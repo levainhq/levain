@@ -54,6 +54,10 @@ Architecture:
   - ``monitor`` (``prediction_diverged`` / ``TrajectoryObserver``) — the runtime prediction-error
     monitor (the unknown-danger backstop; diffs actual-vs-``predicted_trajectory`` → ``killed``).
   - ``liveness`` (``binding_liveness`` / ``gate_liveness``) — binding + kill/gate telemetry.
+  The run journal (S8):
+  - ``RunJournal`` / ``RunRef`` — a binding fire's effects, each at most once: held while a decision on
+    the binding is open, cancelled by a rejection, fenced by a pause/revoke/tighten, poisoned (never
+    retried) when the outcome is unknown, replayed (never re-run) when delivered again.
 """
 from __future__ import annotations
 
@@ -78,7 +82,9 @@ from levain.autonomic.binding import (
     SubGoal,
     TightnessVector,
     TriggerSpec,
+    ReplaceResult,
     binding_invocation,
+    derived_binding_id,
     seal_binding_id,
 )
 from levain.autonomic.chainpath import (
@@ -112,10 +118,22 @@ from levain.autonomic.kill import (
     kill_purity_error,
     kill_trips,
 )
+from levain.autonomic.journal import (
+    EffectOutcome,
+    EffectStatus,
+    HoldResult,
+    JournalCorruptError,
+    RunJournal,
+    RunRef,
+    effect_digest,
+    hold_id_for,
+    run_id_for,
+)
 from levain.autonomic.liveness import binding_liveness, gate_liveness
 from levain.autonomic.monitor import (
     TrajectoryObserver,
     assert_trajectory_pure,
+    bound_declared,
     prediction_diverged,
     trajectory_bound,
     within_envelope,
@@ -179,7 +197,19 @@ __all__ = [
     "Binding",
     "binding_invocation",
     "seal_binding_id",
+    "derived_binding_id",
     "BindingStore",
+    "ReplaceResult",
+    # the run journal (S8: an unattended run's effects, at most once)
+    "RunJournal",
+    "RunRef",
+    "EffectStatus",
+    "EffectOutcome",
+    "HoldResult",
+    "JournalCorruptError",
+    "run_id_for",
+    "hold_id_for",
+    "effect_digest",
     # executor seam
     "Executor",
     "ActionRequest",
@@ -241,6 +271,7 @@ __all__ = [
     "TrajectoryObserver",
     "assert_trajectory_pure",
     "trajectory_bound",
+    "bound_declared",
     "within_envelope",
     "prediction_diverged",
     # binding + gate liveness telemetry (Slice 3a.5)

@@ -38,6 +38,7 @@ def seal_pending_id(
     *, created_at: str, context_id: str, action_name: str, payload: str, proposal_id: str | None,
     posture: str, fail_open: bool, requires_typed: bool, expires_at: str | None,
     authority: dict[str, Any], query_text: str, query_date: str, producers: tuple[str, ...],
+    run_id: str | None = None, effect_id: str | None = None,
 ) -> str:
     """The content-FINGERPRINT pending id: ``pend-<created_at>-<16hex>`` over EVERY governance-relevant
     field of a pending record (L3 codex HIGH-1/2 + complement MED-1 — the cross-substrate consensus).
@@ -66,6 +67,11 @@ def seal_pending_id(
         "expires_at": expires_at, "authority": authority,
         "query_text": query_text, "query_date": query_date, "producers": list(producers),
     }
+    # The journaled run this pending decides (S8). OMITTED when absent, so a pending minted before the
+    # journal existed seals exactly as it did; present, it is sealed, so a pending cannot be re-pointed
+    # at another run's decision.
+    if run_id is not None or effect_id is not None:
+        body["run"] = {"run_id": run_id, "effect_id": effect_id}
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     h = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
     return f"pend-{created_at}-{h}"
@@ -128,12 +134,25 @@ class PendingAction:
     producers: tuple[str, ...] = ()
     proposal_id: str | None = None
     expires_at: str | None = None
+    # The journaled run + effect this pending decides (both or neither): set when a binding's run
+    # proposes; ``resolve`` decides that run's hold and fires the effect through the run journal.
+    run_id: str | None = None
+    effect_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.run_id is None) != (self.effect_id is None):
+            raise ValueError("PendingAction.run_id and effect_id travel together")
+        for name in ("run_id", "effect_id"):
+            v = getattr(self, name)
+            if v is not None and (not isinstance(v, str) or not v):
+                raise ValueError(f"PendingAction.{name} must be a non-empty string or None")
 
     @classmethod
     def create(
         cls, *, created_at: str, action_name: str, payload: str, context_id: str, query_text: str,
         query_date: str, posture: str, fail_open: bool, requires_typed: bool, authority: dict[str, Any],
         producers: tuple[str, ...] = (), proposal_id: str | None = None, expires_at: str | None = None,
+        run_id: str | None = None, effect_id: str | None = None,
     ) -> "PendingAction":
         """Build a SEALED pending action — the ``pending_id`` is the content fingerprint over all the
         governance fields (:func:`seal_pending_id`), so any later alteration is detectable via
@@ -144,13 +163,14 @@ class PendingAction:
             created_at=created_at, context_id=context_id, action_name=action_name, payload=payload,
             proposal_id=proposal_id, posture=posture, fail_open=fail_open, requires_typed=requires_typed,
             expires_at=expires_at, authority=authority, query_text=query_text, query_date=query_date,
-            producers=producers,
+            producers=producers, run_id=run_id, effect_id=effect_id,
         )
         return cls(
             pending_id=pid, created_at=created_at, action_name=action_name, payload=payload,
             context_id=context_id, query_text=query_text, query_date=query_date, posture=posture,
             fail_open=fail_open, requires_typed=requires_typed, authority=authority,
             producers=producers, proposal_id=proposal_id, expires_at=expires_at,
+            run_id=run_id, effect_id=effect_id,
         )
 
     def seal_matches(self) -> bool:
@@ -162,7 +182,7 @@ class PendingAction:
             payload=self.payload, proposal_id=self.proposal_id, posture=self.posture,
             fail_open=self.fail_open, requires_typed=self.requires_typed, expires_at=self.expires_at,
             authority=self.authority, query_text=self.query_text, query_date=self.query_date,
-            producers=self.producers,
+            producers=self.producers, run_id=self.run_id, effect_id=self.effect_id,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -181,6 +201,8 @@ class PendingAction:
             "producers": list(self.producers),
             "proposal_id": self.proposal_id,
             "expires_at": self.expires_at,
+            "run_id": self.run_id,
+            "effect_id": self.effect_id,
         }
 
     @classmethod
@@ -210,6 +232,8 @@ class PendingAction:
             producers=_producer_tuple(d.get("producers") or ()),
             proposal_id=d.get("proposal_id"),
             expires_at=d.get("expires_at"),
+            run_id=d.get("run_id"),
+            effect_id=d.get("effect_id"),
         )
 
 

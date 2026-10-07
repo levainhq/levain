@@ -18,6 +18,13 @@ Ties the governance core into one decision: an :class:`ActionRequest` →
      writes NO receipt (no decision yet — the pending record carries the proposed action), and the
      receipt lands at ``resolve``.
 
+With a :class:`~levain.autonomic.journal.RunJournal` wired, every BINDING fire is a journaled effect
+(its request carries a ``run``): the executor runs inside ``RunJournal.effect``, so it runs at most
+once per run and effect, never while another decision on the binding is open, and never after a fence
+or a cancel; a confirm-class proposal opens the run's hold before it persists the pending, and
+``resolve`` decides that hold. A binding fire without a run is refused once a journal is wired. A
+manual fire (human authority, no run) is not journaled.
+
 The anti-cycle rule, held by construction: this module imports anneal-free vagus internals + the
 injected Executor/ConfirmTransport/Store seams ONLY — never a control-plane surface (Levain/Bridge).
 The dependency arrow stays down. Stdlib-only core.
@@ -32,6 +39,9 @@ from dataclasses import dataclass
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
+from levain.autonomic.journal import (
+    EffectOutcome, EffectStatus, JournalCorruptError, RunJournal, RunRef, effect_digest, hold_id_for,
+)
 from levain.autonomic.kill import kill_trips
 from levain.autonomic.monitor import TrajectoryObserver, prediction_diverged
 from levain.autonomic.pending import PendingAction, PendingActionStore
@@ -69,6 +79,21 @@ def _default_summary(request: ActionRequest) -> str:
     return f"{request.action_name}: {head}"
 
 
+def _execution_record(result: ExecutionResult) -> dict[str, object]:
+    return {"ok": result.ok, "detail": result.detail, "error": result.error,
+            "downstream_id": result.downstream_id}
+
+
+def _execution_from_record(rec: object) -> ExecutionResult:
+    """Rebuild a recorded :class:`ExecutionResult`; a record that does not read is a failure."""
+    if not isinstance(rec, dict) or not isinstance(rec.get("ok"), bool):
+        return ExecutionResult(ok=False, error="recorded_result_unreadable")
+    detail, error, downstream = rec.get("detail"), rec.get("error"), rec.get("downstream_id")
+    return ExecutionResult(ok=rec["ok"], detail=detail if isinstance(detail, str) else "",
+                           error=error if isinstance(error, str) else None,
+                           downstream_id=downstream if isinstance(downstream, str) else None)
+
+
 @dataclass(frozen=True)
 class GateOutcome:
     """The result of gating one action. Exactly one of ``fired`` / ``refused`` / ``deferred`` /
@@ -100,6 +125,14 @@ class GateOutcome:
     # WITHOUT coupling the gate to the binding registry / graduation (it only READS the id off the
     # authority it already carries).
     binding_id: str | None = None
+    # HELD (S8, journaled runs only): the effect did not run and is not decided — a decision is open on
+    # the binding (``hold_id`` names it), or another live process is inside this effect. Not terminal:
+    # delivering the same event again after the decision resumes the run.
+    held: bool = False
+    hold_id: str | None = None
+    # REPLAYED (S8): the effect had already run in this run; ``fired``/``execution`` are the RECORDED
+    # result and the executor was NOT called. Not a new fire: evidence is not recorded for it again.
+    replayed: bool = False
 
     @property
     def is_clean_fire(self) -> bool:
@@ -121,7 +154,8 @@ class GateOutcome:
         check ``deferred``/``refused``/``pending``/``killed`` (or ``not approved``), NOT ``not fired``
         — a fired-then-failed action is not a no-op (L1-LOW-3). A PENDING is not yet approved (no
         decision has been made); a KILLED action was stopped pre-execute by the monitor."""
-        return not self.refused and not self.deferred and not self.pending and not self.killed
+        return (not self.refused and not self.deferred and not self.pending and not self.killed
+                and not self.held)
 
 
 class EfferentGate:
@@ -145,8 +179,11 @@ class EfferentGate:
         confirm_window_s: int = DEFAULT_CONFIRM_WINDOW_S,
         auto_fire_actions: frozenset[str] | None = None,
         trajectory_observer: TrajectoryObserver | None = None,
+        journal: RunJournal | None = None,
     ) -> None:
         self._manifest = manifest
+        # The run journal (S8). None ⇒ nothing is journaled (a request carrying a ``run`` is refused).
+        self._journal = journal
         self._store = store
         self._executor = executor
         # The injected diverse-substrate world-observer for the Slice-3a.5 prediction-error monitor.
@@ -171,6 +208,12 @@ class EfferentGate:
         self._pending_store = pending_store
         self._summarize = summarize or _default_summary
         self._confirm_window_s = confirm_window_s
+
+    @property
+    def journal(self) -> RunJournal | None:
+        """The run journal this gate runs binding effects through, or ``None``. The fire path admits
+        its runs into this same journal."""
+        return self._journal
 
     # =================================================================================================
     # The forward path: gate one action (FIRE / PROPOSE / DEFER / REFUSE).
@@ -197,6 +240,13 @@ class EfferentGate:
         """The gate body (wrapped by ``gate``'s fail-closed net). Pre-execute raises propagate to the
         net (→ refuse); the post-execute paths catch their own faults to preserve the fired state."""
         created_at = self._clock().isoformat()
+
+        # 00. the run journal (S8). A binding fire must be a journaled effect once a journal is wired,
+        # and a journaled effect that already ran, was cancelled or fenced, or is poisoned or in flight
+        # stops HERE, before any decision is made again: a replay re-decides nothing.
+        stop = self._journal_entry(request, created_at)
+        if stop is not None:
+            return stop
 
         # 0. consistency guard (codex L3 MED-5 + complement MED-2): ``human_present`` grants two
         # bypasses (absent-confidence passes §1.5; ABOVE_LOOP base in earned_posture). It is a free
@@ -344,6 +394,27 @@ class EfferentGate:
         the action stays resolvable (the operator can be reached another way); it is logged, not fatal."""
         # _resolve only routes here with both seams wired; assert it (defensive + type-narrowing).
         assert self._pending_store is not None and self._transport is not None
+        run = request.run
+        new_hold = False
+        if run is not None:
+            # The run's hold opens BEFORE the pending is persisted, so from this moment no undecided
+            # effect of the binding runs (hold-until-decided). The hold is keyed by the run and effect,
+            # so proposing the same effect again (a re-delivered event) finds the same decision.
+            assert self._journal is not None   # _journal_entry refused a run without a journal
+            h = self._journal.hold(run.run_id, run.effect_id, digest=self._digest_of(request))
+            if h.status is EffectStatus.APPROVED:
+                # Decided and approved before (the process stopped between the decision and the
+                # effect): run it now under that approval instead of asking again.
+                by = h.decided_by if h.decided_by == "human" else (
+                    "binding" if request.authority.grantor == "binding" else "on-loop")
+                return self._fire(request=request, created_at=created_at, posture=posture,
+                                  verdict="approved" if by == "human" else "auto", by=by,
+                                  actor_first_estimate=request.actor_first_estimate, decided=True)
+            if h.status is EffectStatus.REPLAYED:
+                return self._replayed(request, h, created_at)
+            if h.status is not EffectStatus.HELD:
+                return self._journal_stop(request, h, posture)
+            new_hold = h.new_hold
         expires_at = self._expires_at(created_at)
         # Build a SEALED pending — PendingAction.create computes the id as a content FINGERPRINT over
         # every governance field, so any later alteration is caught by seal_matches() at resolve/sweep
@@ -354,6 +425,8 @@ class EfferentGate:
             posture=posture.name, fail_open=posture.fail_open, requires_typed=posture.requires_typed,
             authority=request.authority.to_dict(), producers=tuple(request.producers),
             proposal_id=request.proposal_id, expires_at=expires_at,
+            run_id=run.run_id if run is not None else None,
+            effect_id=run.effect_id if run is not None else None,
         )
         pending_id = pending.pending_id
         try:
@@ -361,6 +434,11 @@ class EfferentGate:
         except Exception as e:  # noqa: BLE001 — fail-closed: can't persist → can't gate → don't propose
             _log.error("efferent gate: pending persist FAILED (%s): %s — refusing (cannot gate)",
                        type(e).__name__, e)
+            if new_hold:
+                # No pending will ever decide the hold this call opened; reject it (which cancels the
+                # run) rather than leave it blocking the binding. A hold that was already open belongs
+                # to an earlier pending that may still decide it, so it is left alone.
+                self._reject_hold(pending, by="on-loop")
             return GateOutcome(
                 posture=posture, fired=False, refused=True, deferred=False,
                 reason=f"pending_persist_failed:{type(e).__name__}", receipt_id=None, execution=None,
@@ -430,6 +508,9 @@ class EfferentGate:
         # complement MED-1). A mismatch ⇒ a field was altered after propose (tampered/corrupt/drifted) ⇒
         # REFUSE + record a denied receipt; the record is already claimed-out, so it cannot re-fire.
         if not pending.seal_matches():
+            # The run reference on a tampered record is not trusted, so its hold is NOT decided from it;
+            # the hold stays open (the binding's undecided effects stay held) and is listed by
+            # ``RunJournal.open_holds`` for a person to decide.
             _log.error("efferent gate resolve: INTEGRITY mismatch on %s — record altered since propose; "
                        "REFUSED (no fire)", pending_id)
             return self._deny_fields(
@@ -444,6 +525,7 @@ class EfferentGate:
         if posture is None:
             # a corrupt posture name on a record whose seal otherwise verified (a re-sealed corruption,
             # or an enum that was retired) — DROP into a refuse, never an executable rung (codex MED).
+            self._reject_hold(pending, by=decision.by)
             return self._deny_fields(
                 created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
                 context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
@@ -452,8 +534,19 @@ class EfferentGate:
                 reason="corrupt_posture", actor_first_estimate=decision.first_estimate,
             )
         authority = self._authority_of(pending)
+        run = RunRef(pending.run_id, pending.effect_id) if pending.run_id and pending.effect_id else None
+        journal_bar = self._journal_bar(run, authority)
+        if journal_bar is not None:
+            return self._deny_fields(
+                created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
+                context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
+                producers=pending.producers, authority=authority, posture=posture,
+                verdict="denied", by=decision.by, reason=journal_bar,
+                actor_first_estimate=decision.first_estimate,
+            )
 
         if not decision.approved:
+            self._reject_hold(pending, by=decision.by)
             # a silence-window DROP (the sweep, by=on-loop) is a ``timed_out`` MODE; an explicit human
             # deny is ``refused`` — orthogonal to the ``denied`` verdict either way (Slice 3a.5 §2.1).
             deny_terminal = "timed_out" if decision.by == "on-loop" else "refused"
@@ -472,6 +565,7 @@ class EfferentGate:
         # tampered/injection payload fires NOTHING). A guard failure denies (records a denied receipt).
         guard = self._guard_resolve_fire(pending, posture, decision)
         if guard is not None:
+            self._reject_hold(pending, by=decision.by)
             return self._deny_fields(
                 created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
                 context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
@@ -499,11 +593,26 @@ class EfferentGate:
             query_text=pending.query_text, query_date=pending.query_date,
             trust=_RESOLVED_TRUST, grounded=True, authority=authority,
             producers=pending.producers, proposal_id=pending.proposal_id,
-            actor_first_estimate=decision.first_estimate,
+            actor_first_estimate=decision.first_estimate, run=run,
         )
+        if run is not None:
+            # Approve the run's hold with the digest of exactly what fires. ``already_decided`` (a second
+            # pending for the same effect) falls through: the journal then answers with what the first
+            # decision did (replayed, or cancelled). Any other refusal fires nothing.
+            assert self._journal is not None   # _journal_bar refused a run without a journal
+            d = self._journal.decide(hold_id_for(run.run_id, run.effect_id), approve=True,
+                                     digest=self._digest_of(request), by=decision.by)
+            if not d.ok and d.reason != "already_decided":
+                return self._deny_fields(
+                    created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
+                    context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
+                    producers=pending.producers, authority=authority, posture=posture,
+                    verdict="denied", by=decision.by, reason=f"journal:{d.reason}",
+                    actor_first_estimate=decision.first_estimate,
+                )
         return self._fire(
             request=request, created_at=created_at, posture=posture,
-            verdict=verdict, by=by, actor_first_estimate=decision.first_estimate,
+            verdict=verdict, by=by, actor_first_estimate=decision.first_estimate, decided=True,
         )
 
     def _guard_resolve_fire(self, pending: PendingAction, posture: Posture,
@@ -603,6 +712,7 @@ class EfferentGate:
         if posture is None:   # corrupt posture (codex MED) → DROP, no execution path
             if self._pending_store.claim(pending.pending_id) is not None:  # type: ignore[union-attr]
                 _log.error("efferent gate sweep: corrupt posture on %s — DROPPED", pending.pending_id)
+                self._reject_hold(pending, by="on-loop")
             return None
         # HIGH-3 (defence-in-depth behind the seal): the silence default is the VALIDATED posture's,
         # never the raw stored fail_open. A disagreement → DROP, never auto-fire.
@@ -611,6 +721,7 @@ class EfferentGate:
                 _log.error("efferent gate sweep: fail_open/posture mismatch on %s (stored=%s, %s.fail_open=%s)"
                            " — DROPPED, NOT auto-fired", pending.pending_id, pending.fail_open,
                            posture.name, posture.fail_open)
+                self._reject_hold(pending, by="on-loop")
             return None
         if posture.fail_open:
             # AUTO-FIRE (no human at fire-time) is ALLOWLIST-GATED (codex ship-gate HIGH-1): only an
@@ -620,6 +731,7 @@ class EfferentGate:
                 if self._pending_store.claim(pending.pending_id) is not None:  # type: ignore[union-attr]
                     _log.error("efferent gate sweep: %r not in the auto-fire allowlist — cooling-off %s "
                                "DROPPED, not auto-fired", pending.action_name, pending.pending_id)
+                    self._reject_hold(pending, by="on-loop")
                 return None
             decision = ConfirmDecision(approved=True, by="on-loop", reason="cooling_off_window_elapsed")
         else:
@@ -633,7 +745,8 @@ class EfferentGate:
     # Shared terminal paths (FIRE / DENY) — used by both the immediate route and the resolve route.
     # =================================================================================================
     def _fire(self, *, request: ActionRequest, created_at: str, posture: Posture,
-              verdict: str, by: str, actor_first_estimate: object | None) -> GateOutcome:
+              verdict: str, by: str, actor_first_estimate: object | None,
+              decided: bool = False) -> GateOutcome:
         """FIRE the action then build + persist the FILLED receipt. The effect fires FIRST; a
         face-build fault thereafter (codex L3 HIGH-2 / complement MED-1) must NOT raise into the
         caller NOR relabel the outcome as refused — preserve fired-state, drop the receipt.
@@ -652,7 +765,17 @@ class EfferentGate:
             killed = self._run_prediction_monitor(request, created_at, posture, by, actor_first_estimate)
             if killed is not None:
                 return killed       # the monitor stopped the fire — no effect, killed receipt persisted
-        execution = self._safe_execute(request.action_name, request.payload, request.context_id)
+        if request.run is not None:
+            # A journaled effect (S8): it runs inside the journal, at most once. ``decided`` = it runs
+            # under its own approved hold (the resolve path); an undecided effect is held while any
+            # decision on its binding is open.
+            ran = self._journaled_execute(request, created_at=created_at, posture=posture,
+                                          verdict=verdict, by=by, decided=decided)
+            if isinstance(ran, GateOutcome):
+                return ran
+            execution = ran
+        else:
+            execution = self._safe_execute(request.action_name, request.payload, request.context_id)
         try:
             face = build_gate_face(
                 context_id=request.context_id,
@@ -677,6 +800,8 @@ class EfferentGate:
             created_at=created_at, action_name=request.action_name, proposal_id=request.proposal_id,
             posture=posture, fired=execution.ok, face=face,
         )
+        if receipt_id is not None and request.run is not None:
+            self._note_receipt(request.run, receipt_id)
         reason = "" if execution.ok else f"execute_failed:{execution.error}"
         if receipt_id is None:  # the effect may already have fired; the receipt just didn't persist
             reason = f"{reason}; receipt_persist_failed" if reason else "receipt_persist_failed"
@@ -689,7 +814,9 @@ class EfferentGate:
     def _deny(self, request: ActionRequest, created_at: str, posture: Posture, reason: str) -> GateOutcome:
         """Record a terminal gate-side DENY (unknown action / §1.5 refuse / policy refuse). The
         decider is the AUTONOMOUS gate (``by=on-loop``) — see ``_deny_fields`` for why ``on-loop``
-        stands against ``verdict=denied`` (the frozen enum has no ``constitution`` value)."""
+        stands against ``verdict=denied`` (the frozen enum has no ``constitution`` value). A deny of a
+        journaled effect ends its run (:meth:`_cancel_run`)."""
+        self._cancel_run(request, f"denied:{reason}")
         return self._deny_fields(
             created_at=created_at, action_name=request.action_name, proposal_id=request.proposal_id,
             context_id=request.context_id, query_text=request.query_text, query_date=request.query_date,
@@ -794,7 +921,9 @@ class EfferentGate:
         NO effect fired) and return a killed outcome. The autonomous monitor is the decider → the frozen
         ``gate.verdict`` is ``denied`` (the verdict enum has no ``killed`` — the MODE lives in
         ``terminal_state``, §2.1); ``by`` names the autonomous decider (on-loop / binding). Fail-soft on
-        a face/persist fault (like ``_fire``/``_deny_fields``): the kill stands, the trace just drops."""
+        a face/persist fault (like ``_fire``/``_deny_fields``): the kill stands, the trace just drops.
+        A kill of a journaled effect ends its run (:meth:`_cancel_run`)."""
+        self._cancel_run(request, f"killed:{reason}")
         try:
             face = build_gate_face(
                 context_id=request.context_id, query_text=request.query_text,
@@ -824,6 +953,179 @@ class EfferentGate:
     # =================================================================================================
     # internals
     # =================================================================================================
+    # =================================================================================================
+    # The run journal (S8): binding effects at most once.
+    # =================================================================================================
+    @staticmethod
+    def _digest_of(request: ActionRequest) -> str:
+        return effect_digest(action_name=request.action_name, payload=request.payload,
+                             context_id=request.context_id)
+
+    def _journal_bar(self, run: RunRef | None, authority: AuthorityScope) -> str | None:
+        """Why a request or pending may not proceed at all given the journal wiring, or ``None``: a
+        binding fire must be journaled once a journal is wired, and a run cannot be journaled without
+        one."""
+        if run is None:
+            if self._journal is not None and authority.grantor == "binding":
+                return "unjournaled_binding_fire"
+            return None
+        if self._journal is None:
+            return "run_without_journal"
+        return None
+
+    def _journal_entry(self, request: ActionRequest, created_at: str) -> GateOutcome | None:
+        """The gate's first step for a journaled request: refuse a wiring mismatch, and stop an effect
+        the journal already settled (done → replayed; cancelled, fenced, poisoned → refused; in flight
+        elsewhere → held) before any decision is made again. ``None`` = proceed."""
+        bar = self._journal_bar(request.run, request.authority)
+        if bar is not None:
+            return self._deny(request, created_at, Posture.REFUSE_ESCALATE, bar)
+        if request.run is None:
+            return None
+        assert self._journal is not None
+        try:
+            barrier = self._journal.peek(request.run.run_id, request.run.effect_id)
+        except KeyError:
+            return self._deny(request, created_at, Posture.REFUSE_ESCALATE, "run_not_admitted")
+        except (JournalCorruptError, OSError) as e:
+            _log.error("efferent gate: run journal unreadable (%s): %s — refusing", type(e).__name__, e)
+            return GateOutcome(
+                posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
+                reason=f"journal_unreadable:{type(e).__name__}", receipt_id=None, execution=None,
+                binding_id=request.authority.binding_id,
+            )
+        if barrier is None:
+            return None
+        if barrier.status is EffectStatus.REPLAYED:
+            return self._replayed(request, barrier, created_at)
+        return self._journal_stop(request, barrier, Posture.REFUSE_ESCALATE)
+
+    def _journal_stop(self, request: ActionRequest, out: EffectOutcome, posture: Posture) -> GateOutcome:
+        """The outcome for an effect the journal did not let run. HELD and IN_FLIGHT are not terminal
+        (``held``: deliver the event again later); CANCELLED, FENCED and POISONED are (``refused``).
+        No receipt: the journal line that stopped it (the cancel, the fence, the unknown outcome) is
+        the record, and writing one per re-delivery would repeat it."""
+        held = out.status in (EffectStatus.HELD, EffectStatus.IN_FLIGHT)
+        _log.info("efferent gate: %r stopped by the run journal (%s)", request.action_name, out.status.value)
+        return GateOutcome(
+            posture=posture, fired=False, refused=not held, deferred=False,
+            reason=f"journal:{out.status.value}", receipt_id=None, execution=None,
+            binding_id=request.authority.binding_id, held=held, hold_id=out.hold_id,
+        )
+
+    def _journaled_execute(self, request: ActionRequest, *, created_at: str, posture: Posture,
+                           verdict: str, by: str, decided: bool) -> ExecutionResult | GateOutcome:
+        """Run the executor through the journal. Returns the :class:`ExecutionResult` of an effect that
+        ran now, or the :class:`GateOutcome` when the journal stopped or replayed it.
+
+        Unlike :meth:`_safe_execute`, an executor that RAISES, or returns something that is not an
+        ``ExecutionResult``, has an UNKNOWN outcome here: the journal poisons the effect (it is never
+        run again) and the fire reports ``ok=False``. What the receipt needs is recorded with the
+        result, so a replay can write a receipt that never landed."""
+        assert self._journal is not None and request.run is not None
+        run = request.run
+        called = False
+
+        def call() -> dict[str, object]:
+            nonlocal called
+            called = True
+            result = self._executor.execute(request.action_name, request.payload, context_id=request.context_id)
+            if not isinstance(result, ExecutionResult):
+                raise TypeError(f"executor returned {type(result).__name__}, not an ExecutionResult")
+            return {"execution": _execution_record(result), "posture": posture.name,
+                    "verdict": verdict, "by": by}
+
+        try:
+            out = self._journal.effect(run.run_id, run.effect_id, digest=self._digest_of(request),
+                                       fn=call, needs_decision=decided)
+        except Exception as e:  # noqa: BLE001 — the gate never raises
+            if not called:
+                _log.error("efferent gate: run journal FAILED before the effect (%s): %s — nothing ran",
+                           type(e).__name__, e)
+                return GateOutcome(
+                    posture=posture, fired=False, refused=True, deferred=False,
+                    reason=f"journal_error:{type(e).__name__}", receipt_id=None, execution=None,
+                    binding_id=request.authority.binding_id,
+                )
+            _log.error("executor %s on %r: outcome UNKNOWN (%s: %s) — poisoned, never retried",
+                       getattr(self._executor, "name", "?"), request.action_name, type(e).__name__, e)
+            return ExecutionResult(ok=False, error=f"outcome_unknown:{type(e).__name__}: {e}")
+        if out.status is EffectStatus.DONE:
+            return _execution_from_record(out.result.get("execution") if isinstance(out.result, dict) else None)
+        if out.status is EffectStatus.REPLAYED:
+            return self._replayed(request, out, created_at)
+        return self._journal_stop(request, out, posture)
+
+    def _replayed(self, request: ActionRequest, out: EffectOutcome, created_at: str) -> GateOutcome:
+        """The outcome for an effect that already ran in this run: the RECORDED result, the executor
+        not called. If no receipt was noted for it (the process stopped between the effect and its
+        receipt, or the receipt persist failed), the receipt is written now from the recorded fields:
+        a receipt that did not land is written on the next delivery (at least once, not exactly once:
+        two concurrent deliveries can both write it)."""
+        rec = out.result if isinstance(out.result, dict) else {}
+        execution = _execution_from_record(rec.get("execution"))
+        recorded_posture = rec.get("posture")
+        posture = (Posture[recorded_posture] if isinstance(recorded_posture, str)
+                   and recorded_posture in Posture.__members__ else Posture.REFUSE_ESCALATE)
+        receipt_id = out.receipt_id
+        if receipt_id is None and request.run is not None:
+            try:
+                face = build_gate_face(
+                    context_id=request.context_id, query_text=request.query_text,
+                    query_date=request.query_date, producers=request.producers,
+                    gate=build_gate_verdict(verdict=str(rec.get("verdict")), by=str(rec.get("by")),
+                                            binding_id=request.authority.binding_id),
+                    authority=request.authority, terminal_state="fired",
+                    downstream_id=execution.downstream_id, actor_first_estimate=request.actor_first_estimate,
+                )
+            except Exception as e:  # noqa: BLE001 — the effect already ran; a receipt fault is not fatal
+                _log.error("efferent gate: replay receipt face FAILED (%s): %s", type(e).__name__, e)
+            else:
+                receipt_id = self._persist(
+                    created_at=created_at, action_name=request.action_name, proposal_id=request.proposal_id,
+                    posture=posture, fired=execution.ok, face=face,
+                )
+                if receipt_id is not None:
+                    self._note_receipt(request.run, receipt_id)
+        return GateOutcome(
+            posture=posture, fired=execution.ok, refused=False, deferred=False,
+            reason="replayed: the effect already ran in this run", receipt_id=receipt_id,
+            execution=execution, binding_id=request.authority.binding_id, replayed=True,
+        )
+
+    def _note_receipt(self, run: RunRef, receipt_id: str) -> None:
+        try:
+            self._journal.note_receipt(run.run_id, run.effect_id, receipt_id)  # type: ignore[union-attr]
+        except Exception as e:  # noqa: BLE001 — fail-soft: a replay writes the receipt again at worst
+            _log.error("efferent gate: could not note receipt %s in the run journal (%s): %s",
+                       receipt_id, type(e).__name__, e)
+
+    def _cancel_run(self, request: ActionRequest, reason: str) -> None:
+        """End the run of a journaled effect the gate decided not to fire, so a re-delivered event
+        cannot reach a different decision for it (the monitor reads world state). Fail-soft: a journal
+        that cannot be written runs no effect either."""
+        if request.run is None or self._journal is None:
+            return
+        try:
+            self._journal.cancel(request.run.run_id, reason=reason)
+        except Exception as e:  # noqa: BLE001
+            _log.error("efferent gate: could not cancel run %s (%s): %s", request.run.run_id,
+                       type(e).__name__, e)
+
+    def _reject_hold(self, pending: PendingAction, *, by: str) -> None:
+        """Reject the run hold a pending carries (which cancels its run): the pending was denied,
+        dropped or failed to persist, so no approval for it will ever come. Fail-soft."""
+        if self._journal is None or not pending.run_id or not pending.effect_id:
+            return
+        digest = effect_digest(action_name=pending.action_name, payload=pending.payload,
+                               context_id=pending.context_id)
+        try:
+            self._journal.decide(hold_id_for(pending.run_id, pending.effect_id), approve=False,
+                                 digest=digest, by=by)
+        except Exception as e:  # noqa: BLE001
+            _log.error("efferent gate: could not reject the hold of %s (%s): %s", pending.pending_id,
+                       type(e).__name__, e)
+
     def _persist(self, *, created_at, action_name, proposal_id, posture, fired, face) -> str | None:
         """Append the gate-receipt FAIL-SOFT (L1-HIGH-1). A receipt-persist failure (a disk error, or
         a non-serializable value that slipped past ``build_gate_face``'s coercion) must NOT raise into

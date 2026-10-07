@@ -40,6 +40,15 @@ The four design seams (resolved at the 4a build, `projects/vagus/slice4_scope.md
      ``EfferentGate`` + a ``clock`` are all injected; the live event SOURCE (Argus's stream) is an
      adapter/adoption concern — 4a dispatches a single supplied event.
 
+**The run journal (S8).** When the gate carries a :class:`~levain.autonomic.journal.RunJournal`, every
+dispatch of a binding on an event is a journaled RUN: its id is a content address over the binding and
+the exact event (:func:`~levain.autonomic.journal.run_id_for`), it is ADMITTED under the binding's
+current governance generation BEFORE the fresh fireability check (so a pause or revoke that lands after
+the check fences it), and each link's effect runs at most once. The contract with the event source:
+deliver at least once. Delivering an event again is safe (a done effect replays its recorded result
+and records no new graduation evidence), and it is how a HELD dispatch (a decision open on the
+binding, see :attr:`GateOutcome.held`) is resumed once the decision is made.
+
 Stdlib-only core; pure of I/O beyond the injected stores' own reads/writes.
 """
 from __future__ import annotations
@@ -54,6 +63,7 @@ from levain.autonomic.binding import Binding, BindingStore, binding_invocation
 from levain.autonomic.chainpath import ChainExecutor, ChainOutcome
 from levain.autonomic.executor import ActionRequest
 from levain.autonomic.gate import EfferentGate, GateOutcome
+from levain.autonomic.journal import RunRef, run_id_for
 from levain.autonomic.posture import Posture
 from levain.autonomic.risk import ActionRisk
 
@@ -217,6 +227,22 @@ class FireDispatcher:
         # one-shot is NOT claimed/spent on a non-matching event. For a CHAIN, the claim here spends the
         # one-shot as the chain's ONE fire (the whole chain is one fire of the grant). (The residual
         # window — this re-acquire → the gate fire — is irreducible; the lock can't span the gate's I/O.)
+        # 3a. the run journal: derive the run id (pure, before anything is spent: an event that cannot be
+        # addressed skips the binding without claiming a one-shot) and ADMIT the run under the
+        # binding's current generation BEFORE the fireability re-acquire below. Admission first means a
+        # pause/revoke that lands between the two is either seen by the re-acquire or has already
+        # fenced this run, never neither. Re-admitting a known run is a no-op (a re-delivery resumes it).
+        journal = self._gate.journal
+        run_id: str | None = None
+        if journal is not None:
+            try:
+                run_id = run_id_for(binding.binding_id, event)
+            except ValueError as e:
+                _log.warning("firepath: binding %s — the event is not canonical JSON (%s); a run cannot be "
+                             "addressed, so it does not fire", binding.binding_id, e)
+                return None
+            journal.start(run_id, binding_id=binding.binding_id)
+
         one_shot = binding.one_shot
         if one_shot:
             # the one-shot's atomic claim IS the fresh fireable snapshot (it re-reads + flips REVOKED
@@ -234,9 +260,10 @@ class FireDispatcher:
         # the gate fires directly (4a). Both operate on the FRESH (claimed) snapshot.
         if len(fresh.goal) > 1:
             return self._dispatch_chain(fresh, event)
-        return self._dispatch_single_link(fresh, event, one_shot=one_shot)
+        return self._dispatch_single_link(fresh, event, one_shot=one_shot, run_id=run_id)
 
-    def _dispatch_single_link(self, fresh: Binding, event: dict[str, Any], *, one_shot: bool) -> FireDispatch:
+    def _dispatch_single_link(self, fresh: Binding, event: dict[str, Any], *, one_shot: bool,
+                              run_id: str | None = None) -> FireDispatch:
         """The Slice-4a single-link fire-path: build the ACTION-specific request (adapter), OVERLAY the
         governance-critical fields from the FRESH SEALED binding so the adapter cannot forge them
         (``risk`` seam #1, the authority, the effective_guard kills, the prediction trajectory, the
@@ -253,6 +280,7 @@ class FireDispatcher:
             predicted_trajectory=_predicted_trajectory(fresh),
             ratified_posture=fresh.posture,
             trigger_event=event,
+            run=RunRef(run_id, "link-0") if run_id is not None else None,
         )
 
         # fire the gate (it decides FIRE / KILL / PROPOSE / REFUSE and writes the receipt; it never
@@ -268,7 +296,9 @@ class FireDispatcher:
         #   holds no BindingStore) — is recorded by the ADAPTER via ``GateOutcome.binding_id`` (gap #1);
         #   a CHAIN's completion is recorded by the chain executor. This immediate path is the on-loop
         #   (``fires_immediately``) single-link fire. Fail-soft.
-        if outcome.fired and not one_shot:
+        # A REPLAYED outcome is the record of an earlier fire, not a new one: counting it again would
+        # inflate the unsealed evidence that loosens autonomy.
+        if outcome.fired and not one_shot and not outcome.replayed:
             try:
                 self._store.record_fire(fresh.binding_id, clean=outcome.is_clean_fire,
                                         fired_at=self._clock().isoformat())

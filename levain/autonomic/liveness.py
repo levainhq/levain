@@ -2,7 +2,7 @@
 
 A standing grant that fires autonomously, a kill that is supposed to stop it, and a monitor that is
 supposed to catch the unpredicted are all INVISIBLE-INFRASTRUCTURE risks: they can silently rot (a
-binding seal-mismatched and barred; a confirm-class grant with no sealed kill; a kill that never
+registry made inert by a record whose identity does not derive; a confirm-class grant with no sealed kill; a kill that never
 trips; a monitor that never fires) while the registry "looks healthy" by record count. This module is
 the structural read against that failure mode (``invisible_infrastructure_failure``): a pure,
 side-effect-free tally over the binding registry + the gate-receipt trace, so the operator (and
@@ -42,15 +42,17 @@ def _guard_stats(guards: tuple[Guard, ...]) -> tuple[int, int, int, int]:
 
 def binding_liveness(store: BindingStore) -> dict[str, Any]:
     """Tally the live shape of the binding registry. Reads the FULL inspection view (``list_all`` —
-    includes inactive + seal-mismatched, the records ``list_active`` bars) once, plus the fire-view
-    (``list_active``) for the canonical fireable count, so the BARRED gap (records that exist but
-    cannot fire) is visible — the whole point of the read.
+    includes inactive records, which ``list_active`` bars) once, plus the fire-view (``list_active``)
+    for the canonical fireable count, so the BARRED gap (records that exist but cannot fire) is
+    visible — the whole point of the read.
 
     Keys:
+      - ``registry_corrupt`` — ``None``, or why the registry reads as NO bindings
+        (:meth:`~levain.autonomic.binding.BindingStore.integrity`: a duplicate, a record whose core does
+        not seal to its id, unreadable JSON). Without it a corrupt registry tallies exactly like an empty
+        one; a non-``None`` value is a TAMPER/corruption signal and every other count below is zero.
       - ``total`` / ``by_status`` — record count + lifecycle mix.
       - ``fireable`` — the ``list_active`` count (active + sealed + a sealed kill at confirm-class).
-      - ``barred_seal_mismatch`` — ACTIVE records whose floor was altered (seal-broken → barred,
-        ``structural_invariants_beat_discipline``); a nonzero count is a TAMPER/corruption signal.
       - ``barred_confirm_no_kill`` — ACTIVE confirm-class records with no SEALED-floor kill (barred by
         the ``RECEIPT_VERSION=4`` mandate; a nonzero count means a grant was minted/seeded around the
         compiler).
@@ -63,17 +65,14 @@ def binding_liveness(store: BindingStore) -> dict[str, Any]:
     fireable = len(store.list_active())
 
     by_status = {s.value: 0 for s in BindingStatus}
-    barred_seal_mismatch = 0
     barred_confirm_no_kill = 0
     guards_floor = kill_floor = guards_add = kill_add = with_traj = with_bound = 0
 
     for b in all_bindings:
         by_status[b.status.value] = by_status.get(b.status.value, 0) + 1
-        if b.status.is_active and not b.seal_matches():
-            barred_seal_mismatch += 1
-        # confirm-class + active + sealed + NO sealed-floor kill ⇒ barred by the mandate. (A seal-
-        # mismatch is counted above; don't double-count — only flag the kill gap on a sealed record.)
-        if (b.status.is_active and b.seal_matches() and b.posture.needs_confirm
+        # confirm-class + active + NO sealed-floor kill ⇒ barred by the mandate. (Every record read here
+        # proved its seal: one that does not makes the registry corrupt and the read empty.)
+        if (b.status.is_active and b.posture.needs_confirm
                 and not any(g.has_kill for g in b.guard)):
             barred_confirm_no_kill += 1
         f_count, f_kill, f_traj, f_bound = _guard_stats(b.guard)
@@ -86,10 +85,10 @@ def binding_liveness(store: BindingStore) -> dict[str, Any]:
         with_bound += f_bound + a_bound
 
     return {
+        "registry_corrupt": store.integrity(),
         "total": len(all_bindings),
         "by_status": by_status,
         "fireable": fireable,
-        "barred_seal_mismatch": barred_seal_mismatch,
         "barred_confirm_no_kill": barred_confirm_no_kill,
         "guards_floor": guards_floor,
         "kill_bearing_floor": kill_floor,

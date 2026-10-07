@@ -449,15 +449,17 @@ def test_a_legacy_list_without_duplicates_reads_and_converts_on_next_write(tmp_p
 
 
 @pytest.mark.parametrize("extra", [{"posture": "CONFIRM"}, "not-a-record", 5, None])
-def test_a_legacy_entry_that_cannot_be_keyed_refuses_conversion(tmp_path, extra):
-    # converting would drop it from disk (L1+L2, S1h-2: a non-record entry was dropped silently)
+def test_a_legacy_entry_that_proves_no_identity_makes_the_registry_corrupt(tmp_path, extra):
+    # An entry with no derivable identity cannot be keyed or checked (S1h-4): the registry is corrupt,
+    # reads inert, and refuses writes (converting would drop the entry from disk, L1+L2 S1h-2).
     store = BindingStore(tmp_path / "b.json")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     _write_legacy(store, _raw(store) + [extra])
     before = store.path.read_text()
-    assert [x.binding_id for x in store.list_active()] == [b.binding_id]   # still reads
-    with pytest.raises(ValueError, match="cannot be rewritten keyed by id"):
+    assert store.list_active() == []
+    assert "legacy entry 1" in (store.integrity() or "")
+    with pytest.raises(ValueError, match="legacy entry 1"):
         store.set_status(b.binding_id, BindingStatus.PAUSED)
     assert store.path.read_text() == before
 
@@ -486,7 +488,8 @@ def test_supersede_onto_an_existing_new_id_aborts(tmp_path):
     store.add(b_active)
     before = store.path.read_text()
     b_paused = a_binding(guard=(guard(),), posture=Posture.CONFIRM_ELEVATED)   # same id, default PAUSED
-    assert store.replace_atomic(a.binding_id, b_paused) is False
+    result = store.replace_atomic(a, b_paused)
+    assert not result and result.reason == "target_exists"
     assert store.path.read_text() == before
     assert {x.binding_id for x in store.list_active()} == {a.binding_id, b_active.binding_id}
 
@@ -564,8 +567,9 @@ def test_replace_back_to_a_revoked_core_aborts_and_keeps_the_live_grant(tmp_path
     a = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
     store.add(a)
-    assert store.replace_atomic(a.binding_id, b)
-    assert store.replace_atomic(b.binding_id, a) is False
+    assert store.replace_atomic(a, b)
+    result = store.replace_atomic(b, a)
+    assert not result and result.reason == "target_exists"
     assert [x.binding_id for x in store.list_active()] == [b.binding_id]
 
 
@@ -845,18 +849,20 @@ def test_binding_liveness_counts_the_live_shape(tmp_path):
     assert stats["with_predicted_trajectory"] == 1 and stats["with_monitor_bound"] == 1
 
 
-def test_binding_liveness_flags_barred_seal_mismatch(tmp_path):
+def test_binding_liveness_reports_a_registry_made_inert_by_a_tampered_floor(tmp_path):
     store = BindingStore(tmp_path / "b.json")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
-    # tamper the on-disk floor (drop the guard) WITHOUT recomputing the id → an active seal-mismatch
+    assert binding_liveness(store)["registry_corrupt"] is None
+    # tamper the on-disk floor (drop the guard) WITHOUT recomputing the id
     import json
     p = tmp_path / "b.json"
     recs = json.loads(p.read_text())
     recs[b.binding_id]["guard"] = []
     p.write_text(json.dumps(recs))
     stats = binding_liveness(store)
-    assert stats["barred_seal_mismatch"] == 1 and stats["fireable"] == 0
+    assert stats["fireable"] == 0 and stats["total"] == 0
+    assert "seals to" in stats["registry_corrupt"]     # inert, and it says so (not "no bindings")
 
 
 def test_binding_liveness_flags_confirm_without_sealed_kill(tmp_path):
@@ -892,17 +898,38 @@ def test_replace_atomic_validates_the_proposal_before_any_early_return(tmp_path)
     store = BindingStore(tmp_path / "b.json")
     bad = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
     tampered = replace(bad, posture=Posture.ON_LOOP)      # same id, different core: seal-broken
+    never_stored = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM)
     with pytest.raises(ValueError, match="seal-broken"):
-        store.replace_atomic("missing-id", tampered)
+        store.replace_atomic(never_stored, tampered)
     assert not store.path.exists()
 
 
-def test_a_null_trajectory_bound_is_descriptive_not_impure():
-    from levain.autonomic.kill import KillImpurityError
-    from levain.autonomic.monitor import assert_trajectory_pure
-    assert_trajectory_pure({"summary": "x", "bound": None})      # None = no bound: passes
-    with pytest.raises(KillImpurityError):
-        assert_trajectory_pure({"summary": "x", "bound": "field == 1"})
+def test_a_declared_bound_that_is_not_a_predicate_fails_closed():
+    """codex S1h-2 HIGH 2, deleted: ``{"bound": None}`` was accepted and measured identical to no bound
+    (monitor inert). An absent envelope is not consent: a declared bound must be a predicate. Refused at
+    bind time; one that reaches the fire path anyway reads as diverged. Only an OMITTED key is
+    descriptive."""
+    from levain.autonomic.kill import Kleene, KillImpurityError
+    from levain.autonomic.monitor import assert_trajectory_pure, prediction_diverged, within_envelope
+    for bad in (None, "field == 1", [], 0):
+        with pytest.raises(KillImpurityError):
+            assert_trajectory_pure({"summary": "x", "bound": bad})
+        assert within_envelope({"bound": bad}, {"field": 1}) is Kleene.UNKNOWN
+        assert prediction_diverged({"bound": bad}, {"field": 1})[0] is True
+    assert_trajectory_pure({"summary": "x"})                     # no key: descriptive, passes
+    assert prediction_diverged({"summary": "x"}, {"field": 1})[0] is False
+
+
+def test_a_null_bound_cannot_be_persisted_or_tightened(tmp_path):
+    store = BindingStore(tmp_path / "b.json")
+    null_bound = Guard(rationale="watch", dissent_author="codex", predicted_trajectory={"bound": None})
+    with pytest.raises(ValueError):
+        store.add(a_binding(guard=(guard(), null_bound), status=BindingStatus.ACTIVE))
+    b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    store.add(b)
+    with pytest.raises(ValueError):
+        store.tighten_guard(b.binding_id, null_bound)
+    assert store.get(b.binding_id).guard_additions == ()
 
 
 
@@ -922,7 +949,8 @@ def test_add_cannot_revive_a_single_malformed_revoked_record(tmp_path):
     _malformed_revoked(store, b)
     before = store.path.read_text()
     assert store.list_active() == []
-    assert store.add(b) is False
+    with pytest.raises(ValueError, match="proves no identity"):   # S1h-4: the registry is corrupt
+        store.add(b)
     assert store.path.read_text() == before and store.list_active() == []
 
 
@@ -938,7 +966,8 @@ def test_add_cannot_revive_a_seal_broken_record(tmp_path):
     store.path.write_text(json.dumps(raw))
     before = store.path.read_text()
     assert store.list_active() == []
-    assert store.add(b) is False
+    with pytest.raises(ValueError, match="seals to"):             # S1h-4: the registry is corrupt
+        store.add(b)
     assert store.path.read_text() == before and store.list_active() == []
 
 
@@ -951,9 +980,10 @@ def test_replace_atomic_cannot_revive_a_malformed_revoked_target(tmp_path):
     store.set_status(new.binding_id, BindingStatus.REVOKED)
     _malformed_revoked(store, new)
     before = store.path.read_text()
-    assert store.replace_atomic(old.binding_id, new) is False
+    with pytest.raises(ValueError, match="proves no identity"):   # S1h-4: the registry is corrupt
+        store.replace_atomic(old, new)
     assert store.path.read_text() == before
-    assert [x.binding_id for x in store.list_active()] == [old.binding_id]
+    assert store.list_active() == []                              # and inert, whole
 
 
 def test_a_record_that_would_not_read_back_is_never_written(tmp_path):
@@ -971,6 +1001,6 @@ def test_a_record_that_would_not_read_back_is_never_written(tmp_path):
     new = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED,
                     graduation=bad_grad)
     with pytest.raises(ValueError, match="would not read back"):
-        store.replace_atomic(old.binding_id, new)
+        store.replace_atomic(old, new)
     assert store.path.read_text() == before
     assert [x.binding_id for x in store.list_active()] == [old.binding_id]
