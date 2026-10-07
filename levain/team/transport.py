@@ -27,6 +27,7 @@ import secrets
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,13 +63,20 @@ class TeamBusy(TeamError):
 # Every git call here is levain's own plumbing on a private worktree, so none of them runs the project's hooks: git on
 # Linux runs a repository's commit, checkout and reference-transaction hooks on exactly these operations, and a hook that
 # fails, or rewrites the index, makes a sync fail or a real entry look like an empty pick.
-_NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
+# Nor the user's global attributes file (system-wide ones are off through GIT_ATTR_NOSYSTEM, and a .gitattributes on
+# the ledger branch is tamper). The repository's own .git/info/attributes still applies; levain does not override it.
+_NO_HOOKS = ["-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/null"]
 # The only names levain writes under ledger/: <handle>/<device>.jsonl (file_for, _new_device). Compared as bytes.
 _LEDGER_PATH_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[0-9a-f]{16}\.jsonl")
 _LEDGER_DIR_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_TOP_FILES = (b"team.toml", b"PROJECT.md")     # with `ledger`, the whole top level of the ledger branch
 
 
-_INCOMING = "refs/levain/incoming"
+# One quarantine ref and one accepted ref per clone, under refs/levain/ where no refspec of the user's writes. The
+# remote-tracking ref refs/remotes/<remote>/levain-ledger is a mirror for people only: the user's own `git fetch` moves
+# it unjudged, so nothing levain decides reads it.
+_INCOMING = f"refs/levain/incoming/{BRANCH}"
+_ACCEPTED = f"refs/levain/accepted/{BRANCH}"
 _PINS_MAX_BYTES = 8 << 20          # a pins file holds ~120 bytes per ledger file
 _READ_ATTEMPTS = 3
 _PIN_RACE_TEXT = ("the ledger kept moving while this clone recorded what it accepted (a concurrent read pinned a newer "
@@ -93,6 +101,25 @@ _NON_UTF8_LINE = "<a line that is not UTF-8>"   # cannot parse as an entry, so i
 _REGULAR_MODES = (b"100644", b"100755")
 
 
+def _parse_pins(raw: bytes) -> tuple[dict[str, dict], bool, bool]:
+    """(pins, valid, old_format) of a pins.json's bytes. Never raises: anything that is not exactly the shape levain
+    writes (``{"<member>/<device>.jsonl": {"sha256": <64 hex>, "length": <int >= 0>}}``) is invalid."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return {}, False, False
+    if isinstance(data, dict) and data and all(
+            isinstance(v, list) and all(isinstance(x, str) for x in v) for v in data.values()):
+        return {}, False, True
+    ok = isinstance(data, dict) and all(
+        isinstance(k, str) and _LEDGER_PATH_RE.fullmatch(b"ledger/" + k.encode("utf-8", "replace"))
+        and isinstance(v, dict) and set(v) == {"sha256", "length"}
+        and isinstance(v["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", v["sha256"])
+        and isinstance(v["length"], int) and not isinstance(v["length"], bool) and v["length"] >= 0
+        for k, v in data.items())
+    return (data, True, False) if ok else ({}, False, False)
+
+
 def _blob_lines(data: bytes) -> list[bytes]:
     """A ledger file's lines as BYTES. Split on LF only (a CR stays inside its line)."""
     lines = data.split(b"\n")
@@ -115,7 +142,8 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         input_text: str | None = None) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true",
-               GIT_NO_REPLACE_OBJECTS="1")   # a replace ref must not change what levain reads
+               GIT_NO_REPLACE_OBJECTS="1",   # a replace ref must not change what levain reads
+               GIT_ATTR_NOSYSTEM="1")        # nor a system-wide attributes file what it writes
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
     # Bytes in, bytes out: text=True would decode with the parent's locale and turn a CR into a line break. The
     # str fields are for messages and simple tokens (replacement characters, never a lone surrogate); anything
@@ -135,6 +163,25 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         msg = (cp.stderr or cp.stdout).strip().splitlines()
         raise TeamError(f"git {' '.join(args[:2])} failed: {msg[-1] if msg else 'exit ' + str(cp.returncode)}")
     return cp
+
+
+_UMASK_LOCK = threading.Lock()
+
+
+def _umask() -> int:
+    """The process umask. Linux reports it in /proc; elsewhere it can only be read by setting it, so that is done
+    under a lock and restored at once."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError):
+        pass
+    with _UMASK_LOCK:
+        mask = os.umask(0o022)
+        os.umask(mask)
+    return mask
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -197,26 +244,27 @@ class Repo:
     def discover(cls, start: Path) -> "Repo | None":
         """The repository containing ``start`` (a file or a directory, existing or not), or None."""
         d = _existing_dir(start)
-
-        def one(flag: str) -> bytes | None:
-            # One path per call, as bytes, exactly one trailing LF removed: a path may hold any character but NUL,
-            # so a two-path answer split into lines cannot be trusted. Only "not a work tree" means None; any other
-            # failure (git missing, a timeout, safe.directory, a broken config) raises, so a hook in a joined clone
-            # reports it instead of reading "no repository" and going quiet.
-            cp = git(["rev-parse", "--path-format=absolute", flag], d, timeout=10, check=False)
-            if cp.returncode != 0:
-                err = cp.stderr.lower()
-                if "not a git repository" in err or "must be run in a work tree" in err:
-                    return None
-                raise TeamError(f"git rev-parse {flag} failed: {_tail(cp)}")
-            if not cp.stdout_bytes.endswith(b"\n") or len(cp.stdout_bytes) < 2:
-                raise TeamError(f"git rev-parse {flag} gave an answer levain cannot read")
-            return cp.stdout_bytes[:-1]
-
-        top = one("--show-toplevel")
-        common = one("--git-common-dir") if top is not None else None
-        if top is None or common is None:
-            return None
+        # ONE git process answers both questions, so they come from one repository discovery: two calls let a
+        # directory swapped between them (a retargeted symlink) mix two repositories. rev-parse prints each path on its
+        # own line and a path may hold a line break, so the top level is asked twice, as A LF B LF A LF, and the split
+        # is accepted only when exactly one reading fits. Only "not a work tree" means None; any other failure (git
+        # missing, a timeout, safe.directory, a broken config) raises, so a hook in a joined clone reports it instead
+        # of reading "no repository" and going quiet.
+        cp = git(["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir", "--show-toplevel"], d,
+                 timeout=10, check=False)
+        if cp.returncode != 0:
+            err = cp.stderr.lower()
+            if "not a git repository" in err or "must be run in a work tree" in err:
+                return None
+            raise TeamError(f"git rev-parse failed: {_tail(cp)}")
+        out = cp.stdout_bytes
+        fits = [(out[:k], out[k + 1:len(out) - k - 1]) for k in range(1, len(out)) if out[k:k + 1] == b"\n"
+                and len(out) >= 2 * k + 3 and out.endswith(b"\n" + out[:k] + b"\n")]
+        fits = [(top, common[:-1]) for top, common in fits if common.endswith(b"\n") and len(common) > 1
+                and top.startswith(b"/") and common.startswith(b"/")]
+        if len(fits) != 1:
+            raise TeamError("git rev-parse gave an answer levain cannot read (this repository's path is ambiguous)")
+        top, common = fits[0]
         try:
             return cls(Path(top.decode("utf-8")), Path(common.decode("utf-8")))
         except UnicodeDecodeError:
@@ -250,7 +298,7 @@ class GitLedger:
         try:
             data = json.loads(self.state_path.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             return {}
 
     def save_state(self, **changes) -> None:
@@ -505,9 +553,11 @@ class GitLedger:
         return Judgement(led, datas, files, problems)
 
     def _structure(self, rev: str) -> tuple[list[bytes], list[tuple[bytes, str]]]:
-        """(bad_paths, leaves) of the ledger at ``rev``: one ``ls-tree -r -t -z``, judged as bytes. No blob is read."""
-        cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev, "--", "ledger"], self.repo.toplevel, check=False,
-                 timeout=30)
+        """(bad_paths, leaves) of the ledger branch at ``rev``: one ``ls-tree -r -t -z`` of the WHOLE tree, judged as
+        bytes. Levain owns the branch's namespace: its top level is exactly ``team.toml`` and ``PROJECT.md`` (regular
+        files) and ``ledger`` (a tree), so anything else there (a ``.gitattributes`` that would re-encode or filter
+        what levain writes, a ``.gitmodules``, any other file) is tamper too. No blob is read."""
+        cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev], self.repo.toplevel, check=False, timeout=30)
         if cp.returncode != 0:
             raise LedgerReadError(f"could not read the ledger tree: {_tail(cp)}")
         bad_paths: list[bytes] = []
@@ -526,7 +576,9 @@ class GitLedger:
                 continue
             seen_paths.add(path)
             is_tree = mode == b"040000" and kind == b"tree"
-            if path == b"ledger" or _LEDGER_DIR_RE.fullmatch(path):
+            if path in _TOP_FILES:
+                ok = mode in _REGULAR_MODES and kind == b"blob"
+            elif path == b"ledger" or _LEDGER_DIR_RE.fullmatch(path):
                 ok = is_tree
             elif mode in _REGULAR_MODES and kind == b"blob" and _LEDGER_PATH_RE.fullmatch(path):
                 ok = True
@@ -562,22 +614,27 @@ class GitLedger:
         list-of-lines format (a one-time restart, as `levain team repin` would do). One that exists and cannot be
         read or validated is a refusal naming the file and `levain team repin`."""
         try:
-            text = self._pins_bytes().decode("utf-8")
-            data = json.loads(text)
+            raw = self._pins_bytes()
         except FileNotFoundError:
             return {}, ""
-        except (OSError, ValueError, RecursionError):
+        except (OSError, ValueError):
             return {}, _PINS_UNREADABLE
-        if isinstance(data, dict) and data and all(
-                isinstance(v, list) and all(isinstance(x, str) for x in v) for v in data.values()):
+        pins, ok, old = _parse_pins(raw)
+        if old:
             return {}, ""                                             # the old format: restart pinning
-        ok = isinstance(data, dict) and all(
-            isinstance(k, str) and _LEDGER_PATH_RE.fullmatch(b"ledger/" + k.encode("utf-8", "replace"))
-            and isinstance(v, dict) and set(v) == {"sha256", "length"}
-            and isinstance(v["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", v["sha256"])
-            and isinstance(v["length"], int) and not isinstance(v["length"], bool) and v["length"] >= 0
-            for k, v in data.items())
-        return (data, "") if ok else ({}, _PINS_UNREADABLE)
+        return (pins, "") if ok else ({}, _PINS_UNREADABLE)
+
+    def seed_pins_from(self, path: Path) -> dict[str, dict]:
+        """A teammate's pins.json, validated as this clone's own would be (size cap, shape), for ``join``."""
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read(_PINS_MAX_BYTES + 1)
+        except OSError as exc:
+            raise TeamError(f"--pins-from {path}: cannot be read ({exc.strerror})") from None
+        pins, ok, old = _parse_pins(raw) if len(raw) <= _PINS_MAX_BYTES else ({}, False, False)
+        if not ok or old:
+            raise TeamError(f"--pins-from {path}: not a levain pins file (a clone's .git/{DIRNAME}/pins.json)")
+        return pins
 
     @staticmethod
     def _pin_violations(pins: dict[str, dict], datas: dict[str, bytes]) -> list[str]:
@@ -601,7 +658,9 @@ class GitLedger:
         try:
             with self.lock(name="pins.lock", timeout=5.0):
                 stored, bad = self._pins()
-                if bad or self._pin_violations(stored, datas):
+                if bad:
+                    raise LedgerReadError(bad)
+                if self._pin_violations(stored, datas):
                     raise _PinRace()
                 text = json.dumps(new, sort_keys=True)
                 digest = self._pins_digest()
@@ -726,6 +785,12 @@ class GitLedger:
         cp = git(["rev-parse", "--verify", "-q", f"refs/heads/{BRANCH}"], self.repo.toplevel, check=False)
         return cp.returncode == 0
 
+    def _require_remote_name(self, remote: str | None) -> None:
+        """The ledger's remote is a configured git remote NAME (its refs are built from it), never a URL or path."""
+        if remote and git(["remote", "get-url", remote], self.repo.toplevel, check=False, timeout=10).returncode:
+            raise TeamError(f"{remote!r} is not a configured git remote of this repository; add it with "
+                            "`git remote add <name> <url>` and pass the name")
+
     def _default_remote(self) -> str | None:
         cp = git(["remote"], self.repo.toplevel, check=False)
         names = cp.stdout.split()
@@ -755,6 +820,7 @@ class GitLedger:
             raise TeamError(f"the ledger is created by its owner ({team.owner}); your git user.email ({email}) "
                             "maps to someone else")
         remote = remote or self._default_remote()
+        self._require_remote_name(remote)
         if self._local_branch_exists():
             raise TeamError(f"branch {BRANCH} already exists here: use `levain team join`")
         if remote and self._remote_has_branch(remote):
@@ -771,18 +837,40 @@ class GitLedger:
             return f"ledger created and pushed to {remote}/{BRANCH}"
         return f"ledger created locally ({'no remote' if not remote else 'not pushed'})"
 
-    def join(self, *, remote: str | None = None, new_device: bool = False) -> str:
+    def join(self, *, remote: str | None = None, new_device: bool = False, pins_from: Path | None = None) -> str:
+        """Join the team ledger on the remote. With ``pins_from`` (a teammate's pins.json) this clone starts from
+        those pins instead of trusting what it sees first: a ledger that does not hold every byte they pin refuses the
+        join, naming the file. Without it, the first read is trusted, and state.json records that (``first_sight``)."""
         email = self.email()
         if not email:
             raise TeamError("git config user.email is not set in this repository")
+        seed = self.seed_pins_from(pins_from) if pins_from is not None else None
         remote = remote or self._default_remote()
-        if not self._local_branch_exists():
+        self._require_remote_name(remote)
+        if self._local_branch_exists():
+            tip = self.head()
+        else:
             if not remote:
                 raise TeamError("no git remote to join from")
-            git(["fetch", "-q", remote, f"+refs/heads/{BRANCH}:refs/remotes/{remote}/{BRANCH}"],
-                self.repo.toplevel, timeout=120)
-            git(["branch", BRANCH, f"refs/remotes/{remote}/{BRANCH}"], self.repo.toplevel)
-        self.save_state(device=secrets.token_hex(8) if new_device else self._new_device(), remote=remote or "")
+            git(["-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-write-fetch-head", "--refmap=", remote,
+                 f"+refs/heads/{BRANCH}:{_INCOMING}"], self.repo.toplevel, timeout=120)
+            tip = self._ref_sha(_INCOMING)
+        # First sight: the namespace is judged (and, seeded, the teammate's pins) before anything is created.
+        bad = self.judge(tip, self._team_or_none(tip), seed or {}).ledger.tamper
+        if bad:
+            what = f"--pins-from {pins_from}: the team ledger here does not hold what it pins" if seed is not None \
+                else "the team ledger on the remote is refused"
+            raise TeamError(f"{what}, so this clone did not join: " + "; ".join(bad[:3]))
+        if not self._local_branch_exists():
+            git(["branch", BRANCH, tip], self.repo.toplevel)
+            self._advance_accepted(tip)
+            git(["update-ref", "-d", _INCOMING, tip], self.repo.toplevel, check=False)
+        if seed is not None:
+            self.base.mkdir(parents=True, exist_ok=True)
+            with self.lock(name="pins.lock", timeout=10.0):
+                _atomic_write(self.base / "pins.json", json.dumps(seed, sort_keys=True), sync_dir=True)
+        self.save_state(device=secrets.token_hex(8) if new_device else self._new_device(), remote=remote or "",
+                        first_sight=seed is None)
         self._attach_worktree()
         team = self.team()
         handle = team.handle_for_email(email)
@@ -791,7 +879,11 @@ class GitLedger:
                             f"ask the owner ({team.owner}) to run `levain team member add <handle> {email}`")
         if remote:
             self._sync(push=False)
-        return f"joined {team.project} as {handle} (device {self.device})"
+        line = f"joined {team.project} as {handle} (device {self.device})"
+        if seed is None:
+            line += ("\nfirst sight trusted: this clone pins whatever the ledger holds now; to verify, re-join with "
+                     f"--pins-from <a teammate's .git/{DIRNAME}/pins.json>")
+        return line
 
     # ---- write path ----------------------------------------------------------------------------------------
 
@@ -833,8 +925,31 @@ class GitLedger:
                             + ", ".join(foreign[:5]) + f" (inspect {self.wt})")
         mine = [p for p in dirty if own.match(p)]
         if mine:
+            head = self.head()
+            pins, problem = self._pins()
+            if self.judge(head, self._team_or_none(head), pins, problem).ledger.tamper:
+                # Nothing is committed onto a refused ledger. The interrupted write is set aside, not lost, and the
+                # worktree goes back to the committed state so a sync can still bring the repair.
+                kept = self._set_aside(mine)
+                self.warnings.append("an interrupted write of this clone's entry was NOT committed, because the team "
+                                     f"ledger is refused; its file is kept at {kept}")
+                return
             git(["add", "--", *mine], self.wt)
             self._commit("levain team: recover an interrupted write")
+
+    def _set_aside(self, rels: list[str]) -> Path:
+        """Copy each worktree file to <levain-team>/set-aside/ and put the worktree back to HEAD for it."""
+        dest = self.base / "set-aside"
+        dest.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        for rel in rels:
+            src = self.wt / rel
+            with contextlib.suppress(FileNotFoundError):
+                (dest / f"{rel.replace('/', '__')}.{stamp}").write_bytes(src.read_bytes())
+            if git(["checkout", "-q", "HEAD", "--", rel], self.wt, check=False).returncode != 0:
+                with contextlib.suppress(FileNotFoundError):
+                    src.unlink()                          # a new file the branch does not hold
+        return dest
 
     def _commit(self, message: str) -> None:
         git(["-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", message], self.wt)
@@ -923,17 +1038,14 @@ class GitLedger:
         except R.RolesError:
             return None
 
+    # ---- the remote: fetched into quarantine, judged, and only then accepted ---------------------------------------
+    # Every fetch lands in the quarantine ref (_INCOMING). An accepted tip moves the accepted ref (_ACCEPTED,
+    # compare-and-swap) and the quarantine ref is dropped; a refused tip stays quarantined, and that ref IS the record of
+    # the refusal: every read judges it again and refuses while it is refused. The accepted ref is the rollback floor
+    # and the replay target; a successful push advances it to what was pushed.
+
     def _rref(self) -> str | None:
         return f"refs/remotes/{self.remote}/{BRANCH}" if self.remote else None
-
-    def _incoming(self) -> str | None:
-        remote = self.remote
-        if not remote:
-            return None
-        cp = git(["remote", "get-url", remote], self.repo.toplevel, check=False, timeout=10)
-        url = cp.stdout.strip() if cp.returncode == 0 and cp.stdout.strip() else remote   # a URL or path remote
-        key = hashlib.sha256((url + "\0" + BRANCH).encode("utf-8")).hexdigest()[:16]
-        return f"{_INCOMING}/{key}"
 
     def _ref_sha(self, ref: str | None) -> str | None:
         if not ref:
@@ -942,14 +1054,18 @@ class GitLedger:
         return cp.stdout.strip() or None if cp.returncode == 0 else None
 
     def remote_ref(self) -> str | None:
-        """The remote's ledger tip as this clone last ACCEPTED it (the remote-tracking ref), or None. A refused fetch
-        never moves it, so it is safe to render after ``judge_remote``."""
-        return self._ref_sha(self._rref())
+        """The remote's ledger tip as this clone last ACCEPTED it (levain's own accepted ref, which no user fetch
+        moves), or None."""
+        return self._ref_sha(_ACCEPTED)
+
+    def incoming_refusal(self) -> list[str]:
+        """The reasons the quarantined remote tip is refused, or [] when there is none or it is now accepted. Raises
+        LedgerReadError when it cannot be judged."""
+        return self._incoming_refusal()
 
     def _incoming_refusal(self) -> list[str]:
-        """The reasons the quarantined remote tip is refused, or [] when there is none or it is now accepted."""
         try:
-            sha = self._ref_sha(self._incoming())
+            sha = self._ref_sha(_INCOMING)
             if sha is None:
                 return []
             bad = self.judge_remote(sha).ledger.tamper
@@ -978,7 +1094,7 @@ class GitLedger:
         clone reads its own tip). Every other file is judged with this clone's pins; this clone's OWN files (see
         ``_own_rel``) are judged against what this clone wrote: each must still hold every byte the last accepted
         remote tip held (so no repin can adopt a truncation of them), and may lack only this clone's unpushed lines
-        (so a line this clone never wrote is refused). A team.toml that does not parse refuses the tip."""
+        (so a line this clone never wrote is refused). A tip where no version of team.toml parses is refused."""
         try:
             try:
                 team = self.team(rev)
@@ -992,8 +1108,11 @@ class GitLedger:
             j = self.judge(rev, team, {r: p for r, p in pins.items() if not own(r)}, problem)
             if j.ledger.tamper:
                 return j
-            floor, mine, theirs = self._whole(self._ref_sha(self._rref()), own), self._whole(local, own), \
-                self._whole(rev, own)
+            accepted = self._ref_sha(_ACCEPTED)
+            if accepted is None:   # never accepted a fetch (a clone from before the accepted ref): the shared history
+                cp = git(["merge-base", REF, rev], self.repo.toplevel, check=False, timeout=30)
+                accepted = cp.stdout.strip() or None if cp.returncode == 0 else None
+            floor, mine, theirs = self._whole(accepted, own), self._whole(local, own), self._whole(rev, own)
             bad = []
             for rel in sorted(set(floor) | set(mine) | set(theirs)):
                 f, m, t = floor.get(rel, b""), mine.get(rel, b""), theirs.get(rel, b"")
@@ -1010,30 +1129,42 @@ class GitLedger:
         except (TeamError, R.RolesError) as exc:
             raise LedgerReadError(f"the remote ledger could not be judged ({exc})") from None
 
-    def _fetch_quarantined(self, remote: str, timeout: float) -> bool:
+    def _fetch_quarantined(self, remote: str, timeout: float) -> str | None:
         """Fetch the remote's ledger tip into the quarantine ref (git verifies every object it receives), judge it,
-        and only when it is accepted make it the remote-tracking ref and drop the quarantine ref. False when the
-        remote has no ledger branch. A refused tip raises TeamError and stays quarantined (the record)."""
-        inc, rref, top = self._incoming(), self._rref(), self.repo.toplevel
+        and only when it is accepted move the accepted ref to it (compare-and-swap), mirror it to the remote-tracking
+        ref and drop the quarantine ref. Returns the accepted SHA, which callers use (never a ref name a user fetch can
+        move), or None when the remote has no ledger branch. A refused tip raises TeamError and stays quarantined."""
+        top = self.repo.toplevel
+        self.save_state(last_fetch_attempt=time.time())
         # --refmap= : a command-line fetch otherwise ALSO updates the configured remote-tracking ref ("opportunistic"
-        # update), which would put a refused tip exactly where the quarantine keeps it out of.
+        # update), which would put an unjudged tip there.
         cp = git(["-c", "fetch.fsckObjects=true", "fetch", "-q", "--no-write-fetch-head", "--refmap=", remote,
-                  f"+refs/heads/{BRANCH}:{inc}"], top, timeout=timeout, check=False)
+                  f"+refs/heads/{BRANCH}:{_INCOMING}"], top, timeout=timeout, check=False)
         if cp.returncode != 0:
             if "couldn't find remote ref" in (cp.stderr or ""):
-                return False
+                return None
             raise TeamError(f"git fetch failed: {_tail(cp)}")
-        now = time.time()
-        self.save_state(last_fetch_attempt=now, last_fetch_ok=now, last_fetch_error="")
-        sha = self._ref_sha(inc)
+        sha = self._ref_sha(_INCOMING)
         bad = self.judge_remote(sha).ledger.tamper
         if bad:
-            raise TeamError(f"the REMOTE team ledger ({remote}) is refused: " + "; ".join(bad[:3])
-                            + ". Nothing was replayed or pushed; every edit here is denied until a sync finds the "
-                            "remote accepted.")
-        git(["update-ref", rref, sha], top)
-        git(["update-ref", "-d", inc, sha], top, check=False)
-        return True
+            text = (f"the REMOTE team ledger ({remote}) is refused: " + "; ".join(bad[:3])
+                    + ". Nothing was replayed or pushed; every edit here is denied until a sync finds the remote "
+                    "accepted.")
+            self.save_state(last_fetch_error=text)
+            raise TeamError(text)
+        self._advance_accepted(sha)
+        git(["update-ref", "-d", _INCOMING, sha], top, check=False)
+        self.save_state(last_fetch_ok=time.time(), last_fetch_error="")
+        return sha
+
+    def _advance_accepted(self, sha: str) -> None:
+        """Move the accepted ref to ``sha`` by compare-and-swap from the value read here, and mirror it to the
+        remote-tracking ref for people (nothing levain decides reads the mirror)."""
+        top = self.repo.toplevel
+        old = self._ref_sha(_ACCEPTED) or ""
+        git(["update-ref", _ACCEPTED, sha, old], top)
+        if self._rref():
+            git(["update-ref", self._rref(), sha], top, check=False)
 
     def _rebase(self, rref: str, timeout: float, lock_timeout: float) -> None:
         """Put this clone's unpushed commits on top of the remote, under the worktree lock.
@@ -1127,41 +1258,41 @@ class GitLedger:
         git(["reset", "-q", "--hard", orig], self.wt, timeout=60)
 
     def _sync(self, *, push: bool, timeout: float = 120, net_timeout: float = 150,
-              lock_timeout: float = 30.0) -> str:
+              lock_timeout: float = 30.0, retries: int = _PUSH_RETRIES) -> str:
         """Fetch, rebase, optionally push. Must be called WITHOUT the worktree lock held.
 
         Network I/O runs under a separate ``net`` lock, so a hook reading the worktree never waits on a
-        slow remote: the worktree lock is held only for the local rebase and commits.
+        slow remote: the worktree lock is held only for the local rebase and commits. Everything after the fetch uses
+        the ACCEPTED sha it returned, and the push sends the exact sha that was judged.
         """
         remote = self.remote
         if not remote:
             return "local only (no remote)"
-        rref = f"refs/remotes/{remote}/{BRANCH}"
-        local = f"refs/heads/{BRANCH}"
         with self.lock(name="net", timeout=net_timeout):
-            for attempt in range(_PUSH_RETRIES):
-                if not self._fetch_quarantined(remote, timeout):
+            for attempt in range(retries):
+                accepted = self._fetch_quarantined(remote, timeout)
+                if accepted is None:
                     if not push:
                         return f"{remote} has no {BRANCH} branch yet"
                 else:
-                    self._rebase(rref, timeout, lock_timeout)
+                    self._rebase(accepted, timeout, lock_timeout)
                     if not push:
                         return "fetched"
-                    ahead = git(["rev-list", "--count", f"{rref}..{local}"], self.wt).stdout.strip()
+                    ahead = git(["rev-list", "--count", f"{accepted}..{REF}"], self.wt).stdout.strip()
                     if ahead == "0":
                         return "up to date"
-                pins, problem = self._pins()          # the local tip is judged before every push
-                head = self.head()
+                head = self.head()                    # the local tip is judged before every push, and that sha is pushed
+                pins, problem = self._pins()
                 bad = self.judge(head, self._team_or_none(head), pins, problem).ledger.tamper
                 if bad:
                     raise TeamError("this clone's own ledger is refused, so nothing was pushed: " + "; ".join(bad[:3]))
-                cp = git(["push", "-q", "--no-verify", remote, f"{local}:{local}"], self.repo.toplevel,
+                cp = git(["push", "-q", "--no-verify", remote, f"{head}:{REF}"], self.repo.toplevel,
                          check=False, timeout=timeout)
                 if cp.returncode == 0:
-                    try:
+                    with contextlib.suppress(TeamError):
+                        self._advance_accepted(head)  # the push was a fast-forward: the remote now holds exactly this
+                    with contextlib.suppress(TeamError):
                         self._fetch_quarantined(remote, timeout)
-                    except TeamError:
-                        pass  # the push landed; a failed refresh of the tracking ref is not a failed push
                     return "pushed"
                 err = (cp.stderr or "").lower()
                 race = any(s in err for s in ("non-fast-forward", "fetch first", "failed to update ref",
@@ -1171,32 +1302,63 @@ class GitLedger:
                     lines = [l for l in (cp.stderr or "").splitlines() if "rejected" in l or "error" in l.lower()]
                     raise TeamError(f"push failed: {lines[0].strip() if lines else _tail(cp)}")
                 time.sleep(random.uniform(0.05, 0.4) * (attempt + 1))
-        raise TeamError(f"push still rejected after {_PUSH_RETRIES} fetch+rebase rounds")
+        raise TeamError(f"push still rejected after {retries} fetch+rebase rounds")
 
     def fetch_only(self, *, interval: float, timeout: float) -> str | None:
         """Fetch and judge the remote (``_fetch_quarantined``) WITHOUT replaying anything onto the local branch:
         what a read-only surface (the team view) runs. No-op without a remote or when the last attempt is younger
-        than ``interval`` seconds. None when nothing needed doing, another process holds the network lock, or the
-        fetch was accepted; else a one-line reason. Never raises."""
+        than ``interval`` seconds. None when nothing needed doing or the fetch was accepted; "busy: another sync is
+        running" when another process holds the network lock (no attempt is recorded then); else a one-line reason.
+        Never raises."""
         try:
             remote = self.remote
             if not remote:
                 return None
             if time.time() - float(self.state().get("last_fetch_attempt") or 0) < interval:
                 return None
-            self.save_state(last_fetch_attempt=time.time())
             try:
                 with self.lock(name="net", timeout=0.5):
-                    if not self._fetch_quarantined(remote, timeout):
+                    if self._fetch_quarantined(remote, timeout) is None:
                         return "remote has no ledger branch"
             except TeamBusy:
-                return None
+                return "busy: another sync is running"
             return None
         except TeamError as exc:
-            with contextlib.suppress(Exception):
-                self.save_state(last_fetch_error=str(exc))
             return str(exc)
         except Exception as exc:  # noqa: BLE001 - a read-only surface: report, never raise
+            return f"{type(exc).__name__}: {exc}"
+
+    def unpushed(self) -> int | None:
+        """How many local ledger commits the remote does not have yet, counted from the accepted ref (None before the
+        first accepted fetch or push)."""
+        accepted = self._ref_sha(_ACCEPTED)
+        if accepted is None:
+            return None
+        cp = git(["rev-list", "--count", f"{accepted}..{REF}"], self.repo.toplevel, check=False, timeout=10)
+        return int(cp.stdout.strip()) if cp.returncode == 0 and cp.stdout.strip().isdigit() else None
+
+    def unpushed_subjects(self) -> list[str] | None:
+        """The subjects of the local ledger commits the remote does not have yet (None before any accepted tip)."""
+        accepted = self._ref_sha(_ACCEPTED)
+        if accepted is None:
+            return None
+        cp = git(["log", "--format=%s", f"{accepted}..{REF}"], self.repo.toplevel, check=False, timeout=10)
+        return cp.stdout.splitlines() if cp.returncode == 0 else None
+
+    def flush_unpushed(self, *, timeout: float = 10.0) -> str | None:
+        """Push local ledger commits the remote does not have (acknowledgements are committed without a push), in ONE
+        fetch+push round bounded by ``timeout`` per git call: None when there was nothing to push, another process
+        holds the network lock, or it was pushed; else a one-line reason. Never raises."""
+        try:
+            if not self.unpushed():
+                return None
+            self._sync(push=True, timeout=timeout, net_timeout=0.5, lock_timeout=3.0, retries=1)
+            return None
+        except TeamBusy:
+            return None
+        except TeamError as exc:
+            return str(exc)
+        except Exception as exc:  # noqa: BLE001 - a hook path: report, never raise
             return f"{type(exc).__name__}: {exc}"
 
     def fetch_if_due(self, interval: float, *, timeout: float = 8.0) -> str | None:
@@ -1260,7 +1422,7 @@ class GitLedger:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(text)
                 fh.flush()
-                os.fchmod(fh.fileno(), 0o644)
+                os.fchmod(fh.fileno(), 0o666 & ~_umask())   # what git's own checkout would give it
                 os.fsync(fh.fileno())
             os.replace(tmp, self.wt / name)
         except BaseException:
@@ -1278,11 +1440,20 @@ class GitLedger:
         except OSError as exc:
             raise TeamError(f"{name} in the team worktree cannot be read as a regular file ({exc.strerror}); a link "
                             f"or other entry was committed to the ledger branch, and levain will not follow it") from exc
-        with os.fdopen(fd, "rb") as fh:
+        try:
+            fh = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)                                 # fdopen did not take the descriptor: close it here
+            raise
+        with fh:
             if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
                 raise TeamError(f"{name} in the team worktree is not a regular file (a link or other entry was "
                                 f"committed to the ledger branch); levain will not read or write through it")
-            return fh.read().decode("utf-8")
+            try:
+                return fh.read().decode("utf-8")
+            except UnicodeDecodeError:
+                raise TeamError(f"{name} in the team worktree is not valid UTF-8; the team owner fixes it on the "
+                                f"{BRANCH} branch") from None
 
     def _write_file(self, name: str, text: str, message: str, push: bool) -> str:
         self.require_joined()

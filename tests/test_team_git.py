@@ -321,13 +321,13 @@ def test_a_member_cannot_make_the_owner_write_outside_the_worktree_through_a_lin
     git("add", name, cwd=wt)
     git("commit", "-qm", "link", cwd=wt)
     git("push", "-q", "origin", "HEAD:levain-ledger", cwd=wt)
-    team("sync", repo=ana)
+    # The branch's top level is levain's namespace: a PROJECT.md that is not a regular file refuses the remote
+    # before it reaches the owner's worktree, and consolidate refuses with it.
+    assert team("sync", repo=ana) == 2
     out = GitLedger(Repo.discover(ana)).wt / name
-    assert out.is_symlink()                                    # the attack reached the owner's worktree
-    team("consolidate", repo=ana)
+    assert not out.is_symlink()
+    assert team("consolidate", repo=ana) == 2
     assert victim.read_text() == "ORIGINAL\n"
-    assert git("status", "--porcelain", "--untracked-files=all", cwd=out.parent) == ""   # no temp left behind
-    assert not out.is_symlink() and "project canon" in out.read_text()
 
 
 def _push_from_ben(ben, build, msg):
@@ -348,10 +348,10 @@ def test_a_directory_at_project_md_is_a_team_error_not_a_crash(two, capsys):
         (wt / "PROJECT.md").mkdir()
         (wt / "PROJECT.md" / "x").write_text("x\n")
     _push_from_ben(ben, build, "dir canon")
-    team("sync", repo=ana)
+    assert team("sync", repo=ana) == 2                       # refused by the namespace before it reaches the worktree
     capsys.readouterr()
     assert team("consolidate", repo=ana) == 2
-    assert "is a directory" in capsys.readouterr().err
+    assert "PROJECT.md" in capsys.readouterr().err
 
 
 def test_a_dangling_team_toml_link_is_refused_by_name_not_reported_as_not_joined(two, capsys):
@@ -936,8 +936,8 @@ def test_agent_cannot_edit_any_ledger_machinery(two, rel):
 def test_broken_ledger_link_is_visible_not_silent(two):
     tmp, ana, ben = two
     (ben / ".git" / "levain-team" / "state.json").write_text("{")
-    out = edit(ben, "src/settlement.py")
-    assert out["systemMessage"].startswith("[team] ledger unavailable:")
+    out = edit(ben, "src/settlement.py")["hookSpecificOutput"]       # visible, and now a DENY (L1 r1 #4b)
+    assert out["permissionDecision"] == "deny" and "no usable ledger" in out["permissionDecisionReason"]
 
 
 def test_pack_resync_does_not_resurrect_a_rule_the_team_retired(two, capsys):
@@ -1226,7 +1226,7 @@ def test_an_empty_pick_git_stopped_on_is_really_skipped_and_the_entry_survives_o
     git("fetch", "-q", "origin", cwd=gl.wt)
     git("checkout", "-q", "--detach", "origin/levain-ledger", cwd=gl.wt)
     git("checkout", e_sha, "--", entry_file, cwd=gl.wt)                           # upstream gets E's change ...
-    (gl.wt / "side.txt").write_text("x\n")                                       # ... inside a different patch
+    (gl.wt / "PROJECT.md").write_text("x\n")                                     # ... inside a different patch
     git("add", ".", cwd=gl.wt)
     git("commit", "-qm", "E plus another file", cwd=gl.wt)
     git("push", "-q", "origin", "HEAD:refs/heads/levain-ledger", cwd=gl.wt)
