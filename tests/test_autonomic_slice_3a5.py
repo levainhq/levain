@@ -954,3 +954,23 @@ def test_replace_atomic_cannot_revive_a_malformed_revoked_target(tmp_path):
     assert store.replace_atomic(old.binding_id, new) is False
     assert store.path.read_text() == before
     assert [x.binding_id for x in store.list_active()] == [old.binding_id]
+
+
+def test_a_record_that_would_not_read_back_is_never_written(tmp_path):
+    # L3 S1h-3 codex MED, reproduced: Graduation(-1, -1) constructs and seals, but the reader refuses
+    # it, so add wrote an unreadable record and replace_atomic revoked a good grant for it
+    from levain.autonomic.binding import Graduation
+    store = BindingStore(tmp_path / "b.json")
+    bad_grad = Graduation(fire_count=-1, clean_count=-1)
+    with pytest.raises(ValueError, match="would not read back"):
+        store.add(a_binding(guard=(guard(),), graduation=bad_grad))
+    assert not store.path.exists()
+    old = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    store.add(old)
+    before = store.path.read_text()
+    new = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED,
+                    graduation=bad_grad)
+    with pytest.raises(ValueError, match="would not read back"):
+        store.replace_atomic(old.binding_id, new)
+    assert store.path.read_text() == before
+    assert [x.binding_id for x in store.list_active()] == [old.binding_id]
