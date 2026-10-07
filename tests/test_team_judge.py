@@ -14,7 +14,7 @@ import pytest
 from levain.team import entry as E
 from levain.team.transport import GitLedger, LedgerReadError, Repo
 
-from tests.test_team_git import _own_file, _pins_file, _push_wt, clone, edit, git, hook, ledger, record_ruling, team, two  # noqa: F401
+from tests.test_team_git import _own_file, _pinned, _pins_file, _push_wt, clone, edit, git, hook, ledger, record_ruling, team, two  # noqa: F401
 
 
 def _gl(repo):
@@ -110,9 +110,9 @@ def test_after_repin_the_next_read_pins_again_and_is_not_served_from_the_cache(t
     _pins_file(ben).unlink(missing_ok=True)
     ledger(ben)
     assert team("repin", repo=ben) == 0
-    assert not _pins_file(ben).exists()
+    assert _pinned(ben) == {}
     ledger(ben)
-    assert _pins_file(ben).exists()
+    assert _pinned(ben)
 
 
 @pytest.mark.parametrize("text", ["[" * 200000, " " * (9 << 20) + "{}"], ids=["deep", "large"])
@@ -130,10 +130,10 @@ def test_an_old_format_pins_file_restarts_pinning_instead_of_refusing(two):
     assert record_ruling(ana, "src/a.py", "first") == 0
     assert team("sync", repo=ben) == 0
     ledger(ben)
-    rel = next(k for k in json.loads(_pins_file(ben).read_text()) if k.startswith("ana/"))
+    rel = next(k for k in _pinned(ben) if k.startswith("ana/"))
     _pins_file(ben).write_text(json.dumps({rel: ["an old pinned line"]}))
     assert not ledger(ben).tamper
-    assert set(json.loads(_pins_file(ben).read_text())[rel]) == {"sha256", "length"}
+    assert set(_pinned(ben)[rel]) == {"sha256", "length"}
 
 
 def test_doctor_reports_an_unjudgeable_ledger_as_a_fail_row(two, monkeypatch, capsys):
@@ -319,11 +319,11 @@ def test_only_this_clones_own_tip_is_ever_pinned(two):
     assert record_ruling(ana, "src/a.py", "first") == 0
     gb = _gl(ben)
     gb.ledger()
-    before = _pins_file(ben).read_bytes()
+    before = _pinned(ben)
     assert gb.fetch_only(interval=0, timeout=30) is None
     gb.ledger(rev=gb.remote_ref())                                           # a newer, non-local rev
     gb.judge_remote(gb.remote_ref())
-    assert _pins_file(ben).read_bytes() == before
+    assert _pinned(ben) == before
 
 
 @pytest.mark.parametrize("exc", ["RolesError", "TeamError", "LedgerReadError", "RuntimeError", "RecursionError"])
@@ -795,3 +795,67 @@ def test_a_duplicate_id_under_a_non_member_folder_is_still_tamper(two):
     (ga.wt / "ledger" / "eve" / "0123456789abcdef.jsonl").write_bytes(f.read_bytes())
     _push_wt(ga, "a copy under a non-member")
     assert any("both hold entry id" in t for t in ga.ledger().tamper)
+
+
+def test_a_remote_tip_is_judged_and_accepted_inside_the_pins_lock(two, monkeypatch):
+    # L3 r2 codex HIGH 3: a fetch judged with pins read before a concurrent read advanced them, then advanced the
+    # accepted tip anyway. One read-judge-write under pins.lock: while judging, the lock is held.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gb = _gl(ben)
+    real = T.GitLedger.judge_remote
+    held = []
+
+    def probe(self, rev, rec=None):
+        try:
+            with self.lock(name="pins.lock", timeout=0):
+                held.append(False)
+        except T.TeamBusy:
+            held.append(True)
+        return real(self, rev, rec)
+    monkeypatch.setattr(T.GitLedger, "judge_remote", probe)
+    assert gb.fetch_only(interval=0, timeout=30) is None
+    assert held and all(held)
+
+
+def test_repin_then_a_read_then_a_sync_adopts_the_quarantined_rewrite(two):
+    # L3 r2 codex MED 4, RUN: a read between repin and sync re-pinned the old tip, so the sync refused the same rewrite
+    # again. While a quarantined tip waits, reads pin nothing.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    ga = _gl(ana)
+    git("reset", "-q", "--hard", "HEAD~1", cwd=ga.wt)
+    git("push", "-qf", "origin", "HEAD:levain-ledger", cwd=ga.wt)
+    assert team("sync", repo=ben) == 2
+    assert team("repin", repo=ben) == 0
+    ledger(ben)                                                              # e.g. a hook or `status` in between
+    assert team("sync", repo=ben) in (0, 2)
+    assert not _gl(ben).incoming_refusal()                                   # the rewrite is no longer refused
+
+
+def test_nothing_reads_the_accepted_anchor_ref_to_decide():
+    # Head ruling (C): refs/levain/accepted is a gc anchor written from pins.json; trust comes only from the record.
+    import inspect
+    from levain.team import transport as T
+    src = inspect.getsource(T)
+    assert "_ref_sha(_ACCEPTED)" not in src and src.count("_ACCEPTED") == 2   # the definition and the one write
+
+
+def test_a_clone_without_an_accepted_tip_refuses_the_remote_until_it_re_joins(two, capsys):
+    # Head ruling: a MISSING accepted tip is never a silent empty floor. A clone from before levain kept one (its
+    # pins.json in the v1 shape) is told to re-join, and the re-join records it from the shared history.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    _pins_file(ben).write_text(json.dumps(_pinned(ben)))                     # the v1 shape: no accepted tip
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    capsys.readouterr()
+    assert team("sync", repo=ben) == 2
+    assert "levain team join" in capsys.readouterr().err
+    assert team("join", "--no-install", repo=ben) == 0
+    assert team("sync", repo=ben) == 0

@@ -577,6 +577,12 @@ def _pins_file(repo):
     return GitLedger(Repo.discover(repo)).base / "pins.json"
 
 
+def _pinned(repo) -> dict:
+    """The file pins of this clone's trusted record ({} when it has none)."""
+    p = _pins_file(repo)
+    return json.loads(p.read_text())["files"] if p.exists() else {}
+
+
 def test_a_duplicate_id_in_another_file_is_tamper_not_a_shadow(two):
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "first") == 0
@@ -596,15 +602,14 @@ def test_a_tampered_read_does_not_advance_the_pins(two):
     assert record_ruling(ana, "src/a.py", "first") == 0
     assert team("sync", repo=ben) == 0
     assert not ledger(ben).tamper
-    pins = _pins_file(ben)
-    before = pins.read_bytes()
+    before = _pinned(ben)
     assert record_ruling(ana, "src/b.py", "second") == 0
     gl = GitLedger(Repo.discover(ana))
     (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
     _push_wt(gl, "a new entry and a stray file together")
     assert team("sync", repo=ben) == 2   # the remote is refused, recorded, and nothing is installed
     assert ledger(ben).tamper
-    assert pins.read_bytes() == before
+    assert _pinned(ben) == before
 
 
 
@@ -619,7 +624,7 @@ def test_a_corrupt_pins_file_refuses_until_repin(two):
         _pins_file(ben).write_text(bad)
         assert any("pins.json" in t and "repin" in t for t in ledger(ben).tamper), bad
     assert team("repin", repo=ben) == 0
-    assert not ledger(ben).tamper and _pins_file(ben).exists()      # a missing file is the start; the read re-pins
+    assert not ledger(ben).tamper and _pinned(ben)                   # a dropped record is the start; the read re-pins
 
 
 def test_repin_drops_a_pin_and_the_next_read_pins_again(two, capsys):
@@ -627,16 +632,16 @@ def test_repin_drops_a_pin_and_the_next_read_pins_again(two, capsys):
     assert record_ruling(ana, "src/a.py", "first") == 0
     assert team("sync", repo=ben) == 0
     ledger(ben)
-    key = next(k for k in json.loads(_pins_file(ben).read_text()) if k.startswith("ana/"))
+    key = next(k for k in _pinned(ben) if k.startswith("ana/"))
     capsys.readouterr()
     assert team("repin", "--file", key, repo=ben) == 0
     assert "dropped 1 pin" in capsys.readouterr().out
-    assert key not in json.loads(_pins_file(ben).read_text())
+    assert key not in _pinned(ben)
     assert not ledger(ben).tamper
     ledger(ben)                                                      # the next read trusts what it sees and pins again
-    assert key in json.loads(_pins_file(ben).read_text())
+    assert key in _pinned(ben)
     assert team("repin", repo=ben) == 0
-    assert not _pins_file(ben).exists()
+    assert _pinned(ben) == {}                                        # file pins gone; the accepted tip is kept
 
 
 def test_session_start_on_a_tampered_ledger_emits_only_the_refusal(two):
