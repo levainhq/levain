@@ -27,6 +27,7 @@ import secrets
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -158,6 +159,25 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         msg = (cp.stderr or cp.stdout).strip().splitlines()
         raise TeamError(f"git {' '.join(args[:2])} failed: {msg[-1] if msg else 'exit ' + str(cp.returncode)}")
     return cp
+
+
+_UMASK_LOCK = threading.Lock()
+
+
+def _umask() -> int:
+    """The process umask. Linux reports it in /proc; elsewhere it can only be read by setting it, so that is done
+    under a lock and restored at once."""
+    try:
+        with open("/proc/self/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("Umask:"):
+                    return int(line.split()[1], 8)
+    except (OSError, ValueError):
+        pass
+    with _UMASK_LOCK:
+        mask = os.umask(0o022)
+        os.umask(mask)
+    return mask
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -1316,7 +1336,7 @@ class GitLedger:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(text)
                 fh.flush()
-                os.fchmod(fh.fileno(), 0o644)
+                os.fchmod(fh.fileno(), 0o666 & ~_umask())   # what git's own checkout would give it
                 os.fsync(fh.fileno())
             os.replace(tmp, self.wt / name)
         except BaseException:

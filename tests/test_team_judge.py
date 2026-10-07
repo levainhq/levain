@@ -465,3 +465,15 @@ def test_read_plain_closes_its_descriptor_when_fdopen_fails(two, monkeypatch):
             ga._read_plain("team.toml")
     monkeypatch.undo()
     assert len(os.listdir("/dev/fd")) - before <= 1
+
+
+def test_a_rewritten_top_level_file_gets_the_mode_git_checkout_would_give_it(two):
+    # E review (gemini LOW d), RUN: under umask 002 _replace_plain forced 0o644 where git's checkout gives 0o664.
+    tmp, ana, ben = two
+    ga = _gl(ana)
+    old = os.umask(0o002)
+    try:
+        ga._replace_plain("PROJECT.md", "x\n")
+    finally:
+        os.umask(old)
+    assert os.stat(ga.wt / "PROJECT.md").st_mode & 0o777 == 0o664
