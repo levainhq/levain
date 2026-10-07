@@ -847,6 +847,7 @@ def test_nothing_reads_the_accepted_anchor_ref_to_decide():
     from levain.team import transport as T
     src = inspect.getsource(T)
     assert "_ref_sha(_ACCEPTED)" not in src and src.count("_ACCEPTED") == 2   # the definition and the one write
+    assert "_ref_sha(_REFUSED)" not in src and src.count("_REFUSED") == 3     # the definition, its write, its delete
     # L1 r3 NOTE 14: nor through the literal ref name, in any team module.
     import pathlib
     def code(text):
@@ -1359,37 +1360,43 @@ def test_problems_and_refusals_are_kept_bounded(monkeypatch):
     assert led.tamper == ["w", "x", "and 1 more reasons"]
 
 
-def test_a_quarantine_that_appears_while_a_read_waits_for_the_pins_lock_stops_the_pin(two, monkeypatch):
-    # L1 r3 LOW 10 / L2 r3 LOW 3: the no-pin-while-quarantined check ran before pins.lock was taken.
+def test_a_refusal_that_appears_while_a_read_waits_for_the_pins_lock_stops_the_pin(two, monkeypatch):
+    # L1 r3 LOW 10 / L2 r3 LOW 3: the no-pin-while-refused check ran before pins.lock was taken. A fetch that refuses
+    # while a read judges writes Trust.refused under the lock; the read's acceptance meets it there and reads again.
+    from levain.team import transport as T
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "first") == 0
     assert team("sync", repo=ben) == 0
     gb = _gl(ben)
     (gb.base / "history.json").unlink(missing_ok=True)
     before = _pinned(ben)
+    older = git("rev-parse", "levain-ledger~1", cwd=ben).strip()
     real = GitLedger.lock
 
     def lock(self, *a, **k):
         if k.get("name") == "pins.lock":
-            git("update-ref", "refs/levain/incoming/levain-ledger", self.head() + "~1", cwd=ben)
+            rec = self.trust_record()
+            if not rec.refused:
+                T._atomic_write(self.base / "pins.json", T.dataclasses.replace(rec, refused=older).dump())
         return real(self, *a, **k)
     monkeypatch.setattr(GitLedger, "lock", lock)
-    gb.ledger()
-    assert _pinned(ben) == before
+    led = gb.ledger()
+    assert _pinned(ben) == before and led.tamper
 
 
-def test_a_leftover_quarantine_of_the_accepted_tip_is_swept(two):
-    # L2 r3 LOW 7: a crash after the record's write and before the quarantine ref's removal left reads never pinning.
+def test_a_refusal_of_the_accepted_tip_is_cleared(two):
+    # L2 r3 LOW 7: a refusal naming the very tip the record accepted left reads never pinning.
+    from levain.team import transport as T
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "first") == 0
     assert team("sync", repo=ben) == 0
     gb = _gl(ben)
-    git("update-ref", "refs/levain/incoming/levain-ledger", gb.accepted_tip(), cwd=ben)
+    rec = gb.trust_record()
+    T._atomic_write(gb.base / "pins.json", T.dataclasses.replace(rec, refused=rec.accepted).dump())
     (gb.base / "history.json").unlink(missing_ok=True)
     gb.ledger()
+    assert gb.trust_record().refused is None
     assert any(rel.startswith("ana/") for rel in _pinned(ben))           # the read pinned what it accepted
-    assert subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/levain/incoming/levain-ledger"], cwd=ben,
-                          capture_output=True).returncode != 0
 
 
 def test_levains_fetch_brings_no_tags_into_the_code_repository(two):
@@ -1646,8 +1653,8 @@ def test_a_branch_behind_the_remote_must_be_a_prefix_of_what_was_accepted(two):
     assert led.tamper and "forged" not in [x.get("words") for x in led.entries]
 
 
-def test_a_fetch_publishes_its_quarantine_only_with_its_judgement(two, monkeypatch):
-    # Head ruling (C)2 on L3 r3, codex HIGH: the fetch wrote the quarantine ref before it took pins.lock and judged.
+def test_a_fetch_records_its_refusal_only_with_its_judgement(two, monkeypatch):
+    # Head ruling (C)2 on L3 r3, codex HIGH: the fetch published the refusal before it took pins.lock and judged.
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "x") == 0
     assert team("sync", repo=ben) == 0
@@ -1657,12 +1664,12 @@ def test_a_fetch_publishes_its_quarantine_only_with_its_judgement(two, monkeypat
     real = GitLedger.judge_remote
 
     def spy(self, rev, rec=None):
-        seen.append(self._ref_sha("refs/levain/incoming/levain-ledger"))
+        seen.append(self.trust_record().refused)
         return real(self, rev, rec)
     monkeypatch.setattr(GitLedger, "judge_remote", spy)
     assert "refused" in (gb.fetch_only(interval=0, timeout=30) or "")
     assert seen and seen[0] is None
-    assert gb.incoming_refusal()                                     # published with the judgement
+    assert gb.trust_record().refused and gb.incoming_refusal()       # written with the judgement
 
 
 def test_a_read_served_from_the_cache_still_checks_the_quarantine_under_the_lock(two):
@@ -1726,10 +1733,10 @@ def test_a_seed_carries_what_the_teammate_accepted_from_the_remote(two):
     assert team("join", "--pins-from", str(seed), "--no-install", repo=cat) == 2
 
 
-def test_a_reader_sweeping_the_quarantine_cannot_lose_a_fetch(two, monkeypatch):
-    # RAN on CI (run 37671919223, test_concurrent_writers_in_both_clones_converge): a reader swept the shared quarantine
-    # ref (it equalled the accepted tip) between a concurrent fetch's write and its read-back, and the fetch crashed on
-    # a None sha. A fetch now lands in its own staging ref, which no reader touches.
+def test_a_sweep_by_another_call_cannot_lose_a_fetch(two, monkeypatch):
+    # RAN on CI (runs 37671919223, 37676002591, test_concurrent_writers_in_both_clones_converge): a concurrent call
+    # deleted the one shared quarantine ref between a fetch's write and its read-back. Head ruling (a): each fetch owns
+    # a ref of its own, and the sweep of crashed calls' refs skips any whose pid is alive.
     from levain.team import transport as T
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "x") == 0
@@ -1739,10 +1746,12 @@ def test_a_reader_sweeping_the_quarantine_cannot_lose_a_fetch(two, monkeypatch):
     def fetch_then_sweep(args, cwd, **k):
         out = real(args, cwd, **k)
         if "fetch" in args:
-            real(["update-ref", "-d", "refs/levain/incoming/levain-ledger"], cwd, check=False)
+            GitLedger(Repo.discover(ben))._sweep_call_refs()          # another call's sweep, mid-fetch
         return out
     monkeypatch.setattr(T, "git", fetch_then_sweep)
     assert gb.sync() in ("fetched", "up to date", "pushed")
+    left = git("for-each-ref", "--format=%(refname)", "refs/levain/incoming/", "refs/levain/join/", cwd=ben)
+    assert left.strip() == ""                                        # and each call deleted its own
 
 
 def test_problems_are_counted_past_the_cap_never_held(monkeypatch):
@@ -1793,22 +1802,18 @@ def test_a_rejoin_works_offline_from_the_clones_own_branch(two, capsys):
     assert "could not be reached" in capsys.readouterr().out
 
 
-def test_a_join_that_accepts_the_remote_drops_an_older_refusal(two):
-    # complement LOW on L3 r3: a stale quarantine ref survived a join that accepted a newer tip.
+def test_a_join_that_accepts_the_refused_tip_clears_its_refusal_and_never_anothers(two):
+    # complement LOW / codex HIGH on L3 r4: join deleted whatever quarantine existed, a concurrent fetch's included.
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "x") == 0
     assert team("sync", repo=ben) == 0
     ledger(ben)
     _forge_last_line(_gl(ana), "FORGED")
     assert team("sync", repo=ben) != 0 and _gl(ben).incoming_refusal()
+    refused = _gl(ben).trust_record().refused
     assert team("repin", repo=ben) == 0
-    ga = _gl(ana)
-    (ga.wt / "ledger" / "ana" / "aaaaaaaaaaaaaaaa.jsonl").write_text("")
-    _push_wt(ga, "the remote moves on past the refused tip")
-    assert team("join", "--no-install", repo=ben) == 0
-    assert not _gl(ben).incoming_refusal()
-    assert subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/levain/incoming/levain-ledger"], cwd=ben,
-                          capture_output=True).returncode != 0
+    assert team("join", "--no-install", repo=ben) == 0               # the remote's tip IS the refused one: accepted
+    assert _gl(ben).trust_record().refused is None and _gl(ben).accepted_tip() == refused
 
 
 def test_an_unreadable_record_is_said_not_shown_as_no_devices(two):
@@ -1903,3 +1908,37 @@ def test_an_offline_rejoin_of_a_branch_behind_its_fetch_is_not_refused(two, caps
     assert _gl(ben).fetch_only(interval=0, timeout=30) is None       # remote pins A+B; the branch holds A
     git("remote", "set-url", "origin", str(tmp / "unreachable.git"), cwd=ben)
     assert team("join", "--no-install", repo=ben) == 0
+
+
+def test_a_stale_join_ref_from_a_crashed_call_is_never_used_and_is_swept(two):
+    # codex HIGH + gemini LOW on L3 r4: an offline re-join read a stale refs/levain/join left by a crashed join.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    old = gb.head()
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    git("update-ref", "refs/levain/join/999999-dead", old, cwd=ben)       # a crashed join's ref (no such pid)
+    git("remote", "set-url", "origin", str(tmp / "unreachable.git"), cwd=ben)
+    before = gb.accepted_tip()
+    assert team("join", "--no-install", repo=ben) == 0
+    assert gb.accepted_tip() == before                                   # the stale commit was not accepted
+    assert git("for-each-ref", "refs/levain/join/", cwd=ben).strip() == ""
+
+
+def test_a_join_never_clears_a_refusal_of_another_tip(two, monkeypatch):
+    # codex HIGH on L3 r4: a join that judged good tip X erased a refusal of tip Y a concurrent fetch had recorded.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    other = gb.head()
+    assert record_ruling(ana, "src/a.py", "x") == 0                      # the remote moves past `other`
+    real = GitLedger._sweep_call_refs
+
+    def fetch_refused_meanwhile(self):
+        rec = self.trust_record()
+        T._atomic_write(self.base / "pins.json", T.dataclasses.replace(rec, refused=other).dump())
+        return real(self)
+    monkeypatch.setattr(GitLedger, "_sweep_call_refs", fetch_refused_meanwhile)
+    monkeypatch.setattr(GitLedger, "_sync", lambda self, **k: "fetched")   # look at what the join itself wrote
+    assert team("join", "--no-install", repo=ben) == 0
+    assert gb.trust_record().refused == other

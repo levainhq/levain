@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import dataclasses
 import hashlib
 import fcntl
 import json
@@ -114,11 +115,13 @@ _MAX_BAD_PATHS = 100
 _MISSING_TEAM = b"\0team.toml is missing"     # a marker no tree path can equal (paths hold no NUL)     # with `ledger`, the whole top level of the ledger branch
 
 
-# One quarantine ref per clone, under refs/levain/ where no refspec of the user's writes, and one gc anchor for the
-# accepted tip (written from pins.json, never read to decide). The remote-tracking ref refs/remotes/<remote>/levain-ledger
-# is a mirror for people only: the user's own `git fetch` moves it unjudged, so nothing levain decides reads it.
-_INCOMING = f"refs/levain/incoming/{BRANCH}"
-_STAGING = f"refs/levain/staging/{BRANCH}"     # where a fetch lands before it is judged; never read to decide
+# Every fetch (a sync's, a join's) lands in a ref of its OWN, refs/levain/{incoming,join}/<pid>-<nonce>, which that call
+# owns from the fetch to its delete (a finally); a crashed call's ref is swept under pins.lock unless its pid is alive.
+# Whether the remote's tip is REFUSED lives in the one trusted record (Trust.refused), never in a ref. Two gc anchors,
+# for the accepted and the refused tip, are written FROM the record and never read to decide. The remote-tracking ref
+# refs/remotes/<remote>/levain-ledger is a mirror for people only: the user's own `git fetch` moves it unjudged.
+_CALL_REFS = ("refs/levain/incoming/", "refs/levain/join/")
+_REFUSED = f"refs/levain/refused/{BRANCH}"
 # levain's fetches write ONE ref of their own and nothing else in the user's repository: no tags followed or pruned (the
 # user's remote.*.tagOpt and fetch.pruneTags are overridden), no submodules fetched, no FETCH_HEAD, and (--refmap=) no
 # "opportunistic" update of the configured remote-tracking ref, which would put an unjudged tip there.
@@ -131,7 +134,7 @@ _MAX_LEDGER_LINES = 200_000        # lines in every ledger file read for one jud
 _MAX_TOP_FILE = 4 << 20            # team.toml or PROJECT.md, read whole
 _MAX_TEAM_VERSIONS = 200           # team.toml versions walked back to find one that parses
 _READ_ATTEMPTS = 3
-_QUARANTINED = object()            # _accept's answer when a refused remote tip appeared: the read is judged again
+_QUARANTINED = object()            # _accept's answer when a fetch refused the remote while the read judged
 _PIN_RACE_TEXT = ("the ledger kept moving while this clone recorded what it accepted (a concurrent read pinned a newer "
                   "tip); nothing was read, try again")
 
@@ -162,15 +165,17 @@ class Trust:
     each ledger file was first accepted, and whether that was the clone's first sight of the ledger. ``remote``: per
     ledger file, the sha256 and length of the bytes accepted from the remote (a fetch, a join or a push), which this
     clone's own branch may not hold yet (a fetch without a replay): every later remote tip must extend them, and the
-    local branch must agree with them as far as it reaches."""
+    local branch must agree with them as far as it reaches. ``refused``: the remote tip a fetch last REFUSED, until a
+    fetch, a join or a read (after a repin) accepts a tip in its place; every read refuses while it judges bad."""
     files: dict[str, dict] = field(default_factory=dict)
     accepted: str | None = None
     seen: dict[str, dict] = field(default_factory=dict)
     remote: dict[str, dict] = field(default_factory=dict)
+    refused: str | None = None
 
     def dump(self) -> str:
         return json.dumps({"v": 3, "files": self.files, "accepted": self.accepted or "", "seen": self.seen,
-                           "remote": self.remote}, sort_keys=True)
+                           "remote": self.remote, "refused": self.refused or ""}, sort_keys=True)
 
     def noted(self, rels) -> dict[str, dict]:
         """``seen`` with every file in ``rels`` noted as first seen now. A record that has never noted a file (a first
@@ -190,6 +195,18 @@ def _prune_seen(seen: dict[str, dict], live: set[str]) -> dict[str, dict]:
     for _t, k in gone[:len(seen) - _MAX_LEDGER_LEAVES]:
         del seen[k]
     return seen
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:                                  # it exists (owned by someone else)
+        return True
+    return True
 
 
 def _pin(data: bytes) -> dict:
@@ -245,13 +262,15 @@ def _parse_pins(raw: bytes) -> tuple[Trust, bool, bool]:
         return Trust(), False, True
     if isinstance(data, dict) and data.get("v") in (2, 3):
         acc, seen = data.get("accepted"), data.get("seen")
-        keys = {"v", "files", "accepted", "seen"} | ({"remote"} if data.get("v") == 3 else set())
+        ref = data.get("refused", "")
+        keys = {"v", "files", "accepted", "seen"} | ({"remote", "refused"} & set(data) if data.get("v") == 3 else set())
         ok = (set(data) == keys and _valid_pins(data.get("files")) and _valid_pins(data.get("remote", {}))
               and isinstance(acc, str) and (acc == "" or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", acc))
+              and isinstance(ref, str) and (ref == "" or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", ref))
               and isinstance(seen, dict) and all(
                   isinstance(k, str) and isinstance(v, dict) and set(v) == {"t", "first"}
                   and isinstance(v["t"], str) and isinstance(v["first"], bool) for k, v in seen.items()))
-        return (Trust(data["files"], acc or None, seen, data.get("remote", {})), True, False) if ok \
+        return (Trust(data["files"], acc or None, seen, data.get("remote", {}), ref or None), True, False) if ok \
             else (Trust(), False, False)
     return (Trust(data), True, False) if _valid_pins(data) else (Trust(), False, False)
 
@@ -612,14 +631,14 @@ class GitLedger:
         raise LedgerReadError(_PIN_RACE_TEXT)
 
     def _read(self, team: R.Team | None, rev: str, *, explicit: bool = False) -> I.Ledger:
-        """One read: the quarantined remote's refusal if it is refused, else the cache, else judge + accept. While a
-        quarantined remote tip is waiting (refused or not yet taken by a sync), nothing is pinned: the quarantine is
-        resolved first, so a repin followed by a read cannot re-pin the old tip over the remote's."""
+        """One read: the refused remote tip's refusal if it still judges bad, else the cache, else judge + accept.
+        While the record names a refused tip, nothing is pinned: the refusal is resolved first (refused, or accepted
+        after a repin), so a repin followed by a read cannot re-pin the old tip over the remote's."""
         owner = team.owner if team else None
         key = f"parser-v10|{rev}|" + (R.dump_team(team) if team else "")
         cache = self.base / "history.json"
-        # The quarantine is published under pins.lock (_fetch_and_accept), so it is checked under it, cache hits
-        # included: a read is ordered wholly before or wholly after a fetch that refuses.
+        # A refusal is written under pins.lock (_fetch_and_accept), so it is checked under it, cache hits included: a
+        # read is ordered wholly before or wholly after a fetch that refuses.
         with self._pins_lock():
             refusal = self._refusal_locked()
             if refusal:
@@ -638,8 +657,8 @@ class GitLedger:
                 cache.unlink()
             return j.ledger
         digest = self._accept(j.datas, rev, explicit=explicit)
-        if digest is _QUARANTINED:                     # a fetch refused the remote while this read judged
-            return self._read(team, rev, explicit=explicit)
+        if digest is _QUARANTINED:                     # a fetch refused the remote while this read judged:
+            raise _PinRace()                           # read again (bounded); the next read meets the refusal
         if digest is None:
             return j.ledger
         try:
@@ -866,6 +885,10 @@ class GitLedger:
         _atomic_write(self.base / "pins.json", text, sync_dir=True)
         if rec.accepted:
             git(["update-ref", _ACCEPTED, rec.accepted], self.repo.toplevel, check=False)
+        if rec.refused:
+            git(["update-ref", _REFUSED, rec.refused], self.repo.toplevel, check=False)
+        else:
+            git(["update-ref", "-d", _REFUSED], self.repo.toplevel, check=False)
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     def devices(self) -> list[dict]:
@@ -961,17 +984,18 @@ class GitLedger:
     def _accept(self, datas: dict[str, bytes], rev: str, *, explicit: bool = False) -> "str | None | object":
         """THE acceptance transaction of a judged read of this clone's own tip ``rev``: pin every file's accepted bytes
         and note when each was first seen, in the one trusted record, under ``pins.lock``. Everything it depends on is
-        checked there: ``rev`` must still be the branch tip and no quarantined remote tip may be waiting (else None:
-        served, not pinned); the record's pins must still hold for these bytes (else _PinRace: a concurrent reader
-        pinned a newer tip, and the caller reads the tip again). If it cannot be durably saved, the read is refused
-        (LedgerReadError). Returns the record's digest."""
+        checked there: the record must name no refused tip (else _QUARANTINED: the caller reads again and meets it);
+        ``rev`` must still be the branch tip (else _PinRace for a read of the tip, None for a read of a named commit:
+        served, never pinned); the record's pins must still hold for these bytes (else _PinRace: a concurrent reader
+        pinned a newer tip). If it cannot be durably saved, the read is refused (LedgerReadError). Returns the record's
+        digest."""
         files = {rel: _pin(d) for rel, d in datas.items()}
         try:
             with self.lock(name="pins.lock", timeout=15.0):
                 rec, bad = self._trust()
                 if bad:
                     raise LedgerReadError(bad)
-                if self._quarantined(rec):
+                if rec.refused:
                     return _QUARANTINED
                 if rev != self.head():          # the tip moved while this read judged
                     if explicit:
@@ -979,7 +1003,7 @@ class GitLedger:
                     raise _PinRace()                 # a read of the tip: read the new tip (bounded, like a pin race)
                 if self._pin_violations(rec.files, datas) or self._lag_violations(rec, datas):
                     raise _PinRace()
-                new = Trust(files, rec.accepted, rec.noted(files), rec.remote)
+                new = dataclasses.replace(rec, files=files, seen=rec.noted(files))
                 digest = self._pins_digest()
                 if new != rec or digest is None or digest != hashlib.sha256(new.dump().encode("utf-8")).hexdigest():
                     digest = self._write_trust(new)
@@ -1008,7 +1032,7 @@ class GitLedger:
                     accepted = acc if isinstance(acc, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", acc) else None
                 try:
                     if accepted:
-                        self._write_trust(Trust(accepted=accepted))
+                        self._write_trust(Trust(accepted=accepted))   # anything refused is fetched and judged again
                     else:
                         (self.base / "pins.json").unlink()
                 except FileNotFoundError:
@@ -1029,8 +1053,8 @@ class GitLedger:
             if not dropped:
                 return []
             try:
-                self._write_trust(Trust(files, rec.accepted, _prune_seen(dict(rec.seen), set(files) | set(remote)),
-                                        remote))
+                self._write_trust(dataclasses.replace(rec, files=files, remote=remote,
+                                                      seen=_prune_seen(dict(rec.seen), set(files) | set(remote))))
             except OSError as exc:
                 raise TeamError(f"could not save the pins: {exc.strerror}") from None
             return dropped
@@ -1214,20 +1238,21 @@ class GitLedger:
                     seed[r] = pin
         remote = remote or self._default_remote()
         self._require_remote_name(remote)
-        # The remote's tip arrives in a private join ref (never the quarantine ref, whose refusal only an accepted
-        # judgement clears), with every object verified.
-        join_ref, remote_tip, offline = "refs/levain/join", None, ""
-        if remote:
-            cp = git(["-c", "fetch.fsckObjects=true", "fetch", *_FETCH_FLAGS, remote,
-                      f"+refs/heads/{BRANCH}:{join_ref}"], self.repo.toplevel, timeout=120, check=False)
-            if cp.returncode != 0 and "couldn't find remote ref" not in (cp.stderr or ""):
-                if not self._local_branch_exists():
-                    raise TeamError(f"git fetch failed: {_tail(cp)}")
-                offline = _tail(cp)                # a re-join works from this clone's own branch; a sync judges later
-            remote_tip = self._ref_sha(join_ref)
+        # The remote's tip arrives in a join ref of this call's own (deleted in the finally), with every object verified;
+        # it is judged and accepted under pins.lock against the record read there, in one read-judge-write.
+        join_ref, remote_tip, offline = self._call_ref("join"), None, ""
         try:
-            rec, bad_record = self._trust()
-            rec = Trust() if bad_record else rec
+            if remote:
+                cp = git(["-c", "fetch.fsckObjects=true", "fetch", *_FETCH_FLAGS, remote,
+                          f"+refs/heads/{BRANCH}:{join_ref}"], self.repo.toplevel, timeout=120, check=False)
+                if cp.returncode == 0:
+                    remote_tip = self._ref_sha(join_ref)
+                    if remote_tip is None:
+                        raise TeamError("the fetched remote tip could not be read back; run `levain team join` again")
+                elif "couldn't find remote ref" not in (cp.stderr or ""):
+                    if not self._local_branch_exists():
+                        raise TeamError(f"git fetch failed: {_tail(cp)}")
+                    offline = _tail(cp)            # a re-join works from this clone's own branch; a sync judges later
             if remote_tip is None and not self._local_branch_exists():
                 raise TeamError("no git remote with a ledger branch to join from" if remote
                                 else "no git remote to join from")
@@ -1241,49 +1266,49 @@ class GitLedger:
             else:
                 tip = self.head()
                 tip_team = self._team_or_none(tip)
-            # First sight: the team and the namespace are judged, with every pin this clone and the seed hold, before
-            # anything is created. A clone that already has the branch judges the remote as a sync would.
-            if remote_tip is not None and self._local_branch_exists():
-                floor = rec.accepted
-                if floor is None:
-                    cp = git(["merge-base", remote_tip, REF], self.repo.toplevel, check=False)
-                    floor = cp.stdout.strip() if cp.returncode == 0 else ""
-                    if not floor:
-                        raise TeamError(f"this clone's {BRANCH} branch shares no history with the remote's, so this "
-                                        "clone did not join; if this clone's ledger branch is not the team's, delete "
-                                        f"it (`git branch -D {BRANCH}`) and join again")
-                j = self.judge_remote(tip, Trust(rec.files, floor, rec.seen, rec.remote))
-            else:
-                j = self.judge(tip, tip_team, rec.files)
-            # this clone's own remote pins: a remote tip must hold them; its own branch (an offline re-join) may be
-            # behind them, never different
-            own_remote = self._pin_violations(rec.remote, j.datas) if remote_tip is not None \
-                else self._lag_violations(rec, j.datas)
-            bad = j.ledger.tamper or self._pin_violations(seeded.files if seeded else {}, j.datas) \
-                or self._pin_violations(seeded.remote if seeded else {}, j.datas) or own_remote
-            if bad:
-                what = f"--pins-from {pins_from}: the team ledger here does not hold what it pins" if seed is not None \
-                    else "the team ledger on the remote is refused"
-                raise TeamError(f"{what}, so this clone did not join: " + "; ".join(bad[:3]))
-            had_record = (self.base / "pins.json").exists() and not bad_record
-            if not self._local_branch_exists():
-                git(["branch", BRANCH, tip], self.repo.toplevel)
             self.base.mkdir(parents=True, exist_ok=True)
-            with self.lock(name="pins.lock", timeout=10.0):
-                now, now_bad = self._trust()
-                now = Trust() if now_bad else now
-                if now != rec:
-                    raise TeamError("this clone's pins changed while it joined (another levain team command ran); "
-                                    "run `levain team join` again")
-                files = dict(now.files)             # a seed's pins JOIN this clone's own (both held on the tip)
+            with self.lock(name="pins.lock", timeout=30.0):
+                self._sweep_call_refs()
+                rec, bad_record = self._trust()
+                rec = Trust() if bad_record else rec
+                had_record = (self.base / "pins.json").exists() and not bad_record
+                # First sight: the team and the namespace are judged, with every pin this clone and the seed hold,
+                # before anything is created. A clone that already has the branch judges the remote as a sync would.
+                if remote_tip is not None and self._local_branch_exists():
+                    floor = rec.accepted
+                    if floor is None:
+                        cp = git(["merge-base", remote_tip, REF], self.repo.toplevel, check=False)
+                        floor = cp.stdout.strip() if cp.returncode == 0 else ""
+                        if not floor:
+                            raise TeamError(f"this clone's {BRANCH} branch shares no history with the remote's, so "
+                                            "this clone did not join; if this clone's ledger branch is not the team's, "
+                                            f"delete it (`git branch -D {BRANCH}`) and join again")
+                    j = self.judge_remote(tip, dataclasses.replace(rec, accepted=floor))
+                else:
+                    j = self.judge(tip, tip_team, rec.files)
+                # this clone's own remote pins: a remote tip must hold them; its own branch (an offline re-join) may be
+                # behind them, never different
+                own_remote = self._pin_violations(rec.remote, j.datas) if remote_tip is not None \
+                    else self._lag_violations(rec, j.datas)
+                bad = j.ledger.tamper or self._pin_violations(seeded.files if seeded else {}, j.datas) \
+                    or self._pin_violations(seeded.remote if seeded else {}, j.datas) or own_remote
+                if bad:
+                    what = f"--pins-from {pins_from}: the team ledger here does not hold what it pins" \
+                        if seed is not None else "the team ledger on the remote is refused"
+                    raise TeamError(f"{what}, so this clone did not join: " + "; ".join(bad[:3]))
+                if not self._local_branch_exists():
+                    git(["branch", BRANCH, tip], self.repo.toplevel)
+                files = dict(rec.files)             # a seed's pins JOIN this clone's own (both held on the tip)
                 for r, pin in (seed or {}).items():
                     if r not in files or files[r]["length"] < pin["length"]:
                         files[r] = pin
-                accepted = remote_tip or now.accepted
-                self._write_trust(Trust(files, accepted, now.noted(j.datas) if remote_tip else now.seen,
-                                        _merge_pins(now.remote, j.datas) if remote_tip else now.remote))
-                if remote_tip:                      # the remote's tip is accepted: an older refusal no longer stands
-                    git(["update-ref", "-d", _INCOMING], self.repo.toplevel, check=False)
+                if remote_tip:                      # accepted; a refusal of ANOTHER tip (a fetch's) is not this call's
+                    new = dataclasses.replace(rec, files=files, accepted=remote_tip,
+                                              refused=None if rec.refused == remote_tip else rec.refused,
+                                              seen=rec.noted(j.datas), remote=_merge_pins(rec.remote, j.datas))
+                else:
+                    new = dataclasses.replace(rec, files=files)
+                self._write_trust(new)
             if remote_tip and self._rref():
                 git(["update-ref", self._rref(), remote_tip], self.repo.toplevel, check=False)
         finally:
@@ -1518,12 +1543,13 @@ class GitLedger:
             return None
 
     # ---- the remote: fetched into quarantine, judged, and only then accepted ---------------------------------------
-    # Every fetch lands in the quarantine ref (_INCOMING). An accepted tip is written into this clone's ONE trusted
-    # record (pins.json, ``Trust.accepted``) in the same read-judge-write under pins.lock, and the quarantine ref is
-    # dropped; a refused tip stays quarantined, and that ref IS the record of the refusal: every read judges it again
-    # and refuses while it is refused. The accepted tip is the rollback floor for this clone's own files and the replay
-    # target; a successful push advances it to what was pushed. The ref under refs/levain/accepted only keeps the
-    # accepted commit alive for git's gc, written from the record; nothing reads it to decide anything.
+    # Every fetch lands in a ref of its own call. An accepted tip is written into this clone's ONE trusted record
+    # (pins.json, ``Trust.accepted``) in the same read-judge-write under pins.lock; a refused tip is written there as
+    # ``Trust.refused``, and every read judges it again under the same lock and refuses while it is refused (or accepts
+    # it, once a repin makes it acceptable). The accepted tip is the rollback floor for this clone's own files and the
+    # replay target; a successful push advances it to what was pushed. The refs under refs/levain/accepted and
+    # refs/levain/refused only keep those commits alive for git's gc, written from the record; nothing reads them to
+    # decide anything.
 
     def _rref(self) -> str | None:
         return f"refs/remotes/{self.remote}/{BRANCH}" if self.remote else None
@@ -1544,29 +1570,46 @@ class GitLedger:
         LedgerReadError when it cannot be judged."""
         return self._incoming_refusal()
 
-    def _quarantined(self, rec: Trust) -> bool:
-        """Is a fetched remote tip waiting in quarantine? One that the record already accepted (a crash between the
-        record's write and the ref's removal) is not waiting: it is removed here."""
-        sha = self._ref_sha(_INCOMING)
-        if sha is not None and sha == rec.accepted:
-            git(["update-ref", "-d", _INCOMING, sha], self.repo.toplevel, check=False)
-            return False
-        return sha is not None
-
     def _incoming_refusal(self) -> list[str]:
         with self._pins_lock():
             return self._refusal_locked()
 
     def _refusal_locked(self) -> list[str]:
-        """The quarantined remote tip's refusal, judged against the record read here. The caller holds pins.lock."""
+        """The refusal of the remote tip the record names as refused, judged again against the record read here (the
+        caller holds pins.lock). One that now judges clean (after a repin) is ACCEPTED here, in this same
+        read-judge-write: it becomes the accepted tip with its bytes pinned, and the refusal is cleared."""
         try:
             rec, _problem = self._trust()
-            if not self._quarantined(rec):
+            if not rec.refused:
                 return []
-            bad = self.judge_remote(self._ref_sha(_INCOMING), rec).ledger.tamper
+            if rec.refused == rec.accepted:
+                self._write_trust(dataclasses.replace(rec, refused=None))
+                return []
+            j = self.judge_remote(rec.refused, rec)
+            if not j.ledger.tamper:
+                self._write_trust(dataclasses.replace(rec, accepted=rec.refused, refused=None,
+                                                      seen=rec.noted(j.datas), remote=_merge_pins(rec.remote, j.datas)))
+                return []
         except TeamError as exc:
             raise LedgerReadError(f"the fetched remote ledger could not be judged ({exc})") from None
-        return [f"the REMOTE team ledger ({self.remote}) is refused: {t}" for t in bad]
+        except OSError as exc:
+            raise LedgerReadError(f"this clone's trusted record could not be written ({exc})") from None
+        return [f"the REMOTE team ledger ({self.remote}) is refused: {t}" for t in j.ledger.tamper]
+
+    def _call_ref(self, kind: str) -> str:
+        """A ref of this call's own (``kind``: incoming or join), deleted by the call in a finally."""
+        return f"refs/levain/{kind}/{os.getpid()}-{secrets.token_hex(6)}"
+
+    def _sweep_call_refs(self) -> None:
+        """Delete the per-call refs a crashed call left (the caller holds pins.lock): any whose pid is not alive here,
+        and any of the older shared names."""
+        cp = git(["for-each-ref", "--format=%(refname)", *_CALL_REFS, "refs/levain/staging/", "refs/levain/join"],
+                 self.repo.toplevel, check=False, timeout=30)
+        for ref in cp.stdout.split():
+            m = re.fullmatch(r"refs/levain/(?:incoming|join)/(\d+)-[0-9a-f]+", ref)
+            if m and _pid_alive(int(m.group(1))):
+                continue
+            git(["update-ref", "-d", ref], self.repo.toplevel, check=False)
 
     def _own_rel(self, rel: str, handle: str | None) -> bool:
         """A file only THIS clone writes: its device id, under its member's folder or a pack folder it seeded. With the
@@ -1659,35 +1702,39 @@ class GitLedger:
     def _fetch_and_accept(self, remote: str, timeout: float) -> str | None:
         top = self.repo.toplevel
         self.save_state(last_fetch_attempt=time.time())
-        # The fetch lands in a private staging ref that nothing reads; the quarantine ref is written only under
-        # pins.lock, with the judgement, so every reader (who checks it under the same lock) sees it or does not.
-        cp = git(["-c", "fetch.fsckObjects=true", "fetch", *_FETCH_FLAGS, remote,
-                  f"+refs/heads/{BRANCH}:{_STAGING}"], top, timeout=timeout, check=False)
-        if cp.returncode != 0:
-            if "couldn't find remote ref" in (cp.stderr or ""):
-                return None
-            raise TeamError(f"git fetch failed: {_tail(cp)}")
-        sha = self._ref_sha(_STAGING)
-        if sha is None:
-            raise TeamError("the fetched remote tip could not be read back; run `levain team sync` again")
+        # The fetch lands in a ref of this call's own, which nothing else reads or deletes; under pins.lock the tip is
+        # judged against the record read there and either accepted (the record advances, any refusal is cleared) or
+        # recorded as refused (Trust.refused), which every read checks under the same lock.
+        ref = self._call_ref("incoming")
         try:
+            cp = git(["-c", "fetch.fsckObjects=true", "fetch", *_FETCH_FLAGS, remote, f"+refs/heads/{BRANCH}:{ref}"],
+                     top, timeout=timeout, check=False)
+            if cp.returncode != 0:
+                if "couldn't find remote ref" in (cp.stderr or ""):
+                    return None
+                raise TeamError(f"git fetch failed: {_tail(cp)}")
+            sha = self._ref_sha(ref)
+            if sha is None:
+                raise TeamError("the fetched remote tip could not be read back; run `levain team sync` again")
             with self.lock(name="pins.lock", timeout=30.0):
+                self._sweep_call_refs()
                 rec, problem = self._trust()
                 if problem:
                     raise TeamError(problem)
                 j = self.judge_remote(sha, rec)
                 bad = j.ledger.tamper
                 if bad:
-                    git(["update-ref", _INCOMING, sha], top)          # published: every read now refuses
+                    if rec.refused != sha:
+                        self._write_trust(dataclasses.replace(rec, refused=sha))   # every read now refuses
                     raise TeamError(f"the REMOTE team ledger ({remote}) is refused: " + "; ".join(bad[:3])
                                     + ". Nothing was replayed or pushed; every edit here is denied until a sync finds "
                                     "the remote accepted.")
-                new = Trust(rec.files, sha, rec.noted(j.datas), _merge_pins(rec.remote, j.datas))
+                new = dataclasses.replace(rec, accepted=sha, refused=None, seen=rec.noted(j.datas),
+                                          remote=_merge_pins(rec.remote, j.datas))
                 if new != rec:                        # every byte accepted from the remote is pinned with the tip
                     self._write_trust(new)
-                git(["update-ref", "-d", _INCOMING], top, check=False)   # the remote's tip now is accepted
         finally:
-            git(["update-ref", "-d", _STAGING], top, check=False)
+            git(["update-ref", "-d", ref], top, check=False)
         if self._rref():
             git(["update-ref", self._rref(), sha], top, check=False)
         self.save_state(last_fetch_ok=time.time(), last_fetch_error="")
@@ -1705,7 +1752,7 @@ class GitLedger:
             if rec.accepted and git(["merge-base", "--is-ancestor", rec.accepted, pushed], self.repo.toplevel,
                                     check=False, timeout=30).returncode != 0:
                 return False
-            self._write_trust(Trust(rec.files, pushed, rec.seen, _merge_pins(rec.remote, datas)))
+            self._write_trust(dataclasses.replace(rec, accepted=pushed, remote=_merge_pins(rec.remote, datas)))
         if self._rref():
             git(["update-ref", self._rref(), pushed], self.repo.toplevel, check=False)
         return True
