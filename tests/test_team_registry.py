@@ -1061,3 +1061,43 @@ console.log(JSON.stringify(sent));
     sent = json.loads(out.stdout.strip().splitlines()[-1])
     want = {"Accept": "application/json", **({"X-Levain-Token": "t0k"} if with_auth else {})}
     assert sent == [{"url": "/team_views.json", "headers": want}]
+
+
+def test_the_views_request_runs_again_once_the_page_has_its_token():
+    # lane T, measured in Chrome: the first /team_views.json ran before token.js traded the link's one-time code for
+    # the token, got a 403, and the Team tab stayed missing until a reload. The script loads again on unlock.
+    from levain.web_server import load_web_asset
+    import shutil
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    js = load_web_asset("dashboard_team.js")
+    harness = r"""
+const sent = [], made = [];
+let unlock = null;
+global.window = { location: {}, LevainToken: { onUnlock: (fn) => { unlock = fn; } } };
+let authed = false;
+window.levainAuthHeaders = () => (authed ? { "X-Levain-Token": "t0k" } : {});
+global.document = { querySelector: () => ({ appendChild: (c) => made.push(c) }), hidden: false, addEventListener() {},
+  createElement: () => ({ alive: true, remove() { this.alive = false; }, addEventListener() {}, appendChild() {}, style: {}, setAttribute() {} }) };
+global.fetch = (url, opts) => {
+  sent.push(opts.headers);
+  return Promise.resolve(opts.headers["X-Levain-Token"]
+    ? { ok: true, json: async () => ({ views: [{ project: "p", repo: "/r", url: "http://127.0.0.1:7463/" }] }) }
+    : { ok: false, status: 403 });
+};
+%s
+const tick = () => new Promise((r) => setTimeout(r, 20));
+(async () => {
+  await tick();
+  const before = made.filter((c) => c.alive).length;
+  authed = true;
+  unlock();
+  await tick();
+  console.log(JSON.stringify({ before, after: made.filter((c) => c.alive).length, requests: sent.length,
+                               registered: typeof unlock === "function" }));
+})();
+""" % js
+    out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    assert json.loads(out.stdout.strip().splitlines()[-1]) == {"before": 0, "after": 1, "requests": 2,
+                                                              "registered": True}
