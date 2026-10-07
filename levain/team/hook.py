@@ -35,6 +35,7 @@ from . import index as I
 from . import roles as R
 from . import transport as T
 from .transport import BRANCH, DIRNAME, GitLedger, Repo, TeamError
+from .wire import PRETOOLUSE_TIMEOUT
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 TAG = "[levain team]"
@@ -161,12 +162,12 @@ def _wired_but_broken(gl: GitLedger) -> bool:
         return gl.base.is_dir()                       # git cannot answer; levain's own state says a ledger is here
 
 
-# Claude Code lets an edit through when a hook is killed at its timeout (30 s here), so a slow judgement would be an
-# allow. The whole judgement runs under ONE deadline well inside it; every git call and lock wait is clamped to what is
-# left (transport.deadline), and running out anywhere is a deny. _ALARM_AFTER is the backstop for time spent outside
-# git and locks: the process interrupts itself, which reaches the same boundary.
-_PRETOOLUSE_BUDGET = 20.0
-_ALARM_AFTER = 25.0
+# Claude Code lets an edit through when a hook is killed at its timeout (wire.PRETOOLUSE_TIMEOUT), so a slow judgement
+# would be an allow. The whole judgement runs under ONE deadline well inside it; every git call and lock wait is clamped
+# to what is left (transport.deadline), and running out anywhere is a deny. _ALARM_AFTER is the backstop for time spent
+# outside git and locks: the process interrupts itself, which reaches the same boundary.
+_PRETOOLUSE_BUDGET = PRETOOLUSE_TIMEOUT - 10.0
+_ALARM_AFTER = PRETOOLUSE_TIMEOUT - 5.0
 
 
 class _OutOfTime(Exception):

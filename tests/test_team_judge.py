@@ -1533,3 +1533,19 @@ def test_a_failed_fetch_says_what_git_said_first_and_never_a_credential(two):
     cp = subprocess.CompletedProcess([], 128, "", "hint: x\nfatal: unable to access 'https://bob:s3cret@host/r.git/': "
                                                   "403\n")
     assert T._tail(cp) == "fatal: unable to access 'https://***@host/r.git/': 403"
+
+
+def test_a_stale_seed_on_a_joined_clone_merges_and_never_drops_a_stronger_pin(two):
+    # L2 r3 LOW 6: --pins-from on a joined clone REPLACED its pins, so a stale seed silently dropped stronger ones.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    stale = tmp / "stale.json"
+    stale.write_bytes(_pins_file(ben).read_bytes())
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    strong = _pinned(ben)
+    assert team("join", "--pins-from", str(stale), "--no-install", repo=ben) == 0
+    assert all(_pinned(ben)[r]["length"] >= p["length"] for r, p in strong.items())

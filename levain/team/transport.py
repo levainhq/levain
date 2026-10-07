@@ -541,8 +541,8 @@ class GitLedger:
             return self._parse_team_at(rev)
         except R.RolesError as exc:
             first = exc
-        cp = git(["log", f"--max-count={_MAX_TEAM_VERSIONS}", "--format=%H", rev, "--", "team.toml"], self.repo.toplevel,
-                 check=False, timeout=30)
+        cp = git(["log", f"--max-count={_MAX_TEAM_VERSIONS}", "--format=%H", rev, "--", "team.toml"],
+                 self.repo.toplevel, check=False, timeout=30)
         for sha in cp.stdout.split()[1:]:
             try:
                 t = self._parse_team_at(sha)
@@ -674,8 +674,8 @@ class GitLedger:
         blobs = self._blobs([sha for _p, sha in leaves])
         lines_in_tree = sum(blobs[sha].count(b"\n") + 1 for _p, sha in leaves)    # counted before any is split
         if lines_in_tree > _MAX_LEDGER_LINES:
-            raise LedgerReadError(f"the ledger holds {lines_in_tree} lines, past levain's limit of {_MAX_LEDGER_LINES}; "
-                                  "the team owner removes the extra files")
+            raise LedgerReadError(f"the ledger holds {lines_in_tree} lines, past levain's limit of "
+                                  f"{_MAX_LEDGER_LINES}; the team owner removes the extra files")
         whole = {path[len(b"ledger/"):].decode("ascii"): blobs[sha] for path, sha in leaves}
         tamper += self._pin_violations(pins, whole) + self._pin_violations(lagging, whole, lag=True)
         datas: dict[str, bytes] = {}
@@ -699,7 +699,8 @@ class GitLedger:
             folder = rel.split("/", 1)[0]
             if folder not in by_safe and _fold(folder.encode()) in folded_members:
                 tamper.append(f"ledger/{rel} is filed under {folder}/, a case variant of a member's folder (a "
-                              "case-insensitive filesystem would write it over that member's file); the owner removes it")
+                              "case-insensitive filesystem would write it over that member's file); the owner "
+                              "removes it")
                 continue
             if team is not None and folder not in by_safe and not folder.startswith("pack-"):
                 problems.append(f"ledger/{rel}: filed under {folder}/, who is not a member; those lines are not enforced")
@@ -722,12 +723,12 @@ class GitLedger:
         return Judgement(led, datas, files, problems)
 
     def _structure(self, rev: str) -> tuple[list[bytes], list[tuple[bytes, str]], set[bytes]]:
-        """(bad_paths, leaves, aliased) of the ledger branch at ``rev``: one ``ls-tree -r -t -z`` of the WHOLE tree, judged as
-        bytes. Levain owns the branch's namespace: its top level is exactly ``team.toml`` and ``PROJECT.md`` (regular
-        files) and ``ledger`` (a tree), so anything else there (a ``.gitattributes`` that would re-encode or filter
-        what levain writes, a ``.gitmodules``, any other file) is tamper too, and so is a path that differs from another
-        only in case or Unicode normalisation (``aliased``): a case-insensitive filesystem checks the two out as one
-        file. No blob is read."""
+        """(bad_paths, leaves, aliased) of the ledger branch at ``rev``: one ``ls-tree -r -t -z`` of the WHOLE tree,
+        judged as bytes. Levain owns the branch's namespace: its top level is exactly ``team.toml`` and ``PROJECT.md``
+        (regular files) and ``ledger`` (a tree), so anything else there (a ``.gitattributes`` that would re-encode or
+        filter what levain writes, a ``.gitmodules``, any other file) is tamper too, and so is a path that differs
+        from another only in case or Unicode normalisation (``aliased``): a case-insensitive filesystem checks the two
+        out as one file. No blob is read."""
         cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev], self.repo.toplevel, check=False, timeout=30,
                  binary=True, max_out=_MAX_TREE_BYTES)
         if cp.returncode != 0:
@@ -748,7 +749,7 @@ class GitLedger:
         leaves: list[tuple[bytes, str]] = []
         seen_paths: set[bytes] = set()
         folded: dict[str, bytes] = {}
-        aliased: set[bytes] = set()       # a case-insensitive filesystem (macOS, Windows) checks two such paths out as one
+        aliased: set[bytes] = set()       # a case-insensitive filesystem (macOS, Windows) checks these out as one
         for rec in cp.stdout_bytes.split(b"\0"):
             if not rec:
                 continue
@@ -1170,8 +1171,8 @@ class GitLedger:
                     floor = cp.stdout.strip() if cp.returncode == 0 else ""
                     if not floor:
                         raise TeamError(f"this clone's {BRANCH} branch shares no history with the remote's, so this "
-                                        "clone did not join; if this clone's ledger branch is not the team's, delete it "
-                                        f"(`git branch -D {BRANCH}`) and join again")
+                                        "clone did not join; if this clone's ledger branch is not the team's, delete "
+                                        f"it (`git branch -D {BRANCH}`) and join again")
                 j = self.judge_remote(tip, Trust(rec.files, floor, rec.seen, rec.remote))
             else:
                 j = self.judge(tip, self._team_or_none(tip), rec.files)
@@ -1723,7 +1724,7 @@ class GitLedger:
                          check=False, timeout=left(timeout))
                 if cp.returncode == 0:
                     with contextlib.suppress(TeamError, OSError):
-                        self._record_pushed(head, judged.datas)     # the push was a fast-forward: the remote now holds exactly this
+                        self._record_pushed(head, judged.datas)     # a fast-forward: the remote holds exactly this
                     with contextlib.suppress(TeamError):
                         self._fetch_quarantined(remote, left(timeout))
                     return "pushed"
