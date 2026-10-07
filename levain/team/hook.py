@@ -18,13 +18,12 @@ extraction from shell is unreliable); that gap is documented, not hidden.
 from __future__ import annotations
 
 import calendar
-import contextlib
 import hashlib
 import json
 import os
-import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -163,65 +162,100 @@ def _wired_but_broken(gl: GitLedger) -> bool:
 
 
 # Claude Code lets an edit through when a hook is killed at its timeout (wire.PRETOOLUSE_TIMEOUT), so a slow judgement
-# would be an allow. The whole judgement runs under ONE deadline well inside it; every git call and lock wait is clamped
-# to what is left (transport.deadline), and running out anywhere is a deny. _ALARM_AFTER is the backstop for time spent
-# outside git and locks: the process interrupts itself, which reaches the same boundary.
+# would be an allow. The judgement runs in a worker thread under ONE deadline (transport.deadline clamps every git call
+# and lock wait to what is left of it); the caller waits for it at most that long. There is no signal and no handler
+# that writes: whatever happens, exactly one document is encoded and written from one place (_emit).
 _PRETOOLUSE_BUDGET = PRETOOLUSE_TIMEOUT - 10.0
-_ALARM_AFTER = PRETOOLUSE_TIMEOUT - 5.0
+_JOIN_GRACE = 2.0                  # what the caller waits past the budget before it answers for a stuck worker
+_ANSWER_MAX = 64 << 10             # one encoded answer; only its explanatory text is ever cut to fit
+
+_UNKNOWN = "unknown"               # the third scope value: a scan that could not finish is never "out of scope"
 
 
-class _OutOfTime(BaseException):
-    """The alarm: a BaseException, so no ``except Exception`` on the way can swallow it; only the boundary and main()
-    catch it, and both answer with a deny."""
+def _scope(payload: dict) -> bool | str:
+    """Is this edit in levain's scope: True (a repository above the target or the session's cwd holds team state),
+    False (every place was scanned to the end and none does), or _UNKNOWN (any place could not be scanned)."""
+    found, conclusive = False, True
+    for place in _places(payload):
+        roots, ok = _scan(Path(place))
+        found, conclusive = found or bool(roots), conclusive and ok
+    return True if found else (False if conclusive else _UNKNOWN)
 
 
-def _alarm(_signum, _frame):
-    raise _OutOfTime("the ledger judgement ran out of time")
+def _answer_for(payload: dict) -> bytes:
+    """THE fail-closed boundary, and the only one: the ONE encoded document this edit gets (b"" for silence). The
+    scope is decided first; then the edit is judged in a worker thread under one deadline. A worker that raises
+    anything, or does not finish in time, gets a DENY unless the edit is known to be out of scope."""
+    late = _encode(_deny("the team ledger judgement took too long; the edit is denied, never allowed late"))
+    done: dict = {}
+    started = time.monotonic()
+
+    def work() -> None:
+        try:
+            done["scope"] = _scope(payload)
+            answer: list[dict] = []
+            with T.deadline(_PRETOOLUSE_BUDGET):
+                _pretooluse(payload, answer)
+                if T.expired():
+                    raise T.DeadlineExceeded("the ledger judgement ran out of time")
+            done["answer"] = answer[0] if answer else None
+        except BaseException as exc:  # noqa: BLE001 - the boundary: anything at all is answered below
+            done["error"] = exc
+    worker = threading.Thread(target=work, name="levain-team-pretooluse", daemon=True)
+    worker.start()
+    worker.join(_PRETOOLUSE_BUDGET + _JOIN_GRACE)
+    scope = done.get("scope", _UNKNOWN)
+    if worker.is_alive():
+        return late if scope is not False else b""
+    if "error" in done:
+        exc = done["error"]
+        if scope is False:
+            return b""
+        if isinstance(exc, T.DeadlineExceeded) or time.monotonic() - started >= _PRETOOLUSE_BUDGET:
+            return late                      # a wrapped DeadlineExceeded reads as what it is
+        return _encode(_deny(f"the team ledger judgement could not be read ({type(exc).__name__}: {exc}); the edit "
+                             "is denied"))
+    answer = done.get("answer")
+    denied = bool(answer) and answer.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+    if scope == _UNKNOWN and not denied:
+        return _encode(_deny("the team ledger's place could not be read (a .git or its commondir is unreadable), so "
+                             "whether this edit is governed is unknown; the edit is denied"))
+    return _encode(answer) if answer else b""
 
 
-# Whether this edit is in levain's scope (a repository above the target or the session's cwd holds team state), decided
-# ONCE, first, before anything can fail: True, False, or None while it is not known yet. Unknown is a deny.
-_SCOPE: list[bool | None] = [None]
-_ANSWERED: list[bool] = [False]
+def _encode(doc: dict) -> bytes:
+    """One answer as bytes, within _ANSWER_MAX: the decision fields are kept whole and only the explanatory text is
+    shortened to fit."""
+    buf = json.dumps(doc).encode("utf-8")
+    if len(buf) <= _ANSWER_MAX:
+        return buf
+    hso = dict(doc.get("hookSpecificOutput", {}))
+    for key in ("permissionDecisionReason", "additionalContext"):
+        if isinstance(hso.get(key), str):
+            hso[key] = hso[key][:_ANSWER_MAX // 2] + " [cut to fit the hook's answer]"
+    doc = {**doc, "hookSpecificOutput": hso}
+    if isinstance(doc.get("systemMessage"), str):
+        doc["systemMessage"] = doc["systemMessage"][:1024]
+    return json.dumps(doc).encode("utf-8")
 
 
 def pretooluse(payload: dict) -> None:
-    """THE fail-closed boundary, and the only one. The scope is decided first (under the alarm, with bounded reads); then
-    ANY exception while the edit is judged, or a judgement that ran past its one deadline, is a DENY unless the edit is
-    known to be out of scope, where it is silence. No path inside handles its own failures, and the handler decides
-    from the stored scope, never by looking again."""
-    _SCOPE[0], _ANSWERED[0] = None, False
-    answer: list[dict] = []
-    started = time.monotonic()
+    """In-process entry (tests and callers that keep running): the same one answer, written to sys.stdout."""
+    buf = _answer_for(payload)
+    if buf:
+        sys.stdout.write(buf.decode("utf-8"))
+        sys.stdout.flush()
+
+
+def _emit(buf: bytes) -> None:
+    """THE one write site of the hook process: the whole answer, then exit at once, so nothing (a worker still stuck
+    in a system call included) can write after it."""
     try:
-        _SCOPE[0] = any(_ledger_roots(Path(p)) for p in _places(payload))
-        with T.deadline(_PRETOOLUSE_BUDGET):
-            _pretooluse(payload, answer)
-            late = T.expired()
-        if late:
-            raise T.DeadlineExceeded("the ledger judgement ran out of time")
-    except (Exception, _OutOfTime) as exc:  # noqa: BLE001 - the boundary
-        if _SCOPE[0] is not False:
-            late = isinstance(exc, _OutOfTime) or time.monotonic() - started >= _PRETOOLUSE_BUDGET
-            _deny_out(late, exc)
-        _disarm()
-        return
-    for a in answer:
-        _out(a)
-    _ANSWERED[0] = True
-    _disarm()
-
-
-def _deny_out(late: bool, exc: BaseException | None = None) -> None:
-    why = "took too long" if late else f"could not be read ({type(exc).__name__}: {exc})"
-    _out(_deny(f"the team ledger judgement {why}; the edit is denied, never allowed late"))
-    _ANSWERED[0] = True
-
-
-def _disarm() -> None:
-    if hasattr(signal, "setitimer"):
-        with contextlib.suppress(ValueError, OSError):
-            signal.setitimer(signal.ITIMER_REAL, 0)
+        view = memoryview(buf)
+        while view:
+            view = view[os.write(1, view):]
+    finally:
+        os._exit(0)
 
 
 def _places(payload: dict) -> list[str]:
@@ -300,14 +334,19 @@ def _small_text(path: Path) -> str:
 
 
 def _ledger_roots(target: Path) -> list[Path]:
-    """Every directory above ``target`` whose repository holds levain team state, nearest first, read from the
-    filesystem alone (so it answers when git cannot): a ``.git`` directory, or a linked worktree's ``.git`` file and
-    its common dir. A ``.git`` that cannot be read is passed over, never a reason to stop looking."""
+    return _scan(target)[0]
+
+
+def _scan(target: Path) -> tuple[list[Path], bool]:
+    """(roots, conclusive): every directory above ``target`` whose repository holds levain team state, nearest first,
+    read from the filesystem alone (so it answers when git cannot): a ``.git`` directory, or a linked worktree's
+    ``.git`` file and its common dir. A ``.git`` that cannot be read is passed over, never a reason to stop looking,
+    and makes the scan inconclusive."""
     try:
         d = Path(os.path.realpath(target))            # the real path: a symlinked edit path still finds its clone
     except (OSError, ValueError):
         d = Path(os.path.abspath(target))
-    out = []
+    out, conclusive = [], True
     for p in (d, *d.parents):
         g = p / ".git"
         try:
@@ -324,8 +363,9 @@ def _ledger_roots(target: Path) -> list[Path]:
             if (common / DIRNAME).is_dir():
                 out.append(p)
         except OSError:
+            conclusive = False
             continue
-    return out
+    return out, conclusive
 
 
 def _edit_verdict(gl: GitLedger, repo: Repo, target: str, payload: dict, fetch_note: str | None) -> dict | None:
@@ -554,20 +594,15 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(sys.stdin.read() or "{}")
         if not isinstance(payload, dict):
             payload = {}
-        if event == "pretooluse" and hasattr(signal, "setitimer"):
-            try:
-                signal.signal(signal.SIGALRM, _alarm)
-                signal.setitimer(signal.ITIMER_REAL, _ALARM_AFTER)
-            except (ValueError, OSError):
-                pass                       # not the main thread: the monotonic deadline still bounds git and locks
-        (pretooluse if event == "pretooluse" else sessionstart)(payload)
-    except _OutOfTime:                     # the alarm landed in the boundary's own handler: the same deny
-        if event == "pretooluse" and not _ANSWERED[0] and _SCOPE[0] is not False:
-            _deny_out(True)
+    except Exception as exc:  # noqa: BLE001 - no edit can be located: fail open, visibly
+        _fail_open(name, f"{type(exc).__name__}: {exc}")
+        return 0
+    if event == "pretooluse":
+        _emit(_answer_for(payload))            # never returns
+    try:
+        sessionstart(payload)
     except Exception as exc:  # noqa: BLE001 - fail open, visibly
         _fail_open(name, f"{type(exc).__name__}: {exc}")
-    finally:
-        _disarm()
     return 0
 
 

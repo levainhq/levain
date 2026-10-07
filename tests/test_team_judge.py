@@ -8,6 +8,7 @@ import fcntl
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -1258,28 +1259,6 @@ def test_a_judgement_slowed_by_git_is_denied_inside_the_deadline(two, monkeypatc
     assert "took too long" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-def test_the_alarm_backstop_denies_time_spent_outside_git_and_locks(two, monkeypatch, capsys):
-    from levain.team import hook as H
-    from levain.team import index as I
-    tmp, ana, ben = two
-    monkeypatch.setattr(H, "_ALARM_AFTER", 1.0)
-    real = I.build
-
-    def slow(*a, **k):
-        time.sleep(3)
-        return real(*a, **k)
-    monkeypatch.setattr(I, "build", slow)
-    (_gl(ben).base / "history.json").unlink(missing_ok=True)
-    payload = {"session_id": "al", "transcript_path": "/x", "cwd": str(ben), "hook_event_name": "PreToolUse",
-               "tool_name": "Edit", "tool_input": {"file_path": str(ben / "src" / "billing.py")}, "tool_use_id": "t"}
-    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(payload)))
-    t0 = time.monotonic()
-    assert H.main(["pretooluse"]) == 0
-    assert time.monotonic() - t0 < 2.5
-    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
-    assert out["permissionDecision"] == "deny" and "took too long" in out["permissionDecisionReason"]
-
-
 def test_an_edit_outside_every_clone_is_not_judged_by_the_sessions_cwd(two):
     # L1 r3 LOW 11: the session's cwd widens only the boundary's deny condition; it is not a place to judge from.
     tmp, ana, ben = two
@@ -1552,24 +1531,36 @@ def test_a_stale_seed_on_a_joined_clone_merges_and_never_drops_a_stronger_pin(tw
     assert all(_pinned(ben)[r]["length"] >= p["length"] for r, p in strong.items())
 
 
-def _main_pretooluse(payload, monkeypatch, capsys):
+def _one_doc(raw: str) -> dict:
+    """stdout must be exactly one JSON document (or nothing)."""
+    if not raw.strip():
+        return {}
+    doc, end = json.JSONDecoder().raw_decode(raw)
+    assert raw[end:].strip() == "", raw
+    return doc
+
+
+def _in_process(payload, capsys) -> tuple[dict, float]:
     from levain.team import hook as H
-    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(payload)))
     t0 = time.monotonic()
-    assert H.main(["pretooluse"]) == 0
+    H.pretooluse(payload)
     took = time.monotonic() - t0
-    raw = capsys.readouterr().out
-    return json.loads(raw) if raw.strip() else {}, took, raw
+    return _one_doc(capsys.readouterr().out), took
 
 
-def test_a_scope_read_that_hangs_is_a_deny_inside_the_alarm(two, monkeypatch, capsys):
-    # Head ruling (A) on L3 r3 (gemini HIGH + codex HIGH): the handler re-scanned .git/commondir after disarming the
-    # alarm, so a read that hangs there let the hook be killed and the edit through. The scope is decided once, first,
-    # under the alarm; a scope that cannot be decided is a deny.
+def _edit_payload(repo, target):
+    return {"session_id": "h", "transcript_path": "/x", "cwd": str(repo), "hook_event_name": "PreToolUse",
+            "tool_name": "Edit", "tool_input": {"file_path": str(target)}, "tool_use_id": "t"}
+
+
+def test_a_scope_scan_that_hangs_is_exactly_one_deny_inside_the_deadline(two, monkeypatch, capsys):
+    # Head ruling on L3 r4 (the alarm path deleted): a worker thread judges, the caller waits at most the deadline, and
+    # one document is written from one place. gemini + codex HIGH on r3 were a scope re-scan that could hang.
     from levain.team import hook as H
     tmp, ana, ben = two
     git("worktree", "add", "-q", str(tmp / "benwt"), cwd=ben)
-    monkeypatch.setattr(H, "_ALARM_AFTER", 1.0)
+    monkeypatch.setattr(H, "_PRETOOLUSE_BUDGET", 1.0)
+    monkeypatch.setattr(H, "_JOIN_GRACE", 0.5)
     real = H._small_text
 
     def hang(path):
@@ -1577,56 +1568,61 @@ def test_a_scope_read_that_hangs_is_a_deny_inside_the_alarm(two, monkeypatch, ca
             time.sleep(30)
         return real(path)
     monkeypatch.setattr(H, "_small_text", hang)
-    out, took, _raw = _main_pretooluse({"session_id": "h", "transcript_path": "/x", "cwd": str(tmp / "benwt"),
-                                        "hook_event_name": "PreToolUse", "tool_name": "Edit",
-                                        "tool_input": {"file_path": str(tmp / "benwt" / "src" / "settlement.py")},
-                                        "tool_use_id": "t"}, monkeypatch, capsys)
+    out, took = _in_process(_edit_payload(tmp / "benwt", tmp / "benwt" / "src" / "settlement.py"), capsys)
     assert took < 3 and out["hookSpecificOutput"]["permissionDecision"] == "deny", (took, out)
+    assert "took too long" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-def test_an_alarm_inside_the_boundarys_handler_is_still_one_deny(two, monkeypatch, capsys):
-    # complement LOW on L3 r3: an alarm landing in the handler escaped to main()'s fail-open path.
+def test_a_scope_scan_that_raises_is_a_deny(two, monkeypatch, capsys):
     from levain.team import hook as H
     tmp, ana, ben = two
-    monkeypatch.setattr(H, "_ALARM_AFTER", 1.0)
 
-    def boom(*a, **k):
-        raise RuntimeError("judgement failed")
-    monkeypatch.setattr(H, "_pretooluse", boom)
-    real, calls = H._deny, []
-
-    def slow_deny(why):
-        calls.append(why)
-        if len(calls) == 1:
-            time.sleep(3)                                    # the alarm fires here, inside the handler
-        return real(why)
-    monkeypatch.setattr(H, "_deny", slow_deny)
-    out, took, raw = _main_pretooluse({"session_id": "h", "transcript_path": "/x", "cwd": str(ben),
-                                       "hook_event_name": "PreToolUse", "tool_name": "Edit",
-                                       "tool_input": {"file_path": str(ben / "src" / "settlement.py")},
-                                       "tool_use_id": "t"}, monkeypatch, capsys)
-    assert raw.count("hookSpecificOutput") == 1 and out["hookSpecificOutput"]["permissionDecision"] == "deny", raw
+    def boom(target):
+        raise RecursionError("a scan that raises")
+    monkeypatch.setattr(H, "_scan", boom)
+    out, _took = _in_process(_edit_payload(ben, ben / "src" / "billing.py"), capsys)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
-def test_no_broad_handler_on_the_way_can_swallow_the_alarm(two, monkeypatch, capsys):
-    # complement MED on L3 r3: _OutOfTime was an Exception, so fetch_if_due's `except Exception` turned the one-shot
-    # alarm into a note and the judgement ran on unbounded.
+def test_an_unreadable_dot_git_is_an_unknown_scope_and_a_deny(two):
+    # codex HIGH on L3 r4: _ledger_roots swallowed the OSError of a mode-000 .git and stored "out of scope" (silence).
+    tmp, ana, ben = two
+    os.chmod(ben / ".git", 0)
+    try:
+        out = hook("pretooluse", _edit_payload(ben, ben / "src" / "billing.py"))
+    finally:
+        os.chmod(ben / ".git", 0o755)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_a_judgement_stuck_in_python_past_the_deadline_is_one_deny(two, monkeypatch, capsys):
+    # complement MED on L3 r3: time spent outside git and locks (here a stuck sync) was unbounded once an alarm was
+    # swallowed. There is no alarm now: the caller stops waiting at the deadline.
     from levain.team import hook as H
     from levain.team.transport import GitLedger as G
     tmp, ana, ben = two
-    monkeypatch.setattr(H, "_ALARM_AFTER", 1.0)
+    monkeypatch.setattr(H, "_PRETOOLUSE_BUDGET", 1.0)
+    monkeypatch.setattr(H, "_JOIN_GRACE", 0.5)
     _gl(ben).save_state(last_fetch_attempt=0)
 
     def slow_sync(self, **k):
         time.sleep(30)
     monkeypatch.setattr(G, "_sync", slow_sync)
-    out, took, _raw = _main_pretooluse({"session_id": "s", "transcript_path": "/x", "cwd": str(ben),
-                                        "hook_event_name": "PreToolUse", "tool_name": "Edit",
-                                        "tool_input": {"file_path": str(ben / "src" / "billing.py")},
-                                        "tool_use_id": "t"}, monkeypatch, capsys)
+    out, took = _in_process(_edit_payload(ben, ben / "src" / "billing.py"), capsys)
     assert took < 3 and out["hookSpecificOutput"]["permissionDecision"] == "deny", (took, out)
 
 
+def test_a_long_deny_is_still_exactly_one_document(two):
+    # codex HIGH on L3 r4: two write sites could put a second document after the first. One encode, one write site.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/long.py", "a long ruling. " * 100) == 0
+    assert team("sync", repo=ben) == 0
+    cp = subprocess.run([sys.executable, "-P", "-m", "levain.team.hook", "pretooluse"],
+                        input=json.dumps(_edit_payload(ben, ben / "src" / "long.py")), capture_output=True, text=True,
+                        timeout=60)
+    assert len(cp.stdout) > 512
+    out = _one_doc(cp.stdout)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "a long ruling" in out["permissionDecisionReason"]
 def test_a_branch_behind_the_remote_must_be_a_prefix_of_what_was_accepted(two):
     # codex HIGH on L3 r3: a local file SHORTER than its remote pin was skipped, so a local rewrite to A+C (shorter than
     # the accepted A+B) passed and was pinned. It is compared against that file in the accepted commit.
