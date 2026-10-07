@@ -442,7 +442,11 @@ def sessionstart(payload: dict) -> None:
             fresh = calendar.timegm(time.strptime(d["first_seen"], "%Y-%m-%dT%H:%M:%SZ")) >= week   # UTC stamps
         except (ValueError, OverflowError):
             fresh = True
-        if fresh:
+        if fresh and d["member"].startswith("pack-"):
+            lines.append(f"[team] new pack file {I.oneline(d['member'])}/{I.oneline(d['device'])}, first seen "
+                         f"{I.oneline(d['first_seen'])}; pack rules are seeded by the team owner (`levain team "
+                         "pack-sync`)")
+        elif fresh:
             lines.append(f"[team] new device {I.oneline(d['device'])} under {I.oneline(d['member'])}, first seen "
                          f"{I.oneline(d['first_seen'])}; if {I.oneline(d['member'])} did not add it, the remote was "
                          "written by someone else")

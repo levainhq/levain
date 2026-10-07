@@ -1000,3 +1000,104 @@ def test_a_device_file_pushed_under_another_member_is_shown(two, capsys):
     ctx = hook("sessionstart", {"session_id": "nd", "cwd": str(ana), "hook_event_name": "SessionStart",
                                 "source": "startup"})["hookSpecificOutput"]["additionalContext"]
     assert "new device fedcba9876543210 under ana" in ctx
+
+
+def _forge_last_line(gl, words):
+    """Rewrite the last entry of ana's own file to say ``words``, resealed so it verifies: a rewrite, not damage."""
+    f = _own_file(gl)
+    lines = f.read_text().splitlines(keepends=True)
+    e = json.loads(lines[-1])
+    e["words"] = words
+    prev = json.loads(lines[-2])["hash"] if len(lines) > 1 else ""
+    e = E.seal({k: v for k, v in e.items() if k not in ("hash", "prev")}, prev)
+    f.write_text("".join(lines[:-1]) + json.dumps(e, ensure_ascii=False, sort_keys=True) + "\n")
+    git("add", "-A", ".", cwd=gl.wt)
+    git("commit", "-qm", "rewrite", cwd=gl.wt)
+    git("push", "-q", "-f", "origin", "HEAD:levain-ledger", cwd=gl.wt)
+
+
+@pytest.mark.parametrize("how", ["sync", "fetch_only"])
+def test_bytes_accepted_from_the_remote_are_pinned_without_a_read(two, how):
+    # L2 r3 MED 1, RAN (p3.py): a remote tip accepted by a fetch moved the accepted sha but pinned none of its files, so
+    # with no read in between, the next remote tip could rewrite them and was accepted silently.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "the real words") == 0
+    gb = _gl(ben)
+    if how == "sync":
+        assert team("sync", repo=ben) == 0
+    else:
+        assert gb.fetch_only(interval=0, timeout=30) is None
+    _forge_last_line(_gl(ana), "FORGED")
+    if how == "sync":
+        assert team("sync", repo=ben) != 0
+    else:
+        assert "refused" in (gb.fetch_only(interval=0, timeout=30) or "")
+    led = ledger(ben)
+    assert "FORGED" not in [e.get("words") for e in led.entries]
+    assert led.tamper
+
+
+def _ss(repo):
+    return hook("sessionstart", {"session_id": "nd", "cwd": str(repo), "hook_event_name": "SessionStart",
+                                 "source": "startup"})["hookSpecificOutput"]["additionalContext"]
+
+
+def test_a_seeded_join_announces_no_device_as_new(two):
+    # L1 r3 MED 3, RAN: after a join seeded with --pins-from, every teammate device was announced as "new".
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    seed = tmp / "ben_pins.json"
+    seed.write_bytes(_pins_file(ben).read_bytes())
+    cat = clone(tmp, "cat", "ben@ex.com")
+    assert team("join", "--pins-from", str(seed), "--no-install", repo=cat) == 0
+    ledger(cat)
+    assert "new device" not in _ss(cat)
+
+
+def test_a_record_migrated_from_v1_announces_no_device_as_new(two):
+    # L1 r3 MED 3, RAN: a v1 pins.json (a bare map of file pins, no first-seen record) re-joined announced every device.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    _pins_file(ben).write_text(json.dumps(_pinned(ben)))
+    assert team("join", "--no-install", repo=ben) == 0
+    ledger(ben)
+    assert "new device" not in _ss(ben)
+
+
+def test_a_device_added_later_is_announced_and_a_pack_file_is_worded_as_one(two):
+    tmp, ana, ben = two
+    ledger(ben)
+    gl = _gl(ana)
+    (gl.wt / "ledger" / "ben").mkdir(exist_ok=True)
+    (gl.wt / "ledger" / "ben" / "ffffffffffffffff.jsonl").write_text("")
+    (gl.wt / "ledger" / "pack-other-1.0").mkdir()
+    (gl.wt / "ledger" / "pack-other-1.0" / "eeeeeeeeeeeeeeee.jsonl").write_text("")
+    _push_wt(gl, "a device and a pack file nobody here added")
+    assert team("sync", repo=ben) == 0
+    ctx = _ss(ben)
+    assert "new device ffffffffffffffff under ben" in ctx
+    assert "new pack file pack-other-1.0/eeeeeeeeeeeeeeee" in ctx and "under pack-other" not in ctx
+
+
+def test_a_branch_behind_what_a_fetch_accepted_still_reads_and_a_reset_below_a_read_refuses(two):
+    # C1: bytes accepted from the remote are pinned before this clone's branch replays them (fetch_only replays
+    # nothing), so a read of the branch that is merely BEHIND them is not a rewrite; a branch reset below what a read
+    # of it accepted still is.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "one") == 0
+    assert team("sync", repo=ben) == 0
+    assert "one" in [e.get("words") for e in ledger(ben).entries]
+    before = _gl(ben).head()
+    assert record_ruling(ana, "src/b.py", "two") == 0
+    gb = _gl(ben)
+    assert gb.fetch_only(interval=0, timeout=30) is None
+    led = ledger(ben)
+    assert not led.tamper and "two" not in [e.get("words") for e in led.entries]
+    assert team("sync", repo=ben) == 0
+    assert "two" in [e.get("words") for e in ledger(ben).entries]
+    git("update-ref", "refs/heads/levain-ledger", before, cwd=ben)
+    assert ledger(ben).tamper
