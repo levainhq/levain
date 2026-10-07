@@ -974,6 +974,9 @@ def build_policy(
         read the operator's own memory;
       - sibling entities' ``<other>/.levain/`` stores (subtrees) — one entity can't read another's
         memory;
+      - the autonomic engine's store directory ``<levain home>/autonomic`` (``$LEVAIN_HOME``, else
+        ``~/.levain``; subtree, read and write) — the binding registry and run journal that decide
+        what fires, so an entity can neither read nor rewrite its own authority (:data:`AUTONOMIC_STORE_DIR`);
       - ⛔ ALL of ``~/.ssh`` (read+write-denied when ``ssh_mode="agent"``, except ``known_hosts``
         r+w and ``config`` r) — LOCATION-BASED, NOT NAME-BASED. See this module's docstring, which
         is the one home for this fact and carries its provenance (apparatus L2). This bullet used
