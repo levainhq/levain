@@ -8,8 +8,7 @@ seal → id stable across record_fire/set_status), STRICT parsing (bad bool / ou
 NaN / clean>fire / unknown posture·status / empty goal / non-object pattern / non-string tools all
 rejected), the registry (add/get/list_all/list_active/set_status/record_fire/replace_atomic/remove),
 the GOVERNED lifecycle (set_status transition policy: REVOKED terminal, no inert→active, L2-H1; add
-preserves on-disk status+graduation so a re-add can't resurrect a revoked grant or wipe evidence,
-L2-H1/L1-M3; replace_atomic re-ratifies atomically, L2-M3), the FIRE-PATH guard (list_active excludes
+is create-only, so a re-add can't resurrect a revoked grant or wipe evidence, L2-H1/L1-M3, S1h-3; replace_atomic re-ratifies atomically, L2-M3), the FIRE-PATH guard (list_active excludes
 inactive AND seal-mismatched, fail-closed), the PredicateValidator seam at construction (L2-M1), the
 binding_invocation → AuthorityScope bridge incl. its non-active/negative-hops refusal (L2-M4/L1), and
 the fail-soft store reads (missing/corrupt/malformed).
@@ -619,18 +618,18 @@ def test_a_duplicate_key_inside_a_record_is_refused(tmp_path):
         s.ratify(b.binding_id)
 
 
-def test_re_add_over_a_malformed_record_refuses(tmp_path):
-    # Was: the incoming record was written over it. But a record whose status cannot be read may be
-    # a revoked tombstone, and writing over it revived the grant (L1+L2, S1h-2, reproduced). Refuse.
+def test_re_add_over_a_malformed_record_writes_nothing(tmp_path):
+    # A record whose status cannot be read may be a revoked tombstone; writing the incoming record
+    # over it revived the grant (L1+L2, S1h-2). add is create-only now: the id exists, so nothing
+    # is written and the record is not read as trusted.
     s = store(tmp_path)
     b = make_binding()
     s.add(b)
     rec = json.loads(s.path.read_text())[b.binding_id]
     s.path.write_text(json.dumps({b.binding_id: dict(rec, status="frozen")}))   # malformed status
     before = s.path.read_text()
-    with pytest.raises(ValueError, match="malformed"):
-        s.add(make_binding())
-    assert s.path.read_text() == before
+    assert s.add(make_binding()) is False
+    assert s.path.read_text() == before and s.get(b.binding_id) is None
 
 
 def test_a_non_dict_graduation_is_skipped_not_raised(tmp_path):
