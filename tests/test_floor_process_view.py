@@ -150,3 +150,140 @@ def test_the_spelling_is_checked_as_given_not_only_resolved() -> None:
     # On Linux /proc/self/fd/N resolves to the file fd N has open, which may be an ordinary path.
     assert C._process_view_reason("/proc/self/fd/7", Path("/home/u/work/notes.txt")) is not None
     assert C._process_view_reason("/home/u/work/notes.txt", Path("/home/u/work/notes.txt")) is None
+
+
+# --- the file editor judges the object it opened, not only the path it was given -----------------------
+
+
+def test_a_link_flipped_after_the_path_check_is_refused_at_the_open(tmp_path: Path, monkeypatch) -> None:
+    """The race, made deterministic: the path check sees a benign file, and by the time the editor
+    opens the path it leads to a crown jewel."""
+    from openhands.tools.file_editor.definition import FileEditorAction
+
+    from levain.firing.openhands import tools as T
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    jewel_dir = tmp_path / ".anneal-memory"
+    jewel_dir.mkdir()
+    (jewel_dir / "secret.txt").write_text("JEWEL-CONTENT\n")
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    link = ws / "notes.txt"
+    link.write_text("benign\n")
+    ex = T.CrownJewelsFileEditorExecutor(policy=build_policy(ent, workspace=ws))
+    real_check = T.crown_jewel_reason
+
+    def check_then_flip(policy, path):
+        out = real_check(policy, path)
+        if Path(path) == link:          # the shell swaps the file for a link right after the check
+            link.unlink()
+            link.symlink_to(jewel_dir / "secret.txt")
+        return out
+    monkeypatch.setattr(T, "crown_jewel_reason", check_then_flip)
+    obs = ex(FileEditorAction(command="view", path=str(link)))
+    text = "".join(getattr(c, "text", "") for c in obs.to_llm_content)
+    assert "JEWEL-CONTENT" not in text
+    assert obs.is_error and "crown" in text.lower()
+
+
+def test_the_open_check_is_inert_outside_a_floored_call(tmp_path: Path) -> None:
+    from levain.firing.openhands import tools as T
+
+    f = tmp_path / "x"
+    f.write_text("ok")
+    with T._floored_open(f) as fh:
+        assert fh.read() == "ok"
+
+
+def test_opened_file_reason_names_a_jewel_by_the_opened_object(policy, tmp_path: Path) -> None:
+    jewel = tmp_path / ".anneal-memory" / "m.db"
+    jewel.parent.mkdir(exist_ok=True)
+    jewel.write_text("x")
+    other = tmp_path / "plain"
+    other.write_text("y")
+    pol = build_policy(tmp_path / "ent")
+    with open(jewel) as a, open(other) as b:
+        assert C.opened_file_reason(pol, a.fileno()) is not None
+        assert C.opened_file_reason(pol, b.fileno()) is None
+    r, w = os.pipe()
+    try:
+        assert "could not be identified" in (C.opened_file_reason(pol, r) or "")
+    finally:
+        os.close(r)
+        os.close(w)
+
+
+def test_a_write_through_a_flipped_link_neither_truncates_nor_writes_the_jewel(tmp_path: Path,
+                                                                                monkeypatch) -> None:
+    from openhands.tools.file_editor.definition import FileEditorAction
+
+    from levain.firing.openhands import tools as T
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    jewel = tmp_path / ".anneal-memory" / "secret.txt"
+    jewel.parent.mkdir()
+    jewel.write_text("JEWEL-CONTENT\n")
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    target = ws / "new.txt"
+    ex = T.CrownJewelsFileEditorExecutor(policy=build_policy(ent, workspace=ws))
+    real_check = T.crown_jewel_reason
+
+    def check_then_flip(policy, path):
+        out = real_check(policy, path)
+        if Path(path) == target and not target.is_symlink():
+            target.symlink_to(jewel)
+        return out
+    monkeypatch.setattr(T, "crown_jewel_reason", check_then_flip)
+    obs = ex(FileEditorAction(command="create", path=str(target), file_text="PLANTED"))
+    assert obs.is_error
+    assert jewel.read_text() == "JEWEL-CONTENT\n"
+
+
+def test_a_refused_write_open_does_not_truncate_first(tmp_path: Path, monkeypatch) -> None:
+    from levain.firing.openhands import tools as T
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    jewel = tmp_path / ".anneal-memory" / "secret.txt"
+    jewel.parent.mkdir()
+    jewel.write_text("JEWEL-CONTENT\n")
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(jewel)
+    token = T._EDITOR_FLOOR.set(build_policy(ent))
+    try:
+        with pytest.raises(T._FloorRefusedOpen):
+            T._floored_open(link, "w")
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+    assert jewel.read_text() == "JEWEL-CONTENT\n"
+
+
+def test_on_linux_any_other_procfs_counts_as_a_process_view(monkeypatch) -> None:
+    monkeypatch.setattr(C.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(C, "_extra_procfs_mounts", lambda: [Path("/srv/chroot/proc")])
+    assert C._process_view_reason("/srv/chroot/proc/1/environ", Path("/srv/chroot/proc/1/environ"))
+    assert C._process_view_reason("/srv/chroot/etc/hosts", Path("/srv/chroot/etc/hosts")) is None
+
+
+def test_a_host_that_cannot_give_bash_a_pid_namespace_is_named_and_refused(monkeypatch) -> None:
+    monkeypatch.setattr(C.os.path, "isfile", lambda p: True if p == C.BWRAP else os.path.lexists(p))
+    monkeypatch.setattr(C.os, "access", lambda p, m: True if p == C.BWRAP else os.access(p, m))
+    monkeypatch.setattr(C.BwrapProvider, "available", lambda self: False)
+    monkeypatch.setattr(C, "_bwrap_runs_without_a_pid_namespace", lambda: True)
+    d = C.diagnose_confinement("Linux")
+    assert not d.supported and "PID namespace" in d.reason and "systempaths=unconfined" in d.remedy
+
+
+def test_a_file_shaped_procfs_mount_is_masked_not_tmpfsd(policy, tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "bound-environ"
+    f.write_text("")
+    monkeypatch.setattr(C, "_extra_procfs_mounts", lambda: [f])
+    argv = C._bwrap_argv(policy)
+    assert ["--ro-bind", "/dev/null", str(f)] == argv[argv.index(str(f)) - 2: argv.index(str(f)) + 1]
+    assert "--tmpfs" != argv[argv.index(str(f)) - 1]

@@ -1743,12 +1743,66 @@ def _process_view_reason(given: Path | str, resolved: Path) -> str | None:
         spelled = Path(os.path.abspath(os.path.expanduser(str(given))))
     except (ValueError, OSError, RuntimeError):
         spelled = resolved
+    roots = list(_PROCESS_VIEW_ROOTS)
+    if platform.system() == "Linux":
+        # Any other procfs on the host is the same view (a chroot's or a container's /proc): the
+        # editor runs in levain's own mount namespace, where step (8) of the bash plan does not reach.
+        try:
+            roots += _extra_procfs_mounts()
+        except OSError as exc:
+            return f"{given}: the mount table could not be read to rule out a process view ({exc}) — refused"
     for q in (spelled, resolved):
-        if any(_ci_within(q, r) for r in _PROCESS_VIEW_ROOTS) or any(_canon(str(q)) == _canon(str(f))
-                                                                     for f in _PROCESS_VIEW_FILES):
+        if any(_ci_within(q, r) for r in roots) or any(_canon(str(q)) == _canon(str(f))
+                                                       for f in _PROCESS_VIEW_FILES):
             return (f"{given} is a view of a running process (/proc, /dev/fd, /dev/std*), which "
                     "would expose levain's own memory, open files and environment — refused")
     return None
+
+
+def _procfs_devices() -> set[int]:
+    devs: set[int] = set()
+    for mp in [Path("/proc"), *_extra_procfs_mounts()]:
+        try:
+            devs.add(os.stat(mp).st_dev)
+        except OSError:
+            pass
+    return devs
+
+
+def opened_file_path(fd: int) -> str:
+    """The path of the file ``fd`` has open, as the kernel names it: ``/proc/self/fd/<fd>`` on Linux
+    (a process may always read its own), ``F_GETPATH`` on macOS. Raises OSError when there is none
+    (a pipe, a socket) or it cannot be read."""
+    if platform.system() == "Linux":
+        return os.readlink(f"/proc/self/fd/{fd}")
+    import fcntl
+
+    getpath = getattr(fcntl, "F_GETPATH", None)
+    if getpath is None:
+        raise OSError("this platform cannot name an open file")
+    raw = fcntl.fcntl(fd, getpath, bytes(1024))
+    return os.fsdecode(raw.split(b"\0", 1)[0])
+
+
+def opened_file_reason(policy: CrownJewelsPolicy, fd: int) -> str | None:
+    """Why the file ALREADY OPEN on ``fd`` must not be read or written through the file editor, or
+    None. The editor's path check runs before the editor opens the path, so a link the shell flips in
+    between (to ``/proc/<pid>/environ``, or to any jewel) passed it (L2 r1). This judges the object
+    actually opened, by its device (any procfs) and by the name the kernel gives it, before a byte
+    is read. Fail-closed: a file whose name cannot be learnt is refused."""
+    try:
+        st = os.fstat(fd)
+        if platform.system() == "Linux" and st.st_dev in _procfs_devices():
+            return "the opened file is in a /proc filesystem, a view of a running process"
+        if stat.S_ISDIR(st.st_mode):
+            return None
+        path = opened_file_path(fd)
+    except OSError as exc:
+        return f"the opened file could not be identified ({exc}) — refused (fail-closed)"
+    reason = crown_jewel_reason(policy, path)
+    if reason is None and st.st_nlink > 1:
+        reason = linked_jewel_reason(policy, path)
+    return reason
 
 
 def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | None:
@@ -3888,6 +3942,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     for mp in _extra_procfs_mounts():
         if not _reachable(mp) or _shadowed_by(mp, tuple(tmpfs_roots)):
             continue
+        if not mp.is_dir():
+            masks.append(str(mp))   # a bind of one procfs FILE: a tmpfs cannot cover a file (L2 r1)
+            continue
         argv += ["--tmpfs", str(mp)]
         remount_ro.append(str(mp))
 
@@ -3955,6 +4012,19 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         out += ["--remount-ro", r]
     _refuse_bind_after_mask(out)
     return out, create_first
+
+
+def _bwrap_runs_without_a_pid_namespace() -> bool:
+    """True when bwrap starts WITHOUT ``--unshare-pid`` (the probe :func:`bwrap_available` uses has
+    it), which pins a refusal on the PID namespace rather than on user namespaces in general."""
+    try:
+        proc = subprocess.run(
+            [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "/bin/true"],
+            capture_output=True, timeout=10, env=_probe_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
 
 
 def _probe_env() -> dict[str, str]:
@@ -4744,14 +4814,14 @@ class BwrapProvider(ConfinementProvider):
         default_timeout: float = 120.0,
     ) -> SandboxedShell:
         if not bwrap_available():
+            d = diagnose_confinement("Linux")
             raise ConfinementError(
-                f"{BWRAP} cannot establish a namespace on this host — refusing to grant bash hands "
-                "without a confinement floor (fail-closed). The usual cause on Ubuntu 23.10+ is "
-                "`kernel.apparmor_restrict_unprivileged_userns=1`, which blocks unprivileged user "
-                "namespaces for unconfined programs; an AppArmor profile granting `userns` to "
-                f"{BWRAP} is the narrow fix. Note that `bwrap` being INSTALLED and "
-                "`kernel.unprivileged_userns_clone=1` can BOTH be true on a host where this still "
-                "fails — which is why this is probed by running bwrap, not by reading either."
+                f"{BWRAP} cannot establish the floor's namespaces on this host — refusing to grant "
+                f"bash hands without a confinement floor (fail-closed). {d.reason}."
+                + (f" To fix: {d.remedy}." if d.remedy else "")
+                + " The usual cause on Ubuntu 23.10+ is `kernel.apparmor_restrict_unprivileged_userns=1`; "
+                "`bwrap` being installed and `kernel.unprivileged_userns_clone=1` can both be true on "
+                "a host where this still fails, which is why it is probed by running bwrap."
             )
         # ONE ledger transaction from the sweep to the claim (L1 r1): another session's release or sweep
         # cannot remove an object this plan relies on between the plan and the claim. The sweep runs
@@ -4953,6 +5023,18 @@ def diagnose_confinement(system: str | None = None) -> ConfinementDiagnosis:
     if provider.available():
         return ConfinementDiagnosis(True, "bwrap (Linux mount namespace)",
                                     "Linux bwrap floor active", None)
+    if _bwrap_runs_without_a_pid_namespace():
+        # The floor needs `--unshare-pid` (so bash cannot read other processes' environments), and
+        # a new PID namespace needs a fresh /proc mount, which the kernel refuses where /proc has
+        # masked or covered paths: the default inside Docker and podman (L2 r1, from bubblewrap.c).
+        # Never dropped to make bash start: fail closed, with the cause and the fix.
+        return ConfinementDiagnosis(
+            False, "bwrap (Linux mount namespace)",
+            "bwrap runs here, but cannot give bash its own PID namespace: a fresh /proc cannot be "
+            "mounted (usually because this is a container whose /proc has masked paths)",
+            "run levain on the host, or start the container with an unmasked /proc (Docker and "
+            "podman: `--security-opt systempaths=unconfined`)",
+        )
     if _apparmor_restricts_userns():
         return ConfinementDiagnosis(
             False, "bwrap (Linux mount namespace)",

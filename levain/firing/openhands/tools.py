@@ -62,6 +62,8 @@ Requires the ``openhands`` extra.
 """
 from __future__ import annotations
 
+import builtins
+import contextvars
 import dataclasses
 import logging
 import os
@@ -97,12 +99,77 @@ from levain.firing.confinement import (
     SandboxedShell,
     crown_jewel_reason,
     linked_jewel_reason,
+    opened_file_path,
+    opened_file_reason,
     refresh_socket_denies,
     select_provider,
 )
 from levain.firing.binding import ConversationBinding
 
 _log = logging.getLogger("levain.firing.tools")  # module convention: see levain/wrap.py, jobs.py
+
+# THE EDITOR'S OPENS ARE JUDGED AFTER THEY OPEN, BEFORE ANYTHING IS READ (L2 r1). The executor's path
+# check runs before the stock editor opens the path, so a link the shell flips in between (benign at
+# the check, /proc/<pid>/environ or a jewel at the open) passed it. The stock editor opens files with
+# the module-global ``open`` of two modules; each is given this wrapper, which, while a floored
+# executor call is running in this context, asks :func:`opened_file_reason` about the object actually
+# opened and refuses (closing it) before the editor reads a byte. Outside such a call it is ``open``.
+_EDITOR_FLOOR: contextvars.ContextVar[CrownJewelsPolicy | None] = contextvars.ContextVar(
+    "levain_editor_floor", default=None)
+
+
+class _FloorRefusedOpen(PermissionError):
+    """An editor open the floor refused after opening (see :func:`_floored_open`)."""
+
+
+def _floored_open(file, *args, **kwargs):
+    policy = _EDITOR_FLOOR.get()
+    if policy is None or "opener" in kwargs:
+        return builtins.open(file, *args, **kwargs)
+
+    def opener(path, flags):
+        # Judged BEFORE any byte moves: without O_TRUNC (truncating first would already have emptied a
+        # jewel), and a file this call creates is created O_EXCL, so a refusal knows it may remove it.
+        created = False
+        try:
+            fd = os.open(path, flags & ~(os.O_TRUNC | os.O_CREAT), 0o666)
+        except FileNotFoundError:
+            if not flags & os.O_CREAT:
+                raise
+            fd = os.open(path, (flags & ~os.O_TRUNC) | os.O_EXCL, 0o666)
+            created = True
+        try:
+            reason = opened_file_reason(policy, fd)
+        except Exception as exc:  # noqa: BLE001 — a check that cannot run refuses
+            reason = f"the opened file could not be checked ({exc})"
+        if reason is not None:
+            if created:
+                try:
+                    st = os.fstat(fd)
+                    real = opened_file_path(fd)
+                    lst = os.lstat(real)
+                    if (lst.st_dev, lst.st_ino) == (st.st_dev, st.st_ino):
+                        os.unlink(real)
+                except OSError:
+                    pass
+            os.close(fd)
+            raise _FloorRefusedOpen(reason)
+        if flags & os.O_TRUNC:
+            os.ftruncate(fd, 0)
+        return fd
+
+    return builtins.open(file, *args, opener=opener, **kwargs)
+
+
+def _install_floored_open() -> None:
+    from openhands.tools.file_editor import editor as _editor_mod
+    from openhands.tools.file_editor.utils import encoding as _encoding_mod
+
+    for mod in (_editor_mod, _encoding_mod):
+        mod.open = _floored_open   # type: ignore[attr-defined]
+
+
+_install_floored_open()
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
@@ -472,7 +539,20 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
                 command=action.command,
                 is_error=True,
             )
-        return super().__call__(action, conversation)
+        token = _EDITOR_FLOOR.set(policy)
+        try:
+            return super().__call__(action, conversation)
+        except _FloorRefusedOpen as exc:
+            return FileEditorObservation.from_text(
+                text=(
+                    f"REFUSED (crown-jewels floor): {exc}. Your hands reach the rest of the "
+                    "filesystem, but the sovereignty crown jewels are structurally off-limits."
+                ),
+                command=action.command,
+                is_error=True,
+            )
+        finally:
+            _EDITOR_FLOOR.reset(token)
 
 
 class LevainFileEditorTool(FileEditorTool):
