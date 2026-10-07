@@ -137,6 +137,10 @@ def tool_action_summary(event) -> tuple[str, str] | None:
     return tool_name, str(getattr(action, "kind", "") or "")
 
 
+# The only calls :func:`humanize_finish_json` unwraps: the reply and the scratchpad, neither of which acts.
+_UNWRAPPABLE_CALLS = frozenset({"finish", "think"})
+
+
 def humanize_finish_json(text: str) -> str:
     """spore-297: a weak open model (minimax-m3, verified live 2026-07-09) sometimes emits its tool
     calls as JSON TEXT instead of structured tool calls — e.g.::
@@ -150,7 +154,10 @@ def humanize_finish_json(text: str) -> str:
     normal reply that merely contains a brace or a JSON snippet is never mangled: trailing prose after
     a JSON object, a non-dict, or a JSON object that is not a ``finish`` tool call all leave it as-is.
     Conservative by design — it only unwraps a clean, entirely-tool-call-JSON payload that carries a
-    ``finish`` message, so it fixes the observed failure without ever eating a legitimate answer."""
+    ``finish`` message, so it fixes the observed failure without ever eating a legitimate answer. Every
+    call in it must be ``think`` or ``finish``: a payload that also holds any other call (``terminal``, a
+    name it does not know) is kept whole, because that call did not run, and answering with the finish
+    message ("Created x") would hide it from the unreadable-call check that reads this function's output."""
     stripped = text.strip()
     if not stripped.startswith("{"):
         return text
@@ -166,7 +173,7 @@ def humanize_finish_json(text: str) -> str:
             obj, idx = decoder.raw_decode(stripped, idx)
         except ValueError:
             return text  # not a clean, entirely-JSON tool-call payload → leave untouched
-        if not isinstance(obj, dict):
+        if not isinstance(obj, dict) or obj.get("name") not in _UNWRAPPABLE_CALLS:
             return text
         objs.append(obj)
     for obj in objs:
@@ -200,9 +207,15 @@ _GLM_ARG_PAIR = re.compile(r"</arg_key>\s*<arg_value>|</arg_value>\s*<arg_key>")
 # Qwen3-Coder's <function=name>. The bare tag in a sentence ("a <tool_call> tag") is not a call. The space between
 # may cross line and paragraph breaks.
 _TOOL_CALL_OPEN = re.compile(r"<tool_call>\s*(?:\{|<function=|[A-Za-z_][\w.-]*\s*<arg_key>)")
-# A reply this large is not classified, and is shown as it arrived (Phill 2026-10-05, A'): a bound, so no input can
-# make the classifier itself slow.
+# Qwen3-Coder's call without its wrapper: an upstream parser can consume "<tool_call>" and leave the rest as text
+# (glm-5.2:cloud via Ollama, 2026-10-07). The function tag must be followed by a parameter tag or its own close.
+_FUNCTION_CALL_OPEN = re.compile(r"<function=[A-Za-z_][\w.-]*>\s*(?:<parameter=|</function>)")
+# A reply this large is not parsed as Markdown (Phill 2026-10-05, A'): a bound, so no input can make the parser slow.
+# It is still searched for markup and call JSON, with no region counted as code, so a large leak is flagged rather
+# than shown as an answer.
 MAX_CLASSIFIED_BYTES = 200_000
+_CALL_MARKUP = (_TOOL_CALL_OPEN, _FUNCTION_CALL_OPEN, _GLM_ARG_PAIR)
+_SPACE = re.compile(r"\s*")
 
 # The rule (Phill 2026-10-05, A'): tool-call markup found anywhere OUTSIDE a code region is a leak, inside a
 # heading, a list or a quote included. A model has no reason to write that markup in prose; a false flag still shows
@@ -271,8 +284,7 @@ def _json_call_names(text: str) -> list[str] | None:
         return False
 
     while idx < n:
-        while idx < n and text[idx].isspace():
-            idx += 1
+        idx = _SPACE.match(text, idx).end()
         if idx >= n:
             break
         try:
@@ -290,20 +302,25 @@ def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]
 
     An open model's call that fails to parse upstream reaches levain as reply TEXT, and that call did not run.
     Three shapes are recognised. Two are markup found anywhere outside Markdown code (see :func:`_read`):
-    GLM argument markup (a key tag beside a value tag), and a ``<tool_call>`` wrapper that opens a call; markup
-    written in code is an answer. The third is a reply that is entirely function-call JSON (bare, or as the whole of
-    one fenced block) naming only ``tool_names``, the entity's own tools; with none known, that shape is not flagged.
-    Replies over :data:`MAX_CLASSIFIED_BYTES` are not classified. It reads the shape only: the call is never repaired
-    or run."""
-    # Characters first: UTF-8 spends at least one byte per character, so more characters than the bound means more
-    # bytes, and a reply that size is never encoded just to be refused (codex L3 r7).
-    if not text or len(text) > MAX_CLASSIFIED_BYTES or len(text.encode("utf-8", "surrogatepass")) > MAX_CLASSIFIED_BYTES:
+    GLM argument markup (a key tag beside a value tag), and a ``<tool_call>`` wrapper that opens a call or a
+    Qwen3-Coder ``<function=name>`` tag that opens one without it; markup
+    written in code is an answer, unless the reply is nothing but one fenced block, which is read as the call it
+    holds. The third is a reply that is entirely function-call JSON (bare, or as the whole of one fenced block)
+    naming only ``tool_names``, the entity's own tools; with none known, that shape is not flagged. A reply over
+    :data:`MAX_CLASSIFIED_BYTES` is not parsed as Markdown: all of it is searched as if no part were code. It reads
+    the shape only: the call is never repaired or run."""
+    if not text:
         return False
-    prose, body = _read(text)
+    # Characters first: UTF-8 spends at least one byte per character, so more characters than the bound means more
+    # bytes, and a reply that size is never encoded just to be measured (codex L3 r7).
+    if len(text) > MAX_CLASSIFIED_BYTES or len(text.encode("utf-8", "surrogatepass")) > MAX_CLASSIFIED_BYTES:
+        prose, body = text, None
+    else:
+        prose, body = _read(text)
     names = _json_call_names((body if body is not None else text).strip())
     if names and all(n in tool_names for n in names):
         return True
-    return bool(_TOOL_CALL_OPEN.search(prose) or _GLM_ARG_PAIR.search(prose))
+    return any(p.search(region) for region in (prose, body) if region for p in _CALL_MARKUP)
 
 
 def is_corrective_nudge(event) -> bool:

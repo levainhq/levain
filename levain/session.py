@@ -93,6 +93,7 @@ __all__ = [
     "EXIT_TIMEOUT",
     "EXIT_USAGE",
     "EXIT_TURN_FAILED",
+    "EXIT_UNREADABLE_CALL",
     "EntitySession",
     "SessionStartError",
     "TurnResult",
@@ -168,6 +169,15 @@ model endpoint is sick* — never as *the entity is broken*.
 **Nothing is captured to memory on a timeout**, by the same discipline that refuses to capture a
 gated halt: the turn was killed mid-flight, so what completed is unknowable, and an episode
 asserting a completed turn would be memory recording a fiction."""
+
+EXIT_UNREADABLE_CALL = 7
+"""The turn completed, but its reply is the model's raw tool-call syntax (:attr:`TurnResult.unreadable_call`).
+
+The model tried to call a tool, the call failed to parse upstream, and it did not run. Not
+:data:`EXIT_OK`: there is no answer, and a pipeline that read 0 would take the markup, or an empty
+stdout, as one. Not :data:`EXIT_NO_REPLY` either: the model did act, and asking again or switching
+models is the remedy, not a restart. Not 6, which ``levain doctor`` already uses for a different
+outcome (an upgrade step pending)."""
 
 EXIT_INTERRUPTED = 130
 """The operator interrupted the run (SIGINT / Ctrl-C). POSIX convention: 128 + SIGINT(2).
@@ -251,9 +261,9 @@ class TurnResult:
 
     unreadable_call: bool = False
     """:attr:`reply` is the model's raw tool-call syntax, not an answer (:func:`levain.firing.agent_reply.unreadable_tool_call`):
-    its call failed to parse upstream and no tool ran. Display only: a surface shows
-    :data:`~levain.firing.agent_reply.UNREADABLE_CALL_NOTICE` with the text beneath it; :attr:`ok` and
-    :attr:`exit_code` do not read it."""
+    its call failed to parse upstream and no tool ran. A surface shows
+    :data:`~levain.firing.agent_reply.UNREADABLE_CALL_NOTICE` with the text beneath it. Such a turn is not
+    :attr:`ok`, and its :attr:`exit_code` is :data:`EXIT_UNREADABLE_CALL`: the text is not an answer."""
 
     held_digest: str | None = None
     """What an approval of THIS halt binds to (:func:`levain.firing.openhands.gate.held_digest`), read at the
@@ -262,13 +272,14 @@ class TurnResult:
 
     @property
     def ok(self) -> bool:
-        """The turn completed AND produced a reply. Not 'the task succeeded'.
+        """The turn completed AND produced a reply (an unreadable tool call is not one). Not 'the task succeeded'.
 
         A gated turn is not ``ok`` — it has not finished. It is also not an ERROR, which is why
         the two are separate properties rather than one tri-state: a driver that only asks
         ``ok`` still behaves correctly (it does not treat a halt as success), and a driver that
         wants to offer the human a decision asks :attr:`gated`."""
-        return self.error is None and not self.gated and not self.timed_out and bool(self.reply)
+        return (self.error is None and not self.gated and not self.timed_out and bool(self.reply)
+                and not self.unreadable_call)
 
     @property
     def exit_code(self) -> int:
@@ -291,7 +302,9 @@ class TurnResult:
             return EXIT_TURN_FAILED
         if self.gated:
             return EXIT_GATED
-        return EXIT_OK if self.reply else EXIT_NO_REPLY
+        if not self.reply:
+            return EXIT_NO_REPLY
+        return EXIT_UNREADABLE_CALL if self.unreadable_call else EXIT_OK
 
 
 def _apply_drive_policy(cfg: Any, mode: DriveMode) -> bool:

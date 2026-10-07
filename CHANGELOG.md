@@ -4,6 +4,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
+### Fixed
+
+- **An unreadable tool call is no longer hidden or reported as an answer.** A reply holding a tool call as text and then a `finish` call (`{"name":"terminal",...}` then `{"name":"finish","arguments":{"message":"Created x"}}`) was shown as "Created x", though the terminal call never ran; such a text is now unwrapped to its finish message only when every call in it is `think` or `finish`, and otherwise kept whole and flagged. A reply that is nothing but one fenced block holding call markup (`<tool_call><function=terminal>...`) is now flagged; markup in a fence beside prose is still an answer. So is Qwen3-Coder's `<function=name>` tag followed by a `<parameter=...>` tag or its own close, without the `<tool_call>` wrapper, which glm-5.2:cloud via Ollama sent once the wrapper had been consumed upstream. A reply over 200 kB, which was not checked at all, is now searched without the Markdown parser, so nothing in it counts as code. `levain run --task` exits 7 for such a reply (it exited 0) and leaves stdout empty, with `--quiet` too, where the markup used to be printed as the payload; the notice and the text go to stderr. A turn result with an unreadable call is no longer `ok`, and the chat API's `exit_code` for it is 7. The REPL's gate no longer asks `approve?` over a hold that lists nothing: it can only be rejected, as in the chat panel.
+
 ## [0.6.9] — 2026-10-05
 
 A memory fix for the reply classifier's size bound.
