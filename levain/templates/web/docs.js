@@ -137,10 +137,10 @@
         return r.json();
       })
       .then(function (data) {
+        if (rendered) return;   // a late answer to an earlier load, after the manual is up
         if (data === LOCKED) { fail("Locked: enter the token the server printed when it started."); return; }
-        if (rendered) return;
-        rendered = true;
         render(data);
+        rendered = true;
       })
       .catch(function (e) {
         fail("Could not load the manual: " + (e && e.message ? e.message : e));

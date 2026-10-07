@@ -589,7 +589,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         return self.launch_token
 
     @chat_token.setter
-    def chat_token(self, value: str | None) -> None:
+    def chat_token(self, value: str) -> None:
+        # Setting it can change the token, never remove it: None here would turn the gate off on a running server
+        # (complement + codex L3 r2). An ungated server is a make_server decision, not an attribute write.
+        if value is None:
+            raise ValueError("the launch token cannot be removed from a running server.")
         check_launch_token(value)
         self.launch_token = value
 

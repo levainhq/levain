@@ -71,6 +71,13 @@
         ev.preventDefault();
         const t = input.value.trim();
         if (!t) return;
+        if (!/^[A-Za-z0-9_-]+$/.test(t)) {
+          // A header value must be plain ASCII, and a printed token is only these characters (codex L3 r2: anything
+          // else made fetch throw before a request left, so no refusal ever brought the form back).
+          noteEl.textContent = "That is not a token: the printed token uses only letters, digits, - and _.";
+          noteEl.hidden = false;
+          return;
+        }
         input.value = "";
         token = t; keep(t);
         unlocked();

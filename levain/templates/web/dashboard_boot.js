@@ -106,6 +106,7 @@
     try {
       const d = await res.json();
       if (launchRefused(res.status, d, sent)) return false;
+      if (d && d.error === "launch_token") return false;   // even with token.js missing: never the off-box prompt
       return /token/i.test((d && d.message) || "");
     }
     catch (_) { return false; }

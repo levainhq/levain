@@ -169,9 +169,10 @@ class GuardedHandler(BaseHTTPRequestHandler):
         return host_header_allowed(self.headers.get("Host"), self.server.allowed_hosts)
 
     def _launch_token_required(self) -> bool:
-        """True iff this server was started with a launch token. A server that never set one is ungated (a
-        downstream ``make_server`` caller that keeps its own auth posture)."""
-        return getattr(self.server, "launch_token", None) is not None
+        """True iff this server was started with a launch token. Read without a default: a server must say
+        ``launch_token = None`` to be ungated (``make_server`` does, for a downstream that keeps its own auth), and one
+        that never set the attribute fails the request instead of serving it ungated (complement L3 r2)."""
+        return self.server.launch_token is not None
 
     def _launch_token_valid(self) -> bool:
         """True iff the request carries this launch's token, in the current header or the legacy chat one.

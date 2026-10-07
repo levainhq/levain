@@ -322,9 +322,12 @@
       var data = {};
       try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
       if (auth && auth.isRefusal(res.status, data)) {
-        // Refused before the body was read: nothing was installed, and the answers are still in the form.
+        // Refused before the body was read: nothing was installed. A refused token means this is not the server
+        // the plan came from (it restarted, maybe with another target, packs or --force; codex L3 r2), so the plan
+        // is dropped and read again after the unlock, keeping the answers whose fields still exist.
         auth.lock(sent ? "That token was not accepted." : null, sent);
-        setNote("locked: enter the token at the top of the page, then Install again", true);
+        invalidatePlan();
+        setNote("locked: enter the token at the top of the page; the plan is read again, then check the target and Install", true);
       } else if (res.ok) {
         renderResult(data);
         setNote(data.ok ? "done" : "partial — see below", !data.ok);
@@ -336,7 +339,7 @@
       setNote("network error: " + (e && e.message ? e.message : e), true);
     } finally {
       installing = false;
-      submitBtn.disabled = false;
+      submitBtn.disabled = !loaded;   // stays off after a refusal dropped the plan, until it is read again
     }
   }
 
@@ -348,6 +351,24 @@
   // ---- the launch token (token.js, loaded first) ----
   var auth = window.LevainToken;
   function tokenHeaders(h) { return auth ? auth.headers(h) : h; }
+
+  // ---- a plan that may belong to another server ----
+  var keptAnswers = null;
+  function invalidatePlan() {
+    keptAnswers = {};
+    fieldControls.forEach(function (fc) { keptAnswers[fc.field.slot] = fc.control.value; });
+    loaded = false;
+    submitBtn.disabled = true;
+  }
+  function restoreAnswers() {
+    if (!keptAnswers) return 0;
+    var n = 0;
+    fieldControls.forEach(function (fc) {
+      if (Object.prototype.hasOwnProperty.call(keptAnswers, fc.field.slot)) { fc.control.value = keptAnswers[fc.field.slot]; n++; }
+    });
+    keptAnswers = null;
+    return n;
+  }
 
   // ---- load ----
   // One plan render. An unlock that arrives while a load is in flight is latched and re-run when that load settles
@@ -375,9 +396,13 @@
       renderBanner(plan);
       renderAdapters(plan);
       renderSections(plan);
+      var reread = keptAnswers !== null;
+      var kept = restoreAnswers();
       loaded = true;
       submitBtn.disabled = false;
-      statusEl.textContent = plan.fields.length + " fields · fill what you know, submit when ready";
+      statusEl.textContent = reread
+        ? "the plan was read again: check the target above; " + kept + " of " + plan.fields.length + " answers kept"
+        : plan.fields.length + " fields · fill what you know, submit when ready";
     } catch (e) {
       statusEl.textContent = "could not load the interview: " + (e && e.message ? e.message : e);
     } finally {

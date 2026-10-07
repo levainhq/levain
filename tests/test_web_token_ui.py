@@ -76,9 +76,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 const lockForm = () => find(body, (n) => n.className === "levain-lock");
 (async () => {
-  vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
+  if (MODE !== "notokenjs") vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
   vm.runInContext(fs.readFileSync(process.argv[3], "utf8"), ctx);
   await sleep(30);
+  if (MODE === "notokenjs") {
+    // glm L3 r2: with token.js missing, a launch-token 403 (whose message says "token") must not open the off-box
+    // write-token prompt
+    ok(prompted === 0, "no off-box prompt for a launch-token refusal");
+    console.log("PASS"); return;
+  }
+  if (MODE === "badinput") {
+    // codex L3 r2: a value that cannot be a header made fetch throw locally, so no refusal ever brought the form back
+    const before = calls.length;
+    find(lockForm(), (n) => n.tagName === "input").value = "\u{1F512}"; lockForm().fire("submit", {}); await sleep(20);
+    ok(lockForm() && lockForm().textContent.includes("not a token"), "the form stays and says why");
+    ok(calls.length === before && ctx.LevainToken.get() === null, "nothing is sent or kept");
+    console.log("PASS"); return;
+  }
   if (MODE === "stalesubstrate") {
     // complement L3 r1: the first, untokened read stalls; the operator unlocks; then that read's refusal lands. The
     // page must render with the new token and never report the stale 403 as a failure.
@@ -140,7 +154,7 @@ const lockForm = () => find(body, (n) => n.className === "levain-lock");
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("mode", ["fragment", "prompt", "writerefused", "hashchange", "hashjunk", "stalesubstrate"])
+@pytest.mark.parametrize("mode", ["fragment", "prompt", "writerefused", "hashchange", "hashjunk", "stalesubstrate", "notokenjs", "badinput"])
 def test_the_cockpit_page_sends_the_launch_token_and_unlocks_in_place(tmp_path, mode):
     h = tmp_path / "harness.js"
     h.write_text(HARNESS)

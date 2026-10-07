@@ -44,13 +44,16 @@ def _handlers():
     """Every GuardedHandler subclass in the package, found by walking the class tree (L1 2026-10-07: a hand-written
     list of three missed the fourth server, whose own do_GET skipped the launch token)."""
     import importlib
-    import pkgutil
+    from pathlib import Path
 
     import levain
 
-    for mod in pkgutil.walk_packages(levain.__path__, "levain."):
-        if mod.name.endswith(("server", "view")) or ".team." in mod.name:
-            importlib.import_module(mod.name)
+    # Import only the modules that define a handler, found by reading the source, so collecting this test does not
+    # import every package in levain (codex L3 r2: walk_packages imports each package to find its children).
+    root = Path(levain.__file__).parent
+    for py in root.rglob("*.py"):
+        if "GuardedHandler)" in py.read_text(encoding="utf-8"):
+            importlib.import_module("levain." + ".".join(py.relative_to(root).with_suffix("").parts))
     found, todo = [], [GuardedHandler]
     while todo:
         for sub in todo.pop().__subclasses__():
@@ -314,3 +317,47 @@ def test_the_old_chat_token_attribute_can_still_be_set(tmp_path):
         assert httpd.launch_token == "set-the-old-way"
     finally:
         httpd.server_close()
+
+
+def test_the_old_chat_token_attribute_cannot_remove_the_token(tmp_path):
+    """complement + codex L3 r2: `httpd.chat_token = None` turned the gate off on a running server."""
+    from levain.dashboard import AnnealPaths, SubstrateSource
+    from levain.web_server import make_server
+
+    httpd = make_server(SubstrateSource(anneal=AnnealPaths.from_db(tmp_path / "m.db")), host="127.0.0.1", port=0,
+                        launch_token=_TOKEN)
+    try:
+        with pytest.raises(ValueError):
+            httpd.chat_token = None
+        assert httpd.launch_token == _TOKEN
+    finally:
+        httpd.server_close()
+
+
+def test_a_server_that_never_says_launch_token_serves_nothing(tmp_path):
+    """complement L3 r2: the gate read a missing attribute as "ungated". A server must set launch_token = None to be
+    ungated; one that forgot fails the request rather than serving it."""
+    from http.server import ThreadingHTTPServer
+
+    class _Open(GuardedHandler):
+        def _route(self, *, head: bool) -> None:
+            self._send(b"operator data\n", "text/plain", head=head)
+
+    class _Quiet(ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            pass
+
+    httpd = _Quiet(("127.0.0.1", 0), _Open)
+    httpd.allowed_hosts = frozenset({"127.0.0.1"})
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        try:
+            status = _request(httpd.server_address[1], "GET", "/anything", token=None)[0]
+        except (http.client.HTTPException, OSError):
+            status = None
+        assert status != 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
