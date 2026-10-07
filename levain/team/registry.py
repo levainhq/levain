@@ -16,12 +16,14 @@ The protocol, in one place:
 * The ``lock1-`` prefix is the liveness-generation marker. A future mechanism must use a different prefix, so an
   old view can never prune a newer view's files and a reader never has to parse a file to decide whether to trust it.
 * The cockpit never deletes anything. A starting view prunes entries nobody holds, strictly before it publishes.
-  Hidden temp files are never swept: a publisher creates its temp before it locks it, so no rule can tell a
-  starting view's temp from a dead one. A temp left by a killed view stays, and readers ignore temp files.
+  It also sweeps hidden temp files a killed view left behind, but only one older than TEMP_FLOOR that nobody holds:
+  a publisher creates its temp a moment before it locks it, and the age floor keeps a sweep out of that moment.
 * A listing judges entries in sorted name order until MAX_VIEWS live ones are found, the names run out, or
   LIST_BUDGET is spent; whenever names were left unjudged, or the directory could not be read in full, it reports
   ``truncated`` so the cockpit can say the list may be incomplete.
-* A forked child (no exec) closes its copy of the lock fd at once, so it cannot keep a dead view listed.
+* A forked child (no exec) closes its copy of every lock fd at once, so it cannot keep a dead view listed. A lock fd
+  is opened and recorded, and later forgotten and closed, under the same lock the fork handlers take, so no fork
+  can copy one this module is not tracking.
 * Before publishing, a view checks that ``flock`` really conflicts on this filesystem. On a filesystem that emulates
   it (NFS, some FUSE mounts) the view says why it is not registered and keeps serving.
 
@@ -49,6 +51,7 @@ import os
 import re
 import secrets
 import stat
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -63,9 +66,11 @@ PREFIX = "lock1-"
 MAX_VIEWS = 8
 LIST_BUDGET = 1.0                # seconds, the whole listing; checked before each directory entry and each name
 PRUNE_MAX_NAMES = 1024
+TEMP_FLOOR = 60.0                # seconds: a hidden temp younger than this is never swept (a publisher may be starting)
 MAX_ENTRY_BYTES = 4096
 _FIELDS = ("repo", "url", "project", "started")
 _NAME_RE = re.compile(r"lock1-[0-9a-f]{32}\.json")
+_TEMP_RE = re.compile(r"\.(?:lock1-[0-9a-f]{32}|selftest-[0-9a-f]{16})\.tmp")   # the names register() and the self-test make
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
@@ -155,17 +160,43 @@ def _flock_is_real(dir_fd: int) -> bool:
 # ---- the publisher ------------------------------------------------------------------------------------------------
 
 _LIVE: "set[Registration]" = set()      # strong: a dropped, unclosed Registration still has its fds closed at fork
+_PENDING: set[int] = set()              # lock fds register() has opened that no Registration owns yet
+# Held by a fork, and by every change to which lock fds exist and are tracked. Deliberately NOT reentrant: with an
+# RLock, a fork from a signal handler that interrupted a holder would proceed and copy half-updated fd sets. As it is,
+# such a fork deadlocks instead, so a process that registers a view must not fork from a signal handler (levain's own
+# SIGTERM handler only raises KeyboardInterrupt, which the ``with`` blocks release on).
+_FORK_LOCK = threading.Lock()
+
+
+def _before_fork() -> None:
+    _FORK_LOCK.acquire()
+
+
+def _after_fork_in_parent() -> None:
+    _FORK_LOCK.release()
 
 
 def _forget_in_child() -> None:
     """After a bare fork the child holds a copy of every lock fd, and the lock lives as long as any copy does. Close
-    the child's copies (never unlink: the entry is the parent's) so only the parent's view keeps its entry live."""
-    for reg in list(_LIVE):
-        reg._drop_fds()
+    the child's copies (never unlink: the entry is the parent's) so only the parent's view keeps its entry live. The
+    forking thread took _FORK_LOCK, so the sets are exactly the fds that existed; it is this thread's to release."""
+    try:
+        pending = set(_PENDING)
+        _PENDING.clear()
+        for reg in list(_LIVE):
+            reg._drop_fds_locked()
+        for fd in pending:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    finally:
+        _FORK_LOCK.release()
 
 
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_forget_in_child)
+    os.register_at_fork(before=_before_fork, after_in_parent=_after_fork_in_parent,
+                        after_in_child=_forget_in_child)
 
 
 class Registration:
@@ -194,9 +225,10 @@ class Registration:
                 pass
 
     def close(self) -> None:
-        self._drop_fds()
+        with _FORK_LOCK:     # forget and close as one step: a fork in between would copy an fd nobody tracks
+            self._drop_fds_locked()
 
-    def _drop_fds(self) -> None:
+    def _drop_fds_locked(self) -> None:
         _LIVE.discard(self)
         lock_fd, dir_fd = self._lock_fd, self._dir_fd
         self._lock_fd = self._dir_fd = None
@@ -229,15 +261,20 @@ def register(repo: str, url: str, project: str) -> Registration:
         data = json.dumps(entry, sort_keys=True).encode("utf-8")
         if len(data) > MAX_ENTRY_BYTES:      # a reader skips an oversized file, so it must never be published
             raise ValueError(f"registry entry is {len(data)} bytes, over {MAX_ENTRY_BYTES}")
-        lock_fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600,
-                          dir_fd=dir_fd)
+        with _FORK_LOCK:     # open and record as one step, so no fork can copy the fd untracked
+            lock_fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600,
+                              dir_fd=dir_fd)
+            _PENDING.add(lock_fd)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         view = memoryview(data)
         while view:
             view = view[os.write(lock_fd, view):]
         os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         published = name
-        return Registration(name, dir_fd, lock_fd)
+        with _FORK_LOCK:
+            reg = Registration(name, dir_fd, lock_fd)
+            _PENDING.discard(lock_fd)
+        return reg
     except BaseException:
         if published is not None:   # interrupted after the rename: withdraw the entry while still holding its lock
             try:
@@ -245,10 +282,12 @@ def register(repo: str, url: str, project: str) -> Registration:
             except OSError:
                 pass
         if lock_fd is not None:
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
+            with _FORK_LOCK:
+                _PENDING.discard(lock_fd)
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
         try:
             os.unlink(tmp, dir_fd=dir_fd)
         except OSError:
@@ -284,10 +323,11 @@ def _open_entry(dir_fd: int, name: str, *, strict: bool = False) -> tuple[int, o
     return fd, st
 
 
-def prune_dead() -> None:
-    """Remove entries no publisher holds. A shared try-lock excludes exactly a publisher's exclusive lock, so a live
-    entry is never touched and a concurrent reader still sees the entry as dead. Nothing is decided by parsing: a
-    file of a newer grammar has a different name and is never looked at."""
+def prune_dead(temp_floor: float = TEMP_FLOOR) -> None:
+    """Remove entries no publisher holds, and hidden temps older than ``temp_floor`` seconds that nobody holds. A
+    shared try-lock excludes exactly a publisher's exclusive lock, so a live entry is never touched and a concurrent
+    reader still sees the entry as dead. Nothing is decided by parsing: a file of a newer grammar has a different
+    name and is never looked at."""
     if fcntl is None:
         return
     try:
@@ -295,16 +335,20 @@ def prune_dead() -> None:
     except (OSError, RegistryUnavailable):
         return
     try:
-        # Filter, then bound: junk names must not use up the examination budget. Temp files are never swept: a
-        # publisher creates its temp and only then locks it, so a sweep in that window unregistered a starting view
-        # (seen in the lane's run). One left by a killed view is harmless and listed by nothing.
-        cand = [n for n in os.listdir(dir_fd) if _NAME_RE.fullmatch(n)]
-        for name in cand[:PRUNE_MAX_NAMES]:
+        # Filter, then bound: junk names must not use up the examination budget. A temp is swept only past the age
+        # floor: a publisher creates its temp and only then locks it, and a sweep in that window once unregistered a
+        # starting view. A temp still unlocked past the floor belongs to a view that died before its rename.
+        names = os.listdir(dir_fd)
+        cand = [(n, False) for n in names if _NAME_RE.fullmatch(n)][:PRUNE_MAX_NAMES]
+        cand += [(n, True) for n in names if _TEMP_RE.fullmatch(n)][:PRUNE_MAX_NAMES]
+        for name, temp in cand:
             opened = _open_entry(dir_fd, name)
             if opened is None:
                 continue
-            fd, _st = opened
+            fd, st = opened
             try:
+                if temp and time.time() - st.st_mtime < temp_floor:
+                    continue
                 fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 os.unlink(name, dir_fd=dir_fd)
             except OSError:                          # BlockingIOError (alive) or an entry another pruner removed

@@ -224,9 +224,9 @@ def test_only_a_publisher_ever_takes_the_exclusive_lock(pub, monkeypatch):
     assert ops and set(ops) == {fcntl.LOCK_SH | fcntl.LOCK_NB}
 
 
-def test_prune_never_sweeps_a_temp_file(pub):
+def test_prune_never_sweeps_a_fresh_temp_file(pub):
     # A publisher creates its temp, then locks it: a sweep in between unregistered a starting view (lane run,
-    # 2026-10-05), so temps are left alone whatever their lock state.
+    # 2026-10-05), so a temp younger than the floor is left alone whatever its lock state.
     d = R.registry_dir()
     d.mkdir(parents=True)
     temps = [f".lock1-{'a' * 32}.tmp", f".selftest-{'b' * 16}.tmp"]
@@ -234,6 +234,141 @@ def test_prune_never_sweeps_a_temp_file(pub):
         (d / n).write_text("{half")
     R.prune_dead()
     assert sorted(_names()) == sorted(temps)
+
+
+def test_prune_sweeps_an_old_temp_nobody_holds_and_keeps_one_still_locked(pub):
+    # A view SIGKILLed before its rename leaves its temp; without a sweep every cockpit scan pays for it forever.
+    import fcntl
+    d = R.registry_dir()
+    d.mkdir(parents=True)
+    dead = [f".lock1-{'a' * 32}.tmp", f".selftest-{'b' * 16}.tmp"]
+    held = f".lock1-{'c' * 32}.tmp"
+    old = time.time() - 3600                    # an hour: past any floor
+    for n in dead + [held]:
+        (d / n).write_text("{half")
+        os.utime(d / n, (old, old))
+    fd = os.open(d / held, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)          # a publisher stalled after locking, before its rename
+        R.prune_dead()
+        assert _names() == [held]
+    finally:
+        os.close(fd)
+
+
+def _forked_child_keeps_the_lock(monkeypatch, pause_in, release) -> list:
+    """Fork while another thread is paused inside the registry, let the parent drop its view without unpublishing
+    (a crash: the lock must die with the process), and list. The child holds whatever fds it inherited until the
+    listing is done. Returns the listing."""
+    r_end, w_end = os.pipe()
+    ready_r, ready_w = os.pipe()
+    assert pause_in.wait(5)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)   # fork with threads alive is the point of the test
+        pid = os.fork()
+    if pid == 0:                                                # the child: hold the inherited fds, then leave
+        try:
+            os.close(w_end)
+            os.write(ready_w, b"r")                             # the at-fork handlers have run by now
+            os.read(r_end, 1)
+        finally:
+            os._exit(0)
+    os.close(r_end)
+    os.close(ready_w)
+    try:
+        # Wait for the child to be past its at-fork handlers: until then even a fixed child holds its copy for a
+        # moment, and on a loaded machine the parent could list inside that moment.
+        assert os.read(ready_r, 1) == b"r"
+        release()
+        return R.live_views()
+    finally:
+        os.write(w_end, b"x")
+        os.close(w_end)
+        os.close(ready_r)
+        os.waitpid(pid, 0)
+
+
+def test_a_fork_right_after_the_lock_fd_is_opened_does_not_leak_the_lock(monkeypatch):
+    # codex 10-07: the lock fd existed before anything tracked it. This pauses INSIDE os.open, after the fd exists and
+    # before it can be recorded: with the open and the record under the fork lock, the fork waits the pause out and
+    # the child closes the fd; without that lock, the child inherits an fd nobody tracks.
+    import os as real_os
+    paused, go = threading.Event(), threading.Event()
+
+    class OsShim:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        @staticmethod
+        def open(path, flags, *a, **k):
+            fd = real_os.open(path, flags, *a, **k)
+            if str(path).startswith(".lock1-") and str(path).endswith(".tmp"):
+                paused.set()
+                go.wait(1.0)                        # fixed code holds the fork lock here, so the fork waits this out
+            return fd
+    monkeypatch.setattr(R, "os", OsShim())
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("reg", R.register("/w", "http://127.0.0.1:43996/", "o")))
+    t.start()
+
+    def release():
+        go.set()
+        t.join(5)
+        monkeypatch.setattr(R, "os", real_os)
+        out["reg"].close()                          # no unpublish: the entry stays, only its lock says dead
+    assert _forked_child_keeps_the_lock(monkeypatch, paused, release) == []
+
+
+def test_a_fork_between_opening_the_lock_fd_and_registering_it_does_not_leak_the_lock(monkeypatch):
+    # The fd stays tracked (in _PENDING) from its open until a Registration owns it: this pauses in flock, between.
+    import fcntl as real_fcntl
+    paused, go = threading.Event(), threading.Event()
+    calls = {"ex": 0}
+
+    class Shim:
+        LOCK_EX, LOCK_SH, LOCK_NB = real_fcntl.LOCK_EX, real_fcntl.LOCK_SH, real_fcntl.LOCK_NB
+
+        @staticmethod
+        def flock(fd, op):
+            if op == real_fcntl.LOCK_EX:
+                calls["ex"] += 1
+                if calls["ex"] == 2:                # the first is the self-test; the second is the entry's lock fd
+                    paused.set()
+                    go.wait(5)
+            return real_fcntl.flock(fd, op)
+    monkeypatch.setattr(R, "fcntl", Shim)
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("reg", R.register("/w", "http://127.0.0.1:43998/", "f")))
+    t.start()
+
+    def release():
+        go.set()
+        t.join(5)
+        out["reg"].close()                          # no unpublish: the entry stays, only its lock says dead
+    assert _forked_child_keeps_the_lock(monkeypatch, paused, release) == []
+
+
+def test_a_fork_between_forgetting_a_registration_and_closing_its_fd_does_not_leak_the_lock(monkeypatch):
+    # The same window on the way out: close() used to forget the Registration, then close its fds, so a fork in
+    # between copied an fd nobody tracked any more.
+    reg = R.register("/w", "http://127.0.0.1:43997/", "g")
+    paused, go = threading.Event(), threading.Event()
+
+    class Pausing(set):
+        def discard(self, x):
+            super().discard(x)
+            if x is reg:
+                paused.set()
+                go.wait(1.0)                        # fixed code holds the fork lock here, so the fork waits this out
+    monkeypatch.setattr(R, "_LIVE", Pausing(R._LIVE))
+    t = threading.Thread(target=reg.close)
+    t.start()
+
+    def release():
+        go.set()
+        t.join(5)
+    assert _forked_child_keeps_the_lock(monkeypatch, paused, release) == []
 
 
 def test_prune_leaves_other_grammars_alone(pub):
