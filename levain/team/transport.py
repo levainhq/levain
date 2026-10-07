@@ -126,10 +126,7 @@ _FETCH_FLAGS = ["-q", "--no-write-fetch-head", "--refmap=", "--no-tags", "--no-r
 _ACCEPTED = f"refs/levain/accepted/{BRANCH}"
 _MAX_LEDGER_FILE = 64 << 20        # one ledger file; an entry is ~1 KB, so this is tens of thousands of entries
 _MAX_LEDGER_TOTAL = 512 << 20      # every ledger file read for one judgement, counted once per path
-_MAX_LEDGER_LEAVES = 20000         # ledger files in one tree (pins.json holds ~120 bytes each, under its own cap)
-_PINS_MAX_BYTES = 8 << 20          # a pins file holds ~120 bytes per ledger file
-_MAX_TREE_RECORDS = 4 * _MAX_LEDGER_LEAVES   # every path in the tree, folders and refused paths included
-_MAX_TREE_BYTES = _MAX_TREE_RECORDS * 200     # an ls-tree record is ~60 bytes plus a path of at most ~100 levain writes
+_PINS_MAX_BYTES = 8 << 20          # the trusted record (pins.json); the leaf cap is derived from it, below Trust
 _MAX_LEDGER_LINES = 200_000        # lines in every ledger file read for one judgement: each becomes Python objects
 _MAX_TOP_FILE = 4 << 20            # team.toml or PROJECT.md, read whole
 _MAX_TEAM_VERSIONS = 200           # team.toml versions walked back to find one that parses
@@ -186,6 +183,24 @@ class Trust:
 
 def _pin(data: bytes) -> dict:
     return {"sha256": hashlib.sha256(data).hexdigest(), "length": len(data)}
+
+
+def _record_bytes_per_leaf() -> int:
+    """The most one ledger file can add to the trusted record: a pin in each map and a first-seen note, for the
+    longest path levain writes and the largest file it reads (measured on the record's own serialisation)."""
+    def size(n: int) -> int:
+        rels = [chr(ord("a") + i) * 64 + "/" + "f" * 16 + ".jsonl" for i in range(n)]
+        pin = {"sha256": "f" * 64, "length": _MAX_LEDGER_FILE}
+        return len(Trust({r: pin for r in rels}, "f" * 64, {r: {"t": E.now_iso(), "first": False} for r in rels},
+                         {r: pin for r in rels}).dump().encode("utf-8"))
+    return size(2) - size(1)
+
+
+# Ledger files in one tree: as many as a full trusted record can pin, so a tree the leaf cap allows can always be pinned
+# (consistent by construction; a test pins the relation).
+_MAX_LEDGER_LEAVES = (_PINS_MAX_BYTES - 1024) // _record_bytes_per_leaf()
+_MAX_TREE_RECORDS = 4 * _MAX_LEDGER_LEAVES   # every path in the tree, folders and refused paths included
+_MAX_TREE_BYTES = _MAX_TREE_RECORDS * 200     # an ls-tree record is ~60 bytes plus a path of at most ~100 levain writes
 
 
 def _merge_pins(old: dict[str, dict], datas: dict[str, bytes]) -> dict[str, dict]:
@@ -499,7 +514,7 @@ class GitLedger:
                             raise DeadlineExceeded(f"the ledger judgement ran out of time (waiting for {name})") \
                                 from None
                         raise TeamBusy("ledger busy (another levain team operation holds the lock)") from None
-                    time.sleep(0.05)
+                    time.sleep(max(0.0, min(0.05, until - time.monotonic())))
             yield
         finally:
             os.close(fd)  # closing the descriptor releases the flock
@@ -847,7 +862,9 @@ class GitLedger:
         that was this clone's first sight of the ledger: {"member", "device", "first_seen", "first_sight", "own"}.
         Attribution is by folder and authenticated only by the git host's push permissions, so a device nobody added
         is SHOWN here (and at session start), never refused: a teammate legitimately adds a laptop."""
-        rec, _problem = self._trust()
+        rec, problem = self._trust()
+        if problem:                                  # an unreadable record is said, never shown as "no devices"
+            raise LedgerReadError(problem)
         out = []
         for rel, seen in sorted(rec.seen.items()):
             member, _, name = rel.partition("/")
@@ -1183,12 +1200,14 @@ class GitLedger:
         self._require_remote_name(remote)
         # The remote's tip arrives in a private join ref (never the quarantine ref, whose refusal only an accepted
         # judgement clears), with every object verified.
-        join_ref, remote_tip = "refs/levain/join", None
+        join_ref, remote_tip, offline = "refs/levain/join", None, ""
         if remote:
             cp = git(["-c", "fetch.fsckObjects=true", "fetch", *_FETCH_FLAGS, remote,
                       f"+refs/heads/{BRANCH}:{join_ref}"], self.repo.toplevel, timeout=120, check=False)
             if cp.returncode != 0 and "couldn't find remote ref" not in (cp.stderr or ""):
-                raise TeamError(f"git fetch failed: {_tail(cp)}")
+                if not self._local_branch_exists():
+                    raise TeamError(f"git fetch failed: {_tail(cp)}")
+                offline = _tail(cp)                # a re-join works from this clone's own branch; a sync judges later
             remote_tip = self._ref_sha(join_ref)
         try:
             rec, bad_record = self._trust()
@@ -1199,12 +1218,13 @@ class GitLedger:
             if remote_tip is not None:
                 tip = remote_tip
                 try:
-                    self.team(tip)
+                    tip_team = self.team(tip)
                 except R.RolesError as exc:
                     raise TeamError(f"the team ledger on the remote has no usable team.toml ({exc}), so this clone "
                                     "did not join") from None
             else:
                 tip = self.head()
+                tip_team = self._team_or_none(tip)
             # First sight: the team and the namespace are judged, with every pin this clone and the seed hold, before
             # anything is created. A clone that already has the branch judges the remote as a sync would.
             if remote_tip is not None and self._local_branch_exists():
@@ -1218,7 +1238,7 @@ class GitLedger:
                                         f"it (`git branch -D {BRANCH}`) and join again")
                 j = self.judge_remote(tip, Trust(rec.files, floor, rec.seen, rec.remote))
             else:
-                j = self.judge(tip, self._team_or_none(tip), rec.files)
+                j = self.judge(tip, tip_team, rec.files)
             bad = j.ledger.tamper or self._pin_violations(seeded.files if seeded else {}, j.datas) \
                 or self._pin_violations(seeded.remote if seeded else {}, j.datas) \
                 or self._pin_violations(rec.remote, j.datas)
@@ -1243,6 +1263,8 @@ class GitLedger:
                 accepted = remote_tip or now.accepted
                 self._write_trust(Trust(files, accepted, now.noted(j.datas) if remote_tip else now.seen,
                                         _merge_pins(now.remote, j.datas) if remote_tip else now.remote))
+                if remote_tip:                      # the remote's tip is accepted: an older refusal no longer stands
+                    git(["update-ref", "-d", _INCOMING], self.repo.toplevel, check=False)
             if remote_tip and self._rref():
                 git(["update-ref", self._rref(), remote_tip], self.repo.toplevel, check=False)
         finally:
@@ -1256,9 +1278,12 @@ class GitLedger:
         if handle is None:
             raise TeamError(f"joined, but your git user.email ({email}) is not a member of {team.project}: "
                             f"ask the owner ({team.owner}) to run `levain team member add <handle> {email}`")
-        if remote:
+        if remote and not offline:
             self._sync(push=False)
         line = f"joined {team.project} as {handle} (device {self.device})"
+        if offline:
+            line += f"\nthe remote could not be reached ({offline}); joined from this clone's own branch, and the next " \
+                    "`levain team sync` judges the remote"
         if first:
             line += ("\nfirst sight trusted: this clone pins whatever the ledger holds now; to verify, re-join with "
                      f"--pins-from <a teammate's .git/{DIRNAME}/pins.json>")
@@ -1323,8 +1348,8 @@ class GitLedger:
             for rel in mine:
                 cp = git(["cat-file", "blob", f"HEAD:{rel}"], self.wt, check=False, timeout=60, binary=True)
                 committed = cp.stdout_bytes if cp.returncode == 0 else b""
-                data = (self.wt / rel).read_bytes()
-                if data.startswith(committed) and data != committed:
+                data = self._own_worktree_bytes(rel)
+                if data is not None and data.startswith(committed) and data != committed:
                     appends[rel] = data
             odd = [rel for rel in mine if rel not in appends]
             if odd:
@@ -1336,6 +1361,20 @@ class GitLedger:
             if appends:
                 self._commit("levain team: recover an interrupted write")
 
+    def _own_worktree_bytes(self, rel: str) -> bytes | None:
+        """The worktree file at ``rel`` when it is a regular file within the ledger file limit (opened without
+        following a link, checked on the descriptor), else None: never the target of a link, never unbounded."""
+        try:
+            fd = os.open(self.wt / rel, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except OSError:
+            return None
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_LEDGER_FILE:
+                return None
+            data = fh.read(_MAX_LEDGER_FILE + 1)
+        return data if len(data) <= _MAX_LEDGER_FILE else None
+
     def _set_aside(self, rels: list[str]) -> Path:
         """Copy each worktree file to <levain-team>/set-aside/ and put the worktree back to HEAD for it."""
         dest = self.base / "set-aside"
@@ -1343,8 +1382,8 @@ class GitLedger:
         stamp = time.strftime("%Y%m%dT%H%M%S")
         for rel in rels:
             src = self.wt / rel
-            with contextlib.suppress(FileNotFoundError):
-                data = src.read_bytes()
+            data = self._own_worktree_bytes(rel)        # a link or an oversized file is not copied, only removed
+            if data is not None:
                 fd, kept = tempfile.mkstemp(dir=dest, prefix=f"{rel.replace('/', '__')}.{stamp}.")
                 with os.fdopen(fd, "wb") as fh:
                     fh.write(data)

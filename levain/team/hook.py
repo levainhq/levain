@@ -499,7 +499,12 @@ def sessionstart(payload: dict) -> None:
     # A device nobody here added is SHOWN (attribution is by folder; the git host authenticates pushes): one line for
     # each one first seen in the last week, after this clone's first sight of the ledger.
     week = time.time() - 7 * 86400
-    for d in gl.devices():
+    try:
+        devices = gl.devices()
+    except TeamError as exc:
+        devices = []
+        lines.append(f"[team] the devices this clone has seen cannot be listed: {I.oneline(str(exc))}")
+    for d in devices:
         if d["own"] or d["first_sight"]:
             continue
         try:

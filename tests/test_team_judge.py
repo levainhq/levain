@@ -1758,3 +1758,68 @@ def test_problems_are_counted_past_the_cap_never_held(monkeypatch):
     entries = [{"id": f"x-{i}", "type": "decision", "supersedes": [f"gone-{i}"]} for i in range(5)]
     led = I.Ledger(entries, [], [], None, [])
     assert led._links[1][-1] == "and 3 more refused links"
+
+
+def test_a_tree_the_leaf_cap_allows_can_always_be_pinned():
+    # complement LOW on L3 r3: 20,000 leaves at ~450 bytes each overflowed the 8 MiB record cap, so a tree the leaf cap
+    # allowed could never be pinned (every read refused). The leaf cap is derived from the record cap.
+    from levain.team import entry as E
+    from levain.team import transport as T
+    n = T._MAX_LEDGER_LEAVES
+    rels = [f"{i:064d}/{'f' * 16}.jsonl" for i in range(n)]
+    pin = {"sha256": "f" * 64, "length": T._MAX_LEDGER_FILE}
+    rec = T.Trust({r: pin for r in rels}, "f" * 64, {r: {"t": E.now_iso(), "first": False} for r in rels},
+                  {r: pin for r in rels})
+    assert len(rec.dump().encode("utf-8")) <= T._PINS_MAX_BYTES
+
+
+def test_recovery_never_commits_through_a_link(two):
+    # complement LOW on L3 r3: recovery read the worktree file through a symlink, with no size bound.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "mine") == 0
+    gb = _gl(ben)
+    f = next((gb.wt / "ledger" / "ben").glob("*.jsonl"))
+    outside = tmp / "outside.txt"
+    outside.write_bytes(f.read_bytes() + b'{"secret": "outside the repository"}\n')
+    f.unlink()
+    f.symlink_to(outside)
+    assert record_ruling(ben, "src/b.py", "second") == 0
+    own = git("cat-file", "blob", f"levain-ledger:{f.relative_to(gb.wt).as_posix()}", cwd=ben)
+    assert "outside the repository" not in own and "second" in own
+
+
+def test_a_rejoin_works_offline_from_the_clones_own_branch(two, capsys):
+    # complement LOW on L3 r3: a re-join of a clone that has the branch needed the network.
+    tmp, ana, ben = two
+    git("remote", "set-url", "origin", str(tmp / "unreachable.git"), cwd=ben)
+    capsys.readouterr()
+    assert team("join", "--no-install", repo=ben) == 0
+    assert "could not be reached" in capsys.readouterr().out
+
+
+def test_a_join_that_accepts_the_remote_drops_an_older_refusal(two):
+    # complement LOW on L3 r3: a stale quarantine ref survived a join that accepted a newer tip.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    _forge_last_line(_gl(ana), "FORGED")
+    assert team("sync", repo=ben) != 0 and _gl(ben).incoming_refusal()
+    assert team("repin", repo=ben) == 0
+    ga = _gl(ana)
+    (ga.wt / "ledger" / "ana" / "aaaaaaaaaaaaaaaa.jsonl").write_text("")
+    _push_wt(ga, "the remote moves on past the refused tip")
+    assert team("join", "--no-install", repo=ben) == 0
+    assert not _gl(ben).incoming_refusal()
+    assert subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/levain/incoming/levain-ledger"], cwd=ben,
+                          capture_output=True).returncode != 0
+
+
+def test_an_unreadable_record_is_said_not_shown_as_no_devices(two):
+    # glm LOW on L3 r3: devices() dropped the record's problem and returned [].
+    tmp, ana, ben = two
+    ledger(ben)
+    _pins_file(ben).write_text("{not json")
+    with pytest.raises(LedgerReadError):
+        _gl(ben).devices()
+    assert "REFUSED" in _ss(ben)                                     # session start says it (before any device line)
