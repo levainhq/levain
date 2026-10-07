@@ -50,6 +50,7 @@ __all__ = [
     "read_running",
     "request_link_code",
     "runtime_dir",
+    "SigtermStop",
     "stop_on_sigterm",
 ]
 
@@ -105,7 +106,8 @@ _TOKEN_LEN = (8, 256)
 
 
 def check_launch_token(token: "str | None") -> None:
-    """Refuse a launch token the page could not carry. ``None`` means "make one up". Anything else must be
+    """Refuse a launch token the page could not carry. ``None`` passes: its meaning is the caller's (a server builder
+    reads it as "make one up", :func:`arm_launch_token` as "ungated", an explicit choice). Anything else must be
     non-empty URL-safe base64 (``secrets.token_urlsafe``'s alphabet), the only shape token.js takes from a URL
     fragment and the form keeps intact: an empty token would let every request through, and a token with a space
     or a symbol would print an unlocked link the page refuses (codex L3 r1)."""
@@ -442,6 +444,17 @@ class GuardedHandler(BaseHTTPRequestHandler):
             return
         self._post()
 
+    def _other_method(self) -> None:
+        """Any other method (PUT, DELETE, PATCH, OPTIONS, TRACE, CONNECT) passes the same guards as a write, then gets
+        405: no Levain server routes one, and without this BaseHTTPRequestHandler answered 501 before any guard ran
+        (codex L3). No body is read."""
+        self.close_connection = True
+        if self._refuse_write_origin() or self._refuse_untokened_write():
+            return
+        self._reject(405, "method_not_allowed", "this server answers GET, HEAD and POST")
+
+    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = _other_method  # noqa: N815
+
     def _link(self) -> None:
         """``POST /link``: mint a link code for a caller that proves it holds the token without sending it (see
         ``LINK_PROOF_HEADER``). No body is read."""
@@ -724,6 +737,7 @@ def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
     without sending it, and check the server's proof before returning the code. No proxy is used (an
     ``HTTP_PROXY`` in the environment would otherwise receive the request). Raises ``ValueError`` on a non-loopback
     URL or an answer that does not prove the token, ``OSError`` on a connection failure."""
+    import http.client
     import ipaddress
     import urllib.parse
     import urllib.request
@@ -760,6 +774,8 @@ def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
     worker.join(2 * timeout)
     if worker.is_alive() or not got:
         raise ValueError("the answer on that port took too long to be a link; not opening it")
+    if isinstance(got[0], http.client.HTTPException):   # whatever holds the port did not answer in HTTP (complement)
+        raise ValueError("the answer on that port was not a link; not opening it") from got[0]
     if isinstance(got[0], BaseException):
         raise got[0]
     raw = got[0]
@@ -776,37 +792,63 @@ def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
     return code
 
 
-def open_unlocked(url: str, unlocked: str) -> bool:
+def open_unlocked(url: str, unlocked: str) -> "str | None":
     """Open the page. ``unlocked`` (the URL with a single-use link code in its fragment) goes ONLY to macOS's osascript
     controller, which hands the URL over on osascript's stdin and then as an Apple Event, never on a command line.
     Every other controller (``open``, xdg-open, a browser binary, ``$BROWSER``) puts the URL in argv, which other OS
     users can read from the process table: the very callers the token exists to keep out. So the osascript
     controller is called directly, never through ``webbrowser.open``, which on a failure would hand the same URL to
     the next registered controller; if it is not the default or fails, the plain URL opens through the usual chain
-    and the page's unlock form asks. Returns True only when the unlocked link was handed to a browser."""
+    and the page's unlock form asks. Returns ``"unlocked"`` when the unlocked link was handed to a browser,
+    ``"locked"`` when only the plain URL was (the page will ask for the token), and None when no browser took it."""
     import webbrowser
 
     try:
         ctl = webbrowser.get()
         if isinstance(ctl, webbrowser.MacOSXOSAScript) and ctl.open(unlocked):
-            return True
+            return "unlocked"
     except Exception:  # noqa: BLE001 — no usable controller, or no MacOSXOSAScript on this platform
         pass
     try:
-        webbrowser.open(url)
+        if webbrowser.open(url):
+            return "locked"
     except Exception:  # noqa: BLE001 — a headless box without a browser is fine
         pass
-    return False
+    return None
 
 
-def stop_on_sigterm() -> "Callable[[], None]":
+class SigtermStop:
+    """What :func:`stop_on_sigterm` armed. ``hold()`` makes SIGTERM a no-op for the cleanup (call it first in the
+    ``finally``: a SIGTERM that lands during cleanup, say after a Ctrl+C, must not cut it short; complement L3);
+    calling the object puts the previous handler back. Unarmed (``SigtermStop()``), both do nothing."""
+
+    def __init__(self, previous: Any = None, *, armed: bool = False) -> None:
+        self._previous, self._armed = previous, armed
+
+    def hold(self) -> None:
+        import signal
+
+        if self._armed:
+            # A Python no-op, not SIG_IGN, which a child started during shutdown would inherit across exec.
+            signal.signal(signal.SIGTERM, lambda *_a: None)
+
+    def __call__(self) -> None:
+        import signal
+
+        if self._armed:
+            # A handler installed from C reads back as None, which signal.signal will not take: restore the default.
+            signal.signal(signal.SIGTERM, self._previous if self._previous is not None else signal.SIG_DFL)
+            self._armed = False
+
+
+def stop_on_sigterm() -> SigtermStop:
     """Make SIGTERM (what launchd and systemd send to stop a unit) stop ``serve_forever`` the way Ctrl+C does, so a
     server's ``finally`` runs and its runtime file is removed. Only from the main thread, where Python allows it.
-    Returns the call that puts the previous handler back."""
+    Returns the :class:`SigtermStop` whose ``hold()`` the cleanup calls first and whose call ends it."""
     import signal
 
     if threading.current_thread() is not threading.main_thread():
-        return lambda: None
+        return SigtermStop()
 
     def _stop(signum: int, frame: Any) -> None:
         # One stop: a second SIGTERM must not cut the cleanup short. A Python no-op, not SIG_IGN, which a child
@@ -814,6 +856,4 @@ def stop_on_sigterm() -> "Callable[[], None]":
         signal.signal(signal.SIGTERM, lambda *_a: None)
         raise KeyboardInterrupt
 
-    previous = signal.signal(signal.SIGTERM, _stop)
-    # A handler installed from C reads back as None, which signal.signal will not take: restore the default then.
-    return lambda: signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+    return SigtermStop(signal.signal(signal.SIGTERM, _stop), armed=True)

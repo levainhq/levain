@@ -811,14 +811,32 @@ def _first_symlink(path: Path, home: Path) -> Path | None:
 
 @dataclass(frozen=True)
 class _BrowserRoot:
-    path: Path                 # what is denied: the lexical spelling or, through a link, the resolved one
+    path: Path                 # a profile path: the root's resolved spelling, or for a link both spellings
     globs: tuple[str, ...]     # its page storage, walked for other names
     link: Path | None = None   # the symlink on the way, when there is one
+    present: bool = True       # False: only checked for where its link leads (Linux denies only what exists)
+
+
+def _links_below(root: Path, globs: tuple[str, ...]) -> list[Path]:
+    """Symlinks inside a profile root on the way to its page storage (codex L3: ``Default`` linked elsewhere puts the
+    profile, token included, outside the denied root). Every prefix of every glob is looked at."""
+    prefixes = {"/".join(g.split("/")[:i]) for g in globs for i in range(1, len(g.split("/")) + 1)}
+    found: set[Path] = set()
+    for prefix in sorted(prefixes):
+        for hit in root.glob(prefix):
+            try:
+                if stat.S_ISLNK(os.lstat(hit).st_mode):
+                    found.add(hit)
+            except OSError:
+                continue
+    return sorted(found, key=str)
 
 
 def _browser_roots(home: Path) -> list[_BrowserRoot]:
-    """Every browser profile root denied on this platform for a shell spawning now (see ``BROWSER_PROFILE_DIRS``).
-    A root reached through a symlink is listed at both spellings."""
+    """Every browser profile path denied on this platform for a shell spawning now (see ``BROWSER_PROFILE_DIRS``),
+    plus where any symlink on the way leads. A link is found at any component, from below ``home`` down to the root,
+    and inside the root on the way to its page storage; its target is denied too, and checked against the entity's
+    own tree (:func:`_refuse_planted_browser_links`), whether or not it exists yet."""
     darwin = platform.system() == "Darwin"
     out: list[_BrowserRoot] = []
     for os_name, rel, globs in BROWSER_PROFILE_DIRS:
@@ -827,20 +845,30 @@ def _browser_roots(home: Path) -> list[_BrowserRoot]:
         cands = ([base / rel[len(".config/"):] for base in _linux_config_homes(home)]
                  if not darwin and rel.startswith(".config/") else [home / rel])
         for c in cands:
-            if not darwin and not c.exists():
-                continue
+            exists = c.exists()
             link = _first_symlink(c, home)
             if link is None:
-                out.append(_BrowserRoot(c, globs))
-                continue
-            out.append(_BrowserRoot(c, globs, link))
-            out.append(_BrowserRoot(c.resolve(), globs, link))
+                if darwin or exists:
+                    out.append(_BrowserRoot(c.resolve(), globs))
+            else:   # both spellings; an absent target is still checked for where it leads
+                present = darwin or exists
+                out.append(_BrowserRoot(c, globs, link, present))
+                out.append(_BrowserRoot(c.resolve(), globs, link, present))
+            if exists and c.is_dir():
+                inside = c.resolve()
+                for inner in _links_below(c, globs):
+                    target = inner.resolve()
+                    # A link within the profile is denied with it; a link to a socket (Chromium's SingletonSocket
+                    # points into the temp dir) is not profile data.
+                    if target.is_relative_to(inside) or (target.exists() and not (target.is_dir() or target.is_file())):
+                        continue
+                    out.append(_BrowserRoot(target, (), inner, darwin or target.exists()))
     return out
 
 
 def browser_profile_roots(home: Path) -> list[Path]:
     """The browser profile paths denied on this platform for a shell spawning now (see ``BROWSER_PROFILE_DIRS``)."""
-    return list(_dedup_paths([r.path for r in _browser_roots(home)]))
+    return list(_dedup_paths([r.path for r in _browser_roots(home) if r.present]))
 
 
 def _refuse_planted_browser_links(policy: CrownJewelsPolicy) -> None:
@@ -3148,17 +3176,20 @@ def _foreign_runtime_dirs() -> list[str]:
 # two names (pnpm's node_modules hardlinks) was L1's cost finding. Keyed by the policy object itself.
 _STORAGE_ROOTS_CACHE: dict[int, tuple[CrownJewelsPolicy, list[Path]]] = {}
 _STORAGE_ROOTS_CACHE_MAX = 16
+_STORAGE_ROOTS_LOCK = threading.Lock()   # shells spawn concurrently (codex L3)
 
 
 def _browser_storage_roots(policy: CrownJewelsPolicy, browsers: list[_BrowserRoot], *, fresh: bool) -> list[Path]:
-    hit = _STORAGE_ROOTS_CACHE.get(id(policy))
+    with _STORAGE_ROOTS_LOCK:
+        hit = _STORAGE_ROOTS_CACHE.get(id(policy))
     if not fresh and hit is not None and hit[0] is policy:
         return hit[1]
     found = sorted({g for r in browsers if os.path.isdir(r.path) for pattern in r.globs for g in r.path.glob(pattern)},
                    key=str)
-    _STORAGE_ROOTS_CACHE[id(policy)] = (policy, found)
-    while len(_STORAGE_ROOTS_CACHE) > _STORAGE_ROOTS_CACHE_MAX:
-        del _STORAGE_ROOTS_CACHE[next(iter(_STORAGE_ROOTS_CACHE))]
+    with _STORAGE_ROOTS_LOCK:
+        _STORAGE_ROOTS_CACHE[id(policy)] = (policy, found)
+        while len(_STORAGE_ROOTS_CACHE) > _STORAGE_ROOTS_CACHE_MAX:
+            del _STORAGE_ROOTS_CACHE[next(iter(_STORAGE_ROOTS_CACHE))]
     return found
 
 

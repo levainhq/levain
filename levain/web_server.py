@@ -101,6 +101,7 @@ from levain.http_guards import (
     check_launch_token,
     new_launch_token,
     publish_launch_token,
+    SigtermStop,
     stop_on_sigterm,
     read_running,
     request_link_code,
@@ -1364,7 +1365,16 @@ def open_running(port: int, *, stream: "Any | None" = None) -> int:
         return 1
     unlocked = f"{rec['url']}#code={code}"
     tty = bool(getattr(out, "isatty", lambda: False)())
-    if _open_browser(rec["url"], unlocked):
+    how = _open_browser(rec["url"], unlocked)
+    if how == "locked":   # the plain URL opened (not macOS's osascript): the page asks for the token (gemini L3)
+        print(f"Opened {rec['url']} ({rec.get('kind', 'levain')}); it asks for the token.", file=out, flush=True)
+        if tty:
+            print(f"  this link unlocks it, once: {unlocked}", file=out, flush=True)
+            return 0
+        print(f"This output is not a terminal, so the link is not printed. Run `levain serve --open-running --port "
+              f"{port}` from a terminal.", file=sys.stderr)
+        return 1
+    if how:
         print(f"Opened {rec['url']} ({rec.get('kind', 'levain')}).", file=out, flush=True)
         if tty:
             print(f"  if it opened locked, this link works once: {unlocked}", file=out, flush=True)
@@ -1494,13 +1504,14 @@ def run_web_server(
         # accepts it — opening before the blocking call is correct.
         _open_browser(url, unlocked)
 
-    restore_sigterm = lambda: None  # noqa: E731
+    restore_sigterm = SigtermStop()
     try:
         restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
     finally:
+        restore_sigterm.hold()   # a SIGTERM during the cleanup must not cut it short
         published.close()
         httpd.server_close()
         if chat_host is not None:

@@ -36,6 +36,7 @@ from levain.http_guards import (
     new_launch_token,
     open_unlocked,
     publish_launch_token,
+    SigtermStop,
     stop_on_sigterm,
 )
 from levain.web_server import (
@@ -223,13 +224,14 @@ def run_docs_web(
     if open_browser:
         open_unlocked(url, published.unlocked)
 
-    restore_sigterm = lambda: None  # noqa: E731
+    restore_sigterm = SigtermStop()
     try:
         restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
     finally:
+        restore_sigterm.hold()   # a SIGTERM during the cleanup must not cut it short
         published.close()
         httpd.server_close()
         restore_sigterm()

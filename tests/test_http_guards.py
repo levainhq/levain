@@ -114,12 +114,13 @@ def _request(port: int, method: str, path: str = "/", headers: dict | None = Non
 
 
 @pytest.mark.parametrize("kind", ["serve", "init", "docs"])
-@pytest.mark.parametrize("method", ["OPTIONS", "PUT", "DELETE"])
+@pytest.mark.parametrize("method", ["OPTIONS", "PUT", "DELETE", "PATCH", "TRACE"])
 def test_a_framework_generated_response_carries_the_security_headers(tmp_path, kind, method):
-    """The reproduced drift: `levain serve` answered these with a bare 501."""
+    """The reproduced drift: `levain serve` answered these with a bare 501. They now pass the guards and get 405."""
     with _server(kind, tmp_path) as port:
         status, headers = _request(port, method)
-    assert status == 501
+        assert _request(port, method, token=None)[0] == 403   # codex L3: before the guards, this was 501 untokened
+    assert status == 405
     missing = [h for h in SECURITY_HEADERS if h not in headers]
     assert missing == [], f"{kind} {method} -> 501 without {missing}"
 
@@ -604,6 +605,25 @@ def test_stop_on_sigterm_puts_the_previous_handler_back():
     assert signal.getsignal(signal.SIGTERM) == before
 
 
+def test_a_sigterm_during_the_cleanup_does_not_cut_it_short():
+    """complement L3: after a Ctrl+C the SIGTERM handler was still armed through the finally; hold() disarms it for
+    the cleanup, and the call puts the previous handler back."""
+    import signal
+
+    from levain.http_guards import stop_on_sigterm
+
+    before = signal.getsignal(signal.SIGTERM)
+    stop = stop_on_sigterm()
+    stop.hold()
+    try:
+        signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+    except KeyboardInterrupt:
+        stop()
+        pytest.fail("a SIGTERM during the cleanup still stops it")
+    stop()
+    assert signal.getsignal(signal.SIGTERM) == before
+
+
 def test_a_record_whose_pid_now_belongs_to_another_user_is_stale(tmp_path, monkeypatch):
     """L1 + L2 2026-10-07: a PermissionError from kill(pid, 0) was read as "alive". This user wrote the record, so
     the pid belonging to another user (pid 1 here, root's) means the writer is gone."""
@@ -714,7 +734,18 @@ def test_link_round_two_review_fixes(tmp_path, monkeypatch):
                                         "X-Levain-Link-Proof": hg._link_proof(_TOKEN, "levain-link-request", nonce, old)})
         assert got[0] == 403
         pub = hg.publish_launch_token(httpd, f"http://127.0.0.1:{port}/", port=port, kind="serve", stream=io.StringIO())
-        monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: False)
+        monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: None)
+        assert ws.open_running(port, stream=io.StringIO()) == 1
+        # gemini + complement L3: the plain URL did open (Linux); say so, and give a terminal the one-time link
+        monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: "locked")
+
+        class _Tty(io.StringIO):
+            def isatty(self):
+                return True
+
+        tty = _Tty()
+        assert ws.open_running(port, stream=tty) == 0
+        assert "asks for the token" in tty.getvalue() and "#code=" in tty.getvalue()
         assert ws.open_running(port, stream=io.StringIO()) == 1
         pub.close()
     finally:
@@ -873,3 +904,41 @@ def test_request_link_code_gives_up_on_a_listener_dripping_its_headers(tmp_path)
     finally:
         stop.set()
         srv.close()
+
+
+def test_request_link_code_says_not_a_link_when_the_port_does_not_speak_http(tmp_path):
+    """complement L3: an http.client.HTTPException from a squatter reached open_running as a traceback."""
+    import socket
+
+    from levain.http_guards import request_link_code
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def garbage():
+        conn, _ = srv.accept()
+        conn.recv(65536)
+        conn.sendall(b"SSH-2.0-OpenSSH_9.6\r\n")
+        conn.close()
+
+    t = threading.Thread(target=garbage, daemon=True)
+    t.start()
+    try:
+        with pytest.raises(ValueError, match="not a link"):
+            request_link_code(f"http://127.0.0.1:{srv.getsockname()[1]}/", _TOKEN, timeout=2.0)
+    finally:
+        srv.close()
+
+
+def test_open_unlocked_says_locked_when_only_the_plain_url_opened(monkeypatch):
+    """gemini + complement L3: outside macOS's osascript controller the plain URL opens; that is not a failure."""
+    import webbrowser
+
+    from levain.http_guards import open_unlocked
+
+    monkeypatch.setattr(webbrowser, "get", lambda *a: (_ for _ in ()).throw(webbrowser.Error("none")))
+    monkeypatch.setattr(webbrowser, "open", lambda url, *a, **k: True)
+    assert open_unlocked("http://127.0.0.1:1/", "http://127.0.0.1:1/#code=x") == "locked"
+    monkeypatch.setattr(webbrowser, "open", lambda url, *a, **k: False)
+    assert open_unlocked("http://127.0.0.1:1/", "http://127.0.0.1:1/#code=x") is None

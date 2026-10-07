@@ -1282,8 +1282,12 @@ def test_a_log_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
     spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
     (tmp_path / "logs").mkdir(mode=0o700)
     spec.stdout_log.write_text("")
-    me = os.getuid()
-    monkeypatch.setattr(d.os, "getuid", lambda: me + 1)   # the file now belongs to "someone else"
+    import stat as _stat
+    from types import SimpleNamespace
+
+    me = os.getuid()   # the file now belongs to "someone else" (the directory is still this user's)
+    monkeypatch.setattr(d.os, "fstat", lambda fd: SimpleNamespace(st_mode=_stat.S_IFREG | 0o644, st_uid=me + 1,
+                                                                   st_nlink=1))
     with pytest.raises(d.DaemonError, match="not a regular file this user owns"):
         d._prepare_private_logs(spec)
 
@@ -1318,4 +1322,20 @@ def test_a_log_with_another_name_is_refused(tmp_path, monkeypatch):
     other.write_text("mine")
     os.link(other, spec.stdout_log)
     with pytest.raises(d.DaemonError, match="2 names"):
+        d._prepare_private_logs(spec)
+
+
+def test_a_log_dir_others_can_write_is_refused(tmp_path, monkeypatch):
+    """codex L3: the service manager opens the log by path later; in a shared writable directory the checked file
+    could be swapped first."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    os.chmod(shared, 0o1777)
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=shared)
+    with pytest.raises(d.DaemonError, match="no other user can write"):
         d._prepare_private_logs(spec)

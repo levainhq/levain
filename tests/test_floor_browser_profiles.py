@@ -401,3 +401,53 @@ def test_spawn_shell_refuses_a_planted_browser_link_before_the_platform_spawn(ho
     with pytest.raises(ConfinementError, match="symlink"):
         _Recorder().spawn_shell(build_policy(entity))
     assert not _Recorder.spawned
+
+
+@pytest.mark.parametrize("case", ["dangling_root", "ancestor_absent_child", "below_root"])
+def test_a_link_into_the_workspace_refuses_bash_even_when_the_profile_is_absent_or_deeper(home: Path, monkeypatch,
+                                                                                          case) -> None:
+    """L3 (codex, gemini, complement): a dangling ~/.mozilla, a ~/.config linked into the workspace before Chrome
+    exists, and a Default/ inside a real profile linked into the workspace all reach the entity's tree."""
+    cf = _linux(monkeypatch)
+    entity = _entity(home)
+    ws = entity / "workspace"
+    if case == "dangling_root":
+        (home / ".mozilla").symlink_to(ws / "not-yet")          # the entity creates the target later
+        link = home / ".mozilla"
+    elif case == "ancestor_absent_child":
+        (ws / "cfg").mkdir()
+        (home / ".config").symlink_to(ws / "cfg")             # google-chrome/ does not exist yet
+        link = home / ".config"
+    else:
+        (home / ".config" / "google-chrome").mkdir(parents=True)
+        (ws / "profile").mkdir()
+        (home / ".config" / "google-chrome" / "Default").symlink_to(ws / "profile")
+        link = home / ".config" / "google-chrome" / "Default"
+    policy = build_policy(entity)
+    with pytest.raises(cf.ConfinementError, match=f"symlink {link}"):
+        cf._refuse_planted_browser_links(policy)
+
+
+def test_a_profile_folder_linked_elsewhere_is_denied_at_its_target(home: Path, monkeypatch, tmp_path) -> None:
+    """codex L3: Default/ moved to another disk and linked back; the target holds the cookies and the token."""
+    _linux(monkeypatch)
+    elsewhere = tmp_path / "disk" / "chrome-default"
+    elsewhere.mkdir(parents=True)
+    (home / ".config" / "google-chrome").mkdir(parents=True)
+    (home / ".config" / "google-chrome" / "Default").symlink_to(elsewhere)
+    policy = build_policy(_entity(home))
+    assert crown_jewel_reason(policy, elsewhere / "Cookies") is not None
+
+
+def test_roots_are_resolved_when_home_itself_is_a_symlink(tmp_path, monkeypatch) -> None:
+    """complement L3: the file editor compares resolved paths, so a root under a symlinked $HOME must be resolved."""
+    import levain.firing.confinement as cf
+
+    real = tmp_path / "data" / "me"
+    (real / ".mozilla").mkdir(parents=True)
+    (tmp_path / "home").symlink_to(real)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    _linux(monkeypatch)
+    policy = build_policy(_entity(real))
+    assert crown_jewel_reason(policy, tmp_path / "home" / ".mozilla" / "firefox" / "x" / "cookies.sqlite") is not None
+    cf._refuse_planted_browser_links(policy)   # $HOME's own link is not a planted profile link

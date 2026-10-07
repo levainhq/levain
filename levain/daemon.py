@@ -248,9 +248,11 @@ _PRIVATE_UMASK = 0o077
 
 def _prepare_private_logs(spec: "DaemonSpec") -> None:
     """Create the log directory 0700 and both log files 0600 before the service first writes them (an append
-    keeps a file's mode); an existing log file this user owns is narrowed to 0600 too. Levain's own default directory on Linux is also chmod-ed back to 0700 if it exists
-    wider; a directory Levain does not own (macOS's ~/Library/Logs, a caller's --log-dir) is created private when
-    missing and otherwise left as it is."""
+    keeps a file's mode); an existing log file this user owns is narrowed to 0600 too. Levain's own default directory
+    on Linux is also chmod-ed back to 0700 if it exists wider; a directory Levain does not own (macOS's
+    ~/Library/Logs, a caller's --log-dir) is created private when missing and otherwise left as it is, but it must be
+    this user's and writable by no one else: the service manager opens the log by path later, and in a directory
+    another user can write, the file checked here could be swapped before then (codex L3)."""
     for log in (spec.stdout_log, spec.stderr_log):
         d = log.parent
         if not d.exists():
@@ -258,6 +260,10 @@ def _prepare_private_logs(spec: "DaemonSpec") -> None:
             os.chmod(d, 0o700)   # mkdir's mode is masked by the umask
         elif platform.system() != "Darwin" and d.resolve() == _default_log_dir().expanduser().resolve():
             os.chmod(d, 0o700)
+        dst = os.stat(d)
+        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid() or dst.st_mode & 0o022:
+            raise DaemonError(f"{d} must be a directory this user owns that no other user can write; pass another "
+                              "--log-dir.")
         # The service will append to whatever is at this path: it must be a regular file this user owns with one
         # name, never a link (it would be followed), a hardlink to another file, a FIFO or device (it would block), or
         # another user's file (codex L3: in a shared --log-dir someone could pre-create it world-readable). Opened once with O_NOFOLLOW and checked and narrowed
