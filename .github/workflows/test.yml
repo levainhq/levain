@@ -49,3 +49,43 @@ jobs:
 
       - name: Run pytest
         run: pytest -q
+
+  linux-live:
+    # The bwrap floor RUN, not read as data. GitHub's ubuntu runners refuse unprivileged user
+    # namespaces through AppArmor by default, so the `linux_live` tests skip in the job above.
+    # This job lifts that restriction on the runner VM itself, which is the documented remedy the
+    # refusal names, and then requires the live tests to run (LEVAIN_REQUIRE_LINUX_LIVE=1 fails a
+    # skip). It runs the floor test files only.
+    name: bwrap floor live (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install bubblewrap and allow it a user namespace
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --bind / / --proc /proc --dev /dev --unshare-pid /bin/true && echo "bwrap ok"
+
+      - name: Make the runner's container-daemon socket directory readable
+        run: sudo chmod o+rx /run/podman || true
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,openhands]" hatchling
+
+      - name: Run the live floor tests
+        env:
+          LEVAIN_REQUIRE_LINUX_LIVE: "1"
+        run: >
+          pytest -q -rs tests/test_firing_confinement.py tests/test_jewel_recheck.py
+          tests/test_nlink_floor.py tests/test_masks_last.py tests/test_floor_project_memory.py
+          tests/test_floor_spellings.py tests/test_floor_cloud_creds.py tests/test_floor_process_view.py
