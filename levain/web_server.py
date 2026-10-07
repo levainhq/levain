@@ -914,7 +914,11 @@ class _Handler(GuardedHandler):
             return {"error": "bad_request", "message": "body must be a JSON object"}, 400
         try:
             if route == "/chat/open":
-                return host.open(req.get("entity")), 202
+                # A client's idempotency key: an open sent again with the same key gets the same session back, so a
+                # retry after a lost answer cannot open a second one (codex). The key's rules are the host's.
+                key = req.get("idem_key")
+                return (host.open(req.get("entity")) if key is None
+                        else host.open(req.get("entity"), idem_key=key)), 202
             sid = req.get("session_id")
             if route == "/chat/turn":
                 return host.turn(sid, req.get("message")), 202

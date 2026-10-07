@@ -1811,3 +1811,22 @@ def test_the_osascript_controller_still_hands_the_url_over_on_stdin():
     # the property, not one spelling of it: a write pipe to osascript, and no process given the URL as an argument
     assert re.search(r'os\.popen\(\s*"[^"]*osascript"\s*,\s*"w"\s*\)', src)
     assert "subprocess" not in src and "Popen" not in src and "os.system" not in src
+
+
+def test_chat_open_hands_the_clients_idempotency_key_to_the_host(tmp_path):
+    """codex 6: the page sends one key per Start and reuses it on a retry; the route passes it to the host, which
+    answers a repeated key with the same session. An open without a key is called as before."""
+    calls = []
+
+    class _Host:
+        def open(self, entity, **kw):
+            calls.append((entity, kw))
+            return {"session_id": "S", "job_id": "J"}
+
+        def shutdown(self):
+            pass
+
+    with _serving(_source(tmp_path), _Host()) as base:
+        assert _call(base + "/chat/open", {"entity": "ada", "idem_key": "k" * 32})[0] == 202
+        assert _call(base + "/chat/open", {"entity": "ada"})[0] == 202
+    assert calls == [("ada", {"idem_key": "k" * 32}), ("ada", {})]

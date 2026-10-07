@@ -34,6 +34,34 @@
   }
   function clear(n) { while (n.firstChild) n.removeChild(n.firstChild); }
 
+  // The open session survives a reload (codex: a reload lost it, and its slot stayed held until the server
+  // restarted): its id and entity are kept in this tab's session storage, checked against the server when the page
+  // loads, and dropped only when the server confirms it closed or no longer has it. Never the token (token.js keeps
+  // that) and nothing else. Storage that throws or is absent just means no recovery.
+  const SESSION_KEY = "levain.chat.session";
+  function rememberSession(s) {
+    try { window.sessionStorage.setItem(SESSION_KEY, JSON.stringify({ id: s.id, entity: s.entity, workspace: s.workspace })); } catch (e) { /* none */ }
+  }
+  function forgetSession() {
+    try { window.sessionStorage.removeItem(SESSION_KEY); } catch (e) { /* none */ }
+  }
+  function rememberedSession() {
+    try {
+      const v = JSON.parse(window.sessionStorage.getItem(SESSION_KEY) || "null");
+      return v && typeof v.id === "string" && typeof v.entity === "string" ? v : null;
+    } catch (e) { return null; }
+  }
+  // One key per Start click, sent with /chat/open and reused by its retry, so an open whose answer was lost and is
+  // sent again gets the same session back instead of a second one (codex). Not a secret: uniqueness is all it needs.
+  function newOpenKey() {
+    const c = window.crypto;
+    if (c && c.getRandomValues) {
+      const b = new Uint8Array(16); c.getRandomValues(b);
+      return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+    }
+    return Date.now().toString(16) + Math.random().toString(16).slice(2) + Math.random().toString(16).slice(2);
+  }
+
   // One fetch wrapper: JSON in, {status, json, sent} out (`sent`: the launch token the request carried); a network
   // failure is a status of 0, never a thrown error.
   function api(method, path, payload) {
@@ -109,7 +137,42 @@
         note("chat-err", "Chat is unavailable: " + why(r));
         return;
       }
-      showPicker(r.json);
+      const saved = session ? null : rememberedSession();
+      if (saved) restoreSession(saved, r.json); else showPicker(r.json);
+    });
+  }
+
+  // A session this tab had open before a reload: ask the server what it holds now. Gone (404 unknown_session): forget
+  // it and show the picker. Any other answer that is not a 200 leaves it remembered, says so, and shows the picker.
+  function restoreSession(saved, listing) {
+    const myRun = run;
+    api("GET", "/chat/session.json?id=" + encodeURIComponent(saved.id)).then((r) => {
+      if (myRun !== run) return;
+      if (isTokenRefusal(r)) { showTokenPrompt(null, r); return; }
+      const s = r.json || {};
+      if (r.status === 404 && s.error === "unknown_session") {
+        forgetSession();
+        lostNote = "The session open before this page reloaded has ended.";
+        showPicker(listing); return;
+      }
+      if (r.status !== 200) {
+        lostNote = "Could not check the session open before this page reloaded (" + why(r) + "); it is kept until " +
+          "the server says it closed.";
+        showPicker(listing); return;
+      }
+      session = { id: saved.id, entity: saved.entity, workspace: saved.workspace };
+      ensurePanel(); showConversation();
+      if (s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
+        showConsent(s.pending, s.decision_id, myRun, "This page was reloaded while actions were held.", s.approvable);
+        return;
+      }
+      if (s.state === "idle") { note("chat-note", "Reconnected to the session open before this page reloaded."); endOfTurn(false); return; }
+      failure("The session is " + (s.state || "in an unknown state") + " after this page reloaded. Check again in a moment.");
+      endOfTurn(true);
+      const row = el("div", "chat-row");
+      const again = el("button", "chat-btn", "Check again"); again.type = "button";
+      again.addEventListener("click", (ev) => { if (ev.isTrusted) { session = null; run++; loadListing(false); } });
+      row.appendChild(again); log.appendChild(row);
     });
   }
 
@@ -137,7 +200,7 @@
     }
     const open = el("button", "chat-btn", "Start session");
     open.type = "button";
-    open.addEventListener("click", () => { open.disabled = true; openSession(sel ? sel.value : listing.entities[0]); });
+    open.addEventListener("click", () => { open.disabled = true; openSession(sel ? sel.value : listing.entities[0], newOpenKey()); });
     row.appendChild(open);
     body.appendChild(row);
     note("chat-note dim", "model " + (listing.model || "?") + " · a session holds the entity's hands; close it when done.");
@@ -171,13 +234,19 @@
   }
 
   // ---- open ---------------------------------------------------------------------------------------------------
-  function openSession(entity) {
-    api("POST", "/chat/open", { entity: entity }).then((r) => {
+  function openSession(entity, key) {
+    api("POST", "/chat/open", { entity: entity, idem_key: key }).then((r) => {
       if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
       if (r.status !== 202 || !r.json.session_id) {
         clear(body); note("chat-err", "Could not open a session: " + why(r));
-        const back = el("button", "chat-btn", "Back"); back.type = "button";
-        back.addEventListener("click", () => loadListing(false)); body.appendChild(back);
+        // The open may have happened anyway (the answer was lost): Try again sends the SAME key, which the server
+        // answers with that session rather than a second one.
+        const row = el("div", "chat-row");
+        const retry = el("button", "chat-btn", "Try again"); retry.type = "button";
+        retry.addEventListener("click", () => { retry.disabled = true; openSession(entity, key); });
+        const back = el("button", "chat-btn quiet", "Back"); back.type = "button";
+        back.addEventListener("click", () => loadListing(false));
+        row.appendChild(retry); row.appendChild(back); body.appendChild(row);
         return;
       }
       const sid = r.json.session_id, myRun = run;
@@ -185,7 +254,10 @@
       clear(body); note("chat-note", "Opening a session on " + entity + "…");
       poll(r.json.job_id, myRun, (j) => {
         const st = j.result && j.result.session && j.result.session.state;
-        if (j.status === "done" && st === "idle") { session = { id: sid, entity: entity, workspace: j.result.session.workspace }; showConversation(); return; }
+        if (j.status === "done" && st === "idle") {
+          session = { id: sid, entity: entity, workspace: j.result.session.workspace };
+          rememberSession(session); showConversation(); return;
+        }
         clear(body);
         note("chat-err", "The session did not open: " + (j.error || (j.result && j.result.session && j.result.session.error) || j.status));
         const back = el("button", "chat-btn", "Back"); back.type = "button";
@@ -318,7 +390,7 @@
       if (res.timed_out) failure("The turn timed out before it finished.");
       if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
         if (res.reply) replyBubble(res);
-        showConsent(res.pending, res.decision_id, myRun);
+        showConsent(res.pending, res.decision_id, myRun, null, res.approvable);
         return;
       }
       if (res.gated && !res.error) failure("The turn halted on a gated action but reported nothing to decide.");
@@ -453,6 +525,7 @@
       if (isTokenRefusal(r)) { showTokenPrompt(restartedText(), r); return; }
       const s = r.json || {};
       if (r.status === 404 && s.error === "unknown_session") {
+        forgetSession();
         failure(goneText());
         endOfTurn(true);
         const row = el("div", "chat-row");
@@ -463,7 +536,7 @@
       }
       const verdict = r.status === 200 ? judgeLastJob(s.last_job, ctx) : "";
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
-        showConsent(s.pending, s.decision_id, myRun, warning); return;
+        showConsent(s.pending, s.decision_id, myRun, warning, s.approvable); return;
       }
       if (r.status === 200 && s.state === "busy") {
         failure("The session is still working. Check again in a moment.");
@@ -481,15 +554,17 @@
       rereadButton(myRun, ctx);
     });
   }
-  function showConsent(pending, decisionId, myRun, warning) {
+  function showConsent(pending, decisionId, myRun, warning, approvable) {
     const box = el("div", "chat-consent");
     box.setAttribute("role", "group");
     box.setAttribute("aria-label", "actions awaiting your decision");
     box.appendChild(el("div", "chat-consent-head", "Held for your approval"));
     if (warning) box.appendChild(el("div", "chat-reason", "⚠ " + warning));
-    // Fail closed: Approve exists only when this halt carries a decision id AND every held action is shown in
-    // full. Anything else (an unreadable action, an older server) can still be rejected or closed.
-    const decidable = typeof decisionId === "string" && decisionId !== "" && pending.every((p) => shownInFull(p.full));
+    // Fail closed: Approve exists only when this halt carries a decision id, the server says it is approvable
+    // (`approvable: true`; it is false when the hold does not name the bytes it would run), AND every held action is
+    // shown in full. Anything else (an unreadable action, an older server) can still be rejected or closed.
+    const decidable = typeof decisionId === "string" && decisionId !== "" && approvable === true &&
+      pending.every((p) => shownInFull(p.full));
     pending.forEach((p) => {
       const item = el("div", "chat-pending");
       item.appendChild(el("div", "chat-tool", visible(p.tool)));
@@ -532,7 +607,7 @@
       if (res.timed_out) failure("The turn timed out before it finished.");
       if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
         if (res.reply) replyBubble(res);
-        showConsent(res.pending, res.decision_id, myRun); return;
+        showConsent(res.pending, res.decision_id, myRun, null, res.approvable); return;
       }
       if (res.reply) replyBubble(res);
       else if (!res.error && !res.timed_out) failure("The entity returned no reply.");
@@ -623,6 +698,7 @@
         live.textContent = "Could not close yet: " + why(r);
         return;
       }
+      forgetSession();
       loadListing(false);
     });
   }
