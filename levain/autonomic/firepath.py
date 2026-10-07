@@ -211,7 +211,8 @@ class FireDispatcher:
         out: list[Binding] = []
         try:
             for b in self._store.list_all(trigger_type=event_type):
-                if b.one_shot and not b.status.is_active and journal.admitted(run_id_for(b.binding_id, event)):
+                if (b.one_shot and not b.status.is_active
+                        and self._store.claimed_run(b.binding_id) == run_id_for(b.binding_id, event)):
                     out.append(b)
         except Exception as e:  # noqa: BLE001 — a lookup fault resumes nothing (fail closed)
             _log.error("firepath dispatch: resumable one-shot lookup FAILED (%s): %s", type(e).__name__, e)

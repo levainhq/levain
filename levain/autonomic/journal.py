@@ -105,12 +105,16 @@ class RunRef:
 
     run_id: str
     effect_id: str
+    # True for a link of a multi-link chain: its pending may be resolved only through the chain.
+    chained: bool = False
 
     def __post_init__(self) -> None:
         for name in ("run_id", "effect_id"):
             v = getattr(self, name)
             if not isinstance(v, str) or not v:
                 raise ValueError(f"RunRef.{name} must be a non-empty string")
+        if not isinstance(self.chained, bool):
+            raise ValueError("RunRef.chained must be a bool")
 
 
 def _canonical(obj: Any) -> str:
@@ -168,6 +172,24 @@ def durable_fsync(fd: int) -> None:
         except OSError:
             pass   # a filesystem without it (some network mounts): fall back to fsync
     os.fsync(fd)
+
+
+def durable_replace(path: Path, text: str) -> None:
+    """Atomically replace ``path`` with ``text`` so that, once this returns, a power loss cannot bring
+    back the old contents: the temp file is flushed to disk before the rename and the directory after
+    it. The stores' at-most-once claims (a claimed pending, a claimed chain) rely on it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        durable_fsync(f.fileno())
+    os.replace(tmp, path)
+    dfd = os.open(path.parent, os.O_RDONLY)
+    try:
+        durable_fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 class RunJournal:
@@ -314,6 +336,15 @@ class RunJournal:
             raise KeyError(f"unknown record {t!r}")
 
     # --- runs ------------------------------------------------------------------------------
+    def next_generation(self, binding_id: str) -> int:
+        """A generation above every fence AND every run admission this journal has for the binding: a
+        record created at it (a removed grant added again) fences every run admitted before it."""
+        with self._locked():
+            st = self._state()
+            seen = [st.fences.get(binding_id, 0)]
+            seen += [r["generation"] for r in st.runs.values() if r["binding_id"] == binding_id]
+            return max(seen) + 1
+
     def generation(self, binding_id: str) -> int:
         """The binding's current governance generation: the highest fence written for it (0 if none)."""
         with self._locked():
@@ -351,10 +382,12 @@ class RunJournal:
 
     # --- effects ---------------------------------------------------------------------------
     def _barrier(self, st: _State, run_id: str, effect_id: str,
-                 current_generation: int | None) -> EffectOutcome | None:
+                 current_generation: int | None, digest: str | None) -> EffectOutcome | None:
         """The outcome that stops ``effect_id`` before any decision logic, or ``None``.
         ``current_generation`` is the binding's generation from the authority that fences it (the
-        registry); the run is fenced if it or any fence in this journal is past the run's admission."""
+        registry); the run is fenced if it or any fence in this journal is past the run's admission.
+        ``digest`` is what the caller is about to do; a recorded result for DIFFERENT bytes is not a
+        replay of this effect (the run is not deterministic), so the run is cancelled."""
         key = (run_id, effect_id)
         run = st.runs.get(run_id)
         if run is None:
@@ -362,6 +395,11 @@ class RunJournal:
         # a recorded result first: a replay runs nothing, so a cancel or fence after the effect does not
         # hide what already happened (and a receipt that never landed can still be written)
         if key in st.results:
+            done = st.intents.get(key, {}).get("digest")
+            if digest is not None and done is not None and done != digest:
+                if run_id not in st.cancelled:
+                    self._append({"t": "cancel", "run_id": run_id, "reason": "replay_digest_changed"})
+                return EffectOutcome(EffectStatus.CANCELLED)
             return EffectOutcome(EffectStatus.REPLAYED, st.results[key]["result"],
                                  receipt_id=st.receipts.get(key))
         if run_id in st.cancelled:
@@ -376,13 +414,14 @@ class RunJournal:
             return EffectOutcome(EffectStatus.POISONED)
         return None
 
-    def peek(self, run_id: str, effect_id: str, *, current_generation: int | None = None) -> EffectOutcome | None:
+    def peek(self, run_id: str, effect_id: str, *, current_generation: int | None = None,
+             digest: str | None = None) -> EffectOutcome | None:
         """The barrier that would stop ``effect_id`` right now (cancelled, fenced, already done,
         poisoned, in flight), or ``None`` if nothing but a decision could. Runs nothing. A caller
         uses it to short-circuit a replay before deciding anything; :meth:`effect` re-checks under
         its own lock."""
         with self._locked():
-            return self._barrier(self._state(), run_id, effect_id, current_generation)
+            return self._barrier(self._state(), run_id, effect_id, current_generation, digest)
 
     def hold(self, run_id: str, effect_id: str, *, digest: str, at: str | None = None,
              current_generation: int | None = None) -> EffectOutcome:
@@ -397,7 +436,7 @@ class RunJournal:
         hold_id = hold_id_for(run_id, effect_id)
         with self._locked():
             st = self._state()
-            barrier = self._barrier(st, run_id, effect_id, current_generation)
+            barrier = self._barrier(st, run_id, effect_id, current_generation, digest)
             if barrier is not None:
                 return barrier
             h = st.holds.get(hold_id)
@@ -428,7 +467,7 @@ class RunJournal:
         hold_id = hold_id_for(run_id, effect_id)
         with self._locked():
             st = self._state()
-            barrier = self._barrier(st, run_id, effect_id, current_generation)
+            barrier = self._barrier(st, run_id, effect_id, current_generation, digest)
             if barrier is not None:
                 return barrier
             binding_id = st.runs[run_id]["binding_id"]
@@ -509,11 +548,6 @@ class RunJournal:
                 return False
             self._append({"t": "withdraw", "hold_id": hold_id})
             return True
-
-    def admitted(self, run_id: str) -> bool:
-        """True iff ``run_id`` was admitted (a re-delivery of a run that already started)."""
-        with self._locked():
-            return run_id in self._state().runs
 
     def open_holds(self) -> list[dict[str, Any]]:
         """Every undecided hold (``hold_id``, ``binding_id``, ``run_id``, ``effect_id``, ``digest``,
