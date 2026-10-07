@@ -1275,6 +1275,30 @@ class GitLedger:
         except Exception as exc:  # noqa: BLE001 - a read-only surface: report, never raise
             return f"{type(exc).__name__}: {exc}"
 
+    def unpushed(self) -> int | None:
+        """How many local ledger commits the remote does not have yet (None without a remote or a fetched tip)."""
+        rref = self._rref()
+        if not rref or self._ref_sha(rref) is None:
+            return None
+        cp = git(["rev-list", "--count", f"{rref}..{REF}"], self.repo.toplevel, check=False, timeout=10)
+        return int(cp.stdout.strip()) if cp.returncode == 0 and cp.stdout.strip().isdigit() else None
+
+    def flush_unpushed(self, *, timeout: float = 10.0) -> str | None:
+        """Push local ledger commits the remote does not have (acknowledgements are committed without a push), within
+        a bound: None when there was nothing to push, another process holds the network lock, or it was pushed; else a
+        one-line reason. Never raises."""
+        try:
+            if not self.unpushed():
+                return None
+            self._sync(push=True, timeout=timeout, net_timeout=0.5, lock_timeout=3.0)
+            return None
+        except TeamBusy:
+            return None
+        except TeamError as exc:
+            return str(exc)
+        except Exception as exc:  # noqa: BLE001 - a hook path: report, never raise
+            return f"{type(exc).__name__}: {exc}"
+
     def fetch_if_due(self, interval: float, *, timeout: float = 8.0) -> str | None:
         """Best-effort fetch+rebase (never push) when the last attempt is older than ``interval`` seconds.
 

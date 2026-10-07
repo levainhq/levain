@@ -325,6 +325,10 @@ def sessionstart(payload: dict) -> None:
     except (R.RolesError, TeamError) as exc:
         _fail_open("SessionStart", str(exc))
         return
+    # Acknowledgements are committed without a push; a session start sends them, within a bound, so an ack with no
+    # later ledger write still reaches the team. What cannot be sent is said.
+    push_note = gl.flush_unpushed(timeout=10.0)
+    pending = gl.unpushed() if push_note else 0
     live = ledger.in_force
     rulings = [e for e in live if e.get("kind") == "ruling"]
     newest = max((e.get("ts", "") for e in ledger.entries), default="")
@@ -336,6 +340,9 @@ def sessionstart(payload: dict) -> None:
     from .transport import WARNINGS
     # A fallback to an older team.toml (or any other read warning) must reach the session, not only the edit hook.
     lines += [f"[team] {w}" for w in dict.fromkeys(WARNINGS)]
+    if pending:
+        lines.append(f"[team] {pending} local ledger commit(s), acknowledgements included, not pushed yet "
+                     f"({I.oneline(push_note)}); run `levain team sync`")
     lines.append("[team] Edits to governed paths show the recorded decision first. When a person decides "
                  "something about this codebase, record it with their words: `levain team record --help`.")
     # LEVAIN_TEAM_SESSIONSTART_RULINGS=off: count + canon pointer only, so enforcement rests on the edit-time hook.

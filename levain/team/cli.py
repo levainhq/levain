@@ -204,6 +204,10 @@ def cmd_status(args) -> int:
         print("rewrite protection: first sight trusted (this clone pinned what it first read); to verify, re-join "
               "with --pins-from <a teammate's .git/levain-team/pins.json>")
     print(C.staleness(canon_text, state))
+    pending = gl.unpushed()
+    if pending:
+        print(f"{pending} local ledger commit(s) not pushed yet (acknowledgements are committed without a push): "
+              "`levain team sync` sends them")
     if ledger.problems:
         print(f"{len(ledger.problems)} integrity problem(s): run `levain team verify`")
     for e in ledger.in_force:

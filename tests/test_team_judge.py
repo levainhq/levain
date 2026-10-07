@@ -504,3 +504,33 @@ def test_team_view_refuses_a_negative_recheck_or_a_zero_ack_flag(two, monkeypatc
     with pytest.raises(SystemExit):
         team("view", *args, repo=ben)
     assert called == []
+
+
+def test_an_ack_with_no_later_write_reaches_the_remote_at_the_next_session_start(two, capsys):
+    # E review (codex MED e), RUN: acks are committed push=False, so an ack with no later ledger write never left the
+    # clone and the lead's view said no agent had acknowledged a ruling.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    assert team("sync", repo=ben) == 0
+    assert edit(ben, "src/a.py", session="k1")["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "permissionDecision" not in edit(ben, "src/a.py", session="k1")["hookSpecificOutput"]   # proceeds: an ack
+    acked = lambda: subprocess.run(["git", "grep", "-q", '"type": "ack"', "levain-ledger"],  # noqa: E731
+                                   cwd=tmp / "origin.git").returncode == 0
+    assert not acked()
+    hook("sessionstart", {"session_id": "s2", "cwd": str(ben), "hook_event_name": "SessionStart", "source": "startup"})
+    assert acked()
+
+
+def test_acks_that_cannot_be_sent_are_said_at_session_start_and_in_status(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    assert team("sync", repo=ben) == 0
+    edit(ben, "src/a.py", session="k1")
+    edit(ben, "src/a.py", session="k1")                                    # the ack, committed without a push
+    git("remote", "set-url", "origin", str(tmp / "gone.git"), cwd=ben)
+    ctx = hook("sessionstart", {"session_id": "s2", "cwd": str(ben), "hook_event_name": "SessionStart",
+                                "source": "startup"})["hookSpecificOutput"]["additionalContext"]
+    assert "not pushed yet" in ctx
+    capsys.readouterr()
+    assert team("status", repo=ben) == 0
+    assert "not pushed yet" in capsys.readouterr().out
