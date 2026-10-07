@@ -272,6 +272,11 @@ class TurnResult:
     :data:`~levain.firing.agent_reply.UNREADABLE_CALL_NOTICE` with the text beneath it. Such a turn is not
     :attr:`ok`, and its :attr:`exit_code` is :data:`EXIT_UNREADABLE_CALL`: the text is not an answer."""
 
+    unreadable_unchecked: bool = False
+    """The check behind :attr:`unreadable_call` could not run, so the reply is flagged without being judged (fail
+    closed). A surface shows :data:`~levain.firing.agent_reply.UNREADABLE_CHECK_FAILED_NOTICE` instead, which says
+    nothing about the model."""
+
     held_digest: str | None = None
     """What an approval of THIS halt binds to (:func:`levain.firing.openhands.gate.held_digest`), read at the
     same quiescent moment as :attr:`pending`. ``None`` when not gated or the held calls could not be read: a
@@ -400,15 +405,14 @@ def resolve_llm_kwargs(model: str, base_url: str, api_key: str | None) -> dict:
             "native_tool_calling": True}
 
 
-# What a shell prints when a credential it needs is unreadable: git over HTTPS reaching its prompt with no
-# credential to offer and no terminal to ask on (the confined shell has none), and git's Keychain helper
-# failing (it is silent when the item is merely absent).
-_CRED_FAILURE_LINES = re.compile(r"could not read (?:Username|Password) for 'https://|failed to get: -\d+")
+# What git prints over HTTPS when it reaches its prompt with no credential to offer and no terminal to ask on (the
+# confined shell has none). A private or mistyped URL prints the same, so the note says "may".
+_GIT_PROMPT_FAILED = re.compile(r"could not read (?:Username|Password) for 'https://")
 _EPERM = re.compile(r"operation not permitted", re.IGNORECASE)
 CRED_FLOOR_NOTE = (
-    "this may be the standard credential floor, which denies the standard credential stores in this "
-    'drive; to allow them set "deny_standard_creds": false in .levain/confinement.json, or for git use '
-    "an ssh remote"
+    "this may have been denied by the standard credential floor. For git, use an ssh remote if your key is "
+    'in the ssh agent; otherwise set "deny_standard_creds" to false in .levain/confinement.json, which opens '
+    "every listed store and the Keychain in every drive"
 )
 
 
@@ -453,17 +457,22 @@ def turn_tool_activity(events, workspace: Path, *, cred_floor: bool = False) -> 
 
 def _reads_as_cred_failure(event) -> bool:
     """Whether ``event`` is a shell observation whose output reads like a denied or missing credential:
-    a line naming one of the floor's own stores with "operation not permitted" (what Go, Python and
-    Node print for the sandbox's EPERM: gh, docker, kubectl, aws, twine, npm), or git's credential
-    failures. An event with no shell output (a scaffold error, a rejection) does not."""
+    a command that failed (non-zero exit, or none reported) with a line naming one of the floor's own
+    stores and "operation not permitted" (what Go, Python and Node print for the sandbox's EPERM: gh,
+    docker, kubectl, aws, twine, npm), or git's HTTPS prompt failing. The Keychain is denied by its
+    services, not a path, and a denied read looks like a missing item; git's helper then reaches the
+    prompt, so the second form covers it. An event with no shell output (a scaffold error, a
+    rejection) does not."""
     if getattr(event, "tool_name", None) not in BASH_TOOL_NAMES:
         return False
     try:
         text = str(event.observation.text)
     except Exception:  # noqa: BLE001 — a display note must never break a turn
         return False
-    if _CRED_FAILURE_LINES.search(text):
+    if _GIT_PROMPT_FAILED.search(text):
         return True
+    if getattr(event.observation, "exit_code", None) == 0:
+        return False
     # only the lines holding an EPERM are read, so a large output is not split or copied
     for m in _EPERM.finditer(text):
         end = text.find("\n", m.end())
@@ -1204,7 +1213,7 @@ class EntitySession:
 
         events = self.conversation.state.events
         reply = latest_agent_text(events)
-        flagged, beside = self._unreadable_texts(reply, events)
+        flagged, beside, unchecked = self._unreadable_texts(reply, events)
         # A flagged text sent beside a parsed finish lives only in that action's thought. It goes in front of the reply
         # (or is the reply, when the finish carried none): the surfaces show the reply as "what the model sent", and a
         # notice above "Created x" alone would hide the call that did not run.
@@ -1217,10 +1226,12 @@ class EntitySession:
             error=None,
             nudged=nudged,
             unreadable_call=flagged,
+            unreadable_unchecked=unchecked,
         )
 
-    def _unreadable_texts(self, reply: str | None, events) -> tuple[bool, list[str]]:
-        """Whether the turn's reply is flagged, and the flagged texts sent beside a parsed ``finish``.
+    def _unreadable_texts(self, reply: str | None, events) -> tuple[bool, list[str], bool]:
+        """Whether the turn's reply is flagged, the flagged texts sent beside a parsed ``finish``, and whether the
+        check itself failed.
 
         Each agent message is checked on its own, never their join: a call that is the whole of one message (a plan,
         the act-now nudge, then the call) is not the whole of the join, and the shapes that need the whole text would
@@ -1238,8 +1249,9 @@ class EntitySession:
             parts = bool(reply) and any(unreadable_tool_call(t, names) for t in _agent_parts(events))
         except Exception:  # noqa: BLE001 — undeterminable is not "readable"
             # every thought beside a finish is unchecked, so it is flagged and shown, as a flagged one would be
-            return bool(reply) or bool(thoughts), thoughts
-        return bool(beside) or parts, beside
+            flagged = bool(reply) or bool(thoughts)
+            return flagged, thoughts, flagged
+        return bool(beside) or parts, beside, False
 
     def _tool_names(self) -> frozenset[str]:
         """The names of this conversation's tools. When they cannot be read this raises, so :meth:`_unreadable_texts`

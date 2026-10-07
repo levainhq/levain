@@ -132,6 +132,10 @@ function fetch(path, init) {
   if (M === "notstarted" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
     return reply(200, { state: "idle", job_id: null, last_job: { job_id: "J-turn", kind: "turn", status: "done",
       result: { reply: "the earlier turn", tool_activity: ["\u2699 earlier"], gated: true, error: null } } });
+  if (M === "notelastjob" && path === "/chat/approve") return reply(500, {});
+  if (M === "notelastjob" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
+    return reply(200, { state: "idle", job_id: null, last_job: { job_id: "J-other", kind: "approve", status: "done",
+      result: { reply: "the push failed", tool_activity: ["\u2699 terminal: git push", "this may have been denied by the standard credential floor"], gated: false, error: null } } });
   if (M === "leaklastjob" && path === "/chat/approve") return reply(500, {});
   if (M === "leaklastjob" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
     return reply(200, { state: "idle", job_id: null, last_job: { job_id: "J-other", kind: "approve", status: "done",
@@ -321,6 +325,15 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     ok(panel.textContent.includes("terminal: git push") && !find(panel, (n) => n.tagName === "div" && n.className === "chat-text" && n._text.includes("<arg_key>")), "the activity is listed and the markup is not rendered as the reply");
     console.log("PASS"); return;
   }
+  if (process.argv[3] === "notelastjob") {
+    // a note levain adds to the activity (the credential floor's) is not listed among the actions that ran
+    await approveTwice(approve); await sleep(300);
+    byText(panel, "Check what happened").fire("click", { isTrusted: true }); await sleep(150);
+    const acts = find(panel, (n) => n.tagName === "ul" && n.textContent.includes("terminal: git push"));
+    ok(panel.textContent.includes("These actions ran:") && acts && !acts.textContent.includes("credential floor"), "the note is not listed as an action");
+    ok(panel.textContent.includes("this may have been denied by the standard credential floor"), "the note is still shown");
+    console.log("PASS"); return;
+  }
   if (process.argv[3] === "leaklastjob") {
     await approveTwice(approve); await sleep(300);
     byText(panel, "Check what happened").fire("click", { isTrusted: true }); await sleep(150);
@@ -444,7 +457,7 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
                                   "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
                                   "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
                                   "fragment", "stored", "storagethrows", "badfragment", "twoentities",
-                                  "leakafterapprove", "leaklastjob",
+                                  "leakafterapprove", "leaklastjob", "notelastjob",
                                   "malformedfragment", "replacethrows"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)

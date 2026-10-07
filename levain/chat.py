@@ -239,6 +239,7 @@ def _turn_payload(result: Any) -> dict[str, Any]:
     return {
         "reply": result.reply,
         "unreadable_call": bool(getattr(result, "unreadable_call", False)),
+        "unreadable_unchecked": bool(getattr(result, "unreadable_unchecked", False)),
         "tool_activity": activity[-MAX_ACTIVITY_LINES:],
         "error": result.error,
         "nudged": result.nudged,

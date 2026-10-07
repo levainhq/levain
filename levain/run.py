@@ -696,7 +696,8 @@ def _drive_task(
         if result.reply and result.unreadable_call:
             # Not the entity's reply: the model's call failed to parse and did not run. The notice and the text go to
             # STDERR in both modes, and stdout stays empty: --quiet's payload is an answer, and this is not one.
-            print(_unreadable_call_lines(result.reply, result.tool_activity), file=sys.stderr, flush=True)
+            print(_unreadable_call_lines(result.reply, result.tool_activity, result.unreadable_unchecked),
+                  file=sys.stderr, flush=True)
         elif result.reply:
             if not quiet:
                 print(f"\n\033[1m{session.label} ›\033[0m {result.reply}", flush=True)
@@ -738,16 +739,16 @@ def _render_turn(session: EntitySession, result: TurnResult) -> None:
     for line in result.tool_activity:
         print(f"  \033[2m{line}\033[0m")  # dim — activity is context, the reply is the message
     if result.reply and result.unreadable_call:
-        print(_unreadable_call_lines(result.reply, result.tool_activity))
+        print(_unreadable_call_lines(result.reply, result.tool_activity, result.unreadable_unchecked))
         return
     print(f"\n\033[1m{session.label} ›\033[0m {result.reply or '(no reply)'}")
 
 
-def _unreadable_call_lines(text: str, tool_activity) -> str:
+def _unreadable_call_lines(text: str, tool_activity, unchecked: bool = False) -> str:
     """The notice for a reply that is an unreadable tool call, with the text beneath it, dim and escaped by the
     consent surface's allowlist (:func:`levain.firing.gate.visible`): it is the model's markup, not a message."""
     raw = "\n".join("    " + line for line in visible(text, keep_newline=True).split("\n"))
-    return f"\n  ! {unreadable_call_notice(tool_activity)}\n  \033[2mwhat the model sent:\n{raw}\033[0m"
+    return f"\n  ! {unreadable_call_notice(tool_activity, unchecked=unchecked)}\n  \033[2mwhat the model sent:\n{raw}\033[0m"
 
 
 def _entity_label(binding) -> str:

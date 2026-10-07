@@ -301,10 +301,16 @@
   // levain.firing.agent_reply's (a test holds them equal).
   const UNREADABLE_CALL_NOTICE = "The model tried to call a tool, but its call couldn't be read, so nothing ran. Ask again, or switch models.";
   const UNREADABLE_CALL_AFTER_ACTIONS_NOTICE = "The model tried to call a tool, but its last call couldn't be read, so that call did not run. The actions listed with this message did run. Ask again, or switch models.";
+  const UNREADABLE_CHECK_FAILED_NOTICE = "levain could not check whether this reply is a tool call that failed to parse, so it is not treated as an answer. Ask again; if this repeats, report it.";
+  // A turn's activity is its action lines ("⚙ tool: ...") and, last, any note levain adds about them (the credential
+  // floor's); only the action lines are actions that ran.
+  function actionLines(lines) { return Array.isArray(lines) ? lines.filter((l) => String(l).startsWith("⚙ ")) : []; }
   function replyText(b, res, ran) {
     if (res.unreadable_call !== true) { b.appendChild(el("div", "chat-text", res.reply)); return; }
-    const acted = ran || (Array.isArray(res.tool_activity) && res.tool_activity.length > 0);
-    b.appendChild(el("div", "chat-text chat-unreadable", acted ? UNREADABLE_CALL_AFTER_ACTIONS_NOTICE : UNREADABLE_CALL_NOTICE));
+    const acted = ran || actionLines(res.tool_activity).length > 0;
+    const notice = res.unreadable_unchecked === true ? UNREADABLE_CHECK_FAILED_NOTICE
+      : acted ? UNREADABLE_CALL_AFTER_ACTIONS_NOTICE : UNREADABLE_CALL_NOTICE;
+    b.appendChild(el("div", "chat-text chat-unreadable", notice));
     const d = el("details", "chat-raw");
     d.appendChild(el("summary", null, "What the model sent"));
     d.appendChild(el("pre", "chat-text", visible(res.reply, true)));
@@ -423,10 +429,12 @@
     if (last.status === "unknown") { failure("The server no longer has a record of the last " + what + "."); return false; }
     if (last.status === "failed") { failure("The last " + what + " failed: " + (last.error || "no detail")); return false; }
     const res = last.result || {};
-    const ran = Array.isArray(res.tool_activity) ? res.tool_activity : [];
+    const all = Array.isArray(res.tool_activity) ? res.tool_activity : [];
+    const ran = actionLines(all);
     const b = bubble("them", (res.unreadable_call === true ? "levain" : session.entity) + " · what the last " + what + " did");
     b.appendChild(el("div", "chat-text", ran.length ? "These actions ran:" : "No action ran."));
     addLines(b, ran);
+    addLines(b, all.filter((l) => !String(l).startsWith("⚙ ")));
     if (res.reply) replyText(b, res, ran.length > 0);
     if (res.error) b.appendChild(el("div", "chat-text", "error: " + res.error));
     return true;

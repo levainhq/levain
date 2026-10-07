@@ -188,9 +188,20 @@ UNREADABLE_CALL_AFTER_ACTIONS_NOTICE = (
 )
 
 
-def unreadable_call_notice(tool_activity) -> str:
-    """The notice for a turn whose reply is an unreadable tool call, given the actions that turn ran."""
-    return UNREADABLE_CALL_AFTER_ACTIONS_NOTICE if tool_activity else UNREADABLE_CALL_NOTICE
+# The same place, for a reply levain could not check at all (the check itself failed): nothing is known of the model.
+UNREADABLE_CHECK_FAILED_NOTICE = (
+    "levain could not check whether this reply is a tool call that failed to parse, so it is not treated as an "
+    "answer. Ask again; if this repeats, report it."
+)
+
+
+def unreadable_call_notice(tool_activity, *, unchecked: bool = False) -> str:
+    """The notice for a turn whose reply is an unreadable tool call, given the turn's activity (only its action
+    lines, ``⚙ ...``, count as actions that ran), or for a reply the check could not judge (``unchecked``)."""
+    if unchecked:
+        return UNREADABLE_CHECK_FAILED_NOTICE
+    ran = any(isinstance(line, str) and line.startswith("⚙ ") for line in tool_activity or ())
+    return UNREADABLE_CALL_AFTER_ACTIONS_NOTICE if ran else UNREADABLE_CALL_NOTICE
 
 # GLM's argument markup: a key tag next to a value tag. A parse failure upstream can cut the reply anywhere, so
 # either order and either tag half counts ("</arg_key><arg_value>", "</arg_value><arg_key>").

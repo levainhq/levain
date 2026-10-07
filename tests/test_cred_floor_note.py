@@ -13,7 +13,6 @@ from tests.test_session import _Binding, _Event
 
 GIT = "fatal: could not read Username for 'https://github.com': Device not configured"
 GIT_USER_IN_URL = "fatal: could not read Password for 'https://x-access-token@github.com': terminal prompts disabled"
-KEYCHAIN = "failed to get: -25308"
 HOME = os.path.expanduser("~")
 # what each runtime prints for the sandbox's EPERM on a denied store (Go: gh/docker/kubectl; Python: aws/twine; Node: npm)
 GH = f"failed to read configuration: open {HOME}/.config/gh/config.yml: operation not permitted"
@@ -34,7 +33,7 @@ def _turn(*events):
     return [_Event("user", ["push it"]), *events]
 
 
-@pytest.mark.parametrize("text", [GIT, GIT_USER_IN_URL, KEYCHAIN, GH, AWS, STORE])
+@pytest.mark.parametrize("text", [GIT, GIT_USER_IN_URL, GH, AWS, STORE])
 def test_a_credential_failure_ends_the_activity_with_one_note(tmp_path, text):
     events = _turn(_shell("git push"), _output(text), _shell("git push"), _output(text))
     assert turn_tool_activity(events, tmp_path, cred_floor=True) == [
@@ -124,3 +123,23 @@ def test_the_sdks_own_terminal_observation_is_read(tmp_path):
     event = ObservationEvent(observation=TerminalObservation.from_text(GIT, command="git push", exit_code=128),
                              action_id="a1", tool_name="terminal", tool_call_id="c1")
     assert turn_tool_activity(_turn(event), tmp_path, cred_floor=True) == [CRED_FLOOR_NOTE]
+
+
+def test_a_store_named_by_a_command_that_succeeded_is_not_a_denial(tmp_path):
+    # head's ruling: the store-path signature needs a failed command (a log that quotes an old EPERM exits 0);
+    # git's prompt failure needs none, since `git push 2>&1 | tail` exits 0
+    from openhands.sdk.event import ObservationEvent
+    from openhands.tools.terminal.definition import TerminalObservation
+
+    def obs(text, code):
+        return ObservationEvent(observation=TerminalObservation.from_text(text, command="c", exit_code=code),
+                                action_id="a1", tool_name="terminal", tool_call_id="c1")
+
+    assert turn_tool_activity(_turn(obs(AWS, 0)), tmp_path, cred_floor=True) == []
+    assert turn_tool_activity(_turn(obs(AWS, 255)), tmp_path, cred_floor=True) == [CRED_FLOOR_NOTE]
+    assert turn_tool_activity(_turn(obs(GIT, 0)), tmp_path, cred_floor=True) == [CRED_FLOOR_NOTE]
+
+
+def test_the_note_names_the_cost_of_turning_the_floor_off():
+    assert "ssh agent" in CRED_FLOOR_NOTE and "to false" in CRED_FLOOR_NOTE and "every drive" in CRED_FLOOR_NOTE
+    assert CRED_FLOOR_NOTE.index("ssh remote") < CRED_FLOOR_NOTE.index("deny_standard_creds")

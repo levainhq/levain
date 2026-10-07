@@ -12,6 +12,7 @@ import pytest
 from levain.firing.agent_reply import (
     UNREADABLE_CALL_AFTER_ACTIONS_NOTICE,
     UNREADABLE_CALL_NOTICE,
+    UNREADABLE_CHECK_FAILED_NOTICE,
     unreadable_call_notice,
     unreadable_tool_call,
 )
@@ -91,6 +92,13 @@ def test_the_notice_never_says_nothing_ran_when_actions_did():
     assert unreadable_call_notice([]) == UNREADABLE_CALL_NOTICE
     assert unreadable_call_notice(["⚙ terminal: git push"]) == UNREADABLE_CALL_AFTER_ACTIONS_NOTICE
     assert "nothing ran" not in UNREADABLE_CALL_AFTER_ACTIONS_NOTICE
+    # a note levain adds to the activity is not an action that ran
+    from levain.session import CRED_FLOOR_NOTE
+
+    assert unreadable_call_notice([CRED_FLOOR_NOTE]) == UNREADABLE_CALL_NOTICE
+    # a reply the check could not judge says nothing about the model
+    assert unreadable_call_notice(["⚙ terminal: ls"], unchecked=True) == UNREADABLE_CHECK_FAILED_NOTICE
+    assert "model" not in UNREADABLE_CHECK_FAILED_NOTICE
 
 
 def test_the_notice_says_nothing_ran():
@@ -188,6 +196,7 @@ def test_the_panel_shows_the_same_sentence():
     js = (Path(__file__).resolve().parents[1] / "levain" / "templates" / "web" / "dashboard_chat.js").read_text()
     assert f'const UNREADABLE_CALL_NOTICE = "{UNREADABLE_CALL_NOTICE}";' in js
     assert f'const UNREADABLE_CALL_AFTER_ACTIONS_NOTICE = "{UNREADABLE_CALL_AFTER_ACTIONS_NOTICE}";' in js
+    assert f'const UNREADABLE_CHECK_FAILED_NOTICE = "{UNREADABLE_CHECK_FAILED_NOTICE}";' in js
 
 
 def test_the_repl_notice_after_actions_ran_does_not_say_nothing_ran(capsys):
@@ -243,6 +252,7 @@ def test_unreadable_tool_names_fail_closed(tmp_path):
     session.conversation.agent = object()
     result = session.run_turn("x")
     assert result.error is None and result.unreadable_call is True and result.exit_code == 7
+    assert result.unreadable_unchecked is True
 
 # ---------- L3 r2: fences by CommonMark 0.31.2 s4.5 ----------
 
@@ -713,6 +723,7 @@ def test_unreadable_tool_names_fail_closed_on_a_thought_with_no_reply(tmp_path):
     session.conversation.agent = object()
     result = session.run_turn("x")
     assert result.reply == CALL_X and result.unreadable_call is True and result.exit_code == 7
+    assert result.unreadable_unchecked is True
 
 
 def test_a_thought_restating_a_call_that_ran_is_not_flagged(tmp_path):
@@ -755,3 +766,19 @@ def test_humanize_measures_its_bound_in_bytes():
 
     emoji = '{"name": "finish", "arguments": {"message": "' + "\U0001F600" * 190_000 + '"}}'
     assert humanize_finish_json(emoji) == emoji
+
+
+def test_an_unchecked_reply_gets_its_own_notice_on_every_surface(capsys):
+    # L1: on the fail-closed path the operator was told the model's call could not be read, which nothing showed
+    from types import SimpleNamespace
+
+    from levain.chat import _turn_payload
+    from levain.run import _render_turn
+    from levain.session import TurnResult
+
+    result = TurnResult(reply="hello", unreadable_call=True, unreadable_unchecked=True)
+    _render_turn(SimpleNamespace(label="ent"), result)
+    out = capsys.readouterr().out
+    assert UNREADABLE_CHECK_FAILED_NOTICE in out and UNREADABLE_CALL_NOTICE not in out
+    assert _turn_payload(result)["unreadable_unchecked"] is True
+    assert _turn_payload(TurnResult(reply="hi"))["unreadable_unchecked"] is False
