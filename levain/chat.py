@@ -854,10 +854,8 @@ class ChatHost:
         if not isinstance(entity, str) or entity not in self._entities:
             raise ChatError("unknown_entity", "no such entity on this server", 404)
         with self._lock:
+            self._expire_idem()
             if idem_key is not None:
-                now = time.monotonic()
-                while self._idem and next(iter(self._idem.values()))[3] <= now - _IDEM_SECONDS:
-                    self._idem.popitem(last=False)
                 seen = self._idem.get(idem_key)
                 if seen is not None:
                     if seen[0] != entity:
@@ -1223,12 +1221,20 @@ class ChatHost:
             raise ChatError("unknown_session", "no such session", 404)
         return rec
 
+    def _expire_idem(self) -> None:
+        """Drop the idempotency keys past :data:`_IDEM_SECONDS` (oldest first). Caller holds the lock. Run
+        before every pruning that keys pin, so an expired key pins nothing (codex, closing pass)."""
+        now = time.monotonic()
+        while self._idem and next(iter(self._idem.values()))[3] <= now - _IDEM_SECONDS:
+            self._idem.popitem(last=False)
+
     def _new_job(self, rec: _Session, kind: JobKind) -> _Job:
         """Register a running job for ``rec``. Caller holds the lock."""
         job = _Job(job_id=secrets.token_hex(8), session_id=rec.session_id, kind=kind)
         self._jobs[job.job_id] = job
         rec.job_id = job.job_id
         rec.last_job_id = job.job_id
+        self._expire_idem()
         named = {seen[2] for seen in self._idem.values()}     # as for sessions (open), bounded by _IDEM_KEPT
         finished = [j for j in self._jobs.values() if j.status != "running" and j.job_id not in named]
         for old in finished[: max(0, len(finished) - _FINISHED_JOBS_KEPT)]:

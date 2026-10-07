@@ -42,6 +42,8 @@ class _Out:
     timed_out: bool = False
     pending: tuple = ()
     held_digest: str | None = None
+    unreadable_call: bool = False
+    unreadable_unchecked: bool = False
 
     @property
     def ok(self) -> bool:
@@ -2620,3 +2622,32 @@ def test_a_kept_idem_key_never_names_a_pruned_session(tmp_path, monkeypatch):
     assert again["session_id"] == first["session_id"]
     host.session_status(again["session_id"])
     assert host.job_status(again["job_id"])["status"] == "done"
+
+
+# -- the closing codex pass on 51c5fb4 ----------------------------------------------------------------------------
+
+
+def test_an_unchecked_reply_that_is_not_flagged_cannot_be_built():
+    """codex closing MED: `unreadable_unchecked` without `unreadable_call` was accepted, and the panel reads
+    `unreadable_call` first, so the unchecked text would render as the entity's answer."""
+    with pytest.raises(DriverContractError):
+        read_outcome(_Out(reply="All done.", unreadable_unchecked=True))
+    assert read_outcome(_Out(reply="All done.", unreadable_call=True, unreadable_unchecked=True)).unreadable_unchecked
+
+
+def test_an_expired_idem_key_pins_nothing(tmp_path, monkeypatch):
+    """codex closing LOW: keys expired only on a keyed open, so after the TTL a key still pinned its session
+    and job against pruning for as long as no keyed open came."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_ENDED_SESSIONS_KEPT", 1)
+    host = ChatHost({"alpha": tmp_path}, driver_factory=lambda n, p: _Fake([]), max_sessions=2)
+    first = host.open("alpha", idem_key="k" * 20)
+    _wait(host, first["job_id"])
+    host.close(first["session_id"])
+    monkeypatch.setattr(chat, "_IDEM_SECONDS", 0.0)
+    for _ in range(3):
+        sid, _ = _open(host, "alpha")               # unkeyed opens
+        host.close(sid)
+    with pytest.raises(ChatError):
+        host.session_status(first["session_id"])    # pruned, as any ended session past the cap

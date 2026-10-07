@@ -231,8 +231,8 @@ class TurnSnapshot:
     ok: bool
     exit_code: int
     unreadable_unchecked: bool = False
-    """The harness could not check whether ``reply`` is an unreadable tool call (it fails closed with
-    ``unreadable_call`` set too); a client shows its own notice for it."""
+    """The harness could not check whether ``reply`` is an unreadable tool call. It requires
+    ``unreadable_call`` (fail closed: the reply is not shown as an answer); a client shows its own notice."""
 
     def __post_init__(self) -> None:
         for name in ("reply", "error", "held_digest"):
@@ -242,6 +242,9 @@ class TurnSnapshot:
             if not isinstance(getattr(self, name), bool):
                 raise DriverContractError(
                     f"the outcome's `{name}` is not a bool (a method or a value where a flag was meant)")
+        if self.unreadable_unchecked and not self.unreadable_call:
+            # Fail closed: a reply nobody could check is never shown as the entity's answer (codex, closing pass)
+            raise DriverContractError("the outcome's reply is `unreadable_unchecked` but not `unreadable_call`")
         if type(self.exit_code) is not int:
             raise DriverContractError("the outcome's `exit_code` is not an int")
         if type(self.tool_activity) is not tuple or not all(_is_text(x) for x in self.tool_activity):
@@ -406,8 +409,9 @@ class HarnessDriver(abc.ABC):
         nor exactly ``str`` is a contract violation, recorded as a failed release.
 
         Acquire nothing before :meth:`open` (not in ``__init__``): a driver the host made but did not open
-        (it declares a consent timing the host does not drive, or its caps cannot be read, or the factory
-        answered too late) is dropped without :meth:`close`."""
+        (it declares a consent timing the host does not drive, or its name or caps cannot be read in time) is
+        dropped without :meth:`close`. One the factory answered after the host gave up is closed anyway, on its
+        own lane, since nobody holds it."""
 
     @abc.abstractmethod
     def close(self) -> None:
