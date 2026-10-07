@@ -63,7 +63,8 @@ class TeamBusy(TeamError):
 # Linux runs a repository's commit, checkout and reference-transaction hooks on exactly these operations, and a hook that
 # fails, or rewrites the index, makes a sync fail or a real entry look like an empty pick.
 # Nor the user's global attributes file (system-wide ones are off through GIT_ATTR_NOSYSTEM, and a .gitattributes on
-# the ledger branch is tamper). The repository's own .git/info/attributes still applies; levain does not override it.
+# the ledger branch is tamper). The repository's own .git/info/attributes cannot be switched off, so no ledger byte
+# passes through attributes at all: writes are staged with hash-object --no-filters (``_stage``) and reads use cat-file.
 _NO_HOOKS = ["-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/null"]
 # The only names levain writes under ledger/: <handle>/<device>.jsonl (file_for, _new_device). Compared as bytes.
 _LEDGER_PATH_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[0-9a-f]{16}\.jsonl")
@@ -168,7 +169,8 @@ _REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false",
 
 
 def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
-        input_text: str | None = None, binary: bool = False) -> subprocess.CompletedProcess:
+        input_text: str | None = None, binary: bool = False,
+        input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true",
                GIT_NO_REPLACE_OBJECTS="1",   # a replace ref must not change what levain reads
@@ -179,9 +181,9 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     # that is a path or ledger content is read from stdout_bytes. ``binary``: plumbing whose output is ledger content
     # or a tree; stdout is left empty (never a second, decoded copy of up to the size limits in memory).
     try:
+        data = input_bytes if input_bytes is not None else (None if input_text is None else input_text.encode("utf-8"))
         raw = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True,
-                             timeout=timeout, input=None if input_text is None else input_text.encode("utf-8"),
-                             stdin=None if input_text is not None else subprocess.DEVNULL)
+                             timeout=timeout, input=data, stdin=None if data is not None else subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         raise TeamError(f"git {args[0]} timed out after {timeout:.0f}s") from None
     except FileNotFoundError:
@@ -1052,7 +1054,8 @@ class GitLedger:
                 self.warnings.append("an interrupted write of this clone's entry was NOT committed, because the team "
                                      f"ledger is refused; its file is kept at {kept}")
                 return
-            git(["add", "--", *mine], self.wt)
+            for rel in mine:
+                self._stage(rel, (self.wt / rel).read_bytes())
             self._commit("levain team: recover an interrupted write")
 
     def _set_aside(self, rels: list[str]) -> Path:
@@ -1074,10 +1077,16 @@ class GitLedger:
                     src.unlink()                          # a new file the branch does not hold
         return dest
 
+    def _stage(self, rel: str, data: bytes) -> None:
+        """Put exactly ``data`` in the index at ``rel``: hashed with --no-filters and placed with update-index, so no
+        attribute source (the repository's own .git/info/attributes included) changes a byte levain writes."""
+        sha = git(["hash-object", "-w", "--no-filters", "--stdin"], self.wt, input_bytes=data).stdout.strip()
+        git(["update-index", "--add", "--cacheinfo", f"100644,{sha},{rel}"], self.wt)
+
     def _commit(self, message: str) -> None:
         git(["-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", message], self.wt)
 
-    def _append_own(self, handle_dir: str, name: str, line: bytes) -> None:
+    def _append_own(self, handle_dir: str, name: str, line: bytes) -> bytes:
         """Append ``line`` to ``ledger/<handle_dir>/<name>`` by COPY-ON-WRITE: the current bytes are read, the whole new
         file is written to a fresh temp file in levain's state directory (same filesystem), fsynced, and renamed over
         the entry. The old inode is never written, so a link to it (hard or symbolic, made before or after any check)
@@ -1096,15 +1105,10 @@ class GitLedger:
                 except FileExistsError:
                     pass
                 fds.append(os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[-1]))
-            try:
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fds[-1])
-            except FileNotFoundError:
-                old = b""
-            else:
-                with os.fdopen(fd, "rb") as fh:
-                    if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
-                        raise TeamError(f"{rel} in the ledger worktree is not a regular file; refusing to write to it")
-                    old = fh.read()
+            # The current bytes are the COMMITTED blob, never the worktree file: a checkout may have run it through
+            # an attribute filter of the repository's own (.git/info/attributes).
+            cp = git(["cat-file", "blob", f"HEAD:{rel}"], self.wt, check=False, timeout=60, binary=True)
+            old = cp.stdout_bytes if cp.returncode == 0 else b""
             if old and not old.endswith(b"\n"):
                 line = b"\n" + line   # a torn last line stays torn (and reported); it must not swallow this one
             out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=base_fd)
@@ -1114,6 +1118,7 @@ class GitLedger:
                 os.fsync(fh.fileno())
             os.rename(tmp, name, src_dir_fd=base_fd, dst_dir_fd=fds[-1])
             os.fsync(fds[-1])
+            return old + line
         except OSError as exc:
             with contextlib.suppress(OSError, TypeError):
                 os.unlink(tmp, dir_fd=base_fd)
@@ -1148,8 +1153,8 @@ class GitLedger:
             prev = next((f.last_hash for f in ledger.files if f.rel == rel), "")
             sealed = E.seal(entry, prev)
             line = json.dumps(sealed, ensure_ascii=False, sort_keys=True) + "\n"
-            self._append_own(path.parent.name, path.name, line.encode("utf-8"))
-            git(["add", "--", str(path.relative_to(self.wt))], self.wt)
+            data = self._append_own(path.parent.name, path.name, line.encode("utf-8"))
+            self._stage(path.relative_to(self.wt).as_posix(), data)
             self._commit(f"levain team: {sealed['type']} {sealed['id']}")
             if sealed["id"] not in self.ledger().by_id:
                 raise TeamError(f"wrote {sealed['id']} but it does not read back as a valid entry; "
@@ -1628,7 +1633,7 @@ class GitLedger:
             self._recover_dirty()
             require_untampered(self.ledger())
             self._replace_plain(name, text)
-            git(["add", "--", name], self.wt)
+            self._stage(name, text.encode("utf-8"))
             if not git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode:
                 return f"{name} unchanged"
             self._commit(message)
@@ -1651,7 +1656,7 @@ class GitLedger:
             change(team)
             R.validate_team(team)
             self._replace_plain("team.toml", R.dump_team(team))
-            git(["add", "--", "team.toml"], self.wt)
+            self._stage("team.toml", R.dump_team(team).encode("utf-8"))
             if not git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode:
                 return "team.toml unchanged"
             self._commit(message)

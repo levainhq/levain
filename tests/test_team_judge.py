@@ -914,3 +914,17 @@ def test_an_edit_through_a_symlinked_path_still_finds_its_clone(two):
     finally:
         os.chmod(ben / "src" / ".git", 0o644)
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_the_repositorys_own_attributes_never_reach_a_ledger_write(two):
+    # L2 r1 #7 (RUN): `*.jsonl working-tree-encoding=UTF-16` in .git/info/attributes broke every record ("BOM is
+    # required") and left the write dirty for good. Ledger bytes are staged with hash-object --no-filters.
+    tmp, ana, ben = two
+    info = ben / ".git" / "info"
+    info.mkdir(exist_ok=True)
+    (info / "attributes").write_text("*.jsonl working-tree-encoding=UTF-16\n")
+    assert record_ruling(ben, "src/a.py", "attributes do not reach me") == 0
+    assert "attributes do not reach me" in [e.get("words") for e in ledger(ben).entries]
+    gb = _gl(ben)
+    blob = git("cat-file", "blob", f"HEAD:ledger/ben/{gb.device}.jsonl", cwd=gb.wt)
+    assert "attributes do not reach me" in blob                               # UTF-8, exactly as written
