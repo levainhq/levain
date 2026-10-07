@@ -10,8 +10,8 @@ holds one driver, made by entity name (:class:`~levain.chat_driver.OpenHandsDriv
 :class:`~levain.session.EntitySession` loop behind the contract). The job runtime, the
 session cap, the deadline watcher and the decision id and digest an approval binds to stay here, because
 they are the same whatever the harness is; how a session is opened, how a turn is sent and how the
-harness's own consent surfaces are the driver's. Every outcome is checked against the contract before it
-is recorded (:func:`~levain.chat_driver.snapshot_outcome`).
+harness's own consent surfaces are the driver's. A driver returns each outcome as one checked, immutable
+:class:`~levain.chat_driver.TurnSnapshot`, and that object is what is recorded.
 
 **The client never supplies an agent, a tool spec, a model or a mode.** It names an entity the
 OPERATOR registered at startup, and it sends message text. Everything that shapes the agent comes
@@ -113,7 +113,6 @@ from levain.chat_driver import (
     OpenHandsDriver,
     TurnSnapshot,
     read_outcome,
-    snapshot_outcome,
 )
 from levain.firing.gate import shown_in_full
 
@@ -804,7 +803,10 @@ class ChatHost:
             try:
                 driver = rec.driver
                 assert driver is not None
-                snap = snapshot_outcome(driver, call(driver))   # read once; what is checked is what is recorded
+                snap = call(driver)    # the turn's one terminal record, checked where the driver built it
+                if not isinstance(snap, TurnSnapshot):
+                    raise DriverContractError(
+                        f"{driver.harness}: a turn returned {type(snap).__name__}, not a TurnSnapshot")
                 payload = _snapshot_payload(snap)
                 digest = snap.held_digest
                 cut = max(0, len(snap.tool_activity) - MAX_ACTIVITY_LINES)

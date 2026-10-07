@@ -25,8 +25,9 @@ from levain.chat_driver import (
     DriverUnsupported,
     HarnessDriver,
     OpenHandsDriver,
-    check_outcome,
-    snapshot_outcome,
+    PendingApproval,
+    TurnSnapshot,
+    read_outcome,
 )
 from levain.firing.gate import PendingEfferent
 
@@ -59,10 +60,9 @@ class _Fake(HarnessDriver):
 
     harness = "fake"
 
-    def __init__(self, script: list[_Out], *, timing: str = "after_turn", lie_state: DriverState | None = None):
+    def __init__(self, script: list[_Out], *, timing: str = "after_turn"):
         self.caps = DriverCaps(approval_timing=timing)   # type: ignore[arg-type]
         self.script = script
-        self.lie_state = lie_state
         self._state: DriverState = "closed"
         self.calls: list[tuple[str, Any]] = []
         self.sink: Callable[[DriverEvent], None] | None = None
@@ -79,7 +79,7 @@ class _Fake(HarnessDriver):
 
     @property
     def state(self) -> DriverState:
-        return self.lie_state or self._state
+        return self._state
 
     def describe(self):
         return {"label": "fake", "model_label": "fake-model"}
@@ -91,9 +91,9 @@ class _Fake(HarnessDriver):
             self.sink(DriverEvent("a-kind-nobody-knows", "ignored"))
         if self.probe:
             self.probed = self.probe()
-        out = self.script.pop(0)
-        self._state = "awaiting_approval" if out.gated else "idle"
-        return out
+        snap = read_outcome(self.script.pop(0))
+        self._state = "awaiting_approval" if snap.gated else "idle"
+        return snap
 
     def send_turn(self, message):
         return self._next("send_turn", message)
@@ -179,7 +179,7 @@ def test_the_deadline_watcher_interrupts_through_the_driver(tmp_path):
             deadline = time.monotonic() + 5
             while self.stops == 0 and time.monotonic() < deadline:
                 time.sleep(0.01)
-            return _Out(reply=None, timed_out=True)
+            return read_outcome(_Out(reply=None, timed_out=True))
 
     d = Slow([])
     host = _host(tmp_path, {"alpha": d}, turn_seconds=0.05)
@@ -208,18 +208,6 @@ def test_a_driver_that_hides_or_skips_the_consent_row_is_refused(tmp_path, outco
     st = _wait(host, host.turn(sid, "go")["job_id"])
     assert st["status"] == "failed" and needle in st["error"]
     assert host.session_status(sid)["state"] == "broken" and d.closed
-
-
-def test_a_driver_whose_state_disagrees_with_its_outcome_is_refused(tmp_path):
-    d = _Fake([_halt()], lie_state="idle")
-    host = _host(tmp_path, {"alpha": d})
-    sid, _ = _open(host, "alpha")
-    st = _wait(host, host.turn(sid, "go")["job_id"])
-    assert st["status"] == "failed" and "reads 'idle'" in st["error"]
-    d2 = _Fake([_Out(reply="plain")], lie_state="awaiting_approval")
-    host2 = _host(tmp_path, {"alpha": d2})
-    sid2, _ = _open(host2, "alpha")
-    assert "not halted" in _wait(host2, host2.turn(sid2, "go")["job_id"])["error"]
 
 
 def test_a_halt_whose_digest_is_missing_can_only_be_rejected(tmp_path):
@@ -259,17 +247,13 @@ def test_a_session_factory_and_a_driver_factory_together_are_refused(tmp_path):
                  driver_factory=lambda n, p: _Fake([]))
 
 
-def test_check_outcome_is_the_one_place_the_guarantees_live():
-    d = _Fake([])
-    d._state = "awaiting_approval"
-    check_outcome(d, _halt())
-    d._state = "idle"
-    check_outcome(d, _Out())
-    with pytest.raises(DriverContractError):
-        check_outcome(d, _Out(gated=True))
-    d._state = "awaiting_approval"
-    with pytest.raises(DriverContractError):
-        check_outcome(d, _Out(reply="x"))
+def test_a_snapshot_that_breaks_the_hold_guarantees_cannot_be_built():
+    """The guarantees live where the snapshot is built: one that breaks them does not exist to be recorded."""
+    assert read_outcome(_halt()).gated and not read_outcome(_Out()).gated
+    with pytest.raises(DriverContractError, match="no held action"):
+        read_outcome(_Out(gated=True))
+    with pytest.raises(DriverContractError, match="did not report as halted"):
+        read_outcome(_Out(reply="x", pending=(_HELD,)))
 
 
 # -- the base class and the OpenHands driver -----------------------------------------------------------
@@ -341,19 +325,31 @@ def test_a_real_turn_result_satisfies_the_outcome_protocol_the_host_reads():
 
 def test_an_outcome_missing_the_fields_the_host_reads_is_refused(tmp_path):
     """L2: a driver that omits `gated` or `pending` would read as 'nothing held', which is fail-open on
-    exactly the property check_outcome exists for."""
+    exactly the property the snapshot's checks exist for."""
     class Bare:
         reply, tool_activity, error, nudged, timed_out, ok, exit_code = "x", [], None, False, False, True, 0
 
     class Raw(_Fake):
         def send_turn(self, message, *, options=None):
-            return Bare()   # type: ignore[return-value]
+            return read_outcome(Bare())
 
     d = Raw([])
     host = _host(tmp_path, {"alpha": d})
     sid, _ = _open(host, "alpha")
     st = _wait(host, host.turn(sid, "go")["job_id"])
     assert st["status"] == "failed" and "fields the host reads" in st["error"]
+
+
+def test_a_driver_that_returns_anything_but_a_snapshot_is_refused(tmp_path):
+    class Raw(_Fake):
+        def send_turn(self, message, *, options=None):
+            return _Out(reply="looks fine")   # type: ignore[return-value]
+
+    d = Raw([])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    st = _wait(host, host.turn(sid, "go")["job_id"])
+    assert st["status"] == "failed" and "not a TurnSnapshot" in st["error"] and d.closed
 
 
 def test_per_turn_options_and_after_turn_answers_refuse_by_default(tmp_path):
@@ -520,33 +516,53 @@ def test_the_outcome_is_read_once_and_the_snapshot_is_what_gets_recorded():
             reads.append("gated")
             return len(reads) == 1          # True on the first read, False on any later one
 
-    d = _Fake([])
-    d._state = "awaiting_approval"
-    snap = snapshot_outcome(d, Flip())
+    snap = read_outcome(Flip())
     assert snap.gated is True and reads == ["gated"]       # one read; the check and the record agree
     assert snap.pending[0].tool_name == "terminal" and snap.held_digest == "d1"
     with pytest.raises(Exception):
         snap.gated = False                                  # type: ignore[misc]  # frozen
 
 
-def test_outcome_value_shapes_and_the_idle_rule_are_enforced():
-    d = _Fake([])
-    d._state = "idle"
+@pytest.mark.parametrize("bad, needle", [
+    (dict(tool_activity="ls"), "tool_activity"),                       # a str is not split into characters
+    (dict(tool_activity=[1]), "tool_activity"),
+    (dict(tool_activity={"ls"}), "tool_activity"),
+    (dict(gated=1), "`gated` is not a bool"),
+    (dict(nudged="no"), "`nudged` is not a bool"),
+    (dict(reply=b"bytes"), "`reply` is neither text"),
+    (dict(held_digest=7), "`held_digest` is neither text"),
+    (dict(pending="terminal"), "`pending` is not a list"),
+])
+def test_outcome_value_shapes_are_checked_never_coerced(bad, needle):
+    """complement r2 LOW: the snapshot coerced (`tuple("ls")`, `bool(1)`); a shape the contract does not name
+    is refused, so what is recorded is what the harness said."""
+    with pytest.raises(DriverContractError, match=needle):
+        read_outcome(_Out(**bad))
 
     class Meth(_Out):
         def ok(self):                                      # a method where a value was meant
             return True
 
-    with pytest.raises(DriverContractError, match="bool and an int"):
-        snapshot_outcome(d, Meth())
-    d._state = "awaiting_approval"
+    with pytest.raises(DriverContractError, match="`ok` is not a bool"):
+        read_outcome(Meth())
+
+    class BoolCode(_Out):
+        exit_code = True                                   # type: ignore[assignment]
+
+    with pytest.raises(DriverContractError, match="exit_code"):
+        read_outcome(BoolCode())
+
+
+def test_a_held_row_must_name_its_tool_even_on_a_failed_outcome():
+    """complement r2 LOW: an errored halt skipped the tool-name check. The pairing is not asked of a failed
+    outcome, but every row it carries is built as a PendingApproval, which refuses a nameless one."""
     nameless = PendingEfferent("", "x", "r", full="{}")
+    for out in (_Out(reply=None, gated=True, pending=(nameless,), held_digest="d"),
+                _Out(reply=None, gated=True, pending=(nameless,), error="the refusal did not take")):
+        with pytest.raises(DriverContractError, match="names no tool"):
+            read_outcome(out)
     with pytest.raises(DriverContractError, match="names no tool"):
-        snapshot_outcome(d, _Out(reply=None, gated=True, pending=(nameless,), held_digest="d"))
-    for bad in ("active", "closed"):
-        d._state = bad
-        with pytest.raises(DriverContractError, match="not 'idle'"):
-            snapshot_outcome(d, _Out())
+        PendingApproval(tool_name="", detail="", full="", reason="", recognized=False)
 
 
 def test_the_host_ignores_a_driver_event_that_is_not_a_driver_event(tmp_path):
@@ -563,22 +579,20 @@ def test_a_pending_row_attribute_is_read_once_and_validated_from_that_read():
         detail, reason, recognized = "d", "r", True
 
         def __init__(self):
-            self.n = 0
+            self.names = self.fulls = 0
 
         @property
         def tool_name(self):
-            self.n += 1
-            return "terminal" if self.n == 1 else 12345
+            self.names += 1
+            return "terminal" if self.names == 1 else 12345
 
         @property
         def full(self):
-            self.n += 1
-            return "{}" if self.n % 2 else ["not", "a", "str"]
+            self.fulls += 1
+            return "{}" if self.fulls == 1 else ["not", "a", "str"]
 
-    d = _Fake([])
-    d._state = "awaiting_approval"
-    snap = snapshot_outcome(d, _Out(reply=None, gated=True, pending=(Shifty(),), held_digest="d"))
-    assert snap.pending[0].tool_name == "terminal" and isinstance(snap.pending[0].full, str)
+    snap = read_outcome(_Out(reply=None, gated=True, pending=(Shifty(),), held_digest="d"))
+    assert snap.pending[0].tool_name == "terminal" and snap.pending[0].full == "{}"
 
 
 def test_a_result_that_cannot_report_gated_still_releases_the_turn_and_close_returns(tmp_path):
@@ -599,7 +613,8 @@ def test_a_result_that_cannot_report_gated_still_releases_the_turn_and_close_ret
 
     d = OpenHandsDriver(tmp_path, lambda p, on_event: Sess())
     d.open(lambda e: None)
-    d.send_turn("x")
+    with pytest.raises(ValueError):
+        d.send_turn("x")                        # the host's job catches this as a broken turn
     assert d.state == "awaiting_approval"        # unreadable reads as held: fail closed
     t = threading.Thread(target=d.close)
     t.start()
@@ -628,3 +643,161 @@ def test_a_turn_is_refused_and_state_reads_active_while_close_waits_for_it(tmp_p
     orig()
     c.join(5), t.join(5)
     assert d.state == "closed"
+
+
+# -- 1007+5 lane B: the snapshot is built inside the turn; close always ends closed and is bounded -------------
+
+
+def test_a_close_landing_after_the_turn_returned_does_not_void_its_outcome(tmp_path):
+    """L3 r2 (complement, codex, gemini): the host read `driver.state` AFTER the turn returned, so a close
+    landing in that window turned a valid outcome into a contract error. The snapshot is the record now."""
+    class Sess:
+        def run_turn(self, m):
+            return _Out(reply="a real answer")
+
+        def request_stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    class ClosedRightAfter(OpenHandsDriver):
+        def send_turn(self, message, *, options=None):
+            snap = super().send_turn(message, options=options)
+            self.close()                    # lands between the turn's return and the host's record
+            return snap
+
+    host = ChatHost({"alpha": tmp_path}, driver_factory=lambda n, p: ClosedRightAfter(p, lambda d, on_event: Sess()))
+    sid, _ = _open(host, "alpha")
+    st = _wait(host, host.turn(sid, "go")["job_id"])
+    assert st["status"] == "done" and st["result"]["reply"] == "a real answer"
+
+
+def test_gated_is_read_once_from_the_harness_result_end_to_end(tmp_path):
+    """L3 r2 (codex MED): `_run` read `result.gated` and the host's snapshot read it again."""
+    reads: list[int] = []
+
+    class Counted:
+        reply, tool_activity, error, nudged, timed_out, pending, held_digest = "hi", [], None, False, False, (), None
+        ok, exit_code = True, 0
+
+        @property
+        def gated(self):
+            reads.append(1)
+            return False
+
+    class Sess:
+        def __init__(self, on_event):
+            pass
+
+        def run_turn(self, m):
+            return Counted()
+
+        def request_stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    host = ChatHost({"alpha": tmp_path}, session_factory=lambda d, on_event: Sess(on_event))
+    sid, _ = _open(host, "alpha")
+    assert _wait(host, host.turn(sid, "go")["job_id"])["result"]["reply"] == "hi"
+    assert len(reads) == 1
+
+
+def test_a_base_exception_reading_the_result_still_releases_the_turn(tmp_path):
+    """L3 r2 (codex HIGH): a BaseException (the deadline's TurnTimeout) out of reading `gated` skipped the guard
+    release, so the driver read `active` forever and close() never returned."""
+    from levain.firing.deadline import TurnTimeout
+
+    class Odd:
+        reply, tool_activity, error, nudged, timed_out, pending, held_digest = "r", [], None, False, False, (), None
+        ok, exit_code = True, 0
+
+        @property
+        def gated(self):
+            raise TurnTimeout(0.05)       # the bound fired while the result was read
+
+    class Sess:
+        closed = False
+
+        def run_turn(self, m):
+            return Odd()
+
+        def request_stop(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    sess = Sess()
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: sess, close_wait=5)
+    d.open(lambda e: None)
+    with pytest.raises(TurnTimeout):
+        d.send_turn("x")
+    assert d.state == "awaiting_approval"           # released, and unknown reads as held
+    t = threading.Thread(target=d.close, daemon=True)
+    t.start()
+    t.join(2)
+    assert not t.is_alive() and sess.closed and d.state == "closed"
+
+
+def test_a_stop_request_that_raises_out_of_close_still_ends_closed_and_released_once(tmp_path):
+    """L3 r2 (codex HIGH): a BaseException out of `request_stop` in close() left the phase `closing` forever and
+    the session never released. The running turn now releases it on its own return."""
+    class Bail(BaseException):
+        pass
+
+    hands = _Hands()
+
+    def stop():
+        hands.log.append("stop-raised")
+        raise Bail()
+
+    hands.request_stop = stop                          # type: ignore[method-assign]
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: hands, close_wait=5)
+    d.open(lambda e: None)
+    t = threading.Thread(target=lambda: d.send_turn("x"), daemon=True)
+    t.start()
+    assert hands.entered.wait(5)
+    with pytest.raises(Bail):
+        d.close()
+    assert d.state == "active" and "close" not in hands.log     # never released under the running turn
+    with pytest.raises(RuntimeError, match="not open"):
+        d.send_turn("y")
+    hands.stop.set()                                   # the turn returns on its own
+    t.join(5)
+    assert hands.log.count("close") == 1 and hands.log.index("turn-end") < hands.log.index("close")
+    assert d.state == "closed" and d.native is None
+    d.close()                                          # idempotent after the hand-off
+    assert hands.log.count("close") == 1
+
+
+def test_close_is_bounded_and_a_turn_outliving_it_releases_on_its_return(tmp_path):
+    """complement r2 LOW: close() waited without bound on a turn that ignores stop requests."""
+    hands = _Hands()
+    hands.request_stop = lambda: hands.log.append("stop-ignored")   # type: ignore[method-assign]
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: hands, close_wait=0.3)
+    d.open(lambda e: None)
+    t = threading.Thread(target=lambda: d.send_turn("x"), daemon=True)
+    t.start()
+    assert hands.entered.wait(5)
+    started = time.monotonic()
+    c = threading.Thread(target=d.close, daemon=True)
+    c.start()
+    c.join(3)
+    assert not c.is_alive() and time.monotonic() - started < 3
+    assert "stop-ignored" in hands.log and "close" not in hands.log and d.state == "active"
+    second = threading.Thread(target=d.close, daemon=True)  # a second closer is bounded too
+    second.start()
+    second.join(3)
+    assert not second.is_alive()
+    hands.stop.set()
+    t.join(5)
+    assert hands.log.count("close") == 1 and d.state == "closed"
+
+
+@pytest.mark.parametrize("wait", [0, -1, float("inf"), float("nan"), "30"])
+def test_close_wait_must_be_a_finite_bound(tmp_path, wait):
+    with pytest.raises(ValueError, match="bounded"):
+        OpenHandsDriver(tmp_path, lambda p, on_event: None, close_wait=wait)
