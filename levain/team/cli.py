@@ -72,6 +72,12 @@ def _members(values: list[str] | None) -> dict[str, str]:
     return out
 
 
+# One line, said at init and join: append-only is only as strong as the host's refusal to rewrite the branch.
+HOST_ADVICE = ("Protect the levain-ledger branch on your git host against force-push and deletion: GitHub, a branch "
+               "ruleset on levain-ledger with \"Restrict deletions\" and \"Block force pushes\"; GitLab, Settings > "
+               "Repository > Protected branches, levain-ledger, \"Allowed to force push\" off.")
+
+
 def cmd_init(args) -> int:
     repo = _repo(args)
     gl = GitLedger(repo)
@@ -79,6 +85,7 @@ def cmd_init(args) -> int:
     team = R.Team(project=args.project or repo.toplevel.name, owner=args.owner, members=members,
                   client_owners=_split(args.client_owner), mode=args.mode, fetch_interval=args.fetch_interval)
     print(gl.init(team, remote=args.remote, push=not args.no_push))
+    print(HOST_ADVICE)
     if args.anneal_db:
         gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
     if args.pack:
@@ -92,7 +99,9 @@ def cmd_init(args) -> int:
 def cmd_join(args) -> int:
     repo = _repo(args)
     gl = GitLedger(repo)
-    print(gl.join(remote=args.remote, new_device=args.new_device))
+    print(gl.join(remote=args.remote, new_device=args.new_device,
+                  pins_from=Path(args.pins_from).expanduser() if args.pins_from else None))
+    print(HOST_ADVICE)
     if args.anneal_db:
         gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
     if not args.no_install:
@@ -184,12 +193,16 @@ def cmd_status(args) -> int:
             if d:
                 print(f"\n(an agent's first edit here would be {'DENIED with this record' if d.deny else 'allowed, with this shown'})")
         return 0
+    first_sight = bool(gl.state().get("first_sight"))
     if args.json:
         print(json.dumps({"project": team.project, "you": handle, "in_force": ledger.in_force,
-                          "problems": ledger.problems, "canon": C.staleness(canon_text, state)},
-                         ensure_ascii=False))
+                          "problems": ledger.problems, "canon": C.staleness(canon_text, state),
+                          "first_sight": first_sight}, ensure_ascii=False))
         return 0
     print(f"{team.project}: owner {team.owner}, you are {handle or 'NOT a member'}, mode {team.mode}")
+    if first_sight:
+        print("rewrite protection: first sight trusted (this clone pinned what it first read); to verify, re-join "
+              "with --pins-from <a teammate's .git/levain-team/pins.json>")
     print(C.staleness(canon_text, state))
     if ledger.problems:
         print(f"{len(ledger.problems)} integrity problem(s): run `levain team verify`")
@@ -207,6 +220,7 @@ def cmd_repin(args) -> int:
     if not dropped:
         print("no pins to drop" + (f" for {args.file}" if args.file else ""))
         return 0
+    gl.save_state(first_sight=True)
     print(f"dropped {len(dropped)} pin(s): " + ", ".join(dropped))
     print("Rewrite protection for those files restarts at the next read of the ledger: it trusts what it sees then. "
           "If a sync refused the remote, run `levain team sync` to judge it again.")
@@ -438,6 +452,9 @@ def register(subparsers) -> None:
     p.add_argument("--remote")
     p.add_argument("--new-device", action="store_true",
                    help="give this clone its own device id (after copying a .git directory from another machine)")
+    p.add_argument("--pins-from", metavar="PINS_JSON",
+                   help="start from a teammate's .git/levain-team/pins.json instead of trusting the first read; a "
+                        "ledger that does not hold what it pins refuses the join")
     p.add_argument("--anneal-db")
     p.add_argument("--no-install", action="store_true")
 

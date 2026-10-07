@@ -14,7 +14,7 @@ import pytest
 from levain.team import entry as E
 from levain.team.transport import GitLedger, LedgerReadError, Repo
 
-from tests.test_team_git import _own_file, _pins_file, _push_wt, edit, git, ledger, record_ruling, team, two  # noqa: F401
+from tests.test_team_git import _own_file, _pins_file, _push_wt, clone, edit, git, ledger, record_ruling, team, two  # noqa: F401
 
 
 def _gl(repo):
@@ -392,3 +392,48 @@ def test_discovery_reads_the_top_level_and_the_git_dir_from_one_git_process(tmp_
         monkeypatch.setattr(T, "git", real)
         assert len(calls) == 1, calls
         assert os.path.realpath(repo.toplevel) == os.path.realpath(d), name
+
+
+def test_a_join_seeded_with_a_teammates_pins_refuses_a_ledger_rewritten_before_it_joined(two, capsys):
+    # The would-be known limit "TOFU per clone" (head ruling: build the ssh-style seed). RUN before: a clone that
+    # joined after a rewrite trusted the rewritten file silently.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    seed = tmp / "ben_pins.json"
+    seed.write_bytes(_pins_file(ben).read_bytes())
+    ga = _gl(ana)
+    git("reset", "-q", "--hard", "HEAD~1", cwd=ga.wt)
+    git("push", "-qf", "origin", "HEAD:levain-ledger", cwd=ga.wt)
+    cat = clone(tmp, "cat", "ben@ex.com")
+    capsys.readouterr()
+    assert team("join", "--pins-from", str(seed), "--no-install", repo=cat) == 2
+    err = capsys.readouterr().err
+    assert str(seed) in err and "rewritten or removed" in err
+    assert not _gl(cat).joined()
+
+
+def test_a_seeded_join_is_verified_and_an_unseeded_one_says_it_trusted_first_sight(two, capsys):
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    seed = tmp / "ben_pins.json"
+    seed.write_bytes(_pins_file(ben).read_bytes())
+    cat = clone(tmp, "cat", "ben@ex.com")
+    capsys.readouterr()
+    assert team("join", "--pins-from", str(seed), "--no-install", repo=cat) == 0
+    out = capsys.readouterr().out
+    assert "first sight" not in out and "Block force pushes" in out
+    assert team("status", repo=cat) == 0 and "first sight" not in capsys.readouterr().out
+    dan = clone(tmp, "dan", "ben@ex.com")
+    assert team("join", "--no-install", repo=dan) == 0
+    assert "first sight trusted" in capsys.readouterr().out
+    assert team("status", repo=dan) == 0 and "first sight trusted" in capsys.readouterr().out
+    bad = tmp / "not_pins.json"
+    bad.write_text('{"x": 1}')
+    eve = clone(tmp, "eve", "ben@ex.com")
+    assert team("join", "--pins-from", str(bad), "--no-install", repo=eve) == 2
+    assert "not a levain pins file" in capsys.readouterr().err

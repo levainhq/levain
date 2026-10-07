@@ -96,6 +96,25 @@ _NON_UTF8_LINE = "<a line that is not UTF-8>"   # cannot parse as an entry, so i
 _REGULAR_MODES = (b"100644", b"100755")
 
 
+def _parse_pins(raw: bytes) -> tuple[dict[str, dict], bool, bool]:
+    """(pins, valid, old_format) of a pins.json's bytes. Never raises: anything that is not exactly the shape levain
+    writes (``{"<member>/<device>.jsonl": {"sha256": <64 hex>, "length": <int >= 0>}}``) is invalid."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return {}, False, False
+    if isinstance(data, dict) and data and all(
+            isinstance(v, list) and all(isinstance(x, str) for x in v) for v in data.values()):
+        return {}, False, True
+    ok = isinstance(data, dict) and all(
+        isinstance(k, str) and _LEDGER_PATH_RE.fullmatch(b"ledger/" + k.encode("utf-8", "replace"))
+        and isinstance(v, dict) and set(v) == {"sha256", "length"}
+        and isinstance(v["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", v["sha256"])
+        and isinstance(v["length"], int) and not isinstance(v["length"], bool) and v["length"] >= 0
+        for k, v in data.items())
+    return (data, True, False) if ok else ({}, False, False)
+
+
 def _blob_lines(data: bytes) -> list[bytes]:
     """A ledger file's lines as BYTES. Split on LF only (a CR stays inside its line)."""
     lines = data.split(b"\n")
@@ -571,22 +590,27 @@ class GitLedger:
         list-of-lines format (a one-time restart, as `levain team repin` would do). One that exists and cannot be
         read or validated is a refusal naming the file and `levain team repin`."""
         try:
-            text = self._pins_bytes().decode("utf-8")
-            data = json.loads(text)
+            raw = self._pins_bytes()
         except FileNotFoundError:
             return {}, ""
-        except (OSError, ValueError, RecursionError):
+        except (OSError, ValueError):
             return {}, _PINS_UNREADABLE
-        if isinstance(data, dict) and data and all(
-                isinstance(v, list) and all(isinstance(x, str) for x in v) for v in data.values()):
+        pins, ok, old = _parse_pins(raw)
+        if old:
             return {}, ""                                             # the old format: restart pinning
-        ok = isinstance(data, dict) and all(
-            isinstance(k, str) and _LEDGER_PATH_RE.fullmatch(b"ledger/" + k.encode("utf-8", "replace"))
-            and isinstance(v, dict) and set(v) == {"sha256", "length"}
-            and isinstance(v["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", v["sha256"])
-            and isinstance(v["length"], int) and not isinstance(v["length"], bool) and v["length"] >= 0
-            for k, v in data.items())
-        return (data, "") if ok else ({}, _PINS_UNREADABLE)
+        return (pins, "") if ok else ({}, _PINS_UNREADABLE)
+
+    def seed_pins_from(self, path: Path) -> dict[str, dict]:
+        """A teammate's pins.json, validated as this clone's own would be (size cap, shape), for ``join``."""
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read(_PINS_MAX_BYTES + 1)
+        except OSError as exc:
+            raise TeamError(f"--pins-from {path}: cannot be read ({exc.strerror})") from None
+        pins, ok, old = _parse_pins(raw) if len(raw) <= _PINS_MAX_BYTES else ({}, False, False)
+        if not ok or old:
+            raise TeamError(f"--pins-from {path}: not a levain pins file (a clone's .git/{DIRNAME}/pins.json)")
+        return pins
 
     @staticmethod
     def _pin_violations(pins: dict[str, dict], datas: dict[str, bytes]) -> list[str]:
@@ -780,18 +804,37 @@ class GitLedger:
             return f"ledger created and pushed to {remote}/{BRANCH}"
         return f"ledger created locally ({'no remote' if not remote else 'not pushed'})"
 
-    def join(self, *, remote: str | None = None, new_device: bool = False) -> str:
+    def join(self, *, remote: str | None = None, new_device: bool = False, pins_from: Path | None = None) -> str:
+        """Join the team ledger on the remote. With ``pins_from`` (a teammate's pins.json) this clone starts from
+        those pins instead of trusting what it sees first: a ledger that does not hold every byte they pin refuses the
+        join, naming the file. Without it, the first read is trusted, and state.json records that (``first_sight``)."""
         email = self.email()
         if not email:
             raise TeamError("git config user.email is not set in this repository")
+        seed = self.seed_pins_from(pins_from) if pins_from is not None else None
         remote = remote or self._default_remote()
-        if not self._local_branch_exists():
+        if self._local_branch_exists():
+            tip = self.head()
+        else:
             if not remote:
                 raise TeamError("no git remote to join from")
-            git(["fetch", "-q", remote, f"+refs/heads/{BRANCH}:refs/remotes/{remote}/{BRANCH}"],
+            git(["fetch", "-q", "--refmap=", remote, f"+refs/heads/{BRANCH}:refs/remotes/{remote}/{BRANCH}"],
                 self.repo.toplevel, timeout=120)
-            git(["branch", BRANCH, f"refs/remotes/{remote}/{BRANCH}"], self.repo.toplevel)
-        self.save_state(device=secrets.token_hex(8) if new_device else self._new_device(), remote=remote or "")
+            tip = git(["rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{BRANCH}"], self.repo.toplevel
+                      ).stdout.strip()
+        if seed is not None:
+            bad = self.judge(tip, self._team_or_none(tip), seed).ledger.tamper
+            if bad:
+                raise TeamError(f"--pins-from {pins_from}: the team ledger here does not hold what it pins, so this "
+                                "clone did not join: " + "; ".join(bad[:3]))
+        if not self._local_branch_exists():
+            git(["branch", BRANCH, tip], self.repo.toplevel)
+        if seed is not None:
+            self.base.mkdir(parents=True, exist_ok=True)
+            with self.lock(name="pins.lock", timeout=10.0):
+                _atomic_write(self.base / "pins.json", json.dumps(seed, sort_keys=True), sync_dir=True)
+        self.save_state(device=secrets.token_hex(8) if new_device else self._new_device(), remote=remote or "",
+                        first_sight=seed is None)
         self._attach_worktree()
         team = self.team()
         handle = team.handle_for_email(email)
@@ -800,7 +843,11 @@ class GitLedger:
                             f"ask the owner ({team.owner}) to run `levain team member add <handle> {email}`")
         if remote:
             self._sync(push=False)
-        return f"joined {team.project} as {handle} (device {self.device})"
+        line = f"joined {team.project} as {handle} (device {self.device})"
+        if seed is None:
+            line += ("\nfirst sight trusted: this clone pins whatever the ledger holds now; to verify, re-join with "
+                     f"--pins-from <a teammate's .git/{DIRNAME}/pins.json>")
+        return line
 
     # ---- write path ----------------------------------------------------------------------------------------
 
