@@ -147,7 +147,7 @@ def _interval(gl: GitLedger) -> float:
     try:
         return float(gl.team().fetch_interval)
     except (R.RolesError, TeamError):
-        return 300.0
+        return 300.0                                  # the snapshot that follows reports the same failure
 
 
 def _wired_but_broken(gl: GitLedger) -> bool:
@@ -158,6 +158,19 @@ def _wired_but_broken(gl: GitLedger) -> bool:
 
 
 def pretooluse(payload: dict) -> None:
+    """THE fail-closed boundary, and the only one: ANY exception while an edit is judged is a DENY when a repository
+    above the real path of the target (or of the session's cwd) holds levain team state, and silence otherwise. No
+    path inside handles its own failures."""
+    try:
+        _pretooluse(payload)
+    except Exception as exc:  # noqa: BLE001 - the boundary
+        target = _target(payload) if isinstance(payload, dict) else None
+        places = [p for p in (target, payload.get("cwd") if isinstance(payload, dict) else None) if p]
+        if any(_ledger_roots(Path(p)) for p in places):
+            _out(_deny(f"the team ledger could not be read ({type(exc).__name__}: {exc})"))
+
+
+def _pretooluse(payload: dict) -> None:
     if payload.get("tool_name") not in EDIT_TOOLS:
         return
     target = _target(payload)
@@ -175,7 +188,7 @@ def pretooluse(payload: dict) -> None:
     # Every repository above the target that holds levain team state judges the edit, not only the one git finds
     # first: a `.git` planted in a subdirectory (a fake nested repository, or an unreadable one) must not take the
     # edit out of the real clone's ledger. Any deny wins.
-    roots = _ledger_roots(Path(target))
+    roots = list(dict.fromkeys(_ledger_roots(Path(target)) + _ledger_roots(Path(payload.get("cwd") or target))))
     answers = []
     for start in roots or [Path(target)]:
         out = _judge_from(start, target, payload, has_ledger=bool(roots))
@@ -191,18 +204,11 @@ def pretooluse(payload: dict) -> None:
 def _judge_from(start: Path, target: str, payload: dict, *, has_ledger: bool) -> dict | None:
     """The hook's answer for an edit of ``target``, judged in the repository found from ``start``. ``has_ledger``: the
     filesystem shows levain team state there, so anything that stops the judgement is a DENY."""
-    try:
-        repo = Repo.discover(start)
-    except TeamError as exc:
-        return _deny(f"the repository could not be read ({exc})") if has_ledger else None
+    repo = Repo.discover(start)                       # a failure here is the boundary's (pretooluse)
     if repo is None:
         return _deny("the repository holding the team ledger could not be found") if has_ledger else None
     gl = GitLedger(repo)
-    try:
-        joined = gl.joined()
-    except Exception as exc:  # noqa: BLE001 - an invalid state.json (a bad device id) in a clone with a ledger
-        return _deny(f"this clone's levain team state could not be read ({type(exc).__name__}: {exc})")
-    if not joined:
+    if not gl.joined():
         if _wired_but_broken(gl):
             return _deny(f"this clone has a {BRANCH} branch but no usable ledger worktree or state (run `levain team "
                          "join`, then `levain team doctor`)")
@@ -210,10 +216,7 @@ def _judge_from(start: Path, target: str, payload: dict, *, has_ledger: bool) ->
     # Fetch first, then read team, ledger and identity together from the branch ref: one consistent snapshot,
     # no lock (the ref only moves when a rebase or commit completes).
     fetch_note = gl.fetch_if_due(_interval(gl), timeout=5.0)
-    try:
-        return _edit_verdict(gl, repo, target, payload, fetch_note)
-    except Exception as exc:  # noqa: BLE001 - THE fail-closed boundary: a joined clone that cannot judge denies
-        return _deny(f"the team ledger could not be read ({type(exc).__name__}: {exc})")
+    return _edit_verdict(gl, repo, target, payload, fetch_note)
 
 
 def _deny(why: str) -> dict:
@@ -226,7 +229,10 @@ def _ledger_roots(target: Path) -> list[Path]:
     """Every directory above ``target`` whose repository holds levain team state, nearest first, read from the
     filesystem alone (so it answers when git cannot): a ``.git`` directory, or a linked worktree's ``.git`` file and
     its common dir. A ``.git`` that cannot be read is passed over, never a reason to stop looking."""
-    d = Path(os.path.abspath(target))
+    try:
+        d = Path(os.path.realpath(target))            # the real path: a symlinked edit path still finds its clone
+    except (OSError, ValueError):
+        d = Path(os.path.abspath(target))
     out = []
     for p in (d, *d.parents):
         g = p / ".git"

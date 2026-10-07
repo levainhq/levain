@@ -859,3 +859,58 @@ def test_a_clone_without_an_accepted_tip_refuses_the_remote_until_it_re_joins(tw
     assert "levain team join" in capsys.readouterr().err
     assert team("join", "--no-install", repo=ben) == 0
     assert team("sync", repo=ben) == 0
+
+
+_STAGES = [("transport.Repo", "discover"), ("transport.GitLedger", "joined"), ("transport.GitLedger", "fetch_if_due"),
+           ("transport.GitLedger", "team"), ("transport.GitLedger", "snapshot"), ("transport.GitLedger", "handle"),
+           ("transport.GitLedger", "session_denied"), ("hook", "decide"), ("hook", "_edit_verdict")]
+
+
+@pytest.mark.parametrize("where", [f"{m}.{n}" for m, n in _STAGES])
+def test_any_failure_at_any_stage_of_judging_an_edit_is_a_deny(two, monkeypatch, capsys, where):
+    # Head ruling (A) after L3 r2 codex HIGH 1 / complement MED 1: ONE boundary for the whole edit hook.
+    import importlib
+    from levain.team import hook as H
+    tmp, ana, ben = two
+    mod, name = where.rsplit(".", 1)
+    path = mod.split(".")
+    obj = importlib.import_module("levain.team." + path[0])
+    for part in path[1:]:
+        obj = getattr(obj, part)
+
+    def boom(*a, **k):
+        raise RecursionError("injected at " + where)
+    monkeypatch.setattr(obj, name, boom)
+    H.pretooluse({"session_id": "s", "transcript_path": "/x", "cwd": str(ben), "hook_event_name": "PreToolUse",
+                  "tool_name": "Edit", "tool_input": {"file_path": str(ben / "src" / "settlement.py")},
+                  "tool_use_id": "t"})
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny", where
+
+
+def test_a_team_toml_nested_past_the_parser_denies(two):
+    # L3 r2 codex HIGH 1, RUN: a deeply nested team.toml raised RecursionError from _interval, outside the old
+    # per-call boundary, and the hook failed open.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    (gb.wt / "team.toml").write_text("x = " + "[" * 100000 + "]" * 100000 + "\n")
+    git("add", "--", "team.toml", cwd=gb.wt)
+    git("commit", "-qm", "deep", cwd=gb.wt)
+    assert edit(ben, "src/settlement.py", session="deep")["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_an_edit_through_a_symlinked_path_still_finds_its_clone(two):
+    # L3 r2 complement MED 1: the ledger-roots walk used the unresolved path, so an edit through a symlink outside the
+    # clone found no ledger and, with discovery failing (an unreadable .git planted beside it), failed open.
+    tmp, ana, ben = two
+    link = tmp / "elsewhere"
+    link.symlink_to(ben / "src")
+    (ben / "src" / ".git").write_text("gitdir: /nowhere\n")
+    os.chmod(ben / "src" / ".git", 0)
+    try:
+        out = hook("pretooluse", {"session_id": "sy", "transcript_path": "/x", "cwd": str(tmp),
+                                  "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                                  "tool_input": {"file_path": str(link / "settlement.py")}, "tool_use_id": "t"})
+    finally:
+        os.chmod(ben / "src" / ".git", 0o644)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
