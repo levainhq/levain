@@ -37,7 +37,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Deprecated
 
-- The `X-Levain-Chat-Token` header (use `X-Levain-Token`) and the `#chat_token=` link: both still work, and the server notes the header's use once on stderr. Removal is left to a later release.
+- The `X-Levain-Chat-Token` header (use `X-Levain-Token`) and the `#chat_token=` link: both still work (the link only in a tab that holds no token yet: a fragment never replaces a kept token, a fresh `#code=` link does), and the server notes the header's use once on stderr. Removal is left to a later release.
 
 ## [0.6.9] — 2026-10-05
 

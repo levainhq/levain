@@ -704,6 +704,17 @@ def publish_launch_token(server: Any, url: str, *, port: int, kind: str,
     out = stream if stream is not None else sys.stdout
     unlocked = f"{url}#code={mint_link_code(server)}"
     pub_id = secrets.token_hex(8)
+    try:
+        return _publish(url, out, unlocked, token, pub_id, port, kind)
+    except KeyboardInterrupt:
+        # A SIGTERM (the server armed stop_on_sigterm first) or a Ctrl+C after the record was written: the caller never
+        # gets the PublishedToken that would remove it, so remove it here (lane E3).
+        PublishedToken(unlocked, runtime_dir() / f"{int(port)}.json", token, pub_id).close()
+        raise
+
+
+def _publish(url: str, out: Any, unlocked: str, token: str, pub_id: str, port: int,
+             kind: str) -> PublishedToken:
     path: "Path | None" = None
     err: "OSError | None" = None
     try:
@@ -727,7 +738,7 @@ def publish_launch_token(server: Any, url: str, *, port: int, kind: str,
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     json.dump({"kind": kind, "url": url, "token": token, "pid": os.getpid(), "pub_id": pub_id}, fh)
                 os.replace(tmp, path)
-            except OSError:
+            except BaseException:   # an OSError, or a SIGTERM / Ctrl+C before the rename
                 tmp.unlink(missing_ok=True)
                 raise
     except OSError as exc:

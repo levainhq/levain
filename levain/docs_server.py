@@ -212,17 +212,18 @@ def run_docs_web(
     print(f"Levain docs → {url}")
     print(f"  {n_chapters} chapter(s) · install: {install}")
     print("  loopback-only · read-only · Ctrl+C to stop")
-    try:
-        published = publish_launch_token(httpd, url, port=bound_port, kind="docs")
-    except OSError as exc:
-        print(f"Could not write the launch token ({exc}). This output is not a terminal, so there is no "
-              "other place to hand it over; not serving.", file=sys.stderr)
-        httpd.server_close()
-        return 1
-
+    # SIGTERM is armed BEFORE the runtime file is written, so the cleanup below covers it from the moment it exists
+    # (lane E3: a SIGTERM between the two killed the server and left the file).
     restore_sigterm = SigtermStop()
+    published = None
     try:
         restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
+        try:
+            published = publish_launch_token(httpd, url, port=bound_port, kind="docs")
+        except OSError as exc:
+            print(f"Could not write the launch token ({exc}). This output is not a terminal, so there is no "
+                  "other place to hand it over; not serving.", file=sys.stderr)
+            return 1   # the finally closes the server
         if open_browser:   # inside it too: a Ctrl+C while the browser opens still removes the runtime file
             open_unlocked(url, published.unlocked)
         httpd.serve_forever()
@@ -230,7 +231,8 @@ def run_docs_web(
         print("\nstopped.")
     finally:
         restore_sigterm.hold()   # a SIGTERM during the cleanup must not cut it short
-        published.close()
+        if published is not None:
+            published.close()
         httpd.server_close()
         restore_sigterm()
     return 0
