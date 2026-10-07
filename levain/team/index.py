@@ -145,7 +145,7 @@ class Ledger:
     @functools.cached_property
     def _links(self) -> tuple[set[str], list[str]]:
         honoured: set[str] = set()
-        refused: list[str] = []
+        refused = Capped()
         for e in self.entries:
             if e.get("type") == "ack":
                 continue
@@ -159,7 +159,7 @@ class Ledger:
                     honoured.add(s)
                 else:
                     refused.append(f"{e['id']} by {e.get('author')}: {why}; ignored, {s} stays in force")
-        return honoured, refused
+        return honoured, refused.done("refused links")
 
     @property
     def superseded(self) -> set[str]:
@@ -207,13 +207,49 @@ class Ledger:
 MAX_PROBLEMS = 1000
 
 
+class Capped(list):
+    """A list of messages that keeps at most ``limit`` and only COUNTS the rest, so a hostile ledger can make many
+    problems but never hold many in memory. ``done(noun)`` is the list with one "and N more" line."""
+
+    def __init__(self, items=(), limit: int | None = None):
+        super().__init__()
+        self.limit = MAX_PROBLEMS if limit is None else limit
+        self.more = 0
+        self.extend(items)
+
+    def append(self, item) -> None:
+        if len(self) < self.limit:
+            super().append(item)
+        else:
+            self.more += 1
+
+    def extend(self, items) -> None:
+        for item in items:
+            self.append(item)
+        if isinstance(items, Capped):         # what the other one only counted is counted here too
+            self.more += items.more
+
+    def clone(self) -> "Capped":
+        out = Capped(limit=self.limit)
+        out.extend(self)                         # a Capped: its count comes with it
+        return out
+
+    def __iadd__(self, items):
+        self.extend(items)
+        return self
+
+    def done(self, noun: str = "problems") -> list[str]:
+        return list(self) + ([f"and {self.more} more {noun}"] if self.more else [])
+
+
+
 def build(files: list[tuple[str, list[str]]], owner: str | None = None,
           problems: list[str] | None = None, *, tamper: list[str] | None = None) -> Ledger:
     """A ledger from (rel path under ledger/, lines) pairs. Callers split on "\\n" only:
     ``str.splitlines()`` also splits on U+2028/U+2029/U+0085, which JSON written with ensure_ascii=False
     carries unescaped inside a string."""
     entries: list[dict] = []
-    problems = list(problems or [])
+    problems = problems.clone() if isinstance(problems, Capped) else Capped(problems or [])   # a Capped keeps its count
     out_files: list[LedgerFile] = []
     for rel, lines in sorted(files):
         got, probs, last = E.verify_lines(lines)
@@ -232,7 +268,7 @@ def build(files: list[tuple[str, list[str]]], owner: str | None = None,
             if isinstance(obj, dict):
                 raw.append(obj)
         out_files.append(LedgerFile(rel, raw, got, last))
-        problems += [f"{rel}: {p}" for p in probs]
+        problems += (f"{rel}: {p}" for p in probs)
         entries += got
     seen, uniq = set(), []
     for e in entries:
@@ -242,12 +278,9 @@ def build(files: list[tuple[str, list[str]]], owner: str | None = None,
         seen.add(e["id"])
         uniq.append(e)
     uniq.sort(key=lambda e: (e.get("ts", ""), e.get("id", "")))
-    if len(problems) > MAX_PROBLEMS:     # every reader shows, caches and prints these: kept bounded, the rest counted
-        problems = problems[:MAX_PROBLEMS] + [f"and {len(problems) - MAX_PROBLEMS} more problems"]
-    tamper = list(tamper or [])
-    if len(tamper) > MAX_PROBLEMS:
-        tamper = tamper[:MAX_PROBLEMS] + [f"and {len(tamper) - MAX_PROBLEMS} more reasons"]
-    return Ledger(uniq, problems, out_files, owner, tamper)
+    # every reader shows, caches and prints these: kept bounded, the rest counted
+    tamper = tamper.clone() if isinstance(tamper, Capped) else Capped(tamper or [])
+    return Ledger(uniq, problems.done(), out_files, owner, tamper.done("reasons"))
 
 
 def load_dir(ledger_dir: Path, owner: str | None = None) -> Ledger:

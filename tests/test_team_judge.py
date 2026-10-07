@@ -8,13 +8,14 @@ import fcntl
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
 from levain.team import entry as E
-from levain.team.transport import GitLedger, LedgerReadError, Repo
+from levain.team.transport import GitLedger, LedgerReadError, Repo, TeamError
 
 from tests.test_team_git import _own_file, _pinned, _pins_file, _push_wt, clone, edit, git, hook, ledger, record_ruling, team, two  # noqa: F401
 
@@ -846,6 +847,7 @@ def test_nothing_reads_the_accepted_anchor_ref_to_decide():
     from levain.team import transport as T
     src = inspect.getsource(T)
     assert "_ref_sha(_ACCEPTED)" not in src and src.count("_ACCEPTED") == 2   # the definition and the one write
+    assert "_ref_sha(_REFUSED)" not in src and src.count("_REFUSED") == 3     # the definition, its write, its delete
     # L1 r3 NOTE 14: nor through the literal ref name, in any team module.
     import pathlib
     def code(text):
@@ -1258,28 +1260,6 @@ def test_a_judgement_slowed_by_git_is_denied_inside_the_deadline(two, monkeypatc
     assert "took too long" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-def test_the_alarm_backstop_denies_time_spent_outside_git_and_locks(two, monkeypatch, capsys):
-    from levain.team import hook as H
-    from levain.team import index as I
-    tmp, ana, ben = two
-    monkeypatch.setattr(H, "_ALARM_AFTER", 1.0)
-    real = I.build
-
-    def slow(*a, **k):
-        time.sleep(3)
-        return real(*a, **k)
-    monkeypatch.setattr(I, "build", slow)
-    (_gl(ben).base / "history.json").unlink(missing_ok=True)
-    payload = {"session_id": "al", "transcript_path": "/x", "cwd": str(ben), "hook_event_name": "PreToolUse",
-               "tool_name": "Edit", "tool_input": {"file_path": str(ben / "src" / "billing.py")}, "tool_use_id": "t"}
-    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(payload)))
-    t0 = time.monotonic()
-    assert H.main(["pretooluse"]) == 0
-    assert time.monotonic() - t0 < 2.5
-    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
-    assert out["permissionDecision"] == "deny" and "took too long" in out["permissionDecisionReason"]
-
-
 def test_an_edit_outside_every_clone_is_not_judged_by_the_sessions_cwd(two):
     # L1 r3 LOW 11: the session's cwd widens only the boundary's deny condition; it is not a place to judge from.
     tmp, ana, ben = two
@@ -1380,37 +1360,43 @@ def test_problems_and_refusals_are_kept_bounded(monkeypatch):
     assert led.tamper == ["w", "x", "and 1 more reasons"]
 
 
-def test_a_quarantine_that_appears_while_a_read_waits_for_the_pins_lock_stops_the_pin(two, monkeypatch):
-    # L1 r3 LOW 10 / L2 r3 LOW 3: the no-pin-while-quarantined check ran before pins.lock was taken.
+def test_a_refusal_that_appears_while_a_read_waits_for_the_pins_lock_stops_the_pin(two, monkeypatch):
+    # L1 r3 LOW 10 / L2 r3 LOW 3: the no-pin-while-refused check ran before pins.lock was taken. A fetch that refuses
+    # while a read judges writes Trust.refused under the lock; the read's acceptance meets it there and reads again.
+    from levain.team import transport as T
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "first") == 0
     assert team("sync", repo=ben) == 0
     gb = _gl(ben)
     (gb.base / "history.json").unlink(missing_ok=True)
     before = _pinned(ben)
+    older = git("rev-parse", "levain-ledger~1", cwd=ben).strip()
     real = GitLedger.lock
 
     def lock(self, *a, **k):
         if k.get("name") == "pins.lock":
-            git("update-ref", "refs/levain/incoming/levain-ledger", self.head() + "~1", cwd=ben)
+            rec = self.trust_record()
+            if not rec.refused:
+                T._atomic_write(self.base / "pins.json", T.dataclasses.replace(rec, refused=older).dump())
         return real(self, *a, **k)
     monkeypatch.setattr(GitLedger, "lock", lock)
-    gb.ledger()
-    assert _pinned(ben) == before
+    led = gb.ledger()
+    assert _pinned(ben) == before and led.tamper
 
 
-def test_a_leftover_quarantine_of_the_accepted_tip_is_swept(two):
-    # L2 r3 LOW 7: a crash after the record's write and before the quarantine ref's removal left reads never pinning.
+def test_a_refusal_of_the_accepted_tip_is_cleared(two):
+    # L2 r3 LOW 7: a refusal naming the very tip the record accepted left reads never pinning.
+    from levain.team import transport as T
     tmp, ana, ben = two
     assert record_ruling(ana, "src/a.py", "first") == 0
     assert team("sync", repo=ben) == 0
     gb = _gl(ben)
-    git("update-ref", "refs/levain/incoming/levain-ledger", gb.accepted_tip(), cwd=ben)
+    rec = gb.trust_record()
+    T._atomic_write(gb.base / "pins.json", T.dataclasses.replace(rec, refused=rec.accepted).dump())
     (gb.base / "history.json").unlink(missing_ok=True)
     gb.ledger()
+    assert gb.trust_record().refused is None
     assert any(rel.startswith("ana/") for rel in _pinned(ben))           # the read pinned what it accepted
-    assert subprocess.run(["git", "rev-parse", "-q", "--verify", "refs/levain/incoming/levain-ledger"], cwd=ben,
-                          capture_output=True).returncode != 0
 
 
 def test_levains_fetch_brings_no_tags_into_the_code_repository(two):
@@ -1550,3 +1536,465 @@ def test_a_stale_seed_on_a_joined_clone_merges_and_never_drops_a_stronger_pin(tw
     strong = _pinned(ben)
     assert team("join", "--pins-from", str(stale), "--no-install", repo=ben) == 0
     assert all(_pinned(ben)[r]["length"] >= p["length"] for r, p in strong.items())
+
+
+def _one_doc(raw: str) -> dict:
+    """stdout must be exactly one JSON document (or nothing)."""
+    if not raw.strip():
+        return {}
+    doc, end = json.JSONDecoder().raw_decode(raw)
+    assert raw[end:].strip() == "", raw
+    return doc
+
+
+def _in_process(payload, capsys) -> tuple[dict, float]:
+    from levain.team import hook as H
+    t0 = time.monotonic()
+    H.pretooluse(payload)
+    took = time.monotonic() - t0
+    return _one_doc(capsys.readouterr().out), took
+
+
+def _edit_payload(repo, target):
+    return {"session_id": "h", "transcript_path": "/x", "cwd": str(repo), "hook_event_name": "PreToolUse",
+            "tool_name": "Edit", "tool_input": {"file_path": str(target)}, "tool_use_id": "t"}
+
+
+def test_a_scope_scan_that_hangs_is_exactly_one_deny_inside_the_deadline(two, monkeypatch, capsys):
+    # Head ruling on L3 r4 (the alarm path deleted): a worker thread judges, the caller waits at most the deadline, and
+    # one document is written from one place. gemini + codex HIGH on r3 were a scope re-scan that could hang.
+    from levain.team import hook as H
+    tmp, ana, ben = two
+    git("worktree", "add", "-q", str(tmp / "benwt"), cwd=ben)
+    monkeypatch.setattr(H, "_PRETOOLUSE_BUDGET", 1.0)
+    monkeypatch.setattr(H, "_JOIN_GRACE", 0.5)
+    real = H._small_text
+
+    def hang(path):
+        if path.name == "commondir":
+            time.sleep(30)
+        return real(path)
+    monkeypatch.setattr(H, "_small_text", hang)
+    out, took = _in_process(_edit_payload(tmp / "benwt", tmp / "benwt" / "src" / "settlement.py"), capsys)
+    assert took < 3 and out["hookSpecificOutput"]["permissionDecision"] == "deny", (took, out)
+    assert "took too long" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_a_scope_scan_that_raises_is_a_deny(two, monkeypatch, capsys):
+    from levain.team import hook as H
+    tmp, ana, ben = two
+
+    def boom(target):
+        raise RecursionError("a scan that raises")
+    monkeypatch.setattr(H, "_scan", boom)
+    out, _took = _in_process(_edit_payload(ben, ben / "src" / "billing.py"), capsys)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_an_unreadable_dot_git_is_an_unknown_scope_and_a_deny(two):
+    # codex HIGH on L3 r4: _ledger_roots swallowed the OSError of a mode-000 .git and stored "out of scope" (silence).
+    tmp, ana, ben = two
+    os.chmod(ben / ".git", 0)
+    try:
+        out = hook("pretooluse", _edit_payload(ben, ben / "src" / "billing.py"))
+    finally:
+        os.chmod(ben / ".git", 0o755)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_a_judgement_stuck_in_python_past_the_deadline_is_one_deny(two, monkeypatch, capsys):
+    # complement MED on L3 r3: time spent outside git and locks (here a stuck sync) was unbounded once an alarm was
+    # swallowed. There is no alarm now: the caller stops waiting at the deadline.
+    from levain.team import hook as H
+    from levain.team.transport import GitLedger as G
+    tmp, ana, ben = two
+    monkeypatch.setattr(H, "_PRETOOLUSE_BUDGET", 1.0)
+    monkeypatch.setattr(H, "_JOIN_GRACE", 0.5)
+    _gl(ben).save_state(last_fetch_attempt=0)
+
+    def slow_sync(self, **k):
+        time.sleep(30)
+    monkeypatch.setattr(G, "_sync", slow_sync)
+    out, took = _in_process(_edit_payload(ben, ben / "src" / "billing.py"), capsys)
+    assert took < 3 and out["hookSpecificOutput"]["permissionDecision"] == "deny", (took, out)
+
+
+def test_a_long_deny_is_still_exactly_one_document(two):
+    # codex HIGH on L3 r4: two write sites could put a second document after the first. One encode, one write site.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/long.py", "a long ruling. " * 100) == 0
+    assert team("sync", repo=ben) == 0
+    cp = subprocess.run([sys.executable, "-P", "-m", "levain.team.hook", "pretooluse"],
+                        input=json.dumps(_edit_payload(ben, ben / "src" / "long.py")), capture_output=True, text=True,
+                        timeout=60)
+    assert len(cp.stdout) > 512
+    out = _one_doc(cp.stdout)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "a long ruling" in out["permissionDecisionReason"]
+def test_a_branch_behind_the_remote_must_be_a_prefix_of_what_was_accepted(two):
+    # codex HIGH on L3 r3: a local file SHORTER than its remote pin was skipped, so a local rewrite to A+C (shorter than
+    # the accepted A+B) passed and was pinned. It is compared against that file in the accepted commit.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)                                                     # pins A
+    assert record_ruling(ana, "src/b.py", "a long ruling " * 40) == 0
+    gb = _gl(ben)
+    assert gb.fetch_only(interval=0, timeout=30) is None            # accepts A+B, branch still at A
+    f = gb.wt / "ledger" / "ana" / _own_file(_gl(ana)).name
+    lines = f.read_text().splitlines(keepends=True)
+    e = json.loads(lines[-1])
+    forged = E.seal({**{k: v for k, v in e.items() if k not in ("hash", "prev")}, "id": e["id"][:-8] + "0badf00d",
+                     "words": "forged"}, e["hash"])
+    f.write_text("".join(lines) + json.dumps(forged, ensure_ascii=False, sort_keys=True) + "\n")
+    git("add", "-A", ".", cwd=gb.wt)
+    git("commit", "-qm", "a local rewrite", cwd=gb.wt)
+    assert len(f.read_bytes()) < gb.trust_record().remote[f"ana/{f.name}"]["length"]
+    led = ledger(ben)
+    assert led.tamper and "forged" not in [x.get("words") for x in led.entries]
+
+
+def test_a_fetch_records_its_refusal_only_with_its_judgement(two, monkeypatch):
+    # Head ruling (C)2 on L3 r3, codex HIGH: the fetch published the refusal before it took pins.lock and judged.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    _forge_last_line(_gl(ana), "FORGED")
+    gb = _gl(ben)
+    seen = []
+    real = GitLedger.judge_remote
+
+    def spy(self, rev, rec=None):
+        seen.append(self.trust_record().refused)
+        return real(self, rev, rec)
+    monkeypatch.setattr(GitLedger, "judge_remote", spy)
+    assert "refused" in (gb.fetch_only(interval=0, timeout=30) or "")
+    assert seen and seen[0] is None
+    assert gb.trust_record().refused and gb.incoming_refusal()       # written with the judgement
+
+
+def test_a_read_served_from_the_cache_still_checks_the_quarantine_under_the_lock(two):
+    # Head ruling (C)2: every read, cache hits included, checks the quarantine under pins.lock.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    gb = _gl(ben)
+    ledger(ben)
+    ledger(ben)                                                      # the cache is warm
+    fd = os.open(gb.base / "pins.lock", os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        from levain.team import transport as T
+        with T.deadline(1.0), pytest.raises(T.TeamError):           # waits for the lock; never served unlocked
+            gb.ledger()
+    finally:
+        os.close(fd)
+
+
+def test_a_push_that_cannot_be_recorded_says_so(two, monkeypatch):
+    # Head ruling (C)3 on L3 r3, codex HIGH: _record_pushed failures (and the follow-up fetch's) were suppressed and
+    # "pushed" returned, so the pushed bytes went unpinned.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/x.py", "--words",
+                "w", "--no-push", repo=ben) == 0
+
+    def cannot(self, *a, **k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(GitLedger, "_record_pushed", cannot)
+    real, calls = GitLedger._fetch_quarantined, []
+
+    def second_fails(self, remote, timeout):
+        calls.append(1)
+        if len(calls) > 1:
+            raise TeamError("the remote did not answer")
+        return real(self, remote, timeout)
+    monkeypatch.setattr(GitLedger, "_fetch_quarantined", second_fails)
+    out = gb.sync()
+    assert out.startswith("pushed, but not recorded") and "levain team sync" in out, out
+    assert "not recorded" in gb.state()["last_fetch_error"]
+    monkeypatch.setattr(GitLedger, "_fetch_quarantined", real)
+    assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/y.py", "--words",
+                "v", "--no-push", repo=ben) == 0
+    assert gb.sync() == "pushed" and gb.accepted_tip() == gb.head()      # the follow-up fetch recorded it
+
+
+def test_a_seed_carries_what_the_teammate_accepted_from_the_remote(two):
+    # codex HIGH on L3 r3: seed_pins_from returned only the teammate's read pins, dropping its remote pins.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert _gl(ben).fetch_only(interval=0, timeout=30) is None      # ben's record: remote holds A+B, files hold A
+    seed = tmp / "ben_pins.json"
+    seed.write_bytes(_pins_file(ben).read_bytes())
+    _forge_last_line(_gl(ana), "FORGED")                            # the remote rewrites B
+    cat = clone(tmp, "cat", "ben@ex.com")
+    assert team("join", "--pins-from", str(seed), "--no-install", repo=cat) == 2
+
+
+def test_a_sweep_by_another_call_cannot_lose_a_fetch(two, monkeypatch):
+    # RAN on CI (runs 37671919223, 37676002591, test_concurrent_writers_in_both_clones_converge): a concurrent call
+    # deleted the one shared quarantine ref between a fetch's write and its read-back. Head ruling (a): each fetch owns
+    # a ref of its own, and the sweep of crashed calls' refs skips any whose pid is alive.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    gb = _gl(ben)
+    real = T.git
+
+    def fetch_then_sweep(args, cwd, **k):
+        out = real(args, cwd, **k)
+        if "fetch" in args:
+            GitLedger(Repo.discover(ben))._sweep_call_refs()          # another call's sweep, mid-fetch
+        return out
+    monkeypatch.setattr(T, "git", fetch_then_sweep)
+    assert gb.sync() in ("fetched", "up to date", "pushed")
+    left = git("for-each-ref", "--format=%(refname)", "refs/levain/incoming/", "refs/levain/join/", cwd=ben)
+    assert left.strip() == ""                                        # and each call deleted its own
+
+
+def test_problems_are_counted_past_the_cap_never_held(monkeypatch):
+    # codex HIGH on L3 r3: problems were all materialized before the cap (refs x entries), and _links was uncapped.
+    from levain.team import index as I
+    c = I.Capped((f"p{i}" for i in range(10 ** 6)), limit=3)
+    assert list.__len__(c) == 3 and c.more == 10 ** 6 - 3 and c.done()[-1] == f"and {10 ** 6 - 3} more problems"
+    monkeypatch.setattr(I, "MAX_PROBLEMS", 2)
+    entries = [{"id": f"x-{i}", "type": "decision", "supersedes": [f"gone-{i}"]} for i in range(5)]
+    led = I.Ledger(entries, [], [], None, [])
+    assert led._links[1][-1] == "and 3 more refused links"
+
+
+def test_a_tree_the_leaf_cap_allows_can_always_be_pinned():
+    # complement LOW on L3 r3: 20,000 leaves at ~450 bytes each overflowed the 8 MiB record cap, so a tree the leaf cap
+    # allowed could never be pinned (every read refused). The leaf cap is derived from the record cap.
+    from levain.team import entry as E
+    from levain.team import transport as T
+    n = T._MAX_LEDGER_LEAVES
+    rels = [f"{i:064d}/{'f' * 16}.jsonl" for i in range(n)]
+    pin = {"sha256": "f" * 64, "length": T._MAX_LEDGER_FILE}
+    rec = T.Trust({r: pin for r in rels}, "f" * 64, {r: {"t": E.now_iso(), "first": False} for r in rels},
+                  {r: pin for r in rels})
+    assert len(rec.dump().encode("utf-8")) <= T._PINS_MAX_BYTES
+
+
+def test_recovery_never_commits_through_a_link(two):
+    # complement LOW on L3 r3: recovery read the worktree file through a symlink, with no size bound.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "mine") == 0
+    gb = _gl(ben)
+    f = next((gb.wt / "ledger" / "ben").glob("*.jsonl"))
+    outside = tmp / "outside.txt"
+    outside.write_bytes(f.read_bytes() + b'{"secret": "outside the repository"}\n')
+    f.unlink()
+    f.symlink_to(outside)
+    assert record_ruling(ben, "src/b.py", "second") == 0
+    own = git("cat-file", "blob", f"levain-ledger:{f.relative_to(gb.wt).as_posix()}", cwd=ben)
+    assert "outside the repository" not in own and "second" in own
+
+
+def test_a_rejoin_works_offline_from_the_clones_own_branch(two, capsys):
+    # complement LOW on L3 r3: a re-join of a clone that has the branch needed the network.
+    tmp, ana, ben = two
+    git("remote", "set-url", "origin", str(tmp / "unreachable.git"), cwd=ben)
+    capsys.readouterr()
+    assert team("join", "--no-install", repo=ben) == 0
+    assert "could not be reached" in capsys.readouterr().out
+
+
+def test_a_join_that_accepts_the_refused_tip_clears_its_refusal_and_never_anothers(two):
+    # complement LOW / codex HIGH on L3 r4: join deleted whatever quarantine existed, a concurrent fetch's included.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    _forge_last_line(_gl(ana), "FORGED")
+    assert team("sync", repo=ben) != 0 and _gl(ben).incoming_refusal()
+    refused = _gl(ben).trust_record().refused
+    assert team("repin", repo=ben) == 0
+    assert team("join", "--no-install", repo=ben) == 0               # the remote's tip IS the refused one: accepted
+    assert _gl(ben).trust_record().refused is None and _gl(ben).accepted_tip() == refused
+
+
+def test_an_unreadable_record_is_said_not_shown_as_no_devices(two):
+    # glm LOW on L3 r3: devices() dropped the record's problem and returned [].
+    tmp, ana, ben = two
+    ledger(ben)
+    _pins_file(ben).write_text("{not json")
+    with pytest.raises(LedgerReadError):
+        _gl(ben).devices()
+    assert "REFUSED" in _ss(ben)                                     # session start says it (before any device line)
+
+
+def test_a_tip_that_moves_while_it_is_read_is_read_again_never_served_unpinned(two, monkeypatch):
+    # codex HIGH on L3 r4: a tip that moved before _accept was served (the old tip, unpinned) while the new tip held a
+    # new ruling. A read of the tip retries, bounded, like a pin race.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    assert record_ruling(ana, "src/b.py", "the new ruling") == 0
+    gb = _gl(ben)
+    assert gb.fetch_only(interval=0, timeout=30) is None
+    newer = gb.accepted_tip()
+    (gb.base / "history.json").unlink(missing_ok=True)
+    real, moved = GitLedger.lock, []
+
+    def lock(self, *a, **k):
+        if k.get("name") == "pins.lock" and len(moved) == 1:          # the second take: _accept's
+            git("update-ref", "refs/heads/levain-ledger", newer, cwd=ben)
+        if k.get("name") == "pins.lock":
+            moved.append(1)
+        return real(self, *a, **k)
+    monkeypatch.setattr(GitLedger, "lock", lock)
+    led = gb.ledger()
+    assert "the new ruling" in [e.get("words") for e in led.entries]
+
+
+def test_a_capped_count_survives_build(monkeypatch):
+    # glm MED + codex LOW + gemini LOW on L3 r4: a Capped summary passed through build() was re-capped ("and 1 more").
+    from levain.team import index as I
+    monkeypatch.setattr(I, "MAX_PROBLEMS", 2)
+    tamper = I.Capped(f"r{i}" for i in range(7))
+    problems = I.Capped(f"p{i}" for i in range(5))
+    problems += I.Capped(f"x{i}" for i in range(4))
+    led = I.build([], None, problems, tamper=tamper)
+    assert led.tamper[-1] == "and 5 more reasons" and led.file_problems[-1] == "and 7 more problems"
+    assert I.build([], None, problems).file_problems == led.file_problems     # build never changes its input
+
+
+def test_repin_keeps_the_first_seen_notes_within_what_a_record_holds(monkeypatch):
+    # codex MED on L3 r4: repin kept every historical first-seen note, so they outgrew the derived leaf cap.
+    from levain.team import transport as T
+    monkeypatch.setattr(T, "_MAX_LEDGER_LEAVES", 3)
+    seen = {f"m/{i:016x}.jsonl": {"t": f"2026-10-0{i + 1}T00:00:00Z", "first": False} for i in range(6)}
+    kept = T._prune_seen(dict(seen), {"m/0000000000000000.jsonl"})
+    assert len(kept) == 3 and "m/0000000000000000.jsonl" in kept and "m/0000000000000005.jsonl" in kept
+
+
+def test_record_says_when_its_push_was_not_recorded(two, monkeypatch, capsys):
+    # codex HIGH on L3 r4: append() and init() dropped "pushed, but not recorded".
+    tmp, ana, ben = two
+    monkeypatch.setattr(GitLedger, "_sync", lambda self, **k: "pushed, but not recorded (x); run `levain team sync`")
+    capsys.readouterr()
+    assert record_ruling(ben, "src/a.py", "w") == 0
+    assert "not recorded" in capsys.readouterr().err
+
+
+def test_a_push_is_recorded_only_by_a_tip_that_holds_it(two, monkeypatch):
+    # complement LOW on L3 r4: any accepted SHA from the follow-up fetch counted the push as recorded.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    older = gb.accepted_tip()
+    assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/x.py", "--words",
+                "w", "--no-push", repo=ben) == 0
+    monkeypatch.setattr(GitLedger, "_record_pushed", lambda self, *a: False)
+    real, calls = GitLedger._fetch_quarantined, []
+
+    def stale_second(self, remote, timeout):
+        calls.append(1)
+        return real(self, remote, timeout) if len(calls) == 1 else older
+    monkeypatch.setattr(GitLedger, "_fetch_quarantined", stale_second)
+    assert gb.sync().startswith("pushed, but not recorded")
+
+
+def test_an_offline_rejoin_of_a_branch_behind_its_fetch_is_not_refused(two, capsys):
+    # codex MED on L3 r4: an offline re-join checked the clone's own remote pins strictly against its lagging branch.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert _gl(ben).fetch_only(interval=0, timeout=30) is None       # remote pins A+B; the branch holds A
+    git("remote", "set-url", "origin", str(tmp / "unreachable.git"), cwd=ben)
+    assert team("join", "--no-install", repo=ben) == 0
+
+
+def test_a_stale_join_ref_from_a_crashed_call_is_never_used_and_is_swept(two):
+    # codex HIGH + gemini LOW on L3 r4: an offline re-join read a stale refs/levain/join left by a crashed join.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    old = gb.head()
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    git("update-ref", "refs/levain/join/999999-dead", old, cwd=ben)       # a crashed join's ref (no such pid)
+    git("remote", "set-url", "origin", str(tmp / "unreachable.git"), cwd=ben)
+    before = gb.accepted_tip()
+    assert team("join", "--no-install", repo=ben) == 0
+    assert gb.accepted_tip() == before                                   # the stale commit was not accepted
+    assert git("for-each-ref", "refs/levain/join/", cwd=ben).strip() == ""
+
+
+def test_a_join_never_clears_a_refusal_of_another_tip(two, monkeypatch):
+    # codex HIGH on L3 r4: a join that judged good tip X erased a refusal of tip Y a concurrent fetch had recorded.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    other = gb.head()
+    assert record_ruling(ana, "src/a.py", "x") == 0                      # the remote moves past `other`
+    real = GitLedger._sweep_call_refs
+
+    def fetch_refused_meanwhile(self):
+        rec = self.trust_record()
+        T._atomic_write(self.base / "pins.json", T.dataclasses.replace(rec, refused=other).dump())
+        return real(self)
+    monkeypatch.setattr(GitLedger, "_sweep_call_refs", fetch_refused_meanwhile)
+    monkeypatch.setattr(GitLedger, "_sync", lambda self, **k: "fetched")   # look at what the join itself wrote
+    assert team("join", "--no-install", repo=ben) == 0
+    assert gb.trust_record().refused == other
+
+
+def test_a_deny_exits_2_and_an_allow_exits_0_with_one_document(two):
+    # Head ruling on L3 r4: the deny decision is carried by the exit status too (Claude Code: exit 2 blocks a
+    # PreToolUse whatever stdout holds), so a torn document can never read as an allow.
+    tmp, ana, ben = two
+
+    def run(rel):
+        return subprocess.run([sys.executable, "-P", "-m", "levain.team.hook", "pretooluse"],
+                              input=json.dumps(_edit_payload(ben, ben / rel)), capture_output=True, text=True,
+                              timeout=60)
+    denied = run("src/settlement.py")                     # the pack rule denies the first edit
+    assert denied.returncode == 2 and "write_batch" in denied.stderr
+    assert _one_doc(denied.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    allowed = run("src/billing.py")
+    assert allowed.returncode == 0 and denied.stdout.count("hookSpecificOutput") == 1
+    assert _one_doc(allowed.stdout).get("hookSpecificOutput", {}).get("permissionDecision") != "deny"
+
+
+def test_a_refusal_outlives_the_fetchs_ref_and_a_cached_read_still_refuses(two):
+    # Head ruling (record): the refusal lives in pins.json, not in any ref; a per-call ref is gone after its call.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    ledger(ben)                                                      # the cache is warm
+    _forge_last_line(_gl(ana), "FORGED")
+    assert team("sync", repo=ben) != 0
+    assert git("for-each-ref", "refs/levain/incoming/", cwd=ben).strip() == ""
+    assert _gl(ben).trust_record().refused
+    assert ledger(ben).tamper                                        # a read that would hit the cache refuses
+
+
+def test_a_repin_then_a_read_accepts_the_refused_tip_once_and_clears_it(two, monkeypatch):
+    # codex HIGH + complement HIGH on L3 r4: repin -> read recursed until RecursionError. The read now accepts the
+    # refused tip in one read-judge-write.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    _forge_last_line(_gl(ana), "FORGED")
+    assert team("sync", repo=ben) != 0
+    refused = _gl(ben).trust_record().refused
+    assert team("repin", repo=ben) == 0
+    calls = []
+    real = GitLedger._refusal_locked
+
+    def count(self):
+        calls.append(1)
+        return real(self)
+    monkeypatch.setattr(GitLedger, "_refusal_locked", count)
+    _gl(ben).ledger()                    # (its branch still holds the old bytes until a sync replays: it says so)
+    rec = _gl(ben).trust_record()
+    assert rec.refused is None and rec.accepted == refused and len(calls) <= 2
+    monkeypatch.setattr(GitLedger, "_refusal_locked", real)
+    assert team("sync", repo=ben) == 0 and not ledger(ben).tamper
