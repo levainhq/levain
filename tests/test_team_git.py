@@ -74,8 +74,10 @@ def ledger(repo):
 def hook(event: str, payload: dict, env=None) -> dict:
     cp = subprocess.run([PY, "-P", "-m", "levain.team.hook", event], input=json.dumps(payload),
                         capture_output=True, text=True, timeout=60, env={**os.environ, **(env or {})})
-    assert cp.returncode == 0, cp.stderr
-    return json.loads(cp.stdout) if cp.stdout.strip() else {}
+    out = json.loads(cp.stdout) if cp.stdout.strip() else {}
+    denied = out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny"
+    assert cp.returncode == (2 if denied else 0), (cp.returncode, cp.stderr)    # a deny is exit 2 as well as JSON
+    return out
 
 
 def edit(repo: Path, rel: str, session="s1", tool="Edit") -> dict:

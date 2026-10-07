@@ -247,15 +247,32 @@ def pretooluse(payload: dict) -> None:
         sys.stdout.flush()
 
 
+def _denial(buf: bytes) -> str | None:
+    """The reason when ``buf`` is a deny, else None."""
+    if not buf:
+        return None
+    hso = json.loads(buf).get("hookSpecificOutput", {})
+    return hso.get("permissionDecisionReason", "") if hso.get("permissionDecision") == "deny" else None
+
+
 def _emit(buf: bytes) -> None:
     """THE one write site of the hook process: the whole answer, then exit at once, so nothing (a worker still stuck
-    in a system call included) can write after it."""
+    in a system call included) can write after it. A DENY is carried by the exit status too: Claude Code blocks a
+    PreToolUse on exit 2 whatever stdout holds (its reason then comes from the JSON if it parses, else from stderr), so a
+    torn or unreadable document still denies (https://code.claude.com/docs/en/hooks, "Exit Code 2"). An allow exits 0."""
+    reason = _denial(buf)
     try:
-        view = memoryview(buf)
-        while view:
-            view = view[os.write(1, view):]
+        if reason is not None:
+            _write_all(2, (reason[:_ANSWER_MAX // 16] + "\n").encode("utf-8"))
+        _write_all(1, buf)
     finally:
-        os._exit(0)
+        os._exit(2 if reason is not None else 0)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
 
 
 def _places(payload: dict) -> list[str]:

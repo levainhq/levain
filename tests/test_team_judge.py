@@ -1942,3 +1942,59 @@ def test_a_join_never_clears_a_refusal_of_another_tip(two, monkeypatch):
     monkeypatch.setattr(GitLedger, "_sync", lambda self, **k: "fetched")   # look at what the join itself wrote
     assert team("join", "--no-install", repo=ben) == 0
     assert gb.trust_record().refused == other
+
+
+def test_a_deny_exits_2_and_an_allow_exits_0_with_one_document(two):
+    # Head ruling on L3 r4: the deny decision is carried by the exit status too (Claude Code: exit 2 blocks a
+    # PreToolUse whatever stdout holds), so a torn document can never read as an allow.
+    tmp, ana, ben = two
+
+    def run(rel):
+        return subprocess.run([sys.executable, "-P", "-m", "levain.team.hook", "pretooluse"],
+                              input=json.dumps(_edit_payload(ben, ben / rel)), capture_output=True, text=True,
+                              timeout=60)
+    denied = run("src/settlement.py")                     # the pack rule denies the first edit
+    assert denied.returncode == 2 and "write_batch" in denied.stderr
+    assert _one_doc(denied.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    allowed = run("src/billing.py")
+    assert allowed.returncode == 0 and denied.stdout.count("hookSpecificOutput") == 1
+    assert _one_doc(allowed.stdout).get("hookSpecificOutput", {}).get("permissionDecision") != "deny"
+
+
+def test_a_refusal_outlives_the_fetchs_ref_and_a_cached_read_still_refuses(two):
+    # Head ruling (record): the refusal lives in pins.json, not in any ref; a per-call ref is gone after its call.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    ledger(ben)                                                      # the cache is warm
+    _forge_last_line(_gl(ana), "FORGED")
+    assert team("sync", repo=ben) != 0
+    assert git("for-each-ref", "refs/levain/incoming/", cwd=ben).strip() == ""
+    assert _gl(ben).trust_record().refused
+    assert ledger(ben).tamper                                        # a read that would hit the cache refuses
+
+
+def test_a_repin_then_a_read_accepts_the_refused_tip_once_and_clears_it(two, monkeypatch):
+    # codex HIGH + complement HIGH on L3 r4: repin -> read recursed until RecursionError. The read now accepts the
+    # refused tip in one read-judge-write.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "x") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    _forge_last_line(_gl(ana), "FORGED")
+    assert team("sync", repo=ben) != 0
+    refused = _gl(ben).trust_record().refused
+    assert team("repin", repo=ben) == 0
+    calls = []
+    real = GitLedger._refusal_locked
+
+    def count(self):
+        calls.append(1)
+        return real(self)
+    monkeypatch.setattr(GitLedger, "_refusal_locked", count)
+    _gl(ben).ledger()                    # (its branch still holds the old bytes until a sync replays: it says so)
+    rec = _gl(ben).trust_record()
+    assert rec.refused is None and rec.accepted == refused and len(calls) <= 2
+    monkeypatch.setattr(GitLedger, "_refusal_locked", real)
+    assert team("sync", repo=ben) == 0 and not ledger(ben).tamper
