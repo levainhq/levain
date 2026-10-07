@@ -387,8 +387,62 @@ def test_a_valid_revoked_duplicate_cannot_be_bypassed(tmp_path):
     with pytest.raises(ValueError):
         store.set_status(b.binding_id, BindingStatus.ACTIVE)
     assert store.list_active() == []
-    store.set_status(b.binding_id, BindingStatus.REVOKED)      # any write stores the collapsed list
-    assert [r["status"] for r in _raw(store)] == ["revoked"]
+    # duplicates are corruption: no write persists a choice between copies, the file is left as is
+    with pytest.raises(ValueError, match="duplicate"):
+        store.set_status(b.binding_id, BindingStatus.REVOKED)
+    with pytest.raises(ValueError, match="duplicate"):
+        store.add(a_binding(guard=(guard(),), posture=Posture.CONFIRM_ELEVATED))
+    assert [r["status"] for r in _raw(store)] == ["paused", "revoked"]
+
+
+def test_an_unloadable_or_unparseable_duplicate_still_reads_inert(tmp_path):
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    store.add(b)
+    live = _raw(store)[0]
+    _write(store, [live, dict(live, status="revoked", goal="not-a-goal")])
+    assert store.list_active() == []
+    _write(store, [live, dict(live, status="garbage")])
+    assert store.list_active() == []
+
+
+def test_supersede_onto_an_existing_active_new_id_is_not_stranded(tmp_path):
+    store = BindingStore(tmp_path / "b.json")
+    a = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    b_active = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
+    store.add(a)
+    store.add(b_active)
+    b_paused = a_binding(guard=(guard(),), posture=Posture.CONFIRM_ELEVATED)   # same id, default PAUSED
+    assert store.replace_atomic(a.binding_id, b_paused)
+    assert [x.binding_id for x in store.list_active()] == [b_active.binding_id]
+
+
+def test_a_present_non_dict_trajectory_bound_is_refused(tmp_path):
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    store.add(b)
+    bad = guard(kill_predicate=None, kill_drill=None, kill_authored_by=None, spike_id="t",
+                predicted_trajectory={"bound": "not-a-predicate"})
+    with pytest.raises(ValueError):
+        store.tighten_guard(b.binding_id, bad)
+    with pytest.raises(ValueError):
+        store.add(a_binding(guard=(bad,), posture=Posture.CONFIRM_ELEVATED))
+
+
+def test_nested_fields_this_version_does_not_know_survive(tmp_path):
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(status=BindingStatus.ACTIVE, guard=(guard(),))
+    store.add(b)
+    store.tighten_guard(b.binding_id, guard(spike_id="first"))
+    rec = _raw(store)[0]
+    rec["graduation"]["future_counter"] = 7
+    rec["guard_additions"][0]["future_safety"] = True
+    _write(store, [rec])
+    store.record_fire(b.binding_id, clean=True, fired_at="2026-07-01T00:00:00")
+    store.tighten_guard(b.binding_id, guard(spike_id="second"))
+    rec = _raw(store)[0]
+    assert rec["graduation"]["future_counter"] == 7 and rec["graduation"]["fire_count"] == 1
+    assert rec["guard_additions"][0]["future_safety"] is True and len(rec["guard_additions"]) == 2
 
 
 def test_trigger_pattern_copies_are_deep(tmp_path):

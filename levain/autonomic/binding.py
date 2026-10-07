@@ -136,6 +136,16 @@ _ALLOWED_TRANSITIONS: dict[BindingStatus, frozenset[BindingStatus]] = {
 # Restrictiveness rank for "most-restrictive lifecycle wins" when ``add``/``replace_atomic`` collide
 # with existing same-id record(s): a REVOKED tombstone can NEVER be overridden by a duplicate ACTIVE
 # (the resurrection-via-duplicate vector, L3 codex/nemotron). Higher = harder to fire.
+def _status_or_revoked(value: Any) -> "BindingStatus":
+    """Parse a raw status string; anything that does not parse reads as REVOKED (fail closed)."""
+    if isinstance(value, BindingStatus):
+        return value
+    try:
+        return BindingStatus(value)
+    except ValueError:
+        return BindingStatus.REVOKED
+
+
 _STATUS_RESTRICTIVENESS: dict[BindingStatus, int] = {
     BindingStatus.ACTIVE: 0,
     BindingStatus.PAUSED: 1,
@@ -746,8 +756,9 @@ def binding_invocation(binding: Binding, *, hops: int = 0) -> AuthorityScope:
         raise ValueError(f"hops must be >= 0, got {hops}")
     if not BindingStore.is_fireable(binding):
         raise ValueError(
-            f"binding_invocation refuses a non-active binding {binding.binding_id!r} "
-            f"(status={binding.status.value}, seal_ok={binding.seal_matches()})"
+            f"binding_invocation refuses a binding that may not fire {binding.binding_id!r} "
+            f"(status={binding.status.value}, seal_ok={binding.seal_matches()}, "
+            f"confirm-class without a sealed kill={binding.posture.needs_confirm and not any(g.kill_predicate is not None for g in binding.guard)})"
         )
     grant = f"binding:{binding.trigger.type}@{binding.posture.name.lower()}"
     return AuthorityScope(grantor="binding", grant=grant, binding_id=binding.binding_id, hops=hops)
@@ -793,7 +804,8 @@ class BindingStore:
                 os.close(fd)
 
     # --- raw IO (call under the lock for mutations) ------------------------------------
-    def _read_raw(self, *, for_mutation: bool = False) -> list[dict[str, Any]]:
+    def _read_raw(self, *, for_mutation: bool = False, repair_id: str | None = None
+                  ) -> list[dict[str, Any]]:
         """Load the JSON list; fail-soft on READS. A missing file → ``[]``; a corrupt file (bad JSON or
         a non-list top level) → ``[]`` with a WARNING. Non-dict elements are pre-filtered (matching the
         ``pending`` idiom); a dict that fails reconstruction is skipped loudly by :meth:`_load`.
@@ -832,24 +844,40 @@ class BindingStore:
                 raise TypeError(f"binding store top level is {type(data).__name__}, not a list "
                                 "(refusing to mutate over a corrupt registry)")
             return []
-        return self._collapse_duplicates([r for r in data if isinstance(r, dict)])
+        return self._collapse_duplicates([r for r in data if isinstance(r, dict)],
+                                         for_mutation=for_mutation, repair_id=repair_id)
 
     @classmethod
-    def _collapse_duplicates(cls, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """The store never presents two records for one ``binding_id``. Duplicates (only an outside
-        write can make them: ``add`` and ``replace_atomic`` dedup) are merged into ONE record at the
-        first one's position, by :meth:`_preserve_bookkeeping`'s rules: most-restrictive valid status,
-        most evidence, union of tightenings. Every reader and every first-match mutator then sees the
-        merged record, so a valid REVOKED duplicate can no longer be bypassed by acting on an earlier
-        PAUSED or ACTIVE one (reproduced 2026-10-06: ``ratify`` resurrected it), and the next write
-        stores the collapsed list."""
+    def _collapse_duplicates(cls, records: list[dict[str, Any]], *, for_mutation: bool,
+                             repair_id: str | None = None) -> list[dict[str, Any]]:
+        """The store never presents two records for one ``binding_id``. Duplicates can only come from
+        an outside write (``add`` and ``replace_atomic`` dedup), so they are treated as corruption:
+
+          - a READ sees ONE record per id, inert-leaning: the base is the first copy that loads and
+            matches its seal (else the first that loads, else the first), with the MOST RESTRICTIVE
+            status across EVERY copy, and a status that does not parse counts as revoked. So a
+            REVOKED tombstone cannot be bypassed by an earlier ACTIVE or PAUSED copy, nor by being
+            malformed itself (reproduced 2026-10-06: ``ratify`` resurrected one);
+          - a MUTATION refuses (``ValueError``) while any id has duplicates, so no write ever
+            persists a choice between conflicting copies. The one exception is the repair verb:
+            ``add`` of the duplicated id itself, whose record is the INCOMING validated, seal-matching
+            binding (never a disk copy), with :meth:`_preserve_bookkeeping`'s most-restrictive status.
+
+        Earlier, choosing a merged winner and persisting it was beaten by review (a seal-broken or
+        unloadable copy, extension fields on the losing copy); refusing to write is the bounded form."""
         groups: dict[str, list[dict[str, Any]]] = {}
         for r in records:
             bid = r.get("binding_id")
             if isinstance(bid, str):
                 groups.setdefault(bid, []).append(r)
-        if all(len(g) == 1 for g in groups.values()):
+        dups = sorted(bid for bid, g in groups.items() if len(g) > 1)
+        if not dups or (for_mutation and dups == [repair_id]):
             return records
+        if for_mutation and dups != [repair_id]:
+            raise ValueError(
+                f"binding store {len(dups)} id(s) have duplicate records ({', '.join(dups[:3])}); "
+                "refusing to write until the file is repaired")
+        _log.warning("binding store: duplicate records for %s; reading the most restrictive", dups)
         out: list[dict[str, Any]] = []
         done: set[str] = set()
         for r in records:
@@ -861,8 +889,13 @@ class BindingStore:
                 continue
             done.add(bid)
             group = groups[bid]
-            base = next((g for g in group if cls._load(g) is not None), group[0])
-            out.append(cls._preserve_bookkeeping(group, bid, copy.deepcopy(base)))
+            loaded = [(g, cls._load(g)) for g in group]
+            base = next((g for g, b in loaded if b is not None and b.seal_matches()), None) \
+                or next((g for g, b in loaded if b is not None), group[0])
+            merged = copy.deepcopy(base)
+            merged["status"] = max((_status_or_revoked(g.get("status")) for g in group),
+                                   key=lambda st: _STATUS_RESTRICTIVENESS.get(st, 0)).value
+            out.append(merged)
         return out
 
     def _write_raw(self, records: list[dict[str, Any]]) -> None:
@@ -911,6 +944,8 @@ class BindingStore:
         for g in (*binding.guard, *binding.guard_additions):
             if g.kill_predicate is not None:
                 self._validate_kill(g.kill_predicate)
+            if g.predicted_trajectory is not None:
+                assert_trajectory_pure(g.predicted_trajectory)
 
     @staticmethod
     def _preserve_bookkeeping(
@@ -981,7 +1016,7 @@ class BindingStore:
         self._validate(binding)
         record = binding.to_dict()
         with self._locked():
-            records = self._read_raw(for_mutation=True)
+            records = self._read_raw(for_mutation=True, repair_id=binding.binding_id)
             record = self._preserve_bookkeeping(records, binding.binding_id, record)
             kept = [r for r in records if r.get("binding_id") != binding.binding_id]
             kept.append(record)
@@ -1035,7 +1070,8 @@ class BindingStore:
                     return False
             incoming_status = record.get("status")
             record = self._preserve_bookkeeping(records, new_binding.binding_id, record)
-            if record.get("status") != incoming_status:
+            if _STATUS_RESTRICTIVENESS.get(_status_or_revoked(record.get("status")), 0) > \
+                    _STATUS_RESTRICTIVENESS.get(_status_or_revoked(incoming_status), 0):
                 # The new grant's id already exists as a more restrictive tombstone (re-ratifying back
                 # to a revoked core, A -> B -> A): superseding would revoke the old grant and leave the
                 # new one inert, so nothing is live while the call reports success. Abort; write nothing.
@@ -1272,7 +1308,9 @@ class BindingStore:
                     updated = replace(b, graduation=grad)
                     # Update the one field in place: a whole-record rewrite would drop any field this
                     # version does not know (a newer writer's), on every fire.
-                    rec["graduation"] = grad.to_dict()
+                    raw_grad = rec.get("graduation")
+                    rec["graduation"] = ({**raw_grad, **grad.to_dict()} if isinstance(raw_grad, dict)
+                                         else grad.to_dict())
                     self._write_raw(records)
                     return updated
             return None
@@ -1376,7 +1414,10 @@ class BindingStore:
                 # dataclasses.replace (not a positional rebuild) so a future Binding field can't land in
                 # the wrong slot; additions are UNSEALED so the id + seal are unchanged by construction.
                 updated = replace(b, guard_additions=b.guard_additions + tuple(new_guards))
-                rec["guard_additions"] = [g.to_dict() for g in updated.guard_additions]  # in place, as above
+                raw_adds = rec.get("guard_additions")
+                # append to the raw list: existing entries keep any field this version does not know
+                rec["guard_additions"] = ((list(raw_adds) if isinstance(raw_adds, list) else [])
+                                          + [g.to_dict() for g in new_guards])
                 self._write_raw(records)
                 return updated
             return None

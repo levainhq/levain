@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
-from levain.autonomic.kill import Kleene, assert_kill_pure, kill_outcome
+from levain.autonomic.kill import Kleene, KillImpurityError, assert_kill_pure, kill_outcome
 
 __all__ = [
     "TrajectoryObserver",
@@ -78,6 +78,12 @@ def assert_trajectory_pure(predicted_trajectory: Any) -> None:
     bound. A descriptive-only (bound-less) trajectory passes (nothing to check). The compiler calls
     this so a binding whose monitor CANNOT evaluate its own envelope is refused, not minted with a
     silently-inert (always-diverging) monitor."""
+    if isinstance(predicted_trajectory, dict) and "bound" in predicted_trajectory \
+            and not isinstance(predicted_trajectory["bound"], dict):
+        # A present but non-dict bound would read as "no bound" and leave the monitor inert while
+        # the configuration appears to ask for one. Refuse it rather than treat it as absent.
+        raise KillImpurityError(
+            f"predicted_trajectory 'bound' must be a predicate dict, got {type(predicted_trajectory['bound']).__name__}")
     bound = trajectory_bound(predicted_trajectory)
     if bound is not None:
         assert_kill_pure(bound)
