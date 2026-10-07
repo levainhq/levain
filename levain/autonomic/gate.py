@@ -461,11 +461,11 @@ class EfferentGate:
         except Exception as e:  # noqa: BLE001 — fail-closed: can't persist → can't gate → don't propose
             _log.error("efferent gate: pending persist FAILED (%s): %s — refusing (cannot gate)",
                        type(e).__name__, e)
-            if new_hold:
+            if new_hold and not self._pending_open_for(run):
                 # The hold this call opened has no pending to decide it: close it WITHOUT cancelling
-                # the run (a disk fault is nobody's "no"); re-delivering the event proposes it again. A
-                # hold that was already open may belong to a pending this fault hid, so it is left to
-                # that pending, or to the sweep's orphan check.
+                # the run (a disk fault is nobody's "no"); re-delivering the event proposes it again. If
+                # a concurrent proposal's pending for it exists (or the store cannot say), it is that
+                # pending's to decide, or the sweep's orphan check.
                 self._withdraw_hold(run)
             return GateOutcome(
                 posture=posture, fired=False, refused=True, deferred=False,
@@ -533,7 +533,14 @@ class EfferentGate:
         # daemon sweep (or two resolves) can never both fire the same irreversible action, and a crash
         # mid-fire DROPS it (it is already out of the open set) rather than leaving it re-fireable.
         # There is NO post-fire remove (the get→fire→remove TOCTOU is gone).
-        pending = self._pending_store.claim(pending_id)
+        # A JOURNALED pending (sealed, with a run) is the exception: its decision is committed to the run
+        # journal FIRST (write-once, so exactly one resolver's decision counts) and the pending is
+        # removed AFTER (``_release``). Claim-first would leave a window where the pending is gone and
+        # the hold still undecided, which a crash turns into a re-proposal of an action a person denied.
+        peek = self._pending_store.get(pending_id)
+        decide_first = (peek is not None and peek.run_id is not None and peek.effect_id is not None
+                        and self._journal is not None and peek.seal_matches())
+        pending = peek if decide_first else self._pending_store.claim(pending_id)
         if pending is None:
             # already claimed/resolved/swept, or never existed — nothing to fire; surface, don't crash.
             _log.warning("efferent gate resolve: no claimable pending %r (resolved/swept/unknown)", pending_id)
@@ -564,7 +571,10 @@ class EfferentGate:
         if posture is None:
             # a corrupt posture name on a record whose seal otherwise verified (a re-sealed corruption,
             # or an enum that was retired) — DROP into a refuse, never an executable rung (codex MED).
-            self._reject_hold(pending, by=decision.by)
+            settled = self._reject_hold(pending, by=decision.by)
+            self._release(pending, decide_first)
+            if not settled:
+                return self._already_decided(pending)
             return self._deny_fields(
                 created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
                 context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
@@ -576,6 +586,7 @@ class EfferentGate:
         run = RunRef(pending.run_id, pending.effect_id) if pending.run_id and pending.effect_id else None
         journal_bar = self._journal_bar(run, authority)
         if journal_bar is not None:
+            self._release(pending, decide_first)
             return self._deny_fields(
                 created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
                 context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
@@ -585,7 +596,10 @@ class EfferentGate:
             )
 
         if not decision.approved:
-            self._reject_hold(pending, by=decision.by, withdraw=decision.withdraw)
+            settled = self._reject_hold(pending, by=decision.by, withdraw=decision.withdraw)
+            self._release(pending, decide_first)
+            if not settled:
+                return self._already_decided(pending)
             # a silence-window DROP (the sweep, by=on-loop) is a ``timed_out`` MODE; an explicit human
             # deny is ``refused`` — orthogonal to the ``denied`` verdict either way (Slice 3a.5 §2.1).
             deny_terminal = "timed_out" if decision.by == "on-loop" else "refused"
@@ -606,7 +620,13 @@ class EfferentGate:
         if guard is None and decision.by != "human" and not self._unattended_approval_allowed(pending, posture):
             guard = "unattended_approval_not_allowed"
         if guard is not None:
-            self._reject_hold(pending, by=decision.by)
+            # a missing typed proof, or an approval nobody may give unattended, is not a person's "no"
+            # to the action: withdraw (the run stays open); a re-validation failure IS a decision
+            withdraw = guard in ("elevated_requires_typed_proof", "unattended_approval_not_allowed")
+            settled = self._reject_hold(pending, by=decision.by, withdraw=withdraw)
+            self._release(pending, decide_first)
+            if not settled:
+                return self._already_decided(pending)
             return self._deny_fields(
                 created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
                 context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
@@ -644,6 +664,7 @@ class EfferentGate:
             d = self._journal.decide(hold_id_for(run.run_id, run.effect_id), approve=True,
                                      digest=self._digest_of(request), by=decision.by)
             if not d.ok and d.reason != "already_decided":
+                self._release(pending, decide_first)
                 return self._deny_fields(
                     created_at=created_at, action_name=pending.action_name, proposal_id=pending.proposal_id,
                     context_id=pending.context_id, query_text=pending.query_text, query_date=pending.query_date,
@@ -651,6 +672,7 @@ class EfferentGate:
                     verdict="denied", by=decision.by, reason=f"journal:{d.reason}",
                     actor_first_estimate=decision.first_estimate,
                 )
+        self._release(pending, decide_first)   # the decision is committed: the pending can go
         fired = self._fire(
             request=request, created_at=created_at, posture=posture,
             verdict=verdict, by=by, actor_first_estimate=decision.first_estimate, decided=True,
@@ -667,6 +689,27 @@ class EfferentGate:
                 actor_first_estimate=decision.first_estimate,
             )
         return fired
+
+    def _release(self, pending: PendingAction, decide_first: bool) -> None:
+        """Remove a decide-first pending once its decision is in the journal (claim-first pendings are
+        already out of the store). Fail-soft: a pending left behind is decided already, so resolving it
+        again only finds that decision."""
+        if not decide_first or self._pending_store is None:
+            return
+        try:
+            self._pending_store.claim(pending.pending_id)
+        except Exception as e:  # noqa: BLE001
+            _log.error("efferent gate: could not remove decided pending %s (%s): %s", pending.pending_id,
+                       type(e).__name__, e)
+
+    @staticmethod
+    def _already_decided(pending: PendingAction) -> GateOutcome:
+        """Another resolver's decision for this effect was committed first: this one changes nothing."""
+        return GateOutcome(
+            posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
+            reason="journal:already_decided", receipt_id=None, execution=None,
+            binding_id=pending.authority.get("binding_id") if isinstance(pending.authority, dict) else None,
+        )
 
     def _unattended_approval_allowed(self, pending: PendingAction, posture: Posture) -> bool:
         """An approval no human gave (``by != "human"``) is the silence default of a cooling-off rung,
@@ -778,28 +821,28 @@ class EfferentGate:
             return None
         posture = self._posture_of(pending)
         if posture is None:   # corrupt posture (codex MED) → DROP, no execution path
+            self._reject_hold(pending, by="on-loop")   # the decision first, then the pending goes
             if self._pending_store.claim(pending.pending_id) is not None:  # type: ignore[union-attr]
                 _log.error("efferent gate sweep: corrupt posture on %s — DROPPED", pending.pending_id)
-                self._reject_hold(pending, by="on-loop")
             return None
         # HIGH-3 (defence-in-depth behind the seal): the silence default is the VALIDATED posture's,
         # never the raw stored fail_open. A disagreement → DROP, never auto-fire.
         if pending.fail_open != posture.fail_open:
+            self._reject_hold(pending, by="on-loop")   # the decision first, then the pending goes
             if self._pending_store.claim(pending.pending_id) is not None:  # type: ignore[union-attr]
                 _log.error("efferent gate sweep: fail_open/posture mismatch on %s (stored=%s, %s.fail_open=%s)"
                            " — DROPPED, NOT auto-fired", pending.pending_id, pending.fail_open,
                            posture.name, posture.fail_open)
-                self._reject_hold(pending, by="on-loop")
             return None
         if posture.fail_open:
             # AUTO-FIRE (no human at fire-time) is ALLOWLIST-GATED (codex ship-gate HIGH-1): only an
             # action DELIBERATELY opted into auto_fire_actions (in code) may autonomously fire — a
             # forged/recomputed cooling-off record over a non-allowlisted action is DROPPED.
             if pending.action_name not in self._auto_fire_actions:
+                self._reject_hold(pending, by="on-loop")   # the decision first, then the pending goes
                 if self._pending_store.claim(pending.pending_id) is not None:  # type: ignore[union-attr]
                     _log.error("efferent gate sweep: %r not in the auto-fire allowlist — cooling-off %s "
                                "DROPPED, not auto-fired", pending.action_name, pending.pending_id)
-                    self._reject_hold(pending, by="on-loop")
                 return None
             decision = ConfirmDecision(approved=True, by="on-loop", reason="cooling_off_window_elapsed")
         else:
@@ -1117,6 +1160,8 @@ class EfferentGate:
                 continue
             try:
                 at = _dt.datetime.fromisoformat(h["at"])
+                if (at.tzinfo is None) != (now.tzinfo is None):   # align, as _expired does
+                    at = at.replace(tzinfo=now.tzinfo) if at.tzinfo is None else at.replace(tzinfo=None)
                 if now - at < limit:
                     continue
                 self._journal.withdraw(h["hold_id"])
@@ -1234,6 +1279,16 @@ class EfferentGate:
             _log.error("efferent gate: could not note receipt %s in the run journal (%s): %s",
                        receipt_id, type(e).__name__, e)
 
+    def _pending_open_for(self, run: RunRef | None) -> bool:
+        """True iff an open pending carries ``run``'s effect, or the pending store cannot be read."""
+        if run is None or self._pending_store is None:
+            return False
+        try:
+            return any(p.run_id == run.run_id and p.effect_id == run.effect_id
+                       for p in self._pending_store.list_open())
+        except Exception:  # noqa: BLE001 — unknown: leave the hold to the orphan check
+            return True
+
     def _withdraw_hold(self, run: RunRef | None) -> None:
         if run is None or self._journal is None:
             return
@@ -1255,24 +1310,27 @@ class EfferentGate:
             _log.error("efferent gate: could not cancel run %s (%s): %s", request.run.run_id,
                        type(e).__name__, e)
 
-    def _reject_hold(self, pending: PendingAction, *, by: str, withdraw: bool = False) -> None:
+    def _reject_hold(self, pending: PendingAction, *, by: str, withdraw: bool = False) -> bool:
         """Close the run hold a pending carries, so no undecided effect of the binding waits on it.
         A DECISION (a deny, a dropped tampered or expired pending) rejects it, which cancels the run.
         An infrastructure fault (``withdraw``: the pending or the chain state could not be written)
-        withdraws it, leaving the run open for a re-delivery. Fail-soft."""
+        withdraws it, leaving the run open for a re-delivery. Fail-soft. Returns False only when the
+        journal answered that ANOTHER decision was committed first (this one changes nothing)."""
         if self._journal is None or not pending.run_id or not pending.effect_id:
-            return
+            return True
         hold_id = hold_id_for(pending.run_id, pending.effect_id)
         digest = effect_digest(action_name=pending.action_name, payload=pending.payload,
                                context_id=pending.context_id)
         try:
             if withdraw:
                 self._journal.withdraw(hold_id)
-                return
-            self._journal.decide(hold_id, approve=False, digest=digest, by=by)
+                return True
+            d = self._journal.decide(hold_id, approve=False, digest=digest, by=by)
+            return d.ok or d.reason != "already_decided"
         except Exception as e:  # noqa: BLE001
             _log.error("efferent gate: could not reject the hold of %s (%s): %s", pending.pending_id,
                        type(e).__name__, e)
+            return True
 
     def _persist(self, *, created_at, action_name, proposal_id, posture, fired, face) -> str | None:
         """Append the gate-receipt FAIL-SOFT (L1-HIGH-1). A receipt-persist failure (a disk error, or

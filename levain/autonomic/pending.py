@@ -382,10 +382,12 @@ class PendingActionStore:
         record that can't be reconstructed is dropped, never fired."""
         with self._locked():
             records = self._read_raw()
-            idx = next((i for i, r in enumerate(records) if r.get("pending_id") == pending_id), None)
-            if idx is None:
+            matches = [r for r in records if r.get("pending_id") == pending_id]
+            if not matches:
                 return None
-            rec = records.pop(idx)
+            # every copy goes: a file holding two records for one id must not resolve (and fire) twice
+            records = [r for r in records if r.get("pending_id") != pending_id]
+            rec = matches[0]
             try:
                 pending = PendingAction.from_dict(rec)
             except (KeyError, TypeError, ValueError) as e:

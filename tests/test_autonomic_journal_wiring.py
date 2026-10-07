@@ -851,3 +851,161 @@ def test_a_chain_whose_state_cannot_be_written_withdraws_and_proposes_again(tmp_
     assert w.pending.list_open() == [] and w.journal.open_holds() == []
     w.chains._chain_store.add = real
     assert w.dispatch("w1").chain.paused                          # proposed again, not cancelled
+
+
+# --- L3 round 2 (input 35ab0fd2aacd0f38) -------------------------------------------------------
+
+def _one_shot(w, posture=Posture.ON_LOOP):
+    b = Binding.create(created_by="operator", created_at="2026-10-07T09:00:00o",
+                       trigger=TriggerSpec(type="email", pattern={"field": "from", "value": "a@x.example"}),
+                       goal=(SubGoal(goal="s", tools=("mail.read",), output="doc:s"),), tightness=TIGHT,
+                       posture=posture, one_shot=True, status=BindingStatus.PAUSED)
+    w.store.add(b)
+    w.store.ratify(b.binding_id)
+    return b
+
+
+def test_a_claimed_one_shot_revoked_before_its_run_started_never_fires(tmp_path):
+    # codex HIGH 1 + complement MED 1: the claim was written, the process stopped before the run was
+    # admitted, a person revoked it; the re-delivered run was admitted at the NEW generation and fired
+    w = World(tmp_path)
+    b = _one_shot(w)
+    real = w.journal.start
+    w.journal.start = lambda *a, **k: (_ for _ in ()).throw(OSError("stopped here"))
+    assert w.dispatcher.dispatch({"type": "email", "id": "A", "fields": {"from": "a@x.example"}}) == []
+    w.journal.start = real
+    w.store.set_status(b.binding_id, BindingStatus.REVOKED)        # the person cancels it
+    out = w.dispatcher.dispatch({"type": "email", "id": "A", "fields": {"from": "a@x.example"}})
+    assert [d.outcome.reason for d in out] == ["journal:fenced"] and w.outbox() == []
+
+
+def test_a_decision_is_committed_before_its_pending_is_removed(tmp_path):
+    # codex HIGH 2: resolve removed the pending, then the process stopped before the deny reached the
+    # journal; a re-delivery re-proposed the action the person had denied
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    real_claim = w.pending.claim
+    w.pending.claim = lambda pid: (_ for _ in ()).throw(SystemExit("stopped after the decision"))
+    with pytest.raises(SystemExit):
+        w.resolve_open(approve=False)
+    w.pending.claim = real_claim
+    w2 = World(tmp_path)
+    again = w2.dispatch("c1")
+    assert again.chain.aborted and again.outcome.reason == "journal:cancelled"
+    assert w.outbox() == [("link0", "c1-0")]
+    out = w2.resolve_open(approve=True)                            # the leftover pending: already decided
+    assert not out.completed and w.outbox() == [("link0", "c1-0")]
+
+
+def test_refence_after_a_failed_remove_fences_every_earlier_run(tmp_path):
+    # gemini HIGH + codex HIGH 3: refence() of a removed binding wrote a fence at a generation an
+    # admitted run still matched
+    w = World(tmp_path)
+    b = w.mint(chain=True)
+    w.dispatch("r1")
+    [p] = w.pending.list_open()
+    run_gen = json.loads(w.journal.path.read_text().splitlines()[0])["generation"]
+    real = w.journal.fence
+    w.journal.fence = lambda *a, **k: (_ for _ in ()).throw(OSError("no space"))
+    from levain.autonomic import FenceNotRecordedError
+    with pytest.raises(FenceNotRecordedError):
+        w.store.remove(b.binding_id)
+    w.journal.fence = real
+    w.store.refence(b.binding_id)
+    assert w.journal.generation(b.binding_id) > run_gen
+
+
+def test_a_duplicated_manual_pending_resolves_once(tmp_path):
+    # codex MED: two records with one id; each claim removed one copy and fired once
+    from levain.autonomic import PendingAction, PendingActionStore
+    store = PendingActionStore(tmp_path / "p.json")
+    p = PendingAction.create(created_at="t", action_name="a", payload="p", context_id="c", query_text="q",
+                             query_date="d", posture="CONFIRM", fail_open=False, requires_typed=False,
+                             authority={})
+    store.path.write_text(json.dumps([p.to_dict(), p.to_dict()]))
+    assert store.claim(p.pending_id) is not None
+    assert store.claim(p.pending_id) is None
+
+
+def test_only_the_system_may_withdraw_a_decision():
+    # codex MED: a human "withdraw" left the run open, so the denied action could be proposed again
+    with pytest.raises(ValueError):
+        ConfirmDecision(approved=False, by="human", withdraw=True)
+    ConfirmDecision(approved=False, by="on-loop", withdraw=True)
+
+
+def test_a_new_record_is_not_started_at_zero_when_the_journal_cannot_be_read(tmp_path):
+    # complement 2: a transient journal read fault started a re-added record at 0, unfencing old runs
+    w = World(tmp_path)
+    w.journal.next_generation = lambda bid: (_ for _ in ()).throw(OSError("unreadable"))
+    with pytest.raises(OSError):
+        w.mint(chain=False)
+
+
+def test_the_dispatcher_and_chain_executor_share_one_journal_and_one_gate(tmp_path):
+    # complement 3: a store with a journal behind a gate without one ran unjournaled
+    w = World(tmp_path)
+    bare_gate = EfferentGate(manifest=ActionManifest({}), store=w.receipts,
+                             executor=OutboxExecutor(tmp_path / "o.jsonl"))
+    with pytest.raises(ValueError):
+        FireDispatcher(store=w.store, gate=bare_gate, predicate_match=lambda p, e: True,
+                       request_builder=_single_builder, risk_resolver=lambda b: LOW, clock=lambda: FIXED)
+    other = ChainExecutor(gate=bare_gate, request_builder=_chain_builder, risk_resolver=lambda b, i: LOW,
+                          trust_resolver=_trust, chain_store=ChainStateStore(tmp_path / "c2.json"),
+                          clock=lambda: FIXED)
+    with pytest.raises(ValueError):
+        FireDispatcher(store=w.store, gate=w.gate, predicate_match=lambda p, e: True,
+                       request_builder=_single_builder, risk_resolver=lambda b: LOW, clock=lambda: FIXED,
+                       chain_executor=other)
+
+
+def test_a_failed_proposal_does_not_withdraw_a_hold_another_pending_still_waits_on(tmp_path):
+    # complement 4: proposer A's persist failed after B's pending landed; A withdrew B's hold
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    [p] = w.pending.list_open()
+    w.journal.withdraw(hold_id_for(p.run_id, p.effect_id))          # A's hold is new again below
+    w.pending.add_for_run = lambda pending: (_ for _ in ()).throw(OSError("disk full"))
+    assert "pending_persist_failed" in w.dispatch("c1").outcome.reason
+    assert len(w.journal.open_holds()) == 1                         # B's pending still has its hold
+
+
+def test_an_approval_nobody_may_give_unattended_leaves_the_run_open(tmp_path):
+    # complement 5: the refused unattended approval cancelled the run; a person could no longer act
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    assert "unattended_approval_not_allowed" in w.resolve_open_as(
+        ConfirmDecision(approved=True, by="on-loop")).reason
+    assert w.dispatch("c1").chain.paused                           # proposed again
+    assert w.resolve_open(approve=True).completed
+
+
+def test_two_deliveries_of_one_pause_keep_one_chain_state(tmp_path):
+    # complement 6: concurrent deliveries each wrote a chain state for the same pending
+    from levain.autonomic import ChainState
+    w = TickingWorld(tmp_path)
+    w.mint(chain=True)
+    first = w.dispatch("c1").chain
+    st = w.chains._chain_store.get(first.chain_id)
+    twin = ChainState.create(created_at="2026-10-07T13:00:00", binding=st.binding_obj(),
+                             trigger_event=st.trigger_event, completed=st.completed_links(),
+                             paused_at_link=st.paused_at_link, paused_payload=st.paused_payload,
+                             pending_id=st.pending_id)
+    assert twin.chain_id != first.chain_id
+    w.chains._chain_store.add(twin)
+    assert [s.chain_id for s in w.chains._chain_store.list_open()] == [first.chain_id]
+
+
+def test_the_orphan_sweep_accepts_a_naive_clock(tmp_path):
+    # complement 7: a naive `now` against an aware hold time raised, and the orphan stayed forever
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.pending.add_for_run = lambda pending: (_ for _ in ()).throw(SystemExit("stopped"))
+    with pytest.raises(SystemExit):
+        w.dispatch("o1")
+    w = World(tmp_path)
+    w.gate.sweep_timeouts(_dt.datetime(2026, 10, 7, 15, 0, 0))      # naive, 3 hours later
+    assert w.journal.open_holds() == []

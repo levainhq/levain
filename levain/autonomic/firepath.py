@@ -159,8 +159,11 @@ class FireDispatcher:
         self._chain_executor = chain_executor
         # A journaled gate fences and admits through the store: both must use the SAME journal, or a
         # pause would fence a journal the runs are not admitted into.
-        if gate.journal is not None and store.journal is not gate.journal:
-            raise ValueError("FireDispatcher: the gate's run journal must be the binding store's journal")
+        if getattr(store, "journal", None) is not gate.journal:
+            raise ValueError("FireDispatcher: the gate's run journal must be the binding store's journal "
+                             "(both, or neither)")
+        if chain_executor is not None and chain_executor.gate is not gate:
+            raise ValueError("FireDispatcher: the chain executor must fire through the same gate")
 
     def dispatch(self, event: dict[str, Any]) -> list[FireDispatch]:
         """Fire every ACTIVE binding the ``event`` matches. For each candidate from
