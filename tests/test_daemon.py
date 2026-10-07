@@ -1268,5 +1268,21 @@ def test_a_log_path_that_is_not_this_users_regular_file_is_refused(tmp_path, mon
     spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
     (tmp_path / "logs").mkdir(mode=0o700)
     os.mkfifo(spec.stdout_log)
-    with pytest.raises(d.DaemonError, match="not a regular file"):
+    with pytest.raises(d.DaemonError, match="not a regular file|could not open"):
+        d._prepare_private_logs(spec)
+
+
+def test_a_log_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
+    """codex L3: a shared --log-dir where another user pre-created the log, world-readable."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
+    (tmp_path / "logs").mkdir(mode=0o700)
+    spec.stdout_log.write_text("")
+    me = os.getuid()
+    monkeypatch.setattr(d.os, "getuid", lambda: me + 1)   # the file now belongs to "someone else"
+    with pytest.raises(d.DaemonError, match="not a regular file this user owns"):
         d._prepare_private_logs(spec)

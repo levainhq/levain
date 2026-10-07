@@ -58,6 +58,52 @@ def _profile(home: Path, rel: str) -> Path:
     return p
 
 
+@pytest.mark.parametrize("rel", ["Library/Application Support/Google/Chrome",
+                                 "Library/Application Support/BraveSoftware/Brave-Browser",
+                                 "Library/Application Support/Arc/User Data"])
+def test_a_hardlink_to_a_profiles_page_storage_refuses_bash_at_both_depths(home: Path, monkeypatch, rel) -> None:
+    """L1d + L2d: Brave and Arc keep profiles one level deeper than Chrome; their storage is walked too."""
+    import levain.firing.confinement as cf
+    from levain.firing.confinement import ConfinementError, _refuse_multiply_linked_jewels
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Darwin")
+    prof = _profile(home, rel)
+    entity = _entity(home)
+    (entity / "workspace" / "alias.log").hardlink_to(prof / "Session Storage" / "000003.log")
+    try:
+        with pytest.raises(ConfinementError, match="names on disk"):
+            _refuse_multiply_linked_jewels(build_policy(entity))
+    finally:
+        (prof / "Private").chmod(0o700)
+
+
+def test_a_hardlink_to_firefox_page_storage_refuses_bash(home: Path, monkeypatch) -> None:
+    import levain.firing.confinement as cf
+    from levain.firing.confinement import ConfinementError, _refuse_multiply_linked_jewels
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Darwin")
+    store = home / "Library/Application Support/Firefox/Profiles/x.default/storage/default/http+++127.0.0.1+7420/ls"
+    store.mkdir(parents=True)
+    (store / "data.sqlite").write_text("levain.token")
+    entity = _entity(home)
+    (entity / "workspace" / "alias").hardlink_to(store / "data.sqlite")
+    with pytest.raises(ConfinementError, match="names on disk"):
+        _refuse_multiply_linked_jewels(build_policy(entity))
+
+
+def test_a_hardlink_inside_a_profiles_cache_alone_does_not_refuse_bash(home: Path, monkeypatch) -> None:
+    """The carve-out Phill ruled: a profile is not walked whole, so WebKit-style cache hardlinks do not stop bash."""
+    import levain.firing.confinement as cf
+    from levain.firing.confinement import _refuse_multiply_linked_jewels
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Darwin")
+    prof = _profile(home, "Library/Application Support/Google/Chrome")
+    try:
+        _refuse_multiply_linked_jewels(build_policy(_entity(home)))   # does not raise
+    finally:
+        (prof / "Private").chmod(0o700)
+
+
 def test_a_hardlink_to_a_profiles_page_storage_refuses_bash(home: Path) -> None:
     """codex L3: profiles are not walked whole, but their Session/Local Storage is, so another name for the file the
     cockpit's token lives in (say, in the entity's workspace) is caught at shell start."""
@@ -96,13 +142,46 @@ def test_on_linux_an_absent_browser_is_not_denied_so_bwrap_does_not_create_it(ho
     assert browser_profile_roots(home) == [(home / ".mozilla").resolve()]
 
 
-def test_the_list_covers_the_ruled_browsers_on_both_platforms() -> None:
-    joined = "\n".join(rel for _os, rel in BROWSER_PROFILE_DIRS)
-    for name in ("Google/Chrome", "Chromium", "BraveSoftware", "Microsoft Edge", "Arc", "Vivaldi", "Firefox",
-                 "Library/Safari", "Library/Containers/com.apple.Safari", "Library/Cookies",
-                 ".config/google-chrome", ".config/chromium", ".config/microsoft-edge", ".config/vivaldi",
-                 ".mozilla", ".var/app"):
-        assert name in joined, name
+def test_each_ruled_browser_profile_file_is_denied_on_macos(home: Path, monkeypatch) -> None:
+    """L1d + L2d: Chrome's other channels sit beside Google/Chrome, Brave and Arc one level deeper. A real profile file
+    for each browser and channel is denied to the file editor (a path, not an entry name, so this fails if the list
+    stops covering one)."""
+    import levain.firing.confinement as cf
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Darwin")
+    policy = build_policy(_entity(home))
+    AS = "Library/Application Support"
+    for f in (f"{AS}/Google/Chrome/Default/Cookies", f"{AS}/Google/Chrome Canary/Default/Cookies",
+              f"{AS}/Google/Chrome Beta/Default/Cookies", f"{AS}/Google/Chrome Dev/Default/Cookies",
+              f"{AS}/Google/Chrome for Testing/Default/Cookies", f"{AS}/Chromium/Default/Cookies",
+              f"{AS}/BraveSoftware/Brave-Browser/Default/Cookies", f"{AS}/Microsoft Edge Beta/Default/Cookies",
+              f"{AS}/Microsoft Edge/Default/Cookies", f"{AS}/Arc/User Data/Default/Cookies",
+              f"{AS}/Vivaldi/Default/Cookies", f"{AS}/com.operasoftware.Opera/Cookies",
+              f"{AS}/Firefox/Profiles/x.default/cookies.sqlite", "Library/Safari/History.db",
+              "Library/Containers/com.apple.Safari/Data/x", "Library/Cookies/Cookies.binarycookies"):
+        assert crown_jewel_reason(policy, home / f) is not None, f
+
+
+def test_on_linux_each_ruled_browser_is_denied_when_present_and_a_symlinked_root_refuses(home: Path, monkeypatch):
+    import levain.firing.confinement as cf
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Linux")
+    rels = (".config/google-chrome", ".config/google-chrome-unstable", ".config/BraveSoftware", ".mozilla",
+            "snap/firefox/common/.mozilla", "snap/chromium/common/chromium", ".config/opera", ".var/app")
+    for rel in rels:
+        (home / rel).mkdir(parents=True)
+    roots = cf.browser_profile_roots(home)
+    for rel in rels:
+        assert (home / rel).resolve() in roots, rel
+    # $XDG_CONFIG_HOME relocates .config
+    xdg = home / "xdg"
+    (xdg / "chromium").mkdir(parents=True)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    assert (xdg / "chromium").resolve() in cf.browser_profile_roots(home)
+    # L2d: an entity could plant the absent path as a link into its workspace
+    (home / ".config" / "vivaldi").symlink_to(home)
+    with pytest.raises(cf.ConfinementError, match="symlink"):
+        cf.browser_profile_roots(home)
 
 
 @live

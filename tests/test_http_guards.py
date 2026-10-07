@@ -803,3 +803,36 @@ def test_request_link_code_bounds_what_it_reads(tmp_path):
         httpd.shutdown()
         httpd.server_close()
         t.join(timeout=5)
+
+
+def test_request_link_code_gives_up_on_a_dripping_listener(tmp_path):
+    import time as _time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from levain.http_guards import request_link_code
+
+    class _Drip(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", "1000")
+            self.end_headers()
+            for _ in range(1000):
+                self.wfile.write(b" ")
+                self.wfile.flush()
+                _time.sleep(0.2)
+
+        def log_message(self, *a):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Drip)
+    httpd.daemon_threads = True
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        started = _time.monotonic()
+        with pytest.raises(ValueError, match="too long"):
+            request_link_code(f"http://127.0.0.1:{httpd.server_address[1]}/", _TOKEN, timeout=1.0)
+        assert _time.monotonic() - started < 10
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

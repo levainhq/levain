@@ -9,8 +9,9 @@
 // #token= / #chat_token= link still works when the page loads. The token is never put in a cookie (a cookie for
 // 127.0.0.1 would go to every port on it) or a request URL. sessionStorage is on disk: browsers write it into the
 // profile for session restore (Chrome's Session Storage, measured 2026-10-07), where it lasts as long as the tab may be
-// restored. Browser profiles are crown jewels in an entity's confinement floor (levain.firing.confinement), so an
-// entity's hands cannot read it there; the token is still void as soon as its server stops.
+// restored. Browser profiles are crown jewels in an entity's confinement floor (levain.firing.confinement,
+// BROWSER_PROFILE_DIRS), so the browsers listed there are denied to an entity's hands; a browser not on that list is
+// not. The token is void as soon as its server stops.
 //
 // Loaded before every other script on the page. The other scripts send `LevainToken.headers()` with each request, and
 // on a 403 whose JSON says `error: "launch_token"` they call `LevainToken.lock(message, sent)`, which drops the token and

@@ -691,43 +691,101 @@ def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
 PROJECT_MEMORY_HOME = ".anneal-projects"
 
 # BROWSER PROFILES, home-relative, read AND write denied (head ruling 2026-10-07, after L2 measured the cockpit's
-# launch token on disk in Chrome's Session Storage). A profile holds every site's session cookies, saved logins and
-# local storage unencrypted, so it is a crown jewel whatever Levain keeps in it. Each entry is (platform, path): on
-# macOS every entry is denied whether or not it exists (a Seatbelt rule for an absent path costs nothing); on Linux
-# only an entry that exists is, because bwrap CREATES an absent denied path on the host to mount over it (codex L3),
-# which would litter every home with every browser's directories.
+# launch token on disk in Chrome's Session Storage). A profile holds every site's session cookies and saved logins
+# (Chromium browsers encrypt those with a Keychain or keyring key; their page storage is plain), so it is a crown
+# jewel whatever Levain keeps in it. Each entry is (platform, path). On macOS every entry is denied whether or not it
+# exists: a Seatbelt rule for an absent path costs nothing, and an absent denied path cannot be created by the entity.
+# On Linux only an entry that exists when the session's policy is built is denied, because bwrap CREATES an absent
+# denied path on the host to mount over it (codex L3); the policy is rebuilt at every session start, so a browser
+# installed during a session is denied from the next one, and an entry that is a symlink refuses bash (an entity
+# could plant one into its workspace while the path is absent; L2). Paths from the Chromium user-data-dir doc
+# (https://chromium.googlesource.com/chromium/src/+/main/docs/user_data_dir.md) and the vendors' layouts (L1 + L2,
+# 2026-10-07). On Linux, entries under ``.config`` are also checked under ``$XDG_CONFIG_HOME`` and
+# ``$CHROME_CONFIG_HOME`` when those are set.
 BROWSER_PROFILE_DIRS: tuple[tuple[str, str], ...] = (
-    ("darwin", "Library/Application Support/Google/Chrome"),      # Chrome (all channels' profiles)
+    ("darwin", "Library/Application Support/Google"),             # every Chrome channel + Chrome for Testing (also
+                                                                  # holds Android Studio config: denied with it)
     ("darwin", "Library/Application Support/Chromium"),           # Chromium
-    ("darwin", "Library/Application Support/BraveSoftware"),      # Brave
+    ("darwin", "Library/Application Support/BraveSoftware"),      # Brave, all channels
     ("darwin", "Library/Application Support/Microsoft Edge"),     # Edge
-    ("darwin", "Library/Application Support/Arc"),                # Arc
+    ("darwin", "Library/Application Support/Microsoft Edge Beta"),
+    ("darwin", "Library/Application Support/Microsoft Edge Dev"),
+    ("darwin", "Library/Application Support/Microsoft Edge Canary"),
+    ("darwin", "Library/Application Support/Arc"),                # Arc (profiles under Arc/User Data)
     ("darwin", "Library/Application Support/Vivaldi"),            # Vivaldi
-    ("darwin", "Library/Application Support/Firefox"),            # Firefox
+    ("darwin", "Library/Application Support/com.operasoftware.Opera"),     # Opera
+    ("darwin", "Library/Application Support/com.operasoftware.OperaGX"),   # Opera GX
+    ("darwin", "Library/Application Support/Firefox"),            # Firefox, Developer Edition and Nightly
+    ("darwin", "Library/Application Support/zen"),                # Zen (Firefox-based)
+    ("darwin", "Library/Application Support/Orion"),              # Orion
     ("darwin", "Library/Safari"),                                 # Safari history, local storage
     ("darwin", "Library/Containers/com.apple.Safari"),            # Safari's sandbox container
     ("darwin", "Library/Cookies"),                                # the system cookie store Safari uses
     ("linux", ".config/google-chrome"),                           # Chrome
+    ("linux", ".config/google-chrome-beta"),                      # Chrome Beta
+    ("linux", ".config/google-chrome-unstable"),                  # Chrome Dev
+    ("linux", ".config/google-chrome-canary"),                    # Chrome Canary
     ("linux", ".config/chromium"),                                # Chromium
-    ("linux", ".config/BraveSoftware"),                           # Brave
+    ("linux", ".config/BraveSoftware"),                           # Brave, all channels
     ("linux", ".config/microsoft-edge"),                          # Edge
+    ("linux", ".config/microsoft-edge-beta"),
+    ("linux", ".config/microsoft-edge-dev"),
     ("linux", ".config/vivaldi"),                                 # Vivaldi
+    ("linux", ".config/opera"),                                   # Opera
     ("linux", ".mozilla"),                                        # Firefox
-    ("linux", ".var/app"),                                        # every flatpak app's data, flatpak browsers among them
+    ("linux", ".config/mozilla"),                                 # Firefox's XDG location (newer releases)
+    ("linux", "snap/firefox/common/.mozilla"),                    # Ubuntu's default Firefox (snap)
+    ("linux", "snap/chromium/common/chromium"),                   # Chromium (snap)
+    ("linux", "snap/brave"),                                      # Brave (snap)
+    ("linux", ".var/app"),                                        # every flatpak app's data, by design: browsers
+                                                                  # among them, and every other flatpak app too
 )
 
-# Inside a Chromium-family profile, the storage a page's sessionStorage/localStorage lands in. These ARE walked for
-# other names at shell start (a hardlink to them elsewhere would carry the cockpit's token past the path deny; codex
-# L3); the rest of a profile is not (see _jewel_inodes).
-_BROWSER_STORAGE_GLOBS = ("*/Session Storage", "*/Local Storage")
+# The ONLY parts of a profile walked for other names (hardlinks) at shell start, ruled by Phill 2026-10-07 ("levain =
+# (a) please"): a profile is too large, and carries its own hardlinks (WebKit's cache), to walk whole. These are the
+# folders that hold a page's sessionStorage / localStorage, which is where the cockpit's launch token lives, at both
+# profile depths (Chrome <root>/<profile>/, Brave and Arc <root>/<browser>/<profile>/), plus Firefox's per-origin
+# storage and its session store. Cookies, Login Data and the rest of a profile are denied by path only, and
+# Safari's container cannot be walked at all (it refuses a listing).
+_BROWSER_STORAGE_GLOBS = (
+    "*/Session Storage", "*/*/Session Storage",                   # Chromium-family sessionStorage
+    "*/Local Storage", "*/*/Local Storage",                       # Chromium-family localStorage
+    "*/*/storage/default", "Profiles/*/storage/default",          # Firefox per-origin storage (localStorage)
+    "*/*/sessionstore.jsonlz4", "Profiles/*/sessionstore.jsonlz4",    # Firefox's session store (sessionStorage)
+    "*/*/sessionstore-backups", "Profiles/*/sessionstore-backups",
+)
+
+
+def _linux_config_homes(home: Path) -> list[Path]:
+    homes = [home / ".config"]
+    for var in ("XDG_CONFIG_HOME", "CHROME_CONFIG_HOME"):
+        v = os.environ.get(var)
+        if v and Path(v).expanduser() not in homes:
+            homes.append(Path(v).expanduser())
+    return homes
 
 
 def browser_profile_roots(home: Path) -> list[Path]:
-    """The browser profile roots denied on this platform (see ``BROWSER_PROFILE_DIRS``), resolved."""
+    """The browser profile roots denied on this platform for a session starting now (see ``BROWSER_PROFILE_DIRS``),
+    resolved. Raises :class:`ConfinementError` for a Linux entry that is a symlink."""
     if platform.system() == "Darwin":
         return [(home / rel).resolve() for os_name, rel in BROWSER_PROFILE_DIRS if os_name == "darwin"]
-    return [(home / rel).resolve() for os_name, rel in BROWSER_PROFILE_DIRS
-            if os_name == "linux" and (home / rel).exists()]
+    out: list[Path] = []
+    for os_name, rel in BROWSER_PROFILE_DIRS:
+        if os_name != "linux":
+            continue
+        cands = ([base / rel[len(".config/"):] for base in _linux_config_homes(home)]
+                 if rel.startswith(".config/") else [home / rel])
+        for c in cands:
+            if c.is_symlink():
+                raise ConfinementError(
+                    f"{c} is a symlink where a browser profile belongs. A browser would write its profile wherever it "
+                    "points, outside the floor. Refusing to grant bash hands (fail-closed); remove the link.")
+            if c.exists():
+                out.append(c.resolve())
+    return out
+
+
 DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
 
 
@@ -3008,7 +3066,8 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
     """For every crown-jewel file or socket: ``(st_dev, st_ino) -> (st_nlink, one path to it)``.
 
     The jewels are the named ones (followed through symlinks) plus every entry under the hidden
-    subtrees and the ssh dir (walked without following symlinks), and on Linux the session bus and
+    subtrees and the ssh dir (walked without following symlinks), except browser profiles, of which only the page
+    storage named in ``_BROWSER_STORAGE_GLOBS`` is walked (Phill, 2026-10-07), and on Linux the session bus and
     the systemd manager socket bwrap step (7) masks. An absent jewel is skipped: there is no file to
     have other names.
 
@@ -3066,7 +3125,7 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
     # container is privacy-protected (os.walk is refused, which would refuse bash outright), and a Chrome profile can
     # hold gigabytes. Their page storage (_BROWSER_STORAGE_GLOBS), where the cockpit's token is kept, IS walked.
     home = Path.home()
-    unwalked = {(home / rel).resolve() for _os_name, rel in BROWSER_PROFILE_DIRS}
+    unwalked = {(home / rel).resolve() for _os_name, rel in BROWSER_PROFILE_DIRS} | set(browser_profile_roots(home))
     storage_roots = sorted({hit for root in unwalked if os.path.isdir(root)
                             for pattern in _BROWSER_STORAGE_GLOBS for hit in root.glob(pattern)}, key=str)
     roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])} - unwalked,

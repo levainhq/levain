@@ -258,29 +258,25 @@ def _prepare_private_logs(spec: "DaemonSpec") -> None:
             os.chmod(d, 0o700)   # mkdir's mode is masked by the umask
         elif platform.system() != "Darwin" and d.resolve() == _default_log_dir().expanduser().resolve():
             os.chmod(d, 0o700)
-        try:
-            st = os.lstat(log)
-        except FileNotFoundError:
-            st = None
-        except OSError as exc:
-            raise DaemonError(f"could not check {log}: {exc}") from exc
-        if st is None:
-            try:
-                os.close(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600))
-                os.chmod(log, 0o600)
-                continue
-            except FileExistsError:
-                st = os.lstat(log)
-            except OSError as exc:
-                raise DaemonError(f"could not create {log}: {exc}") from exc
         # The service will append to whatever is at this path: it must be a regular file this user owns, never a link
         # (it would be followed), a FIFO or device (it would block), or another user's file (codex L3: in a shared
-        # --log-dir someone could pre-create it world-readable).
-        if stat.S_ISLNK(st.st_mode):
-            raise DaemonError(f"{log} is a symlink; a unit's log must be a regular file. Remove it and install again.")
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
-            raise DaemonError(f"{log} is not a regular file this user owns; remove it or pass another --log-dir.")
-        os.chmod(log, 0o600)   # a log an older unit created wider (its old token lines, since dead)
+        # --log-dir someone could pre-create it world-readable). Opened once with O_NOFOLLOW and checked and narrowed
+        # through that descriptor, so nothing can be swapped in between the check and the chmod (L1 L3).
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(log, flags, 0o600)
+        except OSError as exc:
+            if os.path.islink(log):
+                raise DaemonError(
+                    f"{log} is a symlink; a unit's log must be a regular file. Remove it and install again.") from exc
+            raise DaemonError(f"could not open {log}: {exc}") from exc
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                raise DaemonError(f"{log} is not a regular file this user owns; remove it or pass another --log-dir.")
+            os.fchmod(fd, 0o600)   # new, or an older unit's log created wider (its old token lines, since dead)
+        finally:
+            os.close(fd)
 
 
 def _default_log_dir() -> Path:

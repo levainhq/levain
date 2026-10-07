@@ -620,8 +620,8 @@ class PublishedToken:
     pub_id: str = ""
 
     def close(self) -> None:
-        """Remove this server's runtime file, if it is still this server's: a later server on the port (even one in
-        the same process) may have replaced it, so both the pid and the token must match (codex L3)."""
+        """Remove this server's runtime file, if it is still this publication's: a later server on the port (even one
+        in the same process, even with the same token) may have replaced it, so the record's ``pub_id`` must match."""
         if self.path is None:
             return
         try:
@@ -743,8 +743,18 @@ def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
         headers={LINK_NONCE_HEADER: nonce, LINK_TIME_HEADER: stamp,
                  LINK_PROOF_HEADER: _link_proof(token, "levain-link-request", nonce, stamp)})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    deadline = time.monotonic() + 2 * timeout
+    raw = b""
     with opener.open(req, timeout=timeout) as r:  # noqa: S310 — a loopback origin, checked above
-        raw = r.read(_LINK_REPLY_MAX + 1)   # whoever holds the port cannot make this read without end (codex L3)
+        # Bounded in size AND time: whoever holds the port cannot make this read without end, by volume or by
+        # dripping a byte at a time (codex + L1 L3).
+        while len(raw) <= _LINK_REPLY_MAX:
+            if time.monotonic() > deadline:
+                raise ValueError("the answer on that port took too long to be a link; not opening it")
+            chunk = r.read1(1024)
+            if not chunk:
+                break
+            raw += chunk
     if len(raw) > _LINK_REPLY_MAX:
         raise ValueError("the answer on that port was too long to be a link; not opening it")
     reply = json.loads(raw)
