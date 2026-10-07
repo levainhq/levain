@@ -40,6 +40,21 @@ def _guard_stats(guards: tuple[Guard, ...]) -> tuple[int, int, int, int]:
     return count, kill_bearing, with_traj, with_bound
 
 
+def _journal_liveness(store: BindingStore) -> dict[str, Any] | None:
+    journal = store.journal
+    if journal is None:
+        return None
+    try:
+        holds = journal.open_holds()
+        poisoned = journal.poisoned()
+    except Exception as e:  # noqa: BLE001 — a liveness read reports, it never raises
+        return {"open_holds": {}, "poisoned": 0, "unreadable": f"{type(e).__name__}: {e}"}
+    per_binding: dict[str, int] = {}
+    for h in holds:
+        per_binding[h["binding_id"]] = per_binding.get(h["binding_id"], 0) + 1
+    return {"open_holds": per_binding, "poisoned": len(poisoned), "unreadable": None}
+
+
 def binding_liveness(store: BindingStore) -> dict[str, Any]:
     """Tally the live shape of the binding registry. Reads the FULL inspection view (``list_all`` —
     includes inactive records, which ``list_active`` bars) once, plus the fire-view (``list_active``)
@@ -51,6 +66,10 @@ def binding_liveness(store: BindingStore) -> dict[str, Any]:
         (:meth:`~levain.autonomic.binding.BindingStore.integrity`: a duplicate, a record whose core does
         not seal to its id, unreadable JSON). Without it a corrupt registry tallies exactly like an empty
         one; a non-``None`` value is a TAMPER/corruption signal and every other count below is zero.
+      - ``journal`` — ``None`` without a run journal; else ``{"open_holds": {binding_id: n},
+        "poisoned": n, "unreadable": None | why}``. An open hold stops every undecided effect of its
+        binding, and a poisoned effect needs a person to check the world; neither shows in the counts
+        below, so they are surfaced here.
       - ``total`` / ``by_status`` — record count + lifecycle mix.
       - ``fireable`` — the ``list_active`` count (active + sealed + a sealed kill at confirm-class).
       - ``barred_confirm_no_kill`` — ACTIVE confirm-class records with no SEALED-floor kill (barred by
@@ -86,6 +105,7 @@ def binding_liveness(store: BindingStore) -> dict[str, Any]:
 
     return {
         "registry_corrupt": store.integrity(),
+        "journal": _journal_liveness(store),
         "total": len(all_bindings),
         "by_status": by_status,
         "fireable": fireable,

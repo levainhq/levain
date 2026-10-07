@@ -757,7 +757,8 @@ class ChainExecutor:
                     _log.error("chainpath: chain-state persist FAILED for %s (%s): %s — consuming the "
                                "just-proposed pending %s + aborting (no orphaned fireable pending)",
                                binding.binding_id, type(e).__name__, e, pending_id)
-                    self._consume_pending(pending_id, f"chain_state_persist_failed:{type(e).__name__}")
+                    self._consume_pending(pending_id, f"chain_state_persist_failed:{type(e).__name__}",
+                                          withdraw=True)
                     return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
                                         paused_at=i, reason=f"chain_state_persist_failed:{type(e).__name__}")
                 _log.info("chainpath: binding %s PAUSED at link %d (%s) — pending %s, chain %s",
@@ -919,7 +920,9 @@ class ChainExecutor:
                 _log.warning("chainpath resume: STANDING binding %s not confirmed ACTIVE in the registry "
                              "(absent/inactive/unreadable) — cannot confirm continued authority; ABORTING",
                              binding.binding_id)
-                self._consume_pending(pending_id, "standing_grant_unconfirmed")
+                # withdraw, not reject: an unreadable registry is not a revoke (a real revoke has fenced
+                # the run already), so a re-delivery after recovery may propose the link again
+                self._consume_pending(pending_id, "standing_grant_unconfirmed", withdraw=True)
                 return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=(),
                                     paused_at=state.paused_at_link, reason="standing_grant_unconfirmed")
 
@@ -960,11 +963,12 @@ class ChainExecutor:
                          "unconfirmed (fail-closed abort for a standing grant)", binding_id, type(e).__name__, e)
             return None
 
-    def _consume_pending(self, pending_id: str, reason: str) -> None:
+    def _consume_pending(self, pending_id: str, reason: str, *, withdraw: bool = False) -> None:
         """DENY + consume an orphaned gate pending whose chain ABORTED, so a plain ``gate.resolve`` /
         sweep can never fire the link the chain decided to abort (the two-resource invariant: a pending
         owned by a chain is consumed when the chain aborts — codex HIGH). Fail-soft: a gate fault here
-        must not crash the resume (the chain is already aborted).
+        must not crash the resume (the chain is already aborted). ``withdraw`` marks an
+        infrastructure-fault abort: the pending is consumed but the journaled run is not cancelled.
 
         The deny SHOULD claim+remove the pending. If ``gate.resolve`` returns ``unknown_pending`` (the
         pending-store claim itself faulted → the record SURVIVES) the consume did NOT actually happen —
@@ -973,7 +977,8 @@ class ChainExecutor:
         never an outbound; a non-deliver allowlisted link would need this closed first)."""
         try:
             outcome = self._gate.resolve(pending_id, ConfirmDecision(approved=False, by="on-loop",
-                                                                     reason=f"chain_aborted:{reason}"))
+                                                                     reason=f"chain_aborted:{reason}",
+                                                                     withdraw=withdraw))
         except Exception as e:  # noqa: BLE001 — the chain is already aborted; a consume fault is not fatal
             _log.error("chainpath: failed to consume orphaned pending %s (%s): %s — it MAY remain resolvable",
                        pending_id, type(e).__name__, e)

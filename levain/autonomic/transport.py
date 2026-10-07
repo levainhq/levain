@@ -85,6 +85,9 @@ class ConfirmDecision:
       demands — the gate REFUSES an approved-elevated resolve without it (the stronger affordance the
       rung promises, enforced not just rendered). ``None`` for the one-tap ``confirm`` rung.
     - ``reason`` is a short human/audit string (e.g. ``"cooling_off_window_elapsed"``).
+    - ``withdraw`` (only with ``approved=False``) marks a drop caused by an infrastructure fault, not by
+      a decider: the pending is consumed, but a journaled run is NOT cancelled (its hold is withdrawn),
+      so re-delivering the event proposes the effect again.
     """
 
     approved: bool
@@ -92,6 +95,7 @@ class ConfirmDecision:
     first_estimate: Any | None = None
     typed_proof: str | None = None
     reason: str = ""
+    withdraw: bool = False
 
 
 @runtime_checkable

@@ -165,11 +165,33 @@ def test_a_process_that_dies_mid_effect_leaves_it_poisoned(tmp_path):
 
 
 def test_a_live_owner_is_in_flight_not_poisoned(j):
+    # the owner holds the effect's lease across its call; a reader sees IN_FLIGHT, never POISONED,
+    # whether the owner is another process, a recycled pid, or another thread of this one
     j.start("r1", binding_id="b", generation=1)
-    # an intent recorded by another, still-running process (our parent stands in for it)
-    j._append({"t": "intent", "run_id": "r1", "effect_id": "send", "digest": "d", "pid": os.getppid()})
-    assert j.effect("r1", "send", digest="d", fn=Effect()).status is EffectStatus.IN_FLIGHT
-    assert j.poisoned() == []
+    seen = []
+
+    def slow_send():
+        seen.append(j.effect("r1", "send", digest="d", fn=Effect()).status)   # a second caller, mid-call
+        seen.append(j.poisoned())
+        return "sent"
+
+    assert j.effect("r1", "send", digest="d", fn=slow_send).status is EffectStatus.DONE
+    assert seen == [EffectStatus.IN_FLIGHT, []]
+    assert j.effect("r1", "send", digest="d", fn=Effect()).status is EffectStatus.REPLAYED
+
+
+def test_a_recycled_pid_does_not_make_a_dead_owner_look_alive(j):
+    # an intent whose owner is gone (no lease held) is poisoned even if its recorded pid is alive
+    j.start("r1", binding_id="b", generation=1)
+    j._append({"t": "intent", "run_id": "r1", "effect_id": "send", "digest": "d", "pid": os.getpid()})
+    assert j.effect("r1", "send", digest="d", fn=Effect()).status is EffectStatus.POISONED
+    assert j.poisoned() == [("r1", "send")]
+
+
+def test_the_registry_generation_fences_a_run_the_journal_never_heard_about(j):
+    j.start("r1", binding_id="b", generation=3)
+    assert j.effect("r1", "x", digest="d", fn=Effect(), current_generation=3).status is EffectStatus.DONE
+    assert j.effect("r1", "y", digest="d", fn=Effect(), current_generation=4).status is EffectStatus.FENCED
 
 
 # --- storage -------------------------------------------------------------------------------
@@ -202,7 +224,7 @@ def test_an_effect_with_its_own_approved_hold_runs_while_a_sibling_decision_is_o
 
 
 def test_proposing_the_same_effect_again_finds_the_same_decision(j):
-    j.start("r1", binding_id="b")
+    j.start("r1", binding_id="b", generation=0)
     first = j.hold("r1", "send", digest="d")
     again = j.hold("r1", "send", digest="d")
     assert first.new_hold and not again.new_hold and first.hold_id == again.hold_id
@@ -213,23 +235,23 @@ def test_proposing_the_same_effect_again_finds_the_same_decision(j):
 
 
 def test_proposing_different_bytes_under_an_open_decision_cancels_the_run(j):
-    j.start("r1", binding_id="b")
+    j.start("r1", binding_id="b", generation=0)
     j.hold("r1", "send", digest="d1")
     assert j.hold("r1", "send", digest="d2").status is EffectStatus.CANCELLED
     assert j.effect("r1", "send", digest="d1", fn=Effect()).status is EffectStatus.CANCELLED
 
 
-def test_admission_reads_the_current_generation_and_a_fence_bumps_it(j):
+def test_a_fence_bumps_the_generation_and_stops_older_runs(j):
     assert j.generation("b") == 0
-    j.start("old", binding_id="b")                 # admitted at 0
+    j.start("old", binding_id="b", generation=0)
     assert j.fence("b") == 1
-    j.start("new", binding_id="b")                 # admitted at 1
+    j.start("new", binding_id="b", generation=j.generation("b"))
     assert j.effect("old", "x", digest="d", fn=Effect()).status is EffectStatus.FENCED
     assert j.effect("new", "x", digest="d", fn=Effect()).status is EffectStatus.DONE
 
 
 def test_peek_runs_nothing_and_reports_the_barrier(j):
-    j.start("r1", binding_id="b")
+    j.start("r1", binding_id="b", generation=0)
     assert j.peek("r1", "x") is None
     j.effect("r1", "x", digest="d", fn=Effect("v"))
     seen = j.peek("r1", "x")
@@ -254,7 +276,7 @@ def test_a_run_id_is_a_content_address_over_the_binding_and_the_event():
 
 
 def test_a_malformed_record_fails_closed(j, tmp_path):
-    j.start("r1", binding_id="b")
+    j.start("r1", binding_id="b", generation=0)
     with open(tmp_path / "journal.jsonl", "a") as f:
         f.write('{"t":"result","run_id":"r1"}\n')     # parses, but is missing effect_id
     with pytest.raises(JournalCorruptError):
