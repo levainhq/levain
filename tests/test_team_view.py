@@ -1008,3 +1008,58 @@ def test_a_request_dripped_a_byte_at_a_time_is_cut_at_the_deadline(monkeypatch):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_a_late_deadline_cut_after_the_request_was_routed_does_nothing():
+    # L3 r2 10-07 (codex): Timer.cancel() cannot stop a timer whose wait already ended, so a cut could still shut the
+    # socket of a request that reached _route just at the deadline, mid ledger read. The cut checks its request's flag.
+    calls = []
+    h = object.__new__(V._ViewHandler)
+    h.connection = type("Sock", (), {"shutdown": lambda self, how: calls.append(how)})()
+    h._armed = [True]
+    h._deadline = threading.Timer(3600, lambda: None)
+    h._disarm()
+    h._cut(h._armed)                       # the timer thread, running late
+    assert calls == []
+    h._cut([True])                         # an armed request's cut still cuts
+    assert len(calls) == 1
+
+
+def test_warnings_from_a_read_that_raised_and_from_startup_reach_the_terminal(capfd):
+    # L3 r2 10-07 (complement): only a successful page logged what the transport warned about, and the team.toml read
+    # at start was never drained at all; both went silently off the process-wide list or stayed on it.
+    class Warns(_Stub):
+        def team(self, rev=None):
+            self.warnings.append("team.toml at start: fell back")
+            return TEAM
+
+        def snapshot(self):
+            self.warnings.append("team.toml in a read: fell back")
+            raise RuntimeError("the read failed")
+    stub = Warns()
+    httpd = V.make_view_server(stub, port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        assert stub.warnings == [] and "team.toml at start: fell back" in capfd.readouterr().err
+        r, _ = _req(httpd.server_address[1], "GET", "/view.json")
+        assert r.status == 503
+        assert stub.warnings == [] and "team.toml in a read: fell back" in capfd.readouterr().err
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_a_503_that_is_not_json_says_unavailable_and_draws_nothing(monkeypatch):
+    # L3 r2 10-07 (complement): a 503 whose body is not JSON fell through to render(undefined) and a TypeError.
+    def plain_503(self, *, head):
+        self._disarm()
+        self._send(b"overloaded\n", "text/plain; charset=utf-8", status=503, head=head)
+    monkeypatch.setattr(V._ViewHandler, "_route", plain_503)
+    httpd = V.make_view_server(_Stub(), port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        page = _page(httpd.server_address[1])
+        assert "The ledger is unavailable" in page and "Could not load" not in page
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

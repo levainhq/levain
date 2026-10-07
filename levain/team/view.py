@@ -464,7 +464,7 @@ JS = r"""(function () {
         }
         if (r.status === 503) {
           return r.json().catch(function () { return {}; }).then(function (j) {
-            return { unavailable: j && j.error, wait: parseInt(r.headers.get("Retry-After"), 10) || 2 };
+            return { unavailable: (j && j.error) || "unavailable", wait: parseInt(r.headers.get("Retry-After"), 10) || 2 };
           });
         }
         if (!r.ok) throw new Error("HTTP " + r.status);
@@ -546,6 +546,7 @@ class _ViewServer(ThreadingHTTPServer):
 
 
 _WARNINGS_LOCK = threading.Lock()   # one per process, as transport.WARNINGS is; taken with a server's model_lock
+_CUT_LOCK = threading.Lock()        # a request's deadline cut and its disarm
 
 
 class _Busy(Exception):
@@ -568,20 +569,31 @@ class _ViewHandler(GuardedHandler):
     # forever, and MAX_WORKERS of them would close the page to everyone. A request must reach _route within
     # REQUEST_DEADLINE of the server starting to wait for it, or its socket is shut down; _route disarms the deadline,
     # so a slow ledger read is never cut.
+    # Timer.cancel() cannot stop a timer whose wait has already ended, so the cut and the disarm also agree under a
+    # lock on one flag per request: once disarmed, that request's cut does nothing, however late it runs.
     def handle_one_request(self) -> None:
-        self._deadline = threading.Timer(REQUEST_DEADLINE, self._cut)
+        self._armed = [True]
+        self._deadline = threading.Timer(REQUEST_DEADLINE, self._cut, args=(self._armed,))
         self._deadline.daemon = True
         self._deadline.start()
         try:
             super().handle_one_request()
         finally:
-            self._deadline.cancel()
+            self._disarm()
 
-    def _cut(self) -> None:
-        try:
-            self.connection.shutdown(socket.SHUT_RDWR)   # the blocked read returns at once and the handler ends
-        except OSError:
-            pass
+    def _disarm(self) -> None:
+        with _CUT_LOCK:
+            self._armed[0] = False
+        self._deadline.cancel()
+
+    def _cut(self, armed: list) -> None:
+        with _CUT_LOCK:
+            if not armed[0]:
+                return
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)   # the blocked read returns at once and the handler ends
+            except OSError:
+                pass
 
     def _model(self, path_filter: str = "") -> dict:
         gl: GitLedger = self.server.ledger_reader
@@ -604,16 +616,10 @@ class _ViewHandler(GuardedHandler):
                             recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
                             path_filter=path_filter, problems=self._problems(gl, sha, team, ledger))
             m["cockpit_url"] = self.server.cockpit_url
-            # What the transport wanted a person to hear (a team.toml it had to fall back from, say) goes to the
-            # terminal, word for word (it can carry local paths or git's text); the page counts it. Either way it is
-            # taken off the process-wide list, which would otherwise grow with every request this server answers.
-            new = list(dict.fromkeys(gl.warnings[mark:]))
-            for w in new:
-                _log(f"ledger warning: {w!r}")
-            m["warning_count"] = len(new)
+            m["warning_count"] = _drain_warnings(gl, mark)
             return m
         finally:
-            del gl.warnings[mark:]
+            _drain_warnings(gl, mark)        # a read that raised still says what it warned about
             _WARNINGS_LOCK.release()
             self.server.model_lock.release()
 
@@ -627,7 +633,7 @@ class _ViewHandler(GuardedHandler):
 
     def _route(self, *, head: bool) -> None:
         # GuardedHandler has run the Host allowlist, the cross-site read refusal and the launch token.
-        self._deadline.cancel()
+        self._disarm()
         path, _, query = self.path.partition("?")
         asset = self.server.assets.get(path)
         if asset is not None:
@@ -657,6 +663,27 @@ class _ViewHandler(GuardedHandler):
         self.end_headers()
         if not head:
             self.wfile.write(body)
+
+
+def _drain_warnings(gl: GitLedger, mark: int) -> int:
+    """What the transport wanted a person to hear since ``mark`` (a team.toml it had to fall back from, say) goes to
+    the terminal, word for word (it can carry local paths or git's text), and is taken off the process-wide list, which
+    would otherwise grow with every read. Returns how many distinct warnings there were, for the page to count."""
+    new = list(dict.fromkeys(gl.warnings[mark:]))
+    for w in new:
+        _log(f"ledger warning: {w!r}")
+    del gl.warnings[mark:]
+    return len(new)
+
+
+def _team_logging_warnings(gl: GitLedger, rev: str | None = None) -> R.Team:
+    """``gl.team(rev)`` outside a request (at start and for the cockpit's name), its warnings said in the terminal."""
+    with _WARNINGS_LOCK:
+        mark = len(gl.warnings)
+        try:
+            return gl.team(rev)
+        finally:
+            _drain_warnings(gl, mark)
 
 
 def _log(msg: str) -> None:
@@ -736,7 +763,7 @@ def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFA
         raise ValueError(f"port must be 0..65535, got {port!r}")
     # Fail now, with the ledger's own message, if this clone has no ledger. Only the tip and its team.toml are read:
     # the full read (a cold history walk can take a minute) waits for the first page.
-    gl.team(gl.head())
+    _team_logging_warnings(gl, gl.head())
     check_launch_token(read_token)   # before the bind, so a bad token leaves no socket behind
     httpd = _ViewServer((host, port), _ViewHandler)
     bound = str(httpd.server_address[0])
@@ -790,7 +817,7 @@ def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: i
         except Exception as exc:  # noqa: BLE001
             print(f"  (registry prune failed: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
         try:
-            httpd.registration = registry.register(str(gl.repo.toplevel), url, gl.team().project)
+            httpd.registration = registry.register(str(gl.repo.toplevel), url, _team_logging_warnings(gl).project)
         except Exception as exc:  # noqa: BLE001
             print(f"  (not registered with the cockpit: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
         if open_browser:   # inside it too: a Ctrl+C while the browser opens still removes the runtime file

@@ -363,7 +363,10 @@ def register(repo: str, url: str, project: str) -> Registration:
                 pass
         with _FORK_LOCK:
             _PENDING.discard(dir_fd)
-            os.close(dir_fd)
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
         raise
 
 
