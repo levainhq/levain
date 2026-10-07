@@ -1008,3 +1008,40 @@ def test_request_link_code_does_not_follow_a_redirect(tmp_path):
         for x in (first, other):
             x.shutdown()
             x.server_close()
+
+
+def test_a_read_only_server_declares_allow_once_and_a_post_gets_405(tmp_path):
+    """Head ruling 2026-10-07: a handler that sets ``allow = "GET, HEAD"`` answers POST, like any other method, with
+    the guards and then 405 + that Allow; its _post is never reached."""
+    from http.server import ThreadingHTTPServer
+
+    from levain.http_guards import GuardedHandler, arm_launch_token
+
+    reached = []
+
+    class _ReadOnly(GuardedHandler):
+        allow = "GET, HEAD"
+
+        def _route(self, *, head):
+            self._send(b"ok", "text/plain; charset=utf-8", head=head)
+
+        def _post(self):
+            reached.append("post")
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _ReadOnly)
+    httpd.allowed_hosts = frozenset({"127.0.0.1", "localhost"})
+    arm_launch_token(httpd, _TOKEN, frozenset())
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        port = httpd.server_address[1]
+        assert _request(port, "GET")[0] == 200
+        for method in ("POST", "PUT", "FOO"):
+            status, headers = _request(port, method)
+            assert status == 405 and headers.get("Allow") == "GET, HEAD", method
+        assert _request(port, "POST", token=None)[0] == 403
+        assert reached == []
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)

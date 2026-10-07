@@ -208,6 +208,10 @@ class GuardedHandler(BaseHTTPRequestHandler):
             raise TypeError(f"{cls.__qualname__} defines {own}: a GuardedHandler routes through _route / _post, "
                             "so the shared guards (Host, origin, launch token) always run first.")
 
+    # The methods this server answers, as its 405s' ``Allow`` says them. A read-only server declares ``"GET, HEAD"``
+    # once, and a POST then gets the guards and a 405 like any other method (head ruling 2026-10-07).
+    allow = "GET, HEAD, POST"
+
     # A tidy, modern protocol version (enables keep-alive + proper 1.1 behavior).
     protocol_version = "HTTP/1.1"
     server_version = "levain"
@@ -448,13 +452,13 @@ class GuardedHandler(BaseHTTPRequestHandler):
         self._post()
 
     def _other_method(self) -> None:
-        """Any other method passes the same guards as a write, then gets 405 with ``Allow``: no Levain server routes
-        one, and without this BaseHTTPRequestHandler answered 501 before any guard ran (codex L3). No body is read."""
+        """A method not in ``allow`` passes the same guards as a write, then gets 405 with ``Allow``: without this
+        BaseHTTPRequestHandler answered 501 before any guard ran (codex L3). No body is read."""
         self.close_connection = True
         if self._refuse_write_origin() or self._refuse_untokened_write():
             return
-        self._allow = "GET, HEAD, POST"
-        self._reject(405, "method_not_allowed", "this server answers GET, HEAD and POST")
+        self._allow = self.allow
+        self._reject(405, "method_not_allowed", f"this server answers {self.allow}")
 
     def handle_one_request(self) -> None:
         """The stdlib's request loop with ONE change, the dispatch: GET, HEAD and POST go to this class's guarded
@@ -477,7 +481,9 @@ class GuardedHandler(BaseHTTPRequestHandler):
                 return
             if not self.parse_request():
                 return   # an error was sent
-            {"GET": self.do_GET, "HEAD": self.do_HEAD, "POST": self.do_POST}.get(self.command, self._other_method)()
+            served = {m.strip() for m in self.allow.split(",")}
+            route = {"GET": self.do_GET, "HEAD": self.do_HEAD, "POST": self.do_POST}.get(self.command)
+            (route if route is not None and self.command in served else self._other_method)()
             self.wfile.flush()
         except TimeoutError as e:
             self.log_error("Request timed out: %r", e)
