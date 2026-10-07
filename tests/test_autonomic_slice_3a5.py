@@ -363,6 +363,80 @@ def test_claim_one_shot_refuses_what_is_fireable_refuses(tmp_path):
     assert store.get(b.binding_id).status is BindingStatus.ACTIVE   # not spent by a refused claim
 
 
+def _raw(store):
+    import json
+    return json.loads(store.path.read_text())
+
+
+def _write(store, records):
+    import json
+    store.path.write_text(json.dumps(records))
+
+
+def test_a_valid_revoked_duplicate_cannot_be_bypassed(tmp_path):
+    # Reproduced 2026-10-06 (S1h): with two valid same-id records [PAUSED, REVOKED], ratify acted on
+    # the first and resurrected the revoked grant. The store now collapses duplicates on every read.
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(guard=(guard(),))
+    store.add(b)
+    paused = _raw(store)[0]
+    _write(store, [paused, dict(paused, status="revoked")])
+    assert store.get(b.binding_id).status is BindingStatus.REVOKED
+    with pytest.raises(ValueError):
+        store.ratify(b.binding_id)
+    with pytest.raises(ValueError):
+        store.set_status(b.binding_id, BindingStatus.ACTIVE)
+    assert store.list_active() == []
+    store.set_status(b.binding_id, BindingStatus.REVOKED)      # any write stores the collapsed list
+    assert [r["status"] for r in _raw(store)] == ["revoked"]
+
+
+def test_trigger_pattern_copies_are_deep(tmp_path):
+    # Reproduced 2026-10-06 (S1h): to_dict()/from_dict() copied the predicate shallowly, so editing a
+    # nested clause of the output edited the live trigger.
+    t = TriggerSpec(type="email", pattern={"op": "and", "clauses": [{"field": "a", "op": "==", "value": 1}]})
+    t.to_dict()["pattern"]["clauses"].append({"field": "evil", "op": "==", "value": 2})
+    assert len(t.pattern["clauses"]) == 1
+    d = {"type": "email", "pattern": {"op": "and", "clauses": [{"field": "a", "op": "==", "value": 1}]}}
+    t2 = TriggerSpec.from_dict(d)
+    d["pattern"]["clauses"].clear()
+    assert len(t2.pattern["clauses"]) == 1
+
+
+def test_record_fire_and_tighten_keep_fields_this_version_does_not_know(tmp_path):
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(status=BindingStatus.ACTIVE, guard=(guard(),))
+    store.add(b)
+    _write(store, [dict(_raw(store)[0], labels={"conf": ["flow"]})])
+    store.record_fire(b.binding_id, clean=True, fired_at="2026-07-01T00:00:00")
+    store.tighten_guard(b.binding_id, guard(spike_id="t"))
+    rec = _raw(store)[0]
+    assert rec["labels"] == {"conf": ["flow"]}
+    assert rec["graduation"]["fire_count"] == 1 and len(rec["guard_additions"]) == 1
+
+
+def test_tighten_guard_refuses_an_impure_trajectory_bound(tmp_path):
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding(status=BindingStatus.ACTIVE, guard=(guard(),))
+    store.add(b)
+    bad = guard(kill_predicate=None, kill_drill=None, kill_authored_by=None, spike_id="traj",
+                predicted_trajectory={"bound": {"op": "regex_match", "field": "x", "value": ".*"}})
+    with pytest.raises(ValueError):
+        store.tighten_guard(b.binding_id, bad)
+    assert store.get(b.binding_id).guard_additions == ()
+
+
+def test_replace_back_to_a_revoked_core_aborts_and_keeps_the_live_grant(tmp_path):
+    # Reproduced 2026-10-06 (S1h): A -> B -> A returned True and left both REVOKED (nothing live).
+    store = BindingStore(tmp_path / "b.json")
+    a = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
+    store.add(a)
+    assert store.replace_atomic(a.binding_id, b)
+    assert store.replace_atomic(b.binding_id, a) is False
+    assert [x.binding_id for x in store.list_active()] == [b.binding_id]
+
+
 def test_tighten_guard_rejects_untripping_drill(tmp_path):
     # complement L3 MED-1: the tighten path is NOT a second-class compile citizen — a tightening kill
     # whose drill does NOT trip it is refused (the drill-trip gate, parity with compile_binding).

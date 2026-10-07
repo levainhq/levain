@@ -58,8 +58,9 @@ def make_tightness(g=0.9, t=0.8, p=1.0, o=0.9) -> TightnessVector:
 def make_binding(*, posture: Posture = Posture.CONFIRM, status: BindingStatus = BindingStatus.ACTIVE,
                  one_shot: bool = False, created_at: str = "2026-06-26T13:00:00",
                  trigger: TriggerSpec | None = None, goal=None,
-                 tightness: TightnessVector | None = None) -> Binding:
+                 tightness: TightnessVector | None = None, guard: tuple = ()) -> Binding:
     return Binding.create(
+        guard=guard,
         created_by="phill",
         created_at=created_at,
         trigger=trigger if trigger is not None else make_trigger(),
@@ -246,8 +247,15 @@ def test_binding_from_dict_rejects_unknown_posture_status_and_nonbool_oneshot():
 
 # --- binding_invocation → AuthorityScope -------------------------------------------
 
+def _kill_guard():
+    from levain.autonomic.binding import Guard
+    return Guard(rationale="r", dissent_author="codex",
+                 kill_predicate={"op": "==", "field": "from_domain", "value": "blocked.example"},
+                 kill_drill={"from_domain": "blocked.example"}, kill_authored_by="phill")
+
+
 def test_binding_invocation_produces_binding_grantor_scope():
-    b = make_binding(posture=Posture.CONFIRM)
+    b = make_binding(posture=Posture.CONFIRM, guard=(_kill_guard(),))
     scope = binding_invocation(b, hops=2)
     assert isinstance(scope, AuthorityScope)
     assert scope.grantor == "binding"
@@ -255,6 +263,14 @@ def test_binding_invocation_produces_binding_grantor_scope():
     assert scope.hops == 2
     assert "email" in scope.grant and "confirm" in scope.grant
     assert scope.to_dict()["binding_id"] == b.binding_id
+
+
+def test_binding_invocation_refuses_a_binding_the_fire_view_refuses():
+    # Reproduced 2026-10-06 (S1h): a confirm-class grant with no sealed kill is not fireable
+    # (list_active excludes it) but binding_invocation minted authority for it on is_active alone.
+    b = make_binding(posture=Posture.CONFIRM)
+    with pytest.raises(ValueError):
+        binding_invocation(b)
 
 
 def test_binding_invocation_refuses_non_active_and_negative_hops():

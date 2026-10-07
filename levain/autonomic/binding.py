@@ -73,6 +73,7 @@ from typing import Any, Iterator, Protocol, runtime_checkable
 
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.kill import Kleene, assert_kill_pure, kill_outcome
+from levain.autonomic.monitor import assert_trajectory_pure
 from levain.autonomic.posture import Posture
 
 __all__ = [
@@ -196,14 +197,14 @@ class TriggerSpec:
         _assert_json_canonical(self.pattern, "pattern")
 
     def to_dict(self) -> dict[str, Any]:
-        return {"type": self.type, "pattern": dict(self.pattern)}
+        return {"type": self.type, "pattern": copy.deepcopy(self.pattern)}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "TriggerSpec":
         pattern = d["pattern"]
         # copy a dict so a later caller mutation can't reach into the frozen spec; non-dicts pass
         # through to __post_init__ which raises the clear TypeError (the store read catches it).
-        return cls(type=d["type"], pattern=dict(pattern) if isinstance(pattern, dict) else pattern)
+        return cls(type=d["type"], pattern=copy.deepcopy(pattern) if isinstance(pattern, dict) else pattern)
 
 
 @dataclass(frozen=True)
@@ -743,7 +744,7 @@ def binding_invocation(binding: Binding, *, hops: int = 0) -> AuthorityScope:
     posture, L2-L1)."""
     if hops < 0:
         raise ValueError(f"hops must be >= 0, got {hops}")
-    if not binding.is_active:
+    if not BindingStore.is_fireable(binding):
         raise ValueError(
             f"binding_invocation refuses a non-active binding {binding.binding_id!r} "
             f"(status={binding.status.value}, seal_ok={binding.seal_matches()})"
@@ -831,7 +832,38 @@ class BindingStore:
                 raise TypeError(f"binding store top level is {type(data).__name__}, not a list "
                                 "(refusing to mutate over a corrupt registry)")
             return []
-        return [r for r in data if isinstance(r, dict)]
+        return self._collapse_duplicates([r for r in data if isinstance(r, dict)])
+
+    @classmethod
+    def _collapse_duplicates(cls, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """The store never presents two records for one ``binding_id``. Duplicates (only an outside
+        write can make them: ``add`` and ``replace_atomic`` dedup) are merged into ONE record at the
+        first one's position, by :meth:`_preserve_bookkeeping`'s rules: most-restrictive valid status,
+        most evidence, union of tightenings. Every reader and every first-match mutator then sees the
+        merged record, so a valid REVOKED duplicate can no longer be bypassed by acting on an earlier
+        PAUSED or ACTIVE one (reproduced 2026-10-06: ``ratify`` resurrected it), and the next write
+        stores the collapsed list."""
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for r in records:
+            bid = r.get("binding_id")
+            if isinstance(bid, str):
+                groups.setdefault(bid, []).append(r)
+        if all(len(g) == 1 for g in groups.values()):
+            return records
+        out: list[dict[str, Any]] = []
+        done: set[str] = set()
+        for r in records:
+            bid = r.get("binding_id")
+            if not isinstance(bid, str) or len(groups[bid]) == 1:
+                out.append(r)
+                continue
+            if bid in done:
+                continue
+            done.add(bid)
+            group = groups[bid]
+            base = next((g for g in group if cls._load(g) is not None), group[0])
+            out.append(cls._preserve_bookkeeping(group, bid, copy.deepcopy(base)))
+        return out
 
     def _write_raw(self, records: list[dict[str, Any]]) -> None:
         """Atomically replace the file with ``records`` (tmp + ``os.replace`` — never a torn read).
@@ -1001,7 +1033,15 @@ class BindingStore:
                                  "grant changed since the proposal (revoked/tightened/evidence); aborting",
                                  old_binding_id)
                     return False
+            incoming_status = record.get("status")
             record = self._preserve_bookkeeping(records, new_binding.binding_id, record)
+            if record.get("status") != incoming_status:
+                # The new grant's id already exists as a more restrictive tombstone (re-ratifying back
+                # to a revoked core, A -> B -> A): superseding would revoke the old grant and leave the
+                # new one inert, so nothing is live while the call reports success. Abort; write nothing.
+                _log.warning("binding store: replace_atomic target %r is already %s; aborting",
+                             new_binding.binding_id, record.get("status"))
+                return False
             kept: list[dict[str, Any]] = []
             for r in records:
                 rid = r.get("binding_id")
@@ -1217,7 +1257,7 @@ class BindingStore:
             raise ValueError("record_fire: fired_at must be a non-empty timestamp string")
         with self._locked():
             records = self._read_raw(for_mutation=True)
-            for i, rec in enumerate(records):
+            for rec in records:
                 if rec.get("binding_id") == binding_id:
                     b = self._load(rec)
                     if b is None:
@@ -1230,15 +1270,17 @@ class BindingStore:
                     # dataclasses.replace (not a positional rebuild) so a future Binding field can't
                     # silently land in the wrong slot on this hot path (L3 nemotron).
                     updated = replace(b, graduation=grad)
-                    records[i] = updated.to_dict()
+                    # Update the one field in place: a whole-record rewrite would drop any field this
+                    # version does not know (a newer writer's), on every fire.
+                    rec["graduation"] = grad.to_dict()
                     self._write_raw(records)
                     return updated
             return None
 
     def claim_one_shot(self, binding_id: str) -> Binding | None:
         """ATOMICALLY claim a ONE-SHOT binding for a SINGLE fire (the ``pending.claim`` precedent, one
-        layer up). Under the lock: iff the binding is currently FIREABLE (``is_active`` = ACTIVE status
-        + valid seal) AND ``one_shot``, set it ``REVOKED`` and return the PRE-CLAIM (still-ACTIVE)
+        layer up). Under the lock: iff the binding is currently FIREABLE (:meth:`is_fireable`: ACTIVE
+        status + valid seal + the confirm-class sealed-kill mandate) AND ``one_shot``, set it ``REVOKED`` and return the PRE-CLAIM (still-ACTIVE)
         snapshot; else return ``None``.
 
         At-MOST-once: two concurrent dispatches can never both claim — the first flips it ``REVOKED``
@@ -1311,9 +1353,13 @@ class BindingStore:
                     raise ValueError(
                         f"tighten_guard: kill_drill {g.kill_drill!r} does NOT trip its kill — a drill "
                         "must be a concrete event that TRIPS the kill (an unverified kill is no kill)")
+            if g.predicted_trajectory is not None:
+                # parity with compile_binding: an impure trajectory bound evaluates UNKNOWN at fire
+                # time, which reads as diverged and kills every on-loop fire. Refuse it here instead.
+                assert_trajectory_pure(g.predicted_trajectory)
         with self._locked():
             records = self._read_raw(for_mutation=True)
-            for i, rec in enumerate(records):
+            for rec in records:
                 if rec.get("binding_id") != binding_id:
                     continue
                 b = self._load(rec)
@@ -1330,7 +1376,7 @@ class BindingStore:
                 # dataclasses.replace (not a positional rebuild) so a future Binding field can't land in
                 # the wrong slot; additions are UNSEALED so the id + seal are unchanged by construction.
                 updated = replace(b, guard_additions=b.guard_additions + tuple(new_guards))
-                records[i] = updated.to_dict()
+                rec["guard_additions"] = [g.to_dict() for g in updated.guard_additions]  # in place, as above
                 self._write_raw(records)
                 return updated
             return None
