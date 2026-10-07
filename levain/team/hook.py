@@ -165,10 +165,19 @@ def pretooluse(payload: dict) -> None:
     try:
         _pretooluse(payload)
     except Exception as exc:  # noqa: BLE001 - the boundary
-        target = _target(payload) if isinstance(payload, dict) else None
-        places = [p for p in (target, payload.get("cwd") if isinstance(payload, dict) else None) if p]
-        if any(_ledger_roots(Path(p)) for p in places):
+        if any(_ledger_roots(Path(p)) for p in _places(payload)):
             _out(_deny(f"the team ledger could not be read ({type(exc).__name__}: {exc})"))
+
+
+def _places(payload: dict) -> list[str]:
+    """The paths an edit is judged from: its target and the session's cwd, each only when it is a usable string."""
+    cwd = payload.get("cwd")
+    cwd = cwd if isinstance(cwd, str) and cwd and os.path.isabs(cwd) else None
+    try:
+        target = _target({**payload, "cwd": cwd})
+    except (TypeError, ValueError):
+        target = None
+    return [p for p in (target, cwd) if p]
 
 
 def _pretooluse(payload: dict) -> None:
@@ -189,7 +198,7 @@ def _pretooluse(payload: dict) -> None:
     # Every repository above the target that holds levain team state judges the edit, not only the one git finds
     # first: a `.git` planted in a subdirectory (a fake nested repository, or an unreadable one) must not take the
     # edit out of the real clone's ledger. Any deny wins.
-    roots = list(dict.fromkeys(_ledger_roots(Path(target)) + _ledger_roots(Path(payload.get("cwd") or target))))
+    roots = list(dict.fromkeys(r for p in _places(payload) for r in _ledger_roots(Path(p))))
     answers = []
     for start in roots or [Path(target)]:
         out = _judge_from(start, target, payload, has_ledger=bool(roots))

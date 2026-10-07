@@ -889,6 +889,21 @@ def test_any_failure_at_any_stage_of_judging_an_edit_is_a_deny(two, monkeypatch,
     assert out["permissionDecision"] == "deny", where
 
 
+@pytest.mark.parametrize("cwd", [123, ["x"], {"a": 1}])
+def test_a_malformed_cwd_never_breaks_the_boundary(two, cwd):
+    # L0 on 40a838c, RUN: a payload cwd that is not a string raised inside the judgement AND again inside the
+    # boundary's own ledger check, so for a target outside any clone the exception reached main(), which printed
+    # "ledger unavailable" for a ledger that does not exist. The boundary's own check must not raise.
+    tmp, ana, ben = two
+    outside = tmp / "elsewhere"
+    outside.mkdir()
+    base = {"session_id": "cw", "transcript_path": "/x", "cwd": cwd, "hook_event_name": "PreToolUse",
+            "tool_name": "Edit", "tool_use_id": "t"}
+    assert hook("pretooluse", {**base, "tool_input": {"file_path": str(outside / "a.py")}}) == {}
+    out = hook("pretooluse", {**base, "tool_input": {"file_path": str(ben / "src" / "settlement.py")}})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
 def test_a_team_toml_nested_past_the_parser_denies(two):
     # L3 r2 codex HIGH 1, RUN: a deeply nested team.toml raised RecursionError from _interval, outside the old
     # per-call boundary, and the hook failed open.
