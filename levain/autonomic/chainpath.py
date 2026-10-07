@@ -521,7 +521,11 @@ class ChainStateStore:
         store that cannot be read RAISES (:class:`ChainStoreUnavailableError`) instead of being
         rewritten as if it held only this state."""
         with self._locked():
-            records = [r for r in self._read_raw(for_advance=True) if r.get("chain_id") != state.chain_id]
+            records = self._read_raw(for_advance=True)
+            if any(r.get("pending_id") == state.pending_id and r.get("chain_id") != state.chain_id
+                   for r in records):
+                return   # another delivery already wrote the state for this paused link: one owner
+            records = [r for r in records if r.get("chain_id") != state.chain_id]
             records.append(state.to_dict())
             self._write_raw(records)
 
@@ -662,6 +666,10 @@ class ChainExecutor:
         # STANDING chain resumes on its snapshot); wired ⇒ a human revoke/pause/seal-break of a standing
         # grant mid-chain ABORTS the in-flight chain.
         self._binding_store = binding_store
+
+    @property
+    def gate(self) -> EfferentGate:
+        return self._gate
 
     # ---------------------------------------------------------------------------------------------
     # Entry: walk a fresh (re-acquired, one-shot-claimed) multi-link binding from link 0.

@@ -863,16 +863,12 @@ class BindingStore:
     def _initial_generation(self, binding_id: str) -> int:
         """The governance generation a NEW record starts at: above every fence and every run the
         journal ever admitted for this id, so a removed and re-added grant fences every run admitted
-        under its old record; 0 without a journal. A journal that cannot be read runs no effect, so 0
-        is safe there."""
+        under its old record; 0 without a journal."""
         if self._journal is None:
             return 0
-        try:
-            return self._journal.next_generation(binding_id)
-        except Exception as e:  # noqa: BLE001
-            _log.error("binding store: journal generation for %r unreadable (%s): %s", binding_id,
-                       type(e).__name__, e)
-            return 0
+        # a journal that cannot be read RAISES here: a record started at 0 would fail to fence the runs
+        # an unreadable journal still holds, once it reads again
+        return self._journal.next_generation(binding_id)
 
     def _fence(self, rec: dict[str, Any]) -> tuple[str, int]:
         """Bump the record's governance ``generation`` IN the record, so the bump commits in the same
@@ -923,11 +919,16 @@ class BindingStore:
     def refence(self, binding_id: str) -> None:
         """Retry mirroring ``binding_id``'s registry generation into the run journal (after a
         :class:`FenceNotRecordedError`). A no-op if the journal already has it."""
-        gen = self.generation(binding_id)
-        if gen is None:
-            gen = self._initial_generation(binding_id) - 1
-        with self._locked():
-            if self._journal is not None and self._journal.generation(binding_id) < gen:
+        if self._journal is None:
+            return
+        with self._locked():   # read the authority under the lock that every fencing verb holds
+            rec = next((r for r in self._read_raw(for_mutation=True) if r["binding_id"] == binding_id), None)
+            if rec is None:
+                # removed: fence strictly above every run the journal ever admitted for it
+                gen = self._journal.next_generation(binding_id)
+            else:
+                gen = _record_generation(rec)
+            if self._journal.generation(binding_id) < gen:
                 self._record_fences([(binding_id, gen)])
 
     def generation(self, binding_id: str) -> int | None:
@@ -972,12 +973,15 @@ class BindingStore:
             if b.one_shot and b.status is BindingStatus.REVOKED and rec.get("claimed_run") == run_id:
                 # A re-delivery of THE run this one-shot was claimed for (recorded in the same write
                 # as the claim): let it back in to finish (done effects replay, an approved effect
-                # runs once). A person's revoke after the claim bumped the generation, so that run is
-                # fenced at its next effect. No other run can ever match.
+                # runs once). It is admitted at the generation recorded WITH the claim, never the
+                # current one, so a person's revoke after the claim (which bumped the generation)
+                # fences it even if the run never reached the journal before. No other run can match.
+                claimed_gen = rec.get("claimed_generation")
                 again = replace(b, status=BindingStatus.ACTIVE)
-                if not self.is_fireable(again):
+                if (isinstance(claimed_gen, bool) or not isinstance(claimed_gen, int)
+                        or not self.is_fireable(again)):
                     return None
-                self._journal.start(run_id, binding_id=binding_id, generation=gen)
+                self._journal.start(run_id, binding_id=binding_id, generation=claimed_gen)
                 return again
             if not self.is_fireable(b):
                 return None
@@ -986,6 +990,7 @@ class BindingStore:
                 # whose one run can still be re-delivered, never a live one-shot with a run admitted
                 rec["status"] = BindingStatus.REVOKED.value
                 rec["claimed_run"] = run_id
+                rec["claimed_generation"] = gen
                 self._write_raw(records)
             self._journal.start(run_id, binding_id=binding_id, generation=gen)
             return b
