@@ -824,8 +824,8 @@ def test_a_jewel_retargeted_after_its_mask_does_not_unmask_the_write_only_target
     real_resolve = Path.resolve
     masked = []
 
-    def target(f):
-        out = real_target(f)
+    def target(f, *rest):
+        out = real_target(f, *rest)
         if f == jewel:
             masked.append(out)
         return out

@@ -119,15 +119,15 @@ def test_linux_skips_a_cred_dir_override_this_user_cannot_create(home: Path, tmp
         locked.chmod(0o755)
 
 
-def test_linux_masks_every_aws_cache_after_the_read_only_aws_bind(home: Path, linux) -> None:
+def test_linux_masks_every_aws_cache_after_the_aws_view(home: Path, linux) -> None:
     (home / ".aws" / "sso").mkdir(parents=True)
     argv, _ = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
     aws = str(home / ".aws")
-    i_ro = next(i for i in range(len(argv) - 2) if argv[i:i + 3] == ["--ro-bind", aws, aws])
+    i_view = next(i for i in range(len(argv) - 1) if argv[i:i + 2] == ["--tmpfs", aws])
     for rel in _AWS_CACHES:
         cache = str(home / rel)
         assert [cache] in _ops(argv, "--tmpfs") and [cache] in _ops(argv, "--remount-ro"), rel
-        assert i_ro < argv.index(cache), "the read-only bind of ~/.aws must not land on top of a cache"
+        assert i_view < argv.index(cache), "the ~/.aws view must not land on top of a cache"
 
 
 def test_linux_masks_the_aws_caches_when_aws_is_absent_too(home: Path, linux) -> None:

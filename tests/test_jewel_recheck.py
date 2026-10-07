@@ -214,7 +214,7 @@ def test_an_error_recording_the_manifest_refuses_before_any_start(tmp_path, monk
         raise PermissionError(13, "Permission denied", str(p))
 
     monkeypatch.setattr(conf, "_identity", boom)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)   # fail in _identity only
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)   # fail in _identity only
     started = []
     monkeypatch.setattr(conf._BwrapShell, "start", lambda self: started.append(1) or self)
     with pytest.raises(ConfinementError, match="could not (prepare or record|inspect)"):
@@ -384,7 +384,7 @@ def test_a_jewel_that_changes_while_the_floor_is_planned_refuses_the_spawn(tmp_p
     import levain.firing.confinement as conf
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
     entity = _entity(tmp_path)
     vault = entity / ".levain" / "vaultdir"
     real_plan = conf._bwrap_plan
@@ -422,7 +422,7 @@ def test_the_shell_env_never_carries_bash_env(tmp_path, monkeypatch):
     import levain.firing.confinement as conf
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
     seen = {}
 
     def fake_start(self):
@@ -440,7 +440,7 @@ def test_a_change_during_the_start_closes_the_shell_before_any_command(tmp_path,
     import levain.firing.confinement as conf
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
     entity = _entity(tmp_path)
     late = tmp_path / "creds" / "late-token"
     late.parent.mkdir()
@@ -458,7 +458,7 @@ def test_the_shell_never_runs_startup_code_from_its_env(tmp_path, monkeypatch):
     import levain.firing.confinement as conf
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
     seen = {}
 
     def fake_start(self):
@@ -484,7 +484,7 @@ def test_a_filesystem_error_in_the_post_start_recheck_is_a_refusal(tmp_path, mon
     import levain.firing.confinement as conf
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
     closed = []
     monkeypatch.setattr(conf._BwrapShell, "start", lambda self: self)
     monkeypatch.setattr(conf._BwrapShell, "close", lambda self: closed.append(1))

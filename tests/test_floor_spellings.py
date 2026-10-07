@@ -101,7 +101,7 @@ def test_spellings_keeps_all_three_when_they_differ(tmp_path: Path, monkeypatch)
                                         (real / "dot" / "netrc").resolve()]
 
 
-# --- Linux: tool directories are mounted read-only, $HOME-level links refuse ---------------------
+# --- Linux: tool directories get a read-only view; deeper links refuse ---------------------------
 
 
 def test_linux_plan_masks_a_link_in_a_tool_dir_at_its_target_without_refusing(home: Path) -> None:
@@ -109,7 +109,7 @@ def test_linux_plan_masks_a_link_in_a_tool_dir_at_its_target_without_refusing(ho
     (home / ".kube" / "cache").mkdir()
     argv, _ = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
     kube = str((home / ".kube").resolve())
-    assert [kube, kube] in _ops(argv, "--ro-bind")
+    assert [kube] in _ops(argv, "--tmpfs")
     assert [str(home.resolve() / ".kube" / "cache")] * 2 in _ops(argv, "--bind-try")
     masked = [d for s, d in _ops(argv, "--ro-bind") if s == "/dev/null"]
     assert str(target.resolve()) in masked
@@ -119,20 +119,13 @@ def test_linux_plan_masks_a_link_in_a_tool_dir_at_its_target_without_refusing(ho
     assert argv.index("--ro-bind") < argv.index("/dev/null")
 
 
-def test_linux_plan_refuses_a_home_level_cred_link(home: Path) -> None:
-    target = home / "dotfiles" / "netrc"
-    target.parent.mkdir()
-    target.write_text("machine x login y password z\n")
-    (home / ".netrc").symlink_to(target)
-    with pytest.raises(ConfinementError, match="symlink in a directory this user can write"):
-        C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
-
-
-def test_linux_plan_refuses_a_symlinked_tool_dir(home: Path) -> None:
+def test_linux_plan_follows_a_home_level_symlinked_tool_dir(home: Path) -> None:
+    """Ruling 2026-10-07: a link directly in $HOME cannot be replaced inside bash, so the tool
+    directory it names gets its view at the target instead of a refusal."""
     (home / "dotfiles" / "kube").mkdir(parents=True)
     (home / ".kube").symlink_to(home / "dotfiles" / "kube")
-    with pytest.raises(ConfinementError, match="symlink"):
-        C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
+    argv, _ = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
+    assert [str((home / "dotfiles" / "kube").resolve())] in _ops(argv, "--tmpfs")
 
 
 def test_linux_plan_refuses_a_symlinked_cred_subtree_in_a_writable_dir(home: Path) -> None:
@@ -148,7 +141,7 @@ def test_linux_plan_creates_an_absent_tool_dir_and_puts_no_file_in_it(home: Path
     for tool in (".kube", ".docker", ".aws", ".config/git"):
         d = str(home.resolve() / tool)
         assert d in create_first, tool
-        assert [d, d] in _ops(argv, "--ro-bind"), tool
+        assert [d] in _ops(argv, "--tmpfs"), tool
     masked = [d for s, d in _ops(argv, "--ro-bind") if s == "/dev/null"]
     for f in (".kube/config", ".docker/config.json", ".aws/credentials", ".config/git/credentials"):
         assert str(home.resolve() / f) not in masked, f"{f}: a 0444 stub inside a tool dir"
@@ -470,3 +463,185 @@ def test_a_secret_file_registry_that_cannot_be_read_refuses_the_floor(home: Path
     monkeypatch.setitem(_sys.modules, "levain.launch", None)
     with pytest.raises(ConfinementError):
         build_policy(_entity(home))
+
+
+# --- L3 r2: a failure part-way through the mountpoints ----------------------------------------------
+
+
+def test_mountpoints_made_before_a_failure_reach_the_callers_list(home: Path) -> None:
+    """complement r2: _prepare_mountpoints raising part-way lost what it had made, so the ledger never
+    removed it and a 0444 ~/.netrc stayed on the host for good."""
+    (home / "afile").write_text("")
+    made: list[tuple[str, str]] = []
+    with pytest.raises(OSError):
+        C._prepare_mountpoints({str(home / ".netrc"): "file", str(home / "afile" / "x"): "file"}, made)
+    assert (str(home / ".netrc"), "file") in made
+
+
+def test_a_placeholder_whose_chmod_fails_is_still_reported(home: Path, monkeypatch) -> None:
+    """L1 r3: the file exists from the moment the create succeeds, so it is ledgered from then on."""
+    made: list[tuple[str, str]] = []
+
+    def boom(fd, mode):
+        raise OSError("fchmod failed")
+
+    monkeypatch.setattr(C.os, "fchmod", boom)
+    with pytest.raises(OSError):
+        C._prepare_mountpoints({str(home / ".netrc"): "file"}, made)
+    assert (str(home / ".netrc"), "file") in made
+
+
+# --- ruling 2026-10-07: a link directly in $HOME is masked at its target -----------------------------
+
+
+def _config_link(home: Path) -> Path:
+    """``~/.config`` as a link to a writable directory outside $HOME, holding a gh token."""
+    cfg = home.parent / "elsewhere" / "cfg"
+    (cfg / "gh").mkdir(parents=True)
+    (cfg / "gh" / "hosts.yml").write_text("oauth_token: SECRET-TOKEN\n")
+    (home / ".config").symlink_to(cfg)
+    return cfg.resolve()
+
+
+def test_linux_plan_accepts_a_home_level_dir_link_and_mounts_at_the_resolved_target(home: Path) -> None:
+    cfg = _config_link(home)
+    argv, _ = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
+    link = str(home.resolve() / ".config")
+    through_link = [a for a in argv if a == link or a.startswith(link + "/")]
+    assert through_link == [], "a mount spelled through the link cannot land inside bwrap's new root"
+    assert any(a == str(cfg / "gh") or a.startswith(str(cfg / "gh")) for a in argv), "covered at its target"
+    assert [str(cfg), str(cfg)] in _ops(argv, "--bind"), "the target is pinned against a rename"
+    assert [str(cfg.parent)] * 2 in _ops(argv, "--bind"), "and so is its parent, outside $HOME"
+
+
+def test_linux_plan_masks_a_home_level_cred_link_at_its_target(home: Path) -> None:
+    target = home / "dotfiles" / "netrc"
+    target.parent.mkdir()
+    target.write_text("machine x login y password z\n")
+    (home / ".netrc").symlink_to(target)
+    argv, _ = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
+    masked = [d for s, d in _ops(argv, "--ro-bind") if s == "/dev/null"]
+    assert str(target.resolve()) in masked
+    assert str(home.resolve() / ".netrc") not in masked
+
+
+def test_the_home_level_exemption_needs_the_read_only_home(home: Path, monkeypatch) -> None:
+    """Mutation check of the ruling's premise: without step (0)'s read-only $HOME the link could be
+    swapped from inside, so it is refused again."""
+    _config_link(home)
+    monkeypatch.setattr(C, "_home_read_only_root", lambda: None)
+    with pytest.raises(ConfinementError, match="symlink"):
+        C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
+
+
+_live = pytest.mark.skipif(
+    not (__import__("platform").system() == "Linux" and C.bwrap_available()),
+    reason="needs a Linux host where bwrap can actually establish a namespace",
+)
+
+
+def _live_rc(shell, cmd: str) -> str:
+    return shell.run(cmd + " >/dev/null 2>&1; echo RC=$?", timeout=20).output.strip().split("RC=")[-1]
+
+
+@_live
+def test_linux_live_a_home_level_config_link_starts_and_its_cred_is_denied(home: Path) -> None:
+    cfg = _config_link(home)
+    ent = _entity(home)
+    shell = C.BwrapProvider().spawn_shell(build_policy(ent, workspace=ent / "workspace",
+                                                       deny_standard_creds=True))
+    try:
+        for spelling in (home / ".config" / "gh" / "hosts.yml", cfg / "gh" / "hosts.yml"):
+            out = shell.run(f"cat {spelling} 2>&1; echo END", timeout=20).output
+            assert "SECRET-TOKEN" not in out, spelling
+            assert "END" in out
+    finally:
+        shell.close()
+
+
+@_live
+def test_linux_live_a_home_level_config_link_cannot_be_swapped_or_removed(home: Path) -> None:
+    cfg = _config_link(home)
+    ent = _entity(home)
+    shell = C.BwrapProvider().spawn_shell(build_policy(ent, workspace=ent / "workspace",
+                                                       deny_standard_creds=True))
+    try:
+        assert _live_rc(shell, f"ln -sfn / {home}/.config") != "0"
+        assert _live_rc(shell, f"rm -f {home}/.config") != "0"
+        assert _live_rc(shell, f"mv {cfg} {cfg}.moved") != "0"
+    finally:
+        shell.close()
+    assert os.readlink(home / ".config") == str(home.parent / "elsewhere" / "cfg")
+
+
+@_live
+def test_linux_live_a_deeper_link_still_refuses(home: Path) -> None:
+    (home / "dotfiles" / "gh").mkdir(parents=True)
+    (home / ".config").mkdir()
+    (home / ".config" / "gh").symlink_to(home / "dotfiles" / "gh")
+    ent = _entity(home)
+    with pytest.raises(ConfinementError, match="symlink in a directory this user can write"):
+        C.BwrapProvider().spawn_shell(build_policy(ent, workspace=ent / "workspace",
+                                                   deny_standard_creds=True))
+
+
+# --- ruling 2026-10-07: a tool directory is a view without its cred names ----------------------------
+
+
+def test_linux_plan_gives_a_tool_dir_a_view_without_its_cred_names(home: Path) -> None:
+    kube = home / ".kube"
+    (kube / "cache").mkdir(parents=True)
+    (kube / "notes.txt").write_text("")
+    (kube / "current").symlink_to("cache")
+    (kube / "config").write_text("token: SECRET\n")
+    argv, _ = C._bwrap_plan(build_policy(_entity(home), deny_standard_creds=True))
+    k = str(kube.resolve())
+    assert [k] in _ops(argv, "--tmpfs") and [k] in _ops(argv, "--remount-ro")
+    assert [k, k] not in _ops(argv, "--ro-bind"), "the host directory itself is never shown"
+    assert [k + "/cache"] * 2 in _ops(argv, "--bind-try")
+    assert [k + "/notes.txt"] * 2 in _ops(argv, "--ro-bind-try")
+    assert ["cache", k + "/current"] in _ops(argv, "--symlink")
+    assert not any(s == k + "/config" for s, _ in _ops(argv, "--ro-bind-try") + _ops(argv, "--bind-try"))
+    assert ["/dev/null", k + "/config"] in _ops(argv, "--ro-bind")
+
+
+def test_an_absent_cred_in_a_tool_dir_is_neither_mounted_nor_watched_on_the_host(home: Path) -> None:
+    (home / ".kube").mkdir()
+    policy = build_policy(_entity(home), deny_standard_creds=True)
+    argv, _ = C._bwrap_plan(policy)
+    mounted, unmounted = C._mount_plan_paths(argv, policy)
+    cfg = str(home.resolve() / ".kube" / "config")
+    assert cfg not in mounted and cfg not in unmounted and cfg not in argv
+
+
+@_live
+def test_linux_live_a_cred_the_host_creates_in_a_tool_dir_after_spawn_is_not_readable(home: Path) -> None:
+    kube = home / ".kube"
+    (kube / "cache").mkdir(parents=True)
+    (kube / "cache" / "seen").write_text("CARRIED\n")
+    ent = _entity(home)
+    shell = C.BwrapProvider().spawn_shell(build_policy(ent, workspace=ent / "workspace",
+                                                       deny_standard_creds=True))
+    try:
+        (kube / "config").write_text("token: SECRET-KUBE\n")      # the operator's kubectl, mid-session
+        out = shell.run(f"cat {kube}/config 2>&1; cat {kube}/cache/seen; echo END", timeout=20).output
+        assert "SECRET-KUBE" not in out
+        assert "CARRIED" in out and "END" in out
+        assert _live_rc(shell, f"touch {kube}/config") != "0"
+        assert _live_rc(shell, f"touch {kube}/cache/w") == "0"
+    finally:
+        shell.close()
+    assert (kube / "cache" / "w").exists()
+
+
+def test_nothing_inside_a_tool_dir_view_is_created_on_the_host(home: Path) -> None:
+    """The ruling: no pre-creation on the host. A jewel subtree inside a tool directory (the aws
+    caches) is mounted inside the view; its absent parents are not pinned, so not created, on the host."""
+    (home / ".aws").mkdir()
+    policy = build_policy(_entity(home), deny_standard_creds=True)
+    argv, create_first = C._bwrap_plan(policy)
+    aws = str(home.resolve() / ".aws")
+    assert not [c for c in create_first if c.startswith(aws + "/")]
+    mounted, _ = C._mount_plan_paths(argv, policy)
+    assert not [q for q in mounted if q.startswith(aws + "/")]
+    assert [aws + "/sso/cache"] in _ops(argv, "--tmpfs")

@@ -998,6 +998,12 @@ def main(argv: list[str] | None = None) -> int:
     _register_team(subparsers)
 
     args = parser.parse_args(argv)
+    from levain.launch import api_key_lifted
+
+    if api_key_lifted() and not hasattr(args, "api_key"):
+        # The re-exec lifts --api-key before argparse sees it; a command without that option would
+        # otherwise drop the key silently instead of rejecting it (L3 r2).
+        parser.error("unrecognized arguments: --api-key")
     return args.func(args)
 
 

@@ -352,3 +352,28 @@ def test_the_patched_opens_are_the_editors_only_way_to_read_a_file() -> None:
         for primitive in ("read_text(", "read_bytes(", "write_text(", "write_bytes(", "io.open(",
                           "os.open(", "codecs.open(", "mmap"):
             assert primitive not in src, f"{mod.__name__} uses {primitive}"
+
+
+def test_a_file_another_process_creates_between_the_two_opens_is_opened(tmp_path: Path, monkeypatch) -> None:
+    """L3 r2 (gemini + complement): a file created between the probe and the exclusive create was
+    refused as a dangling symlink. It is opened again instead."""
+    T, token = _under_floor(tmp_path, monkeypatch)
+    f = tmp_path / "raced.txt"
+    real_open = os.open
+    raced = []
+
+    def racing_open(path, flags, mode=0o777, **kw):
+        if str(path) == str(f) and not raced and not flags & os.O_CREAT:
+            raced.append(1)
+            fd = real_open(path, os.O_CREAT | os.O_WRONLY, 0o644)   # the other process wins
+            os.close(fd)
+            raise FileNotFoundError(path)
+        return real_open(path, flags, mode, **kw)
+
+    monkeypatch.setattr(T.os, "open", racing_open)
+    try:
+        with T._floored_open(f, "w") as fh:
+            fh.write("ok")
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+    assert raced and f.read_text() == "ok"

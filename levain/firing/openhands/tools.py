@@ -134,24 +134,31 @@ def _floored_open(file, *args, **kwargs):
         # O_NONBLOCK on the way in: a FIFO the shell planted must be refused, not block the editor.
         created = False
         probe = (flags & ~(os.O_TRUNC | os.O_CREAT | os.O_EXCL)) | os.O_NONBLOCK
-        try:
-            if flags & os.O_CREAT and flags & os.O_EXCL:
-                # `open(path, "x")`: the caller asked to fail on an existing file, so no first open.
-                fd = os.open(path, (flags & ~os.O_TRUNC) | os.O_NONBLOCK, 0o666)
-                created = True
-            else:
+        if flags & os.O_CREAT and flags & os.O_EXCL:
+            # `open(path, "x")`: the caller asked to fail on an existing file, so no first open.
+            fd = os.open(path, (flags & ~os.O_TRUNC) | os.O_NONBLOCK, 0o666)
+            created = True
+        else:
+            for _ in range(3):
                 try:
                     fd = os.open(path, probe, 0o666)
+                    break
                 except FileNotFoundError:
                     if not flags & os.O_CREAT:
                         raise
+                try:
                     fd = os.open(path, (flags & ~os.O_TRUNC) | os.O_EXCL | os.O_NONBLOCK, 0o666)
                     created = True
-        except FileExistsError:
-            if flags & os.O_EXCL:
-                raise   # the caller's own "x" semantics
-            # A dangling link: creating would make a file wherever it points.
-            raise _FloorRefusedOpen(f"{path} is a dangling symlink; the floor does not create its target")
+                    break
+                except FileExistsError:
+                    if os.path.islink(path):
+                        # A dangling link: creating would make a file wherever it points.
+                        raise _FloorRefusedOpen(
+                            f"{path} is a dangling symlink; the floor does not create its target"
+                        ) from None
+                    # Another process created it between the two opens (L3 r2): open it again.
+            else:
+                raise _FloorRefusedOpen(f"{path} kept appearing and vanishing between opens; not opened")
         try:
             st = os.fstat(fd)
             if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):

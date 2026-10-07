@@ -144,6 +144,11 @@ def open_browser(url: str, unlocked: str | None = None) -> None:
         pass
 
 
+def api_key_lifted() -> bool:
+    """True while an ``--api-key`` value the re-exec lifted out of the command line is unclaimed."""
+    return _lifted_api_key is not None
+
+
 def take_lifted_api_key() -> str | None:
     """The ``--api-key`` value the re-exec lifted out of the command line, once."""
     global _lifted_api_key

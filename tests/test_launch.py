@@ -332,3 +332,15 @@ def test_the_restored_carry_arrives_in_a_process_already_not_dumpable() -> None:
             "print(ctypes.CDLL(None).prctl(3, 0, 0, 0, 0), launch.reexecuted)\n")
     r = _run(code, env={"GH_TOKEN": SECRET, "HOME": "/tmp"})
     assert r.stdout.split() == ["0", "True"], r.stderr
+
+
+def test_a_lifted_key_on_a_command_without_the_option_is_rejected(monkeypatch, capsys) -> None:
+    """L3 r2 (complement): the re-exec lifts --api-key before argparse runs, so a command that has no
+    such option dropped the key silently instead of rejecting it."""
+    from levain import cli
+
+    monkeypatch.setattr(launch, "_lifted_api_key", SECRET)
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["doctor"])
+    assert exc.value.code == 2
+    assert "--api-key" in capsys.readouterr().err

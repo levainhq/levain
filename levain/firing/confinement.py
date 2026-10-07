@@ -3404,27 +3404,51 @@ def _reachable(p: Path) -> bool:
         return False
 
 
-def _bwrap_file_target(f: Path) -> Path:
+def _host_spelling(p: Path) -> Path:
+    """``p`` with its parent resolved. A mount destination is spelled this way: bwrap resolves a
+    destination inside its new root, where an absolute link in a parent (``~/.config`` pointing
+    elsewhere) does not lead where it leads on the host, so a mount spelled through one cannot land."""
+    return p.parent.resolve() / p.name
+
+
+def _home_read_only_root() -> Path | None:
+    """The real ``$HOME`` the bwrap plan binds read-only (step (0) of :func:`_bwrap_plan_impl`), or
+    None when it binds none ($HOME unresolvable, the filesystem root, or not a directory)."""
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        return None
+    if home == Path(home.anchor) or not home.is_dir():
+        return None
+    return home
+
+
+def _bwrap_file_target(f: Path, frozen: tuple[Path, ...] = ()) -> Path:
     """Where a mount for the protected FILE ``f`` must land. A mount cannot land on a symlink (bwrap
     aborts; measured 2026-09-30 with a stow-style ~/.ssh/config). A link this user can replace is
     REFUSED, because masking its target leaves the link free to be swapped for a planted file; one
-    they cannot replace is masked at its real path. (A link in a directory the plan mounts read-only
-    cannot be replaced from inside either; step (4) handles that case before calling this.)"""
+    they cannot replace, or one in a directory of ``frozen`` (mounted read-only by the plan, so the
+    link cannot be replaced from inside), is masked at its real path."""
     if not f.is_symlink():
-        return f
-    _refuse_replaceable_link(f)
+        return _host_spelling(f)
+    _refuse_replaceable_link(f, frozen)
     return f.resolve()
 
 
-def _refuse_replaceable_link(f: Path) -> None:
-    """Refuse bash when the jewel spelling ``f`` is a symlink in a directory this user can write."""
+def _refuse_replaceable_link(f: Path, frozen: tuple[Path, ...] = ()) -> None:
+    """Refuse bash when the jewel spelling ``f`` is a symlink in a directory this user can write,
+    unless that directory is one of ``frozen``: the plan mounts it read-only, so inside bash the link
+    can be neither removed nor replaced (``$HOME`` itself, step (0); a store or tool directory)."""
+    if f.parent.resolve() in frozen:
+        return
     if os.access(f.parent, os.W_OK):
         raise ConfinementError(
             f"{f} is a symlink in a directory this user can write. The Linux floor protects files "
             "with mounts, and a mount cannot cover a symlink, so the link could be replaced by a "
             "planted file. Refusing to grant bash hands (fail-closed). Replace the symlink with the "
             "real file to use bash (for a standard credential store, setting "
-            "\"deny_standard_creds\": false in .levain/confinement.json also does it)."
+            "\"deny_standard_creds\": false in .levain/confinement.json also does it). A link "
+            "directly in a home directory bash sees read-only (the usual case) is accepted."
         )
 
 
@@ -3568,6 +3592,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # identity check between the plan and bwrap instead; five review rounds each found a different
     # way past it.
     masks: list[str] = []
+    # $HOME as step (0) binds it read-only. A link directly in it cannot be removed or replaced from
+    # inside bash, so it is masked at its target instead of refused (desk ruling 2026-10-07, after
+    # the CI live job showed $HOME's top level read-only). Deeper links keep the refusal.
+    home_ro = _home_read_only_root()
+    frozen_home: tuple[Path, ...] = (home_ro,) if home_ro is not None else ()
 
     # (2a) THE ENTITY'S OWN STORE DIR (``.levain``) IS MOUNTED READ-ONLY, and every existing ordinary
     # entry in it is bound back read-write. The confined shell can then CREATE nothing at the top of
@@ -3611,28 +3640,47 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # for the shell's life, so a host-side replacement of it is not seen (complement, r2).
             argv += ["--bind-try", str(child), str(child)]
     entity_store_dirs = list(ro_store_dirs)
-    # The standard cred files' TOOL directories get the same construct (lane P2, items 5 and 6): an
-    # absent cred file in one then needs no mountpoint, so no 0444 stub lands on the host, and a
-    # link in one is masked at its target because it cannot be replaced from inside. An absent tool
-    # directory is created first (0700, by the provider: step (1) puts it in ``create_first``) and
-    # recorded in the placeholder ledger, which removes it at close if it is still empty.
+    # The standard cred files' TOOL directories (lane P2, items 5 and 6) get a VIEW, not the host
+    # directory: a read-only tmpfs holding the real directory's existing entries except the cred
+    # names. Subdirectories come back read-write, files read-only, links as the same links. A cred
+    # file absent at spawn then needs no mountpoint, so no 0444 stub lands on the host, and it stays
+    # absent inside bash even when the operator's tool creates it on the host mid-session: the host
+    # directory is not what bash sees (desk ruling 2026-10-07; a read-only bind of the host directory
+    # showed such a file). bash cannot create one either, the tmpfs being read-only. A
+    # cred file that is a link is masked at its target (step 4); any other link is recreated as the
+    # same link, which cannot be replaced from inside. The cost: an entry the
+    # host adds or replaces at the top of a tool directory after spawn is not seen (a per-file bind
+    # pins the inode). An absent tool directory is created first (0700, by the provider: step (1)
+    # puts it in ``create_first``) and recorded in the placeholder ledger, which removes it at close
+    # if it is still empty. The ops are bwrap(1)'s --tmpfs, --bind-try, --ro-bind-try, --symlink and
+    # --remount-ro, and every mountpoint inside the view is made in the tmpfs, never on the host.
+    secret_names = {_host_spelling(p) for p in (*policy.deny_files, *policy.deny_read_write,
+                                               *policy.deny_write_files, *policy.sqlite_sidecars)}
+    tool_views: list[Path] = []
     for t in sorted(policy.ro_tool_dirs, key=lambda p: str(p)):
         real = t.parent.resolve() / t.name
         if real.is_symlink():
-            _refuse_replaceable_link(real)
+            _refuse_replaceable_link(real, (*frozen_home, *entity_store_dirs))
             real = real.resolve()
         if os.path.lexists(real) and not real.is_dir():
             continue   # a file where the tool's directory should be: nothing can live under it
         if real in ro_store_dirs:
             continue
-        argv += ["--ro-bind", str(real), str(real)]
+        argv += ["--tmpfs", str(real)]
+        remount_ro.append(str(real))
         ro_store_dirs.append(real)
+        tool_views.append(real)
         if not real.is_dir():
             continue
         for child in sorted(real.iterdir(), key=lambda p: p.name):
-            if child.is_symlink() or not child.is_dir():
+            if child in secret_names:
                 continue
-            argv += ["--bind-try", str(child), str(child)]
+            if child.is_symlink():
+                argv += ["--symlink", os.readlink(child), str(child)]
+            elif child.is_dir():
+                argv += ["--bind-try", str(child), str(child)]
+            else:
+                argv += ["--ro-bind-try", str(child), str(child)]
 
     def _absent_in_ro_store(f: Path, dirs: list[Path] | None = None) -> bool:
         # Nothing to hide and nothing the shell can create: no mount, so no host stub. Decided by
@@ -3641,7 +3689,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # mounting it made bwrap mkdir inside that read-only mount, so bash never started
         # (Diogenes LOW 2026-10-02, run in the Linux container). An existing subdirectory is bound
         # back read-write in (2a), so a path under one is still mounted. ⚠ SPAWN-TIME, like step
-        # (6): a path the HOST creates there after spawn is visible through the read-only bind.
+        # (6): in the entity's store a path the HOST creates after spawn is visible through the
+        # read-only bind (a tool directory is a tmpfs view, where it is not).
         # A read-only tool directory may not exist yet (the provider creates it just before
         # bwrap), so the walk stops at one whether or not it exists. Compared at the real parent,
         # because the read-only mounts are spelled that way.
@@ -3671,14 +3720,13 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     cred_dir_spellings = set(floor_roots(policy.cred_dir_sources))
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
         # A subtree root spelled lexically (:func:`_spellings`) may be a link, and bwrap refuses to
-        # mount on one ("Can't mount on symlink destination", bubblewrap.c). Its resolved spelling is
+        # mount on one (it resolves the path and aborts; measured 2026-09-30). Its resolved spelling is
         # in the policy too and gets the tmpfs; the link itself is safe only where it cannot be
         # replaced from inside, so a link this user can write the directory of refuses bash, as a
-        # cred FILE link does. Any other root is mounted at its real parent.
+        # cred FILE link does, unless that directory is $HOME itself (read-only in bash, step 0). Any other root is mounted at its real parent.
         real = sub.parent.resolve() / sub.name
         if real.is_symlink():
-            if real.parent not in ro_store_dirs:
-                _refuse_replaceable_link(real)
+            _refuse_replaceable_link(real, (*frozen_home, *ro_store_dirs))
             # Skipped only because its target is mounted under its own spelling, which is checked
             # here rather than assumed (L2 r1): a list that added a link root alone is refused.
             if real.resolve() not in policy.deny_read_write:
@@ -3698,10 +3746,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
             nested_in_ssh.append(sub)   # mounted after step (3)'s ssh tmpfs, see there
             continue
-        # An absent root under a read-only TOOL directory is mounted all the same (created first by
-        # the provider, 0700, ledgered): the shell could not create it, but the operator's tool can,
-        # mid-session, and what it writes there must not be readable through the read-only bind (the
-        # aws caches, research §4; L2 r1). Only the entity's own store dirs skip absent roots.
+        # An absent root under a TOOL directory is mounted all the same, inside that directory's
+        # tmpfs view, so nothing is created on the host: what the operator's tool writes there
+        # mid-session must stay unreadable (the aws caches, research §4; L2 r1), and in the view it
+        # is not even present. Only the entity's own store dirs skip absent roots.
         absent_in_store = _absent_in_ro_store(sub, entity_store_dirs)
         if not sub.exists() and not absent_in_store and not _mountpoint_creatable(sub):
             if sub in cred_dir_spellings:
@@ -3799,10 +3847,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
         if _shadowed_by(f, roots):
             dest = str(f)
-        elif f.is_symlink() and f.parent.resolve() in ro_store_dirs:
-            dest = str(f.resolve())   # a link in a read-only tool dir: masked at its target (2a)
         else:
-            dest = str(_bwrap_file_target(f))
+            # A link in a read-only store or tool dir, or directly in $HOME: masked at its target.
+            dest = str(_bwrap_file_target(f, (*frozen_home, *ro_store_dirs)))
         masks.append(dest)
         masked_both.append(dest)
 
@@ -3871,7 +3918,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 "its target. Refusing to grant bash hands (fail-closed). Remove or fix the link."
             )
         elif f.exists():
-            target = _bwrap_file_target(f)
+            target = _bwrap_file_target(f, frozen_home)
             if _shadowed_by(target, roots) or str(target) in denied_both_targets:
                 # The spelling is outside every hidden subtree but its TARGET is inside one: a
                 # self-bind takes its source from the host tree, so it would put the hidden file
@@ -3884,7 +3931,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             else:
                 argv += ["--ro-bind", str(target), str(target)]
         else:
-            masks.append(str(f))
+            masks.append(str(_host_spelling(f)))
 
     # (6) CONTAINER-DAEMON SOCKETS (spore-725) — THE CONNECT ARM, MEASURED 2026-09-30 on a Linux
     # kernel (6.12, bubblewrap 0.9.0, in Docker with the namespace restrictions relaxed):
@@ -3983,7 +4030,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # finding below. Three cases, all measured or reviewed on 2026-09-30:
     #   · PRESENT: pinned at its RESOLVED path. A mount cannot land on a symlink, so /var/run (a
     #     symlink to /run) aborted bwrap until it was resolved.
-    #   · A SYMLINK THIS USER CAN REPLACE (its parent is writable): REFUSED. Pinning the target leaves
+    #   · A SYMLINK THIS USER CAN REPLACE (its parent is writable, and not $HOME, which step (0)
+    #     makes read-only inside bash): REFUSED. Pinning the target leaves
     #     the link itself free to be swapped for a real directory holding a planted file, and macOS
     #     covers that link by name while a mount cannot. Fail closed, as bwrap itself used to.
     #   · ABSENT: pinned only if the body will CREATE something under it — then it is created here
@@ -4004,7 +4052,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     pins: list[tuple[str, bool]] = []   # (path, needs creating)
     for d in sorted(policy.deny_write_dirs, key=lambda p: str(p)):
         if d.is_symlink():
-            if os.access(d.parent, os.W_OK):
+            # A link directly in $HOME is frozen by step (0)'s read-only bind: pin its target.
+            if os.access(d.parent, os.W_OK) and d.parent.resolve() not in frozen_home:
                 raise ConfinementError(
                     f"{d} is a symlink in a directory this user can write. The Linux floor pins a "
                     "jewel's parent directories with mounts, and a mount cannot pin a symlink, so "
@@ -4014,9 +4063,14 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             entry = (str(d.resolve()), False)
         elif d.is_dir():
             entry = (str(d.resolve()), False)
-        elif any(c == str(d) or c.startswith(str(d) + "/") for c in created):
-            entry = (str(d), True)
+        elif any(c == str(_host_spelling(d)) or c.startswith(str(_host_spelling(d)) + "/")
+                 for c in created):
+            entry = (str(_host_spelling(d)), True)
         else:
+            continue
+        if any(Path(entry[0]) != v and Path(entry[0]).is_relative_to(v) for v in tool_views):
+            # Inside a tool directory's view: the view is read-only, so nothing in it can be renamed,
+            # and a pin there would only create a directory on the host for nothing.
             continue
         if entry[0] not in [p for p, _ in pins]:
             pins.append(entry)
@@ -4032,11 +4086,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # Cost: a tool that creates a NEW top-level file or directory in $HOME (a first ~/.npm, say)
     # fails inside bash.
     home_ops: list[str] = []
-    try:
-        home_real = Path.home().resolve()
-    except (OSError, RuntimeError):
-        home_real = None
-    if home_real is not None and home_real != Path(home_real.anchor) and home_real.is_dir():
+    home_real = home_ro
+    if home_real is not None:
         home_ops = ["--ro-bind", str(home_real), str(home_real)]
         for child in sorted(home_real.iterdir(), key=lambda p: p.name):
             if child.is_symlink() or not child.is_dir():
@@ -4269,6 +4320,8 @@ def _mount_plan_paths(
             i += 3
         elif op in ("--proc", "--dev", "--remount-ro", "--dir"):
             i += 2
+        elif op == "--symlink":   # a link made in a tmpfs view (a tool directory): nothing on the host
+            i += 3
         else:
             i += 1
 
@@ -4299,7 +4352,8 @@ def _named_jewel_paths(policy: CrownJewelsPolicy) -> list[str]:
     return list(dict.fromkeys(spelled(Path(p)) for p in named))
 
 
-def _prepare_mountpoints(mounted: dict[str, str | None]) -> list[tuple[str, str]]:
+def _prepare_mountpoints(mounted: dict[str, str | None],
+                         created: list[tuple[str, str]] | None = None) -> list[tuple[str, str]]:
     """Create every absent host mountpoint before bwrap runs, so the manifest can be recorded before
     the start and nothing is adopted afterwards. bwrap would create the same things (an empty 0444
     file for a ``/dev/null`` bind, a directory for a tmpfs); creating them here first means the object
@@ -4307,8 +4361,10 @@ def _prepare_mountpoints(mounted: dict[str, str | None]) -> list[tuple[str, str]
     which is still recorded before bwrap mounts over it. Returns every object THIS call created,
     parents included, as ``(path, "file" | "dir")``: the ledger owns exactly those (its own
     successful ``mkdir`` or ``O_EXCL`` create, never a path merely seen absent), and removes them
-    once no session needs them."""
-    created: list[tuple[str, str]] = []
+    once no session needs them. Each is appended to ``created`` (the caller's list, when given) as it
+    is made, so a failure part-way still leaves the caller holding what was already created."""
+    if created is None:
+        created = []
 
     def mkdir(a: Path) -> None:
         try:
@@ -4333,11 +4389,11 @@ def _prepare_mountpoints(mounted: dict[str, str | None]) -> list[tuple[str, str]
                              0o444)
             except FileExistsError:
                 continue
+            created.append((q, "file"))   # ledgered as soon as it exists, before anything can fail
             try:
                 os.fchmod(fd, 0o444)   # exactly 0444 whatever the umask: the ledger checks the mode
             finally:
                 os.close(fd)
-            created.append((q, "file"))
     return created
 
 
@@ -4852,7 +4908,7 @@ class BwrapProvider(ConfinementProvider):
         # needs it to exist. Not a jail — reach is default-allowed.
         policy.workspace.mkdir(parents=True, exist_ok=True)
         try:
-            made += _prepare_mountpoints(mounted) or []
+            _prepare_mountpoints(mounted, made)
             manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
         except (OSError, RuntimeError) as exc:
             raise ConfinementError(

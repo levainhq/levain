@@ -2551,14 +2551,18 @@ def test_bwrap_creates_and_pins_an_absent_ssh_dir_before_planting_anything_in_it
     assert inside and min(inside) > i_pin, "a mount inside ~/.ssh landed before ~/.ssh was pinned"
 
 
-def test_bwrap_refuses_a_replaceable_symlinked_jewel_ancestor(tmp_path, monkeypatch) -> None:
-    """A mount cannot pin a symlink; pinning its target leaves the link swappable. Fail closed."""
+def test_bwrap_pins_a_home_level_symlinked_jewel_ancestor_at_its_target(tmp_path, monkeypatch) -> None:
+    """A mount cannot pin a symlink. A link directly in $HOME cannot be swapped from inside bash
+    ($HOME's top level is read-only there, ruling 2026-10-07), so its target is pinned instead; a
+    deeper link still refuses (test_bwrap_refuses_a_replaceable_symlinked_protected_file)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     real = tmp_path / "dotfiles-ssh"
     real.mkdir()
     (tmp_path / ".ssh").symlink_to(real)
-    with pytest.raises(ConfinementError, match="symlink"):
-        _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw"))
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw"))
+    assert ["--bind", str(real.resolve()), str(real.resolve())] in [argv[k:k + 3] for k in range(len(argv))]
+    assert str(tmp_path / ".ssh") not in argv
+    assert not any(a.startswith(str(tmp_path / ".ssh") + "/") for a in argv)
 
 
 def test_bwrap_refuses_a_replaceable_symlinked_protected_file(tmp_path, monkeypatch) -> None:
