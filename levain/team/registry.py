@@ -261,7 +261,6 @@ class Registration:
         self.name = name
         self._dir_fd: int | None = dir_fd
         self._lock_fd: int | None = lock_fd
-        _LIVE.add(self)
 
     @property
     def path(self) -> Path:
@@ -304,6 +303,7 @@ def register(repo: str, url: str, project: str) -> Registration:
         _PENDING.add(dir_fd)
     lock_fd = None
     published = None
+    reg = None
     tmp = f".{PREFIX}x{secrets.token_hex(16)}.tmp"
     try:
         with _FORK_LOCK:     # the self-test opens, locks and closes its own fds: no fork sees them
@@ -326,22 +326,29 @@ def register(repo: str, url: str, project: str) -> Registration:
         view = memoryview(data)
         while view:
             view = view[os.write(lock_fd, view):]
+        published = name   # before the rename or link, so an interrupt just after either still withdraws the entry
         if how == "exlock":
             os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         else:
             os.link(f"/proc/self/fd/{lock_fd}", name, dst_dir_fd=dir_fd, follow_symlinks=True)
-        published = name
-        with _FORK_LOCK:
+        with _FORK_LOCK:     # the Registration takes the fds over: it is live and they are no longer pending at once
             reg = Registration(name, dir_fd, lock_fd)
+            _LIVE.add(reg)
             _PENDING.discard(lock_fd)
             _PENDING.discard(dir_fd)
         return reg
     except BaseException:
-        if published is not None:   # interrupted after the rename: withdraw the entry while still holding its lock
+        if published is not None:   # withdraw the entry (a name never made is ENOENT) while still holding its lock
             try:
                 os.unlink(published, dir_fd=dir_fd)
             except OSError:
                 pass
+        if reg is not None:         # interrupted after the Registration took the fds over: it closes them, once
+            with _FORK_LOCK:
+                reg._drop_fds_locked()
+                _PENDING.discard(lock_fd)
+                _PENDING.discard(dir_fd)
+            raise
         if lock_fd is not None:
             with _FORK_LOCK:
                 _PENDING.discard(lock_fd)

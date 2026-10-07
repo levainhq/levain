@@ -970,3 +970,41 @@ def test_a_runtime_file_that_cannot_be_removed_does_not_skip_the_rest_of_the_cle
     with pytest.raises(OSError, match="read-only runtime dir"):
         V.serve(stub, host="127.0.0.1", port=0, recheck_days=30, ack_flag=3)
     assert calls == ["runtime file", "unpublish", "registry lock"]
+
+
+def test_a_request_dripped_a_byte_at_a_time_is_cut_at_the_deadline(monkeypatch):
+    # L3 r1 10-07 (codex MED, L2): IDLE_TIMEOUT bounds each read, so one byte every few seconds kept a connection,
+    # and MAX_WORKERS such connections closed the page to everyone. A request now has REQUEST_DEADLINE to arrive.
+    import socket
+    import time
+    monkeypatch.setattr(V, "REQUEST_DEADLINE", 1.0)
+    httpd = V.make_view_server(_Stub(), port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        s = socket.create_connection(("127.0.0.1", httpd.server_address[1]))
+        s.settimeout(0.3)
+        t0, closed = time.monotonic(), False
+        for b in b"GET /view.json HTTP/1.1\r\nHost: 127.0.0.1\r\n":
+            try:
+                s.sendall(bytes([b]))
+                if s.recv(1) == b"":
+                    closed = True
+                    break
+            except socket.timeout:
+                pass
+            except OSError:
+                closed = True
+                break
+        assert closed and time.monotonic() - t0 < 3.0          # cut at the deadline, long before the drip ended
+        s.close()
+        # a request that arrives in time is answered, and a ledger read longer than the deadline is never cut
+        class Slow(_Stub):
+            def snapshot(self):
+                time.sleep(1.5)
+                return super().snapshot()
+        httpd.ledger_reader = Slow()
+        r, _ = _req(httpd.server_address[1], "GET", "/view.json")
+        assert r.status == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

@@ -1302,3 +1302,20 @@ def test_on_linux_no_temp_name_ever_appears(monkeypatch):
     finally:
         r.unpublish()
         r.close()
+
+
+def test_an_interrupt_as_the_registration_is_made_leaves_nothing_live_or_listed(monkeypatch):
+    # L3 r1 10-07 (codex + gemini + complement): Registration added itself to _LIVE in its constructor, so a
+    # KeyboardInterrupt (levain's SIGTERM) right after it left a live Registration holding fd numbers the except path
+    # had already closed; a later fork's child would close whatever reused those numbers.
+    real = R.Registration.__init__
+
+    def interrupted(self, *a, **k):
+        real(self, *a, **k)
+        raise KeyboardInterrupt
+    monkeypatch.setattr(R.Registration, "__init__", interrupted)
+    before = set(R._LIVE)
+    with pytest.raises(KeyboardInterrupt):
+        R.register("/work/x", "http://127.0.0.1:41999/", "x")
+    assert set(R._LIVE) == before and not R._PENDING
+    assert R.live_views() == [] and [n for n in os.listdir(R.registry_dir()) if not n.startswith(".")] == []

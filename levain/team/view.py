@@ -20,6 +20,7 @@ import hashlib
 import json
 import ipaddress
 import os
+import socket
 import sys
 import threading
 from urllib.parse import parse_qs
@@ -53,6 +54,7 @@ DEFAULT_ACK_FLAG = 3        # acks on one path before the page suggests its ruli
 BUSY_RETRY = 2              # seconds: what a busy answer tells the browser to wait before asking again
 IDLE_TIMEOUT = 5            # seconds a connection may sit idle, or stall a read or write, before it is closed
 MAX_WORKERS = 32            # connections served at once (a browser keeps about 6 per host open); more are closed
+REQUEST_DEADLINE = 10.0     # seconds a request may take to arrive (line, headers, any body the guards read)
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -562,6 +564,25 @@ class _ViewHandler(GuardedHandler):
     # cannot hold every slot and lock the page out for the guard's 30 seconds.
     timeout = IDLE_TIMEOUT
 
+    # IDLE_TIMEOUT bounds each read, not a request: a client sending one byte every few seconds would hold its slot
+    # forever, and MAX_WORKERS of them would close the page to everyone. A request must reach _route within
+    # REQUEST_DEADLINE of the server starting to wait for it, or its socket is shut down; _route disarms the deadline,
+    # so a slow ledger read is never cut.
+    def handle_one_request(self) -> None:
+        self._deadline = threading.Timer(REQUEST_DEADLINE, self._cut)
+        self._deadline.daemon = True
+        self._deadline.start()
+        try:
+            super().handle_one_request()
+        finally:
+            self._deadline.cancel()
+
+    def _cut(self) -> None:
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)   # the blocked read returns at once and the handler ends
+        except OSError:
+            pass
+
     def _model(self, path_filter: str = "") -> dict:
         gl: GitLedger = self.server.ledger_reader
         # Serializes model generation WITHIN this process only (it says nothing about other processes' git use).
@@ -571,7 +592,8 @@ class _ViewHandler(GuardedHandler):
         if not self.server.model_lock.acquire(blocking=False):
             raise _Busy()
         # transport.WARNINGS is one list per process: what a request appends is taken off it as that request ends, so
-        # two servers in one process take turns, or one would show and drop the other's.
+        # two servers in one process take turns, or one would show and drop the other's. In `levain team view` the
+        # view's requests are the only readers of the ledger in the process, so nothing else appends meanwhile.
         if not _WARNINGS_LOCK.acquire(blocking=False):
             self.server.model_lock.release()
             raise _Busy()
@@ -605,6 +627,7 @@ class _ViewHandler(GuardedHandler):
 
     def _route(self, *, head: bool) -> None:
         # GuardedHandler has run the Host allowlist, the cross-site read refusal and the launch token.
+        self._deadline.cancel()
         path, _, query = self.path.partition("?")
         asset = self.server.assets.get(path)
         if asset is not None:
@@ -790,6 +813,8 @@ def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: i
                     if httpd.registration is not None:
                         httpd.registration.close()
                 finally:
-                    httpd.server_close()
-                    restore_sigterm()
+                    try:
+                        httpd.server_close()
+                    finally:
+                        restore_sigterm()
     return 0
