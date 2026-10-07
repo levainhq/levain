@@ -492,3 +492,15 @@ def test_a_warning_reaches_the_hook_output_once(two):
     assert ctx.count("team.toml at the tip is unusable") == 1, ctx
     ctx = edit(ana, "src/billing.py")["hookSpecificOutput"]["additionalContext"]
     assert ctx.count("team.toml at the tip is unusable") == 1, ctx
+
+
+@pytest.mark.parametrize("args", [["--recheck-days", "-1"], ["--ack-flag", "0"]])
+def test_team_view_refuses_a_negative_recheck_or_a_zero_ack_flag(two, monkeypatch, args):
+    # E review (codex LOW h), RUN: both were accepted and passed to the view.
+    import levain.team.view as V
+    tmp, ana, ben = two
+    called = []
+    monkeypatch.setattr(V, "serve", lambda *a, **k: called.append(k) or 0)
+    with pytest.raises(SystemExit):
+        team("view", *args, repo=ben)
+    assert called == []
