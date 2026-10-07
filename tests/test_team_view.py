@@ -115,6 +115,11 @@ class _Stub:
     def head(self):
         return "sha"
 
+    def trust_record(self):
+        # the accepted remote tip, as the stub's remote_ref says (transport's trust_record carries it as .accepted)
+        import types
+        return types.SimpleNamespace(accepted=self.remote_ref() if hasattr(self, "remote_ref") else None)
+
     def team(self, rev=None):
         return self.snapshot()[1]
 
@@ -1029,6 +1034,65 @@ def test_a_quarantined_tip_that_cannot_be_judged_does_not_stop_the_view_starting
     try:
         r, body = _req(httpd.server_address[1], "GET")
         assert r.status == 200 and b"the fetched remote ledger could not be judged" in body and b"boom" not in body
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_accepted_tip_is_judged_against_the_record_it_was_read_from():
+    # codex, L3 round 2 (9d81f19): the tip came from one read of the trusted record and judge_remote read it again; a
+    # sync advancing the accepted tip in between had the older tip judged against the newer floor, so it looked
+    # truncated. One read (trust_record) now gives both the tip and the record it is judged against.
+    import types
+    seen = []
+
+    class Raced(_RemoteStub):
+        def __init__(self):
+            super().__init__()
+            self.rec = types.SimpleNamespace(accepted="a" * 40)
+
+        def trust_record(self):
+            return self.rec
+
+        def remote_ref(self):
+            return "b" * 40                   # what a second read would say: a sync has advanced it
+
+        def team(self, rev=None):
+            return TEAM
+
+        def judge_remote(self, rev, rec=None):
+            seen.append((rev, rec))
+            return types.SimpleNamespace(ledger=_ledger()[0])
+    stub = Raced()
+    httpd = _serve(stub)
+    try:
+        assert _req(httpd.server_address[1], "GET")[0].status == 200
+        assert seen == [("a" * 40, stub.rec)]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_an_unreadable_trusted_record_is_said_on_the_page_not_a_503(capfd):
+    # The head's ruling on MED2: when trust_record() cannot read pins.json nothing can be judged; the page says so,
+    # shows no panes (empty panes would read as "nothing in force"), and keeps the detail in the terminal.
+    from levain.team.transport import LedgerReadError
+
+    class Unreadable(_RemoteStub):
+        def trust_record(self):
+            raise LedgerReadError("pins.json is unreadable at /home/ana/x")
+
+        def team(self, rev=None):
+            return TEAM
+    httpd = _serve(Unreadable())
+    try:
+        port = httpd.server_address[1]
+        r, body = _req(port, "GET")
+        page = body.decode()
+        assert r.status == 200 and "the ledger could not be judged" in page and "Waiting on you" not in page
+        assert "/home/ana" not in page and "/home/ana" in capfd.readouterr().err
+        m = json.loads(_req(port, "GET", "/view.json")[1])
+        assert m["unjudged"] is True and m["fetch"]["source"] == "unjudged" and m["in_force"] == []
     finally:
         httpd.shutdown()
         httpd.server_close()

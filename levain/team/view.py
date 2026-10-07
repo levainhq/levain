@@ -226,7 +226,9 @@ def _fetch_status(f: dict | None) -> str:
     if not f or not f.get("remote"):
         return ('<span class="stamp fetch">this clone only: no remote</span>'
                 '<button id="refresh" type="button" data-fetch="0">⟳ reload</button>')
-    if f.get("source") == "remote":
+    if f.get("source") == "unjudged":
+        parts = ["no ledger shown"]
+    elif f.get("source") == "remote":
         # "fetched T" only when the last fetch brought its tip in; after a failure the panes are an older copy
         parts = ["remote, as last accepted" if f.get("error") or f.get("busy") else
                  f"remote, fetched {_e(f['last_ok'])}" if f.get("last_ok") else "remote"]
@@ -324,8 +326,9 @@ def render_html(m: dict, cockpit_url: str = DEFAULT_COCKPIT_URL) -> str:
             f"<nav class=\"tabs\"><a class=\"tab\" href=\"{_e(cockpit_url)}\">◍ Cockpit</a>"
             "<a class=\"tab active\" href=\"/\">▣ Team view</a></nav>"
             + pathfilter + pathbar
-            + f"<div class=\"grid team\" id=\"board\">{pane1}{pane2}{pane3}{pane4}</div>"
-            "<footer class=\"deck-foot\">owners rule, everyone sees, nobody is watched · read-only: change anything "
+            + (f"<p class=\"warn unjudged\">⚠ {_e(UNJUDGED_TEXT)}</p>" if m.get("unjudged")
+               else f"<div class=\"grid team\" id=\"board\">{pane1}{pane2}{pane3}{pane4}</div>")
+            + "<footer class=\"deck-foot\">owners rule, everyone sees, nobody is watched · read-only: change anything "
             "with levain team record</footer></div><script src=\"/team_view.js\"></script></body></html>")
 
 
@@ -473,6 +476,14 @@ class _Busy(Exception):
     pass
 
 
+class _Unjudged(Exception):
+    """This clone's trusted record cannot be read, so no ledger can be judged: the page says so and shows none."""
+
+
+UNJUDGED_TEXT = ("the ledger could not be judged: this clone's trusted record (pins.json) could not be read, so no "
+                 "ledger is shown (the detail is in the terminal running the view)")
+
+
 class _ViewHandler(GuardedHandler):
     """GET only. Any other method, known or not, is answered 405 (with the guard headers, via end_headers)."""
 
@@ -499,7 +510,16 @@ class _ViewHandler(GuardedHandler):
         mark = len(gl.warnings)
         try:
             fetch = self._fetch(gl, fetch_now)
-            sha, team, ledger, source = self._snapshot(gl, fetch)
+            try:
+                sha, team, ledger, source = self._snapshot(gl, fetch)
+            except _Unjudged:
+                team = gl.team()
+                m = build_model(team, I.build([], team.owner), gl.handle(team), None, "",
+                                recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag, problems=[])
+                m["unjudged"] = True
+                m["fetch"] = dict(fetch, source="unjudged", unpushed=None, unfetched=None, error=UNJUDGED_TEXT)
+                m["warning_count"] = 0
+                return m
             require_untampered(ledger)   # the refusal is served (503, no entries), never a model
             self.server.fetch_interval = _interval(team)
             m = build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
@@ -521,15 +541,24 @@ class _ViewHandler(GuardedHandler):
 
     def _snapshot(self, gl: GitLedger, fetch: dict) -> tuple[str, R.Team, I.Ledger, dict]:
         """(sha, team, ledger) from ONE commit, plus where it came from. With a remote, that commit is the remote's
-        ledger tip as this clone last ACCEPTED it (``remote_ref``; a refused fetch never moves it), read through
-        ``judge_remote``, which pins and caches nothing. This clone's own branch is never moved here; how far it
-        differs from the remote is counted and shown instead. Without an accepted remote tip, this clone's own copy."""
-        rsha = gl.remote_ref() if fetch.get("remote") else None
+        ledger tip as this clone last ACCEPTED it (a refused fetch never moves it), judged by ``judge_remote`` against
+        the SAME read of the trusted record the tip came from (a second read could see a newer accepted tip, and judge
+        this one against it as a floor it falls short of); ``judge_remote`` pins and caches nothing. This clone's own
+        branch is never moved here; how far it differs from the remote is counted and shown instead. Without an
+        accepted remote tip, this clone's own copy. A trusted record that cannot be read raises _Unjudged."""
+        rec = None
+        if fetch.get("remote"):
+            try:
+                rec = gl.trust_record()      # ONE read: the tip and the record it is judged against
+            except LedgerReadError as exc:
+                _log(f"the trusted record could not be read: {exc}")
+                raise _Unjudged() from None
+        rsha = rec.accepted if rec is not None else None
         if rsha is None:
             sha, team, ledger = gl.snapshot()
             return sha, team, ledger, {"source": "local", "unpushed": 0, "unfetched": 0}
         team = gl.team(rsha)
-        ledger = gl.judge_remote(rsha).ledger
+        ledger = gl.judge_remote(rsha, rec).ledger
         unpushed, unfetched = _divergence(gl, rsha)
         return rsha, team, ledger, {"source": "remote", "unpushed": unpushed, "unfetched": unfetched}
 
@@ -555,8 +584,8 @@ class _ViewHandler(GuardedHandler):
 
     def _fetch(self, gl: GitLedger, now: bool) -> dict:
         """Fetch the remote's ledger when one is due, through ``fetch_only``: into quarantine, judged, and only an
-        accepted tip moves levain's accepted ref (what ``remote_ref`` reads). A fetch only, never a rebase, a merge or
-        a push, so this clone's branch and worktree are untouched. Paced by team.toml's fetch_interval (the accepted
+        accepted tip moves the accepted tip in this clone's trusted record (what ``trust_record`` reads). A fetch only,
+        never a rebase, a merge or a push, so this clone's branch and worktree are untouched. Paced by team.toml's fetch_interval (the accepted
         remote's, as of the last page) and never more often than FETCH_FLOOR; the button asks for the floor.
         The page shows the clone's own record of its last fetch, so a fetch the hook made counts too. Never raises: a
         failure here is shown on the page and the panes still draw. A failure's detail goes to this server's terminal,
