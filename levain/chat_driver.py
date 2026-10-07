@@ -256,7 +256,7 @@ def _pending_row(p: Any) -> PendingApproval:
     not one an operator can judge). Two values fail closed instead of being refused: a ``full`` that is
     missing or not text reads as ``""``, the contract's "could not be read" (the hold is then reject-only),
     and a missing ``recognized`` reads as ``False``."""
-    got = {n: getattr(p, n, _ABSENT) for n in ("tool_name", "detail", "reason", "full", "recognized")}
+    got: dict[str, Any] = {n: getattr(p, n, _ABSENT) for n in ("tool_name", "detail", "reason", "full", "recognized")}
     missing = [n for n in ("tool_name", "detail", "reason") if got[n] is _ABSENT]
     if missing:
         raise DriverContractError(f"a held action does not carry {', '.join(missing)}: there is no consent row to judge")
