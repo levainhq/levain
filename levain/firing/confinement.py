@@ -2614,7 +2614,9 @@ class SeatbeltProvider(ConfinementProvider):
         lines.append(";; root daemon sysmond for every process's argv, so they show the command line of")
         lines.append(";; processes run by ANY user, a different uid included (measured 2026-10-07).")
         lines.append(";; Denying the lookup of its mach service closes that path. A name filter on")
-        lines.append(";; mach-lookup, the same kind as the Keychain rules above.")
+        lines.append(";; mach-lookup, the same kind as the Keychain rules above. Cost inside the")
+        lines.append(";; entity's bash: pgrep and pkill fail outright, by name too (\"sysmond service")
+        lines.append(";; not found\"); kill <pid> and psutil are unaffected (measured 2026-10-07).")
         lines.append(f'(deny mach-lookup (global-name "{_SYSMOND_MACH_SERVICE}"))')
         lines.append("")
 
