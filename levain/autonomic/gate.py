@@ -22,7 +22,7 @@ With a :class:`~levain.autonomic.journal.RunJournal` wired, every BINDING fire i
 (its request carries a ``run``): the executor runs inside ``RunJournal.effect``, so it runs at most
 once per run and effect, never while another decision on the binding is open, and never after a fence
 or a cancel. The journal is the ONLY durable home of a journaled decision: a confirm-class proposal
-records its pending AS the run's hold (one appended line, with a chain link's continuation), the
+records its pending AS the run's hold (one row, with a chain link's continuation), the
 open pendings are read from the open holds, and ``resolve`` is one write-once ``decide``. A binding
 fire without a run is refused once a journal is wired. A manual fire (human authority, no run) is
 not journaled and keeps the pending store; a gate without a journal is the unjournaled (pre-S8)
@@ -190,17 +190,12 @@ class EfferentGate:
         auto_fire_actions: frozenset[str] | None = None,
         trajectory_observer: TrajectoryObserver | None = None,
         journal: RunJournal | None = None,
-        binding_generation: Callable[[str], int | None] | None = None,
     ) -> None:
         self._manifest = manifest
         # The run journal (S8). None ⇒ nothing is journaled (a request carrying a ``run`` is refused).
-        # With a journal, ``binding_generation`` is REQUIRED: the registry is the authority that fences
-        # a binding (``BindingStore.generation``), and the gate reads it before every journaled effect,
-        # so a fence the journal failed to record still stops the run.
-        if journal is not None and binding_generation is None:
-            raise ValueError("EfferentGate: a journal needs binding_generation (BindingStore.generation)")
+        # It shares one database with the binding registry, so every journal check reads the binding's
+        # fence in the same transaction as the decision or effect it guards.
         self._journal = journal
-        self._binding_generation = binding_generation
         self._store = store
         self._executor = executor
         # The injected diverse-substrate world-observer for the Slice-3a.5 prediction-error monitor.
@@ -430,7 +425,7 @@ class EfferentGate:
         receipt — no decision yet); the push is best-effort notification.
 
         A JOURNALED request (a binding run) records its pending as the run's HOLD in the run journal: one
-        appended line holds the sealed pending, the chain continuation of a chain link, and the barrier
+        row holds the sealed pending, the chain continuation of a chain link, and the barrier
         that stops the binding's undecided effects. The journal is the only durable home of that decision;
         the pending store is not written. Proposing the same effect again finds the same hold (and its
         pending), so a re-delivered event never asks twice.
@@ -454,14 +449,10 @@ class EfferentGate:
         )
         if run is not None:
             assert self._journal is not None   # _journal_entry refused a run without a journal
-            gen = self._current_generation(request)
-            if gen is None:
-                return self._deny(request, created_at, Posture.REFUSE_ESCALATE, "binding_generation_unknown",
-                                  cancel=False)
             try:
                 h = self._journal.hold(run.run_id, run.effect_id, digest=self._digest_of(request),
                                        pending=pending.to_dict(), at=created_at, chain=request.continuation,
-                                       chained=run.chained, current_generation=gen)
+                                       chained=run.chained)
             except Exception as e:  # noqa: BLE001 — nothing was recorded: nothing proposed, nothing fired
                 _log.error("efferent gate: journal hold FAILED (%s): %s — not proposed", type(e).__name__, e)
                 return GateOutcome(
@@ -631,15 +622,11 @@ class EfferentGate:
         )
         if not already_approved:
             # Everything that could stop this effect WITHOUT a decision is checked BEFORE the decision is
-            # written, so "refused" never coexists with an approval in the journal: an unreadable
-            # registry or an unadmitted run records nothing; a run that is already fenced or cancelled
-            # is a rejection (it can never fire), recorded as one.
-            gen = self._current_generation(request)
-            if gen is None:
-                return self._refuse_open("binding_generation_unknown", binding_id)
+            # written, so "refused" never coexists with an approval in the journal: an unadmitted run
+            # records nothing; a run that is already fenced or cancelled is a rejection (it can never
+            # fire), recorded as one.
             try:
-                barrier = self._journal.peek(run.run_id, run.effect_id, current_generation=gen,
-                                             digest=self._digest_of(request))
+                barrier = self._journal.peek(run.run_id, run.effect_id, digest=self._digest_of(request))
             except KeyError:
                 return self._refuse_open("run_not_admitted", binding_id)
             if barrier is not None:
@@ -1221,12 +1208,8 @@ class EfferentGate:
         if request.run is None:
             return None
         assert self._journal is not None
-        gen = self._current_generation(request)
-        if gen is None:
-            return self._deny(request, created_at, Posture.REFUSE_ESCALATE, "binding_generation_unknown",
-                              cancel=False)
         try:
-            barrier = self._journal.peek(request.run.run_id, request.run.effect_id, current_generation=gen,
+            barrier = self._journal.peek(request.run.run_id, request.run.effect_id,
                                          digest=self._digest_of(request))
         except KeyError:
             return self._deny(request, created_at, Posture.REFUSE_ESCALATE, "run_not_admitted", cancel=False)
@@ -1242,21 +1225,6 @@ class EfferentGate:
         if barrier.status is EffectStatus.REPLAYED:
             return self._replayed(request, barrier, created_at)
         return self._journal_stop(request, barrier, Posture.REFUSE_ESCALATE)
-
-    def _current_generation(self, request: ActionRequest) -> int | None:
-        """The firing binding's governance generation from the registry, read immediately before the
-        journal barrier, or ``None`` (absent, malformed, unreadable: no authority, refuse). A pause
-        committed after this read is ordered after the barrier: it stops the NEXT effect, the same
-        residual as a fence landing while an effect is inside its call."""
-        bid = request.authority.binding_id
-        if not bid or self._binding_generation is None:
-            return None
-        try:
-            return self._binding_generation(bid)
-        except Exception as e:  # noqa: BLE001
-            _log.error("efferent gate: binding generation for %r unreadable (%s): %s", bid,
-                       type(e).__name__, e)
-            return None
 
     def _journal_stop(self, request: ActionRequest, out: EffectOutcome, posture: Posture) -> GateOutcome:
         """The outcome for an effect the journal did not let run. HELD and IN_FLIGHT are not terminal
@@ -1295,16 +1263,9 @@ class EfferentGate:
             return {"execution": _execution_record(result), "posture": posture.name,
                     "verdict": verdict, "by": by}
 
-        gen = self._current_generation(request)
-        if gen is None:
-            return GateOutcome(
-                posture=posture, fired=False, refused=True, deferred=False,
-                reason="binding_generation_unknown", receipt_id=None, execution=None,
-                binding_id=request.authority.binding_id,
-            )
         try:
             out = self._journal.effect(run.run_id, run.effect_id, digest=self._digest_of(request),
-                                       fn=call, needs_decision=decided, current_generation=gen)
+                                       fn=call, needs_decision=decided)
         except Exception as e:  # noqa: BLE001 — the gate never raises
             if not called:
                 _log.error("efferent gate: run journal FAILED before the effect (%s): %s — nothing ran",

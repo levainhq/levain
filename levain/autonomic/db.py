@@ -1,0 +1,145 @@
+"""levain.autonomic.db — the one durable store of the autonomic engine.
+
+The binding registry and the run journal live in ONE SQLite database, ``autonomic.db``, inside a store
+DIRECTORY. One database because a decision about standing authority is never allowed to live in two
+places: a pause and the fence that stops admitted runs, an admission and a one-shot's claim, a decision
+and the cancel of its run are each ONE transaction, so no crash, fault or race can leave two stores
+disagreeing (SQLite: "transactions appear to be atomic even if the transaction is interrupted by an
+operating system crash or power failure").
+
+A directory because the store's SQLite sidecars (``-wal``, ``-shm``) and the journal's effect leases
+live next to the database, and the confinement floor protects the whole directory as one crown jewel:
+an entity's hands can neither read nor write any of it, and a shell is not refused on its account (a
+directory jewel has no sidecars outside itself to plant).
+
+Durability: WAL journaling, ``synchronous=FULL`` (every commit is on disk before it returns), and
+``fullfsync`` (macOS flushes the drive's cache too; a no-op elsewhere). Every write runs inside
+``BEGIN IMMEDIATE``, so writers are serialized by SQLite itself; ``busy_timeout`` waits for the lock.
+
+The store carries a format marker; a database with another marker is refused rather than read. A
+registry kept in the earlier JSON file format (this package's or the vagus package's) enters only
+through :meth:`levain.autonomic.binding.BindingStore.migrate_json`, a one-way import.
+
+Stdlib only.
+"""
+from __future__ import annotations
+
+import os
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+__all__ = ["AutonomicDB", "StoreFormatError", "STORE_FORMAT", "default_store_dir"]
+
+STORE_FORMAT = "levain-autonomic/1"
+DB_NAME = "autonomic.db"
+
+_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+    # the binding registry: one row per grant, the record as written by BindingStore (JSON), in order
+    "CREATE TABLE IF NOT EXISTS bindings (binding_id TEXT PRIMARY KEY, record TEXT NOT NULL, "
+    "seq INTEGER NOT NULL)",
+    # the run journal
+    "CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY, binding_id TEXT NOT NULL, "
+    "generation INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS fences (binding_id TEXT PRIMARY KEY, generation INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS cancels (run_id TEXT PRIMARY KEY, reason TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS holds (hold_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, "
+    "effect_id TEXT NOT NULL, binding_id TEXT NOT NULL, digest TEXT NOT NULL, at TEXT, "
+    "pending TEXT, pending_id TEXT, chain TEXT, chained INTEGER NOT NULL DEFAULT 0, "
+    "decided INTEGER, decided_by TEXT, seq INTEGER NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS holds_pending ON holds (pending_id)",
+    "CREATE TABLE IF NOT EXISTS effects (run_id TEXT NOT NULL, effect_id TEXT NOT NULL, "
+    "digest TEXT NOT NULL, pid INTEGER, state TEXT NOT NULL CHECK (state IN ('intent','done','unknown')), "
+    "result TEXT, receipt_id TEXT, PRIMARY KEY (run_id, effect_id))",
+)
+
+
+class StoreFormatError(RuntimeError):
+    """The database is not a store of this format (another marker, or not a store at all)."""
+
+
+def default_store_dir() -> Path:
+    """``<levain home>/autonomic``: ``$LEVAIN_HOME/autonomic`` if set, else ``~/.levain/autonomic``."""
+    home = os.environ.get("LEVAIN_HOME")
+    return (Path(home).expanduser() if home else Path.home() / ".levain") / "autonomic"
+
+
+class AutonomicDB:
+    """The store directory and its database. Every operation opens its own connection (cheap, and safe
+    across threads and processes); :meth:`write` is one ``BEGIN IMMEDIATE`` transaction, :meth:`read`
+    a consistent snapshot."""
+
+    def __init__(self, directory: Path | str) -> None:
+        self.directory = Path(directory)
+        self.path = self.directory / DB_NAME
+        self._ready = False
+
+    def _connect(self) -> sqlite3.Connection:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.directory, 0o700)
+        conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
+        try:
+            conn.execute("PRAGMA busy_timeout = 30000")
+            conn.execute("PRAGMA journal_mode = WAL")       # sidecars -wal/-shm stay in the directory
+            conn.execute("PRAGMA synchronous = FULL")
+            conn.execute("PRAGMA fullfsync = ON")
+            conn.execute("PRAGMA checkpoint_fullfsync = ON")
+            if not self._ready:
+                self._ensure_schema(conn)
+                self._ready = True
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+    @staticmethod
+    def _ensure_schema(conn: sqlite3.Connection) -> None:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for stmt in _SCHEMA:
+                conn.execute(stmt)
+            row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+            if row is None:
+                conn.execute("INSERT INTO meta (key, value) VALUES ('format', ?)", (STORE_FORMAT,))
+            elif row[0] != STORE_FORMAT:
+                raise StoreFormatError(f"store format {row[0]!r} is not {STORE_FORMAT!r}")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+    @contextmanager
+    def write(self) -> Iterator[sqlite3.Connection]:
+        """One write transaction (``BEGIN IMMEDIATE``): committed when the block exits, rolled back if it
+        raises. Writers are serialized by SQLite; a reader always sees a committed state."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    @contextmanager
+    def read(self) -> Iterator[sqlite3.Connection]:
+        """A consistent read snapshot."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            try:
+                yield conn
+            finally:
+                conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+    def meta(self, key: str) -> str | None:
+        with self.read() as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None

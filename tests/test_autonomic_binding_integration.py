@@ -25,6 +25,7 @@ from levain.autonomic import (
     binding_invocation,
 )
 from levain.autonomic.receipt import build_gate_face, build_gate_verdict
+from tests.test_autonomic_rawstore import dump, registry_of, write_raw
 
 
 def _guard() -> Guard:
@@ -135,10 +136,10 @@ def test_governed_lifecycle_over_a_real_store(tmp_path):
 
     # a disk tamper of the promoted grant's core bars it (fail-closed), leaving an EMPTY fire-set
     import json
-    raw = json.loads(store.path.read_text())
+    raw = registry_of(store)
     for rec in raw.values():
         if rec["binding_id"] == promoted.binding_id:
             rec["posture"] = "ABOVE_LOOP"     # widen autonomy without re-ratifying
-    store.path.write_text(json.dumps(raw))
+    write_raw(store, raw)
     assert store.list_active() == []          # the widened grant cannot fire
     assert "seals to" in (store.integrity() or "")   # and the registry says why it reads empty

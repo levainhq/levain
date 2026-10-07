@@ -50,21 +50,22 @@ The load-bearing cuts (each one an apparatus finding made structural):
    writes over an existing id) are what close the realistic in-scope (buggy-writer) resurrection paths.
 
 4. **The registry is MUTABLE standing state, not an append-only trace.** Bindings are created, paused,
-   graduated, demoted, revoked — so the store is the ``PendingActionStore`` shape (a mutable JSON file,
-   sidecar-flock-serialized, atomic tmp+replace), NOT the append-only JSONL the receipt/proposal
-   stores use. Revocation prefers ``set_status(REVOKED)`` (audit-preserving) over a hard ``remove``.
+   graduated, demoted, revoked — so the store is a mutable table (the ``bindings`` table of the store
+   directory's SQLite database, shared with the run journal; see :mod:`levain.autonomic.db`), NOT the
+   append-only trace the receipt/proposal stores use. Revocation prefers ``set_status(REVOKED)``
+   (audit-preserving) over a hard ``remove``.
 
 Stdlib-only; ``fcntl`` is POSIX (the stack's macOS/Linux targets).
 """
 from __future__ import annotations
 
 import copy
-import fcntl
 import hashlib
 import json
 import logging
 import math
 import os
+import sqlite3
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -73,6 +74,7 @@ from pathlib import Path
 from typing import Any, Iterator, Protocol, runtime_checkable
 
 from levain.autonomic.authority import AuthorityScope
+from levain.autonomic.db import AutonomicDB
 from levain.autonomic.journal import RunJournal, durable_replace
 from levain.autonomic.kill import Kleene, assert_kill_pure, kill_outcome
 from levain.autonomic.monitor import assert_trajectory_pure
@@ -92,7 +94,6 @@ __all__ = [
     "derived_binding_id",
     "BindingStore",
     "ReplaceResult",
-    "FenceNotRecordedError",
 ]
 
 _log = logging.getLogger("levain.autonomic.binding")
@@ -770,18 +771,6 @@ def binding_invocation(binding: Binding, *, hops: int = 0) -> AuthorityScope:
 # --- the registry ------------------------------------------------------------------------
 
 
-class FenceNotRecordedError(RuntimeError):
-    """A pause, revoke, expire, tighten, supersede or remove COMMITTED, but its fence could not be
-    written to the run journal. The registry generation still stops every run at its next registry
-    read; what is not guaranteed is an effect of an earlier run that had already read the old
-    generation. Retry with :meth:`BindingStore.refence`. ``binding_ids`` names the bindings."""
-
-    def __init__(self, binding_ids: list[str]) -> None:
-        super().__init__(f"committed, but the run journal fence was not recorded for {binding_ids}; "
-                         "retry BindingStore.refence")
-        self.binding_ids = binding_ids
-
-
 @dataclass(frozen=True)
 class ReplaceResult:
     """The outcome of :meth:`BindingStore.replace_atomic`: truthy iff the replacement was written.
@@ -795,15 +784,6 @@ class ReplaceResult:
         return self.ok
 
 
-def _record_generation(rec: dict[str, Any]) -> int:
-    """A stored record's governance generation (0 when absent: a record written before generations).
-    Raises ``ValueError`` on anything but a non-negative int."""
-    g = rec.get("generation", 0)
-    if isinstance(g, bool) or not isinstance(g, int) or g < 0:
-        raise ValueError(f"binding {rec.get('binding_id')!r} has a malformed generation {g!r}")
-    return g
-
-
 def _refuse_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """``json.loads`` ``object_pairs_hook``: build the object, refusing a key that appears twice."""
     out: dict[str, Any] = {}
@@ -814,13 +794,57 @@ def _refuse_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return out
 
 
+def _identified(pairs: list[tuple[Any, Any]]) -> tuple[list[dict[str, Any]], str | None]:
+    """``(records, None)`` when every ``(key, record)`` pair proves its identity, else ``([], why)``: the
+    record is a JSON object whose ``binding_id`` is its key, and that key is the seal recomputed from the
+    record's own sealed core."""
+    records: list[dict[str, Any]] = []
+    for key, rec in pairs:
+        if not isinstance(rec, dict) or rec.get("binding_id") != key:
+            return [], f"entry {key!r} is not a record whose binding_id is its key"
+        try:
+            derived = derived_binding_id(rec)
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            return [], f"entry {key!r}: its sealed core does not parse ({type(e).__name__}: {e}), so it proves no identity"
+        if derived != key:
+            return [], f"entry {key!r} seals to {derived!r}: its stored id is not its content"
+        records.append(rec)
+    return records, None
+
+
+def _parse_json_registry(text: str) -> tuple[list[dict[str, Any]], str | None]:
+    """Read a registry kept in the earlier JSON FILE format, for :meth:`BindingStore.migrate_json`: a JSON
+    object keyed by ``binding_id`` (this package's) or a top-level list (the vagus package's). Parsed with a
+    hook that refuses a duplicate key at ANY depth; two list entries for one id are a duplicate too; every
+    record must prove its identity (:func:`_identified`)."""
+    try:
+        data = json.loads(text, object_pairs_hook=_refuse_duplicate_keys)
+    except (ValueError, RecursionError) as e:   # bad JSON, a duplicate key, or nesting too deep
+        return [], f"unreadable registry ({e})"
+    if isinstance(data, dict):
+        pairs = list(data.items())
+    elif isinstance(data, list):
+        pairs = []
+        seen: set[str] = set()
+        for i, rec in enumerate(data):
+            bid = rec.get("binding_id") if isinstance(rec, dict) else None
+            if not isinstance(bid, str):
+                return [], f"legacy entry {i} is not a record with a string binding_id"
+            if bid in seen:
+                return [], f"legacy list holds duplicate records for {bid!r}"
+            seen.add(bid)
+            pairs.append((bid, rec))
+    else:
+        return [], f"top level is {type(data).__name__}, not an object"
+    return _identified(pairs)
+
+
 class BindingStore:
     """The delegated-authority registry — "the third kind of state" (standing governance: not memory
-    that accretes, not tasks that complete). A mutable JSON-object store keyed by ``binding_id``, ``flock``-serialized + atomic
-    tmp+replace, the same shape as :class:`~levain.autonomic.pending.PendingActionStore` (bindings are
-    created/paused/graduated/revoked, so NOT the append-only JSONL the receipt/proposal traces use).
-    Every mutation is a locked read-modify-write; reads need no lock (atomic-replace means a read sees
-    a whole old-or-new file). A malformed record is skipped LOUDLY on read.
+    that accretes, not tasks that complete). The ``bindings`` table of the store directory's SQLite
+    database, keyed by ``binding_id``, which it shares with the run journal: every mutation is one
+    write transaction, together with the journal writes it implies (a fence, an admission, a one-shot's
+    claim); a read sees a committed state. A malformed record is skipped LOUDLY on read.
 
     An optional :class:`PredicateValidator` injected at construction is the store's SECOND structural
     layer for the deterministic-predicate invariant (the production/flow store wires
@@ -830,174 +854,80 @@ class BindingStore:
 
     def __init__(self, path: str | Path, *, validator: PredicateValidator | None = None,
                  journal: RunJournal | None = None) -> None:
-        self.path = Path(path)
-        self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        # ``path`` is the store DIRECTORY (see :mod:`levain.autonomic.db`): the registry is the
+        # ``bindings`` table of the database in it, shared with the run journal.
+        self.db = AutonomicDB(path)
+        self.path = self.db.directory
         self._validator = validator
-        # The run journal the fire path admits runs into. When set, every verb that takes a binding
-        # out of the fire set or makes it stricter FENCES it there first, so a run already admitted
-        # stops at its next effect (fence-on-cancel). None: nothing to fence (no journaled runs).
+        # The run journal the fire path admits runs into: the SAME database, so a pause and its fence,
+        # an admission and a one-shot's claim, are each one transaction. None: no journaled runs.
+        if journal is not None and journal.directory.resolve() != self.path.resolve():
+            raise ValueError("BindingStore: the run journal must live in the same store directory")
         self._journal = journal
 
-    # --- locking -----------------------------------------------------------------------
+    # --- transactions -------------------------------------------------------------------
     @contextmanager
-    def _locked(self) -> Iterator[None]:
-        """Hold an exclusive ``flock`` on a sidecar lockfile across a read-modify-write. A sidecar
-        (not the data file) so the lock survives the ``os.replace`` that swaps the data inode. Created
-        on first use; never removed. Mirrors ``PendingActionStore._locked``."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            finally:
-                os.close(fd)
+    def _locked(self) -> Iterator[sqlite3.Connection]:
+        """One write transaction for a read-modify-write (``BEGIN IMMEDIATE``): every mutation and the
+        journal writes it implies commit together or not at all."""
+        with self.db.write() as conn:
+            yield conn
 
     @property
     def journal(self) -> RunJournal | None:
         """The run journal this store fences and admits runs into, or ``None``."""
         return self._journal
 
-    def _initial_generation(self, binding_id: str) -> int:
-        """The governance generation a NEW record starts at: above every fence and every run the
-        journal ever admitted for this id, so a removed and re-added grant fences every run admitted
-        under its old record; 0 without a journal."""
-        if self._journal is None:
-            return 0
-        # a journal that cannot be read RAISES here: a record started at 0 would fail to fence the runs
-        # an unreadable journal still holds, once it reads again
-        return self._journal.next_generation(binding_id)
-
-    def _fence(self, rec: dict[str, Any]) -> tuple[str, int]:
-        """Bump the record's governance ``generation`` IN the record, so the bump commits in the same
-        atomic write as the change that caused it (a pause, revoke, expire, tighten, supersede, remove).
-        Call under ``_locked`` before the write; after the write, pass the result to
-        :meth:`_record_fences`. The registry's generation is the authority the gate reads before every
-        journaled effect."""
-        bid = rec["binding_id"]
-        try:
-            old = _record_generation(rec)
-        except ValueError:
-            old = 0
-        journal_gen = 0
+    def _fence(self, rec: dict[str, Any], conn: sqlite3.Connection) -> None:
+        """Fence the binding in the run journal, in the transaction of the change that requires it (a
+        pause, revoke, expire, tighten, supersede, remove): its governance generation rises, and every run
+        admitted under an older one stops at its next effect. The journal's fence is the binding's ONE
+        generation; it outlives the record, so a removed grant added again cannot reopen an old run."""
         if self._journal is not None:
-            try:
-                journal_gen = self._journal.generation(bid)
-            except Exception:  # noqa: BLE001 — an unreadable journal runs no effect; the registry leads
-                journal_gen = 0
-        new = max(old, journal_gen) + 1
-        rec["generation"] = new
-        return bid, new
-
-    def _record_fences(self, fences: list[tuple[str, int]]) -> None:
-        """Mirror committed fences into the run journal, still under the store lock and AFTER the
-        registry write (so a registry write that fails leaves no fence ahead of the registry). The
-        gate reads the registry generation before its journal check and the journal fence under the
-        journal lock, so an effect that read the old generation just before the pause is still caught
-        here, unless it already started (it is then ordered before the pause returned). If the journal
-        fence cannot be written after a retry, that ordering is not guaranteed for an effect already
-        past its registry read, so this RAISES :class:`FenceNotRecordedError` (the change itself is
-        committed; :meth:`refence` retries the mirror)."""
-        if self._journal is None:
-            return
-        failed: list[str] = []
-        for bid, gen in fences:
-            for attempt in (1, 2):
-                try:
-                    self._journal.fence(bid, generation=gen)
-                    break
-                except Exception as e:  # noqa: BLE001
-                    _log.error("binding store: journal fence for %r FAILED (attempt %d, %s): %s",
-                               bid, attempt, type(e).__name__, e)
-            else:
-                failed.append(bid)
-        if failed:
-            raise FenceNotRecordedError(failed)
-
-    def refence(self, binding_id: str) -> None:
-        """Retry mirroring ``binding_id``'s fence into the run journal (after a
-        :class:`FenceNotRecordedError`). For a live record: the record's generation. For a removed
-        binding: a generation above every run the journal admitted for it. A no-op when the journal's
-        fence already covers that."""
-        if self._journal is None:
-            return
-        with self._locked():   # read the authority under the lock that every fencing verb holds
-            rec = next((r for r in self._read_raw(for_mutation=True) if r["binding_id"] == binding_id), None)
-            if rec is None:
-                # removed: fence strictly above every run the journal ever admitted for it
-                top = self._journal.max_run_generation(binding_id)
-                if top is None:
-                    return   # no run was ever admitted: nothing to fence
-                gen = top + 1
-            else:
-                gen = _record_generation(rec)
-            if self._journal.generation(binding_id) < gen:
-                self._record_fences([(binding_id, gen)])
+            bid = rec["binding_id"]
+            self._journal._fence_in(conn, bid, self._journal._generation_in(conn, bid) + 1)
 
     def generation(self, binding_id: str) -> int | None:
-        """The binding's current governance generation from the registry, or ``None`` when it is
-        absent, its generation is malformed, or the registry is corrupt (no authority: fail closed).
-        The gate reads this before every journaled effect."""
-        for r in self._read_raw():
-            if r["binding_id"] == binding_id:
-                try:
-                    return _record_generation(r)
-                except ValueError as e:
-                    _log.warning("binding store: %s", e)
-                    return None
-        return None
+        """The binding's current governance generation (its fence in the run journal), or ``None`` when
+        it is absent or there is no journal."""
+        if self._journal is None or self.get(binding_id) is None:
+            return None
+        return self._journal.generation(binding_id)
 
     def admit(self, binding_id: str, run_id: str) -> Binding | None:
         """Admit a journaled run of ``binding_id`` — the fire path's ONE step between "may this grant
-        fire" and "this run is in": under the store lock, the binding must be fireable (:meth:`is_fireable`),
-        the run is started in the journal at the binding's CURRENT generation, and a ONE-SHOT is
-        claimed (set ``REVOKED``) in the same locked step. Every verb that fences takes the same lock, so
-        a pause or tighten either lands first (the binding is not fireable, or the run is admitted
-        under the new generation and sees its kills) or lands after (the run is admitted under the old
-        generation and is fenced at its first effect): never between the check and the admission.
-        Returns the fireable snapshot (a one-shot's pre-claim ACTIVE form), or ``None``. Re-admitting a
-        known run is a no-op in the journal (a re-delivery keeps its first admission), and a claimed
-        one-shot's own run is let back in on re-delivery (its claim is that run's admission)."""
+        fire" and "this run is in": in one transaction, the binding must be fireable (:meth:`is_fireable`),
+        a ONE-SHOT is claimed (set ``REVOKED``, with the run and generation it was claimed for), and the
+        run is started in the journal at the binding's CURRENT generation. Every verb that fences is a
+        transaction on the same database, so a pause or tighten is ordered entirely before the admission
+        or entirely after it. Returns the fireable snapshot (a one-shot's pre-claim ACTIVE form), or
+        ``None``. Re-admitting a known run is a no-op in the journal (a re-delivery keeps its first
+        admission), and a claimed one-shot's own run is let back in on re-delivery; a person's revoke
+        after the claim has fenced that run, so it stops at its next effect."""
         if self._journal is None:
             raise ValueError("admit needs a run journal: construct the store with journal=")
-        with self._locked():
-            records = self._read_raw(for_mutation=True)
+        with self._locked() as conn:
+            records = self._read_raw(for_mutation=True, conn=conn)
             rec = next((r for r in records if r["binding_id"] == binding_id), None)
             if rec is None:
                 return None
             b = self._load(rec)
             if b is None:
                 return None
-            try:
-                gen = max(_record_generation(rec), self._journal.generation(binding_id))
-            except ValueError as e:
-                _log.warning("binding store: refusing to admit a run of %r: %s", binding_id, e)
-                return None
+            gen = self._journal._generation_in(conn, binding_id)
             if b.one_shot and b.status is BindingStatus.REVOKED and rec.get("claimed_run") == run_id:
-                # A re-delivery of THE run this one-shot was claimed for (recorded in the same write
-                # as the claim): let it back in to finish (done effects replay, an approved effect
-                # runs once). It is admitted at the generation recorded WITH the claim, never the
-                # current one, so a person's revoke after the claim (which bumped the generation)
-                # fences it even if the run never reached the journal before. No other run can match.
-                claimed_gen = rec.get("claimed_generation")
+                # a re-delivery of THE run this one-shot was claimed for: the claim and the run committed
+                # together, so the run exists already (keeping its first admission, which a revoke after
+                # the claim has fenced); let it back in to finish
                 again = replace(b, status=BindingStatus.ACTIVE)
-                if (isinstance(claimed_gen, bool) or not isinstance(claimed_gen, int)
-                        or not self.is_fireable(again)):
-                    return None
-                self._journal.start(run_id, binding_id=binding_id, generation=claimed_gen)
-                return again
+                return again if self.is_fireable(again) else None
             if not self.is_fireable(b):
                 return None
             if b.one_shot:
-                # the claim is DURABLE before the run exists: a crash after it leaves a spent one-shot
-                # whose one run can still be re-delivered, never a live one-shot with a run admitted
                 rec["status"] = BindingStatus.REVOKED.value
                 rec["claimed_run"] = run_id
-                rec["claimed_generation"] = gen
-                self._write_raw(records)
-            self._journal.start(run_id, binding_id=binding_id, generation=gen)
+                self._write_raw(records, conn)
+            self._journal._start_in(conn, run_id, binding_id, gen)
             return b
 
     def claimed_run(self, binding_id: str) -> str | None:
@@ -1008,78 +938,44 @@ class BindingStore:
                 return v if isinstance(v, str) else None
         return None
 
-    # --- raw IO (call under the lock for mutations) ------------------------------------
-    def _scan(self) -> tuple[list[dict[str, Any]], str | None]:
-        """Parse the file: ``(records, None)`` when every entry proves its identity, else ``([], why)``.
-        A missing file is ``([], None)``. ``OSError`` propagates (the caller decides its polarity).
+    # --- raw IO -------------------------------------------------------------------------
+    @staticmethod
+    def _rows(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+        return conn.execute("SELECT binding_id, record FROM bindings ORDER BY seq").fetchall()
 
-        The on-disk format is a JSON OBJECT keyed by ``binding_id``, parsed with a hook that refuses a
-        duplicate key at ANY depth, so two records for one id are UNREPRESENTABLE. Identity is DERIVED,
-        never trusted: each record's key must equal the seal recomputed from its own sealed core
-        (:func:`derived_binding_id`). A record whose core does not parse proves no identity, and a
-        record whose core seals to another id is not the grant its key names; either makes the file
-        corrupt, the same way a duplicate does. So the key every collision check compares IS the
-        record's content address, and a tombstone cannot stop colliding with its grant by having its
-        stored id changed. (A record's unsealed bookkeeping, ``status``/``graduation``/
-        ``guard_additions``, does not take part in identity; a record whose bookkeeping does not parse
-        keeps its identity and is skipped by :meth:`_load`.)
+    def _scan(self, conn: sqlite3.Connection | None = None) -> tuple[list[dict[str, Any]], str | None]:
+        """Read the registry: ``(records, None)`` when every row proves its identity, else ``([], why)``.
 
-        A legacy top-level LIST still reads, so a registry written before the object format is not
-        lost; it is rewritten as an object on its next write. Every entry of a legacy list is held to
-        the same rule, and two entries for one id are a duplicate. MIGRATION DIRECTION: a registry
-        written by the vagus package's store converts forward into this format on its first write here,
-        and the vagus store reads the converted file as empty. One writer owns a registry at a time: cut
-        a deployment over by stopping the vagus writers first, then letting this store write."""
-        try:
-            text = self.path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            return [], None
-        except UnicodeDecodeError as e:
-            return [], f"not UTF-8 text ({e})"
-        try:
-            data = json.loads(text, object_pairs_hook=_refuse_duplicate_keys)
-        except (ValueError, RecursionError) as e:   # bad JSON, a duplicate key, or nesting too deep
-            return [], f"unreadable registry ({e})"
-        if isinstance(data, dict):
-            pairs = list(data.items())
-        elif isinstance(data, list):
-            pairs = []
-            seen: set[str] = set()
-            for i, rec in enumerate(data):
-                bid = rec.get("binding_id") if isinstance(rec, dict) else None
-                if not isinstance(bid, str):
-                    return [], f"legacy entry {i} is not a record with a string binding_id"
-                if bid in seen:
-                    return [], f"legacy list holds duplicate records for {bid!r}"
-                seen.add(bid)
-                pairs.append((bid, rec))
+        Identity is DERIVED, never trusted: each row's key must be its record's ``binding_id`` AND the
+        seal recomputed from the record's own sealed core (:func:`derived_binding_id`). A record that is
+        not JSON, whose core does not parse, or whose core seals to another id is not the grant its key
+        names, and makes the registry corrupt: the key every collision check compares IS the record's
+        content address, so a tombstone cannot stop colliding with its grant by having its stored id
+        changed. (A record's unsealed bookkeeping, ``status``/``graduation``/``guard_additions``, does
+        not take part in identity; a record whose bookkeeping does not parse keeps its identity and is
+        skipped by :meth:`_load`.)"""
+        if conn is None:
+            with self.db.read() as rconn:
+                rows = self._rows(rconn)
         else:
-            return [], f"top level is {type(data).__name__}, not an object"
-        records: list[dict[str, Any]] = []
-        for key, rec in pairs:
-            if not isinstance(rec, dict) or rec.get("binding_id") != key:
-                return [], f"entry {key!r} is not a record whose binding_id is its key"
-            try:
-                derived = derived_binding_id(rec)
-            except (KeyError, TypeError, ValueError, AttributeError) as e:
-                return [], f"entry {key!r}: its sealed core does not parse ({type(e).__name__}: {e}), so it proves no identity"
-            if derived != key:
-                return [], f"entry {key!r} seals to {derived!r}: its stored id is not its content"
-            records.append(rec)
-        return records, None
-
-    def _read_raw(self, *, for_mutation: bool = False) -> list[dict[str, Any]]:
-        """Load the registry as a list of records (file order); fail-soft on READS, loud on MUTATIONS.
-
-        CORRUPT (see :meth:`_scan`: bad JSON, not UTF-8, a duplicate, a record whose identity does not
-        derive from its content, a top level that is neither object nor list): a READ returns ``[]``
-        with a WARNING, so nothing in it fires; a MUTATION raises and leaves the file untouched. Repair
-        is a manual edit of the file; :meth:`integrity` names what is wrong. A transient ``OSError`` is
-        re-raised on a mutation read (L3 nemotron): degrading to ``[]`` there would let the write
-        atomically REPLACE the file and silently delete every other binding."""
+            rows = self._rows(conn)
         try:
-            records, problem = self._scan()
-        except OSError as e:
+            pairs = [(key, json.loads(text)) for key, text in rows]
+        except (ValueError, RecursionError) as e:
+            return [], f"a record is not JSON ({e})"
+        return _identified(pairs)
+
+    def _read_raw(self, *, for_mutation: bool = False,
+                  conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+        """Load the registry as a list of records (in order); fail-soft on READS, loud on MUTATIONS.
+
+        CORRUPT (see :meth:`_scan`): a READ returns ``[]`` with a WARNING, so nothing in it fires; a
+        MUTATION raises and writes nothing. :meth:`integrity` names what is wrong. A store that cannot be
+        read is re-raised on a mutation read: degrading to ``[]`` there would let the write replace every
+        other binding with nothing."""
+        try:
+            records, problem = self._scan(conn)
+        except (OSError, sqlite3.DatabaseError) as e:
             _log.warning("binding store: read failed (%s): %s", type(e).__name__, e)
             if for_mutation:
                 raise
@@ -1089,32 +985,64 @@ class BindingStore:
         _log.warning("binding store %s: %s%s", self.path, problem,
                      " — RE-RAISING (mutation)" if for_mutation else " — returning []")
         if for_mutation:
-            raise ValueError(f"binding store {self.path}: {problem}; refusing to write until the "
-                             "file is repaired by hand")
+            raise ValueError(f"binding store {self.path}: {problem}; refusing to write until it is "
+                             "repaired by hand")
         return []
 
     def integrity(self) -> str | None:
-        """``None`` if the registry reads clean (or does not exist yet), else why it is CORRUPT. A
-        corrupt registry reads as no bindings, which looks exactly like an empty one; this is the
-        signal that tells them apart, for a health check or a cockpit to surface."""
+        """``None`` if the registry reads clean (or is empty), else why it is CORRUPT. A corrupt registry
+        reads as no bindings, which looks exactly like an empty one; this is the signal that tells them
+        apart, for a health check or a cockpit to surface."""
         try:
             return self._scan()[1]
-        except OSError as e:
+        except (OSError, sqlite3.DatabaseError) as e:
             return f"unreadable ({type(e).__name__}: {e})"
 
-    def _write_raw(self, records: list[dict[str, Any]]) -> None:
-        """Atomically replace the file with ``records`` as a JSON object keyed by ``binding_id`` (tmp +
-        ``os.replace`` — never a torn read). Refuses a record without a string id or a second record
-        for one id, so no write can create the ambiguity the read refuses. Call only under ``_locked``."""
-        out: dict[str, dict[str, Any]] = {}
+    def _write_raw(self, records: list[dict[str, Any]], conn: sqlite3.Connection) -> None:
+        """Replace the registry with ``records`` in the caller's transaction. Refuses a record without a
+        string id or a second record for one id, so no write can create the ambiguity the read refuses."""
+        seen: set[str] = set()
         for r in records:
             bid = r.get("binding_id")
-            if not isinstance(bid, str) or bid in out:
+            if not isinstance(bid, str) or bid in seen:
                 raise ValueError(f"binding store: refusing to write a record with binding_id {bid!r} "
                                  "(missing, not a string, or duplicated)")
-            out[bid] = r
-        # durable before the caller acts on it (a one-shot's claim, a pause): file and directory flushed
-        durable_replace(self.path, json.dumps(out, ensure_ascii=False, indent=2))
+            seen.add(bid)
+        conn.execute("DELETE FROM bindings")
+        conn.executemany("INSERT INTO bindings (binding_id, record, seq) VALUES (?, ?, ?)",
+                         [(r["binding_id"], json.dumps(r, ensure_ascii=False, sort_keys=True), i)
+                          for i, r in enumerate(records)])
+
+    def migrate_json(self, json_path: str | Path) -> int:
+        """Import a registry kept in the earlier JSON file format into this store, ONCE (the one way in
+        for one). MIGRATION DIRECTION: forward only. The JSON file may be this package's object format
+        or the vagus package's legacy list; after the import the store is the registry, and the file is
+        no longer read by anything here (cut a deployment over by stopping its writers first).
+
+        It refuses a file that does not read clean (bad JSON, a duplicate key at any depth, two entries
+        for one id, a record whose identity does not derive from its content) and a store that already
+        holds bindings. It writes a backup of the file beside it (``<file>.migrated-backup``), imports
+        every record in one transaction with a record-for-record count check, and records the source and
+        the count in the store's ``meta``. Returns the number of records imported."""
+        src = Path(json_path)
+        text = src.read_text(encoding="utf-8")
+        records, problem = _parse_json_registry(text)
+        if problem is not None:
+            raise ValueError(f"migrate {src}: {problem}; nothing imported")
+        backup = src.with_name(src.name + ".migrated-backup")
+        durable_replace(backup, text)
+        with self._locked() as conn:
+            if conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0]:
+                raise ValueError(f"migrate {src}: the store already holds bindings; nothing imported")
+            self._write_raw(records, conn)
+            stored = conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0]
+            if stored != len(records):
+                raise ValueError(f"migrate {src}: {stored} rows stored for {len(records)} records")
+            conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('migrated_from', ?)",
+                         (json.dumps({"path": str(src), "records": len(records)}),))
+        _log.warning("binding store %s: migrated %d binding(s) from %s (backup %s)", self.path,
+                     len(records), src, backup)
+        return len(records)
 
     @staticmethod
     def _load(rec: dict[str, Any]) -> Binding | None:
@@ -1192,17 +1120,16 @@ class BindingStore:
         The record must read back (:meth:`_persistable`), its seal must hold and the injected
         validator (if any) must accept it, all checked before the lock. Locked read-modify-write."""
         record = self._persistable(binding)
-        with self._locked():
-            records = self._read_raw(for_mutation=True)
+        with self._locked() as conn:
+            records = self._read_raw(for_mutation=True, conn=conn)
             if any(r.get("binding_id") == binding.binding_id for r in records):
                 if binding.guard_additions:
                     raise ValueError(
                         f"add: binding {binding.binding_id!r} already exists; add does not merge "
                         "tightenings into it (use tighten_guard)")
                 return False
-            record["generation"] = self._initial_generation(binding.binding_id)
             records.append(record)
-            self._write_raw(records)
+            self._write_raw(records, conn)
             return True
 
     def replace_atomic(self, expected_old: Binding, new_binding: Binding,
@@ -1245,8 +1172,8 @@ class BindingStore:
                 "re-ratification requires a different core (a no-op promotion is not a re-ratification)"
             )
         record = self._persistable(new_binding)
-        with self._locked():
-            records = self._read_raw(for_mutation=True)
+        with self._locked() as conn:
+            records = self._read_raw(for_mutation=True, conn=conn)
             ids = {r["binding_id"] for r in records}
             if new_binding.binding_id in ids:
                 return self._replace_refused(old_binding_id, "target_exists")
@@ -1262,12 +1189,10 @@ class BindingStore:
                 return self._replace_refused(old_binding_id, "old_changed")
             if precondition is not None and not precondition(current):
                 return self._replace_refused(old_binding_id, "precondition_failed")
-            fence = self._fence(old_rec)
+            self._fence(old_rec, conn)
             old_rec["status"] = BindingStatus.REVOKED.value   # supersede the old grant
-            record["generation"] = self._initial_generation(new_binding.binding_id)
             records.append(record)
-            self._write_raw(records)
-            self._record_fences([fence])
+            self._write_raw(records, conn)
             return ReplaceResult(True, "replaced")
 
     @staticmethod
@@ -1382,8 +1307,8 @@ class BindingStore:
         one-shot is how a person cancels its run) fences the binding's admitted runs first."""
         if not isinstance(status, BindingStatus):
             raise TypeError(f"status must be a BindingStatus, got {type(status).__name__}")
-        with self._locked():
-            records = self._read_raw(for_mutation=True)
+        with self._locked() as conn:
+            records = self._read_raw(for_mutation=True, conn=conn)
             for rec in records:
                 if rec.get("binding_id") == binding_id:
                     try:
@@ -1398,10 +1323,10 @@ class BindingStore:
                             f"for binding {binding_id!r} (revive a revoked/expired grant by minting a "
                             "new binding)"
                         )
-                    fences = [self._fence(rec)] if not status.is_active else []   # stops admitted runs
+                    if not status.is_active:
+                        self._fence(rec, conn)   # stops admitted runs, in this transaction
                     rec["status"] = status.value
-                    self._write_raw(records)
-                    self._record_fences(fences)
+                    self._write_raw(records, conn)
                     return True
             return False
 
@@ -1422,8 +1347,8 @@ class BindingStore:
         An already-ACTIVE binding ratifies IDEMPOTENTLY (returns it). Returns the now-ACTIVE binding, or
         ``None`` if absent. Atomic locked read-modify-write — the fireability checks + the flip happen
         under ONE lock so a concurrent mutation can't slip a non-fireable grant live."""
-        with self._locked():
-            records = self._read_raw(for_mutation=True)
+        with self._locked() as conn:
+            records = self._read_raw(for_mutation=True, conn=conn)
             for rec in records:
                 if rec.get("binding_id") != binding_id:
                     continue
@@ -1448,7 +1373,7 @@ class BindingStore:
                 # status is PAUSED + fireable (the only remaining case — _ALLOWED_TRANSITIONS bars any
                 # other live state) → flip to ACTIVE.
                 rec["status"] = BindingStatus.ACTIVE.value
-                self._write_raw(records)
+                self._write_raw(records, conn)
                 return replace(b, status=BindingStatus.ACTIVE)
             return None
 
@@ -1468,8 +1393,8 @@ class BindingStore:
             raise TypeError(f"record_fire: clean must be a bool, got {type(clean).__name__}")
         if not isinstance(fired_at, str) or not fired_at:
             raise ValueError("record_fire: fired_at must be a non-empty timestamp string")
-        with self._locked():
-            records = self._read_raw(for_mutation=True)
+        with self._locked() as conn:
+            records = self._read_raw(for_mutation=True, conn=conn)
             for rec in records:
                 if rec.get("binding_id") == binding_id:
                     b = self._load(rec)
@@ -1488,7 +1413,7 @@ class BindingStore:
                     raw_grad = rec.get("graduation")
                     rec["graduation"] = ({**raw_grad, **grad.to_dict()} if isinstance(raw_grad, dict)
                                          else grad.to_dict())
-                    self._write_raw(records)
+                    self._write_raw(records, conn)
                     return updated
             return None
 
@@ -1517,8 +1442,8 @@ class BindingStore:
         load-bearing for at-most-once across the cooling-off PROPOSE path too (else N matching events →
         N pendings → N fires). The "re-arm a one-shot the gate refused to even attempt" refinement is a
         deferred lifecycle decision (Slice 4d), not a 4a behavior."""
-        with self._locked():
-            records = self._read_raw(for_mutation=True)
+        with self._locked() as conn:
+            records = self._read_raw(for_mutation=True, conn=conn)
             for rec in records:
                 if rec.get("binding_id") != binding_id:
                     continue
@@ -1530,7 +1455,7 @@ class BindingStore:
                 if b is None or not b.one_shot or not self.is_fireable(b):
                     return None
                 rec["status"] = BindingStatus.REVOKED.value
-                self._write_raw(records)
+                self._write_raw(records, conn)
                 return b   # the pre-claim ACTIVE snapshot (the on-disk record is now REVOKED)
             return None
 
@@ -1572,8 +1497,8 @@ class BindingStore:
                 # parity with compile_binding: an impure trajectory bound evaluates UNKNOWN at fire
                 # time, which reads as diverged and kills every on-loop fire. Refuse it here instead.
                 assert_trajectory_pure(g.predicted_trajectory)
-        with self._locked():
-            records = self._read_raw(for_mutation=True)
+        with self._locked() as conn:
+            records = self._read_raw(for_mutation=True, conn=conn)
             for rec in records:
                 if rec.get("binding_id") != binding_id:
                     continue
@@ -1589,13 +1514,12 @@ class BindingStore:
                 updated = replace(b, guard_additions=b.guard_additions + tuple(new_guards))
                 # a run admitted before the tightening carries the old kill set: fence it, so it stops
                 # at its next effect and a new delivery runs under the new kills.
-                fence = self._fence(rec)
+                self._fence(rec, conn)
                 raw_adds = rec.get("guard_additions")
                 # append to the raw list: existing entries keep any field this version does not know
                 rec["guard_additions"] = ((list(raw_adds) if isinstance(raw_adds, list) else [])
                                           + [g.to_dict() for g in new_guards])
-                self._write_raw(records)
-                self._record_fences([fence])
+                self._write_raw(records, conn)
                 return updated
             return None
 
@@ -1603,12 +1527,13 @@ class BindingStore:
         """HARD-delete a binding (no audit record). Returns True iff present. Governance prefers
         ``set_status(REVOKED)`` (the grant stays in the registry for audit); ``remove`` is for genuine
         cleanup (a fired one-shot, a test). Locked read-modify-write."""
-        with self._locked():
-            records = self._read_raw(for_mutation=True)
+        with self._locked() as conn:
+            records = self._read_raw(for_mutation=True, conn=conn)
             kept = [r for r in records if r.get("binding_id") != binding_id]
             if len(kept) == len(records):
                 return False
-            fences = [self._fence(r) for r in records if r["binding_id"] == binding_id]
-            self._write_raw(kept)
-            self._record_fences(fences)   # the record is gone; a re-add starts above every run
+            for r in records:
+                if r["binding_id"] == binding_id:
+                    self._fence(r, conn)   # the record goes; its fence stays in the journal
+            self._write_raw(kept, conn)
             return True

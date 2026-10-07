@@ -20,6 +20,8 @@ import json
 
 import pytest
 
+from tests.test_autonomic_rawstore import dump, registry_of, write_raw
+
 from levain.autonomic import (
     AuthorityScope,
     Binding,
@@ -434,9 +436,9 @@ def test_a_record_whose_core_does_not_seal_to_its_key_makes_the_registry_corrupt
     b, other = make_binding(), make_binding(created_at="2026-05-02T09:00:00")
     s.add(b)
     s.add(other)
-    raw = json.loads(s.path.read_text())
+    raw = registry_of(s)
     raw[b.binding_id]["posture"] = "ON_LOOP"              # tamper on disk, leave binding_id stale
-    s.path.write_text(json.dumps(raw))
+    write_raw(s, raw)
     with caplog.at_level("WARNING"):
         assert s.list_active() == [] and s.list_all() == [] and s.get(other.binding_id) is None
     problem = s.integrity()
@@ -454,11 +456,11 @@ def test_a_tombstone_whose_stored_id_was_changed_still_collides_with_its_grant(t
     b = make_binding()
     s.add(b)
     s.set_status(b.binding_id, BindingStatus.REVOKED)
-    raw = json.loads(s.path.read_text())
+    raw = registry_of(s)
     rec = raw.pop(b.binding_id)
     rec["binding_id"] = "bind-renamed"
     raw["bind-renamed"] = rec
-    s.path.write_text(json.dumps(raw))
+    write_raw(s, raw)
     with pytest.raises(ValueError, match="seals to"):
         s.add(b)
     assert s.get(b.binding_id) is None and s.list_active() == []
@@ -493,25 +495,27 @@ def test_store_validator_enforces_and_passes_through(tmp_path):
 
 
 def test_the_validator_runs_outside_the_store_lock(tmp_path):
-    # L3 S1h-2 (codex MED): a validator called under the flock deadlocks if it touches the store
-    import fcntl
-    import os
-
+    # L3 S1h-2 (codex MED): a validator called inside the write transaction deadlocks if it touches
+    # the store; it must run before the transaction opens
+    import sqlite3
     s = None
 
     class _LockProbe:
         held: list[bool] = []
 
         def validate(self, pattern: dict) -> None:
-            fd = os.open(s._lock_path, os.O_RDWR | os.O_CREAT, 0o644)   # a fresh fd, like a re-entry
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fcntl.flock(fd, fcntl.LOCK_UN)
+            if not s.db.path.exists():                 # no database yet: nothing can hold its lock
                 self.held.append(False)
-            except BlockingIOError:
+                return
+            conn = sqlite3.connect(s.db.path, timeout=0, isolation_level=None)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("ROLLBACK")
+                self.held.append(False)
+            except sqlite3.OperationalError:
                 self.held.append(True)
             finally:
-                os.close(fd)
+                conn.close()
 
     probe = _LockProbe()
     s = BindingStore(tmp_path / "b.json", validator=probe)
@@ -534,22 +538,25 @@ def test_missing_file_reads_empty(tmp_path):
     assert store(tmp_path).get("x") is None
 
 
-def test_corrupt_json_reads_empty(tmp_path, caplog):
+def test_a_record_that_is_not_json_makes_the_registry_corrupt(tmp_path, caplog):
     s = store(tmp_path)
-    s.path.write_text("{not json")
+    b = make_binding()
+    s.add(b)
+    write_raw(s, {b.binding_id: "{not json"})
     with caplog.at_level("WARNING"):
         assert s.list_all() == []
-    assert "unreadable registry" in caplog.text
+    assert "not JSON" in (s.integrity() or "")
+    with pytest.raises(ValueError, match="repaired by hand"):
+        s.add(make_binding(created_at="t2"))
 
 
-def test_non_object_top_level_reads_empty(tmp_path, caplog):
+def test_migrating_a_registry_file_that_is_not_an_object_or_list_is_refused(tmp_path):
+    src = tmp_path / "legacy.json"
+    src.write_text('"x"')
     s = store(tmp_path)
-    s.path.write_text('"x"')
-    with caplog.at_level("WARNING"):
-        assert s.list_all() == []
-    assert "not an object" in caplog.text
-    with pytest.raises(ValueError, match=f"{s.path.name}.*repaired by hand"):   # names the file
-        s.add(make_binding())
+    with pytest.raises(ValueError, match="not an object.*nothing imported"):
+        s.migrate_json(src)
+    assert s.list_all() == [] and not (tmp_path / "legacy.json.migrated-backup").exists()
 
 
 def test_an_entry_whose_id_is_not_its_key_reads_empty_and_refuses_writes(tmp_path, caplog):
@@ -557,15 +564,15 @@ def test_an_entry_whose_id_is_not_its_key_reads_empty_and_refuses_writes(tmp_pat
     s = store(tmp_path)
     b = make_binding()
     s.add(b)
-    rec = json.loads(s.path.read_text())[b.binding_id]
-    s.path.write_text(json.dumps({b.binding_id: rec, "other-key": rec}))
+    rec = registry_of(s)[b.binding_id]
+    write_raw(s, {b.binding_id: rec, "other-key": rec})
     with caplog.at_level("WARNING"):
         assert s.list_all() == []
     assert "binding_id is its key" in caplog.text
-    before = s.path.read_text()
+    before = dump(s)
     with pytest.raises(ValueError, match="repaired by hand"):
         s.set_status(b.binding_id, BindingStatus.PAUSED)
-    assert s.path.read_text() == before
+    assert dump(s) == before
 
 
 def test_a_record_with_malformed_bookkeeping_is_skipped_loudly(tmp_path, caplog):
@@ -576,9 +583,9 @@ def test_a_record_with_malformed_bookkeeping_is_skipped_loudly(tmp_path, caplog)
     good, bad = make_binding(), make_binding(created_at="2026-05-02T09:00:00")
     s.add(good)
     s.add(bad)
-    raw = json.loads(s.path.read_text())
+    raw = registry_of(s)
     raw[bad.binding_id]["status"] = "NONSENSE"
-    s.path.write_text(json.dumps(raw))
+    write_raw(s, raw)
     with caplog.at_level("WARNING"):
         listed = s.list_all()
     assert [b.binding_id for b in listed] == [good.binding_id]
@@ -591,9 +598,9 @@ def test_a_record_whose_core_does_not_parse_proves_no_identity(tmp_path):
     s = store(tmp_path)
     good = make_binding()
     s.add(good)
-    raw = json.loads(s.path.read_text())
+    raw = registry_of(s)
     raw["bind-bad"] = {"binding_id": "bind-bad", "posture": "NONSENSE"}
-    s.path.write_text(json.dumps(raw))
+    write_raw(s, raw)
     assert s.list_all() == []
     assert "proves no identity" in (s.integrity() or "")
 
@@ -706,52 +713,46 @@ def test_record_fire_rejects_truthy_string_clean_and_empty_fired_at(tmp_path):
 
 # --- duplicates are unrepresentable; re-add over a malformed record (codex-M2/cmpl/nemo) ---
 
-def test_duplicate_key_file_reads_inert_and_add_cannot_repair_it(tmp_path, caplog):
-    # A duplicated id used to collapse on read and ``add`` of that id used to repair it (S1h r2:
-    # the repair resurrected a grant whose revoked copy was malformed). Now the file is corrupt:
-    # nothing in it reads, and no mutation, ``add`` included, writes over it.
-    s = store(tmp_path)
+def test_migrating_a_registry_file_with_a_duplicate_key_is_refused(tmp_path):
+    # A duplicated id used to collapse on read and ``add`` of that id used to repair it (S1h r2: the
+    # repair resurrected a grant whose revoked copy was malformed). The store cannot hold two records
+    # for one id; a JSON file that does is refused at the one way in.
+    s = store(tmp_path / "s")
     b = make_binding()
-    s.add(b)
-    rec = json.dumps(json.loads(s.path.read_text())[b.binding_id])
-    s.path.write_text("{" + f'"{b.binding_id}": {rec.replace("active", "revoked")}, '
-                      f'"{b.binding_id}": {rec}' + "}")
-    before = s.path.read_text()
-    with caplog.at_level("WARNING"):
-        assert s.list_all() == [] and s.list_active() == [] and s.get(b.binding_id) is None
-    assert "duplicate key" in caplog.text
-    with pytest.raises(ValueError, match="repaired by hand"):
-        s.add(make_binding())                      # re-add the same core: not a repair verb
-    with pytest.raises(ValueError, match="repaired by hand"):
-        s.add(make_binding(posture=Posture.ON_LOOP))   # nor is an unrelated add
-    assert s.path.read_text() == before            # untouched
+    rec = json.dumps(b.to_dict())
+    src = tmp_path / "legacy.json"
+    src.write_text("{" + f'"{b.binding_id}": {rec.replace("paused", "revoked")}, '
+                   f'"{b.binding_id}": {rec}' + "}")
+    with pytest.raises(ValueError, match="duplicate key.*nothing imported"):
+        s.migrate_json(src)
+    assert s.list_all() == []
 
 
-def test_a_duplicate_key_inside_a_record_is_refused(tmp_path):
+def test_migrating_a_record_with_a_duplicate_inner_key_is_refused(tmp_path):
     # last-wins parsing would hide the first "status"; the hook refuses it at every depth
-    s = store(tmp_path)
-    b = make_binding()
-    s.add(b)
-    text = s.path.read_text().replace('"status": "active"', '"status": "revoked", "status": "active"')
-    assert text != s.path.read_text()
-    s.path.write_text(text)
+    s = store(tmp_path / "s")
+    b = make_binding(status=BindingStatus.ACTIVE)
+    text = json.dumps({b.binding_id: b.to_dict()}).replace('"status": "active"',
+                                                          '"status": "revoked", "status": "active"')
+    src = tmp_path / "legacy.json"
+    src.write_text(text)
+    with pytest.raises(ValueError, match="duplicate key"):
+        s.migrate_json(src)
     assert s.list_active() == []
-    with pytest.raises(ValueError, match="repaired by hand"):
-        s.ratify(b.binding_id)
 
 
 def test_re_add_over_a_malformed_record_writes_nothing(tmp_path):
     # A record whose status cannot be read may be a revoked tombstone; writing the incoming record
-    # over it revived the grant (L1+L2, S1h-2). add is create-only now: the id exists, so nothing
-    # is written and the record is not read as trusted.
+    # over it revived the grant (L1+L2, S1h-2). add is create-only: the id exists, so nothing is
+    # written and the record is not read as trusted.
     s = store(tmp_path)
     b = make_binding()
     s.add(b)
-    rec = json.loads(s.path.read_text())[b.binding_id]
-    s.path.write_text(json.dumps({b.binding_id: dict(rec, status="frozen")}))   # malformed status
-    before = s.path.read_text()
+    rec = registry_of(s)[b.binding_id]
+    write_raw(s, {b.binding_id: dict(rec, status="frozen")})   # malformed status
+    before = dump(s)
     assert s.add(make_binding()) is False
-    assert s.path.read_text() == before and s.get(b.binding_id) is None
+    assert dump(s) == before and s.get(b.binding_id) is None
 
 
 def test_a_non_dict_graduation_is_skipped_not_raised(tmp_path):
@@ -761,31 +762,34 @@ def test_a_non_dict_graduation_is_skipped_not_raised(tmp_path):
     good, other = make_binding(), make_binding(posture=Posture.ON_LOOP)
     s.add(good)
     s.add(other)
-    raw = json.loads(s.path.read_text())
+    raw = registry_of(s)
     raw[other.binding_id]["graduation"] = "x"
-    s.path.write_text(json.dumps(raw))
+    write_raw(s, raw)
     assert [x.binding_id for x in s.list_all()] == [good.binding_id]
 
 
-def test_nesting_too_deep_reads_empty_and_refuses_writes(tmp_path):
+def test_migrating_a_file_nested_too_deep_is_refused(tmp_path):
     # json.loads raises RecursionError, not ValueError, on deep nesting (L2, S1h-2)
-    s = store(tmp_path)
-    s.path.write_text("[" * 100_000 + "]" * 100_000)
-    assert s.list_all() == []
-    with pytest.raises(ValueError, match="repaired by hand"):
-        s.add(make_binding())
+    src = tmp_path / "legacy.json"
+    src.write_text("[" * 100_000 + "]" * 100_000)
+    with pytest.raises(ValueError, match="nothing imported"):
+        store(tmp_path / "s").migrate_json(src)
 
 
 # --- read failure UNDER MUTATION must fail loud, never write-on-empty (nemotron-MED-1) ---
 
 def test_read_failure_under_mutation_does_not_wipe_the_store(tmp_path):
+    import sqlite3
     s = store(tmp_path)
     s.add(make_binding())
-    s.path.unlink()
-    s.path.mkdir()                                 # data path is now a dir → read_text raises OSError
-    with pytest.raises(OSError):
-        s.add(make_binding(created_at="t2"))       # mutation fails loud, does NOT delete the registry
-    assert s.list_all() == []                       # read-only path still degrades soft
+    for f in s.path.iterdir():
+        if f.name.startswith("autonomic.db"):
+            f.unlink()
+    (s.path / "autonomic.db").mkdir()               # the database is now a directory: unreadable
+    s2 = BindingStore(s.path)
+    with pytest.raises(sqlite3.DatabaseError):
+        s2.add(make_binding(created_at="t2"))       # mutation fails loud, writes nothing
+    assert s2.list_all() == []                       # a read degrades soft
 
 
 # --- non-empty disk-boundary fields (complement-LOW-2 / nemotron-MED-4) ---------------

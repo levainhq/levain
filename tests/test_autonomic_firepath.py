@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from tests.test_autonomic_rawstore import dump, registry_of, write_raw
+
 from levain.autonomic import (
     ActionManifest,
     ActionRequest,
@@ -269,9 +271,9 @@ def test_ratify_refuses_confirm_class_without_kill(tmp_path):
 def test_ratify_refuses_seal_broken(tmp_path):
     import json
     st, b = _mk_binding(tmp_path)
-    raw = json.loads(st.path.read_text())
+    raw = registry_of(st)
     next(iter(raw.values()))["posture"] = "ABOVE_LOOP"          # tamper the sealed core, leave the id stale
-    st.path.write_text(json.dumps(raw))
+    write_raw(st, raw)
     with pytest.raises(ValueError, match="seals to"):          # the registry is corrupt: no write
         st.ratify(b.binding_id)
 
@@ -298,9 +300,9 @@ def test_claim_one_shot_ignores_standing_binding(tmp_path):
 def test_claim_one_shot_ignores_seal_broken(tmp_path):
     import json
     st, b = _mk_binding(tmp_path, status=BindingStatus.ACTIVE, one_shot=True)
-    raw = json.loads(st.path.read_text())
+    raw = registry_of(st)
     next(iter(raw.values()))["posture"] = "ABOVE_LOOP"
-    st.path.write_text(json.dumps(raw))
+    write_raw(st, raw)
     with pytest.raises(ValueError, match="seals to"):                     # tampered → not claimable
         st.claim_one_shot(b.binding_id)
     assert st.list_active() == []
@@ -498,9 +500,9 @@ def test_snapshot_if_fireable_unit(tmp_path):
     assert st.snapshot_if_fireable(b.binding_id) is None          # not active
     st.set_status(b.binding_id, BindingStatus.ACTIVE)
     import json
-    raw = json.loads(st.path.read_text())
+    raw = registry_of(st)
     next(iter(raw.values()))["posture"] = "ABOVE_LOOP"                              # tamper the sealed core
-    st.path.write_text(json.dumps(raw))
+    write_raw(st, raw)
     assert st.snapshot_if_fireable(b.binding_id) is None          # seal-broken → not fireable
     assert st.snapshot_if_fireable("bind-absent") is None
 
@@ -549,9 +551,9 @@ def test_ratify_refuses_seal_broken_even_when_already_active(tmp_path):
     ACTIVE'. Since S1h-4 the refusal comes from the read: the registry's identity check fails."""
     import json
     st, b = _mk_binding(tmp_path, status=BindingStatus.ACTIVE)
-    raw = json.loads(st.path.read_text())
+    raw = registry_of(st)
     next(iter(raw.values()))["posture"] = "ABOVE_LOOP"          # tamper the sealed core of an ACTIVE binding
-    st.path.write_text(json.dumps(raw))
+    write_raw(st, raw)
     with pytest.raises(ValueError, match="seals to"):
         st.ratify(b.binding_id)
 

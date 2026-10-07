@@ -89,15 +89,14 @@ class World:
     def __init__(self, work: Path) -> None:
         work.mkdir(parents=True, exist_ok=True)
         self.work = work
-        self.journal = RunJournal(work / "journal.jsonl")
-        self.store = BindingStore(work / "bindings.json", journal=self.journal)
+        self.journal = RunJournal(work / "store")
+        self.store = BindingStore(work / "store", journal=self.journal)
         self.pending = PendingActionStore(work / "pending.json")
         self.receipts = GateReceiptStore(work / "receipts.jsonl")
         self.gate = EfferentGate(
             manifest=ActionManifest({"link0": LOW, "link1": HIGH}), store=self.receipts,
             executor=OutboxExecutor(work / "outbox.jsonl"), clock=lambda: FIXED,
             transport=_Transport(), pending_store=self.pending, journal=self.journal,
-            binding_generation=self.store.generation,
         )
         self.chains = ChainExecutor(gate=self.gate, request_builder=_chain_builder,
                                     risk_resolver=lambda b, i: [LOW, HIGH][i], trust_resolver=_trust,
@@ -191,9 +190,8 @@ def test_a_receipt_that_never_landed_is_written_on_replay(tmp_path):
     w = World(tmp_path)
     w.mint(chain=False)
     w.dispatch("e1")
-    lines = (tmp_path / "journal.jsonl").read_text().splitlines()
-    (tmp_path / "journal.jsonl").write_text(
-        "\n".join(l for l in lines if json.loads(l)["t"] != "receipt") + "\n")   # as if it stopped first
+    with w.journal.db.write() as conn:                              # as if it stopped before the note
+        conn.execute("UPDATE effects SET receipt_id = NULL")
     (tmp_path / "receipts.jsonl").unlink()
     again = World(tmp_path).dispatch("e1")
     assert again.outcome.replayed and again.outcome.receipt_id is not None
@@ -333,9 +331,6 @@ def test_a_run_without_a_journal_is_refused(tmp_path):
     gate = EfferentGate(manifest=ActionManifest({}), store=GateReceiptStore(tmp_path / "r.jsonl"),
                         executor=OutboxExecutor(tmp_path / "outbox.jsonl"), clock=lambda: FIXED)
     out = gate.gate(_binding_request(RunRef("run-x", "link-0")))
-    with pytest.raises(ValueError, match="binding_generation"):
-        EfferentGate(manifest=ActionManifest({}), store=GateReceiptStore(tmp_path / "r.jsonl"),
-                     executor=OutboxExecutor(tmp_path / "o.jsonl"), journal=RunJournal(tmp_path / "j.jsonl"))
     assert out.refused and out.reason == "run_without_journal"
     assert not (tmp_path / "outbox.jsonl").exists()
 
@@ -347,12 +342,6 @@ def test_a_run_that_was_never_admitted_is_refused(tmp_path):
                               authority=AuthorityScope(grantor="binding", grant="g", binding_id=b.binding_id, hops=0))
     out = w.gate.gate(req)
     assert out.refused and out.reason == "run_not_admitted" and w.outbox() == []
-
-
-def test_a_fire_for_a_binding_the_registry_does_not_hold_is_refused(tmp_path):
-    w = World(tmp_path)
-    out = w.gate.gate(_binding_request(RunRef("run-x", "link-0")))
-    assert out.refused and out.reason == "binding_generation_unknown" and w.outbox() == []
 
 
 def test_the_dispatcher_refuses_a_store_and_gate_on_different_journals(tmp_path):
@@ -415,53 +404,47 @@ def test_a_pause_landing_right_after_admission_stops_the_run(tmp_path):
 
 
 def test_a_dispatch_inside_a_pause_waits_for_it_and_does_not_fire(tmp_path):
-    # L2 P1, reproduced at f9f43c5: a pause wrote its fence before its registry write, and a dispatch
-    # whose admission + lockless snapshot ran between the two fired after set_status returned. Here the
-    # dispatch is started from INSIDE the pause, after its fence: it must wait for the pause to commit
-    # and then see the binding paused.
+    # L2 P1, reproduced at f9f43c5: a dispatch whose admission ran between a pause's fence and its
+    # registry write fired after the pause returned. Here the dispatch starts from INSIDE the pause's
+    # transaction, after its fence: it must wait for the commit and then see the binding paused.
     import threading
     import time
     w = World(tmp_path)
     b = w.mint(chain=False)
-    real_fence = w.journal.fence
+    real_fence_in = w.journal._fence_in
     done: list[bool] = []
+    threads: list[threading.Thread] = []
 
-    def fence_then_dispatch(binding_id, **kw):
-        g = real_fence(binding_id, **kw)
+    def fence_then_dispatch(conn, binding_id, generation):
+        real_fence_in(conn, binding_id, generation)
         t = threading.Thread(target=lambda: done.append(bool(w.dispatcher.dispatch(
             {"type": "email", "id": "e", "fields": {"from": "a@x.example", "dmarc": "pass"}}))))
         t.start()
         time.sleep(0.3)                                   # the dispatch had every chance to run here
-        fence_then_dispatch.thread = t
-        return g
+        threads.append(t)
 
-    w.journal.fence = fence_then_dispatch
+    w.journal._fence_in = fence_then_dispatch
     assert w.store.set_status(b.binding_id, BindingStatus.PAUSED)
-    fence_then_dispatch.thread.join()
+    threads[0].join()
     assert w.outbox() == [] and done == [False]
 
 
-def test_a_pause_whose_journal_fence_fails_still_stops_the_admitted_run(tmp_path):
-    # L2 P3, reproduced at f9f43c5: the fence append failed once, the pause committed, and the sweep
-    # auto-fired the admitted run. The registry generation is the authority now.
+def test_a_pause_and_its_fence_commit_together_or_not_at_all(tmp_path):
+    # L2 P3, reproduced at f9f43c5: the fence write failed once, the pause committed, and the admitted
+    # run fired. A pause and its fence are one transaction now: a failure leaves neither.
     w = World(tmp_path)
     b = w.mint(chain=True)
     w.dispatch("q1")                                               # link1 pending
-    real_fence = w.journal.fence
-
-    def failing_fence(*a, **k):
-        raise OSError(28, "No space left on device")
-
-    w.journal.fence = failing_fence
-    from levain.autonomic import FenceNotRecordedError
-    with pytest.raises(FenceNotRecordedError):                     # committed, and the caller is told
+    real = w.journal._fence_in
+    w.journal._fence_in = lambda *a: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+    with pytest.raises(OSError):
         w.store.set_status(b.binding_id, BindingStatus.PAUSED)
-    assert w.store.get(b.binding_id).status is BindingStatus.PAUSED
-    w.journal.fence = real_fence
-    w.store.ratify(b.binding_id)                                   # even re-activated
+    w.journal._fence_in = real
+    assert w.store.get(b.binding_id).status is BindingStatus.ACTIVE   # nothing committed
+    assert w.store.set_status(b.binding_id, BindingStatus.PAUSED)      # and when it commits, it fences
+    w.store.ratify(b.binding_id)
     out = w.resolve_open(approve=True)
-    assert out.aborted and out.reason == "journal:fenced"
-    assert w.outbox() == [("link0", "q1-0")]
+    assert out.aborted and out.reason == "journal:fenced" and w.outbox() == [("link0", "q1-0")]
 
 
 def test_an_executor_that_returns_garbage_has_an_unknown_outcome(tmp_path):
@@ -649,17 +632,6 @@ def test_a_malformed_manual_pending_record_does_not_stop_the_sweep(tmp_path):
     assert [o.reason for o in out] == ["denied:confirm_window_elapsed"]
 
 
-def test_a_transient_refusal_does_not_end_the_run(tmp_path):
-    # complement MED 2: an unreadable registry generation cancelled the run for good
-    w = World(tmp_path)
-    w.mint(chain=False)
-    real = w.gate._binding_generation
-    w.gate._binding_generation = lambda bid: None
-    assert w.dispatch("g1").outcome.reason == "binding_generation_unknown"
-    w.gate._binding_generation = real
-    assert w.dispatch("g1").outcome.fired and w.outbox() == [("link0", "g1-0")]
-
-
 def test_a_chain_link_never_fires_standalone_and_its_state_cannot_be_lost(tmp_path):
     # codex HIGH 5: a chain state lost between claim and resolve let a plain resolve fire the link alone.
     # The continuation now lives IN the hold, so there is no separate state to lose; a plain resolve of a
@@ -724,26 +696,20 @@ def test_a_removed_and_readded_grant_fences_every_earlier_run(tmp_path):
     w = World(tmp_path)
     b = w.mint(chain=True)
     w.dispatch("r1")                                               # link1 pending under the old record
-    real = w.journal.fence
-    w.journal.fence = lambda *a, **k: (_ for _ in ()).throw(OSError("no space"))
-    from levain.autonomic import FenceNotRecordedError
-    with pytest.raises(FenceNotRecordedError):
-        w.store.remove(b.binding_id)
-    w.journal.fence = real
+    w.store.remove(b.binding_id)
     w.store.add(b)
     w.store.ratify(b.binding_id)
     out = w.resolve_open(approve=True)
     assert out.aborted and out.reason == "journal:fenced" and w.outbox() == [("link0", "r1-0")]
 
 
-def test_a_pause_whose_registry_write_fails_leaves_no_fence_ahead_of_the_registry(tmp_path):
-    # glm MED: the journal fence was written before the registry; a failed registry write then left the
-    # still-active binding fenced for every new run
+def test_a_pause_whose_registry_write_fails_leaves_no_fence(tmp_path):
+    # glm MED: a fence written before a registry write that then failed left a live binding fenced
     w = World(tmp_path)
     b = w.mint(chain=False)
     real = w.store._write_raw
 
-    def fail(records):
+    def fail(records, conn):
         raise OSError("disk full")
 
     w.store._write_raw = fail
@@ -780,18 +746,20 @@ def _one_shot(w, posture=Posture.ON_LOOP):
     return b
 
 
-def test_a_claimed_one_shot_revoked_before_its_run_started_never_fires(tmp_path):
+def test_a_one_shot_claim_and_its_run_commit_together(tmp_path):
     # codex HIGH 1 + complement MED 1: the claim was written, the process stopped before the run was
-    # admitted, a person revoked it; the re-delivered run was admitted at the NEW generation and fired
+    # admitted, a person revoked it, and the re-delivered run fired. The claim and the run are one
+    # transaction: a failure leaves the one-shot unclaimed, and a revoke then stops it outright.
     w = World(tmp_path)
     b = _one_shot(w)
-    real = w.journal.start
-    w.journal.start = lambda *a, **k: (_ for _ in ()).throw(OSError("stopped here"))
+    real = w.journal._start_in
+    w.journal._start_in = lambda *a: (_ for _ in ()).throw(OSError("stopped here"))
     assert w.dispatcher.dispatch({"type": "email", "id": "A", "fields": {"from": "a@x.example"}}) == []
-    w.journal.start = real
+    w.journal._start_in = real
+    assert w.store.claimed_run(b.binding_id) is None and w.store.get(b.binding_id).status is BindingStatus.ACTIVE
     w.store.set_status(b.binding_id, BindingStatus.REVOKED)        # the person cancels it
-    out = w.dispatcher.dispatch({"type": "email", "id": "A", "fields": {"from": "a@x.example"}})
-    assert [d.outcome.reason for d in out] == ["journal:fenced"] and w.outbox() == []
+    assert w.dispatcher.dispatch({"type": "email", "id": "A", "fields": {"from": "a@x.example"}}) == []
+    assert w.outbox() == []
 
 
 def test_a_decision_and_its_pending_are_one_record(tmp_path):
@@ -808,24 +776,6 @@ def test_a_decision_and_its_pending_are_one_record(tmp_path):
     assert w.outbox() == [("link0", "c1-0")]
 
 
-def test_refence_after_a_failed_remove_fences_every_earlier_run(tmp_path):
-    # gemini HIGH + codex HIGH 3: refence() of a removed binding wrote a fence at a generation an
-    # admitted run still matched
-    w = World(tmp_path)
-    b = w.mint(chain=True)
-    w.dispatch("r1")
-    [p] = w.gate.open_pendings()
-    run_gen = json.loads(w.journal.path.read_text().splitlines()[0])["generation"]
-    real = w.journal.fence
-    w.journal.fence = lambda *a, **k: (_ for _ in ()).throw(OSError("no space"))
-    from levain.autonomic import FenceNotRecordedError
-    with pytest.raises(FenceNotRecordedError):
-        w.store.remove(b.binding_id)
-    w.journal.fence = real
-    w.store.refence(b.binding_id)
-    assert w.journal.generation(b.binding_id) > run_gen
-
-
 def test_a_duplicated_manual_pending_resolves_once(tmp_path):
     # codex MED: two records with one id; each claim removed one copy and fired once
     from levain.autonomic import PendingAction, PendingActionStore
@@ -836,14 +786,6 @@ def test_a_duplicated_manual_pending_resolves_once(tmp_path):
     store.path.write_text(json.dumps([p.to_dict(), p.to_dict()]))
     assert store.claim(p.pending_id) is not None
     assert store.claim(p.pending_id) is None
-
-
-def test_a_new_record_is_not_started_at_zero_when_the_journal_cannot_be_read(tmp_path):
-    # complement 2: a transient journal read fault started a re-added record at 0, unfencing old runs
-    w = World(tmp_path)
-    w.journal.next_generation = lambda bid: (_ for _ in ()).throw(OSError("unreadable"))
-    with pytest.raises(OSError):
-        w.mint(chain=False)
 
 
 def test_the_dispatcher_and_chain_executor_share_one_journal_and_one_gate(tmp_path):
@@ -934,18 +876,6 @@ def test_an_approval_after_a_rejection_fires_nothing_and_writes_no_receipt(tmp_p
     assert len(list(w.receipts.read())) == before and w.outbox() == [("link0", "c1-0")]
 
 
-def test_refence_of_a_removed_binding_already_fenced_is_a_no_op(tmp_path):
-    w = World(tmp_path)
-    b = w.mint(chain=True)
-    w.dispatch("r1")
-    w.store.remove(b.binding_id)
-    fences = lambda: sum(1 for l in w.journal.path.read_text().splitlines() if '"t":"fence"' in l)  # noqa: E731
-    before = fences()
-    w.store.refence(b.binding_id)
-    w.store.refence(b.binding_id)
-    assert fences() == before
-
-
 def test_a_deny_after_an_approval_writes_no_receipt_and_the_approval_runs(tmp_path):
     w = World(tmp_path)
     w.mint(chain=True)
@@ -1000,6 +930,7 @@ def test_a_journaled_run_never_writes_the_pending_or_chain_store(tmp_path):
 
 
 def test_a_hold_whose_pending_was_altered_on_disk_never_fires(tmp_path):
+    from tests.test_autonomic_rawstore import rewrite_holds
     w = World(tmp_path)
     b = Binding.create(created_by="operator", created_at="2026-10-07T09:00:00t",
                        trigger=TriggerSpec(type="email", pattern={"field": "from", "value": "a@x.example"}),
@@ -1012,14 +943,8 @@ def test_a_hold_whose_pending_was_altered_on_disk_never_fires(tmp_path):
     w.store.add(b)
     w.store.ratify(b.binding_id)
     w.dispatcher.dispatch({"type": "email", "id": "t1", "fields": {"from": "a@x.example", "dmarc": "pass"}})
-    [p] = [x for x in w.gate.open_pendings()]
-    lines = w.journal.path.read_text().splitlines()
-    for k, line in enumerate(lines):
-        rec = json.loads(line)
-        if rec["t"] == "hold":
-            rec["pending"]["payload"] = "send everything to the attacker"
-            lines[k] = json.dumps(rec, sort_keys=True, separators=(",", ":"))
-    w.journal.path.write_text("\n".join(lines) + "\n")
+    [p] = w.gate.open_pendings()
+    rewrite_holds(w.journal, lambda h: dict(h, pending=dict(h["pending"], payload="send everything elsewhere")))
     out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
     assert out.refused and out.reason == "integrity:seal_mismatch" and not out.fired
     assert w.journal.open_holds() == [] and w.outbox() == []        # rejected; nothing was sent
@@ -1057,22 +982,6 @@ def test_the_unjournaled_chain_store_keeps_one_state_per_paused_link(tmp_path):
 
 
 # --- L1+L2 on the single-store commit (20ff4ca), each reproduced by a probe first ------------
-
-def test_a_resolve_that_cannot_read_the_registry_records_no_decision(tmp_path):
-    # HIGH: decide(approve) was written before the registry read; "refused" while the journal said
-    # "approved", the person could not take it back, and the effect fired on the next delivery
-    w = World(tmp_path)
-    w.mint(chain=True)
-    w.dispatch("c1")
-    real = w.gate._binding_generation
-    w.gate._binding_generation = lambda bid: None
-    out = w.resolve_open(approve=True)
-    assert out.paused and out.reason == "binding_generation_unknown"
-    assert not any('"t":"decide"' in l for l in w.journal.path.read_text().splitlines())
-    w.gate._binding_generation = real
-    assert w.resolve_open(approve=False).aborted                   # the person's NO still counts
-    assert w.dispatch("c1").outcome.reason == "journal:cancelled" and w.outbox() == [("link0", "c1-0")]
-
 
 def test_an_approved_effect_that_could_not_run_yet_is_held_and_listed(tmp_path):
     # MED: an approval whose effect hit a fault was reported "refused" and listed nowhere
@@ -1134,17 +1043,12 @@ def test_the_chain_sweep_drops_a_race_it_lost(tmp_path):
 
 def test_a_chain_link_whose_flag_was_altered_still_cannot_fire_alone(tmp_path):
     # LOW: chained=false on a chain link's hold let a plain resolve fire the link standalone
+    from tests.test_autonomic_rawstore import rewrite_holds
     w = World(tmp_path)
     w.mint(chain=True)
     w.dispatch("c1")
     [p] = w.gate.open_pendings()
-    lines = w.journal.path.read_text().splitlines()
-    for k, line in enumerate(lines):
-        rec = json.loads(line)
-        if rec["t"] == "hold":
-            rec["chained"] = False
-            lines[k] = json.dumps(rec, sort_keys=True, separators=(",", ":"))
-    w.journal.path.write_text("\n".join(lines) + "\n")
+    rewrite_holds(w.journal, lambda h: dict(h, chained=False))
     out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
     assert out.reason == "chained_pending_resolves_through_its_chain" and w.outbox() == [("link0", "c1-0")]
 
@@ -1153,44 +1057,35 @@ def test_a_continuation_from_another_hold_is_refused(tmp_path):
     # LOW: the continuation was not tied to its own hold (pending id, binding); a validly sealed
     # continuation copied from elsewhere must not resume this hold's chain
     from levain.autonomic import ChainState
+    from tests.test_autonomic_rawstore import rewrite_holds
     w = World(tmp_path)
     w.mint(chain=True)
     w.dispatch("c1")
-    [p] = w.gate.open_pendings()
-    lines = w.journal.path.read_text().splitlines()
-    for k, line in enumerate(lines):
-        rec = json.loads(line)
-        if rec["t"] == "hold":
-            st = ChainState.from_dict(rec["chain"])
-            other = ChainState.create(created_at="2026-10-07T12:30:00", binding=st.binding_obj(),
-                                      trigger_event=st.trigger_event, completed=st.completed_links(),
-                                      paused_at_link=st.paused_at_link, paused_payload=st.paused_payload,
-                                      pending_id="hold:run-other:link-1")
-            rec["chain"] = other.to_dict()
-            lines[k] = json.dumps(rec, sort_keys=True, separators=(",", ":"))
-    w.journal.path.write_text("\n".join(lines) + "\n")
+
+    def swap(h):
+        st = ChainState.from_dict(h["chain"])
+        other = ChainState.create(created_at="2026-10-07T12:30:00", binding=st.binding_obj(),
+                                  trigger_event=st.trigger_event, completed=st.completed_links(),
+                                  paused_at_link=st.paused_at_link, paused_payload=st.paused_payload,
+                                  pending_id="hold:run-other:link-1")
+        return dict(h, chain=other.to_dict())
+
+    rewrite_holds(w.journal, swap)
     out = w.resolve_open(approve=True)
     assert out.aborted and out.reason == "integrity:continuation_not_this_hold"
     assert w.outbox() == [("link0", "c1-0")]
 
 
-def test_a_pause_between_the_approval_and_the_effect_stops_it_even_if_the_journal_missed_it(tmp_path):
-    # the registry generation read at effect time is what stops an approved effect when a pause lands
-    # after the decision and its journal fence could not be written
-    from levain.autonomic import FenceNotRecordedError
+def test_a_pause_between_the_approval_and_the_effect_stops_it(tmp_path):
+    # the fence is read in the effect's own transaction, so a pause landing after the decision stops it
     w = World(tmp_path)
     b = w.mint(chain=True)
     w.dispatch("c1")
-    real_decide, real_fence = w.journal.decide, w.journal.fence
+    real_decide = w.journal.decide
 
     def decide_then_pause(*a, **k):
         d = real_decide(*a, **k)
-        w.journal.fence = lambda *x, **y: (_ for _ in ()).throw(OSError("no space"))
-        try:
-            w.store.set_status(b.binding_id, BindingStatus.PAUSED)
-        except FenceNotRecordedError:
-            pass
-        w.journal.fence = real_fence
+        w.store.set_status(b.binding_id, BindingStatus.PAUSED)
         return d
 
     w.journal.decide = decide_then_pause
@@ -1216,3 +1111,50 @@ def test_a_sweep_keeps_its_journaled_outcomes_when_the_manual_store_faults(tmp_p
     w.pending.list_open = lambda: (_ for _ in ()).throw(OSError("EIO"))
     out = w.gate.sweep_timeouts(FIXED + _dt.timedelta(hours=2))
     assert [o.reason for o in out] == ["denied:confirm_window_elapsed"]
+
+
+# --- the one-database store ---------------------------------------------------------------------
+
+def test_many_processes_delivering_one_event_produce_one_effect(tmp_path):
+    w = World(tmp_path)
+    w.mint(chain=False)
+    code = textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {str(Path(__file__).parent)!r})
+        from pathlib import Path
+        from test_autonomic_journal_wiring import World
+        World(Path({str(tmp_path)!r})).dispatch('race')
+    """)
+    procs = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+             for _ in range(8)]
+    assert all(p.wait(timeout=120) == 0 for p in procs)
+    assert w.outbox() == [("link0", "race-0")]                         # exactly once
+    assert w.fire_count(w.store.list_all()[0]) == 1
+
+
+def test_the_store_is_one_private_directory_with_durable_settings(tmp_path):
+    import sqlite3
+    import stat
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    store_dir = tmp_path / "store"
+    assert stat.S_IMODE(store_dir.stat().st_mode) == 0o700
+    outside = [p for p in tmp_path.iterdir() if p.name.startswith("autonomic.db")]
+    assert outside == []                                              # nothing of the store outside it
+    with w.journal.db.write() as conn:                                # an open connection: sidecars exist
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2     # FULL
+        assert conn.execute("PRAGMA fullfsync").fetchone()[0] == 1
+        names = {p.name for p in store_dir.iterdir()}
+        assert {"autonomic.db", "autonomic.db-wal", "autonomic.db-shm"} <= names
+    assert w.journal.db.meta("format") == "levain-autonomic/1"
+    assert sqlite3.connect(store_dir / "autonomic.db").execute(
+        "SELECT COUNT(*) FROM holds").fetchone()[0] == 1
+
+
+def test_a_store_and_a_journal_in_different_directories_are_refused(tmp_path):
+    # they must share one database, or a pause and its fence would commit in two places
+    with pytest.raises(ValueError, match="same store directory"):
+        BindingStore(tmp_path / "a", journal=RunJournal(tmp_path / "b"))
+    BindingStore(tmp_path / "a", journal=RunJournal(tmp_path / "a"))

@@ -117,7 +117,7 @@ _log = logging.getLogger("levain.autonomic.chainpath")
 # Gate refusals of a journaled link's resolve that RECORD NOTHING: the hold is still open, so the chain
 # is still paused at that link (a typed proof or a person may still come).
 _STILL_OPEN = frozenset({"unattended_approval_not_allowed", "elevated_requires_typed_proof",
-                         "binding_generation_unknown", "run_not_admitted"})
+                         "run_not_admitted"})
 
 
 class MalformedChainStateError(Exception):

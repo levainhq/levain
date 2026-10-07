@@ -183,29 +183,24 @@ def test_a_live_owner_is_in_flight_not_poisoned(j):
 def test_a_recycled_pid_does_not_make_a_dead_owner_look_alive(j):
     # an intent whose owner is gone (no lease held) is poisoned even if its recorded pid is alive
     j.start("r1", binding_id="b", generation=1)
-    j._append({"t": "intent", "run_id": "r1", "effect_id": "send", "digest": "d", "pid": os.getpid()})
+    with j.db.write() as conn:
+        conn.execute("INSERT INTO effects (run_id, effect_id, digest, pid, state) VALUES ('r1', 'send', 'd', ?, 'intent')",
+                     (os.getpid(),))
     assert j.effect("r1", "send", digest="d", fn=Effect()).status is EffectStatus.POISONED
     assert j.poisoned() == [("r1", "send")]
 
 
-def test_the_registry_generation_fences_a_run_the_journal_never_heard_about(j):
-    j.start("r1", binding_id="b", generation=3)
-    assert j.effect("r1", "x", digest="d", fn=Effect(), current_generation=3).status is EffectStatus.DONE
-    assert j.effect("r1", "y", digest="d", fn=Effect(), current_generation=4).status is EffectStatus.FENCED
-
-
 # --- storage -------------------------------------------------------------------------------
 
-def test_a_torn_final_line_is_ignored_and_a_corrupt_middle_fails_closed(j, tmp_path):
+def test_a_damaged_store_fails_closed(j):
+    # an unreadable store cannot prove an effect has not run: nothing proceeds
     j.start("r1", binding_id="b", generation=1)
-    path = tmp_path / "journal.jsonl"
-    with open(path, "a") as f:
-        f.write('{"t":"result","run_id"')         # a crash mid-append
     assert j.effect("r1", "send", digest="d", fn=Effect()).status is EffectStatus.DONE
-    lines = path.read_text().splitlines()
-    path.write_text("\n".join([lines[0], "not json"] + lines[1:]) + "\n")
+    for side in j.directory.iterdir():
+        if side.name.startswith("autonomic.db"):
+            side.write_bytes(b"not a database at all" * 100)
     with pytest.raises(JournalCorruptError):
-        j.effect("r1", "other", digest="d", fn=Effect())
+        RunJournal(j.directory).effect("r1", "other", digest="d", fn=Effect())
 
 
 # --- the API the fire path uses (2026-10-07 wiring) ------------------------------------------
@@ -275,20 +270,38 @@ def test_a_run_id_is_a_content_address_over_the_binding_and_the_event():
             run_id_for("b", bad)
 
 
-def test_a_malformed_record_fails_closed(j, tmp_path):
-    j.start("r1", binding_id="b", generation=0)
-    with open(tmp_path / "journal.jsonl", "a") as f:
-        f.write('{"t":"result","run_id":"r1"}\n')     # parses, but is missing effect_id
-    with pytest.raises(JournalCorruptError):
-        j.effect("r1", "x", digest="d", fn=Effect())
+def test_a_store_of_another_format_is_refused(j):
+    from levain.autonomic.db import StoreFormatError
+    j.start("r1", binding_id="b", generation=1)
+    with j.db.write() as conn:
+        conn.execute("UPDATE meta SET value = 'something-else/9' WHERE key = 'format'")
+    with pytest.raises(StoreFormatError):
+        RunJournal(j.directory).start("r2", binding_id="b", generation=1)
 
 
-def test_a_rejection_cancels_its_run_in_the_same_record(j, tmp_path):
+def test_a_rejection_cancels_its_run_in_the_same_transaction(j):
     j.start("r1", binding_id="b", generation=0)
     h = j.hold("r1", "send", digest="d", pending={"pending_id": "p1"})
-    before = len((tmp_path / "journal.jsonl").read_text().splitlines())
     assert j.decide(h.hold_id, approve=False, digest="d").ok
-    lines = (tmp_path / "journal.jsonl").read_text().splitlines()
-    assert len(lines) == before + 1                                   # one record: decided AND cancelled
     assert j.effect("r1", "later", digest="x", fn=Effect()).status is EffectStatus.CANCELLED
     assert j.find_pending("p1")["decided"] is False
+    # the update and the cancel commit together: a failure after the update leaves neither
+    j.start("r2", binding_id="b", generation=0)
+    h2 = j.hold("r2", "send", digest="d", pending={"pending_id": "p2"})
+    real = j._hold_row
+    calls = []
+
+    def fail_after_update(conn, hold_id):
+        if calls:
+            raise RuntimeError("stopped mid-decision")
+        calls.append(1)
+        row = real(conn, hold_id)
+        conn.execute("CREATE TEMP TRIGGER boom AFTER UPDATE ON holds BEGIN SELECT RAISE(ABORT, 'stop'); END")
+        return row
+
+    j._hold_row = fail_after_update
+    with pytest.raises(Exception):
+        j.decide(h2.hold_id, approve=False, digest="d")
+    j._hold_row = real
+    assert j.find_pending("p2")["decided"] is None
+    assert j.effect("r2", "later", digest="x", fn=Effect()).status is EffectStatus.HELD

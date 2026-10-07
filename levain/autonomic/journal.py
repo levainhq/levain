@@ -11,11 +11,10 @@ that already ran instead of running them again. There is deliberately no mid-eff
 suspends BEFORE an effect, never inside one, because an in-flight Python call cannot be resumed.
 
 The journal is the ONLY durable home of a decision about a run's effect. A hold is the pending
-decision itself: one appended line carries the sealed record a person is asked about and, for a
-link of a chain, the state that resumes the chain after the decision. Open pendings and paused
-chains are read from the open holds, never written anywhere else, and a decision is one write-once
-``decide`` line (a rejection's cancel of the run is in that same line). Every transition is one
-appended line, so the file's own append is the atomic commit.
+decision itself: one row carries the sealed record a person is asked about and, for a link of a
+chain, the state that resumes the chain after the decision. Open pendings and paused chains are read
+from the open holds, never written anywhere else, and a decision is one write-once update (a
+rejection's cancel of the run is in the same transaction).
 
 Identity is derived, never assigned: a run's id is a content address over the binding and the
 exact triggering event (:func:`run_id_for`), so delivering the same event again resumes the same
@@ -44,8 +43,10 @@ The lock is not held across the effect call itself (it cannot span the I/O), so 
 written while an effect is already inside its call stops the NEXT effect, not that one. At most one
 effect per run is in flight, and it is journaled.
 
-Storage: one append-only JSONL file, every read-check-write under one ``flock`` on a sidecar lock
-file, every append flushed and fsynced. State is derived by replaying the file. Stdlib only.
+Storage: the store directory's SQLite database (:mod:`levain.autonomic.db`), shared with the binding
+registry, so a binding's fence, a run's admission and a one-shot's claim commit in the same
+transaction as the registry change that requires them. Every verb is one transaction. The effect
+leases are files in the same directory. Stdlib only.
 """
 from __future__ import annotations
 
@@ -54,11 +55,14 @@ import fcntl
 import hashlib
 import json
 import os
+import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from levain.autonomic.db import AutonomicDB
 
 __all__ = [
     "EffectStatus", "EffectOutcome", "HoldResult", "RunJournal", "RunRef", "JournalCorruptError",
@@ -156,19 +160,6 @@ def effect_digest(*, action_name: str, payload: str, context_id: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-@dataclass
-class _State:
-    runs: dict[str, dict[str, Any]]
-    intents: dict[tuple[str, str], dict[str, Any]]
-    results: dict[tuple[str, str], dict[str, Any]]
-    unknown: set[tuple[str, str]]
-    holds: dict[str, dict[str, Any]]
-    by_pending: dict[str, str]
-    fences: dict[str, int]
-    cancelled: set[str]
-    receipts: dict[tuple[str, str], str]
-
-
 def durable_fsync(fd: int) -> None:
     """Flush ``fd`` to stable storage. On macOS ``os.fsync`` only reaches the drive's cache, so a power
     loss can drop a write the caller already acted on; ``F_FULLFSYNC`` flushes the cache too."""
@@ -201,16 +192,22 @@ def durable_replace(path: Path, text: str) -> None:
 
 
 class RunJournal:
-    """The durable journal for unattended runs. One file per journal; many runs and bindings."""
+    """The durable journal for unattended runs, in the store directory's SQLite database (shared with
+    the binding registry, see :mod:`levain.autonomic.db`). Every verb is one transaction."""
 
-    def __init__(self, path: Path | str) -> None:
-        self._path = Path(path)
-        self._lock_path = self._path.with_name(self._path.name + ".lock")
-        self._lease_dir = self._path.with_name(self._path.name + ".leases")
+    def __init__(self, directory: Path | str) -> None:
+        self.db = AutonomicDB(directory)
+        self.directory = self.db.directory
+        self._lease_dir = self.directory / "leases"
+
+    @property
+    def path(self) -> Path:
+        """The database file."""
+        return self.db.path
 
     # --- leases: who is inside an effect right now -------------------------------------------
     # An effect's owner holds an exclusive flock on its lease file from just BEFORE its intent is
-    # appended until just AFTER its result (or unknown) is appended. The OS drops the lock when the
+    # committed until just AFTER its result (or unknown) is committed. The OS drops the lock when the
     # owner dies, so "intent, no result, lease not held" means the owner is gone: POISONED. A process
     # id would be wrong twice: a recycled pid reads a dead owner as alive, and a second thread of the
     # same process reads a live owner as dead.
@@ -220,7 +217,7 @@ class RunJournal:
 
     def _take_lease(self, run_id: str, effect_id: str) -> int:
         self._lease_dir.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._lease_path(run_id, effect_id), os.O_RDWR | os.O_CREAT, 0o644)
+        fd = os.open(self._lease_path(run_id, effect_id), os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BaseException:
@@ -249,200 +246,150 @@ class RunJournal:
             os.close(fd)
         return False
 
-    @property
-    def path(self) -> Path:
-        return self._path
-
-    # --- storage ---------------------------------------------------------------------------
+    # --- transactions --------------------------------------------------------------------------
     @contextmanager
-    def _locked(self) -> Iterator[None]:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self._lock_path, "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
-
-    def _append(self, record: dict[str, Any]) -> None:
-        line = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        existed = self._path.exists()
-        if existed:
-            self._drop_torn_tail()
-        with open(self._path, "a", encoding="utf-8") as f:
-            f.write(line)
-            f.flush()
-            durable_fsync(f.fileno())
-        if not existed:
-            dfd = os.open(self._path.parent, os.O_RDONLY)
-            try:
-                durable_fsync(dfd)
-            finally:
-                os.close(dfd)
-
-    def _drop_torn_tail(self) -> None:
-        """Truncate a final line with no newline: an append the process died inside, which never
-        committed. Without this the next append would glue onto it and corrupt a committed line."""
-        with open(self._path, "rb+") as f:
-            data = f.read()
-            if data and not data.endswith(b"\n"):
-                f.truncate(data.rfind(b"\n") + 1)
-                f.flush()
-                durable_fsync(f.fileno())
-
-    def _state(self) -> _State:
-        st = _State({}, {}, {}, set(), {}, {}, {}, set(), {})
-        if not self._path.exists():
-            return st
+    def _write(self) -> Iterator[sqlite3.Connection]:
         try:
-            text = self._path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            raise JournalCorruptError(f"cannot read run journal {self._path}: {exc}") from exc
-        lines = text.split("\n")
-        for n, line in enumerate(lines, start=1):
-            if not line:
-                continue
-            try:
-                r = json.loads(line)
-                t = r["t"]
-            except (ValueError, KeyError, TypeError) as exc:
-                if n == len(lines) and not text.endswith("\n"):
-                    break  # a torn final append (crash mid-write) never committed; ignore it
-                raise JournalCorruptError(f"run journal {self._path} line {n} is not a record") from exc
-            try:
-                self._apply(st, t, r)
-            except (KeyError, TypeError) as exc:
-                raise JournalCorruptError(f"run journal {self._path} line {n}: malformed {t!r} record") from exc
-        return st
+            with self.db.write() as conn:
+                yield conn
+        except sqlite3.DatabaseError as exc:
+            # an unreadable or damaged store cannot prove an effect has not run: fail closed
+            raise JournalCorruptError(f"run journal {self.db.path}: {exc}") from exc
 
-    def _apply(self, st: _State, t: Any, r: dict[str, Any]) -> None:
-        if t == "run":
-            st.runs[r["run_id"]] = r
-        elif t == "intent":
-            st.intents[(r["run_id"], r["effect_id"])] = r
-        elif t == "result":
-            st.results[(r["run_id"], r["effect_id"])] = r
-        elif t == "unknown":
-            st.unknown.add((r["run_id"], r["effect_id"]))
-        elif t == "hold":
-            if r["hold_id"] not in st.holds:
-                st.holds[r["hold_id"]] = dict(r, decided=None, by=None)
-                pending = r.get("pending")
-                if isinstance(pending, dict) and isinstance(pending.get("pending_id"), str):
-                    st.by_pending[pending["pending_id"]] = r["hold_id"]
-        elif t == "decide":
-            h = st.holds.get(r["hold_id"])
-            if h is not None and h["decided"] is None:
-                h["decided"] = bool(r["approve"])
-                h["by"] = r.get("by")
-                if not h["decided"]:
-                    st.cancelled.add(h["run_id"])   # a rejection ends its run IN THE SAME record
-        elif t == "fence":
-            st.fences[r["binding_id"]] = max(st.fences.get(r["binding_id"], 0), int(r["generation"]))
-        elif t == "cancel":
-            st.cancelled.add(r["run_id"])
-        elif t == "receipt":
-            st.receipts[(r["run_id"], r["effect_id"])] = r["receipt_id"]
-        else:
-            raise KeyError(f"unknown record {t!r}")
+    @contextmanager
+    def _read(self) -> Iterator[sqlite3.Connection]:
+        try:
+            with self.db.read() as conn:
+                yield conn
+        except sqlite3.DatabaseError as exc:
+            raise JournalCorruptError(f"run journal {self.db.path}: {exc}") from exc
 
-    # --- runs ------------------------------------------------------------------------------
-    def next_generation(self, binding_id: str) -> int:
-        """A generation above every fence AND every run admission this journal has for the binding: a
-        record created at it (a removed grant added again) fences every run admitted before it."""
-        with self._locked():
-            st = self._state()
-            seen = [st.fences.get(binding_id, 0)]
-            seen += [r["generation"] for r in st.runs.values() if r["binding_id"] == binding_id]
-            return max(seen) + 1
+    # --- generations (the fence) -------------------------------------------------------------
+    @staticmethod
+    def _generation_in(conn: sqlite3.Connection, binding_id: str) -> int:
+        row = conn.execute("SELECT generation FROM fences WHERE binding_id = ?", (binding_id,)).fetchone()
+        return int(row[0]) if row else 0
+
+    @staticmethod
+    def _max_run_generation_in(conn: sqlite3.Connection, binding_id: str) -> int | None:
+        row = conn.execute("SELECT MAX(generation) FROM runs WHERE binding_id = ?", (binding_id,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+
+    def _next_generation_in(self, conn: sqlite3.Connection, binding_id: str) -> int:
+        top = self._max_run_generation_in(conn, binding_id)
+        return max(self._generation_in(conn, binding_id), top if top is not None else 0) + 1
+
+    @staticmethod
+    def _fence_in(conn: sqlite3.Connection, binding_id: str, generation: int) -> None:
+        conn.execute("INSERT INTO fences (binding_id, generation) VALUES (?, ?) ON CONFLICT(binding_id) "
+                     "DO UPDATE SET generation = MAX(generation, excluded.generation)", (binding_id, generation))
+
+    @staticmethod
+    def _start_in(conn: sqlite3.Connection, run_id: str, binding_id: str, generation: int) -> None:
+        conn.execute("INSERT OR IGNORE INTO runs (run_id, binding_id, generation) VALUES (?, ?, ?)",
+                     (run_id, binding_id, int(generation)))
 
     def generation(self, binding_id: str) -> int:
-        """The binding's current governance generation: the highest fence written for it (0 if none)."""
-        with self._locked():
-            return self._state().fences.get(binding_id, 0)
+        """The binding's current governance generation: its fence (0 if never fenced)."""
+        with self._read() as conn:
+            return self._generation_in(conn, binding_id)
+
+    def next_generation(self, binding_id: str) -> int:
+        """A generation above every fence AND every run admission for the binding: a record created at
+        it (a removed grant added again) fences every run admitted before it."""
+        with self._read() as conn:
+            return self._next_generation_in(conn, binding_id)
+
+    def max_run_generation(self, binding_id: str) -> int | None:
+        """The highest generation any run of ``binding_id`` was admitted at, or ``None`` (no runs)."""
+        with self._read() as conn:
+            return self._max_run_generation_in(conn, binding_id)
 
     def start(self, run_id: str, *, binding_id: str, generation: int) -> None:
-        """Admit a run under the binding's governance ``generation``, which the caller reads from the
-        authority that fences the binding (:meth:`BindingStore.admit` reads it under the store lock).
-        Starting an existing run id again is a no-op (a resumed run keeps its original admission, so a
-        run fenced once stays fenced)."""
-        with self._locked():
-            if run_id in self._state().runs:
-                return
-            self._append({"t": "run", "run_id": run_id, "binding_id": binding_id,
-                          "generation": int(generation)})
+        """Admit a run under the binding's governance ``generation``. (The fire path admits through
+        :meth:`BindingStore.admit`, which does this in the same transaction as its fireability check
+        and a one-shot's claim.) Starting an existing run id again is a no-op: a resumed run keeps its
+        original admission, so a run fenced once stays fenced."""
+        with self._write() as conn:
+            self._start_in(conn, run_id, binding_id, generation)
 
     def fence(self, binding_id: str, *, generation: int | None = None) -> int:
         """Every run of ``binding_id`` admitted under a generation BELOW the fence stops at its next
-        effect. ``generation`` defaults to the current generation plus one. Fence a binding on every
-        governance change that must stop the runs already admitted under it (a store given this
-        journal fences on its own verbs). Returns the fence's generation."""
-        with self._locked():
-            current = self._state().fences.get(binding_id, 0)
-            gen = current + 1 if generation is None else int(generation)
-            self._append({"t": "fence", "binding_id": binding_id, "generation": gen})
-            return gen
+        effect. ``generation`` defaults to the current one plus one. (The binding store fences in the
+        same transaction as the change that requires it.) Returns the fence's generation."""
+        with self._write() as conn:
+            gen = self._generation_in(conn, binding_id) + 1 if generation is None else int(generation)
+            self._fence_in(conn, binding_id, gen)
+            return max(gen, self._generation_in(conn, binding_id))
 
     def cancel(self, run_id: str, *, reason: str) -> None:
         """End a run: none of its later effects run. The gate cancels a run when it makes a terminal
-        decision not to fire one of its effects (a kill, a refusal), so delivering the event again
-        cannot reach a different decision for the same effect."""
-        with self._locked():
-            if run_id not in self._state().cancelled:
-                self._append({"t": "cancel", "run_id": run_id, "reason": reason})
+        decision not to fire one of its effects (a kill, a refusal)."""
+        with self._write() as conn:
+            conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)", (run_id, reason))
 
     # --- effects ---------------------------------------------------------------------------
-    def _barrier(self, st: _State, run_id: str, effect_id: str,
-                 current_generation: int | None, digest: str | None) -> EffectOutcome | None:
-        """The outcome that stops ``effect_id`` before any decision logic, or ``None``.
-        ``current_generation`` is the binding's generation from the authority that fences it (the
-        registry); the run is fenced if it or any fence in this journal is past the run's admission.
-        ``digest`` is what the caller is about to do; a recorded result for DIFFERENT bytes is not a
-        replay of this effect (the run is not deterministic), so the run is cancelled."""
-        key = (run_id, effect_id)
-        run = st.runs.get(run_id)
+    def _barrier(self, conn: sqlite3.Connection, run_id: str, effect_id: str,
+                 digest: str | None) -> EffectOutcome | None:
+        """The outcome that stops ``effect_id`` before any decision logic, or ``None``, read in the
+        caller's transaction. The run is fenced if the binding's fence (committed in the same database as
+        the registry change that required it) is past its admission."""
+        run = conn.execute("SELECT binding_id, generation FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if run is None:
             raise KeyError(f"run {run_id!r} was never started")
+        eff = conn.execute("SELECT digest, state, result, receipt_id FROM effects WHERE run_id = ? "
+                           "AND effect_id = ?", (run_id, effect_id)).fetchone()
+        cancelled = conn.execute("SELECT 1 FROM cancels WHERE run_id = ?", (run_id,)).fetchone() is not None
         # a recorded result first: a replay runs nothing, so a cancel or fence after the effect does not
-        # hide what already happened (and a receipt that never landed can still be written)
-        if key in st.results:
-            done = st.intents.get(key, {}).get("digest")
-            if digest is not None and done is not None and done != digest:
-                if run_id not in st.cancelled:
-                    self._append({"t": "cancel", "run_id": run_id, "reason": "replay_digest_changed"})
+        # hide what already happened (and a receipt that never landed can still be written). A recorded
+        # result for DIFFERENT bytes is not a replay of this effect: the run is cancelled.
+        if eff is not None and eff[1] == "done":
+            if digest is not None and eff[0] != digest:
+                conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)",
+                             (run_id, "replay_digest_changed"))
                 return EffectOutcome(EffectStatus.CANCELLED)
-            return EffectOutcome(EffectStatus.REPLAYED, st.results[key]["result"],
-                                 receipt_id=st.receipts.get(key))
-        if run_id in st.cancelled:
+            return EffectOutcome(EffectStatus.REPLAYED, json.loads(eff[2]), receipt_id=eff[3])
+        if cancelled:
             return EffectOutcome(EffectStatus.CANCELLED)
-        if max(st.fences.get(run["binding_id"], 0), current_generation or 0) > run["generation"]:
+        if self._generation_in(conn, run[0]) > int(run[1]):
             return EffectOutcome(EffectStatus.FENCED)
-        if key in st.unknown:
+        if eff is not None and eff[1] == "unknown":
             return EffectOutcome(EffectStatus.POISONED)
-        if key in st.intents:
+        if eff is not None and eff[1] == "intent":
             if self._lease_held(run_id, effect_id):
                 return EffectOutcome(EffectStatus.IN_FLIGHT)
             return EffectOutcome(EffectStatus.POISONED)
         return None
 
-    def peek(self, run_id: str, effect_id: str, *, current_generation: int | None = None,
-             digest: str | None = None) -> EffectOutcome | None:
+    def peek(self, run_id: str, effect_id: str, *, digest: str | None = None) -> EffectOutcome | None:
         """The barrier that would stop ``effect_id`` right now (cancelled, fenced, already done,
         poisoned, in flight), or ``None`` if nothing but a decision could. Runs nothing. A caller
-        uses it to short-circuit a replay before deciding anything; :meth:`effect` re-checks under
-        its own lock."""
-        with self._locked():
-            return self._barrier(self._state(), run_id, effect_id, current_generation, digest)
+        uses it to short-circuit a replay before deciding anything; :meth:`effect` re-checks in its
+        own transaction."""
+        with self._write() as conn:   # may record the cancel of a changed replay
+            return self._barrier(conn, run_id, effect_id, digest)
+
+    @staticmethod
+    def _hold_row(conn: sqlite3.Connection, hold_id: str) -> tuple | None:
+        return conn.execute("SELECT hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, "
+                            "chained, decided, decided_by FROM holds WHERE hold_id = ?", (hold_id,)).fetchone()
+
+    @staticmethod
+    def _hold_dict(row: tuple) -> dict[str, Any]:
+        hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, chained, decided, by = row
+        return {"hold_id": hold_id, "binding_id": binding_id, "run_id": run_id, "effect_id": effect_id,
+                "digest": digest, "at": at, "pending": json.loads(pending) if pending else None,
+                "chain": json.loads(chain) if chain else None, "chained": bool(chained),
+                "decided": None if decided is None else bool(decided), "by": by}
 
     def hold(self, run_id: str, effect_id: str, *, digest: str, pending: dict[str, Any],
-             at: str | None = None, chain: dict[str, Any] | None = None, chained: bool = False,
-             current_generation: int | None = None) -> EffectOutcome:
+             at: str | None = None, chain: dict[str, Any] | None = None,
+             chained: bool = False) -> EffectOutcome:
         """Open (or find) the decision that guards ``effect_id``: the run suspends BEFORE the effect.
 
         The hold IS the pending decision: it carries the sealed ``pending`` record a person is asked
         about and, for a link of a chain (``chained``), the ``chain`` continuation that resumes the
-        walk after the decision. Both are written in the same appended line as the hold, so there is
-        no second store whose copy of the decision could disagree with this one.
+        walk after the decision, in the same row, written in the same transaction.
 
         Returns HELD with the hold id (``new_hold`` True iff this call opened it; proposing the same
         effect again finds the open one), APPROVED if that hold was already approved (the decision was
@@ -450,157 +397,173 @@ class RunJournal:
         effect. A different ``digest`` from the one the open or approved hold carries means the bytes
         changed under the decision: the run is cancelled."""
         hold_id = hold_id_for(run_id, effect_id)
-        with self._locked():
-            st = self._state()
-            barrier = self._barrier(st, run_id, effect_id, current_generation, digest)
+        with self._write() as conn:
+            barrier = self._barrier(conn, run_id, effect_id, digest)
             if barrier is not None:
                 return barrier
-            h = st.holds.get(hold_id)
-            if h is not None:
+            row = self._hold_row(conn, hold_id)
+            if row is not None:
+                h = self._hold_dict(row)
                 if h["digest"] != digest:
-                    self._append({"t": "cancel", "run_id": run_id, "reason": "digest_changed"})
+                    conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)",
+                                 (run_id, "digest_changed"))
                     return EffectOutcome(EffectStatus.CANCELLED)
                 if h["decided"] is None:
                     return EffectOutcome(EffectStatus.HELD, hold_id=hold_id)
                 if h["decided"]:
                     return EffectOutcome(EffectStatus.APPROVED, hold_id=hold_id, decided_by=h["by"])
                 return EffectOutcome(EffectStatus.CANCELLED)   # rejected (the run is cancelled too)
-            self._append({"t": "hold", "hold_id": hold_id, "binding_id": st.runs[run_id]["binding_id"],
-                          "run_id": run_id, "effect_id": effect_id, "digest": digest, "at": at,
-                          "pending": pending, "chain": chain, "chained": bool(chained)})
+            binding_id = conn.execute("SELECT binding_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()[0]
+            pending_id = pending.get("pending_id") if isinstance(pending, dict) else None
+            conn.execute(
+                "INSERT INTO holds (hold_id, run_id, effect_id, binding_id, digest, at, pending, pending_id, "
+                "chain, chained, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "(SELECT COALESCE(MAX(seq), 0) + 1 FROM holds))",
+                (hold_id, run_id, effect_id, binding_id, digest, at,
+                 json.dumps(pending, sort_keys=True) if pending else None,
+                 pending_id if isinstance(pending_id, str) else None,
+                 json.dumps(chain, sort_keys=True) if chain is not None else None, 1 if chained else 0))
             return EffectOutcome(EffectStatus.HELD, hold_id=hold_id, new_hold=True)
 
     def effect(self, run_id: str, effect_id: str, *, digest: str,
-               fn: Callable[[], Any], needs_decision: bool = False,
-               current_generation: int | None = None) -> EffectOutcome:
+               fn: Callable[[], Any], needs_decision: bool = False) -> EffectOutcome:
         """Run one effect at most once.
 
         ``digest`` identifies exactly what the effect will do (the bytes a person approves). It is
         recorded with the intent and with any hold, and a decision must echo it.
         ``needs_decision`` is the gate's verdict for this effect: True means the effect runs only
         under an APPROVED hold of its own (one is opened if there is none). An effect with no
-        approved hold of its own is HELD while any hold on its binding is open.
-        ``current_generation``: the binding's generation from its fencing authority (see ``_barrier``)."""
+        approved hold of its own is HELD while any hold on its binding is open."""
         hold_id = hold_id_for(run_id, effect_id)
-        with self._locked():
-            st = self._state()
-            barrier = self._barrier(st, run_id, effect_id, current_generation, digest)
-            if barrier is not None:
-                return barrier
-            binding_id = st.runs[run_id]["binding_id"]
-            own = st.holds.get(hold_id)
-            approved = own is not None and own["decided"] is True
-            if own is not None and own["decided"] is None:
-                return EffectOutcome(EffectStatus.HELD, hold_id=hold_id)
-            if own is not None and own["decided"] is False:
-                return EffectOutcome(EffectStatus.CANCELLED)
-            if needs_decision and not approved:
-                self._append({"t": "hold", "hold_id": hold_id, "binding_id": binding_id,
-                              "run_id": run_id, "effect_id": effect_id, "digest": digest})
-                return EffectOutcome(EffectStatus.HELD, hold_id=hold_id)
-            if not approved:
-                # hold-until-decided: an open hold anywhere on the binding stops an undecided effect,
-                # whether the hold belongs to this run or a sibling.
-                for h in st.holds.values():
-                    if h["binding_id"] == binding_id and h["decided"] is None:
-                        return EffectOutcome(EffectStatus.HELD, hold_id=h["hold_id"])
-            if approved and own is not None and own["digest"] != digest:
-                # Approved bytes and the bytes about to run differ: what was approved is not this.
-                self._append({"t": "cancel", "run_id": run_id, "reason": "digest_changed"})
-                return EffectOutcome(EffectStatus.CANCELLED)
-            lease = self._take_lease(run_id, effect_id)   # before the intent: see "leases" above
-            try:
-                self._append({"t": "intent", "run_id": run_id, "effect_id": effect_id,
-                              "digest": digest, "pid": os.getpid()})
-            except BaseException:
-                self._drop_lease(run_id, effect_id, lease)
-                raise
+        taken: list[int] = []   # the lease, once taken: released here if the admission does not commit
+        try:
+            with self._write() as conn:
+                admitted = self._admit_in(conn, run_id, effect_id, hold_id, digest, needs_decision, taken)
+        except BaseException:
+            for fd in taken:
+                self._drop_lease(run_id, effect_id, fd)
+            raise
+        if isinstance(admitted, EffectOutcome):
+            return admitted
+        return self._run_effect(run_id, effect_id, fn, admitted)
+
+    def _admit_in(self, conn: sqlite3.Connection, run_id: str, effect_id: str, hold_id: str, digest: str,
+                  needs_decision: bool, taken: list[int]) -> EffectOutcome | int:
+        """The admission of an effect, in the caller's transaction: the barrier, the hold rules, and
+        the intent (the lease is taken just before it and appended to ``taken``). Returns the outcome
+        that stops the effect, or the lease fd."""
+        barrier = self._barrier(conn, run_id, effect_id, digest)
+        if barrier is not None:
+            return barrier
+        binding_id = conn.execute("SELECT binding_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()[0]
+        row = self._hold_row(conn, hold_id)
+        own = self._hold_dict(row) if row is not None else None
+        approved = own is not None and own["decided"] is True
+        if own is not None and own["decided"] is None:
+            return EffectOutcome(EffectStatus.HELD, hold_id=hold_id)
+        if own is not None and own["decided"] is False:
+            return EffectOutcome(EffectStatus.CANCELLED)
+        if needs_decision and not approved:
+            conn.execute("INSERT INTO holds (hold_id, run_id, effect_id, binding_id, digest, seq) "
+                         "VALUES (?, ?, ?, ?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM holds))",
+                         (hold_id, run_id, effect_id, binding_id, digest))
+            return EffectOutcome(EffectStatus.HELD, hold_id=hold_id)
+        if not approved:
+            # hold-until-decided: an open hold anywhere on the binding stops an undecided effect,
+            # whether the hold belongs to this run or a sibling.
+            other = conn.execute("SELECT hold_id FROM holds WHERE binding_id = ? AND decided IS NULL "
+                                 "ORDER BY seq LIMIT 1", (binding_id,)).fetchone()
+            if other is not None:
+                return EffectOutcome(EffectStatus.HELD, hold_id=other[0])
+        if approved and own is not None and own["digest"] != digest:
+            # Approved bytes and the bytes about to run differ: what was approved is not this.
+            conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)",
+                         (run_id, "digest_changed"))
+            return EffectOutcome(EffectStatus.CANCELLED)
+        lease = self._take_lease(run_id, effect_id)   # before the intent commits: see "leases"
+        taken.append(lease)
+        conn.execute("INSERT INTO effects (run_id, effect_id, digest, pid, state) "
+                     "VALUES (?, ?, ?, ?, 'intent')", (run_id, effect_id, digest, os.getpid()))
+        return lease
+
+    def _run_effect(self, run_id: str, effect_id: str, fn: Callable[[], Any], lease: int) -> EffectOutcome:
+        """Run ``fn`` outside any transaction (the lease marks it in flight), then commit its result,
+        or ``unknown`` if it raised. The lease is released last."""
         try:
             try:
                 result = fn()
-                json.dumps(result)
+                encoded = json.dumps(result)
             except BaseException:
-                with self._locked():
-                    self._append({"t": "unknown", "run_id": run_id, "effect_id": effect_id})
+                with self._write() as conn:
+                    conn.execute("UPDATE effects SET state = 'unknown' WHERE run_id = ? AND effect_id = ?",
+                                 (run_id, effect_id))
                 raise
-            with self._locked():
-                self._append({"t": "result", "run_id": run_id, "effect_id": effect_id, "result": result})
+            with self._write() as conn:
+                conn.execute("UPDATE effects SET state = 'done', result = ? WHERE run_id = ? AND effect_id = ?",
+                             (encoded, run_id, effect_id))
         finally:
             self._drop_lease(run_id, effect_id, lease)
         return EffectOutcome(EffectStatus.DONE, result)
 
     def note_receipt(self, run_id: str, effect_id: str, receipt_id: str) -> None:
         """Record that the receipt for this effect was persisted, so a replay does not write another."""
-        with self._locked():
-            self._append({"t": "receipt", "run_id": run_id, "effect_id": effect_id,
-                          "receipt_id": receipt_id})
+        with self._write() as conn:
+            conn.execute("UPDATE effects SET receipt_id = ? WHERE run_id = ? AND effect_id = ?",
+                         (receipt_id, run_id, effect_id))
 
     # --- decisions -------------------------------------------------------------------------
     def decide(self, hold_id: str, *, approve: bool, digest: str, by: str | None = None) -> HoldResult:
         """Resolve a hold. ``digest`` must equal the one recorded with the hold (the decision is
-        bound to what was shown). A hold decides once: this write-once record IS the claim, so of any
-        number of resolvers exactly one decision counts. A rejection cancels the hold's run, in the
-        same record. ``by`` names the decider."""
-        with self._locked():
-            st = self._state()
-            h = st.holds.get(hold_id)
-            if h is None:
+        bound to what was shown). A hold decides once: this write-once update IS the claim, so of any
+        number of resolvers exactly one decision counts. A rejection cancels the hold's run in the same
+        transaction. ``by`` names the decider."""
+        with self._write() as conn:
+            row = self._hold_row(conn, hold_id)
+            if row is None:
                 return HoldResult(False, "unknown_hold")
+            h = self._hold_dict(row)
             if h["decided"] is not None:
                 return HoldResult(False, "already_decided")
             if h["digest"] != digest:
                 return HoldResult(False, "digest_mismatch")
-            self._append({"t": "decide", "hold_id": hold_id, "approve": bool(approve), "by": by})
+            conn.execute("UPDATE holds SET decided = ?, decided_by = ? WHERE hold_id = ? AND decided IS NULL",
+                         (1 if approve else 0, by, hold_id))
+            if not approve:
+                conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)",
+                             (h["run_id"], "rejected"))
             return HoldResult(True, "approved" if approve else "rejected")
 
-    def max_run_generation(self, binding_id: str) -> int | None:
-        """The highest generation any run of ``binding_id`` was admitted at, or ``None`` (no runs)."""
-        with self._locked():
-            gens = [r["generation"] for r in self._state().runs.values() if r["binding_id"] == binding_id]
-        return max(gens) if gens else None
-
-    _HOLD_FIELDS = ("hold_id", "binding_id", "run_id", "effect_id", "digest", "at", "pending", "chain",
-                    "chained", "decided", "by")
+    def _holds(self, where: str, args: tuple = ()) -> list[dict[str, Any]]:
+        with self._read() as conn:
+            rows = conn.execute("SELECT hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, "
+                                f"chained, decided, decided_by FROM holds {where} ORDER BY seq", args).fetchall()
+        return [self._hold_dict(r) for r in rows]
 
     def open_holds(self) -> list[dict[str, Any]]:
         """Every undecided hold, with its pending record and chain continuation: the OPEN DECISIONS.
         This is the only list of pending decisions for journaled runs; each one is also stopping its
         binding's undecided effects until someone decides it."""
-        with self._locked():
-            st = self._state()
-        return [{k: h.get(k) for k in self._HOLD_FIELDS} for h in st.holds.values() if h["decided"] is None]
+        return self._holds("WHERE decided IS NULL")
 
     def approved_unrun(self) -> list[dict[str, Any]]:
-        """Every APPROVED hold whose effect has not started (no intent, result or unknown outcome): a
-        decision that stands and will run on the next delivery or resolve of its run."""
-        with self._locked():
-            st = self._state()
-            return [{k: h.get(k) for k in self._HOLD_FIELDS} for h in st.holds.values()
-                    if h["decided"] is True and (h["run_id"], h["effect_id"]) not in st.intents
-                    and (h["run_id"], h["effect_id"]) not in st.results
-                    and (h["run_id"], h["effect_id"]) not in st.unknown]
+        """Every APPROVED hold whose effect has not started: a decision that stands and will run on
+        the next delivery or resolve of its run."""
+        return self._holds("WHERE decided = 1 AND NOT EXISTS (SELECT 1 FROM effects e WHERE "
+                           "e.run_id = holds.run_id AND e.effect_id = holds.effect_id)")
 
     def get_hold(self, hold_id: str) -> dict[str, Any] | None:
         """The hold record (open or decided), or ``None``."""
-        with self._locked():
-            h = self._state().holds.get(hold_id)
-            return {k: h.get(k) for k in self._HOLD_FIELDS} if h is not None else None
+        found = self._holds("WHERE hold_id = ?", (hold_id,))
+        return found[0] if found else None
 
     def find_pending(self, pending_id: str) -> dict[str, Any] | None:
         """The hold whose pending record has ``pending_id`` (open or decided), or ``None``."""
-        with self._locked():
-            st = self._state()
-            hold_id = st.by_pending.get(pending_id)
-            h = st.holds.get(hold_id) if hold_id is not None else None
-            return {k: h.get(k) for k in self._HOLD_FIELDS} if h is not None else None
+        found = self._holds("WHERE pending_id = ?", (pending_id,))
+        return found[0] if found else None
 
     def poisoned(self) -> list[tuple[str, str]]:
         """Every effect whose outcome is unknown and whose owner is gone: the list a human must look
         at. (An intent whose owner still holds its lease is in flight, not poisoned.)"""
-        with self._locked():
-            st = self._state()
-            out = set(st.unknown - set(st.results))
-            for key in st.intents:
-                if key not in st.results and key not in st.unknown and not self._lease_held(*key):
-                    out.add(key)
-        return sorted(out)
+        with self._read() as conn:
+            rows = conn.execute("SELECT run_id, effect_id, state FROM effects WHERE state != 'done'").fetchall()
+        return sorted((r, e) for r, e, state in rows if state == "unknown" or not self._lease_held(r, e))
