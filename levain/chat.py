@@ -97,6 +97,7 @@ a failed start also runs one cyclic collection.
 """
 from __future__ import annotations
 
+import functools
 import gc
 import logging
 import math
@@ -172,6 +173,9 @@ stalls holds the session past the deadline until the SDK's own HTTP timeout and 
 a stalled call short needs the SDK's async run, which this host does not use."""
 
 _WATCHER_JOIN_SECONDS = 10.0
+_REAP_POLL_SECONDS = 60.0
+"""How often a reaper waiting on a handed-off release logs that it is still waiting."""
+
 """How long a worker waits for its deadline watcher to exit after the job returns. The watcher's
 stop request blocks only while a step runs, and none is running by then, so this is a backstop."""
 
@@ -208,6 +212,12 @@ def chat_refusal(entity_dir: Path) -> str | None:
             "host it; use `levain run` for this entity."
         )
     return None
+
+
+def _names_bytes(digest: Any) -> bool:
+    """A digest an approval can bind to: non-blank text. A blank one names nothing, so two blanks would
+    "match" across two different holds (codex L3)."""
+    return isinstance(digest, str) and bool(digest.strip())
 
 
 def _cap_line(line: Any) -> str:
@@ -508,11 +518,7 @@ class ChatHost:
                     rec.state = "closed"
                 return self._session_view(rec)
             rec.state = "closing"
-        try:
-            driver.close()
-        finally:
-            with self._lock:
-                rec.state = "closed"
+        self._close_then(rec, driver, lambda: self._settle(rec, "closed"), quiet=False)
         with self._lock:
             return self._session_view(rec)
 
@@ -529,15 +535,54 @@ class ChatHost:
                     rec.driver = None
                     rec.state = "closing"
         for rec, s in to_close:
-            try:
-                s.close()
-            except Exception as exc:  # noqa: BLE001 — one failed teardown must not strand the rest
-                _log.error("chat session %s: close failed at shutdown: %s", rec.session_id, exc)
-            finally:
-                with self._lock:
-                    rec.state = "closed"
+            self._close_then(rec, s, functools.partial(self._settle, rec, "closed"))
 
     # -- internals -----------------------------------------------------------
+
+    def _settle(self, rec: _Session, state: SessionState) -> None:
+        with self._lock:
+            rec.state = state
+
+    def _close_then(self, rec: _Session, driver: HarnessDriver, settle: Callable[[], None], *,
+                    quiet: bool = True) -> None:
+        """Close ``driver``, then run ``settle`` (it takes the lock itself) once the driver reports
+        everything released (:meth:`~levain.chat_driver.HarnessDriver.wait_closed`). The caller leaves the
+        record in a counted state until then, so a release still in flight (a turn that ignored the stop, a
+        native close that has not returned) keeps its slot. ``close()`` is bounded by the driver; what it
+        hands off is waited for on a reaper thread, never on the caller's. A close that raises never skips
+        ``settle`` once the driver reads released; the error is then logged (``quiet``, a worker or
+        shutdown, where nobody is waiting for it) or raised to the caller."""
+        try:
+            driver.close()
+        except Exception as exc:  # noqa: BLE001 — a teardown failure never skips the settle below
+            _log.error("chat session %s: close failed: %s", rec.session_id, exc)
+            if not quiet:
+                raise
+        finally:
+            if self._released(driver, 0):
+                settle()
+            else:
+                reaper = threading.Thread(target=self._reap, args=(rec, driver, settle), daemon=True,
+                                          name="levain-chat-reaper")
+                try:
+                    reaper.start()
+                except RuntimeError:
+                    # still counted: an unreleased session keeps its slot rather than freeing it early
+                    _log.error("chat session %s: no reaper thread; it stays counted", rec.session_id)
+
+    def _released(self, driver: HarnessDriver, timeout: float | None) -> bool:
+        try:
+            return bool(driver.wait_closed(timeout))
+        except Exception as exc:  # noqa: BLE001 — unknown reads as not released: the slot stays counted
+            _log.error("chat: a driver could not say whether it is released: %s", exc)
+            return False
+
+    def _reap(self, rec: _Session, driver: HarnessDriver, settle: Callable[[], None]) -> None:
+        """Wait for a handed-off release, then settle the record. Never gives up: a session whose shell
+        is never released stays counted, which is the true state of the machine."""
+        while not self._released(driver, _REAP_POLL_SECONDS):
+            _log.warning("chat session %s: still releasing its shell", rec.session_id)
+        settle()
 
     def _refuse_if_shut(self) -> None:
         if self._shut:
@@ -593,11 +638,7 @@ class ChatHost:
                     # state first let an open exceed the cap during the teardown).
                     rec.state = "closing" if to_close is not None else ended
             if to_close is not None:
-                try:
-                    to_close.close()
-                finally:
-                    with self._lock:
-                        rec.state = ended
+                self._close_then(rec, to_close, lambda: self._settle(rec, ended))
 
     def _start(
         self,
@@ -650,7 +691,7 @@ class ChatHost:
                 # the screen's set must equal the digest of what the next run() would execute, read now. The
                 # session is gated (no job drives it), so nothing can change between this read and the run.
                 live = rec.driver.held_digest() if rec.driver is not None else None
-                if rec.held_digest is None or live is None or live != rec.held_digest:
+                if not _names_bytes(rec.held_digest) or not _names_bytes(live) or live != rec.held_digest:
                     # Spent, never re-armed: no screen holds a set that matches, so this halt is reject-only.
                     rec.decision_id = None
                     raise ChatError(
@@ -707,9 +748,10 @@ class ChatHost:
             job.deadline_hit = True
         _log.warning("chat %s job %s passed its %ss deadline; stopping it",
                      job.kind, job.job_id, self._turn_seconds)
+        if driver is None:
+            return      # nothing to stop: _start drives only a session that holds a driver
         while True:
             try:
-                assert driver is not None
                 driver.interrupt()
             except Exception as exc:  # noqa: BLE001 — keep asking; a dead watcher is no bound
                 _log.error("chat job %s: stop request failed: %s", job.job_id, exc)
@@ -730,12 +772,15 @@ class ChatHost:
             driver.open(self._route_events(rec))
         except BaseException as exc:  # noqa: BLE001 — a failed start is a RESULT; keep its TEXT only
             error = str(exc) or type(exc).__name__
-            if driver is not None:
-                try:
-                    driver.close()   # a failed open releases what it built (idempotent)
-                except Exception as close_exc:  # noqa: BLE001
-                    _log.error("chat open of %s: close after a failed open: %s", rec.entity, close_exc)
-        # `exc` is unbound here (Python deletes it at the end of the except clause), so nothing in
+        if error is not None and driver is not None:
+            # A failed open releases what it built; the record reads opening (counted) until it has.
+            failed = error
+            self._close_then(rec, driver, lambda: self._settle_open(rec, job, failed, None))
+            return
+        self._settle_open(rec, job, error, driver)
+
+    def _settle_open(self, rec: _Session, job: _Job, error: str | None, driver: HarnessDriver | None) -> None:
+        # `exc` is unbound by now (Python deletes it at the end of the except clause), so nothing in
         # this frame still references the traceback of the failed start. The SDK keeps that failure
         # in a reference cycle (module docstring), so collect it now, BEFORE the failure is published:
         # a client that sees "failed" must not still have the failed hands alive behind it.
@@ -762,10 +807,13 @@ class ChatHost:
             # until the shell is released below.
         if error is None and not accepted:
             assert driver is not None
-            driver.close()
-            with self._lock:
-                rec.state, rec.job_id = "closed", None
-                job.status, job.error = "failed", "the server shut down while the session opened"
+
+            def _shut_out() -> None:
+                with self._lock:
+                    rec.state, rec.job_id = "closed", None
+                    job.status, job.error = "failed", "the server shut down while the session opened"
+
+            self._close_then(rec, driver, _shut_out)
 
     def _route_events(self, rec: _Session) -> Callable[[DriverEvent], None]:
         """The driver's event sink. Bound once at open, it forwards each tool-activity line
@@ -821,50 +869,55 @@ class ChatHost:
             if watcher.is_alive() and error is None:
                 payload, error = None, "the turn's deadline watcher did not exit"
         broken = payload is None or payload["error"] is not None
+        dead: HarnessDriver | None = None
         if broken and rec.driver is not None:
             # Release the shell BEFORE the session reads broken (and stops counting toward the cap),
-            # so the cap can never be exceeded by a teardown still in progress (codex L3 r1).
+            # so the cap can never be exceeded by a teardown still in progress (codex L3 r1): the
+            # record reads busy, its job running, until the driver reports released.
             dead, rec.driver = rec.driver, None
-            dead.close()
-        to_close: Any = None
-        with self._lock:
-            if payload is None:
-                rec.state, rec.error = "broken", error
-                job.status, job.error = "failed", error
-            else:
-                job.status, job.result = "done", payload
-                # The result's tool_activity leaves out held and stop-skipped actions; it replaces
-                # what was streamed on every finish (module docstring).
-                job.activity, job.dropped = list(payload["tool_activity"]), cut
-                rec.decision_id, rec.pending, rec.held_digest = None, [], None
-                if payload["gated"] and payload["error"] is None:
-                    rec.state = "gated"
-                    rec.decision_id = secrets.token_hex(16)
-                    rec.pending = [dict(p) for p in payload["pending"]]
-                    rec.held_digest = digest if isinstance(digest, str) else None
-                    payload["decision_id"] = rec.decision_id
-                elif payload["error"] is not None:
-                    # A turn that raised or could not read its own gate leaves the conversation in a
-                    # state a later turn would resume FROM (EXIT_TURN_FAILED's contract), and a
-                    # refusal that did not take is still holding actions. Either way the session
-                    # takes no further turn, and its shell is released now.
-                    rec.state, rec.error = "broken", payload["error"]
+
+        def _publish() -> None:
+            to_close: HarnessDriver | None = None
+            final: SessionState = "closed"
+            with self._lock:
+                if payload is None:
+                    rec.state, rec.error = "broken", error
+                    job.status, job.error = "failed", error
                 else:
-                    rec.state = "idle"
-            if rec.state == "broken" or self._shut:
-                to_close, rec.driver = rec.driver, None
-                if self._shut and to_close is not None:
-                    rec.state = "closing"     # counted until the shell is released, below
-                elif self._shut:
-                    rec.state = "closed"
-            rec.job_id = None
-        if to_close is not None:
-            try:
-                to_close.close()
-            finally:
-                if self._shut:
-                    with self._lock:
+                    job.status, job.result = "done", payload
+                    # The result's tool_activity leaves out held and stop-skipped actions; it replaces
+                    # what was streamed on every finish (module docstring).
+                    job.activity, job.dropped = list(payload["tool_activity"]), cut
+                    rec.decision_id, rec.pending, rec.held_digest = None, [], None
+                    if payload["gated"] and payload["error"] is None:
+                        rec.state = "gated"
+                        rec.decision_id = secrets.token_hex(16)
+                        rec.pending = [dict(p) for p in payload["pending"]]
+                        rec.held_digest = digest if isinstance(digest, str) else None
+                        payload["decision_id"] = rec.decision_id
+                    elif payload["error"] is not None:
+                        # A turn that raised or could not read its own gate leaves the conversation in a
+                        # state a later turn would resume FROM (EXIT_TURN_FAILED's contract), and a
+                        # refusal that did not take is still holding actions. Either way the session
+                        # takes no further turn, and its shell is released now.
+                        rec.state, rec.error = "broken", payload["error"]
+                    else:
+                        rec.state = "idle"
+                if rec.state == "broken" or self._shut:
+                    to_close, rec.driver = rec.driver, None
+                    final = "closed" if self._shut else rec.state
+                    if self._shut and to_close is not None:
+                        rec.state = "closing"     # counted until the shell is released, below
+                    elif self._shut:
                         rec.state = "closed"
+                rec.job_id = None
+            if to_close is not None:
+                self._close_then(rec, to_close, lambda: self._settle(rec, final))
+
+        if dead is not None:
+            self._close_then(rec, dead, _publish)
+        else:
+            _publish()
 
     @staticmethod
     def _session_view(rec: _Session) -> dict[str, Any]:

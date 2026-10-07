@@ -110,6 +110,9 @@ class _Fake(HarnessDriver):
     def interrupt(self):
         self.stops += 1
 
+    def wait_closed(self, timeout):
+        return self.closed
+
 
 def _wait(host, job_id, timeout=5.0):
     end = time.monotonic() + timeout
@@ -179,7 +182,7 @@ def test_the_deadline_watcher_interrupts_through_the_driver(tmp_path):
             deadline = time.monotonic() + 5
             while self.stops == 0 and time.monotonic() < deadline:
                 time.sleep(0.01)
-            return read_outcome(_Out(reply=None, timed_out=True))
+            return read_outcome(_Out(reply=None, timed_out=True, error="stopped at its bound"))
 
     d = Slow([])
     host = _host(tmp_path, {"alpha": d}, turn_seconds=0.05)
@@ -989,3 +992,108 @@ def test_a_raise_anywhere_in_open_leaves_the_driver_closed_and_nothing_leaked(tm
         pytest.skip("line not executed on this path")
     assert _closes_promptly(d) and d.state == "closed"
     assert all(b.closes == 1 for b in built)
+
+
+# -- L3 r1 (input 6c3d158e56b2f130) --------------------------------------------------------------------------
+
+
+def test_a_blank_digest_cannot_bind_an_approval(tmp_path):
+    """codex HIGH: a driver reporting held_digest "" for hold A and "" again from held_digest() after the hold
+    became B passed the binding check, so the approve ran B unseen. A blank digest names nothing: refused."""
+    class Blank(_Fake):
+        def held_digest(self):
+            return ""
+
+    d = Blank([_Out(reply=None, gated=True, pending=(_HELD,), held_digest=""), _Out(reply="ran B")])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    st = _wait(host, host.turn(sid, "go")["job_id"])
+    assert st["status"] == "failed" and "blank" in st["error"]
+    assert not [c for c in d.calls if c[0] == "approve"] and host.session_status(sid)["state"] == "broken"
+
+
+def test_a_timed_out_outcome_without_an_error_breaks_the_session(tmp_path):
+    """codex MED: timed_out=True with error=None was recorded as an ordinary turn and the session went back to
+    idle, though a stopped turn did not complete and the module says it breaks the session."""
+    d = _Fake([_Out(reply=None, timed_out=True)])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    st = _wait(host, host.turn(sid, "go")["job_id"])
+    assert st["status"] == "failed" and "timed out but carries no error" in st["error"]
+    assert host.session_status(sid)["state"] == "broken" and d.closed
+
+
+def test_a_whitespace_tool_name_is_no_tool_name():
+    """gemini LOW: "   " passed the tool-name check and showed an invisible tool on the consent row."""
+    with pytest.raises(DriverContractError, match="names no tool"):
+        read_outcome(_Out(reply=None, gated=True, held_digest="d",
+                          pending=(PendingEfferent("   ", "x", "r", full="{}"),)))
+
+
+def test_a_blocking_native_close_does_not_hold_close_and_the_slot_stays_counted(tmp_path):
+    """codex HIGH + complement LOW: close_wait bounded only the wait for a turn; a native close that blocks held
+    close() (and the host's caller) forever. And a release still in flight must keep its cap slot."""
+    gate = threading.Event()
+
+    class Sess:
+        def __init__(self, on_event=None):
+            self.closes = 0
+
+        def run_turn(self, m):
+            return _Out(reply="hi")
+
+        def request_stop(self):
+            pass
+
+        def close(self):
+            self.closes += 1
+            assert gate.wait(10)
+
+    s = Sess()
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: s, close_wait=0.3)
+    d.open(lambda e: None)
+    started = time.monotonic()
+    d.close()
+    assert time.monotonic() - started < 2 and not d.wait_closed(0)
+    gate.set()
+    assert d.wait_closed(5) and s.closes == 1 and d.state == "closed"
+
+    gate.clear()
+    made: list[Sess] = []
+
+    def opener(p, on_event):
+        made.append(Sess())
+        return made[-1]
+
+    host = ChatHost({"alpha": tmp_path / "a", "beta": tmp_path / "b"}, max_sessions=1,
+                    driver_factory=lambda n, p: OpenHandsDriver(p, opener, close_wait=0.3))
+    sid, _ = _open(host, "alpha")
+    started = time.monotonic()
+    assert host.close(sid)["state"] == "closing"          # returned at the bound, still releasing
+    assert time.monotonic() - started < 2
+    with pytest.raises(ChatError) as e:
+        host.open("beta")                                  # the slot is still counted
+    assert e.value.code == "too_many_sessions"
+    gate.set()
+    end = time.monotonic() + 5
+    while host.session_status(sid)["state"] != "closed" and time.monotonic() < end:
+        time.sleep(0.02)
+    assert host.session_status(sid)["state"] == "closed"
+    _open(host, "beta")                                    # and comes back once released
+    host.shutdown()
+
+
+def test_a_broken_turn_whose_teardown_raises_still_publishes_its_result(tmp_path):
+    """complement LOW: `dead.close()` raising skipped the publish, so the turn's own result (its error) was
+    replaced by the teardown's exception text."""
+    class Raising(_Fake):
+        def close(self):
+            self.closed = True
+            raise RuntimeError("teardown failed")
+
+    d = Raising([_Out(reply=None, error="boom")])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    st = _wait(host, host.turn(sid, "go")["job_id"])
+    assert st["status"] == "done" and st["result"]["error"] == "boom"
+    assert host.session_status(sid)["state"] == "broken"
