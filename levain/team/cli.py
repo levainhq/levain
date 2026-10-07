@@ -197,13 +197,19 @@ def cmd_status(args) -> int:
     if args.json:
         print(json.dumps({"project": team.project, "you": handle, "in_force": ledger.in_force,
                           "problems": ledger.problems, "canon": C.staleness(canon_text, state),
-                          "first_sight": first_sight}, ensure_ascii=False))
+                          "first_sight": first_sight, "devices": gl.devices()}, ensure_ascii=False))
         return 0
     print(f"{team.project}: owner {team.owner}, you are {handle or 'NOT a member'}, mode {team.mode}")
     if first_sight:
         print("rewrite protection: first sight trusted (this clone pinned what it first read); to verify, re-join "
               "with --pins-from <a teammate's .git/levain-team/pins.json>")
     print(C.staleness(canon_text, state))
+    devices = gl.devices()
+    if devices:
+        print("devices (attribution is by folder, authenticated by the git host's push permissions):")
+        for d in devices:
+            when = "first sight" if d["first_sight"] else f"first seen {I.age(d['first_seen'])}"
+            print(f"  {d['member']}: {d['device']} ({when}{', this clone' if d['own'] else ''})")
     pending = gl.unpushed()
     if pending:
         print(f"{pending} local ledger commit(s) not pushed yet (acknowledgements are committed without a push): "
@@ -220,11 +226,13 @@ def cmd_status(args) -> int:
 
 def cmd_repin(args) -> int:
     gl = GitLedger(_repo(args))
+    gl.require_joined()
     dropped = gl.repin(args.file)
     if not dropped:
         print("no pins to drop" + (f" for {args.file}" if args.file else ""))
         return 0
-    gl.save_state(first_sight=True)
+    if args.file is None:                    # all pins gone: the next read is a first sight again
+        gl.save_state(first_sight=True)
     print(f"dropped {len(dropped)} pin(s): " + ", ".join(dropped))
     print("Rewrite protection for those files restarts at the next read of the ledger: it trusts what it sees then. "
           "If a sync refused the remote, run `levain team sync` to judge it again.")
@@ -259,6 +267,9 @@ def cmd_consolidate(args) -> int:
                         "(This is the team's convention plus a git user.email check, not cryptography.)")
     if gl.remote and not args.no_push:
         gl.sync(push=False)
+        team, handle = _actor(gl)            # the team of the tip the sync brought, the one the ledger is read from
+        if handle != team.owner:
+            raise TeamError(f"only the canon owner ({team.owner}) consolidates; you are {handle}")
     ledger = gl.ledger(team)
     require_untampered(ledger)        # before rendering, --dry-run included: nothing is committed or pushed
     text = C.render(team, ledger, tree=gl.state_hash(ledger, team), by=handle, ts=E.now_iso())

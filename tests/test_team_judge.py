@@ -8,13 +8,14 @@ import fcntl
 import json
 import os
 import subprocess
+import time
 
 import pytest
 
 from levain.team import entry as E
 from levain.team.transport import GitLedger, LedgerReadError, Repo
 
-from tests.test_team_git import _own_file, _pins_file, _push_wt, clone, edit, git, hook, ledger, record_ruling, team, two  # noqa: F401
+from tests.test_team_git import _own_file, _pinned, _pins_file, _push_wt, clone, edit, git, hook, ledger, record_ruling, team, two  # noqa: F401
 
 
 def _gl(repo):
@@ -110,9 +111,9 @@ def test_after_repin_the_next_read_pins_again_and_is_not_served_from_the_cache(t
     _pins_file(ben).unlink(missing_ok=True)
     ledger(ben)
     assert team("repin", repo=ben) == 0
-    assert not _pins_file(ben).exists()
+    assert _pinned(ben) == {}
     ledger(ben)
-    assert _pins_file(ben).exists()
+    assert _pinned(ben)
 
 
 @pytest.mark.parametrize("text", ["[" * 200000, " " * (9 << 20) + "{}"], ids=["deep", "large"])
@@ -130,10 +131,10 @@ def test_an_old_format_pins_file_restarts_pinning_instead_of_refusing(two):
     assert record_ruling(ana, "src/a.py", "first") == 0
     assert team("sync", repo=ben) == 0
     ledger(ben)
-    rel = next(k for k in json.loads(_pins_file(ben).read_text()) if k.startswith("ana/"))
+    rel = next(k for k in _pinned(ben) if k.startswith("ana/"))
     _pins_file(ben).write_text(json.dumps({rel: ["an old pinned line"]}))
     assert not ledger(ben).tamper
-    assert set(json.loads(_pins_file(ben).read_text())[rel]) == {"sha256", "length"}
+    assert set(_pinned(ben)[rel]) == {"sha256", "length"}
 
 
 def test_doctor_reports_an_unjudgeable_ledger_as_a_fail_row(two, monkeypatch, capsys):
@@ -244,6 +245,7 @@ def test_a_rewrite_of_an_accepted_file_denies_with_the_file_and_the_recovery_unt
 
 
 def _plant_stray(gl):
+    (gl.wt / "ledger" / "ana").mkdir(parents=True, exist_ok=True)
     (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
     _push_wt(gl, "plant")
 
@@ -318,11 +320,11 @@ def test_only_this_clones_own_tip_is_ever_pinned(two):
     assert record_ruling(ana, "src/a.py", "first") == 0
     gb = _gl(ben)
     gb.ledger()
-    before = _pins_file(ben).read_bytes()
+    before = _pinned(ben)
     assert gb.fetch_only(interval=0, timeout=30) is None
     gb.ledger(rev=gb.remote_ref())                                           # a newer, non-local rev
     gb.judge_remote(gb.remote_ref())
-    assert _pins_file(ben).read_bytes() == before
+    assert _pinned(ben) == before
 
 
 @pytest.mark.parametrize("exc", ["RolesError", "TeamError", "LedgerReadError", "RuntimeError", "RecursionError"])
@@ -469,15 +471,13 @@ def test_read_plain_closes_its_descriptor_when_fdopen_fails(two, monkeypatch):
     assert len(os.listdir("/dev/fd")) - before <= 1
 
 
-def test_a_rewritten_top_level_file_gets_the_mode_git_checkout_would_give_it(two):
+def test_a_rewritten_top_level_file_gets_the_mode_git_checkout_would_give_it(two, monkeypatch):
     # E review (gemini LOW d), RUN: under umask 002 _replace_plain forced 0o644 where git's checkout gives 0o664.
     tmp, ana, ben = two
     ga = _gl(ana)
-    old = os.umask(0o002)
-    try:
-        ga._replace_plain("PROJECT.md", "x\n")
-    finally:
-        os.umask(old)
+    from levain.team import transport as T
+    monkeypatch.setattr(T, "_UMASK", 0o002)                  # read once at import, before any thread exists
+    ga._replace_plain("PROJECT.md", "x\n")
     assert os.stat(ga.wt / "PROJECT.md").st_mode & 0o777 == 0o664
 
 
@@ -614,3 +614,374 @@ def test_sync_on_a_refused_tip_sets_an_interrupted_write_aside_instead_of_commit
     assert git("rev-parse", "HEAD", cwd=gb.wt) == head
     kept = list((gb.base / "set-aside").iterdir())
     assert kept and b"interrupted" in kept[0].read_bytes()
+
+
+@pytest.mark.parametrize("plant", ["unreadable", "nested_repo"])
+def test_a_git_dir_planted_in_a_subdirectory_does_not_take_an_edit_out_of_the_ledger(two, plant):
+    # L3 r1 gemini HIGH (and its wider class), RUN: an unreadable src/.git made discovery fail and the hook fail open;
+    # a real nested repository at src/ made the edit belong to a repository with no ledger. The pack governs
+    # src/settlement.py, so the edit must be denied either way.
+    tmp, ana, ben = two
+    if plant == "unreadable":
+        (ben / "src" / ".git").write_text("gitdir: /nowhere\n")
+        os.chmod(ben / "src" / ".git", 0)
+    else:
+        git("init", "-q", cwd=ben / "src")
+    try:
+        out = edit(ben, "src/settlement.py", session="pl")["hookSpecificOutput"]
+    finally:
+        if plant == "unreadable":
+            os.chmod(ben / "src" / ".git", 0o644)
+    assert out["permissionDecision"] == "deny"
+
+
+def test_a_remote_tip_without_team_toml_is_refused(two):
+    # L3 r1 codex HIGH 1, RUN: a tip that deleted team.toml was accepted (team() fell back to an older version), and
+    # the clone then read as not joined.
+    tmp, ana, ben = two
+    ga = _gl(ana)
+    git("rm", "-q", "team.toml", cwd=ga.wt)
+    git("commit", "-qm", "no team", cwd=ga.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=ga.wt)
+    assert team("sync", repo=ben) == 2
+    assert any("team.toml is missing" in t for t in ledger(ben).tamper)
+
+
+def test_a_ledger_file_past_the_size_limit_is_denied_before_it_is_read(two, monkeypatch):
+    # L3 r1 codex HIGH 2: every blob was read into memory before any check; a huge one could OOM-kill the hook.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    (_gl(ben).base / "history.json").unlink(missing_ok=True)
+    monkeypatch.setattr(T, "_MAX_LEDGER_FILE", 100)
+    with pytest.raises(T.LedgerReadError, match="past levain's limits"):
+        _gl(ben).ledger()
+
+
+def test_a_hard_link_to_this_clones_file_never_receives_its_write(two):
+    # L3 r1 codex HIGH 3: the single-link check could be raced (a link made after fstat got the append). The append is
+    # copy-on-write now: the linked inode is never written, whenever the link was made.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "first") == 0
+    gb = _gl(ben)
+    own = gb.wt / "ledger" / "ben" / f"{gb.device}.jsonl"
+    victim = tmp / "victim.jsonl"
+    os.link(own, victim)
+    before = victim.read_bytes()
+    assert record_ruling(ben, "src/b.py", "second") == 0
+    assert victim.read_bytes() == before and own.read_bytes() != before
+
+
+def test_pins_that_could_not_be_read_back_are_never_written(two, monkeypatch):
+    # L3 r1 codex MED 4, RUN: enough ledger files made a pins.json over the read cap; it was written anyway and every
+    # later read refused it, with no way back.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    _pins_file(ben).unlink(missing_ok=True)
+    (_gl(ben).base / "history.json").unlink(missing_ok=True)
+    monkeypatch.setattr(T, "_PINS_MAX_BYTES", 50)
+    with pytest.raises(T.LedgerReadError, match="too many files"):
+        _gl(ben).ledger()
+    assert not _pins_file(ben).exists()
+
+
+def test_recovery_sets_an_interrupted_write_aside_while_the_remote_is_refused(two):
+    # L3 r1 codex MED 5, RUN: recovery judged only the local tip and committed onto a ledger refused by its quarantine.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "ben's first") == 0
+    assert team("sync", repo=ana) == 0
+    _plant_stray(_gl(ana))
+    assert team("sync", repo=ben) == 2                                       # the remote is quarantined, refused
+    gb = _gl(ben)
+    own = gb.wt / "ledger" / "ben" / f"{gb.device}.jsonl"
+    with open(own, "a") as fh:
+        fh.write('{"interrupted": true}\n')
+    head = git("rev-parse", "HEAD", cwd=gb.wt)
+    team("sync", repo=ben)
+    assert git("rev-parse", "HEAD", cwd=gb.wt) == head
+    assert any(b"interrupted" in p.read_bytes() for p in (gb.base / "set-aside").iterdir())
+
+
+def test_a_team_toml_that_is_not_utf8_never_becomes_a_configuration(two):
+    # L3 r1 codex MED 7, RUN: git output was decoded with replacement, so project = "p\xff" parsed as "p�".
+    tmp, ana, ben = two
+    ga = _gl(ana)
+    text = (ga.wt / "team.toml").read_bytes()
+    (ga.wt / "team.toml").write_bytes(text.replace(b'project = "ledgerline"', b'project = "ledger\xffline"'))
+    git("add", "--", "team.toml", cwd=ga.wt)
+    git("commit", "-qm", "not utf-8", cwd=ga.wt)
+    assert "�" not in ga.team().project
+
+
+def test_two_set_asides_of_one_file_in_one_second_are_both_kept(two):
+    # L3 r1 codex LOW 8: one-second names let the second set-aside overwrite the first.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "first") == 0
+    gb = _gl(ben)
+    rel = f"ledger/ben/{gb.device}.jsonl"
+    for n in range(2):
+        with open(gb.wt / rel, "a") as fh:
+            fh.write(f'{{"try": {n}}}\n')
+        gb._set_aside([rel])
+    assert len(list((gb.base / "set-aside").iterdir())) == 2
+
+
+def test_a_refusal_quarantined_before_the_remote_branch_was_deleted_heals_with_a_sync(two):
+    # L3 r1 complement MED 2, checked: the quarantine ref outlives a deleted remote branch, but `levain team sync`
+    # pushes this clone's accepted tip, the refresh judges it accepted, and the record clears.
+    tmp, ana, ben = two
+    _plant_stray(_gl(ana))
+    assert team("sync", repo=ben) == 2
+    git("push", "-q", "origin", ":levain-ledger", cwd=ana)
+    assert ledger(ben).tamper
+    assert team("sync", repo=ben) == 0
+    assert not ledger(ben).tamper
+
+
+def test_repin_outside_a_joined_clone_says_so(tmp_path, capsys):
+    # L3 r1 glm LOW: repin ran in an unjoined clone and printed "no pins to drop".
+    git("init", "-q", cwd=tmp_path)
+    assert team("repin", repo=tmp_path) == 2
+    assert "has not joined" in capsys.readouterr().err
+
+
+def test_the_size_limit_counts_a_blob_once_per_path_that_holds_it(two, monkeypatch):
+    # L3 r2 codex HIGH 2: the total counted unique blobs, so one blob at many paths passed the limit while every path
+    # was decoded and held separately.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    ga = _gl(ana)
+    f = _own_file(ga)
+    (f.parent / "0123456789abcdef.jsonl").write_bytes(f.read_bytes())          # the same blob at a second path
+    _push_wt(ga, "one blob, two paths")
+    size = len(f.read_bytes())
+    monkeypatch.setattr(T, "_MAX_LEDGER_TOTAL", int(size * 1.5))
+    with pytest.raises(T.LedgerReadError, match="past levain's limits"):
+        ga.judge(ga.head(), ga.team(), {})
+    monkeypatch.setattr(T, "_MAX_LEDGER_TOTAL", 512 << 20)
+    monkeypatch.setattr(T, "_MAX_LEDGER_LEAVES", 1)
+    with pytest.raises(T.LedgerReadError, match="files, past levain's limit"):
+        ga.judge(ga.head(), ga.team(), {})
+
+
+def test_a_join_whose_remote_team_toml_never_parses_changes_nothing(two, capsys):
+    # L3 r2 codex MED 5, RUN: the branch, accepted ref, state and worktree were created before the failure.
+    tmp, ana, ben = two
+    raw = tmp / "raw.git"
+    git("clone", "-q", "--bare", str(tmp / "origin.git"), str(raw), cwd=tmp)
+    # make every version unparseable: an orphan commit with only the broken team.toml
+    blob = subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=raw, input="not = [toml", text=True,
+                          capture_output=True, check=True).stdout.strip()
+    tree = subprocess.run(["git", "mktree"], cwd=raw, input=f"100644 blob {blob}\tteam.toml\n", text=True,
+                          capture_output=True, check=True).stdout.strip()
+    commit = git("commit-tree", tree, "-m", "orphan", cwd=raw).strip()
+    git("push", "-qf", str(tmp / "origin.git"), f"{commit}:refs/heads/levain-ledger", cwd=raw)
+    cat = clone(tmp, "cat", "ben@ex.com")
+    assert team("join", "--no-install", repo=cat) == 2
+    gc = _gl(cat)
+    assert not gc.joined() and not gc._local_branch_exists() and gc.remote_ref() is None
+
+
+def test_a_duplicate_id_under_a_non_member_folder_is_still_tamper(two):
+    # L3 r2 codex LOW 7: the cross-file duplicate check skipped folders of non-members.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    ga = _gl(ana)
+    f = _own_file(ga)
+    (ga.wt / "ledger" / "eve").mkdir()
+    (ga.wt / "ledger" / "eve" / "0123456789abcdef.jsonl").write_bytes(f.read_bytes())
+    _push_wt(ga, "a copy under a non-member")
+    assert any("both hold entry id" in t for t in ga.ledger().tamper)
+
+
+def test_a_remote_tip_is_judged_and_accepted_inside_the_pins_lock(two, monkeypatch):
+    # L3 r2 codex HIGH 3: a fetch judged with pins read before a concurrent read advanced them, then advanced the
+    # accepted tip anyway. One read-judge-write under pins.lock: while judging, the lock is held.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    gb = _gl(ben)
+    real = T.GitLedger.judge_remote
+    held = []
+
+    def probe(self, rev, rec=None):
+        try:
+            with self.lock(name="pins.lock", timeout=0):
+                held.append(False)
+        except T.TeamBusy:
+            held.append(True)
+        return real(self, rev, rec)
+    monkeypatch.setattr(T.GitLedger, "judge_remote", probe)
+    assert gb.fetch_only(interval=0, timeout=30) is None
+    assert held and all(held)
+
+
+def test_repin_then_a_read_then_a_sync_adopts_the_quarantined_rewrite(two):
+    # L3 r2 codex MED 4, RUN: a read between repin and sync re-pinned the old tip, so the sync refused the same rewrite
+    # again. While a quarantined tip waits, reads pin nothing.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    ga = _gl(ana)
+    git("reset", "-q", "--hard", "HEAD~1", cwd=ga.wt)
+    git("push", "-qf", "origin", "HEAD:levain-ledger", cwd=ga.wt)
+    assert team("sync", repo=ben) == 2
+    assert team("repin", repo=ben) == 0
+    ledger(ben)                                                              # e.g. a hook or `status` in between
+    assert team("sync", repo=ben) in (0, 2)
+    assert not _gl(ben).incoming_refusal()                                   # the rewrite is no longer refused
+
+
+def test_nothing_reads_the_accepted_anchor_ref_to_decide():
+    # Head ruling (C): refs/levain/accepted is a gc anchor written from pins.json; trust comes only from the record.
+    import inspect
+    from levain.team import transport as T
+    src = inspect.getsource(T)
+    assert "_ref_sha(_ACCEPTED)" not in src and src.count("_ACCEPTED") == 2   # the definition and the one write
+
+
+def test_a_clone_without_an_accepted_tip_refuses_the_remote_until_it_re_joins(two, capsys):
+    # Head ruling: a MISSING accepted tip is never a silent empty floor. A clone from before levain kept one (its
+    # pins.json in the v1 shape) is told to re-join, and the re-join records it from the shared history.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    _pins_file(ben).write_text(json.dumps(_pinned(ben)))                     # the v1 shape: no accepted tip
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    capsys.readouterr()
+    assert team("sync", repo=ben) == 2
+    assert "levain team join" in capsys.readouterr().err
+    assert team("join", "--no-install", repo=ben) == 0
+    assert team("sync", repo=ben) == 0
+
+
+_STAGES = [("transport.Repo", "discover"), ("transport.GitLedger", "joined"), ("transport.GitLedger", "fetch_if_due"),
+           ("transport.GitLedger", "team"), ("transport.GitLedger", "snapshot"), ("transport.GitLedger", "handle"),
+           ("transport.GitLedger", "session_denied"), ("hook", "decide"), ("hook", "_edit_verdict")]
+
+
+@pytest.mark.parametrize("where", [f"{m}.{n}" for m, n in _STAGES])
+def test_any_failure_at_any_stage_of_judging_an_edit_is_a_deny(two, monkeypatch, capsys, where):
+    # Head ruling (A) after L3 r2 codex HIGH 1 / complement MED 1: ONE boundary for the whole edit hook.
+    import importlib
+    from levain.team import hook as H
+    tmp, ana, ben = two
+    mod, name = where.rsplit(".", 1)
+    path = mod.split(".")
+    obj = importlib.import_module("levain.team." + path[0])
+    for part in path[1:]:
+        obj = getattr(obj, part)
+
+    def boom(*a, **k):
+        raise RecursionError("injected at " + where)
+    monkeypatch.setattr(obj, name, boom)
+    H.pretooluse({"session_id": "s", "transcript_path": "/x", "cwd": str(ben), "hook_event_name": "PreToolUse",
+                  "tool_name": "Edit", "tool_input": {"file_path": str(ben / "src" / "settlement.py")},
+                  "tool_use_id": "t"})
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny", where
+
+
+def test_a_team_toml_nested_past_the_parser_denies(two):
+    # L3 r2 codex HIGH 1, RUN: a deeply nested team.toml raised RecursionError from _interval, outside the old
+    # per-call boundary, and the hook failed open.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    (gb.wt / "team.toml").write_text("x = " + "[" * 100000 + "]" * 100000 + "\n")
+    git("add", "--", "team.toml", cwd=gb.wt)
+    git("commit", "-qm", "deep", cwd=gb.wt)
+    assert edit(ben, "src/settlement.py", session="deep")["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_an_edit_through_a_symlinked_path_still_finds_its_clone(two):
+    # L3 r2 complement MED 1: the ledger-roots walk used the unresolved path, so an edit through a symlink outside the
+    # clone found no ledger and, with discovery failing (an unreadable .git planted beside it), failed open.
+    tmp, ana, ben = two
+    link = tmp / "elsewhere"
+    link.symlink_to(ben / "src")
+    (ben / "src" / ".git").write_text("gitdir: /nowhere\n")
+    os.chmod(ben / "src" / ".git", 0)
+    try:
+        out = hook("pretooluse", {"session_id": "sy", "transcript_path": "/x", "cwd": str(tmp),
+                                  "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                                  "tool_input": {"file_path": str(link / "settlement.py")}, "tool_use_id": "t"})
+    finally:
+        os.chmod(ben / "src" / ".git", 0o644)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_the_repositorys_own_attributes_never_reach_a_ledger_write(two):
+    # L2 r1 #7 (RUN): `*.jsonl working-tree-encoding=UTF-16` in .git/info/attributes broke every record ("BOM is
+    # required") and left the write dirty for good. Ledger bytes are staged with hash-object --no-filters.
+    tmp, ana, ben = two
+    info = ben / ".git" / "info"
+    info.mkdir(exist_ok=True)
+    (info / "attributes").write_text("*.jsonl working-tree-encoding=UTF-16\n")
+    assert record_ruling(ben, "src/a.py", "attributes do not reach me") == 0
+    assert "attributes do not reach me" in [e.get("words") for e in ledger(ben).entries]
+    gb = _gl(ben)
+    blob = git("cat-file", "blob", f"HEAD:ledger/ben/{gb.device}.jsonl", cwd=gb.wt)
+    assert "attributes do not reach me" in blob                               # UTF-8, exactly as written
+
+
+def test_flush_unpushed_ends_within_its_bound_against_a_slow_remote(two, monkeypatch):
+    # Head addendum (L2 r1 #8 / complement r2 LOW 3): the flush bounded each git call, not the whole round.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "a stays") == 0
+    assert team("sync", repo=ben) == 0
+    edit(ben, "src/a.py", session="k1")
+    edit(ben, "src/a.py", session="k1")                                    # an ack, committed without a push
+    gb = _gl(ben)
+    assert gb.unpushed()
+    real = T.git
+
+    def slow(args, cwd, **kw):
+        if args and args[0] in ("fetch", "push") or args[:3] == ["-c", "fetch.fsckObjects=true", "fetch"]:
+            time.sleep(min(kw.get("timeout", 60), 0.8))
+        return real(args, cwd, **kw)
+    monkeypatch.setattr(T, "git", slow)
+    t0 = time.monotonic()
+    gb.flush_unpushed(timeout=1.0)
+    assert time.monotonic() - t0 < 2.0
+
+
+def test_a_failed_fetch_is_saved_where_every_reader_sees_it(two):
+    # E-team LOW on dda91e3: a failed fetch raised without saving last_fetch_error, so the hook, doctor and a second
+    # view saw no error.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    git("remote", "set-url", "origin", str(tmp / "gone.git"), cwd=ben)
+    note = gb.fetch_only(interval=0, timeout=30)
+    assert note and "fetch failed" in note
+    assert "fetch failed" in GitLedger(Repo.discover(ben)).state().get("last_fetch_error", "")
+
+
+def test_a_device_file_pushed_under_another_member_is_shown(two, capsys):
+    # Head ruling on L3 r1 complement MED 1: attribution is by folder (authenticated only by the git host), so a new
+    # device file under ana's folder, pushed by ben, is not refused but must be SHOWN in status and at session start.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ana)                                                              # ana's first sight is behind her
+    gb = _gl(ben)
+    forged = E.seal(E.build("ana", "decision", kind="ruling", owner="client:Dana", paths=["src/z.py"],
+                            words="ana never said this"), "")
+    (gb.wt / "ledger" / "ana").mkdir(exist_ok=True)
+    (gb.wt / "ledger" / "ana" / "fedcba9876543210.jsonl").write_text(json.dumps(forged, sort_keys=True) + "\n")
+    _push_wt(gb, "a device under ana's folder")
+    assert team("sync", repo=ana) == 0
+    ledger(ana)
+    capsys.readouterr()
+    assert team("status", repo=ana) == 0
+    assert "fedcba9876543210" in capsys.readouterr().out
+    ctx = hook("sessionstart", {"session_id": "nd", "cwd": str(ana), "hook_event_name": "SessionStart",
+                                "source": "startup"})["hookSpecificOutput"]["additionalContext"]
+    assert "new device fedcba9876543210 under ana" in ctx

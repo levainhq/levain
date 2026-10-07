@@ -17,11 +17,13 @@ extraction from shell is unreliable); that gap is documented, not hidden.
 """
 from __future__ import annotations
 
+import calendar
 import hashlib
 import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -146,17 +148,30 @@ def _interval(gl: GitLedger) -> float:
     try:
         return float(gl.team().fetch_interval)
     except (R.RolesError, TeamError):
-        return 300.0
+        return 300.0                                  # the snapshot that follows reports the same failure
 
 
 def _wired_but_broken(gl: GitLedger) -> bool:
     try:
         return bool(gl._local_branch_exists())
     except TeamError:
-        return False
+        return gl.base.is_dir()                       # git cannot answer; levain's own state says a ledger is here
 
 
 def pretooluse(payload: dict) -> None:
+    """THE fail-closed boundary, and the only one: ANY exception while an edit is judged is a DENY when a repository
+    above the real path of the target (or of the session's cwd) holds levain team state, and silence otherwise. No
+    path inside handles its own failures."""
+    try:
+        _pretooluse(payload)
+    except Exception as exc:  # noqa: BLE001 - the boundary
+        target = _target(payload) if isinstance(payload, dict) else None
+        places = [p for p in (target, payload.get("cwd") if isinstance(payload, dict) else None) if p]
+        if any(_ledger_roots(Path(p)) for p in places):
+            _out(_deny(f"the team ledger could not be read ({type(exc).__name__}: {exc})"))
+
+
+def _pretooluse(payload: dict) -> None:
     if payload.get("tool_name") not in EDIT_TOOLS:
         return
     target = _target(payload)
@@ -171,36 +186,38 @@ def pretooluse(payload: dict) -> None:
                                          "ledger is written only through `levain team record` (it validates, "
                                          "hash-chains and attributes every entry); do not edit it directly.")}})
         return
-    try:
-        repo = Repo.discover(Path(target))
-    except TeamError as exc:
-        if _has_ledger_state(Path(target)):           # a joined clone that cannot even be found denies
-            _out(_deny(f"the repository could not be read ({exc})"))
-        else:
-            _fail_open("PreToolUse", str(exc))
-        return
+    # Every repository above the target that holds levain team state judges the edit, not only the one git finds
+    # first: a `.git` planted in a subdirectory (a fake nested repository, or an unreadable one) must not take the
+    # edit out of the real clone's ledger. Any deny wins.
+    roots = list(dict.fromkeys(_ledger_roots(Path(target)) + _ledger_roots(Path(payload.get("cwd") or target))))
+    answers = []
+    for start in roots or [Path(target)]:
+        out = _judge_from(start, target, payload, has_ledger=bool(roots))
+        if out and out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny":
+            _out(out)
+            return
+        if out:
+            answers.append(out)
+    if answers:
+        _out(answers[0])
+
+
+def _judge_from(start: Path, target: str, payload: dict, *, has_ledger: bool) -> dict | None:
+    """The hook's answer for an edit of ``target``, judged in the repository found from ``start``. ``has_ledger``: the
+    filesystem shows levain team state there, so anything that stops the judgement is a DENY."""
+    repo = Repo.discover(start)                       # a failure here is the boundary's (pretooluse)
     if repo is None:
-        return
+        return _deny("the repository holding the team ledger could not be found") if has_ledger else None
     gl = GitLedger(repo)
-    try:
-        joined = gl.joined()
-    except Exception as exc:  # noqa: BLE001 - an invalid state.json (a bad device id) in a clone with a ledger
-        _out(_deny(f"this clone's levain team state could not be read ({type(exc).__name__}: {exc})"))
-        return
-    if not joined:
+    if not gl.joined():
         if _wired_but_broken(gl):
-            _out(_deny(f"this clone has a {BRANCH} branch but no usable ledger worktree or state (run `levain team "
-                       "join`, then `levain team doctor`)"))
-        return
+            return _deny(f"this clone has a {BRANCH} branch but no usable ledger worktree or state (run `levain team "
+                         "join`, then `levain team doctor`)")
+        return None
     # Fetch first, then read team, ledger and identity together from the branch ref: one consistent snapshot,
     # no lock (the ref only moves when a rebase or commit completes).
     fetch_note = gl.fetch_if_due(_interval(gl), timeout=5.0)
-    try:
-        out = _edit_verdict(gl, repo, target, payload, fetch_note)
-    except Exception as exc:  # noqa: BLE001 - THE fail-closed boundary: a joined clone that cannot judge denies
-        out = _deny(f"the team ledger could not be read ({type(exc).__name__}: {exc})")
-    if out:
-        _out(out)
+    return _edit_verdict(gl, repo, target, payload, fetch_note)
 
 
 def _deny(why: str) -> dict:
@@ -209,25 +226,33 @@ def _deny(why: str) -> dict:
                                        f"{TAG} {why}; every edit is denied until `levain team doctor` is clean.")}}
 
 
-def _has_ledger_state(target: Path) -> bool:
-    """Whether a repository above ``target`` holds levain team state, read from the filesystem alone (for when git
-    itself cannot answer): a ``.git`` directory, or a linked worktree's ``.git`` file and its common dir."""
-    d = Path(os.path.abspath(target))
+def _ledger_roots(target: Path) -> list[Path]:
+    """Every directory above ``target`` whose repository holds levain team state, nearest first, read from the
+    filesystem alone (so it answers when git cannot): a ``.git`` directory, or a linked worktree's ``.git`` file and
+    its common dir. A ``.git`` that cannot be read is passed over, never a reason to stop looking."""
+    try:
+        d = Path(os.path.realpath(target))            # the real path: a symlinked edit path still finds its clone
+    except (OSError, ValueError):
+        d = Path(os.path.abspath(target))
+    out = []
     for p in (d, *d.parents):
         g = p / ".git"
         try:
             if g.is_dir():
-                return (g / DIRNAME).is_dir()
-            if g.is_file():
+                common = g
+            elif g.is_file():
                 gitdir = Path(g.read_text(encoding="utf-8", errors="replace").partition("gitdir:")[2].strip())
                 gitdir = gitdir if gitdir.is_absolute() else p / gitdir
                 common = gitdir
                 if (gitdir / "commondir").is_file():
                     common = gitdir / (gitdir / "commondir").read_text(encoding="utf-8", errors="replace").strip()
-                return (common / DIRNAME).is_dir()
+            else:
+                continue
+            if (common / DIRNAME).is_dir():
+                out.append(p)
         except OSError:
-            return False
-    return False
+            continue
+    return out
 
 
 def _edit_verdict(gl: GitLedger, repo: Repo, target: str, payload: dict, fetch_note: str | None) -> dict | None:
@@ -329,21 +354,33 @@ def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str
     return f"[team] ledger imported into your memory store ({db.name})"
 
 
+_SESSIONSTART_BUDGET = 20.0   # seconds: the ack flush gets only what the fetch leaves of this
+
+
 def sessionstart(payload: dict) -> None:
     cwd = payload.get("cwd") or os.getcwd()
+    roots = _ledger_roots(Path(cwd))
     try:
-        repo = Repo.discover(Path(cwd))
+        repo = Repo.discover(roots[0] if roots else Path(cwd))
     except TeamError as exc:
-        _fail_open("SessionStart", str(exc))
+        if roots:                                     # silent where no ledger lives; said where one does
+            _fail_open("SessionStart", str(exc))
         return
     if repo is None:
         return
     gl = GitLedger(repo)
-    if not gl.joined():
+    try:
+        joined = gl.joined()
+    except Exception as exc:  # noqa: BLE001 - an invalid state.json: said, and every edit is denied by PreToolUse
+        _fail_open("SessionStart", f"this clone's levain team state could not be read ({type(exc).__name__}: {exc}); "
+                                   "every edit is denied until `levain team doctor` is clean")
+        return
+    if not joined:
         if _wired_but_broken(gl):
             _fail_open("SessionStart", f"this clone has a {BRANCH} branch but no usable ledger worktree "
                                        "(run `levain team join`, then `levain team doctor`)")
         return
+    started = time.monotonic()
     fetch_note = gl.fetch_if_due(0, timeout=10.0)
     try:
         sha, team, ledger = gl.snapshot()
@@ -359,8 +396,19 @@ def sessionstart(payload: dict) -> None:
         return
     # Acknowledgements are committed without a push; a session start sends them, within a bound, so an ack with no
     # later ledger write still reaches the team. What cannot be sent is said.
-    push_note = gl.flush_unpushed(timeout=10.0)
-    pending = gl.unpushed() if push_note else 0
+    # One budget for the whole hook: the flush gets what the fetch left of _SESSIONSTART_BUDGET, and none when the
+    # fetch already failed (the remote is not answering).
+    left = _SESSIONSTART_BUDGET - (time.monotonic() - started)
+    if fetch_note:
+        push_note = fetch_note
+    elif left > 6:
+        push_note = gl.flush_unpushed(timeout=left)       # one deadline for the whole flush
+    else:
+        push_note = "no time left in the session start to push"
+    try:
+        pending = gl.unpushed() or 0                       # counted after every attempt, whatever it reported
+    except TeamError:
+        pending = 0
     live = ledger.in_force
     rulings = [e for e in live if e.get("kind") == "ruling"]
     newest = max((e.get("ts", "") for e in ledger.entries), default="")
@@ -373,8 +421,22 @@ def sessionstart(payload: dict) -> None:
     # A fallback to an older team.toml (or any other read warning) must reach the session, not only the edit hook.
     lines += [f"[team] {w}" for w in dict.fromkeys(WARNINGS)]
     if pending:
-        lines.append(f"[team] {pending} local ledger commit(s), acknowledgements included, not pushed yet "
-                     f"({I.oneline(push_note)}); run `levain team sync`")
+        lines.append(f"[team] {pending} local ledger commit(s), acknowledgements included, not pushed yet"
+                     + (f" ({I.oneline(push_note)})" if push_note else "") + "; run `levain team sync`")
+    # A device nobody here added is SHOWN (attribution is by folder; the git host authenticates pushes): one line for
+    # each one first seen in the last week, after this clone's first sight of the ledger.
+    week = time.time() - 7 * 86400
+    for d in gl.devices():
+        if d["own"] or d["first_sight"]:
+            continue
+        try:
+            fresh = calendar.timegm(time.strptime(d["first_seen"], "%Y-%m-%dT%H:%M:%SZ")) >= week   # UTC stamps
+        except (ValueError, OverflowError):
+            fresh = True
+        if fresh:
+            lines.append(f"[team] new device {I.oneline(d['device'])} under {I.oneline(d['member'])}, first seen "
+                         f"{I.oneline(d['first_seen'])}; if {I.oneline(d['member'])} did not add it, the remote was "
+                         "written by someone else")
     lines.append("[team] Edits to governed paths show the recorded decision first. When a person decides "
                  "something about this codebase, record it with their words: `levain team record --help`.")
     # LEVAIN_TEAM_SESSIONSTART_RULINGS=off: count + canon pointer only, so enforcement rests on the edit-time hook.
