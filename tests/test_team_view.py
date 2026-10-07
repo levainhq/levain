@@ -764,3 +764,102 @@ def test_connections_past_the_worker_bound_are_closed_without_a_thread():
         idle.close()
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_a_comparison_git_cannot_finish_shows_unknown_not_a_whole_page_503(two_clone_view, monkeypatch):
+    # complement + codex, L3 10-07: git() turns a timeout into TeamError even with check=False, and _divergence did
+    # not catch it, so an optional comparison took the whole page down.
+    from levain.team.transport import TeamError
+    real = V.git
+
+    def slow(args, *a, **k):
+        if args and args[0] == "rev-list":
+            raise TeamError("git rev-list timed out after 10s")
+        return real(args, *a, **k)
+    monkeypatch.setattr(V, "git", slow)
+    _ana, _ben, port = two_clone_view
+    r, body = _req(port, "GET", "/?fetch=1")
+    assert r.status == 200 and "could not compare" in body.decode()
+
+
+def test_a_huge_fetch_interval_neither_stops_the_view_nor_breaks_a_page():
+    # codex, L3 10-07: team.toml takes any nonnegative integer, and float() of a 400-digit one raises OverflowError.
+    class Huge(_Stub):
+        remote = "origin"
+
+        def snapshot(self):
+            sha, team, ledger = super().snapshot()
+            return sha, R.Team(project=team.project, owner=team.owner, members=team.members,
+                               fetch_interval=10 ** 400), ledger
+
+        def remote_ref(self):
+            return None
+
+        def fetch_only(self, *, interval, timeout):
+            self.asked = interval
+
+        def state(self):
+            return {}
+    stub = Huge()
+    httpd = V.make_view_server(stub, port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        assert _req(httpd.server_address[1], "GET")[0].status == 200
+        assert V.FETCH_FLOOR <= stub.asked < float("inf")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_first_page_paces_by_the_remote_team_toml_it_will_show():
+    # codex, L3 10-07: the server started from the LOCAL team.toml's fetch_interval although the panes come from the
+    # accepted remote tip, so the first page could skip a fetch the remote's team.toml says is due.
+    class Split(_Stub):
+        remote = "origin"
+
+        def snapshot(self):
+            sha, team, ledger = super().snapshot()
+            return sha, R.Team(project=team.project, owner=team.owner, members=team.members,
+                               fetch_interval=86400), ledger
+
+        def remote_ref(self):
+            return "r" * 40
+
+        def team(self, rev=None):
+            assert rev == "r" * 40
+            return R.Team(project="ledgerline", owner="ana", members=TEAM.members, fetch_interval=0)
+    httpd = V.make_view_server(Split(), port=0)
+    try:
+        assert httpd.fetch_interval == 0.0
+    finally:
+        httpd.server_close()
+
+
+def test_the_integrity_count_is_recomputed_when_the_history_it_saw_grows(tmp_path):
+    # codex, L3 10-07: the cache was keyed by the tip alone; deepening a shallow clone exposes older team.toml
+    # changes without moving the tip, and the page kept the count from the shallow history.
+    class Counting(_Stub):
+        calls = 0
+
+        def team_history_problems(self, team, rev=None):
+            Counting.calls += 1
+            return []
+    shallow = tmp_path / "shallow"
+    httpd = V.make_view_server(Counting(), port=0)
+    httpd.shallow_path = str(shallow)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        port = httpd.server_address[1]
+        shallow.write_text("aaaa\n")
+        _req(port, "GET")
+        _req(port, "GET")
+        assert Counting.calls == 1                       # same tip, same history: cached
+        shallow.write_text("bbbb\n")                     # a deepen rewrites the shallow boundary
+        _req(port, "GET")
+        assert Counting.calls == 2
+        shallow.unlink()                                 # unshallowed completely
+        _req(port, "GET")
+        assert Counting.calls == 3
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

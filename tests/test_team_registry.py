@@ -1101,3 +1101,39 @@ const tick = () => new Promise((r) => setTimeout(r, 20));
     assert out.returncode == 0, out.stderr
     assert json.loads(out.stdout.strip().splitlines()[-1]) == {"before": 0, "after": 1, "requests": 2,
                                                               "registered": True}
+
+
+def test_an_old_unlocked_temp_of_a_live_publisher_is_never_swept(pub):
+    # codex + complement, L3 10-07: age alone does not prove the publisher is dead; one suspended (SIGSTOP, a
+    # laptop asleep, a clock step) between creating its temp and locking it lost the temp, and its registration.
+    # A temp names its publisher's pid; a live pid keeps it, a dead one or none (an older levain) does not.
+    d = R.registry_dir()
+    d.mkdir(parents=True)
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    live = f".lock1-p{os.getpid()}-{'a' * 32}.tmp"
+    gone = f".lock1-p{dead.pid}-{'b' * 32}.tmp"
+    legacy = f".lock1-{'c' * 32}.tmp"
+    self_live = f".selftest-p{os.getpid()}-{'d' * 16}.tmp"
+    old = time.time() - 3600
+    for n in (live, gone, legacy, self_live):
+        (d / n).write_text("{half")
+        os.utime(d / n, (old, old))
+    R.prune_dead()
+    assert sorted(_names()) == sorted([live, self_live])
+
+
+def test_a_publisher_names_its_temp_with_its_pid(monkeypatch):
+    seen = []
+    real = R.os.rename
+
+    def rename(src, dst, **kw):
+        seen.append(src)
+        return real(src, dst, **kw)
+    monkeypatch.setattr(R.os, "rename", rename)
+    r = R.register("/w", "http://127.0.0.1:43995/", "pid")
+    try:
+        assert seen and seen[0].startswith(f".lock1-p{os.getpid()}-") and R._TEMP_RE.fullmatch(seen[0])
+    finally:
+        r.unpublish()
+        r.close()

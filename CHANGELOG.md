@@ -19,7 +19,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
   - The server serves at most 32 connections at once.
   - Under a path filter, pane 2 no longer shows a project-wide ruling's acknowledgements. A filter such as `project` matched the "(project-wide)" label.
   - In the view registry, a fork at the moment a view opened or closed its lock file could leave the child holding the lock. A dead view then stayed listed in the cockpit for as long as the child lived. Opening, closing and forking are now serialised.
-  - Temp files left by a view killed mid-start are swept once they are a minute old and nobody holds them.
+  - Temp files left by a view killed mid-start are swept once they are a minute old, nobody holds them and the process that made them has exited.
 
 ### Security
 

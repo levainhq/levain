@@ -22,6 +22,7 @@ from __future__ import annotations
 import html
 import json
 import ipaddress
+import os
 import sys
 import threading
 from urllib.parse import parse_qs
@@ -37,7 +38,7 @@ from . import canon as C
 from . import index as I
 from . import roles as R
 from . import verify as VF
-from .transport import REF, GitLedger, git, require_untampered
+from .transport import REF, GitLedger, TeamError, git, require_untampered
 
 DEFAULT_PORT = 7450
 DEFAULT_COCKPIT_URL = "http://127.0.0.1:7420/"
@@ -46,6 +47,7 @@ DEFAULT_ACK_FLAG = 3        # acks on one path before the page suggests its ruli
 FETCH_FLOOR = 10.0          # seconds: no request, the button's included, fetches more often than this
 FETCH_TIMEOUT = 8.0         # seconds: the bound on the one git fetch a page load may run
 BUSY_RETRY = 2              # seconds: what a busy answer tells the browser to wait before asking again
+MAX_FETCH_INTERVAL = 86400 # seconds: fetch_interval is capped at a day (team.toml allows any integer)
 MAX_WORKERS = 32            # connections served at once (a browser keeps about 6 per host open); more are closed
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -427,7 +429,8 @@ class _ViewServer(ThreadingHTTPServer):
     model_lock: threading.Lock
     fetch_interval: float       # team.toml's fetch_interval as of the last snapshot; read and set under model_lock
     workers: threading.BoundedSemaphore
-    problems_cache: tuple[str, list[str]] | None = None   # (ledger commit, verify.problems); read and set under model_lock
+    problems_cache: tuple[tuple, list[str]] | None = None   # ((commit, history boundary), verify.problems); model_lock
+    shallow_path: str | None = None
     registration: Any = None   # holds the registry lock fd for the server's life; see registry.Registration
 
     def handle_error(self, request: Any, client_address: Any) -> None:
@@ -479,7 +482,7 @@ class _ViewHandler(GuardedHandler):
             fetch = self._fetch(gl, fetch_now)
             sha, team, ledger, source = self._snapshot(gl, fetch)
             require_untampered(ledger)   # the refusal is served (503, no entries), never a model
-            self.server.fetch_interval = float(team.fetch_interval)
+            self.server.fetch_interval = _interval(team)
             m = build_model(team, ledger, gl.handle(team), gl.read_canon(sha), gl.state_hash(ledger, team),
                             recheck_days=self.server.recheck_days, ack_flag=self.server.ack_flag,
                             path_filter=path_filter, problems=self._problems(gl, sha, team, ledger))
@@ -507,11 +510,13 @@ class _ViewHandler(GuardedHandler):
         return rsha, team, ledger, {"source": "remote", "unpushed": unpushed, "unfetched": unfetched}
 
     def _problems(self, gl: GitLedger, sha: str, team: R.Team, ledger: I.Ledger) -> list[str]:
-        """verify.problems for this ledger commit, kept for the next request on the same commit: it walks team.toml's
-        history with git, and the model lock (held by the caller) makes the one-entry cache safe."""
+        """verify.problems for this ledger commit, kept for the next request on the same commit and the same history:
+        it walks team.toml's history with git, and deepening a shallow clone reveals older history without moving the
+        tip, so the shallow boundary is part of the key. The model lock (held by the caller) makes the cache safe."""
+        key = (sha, _read_or_none(self.server.shallow_path))
         cached = self.server.problems_cache
-        if cached is None or cached[0] != sha:
-            cached = self.server.problems_cache = (sha, VF.problems(gl, sha, team, ledger))
+        if cached is None or cached[0] != key:
+            cached = self.server.problems_cache = (key, VF.problems(gl, sha, team, ledger))
         return cached[1]
 
     def _fetch(self, gl: GitLedger, now: bool) -> dict:
@@ -618,6 +623,22 @@ def _log(msg: str) -> None:
         pass
 
 
+def _interval(team: R.Team) -> float:
+    """team.toml's fetch_interval in seconds. team.toml takes any nonnegative integer, and float() of a huge one
+    raises; a day is already longer than any useful pace, so the value is capped there."""
+    return float(min(int(team.fetch_interval), MAX_FETCH_INTERVAL))
+
+
+def _read_or_none(path: str | None) -> bytes | None:
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
 def _iso(ts: object) -> str | None:
     """A stored epoch time as the page shows it; None for a missing or unusable value (state.json is a file anyone
     can edit, and json reads Infinity)."""
@@ -630,12 +651,34 @@ def _iso(ts: object) -> str | None:
 def _divergence(gl: GitLedger, rsha: str) -> tuple[int | None, int | None]:
     """(commits on this clone's ledger branch not on the remote, commits on the remote not yet on the branch); None
     for each when git cannot say, which the page shows as unknown, never as zero."""
-    cp = git(["rev-list", "--left-right", "--count", f"{REF}...{rsha}"], gl.repo.toplevel, check=False, timeout=10)
     try:
+        cp = git(["rev-list", "--left-right", "--count", f"{REF}...{rsha}"], gl.repo.toplevel, check=False,
+                 timeout=10)
         a, b = cp.stdout.split()
         return int(a), int(b)
-    except ValueError:
+    except (TeamError, OSError, ValueError):   # git() raises TeamError on a timeout or no git, even with check=False
         return None, None
+
+
+def _paced_by(gl: GitLedger, local: R.Team) -> R.Team:
+    """The team.toml whose fetch_interval paces the first page: the accepted remote tip's when there is one (the
+    panes come from it), else this clone's."""
+    try:
+        rsha = gl.remote_ref() if gl.remote else None
+        return gl.team(rsha) if rsha else local
+    except Exception:  # noqa: BLE001 - pacing only: the first page's own read reports a remote that cannot be read
+        return local
+
+
+def _shallow_path(gl: GitLedger) -> str | None:
+    """Where git records this clone's shallow boundary (absent when the clone has full history), or None."""
+    try:
+        top = gl.repo.toplevel
+        cp = git(["rev-parse", "--git-path", "shallow"], top, check=False, timeout=10)
+    except Exception:  # noqa: BLE001 - no boundary known: the cache is then keyed by the commit alone
+        return None
+    rel = cp.stdout.strip() if cp.returncode == 0 else ""
+    return os.path.join(str(top), rel) if rel else None   # relative to the working tree unless git made it absolute
 
 
 def _ipv4_loopback(host: str) -> bool:
@@ -659,6 +702,7 @@ def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFA
     if not isinstance(port, int) or not 0 <= port <= 65535:
         raise ValueError(f"port must be 0..65535, got {port!r}")
     _sha, team, _ledger = gl.snapshot()  # fail now, with the ledger's own message, if this clone has no ledger
+    team = _paced_by(gl, team)
     httpd = _ViewServer((host, port), _ViewHandler)
     bound = str(httpd.server_address[0])
     if not _ipv4_loopback(bound):
@@ -667,7 +711,8 @@ def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFA
     httpd.allowed_hosts = _LOOPBACK | {bound.lower()}
     httpd.ledger_reader = gl
     httpd.model_lock = threading.Lock()
-    httpd.fetch_interval = float(team.fetch_interval)
+    httpd.fetch_interval = _interval(team)
+    httpd.shallow_path = _shallow_path(gl)
     httpd.workers = threading.BoundedSemaphore(MAX_WORKERS)
     httpd.recheck_days = recheck_days
     httpd.ack_flag = ack_flag

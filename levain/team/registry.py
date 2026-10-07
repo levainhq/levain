@@ -16,8 +16,10 @@ The protocol, in one place:
 * The ``lock1-`` prefix is the liveness-generation marker. A future mechanism must use a different prefix, so an
   old view can never prune a newer view's files and a reader never has to parse a file to decide whether to trust it.
 * The cockpit never deletes anything. A starting view prunes entries nobody holds, strictly before it publishes.
-  It also sweeps hidden temp files a killed view left behind, but only one older than TEMP_FLOOR that nobody holds:
-  a publisher creates its temp a moment before it locks it, and the age floor keeps a sweep out of that moment.
+  It also sweeps hidden temp files a killed view left behind: only one older than TEMP_FLOOR, that nobody holds,
+  and whose publisher (its pid is in the name) is no longer running. A publisher creates its temp a moment before it
+  locks it; the age floor keeps a sweep out of that moment, and the pid keeps it away from a publisher that is still
+  alive however long it was suspended. A temp from an older levain names no pid and is judged by age and lock.
 * A listing judges entries in sorted name order until MAX_VIEWS live ones are found, the names run out, or
   LIST_BUDGET is spent; whenever names were left unjudged, or the directory could not be read in full, it reports
   ``truncated`` so the cockpit can say the list may be incomplete.
@@ -70,7 +72,10 @@ TEMP_FLOOR = 60.0                # seconds: a hidden temp younger than this is n
 MAX_ENTRY_BYTES = 4096
 _FIELDS = ("repo", "url", "project", "started")
 _NAME_RE = re.compile(r"lock1-[0-9a-f]{32}\.json")
-_TEMP_RE = re.compile(r"\.(?:lock1-[0-9a-f]{32}|selftest-[0-9a-f]{16})\.tmp")   # the names register() and the self-test make
+# The temps register() and the self-test make: ``.lock1-p<pid>-<32 hex>.tmp`` and ``.selftest-p<pid>-<16 hex>.tmp``.
+# Without the ``p<pid>-`` part: a temp from an older levain, which named no publisher.
+_TEMP_RE = re.compile(r"\.(?:lock1-(?:p(?P<pid>[0-9]{1,10})-)?[0-9a-f]{32}"
+                      r"|selftest-(?:p(?P<spid>[0-9]{1,10})-)?[0-9a-f]{16})\.tmp")
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 _READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 
@@ -133,7 +138,7 @@ def _open_dir(*, create: bool) -> int:
 def _flock_is_real(dir_fd: int) -> bool:
     """Does an exclusive lock on one open file make a shared try-lock on another fail here? False on filesystems
     that emulate flock (NFS, some FUSE mounts), where the whole design would silently list nothing."""
-    name = f".selftest-{secrets.token_hex(8)}.tmp"
+    name = f".selftest-p{os.getpid()}-{secrets.token_hex(8)}.tmp"
     fa = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0), 0o600, dir_fd=dir_fd)
     fb = None
     try:
@@ -251,7 +256,7 @@ def register(repo: str, url: str, project: str) -> Registration:
     dir_fd = _open_dir(create=True)
     lock_fd = None
     published = None
-    tmp = f".{PREFIX}{secrets.token_hex(16)}.tmp"
+    tmp = f".{PREFIX}p{os.getpid()}-{secrets.token_hex(16)}.tmp"
     try:
         if not _flock_is_real(dir_fd):
             raise RegistryUnavailable("this filesystem does not support the registry's locks")
@@ -323,6 +328,22 @@ def _open_entry(dir_fd: int, name: str, *, strict: bool = False) -> tuple[int, o
     return fd, st
 
 
+def _publisher_alive(temp_name: str) -> bool:
+    """Is the process a temp names still running? False for a temp that names none (an older levain). Signal 0 only
+    asks; EPERM means a process of another user holds that pid, so it is alive (and the registry is one user's)."""
+    m = _TEMP_RE.fullmatch(temp_name)
+    pid = m and (m.group("pid") or m.group("spid"))
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, OverflowError, ValueError):   # gone, or a number no process can have
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def prune_dead(temp_floor: float = TEMP_FLOOR) -> None:
     """Remove entries no publisher holds, and hidden temps older than ``temp_floor`` seconds that nobody holds. A
     shared try-lock excludes exactly a publisher's exclusive lock, so a live entry is never touched and a concurrent
@@ -335,13 +356,15 @@ def prune_dead(temp_floor: float = TEMP_FLOOR) -> None:
     except (OSError, RegistryUnavailable):
         return
     try:
-        # Filter, then bound: junk names must not use up the examination budget. A temp is swept only past the age
-        # floor: a publisher creates its temp and only then locks it, and a sweep in that window once unregistered a
-        # starting view. A temp still unlocked past the floor belongs to a view that died before its rename.
+        # Filter, then bound: junk names must not use up the examination budget. A temp is swept only when its
+        # publisher is gone and it is past the age floor: a publisher creates its temp and only then locks it, and a
+        # sweep in that window once unregistered a starting view.
         names = os.listdir(dir_fd)
         cand = [(n, False) for n in names if _NAME_RE.fullmatch(n)][:PRUNE_MAX_NAMES]
         cand += [(n, True) for n in names if _TEMP_RE.fullmatch(n)][:PRUNE_MAX_NAMES]
         for name, temp in cand:
+            if temp and _publisher_alive(name):
+                continue
             opened = _open_entry(dir_fd, name)
             if opened is None:
                 continue
