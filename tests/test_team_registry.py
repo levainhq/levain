@@ -73,7 +73,7 @@ class _GL(_Stub):
     class repo:
         toplevel = Path("/work/ledgerline")
 
-    def team(self):
+    def team(self, rev=None):
         return _TEAM
 
 
@@ -727,6 +727,27 @@ def test_serve_publishes_while_running_and_removes_the_entry_on_clean_exit(monke
     seen = _serve_with(monkeypatch, _interrupt)
     assert V.serve(_GL(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3) == 0
     assert len(seen["files"]) == 1 and _names() == []
+
+
+def test_the_cockpit_names_the_view_by_the_team_toml_the_panes_come_from(monkeypatch):
+    # complement, L3 round 2: the entry took the project name from this clone's own team.toml while the panes come from
+    # the accepted remote's, so after a rename the cockpit and the page disagreed.
+    import dataclasses
+    names = []
+
+    class Renamed(_GL):
+        remote = "origin"
+
+        def remote_ref(self):
+            return "r" * 40
+
+        def team(self, rev=None):
+            return dataclasses.replace(_TEAM, project="renamed") if rev == "r" * 40 else _TEAM
+    real = R.register
+    monkeypatch.setattr(R, "register", lambda repo, url, project: (names.append(project), real(repo, url, project))[1])
+    _serve_with(monkeypatch, _interrupt)
+    assert V.serve(Renamed(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3) == 0
+    assert names == ["renamed"]
 
 
 def test_a_prune_failure_does_not_skip_registering(monkeypatch):

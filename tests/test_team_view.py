@@ -112,6 +112,12 @@ class _Stub:
         ledger, _ = _ledger()
         return "sha", TEAM, ledger
 
+    def head(self):
+        return "sha"
+
+    def team(self, rev=None):
+        return self.snapshot()[1]
+
     def handle(self, team):
         return "ana"
 
@@ -472,8 +478,11 @@ def test_a_request_during_a_cold_read_is_answered_503_at_once_and_the_page_asks_
         assert r.status == 503 and r.getheader("Retry-After") and b"busy" in body and b"<html" not in body
         # complement, L3 round 3: the refresh reloaded the same URL, so after "fetch now" every retry asked for
         # another fetch. It asks again for the same page and filter, without the fetch.
-        body = _req(port, "GET", "/?fetch=1&path=src%2Ftax")[1]
-        assert f'content="{V.BUSY_RETRY};url=/?path=src%2Ftax"'.encode() in body and b"fetch" not in body
+        body = _req(port, "GET", "/?fetch=1&path=src%2Ftax")[1].decode()
+        assert f'content="{V.BUSY_RETRY};url=/?path=src%2Ftax"' in body and "fetch=" not in body
+        # complement, L3 round 2: dropping the fetch silently made "fetch now" look done. The page says it did not run.
+        assert "Your fetch did not run" in body
+        assert "Your fetch did not run" not in _req(port, "GET", "/?path=src%2Ftax")[1].decode()
     finally:
         httpd.model_lock.release()
         httpd.shutdown()
@@ -886,7 +895,8 @@ def test_the_first_page_paces_by_the_remote_team_toml_it_will_show():
             return "r" * 40
 
         def team(self, rev=None):
-            assert rev == "r" * 40
+            if rev != "r" * 40:
+                return super().team(rev)
             return R.Team(project="ledgerline", owner="ana", members=TEAM.members, fetch_interval=0)
     httpd = V.make_view_server(Split(), port=0)
     try:
@@ -990,6 +1000,93 @@ def test_a_failure_another_command_saved_is_shown_until_a_success_clears_it(capf
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_a_quarantined_tip_that_cannot_be_judged_does_not_stop_the_view_starting(capfd):
+    # codex, L3 round 2 (9d81f19): the server read the whole ledger before binding, and that read judges the quarantined
+    # remote tip; when the tip could not be judged, the view never started, though every page is built to show "could
+    # not be judged" over the last accepted copy. Startup now reads team.toml only.
+    import types
+    from levain.team.transport import LedgerReadError
+
+    class Unjudgeable(_RemoteStub):
+        def snapshot(self):
+            raise LedgerReadError("the fetched remote ledger could not be judged (boom)")
+
+        def team(self, rev=None):
+            return TEAM
+
+        def remote_ref(self):
+            return "r" * 40
+
+        def judge_remote(self, rev, rec=None):
+            return types.SimpleNamespace(ledger=_ledger()[0])
+
+        def incoming_refusal(self):
+            raise LedgerReadError("the fetched remote ledger could not be judged (boom)")
+    httpd = V.make_view_server(Unjudgeable(), port=0)      # not _serve: the stub must be the one the server starts on
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        r, body = _req(httpd.server_address[1], "GET")
+        assert r.status == 200 and b"the fetched remote ledger could not be judged" in body and b"boom" not in body
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_an_idle_connection_is_closed_so_idle_ones_cannot_lock_the_page_out(monkeypatch):
+    # complement, L3 round 2: MAX_WORKERS idle keep-alive connections held every slot for the guard's 30 s socket
+    # timeout, and every new connection was closed unanswered. An idle connection is now closed after IDLE_TIMEOUT.
+    import socket
+    import time as _t
+    from levain.http_guards import GuardedHandler
+    assert V._ViewHandler.timeout == V.IDLE_TIMEOUT < GuardedHandler.timeout
+    monkeypatch.setattr(V, "MAX_WORKERS", 2)
+    monkeypatch.setattr(V._ViewHandler, "timeout", 0.5)              # the same mechanism, faster
+    httpd = V.make_view_server(_Stub(), port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    idle = [socket.create_connection(("127.0.0.1", port)) for _ in range(2)]
+    try:
+        _t.sleep(1.5)                                   # past the idle timeout: both slots are given back
+        assert _req(port, "GET")[0].status == 200
+    finally:
+        for c in idle:
+            c.close()
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_the_shallow_boundary_is_hashed_in_bounded_reads(tmp_path, monkeypatch):
+    # codex, L3 round 2: the shallow file was read whole on every page; it grows with the boundary and nothing bounds
+    # it. Only its digest keys the cache, so it is hashed in fixed-size chunks.
+    import builtins
+    import hashlib
+    f = tmp_path / "shallow"
+    f.write_bytes(b"a" * 200_000)
+    real_open = builtins.open
+    sizes = []
+
+    def spy_open(*a, **k):
+        fh = real_open(*a, **k)
+        real_read = fh.read
+
+        class Spy:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *e):
+                fh.close()
+
+            def read(self, n=-1):
+                sizes.append(n)
+                return real_read(n)
+        return Spy()
+    monkeypatch.setattr(builtins, "open", spy_open)
+    digest = V._digest_or_none(str(f))
+    monkeypatch.setattr(builtins, "open", real_open)
+    assert digest == hashlib.sha256(b"a" * 200_000).digest()
+    assert sizes and all(0 < n <= 1 << 16 for n in sizes)
 
 
 def test_a_failed_fetch_is_not_shown_after_a_later_fetch_succeeded():

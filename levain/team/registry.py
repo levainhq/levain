@@ -316,6 +316,8 @@ def register(repo: str, url: str, project: str) -> Registration:
         data = json.dumps(entry, sort_keys=True).encode("utf-8")
         if len(data) > MAX_ENTRY_BYTES:      # a reader skips an oversized file, so it must never be published
             raise ValueError(f"registry entry is {len(data)} bytes, over {MAX_ENTRY_BYTES}")
+        # A KeyboardInterrupt (levain's SIGTERM handler raises one) between _create returning and the assignment leaves
+        # that fd untracked and open; the process is exiting, and its exit closes the fd and releases the lock.
         with _FORK_LOCK:     # open and record as one step, so no fork can copy the fd untracked
             lock_fd = _create(dir_fd, how, tmp)          # "exlock": the temp exists only locked
             _PENDING.add(lock_fd)

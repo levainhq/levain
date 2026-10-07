@@ -19,6 +19,7 @@ Stdlib only; the guards are the same ``levain.http_guards`` the cockpit and the 
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import ipaddress
@@ -49,6 +50,7 @@ FETCH_FLOOR = 10.0          # seconds: no request, the button's included, fetche
 FETCH_TIMEOUT = 8.0         # seconds: the bound on the one git fetch a page load may run
 BUSY_RETRY = 2              # seconds: what a busy answer tells the browser to wait before asking again
 MAX_FETCH_INTERVAL = 86400 # seconds: fetch_interval is capped at a day (team.toml allows any integer)
+IDLE_TIMEOUT = 5            # seconds a connection may sit idle, or stall a read or write, before it is closed
 MAX_WORKERS = 32            # connections served at once (a browser keeps about 6 per host open); more are closed
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -476,6 +478,10 @@ class _ViewHandler(GuardedHandler):
 
     server_version = "levain-team-view"
     server: _ViewServer
+    # A connection holds one of MAX_WORKERS slots for as long as it is open, idle keep-alives included: this closes an
+    # idle one (and bounds every read and write on its socket) after IDLE_TIMEOUT, so idle connections cannot hold
+    # every slot and lock the page out for the guard's 30 seconds.
+    timeout = IDLE_TIMEOUT
 
     def _model(self, path_filter: str = "", fetch_now: bool = False) -> dict:
         gl: GitLedger = self.server.ledger_reader
@@ -533,7 +539,8 @@ class _ViewHandler(GuardedHandler):
         is kept, for the same commit and the same history (deepening a shallow clone reveals older history without
         moving the tip, so the shallow boundary is part of the key). The model lock (held by the caller) makes the
         cache safe."""
-        return VF.problems(_HistoryCache(gl, self.server, _read_or_none(self.server.shallow_path)), sha, team, ledger)
+        boundary = _digest_or_none(self.server.shallow_path)
+        return VF.problems(_HistoryCache(gl, self.server, boundary), sha, team, ledger)
 
     @staticmethod
     def _refusal(gl: GitLedger) -> tuple[list[str], bool]:
@@ -606,7 +613,8 @@ class _ViewHandler(GuardedHandler):
                 model = self._model(pf, fetch_now=(qs.get("fetch") or [""])[0] == "1")
             except _Busy:
                 again = "/?" + urlencode([(k, v) for k, vs in qs.items() if k != "fetch" for v in vs])
-                return self._send_busy(html_page=path == "/", again=again.rstrip("?"))
+                return self._send_busy(html_page=path == "/", again=again.rstrip("?"),
+                                       fetch_dropped=(qs.get("fetch") or [""])[0] == "1")
             except Exception as exc:  # a broken ledger must say so, not draw an empty page; the detail stays local
                 _log(f"ledger unavailable: {exc!r}")
                 return self._send(b"ledger unavailable: see the terminal running `levain team view`\n",
@@ -617,15 +625,19 @@ class _ViewHandler(GuardedHandler):
             return self._send(render_html(model, self.server.cockpit_url).encode("utf-8"), "text/html; charset=utf-8")
         self._send(b"not found\n", "text/plain; charset=utf-8", status=404)
 
-    def _send_busy(self, *, html_page: bool, again: str = "/") -> None:
+    def _send_busy(self, *, html_page: bool, again: str = "/", fetch_dropped: bool = False) -> None:
         """503 at once, with Retry-After. The page is rendered on the server, so a browser that asked for it gets a
         small page that asks again by itself (a meta refresh: the CSP governs scripts, not that), for ``again``: the
-        same page and filter without ``fetch``, so the retries do not each ask for a fetch."""
+        same page and filter without ``fetch``, so the retries do not each ask for a fetch. When the request asked for
+        one, the page says it did not run."""
         if html_page:
+            dropped = (" Your fetch did not run; press ⟳ fetch now again once the page is back." if fetch_dropped
+                       else "")
             body = (f'<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
                     f'<meta http-equiv="refresh" content="{BUSY_RETRY};url={_e(again)}">'
                     f'<title>team view: busy</title></head>'
-                    f'<body><p>The team view is reading the ledger. This page asks again in {BUSY_RETRY} seconds.</p>'
+                    f'<body><p>The team view is reading the ledger. This page asks again in {BUSY_RETRY} seconds.'
+                    f'{dropped}</p>'
                     f'</body></html>').encode("utf-8")
             ctype = "text/html; charset=utf-8"
         else:
@@ -690,14 +702,19 @@ class _HistoryCache:
         return getattr(self._gl, name)
 
 
-def _read_or_none(path: str | None) -> bytes | None:
+def _digest_or_none(path: str | None) -> bytes | None:
+    """The sha256 of a file, read in chunks (git's shallow file grows with the boundary and nothing bounds it), or
+    None when it is absent or unreadable."""
     if not path:
         return None
+    h = hashlib.sha256()
     try:
         with open(path, "rb") as fh:
-            return fh.read()
+            for chunk in iter(lambda: fh.read(1 << 16), b""):
+                h.update(chunk)
     except OSError:
         return None
+    return h.digest()
 
 
 def _epoch(ts: object) -> float | None:
@@ -729,13 +746,13 @@ def _divergence(gl: GitLedger, rsha: str) -> tuple[int | None, int | None]:
         return None, None
 
 
-def _paced_by(gl: GitLedger, local: R.Team) -> R.Team:
-    """The team.toml whose fetch_interval paces the first page: the accepted remote tip's when there is one (the
-    panes come from it), else this clone's."""
+def _served_team(gl: GitLedger, local: R.Team) -> R.Team:
+    """The team.toml the panes come from: the accepted remote tip's when there is one, else this clone's. Its
+    fetch_interval paces the first page, and its project names the view in the cockpit."""
     try:
         rsha = gl.remote_ref() if gl.remote else None
         return gl.team(rsha) if rsha else local
-    except Exception:  # noqa: BLE001 - pacing only: the first page's own read reports a remote that cannot be read
+    except Exception:  # noqa: BLE001 - pacing and a name only: the first page reports a remote it cannot read
         return local
 
 
@@ -770,8 +787,10 @@ def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFA
                          "(127.0.0.1 or localhost)")
     if not isinstance(port, int) or not 0 <= port <= 65535:
         raise ValueError(f"port must be 0..65535, got {port!r}")
-    _sha, team, _ledger = gl.snapshot()  # fail now, with the ledger's own message, if this clone has no ledger
-    team = _paced_by(gl, team)
+    # Fail now, with the ledger's own message, if this clone has no ledger; judge nothing here. A full read would
+    # also judge a quarantined remote tip and, when that tip cannot be judged, refuse to start, where each page shows
+    # "could not be judged" over the last accepted copy.
+    team = _served_team(gl, gl.team(gl.head()))
     httpd = _ViewServer((host, port), _ViewHandler)
     bound = str(httpd.server_address[0])
     if not _ipv4_loopback(bound):
@@ -813,7 +832,7 @@ def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: i
         except Exception as exc:  # noqa: BLE001
             print(f"  (registry prune failed: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
         try:
-            httpd.registration = registry.register(str(gl.repo.toplevel), url, gl.team().project)
+            httpd.registration = registry.register(str(gl.repo.toplevel), url, _served_team(gl, gl.team()).project)
         except Exception as exc:  # noqa: BLE001
             print(f"  (not registered with the cockpit: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
         try:
