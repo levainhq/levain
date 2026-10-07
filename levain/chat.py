@@ -97,7 +97,7 @@ through a fault: :meth:`EntitySession.close` never raises.
 **No host thread runs driver code, and none waits on it without a deadline** (ruled 2026-10-07). The host
 holds a driver only as a :class:`_DriverProxy`, which exposes none of the driver's methods. Every
 attribute it reads and every call it makes runs on one of that driver's own lanes (threads started
-when the session opens: a turn lane, a control lane, a release lane), through the one boundary
+when the session opens: a turn lane, a control lane, a stop lane, a release lane), through the one boundary
 (:func:`levain.chat_driver._call_driver`), with its result checked for its exact declared type there.
 The host waits for each with a deadline (:data:`_CALL_SECONDS`, :data:`_OPEN_SECONDS`, the turn's bound
 plus :data:`_TURN_GRACE_SECONDS`). A driver that does not answer in time fails the call closed (an
@@ -105,7 +105,8 @@ approve is refused, a turn or an open fails), and a session it leaves stranded r
 which ``close`` and ``shutdown`` act on. Nothing a driver raises (any ``BaseException``) reaches a host
 thread, and nothing driver-made is read under the host lock. The reaper never calls a driver: it
 enforces the report deadline, starts with the first open and exits once no session can start a release.
-No teardown starts a thread.
+No host teardown starts a thread (a driver's own close may: OpenHands asks a running turn to stop from
+a thread of its own, and a stop that cannot start hands the release to the turn's return).
 
 **Why the job registry is in memory, unlike** :mod:`levain.jobs` **(which is on disk).** A turn job is
 meaningful only while its conversation exists, and the conversation lives in this process (nothing
@@ -221,11 +222,16 @@ _CALL_SECONDS = 10.0
 ``interrupt``). Past it the call fails closed and the session reads ``unresponsive``."""
 
 _OPEN_SECONDS = 600.0
-"""How long the host waits for a driver to be made and opened (building the hands can be slow)."""
+"""How long the host waits for the driver to be made, and then again for it to open (building the hands
+can be slow)."""
 
 _TURN_GRACE_SECONDS = 600.0
 """How long past ``turn_seconds`` the host waits for a turn call to return: the stop request lands at a
 step boundary, and a step in flight (a model call within the SDK's own timeout) finishes first."""
+
+_UNBOUNDED_TURN_SECONDS = 86_400.0
+"""How long the host waits for a turn when ``turn_seconds`` is ``None`` (no stop request is ever sent):
+a day, so even then no host thread waits on driver code without a deadline."""
 
 _CLOSE_ROUTE_SECONDS = 5.0
 """How long ``close()`` waits for the driver's close call before it answers ``closing``. The close goes on
@@ -438,7 +444,8 @@ class _Lane:
     def __init__(self, name: str) -> None:
         self._cond = threading.Condition()
         self._queue: deque[tuple[str, Callable[[], DriverCall], "_Pending"]] = deque()
-        self._stuck: str | None = None
+        self._stuck: _Pending | None = None     # the call past its deadline that has not returned
+        self._running_box: _Pending | None = None
         self._retired = False
         self._thread = threading.Thread(target=self._run, daemon=True, name=name)
 
@@ -451,9 +458,9 @@ class _Lane:
             if self._retired:
                 return DriverCall(False, None, f"DriverClosed: {what}: the driver is closed", "the driver is closed")
             if self._stuck is not None:
-                text = f"{what}: an earlier call ({self._stuck}) has not returned"
+                text = f"{what}: an earlier call ({self._stuck.what}) has not returned"
                 return DriverCall(False, None, f"DriverUnresponsive: {text}", text, unanswered=True)
-            box = _Pending(on_done)
+            box = _Pending(on_done, what)
             self._queue.append((what, fn, box))
             self._cond.notify_all()
             return box
@@ -471,9 +478,15 @@ class _Lane:
             if box.result is not None:      # it landed between the wait and this lock
                 return box.result
             box.abandoned = True
-            self._stuck = what
-        text = f"{what}: the driver did not answer within {timeout:.0f}s"
+            if self._running_box is box:
+                self._stuck = box           # still running: later calls fail at once until it returns
+        text = f"{what}: the driver did not answer within {timeout:g}s"
         return DriverCall(False, None, f"DriverUnresponsive: {text}", text, unanswered=True)
+
+    def idle(self) -> bool:
+        """Nothing is queued or running on this lane."""
+        with self._cond:
+            return not self._queue and self._running_box is None
 
     def retire(self) -> None:
         """Run what is queued, then exit."""
@@ -488,10 +501,18 @@ class _Lane:
                 if not self._queue:
                     return
                 what, fn, box = self._queue.popleft()
+                if box.abandoned:
+                    # its caller was told it failed; running it now would act on an answer nobody waits for
+                    box.result = DriverCall(False, None, f"DriverUnresponsive: {what}: abandoned", "abandoned",
+                                            unanswered=True)
+                    box.done.set()
+                    continue
+                self._running_box = box
             result = fn()        # _call_driver: never raises
             with self._cond:
                 box.result = result
-                if box.abandoned and self._stuck == what:
+                self._running_box = None
+                if self._stuck is box:
                     self._stuck = None
             box.done.set()
             if box.on_done is not None:
@@ -504,6 +525,7 @@ class _Lane:
 @dataclass(eq=False)
 class _Pending:
     on_done: Callable[[DriverCall], None] | None
+    what: str = ""
     done: threading.Event = field(default_factory=threading.Event)
     result: DriverCall | None = None
     abandoned: bool = False
@@ -531,8 +553,8 @@ def _invoke(driver: Any, name: str, args: tuple[Any, ...], kwargs: dict[str, Any
 
 class _DriverProxy:
     """How the host holds a driver: never raw. Every attribute read and every call runs on one of the
-    driver's own lanes (a turn lane for open and the turn calls, a control lane for short calls, a release
-    lane for close), started when the session opens, through the boundary, with the host waiting a deadline
+    driver's own lanes (a turn lane for open and the turn calls, a control lane for short calls, a stop lane
+    for stop requests, a release lane for close), started when the session opens, through the boundary, with the host waiting a deadline
     for it. It exposes none of :class:`~levain.chat_driver.HarnessDriver`'s methods, so a direct call cannot
     be written (ruled 2026-10-07)."""
 
@@ -542,7 +564,7 @@ class _DriverProxy:
         """Start the lanes. Raises ``RuntimeError`` when a thread cannot start: this is the OPEN path, so a
         session that cannot get its workers is not opened, and no teardown ever has to start one."""
         self._driver: Any = None
-        self._lanes = {k: _Lane(f"levain-chat-{k}-{name}") for k in ("turn", "control", "release")}
+        self._lanes = {k: _Lane(f"levain-chat-{k}-{name}") for k in ("turn", "control", "stop", "release")}
         started = []
         try:
             for lane in self._lanes.values():
@@ -571,7 +593,7 @@ class _DriverProxy:
             self.caps = caps.value
         return caps if not caps.ok else made
 
-    def call(self, method: str, *args: Any, lane: str = "control", timeout: float | None = None,
+    def call(self, method: str, *args: Any, lane: str = "control", timeout: float | None = _CALL_SECONDS,
              expect: tuple[type, ...] = _ANY, convert: Callable[[Any], Any] | None = None,
              **kwargs: Any) -> DriverCall:
         drv = self._driver
@@ -591,9 +613,15 @@ class _DriverProxy:
         return self._lanes["release"].submit(
             "close", lambda: _invoke(drv, "close", (), {}, _ANY, True, None), on_done)
 
-    def retire(self) -> None:
-        for lane in self._lanes.values():
-            lane.retire()
+    def stop_idle(self) -> bool:
+        """No stop request is queued or still running (one that outlived its deadline could land in the
+        NEXT turn)."""
+        return self._lanes["stop"].idle()
+
+    def retire(self, *, keep_release: bool = False) -> None:
+        for name, lane in self._lanes.items():
+            if not (keep_release and name == "release"):
+                lane.retire()
 
 
 @dataclass(eq=False)
@@ -604,9 +632,10 @@ class _Release:
     proxy: _DriverProxy
     settle: Callable[[], None]
     publish_job: Callable[[], None] | None
-    deadline: float | None            # when "never reported" becomes release_failed; None once that fired
+    deadline: float                   # when "never reported" becomes release_failed
     closed: threading.Event = field(default_factory=threading.Event)   # the close call returned (or failed)
     settled: bool = False             # a None report was handled: released
+    failed: bool = False              # recorded as release_failed (a later None report still settles it)
 
 
 class ChatHost:
@@ -845,9 +874,13 @@ class ChatHost:
 
         ``publish_job`` publishes the job's own outcome, BEFORE the close: a client polling the job never
         waits on a teardown (concurrent.futures' shutdown(wait=False) shape; glm L3 r2)."""
-        try:
-            if publish_job is not None:
+        if publish_job is not None:
+            try:
                 publish_job()         # idempotent: the settle that ends the record runs it again, harmlessly
+            except BaseException as exc:  # noqa: BLE001 — the driver is still closed below
+                _log.error("chat session %s: publishing the job failed: %s", rec.session_id,
+                           ": ".join(_exc_text(exc)))
+        try:
             item = _Release(rec, driver, settle, publish_job, time.monotonic() + _REPORT_SECONDS)
             with self._lock:
                 driver.release = item
@@ -866,6 +899,7 @@ class ChatHost:
                     driver.retire()
 
             submitted = driver.submit_close(_closed)
+            driver.retire(keep_release=True)   # nothing is called after close: the other lanes exit now
             if isinstance(submitted, DriverCall):
                 _closed(submitted)
             return item.closed
@@ -901,7 +935,7 @@ class ChatHost:
                 return
             if error is None:
                 item.settled = True
-                late = item.rec.state == "release_failed"
+                late = item.failed
                 if item in self._reports:
                     self._reports.remove(item)
         if error is not None:
@@ -922,15 +956,22 @@ class ChatHost:
                 return
             if item in self._reports:
                 self._reports.remove(item)
-        self._mark_release_failed(item.rec, failure, item.publish_job)
+        self._mark_release_failed(item.rec, failure, item.publish_job, item)
 
     def _mark_release_failed(self, rec: _Session, failure: str,
-                             publish_job: Callable[[], None] | None = None) -> None:
+                             publish_job: Callable[[], None] | None = None,
+                             item: _Release | None = None) -> None:
         if publish_job is not None:
             self._run_settle(rec, publish_job)    # the job keeps its own outcome
-        _log.error("chat session %s: its release failed, so it stays counted until one is reported: %s",
-                   rec.session_id, failure)
         with self._lock:
+            # Decided in ONE hold with the report's own check (L1 + L2 r5, RAN): a None report that landed
+            # since the caller looked has released the session, and must not be overwritten.
+            if item is not None:
+                if item.settled:
+                    return
+                item.failed = True
+            _log.error("chat session %s: its release failed, so it stays counted until one is reported: %s",
+                       rec.session_id, failure)
             job = self._jobs.get(rec.job_id) if rec.job_id else None
             if job is not None and job.status == "running":
                 job.status, job.error = "failed", f"the session's release failed: {failure}"
@@ -974,13 +1015,21 @@ class ChatHost:
         return True
 
     def _reaper(self) -> None:
+        try:
+            self._reap()
+        finally:
+            with self._lock:
+                if self._reaper_thread is threading.current_thread():
+                    self._reaper_thread = None     # an open starts another, even after a fault here
+
+    def _reap(self) -> None:
         """The host's reaper: it never calls a driver. It enforces one deadline per release (a driver that
         has not REPORTED by :data:`_REPORT_SECONDS` reads ``release_failed``), and exits once no record can
         start a release and no deadline is pending; the next open starts it again."""
         while True:
             with self._reap_cond:
                 now = time.monotonic()
-                expired = [i for i in self._reports if i.deadline is not None and i.deadline <= now]
+                expired = [i for i in self._reports if i.deadline <= now]
                 for item in expired:
                     self._reports.remove(item)
                 if not expired:
@@ -988,7 +1037,7 @@ class ChatHost:
                             r.state in _RELEASING_STATES for r in self._sessions.values()):
                         self._reaper_thread = None      # under the lock: an open sees it gone and starts one
                         return
-                    nearest = min((i.deadline for i in self._reports if i.deadline is not None), default=None)
+                    nearest = min((i.deadline for i in self._reports), default=None)
                     wait = _REAP_IDLE_SECONDS if nearest is None else min(_REAP_IDLE_SECONDS, max(0.0, nearest - now))
                     self._reap_cond.wait(wait)
                     continue
@@ -1001,7 +1050,7 @@ class ChatHost:
                     _log.error("chat session %s: reaping failed: %s", item.rec.session_id,
                                ": ".join(_exc_text(exc)))
                     try:
-                        self._mark_release_failed(item.rec, f"{failure} (and handling it failed)")
+                        self._mark_release_failed(item.rec, f"{failure} (and handling it failed)", item=item)
                     except BaseException:  # noqa: BLE001
                         pass
 
@@ -1206,7 +1255,7 @@ class ChatHost:
         if driver is None:
             return      # nothing to stop: _start drives only a session that holds a driver
         while True:
-            got = driver.call("interrupt", timeout=_CALL_SECONDS)
+            got = driver.call("interrupt", lane="stop", timeout=_CALL_SECONDS)
             if not got.ok:     # keep asking; a dead watcher is no bound
                 _log.error("chat job %s: stop request failed: %s", job.job_id, got.error)
             if done.wait(1.0):
@@ -1231,7 +1280,8 @@ class ChatHost:
             driver = lanes
             if driver.caps.approval_timing != "after_turn":
                 # Reserved in the contract, not driven here: an in-turn consent request needs the approval
-                # state machine (chat_driver module docstring, slice S10). It is closed below, unopened.
+                # state machine (chat_driver module docstring, slice S10). Never opened, it is not closed
+                # either: its lanes are retired below (a driver acquires nothing before open()).
                 raise DriverContractError(
                     f"{driver.harness}: this host drives only after-turn consent; "
                     f"{driver.caps.approval_timing!r} needs the approval state machine, which is not built")
@@ -1324,14 +1374,18 @@ class ChatHost:
         A kind of event this host does not know is ignored (the contract says a consumer must)."""
 
         def _emit(event: DriverEvent) -> None:
-            if not isinstance(event, DriverEvent) or event.kind != "activity":
+            # Exact types, read and capped OUTSIDE the lock: a str subclass's __str__ is driver code (L1 r5).
+            if type(event) is not DriverEvent:
                 return
-            line = event.text
+            kind, text = event.kind, event.text
+            if type(kind) is not str or kind != "activity" or type(text) is not str:
+                return
+            line = _cap_line(text)
             with self._lock:
                 job = self._jobs.get(rec.job_id) if rec.job_id else None
                 if job is None or job.status != "running":
                     return
-                job.activity.append(_cap_line(line))
+                job.activity.append(line)
                 if len(job.activity) > MAX_ACTIVITY_LINES:
                     del job.activity[0]
                     job.dropped += 1
@@ -1357,7 +1411,7 @@ class ChatHost:
                 # `call` is (method, *args); the turn's one terminal record, exactly a TurnSnapshot (a subclass
                 # could run driver code in the host). The host waits past the turn's own bound by a grace for
                 # the step in flight; a driver that does not answer by then fails the turn.
-                limit = None if self._turn_seconds is None else self._turn_seconds + _TURN_GRACE_SECONDS
+                limit = (self._turn_seconds or _UNBOUNDED_TURN_SECONDS) + _TURN_GRACE_SECONDS
                 got = driver.call(*call, lane="turn", timeout=limit, expect=(TurnSnapshot,))
                 snap = got.value           # checked where the driver built it
                 if not got.ok:
@@ -1376,6 +1430,11 @@ class ChatHost:
             watcher.join(_WATCHER_JOIN_SECONDS)
             if watcher.is_alive() and error is None:
                 payload, error = None, "the turn's deadline watcher did not exit"
+        stopping = rec.driver
+        if stopping is not None and not stopping.stop_idle() and error is None:
+            # A stop request that outlived its deadline is still with the driver: it would land in the NEXT
+            # turn (L1 r5, RAN). The same rule as a watcher that did not exit.
+            payload, error = None, "the driver did not answer a stop request"
         broken = payload is None or payload["error"] is not None
         dead: _DriverProxy | None = None
         if broken:

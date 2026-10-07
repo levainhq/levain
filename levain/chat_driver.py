@@ -378,14 +378,23 @@ class HarnessDriver(abc.ABC):
         refusal or a failure raises; the host keeps the message text and drops the exception, and then
         calls :meth:`close` (idempotent) so a failed open releases whatever it had built.
 
-        ``on_released`` is how the driver REPORTS its release: it calls it exactly once, from a thread of
-        its own, when everything the conversation held is released (``None``) or when the release failed
-        (the reason, as ``str``), after any escalation of its own (a kill after a stop) has run. It may
-        report before :meth:`close` is called (an open that failed released what it built) and it may
-        report long after. The host never asks: it keeps the conversation counted until a ``None`` report,
-        and a conversation with no report by the host's deadline reads ``release_failed`` until one comes.
-        A report that is neither ``None`` nor ``str`` is a contract violation, recorded as a failed
-        release."""
+        ``on_released`` is how the driver REPORTS its release, from any thread (inside :meth:`open` or
+        :meth:`close` included; the host holds none of its locks while driver code runs):
+
+        * ``None`` as soon as nothing the conversation held is still live, WHATEVER the cause: a close, a
+          failed open, or a harness that died on its own (a crashed process is released). Nothing may be
+          reported after ``None``.
+        * text (exactly ``str``) ONLY when something may still be live (a process that would not die),
+          after any escalation of the driver's own (a kill after a stop) has failed. A failure may be
+          followed by one ``None`` if the driver later confirms the release; that frees the slot.
+
+        The host never asks: it keeps the conversation counted until a ``None`` report, and one with no
+        report by its deadline reads ``release_failed`` until one comes. A report that is neither ``None``
+        nor exactly ``str`` is a contract violation, recorded as a failed release.
+
+        Acquire nothing before :meth:`open` (not in ``__init__``): a driver the host made but did not open
+        (it declares a consent timing the host does not drive, or its caps cannot be read, or the factory
+        answered too late) is dropped without :meth:`close`."""
 
     @abc.abstractmethod
     def close(self) -> None:
@@ -708,18 +717,27 @@ class OpenHandsDriver(HarnessDriver):
         try:
             with self._cond:
                 if self._phase in ("new", "closed"):
+                    # From "new" nothing was built, and an open that registered a sink before refusing (a
+                    # resume) is told so: the release is reported exactly once on every path (L1 r5).
+                    report = self._on_released if self._phase == "new" else None
                     self._phase = "closed"
-                    return
-                if self._phase in ("opening", "closing"):
+                    self._cond.notify_all()
+                elif self._phase in ("opening", "closing"):
                     # an opener in flight releases its own session on arrival (open()); another closer or a
                     # turn is mid-release. Either way, wait (bounded) until the release is done.
                     if self._phase == "opening":
                         self._phase = "closing"
                     self._cond.wait_for(lambda: self._phase == "closed", timeout=self.close_wait)
                     return
-                took = True
-                self._phase = "closing"      # no new turn can start from here
-                running = self._running
+                else:
+                    report = _ABSENT
+                    took = True
+                    self._phase = "closing"      # no new turn can start from here
+                    running = self._running
+            if report is not _ABSENT:
+                if report is not None:
+                    _call_driver(report, None)
+                return
             if running:
                 # The stop requests run on their own thread: one may block (the SDK's pause waits for a
                 # step's state lock), and close() waits only on the turn guard, with a deadline.

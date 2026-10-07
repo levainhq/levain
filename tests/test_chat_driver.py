@@ -1490,7 +1490,7 @@ def test_the_host_holds_no_driver_method():
     contract = {n for n in dir(HarnessDriver) if not n.startswith("_")}
     exposed = {n for n in dir(_DriverProxy) if not n.startswith("_")}
     assert exposed == {"call", "read", "harness", "caps", "make", "submit_close", "retire", "release",
-                       "early_report"}
+                       "early_report", "stop_idle"}
     assert exposed & contract == {"harness", "caps"}       # values, read once through the boundary
     proxy = _DriverProxy("t")
     assert proxy.make(lambda: _Fake([]), timeout=2).ok
@@ -2017,7 +2017,10 @@ def test_an_open_the_driver_never_finishes_fails_closed(tmp_path, monkeypatch, w
     gate.set()
 
 
-def test_a_stop_request_the_driver_never_answers_does_not_hold_the_watcher(tmp_path, monkeypatch):
+def test_a_stop_request_the_driver_never_answers_breaks_the_session(tmp_path, monkeypatch):
+    """L1 r5 (RAN): a stop request past its deadline kept running and landed in the NEXT turn. It runs on its
+    own lane (so it never takes held_digest's), the watcher is not held by it, and a job that ends with one
+    still outstanding breaks the session instead of handing it back for another turn."""
     import levain.chat as chat
 
     monkeypatch.setattr(chat, "_CALL_SECONDS", 0.1)
@@ -2037,7 +2040,9 @@ def test_a_stop_request_the_driver_never_answers_does_not_hold_the_watcher(tmp_p
     _until(lambda: host.job_status(job)["deadline_hit"], what="the deadline")
     time.sleep(0.5)
     stop.set()
-    assert _wait(host, job)["status"] == "done"
+    st = _wait(host, job)
+    assert st["status"] == "failed" and "stop request" in st["error"]
+    _until(lambda: host.session_status(sid)["state"] == "broken", what="the release")
     gate.set()
 
 
@@ -2067,3 +2072,111 @@ def test_a_closed_drivers_lanes_exit(tmp_path):
     for lane in lanes:
         lane._thread.join(2)
         assert not lane._thread.is_alive()
+
+
+# -- L1 + L2 r5 on ff3268c ---------------------------------------------------------------------------------------
+
+
+def test_a_report_racing_a_failure_is_not_overwritten(tmp_path, monkeypatch):
+    """L1 + L2 r5 (RAN, widened window): the failure path checked `settled`, let go of the lock, and later
+    wrote release_failed over a None report that had settled the record in between: counted forever."""
+    class D(_Fake):
+        def close(self):
+            threading.Timer(0.05, self.report).start()
+            raise RuntimeError("close raised")
+
+    host = _host(tmp_path, {"e": D([]), "f": _Fake([])}, max_sessions=1)
+    real = host._mark_release_failed
+
+    def slow(*a, **k):
+        time.sleep(0.3)             # widen the gap between the caller's check and the write
+        return real(*a, **k)
+
+    monkeypatch.setattr(host, "_mark_release_failed", slow)
+    sid, _ = _open(host, "e")
+    host.close(sid)
+    time.sleep(1.0)
+    assert host.session_status(sid)["state"] == "closed"
+    _open(host, "f")                                  # the slot is free
+
+
+def test_an_events_text_is_never_read_under_the_host_lock(tmp_path):
+    """L1 r5 (RAN): a str subclass in a DriverEvent ran its __str__ with the host lock held. Only exact
+    types are read, outside the lock."""
+    held: list[bool] = []
+
+    class Sly(str):
+        def __str__(self):
+            held.append(host._lock.locked())
+            return "x"
+
+    class D(_Fake):
+        def send_turn(self, message):
+            self.sink(DriverEvent("activity", Sly("hi")))
+            self.sink(DriverEvent("activity", "plain"))
+            return self._next("send_turn", message)
+
+    host = _host(tmp_path, {"e": D([_Out()])})
+    sid, _ = _open(host, "e")
+    jid = host.turn(sid, "go")["job_id"]
+    _wait(host, jid)
+    assert held == []
+
+
+def test_a_close_that_never_returns_leaves_only_its_release_lane(tmp_path):
+    """L1 + L2 r5 (RAN): the other lanes were retired only when close RETURNED, so a driver whose close
+    reported and then hung kept all of them, one set per session, unbounded."""
+    gate = threading.Event()
+
+    class Hangs(_Fake):
+        def close(self):
+            self.report()
+            gate.wait(10)
+
+    host = _host(tmp_path, {"e": Hangs([])})
+    sid, _ = _open(host, "e")
+    lanes = host._sessions[sid].driver._lanes
+    host.close(sid)
+    _until(lambda: host.session_status(sid)["state"] == "closed", what="the report")
+    for name in ("turn", "control", "stop"):
+        lanes[name]._thread.join(2)
+        assert not lanes[name]._thread.is_alive(), name
+    assert lanes["release"]._thread.is_alive()
+    gate.set()
+
+
+def test_a_driver_closed_before_it_opened_reports_its_release(tmp_path):
+    """L1 r5: close() from "new" reported nothing, so an open that registered a sink and then refused (a
+    resume) left the host waiting for a report until its deadline."""
+    heard: list = []
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: None, close_wait=2)
+    with pytest.raises(DriverUnsupported):
+        d.open(lambda e: None, on_released=heard.append, resume="abc")
+    d.close()
+    assert heard == [None]
+
+
+def test_an_abandoned_call_never_runs_and_does_not_hold_the_lane(tmp_path):
+    """L2 r5: a call queued behind a stuck one ran after its caller was told it failed, and a lane cleared
+    by name could be cleared by the wrong call."""
+    from levain.chat import _Lane
+    from levain.chat_driver import _call_driver
+
+    lane = _Lane("t")
+    lane.start()
+    gate, ran = threading.Event(), []
+    slow = threading.Thread(target=lambda: lane.call("a", lambda: _call_driver(lambda: gate.wait(5)), 10))
+    slow.start()                                        # running, within its own (long) deadline
+    _until(lambda: not lane.idle(), what="the first call")
+    queued = lane.call("b", lambda: _call_driver(lambda: ran.append(1)), 0.1)
+    assert queued.unanswered                            # abandoned while queued behind it
+    gate.set()
+    slow.join(5)
+    _until(lambda: lane.idle(), what="the lane")
+    assert ran == []                                    # never run once its caller was told it failed
+    first = lane.call("c", lambda: _call_driver(lambda: gate.clear() or threading.Event().wait(0.5)), 0.1)
+    assert first.unanswered                             # stuck: later calls fail at once ...
+    assert "has not returned" in lane.call("d", lambda: _call_driver(lambda: 1), 1).error
+    _until(lambda: lane.idle(), what="the stuck call")  # ... until it returns
+    assert lane.call("e", lambda: _call_driver(lambda: 7), 1).value == 7
+    lane.retire()
