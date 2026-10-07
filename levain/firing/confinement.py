@@ -357,7 +357,46 @@ def cred_floor_label(system: str | None = None) -> str:
     return base + (" · the Keychain" if (system or _platform.system()) == "Darwin" else "")
 
 
-_STANDARD_CRED_SUBTREES = ("~/.config/gh",)   # gh OAuth token (hosts.yml) → repo push/admin
+_STANDARD_CRED_SUBTREES = (
+    "~/.config/gh",                 # gh OAuth token (hosts.yml) → repo push/admin
+    # Cloud CLI credential caches (lane P2 item 4). Each holds a live token the CLI writes itself:
+    "~/.aws/sso/cache",             # IAM Identity Center tokens (botocore _SSO_TOKEN_CACHE_DIR)
+    "~/.aws/cli/cache",             # assumed-role temporary credentials (aws-cli assumerole CACHE_DIR);
+                                    # not ~/.aws/cli itself, which holds `alias`
+    "~/.aws/login/cache",           # `aws login` tokens (or $AWS_LOGIN_CACHE_DIRECTORY, below)
+    "~/.aws/boto/cache",            # botocore JSONFileCache (assume-role / SSO credentials)
+    "~/.config/gcloud",             # gcloud's credential databases and ADC (or $CLOUDSDK_CONFIG)
+    "~/.azure",                     # az's MSAL token cache and service principals (or $AZURE_CONFIG_DIR)
+)
+# Credential directories that are a tool's WHOLE home, and the environment overrides that move one.
+# On Linux they are denied only while they exist, the browser-profile rule: bwrap must create an
+# absent path to mount over it, and creating ~/.azure would plant a config dir for a tool the
+# operator never used. They are re-checked at every shell spawn (`refresh_socket_denies`), so a
+# first `gcloud auth login` during a session is denied from the next spawn on. macOS denies them
+# whether or not they exist. The ~/.aws caches need neither: ~/.aws is a read-only tool directory
+# on Linux (:data:`_CRED_TOOL_DIRS`), so an absent cache under it cannot be created from inside.
+_PRESENT_ONLY_CRED_DIRS = ("~/.config/gcloud", "~/.azure")
+_CRED_DIR_ENV = ("AWS_LOGIN_CACHE_DIRECTORY", "CLOUDSDK_CONFIG", "AZURE_CONFIG_DIR")
+
+
+def _cred_dir_sources() -> list[Path]:
+    """The present-only credential directories, lexical: the defaults, plus each override in
+    :data:`_CRED_DIR_ENV` that is set to an absolute path (the default stays denied too: it can still
+    hold the tokens written before the override)."""
+    home = Path.home()
+    out = [home / d[2:] for d in _PRESENT_ONLY_CRED_DIRS]
+    for var in _CRED_DIR_ENV:
+        value = os.path.expanduser(os.environ.get(var, ""))
+        if value and os.path.isabs(value):
+            out.append(Path(value))
+    return list(_dedup_paths(out))
+
+
+def _present_cred_dirs(sources: tuple[Path, ...] | list[Path]) -> list[Path]:
+    """Every spelling of each source this platform denies now: all of them off Linux, and on Linux
+    those that exist (a dangling link counts, so the plan refuses it rather than skipping it)."""
+    linux = platform.system() == "Linux"
+    return [p for src in sources if not linux or os.path.lexists(src) for p in _spellings(src)]
 _STANDARD_CRED_FILES = (
     "~/.aws/credentials",           # aws access key/secret. NOT ~/.aws/config — it holds region /
                                     # profile / SSO the entity legitimately needs; an operator whose
@@ -712,6 +751,9 @@ class CrownJewelsPolicy:
     # (:data:`_CRED_TOOL_DIRS`, raw ``Path.home()`` spelling), set with ``deny_standard_creds``. Linux
     # only: the bwrap plan mounts each read-only and binds its existing subdirectories back read-write,
     # creating an absent one at 0700 first. Seatbelt needs no counterpart (it denies absent paths).
+    cred_dir_sources: tuple[Path, ...] = ()  # the present-only credential directories, lexical
+    # (:func:`_cred_dir_sources`), kept so the spawn-time refresh can deny one that appears after the
+    # policy was built, as ``socket_sources`` is for the sockets. Empty unless ``deny_standard_creds``.
 
 
 def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
@@ -1114,8 +1156,12 @@ def build_policy(
     # ``~/.kube/config -> ~/dotfiles/kube/config`` link out of the floor, so ``rm`` + recreate of the
     # link planted a kubeconfig the operator's next kubectl would run (codex L3, 2026-10-07).
     tool_dirs: list[Path] = []
+    cred_dir_sources: list[Path] = []
     if deny_standard_creds:
-        subtrees.extend(p for s in _STANDARD_CRED_SUBTREES for p in _spellings(s))
+        subtrees.extend(p for s in _STANDARD_CRED_SUBTREES if s not in _PRESENT_ONLY_CRED_DIRS
+                        for p in _spellings(s))
+        cred_dir_sources = _cred_dir_sources()
+        subtrees.extend(_present_cred_dirs(cred_dir_sources))
         files.extend(p for f in _STANDARD_CRED_FILES for p in _spellings(f))
         tool_dirs = [home / d[2:] for d in _CRED_TOOL_DIRS]
     # The ledger of the session-scoped Linux placeholders (:func:`_ledger_enter`) decides what levain
@@ -1417,6 +1463,7 @@ def build_policy(
         deny_keychain=deny_standard_creds,
         sqlite_sidecars=sqlite_sidecars_t,
         ro_tool_dirs=tuple(tool_dirs),
+        cred_dir_sources=tuple(cred_dir_sources),
     )
 
 
@@ -1526,7 +1573,10 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     # (spore-1308 follow-on, codex L3 2026-10-03): a store anneal starts trusting after the binding
     # was built is covered from the next spawn on. Raises ConfinementError on an unsafe store.
     listed = _trust_listed_stores(Path.home(), policy.entity_dir, policy.workspace)
-    new_dirs = [d for d in listed if d not in policy.deny_read_write]
+    # Credential directories that exist now and did not at build (on Linux they are denied only
+    # while present: `_PRESENT_ONLY_CRED_DIRS`), the same union.
+    listed += _present_cred_dirs(policy.cred_dir_sources)
+    new_dirs = list(_dedup_paths([d for d in listed if d not in policy.deny_read_write]))
     if new_dirs:
         policy = replace(
             policy,
