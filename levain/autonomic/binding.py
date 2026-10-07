@@ -884,12 +884,16 @@ class BindingStore:
     def _preserve_bookkeeping(
         records: list[dict[str, Any]], binding_id: str, record: dict[str, Any]
     ) -> dict[str, Any]:
-        """Carry verb-owned bookkeeping (``status`` + ``graduation``) forward onto ``record`` from any
-        EXISTING same-id records, so a re-``add`` can neither resurrect a revoked grant nor wipe its
-        evidence. Only records that LOAD CLEANLY contribute (L3 codex/complement/nemotron):
+        """Carry verb-owned bookkeeping (``status`` + ``graduation`` + ``guard_additions``) forward onto
+        ``record`` from any EXISTING same-id records, so a re-``add`` can neither resurrect a revoked
+        grant, wipe its evidence, nor strip a tightening. Only records that LOAD CLEANLY contribute
+        (L3 codex/complement/nemotron):
           - status: the MOST-RESTRICTIVE valid status wins (a REVOKED/EXPIRED tombstone can never be
             overridden by a duplicate ACTIVE — the resurrection-via-duplicate vector);
-          - graduation: the record with the most evidence (max ``fire_count``).
+          - graduation: the record with the most evidence (max ``fire_count``);
+          - guard_additions: the UNION, existing guards first, then any incoming guard not already
+            present (tightening is monotone: a stale writer re-adding the sealed grant it holds must
+            not erase a kill added since; reproduced 2026-10-06 at the fold).
         A MALFORMED same-id record is IGNORED, not entombing-carried (carrying a bad ``status`` forward
         would make the next read drop the binding — a silent data destructor); the caller drops all
         same-id records, so the merged ``record`` is the single deduped survivor. If the collision is
@@ -900,6 +904,7 @@ class BindingStore:
         best_fires = -1
         saw_same_id = False
         saw_clean = False
+        carried_additions: list[dict[str, Any]] = []
         for r in records:
             if r.get("binding_id") != binding_id:
                 continue
@@ -913,8 +918,18 @@ class BindingStore:
                 best_rank, best_status = rank, loaded.status.value
             if loaded.graduation.fire_count > best_fires:
                 best_fires, best_grad = loaded.graduation.fire_count, loaded.graduation.to_dict()
+            carried_additions.extend(g.to_dict() for g in loaded.guard_additions)
         if best_status is not None:
             record["status"] = best_status
+        if carried_additions:
+            merged: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for g in (*carried_additions, *record.get("guard_additions", [])):
+                key = json.dumps(g, sort_keys=True)
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(g)
+            record["guard_additions"] = merged
         if best_grad is not None:
             record["graduation"] = best_grad
         if saw_same_id and not saw_clean:

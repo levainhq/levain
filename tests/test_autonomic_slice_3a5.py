@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as _dt
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pytest
 
@@ -328,6 +328,27 @@ def test_empty_in_list_kill_rejected_as_vacuous():
     # complement L3 LOW-2: a kill `x in []` matches nothing → never trips → refused at the purity gate.
     with pytest.raises(KillImpurityError):
         assert_kill_pure({"op": "in", "field": "x", "value": []})
+
+
+def test_stale_readd_does_not_strip_a_tightening(tmp_path):
+    # Reproduced at the 2026-10-06 fold: a writer holding the sealed grant from before a
+    # tighten_guard re-adds it; the kill added since must survive (tightening is monotone).
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding()
+    store.add(b)
+    store.tighten_guard(b.binding_id, guard(spike_id="later-kill"))
+    store.add(b)
+    assert [g.spike_id for g in store.get(b.binding_id).guard_additions] == ["later-kill"]
+
+
+def test_readd_unions_incoming_and_existing_tightenings(tmp_path):
+    store = BindingStore(tmp_path / "b.json")
+    b = a_binding()
+    store.add(b)
+    store.tighten_guard(b.binding_id, guard(spike_id="on-disk"))
+    incoming = replace(b, guard_additions=(guard(spike_id="on-disk"), guard(spike_id="incoming")))
+    store.add(incoming)
+    assert [g.spike_id for g in store.get(b.binding_id).guard_additions] == ["on-disk", "incoming"]
 
 
 def test_tighten_guard_rejects_untripping_drill(tmp_path):
