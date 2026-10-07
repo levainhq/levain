@@ -343,8 +343,6 @@ _KEYCHAIN_MACH_SERVICES = (
     "com.apple.securityd.xpc",
     "com.apple.securityd.systemkeychain",
 )
-# Other processes' argv + environment (KERN_PROCARGS2), denied by sysctl NAME; see render_profile.
-_DENY_PROCARGS_RULE = '(deny sysctl-read (sysctl-name-prefix "kern.procargs"))'
 
 
 def cred_floor_label(system: str | None = None) -> str:
@@ -2608,17 +2606,6 @@ class SeatbeltProvider(ConfinementProvider):
             for svc in _KEYCHAIN_MACH_SERVICES:
                 lines.append(f'(deny mach-lookup (global-name "{svc}"))')
             lines.append("")
-
-        lines.append(";; OTHER PROCESSES' ARGV AND ENVIRONMENT — KERN_PROCARGS2 returns any same-uid")
-        lines.append(";; process's argv and full environment, so without this rule the entity's bash")
-        lines.append(";; reads every token the operator's other processes were started with (measured")
-        lines.append(";; 2026-10-07). Chromium and Firefox both deny sysctl-read in their own profiles.")
-        lines.append(";; A sysctl NAME filter, never a syscall mask: a syscall filter makes XNU build a")
-        lines.append(";; syscall mask, and a malformed one panicked the kernel on 2026-10-07.")
-        lines.append(";; Cost inside the entity's bash: `ps -o args`/`command`, `ps -E`, `pgrep -f`,")
-        lines.append(";; `pkill -f` and psutil's cmdline() lose other processes' command lines.")
-        lines.append(_DENY_PROCARGS_RULE)
-        lines.append("")
 
         if policy.config_file is not None:
             lines.append(";; the confinement CONFIG that defines the floor is floor-protected (read+")
