@@ -1760,6 +1760,10 @@ class ConfinementConfig:
     # is the EXACT ``own_memory_files`` class from the sibling dataclass; a new field on a public
     # dataclass goes at the END unless the whole class is made keyword-only in a deliberate break.
     # ``test_confinement_config_field_order_is_append_only`` pins it.
+    hands_user: str | None = None
+    # M2: the dedicated unprivileged user the entity's bash runs as outside the interactive REPL,
+    # written by `sudo levain setup-isolation` and removed by its `--undo`. Absent means not set up:
+    # bash runs as the operator. Appended last, per the rule above.
 
 
 _CONFINEMENT_CONFIG_NAME = "confinement.json"
@@ -1873,6 +1877,19 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
             f"deny ON in both ssh_modes (the default)."
         )
 
+    # M2. Absent means not set up. A value must be a name setup-isolation could have written: the
+    # spawn passes it to sudo, so anything else (a typo, another account) is refused, not tried.
+    hands_user = data.get("hands_user")
+    if "hands_user" in data:
+        from levain.firing.hands import HANDS_USER_RE
+
+        if not isinstance(hands_user, str) or not HANDS_USER_RE.match(hands_user):
+            raise ConfinementError(
+                f"{base}: hands_user must be the name `levain setup-isolation` recorded, got "
+                f"{hands_user!r} — fail-closed. Run `sudo levain setup-isolation --undo` and set it "
+                f"up again, or remove the key to run bash as yourself."
+            )
+
     return ConfinementConfig(
         deny_files=_paths("deny_files"),
         deny_subtrees=_paths("deny_subtrees"),
@@ -1881,6 +1898,7 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
         allow_container_sockets=allow_container_sockets,
         allow_localhost_outbound=allow_localhost_outbound,
         efferent_gate=efferent_gate,
+        hands_user=hands_user,
     )
 
 

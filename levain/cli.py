@@ -963,6 +963,38 @@ def main(argv: list[str] | None = None) -> int:
     )
     adopt_p.set_defaults(func=_cmd_adopt_answers)
 
+    iso_p = subparsers.add_parser(
+        "setup-isolation",
+        help="Run an entity's bash as its own unprivileged user (one-time, needs sudo).",
+        description=(
+            "DRAFT COPY. Create a dedicated user for this entity's bash, with no password and no "
+            "login shell, and let your account start it. Once this has run, headless chat turns "
+            "and unattended runs execute bash as that user, so the kernel no longer hands the "
+            "entity the environment of the processes you run, and files only you can read stay "
+            "out of its reach. The interactive "
+            "`levain run` REPL keeps using your account. It needs root once: run it with sudo. "
+            "--undo removes everything it created."
+        ),
+    )
+    iso_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Entity directory (default: cwd).",
+    )
+    iso_p.add_argument(
+        "--undo",
+        action="store_true",
+        help="Remove the user, its group, its sudoers rule and the workspace permissions this created.",
+    )
+    iso_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Print every step and change nothing (does not need sudo).",
+    )
+    iso_p.set_defaults(func=_cmd_setup_isolation)
+
     from levain.team.cli import register as _register_team
 
     _register_team(subparsers)
@@ -1768,6 +1800,12 @@ def _cmd_adopt_answers(args: argparse.Namespace) -> int:
     from levain.install import run_adopt_answers
 
     return run_adopt_answers(args.path, dry_run=args.dry_run)
+
+
+def _cmd_setup_isolation(args: argparse.Namespace) -> int:
+    from levain.firing.hands import cmd_setup_isolation
+
+    return cmd_setup_isolation(args.path, undo=args.undo, dry_run=args.dry_run)
 
 
 def _cmd_daemon_restart(args: argparse.Namespace) -> int:

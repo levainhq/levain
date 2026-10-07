@@ -44,6 +44,7 @@ def _supports_color() -> bool:
 _COLOR = _supports_color()
 _OK = "\033[32m✓\033[0m" if _COLOR else "[OK]"
 _FAIL = "\033[31m✗\033[0m" if _COLOR else "[FAIL]"
+_WARN = "\033[33m!\033[0m" if _COLOR else "[WARN]"
 
 
 EXIT_HEALTHY = 0
@@ -77,12 +78,15 @@ class CheckResult:
     # Meaningful only when ``ok`` is False: the failure is a post-upgrade step still
     # pending, not a broken install. It changes the exit code, never the badge.
     upgrade_pending: bool = False
+    # Meaningful only when ``ok`` is True: a working install with an exposure the operator should
+    # act on. It changes the badge and prints the hint, never the exit code.
+    warn: bool = False
 
 
 def _emit(r: CheckResult) -> None:
-    badge = _OK if r.ok else _FAIL
+    badge = _FAIL if not r.ok else (_WARN if r.warn else _OK)
     print(f"  {badge} {r.name}: {r.detail}")
-    if not r.ok and r.hint:
+    if (not r.ok or r.warn) and r.hint:
         print(f"      → {r.hint}")
 
 
@@ -113,6 +117,8 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     core.extend(_check_recorded_answers(install))
     core.extend(_check_runtime(install))
     core.extend(_check_confinement(install))
+    if hookless:
+        core.extend(_check_hands_isolation(install))
     core.extend(_check_store(install))
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
@@ -876,6 +882,54 @@ def _check_confinement(install: Path) -> list[CheckResult]:
     if d.remedy:
         detail += f"\n      → to enable the bash hand: {d.remedy}"
     return [CheckResult("confinement floor", True, detail)]
+
+
+def _check_hands_isolation(install: Path) -> list[CheckResult]:
+    """Is this entity's bash run as its own unprivileged user outside the interactive REPL (M2)?
+
+    Not set up is a WARNING, loud but not a failure: the entity works, but a headless chat turn or
+    an unattended run executes as the operator, so its bash can read the argv and environment of
+    every process the operator runs. Set up but not usable (the user or the sudoers rule is gone)
+    is a FAILURE: those runs refuse to start rather than fall back to the operator's account."""
+    name = "hands isolation"
+    try:
+        from levain.firing.confinement import load_confinement_config
+        from levain.firing.hands import host_os, sudoers_path
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult(name, True, f"not determinable ({exc})")]
+    try:
+        host_os()
+    except Exception:  # noqa: BLE001 — no setup exists for this OS; nothing to warn about
+        return []
+    try:
+        cfg = load_confinement_config(install)
+    except Exception:  # noqa: BLE001 — _check_confinement already FAILs a broken config
+        return []
+    if cfg.hands_user is None:
+        return [CheckResult(
+            name, True,
+            "NOT SET UP. Headless chat and unattended runs execute bash as YOU, so the entity can "
+            "read the environment and command line of every process you run (tokens included).",
+            hint=f"sudo levain setup-isolation --path {shlex.quote(str(install))}",
+            warn=True,
+        )]
+    import pwd
+
+    try:
+        pwd.getpwnam(cfg.hands_user)
+    except KeyError:
+        return [CheckResult(name, False, f"hands user {cfg.hands_user} does not exist; headless and "
+                            "unattended runs will refuse to start",
+                            hint=f"sudo levain setup-isolation --undo --path {shlex.quote(str(install))}, then set it up again")]
+    if not sudoers_path(cfg.hands_user).exists():
+        return [CheckResult(name, False, f"the sudoers rule for {cfg.hands_user} is missing; headless "
+                            "and unattended runs will refuse to start",
+                            hint=f"sudo levain setup-isolation --undo --path {shlex.quote(str(install))}, then set it up again")]
+    ok, out = _probe(["sudo", "-n", "-u", cfg.hands_user, "/usr/bin/true"])
+    if not ok:
+        return [CheckResult(name, False, f"cannot start a process as {cfg.hands_user} ({out or 'sudo refused'})",
+                            hint=f"sudo levain setup-isolation --undo --path {shlex.quote(str(install))}, then set it up again")]
+    return [CheckResult(name, True, f"bash runs as {cfg.hands_user} outside the interactive REPL")]
 
 
 def _check_store(install: Path) -> list[CheckResult]:
