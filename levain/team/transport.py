@@ -109,6 +109,8 @@ _NO_HOOKS = ["-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/n
 _LEDGER_PATH_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[0-9a-f]{16}\.jsonl")
 _LEDGER_DIR_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _TOP_FILES = (b"team.toml", b"PROJECT.md")
+_MORE_BAD = b"\0more:"                         # followed by how many refused paths were not listed
+_MAX_BAD_PATHS = 100
 _MISSING_TEAM = b"\0team.toml is missing"     # a marker no tree path can equal (paths hold no NUL)     # with `ledger`, the whole top level of the ledger branch
 
 
@@ -121,6 +123,11 @@ _MAX_LEDGER_FILE = 64 << 20        # one ledger file; an entry is ~1 KB, so this
 _MAX_LEDGER_TOTAL = 512 << 20      # every ledger file read for one judgement, counted once per path
 _MAX_LEDGER_LEAVES = 20000         # ledger files in one tree (pins.json holds ~120 bytes each, under its own cap)
 _PINS_MAX_BYTES = 8 << 20          # a pins file holds ~120 bytes per ledger file
+_MAX_TREE_RECORDS = 4 * _MAX_LEDGER_LEAVES   # every path in the tree, folders and refused paths included
+_MAX_TREE_BYTES = _MAX_TREE_RECORDS * 200     # an ls-tree record is ~60 bytes plus a path of at most ~100 levain writes
+_MAX_LEDGER_LINES = 200_000        # lines in every ledger file read for one judgement: each becomes Python objects
+_MAX_TOP_FILE = 4 << 20            # team.toml or PROJECT.md, read whole
+_MAX_TEAM_VERSIONS = 200           # team.toml versions walked back to find one that parses
 _READ_ATTEMPTS = 3
 _PIN_RACE_TEXT = ("the ledger kept moving while this clone recorded what it accepted (a concurrent read pinned a newer "
                   "tip); nothing was read, try again")
@@ -242,7 +249,7 @@ _REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false",
 
 def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         input_text: str | None = None, binary: bool = False,
-        input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+        input_bytes: bytes | None = None, max_out: int | None = None) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true",
                GIT_NO_REPLACE_OBJECTS="1",   # a replace ref must not change what levain reads
@@ -252,11 +259,22 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     # str fields are for messages and simple tokens (replacement characters, never a lone surrogate); anything
     # that is a path or ledger content is read from stdout_bytes. ``binary``: plumbing whose output is ledger content
     # or a tree; stdout is left empty (never a second, decoded copy of up to the size limits in memory).
+    # ``max_out``: the output goes to an unlinked temporary file and is read only if it is no larger than this, so a
+    # hostile tree or file never reaches memory whole.
     timeout = left(timeout)
     try:
         data = input_bytes if input_bytes is not None else (None if input_text is None else input_text.encode("utf-8"))
-        raw = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True,
-                             timeout=timeout, input=data, stdin=None if data is not None else subprocess.DEVNULL)
+        with contextlib.ExitStack() as stack:
+            sink = stack.enter_context(tempfile.TemporaryFile()) if max_out is not None else None
+            raw = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env,
+                                 stdout=sink if sink is not None else subprocess.PIPE, stderr=subprocess.PIPE,
+                                 timeout=timeout, input=data, stdin=None if data is not None else subprocess.DEVNULL)
+            if sink is not None:
+                size = sink.seek(0, os.SEEK_END)
+                if size > max_out:
+                    raise LedgerReadError(f"git {args[0]} gave {size} bytes, past levain's limit of {max_out}")
+                sink.seek(0)
+                raw.stdout = sink.read()
     except subprocess.TimeoutExpired:
         if expired():
             raise DeadlineExceeded(f"the ledger judgement ran out of time (in git {args[0]})") from None
@@ -491,13 +509,14 @@ class GitLedger:
         return cp.stdout.strip()
 
     def _show(self, path: str, rev: str = REF) -> str | None:  # rev: a commit SHA for a consistent snapshot
-        cp = git(["show", f"{rev}:{path}"], self.repo.toplevel, check=False, timeout=30)
+        cp = git(["show", f"{rev}:{path}"], self.repo.toplevel, check=False, timeout=30, max_out=_MAX_TOP_FILE)
         return cp.stdout if cp.returncode == 0 else None
 
     def _parse_team_at(self, rev: str) -> R.Team:
         """team.toml at ``rev``, decoded STRICTLY: bytes that are not UTF-8 never become a configuration with
         replacement characters in it."""
-        cp = git(["show", f"{rev}:team.toml"], self.repo.toplevel, check=False, timeout=30)
+        cp = git(["show", f"{rev}:team.toml"], self.repo.toplevel, check=False, timeout=30, binary=True,
+                 max_out=_MAX_TOP_FILE)
         try:
             text = cp.stdout_bytes.decode("utf-8") if cp.returncode == 0 else ""
         except UnicodeDecodeError:
@@ -512,7 +531,8 @@ class GitLedger:
             return self._parse_team_at(rev)
         except R.RolesError as exc:
             first = exc
-        cp = git(["log", "--format=%H", rev, "--", "team.toml"], self.repo.toplevel, check=False, timeout=30)
+        cp = git(["log", f"--max-count={_MAX_TEAM_VERSIONS}", "--format=%H", rev, "--", "team.toml"], self.repo.toplevel,
+                 check=False, timeout=30)
         for sha in cp.stdout.split()[1:]:
             try:
                 t = self._parse_team_at(sha)
@@ -622,6 +642,9 @@ class GitLedger:
             if path is _MISSING_TEAM:
                 tamper.append(f"team.toml is missing from the {BRANCH} branch; the team owner restores it")
                 continue
+            if path.startswith(_MORE_BAD):
+                tamper.append(f"and {path[len(_MORE_BAD):].decode()} more paths levain does not write")
+                continue
             who = ""
             if n < 20:                                                    # names a commit author only
                 try:
@@ -639,6 +662,10 @@ class GitLedger:
         if pin_problem:
             return Judgement(I.build([], owner, [], tamper=[pin_problem]))
         blobs = self._blobs([sha for _p, sha in leaves])
+        lines_in_tree = sum(blobs[sha].count(b"\n") + 1 for _p, sha in leaves)    # counted before any is split
+        if lines_in_tree > _MAX_LEDGER_LINES:
+            raise LedgerReadError(f"the ledger holds {lines_in_tree} lines, past levain's limit of {_MAX_LEDGER_LINES}; "
+                                  "the team owner removes the extra files")
         whole = {path[len(b"ledger/"):].decode("ascii"): blobs[sha] for path, sha in leaves}
         tamper += self._pin_violations(pins, whole) + self._pin_violations(lagging, whole, lag=True)
         datas: dict[str, bytes] = {}
@@ -692,10 +719,22 @@ class GitLedger:
         only in case or Unicode normalisation (``aliased``): a case-insensitive filesystem checks the two out as one
         file. No blob is read."""
         cp = git(["ls-tree", "-r", "-t", "-z", "--full-tree", rev], self.repo.toplevel, check=False, timeout=30,
-                 binary=True)
+                 binary=True, max_out=_MAX_TREE_BYTES)
         if cp.returncode != 0:
             raise LedgerReadError(f"could not read the ledger tree: {_tail(cp)}")
+        records = cp.stdout_bytes.count(b"\0")
+        if records > _MAX_TREE_RECORDS:                  # counted before anything is split or kept
+            raise LedgerReadError(f"the ledger tree has {records} entries, past levain's limit of {_MAX_TREE_RECORDS}; "
+                                  "the team owner removes the extra files")
         bad_paths: list[bytes] = []
+        more = 0
+
+        def refuse(path: bytes) -> None:
+            nonlocal more
+            if len(bad_paths) < _MAX_BAD_PATHS:
+                bad_paths.append(path)
+            else:
+                more += 1
         leaves: list[tuple[bytes, str]] = []
         seen_paths: set[bytes] = set()
         folded: dict[str, bytes] = {}
@@ -709,11 +748,11 @@ class GitLedger:
                 raise LedgerReadError("git ls-tree gave a record levain cannot read")
             mode, kind = fields[0], fields[1]
             if path in seen_paths:                                        # two entries, one path: never valid
-                bad_paths.append(path)
+                refuse(path)
                 continue
             seen_paths.add(path)
             if folded.setdefault(_fold(path), path) != path:
-                bad_paths.append(path)
+                refuse(path)
                 aliased.add(path)
                 continue
             is_tree = mode == b"040000" and kind == b"tree"
@@ -727,9 +766,11 @@ class GitLedger:
             else:
                 ok = False
             if not ok:
-                bad_paths.append(path)
+                refuse(path)
         if b"team.toml" not in seen_paths:            # the team is part of the ledger: a tip without it is refused
             bad_paths.append(_MISSING_TEAM)
+        if more:
+            bad_paths.append(_MORE_BAD + str(more).encode())
         return bad_paths, leaves, aliased
 
     # ---- rewrite protection: this clone's pins (trust on first use) ---------------------------------------------

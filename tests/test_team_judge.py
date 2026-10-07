@@ -1298,3 +1298,64 @@ def test_a_deleted_process_cwd_does_not_break_the_boundary(tmp_path):
                         env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])})
     assert cp.returncode == 0, cp.stderr
     assert cp.stdout.strip() == "", cp.stdout
+
+
+def test_a_ledger_of_many_tiny_lines_is_refused_before_it_is_split(two):
+    # L1 r3 HIGH 1, RAN: 2 MiB of "xy\n" (699,050 lines) peaked at 152 MiB, ~76x the byte bound. Lines are counted
+    # before anything is split.
+    import tracemalloc
+    tmp, ana, ben = two
+    gl = _gl(ana)
+    (gl.wt / "ledger" / "ana").mkdir(exist_ok=True)
+    (gl.wt / "ledger" / "ana" / "aaaaaaaaaaaaaaaa.jsonl").write_bytes(b"xy\n" * 699050)
+    git("add", "-A", ".", cwd=gl.wt)
+    git("commit", "-qm", "many lines", cwd=gl.wt)
+    gb = _gl(ben)
+    tracemalloc.start()
+    try:
+        with pytest.raises(LedgerReadError, match="lines, past"):
+            gl.judge(gl.head(), gl.team(), {})
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 24 << 20, peak
+
+
+def test_a_tree_past_the_record_limit_is_refused_before_it_is_split(two, monkeypatch):
+    # L1 r3 MED 2: the ls-tree records are counted before the split, and a listing past the byte bound is never read.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    gl = _gl(ana)
+    for i in range(12):
+        (gl.wt / f"junk{i}").write_text("x")
+    git("add", "-A", ".", cwd=gl.wt)
+    git("commit", "-qm", "junk", cwd=gl.wt)
+    monkeypatch.setattr(T, "_MAX_TREE_RECORDS", 10)
+    with pytest.raises(LedgerReadError, match="entries, past"):
+        gl.judge(gl.head(), gl.team(), {})
+    monkeypatch.setattr(T, "_MAX_TREE_RECORDS", 10_000)
+    monkeypatch.setattr(T, "_MAX_TREE_BYTES", 100)
+    with pytest.raises(LedgerReadError, match="past levain's limit of 100"):
+        gl.judge(gl.head(), gl.team(), {})
+    monkeypatch.setattr(T, "_MAX_TREE_BYTES", 10 << 20)
+    monkeypatch.setattr(T, "_MAX_BAD_PATHS", 3)
+    bad = gl.judge(gl.head(), gl.team(), {}).ledger.tamper
+    assert len(bad) == 4 and bad[-1] == "and 9 more paths levain does not write", bad
+
+
+def test_a_team_toml_past_its_bound_is_not_read(two, monkeypatch):
+    # L2 r3 LOW-MED 5: team.toml and PROJECT.md were read whole with no size check.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    gl = _gl(ana)
+    monkeypatch.setattr(T, "_MAX_TOP_FILE", 10)
+    with pytest.raises(LedgerReadError, match="past levain's limit of 10"):
+        gl.team()
+
+
+def test_problems_and_refusals_are_kept_bounded(monkeypatch):
+    from levain.team import index as I
+    monkeypatch.setattr(I, "MAX_PROBLEMS", 2)
+    led = I.build([], None, ["a", "b", "c", "d"], tamper=["w", "x", "y"])
+    assert led.file_problems == ["a", "b", "and 2 more problems"]
+    assert led.tamper == ["w", "x", "and 1 more reasons"]
