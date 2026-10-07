@@ -172,7 +172,10 @@ class TurnOutcome(Protocol):
 
 
 def _is_text(value: Any) -> bool:
-    return isinstance(value, str)
+    """EXACTLY ``str``. A subclass is driver code wearing text's type: it can show ``""`` to the client while
+    its ``__iter__`` or ``__eq__`` says otherwise to the host's checks (codex L3 r4, run: a blank-looking
+    held call passed ``shown_in_full`` and was approved)."""
+    return type(value) is str
 
 
 @dataclass(frozen=True)
@@ -225,11 +228,11 @@ class TurnSnapshot:
             if not isinstance(getattr(self, name), bool):
                 raise DriverContractError(
                     f"the outcome's `{name}` is not a bool (a method or a value where a flag was meant)")
-        if isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int):
+        if type(self.exit_code) is not int:
             raise DriverContractError("the outcome's `exit_code` is not an int")
-        if not isinstance(self.tool_activity, tuple) or not all(_is_text(x) for x in self.tool_activity):
+        if type(self.tool_activity) is not tuple or not all(_is_text(x) for x in self.tool_activity):
             raise DriverContractError("the outcome's `tool_activity` is not a sequence of text lines")
-        if not isinstance(self.pending, tuple) or not all(isinstance(p, PendingApproval) for p in self.pending):
+        if type(self.pending) is not tuple or not all(type(p) is PendingApproval for p in self.pending):
             raise DriverContractError("the outcome's `pending` is not a tuple of PendingApproval rows")
         if self.held_digest is not None and not self.held_digest.strip():
             raise DriverContractError("the outcome's `held_digest` is blank: it names no bytes an approval could bind to")
@@ -321,7 +324,7 @@ def _pending_row(p: Any) -> PendingApproval:
     one an operator can judge). Present but blank ``detail`` or ``reason`` text is carried as it is: the
     bytes an approval runs are ``full``, which the host refuses to approve when blank, and ``detail`` is a
     one-line convenience parsed from it that can legitimately be empty. Two values fail closed instead of being refused: a ``full`` that is
-    missing or not text reads as ``""``, the contract's "could not be read" (the hold is then reject-only),
+    missing or not exactly text reads as ``""``, the contract's "could not be read" (the hold is then reject-only),
     and a missing ``recognized`` reads as ``False``."""
     got: dict[str, Any] = {n: getattr(p, n, _ABSENT) for n in ("tool_name", "detail", "reason", "full", "recognized")}
     missing = [n for n in ("tool_name", "detail", "reason") if got[n] is _ABSENT]
@@ -331,7 +334,7 @@ def _pending_row(p: Any) -> PendingApproval:
     return PendingApproval(
         tool_name=got["tool_name"],
         detail=got["detail"],
-        full=full if isinstance(full, str) else "",
+        full=full if _is_text(full) else "",
         reason=got["reason"],
         recognized=False if recognized is _ABSENT else recognized,
     )

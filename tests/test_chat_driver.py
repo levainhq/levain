@@ -1633,7 +1633,7 @@ def test_a_worker_whose_driver_closed_with_nothing_handed_exits(tmp_path):
 
 class _Unprintable(BaseException):
     def __str__(self):
-        raise ValueError("unprintable")
+        raise _Unprintable()        # and so does what it raises: every handler that prints it fails
 
 
 def test_the_boundary_survives_an_exception_it_cannot_print():
@@ -1796,3 +1796,103 @@ def test_a_banner_is_copied_into_plain_data(tmp_path):
     rec = host._sessions[sid]
     assert type(rec.info) is dict and rec.info == {"label": "fake", "n": 3}
     assert host.session_status(sid)["label"] == "fake"
+
+
+# -- L3 r4 (input cd208f2244398812) -----------------------------------------------------------------------------
+
+
+class _Liar(str):
+    """Shows "" (or what it was built with) while its iteration and equality say otherwise."""
+
+    def __iter__(self):
+        return iter("rm -rf target")
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+    __hash__ = str.__hash__
+
+
+def test_a_held_call_that_only_looks_blank_cannot_be_approved(tmp_path):
+    """codex r4 HIGH (RAN): a str subclass passed the contract's isinstance check; the client saw full == ""
+    while shown_in_full iterated it as text, and approve ran a call never shown. Only exact str is text."""
+    held = PendingEfferent("terminal", "rm", "bash fans in", full=_Liar(""))
+    d = _Fake([_Out(reply=None, gated=True, pending=(held,), held_digest="d1"), _Out()])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    st = _wait(host, host.turn(sid, "go")["job_id"])
+    assert st["result"]["pending"][0]["full"] == ""
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=st["result"]["decision_id"])
+    assert e.value.code == "undecidable" and ("approve", None) not in d.calls
+
+
+@pytest.mark.parametrize("field", ["reply", "tool_activity", "tool_name"])
+def test_text_that_is_a_str_subclass_breaks_the_contract(field):
+    with pytest.raises(DriverContractError):
+        if field == "tool_name":
+            PendingApproval(_Liar("terminal"), "d", "f", "r", True)
+        elif field == "reply":
+            read_outcome(_Out(reply=_Liar("hi")))
+        else:
+            read_outcome(_Out(tool_activity=[_Liar("x")]))
+
+
+def test_a_live_digest_that_is_not_exactly_text_binds_nothing(tmp_path):
+    """complement r4 LOW: a digest subclass overriding == matched any recorded digest."""
+    class Lying(_Fake):
+        def held_digest(self):
+            return _Liar("anything")
+
+    d = Lying([_halt(), _Out()])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    st = _wait(host, host.turn(sid, "go")["job_id"])
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=st["result"]["decision_id"])
+    assert e.value.code == "stale_decision"
+
+
+def test_a_factory_raising_an_unprintable_exception_is_an_ordinary_failed_open(tmp_path, escaped):
+    """codex r4 MED (RAN): the factory ran outside the boundary and the catch-all rendered str(exc); an
+    unprintable BaseException killed the worker and left the job running and the record opening."""
+    def factory(name, path):
+        raise _Unprintable()
+
+    host = ChatHost({"alpha": tmp_path}, driver_factory=factory)
+    out = host.open("alpha")
+    st = _wait(host, out["job_id"])
+    assert st["status"] == "failed" and "unprintable" in st["error"]
+    assert host.session_status(out["session_id"])["state"] == "failed"
+    assert escaped == []
+
+
+def test_a_banner_float_that_json_cannot_carry_is_dropped(tmp_path):
+    """complement r4 LOW: nan or inf in describe() made every view of that session invalid JSON."""
+    import json
+
+    class Banner(_Fake):
+        def describe(self):
+            return {"label": "fake", "nan": float("nan"), "inf": float("inf"), "ok": 1.5}
+
+    host = _host(tmp_path, {"alpha": Banner([])})
+    sid, _ = _open(host, "alpha")
+    json.dumps(host.listing(), allow_nan=False)
+    assert host._sessions[sid].info == {"label": "fake", "ok": 1.5}
+
+
+def test_a_failed_release_keeps_the_error_that_ended_the_session(tmp_path):
+    """complement r4 LOW: release_failed replaced a broken turn's error with the release failure."""
+    class Raising(_Fake):
+        def close(self):
+            raise RuntimeError("teardown failed")
+
+    host = _host(tmp_path, {"alpha": Raising([_Out(reply=None, error="boom")])})
+    sid, _ = _open(host, "alpha")
+    _wait(host, host.turn(sid, "go")["job_id"])
+    _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the release")
+    err = host.session_status(sid)["error"]
+    assert "boom" in err and "teardown failed" in err

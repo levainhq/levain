@@ -139,6 +139,7 @@ from levain.chat_driver import (
     OpenHandsDriver,
     TurnSnapshot,
     _call_driver,
+    _exc_text,
     read_outcome,
 )
 from levain.firing.gate import shown_in_full
@@ -219,6 +220,10 @@ shell is gone. One that never answers holds that thread (the contract forbids it
 _SHUTDOWN_JOIN_SECONDS = 60.0
 """How long :meth:`ChatHost.shutdown` waits for its side-by-side closes. Each is bounded by its driver;
 this bounds a driver that does not keep that promise (its record stays ``closing``, counted)."""
+
+
+class _FailedStart(Exception):
+    """A failed open whose text is already plain (read through the boundary)."""
 
 
 class ChatError(Exception):
@@ -387,10 +392,11 @@ def _default_factory(
 
 def _plain_banner(described: dict[Any, Any]) -> dict[str, Any]:
     """A driver's banner as plain JSON data: exact ``str`` keys, and values of exactly ``str``, ``bool``,
-    ``int``, ``float`` or ``None``. Anything else is dropped, never converted (a conversion runs the
-    driver's own code)."""
+    ``int``, a finite ``float``, or ``None``. Anything else is dropped, never converted (a conversion runs
+    the driver's own code; JSON has no NaN)."""
     return {k: v for k, v in dict.items(described)
-            if type(k) is str and (v is None or type(v) in (str, bool, int, float))}
+            if type(k) is str and (v is None or type(v) in (str, bool, int)
+                                   or (type(v) is float and math.isfinite(v)))}
 
 
 _HOST_VIEW_KEYS = frozenset({"session_id", "entity", "state", "job_id", "error", "release_failed_since",
@@ -735,7 +741,9 @@ class ChatHost:
             if job is not None and job.status == "running":
                 job.status, job.error = "failed", f"the session's release failed: {failure}"
             rec.job_id = None
-            rec.state, rec.error = "release_failed", failure
+            # the error that ended the session (a broken turn's, a failed open's) is kept, not replaced
+            rec.state = "release_failed"
+            rec.error = failure if rec.error is None else f"{rec.error}; then its release failed: {failure}"
             rec.release_failed_since = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     def _run_settle(self, rec: _Session, settle: Callable[[], None],
@@ -747,7 +755,7 @@ class ChatHost:
                 publish_job()
             settle()
         except BaseException as exc:  # noqa: BLE001 — no worker may be left to settle this record
-            text = f"{type(exc).__name__}: {exc}"
+            text = ": ".join(_exc_text(exc))
             _log.error("chat session %s: settling after its release failed: %s", rec.session_id, text)
             with self._lock:
                 job = self._jobs.get(rec.job_id) if rec.job_id else None
@@ -845,7 +853,7 @@ class ChatHost:
         try:
             target(rec, job, *args)
         except BaseException as exc:  # noqa: BLE001 — a worker must always settle its records
-            text = f"{type(exc).__name__}: {exc}"
+            text = ": ".join(_exc_text(exc))
             _log.error("chat %s job %s escaped its worker: %s", job.kind, job.job_id, text)
             to_close: Any = None
             ended: SessionState = "failed" if job.kind == "open" else "broken"
@@ -919,7 +927,8 @@ class ChatHost:
             driver, shown, held_id = rec.driver, rec.held_digest, rec.decision_id
             rec.state, rec.decision_id = "busy", None
         got = driver.call("held_digest") if driver is not None else None
-        live = got.value if got is not None and got.ok else None   # unreadable: reject-only
+        # unreadable, or not exactly text (a subclass could override `==`): reject-only
+        live = got.value if got is not None and got.ok and type(got.value) is str else None
         to_close: _DriverProxy | None = None
         with self._lock:
             rec.state = "gated"
@@ -1006,8 +1015,12 @@ class ChatHost:
         driver: _DriverProxy | None = None
         info: dict[str, Any] = {}
         try:
-            # The factory is the operator's code, not a driver's; a raise from it is an ordinary failed open.
-            driver = _DriverProxy(self._driver_factory(rec.entity, self._entities[rec.entity]))
+            # The factory makes driver code, so it is called through the boundary too; a raise from it is an
+            # ordinary failed open (its text kept, read so that it cannot raise).
+            made = _call_driver(self._driver_factory, rec.entity, self._entities[rec.entity])
+            if not made.ok:
+                raise _FailedStart(made.message or "the driver could not be made")
+            driver = _DriverProxy(made.value)
             if driver.caps.approval_timing != "after_turn":
                 # Reserved in the contract, not driven here: an in-turn consent request needs the approval
                 # state machine (chat_driver module docstring, slice S10). It is closed below, unopened.
@@ -1034,7 +1047,8 @@ class ChatHost:
                     else:
                         error = f"{driver.harness}: describe() could not be read: {banner.error}"
         except BaseException as exc:  # noqa: BLE001 — a failed start is a RESULT; keep its TEXT only
-            error = str(exc) or type(exc).__name__
+            name, text = _exc_text(exc)
+            error = text or name
         if error is not None and driver is not None:
             # A failed open releases what it built. The job's outcome is published before the close (a
             # client polling it does not wait on a teardown); the record reads closing, counted, until the
@@ -1145,7 +1159,7 @@ class ChatHost:
                     digest = snap.held_digest
                     cut = max(0, len(snap.tool_activity) - MAX_ACTIVITY_LINES)
             except BaseException as exc:  # noqa: BLE001 — the turn methods return results; this is a backstop
-                error = f"{type(exc).__name__}: {exc}"
+                error = ": ".join(_exc_text(exc))
         finally:
             done.set()
         if watcher is not None:
@@ -1162,6 +1176,9 @@ class ChatHost:
             # record reads busy until the driver confirms the release.
             with self._lock:
                 dead, rec.driver = rec.driver, None
+                if dead is not None:
+                    # why it broke, kept if its release then fails too (complement r4)
+                    rec.error = error if payload is None else payload["error"]
 
         def _publish() -> None:
             to_close: _DriverProxy | None = None
