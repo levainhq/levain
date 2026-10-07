@@ -866,8 +866,9 @@ class GitLedger:
         """The remote tip this clone last accepted, from its trusted record (None before any)."""
         return self._trust()[0].accepted
 
-    def seed_pins_from(self, path: Path) -> dict[str, dict]:
-        """A teammate's pins.json, validated as this clone's own would be (size cap, shape), for ``join``."""
+    def seed_pins_from(self, path: Path) -> Trust:
+        """A teammate's pins.json, validated as this clone's own would be (size cap, shape), for ``join``: the whole
+        record, so the bytes it accepted from the remote (``remote``) seed this clone as well as its reads do."""
         try:
             with open(path, "rb") as fh:
                 raw = fh.read(_PINS_MAX_BYTES + 1)
@@ -876,7 +877,7 @@ class GitLedger:
         rec, ok, old = _parse_pins(raw) if len(raw) <= _PINS_MAX_BYTES else (Trust(), False, False)
         if not ok or old:
             raise TeamError(f"--pins-from {path}: not a levain pins file (a clone's .git/{DIRNAME}/pins.json)")
-        return rec.files
+        return rec
 
     def _pin_violations(self, pins: dict[str, dict], datas: dict[str, bytes]) -> list[str]:
         """The files of ``datas`` that do not hold the bytes ``pins`` pin. A file of THIS clone's device is never
@@ -1170,7 +1171,13 @@ class GitLedger:
         email = self.email()
         if not email:
             raise TeamError("git config user.email is not set in this repository")
-        seed = self.seed_pins_from(pins_from) if pins_from is not None else None
+        seeded = self.seed_pins_from(pins_from) if pins_from is not None else None
+        seed = None
+        if seeded is not None:                     # the strongest of the teammate's two maps, per file
+            seed = dict(seeded.files)
+            for r, pin in seeded.remote.items():
+                if r not in seed or seed[r]["length"] < pin["length"]:
+                    seed[r] = pin
         remote = remote or self._default_remote()
         self._require_remote_name(remote)
         # The remote's tip arrives in a private join ref (never the quarantine ref, whose refusal only an accepted
@@ -1211,7 +1218,8 @@ class GitLedger:
                 j = self.judge_remote(tip, Trust(rec.files, floor, rec.seen, rec.remote))
             else:
                 j = self.judge(tip, self._team_or_none(tip), rec.files)
-            bad = j.ledger.tamper or self._pin_violations(seed or {}, j.datas) \
+            bad = j.ledger.tamper or self._pin_violations(seeded.files if seeded else {}, j.datas) \
+                or self._pin_violations(seeded.remote if seeded else {}, j.datas) \
                 or self._pin_violations(rec.remote, j.datas)
             if bad:
                 what = f"--pins-from {pins_from}: the team ledger here does not hold what it pins" if seed is not None \

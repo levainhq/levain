@@ -1713,3 +1713,18 @@ def test_a_push_that_cannot_be_recorded_says_so(two, monkeypatch):
     assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/y.py", "--words",
                 "v", "--no-push", repo=ben) == 0
     assert gb.sync() == "pushed" and gb.accepted_tip() == gb.head()      # the follow-up fetch recorded it
+
+
+def test_a_seed_carries_what_the_teammate_accepted_from_the_remote(two):
+    # codex HIGH on L3 r3: seed_pins_from returned only the teammate's read pins, dropping its remote pins.
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)
+    assert record_ruling(ana, "src/b.py", "second") == 0
+    assert _gl(ben).fetch_only(interval=0, timeout=30) is None      # ben's record: remote holds A+B, files hold A
+    seed = tmp / "ben_pins.json"
+    seed.write_bytes(_pins_file(ben).read_bytes())
+    _forge_last_line(_gl(ana), "FORGED")                            # the remote rewrites B
+    cat = clone(tmp, "cat", "ben@ex.com")
+    assert team("join", "--pins-from", str(seed), "--no-install", repo=cat) == 2
