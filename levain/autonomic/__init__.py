@@ -8,7 +8,9 @@ installment after ``levain.firing`` (2026-07-07). The modules were copied as the
 mean this engine.
 
 The active membrane's hard half: where an afferent proposal (or a bound trigger) becomes an action
-on the world, HUMAN-GATED by construction. ``govern-not-trust`` compiled into a runtime invariant —
+on the world, and EVERY such action passes the posture gate. The gate may fire without a human only
+on the two rungs that say so (``ABOVE_LOOP`` / ``ON_LOOP``, ``Posture.fires_immediately``), and only
+where the unbuyable risk floor allows it. ``govern-not-trust`` compiled into a runtime invariant —
 the augmentation thesis stops being positioning and becomes the binary's behavior. The gate's trace
 is the action-face of the FROZEN DecisionInfluenceReceipt (the vagus is its PRODUCER).
 
@@ -20,7 +22,8 @@ concrete actions, the flowConnect wire, the specific manifest content) stays in 
 
 The membrane (load-bearing — the anti-grab-bag guard):
   - It NEVER renders (the surface layer's job).
-  - It NEVER converts proposal → conclusion → action without the human.
+  - It decides HOW MUCH human an action needs; it does not decide that no human is needed by
+    default. Which rungs exist and when each fires is ``levain.autonomic.posture``.
   - It is a LEAF: it imports the standard library and ``levain.autonomic`` only, never another
     Levain module, anneal or a control-plane surface; adapters inject what it needs. The
     anti-cycle rule; the dependency arrow stays down (asserted by ``tests/test_autonomic_leaf.py``).
