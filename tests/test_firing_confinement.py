@@ -3410,6 +3410,19 @@ def test_token_files_found_readable_by_a_headless_entity_are_standard_cred_store
     assert path in _STANDARD_CRED_FILES
 
 
+@pytest.mark.parametrize("deny_creds", [False, True])
+@pytest.mark.parametrize("ssh_mode", ["agent", "raw"])
+def test_the_rendered_seatbelt_profile_never_contains_a_syscall_rule(tmp_path, deny_creds, ssh_mode) -> None:
+    # A Seatbelt `syscall-unix` / `syscall-number` rule makes XNU build a syscall mask, and a
+    # malformed one panicked the kernel on 2026-10-07 (a hand-written experiment, not levain's
+    # profile). Levain's own profile must never contain one; this renders the text only and
+    # starts no sandbox.
+    policy = build_policy(_entity(tmp_path), ssh_mode=ssh_mode, deny_standard_creds=deny_creds)
+    text = SeatbeltProvider().render_profile(policy)
+    assert "syscall-unix" not in text
+    assert "syscall-number" not in text
+
+
 def test_readme_names_every_store_the_cred_floor_denies() -> None:
     # The README lists the stores by hand for a reader deciding whether to set
     # deny_standard_creds; a store the floor gains must reach that list.
