@@ -917,8 +917,9 @@ class _Handler(GuardedHandler):
                 # A client's idempotency key: an open sent again with the same key gets the same session back, so a
                 # retry after a lost answer cannot open a second one (codex). The key's rules are the host's.
                 key = req.get("idem_key")
-                return (host.open(req.get("entity")) if key is None
-                        else host.open(req.get("entity"), idem_key=key)), 202
+                if key is None or not _host_takes_idem_key(host):   # a host without keys opens as before (L3)
+                    return host.open(req.get("entity")), 202
+                return host.open(req.get("entity"), idem_key=key), 202
             sid = req.get("session_id")
             if route == "/chat/turn":
                 return host.turn(sid, req.get("message")), 202
@@ -1034,6 +1035,17 @@ class _Handler(GuardedHandler):
             self.server.request_gate.release()
         if result is not None:
             self._send_json(result, 200)
+
+
+def _host_takes_idem_key(host: Any) -> bool:
+    """Whether this chat host's ``open`` takes an ``idem_key`` (a host that predates it would raise TypeError)."""
+    import inspect
+
+    try:
+        params = inspect.signature(host.open).parameters
+    except (TypeError, ValueError):
+        return False
+    return "idem_key" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def make_server(
@@ -1516,15 +1528,14 @@ def run_web_server(
         return 1
     unlocked = published.unlocked
 
-    if open_browser:
-        # The listening socket is already bound (ThreadingHTTPServer binds in
-        # __init__), so the browser's connection queues until serve_forever
-        # accepts it — opening before the blocking call is correct.
-        _open_browser(url, unlocked)
-
     restore_sigterm = SigtermStop()
     try:
         restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
+        if open_browser:
+            # The listening socket is already bound (ThreadingHTTPServer binds in __init__), so the browser's
+            # connection queues until serve_forever accepts it. Inside the try: a Ctrl+C while the browser opens
+            # still removes the runtime file (complement L3).
+            _open_browser(url, unlocked)
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")

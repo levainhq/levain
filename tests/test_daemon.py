@@ -1358,3 +1358,22 @@ def test_a_log_dir_under_a_directory_others_can_rename_in_is_refused(tmp_path, m
         d._prepare_private_logs(spec)
     os.chmod(shared, 0o1777)   # sticky: others cannot rename what is not theirs
     d._prepare_private_logs(spec)
+
+
+def test_a_group_writable_parent_is_refused_unless_the_group_is_this_users_own(tmp_path, monkeypatch):
+    """complement L3: on Ubuntu/Fedora (user-private groups, umask 002) ~/.local is 0775 and must not refuse."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    parent = tmp_path / "local"
+    parent.mkdir()
+    os.chmod(parent, 0o775)
+    (parent / "logs").mkdir(mode=0o700)
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=parent / "logs")
+    monkeypatch.setattr(d, "_private_group", lambda gid: True)
+    d._prepare_private_logs(spec)
+    monkeypatch.setattr(d, "_private_group", lambda gid: False)
+    with pytest.raises(d.DaemonError, match="another user could replace it in"):
+        d._prepare_private_logs(spec)

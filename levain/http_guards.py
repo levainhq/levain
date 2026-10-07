@@ -785,7 +785,11 @@ def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
         f"http://{parts.netloc}{LINK_PATH}", data=b"", method="POST",
         headers={LINK_NONCE_HEADER: nonce, LINK_TIME_HEADER: stamp,
                  LINK_PROOF_HEADER: _link_proof(token, "levain-link-request", nonce, stamp)})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_a: Any, **_k: Any) -> None:   # a 3xx is an answer, never a second request
+            return None
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     got: list[bytes | BaseException] = []
 
     def exchange() -> None:

@@ -960,3 +960,51 @@ def test_every_server_cleanup_holds_sigterm_first(module):
     for t in tries:
         first = t.finalbody[0]
         assert ast.unparse(first) == "restore_sigterm.hold()", (module, ast.unparse(first))
+        # complement L3: the browser opens inside the try, so a Ctrl+C then still runs the cleanup
+        body = "\n".join(ast.unparse(b) for b in t.body)
+        assert "open_unlocked(" in body or "_open_browser(" in body, module
+
+
+def test_request_link_code_does_not_follow_a_redirect(tmp_path):
+    """complement L3: whatever holds the port could answer 302 and send this client somewhere else."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from levain.http_guards import request_link_code
+
+    hits = []
+
+    class _Other(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            hits.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+
+        do_GET = do_POST  # noqa: N815
+
+        def log_message(self, *a):
+            pass
+
+    other = ThreadingHTTPServer(("127.0.0.1", 0), _Other)
+
+    class _Redirect(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{other.server_address[1]}/elsewhere")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    first = ThreadingHTTPServer(("127.0.0.1", 0), _Redirect)
+    threads = [threading.Thread(target=x.serve_forever, daemon=True) for x in (first, other)]
+    for t in threads:
+        t.start()
+    try:
+        with pytest.raises((OSError, ValueError)):
+            request_link_code(f"http://127.0.0.1:{first.server_address[1]}/", _TOKEN, timeout=2.0)
+        assert hits == []
+    finally:
+        for x in (first, other):
+            x.shutdown()
+            x.server_close()

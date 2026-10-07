@@ -1830,3 +1830,16 @@ def test_chat_open_hands_the_clients_idempotency_key_to_the_host(tmp_path):
         assert _call(base + "/chat/open", {"entity": "ada", "idem_key": "k" * 32})[0] == 202
         assert _call(base + "/chat/open", {"entity": "ada"})[0] == 202
     assert calls == [("ada", {"idem_key": "k" * 32}), ("ada", {})]
+
+
+def test_chat_open_with_a_key_still_opens_on_a_host_that_takes_none(tmp_path):
+    """L3 (glm + codex): the page always sends idem_key; a host whose open() has no such parameter must still open,
+    not answer 500 TypeError."""
+    host = _host(tmp_path, _Factory([]))
+    try:
+        with _serving(_source(tmp_path), host) as base:
+            entity = host.listing()["entities"][0]
+            status, body = _call(base + "/chat/open", {"entity": entity, "idem_key": "k" * 32})[:2]
+            assert status == 202, body
+    finally:
+        host.shutdown()

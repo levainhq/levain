@@ -71,8 +71,12 @@ def test_no_innerhtml_and_the_token_is_kept_only_in_this_tabs_session_storage():
         assert touch not in chat
     # codex 5: the chat panel keeps ONE thing in session storage, the open session's id and entity, under its own key
     assert {m.group(0) for m in re.finditer(r"sessionStorage\.\w+\([^)]*\)", chat)} == {
-        "sessionStorage.setItem(SESSION_KEY, JSON.stringify({ id: s.id, entity: s.entity, workspace: s.workspace })",
-        "sessionStorage.removeItem(SESSION_KEY)", "sessionStorage.getItem(SESSION_KEY)"}
+        "sessionStorage.setItem(SESSION_KEY, JSON.stringify(v)", "sessionStorage.removeItem(SESSION_KEY)",
+        "sessionStorage.getItem(SESSION_KEY)", "sessionStorage.getItem(OPENING_KEY)",
+        "sessionStorage.setItem(OPENING_KEY, JSON.stringify({ entity: v.entity, key: v.key })",
+        "sessionStorage.removeItem(OPENING_KEY)"}
+    assert re.search(r"const SESSION_KEY = \"levain\.chat\.session\";", chat)
+    assert re.search(r"const OPENING_KEY = \"levain\.chat\.opening\";", chat)
     assert {m.group(0) for m in re.finditer(r"sessionStorage\.\w+\(KEY[^)]*\)", tok)} == {
         "sessionStorage.getItem(KEY)", "sessionStorage.setItem(KEY, t)", "sessionStorage.removeItem(KEY)"}
     assert tok.count("sessionStorage.") == 3   # those three calls and no other use
@@ -130,11 +134,14 @@ function fetch(path, init) {
     { state: "release_failed" }, { entity: "ent", state: "idle" }] });
   if (path === "/chat.json" && process.argv[3] === "nosessions") return reply(200, { entities: ["ent"], model: "m" });
   if (path === "/chat.json") return reply(200, { entities: process.argv[3] === "twoentities" ? ["ent", "other"] : ["ent"], model: "m", sessions: [] });
-  if (process.argv[3] === "openretry" && path === "/chat/open") { opens.push(JSON.parse(init.body).idem_key); if (opens.length === 1) return reply(500, {}); }
+  if ((process.argv[3] === "openretry" || process.argv[3] === "pendingkey") && path === "/chat/open") { opens.push(JSON.parse(init.body).idem_key); if (opens.length === 1) return reply(500, {}); }
+  if (process.argv[3] === "openslow" && path.startsWith("/chat/job.json?id=J-open")) return new Promise(() => {});
+  if (process.argv[3] === "reloadtransient" && path.startsWith("/chat/session.json?id=S")) return reply(503, {});
+  if (process.argv[3] === "reloadunknown" && path.startsWith("/chat/session.json?id=S")) return reply(200, { state: "idle", job_id: null, last_job: { job_id: "J-x", kind: "turn", status: "done", result: { reply: "it ran", tool_activity: ["\u2699 ran"], gated: false, error: null } } });
   if (path === "/chat/open") return reply(202, { session_id: "S", job_id: "J-open" });
   if (path.startsWith("/chat/job.json?id=J-open")) return reply(200, { status: "done", result: { session: { state: "idle", workspace: "/ws/ent" } } });
   if (path === "/chat/turn" && process.argv[3] === "turn500") return reply(500, {});
-  if (path === "/chat/turn" && (process.argv[3] === "turn403json" || process.argv[3] === "turn403unlock")) return reply(403, { error: "launch_token", message: "needs token" });
+  if (path === "/chat/turn" && (process.argv[3] === "turn403json" || process.argv[3] === "turn403unlock" || process.argv[3] === "lostmid")) return reply(403, { error: "launch_token", message: "needs token" });
   if (path === "/chat/approve" && process.argv[3] === "approve403json") return reply(403, { error: "launch_token", message: "needs token" });
   if (path.startsWith("/chat/job.json?id=J-appr") && process.argv[3] === "poll403json") return reply(403, { error: "launch_token", message: "needs token" });
   if (path === "/chat/turn" && process.argv[3] === "turn409") return reply(409, { error: "wrong_state", message: "the session is busy" });
@@ -193,7 +200,8 @@ const fireLong = () => { for (const [i, f] of [...longTimers]) { longTimers.dele
 // The browser objects the token code touches, per mode. Absent by default: the prompt path must work without them.
 const MODE = process.argv[3], store = new Map(), replaced = [];
 const extra = {};
-const STORED_TOKEN_MODES = ["stored", "reload", "reloadgone", "openretry", "openclose", "notapprovable"];
+const STORED_TOKEN_MODES = ["stored", "reload", "reloadgone", "openretry", "openclose", "notapprovable", "openslow",
+  "pendingkey", "reloadunknown", "reloadtransient", "lostmid"];
 if (["fragment", "legacyfragment", "storagethrows", "badfragment", "malformedfragment", "replacethrows", ...STORED_TOKEN_MODES].includes(MODE)) {
   extra.location = { hash: { fragment: "#token=" + TOKEN, legacyfragment: "#chat_token=" + TOKEN, storagethrows: "#token=" + TOKEN,
     badfragment: "#token=nope-nope", malformedfragment: "#token=" + TOKEN + "=&x", replacethrows: "#token=" + TOKEN }[MODE] || "",
@@ -203,7 +211,8 @@ if (["fragment", "legacyfragment", "storagethrows", "badfragment", "malformedfra
     ? { getItem() { throw new Error("blocked"); }, setItem() { throw new Error("blocked"); }, removeItem() { throw new Error("blocked"); } }
     : { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: (k) => store.delete(k) };
   if (STORED_TOKEN_MODES.includes(MODE)) store.set("levain.token", TOKEN);
-  if (MODE === "reload" || MODE === "reloadgone") store.set("levain.chat.session", JSON.stringify({ id: "S", entity: "ent" }));
+  if (["reload", "reloadgone", "reloadtransient"].includes(MODE)) store.set("levain.chat.session", JSON.stringify({ id: "S", entity: "ent" }));
+  if (MODE === "reloadunknown") store.set("levain.chat.session", JSON.stringify({ id: "S", entity: "ent", unknown: true, lastJob: "J-turn" }));
 }
 const ctx = vm.createContext({ ...extra, document, fetch, encodeURIComponent, JSON, Promise, Array, Object, String,
   setTimeout: (f, ms) => { if (ms >= 2000) { const i = ++tid; longTimers.set(i, f); return i; } setImmediate(f); return 0; },
@@ -232,6 +241,49 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
     await sleep(30);
     ok(!store.has("levain.chat.session"), "a session the server no longer has is forgotten");
     ok(chatPanel().textContent.includes("has ended") && byText(chatPanel(), "Start session"), "the picker says so");
+    console.log("PASS"); return;
+  }
+  if (MODE === "lostmid") {
+    // codex L3: a token refused while a turn was out marks the remembered session's outcome unknown
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(60);
+    find(chatPanel(), (n) => n.tagName === "textarea").value = "do it";
+    byText(chatPanel(), "Send").fire("click", { isTrusted: true }); await sleep(60);
+    ok(JSON.parse(store.get("levain.chat.session")).unknown === true, "marked unknown");
+    console.log("PASS"); return;
+  }
+  if (MODE === "openslow") {
+    // complement + codex L3: remembered at the 202, before the open job ends, so a reload then finds it
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(40);
+    ok(JSON.parse(store.get("levain.chat.session")).id === "S" && !store.has("levain.chat.opening"), "remembered at 202");
+    console.log("PASS"); return;
+  }
+  if (MODE === "pendingkey") {
+    // codex L3: Back after an ambiguous open, then Start again on the same entity, resends the SAME key
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(40);
+    ok(store.has("levain.chat.opening"), "the pending key is kept");
+    byText(chatPanel(), "Back").fire("click", { isTrusted: true }); await sleep(40);
+    byText(chatPanel(), "Start session").fire("click", { isTrusted: true }); await sleep(60);
+    ok(opens.length === 2 && opens[0] === opens[1], "one key: " + JSON.stringify(opens));
+    console.log("PASS"); return;
+  }
+  if (MODE === "reloadunknown") {
+    // codex L3: a token refused mid-request before the reload: compose stays off until the operator checks
+    await sleep(40);
+    const p = chatPanel();
+    ok(byText(p, "Check what happened") && find(p, (n) => n.tagName === "textarea").disabled, "check first, compose off");
+    byText(p, "Check what happened").fire("click", { isTrusted: true }); await sleep(40);
+    ok(p.textContent.includes("it ran"), "the check reports the last job");
+    ok(JSON.parse(store.get("levain.chat.session")).unknown === false, "checked: no longer unknown");
+    console.log("PASS"); return;
+  }
+  if (MODE === "reloadtransient") {
+    // codex L3: a failed check does not show the picker, where Start would replace the only record of the session
+    await sleep(40);
+    const p = chatPanel();
+    ok(!byText(p, "Start session") && byText(p, "Check again") && byText(p, "Forget it"), "blocked recovery view");
+    ok(store.has("levain.chat.session"), "still remembered");
+    byText(p, "Forget it").fire("click", { isTrusted: true }); await sleep(20);
+    ok(!store.has("levain.chat.session") && byText(chatPanel(), "Start session"), "forgotten only on request");
     console.log("PASS"); return;
   }
   if (MODE === "openclose") {
@@ -573,6 +625,7 @@ const chatPanel = () => find(body, (n) => n.className === "panel chat-panel");
                                   "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
                                   "fragment", "legacyfragment", "stored", "storagethrows", "badfragment", "twoentities", "releasefailed", "nosessions",
                                   "reload", "reloadgone", "openclose", "openretry", "notapprovable",
+                                  "openslow", "pendingkey", "reloadunknown", "reloadtransient", "lostmid",
                                   "leakafterapprove", "leaklastjob",
                                   "malformedfragment", "replacethrows"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
@@ -643,3 +696,24 @@ def test_a_check_row_is_retired_whenever_a_new_request_is_sent():
     assert "retireChecks(); deciding = true;" in src[src.index("function lock()"):]
     judge = src[src.index("function judgeLastJob("):src.index("function resync(")]
     assert "rereadButton(" not in judge
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_a_malformed_kept_token_is_removed_when_the_page_loads(tmp_path):
+    """complement L3: take() called drop() before `token` was initialised, so the removal threw and was swallowed and
+    the malformed value stayed in session storage until the next lock()."""
+    h = tmp_path / "t.js"
+    h.write_text(r"""
+const fs = require("fs"), vm = require("vm");
+const store = new Map([["levain.token", "not a token!"]]);
+const ctx = vm.createContext({ JSON, Promise, String, Array, Object,
+  location: { hash: "", pathname: "/", search: "" }, history: { replaceState() {} },
+  sessionStorage: { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, v),
+                    removeItem: (k) => store.delete(k) },
+  document: { addEventListener() {}, readyState: "loading" }, setTimeout, fetch: () => new Promise(() => {}) });
+ctx.window = ctx;
+vm.runInContext(fs.readFileSync(process.argv[2], "utf8"), ctx);
+console.log(store.has("levain.token") ? "KEPT" : "REMOVED");
+""")
+    p = subprocess.run(["node", str(h), str(TOKEN_JS)], capture_output=True, text=True, timeout=30)
+    assert p.stdout.strip() == "REMOVED", p.stdout + p.stderr

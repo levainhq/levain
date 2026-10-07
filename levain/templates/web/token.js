@@ -24,7 +24,8 @@
   let pendingCode = null;    // a single-use link code from the fragment, traded once for the token
   let exchanging = false;    // that trade is in flight: a refusal meanwhile waits for its answer
   let deferredLock = null;   // the message such a refusal brought
-  let token = take();
+  let token = null;          // declared before take() runs: take() may drop() a bad kept value, which writes it
+  token = take();
   let form = null;
   let noteEl = null;
 

@@ -246,6 +246,35 @@ def _daemon_env(invocation: list[str]) -> dict[str, str]:
 _PRIVATE_UMASK = 0o077
 
 
+def _others_can_write(st: os.stat_result, *, sticky_ok: bool = True) -> bool:
+    """Whether a directory with this ``lstat`` lets another user add, rename or remove entries: world-writable, or
+    group-writable unless the group is this user's own private group (Ubuntu and Fedora give every user one, with a
+    002 umask, so a normal ``~/.local`` is 0775; complement L3). With ``sticky_ok`` the sticky bit makes either safe
+    (others cannot rename or remove what is not theirs), which holds for a parent but not for the log directory
+    itself, where another user could still create the log first."""
+    if sticky_ok and st.st_mode & stat.S_ISVTX:
+        return False
+    if st.st_mode & 0o002:
+        return True
+    return bool(st.st_mode & 0o020) and not _private_group(st.st_gid)
+
+
+def _private_group(gid: int) -> bool:
+    """True when no user but this one is in group ``gid`` (by membership list or as a primary group)."""
+    import grp
+    import pwd
+
+    me = pwd.getpwuid(os.getuid()).pw_name
+    if gid != os.getgid():
+        return False
+    try:
+        if any(m != me for m in grp.getgrgid(gid).gr_mem):
+            return False
+    except KeyError:
+        return False
+    return not any(p.pw_gid == gid and p.pw_name != me for p in pwd.getpwall())
+
+
 def _prepare_private_logs(spec: "DaemonSpec") -> None:
     """Create the log directory 0700 and both log files 0600 before the service first writes them (an append
     keeps a file's mode); an existing log file this user owns is narrowed to 0600 too. Levain's own default directory
@@ -261,7 +290,7 @@ def _prepare_private_logs(spec: "DaemonSpec") -> None:
         elif platform.system() != "Darwin" and d.resolve() == _default_log_dir().expanduser().resolve():
             os.chmod(d, 0o700)
         dst = os.lstat(d)   # the spec's path is already resolved (build_spec), so this is the directory itself
-        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid() or dst.st_mode & 0o022:
+        if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid() or _others_can_write(dst, sticky_ok=False):
             kind = "a symlink" if stat.S_ISLNK(dst.st_mode) else f"mode {stat.S_IMODE(dst.st_mode):04o}"
             raise DaemonError(f"{d} must be a directory this user owns that no other user can write (it is {kind}, "
                               f"owner uid {dst.st_uid}); pass another --log-dir.")
@@ -269,8 +298,7 @@ def _prepare_private_logs(spec: "DaemonSpec") -> None:
         # rename the log directory away and put their own in its place.
         for anc in d.parents:
             ast_ = os.lstat(anc)
-            if stat.S_ISLNK(ast_.st_mode) or ast_.st_uid not in (0, os.getuid()) or (
-                    ast_.st_mode & 0o022 and not ast_.st_mode & stat.S_ISVTX):
+            if stat.S_ISLNK(ast_.st_mode) or ast_.st_uid not in (0, os.getuid()) or _others_can_write(ast_):
                 raise DaemonError(f"{d} sits under {anc} (mode {stat.S_IMODE(ast_.st_mode):04o}, owner uid "
                                   f"{ast_.st_uid}), which another user could replace it in; pass another --log-dir.")
         # The service will append to whatever is at this path: it must be a regular file this user owns with one

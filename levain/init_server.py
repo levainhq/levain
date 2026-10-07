@@ -708,12 +708,11 @@ def run_init_web(
         httpd.server_close()
         return 1
 
-    if open_browser:
-        open_unlocked(url, published.unlocked)
-
     restore_sigterm = SigtermStop()
     try:
         restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
+        if open_browser:   # inside it too: a Ctrl+C while the browser opens still removes the runtime file
+            open_unlocked(url, published.unlocked)
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")

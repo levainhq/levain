@@ -39,8 +39,11 @@
   // loads, and dropped only when the server confirms it closed or no longer has it. Never the token (token.js keeps
   // that) and nothing else. Storage that throws or is absent just means no recovery.
   const SESSION_KEY = "levain.chat.session";
-  function rememberSession(s) {
-    try { window.sessionStorage.setItem(SESSION_KEY, JSON.stringify({ id: s.id, entity: s.entity, workspace: s.workspace })); } catch (e) { /* none */ }
+  // `unknown`: the token was refused while a request was out, so its outcome is unknown and a restore must not
+  // re-enable compose before the operator checks what happened (codex L3). `lastJob`: the last job this page saw start.
+  function rememberSession(s, unknown) {
+    const v = { id: s.id, entity: s.entity, workspace: s.workspace, unknown: !!unknown, lastJob: confirmedJob };
+    try { window.sessionStorage.setItem(SESSION_KEY, JSON.stringify(v)); } catch (e) { /* none */ }
   }
   function forgetSession() {
     try { window.sessionStorage.removeItem(SESSION_KEY); } catch (e) { /* none */ }
@@ -51,8 +54,26 @@
       return v && typeof v.id === "string" && typeof v.entity === "string" ? v : null;
     } catch (e) { return null; }
   }
-  // One key per Start click, sent with /chat/open and reused by its retry, so an open whose answer was lost and is
-  // sent again gets the same session back instead of a second one (codex). Not a secret: uniqueness is all it needs.
+  // One key per open, sent with /chat/open and kept (with its entity) until the open's answer is known, so an open
+  // whose answer was lost, sent again by Try again, by a later Start on the same entity, or after a reload, gets the
+  // same session back instead of a second one (codex L3). Not a secret: uniqueness is all it needs.
+  const OPENING_KEY = "levain.chat.opening";
+  function pendingOpen() {
+    try {
+      const v = JSON.parse(window.sessionStorage.getItem(OPENING_KEY) || "null");
+      return v && typeof v.key === "string" && typeof v.entity === "string" ? v : null;
+    } catch (e) { return null; }
+  }
+  function setPendingOpen(v) {
+    try {
+      if (v) window.sessionStorage.setItem(OPENING_KEY, JSON.stringify({ entity: v.entity, key: v.key }));
+      else window.sessionStorage.removeItem(OPENING_KEY);
+    } catch (e) { /* none */ }
+  }
+  function openKeyFor(entity) {
+    const p = pendingOpen();
+    return p && p.entity === entity ? p.key : newOpenKey();
+  }
   function newOpenKey() {
     const c = window.crypto;
     if (c && c.getRandomValues) {
@@ -110,6 +131,7 @@
   let lostNote = null;
   function showTokenPrompt(message, r) {
     if (r && auth && auth.get() && r.sent !== auth.get()) return;
+    if (session && message === TOKEN_LOST_MID_REQUEST) rememberSession(session, true);
     session = null; run++; deciding = false;
     lostNote = message || null;
     if (message) { ensurePanel(); clear(body); note("chat-err", message); }
@@ -145,6 +167,7 @@
   // A session this tab had open before a reload: ask the server what it holds now. Gone (404 unknown_session): forget
   // it and show the picker. Any other answer that is not a 200 leaves it remembered, says so, and shows the picker.
   function restoreSession(saved, listing) {
+    run++;   // a second restore (an unlock while this one reads) supersedes the first (complement L3)
     const myRun = run;
     api("GET", "/chat/session.json?id=" + encodeURIComponent(saved.id)).then((r) => {
       if (myRun !== run) return;
@@ -156,12 +179,32 @@
         showPicker(listing); return;
       }
       if (r.status !== 200) {
-        lostNote = "Could not check the session open before this page reloaded (" + why(r) + "); it is kept until " +
-          "the server says it closed.";
-        showPicker(listing); return;
+        // Not the picker: a new session would replace the only record of this one, which may still hold a slot
+        // (codex L3). Check again, or let it go explicitly.
+        ensurePanel(); clear(body);
+        note("chat-err", "Could not check the session open before this page reloaded (" + why(r) + ").");
+        const row = el("div", "chat-row");
+        const again = el("button", "chat-btn", "Check again"); again.type = "button";
+        again.addEventListener("click", (ev) => { if (ev.isTrusted) restoreSession(saved, listing); });
+        const drop = el("button", "chat-btn quiet", "Forget it"); drop.type = "button";
+        drop.addEventListener("click", (ev) => {
+          if (!ev.isTrusted) return;
+          forgetSession();
+          lostNote = "Forgot the earlier session; if it is still open on the server it holds a slot until it ends.";
+          showPicker(listing);
+        });
+        row.appendChild(again); row.appendChild(drop); body.appendChild(row);
+        return;
       }
       session = { id: saved.id, entity: saved.entity, workspace: saved.workspace };
+      confirmedJob = saved.lastJob || null;
       ensurePanel(); showConversation();
+      if (saved.unknown) {
+        // The token was refused while a request was out: what it did is unknown until the operator checks
+        // (codex L3). Compose stays off; the check reads the session's last job like any lost request.
+        ambiguousStop(myRun, "request", null);
+        return;
+      }
       if (s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
         showConsent(s.pending, s.decision_id, myRun, "This page was reloaded while actions were held.", s.approvable);
         return;
@@ -171,7 +214,7 @@
       endOfTurn(true);
       const row = el("div", "chat-row");
       const again = el("button", "chat-btn", "Check again"); again.type = "button";
-      again.addEventListener("click", (ev) => { if (ev.isTrusted) { session = null; run++; loadListing(false); } });
+      again.addEventListener("click", (ev) => { if (ev.isTrusted) { session = null; loadListing(false); } });
       row.appendChild(again); log.appendChild(row);
     });
   }
@@ -200,7 +243,7 @@
     }
     const open = el("button", "chat-btn", "Start session");
     open.type = "button";
-    open.addEventListener("click", () => { open.disabled = true; openSession(sel ? sel.value : listing.entities[0], newOpenKey()); });
+    open.addEventListener("click", () => { open.disabled = true; const ent = sel ? sel.value : listing.entities[0]; openSession(ent, openKeyFor(ent)); });
     row.appendChild(open);
     body.appendChild(row);
     note("chat-note dim", "model " + (listing.model || "?") + " · a session holds the entity's hands; close it when done.");
@@ -235,6 +278,7 @@
 
   // ---- open ---------------------------------------------------------------------------------------------------
   function openSession(entity, key) {
+    setPendingOpen({ entity: entity, key: key });
     api("POST", "/chat/open", { entity: entity, idem_key: key }).then((r) => {
       if (isTokenRefusal(r)) { showTokenPrompt(TOKEN_LOST_MID_REQUEST, r); return; }
       if (r.status !== 202 || !r.json.session_id) {
@@ -251,12 +295,14 @@
       }
       const sid = r.json.session_id, myRun = run;
       confirmedJob = r.json.job_id;
+      // Remembered at once, before the open job ends (complement + codex L3): a reload while it opens finds it.
+      rememberSession({ id: sid, entity: entity }); setPendingOpen(null);
       clear(body); note("chat-note", "Opening a session on " + entity + "…");
       poll(r.json.job_id, myRun, (j) => {
         const st = j.result && j.result.session && j.result.session.state;
         if (j.status === "done" && st === "idle") {
           session = { id: sid, entity: entity, workspace: j.result.session.workspace };
-          rememberSession(session); showConversation(); return;
+          rememberSession(session); showConversation(); return;   // now with its workspace
         }
         clear(body);
         note("chat-err", "The session did not open: " + (j.error || (j.result && j.result.session && j.result.session.error) || j.status));
@@ -535,6 +581,7 @@
         return;
       }
       const verdict = r.status === 200 ? judgeLastJob(s.last_job, ctx) : "";
+      if (r.status === 200) rememberSession(session);   // checked: a reload no longer has to ask again
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
         showConsent(s.pending, s.decision_id, myRun, warning, s.approvable); return;
       }

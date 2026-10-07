@@ -408,3 +408,32 @@ def test_on_macos_a_linked_root_is_denied_at_both_spellings(home: Path, monkeypa
     policy = build_policy(_entity(home))
     assert home / "Library/Application Support/Firefox" in policy.deny_read_write
     assert real.resolve() in policy.deny_read_write
+
+
+def test_on_macos_an_operator_jewel_at_a_linux_browser_path_is_still_walked(home: Path, monkeypatch) -> None:
+    """codex L3: the unwalked set held both platforms' entries, so on macOS a declared jewel at ~/.mozilla was never
+    walked for other names."""
+    import levain.firing.confinement as cf
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Darwin")
+    (home / ".mozilla").mkdir()
+    (home / ".mozilla" / "secret").write_text("x")
+    entity = _entity(home)
+    (entity / "workspace" / "alias").hardlink_to(home / ".mozilla" / "secret")
+    with pytest.raises(cf.ConfinementError, match="names on disk"):
+        cf._refuse_multiply_linked_jewels(build_policy(entity, extra_deny_read_write=(str(home / ".mozilla"),)))
+
+
+def test_the_storage_scan_is_reused_across_a_replaced_policy_object(home: Path, monkeypatch) -> None:
+    """codex L3: the floor replaces its policy object on every refresh, so a cache keyed by the object never hit."""
+    import dataclasses
+
+    import levain.firing.confinement as cf
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Darwin")
+    policy = build_policy(_entity(home))
+    cf._browser_storage(policy, fresh=True)
+    globbed = []
+    monkeypatch.setattr(cf, "_browser_roots", lambda h: globbed.append(h) or [])
+    cf._browser_storage(dataclasses.replace(policy), fresh=False)
+    assert globbed == []

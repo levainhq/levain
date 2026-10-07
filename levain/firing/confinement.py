@@ -832,7 +832,7 @@ def _browser_roots(home: Path) -> list[_BrowserRoot]:
                 out.append(_BrowserRoot(target, globs))
                 if target != c:
                     out.append(_BrowserRoot(c, globs))
-            elif target.exists():
+            elif os.path.exists(target):   # never raises (Path.exists() raises PermissionError before 3.14)
                 out.append(_BrowserRoot(target, globs))
     return out
 
@@ -3132,27 +3132,29 @@ def _foreign_runtime_dirs() -> list[str]:
     return out
 
 
-# The browser roots and which page-storage folders exist, found once per spawn (the shell-start check) and reused by the file editor's
-# checks against that spawn's policy until the next one: globbing every profile on every editor touch of a file with
-# two names (pnpm's node_modules hardlinks) was L1's cost finding. Keyed by the policy object itself.
-_STORAGE_ROOTS_CACHE: dict[int, tuple[CrownJewelsPolicy, list[_BrowserRoot], list[Path]]] = {}
-_STORAGE_ROOTS_CACHE_MAX = 16
+# The browser roots and which page-storage folders exist: found afresh at every shell spawn (the shell-start check)
+# and reused by the file editor's checks for a short while after (L1 cost: globbing every profile on every editor touch
+# of a file with two names, pnpm's node_modules hardlinks). Keyed by HOME, not by the policy object: the floor replaces
+# its policy object on every refresh (codex L3), so a per-object key never hit. A folder created since is seen by the
+# next spawn, or by the editor once the entry is older than _STORAGE_ROOTS_TTL.
+_STORAGE_ROOTS_CACHE: dict[str, tuple[float, list[_BrowserRoot], list[Path]]] = {}
+_STORAGE_ROOTS_TTL = 30.0
 _STORAGE_ROOTS_LOCK = threading.Lock()   # shells spawn concurrently (codex L3)
 
 
 def _browser_storage(policy: CrownJewelsPolicy, *, fresh: bool) -> tuple[list[_BrowserRoot], list[Path]]:
-    """The browser roots and the page-storage folders under them, found afresh or reused from this policy's spawn."""
+    """The browser roots and the page-storage folders under them, found afresh or reused (see above)."""
+    home = Path.home()
+    key = f"{platform.system()}:{home}"
     with _STORAGE_ROOTS_LOCK:
-        hit = _STORAGE_ROOTS_CACHE.get(id(policy))
-    if not fresh and hit is not None and hit[0] is policy:
+        hit = _STORAGE_ROOTS_CACHE.get(key)
+    if not fresh and hit is not None and time.monotonic() - hit[0] < _STORAGE_ROOTS_TTL:
         return hit[1], hit[2]
-    browsers = _browser_roots(Path.home())
+    browsers = _browser_roots(home)
     found = sorted({g for r in browsers if not r.loop and os.path.isdir(r.path)
                     for pattern in r.globs for g in r.path.glob(pattern)}, key=str)
     with _STORAGE_ROOTS_LOCK:
-        _STORAGE_ROOTS_CACHE[id(policy)] = (policy, browsers, found)
-        while len(_STORAGE_ROOTS_CACHE) > _STORAGE_ROOTS_CACHE_MAX:
-            del _STORAGE_ROOTS_CACHE[next(iter(_STORAGE_ROOTS_CACHE))]
+        _STORAGE_ROOTS_CACHE[key] = (time.monotonic(), browsers, found)
     return browsers, found
 
 
@@ -3163,7 +3165,7 @@ def _jewel_inodes(policy: CrownJewelsPolicy, *, fresh: bool = True) -> dict[tupl
     socket bwrap step (7) masks, and every entry under the hidden subtrees and the ssh dir (walked without following
     symlinks). Browser profiles are the exception among the subtrees: only the page storage their
     ``BROWSER_PROFILE_DIRS`` globs name is walked (Phill, 2026-10-07). Which of those folders exist is found afresh,
-    unless ``fresh`` is False, when the answer found for this policy at its spawn is reused. An absent jewel is
+    unless ``fresh`` is False, when a recent answer is reused (``_STORAGE_ROOTS_TTL``). An absent jewel is
     skipped: there is no file to have other names.
 
     ⛔ A jewel this user cannot stat or list raises :class:`ConfinementError` ("could not check"),
@@ -3222,7 +3224,10 @@ def _jewel_inodes(policy: CrownJewelsPolicy, *, fresh: bool = True) -> dict[tupl
     # kept, IS walked.
     home = Path.home()
     browsers, storage_roots = _browser_storage(policy, fresh=fresh)
-    unwalked = {home / rel for _os_name, rel, _globs in BROWSER_PROFILE_DIRS} | {r.path for r in browsers}
+    # Only this platform's entries (codex L3: on macOS an operator-declared jewel at ~/.mozilla was left unwalked
+    # because .mozilla is a Linux browser entry).
+    mine = "darwin" if platform.system() == "Darwin" else "linux"
+    unwalked = {home / rel for os_name, rel, _globs in BROWSER_PROFILE_DIRS if os_name == mine} | {r.path for r in browsers}
     roots = sorted({*policy.deny_read_write, *([policy.ssh_dir] if policy.ssh_dir else [])} - unwalked,
                    key=lambda p: str(p))
     walked: list[Path] = []
