@@ -60,10 +60,10 @@ def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session
     acked = ledger.acked(session, handle) if session else set()
     seen = denied_before | acked
     pending = [e for e in once if e["id"] not in seen]
-    owners = sorted({e["owner"] for e in tensions + foreign if e.get("owner")})
+    owners = sorted({I.oneline(e["owner"]) for e in tensions + foreign if e.get("owner")})
     blocks = "\n\n".join(I.render(e) for e in matched)
     head = (f"{TAG} {rel} is governed by {len(matched)} recorded entr{'y' if len(matched) == 1 else 'ies'} in "
-            f"the {team.project} team ledger.")
+            f"the {I.oneline(team.project)} team ledger.")
     if always or pending:
         how = []
         if pending:
@@ -73,7 +73,7 @@ def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session
                        f"({', '.join(owners) or 'the owner'}) before changing anything; do not route around this "
                        "check (no Bash, sed, heredoc or copy edits of this path). If the owner changes the call, "
                        "record their words as a new ruling (`levain team record decision --kind ruling --owner ... "
-                       f"--words ... --refs <old id>`); the team owner ({team.owner}) or the ruling's author then "
+                       f"--words ... --refs <old id>`); the team owner ({I.oneline(team.owner)}) or the ruling's author then "
                        "supersedes the old one.")
         if [e for e in foreign if _mode(e, team) == "block" and e in always]:
             how.append("A ruling above is in BLOCK mode: no edit to this path until a superseding ruling is "
@@ -84,11 +84,12 @@ def decide(team: R.Team, ledger: I.Ledger, handle: str | None, rel: str, session
         if handle is None:
             how.append("(This clone's git user.email maps to no member of the team, so every ruling here counts "
                        "as someone else's: `levain team doctor` shows the mapping.)")
-        text = f"{head} Read it before changing this file.\n\n{blocks}\n\nWhat to do: " + " ".join(how)
+        text = (f"{I.oneline(head)} Read it before changing this file.\n\n{blocks}\n\nWhat to do: "
+                + " ".join(I.oneline(h) for h in how))
         return Decision(deny=True, text=text, newly_denied={e["id"] for e in pending})
     acks = [e["id"] for e in once if e["id"] in denied_before and e["id"] not in acked]
     lead = "Proceeding is allowed; stay within these." if foreign else "For your information:"
-    return Decision(deny=False, text=f"{head} {lead}\n\n{blocks}", ack=acks)
+    return Decision(deny=False, text=f"{I.oneline(head)} {lead}\n\n{blocks}", ack=acks)
 
 
 # ---- I/O -----------------------------------------------------------------------------------------------------
@@ -107,7 +108,7 @@ def _tamper_text(ledger: I.Ledger, team: R.Team) -> str:
 
 
 def _fail_open(event: str, reason: str) -> None:
-    line = f"[team] ledger unavailable: {reason}"
+    line = f"[team] ledger unavailable: {I.oneline(reason)}"
     _out({"systemMessage": line,
           "hookSpecificOutput": {"hookEventName": event, "additionalContext": line}})
 
@@ -168,7 +169,7 @@ def pretooluse(payload: dict) -> None:
     if _in_ledger_machinery(target):
         _out({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
-            "permissionDecisionReason": (f"{TAG} {target} is inside the team ledger's private machinery. The "
+            "permissionDecisionReason": (f"{TAG} {I.oneline(target)} is inside the team ledger's private machinery. The "
                                          "ledger is written only through `levain team record` (it validates, "
                                          "hash-chains and attributes every entry); do not edit it directly.")}})
         return
@@ -223,6 +224,7 @@ def pretooluse(payload: dict) -> None:
         notes.append(f"[team] ledger not refreshed: {fetch_note} (showing the last fetched copy)")
     if ledger.problems:
         notes.append(f"[team] ledger integrity: {len(ledger.problems)} problem(s); run `levain team verify`")
+    notes = [I.oneline(n) for n in notes]   # a warning or a fetch error can carry git or ledger text
     if d is None:
         if notes:
             _out({"systemMessage": notes[0],
@@ -235,7 +237,7 @@ def pretooluse(payload: dict) -> None:
                 gl.mark_denied(session, d.newly_denied)
             except OSError as exc:
                 # Not remembering the deny means the next attempt is denied again: never a reason to allow.
-                text += f"\n\n[team] could not record this denial ({exc}); a retry will be denied again"
+                text += f"\n\n[team] could not record this denial ({I.oneline(str(exc))}); a retry will be denied again"
         _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                      "permissionDecisionReason": text}})
         return
@@ -245,7 +247,7 @@ def pretooluse(payload: dict) -> None:
                               summary=f"proceeded with an edit of {rel} after the ruling was shown"),
                       push=False, lock_timeout=3.0)
         except (TeamError, E.EntryError) as exc:
-            text += f"\n\n[team] acknowledgement not recorded: {exc}"
+            text += f"\n\n[team] acknowledgement not recorded: {I.oneline(str(exc))}"
     _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}})
 
 
@@ -330,18 +332,24 @@ def sessionstart(payload: dict) -> None:
     rulings = [e for e in live if e.get("kind") == "ruling"]
     newest = max((e.get("ts", "") for e in ledger.entries), default="")
     handle = gl.handle(team)
-    lines = [f"[team] {team.project}: {len(rulings)} ruling(s) and {len(live) - len(rulings)} other entr"
+    lines = [f"[team] {I.oneline(team.project)}: {len(rulings)} ruling(s) and {len(live) - len(rulings)} other entr"
              f"{'y' if len(live) - len(rulings) == 1 else 'ies'} in force; newest entry "
              f"{I.age(newest) if newest else 'none'}; you are {handle or 'NOT a member (git user.email unmapped)'}."]
     lines.append(f"[team] {C.staleness(canon_text, tree)}. Canon: {gl.wt / 'PROJECT.md'} (or `levain team status`)")
+    from .transport import WARNINGS
+    # A fallback to an older team.toml (or any other read warning) must reach the session, not only the edit hook.
+    lines += [f"[team] {w}" for w in WARNINGS]
     lines.append("[team] Edits to governed paths show the recorded decision first. When a person decides "
                  "something about this codebase, record it with their words: `levain team record --help`.")
     # LEVAIN_TEAM_SESSIONSTART_RULINGS=off: count + canon pointer only, so enforcement rests on the edit-time hook.
     show = os.environ.get("LEVAIN_TEAM_SESSIONSTART_RULINGS", "").lower() not in ("0", "off", "false", "no")
     for e in (rulings[:15] if show else []):
-        where = ", ".join(e.get("paths") or ["(project-wide)"])
-        words = e.get("words", "")
-        lines.append(f"  - {where}: owner {e.get('owner')}: \"{words[:160]}{'...' if len(words) > 160 else ''}\"")
+        # Every ledger-supplied string goes through oneline: a member writes these, and a line break in
+        # them would draw a forged "[team]" line into every teammate's session context.
+        where = I.oneline(", ".join(e.get("paths") or ["(project-wide)"]))
+        words = I.oneline(e.get("words", ""))
+        owner = I.oneline(str(e.get("owner")))
+        lines.append(f"  - {where}: owner {owner}: \"{words[:160]}{'...' if len(words) > 160 else ''}\"")
     if show and len(rulings) > 15:
         lines.append(f"  - ...and {len(rulings) - 15} more in PROJECT.md / `levain team status`")
     if fetch_note:
@@ -351,7 +359,7 @@ def sessionstart(payload: dict) -> None:
     note = anneal_import(gl, ledger, tree, team.owner)
     if note:
         lines.append(note)
-    text = "\n".join(lines)
+    text = "\n".join(I.oneline(line) for line in lines)   # every assembled line, whatever fed it
     _out({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}})
 
 

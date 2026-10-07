@@ -94,6 +94,7 @@ __all__ = [
     "PendingEfferent",
     "classify_action",
     "resolve_gate_mode",
+    "visible",
 ]
 
 
@@ -216,6 +217,35 @@ def classify_action(
     )
 
 
+def shown_in_full(full: object) -> bool:
+    """Whether a held action's text can stand as "the whole action": a ``str`` holding something other than
+    spaces and line feeds. One rule for the server, the REPL and the cockpit panel (``shownInFull`` there);
+    anything else (not a string, empty, blank) can only be rejected."""
+    return isinstance(full, str) and any(ch not in " \n" for ch in full)
+
+
+def visible(text: str, *, keep_newline: bool = False) -> str:
+    """``text`` for a surface where the operator decides on what they read: an ALLOWLIST. Printable ASCII
+    (U+0020 to U+007E) renders as itself, a backslash renders as ``\\\\``, and EVERY other code point (tab,
+    CR, every non-ASCII character, letters, emoji and look-alikes such as a Cyrillic ``\u0430`` included)
+    renders as ``\\u{XXXX}``. ``keep_newline`` leaves LF literal, for the one multi-line field (``full``);
+    anywhere else a newline would forge the layout. The mapping is injective by construction: the output
+    contains a backslash only as the start of ``\\\\`` or ``\\u{...}``, so a typed ``\\u{41}`` (shown
+    ``\\\\u{41}``) can never read as the escape for ``A``. The cockpit panel's ``visible()`` is the same
+    rule; the two must change together."""
+    out = []
+    for ch in str(text):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n" and keep_newline:
+            out.append(ch)
+        elif " " <= ch <= "~":
+            out.append(ch)
+        else:
+            out.append("\\u{%04X}" % ord(ch))
+    return "".join(out)
+
+
 @dataclass(frozen=True)
 class PendingEfferent:
     """One action the gate stopped, rendered for a human decision.
@@ -234,11 +264,29 @@ class PendingEfferent:
     detail: str
     reason: str
     recognized: bool = True
+    # The held tool call's arguments as the runtime stored them (the action is built from them), less only the
+    # model's narration of itself (its own risk rating and summary, which the runtime drops before building).
+    # ``detail`` is a one-line convenience parsed from the same text and is never shown instead of it. ``""``
+    # means the call could not be read: reject only.
+    full: str = ""
+
+    @property
+    def decidable(self) -> bool:
+        """``False`` when the whole action could not be shown (``full`` empty or blank): it can only be rejected."""
+        return shown_in_full(self.full)
 
     def line(self) -> str:
         """A single operator-facing entry: what it wants to do, and why that fans in."""
         mark = "" if self.recognized else "⚠ "
-        return f"{mark}{self.tool_name}: {self.detail}\n      ↳ {self.reason}"
+        out = f"{mark}{visible(self.tool_name)}: {visible(self.detail)}\n      ↳ {visible(self.reason)}"
+        if not self.decidable:
+            out += "\n      NOT SHOWN IN FULL: this cannot be approved (only rejected)"
+        else:
+            # `splitlines` would also break on \r, \x0b, \x85 and the like; visible() has already made
+            # those inert, and the newline it kept is the only line break.
+            body = "\n".join("        " + ln for ln in visible(self.full, keep_newline=True).split("\n"))
+            out += f"\n      the call's arguments, exactly (what approving runs):\n{body}"
+        return out
 
 
 def resolve_gate_mode(setting: GateSetting | str, *, human_present: bool) -> GateMode:

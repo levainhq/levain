@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "levain"
-version = "0.6.4.dev0"
+version = "0.6.10.dev0"
 description = "A portable cognitive-partnership memory + methodology kit. Ship the seed that grows a practice, not the practice."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -122,6 +122,11 @@ dependencies = [
     # their API additions (`prepare_wrap(wrap_token=)` above, `Store.wrap_status_snapshot`,
     # `Store.keyword_candidates`) are additive and the seed does not depend on them.
     "anneal-memory>=0.9.39,<0.10",
+    # The reply classifier (levain.firing.agent_reply.unreadable_tool_call) reads Markdown code regions with a
+    # CommonMark parser rather than a hand-written one: four review rounds on a hand reader each found its next edge
+    # (Phill 2026-10-05, "Let's do A"). Floor 4.0: 3.0.0 took 23 s on a reply of 5,000 reference definitions,
+    # 4.2.0 took 0.05 s (measured 2026-10-05; upstream's fix for the quadratic path, markdown-it issue 996, is in 4.0).
+    "markdown-it-py>=4,<5",
 ]
 
 [project.optional-dependencies]

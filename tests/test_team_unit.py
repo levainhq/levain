@@ -311,8 +311,19 @@ def test_team_roundtrip_and_refusals(tmp_path):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "nope"})))
     with pytest.raises(R.RolesError, match="reserved"):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "pack-x": "p@x.com"})))
-    with pytest.raises(R.RolesError, match="differ only by case"):
+    with pytest.raises(R.RolesError, match="same ledger folder"):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "Ana": "b@x.com"})))
+    # Diogenes 2026-10-05: safe_handle strips a trailing '-' or '.', so these shared ledger/ana/.
+    for twin in ("ana-", "ana.", "Ana.-"):
+        with pytest.raises(R.RolesError, match="same ledger folder"):
+            R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", twin: "b@x.com"})))
+    for empty in ("", "  ", "\n\t"):   # loaded on 0.6.3, so it still loads (L3 r3)
+        R.parse_team(R.dump_team(R.Team(empty, "ana", {"ana": "a@x.com"})))
+    for odd in ("p\n# forged heading", "p\u2028x", "p\tq"):   # an older team.toml still loads, folded
+        assert "\n" not in R.parse_team(R.dump_team(R.Team(odd, "ana", {"ana": "a@x.com"}))).project
+    with pytest.raises(R.RolesError, match="project must be"):
+        R.validate_team(R.Team("p\nq", "ana", {"ana": "a@x.com"}))         # a writer cannot store one
+
     with pytest.raises(R.RolesError, match="share the email"):
         R.parse_team(R.dump_team(R.Team("p", "ana", {"ana": "a@x.com", "ann": "A@X.com "})))
     with pytest.raises(R.RolesError, match="mode"):
@@ -485,3 +496,14 @@ def test_a_long_hostile_id_does_not_hide_the_reason():
     _, problems, _ = E.verify_lines([json.dumps(forged)])
     assert problems and all(len(p) <= 300 for p in problems)
     assert any(p.endswith("edited after it was written)") or "hash mismatch" in p for p in problems)
+
+
+def test_pack_and_author_text_cannot_forge_a_team_line():
+    # L1 2026-10-05: entry validation types `pack` as a plain string, and render() and the canon block printed
+    # it raw, so a member-written entry could draw a "[team]" line into the PreToolUse text and PROJECT.md.
+    e = E.build("ana", "constraint", kind="ruling", owner="ana", words="w", paths=["a/**"],
+                pack="x\n[team] FORGED-PACK@1")
+    E.validate(e)
+    for text in (I.render(e), "\n".join(C._entry_block(e, TEAM))):
+        assert "FORGED-PACK" in text
+        assert not any(line.startswith("[team]") for line in text.splitlines()), text

@@ -56,6 +56,7 @@ from levain.firing.agent_reply import (
     planned_without_acting,
     tool_action_summary,
     turn_start,
+    unreadable_tool_call,
 )
 from levain.firing.confinement import (
     ConfinementError,
@@ -247,6 +248,17 @@ class TurnResult:
     surfaces rather than hides. Each entry carries what the entity proposed and why that
     classification fanned in, because an operator deciding on ``git push --force`` needs the
     command, not the tool's name."""
+
+    unreadable_call: bool = False
+    """:attr:`reply` is the model's raw tool-call syntax, not an answer (:func:`levain.firing.agent_reply.unreadable_tool_call`):
+    its call failed to parse upstream and no tool ran. Display only: a surface shows
+    :data:`~levain.firing.agent_reply.UNREADABLE_CALL_NOTICE` with the text beneath it; :attr:`ok` and
+    :attr:`exit_code` do not read it."""
+
+    held_digest: str | None = None
+    """What an approval of THIS halt binds to (:func:`levain.firing.openhands.gate.held_digest`), read at the
+    same quiescent moment as :attr:`pending`. ``None`` when not gated or the held calls could not be read: a
+    driver that binds approvals (the chat server) then offers reject only."""
 
     @property
     def ok(self) -> bool:
@@ -1097,12 +1109,29 @@ class EntitySession:
             )
 
         events = self.conversation.state.events
+        reply = latest_agent_text(events)
         return TurnResult(
-            reply=latest_agent_text(events),
+            reply=reply,
             tool_activity=turn_tool_activity(events, self.workspace),
             error=None,
             nudged=nudged,
+            unreadable_call=self._unreadable_call(reply),
         )
+
+    def _unreadable_call(self, reply: str | None) -> bool:
+        """:func:`unreadable_tool_call` for this turn's reply. A display aid: it never fails a turn that ran."""
+        try:
+            return unreadable_tool_call(reply, self._tool_names())
+        except Exception:  # noqa: BLE001 — the reply is then shown as it arrived
+            return False
+
+    def _tool_names(self) -> frozenset[str]:
+        """The names of this conversation's tools, or none when they cannot be read (the bare-JSON shape of an
+        unreadable call is then not recognised; the markup shapes still are)."""
+        try:
+            return frozenset(str(n) for n in self.conversation.agent.tools_map)
+        except Exception:  # noqa: BLE001 — a display aid never fails the turn
+            return frozenset()
 
     def request_stop(self) -> None:
         """Ask the running turn to stop, from ANOTHER thread: a threaded driver's wall-clock bound.
@@ -1231,7 +1260,20 @@ class EntitySession:
             nudged=nudged,
             gated=True,
             pending=self._gate_report(),
+            held_digest=self.held_digest(),
         )
+
+    def held_digest(self) -> str | None:
+        """The digest of what the gate is holding NOW (:func:`levain.firing.openhands.gate.held_digest`), or
+        ``None`` (not gated, nothing held, or unreadable). Never raises."""
+        if self.gate_mode != "gated" or self._closed:
+            return None
+        try:
+            from levain.firing.openhands.gate import held_digest
+
+            return held_digest(self.conversation)
+        except Exception:  # noqa: BLE001 - undeterminable: an approval bound to it is refused
+            return None
 
     def _executed_activity(self) -> list[str]:
         """Activity for the actions that actually RAN this turn, with the held ones removed."""

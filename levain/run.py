@@ -41,7 +41,8 @@ import textwrap
 from pathlib import Path
 
 from levain.firing.deadline import TurnDeadline, TurnTimeout, format_timeout_report
-from levain.firing.gate import PendingEfferent
+from levain.firing.agent_reply import unreadable_call_notice
+from levain.firing.gate import PendingEfferent, visible
 from levain.firing.confinement import OFFLINE_RESIDUAL, diagnose_confinement
 from levain.session import (
     EXIT_INTERRUPTED,
@@ -190,6 +191,13 @@ def _drain_gate(
     while result.gated:
         print("\n  ⛔ \033[1mheld at the efferent gate\033[0m — this changes the world:")
         _print_pending(result.pending)
+        if not all(item.decidable for item in result.pending):
+            # An approval runs the whole action; one that could not be shown whole cannot be approved.
+            print("  → this hold cannot be shown in full, so it can only be rejected.")
+            result = session.reject_turn("the held action could not be shown in full, so it was not approved")
+            if result.error is not None:
+                return result, False
+            continue
         try:
             answer = input("\n  approve? [y/N] ").strip().lower()
         except (EOFError, KeyboardInterrupt):
@@ -682,8 +690,15 @@ def _drive_task(
             return result.exit_code
 
         # The reply goes to STDOUT as the payload — activity already streamed above, so it is
-        # NOT reprinted here (printing `result.tool_activity` too would double every line).
-        if result.reply:
+        # NOT reprinted here (printing `result.tool_activity` too would double every line). A reply that
+        # is an unreadable tool call is not a reply: without --quiet it goes to stderr with the notice.
+        if result.reply and result.unreadable_call:
+            # Not the entity's reply: the model's call failed to parse and nothing ran. The notice and the text go to
+            # STDERR; --quiet's stdout payload stays the text as it arrived, so a pipeline's contract is unchanged.
+            print(_unreadable_call_lines(result.reply, result.tool_activity), file=sys.stderr, flush=True)
+            if quiet:
+                print(result.reply, flush=True)
+        elif result.reply:
             if not quiet:
                 print(f"\n\033[1m{session.label} ›\033[0m {result.reply}", flush=True)
             else:
@@ -723,7 +738,17 @@ def _render_turn(session: EntitySession, result: TurnResult) -> None:
     headless driver streams instead and must not also call this, or activity prints twice."""
     for line in result.tool_activity:
         print(f"  \033[2m{line}\033[0m")  # dim — activity is context, the reply is the message
+    if result.reply and result.unreadable_call:
+        print(_unreadable_call_lines(result.reply, result.tool_activity))
+        return
     print(f"\n\033[1m{session.label} ›\033[0m {result.reply or '(no reply)'}")
+
+
+def _unreadable_call_lines(text: str, tool_activity) -> str:
+    """The notice for a reply that is an unreadable tool call, with the text beneath it, dim and escaped by the
+    consent surface's allowlist (:func:`levain.firing.gate.visible`): it is the model's markup, not a message."""
+    raw = "\n".join("    " + line for line in visible(text, keep_newline=True).split("\n"))
+    return f"\n  ! {unreadable_call_notice(tool_activity)}\n  \033[2mwhat the model sent:\n{raw}\033[0m"
 
 
 def _entity_label(binding) -> str:

@@ -17,7 +17,6 @@ from __future__ import annotations
 import html
 import json
 import ipaddress
-import secrets
 import sys
 import threading
 from urllib.parse import parse_qs
@@ -361,6 +360,8 @@ JS = """\
 # ---- the server --------------------------------------------------------------------------------------------
 
 class _ViewServer(ThreadingHTTPServer):
+    # Explicit: if a supported Python ever defaulted this to True, two views could bind one port and both publish.
+    allow_reuse_port = False
     allowed_hosts: frozenset[str]
     ledger_reader: Any
     recheck_days: int
@@ -369,7 +370,7 @@ class _ViewServer(ThreadingHTTPServer):
     assets: dict
     model_lock: threading.Lock
     model_lock_timeout: float
-    nonce: str
+    registration: Any = None   # holds the registry lock fd for the server's life; see registry.Registration
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
@@ -483,11 +484,7 @@ def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFA
     httpd.recheck_days = recheck_days
     httpd.ack_flag = ack_flag
     httpd.cockpit_url = cockpit_url if cockpit_url.startswith(("http://", "https://")) else DEFAULT_COCKPIT_URL
-    # The nonce ties a registry entry to THIS process: served at /team_view.id, written into the entry, and required
-    # by the cockpit's probe, so a reused pid or another view on the same port is not mistaken for this one.
-    httpd.nonce = secrets.token_hex(16)
-    httpd.assets = {"/team_view.id": (f"levain-team-view:{httpd.nonce}\n".encode("ascii"), "text/plain; charset=utf-8"),
-                    "/dashboard.css": (load_web_asset("dashboard.css").encode("utf-8"), "text/css; charset=utf-8"),
+    httpd.assets = {"/dashboard.css": (load_web_asset("dashboard.css").encode("utf-8"), "text/css; charset=utf-8"),
                     "/team_view.css": (CSS.encode("utf-8"), "text/css; charset=utf-8"),
                     "/team_view.js": (JS.encode("utf-8"), "text/javascript; charset=utf-8")}
     return httpd
@@ -498,25 +495,25 @@ def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: i
     from . import registry
     httpd = make_view_server(gl, host=host, port=port, recheck_days=recheck_days, ack_flag=ack_flag,
                              cockpit_url=cockpit_url)
-    bh, bp = str(httpd.server_address[0]), httpd.server_address[1]
-    url = f"http://{bh}:{bp}/"
-    print(f"Levain team view -> {url}")
-    print("  loopback-only · read-only (GET only) · Ctrl+C to stop", flush=True)
-    entry = None
+    previous = None
+    installed = False
     try:
+        bh, bp = str(httpd.server_address[0]), httpd.server_address[1]
+        url = f"http://{bh}:{bp}/"
+        print(f"Levain team view -> {url}")
+        print("  loopback-only · read-only (GET only) · Ctrl+C to stop", flush=True)
         # Back-link: tell the cockpit this view exists (see registry.py). Best effort: a registry that cannot be
         # written costs the cockpit's Team tab, never the view. Pruning and registering are separate steps, so a
-        # prune failure cannot skip the registration; the outer finally always unregisters, whatever else fails.
+        # prune failure cannot skip the registration. The socket is already bound, so a published entry always has
+        # its listener behind it.
         try:
             registry.prune_dead()
         except Exception as exc:  # noqa: BLE001
             print(f"  (registry prune failed: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
         try:
-            entry = registry.register(str(gl.repo.toplevel), url, gl.team().project, nonce=httpd.nonce)
+            httpd.registration = registry.register(str(gl.repo.toplevel), url, gl.team().project)
         except Exception as exc:  # noqa: BLE001
             print(f"  (not registered with the cockpit: {type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
-        previous = None
-        installed = False
         try:
             if threading.current_thread() is threading.main_thread():
                 import signal
@@ -525,16 +522,24 @@ def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: i
             httpd.serve_forever()
         except KeyboardInterrupt:
             pass
+    finally:
+        # Unpublish, then release the lock, then close the socket, each in its own finally so a failure in one never
+        # skips the next. This order keeps "lock held implies socket held" true on every clean exit.
+        try:
+            if installed:
+                import signal
+                signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
+        try:
+            if httpd.registration is not None:
+                httpd.registration.unpublish()
         finally:
             try:
-                if installed:
-                    import signal
-                    signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
-            except (ValueError, OSError):
-                pass
-            httpd.server_close()
-    finally:
-        registry.unregister(entry)
+                if httpd.registration is not None:
+                    httpd.registration.close()
+            finally:
+                httpd.server_close()
     return 0
 
 

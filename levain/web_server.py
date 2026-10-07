@@ -251,6 +251,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/dashboard_core.js": ("dashboard_core.js", "text/javascript; charset=utf-8"),
     "/dashboard_boot.js": ("dashboard_boot.js", "text/javascript; charset=utf-8"),
     "/dashboard_team.js": ("dashboard_team.js", "text/javascript; charset=utf-8"),
+    "/dashboard_chat.js": ("dashboard_chat.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -722,27 +723,31 @@ class _Handler(GuardedHandler):
 
         if path == "/team_views.json" and self._team_views_allowed():
             # The running `levain team view` servers registered on this machine (levain/team/registry.py): project,
-            # repo and loopback URL, each confirmed by a pid check and a nonce probe. Served ONLY to a loopback peer
-            # on a loopback-bound cockpit; anything else gets the ordinary 404 below, as if the route did not exist.
+            # repo and loopback URL, each held live by its view's file lock. Served ONLY to a loopback peer on a
+            # loopback-bound cockpit; anything else gets the ordinary 404 below, as if the route did not exist.
             # That one rule is why this needs no write token (dashboard_team.js carries no token logic), why repo
             # paths and project names never reach an off-box client, and why a remote browser is never handed a
-            # 127.0.0.1 link to the wrong machine. The registry probe is slow-ish, so it is NOT run under
-            # request_gate (that is for substrate reads); it has its own small cap.
+            # 127.0.0.1 link to the wrong machine. The listing opens and locks files, which can block on a dead hard
+            # mount, so it is NOT run under request_gate (that is for substrate reads); it has its own small cap.
             if not _TEAM_VIEWS_GATE.acquire(blocking=False):
                 self._send(
                     b"busy\n", "text/plain; charset=utf-8", status=503, head=head
                 )
                 return
             try:
-                from levain.team.registry import live_views
+                from levain.team.registry import live_views_scan
 
+                found, truncated = live_views_scan()
                 body = json.dumps({"views": [
-                    {"project": v["project"], "repo": v["repo"], "url": v["url"]} for v in live_views()
-                ]}).encode("utf-8")
-            except Exception:  # noqa: BLE001 - a registry fault means "no team views", never a 500
-                body = b'{"views": []}'
+                    {"project": v["project"], "repo": v["repo"], "url": v["url"]} for v in found
+                ], "truncated": truncated}).encode("utf-8")
+            except Exception:  # noqa: BLE001 - a registry fault is not "no views": a non-200 keeps the page's last list
+                body = None
             finally:
                 _TEAM_VIEWS_GATE.release()
+            if body is None:
+                self._send(b"team view registry error\n", "text/plain; charset=utf-8", status=500, head=head)
+                return
             self._send(body, "application/json; charset=utf-8", head=head)
             return
 
@@ -895,9 +900,9 @@ class _Handler(GuardedHandler):
             if route == "/chat/turn":
                 return host.turn(sid, req.get("message")), 202
             if route == "/chat/approve":
-                return host.approve(sid), 202
+                return host.approve(sid, req.get("expect")), 202
             if route == "/chat/reject":
-                return host.reject(sid, req.get("reason")), 202
+                return host.reject(sid, req.get("reason"), req.get("expect")), 202
             return host.close(sid), 200
         except ChatError as exc:
             return {"error": exc.code, "message": str(exc)}, exc.http_status
@@ -1313,6 +1318,28 @@ def make_server(
     return httpd
 
 
+def _open_browser(url: str, unlocked: str) -> None:
+    """Open the cockpit. ``unlocked`` (the URL with the chat token in its fragment) goes ONLY to macOS's osascript
+    controller, which hands the URL over on osascript's stdin and then as an Apple Event, never on a command line.
+    Every other controller (``open``, xdg-open, a browser binary, ``$BROWSER``) puts the URL in argv, which other OS
+    users can read from the process table: the very callers the chat token exists to keep out. So the osascript
+    controller is called directly, never through ``webbrowser.open``, which on a failure would hand the same URL to
+    the next registered controller; if it is not the default or fails, the plain URL opens through the usual chain
+    and the token field asks."""
+    import webbrowser
+
+    try:
+        ctl = webbrowser.get()
+        if isinstance(ctl, webbrowser.MacOSXOSAScript) and ctl.open(unlocked):
+            return
+    except Exception:  # noqa: BLE001 — no usable controller, or no MacOSXOSAScript on this platform
+        pass
+    try:
+        webbrowser.open(url)
+    except Exception:  # noqa: BLE001 — a headless box without a browser is fine
+        pass
+
+
 def run_web_server(
     path: Path,
     *,
@@ -1407,22 +1434,23 @@ def run_web_server(
     if chat_host is not None:
         names = ", ".join(chat_host.listing()["entities"])
         print(f"  chat: {names} · model {model} · POST /chat/open, /chat/turn; poll /chat/job.json")
-        # Flushed: this line is the only place the token is published, and stdout is block-buffered
+        # Flushed: this terminal is where the token is published (and, on macOS, the browser it opens), and stdout is block-buffered
         # when it is not a terminal (a supervisor, a log file), where it would otherwise not appear
         # until the buffer filled. RUN 2026-10-03: piped to a file, the token never showed.
         print(f"  chat token (send as {_CHAT_TOKEN_HEADER}; valid until this server stops): "
               f"{httpd.chat_token}", flush=True)
+        # The link carries the token in the URL FRAGMENT, which a browser keeps to itself: it is never sent to a
+        # server, so it reaches no access log and no Referer. The panel reads it and strips it from the address bar.
+        unlocked = f"{url}#chat_token={httpd.chat_token}"
+        print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
+    else:
+        unlocked = url
 
     if open_browser:
         # The listening socket is already bound (ThreadingHTTPServer binds in
         # __init__), so the browser's connection queues until serve_forever
         # accepts it — opening before the blocking call is correct.
-        import webbrowser
-
-        try:
-            webbrowser.open(url)
-        except Exception:  # noqa: BLE001 — a headless box without a browser is fine
-            pass
+        _open_browser(url, unlocked)
 
     try:
         httpd.serve_forever()

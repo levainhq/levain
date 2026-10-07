@@ -19,6 +19,9 @@ Two SDK realities it encodes (verified against OpenHands 1.26.0, 2026-07-08):
 from __future__ import annotations
 
 import json
+import re
+
+from markdown_it import MarkdownIt
 
 # The discriminator of the built-in ``finish`` tool's action (a stable pydantic ``.kind``).
 FINISH_ACTION_KIND = "FinishAction"
@@ -172,6 +175,135 @@ def humanize_finish_json(text: str) -> str:
             if isinstance(message, str) and message.strip():
                 return message.strip()
     return text  # no finish message found → don't fabricate a reply from the scratchpad
+
+
+# What the panel and the REPL show instead of a reply that is a model's unreadable tool call (Phill, 2026-10-05).
+UNREADABLE_CALL_NOTICE = (
+    "The model tried to call a tool, but its call couldn't be read, so nothing ran. Ask again, or switch models."
+)
+# The same, for a turn in which other actions DID run (listed with it): "nothing ran" would be false there, and an
+# operator who believed it could ask again and run an approved action twice.
+UNREADABLE_CALL_AFTER_ACTIONS_NOTICE = (
+    "The model tried to call a tool, but its last call couldn't be read, so that call did not run. The actions "
+    "listed with this message did run. Ask again, or switch models."
+)
+
+
+def unreadable_call_notice(tool_activity) -> str:
+    """The notice for a turn whose reply is an unreadable tool call, given the actions that turn ran."""
+    return UNREADABLE_CALL_AFTER_ACTIONS_NOTICE if tool_activity else UNREADABLE_CALL_NOTICE
+
+# GLM's argument markup: a key tag next to a value tag. A parse failure upstream can cut the reply anywhere, so
+# either order and either tag half counts ("</arg_key><arg_value>", "</arg_value><arg_key>").
+_GLM_ARG_PAIR = re.compile(r"</arg_key>\s*<arg_value>|</arg_value>\s*<arg_key>")
+# The <tool_call> wrapper opening an actual call: a JSON object, a tool name followed by GLM argument markup, or
+# Qwen3-Coder's <function=name>. The bare tag in a sentence ("a <tool_call> tag") is not a call. The space between
+# may cross line and paragraph breaks.
+_TOOL_CALL_OPEN = re.compile(r"<tool_call>\s*(?:\{|<function=|[A-Za-z_][\w.-]*\s*<arg_key>)")
+# A reply this large is not classified, and is shown as it arrived (Phill 2026-10-05, A'): a bound, so no input can
+# make the classifier itself slow.
+MAX_CLASSIFIED_BYTES = 200_000
+
+# The rule (Phill 2026-10-05, A'): tool-call markup found anywhere OUTSIDE a code region is a leak, inside a
+# heading, a list or a quote included. A model has no reason to write that markup in prose; a false flag still shows
+# the answer, under the notice; nothing runs either way. Code regions are the CommonMark parser's to decide
+# (markdown-it-py, "commonmark" preset): fenced and indented code blocks and code spans. Everything else is kept, in
+# document order, one region per line; an entity or a backslash escape ("&lt;", "\\<") and a code span become a
+# placeholder that is neither a space nor markup, so "&lt;tool_call>" and "\\<tool_call>" are not "<tool_call>".
+_MD = MarkdownIt("commonmark").disable("text_join")
+# markdown-it-py compiles each rule chain on first use and publishes the empty cache before filling it, so two
+# threads parsing their first reply at once could run without rules (codex L3 r5). Parse once here, single-threaded.
+_MD.parse("warm *a* `b` [c](d)\n\n> e\n\n- f\n\n# g\n\n```\nh\n```\n")
+_MARK = "\x00"
+
+
+def _inline_text(token) -> str:
+    parts: list[str] = []
+    for c in token.children or ():
+        if c.type in ("softbreak", "hardbreak"):
+            parts.append("\n")
+        elif c.type in ("text", "html_inline"):
+            parts.append(c.content)
+        elif c.type in ("text_special", "code_inline"):   # an escape or entity is quoted text, not markup
+            parts.append(_MARK)
+        elif c.children:
+            parts.append(_inline_text(c))
+    return "".join(parts)
+
+
+def _read(text: str) -> tuple[str, str | None]:
+    """One parse of ``text``: (``text`` with its code regions removed, see above; the inside of ``text`` when its only
+    top-level block is one fenced code block, else ``None``). If the parser fails, all of ``text`` counts as outside
+    code and there is no fence: a display aid that cannot read the reply flags rather than hides."""
+    try:
+        tokens = _MD.parse(text)
+    except Exception:  # noqa: BLE001
+        return text, None
+    regions = []
+    for t in tokens:
+        if t.type == "inline":
+            regions.append(_inline_text(t))
+        elif t.type == "html_block":
+            regions.append(t.content)
+    blocks = [t for t in tokens if t.level == 0 and not t.type.endswith("_close")]
+    body = blocks[0].content if len(blocks) == 1 and blocks[0].type == "fence" else None
+    return "\n".join(regions), body
+
+
+def _json_call_names(text: str) -> list[str] | None:
+    """The tool names of ``text`` when ALL of it is one or more function-call JSON values, else ``None``.
+    A call is an object with a string ``name`` and an ``arguments`` or ``parameters`` key, or an OpenAI
+    ``{"type": "function", "function": {...}}`` wrapper of one; a top-level JSON array of call objects counts too.
+    Never raises: input the decoder cannot take (malformed, or nested past its recursion limit) is not a call."""
+    decoder = json.JSONDecoder()
+    names: list[str] = []
+    idx, n = 0, len(text)
+
+    def call(obj: object) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        if obj.get("type") == "function" and isinstance(obj.get("function"), dict):
+            obj = obj["function"]
+        name = obj.get("name")
+        if isinstance(name, str) and ("arguments" in obj or "parameters" in obj):
+            names.append(name)
+            return True
+        return False
+
+    while idx < n:
+        while idx < n and text[idx].isspace():
+            idx += 1
+        if idx >= n:
+            break
+        try:
+            obj, idx = decoder.raw_decode(text, idx)
+        except (ValueError, RecursionError):
+            return None
+        items = obj if isinstance(obj, list) and obj else [obj]
+        if not all(call(x) for x in items):
+            return None
+    return names or None
+
+
+def unreadable_tool_call(text: str | None, tool_names: frozenset[str] | set[str]) -> bool:
+    """Whether ``text``, an agent's reply, is a model's raw tool-call syntax rather than an answer.
+
+    An open model's call that fails to parse upstream reaches levain as reply TEXT, and that call did not run.
+    Three shapes are recognised. Two are markup found anywhere outside Markdown code (see :func:`_read`):
+    GLM argument markup (a key tag beside a value tag), and a ``<tool_call>`` wrapper that opens a call; markup
+    written in code is an answer. The third is a reply that is entirely function-call JSON (bare, or as the whole of
+    one fenced block) naming only ``tool_names``, the entity's own tools; with none known, that shape is not flagged.
+    Replies over :data:`MAX_CLASSIFIED_BYTES` are not classified. It reads the shape only: the call is never repaired
+    or run."""
+    # Characters first: UTF-8 spends at least one byte per character, so more characters than the bound means more
+    # bytes, and a reply that size is never encoded just to be refused (codex L3 r7).
+    if not text or len(text) > MAX_CLASSIFIED_BYTES or len(text.encode("utf-8", "surrogatepass")) > MAX_CLASSIFIED_BYTES:
+        return False
+    prose, body = _read(text)
+    names = _json_call_names((body if body is not None else text).strip())
+    if names and all(n in tool_names for n in names):
+        return True
+    return bool(_TOOL_CALL_OPEN.search(prose) or _GLM_ARG_PAIR.search(prose))
 
 
 def is_corrective_nudge(event) -> bool:

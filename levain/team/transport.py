@@ -24,6 +24,7 @@ import stat
 import random
 import re
 import secrets
+import stat
 import subprocess
 import tempfile
 import time
@@ -248,7 +249,7 @@ class GitLedger:
         return r if isinstance(r, str) and r else None
 
     def joined(self) -> bool:
-        return (self.wt / ".git").exists() and bool(self.device) and (self.wt / "team.toml").is_file()
+        return (self.wt / ".git").exists() and bool(self.device) and os.path.lexists(self.wt / "team.toml")
 
     def require_joined(self) -> None:
         if not self.joined():
@@ -1026,12 +1027,59 @@ class GitLedger:
         state = ["v1", ids, R.dump_team(team), sorted(ledger.problems)]
         return hashlib.sha256(json.dumps(state).encode("utf-8")).hexdigest()[:16]
 
+    def _refuse_odd_entry(self, name: str) -> None:
+        """A top-level worktree file that a member committed as a directory or gitlink cannot be replaced by a
+        rename; say so as a team error instead of failing with a raw OSError."""
+        try:
+            st = os.lstat(self.wt / name)
+        except FileNotFoundError:
+            return
+        if stat.S_ISDIR(st.st_mode):
+            raise TeamError(f"{name} in the team worktree is a directory (it was committed to the ledger branch "
+                            f"that way); levain will not replace it. The owner removes it from the ledger branch")
+
+    def _replace_plain(self, name: str, text: str) -> None:
+        """Write a top-level worktree file as a NEW regular file renamed into place. The ledger branch is written by
+        every member, so ``name`` may arrive as a symlink (or a hard link): writing to the path would follow it
+        out of the worktree. A rename replaces the directory entry itself, so a link there is replaced, never
+        followed. The temp file is made outside the worktree (in the team state directory, the same filesystem)
+        under a random name, so a crash leaves nothing git sees and no member can commit the name in advance."""
+        self._refuse_odd_entry(name)
+        fd, tmp = tempfile.mkstemp(prefix=f".{name}.", suffix=".tmp", dir=self.base)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+                fh.flush()
+                os.fchmod(fh.fileno(), 0o644)
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.wt / name)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _read_plain(self, name: str) -> str:
+        """A top-level worktree file, read only if the entry itself is a regular file: opened without following a
+        link and checked on the open descriptor, so a swap between a check and the read cannot redirect it."""
+        try:
+            fd = os.open(self.wt / name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        except OSError as exc:
+            raise TeamError(f"{name} in the team worktree cannot be read as a regular file ({exc.strerror}); a link "
+                            f"or other entry was committed to the ledger branch, and levain will not follow it") from exc
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                raise TeamError(f"{name} in the team worktree is not a regular file (a link or other entry was "
+                                f"committed to the ledger branch); levain will not read or write through it")
+            return fh.read().decode("utf-8")
+
     def _write_file(self, name: str, text: str, message: str, push: bool) -> str:
         self.require_joined()
         with self.lock():
             self._recover_dirty()
             require_untampered(self.ledger())           # judged INSIDE the lock, against the current tip
-            (self.wt / name).write_text(text, encoding="utf-8")
+            self._replace_plain(name, text)
             git(["add", "--", name], self.wt)
             if not git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode:
                 return f"{name} unchanged"
@@ -1050,10 +1098,10 @@ class GitLedger:
         with self.lock():
             self._recover_dirty()
             require_untampered(self.ledger())           # judged INSIDE the lock, against the current tip
-            team = R.parse_team((self.wt / "team.toml").read_text(encoding="utf-8"), "team.toml")
+            team = R.parse_team(self._read_plain("team.toml"), "team.toml")
             change(team)
             R.validate_team(team)
-            (self.wt / "team.toml").write_text(R.dump_team(team), encoding="utf-8")
+            self._replace_plain("team.toml", R.dump_team(team))
             git(["add", "--", "team.toml"], self.wt)
             if not git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode:
                 return "team.toml unchanged"

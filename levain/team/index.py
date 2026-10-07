@@ -269,7 +269,8 @@ def age(ts: str, now: datetime | None = None) -> str:
     return f"{h}h ago" if h else f"{max(1, d.seconds // 60)}m ago"
 
 
-_BREAKS = ("\r\n", "\n", "\r", " ", " ", "\x85", "\x0b", "\x0c")
+_BREAKS = ("\r\n", "\n", "\r", " ", " ", "\x85", "\x0b", "\x0c",
+           "\x1c", "\x1d", "\x1e")  # FS/GS/RS: str.splitlines() breaks on these too
 
 
 def oneline(text: str) -> str:
@@ -287,14 +288,16 @@ def render(e: dict) -> str:
         bits.append(f'  words: "{oneline(e["words"])}"')
     if e.get("owner"):
         bits.append(f"  owner of the call: {oneline(e['owner'])}")
-    src = f"pack {e['pack']}" if e.get("pack") else (e.get("agent") or "human")
-    bits.append(f"  recorded by {e.get('author')} ({src}), {age(e.get('ts', ''))}")
+    src = f"pack {oneline(e['pack'])}" if e.get("pack") else (e.get("agent") or "human")
+    bits.append(f"  recorded by {oneline(str(e.get('author')))} ({src}), {age(e.get('ts', ''))}")
     if e.get("summary"):
-        bits.append(f"  summary by {e.get('author')}: {oneline(e['summary'])}")
+        bits.append(f"  summary by {oneline(str(e.get('author')))}: {oneline(e['summary'])}")
     if e.get("reason"):
         bits.append(f"  why: {oneline(e['reason'])}")
     if e.get("paths"):
         bits.append(f"  governs: {oneline(', '.join(e['paths']))}")
     if e.get("recheck"):
         bits.append(f"  re-check: {oneline(e['recheck'])}")
-    return "\n".join(bits)
+    # One fold over every line this emits, whatever field fed it: per-field folding missed a new field each review
+    # round (spore-813), and a line break in any of them draws a forged line in an agent's context.
+    return "\n".join(oneline(b) for b in bits)

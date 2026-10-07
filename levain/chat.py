@@ -97,6 +97,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
 
+from levain.firing.gate import shown_in_full
+
 if TYPE_CHECKING:
     from levain.firing.drive import DriveMode
 
@@ -214,6 +216,10 @@ class _Session:
     session_id: str
     entity: str
     state: SessionState = "opening"
+    decision_id: str | None = None   # single-use: names ONE gated halt; spent the moment a decision starts
+    pending: list[dict[str, Any]] = field(default_factory=list)   # the held set that id names, for a re-read
+    held_digest: str | None = None   # what an approve of that id binds to (levain.firing.openhands.gate.held_digest)
+    last_job_id: str | None = None   # the most recent job that STARTED on this session, for a page that lost it
     session: Any = None          # the EntitySession once open; None before and after
     error: str | None = None     # why it failed or broke, as text (see the module docstring)
     job_id: str | None = None    # the job currently driving it, if any
@@ -225,18 +231,20 @@ def _turn_payload(result: Any) -> dict[str, Any]:
     result's own derived properties, so a client reads the harness's classification rather than
     re-deriving it."""
     activity = [_cap_line(x) for x in result.tool_activity]
+    pending = [
+        {"tool": p.tool_name, "detail": p.detail, "full": getattr(p, "full", ""), "reason": p.reason,
+         "recognized": p.recognized}
+        for p in result.pending
+    ]
     return {
         "reply": result.reply,
+        "unreadable_call": bool(getattr(result, "unreadable_call", False)),
         "tool_activity": activity[-MAX_ACTIVITY_LINES:],
         "error": result.error,
         "nudged": result.nudged,
         "gated": result.gated,
         "timed_out": result.timed_out,
-        "pending": [
-            {"tool": p.tool_name, "detail": p.detail, "reason": p.reason,
-             "recognized": p.recognized}
-            for p in result.pending
-        ],
+        "pending": pending,
         "ok": result.ok,
         "exit_code": result.exit_code,
     }
@@ -357,28 +365,47 @@ class ChatHost:
             }
 
     def session_status(self, session_id: Any) -> dict[str, Any]:
+        """One session's state. For a ``gated`` session it also carries the CURRENT ``decision_id`` and the
+        ``pending`` set that id names, so a caller that lost the turn's result (a reloaded page, a lost
+        poll) can decide again. Only here, never in :meth:`listing`: the id is addressed by a session id. A
+        gated session with no current id (an approve found the held calls changed) still reports its
+        ``pending`` set, so it can be shown and rejected; without an id it cannot be approved. ``last_job`` is the
+        most recent job that started on the session (its kind, status, activity and result, as
+        :meth:`job_status` gives them), so a page that lost track of a turn or decision can see what it did."""
         with self._lock:
-            return self._session_view(self._get(session_id))
+            rec = self._get(session_id)
+            out = self._session_view(rec)
+            if rec.last_job_id is not None:
+                out["last_job"] = self._job_view(rec.last_job_id)
+            if rec.state == "gated":
+                out["pending"] = [dict(p) for p in rec.pending]
+                if rec.decision_id is not None:
+                    out["decision_id"] = rec.decision_id
+            return out
 
     def job_status(self, job_id: str) -> dict[str, Any]:
         with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return {"job_id": job_id, "status": "unknown"}
-            out: dict[str, Any] = {
-                "job_id": job.job_id,
-                "session_id": job.session_id,
-                "kind": job.kind,
-                "status": job.status,
-                "activity": list(job.activity),
-                "activity_dropped": job.dropped,
-                "deadline_hit": job.deadline_hit,
-            }
-            if job.result is not None:
-                out["result"] = dict(job.result)
-            if job.error is not None:
-                out["error"] = job.error
-            return out
+            return self._job_view(job_id)
+
+    def _job_view(self, job_id: str) -> dict[str, Any]:
+        """One job as JSON-shaped data; ``status: unknown`` once it is no longer held. Caller holds the lock."""
+        job = self._jobs.get(job_id)
+        if job is None:
+            return {"job_id": job_id, "status": "unknown"}
+        out: dict[str, Any] = {
+            "job_id": job.job_id,
+            "session_id": job.session_id,
+            "kind": job.kind,
+            "status": job.status,
+            "activity": list(job.activity),
+            "activity_dropped": job.dropped,
+            "deadline_hit": job.deadline_hit,
+        }
+        if job.result is not None:
+            out["result"] = dict(job.result)
+        if job.error is not None:
+            out["error"] = job.error
+        return out
 
     # -- operations ----------------------------------------------------------
 
@@ -415,15 +442,18 @@ class ChatHost:
             raise ChatError("too_large", f"message exceeds {MAX_MESSAGE_CHARS} characters", 413)
         return self._start(session_id, "turn", ("idle",), lambda s: s.run_turn(message))
 
-    def approve(self, session_id: Any) -> dict[str, Any]:
-        return self._start(session_id, "approve", ("gated",), lambda s: s.resume_turn())
+    def approve(self, session_id: Any, expect: Any = None) -> dict[str, Any]:
+        """Run the held actions. ``expect`` (the current decision id) is REQUIRED: an approval is bound to
+        the set the operator was shown, for every caller, API included (Phill 2026-10-05)."""
+        return self._start(session_id, "approve", ("gated",), lambda s: s.resume_turn(), expect=expect,
+                           require_expect=True)
 
-    def reject(self, session_id: Any, reason: Any = None) -> dict[str, Any]:
+    def reject(self, session_id: Any, reason: Any = None, expect: Any = None) -> dict[str, Any]:
         if reason is None:
             reason = "the operator declined this action"
         if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
             raise ChatError("bad_reason", "reason must be a non-empty string under 2000 chars", 400)
-        return self._start(session_id, "reject", ("gated",), lambda s: s.reject_turn(reason))
+        return self._start(session_id, "reject", ("gated",), lambda s: s.reject_turn(reason), expect=expect)
 
     def close(self, session_id: Any) -> dict[str, Any]:
         """Close a session. Refused while a job is driving it (the turn would be torn down under
@@ -486,6 +516,7 @@ class ChatHost:
         job = _Job(job_id=secrets.token_hex(8), session_id=rec.session_id, kind=kind)
         self._jobs[job.job_id] = job
         rec.job_id = job.job_id
+        rec.last_job_id = job.job_id
         finished = [j for j in self._jobs.values() if j.status != "running"]
         for old in finished[: max(0, len(finished) - _FINISHED_JOBS_KEPT)]:
             del self._jobs[old.job_id]
@@ -536,6 +567,9 @@ class ChatHost:
         kind: JobKind,
         accepts: tuple[SessionState, ...],
         call: Callable[[Any], Any],
+        *,
+        expect: Any = None,
+        require_expect: bool = False,
     ) -> dict[str, Any]:
         with self._lock:
             self._refuse_if_shut()
@@ -546,8 +580,52 @@ class ChatHost:
                     f"the session is {rec.state}; {kind} needs it {' or '.join(accepts)}",
                     409,
                 )
+            # ``expect`` is the decision id the operator's screen was shown. An APPROVE requires it, from
+            # every caller: approving by session id alone would run whatever is held now, which may not be
+            # what any screen showed. A REJECT may omit it (rejecting runs nothing and only tells the entity
+            # no); one that names an id still has to match. The id is per halt, never per content, so two
+            # textually identical holds cannot share one.
+            if not expect:
+                expect = None   # "", 0, [] and the like are a missing id, not a wrong one
+            if require_expect and expect is None:
+                raise ChatError(
+                    "decision_id_required",
+                    f"{kind} needs the current decision id in the `expect` field; read it from "
+                    "GET /chat/session.json?id=<session_id> (`decision_id`) while the session is gated; a turn that "
+                    "halts also returns it as `decision_id` in its result",
+                    400,
+                )
+            if expect is not None and (not isinstance(expect, str) or expect != rec.decision_id):
+                raise ChatError(
+                    "stale_decision",
+                    f"the held action is not the one this {kind} was made on; read the session again",
+                    409,
+                )
+            if kind == "approve" and (not rec.pending or any(not shown_in_full(p.get("full")) for p in rec.pending)):
+                raise ChatError(
+                    "undecidable",
+                    "this hold cannot be shown in full, so it can only be rejected",
+                    409,
+                )
+            if kind == "approve":
+                # The approval binds to the held calls' bytes, not only to the halt: the digest recorded with
+                # the screen's set must equal the digest of what the next run() would execute, read now. The
+                # session is gated (no job drives it), so nothing can change between this read and the run.
+                live = rec.session.held_digest() if rec.session is not None else None
+                if rec.held_digest is None or live is None or live != rec.held_digest:
+                    # Spent, never re-armed: no screen holds a set that matches, so this halt is reject-only.
+                    rec.decision_id = None
+                    raise ChatError(
+                        "stale_decision",
+                        "what the gate holds is not what was shown, or cannot be read; nothing ran; this hold "
+                        "can now only be rejected",
+                        409,
+                    )
+            spent = rec.decision_id
+            rec.decision_id = None   # spent: whatever this decision does, no screen can decide this halt again
             before = rec.state
             rec.state = "busy"
+            prev_last = rec.last_job_id
             job = self._new_job(rec, kind)
             done = threading.Event()
             watcher = None
@@ -569,6 +647,8 @@ class ChatHost:
             if not started or not self._spawn(self._run_job, rec, job, call, done, watcher):
                 done.set()
                 rec.state, rec.job_id = before, None
+                rec.last_job_id = prev_last   # this job never started, so it is not "what happened"
+                rec.decision_id = spent   # nothing was decided: the halt is still held and still undecided
                 del self._jobs[job.job_id]
                 raise ChatError("busy", "could not start a worker; try again", 503)
         return {"session_id": rec.session_id, "job_id": job.job_id, "state": "busy"}
@@ -660,11 +740,13 @@ class ChatHost:
     ) -> None:
         payload: dict[str, Any] | None = None
         error: str | None = None
+        digest: str | None = None
         cut = 0
         try:
             try:
                 result = call(rec.session)
                 payload = _turn_payload(result)
+                digest = getattr(result, "held_digest", None)
                 cut = max(0, len(result.tool_activity) - MAX_ACTIVITY_LINES)
             except BaseException as exc:  # noqa: BLE001 — the turn methods return results; this is a backstop
                 error = f"{type(exc).__name__}: {exc}"
@@ -692,8 +774,13 @@ class ChatHost:
                 # The result's tool_activity leaves out held and stop-skipped actions; it replaces
                 # what was streamed on every finish (module docstring).
                 job.activity, job.dropped = list(payload["tool_activity"]), cut
+                rec.decision_id, rec.pending, rec.held_digest = None, [], None
                 if payload["gated"] and payload["error"] is None:
                     rec.state = "gated"
+                    rec.decision_id = secrets.token_hex(16)
+                    rec.pending = [dict(p) for p in payload["pending"]]
+                    rec.held_digest = digest if isinstance(digest, str) else None
+                    payload["decision_id"] = rec.decision_id
                 elif payload["error"] is not None:
                     # A turn that raised or could not read its own gate leaves the conversation in a
                     # state a later turn would resume FROM (EXIT_TURN_FAILED's contract), and a

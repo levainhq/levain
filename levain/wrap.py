@@ -541,9 +541,10 @@ def wrap_entity(
     Returns a process exit code: 0 on a clean consolidate (or an empty no-op); 2 for a
     precondition/environment error where nothing started (not an entity, isolation refusal, missing
     extra, wrong schema, an unreadable store, or a wrap already in progress); 1 only when THIS
-    invocation started a wrap that did not complete (the compose or the save failed) — in which case
-    the entity's identity is left UNCHANGED and its episodes are safe; **5 when the wall-clock bound
-    fired** (:data:`levain.session.EXIT_TIMEOUT`).
+    invocation started a wrap that did not complete cleanly. Exit 1 does NOT by itself mean the
+    identity is unchanged: the printed message says what the store establishes (refused and
+    unchanged, committed but not written out, or unknown, with the command that settles it);
+    **5 when the wall-clock bound fired** (:data:`levain.session.EXIT_TIMEOUT`).
 
     ``max_seconds`` bounds the WHOLE consolidate — store open, lock, prepare, compose and save — for
     the same reason the turn bound wraps startup and teardown: launchd coalesces on PROCESS lifetime
@@ -613,11 +614,10 @@ def wrap_entity(
         # Should be unreachable: nothing in the shipped consolidate path writes the crystal tier.
         # Reported as a DEFECT rather than an operator error, and deliberately NOT given a new exit
         # code — inventing a seventh rung for a state that should never occur is ceremony, while
-        # `1` already carries the correct operator response (the wrap did not complete; memory is
-        # unchanged; episodes are safe).
+        # `1` already carries the correct operator response (the wrap did not complete).
         print(
             f"levain wrap: {exc}\n"
-            "  Nothing was saved; the entity's identity is unchanged and its episodes are safe.\n"
+            "  The wrap did not complete; check the store with `anneal-memory status` before retrying.\n"
             "  Please report this — it means a code path tried to promote a pattern into the "
             "always-loaded tier with no human present.",
             file=sys.stderr, flush=True,

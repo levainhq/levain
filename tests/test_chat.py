@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -37,6 +38,11 @@ class _Result:
     gated: bool = False
     timed_out: bool = False
     pending: tuple = ()
+    held_digest: str | None = None   # defaults to a stand-in digest of `pending` when gated
+
+    def __post_init__(self):
+        if self.gated and self.held_digest is None:
+            self.held_digest = "digest:" + repr(self.pending)
 
     @property
     def ok(self) -> bool:
@@ -64,13 +70,19 @@ class _Stub:
         self.hold = hold
         self.calls: list[tuple[str, Any]] = []
         self.closed = False
+        self.live: str | None = None   # what held_digest() reads now; a test may change it under a hold
 
     def _next(self, name: str, arg: Any = None) -> _Result:
         self.calls.append((name, arg))
         self.on_event(f"⚙ terminal: {name}")
         if self.hold is not None:
             assert self.hold.wait(5)
-        return self.script.pop(0)
+        r = self.script.pop(0)
+        self.live = getattr(r, "held_digest", None) if getattr(r, "gated", False) else None
+        return r
+
+    def held_digest(self):
+        return self.live
 
     def run_turn(self, message):
         return self._next("run_turn", message)
@@ -181,7 +193,7 @@ def test_a_busy_session_refuses_a_second_turn_until_the_first_finishes(tmp_path)
 
 
 def test_a_gated_turn_holds_new_messages_and_accepts_approve_or_reject(tmp_path):
-    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress")
+    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress", full="git push")
     f = _Factory([
         _Result(reply=None, gated=True, pending=(held,)),
         _Result(reply="pushed"),
@@ -192,14 +204,21 @@ def test_a_gated_turn_holds_new_messages_and_accepts_approve_or_reject(tmp_path)
     sid = _opened(host)
     st = _wait(host, host.turn(sid, "push it")["job_id"])
     assert st["result"]["gated"] is True and st["result"]["exit_code"] == 4
-    assert st["result"]["pending"] == [{"tool": "terminal", "detail": "git push",
+    assert st["result"]["pending"] == [{"tool": "terminal", "detail": "git push", "full": "git push",
                                         "reason": "network egress", "recognized": True}]
     assert host.session_status(sid)["state"] == "gated"
+    # a decision made on another held set (a stale or re-armed screen) is refused and changes nothing
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect="0" * 64)
+    assert e.value.code == "stale_decision" and e.value.http_status == 409
+    assert host.session_status(sid)["state"] == "gated"
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+    expect = st["result"]["decision_id"]
     with pytest.raises(ChatError) as e:
         host.turn(sid, "wait, don't")   # a new message here would be read as approval
     assert e.value.http_status == 409
 
-    assert _wait(host, host.approve(sid)["job_id"])["result"]["reply"] == "pushed"
+    assert _wait(host, host.approve(sid, expect=expect)["job_id"])["result"]["reply"] == "pushed"   # the shown set
     assert host.session_status(sid)["state"] == "idle"
     with pytest.raises(ChatError):
         host.approve(sid)               # nothing is held now
@@ -214,7 +233,7 @@ def test_a_held_action_streamed_mid_turn_does_not_stay_in_the_jobs_activity(tmp_
     """The stream fires when an action is ISSUED, before the gate holds it. At a gated finish the
     job's activity becomes the result's tool_activity (held actions removed), so a held push never
     reads as work that ran."""
-    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress")
+    held = PendingEfferent(tool_name="terminal", detail="git push", reason="network egress", full="git push")
     f = _Factory([_Result(reply=None, gated=True, pending=(held,),
                           tool_activity=["⚙ file_editor: view README.md"])])
     host = _host(tmp_path, f)
@@ -1441,3 +1460,317 @@ def test_each_launch_gets_its_own_token(tmp_path):
         assert httpd.chat_token is None            # no chat, no token
     finally:
         httpd.server_close()
+
+
+def test_a_decision_id_is_single_use_even_when_two_holds_are_textually_identical(tmp_path):
+    """codex L3: a content digest let a stale box approve a SECOND hold that read the same. The id names
+    the halt, not its text."""
+    pend = PendingEfferent("terminal", "git push", "network egress", full="git push")
+    f = _Factory([_Result(reply=None, gated=True, pending=(pend,)),
+                  _Result(reply=None, gated=True, pending=(pend,)),
+                  _Result(reply="pushed")])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    first = _wait(host, host.turn(sid, "push it")["job_id"])["result"]
+    second = _wait(host, host.approve(sid, expect=first["decision_id"])["job_id"])["result"]
+    assert second["gated"] and second["pending"] == first["pending"]            # the same text again ...
+    assert second["decision_id"] and second["decision_id"] != first["decision_id"]   # ... a different halt
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=first["decision_id"])                           # the first screen's id
+    assert e.value.code == "stale_decision" and e.value.http_status == 409
+    assert host.session_status(sid)["state"] == "gated"
+    assert _wait(host, host.approve(sid, expect=second["decision_id"])["job_id"])["result"]["reply"] == "pushed"
+    with pytest.raises(ChatError):
+        host.approve(sid, expect=second["decision_id"])                          # spent
+
+
+def _gated_host(tmp_path, extra=()):
+    held = PendingEfferent("terminal", "git push", "network egress", full="git push")
+    f = _Factory([_Result(reply=None, gated=True, pending=(held,)), *extra])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    res = _wait(host, host.turn(sid, "push it")["job_id"])["result"]
+    return host, sid, res, f
+
+
+def test_approve_needs_the_decision_id_from_every_caller_and_reject_does_not(tmp_path):
+    """Phill 2026-10-05: no approve-by-session-id-alone path. A missing id is refused (400) and does not
+    spend the halt; reject without one stays allowed (it runs nothing); a wrong id is still 409."""
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed")])
+    for missing in (None, "", 0, []):
+        with pytest.raises(ChatError) as e:
+            host.approve(sid, missing)
+        assert e.value.code == "decision_id_required" and e.value.http_status == 400, repr(missing)
+        assert "expect" in str(e.value) and "/chat/session.json" in str(e.value)
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+    assert host.session_status(sid)["decision_id"] == res["decision_id"]        # not spent
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, "0" * 32)
+    assert e.value.code == "stale_decision" and e.value.http_status == 409
+    assert _wait(host, host.approve(sid, res["decision_id"])["job_id"])["result"]["reply"] == "pushed"
+
+
+def test_reject_without_a_decision_id_is_allowed(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="ok, not pushing")])
+    assert _wait(host, host.reject(sid, "no")["job_id"])["result"]["reply"] == "ok, not pushing"
+
+
+def test_the_approve_route_refuses_a_missing_id_and_session_json_hands_it_out(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed")])
+    with _serving(_source(tmp_path), host) as base:
+        code, out = _call(f"{base}/chat/approve", {"session_id": sid})
+        assert code == 400 and out["error"] == "decision_id_required" and "expect" in out["message"]
+        code, view = _call(f"{base}/chat/session.json?id={sid}")
+        assert code == 200 and view["state"] == "gated"
+        assert view["decision_id"] == res["decision_id"] and view["pending"] == res["pending"]
+        code, out = _call(f"{base}/chat/approve", {"session_id": sid, "expect": view["decision_id"]})
+        assert code == 202 and _poll(base, out["job_id"])["result"]["reply"] == "pushed"
+        code, view = _call(f"{base}/chat/session.json?id={sid}")
+        assert view["state"] == "idle" and "decision_id" not in view and "pending" not in view
+        assert "decision_id" not in json.dumps(_call(f"{base}/chat.json")[1])
+
+
+def test_session_status_of_a_gated_session_carries_the_decision_and_the_held_set(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path)
+    view = host.session_status(sid)
+    assert view["decision_id"] == res["decision_id"] and view["pending"] == res["pending"]
+    assert "decision_id" not in json.dumps(host.listing())              # the listing never carries it
+
+
+def test_a_worker_that_cannot_start_restores_the_decision_id(tmp_path, monkeypatch):
+    """codex MED + complement MED r2: a 503 from a failed worker start left the hold undecidable."""
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed")])
+    monkeypatch.setattr(host, "_spawn", lambda *a, **k: False)
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, res["decision_id"])
+    assert e.value.http_status == 503
+    assert host.session_status(sid)["decision_id"] == res["decision_id"]
+    assert host.session_status(sid)["last_job"]["kind"] == "turn"   # the approve that never started is not "what happened"
+    monkeypatch.undo()
+    assert _wait(host, host.approve(sid, res["decision_id"])["job_id"])["result"]["reply"] == "pushed"
+
+
+def test_an_approve_on_a_hold_that_cannot_be_shown_in_full_is_refused_and_the_hold_stays(tmp_path):
+    undecidable = PendingEfferent("terminal", "echo xxx", "bash fans in", full="")
+    f = _Factory([_Result(reply=None, gated=True, pending=(undecidable,)), _Result(reply="declined")])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    res = _wait(host, host.turn(sid, "go")["job_id"])["result"]
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, res["decision_id"])                       # the RIGHT id
+    assert e.value.code == "undecidable" and e.value.http_status == 409
+    assert host.session_status(sid)["decision_id"] == res["decision_id"]      # not spent
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+    assert _wait(host, host.reject(sid, "no", res["decision_id"])["job_id"])["result"]["reply"] == "declined"
+
+
+@pytest.mark.parametrize("full", [1, None, ["rm -rf x"], "", " \n "])
+def test_a_full_that_is_not_a_string_with_content_cannot_be_approved_at_the_server(tmp_path, full):
+    """L3 r4 (codex): the server judged `str(full).strip()`, so full=1 passed it while the panel withheld Approve.
+    One rule (shown_in_full) for the server, the REPL and the panel; blanks and non-strings are not "the whole action"."""
+    odd = PendingEfferent("terminal", "x", "bash fans in", full=full)
+    f = _Factory([_Result(reply=None, gated=True, pending=(odd,))])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    res = _wait(host, host.turn(sid, "go")["job_id"])["result"]
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, res["decision_id"])
+    assert e.value.code == "undecidable"
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+
+
+def test_decision_id_required_message_says_where_a_turn_result_carries_it(tmp_path):
+    host, sid, res, f = _gated_host(tmp_path)
+    with pytest.raises(ChatError) as e:
+        host.approve(sid)
+    assert "decision_id" in str(e.value) and "result" in str(e.value)
+
+
+def test_a_whitespace_only_full_cannot_be_approved_at_the_server(tmp_path):
+    blank = PendingEfferent("terminal", "x", "bash fans in", full="   \n ")
+    f = _Factory([_Result(reply=None, gated=True, pending=(blank,))])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    res = _wait(host, host.turn(sid, "go")["job_id"])["result"]
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, res["decision_id"])
+    assert e.value.code == "undecidable"
+
+
+# ---------- chat r7: approve binds to the held calls' bytes (Phill 2026-10-05, raw tool-call frame) ----------
+
+def test_an_approve_is_refused_when_the_held_calls_changed_since_they_were_shown(tmp_path):
+    """The decision id names the halt; the digest names its bytes. If what the next run() would execute differs
+    from what was recorded with the shown set, approve runs NOTHING, the id is spent, and the hold stays
+    rejectable (session.json still reports it, without an id)."""
+    held = PendingEfferent(tool_name="terminal", detail="ls", reason="bash fans in", full='{"command": "ls"}')
+    f = _Factory([_Result(reply=None, gated=True, pending=(held,)), _Result(reply="ok, not running it")])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "list it")["job_id"])
+    expect = st["result"]["decision_id"]
+    f.made[0].live = "digest:something-else"
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=expect)
+    assert e.value.code == "stale_decision" and e.value.http_status == 409
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+    view = host.session_status(sid)
+    assert view["state"] == "gated" and "decision_id" not in view and view["pending"][0]["full"] == '{"command": "ls"}'
+    f.made[0].live = st["result"].get("held_digest") or "digest:" + repr((held,))   # even back to equal: spent
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=expect)
+    assert e.value.code == "stale_decision"
+    assert _wait(host, host.reject(sid, "no")["job_id"])["result"]["reply"] == "ok, not running it"
+
+
+@pytest.mark.parametrize("recorded,live", [(None, "d"), ("d", None), (None, None)])
+def test_an_approve_with_no_readable_digest_is_refused(tmp_path, recorded, live):
+    held = PendingEfferent(tool_name="terminal", detail="ls", reason="bash fans in", full='{"command": "ls"}')
+    r = _Result(reply=None, gated=True, pending=(held,))
+    r.held_digest = recorded
+    f = _Factory([r])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    expect = _wait(host, host.turn(sid, "list it")["job_id"])["result"]["decision_id"]
+    f.made[0].live = live
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=expect)
+    assert e.value.code == "stale_decision"
+    assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
+
+
+def test_the_digest_recorded_is_the_one_read_with_the_shown_set(tmp_path):
+    """A matching live digest approves; the digest itself never reaches a client (it is not a credential, but
+    nothing needs it)."""
+    held = PendingEfferent(tool_name="terminal", detail="ls", reason="bash fans in", full='{"command": "ls"}')
+    f = _Factory([_Result(reply=None, gated=True, pending=(held,), held_digest="abc"), _Result(reply="listed")])
+    host = _host(tmp_path, f)
+    sid = _opened(host)
+    st = _wait(host, host.turn(sid, "list it")["job_id"])
+    assert "held_digest" not in st["result"] and "held_digest" not in host.session_status(sid)
+    assert _wait(host, host.approve(sid, expect=st["result"]["decision_id"])["job_id"])["result"]["reply"] == "listed"
+
+
+def test_session_json_reports_the_last_job_so_a_page_that_lost_it_can_see_what_ran(tmp_path):
+    """0.6.7 (Phill, after the step-3 click-through): "Check what happened" after a lost approve must show whether
+    the action ran. The page never got that job's id, so the session reports its most recent job."""
+    host, sid, res, f = _gated_host(tmp_path, [_Result(reply="pushed", tool_activity=["\u2699 terminal: git push"])])
+    job = host.approve(sid, res["decision_id"])["job_id"]
+    _wait(host, job)
+    last = host.session_status(sid)["last_job"]
+    assert last["job_id"] == job and last["kind"] == "approve" and last["status"] == "done"
+    assert last["result"]["tool_activity"] == ["\u2699 terminal: git push"] and last["result"]["reply"] == "pushed"
+
+
+def test_serve_chat_opens_and_prints_the_link_with_the_token_in_the_fragment_only(tmp_path, monkeypatch, capsys):
+    # 0.6.8 (t), Phill 2026-10-05 "yes, add the token UX after (a)": the browser opens unlocked. The token rides the
+    # URL fragment, which a browser never sends, so it is never in a request line, a server log or a Referer.
+    import webbrowser
+    from types import SimpleNamespace
+
+    import levain.web_server as ws
+
+    db = tmp_path / "memory.db"
+    db.write_bytes(b"")
+    monkeypatch.setattr(ws, "_resolve_source", lambda p: _source(tmp_path))
+    fake_host = SimpleNamespace(listing=lambda: {"entities": ["ent"]}, shutdown=lambda: None)
+    monkeypatch.setattr(ws, "_build_chat_host", lambda *a, **k: (fake_host, None))
+
+    class _Httpd:
+        server_address = ("127.0.0.1", 7462)
+        chat_token = "tok_-AZ09"
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    monkeypatch.setattr(ws, "make_server", lambda *a, **k: _Httpd())
+    opened = []
+    calls = []
+    monkeypatch.setattr(ws, "_open_browser", lambda url, unlocked: calls.append((url, unlocked)))
+    assert ws.run_web_server(tmp_path, chat=[tmp_path], write=True) == 0
+    out = capsys.readouterr().out
+    assert calls == [("http://127.0.0.1:7462/", "http://127.0.0.1:7462/#chat_token=tok_-AZ09")]
+    assert "open the cockpit, unlocked: http://127.0.0.1:7462/#chat_token=tok_-AZ09" in out
+    assert "valid until this server stops): tok_-AZ09" in out          # the printed fallback stays
+    assert "?" not in calls[0][1]
+
+
+def test_serve_without_chat_opens_the_plain_url(tmp_path, monkeypatch, capsys):
+    import webbrowser
+
+    import levain.web_server as ws
+
+    (tmp_path / "memory.db").write_bytes(b"")
+    monkeypatch.setattr(ws, "_resolve_source", lambda p: _source(tmp_path))
+
+    class _Httpd:
+        server_address = ("127.0.0.1", 7463)
+
+        def serve_forever(self):
+            raise KeyboardInterrupt
+
+        def server_close(self):
+            pass
+
+    monkeypatch.setattr(ws, "make_server", lambda *a, **k: _Httpd())
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", opened.append)
+    assert ws.run_web_server(tmp_path) == 0
+    assert opened == ["http://127.0.0.1:7463/"] and "chat_token" not in capsys.readouterr().out
+
+
+
+def test_the_token_url_goes_only_to_the_osascript_controller_never_to_the_fallback_chain(monkeypatch):
+    # (CPython defines webbrowser.MacOSXOSAScript only on macOS; elsewhere a stand-in class plays it, so this runs
+    # on CI's Linux too.)
+    # L1+L2 r1 and L3 r1 (codex + gemini): every controller but macOS's osascript one puts the URL in argv, readable
+    # by other OS users. webbrowser.open walks every registered controller on a failure, so the token URL goes to the
+    # osascript controller directly or nowhere.
+    import webbrowser
+
+    import levain.web_server as ws
+
+    chain = []
+    monkeypatch.setattr(webbrowser, "open", lambda u, *a, **k: chain.append(u) or True)
+    if not hasattr(webbrowser, "MacOSXOSAScript"):
+        monkeypatch.setattr(webbrowser, "MacOSXOSAScript", type("MacOSXOSAScript", (webbrowser.BaseBrowser,), {}), raising=False)
+
+    class _Osa(webbrowser.MacOSXOSAScript):
+        def __init__(self, ok):
+            webbrowser.BaseBrowser.__init__(self, "default")
+            self.ok, self.got = ok, []
+
+        def open(self, url, new=0, autoraise=True):
+            self.got.append(url)
+            return self.ok
+
+    good = _Osa(True)
+    monkeypatch.setattr(webbrowser, "get", lambda *a: good)
+    ws._open_browser("http://h/", "http://h/#chat_token=t")
+    assert good.got == ["http://h/#chat_token=t"] and chain == []
+
+    bad = _Osa(False)                       # osascript failed (SSH, headless): the fallback gets the plain URL only
+    monkeypatch.setattr(webbrowser, "get", lambda *a: bad)
+    ws._open_browser("http://h/", "http://h/#chat_token=t")
+    assert chain == ["http://h/"]
+
+    chain.clear()                           # xdg-open, a browser binary, $BROWSER
+    monkeypatch.setattr(webbrowser, "get", lambda *a: webbrowser.GenericBrowser("xdg-open"))
+    ws._open_browser("http://h/", "http://h/#chat_token=t")
+    assert chain == ["http://h/"]
+
+
+@pytest.mark.skipif(not hasattr(__import__("webbrowser"), "MacOSXOSAScript"), reason="macOS's controller only")
+def test_the_osascript_controller_still_hands_the_url_over_on_stdin():
+    # The guarantee _open_browser relies on is CPython's: MacOSXOSAScript pipes its script to osascript's stdin. If a
+    # future CPython puts the URL on a command line instead, this fails rather than the token reaching argv.
+    import inspect
+    import webbrowser
+
+    src = inspect.getsource(webbrowser.MacOSXOSAScript.open)
+    # the property, not one spelling of it: a write pipe to osascript, and no process given the URL as an argument
+    assert re.search(r'os\.popen\(\s*"[^"]*osascript"\s*,\s*"w"\s*\)', src)
+    assert "subprocess" not in src and "Popen" not in src and "os.system" not in src
