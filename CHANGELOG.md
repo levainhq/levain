@@ -4,6 +4,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
+### Added
+
+- **`levain.autonomic`: the governed action engine for work that runs with no session open.** Folded in from the vagus project's efferent half (vagus is retiring as a separate package; this is the second piece of that fold, after `levain.firing` in July). It holds bindings (a standing grant to act when an event matches), the risk and trust postures with floors that no trust level can buy down, the confirm-and-timeout queue, chains, graduation and the kill check. It ships as a library only: no command, server route or default config reaches it yet, so an install behaves exactly as before. It imports nothing outside itself and the standard library.
+
 ## [0.6.9] — 2026-10-05
 
 A memory fix for the reply classifier's size bound.
