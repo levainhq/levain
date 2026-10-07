@@ -3352,7 +3352,7 @@ def test_bwrap_a_file_subtree_root_is_not_rebound_readable_by_the_write_floor(tm
 
 
 @pytest.mark.parametrize("mode,setting,expected", [
-    ("interactive", None, False), ("headless", None, False), ("unattended", None, True),
+    ("interactive", None, False), ("headless", None, True), ("unattended", None, True),
     ("unattended", False, False),   # the per-entity opt-out keeps the Keychain for that seat
     ("interactive", True, True),    # and an operator can pin it on while driving
 ])

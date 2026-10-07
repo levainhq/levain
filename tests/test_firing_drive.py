@@ -54,15 +54,16 @@ def test_explicit_false_allows_in_every_mode(mode: str) -> None:
 
 def test_absent_derives_from_the_drive() -> None:
     assert resolve_cred_floor(None, mode="interactive") is False
-    assert resolve_cred_floor(None, mode="headless") is False
+    assert resolve_cred_floor(None, mode="headless") is True    # flipped 2026-10-07 (cockpit chat)
     assert resolve_cred_floor(None, mode="unattended") is True
 
 
-def test_the_floor_does_NOT_collapse_headless_and_unattended() -> None:
-    """The counterpart to the gate test above, and the whole reason this module exists: a human
-    typing `--task "open a PR"` legitimately needs gh, while a scheduled seat's silent credential
-    read can compound into always-loaded memory with nobody in the loop."""
-    assert resolve_cred_floor(None, mode="headless") != resolve_cred_floor(None, mode="unattended")
+@pytest.mark.parametrize("mode", [*DRIVE_MODES, "garbage"])
+def test_the_absent_cred_floor_follows_the_gates_own_line(mode) -> None:
+    """Since 2026-10-07 (Phill ruled the default flipped): the standard credential stores are open by
+    default only where a human watches the read as it happens, which is exactly human_present. A
+    headless turn (a --task run, a cockpit chat turn) is captured before anyone reads it."""
+    assert resolve_cred_floor(None, mode=mode) is (not human_present(mode))
 
 
 def test_garbage_mode_denies_on_BOTH_halves_of_the_authority() -> None:

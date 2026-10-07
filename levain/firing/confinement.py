@@ -324,7 +324,8 @@ _OWN_MEMORY_FILENAMES = (
 )
 
 # Standard, tool-CANONICAL credential locations. Folding these into the floor is an OPT-IN
-# (``deny_standard_creds`` in ``confinement.json``, default OFF), never automatic, for two reasons:
+# (``deny_standard_creds`` in ``confinement.json``) at THIS layer; the drive layer
+# (levain.firing.drive.resolve_cred_floor) turns it on unless a human drives the session. Two reasons:
 # (1) unlike an app secret (``.env.flow``), these ARE structurally knowable — gh / aws / curl look
 # here BY DEFINITION, so naming them is not the FALSE-SECURITY guessing the module otherwise refuses;
 # (2) denying their READ breaks the entity's OWN legitimate ``gh`` / ``aws`` / netrc-``curl`` use, so a
@@ -1712,7 +1713,7 @@ class ConfinementConfig:
     #   True  → deny ALWAYS (an explicit operator pin; the drive mode does not soften it)
     #   False → allow ALWAYS (an explicit operator OPT-IN that deliberately survives an unattended
     #           seat — a seat whose job is "open a PR nightly" genuinely needs gh)
-    #   None  → ABSENT: derive from the DRIVE MODE (deny for an unattended seat, allow otherwise)
+    #   None  → ABSENT: derive from the DRIVE MODE (allow only interactive, deny otherwise)
     # It was a plain `bool = False` until an unattended seat existed to distinguish, at which point
     # ABSENT and EXPLICIT-FALSE being indistinguishable made the new default either un-overridable
     # or defeated by every config already on disk. The reason this is not the `efferent_gate: "auto"`
@@ -2590,7 +2591,7 @@ class SeatbeltProvider(ConfinementProvider):
             lines.append("")
 
         if policy.deny_keychain:
-            lines.append(";; THE KEYCHAIN (spore-1245) — on with the standard cred floor (unattended by")
+            lines.append(";; THE KEYCHAIN (spore-1245) — on with the standard cred floor (any non-interactive drive by")
             lines.append(";; default). Without it, `security find-generic-password -w` and every")
             lines.append(";; credential helper (`git credential-osxkeychain`, gh's stored token) read")
             lines.append(";; the operator's secrets from inside this sandbox (measured 2026-10-01).")

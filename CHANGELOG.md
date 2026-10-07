@@ -4,6 +4,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
+### Changed
+
+- **Chat and `levain run --task` no longer read your standard credential stores by default.** `~/.config/gh`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials` and, on macOS, the Keychain are now denied in every drive except the interactive `levain run` REPL, as they already were for a scheduled seat. Before, a `headless` session (a cockpit chat turn, or `--task` without `--unattended`) could read them, and reading a file is not an action the gate holds. An entity that needs `gh` or `aws` there sets `"deny_standard_creds": false` in `.levain/confinement.json`; an explicit `true` or `false` is unchanged. Measured 2026-10-07 on macOS under the real sandbox profile: a headless session's shell got `~/.config/gh/hosts.yml` before this change and is denied after it.
+
+### Fixed
+
+- **The launch banner names every credential store the floor covers.** Its "READABLE" warning listed three of the five files (it left out both git credential files); it now reads the floor's own list.
+
 ## [0.6.9] — 2026-10-05
 
 A memory fix for the reply classifier's size bound.

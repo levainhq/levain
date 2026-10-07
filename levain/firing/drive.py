@@ -9,16 +9,18 @@ efferent gate and wrong for the crown-jewels floor.
 mode             who invoked it      who reads the activity      gate      standard creds
 ===============  ==================  ==========================  ========  ===================
 ``interactive``  a human, live       a human, AS IT HAPPENS      ungated   per config (allow)
-``headless``     a human             a human, AFTERWARDS         gated     per config (allow)
+``headless``     a human             a human, AFTERWARDS         gated     DENIED by default
 ``unattended``   a SCHEDULER         nobody, necessarily         gated     DENIED by default
 ===============  ==================  ==========================  ========  ===================
 
-**The gate is right to collapse the last two** — its job is FAN-IN, and neither a ``--task`` run nor
+**The gate collapses the last two, and since 2026-10-07 so does the floor** — its job is FAN-IN, and neither a ``--task`` run nor
 a scheduled seat has a human to fan an action in to at the moment it would fire. So
 :func:`human_present` is a pure derivation and :func:`levain.firing.gate.resolve_gate_mode` keeps its
 existing ``human_present: bool`` signature untouched. **K3's security boundary does not change here.**
 
-**The floor is NOT right to collapse them, and the reason is specific rather than a vibe.** Note
+**Why the floor follows the same line.** Until 2026-10-07 the floor kept ``headless`` open and denied
+only ``unattended``; Phill ruled the default flipped (cockpit chat is ``headless``, and its every turn
+is captured). Note
 first that the crown-jewels floor is otherwise presence-INDEPENDENT: ``~/.anneal-memory`` is denied
 at the REPL too, with a human sitting right there, because the floor is *irreversibility
 containment* and not fan-in. So credentials need an actual argument to be drive-dependent, and it is
@@ -37,10 +39,12 @@ this:
    interactive turns, where the gate is UNGATED and bash is available.* A silent unattended read can
    surface a live credential into a session that CAN exfiltrate it.
 
-So the discriminator is not "is somebody watching". It is **whether a read can compound into durable
-identity with no human anywhere in the loop** — always true for a scheduled seat, and never silently
-true at the REPL, where the operator sees the ``view``, sees the echo, and can wipe the store before
-a wrap ever runs.
+So the discriminator is **whether a human sees the read as it happens**: only at the REPL does the
+operator see the ``view`` and the echo before the turn is captured and can wipe the store before a wrap
+runs. A ``headless`` turn (a ``--task`` run, a cockpit chat turn) is read afterwards, after its text
+was already captured, so it gets the same default as a scheduled seat. That is :func:`human_present`,
+the gate's own derivation, so the floor and the gate answer from one place. An entity that needs
+``gh`` or ``aws`` headless opts in with ``"deny_standard_creds": false``.
 
 **The gap this does NOT close, named so a later slice can.** ``ssh_mode="agent"`` already solved this
 class properly — *use-not-steal*: the entity authenticates through the agent socket and may never
@@ -102,8 +106,8 @@ def resolve_cred_floor(setting: bool | None, *, mode: DriveMode | str) -> bool:
     - ``False`` → allow, always. **An explicit operator opt-IN, and it must keep working even for
       an unattended seat** — a seat whose job is "open a PR nightly" genuinely needs ``gh``. This is
       a DEFAULT being overridden, not a prohibition being defeated.
-    - ``None`` (the key is ABSENT) → derive from the drive: deny for ``unattended``, allow
-      otherwise.
+    - ``None`` (the key is ABSENT) → derive from the drive: allow only ``interactive``, where a
+      human watches the read as it happens; deny ``headless``, ``unattended`` and any unknown mode.
 
     **Why absent-means-derive rather than a three-valued string** like the ``efferent_gate: "auto"``
     field one row away in the same dataclass, which solves the identical problem: changing
@@ -115,7 +119,7 @@ def resolve_cred_floor(setting: bool | None, *, mode: DriveMode | str) -> bool:
     """
     if setting is not None:
         return setting
-    # An UNRECOGNIZED mode denies, the fail-closed side. A conversation binding refuses an unknown
-    # mode outright (`ConversationBinding.create`); this must not answer differently, or a typo'd mode would get
-    # "allowed" here and "denied" from the tool policy — one authority, two answers. (codex L3 LOW.)
-    return mode not in ("interactive", "headless")
+    # An UNRECOGNIZED mode denies, the fail-closed side (human_present is False for it). A conversation
+    # binding refuses an unknown mode outright (`ConversationBinding.create`); this must not answer
+    # differently, or a typo'd mode would get "allowed" here and "denied" from the tool policy. (codex L3 LOW.)
+    return not human_present(mode)

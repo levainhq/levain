@@ -465,12 +465,11 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "With --task: declare that NO HUMAN is in the loop at all — a scheduler invoked "
             "this and nobody will necessarily read the output (what `levain daemon install-seat` "
-            "emits). Beyond the gate that --task already arms, this also folds the standard "
-            "credential stores (gh, AWS and the netrc / git credential files; on macOS also "
-            "the Keychain) into the "
-            "crown-jewels floor by default, because an unattended read can compound into "
-            "always-loaded memory with nobody to notice. Override per-entity with "
-            "deny_standard_creds in .levain/confinement.json."
+            "emits). With --consolidate, the consolidate may metabolize but is refused from "
+            "crystallizing. The "
+            "gate and the standard-credential denial (gh, AWS and the netrc / git credential "
+            "files; on macOS also the Keychain) already apply to any --task run; an entity "
+            "that needs them sets deny_standard_creds to false in .levain/confinement.json."
         ),
     )
     run_p.set_defaults(func=_cmd_run)
