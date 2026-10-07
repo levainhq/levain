@@ -437,3 +437,15 @@ def test_a_seeded_join_is_verified_and_an_unseeded_one_says_it_trusted_first_sig
     eve = clone(tmp, "eve", "ben@ex.com")
     assert team("join", "--pins-from", str(bad), "--no-install", repo=eve) == 2
     assert "not a levain pins file" in capsys.readouterr().err
+
+
+def test_a_team_toml_that_is_not_utf8_is_a_team_error_not_a_crash(two):
+    # E review (complement LOW a), RUN: `member add` on a non-UTF-8 team.toml raised a raw UnicodeDecodeError.
+    from levain.team.transport import TeamError
+    tmp, ana, ben = two
+    ga = _gl(ana)
+    (ga.wt / "team.toml").write_bytes(b'project = "p\xff"\n' + (ga.wt / "team.toml").read_bytes())
+    git("add", "-A", ".", cwd=ga.wt)
+    git("commit", "-qm", "not utf-8", cwd=ga.wt)
+    with pytest.raises(TeamError, match="not valid UTF-8"):
+        ga.update_team(lambda t: None, "x", push=False)

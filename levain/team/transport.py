@@ -1338,7 +1338,11 @@ class GitLedger:
             if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
                 raise TeamError(f"{name} in the team worktree is not a regular file (a link or other entry was "
                                 f"committed to the ledger branch); levain will not read or write through it")
-            return fh.read().decode("utf-8")
+            try:
+                return fh.read().decode("utf-8")
+            except UnicodeDecodeError:
+                raise TeamError(f"{name} in the team worktree is not valid UTF-8; the team owner fixes it on the "
+                                f"{BRANCH} branch") from None
 
     def _write_file(self, name: str, text: str, message: str, push: bool) -> str:
         self.require_joined()
