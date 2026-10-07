@@ -4050,16 +4050,20 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
 
 
 def _bwrap_runs_without_a_pid_namespace() -> bool:
-    """True when bwrap starts WITHOUT ``--unshare-pid`` (the probe :func:`bwrap_available` uses has
-    it), which pins a refusal on the PID namespace rather than on user namespaces in general."""
-    try:
-        proc = subprocess.run(
-            [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "/bin/true"],
-            capture_output=True, timeout=10, env=_probe_env(),
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return proc.returncode == 0
+    """True when bwrap starts WITHOUT ``--unshare-pid`` and fails WITH it, which pins a refusal on the
+    PID namespace rather than on user namespaces in general. Both probes run here, so the answer
+    never rests on another check's result."""
+    def runs(*extra: str) -> bool:
+        try:
+            proc = subprocess.run(
+                [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", *extra, "/bin/true"],
+                capture_output=True, timeout=10, env=_probe_env(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0
+
+    return runs() and not runs("--unshare-pid")
 
 
 def _probe_env() -> dict[str, str]:

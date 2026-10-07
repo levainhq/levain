@@ -200,14 +200,16 @@ def test_live_confined_shell_cannot_touch_project_memory(home: Path) -> None:
 @live
 def test_live_confined_shell_cannot_replace_an_env_trust_file(home: Path, monkeypatch) -> None:
     """Only the file literal protects it here, so a write, a replace-by-rename onto it and an unlink
-    must all be refused while the shell still writes beside it."""
-    trust = home / "derive-trust.json"
+    must all be refused while the shell still writes beside it. (In a subdirectory of $HOME: on Linux
+    $HOME's own entries are read-only inside bash, so "beside" at the top level is refused too.)"""
+    (home / "cfg").mkdir()
+    trust = home / "cfg" / "derive-trust.json"
     trust.write_text("ORIGINAL")
     monkeypatch.setenv(DERIVE_TRUST_ENV, str(trust))
     with select_provider().spawn_shell(build_policy(_entity(home))) as sh:
-        _ok(sh, f"echo x > '{home}/beside'")
+        _ok(sh, f"echo x > '{home}/cfg/beside'")
         _refused(sh, f"echo PLANTED > '{trust}'")
-        _refused(sh, f"mv -f '{home}/beside' '{trust}'")
+        _refused(sh, f"mv -f '{home}/cfg/beside' '{trust}'")
         _refused(sh, f"rm -f '{trust}'")
     assert trust.read_text() == "ORIGINAL"
 
