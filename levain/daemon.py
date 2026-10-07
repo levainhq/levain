@@ -260,10 +260,11 @@ def _prepare_private_logs(spec: "DaemonSpec") -> None:
             os.chmod(d, 0o700)   # mkdir's mode is masked by the umask
         elif platform.system() != "Darwin" and d.resolve() == _default_log_dir().expanduser().resolve():
             os.chmod(d, 0o700)
-        dst = os.stat(d)
+        dst = os.lstat(d)   # the spec's path is already resolved (build_spec), so this is the directory itself
         if not stat.S_ISDIR(dst.st_mode) or dst.st_uid != os.getuid() or dst.st_mode & 0o022:
-            raise DaemonError(f"{d} must be a directory this user owns that no other user can write; pass another "
-                              "--log-dir.")
+            kind = "a symlink" if stat.S_ISLNK(dst.st_mode) else f"mode {stat.S_IMODE(dst.st_mode):04o}"
+            raise DaemonError(f"{d} must be a directory this user owns that no other user can write (it is {kind}, "
+                              f"owner uid {dst.st_uid}); pass another --log-dir.")
         # The service will append to whatever is at this path: it must be a regular file this user owns with one
         # name, never a link (it would be followed), a hardlink to another file, a FIFO or device (it would block), or
         # another user's file (codex L3: in a shared --log-dir someone could pre-create it world-readable). Opened once with O_NOFOLLOW and checked and narrowed

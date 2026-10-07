@@ -114,13 +114,14 @@ def _request(port: int, method: str, path: str = "/", headers: dict | None = Non
 
 
 @pytest.mark.parametrize("kind", ["serve", "init", "docs"])
-@pytest.mark.parametrize("method", ["OPTIONS", "PUT", "DELETE", "PATCH", "TRACE"])
+@pytest.mark.parametrize("method", ["OPTIONS", "PUT", "DELETE", "PATCH", "TRACE", "PROPFIND", "get"])
 def test_a_framework_generated_response_carries_the_security_headers(tmp_path, kind, method):
-    """The reproduced drift: `levain serve` answered these with a bare 501. They now pass the guards and get 405."""
+    """The reproduced drift: `levain serve` answered these with a bare 501. Every method, named or not (L1: PROPFIND,
+    a lowercase get), now passes the guards and gets 405 with Allow."""
     with _server(kind, tmp_path) as port:
         status, headers = _request(port, method)
         assert _request(port, method, token=None)[0] == 403   # codex L3: before the guards, this was 501 untokened
-    assert status == 405
+    assert status == 405 and headers.get("Allow") == "GET, HEAD, POST"
     missing = [h for h in SECURITY_HEADERS if h not in headers]
     assert missing == [], f"{kind} {method} -> 501 without {missing}"
 
@@ -942,3 +943,20 @@ def test_open_unlocked_says_locked_when_only_the_plain_url_opened(monkeypatch):
     assert open_unlocked("http://127.0.0.1:1/", "http://127.0.0.1:1/#code=x") == "locked"
     monkeypatch.setattr(webbrowser, "open", lambda url, *a, **k: False)
     assert open_unlocked("http://127.0.0.1:1/", "http://127.0.0.1:1/#code=x") is None
+
+
+@pytest.mark.parametrize("module", ["levain.web_server", "levain.docs_server", "levain.init_server"])
+def test_every_server_cleanup_holds_sigterm_first(module):
+    """L1: the hold() is what keeps a SIGTERM from cutting the cleanup short; each server's serve_forever ``finally``
+    must call it before anything else."""
+    import ast
+    import importlib
+    import inspect
+
+    tree = ast.parse(inspect.getsource(importlib.import_module(module)))
+    tries = [n for n in ast.walk(tree) if isinstance(n, ast.Try) and n.finalbody
+             and any(isinstance(c, ast.Attribute) and c.attr == "serve_forever" for c in ast.walk(n))]
+    assert tries, module
+    for t in tries:
+        first = t.finalbody[0]
+        assert ast.unparse(first) == "restore_sigterm.hold()", (module, ast.unparse(first))

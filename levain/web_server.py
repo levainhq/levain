@@ -1358,7 +1358,8 @@ def open_running(port: int, *, stream: "Any | None" = None) -> int:
     """``levain serve --open-running``: open the page of the Levain server on ``port``, unlocked, from the
     runtime file it left (:func:`levain.http_guards.publish_launch_token`). The browser gets a fresh
     single-use link code, never the token (:func:`levain.http_guards.request_link_code`); the link is printed
-    only to a terminal. Returns 1 when no live server left a record for that port."""
+    only to a terminal. Returns 1 when the page could not be opened: no live server left a record for that port, the
+    server gave no link, or no browser took it (or it opened locked) and the output is not a terminal."""
     out = stream if stream is not None else sys.stdout
     try:
         rec = read_running(port)

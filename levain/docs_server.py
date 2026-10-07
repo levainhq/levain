@@ -90,9 +90,8 @@ class _DocsServer(ThreadingHTTPServer):
 class _DocsHandler(GuardedHandler):
     """Serves the docs page (GET/HEAD only) behind the same DNS-rebinding Host
     allowlist + cross-site read refusal the dashboard/init servers use (the shared
-    :class:`~levain.http_guards.GuardedHandler`). No write route exists — an
-    unsupported method falls through to the stdlib's 501, which still carries the
-    security headers via ``end_headers``."""
+    :class:`~levain.http_guards.GuardedHandler`). No write route exists: a POST is refused
+    after the guards, and any other method gets the guards and then 405."""
 
     server_version = "levain-docs"
     server: _DocsServer  # narrow the type for typed attribute access

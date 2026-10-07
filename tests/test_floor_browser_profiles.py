@@ -231,7 +231,7 @@ def _linux(monkeypatch):
     return cf
 
 
-def test_a_profile_reached_through_a_symlink_elsewhere_is_denied_at_both_spellings(home: Path, monkeypatch, tmp_path):
+def test_a_profile_reached_through_a_symlink_elsewhere_is_denied_by_either_spelling(home: Path, monkeypatch, tmp_path):
     """Head ruling (L1 + L2, 2026-10-07): a dotfile manager's or a moved disk's ~/.mozilla is legitimate. It is denied
     at the link's spelling and the target's, and bash is not refused."""
     cf = _linux(monkeypatch)
@@ -240,7 +240,7 @@ def test_a_profile_reached_through_a_symlink_elsewhere_is_denied_at_both_spellin
     (home / ".mozilla").symlink_to(real)
     entity = _entity(home)
     policy = build_policy(entity)
-    assert home / ".mozilla" in policy.deny_read_write and real.resolve() in policy.deny_read_write
+    assert real.resolve() in policy.deny_read_write   # on Linux a mount through the link IS the target's mount
     assert crown_jewel_reason(policy, home / ".mozilla" / "firefox" / "x" / "cookies.sqlite") is not None
     assert crown_jewel_reason(policy, real / "firefox" / "x" / "cookies.sqlite") is not None
     cf._refuse_planted_browser_links(policy)   # does not raise
@@ -319,13 +319,13 @@ def test_the_editors_check_reuses_the_spawns_storage_scan(home: Path, monkeypatc
     monkeypatch.setattr(cf.platform, "system", lambda: "Darwin")
     policy = build_policy(_entity(home))
     calls = []
-    real = cf._browser_storage_roots
+    real = cf._browser_storage
 
     def counting(*a, **k):
         calls.append(k["fresh"])
         return real(*a, **k)
 
-    monkeypatch.setattr(cf, "_browser_storage_roots", counting)
+    monkeypatch.setattr(cf, "_browser_storage", counting)
     cf._refuse_multiply_linked_jewels(policy)
     store = home / "Library/Application Support/Chromium/Default/Session Storage"
     store.mkdir(parents=True)
@@ -467,3 +467,64 @@ def test_roots_are_resolved_when_home_itself_is_a_symlink(tmp_path, monkeypatch)
     policy = build_policy(_entity(real))
     assert crown_jewel_reason(policy, tmp_path / "home" / ".mozilla" / "firefox" / "x" / "cookies.sqlite") is not None
     cf._refuse_planted_browser_links(policy)   # $HOME's own link is not a planted profile link
+
+
+def test_an_absent_root_under_a_linked_config_is_created_at_its_target(home: Path, monkeypatch, tmp_path) -> None:
+    """L1: GNU stow folds ~/.config into a link; an absent google-chrome under it is denied and created there too."""
+    cf = _linux(monkeypatch)
+    dotfiles = tmp_path / "dotfiles" / "config"
+    dotfiles.mkdir(parents=True)
+    (home / ".config").symlink_to(dotfiles)
+    policy = build_policy(_entity(home))
+    assert (dotfiles / "google-chrome").resolve() in policy.browser_mountpoints
+    assert crown_jewel_reason(policy, home / ".config" / "google-chrome" / "Default" / "Cookies") is not None
+    cf._refuse_planted_browser_links(policy)   # a dotfile manager's link is legitimate
+
+
+@pytest.mark.parametrize("store", [".config/google-chrome/Default/Session Storage",
+                                   ".mozilla/firefox/x.default/storage/default/http+++127.0.0.1+7420/ls"])
+def test_a_link_inside_page_storage_that_leaves_the_profile_refuses_bash(home: Path, monkeypatch, store) -> None:
+    """L1: LevelDB's create follows a link planted in the storage folder, so the token lands where it points."""
+    cf = _linux(monkeypatch)
+    entity = _entity(home)
+    d = home / store
+    d.mkdir(parents=True)
+    (d / "000003.log").symlink_to(entity / "workspace" / "stolen.log")
+    with pytest.raises(cf.ConfinementError, match="out of the profile"):
+        cf._refuse_planted_browser_links(build_policy(entity))
+
+
+@pytest.mark.parametrize("plant", ["snap", ".config/google-chrome/Default"])
+def test_a_symlink_loop_refuses_bash_and_still_opens_the_session(home: Path, monkeypatch, plant) -> None:
+    """L1: Path.resolve() raises RuntimeError on a loop (Python 3.12); the session must still open."""
+    cf = _linux(monkeypatch)
+    p = home / plant
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.symlink_to(p)
+    entity = _entity(home)
+    policy = build_policy(entity)
+    with pytest.raises(cf.ConfinementError, match="loop"):
+        cf._refuse_planted_browser_links(policy)
+
+
+def test_a_non_browser_flatpak_apps_link_does_not_refuse_bash(home: Path, monkeypatch) -> None:
+    """L1: only the browsers' flatpak folders are walked."""
+    cf = _linux(monkeypatch)
+    entity = _entity(home)
+    d = home / ".var/app/org.example.Notes/config/notes"
+    d.mkdir(parents=True)
+    (d / "settings").symlink_to(entity / "workspace")
+    cf._refuse_planted_browser_links(build_policy(entity))
+
+
+def test_on_macos_a_linked_root_is_denied_at_both_spellings(home: Path, monkeypatch, tmp_path) -> None:
+    import levain.firing.confinement as cf
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Darwin")
+    real = tmp_path / "ext" / "Firefox"
+    real.mkdir(parents=True)
+    (home / "Library/Application Support").mkdir(parents=True)
+    (home / "Library/Application Support/Firefox").symlink_to(real)
+    policy = build_policy(_entity(home))
+    assert home / "Library/Application Support/Firefox" in policy.deny_read_write
+    assert real.resolve() in policy.deny_read_write

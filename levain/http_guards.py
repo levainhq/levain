@@ -218,9 +218,11 @@ class GuardedHandler(BaseHTTPRequestHandler):
 
     def end_headers(self) -> None:
         """Stamp the security headers on EVERY response, structurally. ``_send`` is the normal path,
-        but the stdlib's ``send_error`` (an unsupported method, an OPTIONS preflight, a malformed
-        request) builds its own response that never passes through ``_send``; stamping here covers
-        those too. Nothing else sets these headers, so each appears exactly once per response."""
+        but the stdlib's ``send_error`` (a malformed request line, an oversized header) builds its own
+        response that never passes through ``_send``; stamping here covers those too. Nothing else sets
+        these headers, so each appears exactly once per response. A 405 also carries ``Allow``."""
+        if getattr(self, "_allow", None):
+            self.send_header("Allow", self._allow)
         self.send_header("Content-Security-Policy", _CSP)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
@@ -445,15 +447,21 @@ class GuardedHandler(BaseHTTPRequestHandler):
         self._post()
 
     def _other_method(self) -> None:
-        """Any other method (PUT, DELETE, PATCH, OPTIONS, TRACE, CONNECT) passes the same guards as a write, then gets
-        405: no Levain server routes one, and without this BaseHTTPRequestHandler answered 501 before any guard ran
-        (codex L3). No body is read."""
+        """Any other method passes the same guards as a write, then gets 405 with ``Allow``: no Levain server routes
+        one, and without this BaseHTTPRequestHandler answered 501 before any guard ran (codex L3). No body is read."""
         self.close_connection = True
         if self._refuse_write_origin() or self._refuse_untokened_write():
             return
+        self._allow = "GET, HEAD, POST"
         self._reject(405, "method_not_allowed", "this server answers GET, HEAD and POST")
 
-    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_TRACE = do_CONNECT = _other_method  # noqa: N815
+    def __getattr__(self, name: str) -> Any:
+        # BaseHTTPRequestHandler dispatches to ``do_<METHOD>`` when the attribute exists and answers 501 otherwise:
+        # every method it would not find here (PROPFIND, a lowercase "get", any token) goes to _other_method, so
+        # none reaches a response before the guards (L1).
+        if name.startswith("do_"):
+            return self._other_method
+        raise AttributeError(name)
 
     def _link(self) -> None:
         """``POST /link``: mint a link code for a caller that proves it holds the token without sending it (see
@@ -736,7 +744,8 @@ def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
     """Ask the server at ``url`` (a loopback origin from a runtime record) for a fresh link code, proving the token
     without sending it, and check the server's proof before returning the code. No proxy is used (an
     ``HTTP_PROXY`` in the environment would otherwise receive the request). Raises ``ValueError`` on a non-loopback
-    URL or an answer that does not prove the token, ``OSError`` on a connection failure."""
+    URL, an answer that does not prove the token, is not HTTP, is too long or takes too long, and ``OSError`` on a
+    connection failure."""
     import http.client
     import ipaddress
     import urllib.parse

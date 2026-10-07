@@ -1337,5 +1337,6 @@ def test_a_log_dir_others_can_write_is_refused(tmp_path, monkeypatch):
     shared.mkdir()
     os.chmod(shared, 0o1777)
     spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=shared)
-    with pytest.raises(d.DaemonError, match="no other user can write"):
+    with pytest.raises(d.DaemonError, match="no other user can write .it is mode 1777"):
         d._prepare_private_logs(spec)
+
