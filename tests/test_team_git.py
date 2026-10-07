@@ -936,8 +936,8 @@ def test_agent_cannot_edit_any_ledger_machinery(two, rel):
 def test_broken_ledger_link_is_visible_not_silent(two):
     tmp, ana, ben = two
     (ben / ".git" / "levain-team" / "state.json").write_text("{")
-    out = edit(ben, "src/settlement.py")
-    assert out["systemMessage"].startswith("[team] ledger unavailable:")
+    out = edit(ben, "src/settlement.py")["hookSpecificOutput"]       # visible, and now a DENY (L1 r1 #4b)
+    assert out["permissionDecision"] == "deny" and "no usable ledger" in out["permissionDecisionReason"]
 
 
 def test_pack_resync_does_not_resurrect_a_rule_the_team_retired(two, capsys):

@@ -375,13 +375,12 @@ def cmd_doctor(args) -> int:
         rows.append((not err, f"remote {gl.remote}: last fetch "
                      + (I.age(_iso(st.get('last_fetch_ok'))) if st.get("last_fetch_ok") else "never")
                      + (f"; last error: {err}" if err else "")))
-        ahead = subprocess.run(["git", "log", "--format=%s", f"refs/remotes/{gl.remote}/levain-ledger..HEAD"],
-                               cwd=gl.wt, capture_output=True, text=True)
-        subjects = ahead.stdout.splitlines() if ahead.returncode == 0 else ["?"]
+        subjects = gl.unpushed_subjects()
+        subjects = ["?"] if subjects is None else subjects
         real = [s for s in subjects if not s.startswith("levain team: ack ")]
         rows.append((not real, f"{len(subjects)} local ledger commit(s) not pushed"
                      + ("" if not subjects else (": run `levain team sync`" if real
-                        else " (acknowledgements only; they go out with the next write)"))))
+                        else " (acknowledgements only; the next session start or write sends them)"))))
     else:
         rows.append((True, "no remote: ledger is local only"))
     rows += W.check(repo)

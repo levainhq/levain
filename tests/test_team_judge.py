@@ -366,7 +366,9 @@ def test_a_top_level_attributes_file_on_the_ledger_branch_is_tamper(two):
     tmp, ana, ben = two
     ga = _gl(ana)
     (ga.wt / ".gitattributes").write_text("ledger/** working-tree-encoding=UTF-16\n")
-    _push_wt(ga, "attributes")
+    git("add", "--", ".gitattributes", cwd=ga.wt)          # only this file: re-adding a ledger file under UTF-16 fails
+    git("commit", "-qm", "attributes", cwd=ga.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=ga.wt)
     assert team("sync", repo=ben) == 2
     assert any(".gitattributes" in t for t in ledger(ben).tamper)
     out = edit(ben, "src/unrelated.py", session="ga")["hookSpecificOutput"]
@@ -534,3 +536,81 @@ def test_acks_that_cannot_be_sent_are_said_at_session_start_and_in_status(two, c
     capsys.readouterr()
     assert team("status", repo=ben) == 0
     assert "not pushed yet" in capsys.readouterr().out
+
+
+def test_a_users_own_git_fetch_cannot_move_the_floor_under_a_truncation(two):
+    # L1 r1 #1 / L2 r1 #1 / E-team L3 codex HIGH, RUN: the floor was refs/remotes/origin/levain-ledger, which a plain
+    # `git fetch` (default refspec) moves with no quarantine; a truncation of this clone's own pushed file then passed,
+    # and `repin` adopted it.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/f1.py", "F1") == 0
+    assert record_ruling(ben, "src/f2.py", "F2") == 0
+    assert team("sync", repo=ana) == 0
+    ga = _gl(ana)
+    f = next(p for p in (ga.wt / "ledger" / "ben").glob("*.jsonl") if p.name == f"{_gl(ben).device}.jsonl")
+    f.write_text(f.read_text().splitlines()[0] + "\n")
+    _push_wt(ga, "truncate ben's own file")
+    git("fetch", "-q", "origin", cwd=ben)                                    # the developer's own, ordinary fetch
+    assert team("sync", repo=ben) == 2
+    assert team("repin", repo=ben) == 0
+    assert team("sync", repo=ben) == 2                                       # no repin adopts it
+    assert "F2" in git("grep", "-h", "F2", "levain-ledger", cwd=ben)
+
+
+def test_a_sibling_device_under_the_same_handle_is_pinned_like_any_teammate(two):
+    # Head precision on the floor rule: "own" is exactly this clone's device file; a sibling device's file under the
+    # same handle is pinned, so one device cannot truncate another's history under the floor rule.
+    tmp, ana, ben = two
+    ben2 = clone(tmp, "ben2", "ben@ex.com")
+    assert team("join", "--no-install", repo=ben2) == 0
+    assert record_ruling(ben2, "src/s1.py", "S1") == 0
+    assert record_ruling(ben2, "src/s2.py", "S2") == 0
+    assert team("sync", repo=ben) == 0
+    ledger(ben)                                                              # ben pins ben2's file
+    gb2 = _gl(ben2)
+    f = gb2.wt / "ledger" / "ben" / f"{gb2.device}.jsonl"
+    f.write_text(f.read_text().splitlines()[0] + "\n")
+    _push_wt(gb2, "truncate a sibling device's file")
+    assert team("sync", repo=ben) == 2
+    assert any(f.name in t and "rewritten" in t for t in ledger(ben).tamper)
+
+
+@pytest.mark.parametrize("state", ['{"device": "not-hex", "remote": "origin"}', "{"])
+def test_an_unreadable_or_invalid_state_json_in_a_joined_clone_denies(two, state):
+    # L1 r1 #4 (a)(b), RUN: a bad device id raised outside the boundary and a corrupt state.json read as "not joined";
+    # both failed OPEN at the hook in a clone that has a ledger.
+    tmp, ana, ben = two
+    (_gl(ben).base / "state.json").write_text(state)
+    out = edit(ben, "src/settlement.py", session="st")["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
+
+
+def test_a_repository_git_cannot_read_still_denies_when_it_holds_ledger_state(two, monkeypatch, capsys):
+    # L1 r1 #4 (c): discover failing (a timeout, safe.directory) failed open.
+    from levain.team import hook as H, transport as T
+
+    def broken(cls, start):
+        raise T.TeamError("git rev-parse failed: timed out")
+    tmp, ana, ben = two
+    monkeypatch.setattr(T.Repo, "discover", classmethod(broken))
+    H.pretooluse({"session_id": "s", "transcript_path": "/x", "cwd": str(ben), "hook_event_name": "PreToolUse",
+                  "tool_name": "Edit", "tool_input": {"file_path": str(ben / "src" / "a.py")}, "tool_use_id": "t"})
+    assert json.loads(capsys.readouterr().out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_sync_on_a_refused_tip_sets_an_interrupted_write_aside_instead_of_committing_it(two):
+    # L1 r1 #2, RUN: sync's recovery committed this clone's interrupted entry onto a locally refused ledger.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "ben's first") == 0
+    gb = _gl(ben)
+    own = gb.wt / "ledger" / "ben" / f"{gb.device}.jsonl"
+    (gb.wt / "ledger" / "ben" / "notes.txt").write_text("x\n")
+    git("add", "--", "ledger/ben/notes.txt", cwd=gb.wt)
+    git("commit", "-qm", "a stray file, committed locally", cwd=gb.wt)
+    with open(own, "a") as fh:
+        fh.write('{"interrupted": true}\n')
+    head = git("rev-parse", "HEAD", cwd=gb.wt)
+    team("sync", repo=ben)
+    assert git("rev-parse", "HEAD", cwd=gb.wt) == head
+    kept = list((gb.base / "set-aside").iterdir())
+    assert kept and b"interrupted" in kept[0].read_bytes()
