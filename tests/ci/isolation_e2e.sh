@@ -40,6 +40,13 @@ check "operator can run as hands" sudo -n -u "$H" /usr/bin/true
 refused "hands can sudo" sudo -n -u "$H" sudo -n /usr/bin/true
 check "levain doctor is green on isolation" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'bash runs as $H'"
 
+echo "== the entity's own ssh key"
+HHOME="$(eval echo ~"$H")"
+check "hands key exists and is the hands user's" sudo -n -u "$H" test -O "$HHOME/.ssh/id_ed25519"
+check "hands key is mode 600" bash -c "test \"\$(sudo stat -c %a '$HHOME/.ssh/id_ed25519' 2>/dev/null || sudo stat -f %Lp '$HHOME/.ssh/id_ed25519')\" = 600"
+refused "operator reads the hands key without sudo" /bin/cat "$HHOME/.ssh/id_ed25519"
+check "hands can sign with its key" sudo -n -u "$H" env "HOME=$HHOME" bash -c "cd /tmp && echo p > /tmp/levain-iso-payload-\$\$ && ssh-keygen -Y sign -f '$HHOME/.ssh/id_ed25519' -n levain /tmp/levain-iso-payload-\$\$"
+
 echo "== the uid gate"
 SECRET="$HOME/levain-iso-secret"; echo x > "$SECRET"; chmod 600 "$SECRET"
 refused "hands reads the operator's 0600 file" sudo -n -u "$H" /bin/cat "$SECRET"

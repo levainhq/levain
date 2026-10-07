@@ -894,7 +894,7 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
     name = "hands isolation"
     try:
         from levain.firing.confinement import load_confinement_config
-        from levain.firing.hands import host_os, sudoers_path
+        from levain.firing.hands import host_os
     except Exception as exc:  # noqa: BLE001
         return [CheckResult(name, True, f"not determinable ({exc})")]
     try:
@@ -921,10 +921,8 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
         return [CheckResult(name, False, f"hands user {cfg.hands_user} does not exist; headless and "
                             "unattended runs will refuse to start",
                             hint=f"sudo levain setup-isolation --undo --path {shlex.quote(str(install))}, then set it up again")]
-    if not sudoers_path(cfg.hands_user).exists():
-        return [CheckResult(name, False, f"the sudoers rule for {cfg.hands_user} is missing; headless "
-                            "and unattended runs will refuse to start",
-                            hint=f"sudo levain setup-isolation --undo --path {shlex.quote(str(install))}, then set it up again")]
+    # No stat of the sudoers drop-in: /etc/sudoers.d is root-only on Linux (measured in CI), so the
+    # operator cannot see it. Starting a process as the hands user is the test that matters.
     ok, out = _probe(["sudo", "-n", "-u", cfg.hands_user, "/usr/bin/true"])
     if not ok:
         return [CheckResult(name, False, f"cannot start a process as {cfg.hands_user} ({out or 'sudo refused'})",

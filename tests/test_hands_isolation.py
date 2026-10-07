@@ -98,7 +98,21 @@ def test_linux_plan_makes_a_system_user_with_no_login_and_its_own_group(tmp_path
     assert "--system" in useradd and useradd[useradd.index("--gid") + 1] == plan.group
     assert useradd[useradd.index("--shell") + 1] == "/usr/sbin/nologin"
     assert useradd[useradd.index("--comment") + 1] == HANDS_MARKER
-    assert ("usermod", "--append", "--groups", plan.group, "alice") in _argvs(plan)
+
+
+
+@pytest.mark.parametrize("host", ["darwin", "linux"])
+def test_the_workspace_acl_names_both_users_not_a_shared_group(tmp_path: Path, host) -> None:
+    # A group added to the operator reaches its running processes only after a new login on Linux
+    # (measured in CI: the operator could not append to a file the hands user created), so the ACL
+    # names the two users and the operator is never put in the entity group.
+    plan = plan_setup(_entity(tmp_path), operator="alice", host=host, used_ids=set())
+    acl = [a for a in _argvs(plan) if any("chmod" in x or "setfacl" in x for x in a) and str(plan.workspace) in a]
+    text = " ".join(" ".join(a) for a in acl)
+    for user in ("alice", plan.hands_user):
+        assert (f"user:{user} allow" in text) if host == "darwin" else (f"u:{user}:rwX" in text)
+    assert "group:" not in text and "g:" not in text
+    assert not any(a[0] in ("usermod", "gpasswd") or (a[0].endswith("dseditgroup") and "alice" in a) for a in _argvs(plan))
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
@@ -282,3 +296,17 @@ def test_the_warn_badge_prints_its_hint(capsys) -> None:
     doctor._emit(doctor.CheckResult("x", True, "detail", hint="do this", warn=True))
     out = capsys.readouterr().out
     assert "do this" in out and "[OK]" not in out
+
+
+@pytest.mark.parametrize("host", ["darwin", "linux"])
+def test_setup_generates_the_entity_key_as_the_hands_user_without_a_passphrase_prompt(tmp_path: Path, host) -> None:
+    plan = plan_setup(_entity(tmp_path), operator="alice", host=host, used_ids=set())
+    keygen = next(s for s in plan.steps if "ssh-keygen" in s.argv)
+    argv = keygen.argv
+    assert argv[:4] == ("/usr/bin/sudo", "-u", plan.hands_user, "/usr/bin/env")  # owned by the hands
+    assert argv[argv.index("-t") + 1] == "ed25519" and argv[argv.index("-N") + 1] == ""
+    key = argv[argv.index("-f") + 1]
+    assert key.endswith("/.ssh/id_ed25519") and keygen.skip_if == ("test", "-e", key)
+    mk = next(s for s in plan.steps if s.argv[-1] == str(Path(key).parent))
+    assert "-m" in mk.argv and mk.argv[mk.argv.index("-m") + 1] == "700"
+    assert plan.steps.index(mk) < plan.steps.index(keygen)
