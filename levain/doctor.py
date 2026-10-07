@@ -179,7 +179,8 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     elif verify_rc != 0:
         print("Static checks passed but live-fire verify-hooks FAILED.")
     else:
-        print("All checks passed.")
+        warned = [r for r in all_results if r.ok and r.warn]
+        print("All checks passed." if not warned else f"All checks passed, with {len(warned)} warning(s) above.")
     if pending and not broken and verify_rc == 0:
         print(
             f"  Every failure above is a post-upgrade step not yet applied "
@@ -914,18 +915,29 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
         )]
     import pwd
 
+    redo = f"sudo levain setup-isolation --undo --path {shlex.quote(str(install))}, then set it up again"
     try:
-        pwd.getpwnam(cfg.hands_user)
+        entry = pwd.getpwnam(cfg.hands_user)
     except KeyError:
-        return [CheckResult(name, False, f"hands user {cfg.hands_user} does not exist",
-                            hint=f"sudo levain setup-isolation --undo --path {shlex.quote(str(install))}, then set it up again")]
+        return [CheckResult(name, False, f"hands user {cfg.hands_user} does not exist", hint=redo)]
+    if entry.pw_uid != cfg.hands_uid:
+        # an OS update can take an id for a system account (macOS 15 did, for 301-304)
+        return [CheckResult(name, False, f"hands user {cfg.hands_user} now has id {entry.pw_uid}, not the "
+                            f"recorded {cfg.hands_uid}", hint=redo)]
     # No stat of the sudoers drop-in: /etc/sudoers.d is root-only on Linux (measured in CI), so the
-    # operator cannot see it. Starting a process as the hands user is the test that matters.
-    ok, out = _probe(["sudo", "-n", "-u", cfg.hands_user, "/usr/bin/true"])
+    # operator cannot see it. Writing to the workspace AS the hands user tests the rule, the account
+    # and the workspace ACL in one step.
+    ok, out = _probe(["sudo", "-n", "-u", cfg.hands_user, "/bin/test", "-w", str(cfg.hands_workspace)])
     if not ok:
-        return [CheckResult(name, False, f"cannot start a process as {cfg.hands_user} ({out or 'sudo refused'})",
-                            hint=f"sudo levain setup-isolation --undo --path {shlex.quote(str(install))}, then set it up again")]
-    return [CheckResult(name, True, f"bash runs as {cfg.hands_user} outside the interactive REPL")]
+        return [CheckResult(name, False, f"{cfg.hands_user} cannot write its workspace "
+                            f"{cfg.hands_workspace} ({out or 'refused'})", hint=redo)]
+    return [CheckResult(
+        name, True,
+        f"hands user {cfg.hands_user} is set up (workspace {cfg.hands_workspace}), but this version of "
+        "levain still runs the entity's bash as you",
+        hint="the change that starts bash as the hands user is not in this build yet",
+        warn=True,
+    )]
 
 
 def _check_store(install: Path) -> list[CheckResult]:

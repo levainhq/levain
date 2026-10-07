@@ -1,8 +1,8 @@
-"""M2: `levain setup-isolation` plans, the `hands_user` config key, and the doctor check.
+"""M2: `levain setup-isolation` plans, the hands keys in confinement.json, and the doctor check.
 
 Every test here is pure or runs harmless commands (`true`, `false`, `visudo -cf` on a temp file); none
-needs root and none starts a sandbox. The real setup/undo runs on Linux CI (tests/ci/linux_isolation.sh)
-and was measured on macOS in a VM (2026-10-07).
+needs root and none starts a sandbox. The real setup/undo runs on Linux and macOS CI runners
+(tests/ci/isolation_e2e.sh) and was measured on macOS in a VM (2026-10-07).
 """
 from __future__ import annotations
 
@@ -20,7 +20,9 @@ from levain.firing.hands import (
     HANDS_USER_RE,
     HandsSetupError,
     Step,
+    choose_id,
     hands_user_name,
+    hands_workspace,
     plan_setup,
     plan_undo,
     run_plan,
@@ -34,27 +36,34 @@ def _entity(tmp_path: Path, name: str = "coyote") -> Path:
     return d
 
 
+def _setup(tmp_path: Path, host: str = "darwin", **kw):
+    kw.setdefault("hands_id", 499 if host == "darwin" else 999)
+    return plan_setup(_entity(tmp_path), operator="alice", host=host, operator_gid=20, **kw)
+
+
+def _undo(tmp_path: Path, host: str = "darwin", **kw):
+    ed = _entity(tmp_path)
+    kw.setdefault("hands_user", hands_user_name(ed))
+    kw.setdefault("hands_id", 499)
+    return plan_undo(ed, operator="alice", host=host, operator_gid=20, workspace=None, **kw)
+
+
 def _argvs(plan) -> list[tuple[str, ...]]:
     return [s.argv for s in plan.steps if s.argv]
 
 
-@pytest.fixture(autouse=True)
-def _operator_home(monkeypatch, tmp_path):
-    # plan_setup looks up the operator's home for its git config step; tests use a fake operator.
-    real = hands._home_of
-    monkeypatch.setattr(hands, "_home_of", lambda user, default=None: str(tmp_path / f"home-{user}")
-                        if user in ("alice",) else real(user, default))
+def _joined(plan) -> str:
+    return "\n".join(" ".join(a) for a in _argvs(plan))
 
 
-# --- the name -------------------------------------------------------------------------------------
+# --- names and ids ---------------------------------------------------------------------------------
 
 
 def test_hands_user_name_is_valid_deterministic_and_per_path(tmp_path: Path) -> None:
     a, b = _entity(tmp_path / "x"), _entity(tmp_path / "y")  # same dir name, different paths
     na, nb = hands_user_name(a), hands_user_name(b)
     assert HANDS_USER_RE.match(na) and HANDS_USER_RE.match(nb)
-    assert na == hands_user_name(a)
-    assert na != nb
+    assert na == hands_user_name(a) and na != nb
     assert len(na) <= 31  # macOS short names; Linux allows 32
 
 
@@ -62,69 +71,89 @@ def test_hands_user_name_survives_a_name_with_no_usable_characters(tmp_path: Pat
     assert hands_user_name(_entity(tmp_path, "ÉÉ--")).startswith("_levain_entity_")
 
 
+@pytest.mark.parametrize("host,top", [("darwin", 499), ("linux", 999)])
+def test_ids_come_from_the_top_of_the_range_skipping_used_and_retired(host, top) -> None:
+    assert choose_id(host, set(), set()) == top
+    assert choose_id(host, {top}, {top - 1}) == top - 2
+
+
+def test_darwin_ids_never_reach_the_range_macos_claims_for_daemons() -> None:
+    # macOS 15 took 301-304 and deletes colliding accounts on upgrade (NixOS/nix#10892).
+    with pytest.raises(HandsSetupError, match="no free"):
+        choose_id("darwin", set(range(400, 500)), set())
+
+
 # --- the setup plan --------------------------------------------------------------------------------
 
 
-def test_darwin_plan_makes_a_hidden_passwordless_user_outside_staff(tmp_path: Path) -> None:
-    ed = _entity(tmp_path)
-    plan = plan_setup(ed, operator="alice", host="darwin", used_ids={300, 301})
+def test_darwin_plan_makes_a_hidden_disabled_passwordless_user_outside_staff(tmp_path: Path) -> None:
+    plan = _setup(tmp_path, hands_id=480)
     u = f"/Users/{plan.hands_user}"
     argvs = _argvs(plan)
-    assert ("/usr/bin/dscl", ".", "-create", u, "UniqueID", "302") in argvs   # first free id
-    assert ("/usr/bin/dscl", ".", "-create", u, "PrimaryGroupID", "302") in argvs  # its own group
-    assert ("/usr/bin/dscl", ".", "-create", u, "UserShell", "/usr/bin/false") in argvs
-    assert ("/usr/bin/dscl", ".", "-create", u, "Password", "*") in argvs
-    assert ("/usr/bin/dscl", ".", "-create", u, "IsHidden", "1") in argvs
-    assert ("/usr/bin/dscl", ".", "-create", u, "RealName", HANDS_MARKER) in argvs
-    # never added to staff (20) or admin: those are what would reopen the operator's home
-    joined = " ".join(" ".join(a) for a in argvs)
-    assert " staff" not in joined and " admin" not in joined and '"20"' not in joined
-    assert not any(a[:2] == ("/usr/sbin/dseditgroup", "-o") and a[-1] in ("staff", "admin") for a in argvs)
+    for attr, value in [("UniqueID", "480"), ("PrimaryGroupID", "480"), ("UserShell", "/usr/bin/false"),
+                        ("Password", "*"), ("IsHidden", "1"), ("RealName", HANDS_MARKER),
+                        ("AuthenticationAuthority", ";DisabledUser;")]:
+        assert ("/usr/bin/dscl", ".", "-create", u, attr, value) in argvs, attr
+    assert not any("dseditgroup" in a[0] for a in argvs)          # nobody is put in a group
+    assert " staff" not in _joined(plan) and " admin" not in _joined(plan)
 
 
-def test_darwin_plan_skips_every_used_id_in_users_and_groups(tmp_path: Path) -> None:
-    plan = plan_setup(_entity(tmp_path), operator="alice", host="darwin", used_ids=set(range(300, 450)))
-    assert ("/usr/bin/dscl", ".", "-create", f"/Users/{plan.hands_user}", "UniqueID", "450") in _argvs(plan)
-
-
-def test_darwin_plan_refuses_when_no_id_is_free(tmp_path: Path) -> None:
-    with pytest.raises(HandsSetupError, match="no free"):
-        plan_setup(_entity(tmp_path), operator="alice", host="darwin", used_ids=set(range(300, 500)))
-
-
-def test_linux_plan_makes_a_system_user_with_no_login_and_its_own_group(tmp_path: Path) -> None:
-    plan = plan_setup(_entity(tmp_path), operator="alice", host="linux")
-    useradd = next(a for a in _argvs(plan) if a and a[0] == "useradd")
-    assert "--system" in useradd and useradd[useradd.index("--gid") + 1] == plan.group
-    assert useradd[useradd.index("--shell") + 1] == "/usr/sbin/nologin"
+def test_linux_plan_makes_a_system_user_with_explicit_ids_and_no_login(tmp_path: Path) -> None:
+    plan = _setup(tmp_path, host="linux", hands_id=950)
+    useradd = next(a for a in _argvs(plan) if a[0].endswith("useradd"))
+    assert "--system" in useradd
+    assert useradd[useradd.index("--uid") + 1] == "950" and useradd[useradd.index("--gid") + 1] == "950"
+    assert useradd[useradd.index("--shell") + 1] in ("/usr/sbin/nologin", "/sbin/nologin", "/bin/false")
     assert useradd[useradd.index("--comment") + 1] == HANDS_MARKER
-
+    groupadd = next(a for a in _argvs(plan) if a[0].endswith("groupadd"))
+    assert groupadd[groupadd.index("--gid") + 1] == "950"
+    assert not any(a[0].endswith(("usermod", "gpasswd")) for a in _argvs(plan))
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
-def test_the_workspace_acl_names_both_users_not_a_shared_group(tmp_path: Path, host) -> None:
+def test_the_workspace_is_outside_home_owned_by_the_operator_and_never_entity_workspace(tmp_path: Path, host) -> None:
+    plan = _setup(tmp_path, host=host)
+    assert plan.workspace == hands_workspace(host, plan.hands_user)
+    assert plan.workspace.is_relative_to(hands.WORKSPACE_ROOT[host])
+    assert str(plan.entity_dir / "workspace") not in _joined(plan)
+    chown = next(a for a in _argvs(plan) if a[0].endswith("chown") and str(plan.workspace) in a)
+    assert chown[1] == "alice:20"
+    mkdirs = [a for a in _argvs(plan) if a[0].endswith("mkdir") and a[-1] in (str(plan.workspace), str(plan.workspace.parent))]
+    assert all("-p" not in a and a[a.index("-m") + 1] == "700" for a in mkdirs) and len(mkdirs) == 2
+
+
+@pytest.mark.parametrize("host", ["darwin", "linux"])
+def test_the_workspace_acl_names_both_users_not_a_group(tmp_path: Path, host) -> None:
     # A group added to the operator reaches its running processes only after a new login on Linux
-    # (measured in CI: the operator could not append to a file the hands user created), so the ACL
-    # names the two users and the operator is never put in the entity group.
-    plan = plan_setup(_entity(tmp_path), operator="alice", host=host, used_ids=set())
-    acl = [a for a in _argvs(plan) if any("chmod" in x or "setfacl" in x for x in a) and str(plan.workspace) in a]
-    text = " ".join(" ".join(a) for a in acl)
-    for user in ("alice", plan.hands_user):
-        assert (f"user:{user} allow" in text) if host == "darwin" else (f"u:{user}:rwX" in text)
-    assert "group:" not in text and "g:" not in text
-    assert not any(a[0] in ("usermod", "gpasswd") or (a[0].endswith("dseditgroup") and "alice" in a) for a in _argvs(plan))
+    # (measured in CI: the operator could not append to a file the hands user created).
+    plan = _setup(tmp_path, host=host)
+    acl = "\n".join(" ".join(a) for a in _argvs(plan) if str(plan.workspace) in a and ("chmod" in a[0] or "setfacl" in a[0]))
+    if host == "darwin":
+        assert f"user:{plan.hands_user} allow" in acl and "user:alice allow" in acl
+    else:
+        assert f"u:{plan.hands_id}:rwX" in acl and "u:alice:rwX" in acl and " -d " in acl
+    assert "group:" not in acl and "g:" not in acl
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
-def test_the_sudoers_step_is_validated_and_names_only_the_hands_user(tmp_path: Path, host) -> None:
-    plan = plan_setup(_entity(tmp_path), operator="alice", host=host, used_ids=set())
-    (step,) = [s for s in plan.steps if s.write is not None]
+def test_the_operator_gets_no_safe_directory_entry_and_the_hands_trust_all(tmp_path: Path, host) -> None:
+    # A repo the hands user controls must never be trusted by the operator's git (its config and
+    # hooks would run as the operator). The hands user's git runs only in its confined shell.
+    plan = _setup(tmp_path, host=host)
+    safe = [a for a in _argvs(plan) if "safe.directory" in a]
+    assert len(safe) == 1 and safe[0][2] == plan.hands_user and safe[0][-1] == "*"
+
+
+@pytest.mark.parametrize("host", ["darwin", "linux"])
+def test_the_sudoers_step_is_validated_and_scoped_to_the_hands_user(tmp_path: Path, host) -> None:
+    plan = _setup(tmp_path, host=host)
+    (step,) = [s for s in plan.steps if s.write is not None and "sudoers" in str(s.write[0])]
     path, content, mode = step.write
     assert path == Path("/etc/sudoers.d") / f"levain-{plan.hands_user}" and "." not in path.name
-    assert mode == 0o440
-    assert step.validate == ("visudo", "-cf")
+    assert mode == 0o440 and step.validate[-1] == "-cf" and step.validate[0].endswith("visudo")
     rules = [ln for ln in content.splitlines() if ln and not ln.startswith("#")]
-    assert rules == ["Defaults:alice !requiretty", f"alice ALL=({plan.hands_user}) NOPASSWD: ALL"]
+    h = plan.hands_user
+    assert rules == [f"Defaults>{h} !requiretty", f"Defaults>{h} env_reset", f"alice ALL=({h}) NOPASSWD: ALL"]
 
 
 @pytest.mark.skipif(shutil.which("visudo") is None, reason="needs visudo")
@@ -137,13 +166,69 @@ def test_the_sudoers_text_parses(tmp_path: Path) -> None:
     assert r.returncode == 0, r.stdout + r.stderr
 
 
+@pytest.mark.parametrize("bad", ["a,b", "a b", "a:b", "a\\b", "-x", "1abc", "x" * 40])
+def test_setup_refuses_an_operator_name_that_could_change_a_sudoers_rule(tmp_path: Path, bad) -> None:
+    with pytest.raises(HandsSetupError, match="refusing the account name"):
+        plan_setup(_entity(tmp_path), operator=bad, host="linux", hands_id=999, operator_gid=1)
+
+
+def test_remote_login_is_refused_only_through_a_checked_sshd_drop_in(tmp_path: Path) -> None:
+    assert not [s for s in _setup(tmp_path / "a").steps if s.write and "sshd" in str(s.write[0])]
+    plan = _setup(tmp_path / "b", sshd_dropins=True)
+    (step,) = [s for s in plan.steps if s.write and "sshd" in str(s.write[0])]
+    assert step.write[0].name == f"levain-{plan.hands_user}.conf"
+    assert f"DenyUsers {plan.hands_user}" in step.write[1]
+    assert step.call is not None
+
+
+def test_the_sshd_check_removes_a_drop_in_that_breaks_sshd_and_keeps_one_that_does_not(tmp_path: Path, monkeypatch) -> None:
+    dropin = tmp_path / "levain-x.conf"
+    dropin.write_text("DenyUsers x\n")
+    results = iter([(False, "bad"), (True, "")])           # fails with it, passes without it
+    monkeypatch.setattr(hands, "_run_ok", lambda argv, **kw: next(results))
+    assert hands._sshd_config_check(dropin) == (False, "bad") and not dropin.exists()
+    dropin.write_text("DenyUsers x\n")
+    results = iter([(False, "no hostkeys"), (False, "no hostkeys")])  # fails either way
+    monkeypatch.setattr(hands, "_run_ok", lambda argv, **kw: next(results))
+    ok, why = hands._sshd_config_check(dropin)
+    assert ok and "without it too" in why and dropin.read_text() == "DenyUsers x\n"
+
+
+def test_only_existing_cron_and_at_deny_lists_are_extended(tmp_path: Path) -> None:
+    deny = tmp_path / "cron.deny"
+    deny.write_text("daemon\n")
+    plan = _setup(tmp_path, deny_lists=(deny,))
+    (step,) = [s for s in plan.steps if "scheduled jobs" in s.why]
+    assert step.call() == (True, "")
+    assert deny.read_text() == f"daemon\n{plan.hands_user}\n"
+    assert step.call() == (True, "already so")
+
+
 @pytest.mark.parametrize("host", ["darwin", "linux"])
-def test_both_users_trust_the_workspace_in_git_and_it_is_idempotent(tmp_path: Path, host) -> None:
-    plan = plan_setup(_entity(tmp_path), operator="alice", host=host, used_ids=set())
-    git = [s for s in plan.steps if "safe.directory" in s.argv]
-    assert {s.argv[2] for s in git} == {"alice", plan.hands_user}
-    assert all(s.argv[-1] == f"{plan.workspace}/*" for s in git)
-    assert all(s.skip_if and "--get-all" in s.skip_if for s in git)
+def test_setup_generates_the_entity_key_as_the_hands_user(tmp_path: Path, host) -> None:
+    plan = _setup(tmp_path, host=host)
+    keygen = next(s for s in plan.steps if any(x.endswith("ssh-keygen") for x in s.argv))
+    argv = keygen.argv
+    assert argv[:3] == ("/usr/bin/sudo", "-u", plan.hands_user) and "-i" in argv  # owned by the hands
+    assert argv[argv.index("-t") + 1] == "ed25519" and argv[argv.index("-N") + 1] == ""
+    key = argv[argv.index("-f") + 1]
+    assert key.endswith("/.ssh/id_ed25519") and keygen.skip_if == ("/bin/test", "-e", key)
+
+
+def test_the_operators_git_identity_is_copied_to_the_hands_user(tmp_path: Path) -> None:
+    ident = {"user.name": "Alice A", "user.email": "a@example.invalid"}
+    plan = _setup(tmp_path / "a", host="linux", git_identity=ident)
+    sets = {a[-2]: a[-1] for a in _argvs(plan) if a[-2] in ident}
+    assert sets == ident
+    assert not [a for a in _argvs(_setup(tmp_path / "b", host="linux")) if "user.name" in a]
+
+
+def test_every_root_command_is_an_absolute_path_or_resolved_on_the_secure_path(tmp_path: Path) -> None:
+    for host in ("darwin", "linux"):
+        for a in _argvs(_setup(tmp_path / host, host=host)):
+            first = a[0]
+            on_this_host = shutil.which(Path(first).name, path=hands.SECURE_PATH)
+            assert first.startswith("/") or on_this_host is None, a  # bare only when absent here
 
 
 # --- the undo plan ---------------------------------------------------------------------------------
@@ -152,40 +237,75 @@ def test_both_users_trust_the_workspace_in_git_and_it_is_idempotent(tmp_path: Pa
 @pytest.mark.parametrize("bad", ["root", "alice", "_levain_", "_levain_x_abcdeg", "_levain_X_abcdef"])
 def test_undo_refuses_a_name_setup_could_not_have_written(tmp_path: Path, bad) -> None:
     with pytest.raises(HandsSetupError, match="refusing"):
-        plan_undo(_entity(tmp_path), operator="alice", host="linux", hands_user=bad)
+        _undo(tmp_path, hands_user=bad)
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
-def test_undo_removes_the_sudoers_rule_first_and_tolerates_missing_pieces(tmp_path: Path, host) -> None:
-    ed = _entity(tmp_path)
-    name = hands_user_name(ed)
-    plan = plan_undo(ed, operator="alice", host=host, hands_user=name)
-    assert plan.steps[0].argv == ("rm", "-f", f"/etc/sudoers.d/levain-{name}")
-    assert all(s.allow_fail for s in plan.steps[1:])
-    # what the hands user created goes back to the operator BEFORE the user is deleted
-    order = [s.argv[0] for s in plan.steps]
-    chown = next(i for i, s in enumerate(plan.steps) if s.argv[:1] == ("find",) and "-user" in s.argv)
-    delete = next(i for i, s in enumerate(plan.steps) if s.argv[:1] in (("userdel",), ("/usr/bin/dscl",)))
-    assert chown < delete, order
-    assert plan.steps[chown].argv[plan.steps[chown].argv.index("-user") + 1] == name
+def test_undo_order_rule_then_kill_then_files_then_account(tmp_path: Path, host) -> None:
+    plan = _undo(tmp_path, host=host)
+    why = [s.why for s in plan.steps]
+    first = lambda text: next(i for i, w in enumerate(why) if text in w)  # noqa: E731
+    assert first("sudoers") == 0
+    assert first("sudoers") < first("stop every process") < first("give the files") < first("delete the hands user")
+    assert first("give the files") < first("remove the workspace ACLs") < first("delete the hands user")
+    assert why[-1].startswith("retire the user id")
 
 
-# --- running a plan --------------------------------------------------------------------------------
+@pytest.mark.parametrize("host", ["darwin", "linux"])
+def test_undo_account_deletion_fails_loudly_and_skips_only_when_already_gone(tmp_path: Path, host) -> None:
+    plan = _undo(tmp_path, host=host)
+    for s in plan.steps:
+        if s.why.startswith(("delete the hands user", "delete the hands group")):
+            assert not s.allow_fail and s.skip_if and s.skip_if[:2] == ("/bin/sh", "-c") and "!" in s.skip_if[2]
+
+
+def test_undo_without_a_known_id_does_not_kill_or_chown_by_name(tmp_path: Path) -> None:
+    plan = _undo(tmp_path, hands_id=None)
+    why = " ".join(s.why for s in plan.steps)
+    assert "stop every process" not in why and "give the files" not in why and "retire" not in why
+
+
+# --- step bodies -----------------------------------------------------------------------------------
+
+
+def test_ensure_line_adds_once_removes_and_keeps_other_lines(tmp_path: Path) -> None:
+    f = tmp_path / "deny"
+    f.write_text("a\nb\n")
+    assert hands._ensure_line(f, "h", present=True) == (True, "")
+    assert hands._ensure_line(f, "h", present=True) == (True, "already so")
+    assert f.read_text() == "a\nb\nh\n"
+    assert hands._ensure_line(f, "h", present=False) == (True, "")
+    assert f.read_text() == "a\nb\n"
+    missing = tmp_path / "nope"
+    assert hands._ensure_line(missing, "h", present=True)[0] and not missing.exists()  # never created...
+    assert hands._ensure_line(missing, "7", present=True, create=True)[0] and missing.read_text() == "7\n"  # ...unless asked
+
+
+def test_remove_if_empty_keeps_a_workspace_with_files(tmp_path: Path) -> None:
+    ws = tmp_path / "h" / "workspace"
+    ws.mkdir(parents=True)
+    (ws / "f").write_text("x")
+    ok, why = hands._remove_if_empty(ws)
+    assert ok and "kept" in why and ws.exists()
+    (ws / "f").unlink()
+    assert hands._remove_if_empty(ws) == (True, "") and not ws.parent.exists()
 
 
 def _plan(*steps: Step):
-    return hands.Plan("linux", "alice", "_levain_x_abcdef", "_levain_x_abcdef", Path("/e"), Path("/e/w"), steps)
+    return hands.Plan("linux", "alice", "_levain_x_abcdef", 999, Path("/e"), Path("/e/w"), steps)
 
 
 def test_dry_run_executes_nothing(tmp_path: Path) -> None:
     marker = tmp_path / "ran"
-    assert run_plan(_plan(Step("touch", ("touch", str(marker)))), dry_run=True, emit=lambda _: None) == 0
-    assert not marker.exists()
+    called = []
+    plan = _plan(Step("touch", ("touch", str(marker))), Step("call", call=lambda: called.append(1) or (True, "")))
+    assert run_plan(plan, dry_run=True, emit=lambda _: None) == 0
+    assert not marker.exists() and not called
 
 
 def test_run_plan_stops_at_the_first_failure(tmp_path: Path) -> None:
     marker = tmp_path / "ran"
-    plan = _plan(Step("fail", ("false",)), Step("touch", ("touch", str(marker))))
+    plan = _plan(Step("fail", call=lambda: (False, "no")), Step("touch", ("touch", str(marker))))
     assert run_plan(plan, dry_run=False, emit=lambda _: None) == 1
     assert not marker.exists()
 
@@ -208,36 +328,74 @@ def test_a_drop_in_that_fails_validation_is_never_installed(tmp_path: Path) -> N
     assert list(target.parent.iterdir()) == []  # the temp copy is gone too
 
 
-# --- the record and the config key ----------------------------------------------------------------
+# --- the record and the config keys ---------------------------------------------------------------
 
 
-def test_record_hands_user_sets_and_removes_the_key_keeping_others(tmp_path: Path) -> None:
+def _record(ed: Path) -> dict:
+    return {"hands_user": hands_user_name(ed), "hands_uid": 499,
+            "hands_workspace": str(hands_workspace("darwin", hands_user_name(ed)))}
+
+
+def test_record_hands_sets_and_removes_the_keys_keeping_others(tmp_path: Path) -> None:
     ed = _entity(tmp_path)
     cfg = ed / ".levain" / "confinement.json"
     cfg.write_text(json.dumps({"ssh_mode": "raw"}))
-    name = hands_user_name(ed)
-    hands.record_hands_user(ed, name, owner_uid=os.getuid(), owner_gid=os.getgid())
-    assert json.loads(cfg.read_text()) == {"ssh_mode": "raw", "hands_user": name}
-    assert load_confinement_config(ed).hands_user == name
-    hands.record_hands_user(ed, None, owner_uid=os.getuid(), owner_gid=os.getgid())
+    hands.record_hands(ed, _record(ed), owner_uid=os.getuid(), owner_gid=os.getgid())
+    loaded = load_confinement_config(ed)
+    assert (loaded.hands_user, loaded.hands_uid) == (hands_user_name(ed), 499)
+    assert loaded.hands_workspace == hands_workspace("darwin", hands_user_name(ed))
+    assert json.loads(cfg.read_text())["ssh_mode"] == "raw"
+    hands.record_hands(ed, None, owner_uid=os.getuid(), owner_gid=os.getgid())
     assert json.loads(cfg.read_text()) == {"ssh_mode": "raw"}
-    assert load_confinement_config(ed).hands_user is None
 
 
-@pytest.mark.parametrize("bad", ["root", "", 5, None, "_levain_coyote_ABCDEF"])
-def test_the_loader_refuses_a_hands_user_setup_could_not_have_written(tmp_path: Path, bad) -> None:
+def test_record_hands_refuses_a_symlinked_config(tmp_path: Path) -> None:
     ed = _entity(tmp_path)
-    (ed / ".levain" / "confinement.json").write_text(json.dumps({"hands_user": bad}))
-    with pytest.raises(ConfinementError, match="hands_user"):
+    target = tmp_path / "elsewhere.json"
+    target.write_text("{}")
+    (ed / ".levain" / "confinement.json").symlink_to(target)
+    with pytest.raises(HandsSetupError, match="symlink"):
+        hands.record_hands(ed, _record(ed), owner_uid=os.getuid(), owner_gid=os.getgid())
+    assert target.read_text() == "{}"
+
+
+@pytest.mark.parametrize("mutate", [
+    {"hands_user": "root"}, {"hands_user": 5}, {"hands_user": "_levain_coyote_ABCDEF"},
+    {"hands_uid": 0}, {"hands_uid": True}, {"hands_uid": "499"},
+    {"hands_workspace": "relative/ws"}, {"hands_workspace": "/Users/Shared/levain/x/../../etc"},
+    {"hands_workspace": "/tmp/ws"}, {"hands_workspace": None},
+])
+def test_the_loader_refuses_hands_values_setup_could_not_have_written(tmp_path: Path, mutate) -> None:
+    ed = _entity(tmp_path)
+    (ed / ".levain" / "confinement.json").write_text(json.dumps({**_record(ed), **mutate}))
+    with pytest.raises(ConfinementError, match="hands_"):
         load_confinement_config(ed)
 
 
-def test_hands_user_is_appended_last_to_the_config_dataclass() -> None:
+@pytest.mark.parametrize("drop", ["hands_user", "hands_uid", "hands_workspace"])
+def test_the_loader_refuses_a_partial_hands_record(tmp_path: Path, drop) -> None:
+    ed = _entity(tmp_path)
+    rec = _record(ed)
+    del rec[drop]
+    (ed / ".levain" / "confinement.json").write_text(json.dumps(rec))
+    with pytest.raises(ConfinementError, match="come together"):
+        load_confinement_config(ed)
+
+
+def test_the_loader_refuses_a_workspace_under_home(tmp_path: Path, monkeypatch) -> None:
+    ed = _entity(tmp_path)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path("/Users/Shared/levain")))
+    (ed / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))
+    with pytest.raises(ConfinementError, match="hands_workspace"):
+        load_confinement_config(ed)
+
+
+def test_hands_keys_are_appended_last_to_the_config_dataclass() -> None:
     from dataclasses import fields
 
     from levain.firing.confinement import ConfinementConfig
 
-    assert [f.name for f in fields(ConfinementConfig)][-1] == "hands_user"
+    assert [f.name for f in fields(ConfinementConfig)][-3:] == ["hands_user", "hands_uid", "hands_workspace"]
 
 
 # --- preconditions ---------------------------------------------------------------------------------
@@ -260,10 +418,18 @@ def test_setup_refuses_root_without_a_sudo_user(monkeypatch, sudo_user) -> None:
         hands.invoking_operator()
 
 
+def test_setup_refuses_an_operator_name_from_sudo_that_could_change_a_rule(monkeypatch) -> None:
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setenv("SUDO_USER", "a,b")
+    with pytest.raises(HandsSetupError, match="refusing the account name"):
+        hands.invoking_operator()
+
+
 def test_setup_refuses_an_entity_already_set_up(tmp_path: Path, monkeypatch, capsys) -> None:
     ed = _entity(tmp_path)
-    (ed / ".levain" / "confinement.json").write_text(json.dumps({"hands_user": hands_user_name(ed)}))
-    monkeypatch.setattr(hands, "invoking_operator", lambda: "alice")
+    (ed / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))
+    monkeypatch.setattr(hands, "invoking_operator", lambda: os.environ.get("USER") or "root")
+    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: hands.pwd.getpwuid(os.getuid()))
     assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
     assert "already set up" in capsys.readouterr().out
 
@@ -285,9 +451,40 @@ def test_doctor_fails_when_the_recorded_user_is_gone(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(hands, "host_os", lambda: "linux")
     ed = _entity(tmp_path)
-    (ed / ".levain" / "confinement.json").write_text(json.dumps({"hands_user": "_levain_nobody_000000"}))
+    (ed / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))
     (r,) = doctor._check_hands_isolation(ed)
     assert not r.ok and "does not exist" in r.detail
+
+
+def test_doctor_fails_when_the_os_took_the_recorded_id(tmp_path: Path, monkeypatch) -> None:
+    from levain import doctor
+
+    monkeypatch.setattr(hands, "host_os", lambda: "darwin")
+    ed = _entity(tmp_path)
+    (ed / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))
+    me = hands.pwd.getpwuid(os.getuid())
+    monkeypatch.setattr(doctor, "_probe", lambda cmd: (True, ""))
+    import pwd as _pwd
+    monkeypatch.setattr(_pwd, "getpwnam", lambda n: me)
+    (r,) = doctor._check_hands_isolation(ed)
+    assert not r.ok and "not the recorded 499" in r.detail
+
+
+def test_doctor_stays_a_warning_while_bash_does_not_use_the_hands_user(tmp_path: Path, monkeypatch) -> None:
+    from levain import doctor
+
+    monkeypatch.setattr(hands, "host_os", lambda: "darwin")
+    ed = _entity(tmp_path)
+    me = hands.pwd.getpwuid(os.getuid())
+    rec = {**_record(ed), "hands_uid": me.pw_uid}
+    (ed / ".levain" / "confinement.json").write_text(json.dumps(rec))
+    probes = []
+    monkeypatch.setattr(doctor, "_probe", lambda cmd: probes.append(cmd) or (True, ""))
+    import pwd as _pwd
+    monkeypatch.setattr(_pwd, "getpwnam", lambda n: me)
+    (r,) = doctor._check_hands_isolation(ed)
+    assert r.ok and r.warn and "still runs the entity's bash as you" in r.detail
+    assert probes == [["sudo", "-n", "-u", rec["hands_user"], "/bin/test", "-w", rec["hands_workspace"]]]
 
 
 def test_the_warn_badge_prints_its_hint(capsys) -> None:
@@ -296,28 +493,3 @@ def test_the_warn_badge_prints_its_hint(capsys) -> None:
     doctor._emit(doctor.CheckResult("x", True, "detail", hint="do this", warn=True))
     out = capsys.readouterr().out
     assert "do this" in out and "[OK]" not in out
-
-
-@pytest.mark.parametrize("host", ["darwin", "linux"])
-def test_setup_generates_the_entity_key_as_the_hands_user_without_a_passphrase_prompt(tmp_path: Path, host) -> None:
-    plan = plan_setup(_entity(tmp_path), operator="alice", host=host, used_ids=set())
-    keygen = next(s for s in plan.steps if "ssh-keygen" in s.argv)
-    argv = keygen.argv
-    assert argv[:4] == ("/usr/bin/sudo", "-u", plan.hands_user, "/usr/bin/env")  # owned by the hands
-    assert argv[argv.index("-t") + 1] == "ed25519" and argv[argv.index("-N") + 1] == ""
-    key = argv[argv.index("-f") + 1]
-    assert key.endswith("/.ssh/id_ed25519") and keygen.skip_if == ("test", "-e", key)
-    mk = next(s for s in plan.steps if s.argv[-1] == str(Path(key).parent))
-    assert "-m" in mk.argv and mk.argv[mk.argv.index("-m") + 1] == "700"
-    assert plan.steps.index(mk) < plan.steps.index(keygen)
-
-
-def test_the_operators_git_identity_is_copied_to_the_hands_user(tmp_path: Path) -> None:
-    ident = {"user.name": "Alice A", "user.email": "a@example.invalid"}
-    plan = plan_setup(_entity(tmp_path), operator="alice", host="linux", git_identity=ident)
-    sets = {s.argv[-2]: s.argv[-1] for s in plan.steps
-            if s.argv[-3:-2] == ("--global",) and s.argv[-2] in ident}
-    assert sets == ident
-    assert all(s.argv[2] == plan.hands_user for s in plan.steps if s.argv[-2:-1] in (("user.name",), ("user.email",)))
-    assert not [s for s in plan_setup(_entity(tmp_path / "b"), operator="alice", host="linux").steps
-                if "user.name" in s.argv]

@@ -965,15 +965,14 @@ def main(argv: list[str] | None = None) -> int:
 
     iso_p = subparsers.add_parser(
         "setup-isolation",
-        help="Run an entity's bash as its own unprivileged user (one-time, needs sudo).",
+        help="Create a dedicated unprivileged user for an entity's bash (one-time, needs sudo).",
         description=(
-            "DRAFT COPY. Create a dedicated user for this entity's bash, with no password and no "
-            "login shell, and let your account start it. Once this has run, headless chat turns "
-            "and unattended runs execute bash as that user, so the kernel no longer hands the "
-            "entity the environment of the processes you run, and files only you can read stay "
-            "out of its reach. The interactive "
-            "`levain run` REPL keeps using your account. It needs root once: run it with sudo. "
-            "--undo removes everything it created."
+            "Create a dedicated user for this entity's bash, with no password and no login shell, "
+            "a workspace for it outside your home directory (/Users/Shared/levain on macOS, "
+            "/var/lib/levain on Linux) that you can both edit, an ssh key of its own, and one "
+            "sudoers rule that lets your account start commands as that user. A process running "
+            "as that user cannot read the environment of your processes or files only you can "
+            "read. Needs root once: run it with sudo. --undo removes what it created."
         ),
     )
     iso_p.add_argument(
@@ -985,7 +984,10 @@ def main(argv: list[str] | None = None) -> int:
     iso_p.add_argument(
         "--undo",
         action="store_true",
-        help="Remove the user, its group, its sudoers rule and the workspace permissions this created.",
+        help=(
+            "Remove the user, its group, its ssh key, its sudoers rule and the workspace "
+            "permissions. Files it created are handed to you; the workspace is removed only if empty."
+        ),
     )
     iso_p.add_argument(
         "--dry-run",

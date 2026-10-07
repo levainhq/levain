@@ -1761,8 +1761,11 @@ class ConfinementConfig:
     # dataclass goes at the END unless the whole class is made keyword-only in a deliberate break.
     # ``test_confinement_config_field_order_is_append_only`` pins it.
     hands_user: str | None = None
+    hands_uid: int | None = None
+    hands_workspace: Path | None = None
     # M2: the dedicated unprivileged user `sudo levain setup-isolation` created for this entity's
-    # bash, removed by its `--undo`. Absent means not set up. Appended last, per the rule above.
+    # bash, its numeric id, and the workspace it created for it outside the operator's home; removed
+    # by its `--undo`. All three or none: absent means not set up. Appended last, per the rule above.
 
 
 _CONFINEMENT_CONFIG_NAME = "confinement.json"
@@ -1876,18 +1879,44 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
             f"deny ON in both ssh_modes (the default)."
         )
 
-    # M2. Absent means not set up. A value must be a name setup-isolation could have written: the
-    # spawn passes it to sudo, so anything else (a typo, another account) is refused, not tried.
+    # M2. Absent means not set up. Each value must be one setup-isolation could have written, and
+    # the three come together: anything else (a typo, another account, a hand-edited path) is
+    # refused, not tried.
     hands_user = data.get("hands_user")
-    if "hands_user" in data:
-        from levain.firing.hands import HANDS_USER_RE
+    hands_uid = data.get("hands_uid")
+    hands_workspace_raw = data.get("hands_workspace")
+    hands_workspace: Path | None = None
+    present = [k for k in ("hands_user", "hands_uid", "hands_workspace") if k in data]
+    if present:
+        from levain.firing.hands import HANDS_USER_RE, WORKSPACE_ROOT
 
+        redo = (" Run `sudo levain setup-isolation --undo` and set it up again — fail-closed.")
+        if len(present) != 3:
+            raise ConfinementError(
+                f"{base}: hands_user, hands_uid and hands_workspace come together; found only "
+                f"{', '.join(present)}.{redo}"
+            )
         if not isinstance(hands_user, str) or not HANDS_USER_RE.match(hands_user):
             raise ConfinementError(
                 f"{base}: hands_user must be the name `levain setup-isolation` recorded, got "
-                f"{hands_user!r} — fail-closed. Run `sudo levain setup-isolation --undo` and set it "
-                f"up again, or remove the key to run bash as yourself."
+                f"{hands_user!r}.{redo}"
             )
+        if isinstance(hands_uid, bool) or not isinstance(hands_uid, int) or hands_uid <= 0:
+            raise ConfinementError(f"{base}: hands_uid must be a positive integer, got {hands_uid!r}.{redo}")
+        roots = tuple(str(r) + os.sep for r in WORKSPACE_ROOT.values())
+        home = str(Path.home()) + os.sep
+        if (
+            not isinstance(hands_workspace_raw, str)
+            or not os.path.isabs(hands_workspace_raw)
+            or os.path.normpath(hands_workspace_raw) != hands_workspace_raw
+            or not hands_workspace_raw.startswith(roots)
+            or (hands_workspace_raw + os.sep).startswith(home)
+        ):
+            raise ConfinementError(
+                f"{base}: hands_workspace must be the absolute path setup-isolation created under "
+                f"{' or '.join(str(r) for r in WORKSPACE_ROOT.values())}, got {hands_workspace_raw!r}.{redo}"
+            )
+        hands_workspace = Path(hands_workspace_raw)
 
     return ConfinementConfig(
         deny_files=_paths("deny_files"),
@@ -1898,6 +1927,8 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
         allow_localhost_outbound=allow_localhost_outbound,
         efferent_gate=efferent_gate,
         hands_user=hands_user,
+        hands_uid=hands_uid,
+        hands_workspace=hands_workspace,
     )
 
 
