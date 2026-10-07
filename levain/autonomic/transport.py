@@ -97,6 +97,20 @@ class ConfirmDecision:
     reason: str = ""
     withdraw: bool = False
 
+    def __post_init__(self) -> None:
+        # A decision is an authority boundary: a truthy string ("false") must never read as approval.
+        for name in ("approved", "withdraw"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"ConfirmDecision.{name} must be a bool, got {type(getattr(self, name)).__name__}")
+        if self.by not in ("human", "on-loop"):
+            raise ValueError(f"ConfirmDecision.by must be 'human' or 'on-loop', got {self.by!r}")
+        if self.withdraw and self.approved:
+            raise ValueError("ConfirmDecision.withdraw is a drop: it cannot be approved")
+        if self.typed_proof is not None and not isinstance(self.typed_proof, str):
+            raise TypeError("ConfirmDecision.typed_proof must be a string or None")
+        if not isinstance(self.reason, str):
+            raise TypeError("ConfirmDecision.reason must be a string")
+
 
 @runtime_checkable
 class ConfirmTransport(Protocol):

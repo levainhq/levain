@@ -82,6 +82,7 @@ from levain.autonomic.binding import (
     SubGoal,
     TightnessVector,
     TriggerSpec,
+    FenceNotRecordedError,
     ReplaceResult,
     binding_invocation,
     derived_binding_id,
@@ -200,6 +201,7 @@ __all__ = [
     "derived_binding_id",
     "BindingStore",
     "ReplaceResult",
+    "FenceNotRecordedError",
     # the run journal (S8: an unattended run's effects, at most once)
     "RunJournal",
     "RunRef",

@@ -87,7 +87,7 @@ from typing import Any, Iterator
 from levain.autonomic.binding import Binding, BindingStore, binding_invocation
 from levain.autonomic.executor import ActionRequest, ExecutionResult
 from levain.autonomic.gate import EfferentGate, GateOutcome
-from levain.autonomic.journal import RunRef, run_id_for
+from levain.autonomic.journal import RunRef, durable_replace, run_id_for
 from levain.autonomic.risk import ActionRisk
 from levain.autonomic.transport import ConfirmDecision
 from levain.autonomic.trust import TrustContext
@@ -513,16 +513,15 @@ class ChainStateStore:
 
     def _write_raw(self, records: list[dict[str, Any]]) -> None:
         """Atomically replace the file (tmp + ``os.replace`` — never a torn read). Call under ``_locked``."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, self.path)
+        durable_replace(self.path, json.dumps(records, ensure_ascii=False, indent=2))
 
     # --- public API --------------------------------------------------------------------
     def add(self, state: ChainState) -> None:
-        """Persist a chain state. A duplicate ``chain_id`` is REPLACED (idempotent re-pause). Locked."""
+        """Persist a chain state. A duplicate ``chain_id`` is REPLACED (idempotent re-pause). Locked. A
+        store that cannot be read RAISES (:class:`ChainStoreUnavailableError`) instead of being
+        rewritten as if it held only this state."""
         with self._locked():
-            records = [r for r in self._read_raw() if r.get("chain_id") != state.chain_id]
+            records = [r for r in self._read_raw(for_advance=True) if r.get("chain_id") != state.chain_id]
             records.append(state.to_dict())
             self._write_raw(records)
 
@@ -603,9 +602,10 @@ class ChainStateStore:
             return state
 
     def remove(self, chain_id: str) -> bool:
-        """Delete one chain state. Returns True iff present. Locked read-modify-write."""
+        """Delete one chain state. Returns True iff present. Locked read-modify-write; an unreadable
+        store RAISES rather than being rewritten empty."""
         with self._locked():
-            records = self._read_raw()
+            records = self._read_raw(for_advance=True)
             kept = [r for r in records if r.get("chain_id") != chain_id]
             if len(kept) == len(records):
                 return False
@@ -746,6 +746,13 @@ class ChainExecutor:
                 # chain that can't persist its resume state leaves NO orphaned fireable pending (the
                 # two-resource invariant — codex/L1 HIGH).
                 pending_id = outcome.pending_id or ""
+                owner = self._chain_store.find_by_pending(pending_id) if pending_id else None
+                if owner is not None:
+                    # a re-delivery reached the same paused link: its pending and its chain state are
+                    # already open, so report that pause instead of writing a second state for it
+                    return ChainOutcome(binding_id=binding.binding_id, state="paused", links=tuple(results),
+                                        paused_at=i, pending_id=pending_id, chain_id=owner.chain_id,
+                                        reason=outcome.reason)
                 try:
                     state = ChainState.create(
                         created_at=self._clock().isoformat(), binding=binding, trigger_event=event,
@@ -832,7 +839,7 @@ class ChainExecutor:
             predicted_trajectory=_predicted_trajectory(binding),
             trigger_event=event,
             ratified_posture=(binding.posture if is_terminal else None),
-            run=(RunRef(run_id_for(binding.binding_id, event), f"link-{i}")
+            run=(RunRef(run_id_for(binding.binding_id, event), f"link-{i}", chained=True)
                  if self._gate.journal is not None else None),
         )
         return request, self._gate.gate(request)
@@ -874,6 +881,16 @@ class ChainExecutor:
                        "not falling through (retry)", pending_id, e)
             return ChainOutcome(binding_id="?", state="aborted", links=(), reason="chain_store_unavailable")
         if state is None:
+            pending = self._gate.get_pending(pending_id)
+            if pending is not None and pending.chained:
+                # A chain link's pending whose chain state is gone (the process stopped after claiming
+                # it, or it was never written): never fall back to a plain resolve, which would fire the
+                # link alone. Re-delivering the event re-walks the chain (done links replay), finds this
+                # same pending for the paused link, and writes its chain state again.
+                _log.warning("chainpath resume: chain state for pending %s is lost — re-deliver the event",
+                             pending_id)
+                return ChainOutcome(binding_id=str(pending.authority.get("binding_id") or "?"),
+                                    state="aborted", links=(), reason="chain_state_lost")
             return None  # genuinely no chain owns this pending → the caller's 4a single-link fallback
 
         # Every abort path BELOW claims-out the chain state, leaving the gate pending live — so each one
@@ -928,7 +945,7 @@ class ChainExecutor:
 
         # fire the paused link via the gate's resolve (at-most-once for the LINK; re-validates the seal,
         # re-screens §1.5, claims the pending). The gate writes the link's receipt.
-        link_outcome = self._gate.resolve(pending_id, decision)
+        link_outcome = self._gate.resolve(pending_id, decision, chain_owned=True)
         results = [ChainLinkResult(link_index=state.paused_at_link, outcome=link_outcome)]
 
         if not link_outcome.fired:
@@ -976,7 +993,7 @@ class ChainExecutor:
         bounded by the auto-fire allowlist — only a benign local ``deliver_as_document`` could misfire,
         never an outbound; a non-deliver allowlisted link would need this closed first)."""
         try:
-            outcome = self._gate.resolve(pending_id, ConfirmDecision(approved=False, by="on-loop",
+            outcome = self._gate.resolve(pending_id, chain_owned=True, decision=ConfirmDecision(approved=False, by="on-loop",
                                                                      reason=f"chain_aborted:{reason}",
                                                                      withdraw=withdraw))
         except Exception as e:  # noqa: BLE001 — the chain is already aborted; a consume fault is not fatal

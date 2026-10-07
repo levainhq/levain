@@ -131,8 +131,11 @@ class World:
         return d
 
     def resolve_open(self, approve: bool):
+        return self.resolve_open_as(ConfirmDecision(approved=approve, by="human"))
+
+    def resolve_open_as(self, decision):
         [p] = self.pending.list_open()
-        return self.chains.resume(p.pending_id, ConfirmDecision(approved=approve, by="human"))
+        return self.chains.resume(p.pending_id, decision)
 
     def outbox(self) -> list[tuple[str, str]]:
         p = self.work / "outbox.jsonl"
@@ -285,7 +288,7 @@ def test_a_pause_fences_an_admitted_run_even_after_the_grant_is_reactivated(tmp_
 def test_every_verb_that_stops_or_tightens_a_grant_fences_it(tmp_path, verb):
     w = World(tmp_path)
     b = w.mint(chain=False)
-    before = w.journal.generation(b.binding_id)
+    before = w.store.generation(b.binding_id)
     if verb == "revoke":
         w.store.set_status(b.binding_id, BindingStatus.REVOKED)
     elif verb == "tighten":
@@ -298,14 +301,17 @@ def test_every_verb_that_stops_or_tightens_a_grant_fences_it(tmp_path, verb):
             tightness=b.tightness, posture=Posture.ABOVE_LOOP, guard=b.guard, status=BindingStatus.ACTIVE))
     else:
         w.store.remove(b.binding_id)
-    assert w.journal.generation(b.binding_id) == before + 1
+    assert w.journal.generation(b.binding_id) == before + 1          # mirrored into the journal
+    if verb != "remove":
+        assert w.store.generation(b.binding_id) == before + 1        # bumped in the registry record
 
 
 def test_activating_verbs_do_not_fence(tmp_path):
     w = World(tmp_path)
     b = w.mint(chain=False)                                       # add + ratify
+    before = w.store.generation(b.binding_id)
     w.store.record_fire(b.binding_id, clean=True, fired_at="2026-10-07T12:00:00")
-    assert w.journal.generation(b.binding_id) == 0
+    assert w.store.generation(b.binding_id) == before and w.journal.generation(b.binding_id) == 0
 
 
 # --- the wiring is structural -------------------------------------------------------------------
@@ -448,7 +454,10 @@ def test_a_pause_whose_journal_fence_fails_still_stops_the_admitted_run(tmp_path
         raise OSError(28, "No space left on device")
 
     w.journal.fence = failing_fence
-    assert w.store.set_status(b.binding_id, BindingStatus.PAUSED)
+    from levain.autonomic import FenceNotRecordedError
+    with pytest.raises(FenceNotRecordedError):                     # committed, and the caller is told
+        w.store.set_status(b.binding_id, BindingStatus.PAUSED)
+    assert w.store.get(b.binding_id).status is BindingStatus.PAUSED
     w.journal.fence = real_fence
     w.store.ratify(b.binding_id)                                   # even re-activated
     out = w.resolve_open(approve=True)
@@ -456,7 +465,7 @@ def test_a_pause_whose_journal_fence_fails_still_stops_the_admitted_run(tmp_path
     assert w.outbox() == [("link0", "q1-0")]
 
 
-def test_an_orphaned_hold_is_rejected_by_the_sweep(tmp_path):
+def test_an_orphaned_hold_is_withdrawn_by_the_sweep(tmp_path):
     # L2 P5: the process stopped after the hold and before the pending: nothing would ever decide it
     w = World(tmp_path)
     w.mint(chain=True)
@@ -464,7 +473,7 @@ def test_an_orphaned_hold_is_rejected_by_the_sweep(tmp_path):
     def crash(pending):
         raise SystemExit("process stopped here")
 
-    w.pending.add = crash
+    w.pending.add_for_run = crash
     with pytest.raises(SystemExit):
         w.dispatch("o1")
     w = World(tmp_path)
@@ -483,7 +492,7 @@ def test_a_hold_whose_pending_cannot_persist_is_rejected_not_left_open(tmp_path)
     def broken_add(pending):
         raise OSError("disk full")
 
-    w.pending.add = broken_add
+    w.pending.add_for_run = broken_add
     out = w.dispatch("d1")
     assert out.chain.aborted and "pending_persist_failed" in out.outcome.reason
     assert w.journal.open_holds() == []                            # no orphaned decision blocks the binding
@@ -515,7 +524,9 @@ class TickingWorld(World):
     def __init__(self, work: Path) -> None:
         super().__init__(work)
         ticks = iter(range(10_000))
-        self.gate._clock = lambda: FIXED + _dt.timedelta(seconds=next(ticks))
+        clock = lambda: FIXED + _dt.timedelta(seconds=next(ticks))  # noqa: E731
+        self.gate._clock = clock
+        self.chains._clock = clock
 
 
 def test_a_redelivery_while_a_decision_is_open_reuses_its_pending(tmp_path):
@@ -560,15 +571,15 @@ def test_an_infrastructure_fault_withdraws_the_decision_without_cancelling_the_r
     # L1 F6: a transient pending-store fault cancelled the run for good
     w = World(tmp_path)
     w.mint(chain=True)
-    real_add = w.pending.add
+    real_add = w.pending.add_for_run
 
     def disk_full(pending):
         raise OSError(28, "No space left on device")
 
-    w.pending.add = disk_full
+    w.pending.add_for_run = disk_full
     assert "pending_persist_failed" in w.dispatch("f1").outcome.reason
     assert w.journal.open_holds() == []
-    w.pending.add = real_add
+    w.pending.add_for_run = real_add
     assert w.dispatch("f1").chain.paused                           # proposed again after recovery
     assert w.resolve_open(approve=True).completed
     assert w.outbox() == [("link0", "f1-0"), ("link1", "f1-1")]
@@ -615,3 +626,228 @@ def test_an_approval_the_journal_stopped_still_gets_a_receipt(tmp_path):
     out = w.resolve_open(approve=True)
     assert out.reason == "journal:fenced" and out.links[-1].outcome.receipt_id is not None
     assert sorted(r.fired for r in w.receipts.read()) == [False, True]   # link0 fired; link1's stop
+
+
+# --- L3 round 1 (input 87b8ffcaa864c223), each reproduced first (job tmp l3/repro.py) ----------
+
+def test_an_unattended_approval_of_a_confirm_pending_is_refused(tmp_path):
+    # codex HIGH 1: resolve(approved, by="on-loop") fired a CONFIRM link no human approved
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    out = w.resolve_open_as(ConfirmDecision(approved=True, by="on-loop"))
+    assert out.aborted and "unattended_approval_not_allowed" in out.reason
+    assert w.outbox() == [("link0", "c1-0")]
+
+
+def test_a_decision_with_a_non_bool_approval_cannot_be_built():
+    # codex HIGH 3: approved="false" is truthy and approved the effect
+    for bad in ("false", 1, None):
+        with pytest.raises(TypeError):
+            ConfirmDecision(approved=bad)
+    with pytest.raises(ValueError):
+        ConfirmDecision(approved=True, by="anyone")
+    with pytest.raises(ValueError):
+        ConfirmDecision(approved=True, withdraw=True)
+
+
+def test_a_one_shot_whose_claim_write_failed_fires_for_at_most_one_event(tmp_path):
+    # codex HIGH 2: run A admitted, the claim write failed; event B claimed; A re-delivered also fired
+    w = World(tmp_path)
+    b = Binding.create(created_by="operator", created_at="2026-10-07T09:00:00o",
+                       trigger=TriggerSpec(type="email", pattern={"field": "from", "value": "a@x.example"}),
+                       goal=(SubGoal(goal="s", tools=("mail.read",), output="doc:s"),), tightness=TIGHT,
+                       posture=Posture.ON_LOOP, one_shot=True, status=BindingStatus.PAUSED)
+    w.store.add(b)
+    w.store.ratify(b.binding_id)
+    real = w.store._write_raw
+
+    def crash(records):
+        raise OSError("stopped before the claim was written")
+
+    w.store._write_raw = crash
+    assert w.dispatcher.dispatch({"type": "email", "id": "A", "fields": {"from": "a@x.example"}}) == []
+    w.store._write_raw = real
+    for eid in ("B", "A", "B", "C"):
+        w.dispatcher.dispatch({"type": "email", "id": eid, "fields": {"from": "a@x.example"}})
+    assert [a for a, _ in w.outbox()] == ["link0"]                 # exactly one event's effect, ever
+
+
+def test_a_replay_whose_bytes_changed_cancels_instead_of_replaying(tmp_path):
+    # codex HIGH 7: link0 replayed its old result while the chain recorded new bytes for it
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("d1")
+    w2 = World(tmp_path)
+    w2.chains._request_builder = lambda b, ctx, i: dataclasses.replace(
+        _chain_builder(b, ctx, i), payload="something else")
+    out = w2.dispatch("d1")
+    assert out.chain.aborted and len(out.chain.links) == 1                    # stopped AT link0
+    assert out.chain.links[0].outcome.reason == "journal:cancelled"
+    assert w.outbox() == [("link0", "d1-0")]
+
+
+def test_a_malformed_pending_record_does_not_stop_the_sweep(tmp_path):
+    # codex MED 10 / complement MED 1: a ValueError on read aborted list_open and every sweep
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    good = json.loads(w.pending.path.read_text())[0]
+    bad = dict(good, pending_id="p-bad", effect_id=None)          # parses field by field, then ValueError
+    w.pending.path.write_text(json.dumps([bad, good]))
+    assert [p.pending_id for p in w.pending.list_open()] == [good["pending_id"]]
+    assert w.pending.get("p-bad") is None
+    assert w.pending.claim("p-bad") is None and len(w.pending.list_open()) == 1
+
+
+def test_a_transient_refusal_does_not_end_the_run(tmp_path):
+    # complement MED 2: an unreadable registry generation cancelled the run for good
+    w = World(tmp_path)
+    w.mint(chain=False)
+    real = w.gate._binding_generation
+    w.gate._binding_generation = lambda bid: None
+    assert w.dispatch("g1").outcome.reason == "binding_generation_unknown"
+    w.gate._binding_generation = real
+    assert w.dispatch("g1").outcome.fired and w.outbox() == [("link0", "g1-0")]
+
+
+def test_a_chain_link_never_fires_standalone_and_a_lost_chain_state_is_rebuilt(tmp_path):
+    # codex HIGH 5: the chain state claimed, the process stopped; the next resume fell back to a
+    # plain resolve that fired the link alone and dropped the rest of the chain
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    [p] = w.pending.list_open()
+    assert w.chains._chain_store.claim_by_pending(p.pending_id) is not None   # then the process stops
+    lost = w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    assert lost.aborted and lost.reason == "chain_state_lost"
+    plain = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    assert plain.refused and plain.reason == "chained_pending_resolves_through_its_chain"
+    assert w.outbox() == [("link0", "c1-0")] and len(w.pending.list_open()) == 1
+    assert w.dispatch("c1").chain.paused                           # re-delivery rebuilds the chain state
+    assert w.resolve_open(approve=True).completed
+    assert w.outbox() == [("link0", "c1-0"), ("link1", "c1-1")]
+
+
+def test_two_proposals_of_one_effect_write_one_pending(tmp_path):
+    # codex MED 8 / complement 6: both saw the hold before either pending existed and both wrote one
+    from levain.autonomic import PendingAction
+    w = World(tmp_path)
+
+    def mk(at):
+        return PendingAction.create(created_at=at, action_name="a", payload="p", context_id="c",
+                                    query_text="q", query_date="d", posture="CONFIRM", fail_open=False,
+                                    requires_typed=False, authority={}, run_id="run-1", effect_id="link-1")
+
+    first, made = w.pending.add_for_run(mk("t1"))
+    second, made2 = w.pending.add_for_run(mk("t2"))
+    assert made and not made2 and second.pending_id == first.pending_id
+    assert len(w.pending.list_open()) == 1
+
+
+def test_a_redelivered_pause_reuses_its_chain_state(tmp_path):
+    # complement 5: each re-delivery wrote another chain state for the same pending
+    w = TickingWorld(tmp_path)
+    w.mint(chain=True)
+    first = w.dispatch("c1").chain
+    again = w.dispatch("c1").chain
+    assert again.paused and again.chain_id == first.chain_id
+    assert len(w.chains._chain_store.list_open()) == 1
+
+
+def test_stores_refuse_to_overwrite_a_file_they_cannot_read(tmp_path):
+    # codex MED 9 / glm: a mutation that read an unreadable store as empty rewrote it with one record
+    from levain.autonomic import ChainStoreUnavailableError
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c1")
+    w.pending.path.write_text("{not json")
+    with pytest.raises(OSError):
+        w.pending.remove("anything")
+    assert w.pending.path.read_text() == "{not json"
+    w.chains._chain_store.path.write_text("{not json")
+    with pytest.raises(ChainStoreUnavailableError):
+        w.chains._chain_store.remove("anything")
+    assert w.chains._chain_store.path.read_text() == "{not json"
+
+
+def test_a_pending_that_cannot_be_built_closes_its_hold(tmp_path):
+    # glm MED: a raise between the hold and the pending write left the hold open
+    w = World(tmp_path)
+    w.mint(chain=True)
+    import levain.autonomic.gate as gate_mod
+    real = gate_mod.PendingAction.create
+    gate_mod.PendingAction.create = staticmethod(lambda **kw: (_ for _ in ()).throw(ValueError("bad")))
+    try:
+        out = w.dispatch("x1")
+    finally:
+        gate_mod.PendingAction.create = real
+    assert "pending_persist_failed" in out.outcome.reason and w.journal.open_holds() == []
+    assert w.dispatch("x1").chain.paused                           # not cancelled: proposed again
+
+
+def test_a_removed_and_readded_grant_fences_every_earlier_run(tmp_path):
+    # complement 7: a re-add started at a generation an earlier admitted run could still match
+    w = World(tmp_path)
+    b = w.mint(chain=True)
+    w.dispatch("r1")                                               # link1 pending under the old record
+    real = w.journal.fence
+    w.journal.fence = lambda *a, **k: (_ for _ in ()).throw(OSError("no space"))
+    from levain.autonomic import FenceNotRecordedError
+    with pytest.raises(FenceNotRecordedError):
+        w.store.remove(b.binding_id)
+    w.journal.fence = real
+    w.store.add(b)
+    w.store.ratify(b.binding_id)
+    out = w.resolve_open(approve=True)
+    assert out.aborted and out.reason == "journal:fenced" and w.outbox() == [("link0", "r1-0")]
+
+
+def test_a_pause_whose_registry_write_fails_leaves_no_fence_ahead_of_the_registry(tmp_path):
+    # glm MED: the journal fence was written before the registry; a failed registry write then left the
+    # still-active binding fenced for every new run
+    w = World(tmp_path)
+    b = w.mint(chain=False)
+    real = w.store._write_raw
+
+    def fail(records):
+        raise OSError("disk full")
+
+    w.store._write_raw = fail
+    with pytest.raises(OSError):
+        w.store.set_status(b.binding_id, BindingStatus.PAUSED)
+    w.store._write_raw = real
+    assert w.journal.generation(b.binding_id) == 0
+    assert w.dispatch("s1").outcome.fired                         # still live, still fires
+
+
+def test_admission_lets_a_claimed_one_shot_back_in_only_for_its_own_run(tmp_path):
+    # codex HIGH 2 at the store: only the run recorded with the claim may re-enter
+    w = World(tmp_path)
+    b = Binding.create(created_by="operator", created_at="2026-10-07T09:00:00o",
+                       trigger=TriggerSpec(type="email", pattern={"field": "from", "value": "a@x.example"}),
+                       goal=(SubGoal(goal="s", tools=("mail.read",), output="doc:s"),), tightness=TIGHT,
+                       posture=Posture.ON_LOOP, one_shot=True, status=BindingStatus.PAUSED)
+    w.store.add(b)
+    w.store.ratify(b.binding_id)
+    assert w.store.admit(b.binding_id, "run-X") is not None and w.store.claimed_run(b.binding_id) == "run-X"
+    assert w.store.admit(b.binding_id, "run-Y") is None
+    assert w.store.admit(b.binding_id, "run-X") is not None
+
+
+def test_a_chain_whose_state_cannot_be_written_withdraws_and_proposes_again(tmp_path):
+    # L1 F6 on the chain path: chain_state_persist_failed consumed the pending by REJECTING it, which
+    # cancelled the run; an infrastructure fault must leave the run open
+    w = World(tmp_path)
+    w.mint(chain=True)
+    real = w.chains._chain_store.add
+
+    def disk_full(state):
+        raise OSError(28, "No space left on device")
+
+    w.chains._chain_store.add = disk_full
+    out = w.dispatch("w1")
+    assert out.chain.aborted and "chain_state_persist_failed" in out.chain.reason
+    assert w.pending.list_open() == [] and w.journal.open_holds() == []
+    w.chains._chain_store.add = real
+    assert w.dispatch("w1").chain.paused                          # proposed again, not cancelled
