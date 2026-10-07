@@ -461,6 +461,9 @@ class ChainExecutor:
         self._clock = clock
         if gate.journal is None:
             raise ValueError("ChainExecutor: the gate must carry a run journal (a binding fire is journaled)")
+        if gate.binding_risk is None:
+            raise ValueError("ChainExecutor: the gate needs binding_risk (the binding's risk resolver), to "
+                             "re-derive a link's risk when its pending is resolved")
         # The registry, for the §2.6 graduation evidence of a completed chain (``record_fire``) only. A
         # revoke or pause of the grant mid-chain is stopped by the run journal's fence at the next link.
         self._binding_store = binding_store

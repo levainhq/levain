@@ -86,6 +86,7 @@ def _gate(tmp_path, *, executor=None, observer=None, auto_fire=None):
         trajectory_observer=observer,
         auto_fire_actions=auto_fire,
         journal=rig(tmp_path / "store")[0],
+        binding_risk=lambda binding, i: LOW_INTERNAL,   # every binding here is a single low-risk link
     )
 
 

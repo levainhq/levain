@@ -95,19 +95,23 @@ class World:
         self.store = BindingStore(work / "store", journal=self.journal)
         self.pending = PendingActionStore(work / "pending.json")
         self.receipts = GateReceiptStore(work / "receipts.jsonl")
+        # the risk of link i's sealed tools, as the binding's risk resolver derives it now (a test may
+        # reclassify a tool by changing it); the chain, the dispatcher and the gate's resolve share it
+        self.tool_risk = {0: LOW, 1: HIGH}
         self.gate = EfferentGate(
             manifest=ActionManifest({"link0": LOW, "link1": HIGH}), store=self.receipts,
             executor=OutboxExecutor(work / "outbox.jsonl"), clock=lambda: FIXED,
             transport=_Transport(), pending_store=self.pending, journal=self.journal,
+            binding_risk=lambda b, i: self.tool_risk[i],
         )
         self.chains = ChainExecutor(gate=self.gate, request_builder=_chain_builder,
-                                    risk_resolver=lambda b, i: [LOW, HIGH][i], trust_resolver=_trust,
+                                    risk_resolver=lambda b, i: self.tool_risk[i], trust_resolver=_trust,
                                     clock=lambda: FIXED,
                                     binding_store=self.store)
         self.dispatcher = FireDispatcher(
             store=self.store, gate=self.gate,
             predicate_match=lambda p, e: e.get("fields", {}).get(p["field"]) == p["value"],
-            request_builder=_single_builder, risk_resolver=lambda b: LOW, clock=lambda: FIXED,
+            request_builder=_single_builder, risk_resolver=lambda b: self.tool_risk[0], clock=lambda: FIXED,
             chain_executor=self.chains)
 
     def mint(self, *, chain: bool) -> Binding:
@@ -799,7 +803,8 @@ def test_the_dispatcher_and_chain_executor_share_one_journal_and_one_gate(tmp_pa
         ChainExecutor(gate=bare_gate, request_builder=_chain_builder, risk_resolver=lambda b, i: LOW,
                       trust_resolver=_trust, clock=lambda: FIXED)
     other_gate = EfferentGate(manifest=ActionManifest({}), store=w.receipts,
-                              executor=OutboxExecutor(tmp_path / "o.jsonl"), journal=w.journal)
+                              executor=OutboxExecutor(tmp_path / "o.jsonl"), journal=w.journal,
+                              binding_risk=lambda b, i: LOW)
     other = ChainExecutor(gate=other_gate, request_builder=_chain_builder, risk_resolver=lambda b, i: LOW,
                           trust_resolver=_trust, clock=lambda: FIXED)
     with pytest.raises(ValueError):
@@ -1581,3 +1586,65 @@ def test_a_new_proposal_is_made_at_the_raised_rung(tmp_path):
     w.dispatch("n7")
     [p] = w.gate.open_pendings()
     assert p.posture == "CONFIRM_ELEVATED" and p.requires_typed
+
+
+# --- the head's ruling (a): the resolve re-derives the binding's risk from its sealed tools ---------------
+
+def test_a_tool_reclassified_up_raises_the_rung_though_the_manifest_name_entry_is_low(tmp_path):
+    # codex HIGH 4, its own case: link1's tool is reclassified financial after the proposal, while the
+    # manifest's entry for the action NAME stays at its old (CONFIRM) floor. The resolve re-runs the
+    # binding's risk resolver over the sealed binding, so a plain approval no longer fires it.
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("t1")
+    w.tool_risk[1] = FINANCIAL                                     # the tool, not the action name
+    assert w.gate._manifest.risk_of("link1") == HIGH               # the name entry did not move
+    plain = _approve(w)
+    assert plain.paused and plain.reason == "elevated_requires_typed_proof"
+    assert ("link1", "t1-1") not in w.outbox()
+    assert _approve(w, typed_proof="I approve t1").completed
+
+
+def test_a_binding_risk_that_cannot_be_derived_fails_closed(tmp_path):
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("t2")
+
+    def unknown_tool(b, i):
+        raise KeyError("tool no longer declared")
+
+    w.gate._binding_risk = unknown_tool
+    out = _approve(w)
+    assert out.aborted and out.reason.startswith("revalidate:binding_risk_unavailable")
+    assert ("link1", "t2-1") not in w.outbox() and w.gate.open_pendings() == []
+
+
+def test_a_single_link_pending_re_derives_from_the_registry_record(tmp_path):
+    w = World(tmp_path)
+    b = Binding.create(created_by="operator", created_at="2026-10-07T09:00:00sl",
+                       trigger=TriggerSpec(type="email", pattern={"field": "from", "value": "a@x.example"}),
+                       goal=(SubGoal(goal="send", tools=("mail.send",), output="email:x"),), tightness=TIGHT,
+                       posture=Posture.CONFIRM,
+                       guard=(Guard(rationale="r", dissent_author="codex",
+                                    kill_predicate={"op": "==", "field": "dmarc", "value": "fail"},
+                                    kill_drill={"dmarc": "fail"}, kill_authored_by="operator"),),
+                       status=BindingStatus.PAUSED)
+    w.store.add(b)
+    w.store.ratify(b.binding_id)
+    w.dispatch("t3")
+    [p] = w.gate.open_pendings()
+    w.tool_risk[0] = FINANCIAL
+    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    assert out.refused and out.reason == "elevated_requires_typed_proof" and w.outbox() == []
+
+
+def test_the_fire_path_needs_a_gate_that_can_re_derive_binding_risk(tmp_path):
+    w = World(tmp_path)
+    gate = EfferentGate(manifest=ActionManifest({}), store=w.receipts, executor=OutboxExecutor(tmp_path / "o"),
+                        journal=w.journal)                         # no binding_risk
+    with pytest.raises(ValueError, match="binding_risk"):
+        FireDispatcher(store=w.store, gate=gate, predicate_match=lambda p, e: True,
+                       request_builder=_single_builder, risk_resolver=lambda b: LOW, clock=lambda: FIXED)
+    with pytest.raises(ValueError, match="binding_risk"):
+        ChainExecutor(gate=gate, request_builder=_chain_builder, risk_resolver=lambda b, i: LOW,
+                      trust_resolver=_trust, clock=lambda: FIXED)

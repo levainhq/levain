@@ -41,6 +41,7 @@ from typing import Any
 from dataclasses import dataclass
 
 from levain.autonomic.authority import AuthorityScope
+from levain.autonomic.binding import Binding, BindingStore
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
 from levain.autonomic.journal import (
@@ -190,8 +191,16 @@ class EfferentGate:
         auto_fire_actions: frozenset[str] | None = None,
         trajectory_observer: TrajectoryObserver | None = None,
         journal: RunJournal | None = None,
+        binding_risk: Callable[[Binding, int], ActionRisk] | None = None,
     ) -> None:
         self._manifest = manifest
+        # The binding's risk resolver: (sealed binding, link index) -> the risk of that link's tools NOW
+        # (the same function the fire path derives a binding fire's risk with). The resolve of a
+        # binding's pending re-runs it, so a tool reclassified since the proposal raises the rung even
+        # where the manifest's entry for the action name did not move. ``FireDispatcher`` and
+        # ``ChainExecutor`` refuse a gate without one; a binding's pending resolved on a gate without one
+        # fails closed (its risk cannot be re-derived).
+        self._binding_risk = binding_risk
         # The run journal (S8). None ⇒ a manual-only gate: a request carrying a ``run`` is refused, and
         # so is every binding fire (a binding fire is always a journaled run).
         # It shares one database with the binding registry, so every journal check reads the binding's
@@ -246,6 +255,10 @@ class EfferentGate:
         if self._pending_store is not None:
             out.extend(self._pending_store.list_open())
         return out
+
+    @property
+    def binding_risk(self) -> Callable[[Binding, int], ActionRisk] | None:
+        return self._binding_risk
 
     @property
     def journal(self) -> RunJournal | None:
@@ -612,14 +625,12 @@ class EfferentGate:
             return reject(posture, f"denied:{decision.reason or decision.by}", terminal=deny_terminal)
 
         # The rung the approval must meet NOW: the sealed posture, raised by the risk floor the proposal
-        # was sealed at and by the manifest's current floor for the action. At a raised rung a reply must
+        # was sealed at, the manifest's current floor for the action and the floor of the binding's
+        # tools now (REFUSE_ESCALATE when that cannot be re-derived). At a raised rung a reply must
         # meet that rung (its typed-proof and unattended checks below leave the decision open), and
         # silence takes that rung's default (``silence_decision``).
-        effective, bad = self._resolve_posture(pending, posture)
-        if bad is not None:
-            return reject(posture, bad)
-        if effective is Posture.REFUSE_ESCALATE:
-            return reject(posture, "revalidate:risk_floor_rose")
+        effective, why = self._resolve_posture(pending, posture, hold)
+        stop_reason = why or "revalidate:risk_floor_rose"
         if effective > posture and hold.get("decided") is True:
             # Approved at the lower rung, and a decision is write-once, so it cannot be asked again at
             # the raised one: the run ends instead, with a receipt. Only while the effect has not
@@ -630,16 +641,18 @@ class EfferentGate:
                 return self._refuse_open("run_not_admitted", binding_id)
             if started is None:
                 try:
-                    self._journal.cancel(hold["run_id"], reason="revalidate:risk_floor_rose")
+                    self._journal.cancel(hold["run_id"], reason=stop_reason)
                 except Exception as e:  # noqa: BLE001
                     _log.error("efferent gate resolve: could not cancel run %s (%s): %s", hold["run_id"],
                                type(e).__name__, e)
                     return GateOutcome(
                         posture=effective, fired=False, refused=False, deferred=False, held=True,
-                        reason="cancel_unrecorded:revalidate:risk_floor_rose", receipt_id=None,
+                        reason=f"cancel_unrecorded:{stop_reason}", receipt_id=None,
                         execution=None, binding_id=binding_id,
                     )
-                return deny(effective, "revalidate:risk_floor_rose", by="on-loop")
+                return deny(effective, stop_reason, by="on-loop")
+        elif effective is Posture.REFUSE_ESCALATE:
+            return reject(posture, stop_reason)   # no rung may approve it: a decision, recorded
         else:
             posture = effective
 
@@ -833,22 +846,49 @@ class EfferentGate:
             verdict=verdict, by=by, actor_first_estimate=decision.first_estimate,
         )
 
-    def _resolve_posture(self, pending: PendingAction, posture: Posture) -> tuple[Posture, str | None]:
-        """The rung a binding's pending must be approved at now, and ``None``; or the sealed posture and
-        why the pending cannot be re-validated. A manual pending (no sealed floor) keeps its posture; its
-        manifest check is in :meth:`_guard_resolve_fire`. For a binding's: ``max(posture, the sealed
-        floor, the manifest's current floor for the action if it declares one)``."""
+    def _resolve_posture(self, pending: PendingAction, posture: Posture,
+                         hold: dict[str, Any]) -> tuple[Posture, str | None]:
+        """The rung a binding's pending must be approved at now, and why when that rung is
+        REFUSE_ESCALATE because something could not be re-derived (fail closed to the highest rung,
+        never the lowest). A manual pending (no sealed floor) keeps its posture; its manifest check is
+        in :meth:`_guard_resolve_fire`. For a binding's: ``max(posture, the sealed floor, the manifest's
+        current floor for the action if it declares one, the floor of the binding's tools now)``."""
         if pending.risk_floor is None:
             return posture, None
         try:
             floor = Posture[pending.risk_floor]
         except KeyError:
-            return posture, "revalidate:corrupt_risk_floor"
+            return Posture.REFUSE_ESCALATE, "revalidate:corrupt_risk_floor"
         try:
             floor = max(floor, risk_floor(self._manifest.risk_of(pending.action_name)))
         except UnknownAction:
-            pass   # the action name is not declared: the floor sealed from the binding's tools stands
-        return max(posture, floor), None
+            pass   # the action name is not declared: the binding's own risk stands
+        now, why = self._binding_floor_now(pending, hold)
+        if now is None:
+            return Posture.REFUSE_ESCALATE, why
+        return max(posture, floor, now), None
+
+    def _binding_floor_now(self, pending: PendingAction, hold: dict[str, Any]) -> tuple[Posture | None, str]:
+        """The risk floor of the hold's link as the binding's risk resolver derives it NOW, from the sealed
+        binding: the chain continuation's snapshot for a link of a chain, the registry's record for a
+        single link. ``(None, why)`` when it cannot be derived (no resolver, the binding is absent or does
+        not seal, the resolver raises): the caller fails closed."""
+        if self._binding_risk is None:
+            return None, "revalidate:binding_risk_unavailable:no_resolver"
+        binding_id = pending.authority.get("binding_id")
+        try:
+            link = int(str(hold["effect_id"]).removeprefix("link-"))
+            if hold.get("chain") is not None:
+                binding = Binding.from_dict(hold["chain"]["binding"])
+            else:
+                binding = BindingStore(self._journal.db.directory, journal=self._journal).get(binding_id)  # type: ignore[union-attr]
+            if binding is None or binding.binding_id != binding_id or not binding.seal_matches():
+                return None, "revalidate:binding_risk_unavailable:binding"
+            return risk_floor(self._binding_risk(binding, link)), ""
+        except Exception as e:  # noqa: BLE001 — an unknown tool, a malformed record: fail closed
+            _log.warning("efferent gate resolve: cannot re-derive the risk of %s (%s): %s", binding_id,
+                         type(e).__name__, e)
+            return None, f"revalidate:binding_risk_unavailable:{type(e).__name__}"
 
     def _unattended_approval_allowed(self, pending: PendingAction, posture: Posture) -> bool:
         """An approval no human gave (``by != "human"``) is the silence default of a cooling-off rung,
@@ -1016,11 +1056,11 @@ class EfferentGate:
             return None
         posture = self._posture_of(pending)
         if posture is not None and pending.seal_matches():
-            effective, bad = self._resolve_posture(pending, posture)
-            if bad is not None or effective > posture:
-                # the rung rose since the proposal: silence takes the RAISED rung's default, and a rung
-                # above cooling-off never fires on silence
-                return ConfirmDecision(approved=False, by="on-loop", reason=bad or "revalidate:risk_floor_rose")
+            effective, why = self._resolve_posture(pending, posture, hold)
+            if effective > posture:
+                # the rung rose since the proposal (or cannot be re-derived): silence takes the RAISED
+                # rung's default, and a rung above cooling-off never fires on silence
+                return ConfirmDecision(approved=False, by="on-loop", reason=why or "revalidate:risk_floor_rose")
         if (not pending.seal_matches() or posture is None or pending.fail_open != posture.fail_open
                 or not posture.fail_open or pending.action_name not in self._auto_fire_actions):
             reason = "cooling_off_not_allowlisted" if (posture is not None and posture.fail_open) else "confirm_window_elapsed"

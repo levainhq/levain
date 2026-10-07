@@ -131,7 +131,7 @@ def _registry(tmp_path) -> BindingStore:
     return _rig(tmp_path)[1]
 
 
-def _gate(tmp_path, *, executor=None, transport=None, auto_fire=None, manifest=None):
+def _gate(tmp_path, *, executor=None, transport=None, auto_fire=None, manifest=None, binding_risk=None):
     return EfferentGate(
         manifest=manifest if manifest is not None else _RESOLVE_MANIFEST,
         store=GateReceiptStore(tmp_path / "r.jsonl"),
@@ -141,6 +141,7 @@ def _gate(tmp_path, *, executor=None, transport=None, auto_fire=None, manifest=N
         pending_store=PendingActionStore(tmp_path / "pend.json") if transport is not None else None,
         auto_fire_actions=auto_fire,
         journal=_journal(tmp_path),
+        binding_risk=binding_risk or _risk_resolver,
     )
 
 
@@ -169,7 +170,8 @@ def _request_builder(binding, ctx: ChainContext, i):
 
 def _executor(tmp_path, *, transport=None, auto_fire=None, executor=None, binding_store=None,
               risk_resolver=_risk_resolver, trust_resolver=_trust_resolver, manifest=None):
-    gate = _gate(tmp_path, executor=executor, transport=transport, auto_fire=auto_fire, manifest=manifest)
+    gate = _gate(tmp_path, executor=executor, transport=transport, auto_fire=auto_fire, manifest=manifest,
+                 binding_risk=risk_resolver)
     return ChainExecutor(
         gate=gate, request_builder=_request_builder, risk_resolver=risk_resolver,
         trust_resolver=trust_resolver, clock=lambda: FIXED, binding_store=binding_store,

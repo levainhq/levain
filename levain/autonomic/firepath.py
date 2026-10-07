@@ -152,6 +152,9 @@ class FireDispatcher:
         if gate.journal is None or getattr(store, "journal", None) is not gate.journal:
             raise ValueError("FireDispatcher: the gate needs a run journal, and it must be the binding "
                              "store's journal")
+        if gate.binding_risk is None:
+            raise ValueError("FireDispatcher: the gate needs binding_risk (the binding's risk resolver), "
+                             "to re-derive a binding's risk when its pending is resolved")
         if chain_executor is not None and chain_executor.gate is not gate:
             raise ValueError("FireDispatcher: the chain executor must fire through the same gate")
 
