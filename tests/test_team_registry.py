@@ -899,3 +899,30 @@ const notes = () => made.filter((c) => c.alive && c.className === "tab-team-note
     assert out.returncode == 0, out.stderr
     got = json.loads(out.stdout.strip().splitlines()[-1])
     assert len(got["a"]) == 1 and "incomplete" in got["a"][0] and got["b"] == []
+
+
+@pytest.mark.parametrize("with_auth", [True, False])
+def test_the_views_request_carries_the_cockpit_auth_headers_when_the_page_has_them(with_auth):
+    # The cockpit's data routes may require a launch token (window.levainAuthHeaders, from dashboard_boot.js); this
+    # script's one request must send it when the page provides it, and work unchanged when it does not.
+    from levain.web_server import load_web_asset
+    import shutil
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    js = load_web_asset("dashboard_team.js")
+    auth = 'window.levainAuthHeaders = () => ({ "X-Levain-Token": "t0k" });' if with_auth else ""
+    harness = r"""
+const sent = [];
+global.window = { location: {} };
+%s
+global.document = { querySelector: () => ({ appendChild() {} }), hidden: false, addEventListener() {},
+  createElement: () => ({ remove() {}, addEventListener() {}, appendChild() {}, style: {}, setAttribute() {} }) };
+global.fetch = (url, opts) => { sent.push({ url, headers: opts.headers }); return new Promise(() => {}); };
+%s
+console.log(JSON.stringify(sent));
+""" % (auth, js)
+    out = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=20)
+    assert out.returncode == 0, out.stderr
+    sent = json.loads(out.stdout.strip().splitlines()[-1])
+    want = {"Accept": "application/json", **({"X-Levain-Token": "t0k"} if with_auth else {})}
+    assert sent == [{"url": "/team_views.json", "headers": want}]
