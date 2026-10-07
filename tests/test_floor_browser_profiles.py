@@ -143,11 +143,11 @@ def test_a_hardlink_to_a_profiles_page_storage_refuses_bash(home: Path) -> None:
 
 def test_every_browser_profile_root_is_denied_to_the_file_editor(home: Path) -> None:
     mine = "darwin" if platform.system() == "Darwin" else "linux"
-    for os_name, rel in BROWSER_PROFILE_DIRS:   # present, so Linux denies them too
+    for os_name, rel, _globs in BROWSER_PROFILE_DIRS:   # present, so Linux denies them too
         if os_name == mine:
             (home / rel).mkdir(parents=True, exist_ok=True)
     policy = build_policy(_entity(home))
-    for os_name, rel in BROWSER_PROFILE_DIRS:
+    for os_name, rel, _globs in BROWSER_PROFILE_DIRS:
         if os_name != mine:
             continue
         root = (home / rel).resolve()
@@ -183,26 +183,144 @@ def test_each_ruled_browser_profile_file_is_denied_on_macos(home: Path, monkeypa
         assert crown_jewel_reason(policy, home / f) is not None, f
 
 
-def test_on_linux_each_ruled_browser_is_denied_when_present_and_a_symlinked_root_refuses(home: Path, monkeypatch):
+def test_on_linux_each_ruled_browser_is_denied_when_present(home: Path, monkeypatch):
     import levain.firing.confinement as cf
 
     monkeypatch.setattr(cf.platform, "system", lambda: "Linux")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("CHROME_CONFIG_HOME", raising=False)
     rels = (".config/google-chrome", ".config/google-chrome-unstable", ".config/BraveSoftware", ".mozilla",
-            "snap/firefox/common/.mozilla", "snap/chromium/common/chromium", ".config/opera", ".var/app")
+            "snap/firefox/common/.mozilla", "snap/chromium/common/chromium", ".config/opera", ".var/app", ".zen",
+            ".librewolf", ".waterfox", ".config/opera-developer", ".config/vivaldi-snapshot",
+            ".cache/chrome-devtools-mcp")
     for rel in rels:
         (home / rel).mkdir(parents=True)
     roots = cf.browser_profile_roots(home)
     for rel in rels:
         assert (home / rel).resolve() in roots, rel
-    # $XDG_CONFIG_HOME relocates .config
+    # $XDG_CONFIG_HOME adds a location; the default one stays denied too (levain's environment may not be the
+    # browser's)
     xdg = home / "xdg"
     (xdg / "chromium").mkdir(parents=True)
+    (home / ".config" / "chromium").mkdir()
     monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
-    assert (xdg / "chromium").resolve() in cf.browser_profile_roots(home)
-    # L2d: an entity could plant the absent path as a link into its workspace
-    (home / ".config" / "vivaldi").symlink_to(home)
-    with pytest.raises(cf.ConfinementError, match="symlink"):
-        cf.browser_profile_roots(home)
+    roots = cf.browser_profile_roots(home)
+    assert (xdg / "chromium").resolve() in roots and (home / ".config" / "chromium").resolve() in roots
+
+
+def _linux(monkeypatch):
+    import levain.firing.confinement as cf
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Linux")
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("CHROME_CONFIG_HOME", raising=False)
+    return cf
+
+
+def test_a_profile_reached_through_a_symlink_elsewhere_is_denied_at_both_spellings(home: Path, monkeypatch, tmp_path):
+    """Head ruling (L1 + L2, 2026-10-07): a dotfile manager's or a moved disk's ~/.mozilla is legitimate. It is denied
+    at the link's spelling and the target's, and bash is not refused."""
+    cf = _linux(monkeypatch)
+    real = tmp_path / "data" / "mozilla"
+    (real / "firefox").mkdir(parents=True)
+    (home / ".mozilla").symlink_to(real)
+    entity = _entity(home)
+    policy = build_policy(entity)
+    assert home / ".mozilla" in policy.deny_read_write and real.resolve() in policy.deny_read_write
+    assert crown_jewel_reason(policy, home / ".mozilla" / "firefox" / "x" / "cookies.sqlite") is not None
+    assert crown_jewel_reason(policy, real / "firefox" / "x" / "cookies.sqlite") is not None
+    cf._refuse_planted_browser_links(policy)   # does not raise
+
+
+@pytest.mark.parametrize("plant", ["snap", ".mozilla", ".config"])
+def test_a_profile_path_linked_into_the_entitys_workspace_refuses_bash_not_the_session(home: Path, monkeypatch,
+                                                                                       plant) -> None:
+    """L1 + L2: with the Linux base bound read-write an entity can plant an absent ancestor (~/snap) or the root
+    itself as a link into its workspace; any component counts, not only the last. The session is still built; bash
+    is refused at spawn."""
+    cf = _linux(monkeypatch)
+    entity = _entity(home)
+    ws = entity / "workspace"
+    target = ws / "planted"
+    rel = {"snap": "snap/firefox/common/.mozilla", ".mozilla": ".mozilla", ".config": ".config/google-chrome"}[plant]
+    (target / Path(rel).relative_to(plant)).mkdir(parents=True)
+    (home / plant).symlink_to(target)
+    policy = build_policy(entity)                       # the session opens
+    with pytest.raises(cf.ConfinementError, match=f"symlink {home / plant}"):
+        cf._refuse_planted_browser_links(policy)        # bash does not
+
+
+def test_a_profile_that_appears_mid_session_is_denied_from_the_next_spawn(home: Path, monkeypatch) -> None:
+    """L1: the roots are re-derived at every spawn, as a union."""
+    cf = _linux(monkeypatch)
+    policy = build_policy(_entity(home))
+    assert crown_jewel_reason(policy, home / ".mozilla" / "firefox" / "x" / "cookies.sqlite") is None
+    (home / ".mozilla").mkdir()
+    refreshed = cf.refresh_socket_denies(policy)
+    assert crown_jewel_reason(refreshed, home / ".mozilla" / "firefox" / "x" / "cookies.sqlite") is not None
+
+
+@pytest.mark.parametrize("osname,store", [
+    ("Darwin", "Library/Application Support/com.openai.atlas/browser-data/host/Default/Local Storage"),
+    ("Darwin", "Library/Application Support/com.openai.atlas/browser-data/host/user-abc/Session Storage"),
+    ("Darwin", ".cache/chrome-devtools-mcp/chrome-profile/Default/Session Storage"),
+    ("Darwin", "Library/WebKit/com.kagi.kagimacOS/WebsiteData/Default/abc123/LocalStorage"),
+    ("Darwin", "Library/Application Support/zen/Profiles/x.default/storage/default"),
+    ("Darwin", "Library/Application Support/com.operasoftware.OperaDeveloper/Local Storage"),
+    ("Linux", ".zen/x.default/storage/default"),
+    ("Linux", ".librewolf/x.default/webappsstore.sqlite"),
+    ("Linux", ".var/app/io.gitlab.librewolf-community/.librewolf/x.default/storage/default"),
+    ("Linux", ".var/app/com.opera.Opera/config/opera/Session Storage"),
+    ("Linux", ".cache/chrome-devtools-mcp/chrome-profile/Default/Local Storage"),
+])
+def test_a_hardlink_to_each_layouts_page_storage_refuses_bash(home: Path, monkeypatch, osname, store) -> None:
+    """L2: each browser's page storage at its own depth (Atlas two levels down, Orion's WebKit data, flatpak forks)."""
+    import levain.firing.confinement as cf
+    from levain.firing.confinement import ConfinementError, _refuse_multiply_linked_jewels
+
+    monkeypatch.setattr(cf.platform, "system", lambda: osname)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("CHROME_CONFIG_HOME", raising=False)
+    p = home / store
+    if store.endswith(".sqlite"):
+        p.parent.mkdir(parents=True)
+        p.write_text("levain.token")
+        f = p
+    else:
+        p.mkdir(parents=True)
+        f = p / "000003.log"
+        f.write_text("levain.token")
+    entity = _entity(home)
+    (entity / "workspace" / "alias").hardlink_to(f)
+    with pytest.raises(ConfinementError, match="names on disk"):
+        _refuse_multiply_linked_jewels(build_policy(entity))
+
+
+def test_the_editors_check_reuses_the_spawns_storage_scan(home: Path, monkeypatch) -> None:
+    """L1 cost: which storage folders exist is found at spawn and reused by the editor's checks for that policy."""
+    import levain.firing.confinement as cf
+
+    monkeypatch.setattr(cf.platform, "system", lambda: "Darwin")
+    policy = build_policy(_entity(home))
+    calls = []
+    real = cf._browser_storage_roots
+
+    def counting(*a, **k):
+        calls.append(k["fresh"])
+        return real(*a, **k)
+
+    monkeypatch.setattr(cf, "_browser_storage_roots", counting)
+    cf._refuse_multiply_linked_jewels(policy)
+    store = home / "Library/Application Support/Chromium/Default/Session Storage"
+    store.mkdir(parents=True)
+    (store / "000003.log").write_text("levain.token")
+    alias = home / "alias"
+    alias.hardlink_to(store / "000003.log")
+    assert cf.linked_jewel_reason(policy, alias) is None          # the spawn's scan, before the folder existed
+    with pytest.raises(cf.ConfinementError, match="names on disk"):
+        cf._refuse_multiply_linked_jewels(policy)                  # the next spawn looks again
+    assert cf.linked_jewel_reason(policy, alias) is not None
+    assert calls == [True, False, True, False]
 
 
 @live
@@ -257,3 +375,29 @@ def test_on_linux_a_relative_xdg_config_home_is_ignored(home: Path, monkeypatch)
     monkeypatch.setenv("XDG_CONFIG_HOME", "relxdg")
     monkeypatch.delenv("CHROME_CONFIG_HOME", raising=False)
     assert (home / "relxdg" / "chromium").resolve() not in cf.browser_profile_roots(home)
+
+
+def test_spawn_shell_refuses_a_planted_browser_link_before_the_platform_spawn(home: Path, monkeypatch) -> None:
+    from levain.firing.confinement import ConfinementError, ConfinementProvider
+
+    class _Recorder(ConfinementProvider):
+        name = "recorder"
+        spawned = False
+
+        def available(self) -> bool:
+            return True
+
+        def render_profile(self, policy):
+            return ""
+
+        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0):
+            type(self).spawned = True
+            raise ConfinementError("recorder reached the platform spawn")
+
+    _linux(monkeypatch)
+    entity = _entity(home)
+    (entity / "workspace" / "planted").mkdir()
+    (home / ".mozilla").symlink_to(entity / "workspace" / "planted")
+    with pytest.raises(ConfinementError, match="symlink"):
+        _Recorder().spawn_shell(build_policy(entity))
+    assert not _Recorder.spawned

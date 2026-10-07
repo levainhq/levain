@@ -1303,3 +1303,19 @@ def test_a_log_this_user_cannot_open_gets_the_ownership_message(tmp_path, monkey
         pytest.skip("running as a user who can write a 0444 file")
     with pytest.raises(d.DaemonError, match="not a regular file this user owns"):
         d._prepare_private_logs(spec)
+
+
+def test_a_log_with_another_name_is_refused(tmp_path, monkeypatch):
+    """L2: a hardlink at the log path is another of this user's files; the service would append to it."""
+    import os
+
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
+    (tmp_path / "logs").mkdir(mode=0o700)
+    other = tmp_path / "notes.txt"
+    other.write_text("mine")
+    os.link(other, spec.stdout_log)
+    with pytest.raises(d.DaemonError, match="2 names"):
+        d._prepare_private_logs(spec)

@@ -119,7 +119,9 @@
     if (lostNote) { note("chat-err", lostNote); lostNote = null; }
     // A session whose release failed still holds its slot until the server restarts (levain/chat.py); say so.
     (Array.isArray(listing.sessions) ? listing.sessions : []).forEach((s) => {
-      if (s && s.state === "release_failed") note("chat-err", "release failed: " + (s.error || "no detail") + " since " + (s.release_failed_since || "an unknown time") + "; restart levain serve to free this slot");
+      if (!s || s.state !== "release_failed") return;
+      note("chat-err", "release failed" + (s.entity ? " (" + s.entity + ")" : "") + (s.error ? ": " + s.error : "") +
+        (s.release_failed_since ? " since " + s.release_failed_since : "") + "; restart levain serve to free this slot");
     });
     if (!listing.entities.length) { note("chat-note", "No entities are registered for chat."); return; }
     // One entity: one click starts a session on it. The picker appears only when there is a choice to make.
