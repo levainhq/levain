@@ -276,6 +276,26 @@ def test_without_the_launch_token_only_the_data_free_shell_is_served(server):
     assert re.findall(r'<script src="([^"]+)"', shell) == ["/token.js", "/team_view.js"]   # token.js first
 
 
+def test_the_unlocked_link_trades_its_code_for_the_token_on_the_view():
+    # The residue run (10-07): with allow = "GET, HEAD" a POST never reached /unlock, so the page could not trade a
+    # link's #code= and the link the view prints did not unlock it. The trade is the one POST a read-only view takes.
+    from levain.http_guards import LINK_CODE_HEADER, UNLOCK_PATH, mint_link_code
+    httpd = V.make_view_server(_Stub(), port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    try:
+        code = mint_link_code(httpd)
+        r, body = _req(port, "POST", UNLOCK_PATH, headers={LINK_CODE_HEADER: code}, token=None)
+        assert r.status == 200 and json.loads(body) == {"token": TOKEN}
+        r, _ = _req(port, "POST", UNLOCK_PATH, headers={LINK_CODE_HEADER: code}, token=None)
+        assert r.status == 403                                          # single use
+        r, _ = _req(port, "POST", "/view.json")                         # any other POST: still read-only
+        assert r.status == 405 and r.getheader("Allow") == "GET, HEAD"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_a_browser_without_the_token_is_shown_the_unlock_form_and_no_data(server):
     got = _page_full(server, token=None)
     assert "carl" not in got["html"] and "Waiting on you" not in got["html"]
