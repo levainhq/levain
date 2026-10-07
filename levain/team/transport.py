@@ -1622,20 +1622,22 @@ class GitLedger:
         self.save_state(last_fetch_ok=time.time(), last_fetch_error="")
         return sha
 
-    def _record_pushed(self, pushed: str, datas: dict[str, bytes]) -> None:
+    def _record_pushed(self, pushed: str, datas: dict[str, bytes]) -> bool:
         """After a successful (fast-forward) push, the remote holds ``pushed`` (whose judged bytes are ``datas``): it
         becomes the accepted tip, with those bytes pinned, in the trusted record under ``pins.lock``, if it descends
-        from the one recorded there."""
+        from the one recorded there. False when it was not recorded; raises when the record cannot be read or
+        written."""
         with self.lock(name="pins.lock", timeout=30.0):
             rec, problem = self._trust()
             if problem:
-                return
+                raise TeamError(problem)
             if rec.accepted and git(["merge-base", "--is-ancestor", rec.accepted, pushed], self.repo.toplevel,
                                     check=False, timeout=30).returncode != 0:
-                return
+                return False
             self._write_trust(Trust(rec.files, pushed, rec.seen, _merge_pins(rec.remote, datas)))
         if self._rref():
             git(["update-ref", self._rref(), pushed], self.repo.toplevel, check=False)
+        return True
 
     def _rebase(self, rref: str, timeout: float, lock_timeout: float) -> None:
         """Put this clone's unpushed commits on top of the remote, under the worktree lock.
@@ -1769,11 +1771,23 @@ class GitLedger:
                 cp = git(["push", "-q", "--no-verify", remote, f"{head}:{REF}"], self.repo.toplevel,
                          check=False, timeout=left(timeout))
                 if cp.returncode == 0:
-                    with contextlib.suppress(TeamError, OSError):
-                        self._record_pushed(head, judged.datas)     # a fast-forward: the remote holds exactly this
-                    with contextlib.suppress(TeamError):
-                        self._fetch_quarantined(remote, left(timeout))
-                    return "pushed"
+                    # The remote now holds exactly `head` (a fast-forward). It is recorded, with its bytes pinned, here
+                    # or by the judged fetch that follows; if neither can, the push says so instead of "pushed".
+                    why = ""
+                    try:
+                        recorded = self._record_pushed(head, judged.datas)
+                    except (TeamError, OSError) as exc:
+                        recorded, why = False, str(exc)
+                    try:
+                        recorded = self._fetch_quarantined(remote, left(timeout)) is not None or recorded
+                    except TeamError as exc:
+                        why = why or str(exc)
+                    if recorded:
+                        return "pushed"
+                    note = f"pushed, but not recorded ({why or 'the remote tip was not accepted'})"
+                    with contextlib.suppress(Exception):
+                        self.save_state(last_fetch_error=note)
+                    return note + "; run `levain team sync`"
                 err = (cp.stderr or "").lower()
                 race = any(s in err for s in ("non-fast-forward", "fetch first", "failed to update ref",
                                               "cannot lock ref", "stale info", "but expected", "incorrect old value"))
@@ -1845,9 +1859,9 @@ class GitLedger:
         try:
             if not self.unpushed():
                 return None
-            self._sync(push=True, timeout=timeout, net_timeout=0.5, lock_timeout=3.0, retries=1,
-                       deadline=time.monotonic() + timeout)
-            return None
+            result = self._sync(push=True, timeout=timeout, net_timeout=0.5, lock_timeout=3.0, retries=1,
+                                deadline=time.monotonic() + timeout)
+            return result if result.startswith("pushed, but") else None
         except TeamBusy:
             return "busy: another sync is running"
         except TeamError as exc:

@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from levain.team import entry as E
-from levain.team.transport import GitLedger, LedgerReadError, Repo
+from levain.team.transport import GitLedger, LedgerReadError, Repo, TeamError
 
 from tests.test_team_git import _own_file, _pinned, _pins_file, _push_wt, clone, edit, git, hook, ledger, record_ruling, team, two  # noqa: F401
 
@@ -1685,3 +1685,31 @@ def test_a_read_served_from_the_cache_still_checks_the_quarantine_under_the_lock
             gb.ledger()
     finally:
         os.close(fd)
+
+
+def test_a_push_that_cannot_be_recorded_says_so(two, monkeypatch):
+    # Head ruling (C)3 on L3 r3, codex HIGH: _record_pushed failures (and the follow-up fetch's) were suppressed and
+    # "pushed" returned, so the pushed bytes went unpinned.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/x.py", "--words",
+                "w", "--no-push", repo=ben) == 0
+
+    def cannot(self, *a, **k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(GitLedger, "_record_pushed", cannot)
+    real, calls = GitLedger._fetch_quarantined, []
+
+    def second_fails(self, remote, timeout):
+        calls.append(1)
+        if len(calls) > 1:
+            raise TeamError("the remote did not answer")
+        return real(self, remote, timeout)
+    monkeypatch.setattr(GitLedger, "_fetch_quarantined", second_fails)
+    out = gb.sync()
+    assert out.startswith("pushed, but not recorded") and "levain team sync" in out, out
+    assert "not recorded" in gb.state()["last_fetch_error"]
+    monkeypatch.setattr(GitLedger, "_fetch_quarantined", real)
+    assert team("record", "decision", "--kind", "ruling", "--owner", "client:Dana", "--paths", "src/y.py", "--words",
+                "v", "--no-push", repo=ben) == 0
+    assert gb.sync() == "pushed" and gb.accepted_tip() == gb.head()      # the follow-up fetch recorded it
