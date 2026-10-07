@@ -3,7 +3,7 @@ existing efferent kernel to produce the FROZEN DecisionInfluenceReceipt action-f
 
 Unit tests (test_efferent_binding.py) prove the schema + registry in isolation. This file proves the
 cross-module SEMANTICS the slice claims: (1) a binding fired through the real `receipt.build_gate_face`
-+ `build_gate_verdict` producer yields EXACTLY the frozen 12-key action-face — no new keys, the freeze
++ `build_gate_verdict` producer yields EXACTLY the frozen action-face (``FROZEN_FACE_KEYS``) — no new keys, the freeze
 holds — with `authority_scope` carrying the binding's grant + id and `gate.by == "binding"`; (2) the
 full governed lifecycle over a real on-disk store does the right thing at each step (fire-set
 membership, tamper barring, atomic re-ratification, dormancy bookkeeping).
@@ -34,10 +34,19 @@ def _guard() -> Guard:
                  kill_predicate={"op": "==", "field": "from_domain", "value": "blocked.example"},
                  kill_drill={"from_domain": "blocked.example"}, kill_authored_by="phill")
 
-# the FROZEN DecisionInfluenceReceipt action-face shape (must not grow when a binding produces it)
-FROZEN_FACE_KEYS = set(
-    build_action_face(context_id="c", query_text="q", query_date="2026-06-26", producers=["afferent"]).keys()
-)
+# the FROZEN DecisionInfluenceReceipt action-face shape (must not grow when a binding produces it).
+# Written out, not derived from the builder, so a key added to the builder fails here (code L3 r1 of
+# the fold: a derived set could never catch schema growth).
+FROZEN_FACE_KEYS = {
+    "context_id", "query_text", "query_truncated", "query_date", "exposed", "provenance_spans",
+    "cited_used", "actor_first_estimate", "gate", "authority_scope", "downstream_claim_or_action_id",
+    "outcome_signal", "terminal_state", "refuse_class",
+}
+
+
+def test_the_builder_emits_exactly_the_frozen_face():
+    face = build_action_face(context_id="c", query_text="q", query_date="2026-06-26", producers=["afferent"])
+    assert set(face) == FROZEN_FACE_KEYS
 
 
 def _binding(**kw) -> Binding:
