@@ -567,19 +567,26 @@ class _ViewHandler(GuardedHandler):
 
     # IDLE_TIMEOUT bounds each read, not a request: a client sending one byte every few seconds would hold its slot
     # forever, and MAX_WORKERS of them would close the page to everyone. A request must reach _route within
-    # REQUEST_DEADLINE of the server starting to wait for it, or its socket is shut down; _route disarms the deadline,
-    # so a slow ledger read is never cut.
+    # REQUEST_DEADLINE of the connection opening, or of the last routed request's answer on it, or the socket is shut
+    # down; _route disarms the deadline, so a slow ledger read is never cut. (The request loop itself is
+    # GuardedHandler's, the one shared copy, so the deadline is armed from setup and _route, not from that loop.)
     # Timer.cancel() cannot stop a timer whose wait has already ended, so the cut and the disarm also agree under a
-    # lock on one flag per request: once disarmed, that request's cut does nothing, however late it runs.
-    def handle_one_request(self) -> None:
+    # lock on one flag per arming: once disarmed, that arming's cut does nothing, however late it runs.
+    def setup(self) -> None:
+        super().setup()
+        self._arm()
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        finally:
+            self._disarm()
+
+    def _arm(self) -> None:
         self._armed = [True]
         self._deadline = threading.Timer(REQUEST_DEADLINE, self._cut, args=(self._armed,))
         self._deadline.daemon = True
         self._deadline.start()
-        try:
-            super().handle_one_request()
-        finally:
-            self._disarm()
 
     def _disarm(self) -> None:
         with _CUT_LOCK:
@@ -634,6 +641,12 @@ class _ViewHandler(GuardedHandler):
     def _route(self, *, head: bool) -> None:
         # GuardedHandler has run the Host allowlist, the cross-site read refusal and the launch token.
         self._disarm()
+        try:
+            self._answer(head=head)
+        finally:
+            self._arm()          # the next request on this connection gets its own deadline
+
+    def _answer(self, *, head: bool) -> None:
         path, _, query = self.path.partition("?")
         asset = self.server.assets.get(path)
         if asset is not None:

@@ -997,6 +997,29 @@ def test_a_request_dripped_a_byte_at_a_time_is_cut_at_the_deadline(monkeypatch):
                 break
         assert closed and time.monotonic() - t0 < 3.0          # cut at the deadline, long before the drip ended
         s.close()
+        # and the next request on a kept-alive connection gets a deadline of its own after a routed one
+        s = socket.create_connection(("127.0.0.1", httpd.server_address[1]))
+        s.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        s.settimeout(2)
+        got = b""
+        while b"</html>" not in got:
+            got += s.recv(65536)
+        assert got.startswith(b"HTTP/1.0 200") or got.startswith(b"HTTP/1.1 200")
+        s.settimeout(0.3)
+        t0, closed = time.monotonic(), False
+        for b in b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n":
+            try:
+                s.sendall(bytes([b]))
+                if s.recv(1) == b"":
+                    closed = True
+                    break
+            except socket.timeout:
+                pass
+            except OSError:
+                closed = True
+                break
+        assert closed and time.monotonic() - t0 < 3.0
+        s.close()
         # a request that arrives in time is answered, and a ledger read longer than the deadline is never cut
         class Slow(_Stub):
             def snapshot(self):
