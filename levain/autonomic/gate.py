@@ -630,7 +630,7 @@ class EfferentGate:
             except KeyError:
                 return self._refuse_open("run_not_admitted", binding_id)
             if barrier is not None:
-                if barrier.status in (EffectStatus.FENCED, EffectStatus.CANCELLED):
+                if barrier.status in (EffectStatus.FENCED, EffectStatus.CANCELLED, EffectStatus.BARRED):
                     return reject(posture, f"journal:{barrier.status.value}")
                 return self._refuse_open(f"journal:{barrier.status.value}", binding_id)
             d = self._journal.decide(hold_id, approve=True, digest=self._digest_of(request), by=decision.by)
@@ -647,7 +647,8 @@ class EfferentGate:
         )
         if fired.fired or fired.replayed or fired.receipt_id is not None:
             return fired
-        if fired.refused and fired.reason in ("journal:fenced", "journal:cancelled", "journal:poisoned"):
+        if fired.refused and fired.reason in ("journal:fenced", "journal:cancelled", "journal:poisoned",
+                                              "journal:barred"):
             # an approval the journal stopped for good (fenced or cancelled since the decision, or an
             # outcome already unknown): a terminal end, so it gets a receipt like every other one
             return deny(posture, fired.reason, by="on-loop")

@@ -226,7 +226,7 @@ def test_build_promoted_carries_guard_additions():
 
 
 def test_replace_atomic_promotion_revokes_old_persists_new(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     src = _binding(posture=Posture.COOLING_OFF, guard=(_kill_guard(),), clean=9, fires=9)
     store.add(src)
     p = _propose(src)
@@ -332,7 +332,7 @@ def test_one_shot_does_not_graduate_even_with_evidence():
 
 def test_replace_atomic_precondition_aborts_on_change(tmp_path):
     # codex L3 HIGH-2 / L1 TOCTOU: an extra caller precondition is still evaluated under the lock.
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     src = _binding(posture=Posture.COOLING_OFF, guard=(_kill_guard(),), clean=9, fires=9)
     store.add(src)
     p = _propose(src)
@@ -350,7 +350,7 @@ def test_replace_atomic_precondition_aborts_on_change(tmp_path):
 def test_replace_atomic_precondition_catches_concurrent_revoke(tmp_path):
     # the concrete govern-not-trust case: a revoke between the proposal read and the apply must NOT be
     # resurrected looser. The live-old check is part of the write now, so no precondition is needed.
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     src = _binding(posture=Posture.COOLING_OFF, guard=(_kill_guard(),), clean=9, fires=9)
     store.add(src)
     p = _propose(src)

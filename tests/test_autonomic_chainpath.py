@@ -351,7 +351,7 @@ def test_standing_kill_switch_aborts_resume_and_consumes_pending(tmp_path):
     codex HIGH two-resource invariant)."""
     ex = RecordingExecutor()
     tr = FakeTransport()
-    registry = BindingStore(tmp_path / "reg.json")
+    registry = BindingStore(tmp_path / "reg")
     b = _two_link_binding(one_shot=False)
     registry.add(b)
     registry.ratify(b.binding_id)  # ACTIVE
@@ -372,7 +372,7 @@ def test_standing_hard_delete_aborts_resume(tmp_path):
     resume ABORTS (fail-closed; codex/nemotron MED)."""
     ex = RecordingExecutor()
     tr = FakeTransport()
-    registry = BindingStore(tmp_path / "reg.json")
+    registry = BindingStore(tmp_path / "reg")
     b = _two_link_binding(one_shot=False)
     registry.add(b)
     registry.ratify(b.binding_id)
@@ -492,7 +492,7 @@ def test_one_shot_resumes_on_snapshot_despite_revoked_registry(tmp_path):
     claim-revoke at chain-start is expected — NOT a human pull)."""
     ex = RecordingExecutor()
     tr = FakeTransport()
-    registry = BindingStore(tmp_path / "reg.json")
+    registry = BindingStore(tmp_path / "reg")
     b = _two_link_binding(one_shot=True)
     registry.add(b)
     registry.set_status(b.binding_id, BindingStatus.REVOKED)  # as if claim_one_shot spent it at chain start
@@ -507,7 +507,7 @@ def test_one_shot_resumes_on_snapshot_despite_revoked_registry(tmp_path):
 # Block 5 — FireDispatcher delegation
 # =================================================================================================
 def test_dispatcher_routes_multilink_to_chain_executor(tmp_path):
-    registry = BindingStore(tmp_path / "reg.json")
+    registry = BindingStore(tmp_path / "reg")
     b = _two_link_binding(status=BindingStatus.PAUSED)
     registry.add(b)
     registry.ratify(b.binding_id)
@@ -530,7 +530,7 @@ def test_dispatcher_routes_multilink_to_chain_executor(tmp_path):
 def test_dispatcher_skips_multilink_when_no_chain_executor(tmp_path):
     """A 4a-only dispatcher (no chain executor) SKIPS a multi-link binding (never half-fires; the
     one-shot is NOT spent — the skip is pre-claim)."""
-    registry = BindingStore(tmp_path / "reg.json")
+    registry = BindingStore(tmp_path / "reg")
     b = _two_link_binding(status=BindingStatus.PAUSED, one_shot=True)
     registry.add(b)
     registry.ratify(b.binding_id)
@@ -571,7 +571,7 @@ def _on_loop_executor(tmp_path, reg, *, one_shot_binding=None):
 
 
 def test_completed_chain_records_graduation_evidence_immediate(tmp_path):
-    reg = BindingStore(tmp_path / "reg.json")
+    reg = BindingStore(tmp_path / "reg")
     b = _on_loop_chain()
     reg.add(b)
     out = _on_loop_executor(tmp_path, reg).execute(b, EVENT)
@@ -583,7 +583,7 @@ def test_completed_chain_records_graduation_evidence_immediate(tmp_path):
 
 def test_completed_chain_records_on_resume_out_of_band(tmp_path):
     # the carried gap: a chain that PAUSES at execute and completes later via resume records exactly once.
-    reg = BindingStore(tmp_path / "reg.json")
+    reg = BindingStore(tmp_path / "reg")
     b = _two_link_binding()
     reg.add(b)
     chain, _g = _executor(tmp_path, store=ChainStateStore(tmp_path / "chain.json"),
@@ -598,7 +598,7 @@ def test_completed_chain_records_on_resume_out_of_band(tmp_path):
 
 
 def test_one_shot_chain_does_not_record(tmp_path):
-    reg = BindingStore(tmp_path / "reg.json")
+    reg = BindingStore(tmp_path / "reg")
     b = Binding.create(
         created_by="phill", created_at="2026-06-30T09:00:00",
         trigger=TriggerSpec(type="email", pattern={"op": "exists", "field": "from"}),
@@ -624,7 +624,7 @@ def test_bare_executor_no_binding_store_does_not_crash(tmp_path):
 
 
 def test_aborted_chain_does_not_record(tmp_path):
-    reg = BindingStore(tmp_path / "reg.json")
+    reg = BindingStore(tmp_path / "reg")
     b = _two_link_binding()
     reg.add(b)
     chain, _g = _executor(tmp_path, transport=FakeTransport(), executor=RecordingExecutor(), binding_store=reg)
@@ -637,7 +637,7 @@ def test_aborted_chain_does_not_record(tmp_path):
 def test_dispatcher_chain_completion_records_once_no_double_count(tmp_path):
     """A chain completing through the FULL FireDispatcher records EXACTLY ONCE (the ChainExecutor on
     completion); the dispatcher no longer records (it would double-count)."""
-    registry = BindingStore(tmp_path / "reg.json")
+    registry = BindingStore(tmp_path / "reg")
     b = _on_loop_chain()
     registry.add(b)
     chain_exec = _on_loop_executor(tmp_path, registry)

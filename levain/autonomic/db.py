@@ -8,15 +8,19 @@ disagreeing (SQLite: "transactions appear to be atomic even if the transaction i
 operating system crash or power failure").
 
 A directory because the store's SQLite sidecars (``-wal``, ``-shm``) and the journal's effect leases
-live next to the database, and the confinement floor protects the whole directory as one crown jewel:
-an entity's hands can neither read nor write any of it, and a shell is not refused on its account (a
-directory jewel has no sidecars outside itself to plant).
+live next to the database, and the confinement floor protects the whole directory as one crown jewel
+(``levain.firing.confinement.AUTONOMIC_STORE_DIR``, at :func:`default_store_dir`): an entity's hands can
+neither read nor write any of it, and a shell is not refused on its account (a directory jewel has no
+sidecars outside itself to plant). A store kept anywhere else is protected by naming its directory in
+the entity's ``deny_subtrees``.
 
 Durability: WAL journaling, ``synchronous=FULL`` (every commit is on disk before it returns), and
 ``fullfsync`` (macOS flushes the drive's cache too; a no-op elsewhere). Every write runs inside
 ``BEGIN IMMEDIATE``, so writers are serialized by SQLite itself; ``busy_timeout`` waits for the lock.
 
-The store carries a format marker; a database with another marker is refused rather than read. A
+The store carries a format marker; a database with another marker, or tables and no marker, is refused
+rather than read or taken over, and a store that disappears under a running object is refused rather
+than silently started empty. The directory is created ``0700``; an existing one keeps its mode. A
 registry kept in the earlier JSON file format (this package's or the vagus package's) enters only
 through :meth:`levain.autonomic.binding.BindingStore.migrate_json`, a one-way import.
 
@@ -56,6 +60,15 @@ _SCHEMA = (
 )
 
 
+def _rollback(conn: sqlite3.Connection) -> None:
+    """Roll back, never masking the error that caused it (a failed rollback is also a rolled-back
+    transaction once the connection closes)."""
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+
+
 class StoreFormatError(RuntimeError):
     """The database is not a store of this format (another marker, or not a store at all)."""
 
@@ -77,8 +90,13 @@ class AutonomicDB:
         self._ready = False
 
     def _connect(self) -> sqlite3.Connection:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.directory, 0o700)
+        if self._ready:
+            # the store existed when this object first opened it: if it is gone now, fail rather than
+            # start an empty one (an empty store has no fences, holds or decisions)
+            if not self.path.exists():
+                raise StoreFormatError(f"store {self.path} has disappeared")
+        elif not self.directory.exists():
+            self.directory.mkdir(parents=True, mode=0o700)   # the umask can only narrow it
         conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
         try:
             conn.execute("PRAGMA busy_timeout = 30000")
@@ -98,6 +116,12 @@ class AutonomicDB:
     def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            marked = "meta" in tables and conn.execute(
+                "SELECT 1 FROM meta WHERE key = 'format'").fetchone() is not None
+            if tables and not marked:
+                raise StoreFormatError("the database holds tables but no store format marker: it is not "
+                                       "an autonomic store, and is not taken over")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
@@ -107,7 +131,7 @@ class AutonomicDB:
                 raise StoreFormatError(f"store format {row[0]!r} is not {STORE_FORMAT!r}")
             conn.execute("COMMIT")
         except BaseException:
-            conn.execute("ROLLBACK")
+            _rollback(conn)
             raise
 
     @contextmanager
@@ -120,7 +144,7 @@ class AutonomicDB:
             try:
                 yield conn
             except BaseException:
-                conn.execute("ROLLBACK")
+                _rollback(conn)
                 raise
             conn.execute("COMMIT")
         finally:

@@ -71,8 +71,8 @@ __all__ = [
 
 
 class JournalCorruptError(RuntimeError):
-    """The journal file cannot be read. Fail closed: an unreadable journal cannot prove an effect
-    has not already run, so nothing proceeds until a human looks at it."""
+    """The store cannot be read or written (damaged, or locked past the busy timeout). Fail closed: a
+    journal that cannot be read cannot prove an effect has not already run, so nothing proceeds."""
 
 
 class EffectStatus(str, enum.Enum):
@@ -83,6 +83,7 @@ class EffectStatus(str, enum.Enum):
     POISONED = "poisoned"    # intent recorded, outcome unknown; ``fn`` NOT called, needs a human
     IN_FLIGHT = "in_flight"  # another live process is inside this effect right now; ``fn`` NOT called
     FENCED = "fenced"        # the binding was fenced past this run's generation; ``fn`` NOT called
+    BARRED = "barred"        # the registry no longer grants this run (corrupt, absent, not fireable)
     CANCELLED = "cancelled"  # the run was cancelled (a rejected hold); ``fn`` NOT called
 
 
@@ -271,15 +272,6 @@ class RunJournal:
         return int(row[0]) if row else 0
 
     @staticmethod
-    def _max_run_generation_in(conn: sqlite3.Connection, binding_id: str) -> int | None:
-        row = conn.execute("SELECT MAX(generation) FROM runs WHERE binding_id = ?", (binding_id,)).fetchone()
-        return int(row[0]) if row and row[0] is not None else None
-
-    def _next_generation_in(self, conn: sqlite3.Connection, binding_id: str) -> int:
-        top = self._max_run_generation_in(conn, binding_id)
-        return max(self._generation_in(conn, binding_id), top if top is not None else 0) + 1
-
-    @staticmethod
     def _fence_in(conn: sqlite3.Connection, binding_id: str, generation: int) -> None:
         conn.execute("INSERT INTO fences (binding_id, generation) VALUES (?, ?) ON CONFLICT(binding_id) "
                      "DO UPDATE SET generation = MAX(generation, excluded.generation)", (binding_id, generation))
@@ -294,24 +286,13 @@ class RunJournal:
         with self._read() as conn:
             return self._generation_in(conn, binding_id)
 
-    def next_generation(self, binding_id: str) -> int:
-        """A generation above every fence AND every run admission for the binding: a record created at
-        it (a removed grant added again) fences every run admitted before it."""
-        with self._read() as conn:
-            return self._next_generation_in(conn, binding_id)
-
-    def max_run_generation(self, binding_id: str) -> int | None:
-        """The highest generation any run of ``binding_id`` was admitted at, or ``None`` (no runs)."""
-        with self._read() as conn:
-            return self._max_run_generation_in(conn, binding_id)
-
-    def start(self, run_id: str, *, binding_id: str, generation: int) -> None:
-        """Admit a run under the binding's governance ``generation``. (The fire path admits through
-        :meth:`BindingStore.admit`, which does this in the same transaction as its fireability check
-        and a one-shot's claim.) Starting an existing run id again is a no-op: a resumed run keeps its
-        original admission, so a run fenced once stays fenced."""
+    def start(self, run_id: str, *, binding_id: str) -> None:
+        """Admit a run under the binding's CURRENT governance generation, read in the same transaction.
+        (The fire path admits through :meth:`BindingStore.admit`, which does this in the same
+        transaction as its fireability check and a one-shot's claim.) Starting an existing run id again
+        is a no-op: a resumed run keeps its original admission, so a run fenced once stays fenced."""
         with self._write() as conn:
-            self._start_in(conn, run_id, binding_id, generation)
+            self._start_in(conn, run_id, binding_id, self._generation_in(conn, binding_id))
 
     def fence(self, binding_id: str, *, generation: int | None = None) -> int:
         """Every run of ``binding_id`` admitted under a generation BELOW the fence stops at its next
@@ -353,6 +334,13 @@ class RunJournal:
             return EffectOutcome(EffectStatus.CANCELLED)
         if self._generation_in(conn, run[0]) > int(run[1]):
             return EffectOutcome(EffectStatus.FENCED)
+        if conn.execute("SELECT 1 FROM meta WHERE key = 'registry'").fetchone() is not None:
+            # this store holds a binding registry: the run's grant must still stand, read in this same
+            # transaction (a corrupt registry, an absent or no-longer-fireable binding stops it)
+            from levain.autonomic.binding import registry_bars
+            barred = registry_bars(conn, run[0], run_id)
+            if barred is not None:
+                return EffectOutcome(EffectStatus.BARRED, barred)
         if eff is not None and eff[1] == "unknown":
             return EffectOutcome(EffectStatus.POISONED)
         if eff is not None and eff[1] == "intent":
@@ -546,10 +534,13 @@ class RunJournal:
         return self._holds("WHERE decided IS NULL")
 
     def approved_unrun(self) -> list[dict[str, Any]]:
-        """Every APPROVED hold whose effect has not started: a decision that stands and will run on
-        the next delivery or resolve of its run."""
-        return self._holds("WHERE decided = 1 AND NOT EXISTS (SELECT 1 FROM effects e WHERE "
-                           "e.run_id = holds.run_id AND e.effect_id = holds.effect_id)")
+        """Every APPROVED hold whose effect has not started and whose run is neither cancelled nor
+        fenced: a decision that stands and will run on the next delivery or resolve of its run."""
+        return self._holds(
+            "WHERE decided = 1 AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.run_id = holds.run_id "
+            "AND e.effect_id = holds.effect_id) AND NOT EXISTS (SELECT 1 FROM cancels c WHERE "
+            "c.run_id = holds.run_id) AND NOT EXISTS (SELECT 1 FROM runs r JOIN fences f ON "
+            "f.binding_id = r.binding_id WHERE r.run_id = holds.run_id AND f.generation > r.generation)")
 
     def get_hold(self, hold_id: str) -> dict[str, Any] | None:
         """The hold record (open or decided), or ``None``."""
@@ -564,6 +555,6 @@ class RunJournal:
     def poisoned(self) -> list[tuple[str, str]]:
         """Every effect whose outcome is unknown and whose owner is gone: the list a human must look
         at. (An intent whose owner still holds its lease is in flight, not poisoned.)"""
-        with self._read() as conn:
+        with self._write() as conn:   # the write lock: an owner cannot commit 'done' while this checks
             rows = conn.execute("SELECT run_id, effect_id, state FROM effects WHERE state != 'done'").fetchall()
-        return sorted((r, e) for r, e, state in rows if state == "unknown" or not self._lease_held(r, e))
+            return sorted((r, e) for r, e, state in rows if state == "unknown" or not self._lease_held(r, e))

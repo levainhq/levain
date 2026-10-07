@@ -335,7 +335,7 @@ def test_empty_in_list_kill_rejected_as_vacuous():
 def test_stale_readd_does_not_strip_a_tightening(tmp_path):
     # Reproduced at the 2026-10-06 fold: a writer holding the sealed grant from before a
     # tighten_guard re-adds it; the kill added since must survive (tightening is monotone).
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding()
     store.add(b)
     store.tighten_guard(b.binding_id, guard(spike_id="later-kill"))
@@ -345,7 +345,7 @@ def test_stale_readd_does_not_strip_a_tightening(tmp_path):
 
 def test_a_re_add_carrying_tightenings_refuses_rather_than_dropping_them(tmp_path):
     # add no longer merges (S1h-3). A no-op would silently drop the incoming kill, so it raises.
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding()
     assert store.add(b) is True
     store.tighten_guard(b.binding_id, guard(spike_id="on-disk"))
@@ -362,7 +362,7 @@ def test_claim_one_shot_refuses_what_is_fireable_refuses(tmp_path):
     # Reproduced 2026-10-06 (codex, code L3 r1 of the fold): an ACTIVE confirm-class one-shot with no
     # sealed kill is excluded by list_active, yet claim_one_shot returned it, and that snapshot could
     # mint authority. The claim must use the same fire-view predicate.
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(posture=Posture.CONFIRM, one_shot=True, guard=(), status=BindingStatus.ACTIVE)
     store.add(b)
     assert not BindingStore.is_fireable(store.get(b.binding_id))
@@ -399,7 +399,7 @@ def test_migrating_a_legacy_list_with_a_duplicate_is_refused(tmp_path):
 def test_add_creates_only_and_never_merges_into_a_stored_record(tmp_path):
     # codex S1h r2 (a): add() of an existing id "repaired" a record. add is create-only: an existing id
     # is never written over, whatever state its record is in.
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     store.set_status(b.binding_id, BindingStatus.REVOKED)
@@ -420,9 +420,38 @@ def test_migrating_a_vagus_format_list_imports_it_once(tmp_path):
     assert [x.binding_id for x in store.list_all()] == [a.binding_id, b.binding_id]
     assert [x.binding_id for x in store.list_active()] == [b.binding_id]
     assert json.loads(store.db.meta("migrated_from"))["records"] == 2
-    with pytest.raises(ValueError, match="already holds bindings"):
+    with pytest.raises(ValueError, match="holds .or has held. a registry"):
         store.migrate_json(src)                                   # once
     assert store.ratify(a.binding_id) is not None
+
+
+def test_a_migration_is_once_even_after_every_binding_is_removed(tmp_path):
+    # L1 on 4ae4a00: the once-check counted bindings, so a store emptied by removes took a second import
+    import json
+    a = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    src = tmp_path / "legacy.json"
+    src.write_text(json.dumps([a.to_dict()]))
+    store = BindingStore(tmp_path / "store")
+    assert store.migrate_json(src) == 1
+    assert store.remove(a.binding_id)
+    assert store.list_all() == []
+    with pytest.raises(ValueError, match="registry"):
+        store.migrate_json(src)
+    assert store.list_all() == []
+
+
+def test_a_store_with_run_state_refuses_a_migration_and_writes_no_backup(tmp_path):
+    import json
+    from levain.autonomic import RunJournal
+    a = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    src = tmp_path / "legacy.json"
+    src.write_text(json.dumps([a.to_dict()]))
+    RunJournal(tmp_path / "store").fence("someone")
+    store = BindingStore(tmp_path / "store")
+    with pytest.raises(ValueError, match="already holds fences"):
+        store.migrate_json(src)
+    assert not (tmp_path / "legacy.json.migrated-backup").exists()   # refused before anything is written
+    assert store.list_all() == []
 
 
 def test_migrating_the_object_format_imports_it(tmp_path):
@@ -451,7 +480,7 @@ def test_migrating_a_list_entry_that_proves_no_identity_is_refused(tmp_path, ext
 def test_a_re_add_never_writes_over_a_stored_impure_tightening(tmp_path):
     # codex S1h r2 HIGH (b) was a merged record carrying an unvalidated stored kill; with no merge
     # there is no carried record: the re-add writes nothing (S1h-3)
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     rec = _raw(store)[0]
@@ -465,7 +494,7 @@ def test_a_re_add_never_writes_over_a_stored_impure_tightening(tmp_path):
 def test_supersede_onto_an_existing_new_id_aborts(tmp_path):
     # the target id already exists (here ACTIVE): replace_atomic writes nothing and returns False,
     # so neither grant is stranded and no bookkeeping is chosen between (S1h-3)
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     a = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     b_active = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
     store.add(a)
@@ -479,7 +508,7 @@ def test_supersede_onto_an_existing_new_id_aborts(tmp_path):
 
 
 def test_a_present_non_dict_trajectory_bound_is_refused(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     bad = guard(kill_predicate=None, kill_drill=None, kill_authored_by=None, spike_id="t",
@@ -491,7 +520,7 @@ def test_a_present_non_dict_trajectory_bound_is_refused(tmp_path):
 
 
 def test_nested_fields_this_version_does_not_know_survive(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(status=BindingStatus.ACTIVE, guard=(guard(),))
     store.add(b)
     store.tighten_guard(b.binding_id, guard(spike_id="first"))
@@ -523,7 +552,7 @@ def test_trigger_pattern_copies_are_deep(tmp_path):
 
 
 def test_record_fire_and_tighten_keep_fields_this_version_does_not_know(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(status=BindingStatus.ACTIVE, guard=(guard(),))
     store.add(b)
     _write(store, [dict(_raw(store)[0], labels={"conf": ["flow"]})])
@@ -535,7 +564,7 @@ def test_record_fire_and_tighten_keep_fields_this_version_does_not_know(tmp_path
 
 
 def test_tighten_guard_refuses_an_impure_trajectory_bound(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(status=BindingStatus.ACTIVE, guard=(guard(),))
     store.add(b)
     bad = guard(kill_predicate=None, kill_drill=None, kill_authored_by=None, spike_id="traj",
@@ -547,7 +576,7 @@ def test_tighten_guard_refuses_an_impure_trajectory_bound(tmp_path):
 
 def test_replace_back_to_a_revoked_core_aborts_and_keeps_the_live_grant(tmp_path):
     # Reproduced 2026-10-06 (S1h): A -> B -> A returned True and left both REVOKED (nothing live).
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     a = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
     store.add(a)
@@ -560,7 +589,7 @@ def test_replace_back_to_a_revoked_core_aborts_and_keeps_the_live_grant(tmp_path
 def test_tighten_guard_rejects_untripping_drill(tmp_path):
     # complement L3 MED-1: the tighten path is NOT a second-class compile citizen — a tightening kill
     # whose drill does NOT trip it is refused (the drill-trip gate, parity with compile_binding).
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     bad = guard(kill_predicate={"op": "==", "field": "status", "value": "danger"},
@@ -574,7 +603,7 @@ def test_tighten_guard_rejects_untripping_drill(tmp_path):
 # ===============================================================================================
 
 def test_tighten_guard_preserves_id_and_seal(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     extra = guard(spike_id="extra", rationale="a second, tighter watch", kill_drill={"from_domain": "blocked.example"})
@@ -591,7 +620,7 @@ def test_tighten_guard_preserves_id_and_seal(tmp_path):
 
 
 def test_tighten_guard_preserves_graduation(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     store.record_fire(b.binding_id, clean=True, fired_at="2026-06-30T10:00:00")
@@ -628,7 +657,7 @@ def test_guard_additions_round_trip_and_backward_compat():
 
 
 def test_tighten_guard_refuses_inert_binding(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(guard=(guard(),), status=BindingStatus.REVOKED)
     store.add(b)
     with pytest.raises(ValueError):
@@ -636,7 +665,7 @@ def test_tighten_guard_refuses_inert_binding(tmp_path):
 
 
 def test_tighten_guard_rejects_impure_addition_kill(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     bad = guard(kill_predicate={"op": "regex_match", "field": "x", "value": ".*"},
@@ -646,7 +675,7 @@ def test_tighten_guard_rejects_impure_addition_kill(tmp_path):
 
 
 def test_tighten_guard_absent_and_empty(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     assert store.tighten_guard("bind-nope", guard()) is None        # absent → None
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
@@ -655,7 +684,7 @@ def test_tighten_guard_absent_and_empty(tmp_path):
 
 def test_confirm_class_kill_must_be_in_the_sealed_floor(tmp_path):
     # an addition CANNOT satisfy the confirm-class mandatory-kill gate (a mandatory kill must be sealed).
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     # a confirm-class binding with NO sealed kill, then a kill added ONLY to the unsealed tier:
     bare = a_binding(guard=(Guard(rationale="watch", dissent_author="codex"),),  # calibration-only floor
                      status=BindingStatus.ACTIVE, posture=Posture.CONFIRM)
@@ -817,7 +846,7 @@ def test_normal_deny_carries_refused_terminal_state(tmp_path):
 # ===============================================================================================
 
 def test_binding_liveness_counts_the_live_shape(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     active = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(active)
     store.tighten_guard(active.binding_id, guard(spike_id="extra",
@@ -834,7 +863,7 @@ def test_binding_liveness_counts_the_live_shape(tmp_path):
 
 
 def test_binding_liveness_reports_a_registry_made_inert_by_a_tampered_floor(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     assert binding_liveness(store)["registry_corrupt"] is None
@@ -847,7 +876,7 @@ def test_binding_liveness_reports_a_registry_made_inert_by_a_tampered_floor(tmp_
 
 
 def test_binding_liveness_flags_confirm_without_sealed_kill(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     bare = a_binding(guard=(Guard(rationale="watch", dissent_author="codex"),),
                      status=BindingStatus.ACTIVE, posture=Posture.CONFIRM)
     store.add(bare)
@@ -876,7 +905,7 @@ def test_gate_liveness_counts_terminal_states(tmp_path):
 def test_replace_atomic_validates_the_proposal_before_any_early_return(tmp_path):
     # L3 S1h-2 (codex LOW, complement LOW): an invalid proposal returned False when the old grant
     # was absent, indistinguishable from a lost race. It is validated first and raises.
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     bad = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
     tampered = replace(bad, posture=Posture.ON_LOOP)      # same id, different core: seal-broken
     never_stored = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM)
@@ -902,7 +931,7 @@ def test_a_declared_bound_that_is_not_a_predicate_fails_closed():
 
 
 def test_a_null_bound_cannot_be_persisted_or_tightened(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     null_bound = Guard(rationale="watch", dissent_author="codex", predicted_trajectory={"bound": None})
     with pytest.raises(ValueError):
         store.add(a_binding(guard=(guard(), null_bound), status=BindingStatus.ACTIVE))
@@ -923,7 +952,7 @@ def _malformed_revoked(store, binding):
 def test_add_cannot_revive_a_single_malformed_revoked_record(tmp_path):
     # L1+L2 S1h-2, reproduced on fb93c3b: the class of S1h r2 (a) without a duplicate. A revoked
     # grant whose one record is malformed reads inert; a re-add wrote it back ACTIVE and fireable.
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     store.set_status(b.binding_id, BindingStatus.REVOKED)
@@ -939,7 +968,7 @@ def test_add_cannot_revive_a_seal_broken_record(tmp_path):
     # L3 S1h-2 codex HIGH, reproduced: add(original) over a tampered ACTIVE record restored the
     # valid core under the stored ACTIVE status, fireable without ratification
     import json
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     store.add(b)
     raw = registry_of(store)
@@ -953,7 +982,7 @@ def test_add_cannot_revive_a_seal_broken_record(tmp_path):
 
 
 def test_replace_atomic_cannot_revive_a_malformed_revoked_target(tmp_path):
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     old = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
     new = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
     store.add(old)
@@ -971,7 +1000,7 @@ def test_a_record_that_would_not_read_back_is_never_written(tmp_path):
     # L3 S1h-3 codex MED, reproduced: Graduation(-1, -1) constructs and seals, but the reader refuses
     # it, so add wrote an unreadable record and replace_atomic revoked a good grant for it
     from levain.autonomic.binding import Graduation
-    store = BindingStore(tmp_path / "b.json")
+    store = BindingStore(tmp_path / "b")
     bad_grad = Graduation(fire_count=-1, clean_count=-1)
     with pytest.raises(ValueError, match="would not read back"):
         store.add(a_binding(guard=(guard(),), graduation=bad_grad))
@@ -985,3 +1014,18 @@ def test_a_record_that_would_not_read_back_is_never_written(tmp_path):
         store.replace_atomic(old, new)
     assert dump(store) == before
     assert [x.binding_id for x in store.list_active()] == [old.binding_id]
+
+
+def test_a_migration_whose_records_do_not_read_back_imports_nothing(tmp_path, monkeypatch):
+    import json
+    a = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE)
+    b = a_binding(guard=(guard(),), status=BindingStatus.ACTIVE, posture=Posture.CONFIRM_ELEVATED)
+    src = tmp_path / "legacy.json"
+    src.write_text(json.dumps([a.to_dict(), b.to_dict()]))
+    store = BindingStore(tmp_path / "store")
+    real = BindingStore._write_raw
+    monkeypatch.setattr(BindingStore, "_write_raw", lambda self, recs, conn: real(self, recs[:1], conn))
+    with pytest.raises(ValueError, match="read back differ"):
+        store.migrate_json(src)
+    monkeypatch.undo()
+    assert store.list_all() == [] and store.db.meta("migrated_from") is None

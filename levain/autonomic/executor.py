@@ -86,7 +86,7 @@ class ActionRequest:
     # on the binding is open, stopped by a fence or a cancel). None ⇒ a manual action, not journaled.
     run: RunRef | None = None
     # ``continuation`` — for a link of a journaled chain: the chain state to resume from if this link
-    # pauses for a decision. The gate writes it INTO the run's hold, the same appended line as the
+    # pauses for a decision. The gate writes it INTO the run's hold, the same row as the
     # pending, so the decision and the way to continue after it live in one record.
     continuation: dict[str, Any] | None = None
 

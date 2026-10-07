@@ -30,13 +30,13 @@ class Effect:
 
 @pytest.fixture
 def j(tmp_path):
-    return RunJournal(tmp_path / "journal.jsonl")
+    return RunJournal(tmp_path / "journal")
 
 
 # --- dedup-on-replay ---------------------------------------------------------------------
 
 def test_dedup_on_replay_a_recorded_effect_never_runs_again(j):
-    j.start("r1", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
     send = Effect("msg-42")
     first = j.effect("r1", "send", digest="d", fn=send)
     again = j.effect("r1", "send", digest="d", fn=send)
@@ -46,12 +46,12 @@ def test_dedup_on_replay_a_recorded_effect_never_runs_again(j):
 
 
 def test_a_resumed_run_replays_done_effects_and_runs_only_the_rest(j, tmp_path):
-    j.start("r1", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
     send, pay = Effect(), Effect()
     j.effect("r1", "send", digest="d1", fn=send)
     # a new journal object on the same file = a restarted process resuming the run
-    resumed = RunJournal(tmp_path / "journal.jsonl")
-    resumed.start("r1", binding_id="b", generation=1)
+    resumed = RunJournal(tmp_path / "journal")
+    resumed.start("r1", binding_id="b")
     assert resumed.effect("r1", "send", digest="d1", fn=send).status is EffectStatus.REPLAYED
     assert resumed.effect("r1", "pay", digest="d2", fn=pay).status is EffectStatus.DONE
     assert (send.calls, pay.calls) == (1, 1)
@@ -60,7 +60,7 @@ def test_a_resumed_run_replays_done_effects_and_runs_only_the_rest(j, tmp_path):
 # --- hold-until-decided --------------------------------------------------------------------
 
 def test_hold_suspends_before_the_effect_and_resumes_after_approval(j):
-    j.start("r1", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
     pay = Effect()
     held = j.effect("r1", "pay", digest="pay-100", fn=pay, needs_decision=True)
     assert held.status is EffectStatus.HELD and pay.calls == 0
@@ -70,9 +70,9 @@ def test_hold_suspends_before_the_effect_and_resumes_after_approval(j):
 
 
 def test_hold_until_decided_stops_sibling_runs_of_the_binding(j):
-    j.start("r1", binding_id="b", generation=1)
-    j.start("r2", binding_id="b", generation=1)
-    j.start("other", binding_id="c", generation=1)
+    j.start("r1", binding_id="b")
+    j.start("r2", binding_id="b")
+    j.start("other", binding_id="c")
     sibling, unrelated = Effect(), Effect()
     held = j.effect("r1", "pay", digest="p", fn=Effect(), needs_decision=True)
     assert j.effect("r2", "send", digest="s", fn=sibling).status is EffectStatus.HELD
@@ -83,7 +83,7 @@ def test_hold_until_decided_stops_sibling_runs_of_the_binding(j):
 
 
 def test_a_decision_must_echo_the_digest_it_was_shown(j):
-    j.start("r1", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
     held = j.effect("r1", "pay", digest="pay-100", fn=Effect(), needs_decision=True)
     assert j.decide(held.hold_id, approve=True, digest="pay-999").reason == "digest_mismatch"
     assert j.decide(held.hold_id, approve=True, digest="pay-100").ok
@@ -91,7 +91,7 @@ def test_a_decision_must_echo_the_digest_it_was_shown(j):
 
 
 def test_approved_bytes_that_change_before_running_cancel_the_run(j):
-    j.start("r1", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
     pay = Effect()
     held = j.effect("r1", "pay", digest="pay-100", fn=pay, needs_decision=True)
     j.decide(held.hold_id, approve=True, digest="pay-100")
@@ -102,7 +102,7 @@ def test_approved_bytes_that_change_before_running_cancel_the_run(j):
 # --- reject-cancels ------------------------------------------------------------------------
 
 def test_reject_cancels_the_run(j):
-    j.start("r1", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
     pay, later = Effect(), Effect()
     held = j.effect("r1", "pay", digest="p", fn=pay, needs_decision=True)
     assert j.decide(held.hold_id, approve=False, digest="p").reason == "rejected"
@@ -114,12 +114,12 @@ def test_reject_cancels_the_run(j):
 # --- fence-on-cancel -----------------------------------------------------------------------
 
 def test_fence_stops_runs_admitted_under_an_older_generation(j):
-    j.start("old", binding_id="b", generation=7)
+    j.start("old", binding_id="b")
     first, second, fresh = Effect(), Effect(), Effect()
     assert j.effect("old", "one", digest="1", fn=first).status is EffectStatus.DONE
     j.fence("b", generation=8)                     # a demotion between two effects of a run
     assert j.effect("old", "two", digest="2", fn=second).status is EffectStatus.FENCED
-    j.start("new", binding_id="b", generation=8)   # re-admitted under the new generation
+    j.start("new", binding_id="b")   # re-admitted under the new generation
     assert j.effect("new", "two", digest="2", fn=fresh).status is EffectStatus.DONE
     assert (first.calls, second.calls, fresh.calls) == (1, 0, 1)
 
@@ -127,7 +127,7 @@ def test_fence_stops_runs_admitted_under_an_older_generation(j):
 # --- unknown outcome -----------------------------------------------------------------------
 
 def test_an_effect_that_raises_is_poisoned_never_retried(j):
-    j.start("r1", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
 
     def flaky():
         flaky.calls += 1
@@ -142,13 +142,13 @@ def test_an_effect_that_raises_is_poisoned_never_retried(j):
 
 
 def test_a_process_that_dies_mid_effect_leaves_it_poisoned(tmp_path):
-    path = tmp_path / "journal.jsonl"
+    path = tmp_path / "journal"
     marker = tmp_path / "effect_ran"
     child = textwrap.dedent(f"""
         import os
         from levain.autonomic.journal import RunJournal
         j = RunJournal({str(path)!r})
-        j.start("r1", binding_id="b", generation=1)
+        j.start("r1", binding_id="b")
         def send():
             open({str(marker)!r}, "w").write("sent")
             os._exit(9)                      # dies after the effect, before the result is recorded
@@ -167,7 +167,7 @@ def test_a_process_that_dies_mid_effect_leaves_it_poisoned(tmp_path):
 def test_a_live_owner_is_in_flight_not_poisoned(j):
     # the owner holds the effect's lease across its call; a reader sees IN_FLIGHT, never POISONED,
     # whether the owner is another process, a recycled pid, or another thread of this one
-    j.start("r1", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
     seen = []
 
     def slow_send():
@@ -182,7 +182,7 @@ def test_a_live_owner_is_in_flight_not_poisoned(j):
 
 def test_a_recycled_pid_does_not_make_a_dead_owner_look_alive(j):
     # an intent whose owner is gone (no lease held) is poisoned even if its recorded pid is alive
-    j.start("r1", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
     with j.db.write() as conn:
         conn.execute("INSERT INTO effects (run_id, effect_id, digest, pid, state) VALUES ('r1', 'send', 'd', ?, 'intent')",
                      (os.getpid(),))
@@ -194,7 +194,7 @@ def test_a_recycled_pid_does_not_make_a_dead_owner_look_alive(j):
 
 def test_a_damaged_store_fails_closed(j):
     # an unreadable store cannot prove an effect has not run: nothing proceeds
-    j.start("r1", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
     assert j.effect("r1", "send", digest="d", fn=Effect()).status is EffectStatus.DONE
     for side in j.directory.iterdir():
         if side.name.startswith("autonomic.db"):
@@ -207,8 +207,8 @@ def test_a_damaged_store_fails_closed(j):
 
 def test_an_effect_with_its_own_approved_hold_runs_while_a_sibling_decision_is_open(j):
     # a person approved exactly these bytes; only UNDECIDED effects wait on a sibling's open decision
-    j.start("r1", binding_id="b", generation=1)
-    j.start("r2", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
+    j.start("r2", binding_id="b")
     h1 = j.hold("r1", "pay", digest="p1", pending={})
     h2 = j.hold("r2", "pay", digest="p2", pending={})
     assert j.decide(h2.hold_id, approve=True, digest="p2").ok
@@ -219,7 +219,7 @@ def test_an_effect_with_its_own_approved_hold_runs_while_a_sibling_decision_is_o
 
 
 def test_proposing_the_same_effect_again_finds_the_same_decision(j):
-    j.start("r1", binding_id="b", generation=0)
+    j.start("r1", binding_id="b")
     first = j.hold("r1", "send", digest="d", pending={})
     again = j.hold("r1", "send", digest="d", pending={})
     assert first.new_hold and not again.new_hold and first.hold_id == again.hold_id
@@ -230,7 +230,7 @@ def test_proposing_the_same_effect_again_finds_the_same_decision(j):
 
 
 def test_proposing_different_bytes_under_an_open_decision_cancels_the_run(j):
-    j.start("r1", binding_id="b", generation=0)
+    j.start("r1", binding_id="b")
     j.hold("r1", "send", digest="d1", pending={})
     assert j.hold("r1", "send", digest="d2", pending={}).status is EffectStatus.CANCELLED
     assert j.effect("r1", "send", digest="d1", fn=Effect()).status is EffectStatus.CANCELLED
@@ -238,15 +238,15 @@ def test_proposing_different_bytes_under_an_open_decision_cancels_the_run(j):
 
 def test_a_fence_bumps_the_generation_and_stops_older_runs(j):
     assert j.generation("b") == 0
-    j.start("old", binding_id="b", generation=0)
+    j.start("old", binding_id="b")
     assert j.fence("b") == 1
-    j.start("new", binding_id="b", generation=j.generation("b"))
+    j.start("new", binding_id="b")
     assert j.effect("old", "x", digest="d", fn=Effect()).status is EffectStatus.FENCED
     assert j.effect("new", "x", digest="d", fn=Effect()).status is EffectStatus.DONE
 
 
 def test_peek_runs_nothing_and_reports_the_barrier(j):
-    j.start("r1", binding_id="b", generation=0)
+    j.start("r1", binding_id="b")
     assert j.peek("r1", "x") is None
     j.effect("r1", "x", digest="d", fn=Effect("v"))
     seen = j.peek("r1", "x")
@@ -272,21 +272,21 @@ def test_a_run_id_is_a_content_address_over_the_binding_and_the_event():
 
 def test_a_store_of_another_format_is_refused(j):
     from levain.autonomic.db import StoreFormatError
-    j.start("r1", binding_id="b", generation=1)
+    j.start("r1", binding_id="b")
     with j.db.write() as conn:
         conn.execute("UPDATE meta SET value = 'something-else/9' WHERE key = 'format'")
     with pytest.raises(StoreFormatError):
-        RunJournal(j.directory).start("r2", binding_id="b", generation=1)
+        RunJournal(j.directory).start("r2", binding_id="b")
 
 
 def test_a_rejection_cancels_its_run_in_the_same_transaction(j):
-    j.start("r1", binding_id="b", generation=0)
+    j.start("r1", binding_id="b")
     h = j.hold("r1", "send", digest="d", pending={"pending_id": "p1"})
     assert j.decide(h.hold_id, approve=False, digest="d").ok
     assert j.effect("r1", "later", digest="x", fn=Effect()).status is EffectStatus.CANCELLED
     assert j.find_pending("p1")["decided"] is False
     # the update and the cancel commit together: a failure after the update leaves neither
-    j.start("r2", binding_id="b", generation=0)
+    j.start("r2", binding_id="b")
     h2 = j.hold("r2", "send", digest="d", pending={"pending_id": "p2"})
     real = j._hold_row
     calls = []
@@ -305,3 +305,43 @@ def test_a_rejection_cancels_its_run_in_the_same_transaction(j):
     j._hold_row = real
     assert j.find_pending("p2")["decided"] is None
     assert j.effect("r2", "later", digest="x", fn=Effect()).status is EffectStatus.HELD
+
+
+def test_approved_unrun_leaves_out_cancelled_and_fenced_runs(j):
+    # L1 on 4ae4a00: a decision whose run can no longer proceed was listed as standing
+    for run in ("r1", "r2", "r3"):
+        j.start(run, binding_id="b" if run != "r3" else "c")
+        h = j.hold(run, "send", digest="d", pending={"p": run})
+        assert j.decide(h.hold_id, approve=True, digest="d", by="human").ok
+    j.cancel("r1", reason="killed")
+    j.fence("c")
+    assert [h["run_id"] for h in j.approved_unrun()] == ["r2"]
+
+
+def test_poisoned_does_not_report_an_effect_its_owner_is_committing(j, monkeypatch):
+    # L1 on 4ae4a00: poisoned() read 'intent' in a snapshot, the owner then committed 'done' and dropped
+    # its lease, and the lease check reported a finished effect as poisoned
+    import threading
+    j.start("r1", binding_id="b")
+    inside, release = threading.Event(), threading.Event()
+
+    def send():
+        inside.set()
+        release.wait(5)
+        return "sent"
+
+    owner = threading.Thread(target=lambda: j.effect("r1", "send", digest="d", fn=send))
+    owner.start()
+    assert inside.wait(5)
+    real = RunJournal._lease_held
+
+    def let_the_owner_finish_first(self, run_id, effect_id):
+        release.set()
+        owner.join(1.0)                       # under the write lock the owner cannot commit yet
+        return real(self, run_id, effect_id)
+
+    monkeypatch.setattr(RunJournal, "_lease_held", let_the_owner_finish_first)
+    assert j.poisoned() == []
+    owner.join(10)
+    monkeypatch.undo()
+    assert j.peek("r1", "send").status is EffectStatus.REPLAYED and j.poisoned() == []

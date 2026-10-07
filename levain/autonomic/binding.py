@@ -55,7 +55,7 @@ The load-bearing cuts (each one an apparatus finding made structural):
    append-only trace the receipt/proposal stores use. Revocation prefers ``set_status(REVOKED)``
    (audit-preserving) over a hard ``remove``.
 
-Stdlib-only; ``fcntl`` is POSIX (the stack's macOS/Linux targets).
+Stdlib-only (``sqlite3`` for the store, see :mod:`levain.autonomic.db`).
 """
 from __future__ import annotations
 
@@ -812,6 +812,36 @@ def _identified(pairs: list[tuple[Any, Any]]) -> tuple[list[dict[str, Any]], str
     return records, None
 
 
+def _scan_in(conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], str | None]:
+    """The registry rows read in ``conn``'s transaction, identity-checked (see :meth:`BindingStore._scan`)."""
+    rows = conn.execute("SELECT binding_id, record FROM bindings ORDER BY seq").fetchall()
+    try:
+        pairs = [(key, json.loads(text)) for key, text in rows]
+    except (ValueError, RecursionError) as e:
+        return [], f"a record is not JSON ({e})"
+    return _identified(pairs)
+
+
+def registry_bars(conn: sqlite3.Connection, binding_id: str, run_id: str) -> str | None:
+    """Why the registry no longer grants run ``run_id`` of ``binding_id``, read in the caller's
+    transaction, or ``None`` if it does: the registry must read clean (a corrupt registry fires
+    nothing), the binding must be present and load, and it must be fireable (a claimed one-shot counts
+    as live for the one run it was claimed for). Called by the run journal's barrier before every effect
+    of a store that holds a registry."""
+    records, problem = _scan_in(conn)
+    if problem is not None:
+        return "registry_corrupt"
+    rec = next((r for r in records if r["binding_id"] == binding_id), None)
+    if rec is None:
+        return "binding_absent"
+    b = BindingStore._load(rec)
+    if b is None:
+        return "binding_malformed"
+    if b.one_shot and b.status is BindingStatus.REVOKED and rec.get("claimed_run") == run_id:
+        b = replace(b, status=BindingStatus.ACTIVE)
+    return None if BindingStore.is_fireable(b) else "binding_not_fireable"
+
+
 def _parse_json_registry(text: str) -> tuple[list[dict[str, Any]], str | None]:
     """Read a registry kept in the earlier JSON FILE format, for :meth:`BindingStore.migrate_json`: a JSON
     object keyed by ``binding_id`` (this package's) or a top-level list (the vagus package's). Parsed with a
@@ -878,26 +908,27 @@ class BindingStore:
         """The run journal this store fences and admits runs into, or ``None``."""
         return self._journal
 
-    def _fence(self, rec: dict[str, Any], conn: sqlite3.Connection) -> None:
-        """Fence the binding in the run journal, in the transaction of the change that requires it (a
-        pause, revoke, expire, tighten, supersede, remove): its governance generation rises, and every run
-        admitted under an older one stops at its next effect. The journal's fence is the binding's ONE
-        generation; it outlives the record, so a removed grant added again cannot reopen an old run."""
-        if self._journal is not None:
-            bid = rec["binding_id"]
-            self._journal._fence_in(conn, bid, self._journal._generation_in(conn, bid) + 1)
+    @staticmethod
+    def _fence(rec: dict[str, Any], conn: sqlite3.Connection) -> None:
+        """Fence the binding, in the transaction of the change that requires it (a pause, revoke, expire,
+        tighten, supersede, remove): its governance generation rises, and every run admitted under an
+        older one stops at its next effect. The fence is a row of THIS database, written whether or not
+        this store object was given the journal: whoever changes the grant fences its runs. It outlives
+        the record, so a removed grant added again cannot reopen an old run."""
+        bid = rec["binding_id"]
+        RunJournal._fence_in(conn, bid, RunJournal._generation_in(conn, bid) + 1)
 
     def generation(self, binding_id: str) -> int | None:
-        """The binding's current governance generation (its fence in the run journal), or ``None`` when
-        it is absent or there is no journal."""
-        if self._journal is None or self.get(binding_id) is None:
+        """The binding's current governance generation (its fence), or ``None`` when it is absent."""
+        if self.get(binding_id) is None:
             return None
-        return self._journal.generation(binding_id)
+        with self.db.read() as conn:
+            return RunJournal._generation_in(conn, binding_id)
 
     def admit(self, binding_id: str, run_id: str) -> Binding | None:
         """Admit a journaled run of ``binding_id`` — the fire path's ONE step between "may this grant
         fire" and "this run is in": in one transaction, the binding must be fireable (:meth:`is_fireable`),
-        a ONE-SHOT is claimed (set ``REVOKED``, with the run and generation it was claimed for), and the
+        a ONE-SHOT is claimed (set ``REVOKED``, with the run it was claimed for), and the
         run is started in the journal at the binding's CURRENT generation. Every verb that fences is a
         transaction on the same database, so a pause or tighten is ordered entirely before the admission
         or entirely after it. Returns the fireable snapshot (a one-shot's pre-claim ACTIVE form), or
@@ -956,14 +987,8 @@ class BindingStore:
         skipped by :meth:`_load`.)"""
         if conn is None:
             with self.db.read() as rconn:
-                rows = self._rows(rconn)
-        else:
-            rows = self._rows(conn)
-        try:
-            pairs = [(key, json.loads(text)) for key, text in rows]
-        except (ValueError, RecursionError) as e:
-            return [], f"a record is not JSON ({e})"
-        return _identified(pairs)
+                return _scan_in(rconn)
+        return _scan_in(conn)
 
     def _read_raw(self, *, for_mutation: bool = False,
                   conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
@@ -1008,6 +1033,9 @@ class BindingStore:
                 raise ValueError(f"binding store: refusing to write a record with binding_id {bid!r} "
                                  "(missing, not a string, or duplicated)")
             seen.add(bid)
+        # mark the database as holding a registry: from now on every journaled effect asks it whether the
+        # run's grant still stands (RunJournal._barrier -> registry_bars)
+        conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('registry', '1')")
         conn.execute("DELETE FROM bindings")
         conn.executemany("INSERT INTO bindings (binding_id, record, seq) VALUES (?, ?, ?)",
                          [(r["binding_id"], json.dumps(r, ensure_ascii=False, sort_keys=True), i)
@@ -1020,29 +1048,46 @@ class BindingStore:
         no longer read by anything here (cut a deployment over by stopping its writers first).
 
         It refuses a file that does not read clean (bad JSON, a duplicate key at any depth, two entries
-        for one id, a record whose identity does not derive from its content) and a store that already
-        holds bindings. It writes a backup of the file beside it (``<file>.migrated-backup``), imports
-        every record in one transaction with a record-for-record count check, and records the source and
+        for one id, a record whose identity does not derive from its content) and a store that has been
+        used (it holds or has held a registry, a migration, or any run state); both are checked before
+        anything is written. It writes a backup of the file beside it (``<file>.migrated-backup``), imports
+        every record in one transaction, reads them back and compares, and records the source and
         the count in the store's ``meta``. Returns the number of records imported."""
         src = Path(json_path)
         text = src.read_text(encoding="utf-8")
         records, problem = _parse_json_registry(text)
         if problem is not None:
             raise ValueError(f"migrate {src}: {problem}; nothing imported")
+        with self.db.read() as conn:
+            used = self._used(conn)
+        if used is not None:
+            raise ValueError(f"migrate {src}: {used}; nothing imported")
         backup = src.with_name(src.name + ".migrated-backup")
         durable_replace(backup, text)
         with self._locked() as conn:
-            if conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0]:
-                raise ValueError(f"migrate {src}: the store already holds bindings; nothing imported")
+            used = self._used(conn)                # again under the lock: a writer may have run since
+            if used is not None:
+                raise ValueError(f"migrate {src}: {used}; nothing imported")
             self._write_raw(records, conn)
-            stored = conn.execute("SELECT COUNT(*) FROM bindings").fetchone()[0]
-            if stored != len(records):
-                raise ValueError(f"migrate {src}: {stored} rows stored for {len(records)} records")
+            stored, problem = _scan_in(conn)       # read back what this transaction wrote
+            if problem is not None or stored != records:
+                raise ValueError(f"migrate {src}: the records read back differ from the file "
+                                 f"({problem or f'{len(stored)} for {len(records)}'}); nothing imported")
             conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('migrated_from', ?)",
                          (json.dumps({"path": str(src), "records": len(records)}),))
         _log.warning("binding store %s: migrated %d binding(s) from %s (backup %s)", self.path,
                      len(records), src, backup)
         return len(records)
+
+    @staticmethod
+    def _used(conn: sqlite3.Connection) -> str | None:
+        """Why this store can no longer take a migration, or ``None`` if it is fresh."""
+        if conn.execute("SELECT 1 FROM meta WHERE key IN ('registry', 'migrated_from')").fetchone():
+            return "the store already holds (or has held) a registry"
+        for table in ("bindings", "runs", "fences", "holds", "effects", "cancels"):
+            if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                return f"the store already holds {table}"
+        return None
 
     @staticmethod
     def _load(rec: dict[str, Any]) -> Binding | None:

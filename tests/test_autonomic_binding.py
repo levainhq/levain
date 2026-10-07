@@ -74,7 +74,7 @@ def make_binding(*, posture: Posture = Posture.CONFIRM, status: BindingStatus = 
 
 
 def store(tmp_path, **kw):
-    return BindingStore(tmp_path / "bindings.json", **kw)
+    return BindingStore(tmp_path / "bindings", **kw)
 
 
 # --- schema round-trip --------------------------------------------------------------
@@ -488,7 +488,7 @@ def test_store_validator_enforces_and_passes_through(tmp_path):
         s_rej.add(b)
     assert s_rej.get(b.binding_id) is None     # rejected binding was NOT persisted
     acc = _AcceptingValidator()
-    s_acc = BindingStore(tmp_path / "ok.json", validator=acc)
+    s_acc = BindingStore(tmp_path / "ok", validator=acc)
     s_acc.add(b)
     assert acc.seen == [PATTERN]               # the validator saw the opaque pattern
     assert s_acc.get(b.binding_id) == b
@@ -518,7 +518,7 @@ def test_the_validator_runs_outside_the_store_lock(tmp_path):
                 conn.close()
 
     probe = _LockProbe()
-    s = BindingStore(tmp_path / "b.json", validator=probe)
+    s = BindingStore(tmp_path / "b", validator=probe)
     a = make_binding(posture=Posture.ON_LOOP)
     s.add(a)
     assert s.replace_atomic(a, make_binding(posture=Posture.ABOVE_LOOP))

@@ -66,7 +66,7 @@ def _binding(**kw) -> Binding:
 
 def test_a_fired_binding_produces_the_frozen_action_face_unchanged(tmp_path):
     """The freeze watch-edge: a binding PRODUCING a receipt must not mutate the contract shape."""
-    store = BindingStore(tmp_path / "bindings.json")
+    store = BindingStore(tmp_path / "bindings")
     b = _binding()
     store.add(b)
     fired = store.list_active(trigger_type="email")
@@ -98,7 +98,7 @@ def test_a_fired_binding_produces_the_frozen_action_face_unchanged(tmp_path):
 
 def test_tampered_or_revoked_grant_cannot_produce_authority(tmp_path):
     """Fail-closed end-to-end: a grant barred from the fire-set also cannot mint a receipt's authority."""
-    store = BindingStore(tmp_path / "bindings.json")
+    store = BindingStore(tmp_path / "bindings")
     b = _binding()
     store.add(b)
     store.set_status(b.binding_id, BindingStatus.REVOKED)
@@ -113,7 +113,7 @@ def test_tampered_or_revoked_grant_cannot_produce_authority(tmp_path):
 
 
 def test_governed_lifecycle_over_a_real_store(tmp_path):
-    store = BindingStore(tmp_path / "bindings.json")
+    store = BindingStore(tmp_path / "bindings")
     # CONFIRM + a kill-guard → fireable (the guard-mandate); differs from the ON_LOOP `promoted` below
     # (so the re-ratification produces a different sealed id).
     b = _binding(posture=Posture.CONFIRM, guard=(_guard(),))

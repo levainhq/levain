@@ -30,6 +30,8 @@ from levain.autonomic import (
     SignalAuth, SubGoal, TightnessVector, TriggerSpec, TrustContext, hold_id_for, manual_invocation,
     run_id_for,
 )
+from levain.autonomic.journal import EffectStatus
+from tests.test_autonomic_rawstore import registry_of, write_raw
 
 FIXED = _dt.datetime(2026, 10, 7, 12, 0, 0, tzinfo=_dt.timezone.utc)
 LOW = ActionRisk(cls=RiskClass.LOW, reversible=True, external=False, financial=False)
@@ -347,7 +349,7 @@ def test_a_run_that_was_never_admitted_is_refused(tmp_path):
 def test_the_dispatcher_refuses_a_store_and_gate_on_different_journals(tmp_path):
     w = World(tmp_path)
     with pytest.raises(ValueError, match="same|SAME|must be"):
-        FireDispatcher(store=BindingStore(tmp_path / "other.json"), gate=w.gate,
+        FireDispatcher(store=BindingStore(tmp_path / "other"), gate=w.gate,
                        predicate_match=lambda p, e: True, request_builder=_single_builder,
                        risk_resolver=lambda b: LOW, clock=lambda: FIXED)
 
@@ -403,7 +405,7 @@ def test_a_pause_landing_right_after_admission_stops_the_run(tmp_path):
     assert out.refused and out.reason == "journal:fenced" and w.outbox() == []
 
 
-def test_a_dispatch_inside_a_pause_waits_for_it_and_does_not_fire(tmp_path):
+def test_a_dispatch_inside_a_pause_waits_for_it_and_does_not_fire(tmp_path, monkeypatch):
     # L2 P1, reproduced at f9f43c5: a dispatch whose admission ran between a pause's fence and its
     # registry write fired after the pause returned. Here the dispatch starts from INSIDE the pause's
     # transaction, after its fence: it must wait for the commit and then see the binding paused.
@@ -411,7 +413,7 @@ def test_a_dispatch_inside_a_pause_waits_for_it_and_does_not_fire(tmp_path):
     import time
     w = World(tmp_path)
     b = w.mint(chain=False)
-    real_fence_in = w.journal._fence_in
+    real_fence_in = RunJournal._fence_in
     done: list[bool] = []
     threads: list[threading.Thread] = []
 
@@ -423,23 +425,23 @@ def test_a_dispatch_inside_a_pause_waits_for_it_and_does_not_fire(tmp_path):
         time.sleep(0.3)                                   # the dispatch had every chance to run here
         threads.append(t)
 
-    w.journal._fence_in = fence_then_dispatch
+    monkeypatch.setattr(RunJournal, "_fence_in", staticmethod(fence_then_dispatch))
     assert w.store.set_status(b.binding_id, BindingStatus.PAUSED)
     threads[0].join()
     assert w.outbox() == [] and done == [False]
 
 
-def test_a_pause_and_its_fence_commit_together_or_not_at_all(tmp_path):
+def test_a_pause_and_its_fence_commit_together_or_not_at_all(tmp_path, monkeypatch):
     # L2 P3, reproduced at f9f43c5: the fence write failed once, the pause committed, and the admitted
     # run fired. A pause and its fence are one transaction now: a failure leaves neither.
     w = World(tmp_path)
     b = w.mint(chain=True)
     w.dispatch("q1")                                               # link1 pending
-    real = w.journal._fence_in
-    w.journal._fence_in = lambda *a: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+    monkeypatch.setattr(RunJournal, "_fence_in", staticmethod(
+        lambda *a: (_ for _ in ()).throw(OSError(28, "No space left on device"))))
     with pytest.raises(OSError):
         w.store.set_status(b.binding_id, BindingStatus.PAUSED)
-    w.journal._fence_in = real
+    monkeypatch.undo()
     assert w.store.get(b.binding_id).status is BindingStatus.ACTIVE   # nothing committed
     assert w.store.set_status(b.binding_id, BindingStatus.PAUSED)      # and when it commits, it fences
     w.store.ratify(b.binding_id)
@@ -1158,3 +1160,95 @@ def test_a_store_and_a_journal_in_different_directories_are_refused(tmp_path):
     with pytest.raises(ValueError, match="same store directory"):
         BindingStore(tmp_path / "a", journal=RunJournal(tmp_path / "b"))
     BindingStore(tmp_path / "a", journal=RunJournal(tmp_path / "a"))
+
+
+def test_a_store_object_without_the_journal_still_fences_the_runs_it_stops(tmp_path):
+    # L1 on 4ae4a00: a BindingStore opened without a journal paused the binding but wrote no fence, so
+    # the admitted run fired once the binding was ratified again
+    w = World(tmp_path)
+    b = w.mint(chain=True)
+    w.dispatch("q1")                                               # link1 pending
+    other = BindingStore(tmp_path / "store")                       # a second, journal-less handle
+    assert other.set_status(b.binding_id, BindingStatus.PAUSED)
+    assert other.generation(b.binding_id) == w.journal.generation(b.binding_id) >= 1
+    other.ratify(b.binding_id)
+    out = w.resolve_open(approve=True)
+    assert out.aborted and out.reason == "journal:fenced" and w.outbox() == [("link0", "q1-0")]
+
+
+def _before_effect(w, change):
+    """Apply ``change(binding_id)`` right before the journal runs an effect: after every check the fire
+    path makes on its own, so only the effect's barrier stands between the change and the effect."""
+    original = w.journal.effect
+    [b] = w.store.list_all()
+
+    def change_then_effect(*a, **k):
+        change(b.binding_id)
+        return original(*a, **k)
+
+    w.journal.effect = change_then_effect
+
+
+def test_an_effect_stops_when_the_registry_turns_corrupt_after_admission(tmp_path):
+    # L1 on 4ae4a00: the barrier read only the fence, so a registry that stopped reading clean after
+    # the fire path's checks did not stop the effect
+    w = World(tmp_path)
+    w.mint(chain=False)
+    _before_effect(w, lambda bid: write_raw(w.store, {**registry_of(w.store), bid: "not json"}))
+    out = w.dispatch("c1").outcome
+    assert out.refused and out.reason == "journal:barred" and w.outbox() == []
+
+
+def test_an_effect_stops_when_its_binding_is_gone_from_the_registry(tmp_path):
+    w = World(tmp_path)
+    w.mint(chain=False)
+    _before_effect(w, lambda bid: write_raw(w.store, {}))             # removed out of band: no fence
+    out = w.dispatch("c2").outcome
+    assert out.refused and out.reason == "journal:barred" and w.outbox() == []
+
+
+def test_an_effect_stops_when_its_binding_is_no_longer_fireable(tmp_path):
+    w = World(tmp_path)
+    w.mint(chain=False)
+
+    def pause_without_fence(bid):
+        reg = registry_of(w.store)
+        reg[bid] = {**reg[bid], "status": "paused"}                # status is bookkeeping: identity holds
+        write_raw(w.store, reg)
+
+    _before_effect(w, pause_without_fence)
+    out = w.dispatch("c3").outcome
+    assert out.refused and out.reason == "journal:barred" and w.outbox() == []
+
+
+def test_an_approval_barred_at_its_effect_gets_a_receipt(tmp_path):
+    # the registry stopped granting the run after the resolve's own checks: the effect's barrier stops
+    # it, and the stop is receipted like a fence's
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("g2")                                               # link1 pending
+
+    def pause_without_fence(bid):
+        reg = registry_of(w.store)
+        reg[bid] = {**reg[bid], "status": "paused"}
+        write_raw(w.store, reg)
+
+    _before_effect(w, pause_without_fence)
+    out = w.resolve_open(approve=True)
+    assert out.reason == "journal:barred" and out.links[-1].outcome.receipt_id is not None
+    assert sorted(r.fired for r in w.receipts.read()) == [False, True]
+    assert w.outbox() == [("link0", "g2-0")]
+
+
+@pytest.mark.parametrize("change,why", [
+    (lambda w, bid: write_raw(w.store, {**registry_of(w.store), "x": "not json"}), "registry_corrupt"),
+    (lambda w, bid: write_raw(w.store, {}), "binding_absent"),
+])
+def test_the_barrier_says_why_the_registry_bars_a_run(tmp_path, change, why):
+    w = World(tmp_path)
+    b = w.mint(chain=False)
+    run = "r-barrier"
+    assert w.store.admit(b.binding_id, run) is not None
+    change(w, b.binding_id)
+    out = w.journal.peek(run, "x")
+    assert out is not None and out.status is EffectStatus.BARRED and out.result == why

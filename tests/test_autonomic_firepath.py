@@ -224,7 +224,7 @@ def _mk_binding(tmp_path, *, posture=Posture.ON_LOOP, status=BindingStatus.PAUSE
         tightness=TightnessVector(goal_spec=0.9, tool_min=0.9, pattern_precision=0.9, output_bound=0.9),
         posture=posture, status=status, one_shot=one_shot, guard=guard,
     )
-    st = store or BindingStore(tmp_path / "b.json")
+    st = store or BindingStore(tmp_path / "b")
     st.add(b)
     return st, b
 
@@ -264,7 +264,7 @@ def test_ratify_refuses_confirm_class_without_kill(tmp_path):
         st.ratify(b.binding_id)
     # WITH a sealed kill it ratifies fine
     st2, b2 = _mk_binding(tmp_path, posture=Posture.CONFIRM, guard=(_kill_guard(),),
-                          store=BindingStore(tmp_path / "b2.json"))
+                          store=BindingStore(tmp_path / "b2"))
     assert st2.ratify(b2.binding_id) is not None
 
 
@@ -279,7 +279,7 @@ def test_ratify_refuses_seal_broken(tmp_path):
 
 
 def test_ratify_absent_returns_none(tmp_path):
-    st = BindingStore(tmp_path / "b.json")
+    st = BindingStore(tmp_path / "b")
     assert st.ratify("bind-nope") is None
 
 
@@ -338,7 +338,7 @@ def _builder(*, signal=SignalAuth.STRONG, action="deliver", builder_risk=None):
 
 def _active_binding(tmp_path, *, pattern, posture=Posture.ON_LOOP, one_shot=False, guard=(),
                     goal=None, store=None):
-    st = store or BindingStore(tmp_path / "b.json")
+    st = store or BindingStore(tmp_path / "b")
     b = Binding.create(
         created_by="phill", created_at="2026-06-30T12:00:00",
         trigger=TriggerSpec(type="time", pattern=pattern),
@@ -433,7 +433,7 @@ def test_dispatch_records_fire_bookkeeping_for_standing_binding(tmp_path):
 def test_dispatch_ignores_paused_binding(tmp_path):
     """Only ACTIVE bindings fire — a PAUSED candidate is not in list_active, so dispatch never fires it."""
     ex = RecordingExecutor()
-    st = BindingStore(tmp_path / "b.json")
+    st = BindingStore(tmp_path / "b")
     b = Binding.create(
         created_by="phill", created_at="2026-06-30T12:00:00",
         trigger=TriggerSpec(type="time", pattern={"op": "==", "field": "tick", "value": "1"}),

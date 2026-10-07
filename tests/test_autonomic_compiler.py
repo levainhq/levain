@@ -235,7 +235,7 @@ def test_guarded_binding_persists_and_lists_active():
     import tempfile
     import os
     d = tempfile.mkdtemp()
-    store = BindingStore(os.path.join(d, "bindings.json"))
+    store = BindingStore(os.path.join(d, "bindings"))
     store.add(b)
     got = store.get(b.binding_id)
     assert got is not None and got.guard == (g,) and got.seal_matches()
@@ -521,7 +521,7 @@ def test_list_active_bars_confirm_class_without_kill_guard(tmp_path):
     # codex-HIGH2 / complement-LOW1 / L1-MED1: the fire-view structurally bars an ACTIVE confirm-class
     # binding that lacks a kill-guard, even if minted directly (bypassing the compiler).
     from levain.autonomic import BindingStatus as BS
-    s = BindingStore(tmp_path / "b.json")
+    s = BindingStore(tmp_path / "b")
     guardless = _binding(posture=Posture.CONFIRM)   # confirm-class, no guard
     s.add(guardless)
     s.set_status(guardless.binding_id, BS.ACTIVE)    # ratify to active (bypassing the guard mandate)
