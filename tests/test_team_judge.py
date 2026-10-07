@@ -951,3 +951,14 @@ def test_flush_unpushed_ends_within_its_bound_against_a_slow_remote(two, monkeyp
     t0 = time.monotonic()
     gb.flush_unpushed(timeout=1.0)
     assert time.monotonic() - t0 < 2.0
+
+
+def test_a_failed_fetch_is_saved_where_every_reader_sees_it(two):
+    # E-team LOW on dda91e3: a failed fetch raised without saving last_fetch_error, so the hook, doctor and a second
+    # view saw no error.
+    tmp, ana, ben = two
+    gb = _gl(ben)
+    git("remote", "set-url", "origin", str(tmp / "gone.git"), cwd=ben)
+    note = gb.fetch_only(interval=0, timeout=30)
+    assert note and "fetch failed" in note
+    assert "fetch failed" in GitLedger(Repo.discover(ben)).state().get("last_fetch_error", "")
