@@ -157,6 +157,7 @@ def test_t4_listing_makes_no_network_connection(pub, monkeypatch):
     assert [v["project"] for v in R.live_views()] == ["ledgerline"]
 
 
+@pytest.mark.skipif(not hasattr(os, "O_EXLOCK"), reason="the temp-and-rename way: macOS and the BSDs")
 def test_t2_the_lock_is_taken_before_the_entry_becomes_visible(monkeypatch):
     """At rename time, a second fd on the temp file must already be unable to take a shared lock."""
     import fcntl
@@ -224,34 +225,19 @@ def test_only_a_publisher_ever_takes_the_exclusive_lock(pub, monkeypatch):
     assert ops and set(ops) == {fcntl.LOCK_SH | fcntl.LOCK_NB}
 
 
-def test_prune_never_sweeps_a_fresh_temp_file(pub):
-    # A publisher creates its temp, then locks it: a sweep in between unregistered a starting view (lane run,
-    # 2026-10-05), so a temp younger than the floor is left alone whatever its lock state.
-    d = R.registry_dir()
-    d.mkdir(parents=True)
-    temps = [f".lock1-{'a' * 32}.tmp", f".selftest-{'b' * 16}.tmp"]
-    for n in temps:
-        (d / n).write_text("{half")
-    R.prune_dead()
-    assert sorted(_names()) == sorted(temps)
-
-
-def test_prune_sweeps_an_old_temp_nobody_holds_and_keeps_one_still_locked(pub):
-    # A view SIGKILLed before its rename leaves its temp; without a sweep every cockpit scan pays for it forever.
+def test_prune_sweeps_a_born_locked_temp_nobody_holds_at_any_age_and_keeps_a_held_one(pub):
+    # A view SIGKILLed before its rename leaves its temp; without a sweep every cockpit scan pays for it forever. A
+    # temp of this grammar exists only locked, so one nobody holds is dead however new it is.
     import fcntl
     d = R.registry_dir()
     d.mkdir(parents=True)
-    gone = subprocess.Popen([sys.executable, "-c", "pass"])
-    gone.wait()
-    dead = [f".lock1-p{gone.pid}-{'a' * 32}.tmp", f".selftest-p{gone.pid}-{'b' * 16}.tmp"]
-    held = f".lock1-p{gone.pid}-{'c' * 32}.tmp"
-    old = time.time() - 3600                    # an hour: past any floor
+    dead = [f".lock1-x{'a' * 32}.tmp", f".selftest-x{'b' * 16}.tmp"]
+    held = f".lock1-x{'c' * 32}.tmp"
     for n in dead + [held]:
-        (d / n).write_text("{half")
-        os.utime(d / n, (old, old))
+        (d / n).write_text("{half")             # just made: no age floor any more
     fd = os.open(d / held, os.O_RDONLY)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)          # a publisher stalled after locking, before its rename
+        fcntl.flock(fd, fcntl.LOCK_EX)          # a publisher between creating its temp and renaming it
         R.prune_dead()
         assert _names() == [held]
     finally:
@@ -323,23 +309,21 @@ def test_a_fork_right_after_the_lock_fd_is_opened_does_not_leak_the_lock(monkeyp
 
 
 def test_a_fork_between_opening_the_lock_fd_and_registering_it_does_not_leak_the_lock(monkeypatch):
-    # The fd stays tracked (in _PENDING) from its open until a Registration owns it: this pauses in flock, between.
-    import fcntl as real_fcntl
+    # The fd stays tracked (in _PENDING) from its open until a Registration owns it: this pauses in the entry's
+    # write, between the two.
+    import os as real_os
     paused, go = threading.Event(), threading.Event()
-    calls = {"ex": 0}
 
-    class Shim:
-        LOCK_EX, LOCK_SH, LOCK_NB = real_fcntl.LOCK_EX, real_fcntl.LOCK_SH, real_fcntl.LOCK_NB
+    class OsShim:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
 
         @staticmethod
-        def flock(fd, op):
-            if op == real_fcntl.LOCK_EX:
-                calls["ex"] += 1
-                if calls["ex"] == 2:                # the first is the self-test; the second is the entry's lock fd
-                    paused.set()
-                    go.wait(5)
-            return real_fcntl.flock(fd, op)
-    monkeypatch.setattr(R, "fcntl", Shim)
+        def write(fd, data):
+            paused.set()
+            go.wait(5)
+            return real_os.write(fd, data)
+    monkeypatch.setattr(R, "os", OsShim())
     out = {}
     t = threading.Thread(target=lambda: out.setdefault("reg", R.register("/w", "http://127.0.0.1:43998/", "f")))
     t.start()
@@ -347,6 +331,7 @@ def test_a_fork_between_opening_the_lock_fd_and_registering_it_does_not_leak_the
     def release():
         go.set()
         t.join(5)
+        monkeypatch.setattr(R, "os", real_os)
         out["reg"].close()                          # no unpublish: the entry stays, only its lock says dead
     assert _forked_child_keeps_the_lock(monkeypatch, paused, release) == []
 
@@ -1105,41 +1090,6 @@ const tick = () => new Promise((r) => setTimeout(r, 20));
                                                               "registered": True}
 
 
-def test_an_old_unlocked_temp_of_a_live_publisher_is_never_swept(pub):
-    # codex + complement, L3 10-07: age alone does not prove the publisher is dead; one suspended (SIGSTOP, a
-    # laptop asleep, a clock step) between creating its temp and locking it lost the temp, and its registration.
-    # A temp names its publisher's pid; a live pid keeps it, a dead one or none (an older levain) does not.
-    d = R.registry_dir()
-    d.mkdir(parents=True)
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()
-    live = f".lock1-p{os.getpid()}-{'a' * 32}.tmp"
-    gone = f".lock1-p{dead.pid}-{'b' * 32}.tmp"
-    self_live = f".selftest-p{os.getpid()}-{'d' * 16}.tmp"
-    old = time.time() - 3600
-    for n in (live, gone, self_live):
-        (d / n).write_text("{half")
-        os.utime(d / n, (old, old))
-    R.prune_dead()
-    assert sorted(_names()) == sorted([live, self_live])
-
-
-def test_a_publisher_names_its_temp_with_its_pid(monkeypatch):
-    seen = []
-    real = R.os.rename
-
-    def rename(src, dst, **kw):
-        seen.append(src)
-        return real(src, dst, **kw)
-    monkeypatch.setattr(R.os, "rename", rename)
-    r = R.register("/w", "http://127.0.0.1:43995/", "pid")
-    try:
-        assert seen and seen[0].startswith(f".lock1-p{os.getpid()}-") and R._TEMP_RE.fullmatch(seen[0])
-    finally:
-        r.unpublish()
-        r.close()
-
-
 def test_no_fd_register_opens_is_left_in_a_fork_child(monkeypatch):
     # glm + codex + gemini, L3 10-07 round 2: the directory fd and the self-test's fds were opened outside the fork
     # lock, so a fork in that window left the child holding them. Every fd register() opens is now either opened
@@ -1194,18 +1144,133 @@ def test_no_fd_register_opens_is_left_in_a_fork_child(monkeypatch):
     assert leaked == []
 
 
-def test_a_legacy_temp_that_names_no_publisher_is_never_swept(pub):
-    # codex, L3 10-07 round 2: a temp from an older levain names no pid, so nothing proves its publisher has exited
-    # (one suspended past the floor between creating and locking it would lose its registration); such temps are
-    # left alone, and an older version makes no new ones, so they are a fixed set.
+def test_a_temp_from_another_grammar_is_never_swept(pub):
+    # codex, L3 10-07 round 2: a temp from levain 0.6.9 or older was created and only then locked, so an unlocked one
+    # may belong to a publisher still starting; such temps are left alone, and an older version makes no new ones.
+    # (The p<pid> names were made only by unreleased commits of this branch.)
     d = R.registry_dir()
     d.mkdir(parents=True)
-    legacy = [f".lock1-{'c' * 32}.tmp", f".selftest-{'d' * 16}.tmp"]
+    other = [f".lock1-{'c' * 32}.tmp", f".selftest-{'d' * 16}.tmp", f".lock1-p123-{'e' * 32}.tmp"]
     old = time.time() - 3600
-    for n in legacy:
+    for n in other:
         (d / n).write_text("{half")
         os.utime(d / n, (old, old))
     R.prune_dead()
-    assert sorted(_names()) == sorted(legacy)
-    # complement: "p0" is no pid (os.kill(0, 0) would ask about the process group); such a name is not a temp of ours
-    assert R._TEMP_RE.fullmatch(f".lock1-p0-{'e' * 32}.tmp") is None
+    assert sorted(_names()) == sorted(other)
+
+
+@pytest.mark.skipif(not hasattr(os, "O_EXLOCK"), reason="O_EXLOCK: macOS and the BSDs")
+def test_a_temp_is_locked_from_the_moment_it_exists(monkeypatch):
+    # L3 rounds 1 and 2 (10-07) found the window between creating the temp and locking it; each guard on "is this
+    # unlocked temp's publisher dead?" drew the next finding. The temp is now created holding its lock (O_EXLOCK), so
+    # the window is gone: the moment open() returns, no other open file can take even a shared lock.
+    import fcntl
+    import os as real_os
+    seen = []
+
+    class OsShim:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        @staticmethod
+        def open(path, flags, *a, **k):
+            fd = real_os.open(path, flags, *a, **k)
+            if flags & real_os.O_CREAT and isinstance(path, str) and R._TEMP_RE.fullmatch(path):
+                probe = real_os.open(path, real_os.O_RDONLY, dir_fd=k.get("dir_fd"))
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    seen.append((path, "UNLOCKED"))
+                except BlockingIOError:
+                    seen.append((path, "locked"))
+                finally:
+                    real_os.close(probe)
+            return fd
+    monkeypatch.setattr(R, "os", OsShim())
+    r = R.register("/w", "http://127.0.0.1:43995/", "born")
+    monkeypatch.setattr(R, "os", real_os)
+    try:
+        assert [s for _p, s in seen] == ["locked", "locked"]            # the self-test's file, then the entry's
+        assert seen[0][0].startswith(".selftest-x") and seen[1][0].startswith(".lock1-x")
+    finally:
+        r.unpublish()
+        r.close()
+
+
+def _platform(monkeypatch, how):
+    """Make this platform look like one with only ``how`` ("exlock", "tmpfile" or None) available."""
+    for flag in ("O_EXLOCK", "O_TMPFILE"):
+        monkeypatch.delattr(os, flag, raising=False)
+    if how == "exlock":                 # a bit no real open flag uses: the tests that set it mock the open
+        monkeypatch.setattr(os, "O_EXLOCK", 1 << 41, raising=False)
+    if how == "tmpfile":
+        monkeypatch.setattr(os, "O_TMPFILE", 1 << 40, raising=False)
+
+
+def test_a_platform_with_neither_way_registers_nothing_and_the_view_says_so(monkeypatch, capsys):
+    # The head's ruling (10-07): where neither O_EXLOCK nor O_TMPFILE exists there is no window-free way to publish,
+    # so the view fails closed (serves, registers nothing, says so) instead of guarding a sweep.
+    _platform(monkeypatch, None)
+    with pytest.raises(R.RegistryUnavailable, match="neither"):
+        R.register("/r", "http://127.0.0.1:41802/", "p")
+    assert _names() == []
+    _serve_with(monkeypatch, _interrupt)
+    assert V.serve(_GL(), host="127.0.0.1", port=0, recheck_days=30, ack_flag=3) == 0
+    assert "not registered with the cockpit" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("how,flag", [("exlock", "O_EXLOCK"), ("tmpfile", "O_TMPFILE")])
+@pytest.mark.parametrize("err", [errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL])
+def test_each_platform_way_is_chosen_and_a_filesystem_that_refuses_it_registers_nothing(monkeypatch, how, flag, err):
+    # The open flag is mocked (no kernel experiments): the branch is chosen by which flag the platform has, and a
+    # refusal (EOPNOTSUPP; EISDIR from a Linux older than 3.11; EINVAL) is the registry being unavailable, not a
+    # weaker fallback.
+    _platform(monkeypatch, how)
+    import os as real_os
+    asked = []
+
+    class OsShim:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        @staticmethod
+        def open(path, flags, *a, **k):
+            if flags & getattr(real_os, flag):
+                asked.append(path)
+                raise OSError(err, real_os.strerror(err))
+            return real_os.open(path, flags, *a, **k)
+    monkeypatch.setattr(R, "os", OsShim())
+    assert R._how() == how
+    with pytest.raises(R.RegistryUnavailable, match=f"refuses {flag}"):
+        R.register("/r", "http://127.0.0.1:41803/", "p")
+    monkeypatch.setattr(R, "os", real_os)
+    assert len(asked) == 1                                       # refused at the self-test, before any entry
+    assert (asked[0] == ".") if how == "tmpfile" else asked[0].startswith(".selftest-x")
+    assert _names() == []
+
+
+@pytest.mark.skipif(not (hasattr(os, "O_TMPFILE") and os.path.isdir("/proc/self/fd")),
+                    reason="O_TMPFILE and /proc: Linux")
+def test_on_linux_no_temp_name_ever_appears(monkeypatch):
+    # Linux: the entry is created unnamed, locked and written, and only then linked into place, so the directory
+    # never holds a temp, and the entry is locked the moment it has a name.
+    import fcntl
+    real_link = os.link
+    seen = []
+
+    def link(src, dst, **kw):
+        seen.append(sorted(os.listdir(R.registry_dir())))
+        out = real_link(src, dst, **kw)
+        probe = os.open(R.registry_dir() / dst, os.O_RDONLY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+        return out
+    monkeypatch.setattr(R.os, "link", link)
+    r = R.register("/w", "http://127.0.0.1:43996/", "linux")
+    try:
+        assert seen == [[]] and _names() == [r.name] and [v["project"] for v in R.live_views()] == ["linux"]
+    finally:
+        r.unpublish()
+        r.close()
