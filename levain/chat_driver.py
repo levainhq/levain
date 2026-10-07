@@ -59,9 +59,13 @@ approval of one raw call must never become a standing rule such as Codex's execp
 per request. Never emulate in-turn consent as after-turn (deny, record, rerun on approve): the model
 re-issues the call, so the bytes that run would not be the bytes approved.
 
-**Driver-author rules.** The host reads :meth:`~HarnessDriver.held_digest` while holding its own lock,
-and its event sink takes that lock: a driver must never call ``on_event`` while holding a lock that
-``held_digest`` also takes, and ``held_digest`` may not block on a reader loop. :meth:`~HarnessDriver.interrupt` is repeated about once a second until the job ends, so it must
+**Driver-author rules.** Every host call into a driver goes through one boundary
+(:func:`_call_driver`): nothing it raises reaches the host, and it is called outside the host's lock
+(the host's event sink takes that lock, so a driver may call ``on_event`` from any thread). While the host
+reads :meth:`~HarnessDriver.held_digest` for an approve, the session reads busy, so a slow digest delays
+that approve and nothing else. The release probes (:meth:`~HarnessDriver.wait_closed` at ``0``,
+:meth:`~HarnessDriver.release_error`) are the exception that must never block (their docstrings say why).
+:meth:`~HarnessDriver.interrupt` is repeated about once a second until the job ends, so it must
 be idempotent, and it may reach a harness session that is being released concurrently (the stop request
 is made outside the driver's lock), so it must tolerate one. :meth:`~HarnessDriver.set_model` and :meth:`~HarnessDriver.set_effort` apply to the NEXT
 turn and are for an idle driver; per-turn choices travel in :class:`TurnOptions`. ``exit_code``,
@@ -133,10 +137,6 @@ class DriverCaps:
     can_set_model: bool = False
     can_set_effort: bool = False
     can_list_models: bool = False
-    can_force_release: bool = False
-    """The driver escalates a graceful release that failed (:meth:`~HarnessDriver.force_release`: for a
-    process, the kill after the stop). The driver runs it itself, on its own release worker; a host never
-    calls it."""
 
 
 @dataclass(frozen=True)
@@ -269,21 +269,40 @@ def _call_driver(fn: Callable[..., Any], *args: Any, deadline: float | None = No
     stop requests. It catches
     ``BaseException`` (a ``TurnTimeout`` or any other non-``Exception`` included), so nothing the call
     raises escapes into the caller, and returns a :class:`DriverCall`; the call site decides what a failure
-    means. ``deadline`` (a :func:`time.monotonic` time) is the bound the contract promises for this call:
-    a call that returns after it is reported as failed (``value`` is kept), because a call that blocks
-    where it promised not to is a broken contract even when it comes back. The call runs on the calling
-    thread: no thread is made here, so a teardown never has to acquire one."""
+    means. ``deadline`` (a :func:`time.monotonic` time) is when the contract says this call has returned:
+    a call that returns after it is reported as failed (``value`` is kept). It is a CLASSIFIER, not a
+    bound: the call runs on the calling thread (no thread is made here, so a teardown never has to acquire
+    one), and a call that never returns holds that thread. The contract forbids that for the calls a host
+    passes a deadline to (:meth:`HarnessDriver.wait_closed` at ``0``, :meth:`HarnessDriver.release_error`)."""
     try:
         value = fn(*args)
     except BaseException as exc:  # noqa: BLE001 — the boundary: nothing a driver raises crosses it
-        return DriverCall(False, None, f"{type(exc).__name__}: {exc}", str(exc) or type(exc).__name__)
+        name, text = _exc_text(exc)
+        return DriverCall(False, None, f"{name}: {text}", text or name)
     if deadline is not None:
         late = time.monotonic() - deadline
         if late > 0:
-            name = getattr(fn, "__name__", "a driver call")
-            text = f"{name} returned {late:.1f}s past its bound"
+            try:
+                name = str(fn.__name__)
+            except BaseException:  # noqa: BLE001 — a name that cannot be read is driver code failing too
+                name = "a driver call"
+            text = f"{name} returned {late:.1f}s past its deadline"
             return DriverCall(False, value, f"DriverContractError: {text}", text)
     return DriverCall(True, value)
+
+
+def _exc_text(exc: BaseException) -> tuple[str, str]:
+    """An exception's class name and text, read so that neither can raise: both are driver code (a
+    metaclass ``__name__``, an ``__str__``) and this runs inside the boundary's own ``except``."""
+    try:
+        name = str(type(exc).__name__)
+    except BaseException:  # noqa: BLE001
+        name = "BaseException"
+    try:
+        text = str(exc)
+    except BaseException:  # noqa: BLE001
+        text = f"<unprintable {name}>"
+    return name, text
 _OUTCOME_FIELDS = ("reply", "tool_activity", "error", "nudged", "gated", "timed_out", "pending",
                    "held_digest", "ok", "exit_code")
 
@@ -377,22 +396,22 @@ class HarnessDriver(abc.ABC):
         """``True`` once everything the conversation held is CONFIRMED released, waiting at most
         ``timeout`` seconds (``0``: just ask; ``None``: until it is). A release that failed is not a
         release: this stays ``False`` (:meth:`release_error` says why). A host keeps a conversation
-        counted toward its limits until this reads ``True``."""
+        counted toward its limits until this reads ``True``.
+
+        The chat host asks with ``0`` about every quarter second, from ONE thread that every session's
+        release shares, so at ``0`` this MUST NOT BLOCK (never wait on a lock a kill or a reader loop also
+        holds). An answer later than the host's probe deadline (:data:`levain.chat._PROBE_SECONDS`) that is
+        not a confirmation, and any answer that is not a ``bool``, is recorded as a failed release, which
+        holds the conversation's slot until the server restarts; one that never comes stalls every
+        session's release."""
 
     @abc.abstractmethod
     def release_error(self) -> str | None:
-        """Why the release failed (the error's class and text), or ``None`` while it has not failed. A
-        failed release is final: it is reported only after the driver's own escalation
-        (:meth:`force_release`, where it has one) has failed too."""
-
-    def force_release(self, native: Any) -> None:
-        """Escalate past a failed graceful release of ``native`` (what the graceful release was given), once,
-        where :attr:`DriverCaps.can_force_release` says the driver can. The driver calls this ITSELF, on its
-        own release worker, after its graceful release fails; a host never calls it (a blocking escalation
-        must not hold a host thread, and the host's reaper is shared by every session). It returns once the
-        escalation has released ``native`` and raises when it has not; until it ends,
-        :meth:`release_error` reads ``None`` and :meth:`wait_closed` ``False``."""
-        raise DriverUnsupported(f"{self.harness} has no force release")
+        """Why the release failed (the error's class and text, as ``str``), or ``None`` while it has not
+        failed. A failed release is final: a driver that can escalate (a kill after a stop) does so ITSELF,
+        on its own thread, and reports a failure only once that has failed too; a host never escalates.
+        Polled like :meth:`wait_closed` and under the same rules: it must not block, and anything but a
+        ``str`` or ``None`` is a contract violation the host records as a failed release."""
 
     @property
     @abc.abstractmethod
@@ -525,7 +544,7 @@ class OpenHandsDriver(HarnessDriver):
                 began = True
                 self._phase = "opening"
             # The release worker is acquired HERE, before anything exists for it to release (the kubelet is
-            # there before the pod): no teardown path ever has to create a thread, so none can fail to.
+            # there before the pod): no release ever has to create a thread, so none can fail to.
             worker = threading.Thread(target=self._release_worker, daemon=True, name="levain-driver-release")
             worker.start()
             with self._cond:
@@ -545,19 +564,23 @@ class OpenHandsDriver(HarnessDriver):
     def _release(self, session: Any) -> None:
         """Close ``session`` (the caller has already taken it off the driver) and end the phase at
         ``closed`` whatever happens. Every call into the session goes through :func:`_call_driver`. A failed
-        close escalates once where the driver can (:meth:`force_release`); one that still failed is NOT a
+        close escalates once where the driver can (:meth:`_escalate_release`); one that still failed is NOT a
         release: it is logged and kept as text, so :meth:`wait_closed` stays ``False``, :meth:`release_error`
         says why, and :meth:`close` raises it when it is still waiting (this runs on the release worker,
         where nothing else would see it)."""
-        failure: str | None = None
+        failure: str | None = "the release did not complete"     # fail closed: cleared only by a release
         try:
-            if session is not None:
-                closed = _call_driver(session.close)
-                if not closed.ok:
-                    failure = f"close: {closed.error}"
-                    if self.caps.can_force_release:
-                        forced = _call_driver(self.force_release, session)
-                        failure = None if forced.ok else f"{failure}; force release: {forced.error}"
+            if session is None:
+                failure = None
+            else:
+                closed = _call_driver(lambda: session.close())     # the lookup is the session's code too
+                failure = None if closed.ok else f"close: {closed.error}"
+                if failure is not None:
+                    forced = _call_driver(self._escalate_release, session)
+                    if forced.ok and forced.value is True:
+                        failure = None
+                    elif not forced.ok:
+                        failure = f"{failure}; escalation: {forced.error}"
         finally:
             with self._cond:
                 if failure is not None:
@@ -565,6 +588,14 @@ class OpenHandsDriver(HarnessDriver):
                     self._release_error = failure
                 self._phase = "closed"
                 self._cond.notify_all()
+
+    def _escalate_release(self, session: Any) -> bool:
+        """The escalation past a graceful close of ``session`` that failed (for a process, the kill after
+        the stop), run once, on the release worker, never by a host. ``True``: escalated and released.
+        ``False``: there is no escalation, and the failure stands. A raise: the escalation failed too. An
+        :class:`~levain.session.EntitySession` has nothing further to kill (its close never raises), so
+        OpenHands has none; a subclass that holds a process overrides this."""
+        return False
 
     def _hand_release(self, session: Any) -> None:
         """Hand ``session`` to the release worker: a native close may block (a process or socket that will

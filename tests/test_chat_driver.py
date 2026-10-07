@@ -1203,11 +1203,11 @@ def test_a_settle_that_fails_after_a_late_release_still_ends_the_record(tmp_path
 
 
 class _Forcing(_Fake):
-    """A driver whose graceful release fails and that offers a force release."""
+    """A driver whose graceful release fails and that has an escalation of its own (an old-style
+    force_release a host could have called)."""
 
     def __init__(self):
         super().__init__([])
-        self.caps = DriverCaps(can_force_release=True)
         self.forced = 0
 
     def wait_closed(self, timeout):
@@ -1500,7 +1500,7 @@ def test_a_probe_that_blocks_past_its_bound_is_not_asked_again(tmp_path, monkeyp
     host = _host(tmp_path, {"alpha": Slow([])})
     sid, _ = _open(host, "alpha")
     view = host.close(sid)
-    assert view["state"] == "release_failed" and "past its bound" in view["error"]
+    assert view["state"] == "release_failed" and "past its deadline" in view["error"]
     time.sleep(0.5)
     assert Slow.asks == 1
 
@@ -1574,13 +1574,13 @@ def test_the_driver_escalates_on_its_own_release_worker(tmp_path, force_ok):
     ran: list[str] = []
 
     class Forcing(OpenHandsDriver):
-        def force_release(self, native):
+        def _escalate_release(self, session):
             ran.append(threading.current_thread().name)
             if not force_ok:
                 raise OSError("kill failed")
+            return True
 
     d = Forcing(tmp_path, lambda p, on_event: _NativeRaises(OSError("would not stop")), close_wait=2)
-    d.caps = DriverCaps(can_force_release=True)
     d.open(lambda e: None)
     if force_ok:
         d.close()
@@ -1626,3 +1626,173 @@ def test_a_worker_whose_driver_closed_with_nothing_handed_exits(tmp_path):
     d._release(None)            # what _hand_release does when no worker was recorded
     worker.join(2)
     assert not worker.is_alive() and d.wait_closed(0)
+
+
+# -- L1 + L2 on df9d4b2: the boundary's own edges -------------------------------------------------------------
+
+
+class _Unprintable(BaseException):
+    def __str__(self):
+        raise ValueError("unprintable")
+
+
+def test_the_boundary_survives_an_exception_it_cannot_print():
+    """L1 r4 HIGH (RAN): the boundary's own except built str(exc), so an exception whose __str__ raised
+    escaped _call_driver itself."""
+    from levain.chat_driver import _call_driver
+
+    def boom():
+        raise _Unprintable()
+
+    got = _call_driver(boom)
+    assert not got.ok and got.error == "_Unprintable: <unprintable _Unprintable>"
+
+
+def test_a_session_whose_close_lookup_raises_is_not_released(tmp_path, escaped):
+    """L1 r4 HIGH (RAN): `_call_driver(session.close)` looked the method up OUTSIDE the boundary; a raising
+    lookup escaped _release, whose finally then marked the driver closed with no error: released."""
+    class Sess:
+        def run_turn(self, m):
+            return _Out()
+
+        def request_stop(self):
+            pass
+
+        def __getattr__(self, name):
+            if name == "close":
+                raise RuntimeError("close lookup broke")
+            raise AttributeError(name)
+
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: Sess(), close_wait=2)
+    d.open(lambda e: None)
+    with pytest.raises(RuntimeError, match="close lookup broke"):
+        d.close()
+    assert not d.wait_closed(0) and "close lookup broke" in d.release_error()
+    assert escaped == []
+
+
+@pytest.mark.parametrize("probe", ["wait_closed", "release_error"])
+def test_a_probe_answering_with_the_wrong_type_is_a_failed_release(tmp_path, escaped, probe):
+    """L2 r4 (RAN): wait_closed returning None (a forgotten return) left the record closing forever with no
+    error; L1 r4 HIGH (RAN): str() of release_error's value ran driver code outside the boundary, and a
+    raising __str__ left the record closing with nothing queued."""
+    class BadStr:
+        def __str__(self):
+            raise RuntimeError("str broke")
+
+    class Bad(_Fake):
+        def wait_closed(self, timeout):
+            return None if probe == "wait_closed" else False
+
+        def release_error(self):
+            return BadStr() if probe == "release_error" else None
+
+    host = _host(tmp_path, {"alpha": Bad([])})
+    sid, _ = _open(host, "alpha")
+    view = host.close(sid)
+    assert view["state"] == "release_failed" and "DriverContractError" in view["error"]
+    assert escaped == []
+
+
+def test_a_late_confirmation_still_frees_the_slot(tmp_path, monkeypatch):
+    """L2 r4 (RAN): a wait_closed that confirmed the release 0.2 s past the probe deadline cost the slot until
+    restart, though the driver said the shell is gone. A late confirmation settles (and is logged)."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_PROBE_SECONDS", 0.05)
+
+    class Slow(_Fake):
+        def wait_closed(self, timeout):
+            time.sleep(0.2)
+            return True
+
+    host = _host(tmp_path, {"alpha": Slow([])}, max_sessions=1)
+    sid, _ = _open(host, "alpha")
+    assert host.close(sid)["state"] == "closed"
+
+
+def test_a_fault_in_reaping_ends_the_record_rather_than_retrying_forever(tmp_path, monkeypatch):
+    """L1 r4: the reaper's catch-all left the item queued, retried every sweep, forever."""
+    late = _LateRelease()
+    host = _host(tmp_path, {"alpha": late})
+    sid, _ = _open(host, "alpha")
+    host.close(sid)
+    calls = []
+    real = host._after_close
+
+    def broken(item):
+        calls.append(1)
+        raise RuntimeError("host bug")
+
+    monkeypatch.setattr(host, "_after_close", broken)
+    _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the reaper")
+    time.sleep(0.6)
+    assert len(calls) == 1 and host._reaping == []
+    monkeypatch.setattr(host, "_after_close", real)
+
+
+def test_a_failed_turns_outcome_is_published_before_its_close_returns(tmp_path):
+    """L1 r4 (RAN, a regression of glm L3 r2): the job was published only after close() returned, 3 s here."""
+    gate = threading.Event()
+
+    class SlowClose(_Fake):
+        def close(self):
+            assert gate.wait(10)
+            self.closed = True
+
+    d = SlowClose([_Out(reply=None, error="boom")])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    st = _wait(host, host.turn(sid, "go")["job_id"], timeout=2)
+    assert st["status"] == "done" and host.session_status(sid)["state"] == "busy"
+    gate.set()
+    _until(lambda: host.session_status(sid)["state"] == "broken", what="the release")
+
+
+def test_held_digest_is_read_outside_the_host_lock(tmp_path):
+    """L2 r4 (RAN): approve read held_digest (driver code) under the host lock, so one slow digest stalled
+    every route. It is read outside it; meanwhile the session reads busy."""
+    gate, inside = threading.Event(), threading.Event()
+
+    class SlowDigest(_Fake):
+        def held_digest(self):
+            inside.set()
+            assert gate.wait(10)
+            return "d1"
+
+    d = SlowDigest([_halt(), _Out()])
+    host = _host(tmp_path, {"alpha": d, "beta": _Fake([])})
+    sid, _ = _open(host, "alpha")
+    did = _wait(host, host.turn(sid, "go")["job_id"])["result"]["decision_id"]
+    out: dict = {}
+    t = threading.Thread(target=lambda: out.update(host.approve(sid, expect=did)))
+    t.start()
+    assert inside.wait(5)
+    started = time.monotonic()
+    host.listing()                                    # not stalled behind the digest
+    assert host.session_status(sid)["state"] == "busy"
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=did)                 # the id is held aside: a second approve is stale
+    assert e.value.code in ("wrong_state", "stale_decision")
+    assert time.monotonic() - started < 1
+    gate.set()
+    t.join(5)
+    assert _wait(host, out["job_id"])["status"] == "done"
+
+
+def test_a_banner_is_copied_into_plain_data(tmp_path):
+    """L1 r4 LOW: describe()'s dict was kept as returned, so a dict subclass ran driver code under the host
+    lock on every view. It is copied into plain data inside the boundary, dropping what is not plain."""
+    class Sneaky(dict):
+        def items(self):
+            raise RuntimeError("driver code under the host lock")
+
+    class Banner(_Fake):
+        def describe(self):
+            return Sneaky(label="fake", nested={"x": 1}, n=3)
+
+    host = _host(tmp_path, {"alpha": Banner([])})
+    sid, _ = _open(host, "alpha")
+    rec = host._sessions[sid]
+    assert type(rec.info) is dict and rec.info == {"label": "fake", "n": 3}
+    assert host.session_status(sid)["label"] == "fake"

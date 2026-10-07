@@ -281,6 +281,8 @@ def test_a_failed_open_keeps_the_message_text_and_never_the_exception(tmp_path):
     out = host.open("alpha")
     st = _wait(host, out["job_id"])
     assert st["status"] == "failed" and st["error"] == "no such model"
+    # the job's outcome is published before the release (glm L3 r2); the record follows it
+    _until(lambda: host.session_status(out["session_id"])["state"] == "failed", what="the release")
     view = host.session_status(out["session_id"])
     assert view["state"] == "failed" and view["error"] == "no such model"
     # Every value the host holds for it is plain data: no exception, so no traceback, so no frame.
@@ -1252,7 +1254,8 @@ def test_a_watcher_that_does_not_exit_breaks_the_session(tmp_path, monkeypatch):
 
 def test_an_open_landing_after_shutdown_holds_its_slot_until_the_shell_is_released(tmp_path):
     """`_run_open`'s shut path: the session it opened is torn down while the record still reads
-    `opening` (counted, job running), and only then published `closed`."""
+    `opening` (counted), and only then published `closed`. The job's outcome is published at once
+    (L3 r2, glm: a client polling the job must not wait on the teardown; L1 r4 caught this reverted)."""
     gate = threading.Event()
     made: list[_HeldClose] = []
 
@@ -1268,10 +1271,9 @@ def test_an_open_landing_after_shutdown_holds_its_slot_until_the_shell_is_releas
     _until(lambda: made, what="the open")
     assert made[0].closing.wait(5)
     assert host.session_status(out["session_id"])["state"] == "opening"
-    assert host.job_status(out["job_id"])["status"] == "running"
+    assert host.job_status(out["job_id"])["status"] == "failed"
     made[0].release.set()
-    st = _wait(host, out["job_id"])
-    assert st["status"] == "failed" and host.session_status(out["session_id"])["state"] == "closed"
+    _until(lambda: host.session_status(out["session_id"])["state"] == "closed", what="the release")
 
 
 def test_shutdown_publishes_closed_only_after_each_shell_is_released(tmp_path):
