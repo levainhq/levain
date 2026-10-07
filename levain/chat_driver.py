@@ -59,12 +59,14 @@ approval of one raw call must never become a standing rule such as Codex's execp
 per request. Never emulate in-turn consent as after-turn (deny, record, rerun on approve): the model
 re-issues the call, so the bytes that run would not be the bytes approved.
 
-**Driver-author rules.** Every host call into a driver goes through one boundary
-(:func:`_call_driver`): nothing it raises reaches the host, and it is called outside the host's lock
-(the host's event sink takes that lock, so a driver may call ``on_event`` from any thread). While the host
-reads :meth:`~HarnessDriver.held_digest` for an approve, the session reads busy, so a slow digest delays
-that approve and nothing else. The release probes (:meth:`~HarnessDriver.wait_closed` at ``0``,
-:meth:`~HarnessDriver.release_error`) are the exception that must never block (their docstrings say why).
+**Driver-author rules.** The chat host runs every call into a driver (each attribute it reads included)
+on worker threads of that driver's own, started when the session opens, through one boundary
+(:func:`_call_driver`), and waits for each with a deadline. Nothing a driver raises reaches the host, no
+call is made under the host's lock (the host's event sink takes that lock, so a driver may call
+``on_event`` and ``on_released`` from any thread), and a driver that does not answer in time is not
+waited for: the call fails closed (an approve is refused, a turn fails) and the session reads
+``unresponsive`` until it is closed. Every value is checked for its exact declared type. A release is
+REPORTED by the driver (``on_released``, :meth:`~HarnessDriver.open`), never polled.
 :meth:`~HarnessDriver.interrupt` is repeated about once a second until the job ends, so it must
 be idempotent, and it may reach a harness session that is being released concurrently (the stop request
 is made outside the driver's lock), so it must tolerate one. :meth:`~HarnessDriver.set_model` and :meth:`~HarnessDriver.set_effort` apply to the NEXT
@@ -264,34 +266,21 @@ class DriverCall:
     value: Any = None
     error: str | None = None      # "<class>: <text>", for a record and a log
     message: str | None = None    # the exception's own text, or its class name when it has none
+    unanswered: bool = False      # the host stopped waiting: the driver did not answer within its deadline
 
 
-def _call_driver(fn: Callable[..., Any], *args: Any, deadline: float | None = None) -> DriverCall:
-    """THE one way into driver code from a thread that must outlive it (ruled 2026-10-07): the chat host's
-    request, worker, deadline, shutdown and reaper threads, and an OpenHands driver's own release worker and
-    stop requests. It catches
-    ``BaseException`` (a ``TurnTimeout`` or any other non-``Exception`` included), so nothing the call
-    raises escapes into the caller, and returns a :class:`DriverCall`; the call site decides what a failure
-    means. ``deadline`` (a :func:`time.monotonic` time) is when the contract says this call has returned:
-    a call that returns after it is reported as failed (``value`` is kept). It is a CLASSIFIER, not a
-    bound: the call runs on the calling thread (no thread is made here, so a teardown never has to acquire
-    one), and a call that never returns holds that thread. The contract forbids that for the calls a host
-    passes a deadline to (:meth:`HarnessDriver.wait_closed` at ``0``, :meth:`HarnessDriver.release_error`)."""
+def _call_driver(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> DriverCall:
+    """THE one way to run driver code (ruled 2026-10-07): it catches ``BaseException`` (a ``TurnTimeout`` or
+    any other non-``Exception`` included), so nothing the call raises escapes into the caller, and returns
+    a :class:`DriverCall` whose error is TEXT read by :func:`_exc_text`, which cannot raise. The call site
+    decides what a failure means. It runs ``fn`` on the calling thread and does not bound it: the chat host
+    runs it on the driver's own call workers and waits for them with a deadline (:mod:`levain.chat`), and
+    an OpenHands driver runs it on its own release worker and stop thread."""
     try:
-        value = fn(*args)
+        return DriverCall(True, fn(*args, **kwargs))
     except BaseException as exc:  # noqa: BLE001 — the boundary: nothing a driver raises crosses it
         name, text = _exc_text(exc)
         return DriverCall(False, None, f"{name}: {text}", text or name)
-    if deadline is not None:
-        late = time.monotonic() - deadline
-        if late > 0:
-            try:
-                name = str(fn.__name__)
-            except BaseException:  # noqa: BLE001 — a name that cannot be read is driver code failing too
-                name = "a driver call"
-            text = f"{name} returned {late:.1f}s past its deadline"
-            return DriverCall(False, value, f"DriverContractError: {text}", text)
-    return DriverCall(True, value)
 
 
 def _exc_text(exc: BaseException) -> tuple[str, str]:
@@ -369,9 +358,11 @@ def read_outcome(outcome: Any, *, strict: bool = True) -> TurnSnapshot:
 class HarnessDriver(abc.ABC):
     """One conversation with one entity through one harness. See the module docstring.
 
-    Threading: the host calls :meth:`open`, :meth:`send_turn`, :meth:`approve` and :meth:`reject` from
-    one worker thread at a time (a session runs at most one job), and :meth:`interrupt` and
-    :meth:`close` from other threads while a job runs, which every implementation must tolerate."""
+    Threading: the chat host calls :meth:`open`, :meth:`send_turn`, :meth:`approve` and :meth:`reject` on
+    one thread (the session's turn lane, one call at a time), :meth:`interrupt`, :meth:`held_digest`,
+    :meth:`describe` and every attribute read on another (its control lane), and :meth:`close` on a third
+    (its release lane), so :meth:`interrupt` and :meth:`close` can arrive while a turn runs, which every
+    implementation must tolerate. It waits for each with a deadline and does not wait past it."""
 
     harness: str = "unnamed"
     """The harness's name, for display and logs (``openhands``, later ``claude-code`` and ``codex``)."""
@@ -381,40 +372,30 @@ class HarnessDriver(abc.ABC):
     # -- life cycle ------------------------------------------------------------
 
     @abc.abstractmethod
-    def open(self, on_event: Callable[[DriverEvent], None], *, resume: str | None = None) -> None:
+    def open(self, on_event: Callable[[DriverEvent], None], *, on_released: Callable[[str | None], None],
+             resume: str | None = None) -> None:
         """Open the conversation, or resume ``resume`` where :attr:`caps` says that is possible. A
         refusal or a failure raises; the host keeps the message text and drops the exception, and then
-        calls :meth:`close` (idempotent) so a failed open releases whatever it had built."""
+        calls :meth:`close` (idempotent) so a failed open releases whatever it had built.
+
+        ``on_released`` is how the driver REPORTS its release: it calls it exactly once, from a thread of
+        its own, when everything the conversation held is released (``None``) or when the release failed
+        (the reason, as ``str``), after any escalation of its own (a kill after a stop) has run. It may
+        report before :meth:`close` is called (an open that failed released what it built) and it may
+        report long after. The host never asks: it keeps the conversation counted until a ``None`` report,
+        and a conversation with no report by the host's deadline reads ``release_failed`` until one comes.
+        A report that is neither ``None`` nor ``str`` is a contract violation, recorded as a failed
+        release."""
 
     @abc.abstractmethod
     def close(self) -> None:
-        """Release everything the conversation holds (a shell, a process, a socket). Idempotent, and
-        bounded: it never releases under a running turn, it stops the turn and waits for its return, and a
-        release it could not wait for is made by whoever still holds the conversation when they let go
-        (the turn on its return, an opener on its arrival, a native release still running). No new turn
-        starts once it is called. Whether everything is released when it returns is :meth:`wait_closed`."""
-
-    @abc.abstractmethod
-    def wait_closed(self, timeout: float | None) -> bool:
-        """``True`` once everything the conversation held is CONFIRMED released, waiting at most
-        ``timeout`` seconds (``0``: just ask; ``None``: until it is). A release that failed is not a
-        release: this stays ``False`` (:meth:`release_error` says why). A host keeps a conversation
-        counted toward its limits until this reads ``True``.
-
-        The chat host asks with ``0`` about every quarter second, from ONE thread that every session's
-        release shares, so at ``0`` this MUST NOT BLOCK (never wait on a lock a kill or a reader loop also
-        holds). An answer later than the host's probe deadline (:data:`levain.chat._PROBE_SECONDS`) that is
-        not a confirmation, and any answer that is not a ``bool``, is recorded as a failed release, which
-        holds the conversation's slot until the server restarts; one that never comes stalls every
-        session's release."""
-
-    @abc.abstractmethod
-    def release_error(self) -> str | None:
-        """Why the release failed (the error's class and text, as ``str``), or ``None`` while it has not
-        failed. A failed release is final: a driver that can escalate (a kill after a stop) does so ITSELF,
-        on its own thread, and reports a failure only once that has failed too; a host never escalates.
-        Polled like :meth:`wait_closed` and under the same rules: it must not block, and anything but a
-        ``str`` or ``None`` is a contract violation the host records as a failed release."""
+        """Start the release of everything the conversation holds (a shell, a process, a socket).
+        Idempotent, and bounded: it never releases under a running turn, it stops the turn and waits for
+        its return, and a release it could not wait for is made by whoever still holds the conversation
+        when they let go (the turn on its return, an opener on its arrival, a native release still
+        running). No new turn starts once it is called. The release's outcome is reported through
+        ``on_released`` (:meth:`open`); a close that raises is recorded as a failed release unless a
+        ``None`` report follows."""
 
     @property
     @abc.abstractmethod
@@ -520,6 +501,7 @@ class OpenHandsDriver(HarnessDriver):
     _release_error: str | None = field(default=None, init=False, repr=False)   # text only (DriverCall)
     _worker: threading.Thread | None = field(default=None, init=False, repr=False)   # the release worker
     _handed: Any = field(default=_ABSENT, init=False, repr=False)         # what the worker is to release
+    _on_released: Callable[[str | None], None] | None = field(default=None, init=False, repr=False)
     _cond: Any = field(default_factory=threading.Condition, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -527,7 +509,11 @@ class OpenHandsDriver(HarnessDriver):
         if isinstance(wait, bool) or not (isinstance(wait, (int, float)) and 0 < wait <= threading.TIMEOUT_MAX):
             raise ValueError("close_wait must be a finite number of seconds above 0: close() is bounded")
 
-    def open(self, on_event: Callable[[DriverEvent], None], *, resume: str | None = None) -> None:
+    def open(self, on_event: Callable[[DriverEvent], None], *, on_released: Callable[[str | None], None],
+             resume: str | None = None) -> None:
+        with self._cond:
+            if self._on_released is None:
+                self._on_released = on_released   # first, so a release of any open that began is reported
         if resume is not None:
             raise DriverUnsupported(
                 "openhands conversations live in server memory only; resume across a restart is not offered")
@@ -568,7 +554,7 @@ class OpenHandsDriver(HarnessDriver):
         """Close ``session`` (the caller has already taken it off the driver) and end the phase at
         ``closed`` whatever happens. Every call into the session goes through :func:`_call_driver`. A failed
         close escalates once where the driver can (:meth:`_escalate_release`); one that still failed is NOT a
-        release: it is logged and kept as text, so :meth:`wait_closed` stays ``False``, :meth:`release_error`
+        release: it is logged, kept as text and REPORTED (``on_released``), so :meth:`wait_closed` stays ``False``, :meth:`release_error`
         says why, and :meth:`close` raises it when it is still waiting (this runs on the release worker,
         where nothing else would see it)."""
         failure: str | None = "the release did not complete"     # fail closed: cleared only by a release
@@ -591,6 +577,13 @@ class OpenHandsDriver(HarnessDriver):
                     self._release_error = failure
                 self._phase = "closed"
                 self._cond.notify_all()
+                report = self._on_released
+            if report is not None:
+                # The host's sink: host code, but called through the boundary all the same, so nothing it
+                # raises ends this worker before the phase above is published.
+                reported = _call_driver(report, failure)
+                if not reported.ok:
+                    _log.error("openhands driver: reporting the release failed: %s", reported.error)
 
     def _escalate_release(self, session: Any) -> bool:
         """The escalation past a graceful close of ``session`` that failed (for a process, the kill after
@@ -623,11 +616,14 @@ class OpenHandsDriver(HarnessDriver):
             self._release(session)
 
     def wait_closed(self, timeout: float | None) -> bool:
+        """``True`` once the release is confirmed, waiting at most ``timeout`` seconds. For a caller that holds
+        this driver directly; the chat host is told through ``on_released`` and never asks."""
         with self._cond:
             return self._cond.wait_for(lambda: self._phase == "closed", timeout=timeout) \
                 and self._release_error is None
 
     def release_error(self) -> str | None:
+        """Why the release failed, or ``None`` (not failed, or not finished). What ``on_released`` reported."""
         with self._cond:
             return self._release_error if self._phase == "closed" else None
 

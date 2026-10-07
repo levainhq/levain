@@ -70,12 +70,22 @@ class _Fake(HarnessDriver):
         self.stops = 0
         self.probe: Callable[[], Any] | None = None
         self.probed: Any = None
+        self.on_released: Callable[[Any], None] | None = None
+        self.reported = False
 
-    def open(self, on_event, *, resume=None):
+    def open(self, on_event, *, on_released, resume=None):
         self.sink, self.opened, self._state = on_event, True, "idle"
+        self.on_released = on_released
 
     def close(self):
         self.closed, self._state = True, "closed"
+        self.report()
+
+    def report(self, error=None):
+        """Tell the host the release is done (or failed): the push half of the contract."""
+        if self.on_released is not None and not self.reported:
+            self.reported = True
+            self.on_released(error)
 
     @property
     def state(self) -> DriverState:
@@ -110,11 +120,6 @@ class _Fake(HarnessDriver):
     def interrupt(self):
         self.stops += 1
 
-    def wait_closed(self, timeout):
-        return self.closed
-
-    def release_error(self):
-        return None
 
 
 def _wait(host, job_id, timeout=5.0):
@@ -138,6 +143,10 @@ def _open(host, name):
     out = host.open(name)
     st = _wait(host, out["job_id"])
     return out["session_id"], st
+
+
+def _unheard(error):
+    """An on_released for a driver driven directly (no host listening)."""
 
 
 def _until(pred, timeout: float = 5.0, what: str = "") -> None:
@@ -221,7 +230,7 @@ def test_a_driver_that_hides_or_skips_the_consent_row_is_refused(tmp_path, outco
     sid, _ = _open(host, "alpha")
     st = _wait(host, host.turn(sid, "go")["job_id"])
     assert st["status"] == "failed" and needle in st["error"]
-    assert host.session_status(sid)["state"] == "broken" and d.closed
+    _until(lambda: host.session_status(sid)["state"] == "broken" and d.closed, what="the release")
 
 
 def test_a_halt_whose_digest_is_missing_can_only_be_rejected(tmp_path):
@@ -245,7 +254,7 @@ def test_a_driver_that_needs_in_turn_consent_is_refused_at_open_not_driven(tmp_p
     host = _host(tmp_path, {"alpha": d})
     sid, st = _open(host, "alpha")
     assert st["status"] == "failed" and "approval state machine" in st["error"]
-    assert not d.opened and host.session_status(sid)["state"] == "failed"
+    _until(lambda: not d.opened and host.session_status(sid)["state"] == "failed", what="the release")
 
 
 def test_a_failed_outcome_is_not_second_guessed(tmp_path):
@@ -253,7 +262,7 @@ def test_a_failed_outcome_is_not_second_guessed(tmp_path):
     host = _host(tmp_path, {"alpha": d})
     sid, _ = _open(host, "alpha")
     st = _wait(host, host.turn(sid, "go")["job_id"])
-    assert st["result"]["error"] == "boom" and host.session_status(sid)["state"] == "broken"
+    _until(lambda: st["result"]["error"] == "boom" and host.session_status(sid)["state"] == "broken", what="the release")
 
 
 def test_a_session_factory_and_a_driver_factory_together_are_refused(tmp_path):
@@ -282,7 +291,7 @@ def test_optional_capabilities_refuse_by_default_and_openhands_offers_none_of_th
     oh = OpenHandsDriver(tmp_path, lambda p, on_event: None)
     assert oh.caps == DriverCaps() and oh.caps.approval_timing == "after_turn"
     with pytest.raises(DriverUnsupported):
-        oh.open(lambda e: None, resume="abc")      # nothing is persisted, so nothing resumes
+        oh.open(lambda e: None, on_released=_unheard, resume="abc")      # nothing is persisted, so nothing resumes
 
 
 def test_the_openhands_driver_tracks_state_and_forwards_text_events_as_activity(tmp_path):
@@ -315,7 +324,7 @@ def test_the_openhands_driver_tracks_state_and_forwards_text_events_as_activity(
     seen: list[DriverEvent] = []
     d = OpenHandsDriver(tmp_path, lambda p, on_event: Sess(on_event))
     assert d.state == "closed" and d.native is None
-    d.open(seen.append)
+    d.open(seen.append, on_released=_unheard)
     assert d.state == "idle" and d.describe()["label"] == "e" and d.describe()["workspace"] == str(tmp_path)
     assert d.send_turn("x").gated and d.state == "awaiting_approval"
     assert seen == [DriverEvent("activity", "⚙ terminal: ls")]
@@ -364,7 +373,7 @@ def test_a_driver_that_returns_anything_but_a_snapshot_is_refused(tmp_path):
     host = _host(tmp_path, {"alpha": d})
     sid, _ = _open(host, "alpha")
     st = _wait(host, host.turn(sid, "go")["job_id"])
-    assert st["status"] == "failed" and "not a TurnSnapshot" in st["error"] and d.closed
+    assert st["status"] == "failed" and "not TurnSnapshot" in st["error"] and d.closed
 
 
 def test_per_turn_options_and_after_turn_answers_refuse_by_default(tmp_path):
@@ -383,14 +392,15 @@ def test_per_turn_options_and_after_turn_answers_refuse_by_default(tmp_path):
 def test_a_failed_open_closes_the_driver_it_built(tmp_path):
     """L1: a driver's open() may allocate before it raises; the host closes it and keeps only the text."""
     class Leaky(_Fake):
-        def open(self, on_event, *, resume=None):
-            self.opened = True
+        def open(self, on_event, *, on_released, resume=None):
+            self.opened, self.on_released = True, on_released
             raise RuntimeError("half built")
 
     d = Leaky([])
     host = _host(tmp_path, {"alpha": d})
     sid, st = _open(host, "alpha")
-    assert st["status"] == "failed" and st["error"] == "half built" and d.closed
+    assert st["status"] == "failed" and st["error"] == "half built"
+    _until(lambda: d.closed and host.session_status(sid)["state"] == "failed", what="the release")
 
 
 def test_the_openhands_driver_is_not_driveable_when_closed_and_keeps_an_errored_halt_held(tmp_path):
@@ -404,7 +414,7 @@ def test_the_openhands_driver_is_not_driveable_when_closed_and_keeps_an_errored_
     d = OpenHandsDriver(tmp_path, lambda p, on_event: Sess())
     with pytest.raises(RuntimeError):
         d.send_turn("x")                     # never opened
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     assert d.send_turn("x").error and d.state == "awaiting_approval"   # the harness still holds actions
     d.close()
     with pytest.raises(RuntimeError):
@@ -442,7 +452,7 @@ class _Hands:
 def test_close_during_a_running_turn_ends_the_turn_and_only_then_releases_the_session(tmp_path):
     hands = _Hands()
     d = OpenHandsDriver(tmp_path, lambda p, on_event: hands)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     t = threading.Thread(target=lambda: d.send_turn("x"))
     t.start()
     assert hands.entered.wait(5)
@@ -455,7 +465,7 @@ def test_close_during_a_running_turn_ends_the_turn_and_only_then_releases_the_se
 def test_a_turn_cannot_start_while_closing_or_overlap_another(tmp_path):
     hands = _Hands()
     d = OpenHandsDriver(tmp_path, lambda p, on_event: hands)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     t = threading.Thread(target=lambda: d.send_turn("x"))
     t.start()
     assert hands.entered.wait(5)
@@ -481,7 +491,7 @@ def test_close_racing_open_leaves_no_published_session(tmp_path):
 
     def _open():
         try:
-            d.open(lambda e: None)
+            d.open(lambda e: None, on_released=_unheard)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -501,19 +511,19 @@ def test_close_racing_open_leaves_no_published_session(tmp_path):
 
 def test_a_driver_opens_once_and_a_failed_opener_leaves_it_closed(tmp_path):
     d = OpenHandsDriver(tmp_path, lambda p, on_event: _Hands())
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     with pytest.raises(RuntimeError, match="opens once"):
-        d.open(lambda e: None)
+        d.open(lambda e: None, on_released=_unheard)
     d.close()
     with pytest.raises(RuntimeError, match="opens once"):
-        d.open(lambda e: None)
+        d.open(lambda e: None, on_released=_unheard)
 
     def boom(p, on_event):
         raise ValueError("no hands")
 
     f = OpenHandsDriver(tmp_path, boom)
     with pytest.raises(ValueError):
-        f.open(lambda e: None)
+        f.open(lambda e: None, on_released=_unheard)
     f.close()
     assert f.state == "closed"
 
@@ -627,7 +637,7 @@ def test_a_result_that_cannot_report_gated_still_releases_the_turn_and_close_ret
             self.closed = True
 
     d = OpenHandsDriver(tmp_path, lambda p, on_event: Sess())
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     with pytest.raises(ValueError):
         d.send_turn("x")                        # the host's job catches this as a broken turn
     assert d.state == "awaiting_approval"        # unreadable reads as held: fail closed
@@ -640,7 +650,7 @@ def test_a_result_that_cannot_report_gated_still_releases_the_turn_and_close_ret
 def test_a_turn_is_refused_and_state_reads_active_while_close_waits_for_it(tmp_path):
     hands = _Hands()
     d = OpenHandsDriver(tmp_path, lambda p, on_event: hands)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     t = threading.Thread(target=lambda: d.send_turn("x"))
     t.start()
     assert hands.entered.wait(5)
@@ -747,7 +757,7 @@ def test_a_base_exception_reading_the_result_still_releases_the_turn(tmp_path):
 
     sess = Sess()
     d = OpenHandsDriver(tmp_path, lambda p, on_event: sess, close_wait=5)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     with pytest.raises(TurnTimeout):
         d.send_turn("x")
     assert d.state == "awaiting_approval"           # released, and unknown reads as held
@@ -769,7 +779,7 @@ def test_a_failing_stop_request_never_releases_under_the_turn_and_close_still_en
 
     hands.request_stop = stop                          # type: ignore[method-assign]
     d = OpenHandsDriver(tmp_path, lambda p, on_event: hands, close_wait=0.3)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     t = threading.Thread(target=lambda: d.send_turn("x"), daemon=True)
     t.start()
     assert hands.entered.wait(5)
@@ -799,7 +809,7 @@ def test_a_blocking_stop_request_does_not_hold_close_past_its_bound(tmp_path):
 
     hands.request_stop = stop                          # type: ignore[method-assign]
     d = OpenHandsDriver(tmp_path, lambda p, on_event: hands, close_wait=0.2)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     t = threading.Thread(target=lambda: d.send_turn("x"), daemon=True)
     t.start()
     assert hands.entered.wait(5)
@@ -824,7 +834,7 @@ def test_a_release_that_fails_after_the_turn_does_not_replace_its_outcome(tmp_pa
 
     hands.close = bad_close                            # type: ignore[method-assign]
     d = OpenHandsDriver(tmp_path, lambda p, on_event: hands, close_wait=0.2)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     got: list[Any] = []
     t = threading.Thread(target=lambda: got.append(d.send_turn("x")), daemon=True)
     t.start()
@@ -863,7 +873,7 @@ def test_close_is_bounded_and_a_turn_outliving_it_releases_on_its_return(tmp_pat
     hands = _Hands()
     hands.request_stop = lambda: hands.log.append("stop-ignored")   # type: ignore[method-assign]
     d = OpenHandsDriver(tmp_path, lambda p, on_event: hands, close_wait=0.3)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     t = threading.Thread(target=lambda: d.send_turn("x"), daemon=True)
     t.start()
     assert hands.entered.wait(5)
@@ -966,7 +976,7 @@ def test_a_raise_anywhere_in_a_turn_never_leaves_the_guard_set(tmp_path, lineno)
     s = _Counted()
     s.stop.set()
     d = OpenHandsDriver(tmp_path, lambda p, on_event: s, close_wait=0.5)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     if not _traced(OpenHandsDriver._run, lineno, lambda: d.send_turn("x")):
         pytest.skip("line not executed on this path")
     assert d.state != "active"
@@ -980,7 +990,7 @@ def test_a_raise_anywhere_in_close_still_releases_exactly_once(tmp_path, lineno,
     one to release; a later close() then waited on a release that never came."""
     s = _Counted()
     d = OpenHandsDriver(tmp_path, lambda p, on_event: s, close_wait=0.5)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     t = None
     if busy:
         t = threading.Thread(target=lambda: d.send_turn("x"), daemon=True)
@@ -1008,7 +1018,7 @@ def test_a_raise_anywhere_in_open_leaves_the_driver_closed_and_nothing_leaked(tm
         return built[-1]
 
     d = OpenHandsDriver(tmp_path, opener, close_wait=0.5)
-    if not _traced(OpenHandsDriver.open, lineno, lambda: d.open(lambda e: None)):
+    if not _traced(OpenHandsDriver.open, lineno, lambda: d.open(lambda e: None, on_released=_unheard)):
         pytest.skip("line not executed on this path")
     assert _closes_promptly(d) and d.state == "closed"
     assert all(b.closes == 1 for b in built)
@@ -1029,7 +1039,7 @@ def test_a_blank_digest_cannot_bind_an_approval(tmp_path):
     sid, _ = _open(host, "alpha")
     st = _wait(host, host.turn(sid, "go")["job_id"])
     assert st["status"] == "failed" and "blank" in st["error"]
-    assert not [c for c in d.calls if c[0] == "approve"] and host.session_status(sid)["state"] == "broken"
+    _until(lambda: not [c for c in d.calls if c[0] == "approve"] and host.session_status(sid)["state"] == "broken", what="the release")
 
 
 def test_a_timed_out_outcome_without_an_error_breaks_the_session(tmp_path):
@@ -1040,7 +1050,7 @@ def test_a_timed_out_outcome_without_an_error_breaks_the_session(tmp_path):
     sid, _ = _open(host, "alpha")
     st = _wait(host, host.turn(sid, "go")["job_id"])
     assert st["status"] == "failed" and "timed out but carries no error" in st["error"]
-    assert host.session_status(sid)["state"] == "broken" and d.closed
+    _until(lambda: host.session_status(sid)["state"] == "broken" and d.closed, what="the release")
 
 
 def test_a_whitespace_tool_name_is_no_tool_name():
@@ -1071,7 +1081,7 @@ def test_a_blocking_native_close_does_not_hold_close_and_the_slot_stays_counted(
 
     s = Sess()
     d = OpenHandsDriver(tmp_path, lambda p, on_event: s, close_wait=0.3)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     started = time.monotonic()
     d.close()
     assert time.monotonic() - started < 2 and not d.wait_closed(0)
@@ -1098,7 +1108,7 @@ def test_a_blocking_native_close_does_not_hold_close_and_the_slot_stays_counted(
     end = time.monotonic() + 5
     while host.session_status(sid)["state"] != "closed" and time.monotonic() < end:
         time.sleep(0.02)
-    assert host.session_status(sid)["state"] == "closed"
+    _until(lambda: host.session_status(sid)["state"] == "closed", what="the release")
     _open(host, "beta")                                    # and comes back once released
     host.shutdown()
 
@@ -1124,40 +1134,54 @@ def test_a_broken_turn_whose_teardown_raises_still_publishes_its_result(tmp_path
 # -- L1 on 3331e91..3328b56 -----------------------------------------------------------------------------------
 
 
+class _Trigger:
+    """`done.set()` for a fake whose release ends later: it REPORTS the release (the push contract)."""
+
+    def __init__(self, report):
+        self._report = report
+
+    def set(self):
+        self._report(None)
+
+
 class _LateRelease(_Fake):
-    """A driver whose close() returns before everything is released, until `done` is set."""
+    """A driver whose close() returns before everything is released; it reports when `done` is set."""
 
     def __init__(self, script=None):
         super().__init__(script or [])
-        self.done = threading.Event()
-        self.asks = 0
+        self.done = _Trigger(self.report)
 
-    def wait_closed(self, timeout):
-        self.asks += 1
-        return self.done.wait(timeout if timeout is not None else 10)
+    def close(self):
+        self.closed, self._state = True, "closed"        # no report yet
 
 
-def test_a_reaper_whose_driver_cannot_say_does_not_spin(tmp_path, monkeypatch):
-    """L1 (RAN): `wait_closed` raising made the reaper's 60 s poll a 0 s poll, ~3M calls a second."""
+def test_a_driver_that_never_reports_is_release_failed_at_the_deadline(tmp_path, monkeypatch):
+    """Ruling 2026-10-07 (B): the host never asks a driver whether it released; a driver that has not
+    REPORTED by the deadline reads release_failed, still counted, and nothing is polled meanwhile."""
     import levain.chat as chat
 
-    monkeypatch.setattr(chat, "_REAP_POLL_SECONDS", 0.2)
+    monkeypatch.setattr(chat, "_REPORT_SECONDS", 0.3)
 
-    class Mute(_Fake):
+    class Asked(_LateRelease):
         asks = 0
 
         def wait_closed(self, timeout):
-            self.asks += 1
-            raise OSError("cannot tell")
+            Asked.asks += 1
+            return False
 
-    d = Mute([])
-    host = _host(tmp_path, {"alpha": d})
+        def release_error(self):
+            Asked.asks += 1
+            return None
+
+    d = Asked()
+    host = _host(tmp_path, {"alpha": d}, max_sessions=1)
     sid, _ = _open(host, "alpha")
-    host.close(sid)
-    time.sleep(1.0)
-    # a driver that cannot say whether it released is recorded, not polled forever (ruled 2026-10-07)
-    assert d.asks < 20 and host.session_status(sid)["state"] == "release_failed"
-    assert "cannot tell" in host.session_status(sid)["error"]
+    assert host.close(sid)["state"] == "closing"
+    _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the deadline")
+    assert "did not report" in host.session_status(sid)["error"] and Asked.asks == 0
+    with pytest.raises(ChatError) as e:
+        host.open("alpha")
+    assert e.value.code == "too_many_sessions"
 
 
 def test_shutdown_closes_sessions_side_by_side(tmp_path):
@@ -1197,27 +1221,24 @@ def test_a_settle_that_fails_after_a_late_release_still_ends_the_record(tmp_path
     end = time.monotonic() + 5
     while host.session_status(sid)["state"] == "busy" and time.monotonic() < end:
         time.sleep(0.02)
-    assert host.session_status(sid)["state"] == "broken" and host.job_status(job.job_id)["status"] == "failed"
+    _until(lambda: host.session_status(sid)["state"] == "broken" and host.job_status(job.job_id)["status"] == "failed", what="the release")
 
 
 # -- L3 r2 (input 74542a05e53135bf) and the 2026-10-07 ruling on a failed release ------------------------------
 
 
 class _Forcing(_Fake):
-    """A driver whose graceful release fails and that has an escalation of its own (an old-style
-    force_release a host could have called)."""
+    """A driver whose release fails, and that has a force_release a host could be tempted to call."""
 
     def __init__(self):
         super().__init__([])
         self.forced = 0
 
-    def wait_closed(self, timeout):
-        return False
+    def close(self):
+        self.closed = True
+        self.report("OSError: the shell would not stop")
 
-    def release_error(self):
-        return "OSError: the shell would not stop"
-
-    def force_release(self, native):
+    def force_release(self, native=None):
         self.forced += 1
 
 
@@ -1237,22 +1258,24 @@ def test_a_failed_release_stays_counted_and_the_host_never_forces_it(tmp_path):
     assert e.value.code == "too_many_sessions"
 
 
-def test_the_reaper_does_not_spin_on_a_driver_that_answers_at_once(tmp_path):
-    """codex r2 MED: `wait_closed(timeout)` may answer False at once (it is "at most"), and the reaper then
-    looped with no pause; it now asks each pending driver once per sweep."""
-    class Quick(_Fake):
-        asks = 0
-
+def test_the_host_never_polls_a_driver_for_its_release(tmp_path):
+    """Ruling 2026-10-07 (B): the polling is deleted, not bounded. A driver whose probes would block forever
+    is never asked, and its report still settles the record."""
+    class Never(_LateRelease):
         def wait_closed(self, timeout):
-            self.asks += 1
-            return False
+            raise AssertionError("the host polled wait_closed")
 
-    d = Quick([])
+        def release_error(self):
+            raise AssertionError("the host polled release_error")
+
+    d = Never()
     host = _host(tmp_path, {"alpha": d})
     sid, _ = _open(host, "alpha")
     host.close(sid)
-    time.sleep(1.0)
-    assert d.asks < 20 and host.session_status(sid)["state"] == "closing"
+    time.sleep(0.3)
+    assert host.session_status(sid)["state"] == "closing"
+    d.done.set()
+    _until(lambda: host.session_status(sid)["state"] == "closed", what="the report")
 
 
 def test_a_drivers_banner_cannot_overwrite_the_hosts_fields(tmp_path):
@@ -1292,7 +1315,7 @@ def test_no_teardown_needs_a_new_thread(tmp_path, monkeypatch):
             gate.wait(10)
 
     d = OpenHandsDriver(tmp_path, lambda p, on_event: Sess(), close_wait=0.3)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
 
     def no_threads(self):
         raise RuntimeError("can't start new thread")
@@ -1322,7 +1345,7 @@ def test_a_broken_turns_outcome_is_published_before_its_release_ends(tmp_path):
     end = time.monotonic() + 5
     while host.session_status(sid)["state"] != "broken" and time.monotonic() < end:
         time.sleep(0.02)
-    assert host.session_status(sid)["state"] == "broken"
+    _until(lambda: host.session_status(sid)["state"] == "broken", what="the release")
 
 
 def test_a_host_with_its_own_drivers_builds_no_openhands_opener(tmp_path, monkeypatch):
@@ -1382,25 +1405,15 @@ def _raising(method: str, base: type[_Fake] = _Fake, **kw):
     return Raises(**kw) if kw else Raises([])
 
 
-@pytest.mark.parametrize("method", ["close", "wait_closed", "release_error"])
-def test_nothing_a_release_probe_raises_escapes_and_the_record_stays_counted(tmp_path, escaped, method):
-    """codex r3 HIGH (RAN): `wait_closed` raising a BaseException escaped `_released()`, so `_close_then` never
-    queued the driver, the record stayed closing for good and, on the reaper, the one reaper thread died.
-    Through the boundary every such raise ends the record release_failed, with the error's class."""
-    if method == "release_error":
-        class Late(_Fake):
-            def wait_closed(self, timeout):
-                return False
-
-        d = _raising(method, Late)
-    else:
-        d = _raising(method)
+def test_a_close_that_raises_anything_is_a_failed_release_and_nothing_escapes(tmp_path, escaped):
+    """codex r3 HIGH (RAN), the close half: a BaseException from close() escaped and stranded the record.
+    Through the boundary it ends release_failed, with the error's class, counted."""
+    d = _raising("close")
     host = _host(tmp_path, {"alpha": d, "beta": _Fake([])}, max_sessions=2)
     sid, _ = _open(host, "alpha")
     host.close(sid)
     _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the failed release")
     assert "_Escape" in host.session_status(sid)["error"]
-    assert host._reaper_thread.is_alive()
     _open(host, "beta")                    # the host still works, and the failed slot is still counted
     with pytest.raises(ChatError) as e:
         host.open("beta")
@@ -1408,21 +1421,21 @@ def test_nothing_a_release_probe_raises_escapes_and_the_record_stays_counted(tmp
     assert escaped == []
 
 
-def test_a_release_failing_on_the_reaper_does_not_strand_the_others(tmp_path, escaped):
-    """codex r3 HIGH, the reaper half: a probe raising on the reaper killed it, stranding every pending release."""
-    class Raises(_LateRelease):
-        def release_error(self):
-            raise _Escape("release_error escaped")
+def test_one_driver_that_never_reports_does_not_hold_up_the_others(tmp_path, monkeypatch, escaped):
+    """codex r3 HIGH, the reaper half: one bad driver stranded every pending release. Now nothing is shared
+    but the deadline clock: the silent one goes release_failed, the other settles on its report."""
+    import levain.chat as chat
 
-    bad, good = Raises(), _LateRelease()
+    monkeypatch.setattr(chat, "_REPORT_SECONDS", 0.3)
+    bad, good = _LateRelease(), _LateRelease()
     host = _host(tmp_path, {"bad": bad, "good": good})
     s_bad, _ = _open(host, "bad")
     s_good, _ = _open(host, "good")
     host.close(s_bad)
     host.close(s_good)
-    _until(lambda: host.session_status(s_bad)["state"] == "release_failed", what="the bad release")
     good.done.set()
     _until(lambda: host.session_status(s_good)["state"] == "closed", what="the good release")
+    _until(lambda: host.session_status(s_bad)["state"] == "release_failed", what="the bad release")
     assert escaped == []
 
 
@@ -1476,59 +1489,69 @@ def test_the_host_holds_no_driver_method():
 
     contract = {n for n in dir(HarnessDriver) if not n.startswith("_")}
     exposed = {n for n in dir(_DriverProxy) if not n.startswith("_")}
-    assert exposed == {"call", "read", "harness", "caps"}
+    assert exposed == {"call", "read", "harness", "caps", "make", "submit_close", "retire", "release",
+                       "early_report"}
     assert exposed & contract == {"harness", "caps"}       # values, read once through the boundary
-    proxy = _DriverProxy(_Fake([]))
+    proxy = _DriverProxy("t")
+    assert proxy.make(lambda: _Fake([]), timeout=2).ok
     with pytest.raises(AttributeError):
         proxy.close  # noqa: B018
+    proxy.retire()
 
 
-def test_a_probe_that_blocks_past_its_bound_is_not_asked_again(tmp_path, monkeypatch):
-    """A release probe the contract says does not block, blocking, holds the reaper every session shares:
-    its release counts as unconfirmed and it is not asked again."""
+def test_a_driver_that_does_not_answer_fails_closed_and_can_still_be_closed(tmp_path, monkeypatch):
+    """L2 r4 + complement r4 (ruling: no host call waits unbounded on driver code). A held_digest that never
+    returns: the approve is refused ("the driver did not answer"), nothing runs, and the session reads
+    unresponsive, which close acts on (it is never treated as busy)."""
     import levain.chat as chat
 
-    monkeypatch.setattr(chat, "_PROBE_SECONDS", 0.05)
+    monkeypatch.setattr(chat, "_CALL_SECONDS", 0.2)
+    gate = threading.Event()
 
-    class Slow(_Fake):
-        asks = 0
+    class Hung(_Fake):
+        def held_digest(self):
+            gate.wait(10)
+            return "d1"
 
-        def wait_closed(self, timeout):
-            Slow.asks += 1
-            time.sleep(0.2)
-            return False
-
-    host = _host(tmp_path, {"alpha": Slow([])})
+    d = Hung([_halt()])
+    host = _host(tmp_path, {"alpha": d}, max_sessions=1)
     sid, _ = _open(host, "alpha")
-    view = host.close(sid)
-    assert view["state"] == "release_failed" and "past its deadline" in view["error"]
-    time.sleep(0.5)
-    assert Slow.asks == 1
+    did = _wait(host, host.turn(sid, "go")["job_id"])["result"]["decision_id"]
+    started = time.monotonic()
+    with pytest.raises(ChatError) as e:
+        host.approve(sid, expect=did)
+    assert e.value.code == "unresponsive" and time.monotonic() - started < 2
+    assert host.session_status(sid)["state"] == "unresponsive"
+    assert not [c for c in d.calls if c[0] == "approve"]
+    host.close(sid)                                   # the release lane is not the stuck one
+    _until(lambda: host.session_status(sid)["state"] == "closed", what="the close")
+    gate.set()
 
 
-def test_the_reaper_exits_once_the_host_is_shut_and_nothing_is_pending(tmp_path):
-    """codex r3 MED + complement r3 LOW (ruling (a)): every host kept a reaper thread, and the host graph,
-    forever. It exits once shut with nothing queued; a release in flight at shutdown is finished first."""
-    host = _host(tmp_path, {"alpha": _Fake([])})
-    _open(host, "alpha")
-    host.shutdown()
-    host._reaper_thread.join(2)
-    assert not host._reaper_thread.is_alive()
-
+def test_the_reaper_starts_with_the_first_open_and_exits_when_nothing_is_live(tmp_path):
+    """codex r3/r4 MED + complement LOW (ruling: lazy). A host holds no reaper until an open, and the reaper
+    exits once no session can start a release and no report is awaited, so a host nobody shut down holds no
+    thread. A release in flight keeps it."""
     late = _LateRelease()
-    host = _host(tmp_path, {"alpha": late})
+    host = _host(tmp_path, {"alpha": late, "beta": _Fake([])})
+    assert host._reaper_thread is None
     sid, _ = _open(host, "alpha")
-    host.shutdown()
-    time.sleep(0.3)
-    assert host._reaper_thread.is_alive() and host.session_status(sid)["state"] == "closing"
+    reaper = host._reaper_thread
+    assert reaper is not None and reaper.is_alive()
+    host.close(sid)
+    time.sleep(1.5)
+    assert reaper.is_alive() and host.session_status(sid)["state"] == "closing"
     late.done.set()
-    host._reaper_thread.join(2)
-    assert not host._reaper_thread.is_alive() and host.session_status(sid)["state"] == "closed"
+    reaper.join(3)
+    assert not reaper.is_alive() and host._reaper_thread is None
+    _until(lambda: host.session_status(sid)["state"] == "closed", what="the release")
+    _open(host, "beta")                              # the next open starts it again
+    assert host._reaper_thread is not None and host._reaper_thread.is_alive()
 
 
-def test_shutdown_never_runs_a_close_in_place_of_a_closer_that_could_not_start(tmp_path, monkeypatch):
-    """codex r3 MED (ruling (c)): under thread exhaustion shutdown ran each close inline, serially and
-    unbounded. The record is left counted, release_failed, and says the closer could not start."""
+def test_shutdown_starts_no_thread(tmp_path, monkeypatch):
+    """codex r3 MED (ruling (c)): shutdown started a closer thread per session and, when one could not
+    start, ran the close inline. Every close now goes on its driver's own release lane, started at open."""
     d = _Fake([])
     host = _host(tmp_path, {"alpha": d})
     sid, _ = _open(host, "alpha")
@@ -1539,9 +1562,8 @@ def test_shutdown_never_runs_a_close_in_place_of_a_closer_that_could_not_start(t
     monkeypatch.setattr(threading.Thread, "start", no_threads)
     host.shutdown()
     monkeypatch.undo()
-    view = host.session_status(sid)
-    assert not d.closed
-    assert view["state"] == "release_failed" and "closer could not start" in view["error"]
+    assert d.closed
+    _until(lambda: host.session_status(sid)["state"] == "closed", what="the release")
 
 
 class _NativeRaises:
@@ -1562,7 +1584,7 @@ def test_a_native_close_that_raises_any_baseexception_is_not_a_release(tmp_path)
     """codex r3 HIGH: a TurnTimeout (a BaseException) from the native close skipped recording the failure,
     and the phase still went to closed, so wait_closed() read True for a shell that may be live."""
     d = OpenHandsDriver(tmp_path, lambda p, on_event: _NativeRaises(_Escape("mid-teardown")), close_wait=2)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     with pytest.raises(RuntimeError, match="release failed"):
         d.close()
     assert not d.wait_closed(0) and "_Escape" in d.release_error()
@@ -1582,7 +1604,7 @@ def test_the_driver_escalates_on_its_own_release_worker(tmp_path, force_ok):
             return True
 
     d = Forcing(tmp_path, lambda p, on_event: _NativeRaises(OSError("would not stop")), close_wait=2)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     if force_ok:
         d.close()
         assert d.wait_closed(0) and d.release_error() is None
@@ -1602,7 +1624,7 @@ def test_the_release_worker_exits_when_the_phase_reaches_closed(tmp_path):
             pass
 
     d = OpenHandsDriver(tmp_path, lambda p, on_event: Sess(), close_wait=2)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     d.close()
     d._worker.join(2)
     assert not d._worker.is_alive()
@@ -1612,7 +1634,7 @@ def test_the_release_worker_exits_when_the_phase_reaches_closed(tmp_path):
 
     d = OpenHandsDriver(tmp_path, opener, close_wait=2)
     with pytest.raises(OSError):
-        d.open(lambda e: None)
+        d.open(lambda e: None, on_released=_unheard)
     d._worker.join(2)
     assert not d._worker.is_alive() and d.wait_closed(0)
 
@@ -1665,71 +1687,72 @@ def test_a_session_whose_close_lookup_raises_is_not_released(tmp_path, escaped):
             raise AttributeError(name)
 
     d = OpenHandsDriver(tmp_path, lambda p, on_event: Sess(), close_wait=2)
-    d.open(lambda e: None)
+    d.open(lambda e: None, on_released=_unheard)
     with pytest.raises(RuntimeError, match="close lookup broke"):
         d.close()
     assert not d.wait_closed(0) and "close lookup broke" in d.release_error()
     assert escaped == []
 
 
-@pytest.mark.parametrize("probe", ["wait_closed", "release_error"])
-def test_a_probe_answering_with_the_wrong_type_is_a_failed_release(tmp_path, escaped, probe):
-    """L2 r4 (RAN): wait_closed returning None (a forgotten return) left the record closing forever with no
-    error; L1 r4 HIGH (RAN): str() of release_error's value ran driver code outside the boundary, and a
-    raising __str__ left the record closing with nothing queued."""
-    class BadStr:
+@pytest.mark.parametrize("report", [5, "str-subclass"])
+def test_a_release_report_that_breaks_the_contract_is_a_failed_release(tmp_path, escaped, report):
+    """L2 r4 (RAN): a probe answering None left the record closing forever; L1 r4 (RAN): str() of a reported
+    value ran driver code. A report that is neither None nor exactly str is a contract violation:
+    release_failed, never "still releasing", and no driver code runs reading it."""
+    class BadStr(str):
         def __str__(self):
             raise RuntimeError("str broke")
 
-    class Bad(_Fake):
-        def wait_closed(self, timeout):
-            return None if probe == "wait_closed" else False
+    class Bad(_LateRelease):
+        def close(self):
+            self.closed = True
+            self.on_released(BadStr("x") if report == "str-subclass" else report)
 
-        def release_error(self):
-            return BadStr() if probe == "release_error" else None
-
-    host = _host(tmp_path, {"alpha": Bad([])})
+    host = _host(tmp_path, {"alpha": Bad()})
     sid, _ = _open(host, "alpha")
-    view = host.close(sid)
-    assert view["state"] == "release_failed" and "DriverContractError" in view["error"]
+    host.close(sid)
+    _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the contract")
+    assert "driver contract" in host.session_status(sid)["error"]
     assert escaped == []
 
 
 def test_a_late_confirmation_still_frees_the_slot(tmp_path, monkeypatch):
-    """L2 r4 (RAN): a wait_closed that confirmed the release 0.2 s past the probe deadline cost the slot until
-    restart, though the driver said the shell is gone. A late confirmation settles (and is logged)."""
+    """Ruling 2026-10-07: release_failed means "not confirmed YET". A release reported after the deadline,
+    or after a close that raised, frees the slot, and the session says it was released late."""
     import levain.chat as chat
 
-    monkeypatch.setattr(chat, "_PROBE_SECONDS", 0.05)
-
-    class Slow(_Fake):
-        def wait_closed(self, timeout):
-            time.sleep(0.2)
-            return True
-
-    host = _host(tmp_path, {"alpha": Slow([])}, max_sessions=1)
+    monkeypatch.setattr(chat, "_REPORT_SECONDS", 0.2)
+    d = _LateRelease()
+    host = _host(tmp_path, {"alpha": d, "beta": _Fake([])}, max_sessions=1)
     sid, _ = _open(host, "alpha")
-    assert host.close(sid)["state"] == "closed"
+    host.close(sid)
+    _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the deadline")
+    d.done.set()
+    view = host.session_status(sid)
+    assert view["state"] == "closed" and view["released_late"] and "release_failed_since" not in view
+    _open(host, "beta")                              # the slot is free
 
 
 def test_a_fault_in_reaping_ends_the_record_rather_than_retrying_forever(tmp_path, monkeypatch):
-    """L1 r4: the reaper's catch-all left the item queued, retried every sweep, forever."""
+    """L1 r4: the reaper's catch-all left a faulting item queued and retried it forever. A deadline is
+    handled once: a fault in handling it still ends the record release_failed, and is not retried."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_REPORT_SECONDS", 0.2)
     late = _LateRelease()
     host = _host(tmp_path, {"alpha": late})
     sid, _ = _open(host, "alpha")
-    host.close(sid)
     calls = []
-    real = host._after_close
 
-    def broken(item):
+    def broken(item, failure):
         calls.append(1)
         raise RuntimeError("host bug")
 
-    monkeypatch.setattr(host, "_after_close", broken)
+    monkeypatch.setattr(host, "_release_failed", broken)
+    host.close(sid)
     _until(lambda: host.session_status(sid)["state"] == "release_failed", what="the reaper")
-    time.sleep(0.6)
-    assert len(calls) == 1 and host._reaping == []
-    monkeypatch.setattr(host, "_after_close", real)
+    time.sleep(0.5)
+    assert len(calls) == 1 and host._reports == []
 
 
 def test_a_failed_turns_outcome_is_published_before_its_close_returns(tmp_path):
@@ -1740,6 +1763,7 @@ def test_a_failed_turns_outcome_is_published_before_its_close_returns(tmp_path):
         def close(self):
             assert gate.wait(10)
             self.closed = True
+            self.report()
 
     d = SlowClose([_Out(reply=None, error="boom")])
     host = _host(tmp_path, {"alpha": d})
@@ -1867,7 +1891,7 @@ def test_a_factory_raising_an_unprintable_exception_is_an_ordinary_failed_open(t
     out = host.open("alpha")
     st = _wait(host, out["job_id"])
     assert st["status"] == "failed" and "unprintable" in st["error"]
-    assert host.session_status(out["session_id"])["state"] == "failed"
+    _until(lambda: host.session_status(out["session_id"])["state"] == "failed", what="the release")
     assert escaped == []
 
 
@@ -1933,3 +1957,113 @@ def test_a_reject_binds_to_the_halt_its_caller_saw(tmp_path):
             host.reject(sid, "no", **kw)
         assert e.value.code in ("decision_id_required", "stale_decision")
     assert [c[0] for c in d.calls].count("reject") == 1
+
+
+# -- the 2026-10-07 rulings after r4: every host->driver call on the driver's lanes, with a deadline ----------
+
+
+def test_a_turn_the_driver_never_returns_fails_and_the_session_is_released(tmp_path, monkeypatch):
+    """No host call waits unbounded on driver code: a turn call past turn_seconds plus the grace fails ("the
+    driver did not answer"), and the session is closed on its release lane, which the stuck turn lane does
+    not block."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_TURN_GRACE_SECONDS", 0.2)
+    gate = threading.Event()
+
+    class Hung(_Fake):
+        def send_turn(self, message):
+            gate.wait(10)
+            return read_outcome(_Out())
+
+    host = _host(tmp_path, {"alpha": Hung([])}, turn_seconds=0.2)
+    sid, _ = _open(host, "alpha")
+    st = _wait(host, host.turn(sid, "go")["job_id"], timeout=5)
+    assert st["status"] == "failed" and "did not answer" in st["error"]
+    _until(lambda: host.session_status(sid)["state"] == "broken", what="the release")
+    gate.set()
+
+
+@pytest.mark.parametrize("where", ["make", "open", "describe"])
+def test_an_open_the_driver_never_finishes_fails_closed(tmp_path, monkeypatch, where):
+    """The factory, open() and describe() run on the driver's lanes with deadlines too."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_OPEN_SECONDS", 0.3)
+    monkeypatch.setattr(chat, "_CALL_SECONDS", 0.3)
+    gate = threading.Event()
+
+    class Slow(_Fake):
+        def open(self, on_event, *, on_released, resume=None):
+            super().open(on_event, on_released=on_released)
+            if where == "open":
+                gate.wait(10)
+
+        def describe(self):
+            if where == "describe":
+                gate.wait(10)
+            return super().describe()
+
+    def factory(name, path):
+        if where == "make":
+            gate.wait(10)
+        return Slow([])
+
+    host = ChatHost({"alpha": tmp_path}, driver_factory=factory, max_sessions=1)
+    out = host.open("alpha")
+    st = _wait(host, out["job_id"], timeout=5)
+    assert st["status"] == "failed" and "did not answer" in st["error"]
+    _until(lambda: host.session_status(out["session_id"])["state"] == "failed", what="the release")
+    gate.set()
+
+
+def test_a_stop_request_the_driver_never_answers_does_not_hold_the_watcher(tmp_path, monkeypatch):
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_CALL_SECONDS", 0.1)
+    gate, stop = threading.Event(), threading.Event()
+
+    class Stuck(_Fake):
+        def send_turn(self, message):
+            assert stop.wait(10)
+            return read_outcome(_Out())
+
+        def interrupt(self):
+            gate.wait(10)       # never answers within the deadline
+
+    host = _host(tmp_path, {"alpha": Stuck([])}, turn_seconds=0.1)
+    sid, _ = _open(host, "alpha")
+    job = host.turn(sid, "go")["job_id"]
+    _until(lambda: host.job_status(job)["deadline_hit"], what="the deadline")
+    time.sleep(0.5)
+    stop.set()
+    assert _wait(host, job)["status"] == "done"
+    gate.set()
+
+
+def test_a_release_reported_before_close_is_still_heard(tmp_path):
+    """A driver may report before close is called (its failed open released what it built)."""
+    class Early(_Fake):
+        def open(self, on_event, *, on_released, resume=None):
+            super().open(on_event, on_released=on_released)
+            self.report()
+            raise OSError("no entity")
+
+        def close(self):
+            self.closed = True       # already reported
+
+    host = _host(tmp_path, {"alpha": Early([])}, max_sessions=1)
+    out = host.open("alpha")
+    assert _wait(host, out["job_id"])["status"] == "failed"
+    _until(lambda: host.session_status(out["session_id"])["state"] == "failed", what="the release")
+
+
+def test_a_closed_drivers_lanes_exit(tmp_path):
+    d = _Fake([])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    lanes = list(host._sessions[sid].driver._lanes.values())
+    host.close(sid)
+    for lane in lanes:
+        lane._thread.join(2)
+        assert not lane._thread.is_alive()

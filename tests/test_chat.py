@@ -272,7 +272,7 @@ def test_a_broken_sessions_shell_is_released_before_it_reads_broken(tmp_path):
     seen = []
     f.made[0].close = lambda: seen.append(host.session_status(sid)["state"])
     _wait(host, host.turn(sid, "x")["job_id"])
-    assert seen == ["busy"] and host.session_status(sid)["state"] == "broken"
+    _until(lambda: seen == ["busy"] and host.session_status(sid)["state"] == "broken", what="the release")
 
 
 def test_a_failed_open_keeps_the_message_text_and_never_the_exception(tmp_path):
@@ -334,7 +334,7 @@ def test_a_broken_session_does_not_hold_a_slot_and_ended_ones_are_pruned(tmp_pat
     host = _host(tmp_path, f, max_sessions=1)
     broken = _opened(host)
     _wait(host, host.turn(broken, "x")["job_id"])
-    assert host.session_status(broken)["state"] == "broken"
+    _until(lambda: host.session_status(broken)["state"] == "broken", what="the release")
     later = []
     for _ in range(3):
         sid = _opened(host)          # the broken one does not count against max_sessions=1
@@ -373,7 +373,7 @@ def test_a_base_exception_from_a_turn_settles_the_job_and_frees_the_slot(tmp_pat
     f.made[0].run_turn = lambda m: (_ for _ in ()).throw(_Escape("stop"))
     st = _wait(host, host.turn(sid, "x")["job_id"])
     assert st["status"] == "failed" and "_Escape" in st["error"]
-    assert host.session_status(sid)["state"] == "broken" and f.made[0].closed
+    _until(lambda: host.session_status(sid)["state"] == "broken" and f.made[0].closed, what="the release")
     _opened(host)   # the slot came back
 
 
@@ -393,7 +393,8 @@ def test_a_fault_while_settling_a_job_still_settles_it(tmp_path):
     out = host.open("alpha")
     st = _wait(host, out["job_id"])
     assert st["status"] == "failed" and "label broke" in st["error"]
-    assert host.session_status(out["session_id"])["state"] == "failed"
+    # the job is published before the release (glm L3 r2); the record follows the driver's report
+    _until(lambda: host.session_status(out["session_id"])["state"] == "failed", what="the release")
     assert made[0].closed
 
 
@@ -409,7 +410,7 @@ def test_shutdown_during_a_turn_closes_the_session_when_the_turn_ends(tmp_path):
     assert host.session_status(sid)["state"] == "busy" and not f.made[0].closed
     hold.set()
     _wait(host, job)
-    assert host.session_status(sid)["state"] == "closed" and f.made[0].closed
+    _until(lambda: host.session_status(sid)["state"] == "closed" and f.made[0].closed, what="the release")
 
 
 def test_shutdown_during_an_open_closes_the_session_it_opened(tmp_path):
@@ -427,7 +428,7 @@ def test_shutdown_during_an_open_closes_the_session_it_opened(tmp_path):
     gate.set()
     st = _wait(host, out["job_id"])
     assert st["status"] == "failed" and "shut down" in st["error"]
-    assert host.session_status(out["session_id"])["state"] == "closed" and made[0].closed
+    _until(lambda: host.session_status(out["session_id"])["state"] == "closed" and made[0].closed, what="the release")
 
 
 def test_a_worker_that_cannot_start_leaves_nothing_behind(tmp_path, monkeypatch):
@@ -640,7 +641,7 @@ def test_shutdown_closes_every_idle_session_and_refuses_new_work(tmp_path):
     sid = _opened(host)
     host.shutdown()
     assert f.made[0].closed is True
-    assert host.session_status(sid)["state"] == "closed"
+    _until(lambda: host.session_status(sid)["state"] == "closed", what="the release")
     with pytest.raises(ChatError) as e:
         host.open("alpha")
     assert e.value.http_status == 503
@@ -917,7 +918,7 @@ def test_a_turn_past_its_deadline_is_stopped_and_its_session_released(tmp_path):
     sid = _opened(host)
     st = _wait(host, host.turn(sid, "long")["job_id"])
     assert st["deadline_hit"] is True and st["result"]["timed_out"] is True
-    assert host.session_status(sid)["state"] == "broken" and made[0].closed
+    _until(lambda: host.session_status(sid)["state"] == "broken" and made[0].closed, what="the release")
     assert made[0].stops >= 1
 
 
@@ -1004,7 +1005,7 @@ def test_a_session_being_closed_still_holds_its_slot(tmp_path):
     assert e.value.http_status == 409
     release.set()
     closer.join(5)
-    assert host.session_status(sid)["state"] == "closed" and made[0].closed
+    _until(lambda: host.session_status(sid)["state"] == "closed" and made[0].closed, what="the release")
     _opened(host, "beta")
 
 
@@ -1247,7 +1248,7 @@ def test_a_watcher_that_does_not_exit_breaks_the_session(tmp_path, monkeypatch):
     try:
         st = _wait(host, host.turn(sid, "x")["job_id"])
         assert st["status"] == "failed" and "watcher did not exit" in st["error"]
-        assert host.session_status(sid)["state"] == "broken" and made[0].closed
+        _until(lambda: host.session_status(sid)["state"] == "broken" and made[0].closed, what="the release")
     finally:
         made[0].release.set()
 
