@@ -129,7 +129,7 @@ def test_governed_lifecycle_over_a_real_store(tmp_path):
     # re-ratify (promote posture) atomically → old revoked, new active, exactly one fireable
     promoted = _binding(posture=Posture.ON_LOOP)
     assert promoted.binding_id != b.binding_id
-    assert store.replace_atomic(b.binding_id, promoted) is True
+    assert store.replace_atomic(after, promoted)
     assert store.get(b.binding_id).status is BindingStatus.REVOKED   # type: ignore[union-attr]
     assert {x.binding_id for x in store.list_active()} == {promoted.binding_id}
 
@@ -141,3 +141,4 @@ def test_governed_lifecycle_over_a_real_store(tmp_path):
             rec["posture"] = "ABOVE_LOOP"     # widen autonomy without re-ratifying
     store.path.write_text(json.dumps(raw))
     assert store.list_active() == []          # the widened grant cannot fire
+    assert "seals to" in (store.integrity() or "")   # and the registry says why it reads empty

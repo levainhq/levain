@@ -27,7 +27,11 @@ The monitor reads ONE optional machine-checkable key, ``bound`` — a determinis
 same grammar a kill uses) describing the envelope the actual post-state must satisfy. A
 ``predicted_trajectory`` with NO ``bound`` is DESCRIPTIVE-only (free-form text/structure for the human);
 the monitor is INERT for it (there is no envelope to violate) — prediction-error protection is OPT-IN
-via the ``bound``, the same way a kill is opt-in via ``kill_predicate``.
+via the ``bound``, the same way a kill is opt-in via ``kill_predicate``. Opting in is the KEY, not its
+value: a ``bound`` key that is present but holds no predicate (``null``, a string, a list) is not
+"no bound". It is an envelope that cannot be evaluated, and an absent envelope is not consent to fire
+unwatched, so it is refused at bind time (:func:`assert_trajectory_pure`) and, if one reaches the
+fire path anyway, reads as diverged (:func:`within_envelope` returns ``UNKNOWN``).
 
 Stdlib-only; corpus-agnostic; pure. The ``TrajectoryObserver`` seam is INJECTED (Slice 4 wires the
 real world-observation; the core never observes the world directly — the anti-cycle rule).
@@ -41,6 +45,7 @@ from levain.autonomic.kill import Kleene, KillImpurityError, assert_kill_pure, k
 __all__ = [
     "TrajectoryObserver",
     "trajectory_bound",
+    "bound_declared",
     "assert_trajectory_pure",
     "within_envelope",
     "prediction_diverged",
@@ -63,12 +68,19 @@ class TrajectoryObserver(Protocol):
 
 def trajectory_bound(predicted_trajectory: Any) -> dict[str, Any] | None:
     """Extract the machine-checkable envelope predicate from a ``predicted_trajectory``, or ``None``
-    if it is descriptive-only (no ``bound`` key, or a non-dict trajectory). Centralizes the opt-in
-    contract so the compiler (purity-check) and the gate (run-time) read the SAME key."""
+    if there is none to evaluate (no ``bound`` key, a non-dict trajectory, or a ``bound`` that is not a
+    predicate — :func:`bound_declared` tells the last case apart). Centralizes the opt-in contract so
+    the compiler (purity-check) and the gate (run-time) read the SAME key."""
     if not isinstance(predicted_trajectory, dict):
         return None
     bound = predicted_trajectory.get("bound")
     return bound if isinstance(bound, dict) else None
+
+
+def bound_declared(predicted_trajectory: Any) -> bool:
+    """True iff the trajectory carries a ``bound`` KEY, whatever its value. A declared bound opts the
+    binding into the monitor; one that is not a predicate dict cannot be evaluated and fails closed."""
+    return isinstance(predicted_trajectory, dict) and "bound" in predicted_trajectory
 
 
 def assert_trajectory_pure(predicted_trajectory: Any) -> None:
@@ -78,12 +90,12 @@ def assert_trajectory_pure(predicted_trajectory: Any) -> None:
     bound. A descriptive-only (bound-less) trajectory passes (nothing to check). The compiler calls
     this so a binding whose monitor CANNOT evaluate its own envelope is refused, not minted with a
     silently-inert (always-diverging) monitor."""
-    if isinstance(predicted_trajectory, dict) and predicted_trajectory.get("bound") is not None \
-            and not isinstance(predicted_trajectory["bound"], dict):
-        # A present, non-None, non-dict bound would read as "no bound" and leave the monitor inert while
-        # the configuration appears to ask for one. Refuse it rather than treat it as absent.
+    if bound_declared(predicted_trajectory) and not isinstance(predicted_trajectory["bound"], dict):
+        # A declared bound that is not a predicate (``null`` included) is an envelope nobody can check.
+        # Treating it as "no bound" would leave the monitor inert while the grant asks for one.
         raise KillImpurityError(
-            f"predicted_trajectory 'bound' must be a predicate dict, got {type(predicted_trajectory['bound']).__name__}")
+            f"predicted_trajectory 'bound' must be a predicate dict, got {type(predicted_trajectory['bound']).__name__}"
+            " (omit the key for a descriptive trajectory)")
     bound = trajectory_bound(predicted_trajectory)
     if bound is not None:
         assert_kill_pure(bound)
@@ -95,10 +107,11 @@ def within_envelope(predicted_trajectory: Any, actual: Any) -> Kleene:
     ``Kleene.TRUE`` = provably within; ``FALSE`` = a predicted invariant is violated; ``UNKNOWN`` =
     can't confirm (missing/partial observation). A bound-LESS (descriptive) trajectory returns
     ``TRUE`` — there is no envelope to fall outside of, so it is vacuously "within" (the monitor is
-    inert; the caller :func:`prediction_diverged` reports no divergence)."""
+    inert; the caller :func:`prediction_diverged` reports no divergence). A DECLARED bound that is not a
+    predicate returns ``UNKNOWN``: it cannot confirm anything, so it fails closed."""
     bound = trajectory_bound(predicted_trajectory)
     if bound is None:
-        return Kleene.TRUE
+        return Kleene.UNKNOWN if bound_declared(predicted_trajectory) else Kleene.TRUE
     return kill_outcome(bound, actual)
 
 
@@ -110,6 +123,7 @@ def prediction_diverged(predicted_trajectory: Any, actual: Any) -> tuple[bool, s
       - bound satisfied → TRUE → ``(False, ...)`` (the actual matched the prediction).
       - bound violated → FALSE → ``(True, ...)`` (a predicted invariant broke — diverged → KILL).
       - bound unconfirmable → UNKNOWN → ``(True, ...)`` (can't confirm the world matched → KILL).
+      - a declared ``bound`` that is not a predicate → UNKNOWN → ``(True, ...)`` (KILL).
     """
     outcome = within_envelope(predicted_trajectory, actual)
     if outcome is Kleene.TRUE:
@@ -118,5 +132,7 @@ def prediction_diverged(predicted_trajectory: Any, actual: Any) -> tuple[bool, s
         return False, "actual observation is within the predicted envelope"
     if outcome is Kleene.FALSE:
         return True, "actual observation VIOLATES the predicted envelope (a predicted invariant broke)"
+    if trajectory_bound(predicted_trajectory) is None:
+        return True, "the declared bound is not a predicate, so nothing can be confirmed — fail-safe kill"
     return True, ("actual observation cannot be confirmed within the predicted envelope "
                   "(missing/partial observation) — fail-safe kill")

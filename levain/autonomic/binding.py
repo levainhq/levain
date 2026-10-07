@@ -40,8 +40,9 @@ The load-bearing cuts (each one an apparatus finding made structural):
    mutable bookkeeping (``status``, ``graduation``) — pausing, revoking, or bumping a fire counter is a
    GOVERNED verb that must not require re-minting the grant. A LEGITIMATE posture promotion
    (graduation, §2.6) is a re-ratification: mint a NEW sealed binding and revoke the old (see
-   :meth:`BindingStore.replace_atomic`) — never an in-place posture edit. A seal mismatch ⇒ the
-   binding is structurally BARRED from the active-fire set (``list_active`` excludes it, fail-closed).
+   :meth:`BindingStore.replace_atomic`) — never an in-place posture edit. The store DERIVES each
+   record's identity from its core on every read: a record whose core seals to anything but its key
+   makes the registry corrupt, so nothing in it fires (:meth:`BindingStore.integrity` says why).
    KEYLESS (like ``pending``'s seal) — it does not defend against a malicious local process that can
    also recompute it (full local compromise out of scope); it defends against accidental corruption,
    schema drift, and a buggy writer. An unsealed field (``status``) tampered DIRECTLY on disk is the
@@ -72,6 +73,7 @@ from pathlib import Path
 from typing import Any, Iterator, Protocol, runtime_checkable
 
 from levain.autonomic.authority import AuthorityScope
+from levain.autonomic.journal import RunJournal
 from levain.autonomic.kill import Kleene, assert_kill_pure, kill_outcome
 from levain.autonomic.monitor import assert_trajectory_pure
 from levain.autonomic.posture import Posture
@@ -87,7 +89,9 @@ __all__ = [
     "Binding",
     "binding_invocation",
     "seal_binding_id",
+    "derived_binding_id",
     "BindingStore",
+    "ReplaceResult",
 ]
 
 _log = logging.getLogger("levain.autonomic.binding")
@@ -677,29 +681,14 @@ class Binding:
         ``posture`` parses STRICTLY by ``Posture`` name, ``status`` by ``BindingStatus`` value, and
         ``one_shot`` as a strict bool — an unknown/untrusted governance level raises (a record whose
         level can't be trusted is dropped, the safe direction), never coerced to a default."""
-        posture_name = d["posture"]
-        if not isinstance(posture_name, str) or posture_name not in Posture.__members__:
-            raise ValueError(f"unknown posture {posture_name!r}")
+        core = _parse_core(d)
         try:
             status = BindingStatus(d["status"])
         except ValueError as e:
             raise ValueError(f"unknown status {d.get('status')!r}") from e
-        created_by = d["created_by"]
-        created_at = d["created_at"]
-        if not isinstance(created_by, str) or not isinstance(created_at, str):
-            raise TypeError("created_by / created_at must be strings")
-        if not created_by or not created_at:
-            raise ValueError("created_by / created_at must be non-empty (the disk-trust boundary "
-                             "enforces what create() does — an empty-identity grant defeats provenance)")
         binding_id = d["binding_id"]
         if not isinstance(binding_id, str) or not binding_id:
             raise ValueError("Binding.binding_id must be a non-empty string")
-        goal_raw = d["goal"]
-        if not isinstance(goal_raw, list) or not goal_raw:
-            raise ValueError("Binding.goal must be a non-empty list")
-        guard_raw = d.get("guard", [])   # backward-compat: pre-3c records have no guard → empty
-        if not isinstance(guard_raw, list):
-            raise TypeError(f"Binding.guard must be a list, got {type(guard_raw).__name__}")
         # backward-compat: pre-3a.5 records have no guard_additions → empty (the UNSEALED tightening
         # tier; absent ⇒ no tightening ⇒ the seal recomputes over the floor exactly as before).
         additions_raw = d.get("guard_additions", [])
@@ -707,18 +696,51 @@ class Binding:
             raise TypeError(f"Binding.guard_additions must be a list, got {type(additions_raw).__name__}")
         return cls(
             binding_id=binding_id,
-            created_by=created_by,
-            created_at=created_at,
             status=status,
-            one_shot=_strict_bool(d["one_shot"], "one_shot"),
-            trigger=TriggerSpec.from_dict(d["trigger"]),
-            goal=tuple(SubGoal.from_dict(g) for g in goal_raw),
-            tightness=TightnessVector.from_dict(d["tightness"]),
-            posture=Posture[posture_name],
             graduation=Graduation.from_dict(d["graduation"]),
-            guard=tuple(Guard.from_dict(g) for g in guard_raw),
             guard_additions=tuple(Guard.from_dict(g) for g in additions_raw),
+            **core,
         )
+
+
+def _parse_core(d: dict[str, Any]) -> dict[str, Any]:
+    """Parse the SEALED governance core of a stored record (everything :func:`seal_binding_id`
+    covers), strictly, as keyword arguments for :func:`seal_binding_id` and ``Binding``. Raises
+    ``KeyError``/``TypeError``/``ValueError``/``AttributeError`` on a core that does not parse. Shared
+    by :meth:`Binding.from_dict` and the store's identity check, so both read the core the same way."""
+    posture_name = d["posture"]
+    if not isinstance(posture_name, str) or posture_name not in Posture.__members__:
+        raise ValueError(f"unknown posture {posture_name!r}")
+    created_by = d["created_by"]
+    created_at = d["created_at"]
+    if not isinstance(created_by, str) or not isinstance(created_at, str):
+        raise TypeError("created_by / created_at must be strings")
+    if not created_by or not created_at:
+        raise ValueError("created_by / created_at must be non-empty (the disk-trust boundary "
+                         "enforces what create() does — an empty-identity grant defeats provenance)")
+    goal_raw = d["goal"]
+    if not isinstance(goal_raw, list) or not goal_raw:
+        raise ValueError("Binding.goal must be a non-empty list")
+    guard_raw = d.get("guard", [])   # backward-compat: pre-3c records have no guard → empty
+    if not isinstance(guard_raw, list):
+        raise TypeError(f"Binding.guard must be a list, got {type(guard_raw).__name__}")
+    return {
+        "created_by": created_by,
+        "created_at": created_at,
+        "one_shot": _strict_bool(d["one_shot"], "one_shot"),
+        "trigger": TriggerSpec.from_dict(d["trigger"]),
+        "goal": tuple(SubGoal.from_dict(g) for g in goal_raw),
+        "tightness": TightnessVector.from_dict(d["tightness"]),
+        "posture": Posture[posture_name],
+        "guard": tuple(Guard.from_dict(g) for g in guard_raw),
+    }
+
+
+def derived_binding_id(record: dict[str, Any]) -> str:
+    """The identity a stored record PROVES: the seal recomputed from its sealed core, never the id it
+    claims. Raises ``KeyError``/``TypeError``/``ValueError``/``AttributeError`` when the core does not
+    parse (the record then proves no identity at all)."""
+    return seal_binding_id(**_parse_core(record))
 
 
 def binding_invocation(binding: Binding, *, hops: int = 0) -> AuthorityScope:
@@ -747,6 +769,19 @@ def binding_invocation(binding: Binding, *, hops: int = 0) -> AuthorityScope:
 # --- the registry ------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ReplaceResult:
+    """The outcome of :meth:`BindingStore.replace_atomic`: truthy iff the replacement was written.
+    ``reason`` is ``"replaced"`` or the check that refused it (``target_exists``, ``old_absent``,
+    ``old_unloadable``, ``old_not_fireable``, ``old_changed``, ``precondition_failed``)."""
+
+    ok: bool
+    reason: str
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
 def _refuse_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """``json.loads`` ``object_pairs_hook``: build the object, refusing a key that appears twice."""
     out: dict[str, Any] = {}
@@ -771,10 +806,15 @@ class BindingStore:
     the primary enforcement home: the fire-path (Slice 4), which has the corpus, MUST re-validate a
     predicate before matching — it cannot trust that a stored predicate was ever validated."""
 
-    def __init__(self, path: str | Path, *, validator: PredicateValidator | None = None) -> None:
+    def __init__(self, path: str | Path, *, validator: PredicateValidator | None = None,
+                 journal: RunJournal | None = None) -> None:
         self.path = Path(path)
         self._lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         self._validator = validator
+        # The run journal the fire path admits runs into. When set, every verb that takes a binding
+        # out of the fire set or makes it stricter FENCES it there first, so a run already admitted
+        # stops at its next effect (fence-on-cancel). None: nothing to fence (no journaled runs).
+        self._journal = journal
 
     # --- locking -----------------------------------------------------------------------
     @contextmanager
@@ -793,73 +833,108 @@ class BindingStore:
             finally:
                 os.close(fd)
 
+    def _fence(self, binding_id: str) -> None:
+        """Fence ``binding_id`` in the run journal, BEFORE the store write that changes it: if the
+        write then fails, runs were stopped for a grant that stayed live, which is the safe direction.
+        A fence that cannot be written is logged, not raised: stopping a grant must never be blocked by
+        the journal, and a journal that cannot be read or appended to runs no effect at all."""
+        if self._journal is None:
+            return
+        try:
+            self._journal.fence(binding_id)
+        except Exception as e:  # noqa: BLE001 — see the docstring: never block a stop on the journal
+            _log.error("binding store: journal fence for %r FAILED (%s): %s", binding_id, type(e).__name__, e)
+
     # --- raw IO (call under the lock for mutations) ------------------------------------
-    def _read_raw(self, *, for_mutation: bool = False) -> list[dict[str, Any]]:
-        """Load the registry as a list of records (file order); fail-soft on READS, loud on MUTATIONS.
+    def _scan(self) -> tuple[list[dict[str, Any]], str | None]:
+        """Parse the file: ``(records, None)`` when every entry proves its identity, else ``([], why)``.
+        A missing file is ``([], None)``. ``OSError`` propagates (the caller decides its polarity).
 
         The on-disk format is a JSON OBJECT keyed by ``binding_id``, parsed with a hook that refuses a
-        duplicate key at ANY depth, so two records for one id are UNREPRESENTABLE: there is no copy to
-        choose between, no merge, and no repair verb. (A duplicate key inside a record, e.g. ``status``
-        twice, is refused the same way, since last-wins parsing would hide the first value.) Every
-        entry must be a record whose own ``binding_id`` equals its key.
+        duplicate key at ANY depth, so two records for one id are UNREPRESENTABLE. Identity is DERIVED,
+        never trusted: each record's key must equal the seal recomputed from its own sealed core
+        (:func:`derived_binding_id`). A record whose core does not parse proves no identity, and a
+        record whose core seals to another id is not the grant its key names; either makes the file
+        corrupt, the same way a duplicate does. So the key every collision check compares IS the
+        record's content address, and a tombstone cannot stop colliding with its grant by having its
+        stored id changed. (A record's unsealed bookkeeping, ``status``/``graduation``/
+        ``guard_additions``, does not take part in identity; a record whose bookkeeping does not parse
+        keeps its identity and is skipped by :meth:`_load`.)
 
         A legacy top-level LIST still reads, so a registry written before the object format is not
-        lost; it is rewritten as an object on its next write. A legacy list that holds two records
-        for one id is CORRUPT like any other ambiguous file. An entry that is not a record with a string
-        ``binding_id`` cannot be keyed, so a legacy list holding one refuses writes (it still reads:
-        a non-record entry is skipped, a record without an id is skipped loudly by :meth:`_load`).
-
-        CORRUPT (bad JSON, a duplicate key, a duplicated legacy id, a key/id mismatch, a non-record
-        entry in the object, a top level that is neither object nor list): a READ returns ``[]`` with a WARNING, so
-        nothing in it fires; a MUTATION raises and leaves the file untouched. Repair is a manual edit
-        of the file. A missing file reads ``[]`` (the first-write case). A transient ``OSError`` is
-        re-raised on a mutation read (L3 nemotron): degrading to ``[]`` there would let the write
-        atomically REPLACE the file and silently delete every other binding."""
+        lost; it is rewritten as an object on its next write. Every entry of a legacy list is held to
+        the same rule, and two entries for one id are a duplicate."""
         try:
             text = self.path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            return []
+            return [], None
+        except UnicodeDecodeError as e:
+            return [], f"not UTF-8 text ({e})"
+        try:
+            data = json.loads(text, object_pairs_hook=_refuse_duplicate_keys)
+        except (ValueError, RecursionError) as e:   # bad JSON, a duplicate key, or nesting too deep
+            return [], f"unreadable registry ({e})"
+        if isinstance(data, dict):
+            pairs = list(data.items())
+        elif isinstance(data, list):
+            pairs = []
+            seen: set[str] = set()
+            for i, rec in enumerate(data):
+                bid = rec.get("binding_id") if isinstance(rec, dict) else None
+                if not isinstance(bid, str):
+                    return [], f"legacy entry {i} is not a record with a string binding_id"
+                if bid in seen:
+                    return [], f"legacy list holds duplicate records for {bid!r}"
+                seen.add(bid)
+                pairs.append((bid, rec))
+        else:
+            return [], f"top level is {type(data).__name__}, not an object"
+        records: list[dict[str, Any]] = []
+        for key, rec in pairs:
+            if not isinstance(rec, dict) or rec.get("binding_id") != key:
+                return [], f"entry {key!r} is not a record whose binding_id is its key"
+            try:
+                derived = derived_binding_id(rec)
+            except (KeyError, TypeError, ValueError, AttributeError) as e:
+                return [], f"entry {key!r}: its sealed core does not parse ({type(e).__name__}: {e}), so it proves no identity"
+            if derived != key:
+                return [], f"entry {key!r} seals to {derived!r}: its stored id is not its content"
+            records.append(rec)
+        return records, None
+
+    def _read_raw(self, *, for_mutation: bool = False) -> list[dict[str, Any]]:
+        """Load the registry as a list of records (file order); fail-soft on READS, loud on MUTATIONS.
+
+        CORRUPT (see :meth:`_scan`: bad JSON, not UTF-8, a duplicate, a record whose identity does not
+        derive from its content, a top level that is neither object nor list): a READ returns ``[]``
+        with a WARNING, so nothing in it fires; a MUTATION raises and leaves the file untouched. Repair
+        is a manual edit of the file; :meth:`integrity` names what is wrong. A transient ``OSError`` is
+        re-raised on a mutation read (L3 nemotron): degrading to ``[]`` there would let the write
+        atomically REPLACE the file and silently delete every other binding."""
+        try:
+            records, problem = self._scan()
         except OSError as e:
             _log.warning("binding store: read failed (%s): %s", type(e).__name__, e)
             if for_mutation:
                 raise
             return []
+        if problem is None:
+            return records
+        _log.warning("binding store %s: %s%s", self.path, problem,
+                     " — RE-RAISING (mutation)" if for_mutation else " — returning []")
+        if for_mutation:
+            raise ValueError(f"binding store {self.path}: {problem}; refusing to write until the "
+                             "file is repaired by hand")
+        return []
 
-        def corrupt(why: str) -> list[dict[str, Any]]:
-            _log.warning("binding store %s: %s%s", self.path, why,
-                         " — RE-RAISING (mutation)" if for_mutation else " — returning []")
-            if for_mutation:
-                raise ValueError(f"binding store {self.path}: {why}; refusing to write until the "
-                                 "file is repaired by hand")
-            return []
-
+    def integrity(self) -> str | None:
+        """``None`` if the registry reads clean (or does not exist yet), else why it is CORRUPT. A
+        corrupt registry reads as no bindings, which looks exactly like an empty one; this is the
+        signal that tells them apart, for a health check or a cockpit to surface."""
         try:
-            data = json.loads(text, object_pairs_hook=_refuse_duplicate_keys)
-        except (ValueError, RecursionError) as e:   # bad JSON, a duplicate key, or nesting too deep
-            return corrupt(f"unreadable registry ({e})")
-        if isinstance(data, dict):
-            records: list[dict[str, Any]] = []
-            for key, rec in data.items():
-                if not isinstance(rec, dict) or rec.get("binding_id") != key:
-                    return corrupt(f"entry {key!r} is not a record whose binding_id is its key")
-                records.append(rec)
-            return records
-        if isinstance(data, list):
-            records = [r for r in data if isinstance(r, dict)]
-            seen: set[str] = set()
-            dups: set[str] = set()
-            for r in records:
-                bid = r.get("binding_id")
-                if isinstance(bid, str):
-                    (dups if bid in seen else seen).add(bid)
-            if dups:
-                return corrupt(f"legacy list holds duplicate records for {sorted(dups)}")
-            if for_mutation and len(seen) != len(data):
-                raise ValueError(f"binding store {self.path}: a legacy entry is not a record with a "
-                                 "string binding_id, so the registry cannot be rewritten keyed by id "
-                                 "without losing it; repair the file by hand")
-            return records
-        return corrupt(f"top level is {type(data).__name__}, not an object")
+            return self._scan()[1]
+        except OSError as e:
+            return f"unreadable ({type(e).__name__}: {e})"
 
     def _write_raw(self, records: list[dict[str, Any]]) -> None:
         """Atomically replace the file with ``records`` as a JSON object keyed by ``binding_id`` (tmp +
@@ -938,7 +1013,7 @@ class BindingStore:
     def add(self, binding: Binding) -> bool:
         """CREATE a binding. Returns True iff it was written; False iff its ``binding_id`` already
         exists, in which case NOTHING is written and the stored record is neither read as trusted
-        nor touched, whatever state it is in (revoked, malformed, seal-broken).
+        nor touched, whatever state it is in (revoked, paused, or with bookkeeping that does not load).
 
         ``add`` is create-only. A same-id record already holds the same sealed core (the id is the
         seal of the core), so all a re-add could change is the unsealed bookkeeping: ``status``,
@@ -965,8 +1040,8 @@ class BindingStore:
             self._write_raw(records)
             return True
 
-    def replace_atomic(self, old_binding_id: str, new_binding: Binding,
-                       *, precondition: Callable[[Binding], bool] | None = None) -> bool:
+    def replace_atomic(self, expected_old: Binding, new_binding: Binding,
+                       *, precondition: Callable[[Binding], bool] | None = None) -> "ReplaceResult":
         """RE-RATIFICATION as one atomic, ALL-OR-NOTHING step: persist ``new_binding`` (a fresh sealed
         grant — a posture promotion / re-author / tightening produces a DIFFERENT core ⇒ a different
         id) AND set the old grant to ``REVOKED``, under ONE lock. The non-atomic alternative (``add``
@@ -974,25 +1049,31 @@ class BindingStore:
         same trigger fires at both postures and the looser (newly-promoted) one wins on overlap = a
         weakening on crash (L2-M3; the ``pending.claim`` lesson, one layer up).
 
-        Two edges closed (L3 codex/complement/nemotron): ``old_binding_id == new_binding.binding_id``
-        is not a re-ratification (identical core ⇒ identical id) → raises. And if the old grant is
-        ABSENT, the call writes NOTHING and returns ``False`` — re-ratification supersedes an EXISTING
-        grant; with nothing to supersede the precondition failed, and writing the new (looser) grant
-        anyway would be a fail-OPEN (a caller that ignores the bool would get a live autonomous grant
-        with no revoke). If ``new_binding``'s id ALREADY exists (a live grant, a paused candidate, or
-        a tombstone), the call also writes nothing and returns ``False``: superseding onto it would
-        mean choosing between two sets of bookkeeping, which this store no longer does. Returns True
-        iff the old grant was found + revoked and the new one written.
+        The write states what it expects to find, and that check cannot be left out (the etcd ``Txn``
+        shape: the compare is part of the write). The caller passes the old grant AS IT READ IT, and
+        under the lock the stored old grant must:
 
-        ``precondition`` (Slice 4c — codex L3 HIGH-2 / L1 TOCTOU) is a COMPARE-AND-SWAP guard: the caller
-        builds ``new_binding`` from a LOCKLESS read of the old grant, so between that read and this locked
-        write a concurrent op could REVOKE/pause the old grant (→ resurrecting it looser under a new id is
-        a govern-not-trust violation), TIGHTEN it (→ the stale ``new_binding`` would DROP the freshly-added
-        kill), or change its EVIDENCE (→ promoting a grant that no longer qualifies). When supplied,
-        ``precondition`` is evaluated against the CURRENT old binding UNDER THE LOCK; ``False`` (or an
-        old record that no longer loads) ABORTS the whole op (writes nothing, returns ``False``) so the
-        caller re-derives from the fresh state. ``replace_atomic`` stays generic — the graduation-specific
-        re-validation lives in the caller's closure."""
+          - exist and load (``old_absent`` / ``old_unloadable``);
+          - be LIVE: fireable by the same :meth:`is_fireable` the fire view uses (``old_not_fireable``).
+            Re-ratification supersedes a live grant; a revoked, expired, paused or barred grant is not
+            superseded into a live one. (A revoked or expired grant is revived by minting a NEW binding
+            with :meth:`add` and ratifying it.);
+          - EQUAL ``expected_old``, bookkeeping included (``old_changed``): a pause, a tightening or an
+            evidence change committed since the caller's read aborts the write, so the caller re-derives
+            from the fresh state instead of superseding a grant it never saw.
+
+        ``precondition`` is an optional EXTRA compare, evaluated against the current old grant under
+        the lock (``precondition_failed``). ``new_binding``'s id must not exist yet (``target_exists``:
+        superseding onto an existing record would mean choosing between two sets of bookkeeping).
+        ``expected_old`` and ``new_binding`` with one id is not a re-ratification and raises.
+
+        Returns a :class:`ReplaceResult`, truthy iff the old grant was revoked and the new one written;
+        its ``reason`` names which check stopped it. Nothing is written on any failure. When a journal
+        is wired, the old grant is fenced before the write."""
+        if not isinstance(expected_old, Binding):
+            raise TypeError("replace_atomic: expected_old must be the old Binding as the caller read it "
+                            f"(got {type(expected_old).__name__})")
+        old_binding_id = expected_old.binding_id
         if old_binding_id == new_binding.binding_id:
             raise ValueError(
                 f"replace_atomic: old and new binding_id are identical ({old_binding_id!r}) — "
@@ -1001,40 +1082,36 @@ class BindingStore:
         record = self._persistable(new_binding)
         with self._locked():
             records = self._read_raw(for_mutation=True)
-            if any(r.get("binding_id") == new_binding.binding_id for r in records):
-                # The new grant's id already exists (a live grant, a candidate, or a tombstone from
-                # A -> B -> A). Superseding onto it would mean choosing between its stored
-                # bookkeeping and the incoming one, the merge add() no longer does. Abort; write
-                # nothing; the caller re-derives (fail closed: the old grant stays as it is).
-                _log.warning("binding store: replace_atomic target %r already exists; aborting",
-                             new_binding.binding_id)
-                return False
-            old_rec = next((r for r in records if r.get("binding_id") == old_binding_id), None)
+            ids = {r["binding_id"] for r in records}
+            if new_binding.binding_id in ids:
+                return self._replace_refused(old_binding_id, "target_exists")
+            old_rec = next((r for r in records if r["binding_id"] == old_binding_id), None)
             if old_rec is None:
-                return False   # nothing to supersede → abort, write nothing (fail-closed)
-            if precondition is not None:
-                # CAS: re-validate the CURRENT old grant under the lock before superseding it. A grant
-                # that can no longer be loaded (corrupted since the read) fails closed.
-                current_old = self._load(old_rec)
-                if current_old is None or not precondition(current_old):
-                    _log.warning("binding store: replace_atomic precondition FAILED for %r — the old "
-                                 "grant changed since the proposal (revoked/tightened/evidence); aborting",
-                                 old_binding_id)
-                    return False
-            kept: list[dict[str, Any]] = []
-            for r in records:
-                rid = r.get("binding_id")
-                if rid == old_binding_id:
-                    r["status"] = BindingStatus.REVOKED.value  # supersede the old grant
-                kept.append(r)
-            kept.append(record)
-            self._write_raw(kept)
-            return True
+                return self._replace_refused(old_binding_id, "old_absent")
+            current = self._load(old_rec)
+            if current is None:
+                return self._replace_refused(old_binding_id, "old_unloadable")
+            if not self.is_fireable(current):
+                return self._replace_refused(old_binding_id, "old_not_fireable")
+            if current != expected_old:
+                return self._replace_refused(old_binding_id, "old_changed")
+            if precondition is not None and not precondition(current):
+                return self._replace_refused(old_binding_id, "precondition_failed")
+            self._fence(old_binding_id)
+            old_rec["status"] = BindingStatus.REVOKED.value   # supersede the old grant
+            records.append(record)
+            self._write_raw(records)
+            return ReplaceResult(True, "replaced")
+
+    @staticmethod
+    def _replace_refused(old_binding_id: str, reason: str) -> "ReplaceResult":
+        _log.warning("binding store: replace_atomic of %r refused (%s); nothing written", old_binding_id, reason)
+        return ReplaceResult(False, reason)
 
     def get(self, binding_id: str) -> Binding | None:
-        """Return the binding by id, or ``None`` (absent or malformed). NOTE: ``get`` returns the
-        binding REGARDLESS of seal/status — it is the inspection path (the cockpit shows a tampered or
-        revoked grant). The fire-path must use :meth:`list_active` / check ``binding.is_active``."""
+        """Return the binding by id, or ``None`` (absent, malformed, or the registry is corrupt). NOTE:
+        ``get`` returns the binding REGARDLESS of status — it is the inspection path (the cockpit
+        shows a revoked grant). The fire-path must use :meth:`list_active` / :meth:`is_fireable`."""
         for r in self._read_raw():
             if r.get("binding_id") == binding_id:
                 return self._load(r)
@@ -1044,7 +1121,7 @@ class BindingStore:
         self, *, status: BindingStatus | None = None, trigger_type: str | None = None
     ) -> list[Binding]:
         """All bindings (file order), optionally filtered by ``status`` and/or ``trigger_type``.
-        Malformed records are skipped loudly. The full inspection view (includes inactive + tampered);
+        Malformed records are skipped loudly. The full inspection view (includes inactive grants);
         the fire-path wants :meth:`list_active`. (Named ``list_all`` not ``list`` so the method never
         shadows the builtin ``list`` for ``list[…]`` annotations in this class — mypy catches that.)"""
         out: list[Binding] = []
@@ -1076,9 +1153,8 @@ class BindingStore:
 
     def list_active(self, *, trigger_type: str | None = None) -> list[Binding]:
         """The FIRE-PATH view: bindings that may actually fire — active status, a valid seal, AND (at
-        confirm-class) a kill-bearing guard. A seal-mismatched binding (its core was tampered) is
-        EXCLUDED and logged LOUDLY: a tampered standing grant is structurally barred from autonomous
-        firing (fail-closed, ``structural_invariants_beat_discipline``).
+        confirm-class) a kill-bearing guard. (A record whose core does not seal to its id never gets
+        here: it makes the whole registry read as corrupt.)
 
         **A confirm-class (``posture.needs_confirm``) binding that lacks a kill-bearing guard is also
         EXCLUDED** (codex-HIGH2 / complement-LOW1 / L1-MED1): the ``RECEIPT_VERSION=4`` mandate — a
@@ -1098,25 +1174,17 @@ class BindingStore:
                 continue
             if trigger_type is not None and b.trigger.type != trigger_type:
                 continue
-            # the fire-view filter (:meth:`is_fireable`) — active here, so a non-fireable record is a
-            # SEAL MISMATCH or the confirm-class kill-mandate gap; log WHICH (the invisible-infrastructure
-            # signal) but route both through the one canonical predicate so the fire-view + the per-id
-            # snapshot_if_fireable can never drift apart.
+            # the fire-view filter (:meth:`is_fireable`), the one canonical predicate so the fire-view and
+            # the per-id snapshot_if_fireable can never drift apart. Active and identity-checked here, so
+            # a non-fireable record is the confirm-class kill-mandate gap: the mandatory kill is checked
+            # on the SEALED floor ``guard`` ONLY (an unsealed addition can be stripped without tripping
+            # the seal, so it can ADD kills the runtime honors but never satisfy the mandate).
             if not self.is_fireable(b):
-                if not b.seal_matches():
-                    _log.warning(
-                        "binding store: SEAL MISMATCH on active binding %r — barred from the fire set "
-                        "(its governance core was altered without re-ratification)", b.binding_id,
-                    )
-                else:
-                    # the mandatory kill is checked on the SEALED floor ``guard`` ONLY (an unsealed
-                    # ``guard_additions`` kill could be stripped without tripping the seal, so it can ADD
-                    # kills the runtime honors but NEVER satisfy the confirm-class mandate — Slice 3a.5).
-                    _log.warning(
-                        "binding store: confirm-class binding %r has NO kill-bearing guard in its SEALED "
-                        "floor — barred from the fire set (RECEIPT_VERSION=4: a binding-driven confirm-class "
-                        "fire requires a SEALED guard with a kill; unsealed additions don't count)", b.binding_id,
-                    )
+                _log.warning(
+                    "binding store: confirm-class binding %r has NO kill-bearing guard in its SEALED "
+                    "floor — barred from the fire set (RECEIPT_VERSION=4: a binding-driven confirm-class "
+                    "fire requires a SEALED guard with a kill; unsealed additions don't count)", b.binding_id,
+                )
                 continue
             out.append(b)
         return out
@@ -1142,7 +1210,9 @@ class BindingStore:
         and NOTHING inert re-activates (the structural close on the silent-reactivation hole, L2-H1).
         An illegal transition RAISES ``ValueError`` (a governance violation fails loud, never a silent
         no-op); an idempotent ``X→X`` is allowed. Returns True iff the binding was present; False if
-        absent. Locked read-modify-write; the seal is unaffected (``status`` is not sealed)."""
+        absent. Locked read-modify-write; the seal is unaffected (``status`` is not sealed). Any
+        target other than ``ACTIVE`` (including an idempotent one: a revoke repeated on a claimed
+        one-shot is how a person cancels its run) fences the binding's admitted runs first."""
         if not isinstance(status, BindingStatus):
             raise TypeError(f"status must be a BindingStatus, got {type(status).__name__}")
         with self._locked():
@@ -1158,8 +1228,11 @@ class BindingStore:
                     if status != current and status not in _ALLOWED_TRANSITIONS[current]:
                         raise ValueError(
                             f"illegal lifecycle transition {current.value} → {status.value} "
-                            f"for binding {binding_id!r} (revive a revoked/expired grant by re-ratifying)"
+                            f"for binding {binding_id!r} (revive a revoked/expired grant by minting a "
+                            "new binding)"
                         )
+                    if not status.is_active:
+                        self._fence(binding_id)   # a pause/revoke/expire stops admitted runs
                     rec["status"] = status.value
                     self._write_raw(records)
                     return True
@@ -1173,12 +1246,12 @@ class BindingStore:
         REFUSES (raises ``ValueError``) to ratify a candidate that could not actually FIRE, so a
         ratification never produces a silently-BARRED 'active' grant — the ``list_active`` fail-closed
         exclusions surfaced EARLY as a clear refusal instead of a confusing active-but-inert state:
-          - a SEAL-broken binding (its floor was altered → re-ratify via :meth:`replace_atomic`, never
-            flip a tampered grant live);
           - a CONFIRM-class binding with no sealed-floor kill (the ``RECEIPT_VERSION=4`` mandate
             ``list_active`` enforces — a kill-less confirm-class grant can never fire, so it can never
             ratify);
-          - an INERT (REVOKED/EXPIRED) target — you re-ratify a dead grant, you do not flip it.
+          - an INERT (REVOKED/EXPIRED) target — a dead grant is revived as a NEW binding, never flipped.
+        (A record whose floor was altered cannot reach here: its identity no longer derives, and the
+        registry reads as corrupt.)
         An already-ACTIVE binding ratifies IDEMPOTENTLY (returns it). Returns the now-ACTIVE binding, or
         ``None`` if absent. Atomic locked read-modify-write — the fireability checks + the flip happen
         under ONE lock so a concurrent mutation can't slip a non-fireable grant live."""
@@ -1191,17 +1264,13 @@ class BindingStore:
                 if b is None:
                     raise ValueError(f"ratify: binding {binding_id!r} is malformed — cannot ratify")
                 # The fireability checks run BEFORE the already-ACTIVE idempotence return (codex L3): a
-                # seal-broken / kill-less-confirm-class binding that is ALREADY active is still barred by
+                # kill-less confirm-class binding that is ALREADY active is still barred by
                 # list_active, so ratify must REFUSE it (a clear error) rather than bless it with a
                 # misleading "already ACTIVE" — the ratify fireability claim must hold for ACTIVE too.
                 if b.status.is_inert:   # REVOKED / EXPIRED
                     raise ValueError(
-                        f"ratify refuses a {b.status.value} binding {binding_id!r} — re-ratify a "
-                        "revoked/expired grant via replace_atomic, never flip it live")
-                if not b.seal_matches():
-                    raise ValueError(
-                        f"ratify refuses a seal-broken binding {binding_id!r} — its floor was altered; "
-                        "re-ratify (replace_atomic), never flip a tampered grant live (it would be barred)")
+                        f"ratify refuses a {b.status.value} binding {binding_id!r} — a dead grant "
+                        "is revived as a NEW binding (add, then ratify), never flipped live")
                 if b.posture.needs_confirm and not any(g.has_kill for g in b.guard):
                     raise ValueError(
                         f"ratify refuses confirm-class binding {binding_id!r} with NO sealed-floor kill "
@@ -1305,19 +1374,19 @@ class BindingStore:
         across a safety hardening — the whole point (a re-ratification would reset the grant's identity
         + evidence). Monotonicity is STRUCTURAL, not policed: this verb can ONLY add guards — there is
         no path through it to remove or weaken a floor guard, so it cannot loosen. (To LOOSEN — drop or
-        weaken a ratified guard — you must touch the sealed floor, which a seal mismatch bars from
-        firing; re-ratify via :meth:`replace_atomic` instead. ``structural_invariants_beat_discipline``:
+        weaken a ratified guard — you must mint a new core, a re-ratification via
+        :meth:`replace_atomic`. ``structural_invariants_beat_discipline``:
         loosening is not a rejected tighten, it is simply not expressible here.)
 
         Returns the updated binding, or ``None`` if absent / malformed. RAISES ``ValueError`` on an
-        inert (revoked/expired) target — you re-ratify a dead grant, you do not tighten it — or on a
-        seal-broken target (a tampered floor is barred, never edited). Each new guard's kill (if any) is
+        inert (revoked/expired) target — a dead grant is not tightened. Each new guard's kill (if any) is
         held to the FULL compile-grade kill gate BEFORE the lock — purity + the injected validator AND
         the DRILL-TRIP gate (the drill must actually trip the kill on the diverse substrate; complement
         L3) — so the tighten path is NOT a second-class compile citizen: a kill the drill lets through,
         or an impure kill, is refused, never persisted. An empty ``new_guards`` is a no-op. Locked
         read-modify-write; the seal is unaffected (additions are unsealed), so the recomputed floor-seal
-        still matches + the id is stable."""
+        still matches + the id is stable. Fences the binding's admitted runs first, so a run that
+        started under the old kill set stops at its next effect."""
         if not new_guards:
             return self.get(binding_id)
         if not all(isinstance(g, Guard) for g in new_guards):
@@ -1347,14 +1416,13 @@ class BindingStore:
                 if b.status.is_inert:
                     raise ValueError(
                         f"tighten_guard refuses an inert binding {binding_id!r} (status={b.status.value})"
-                        " — re-ratify a revoked/expired grant, don't tighten it")
-                if not b.seal_matches():
-                    raise ValueError(
-                        f"tighten_guard refuses a seal-broken binding {binding_id!r} — its floor was "
-                        "altered (barred from the fire set), not editable; re-ratify instead")
+                        " — a dead grant is not tightened")
                 # dataclasses.replace (not a positional rebuild) so a future Binding field can't land in
                 # the wrong slot; additions are UNSEALED so the id + seal are unchanged by construction.
                 updated = replace(b, guard_additions=b.guard_additions + tuple(new_guards))
+                # a run admitted before the tightening carries the old kill set: fence it, so it stops
+                # at its next effect and a new delivery runs under the new kills.
+                self._fence(binding_id)
                 raw_adds = rec.get("guard_additions")
                 # append to the raw list: existing entries keep any field this version does not know
                 rec["guard_additions"] = ((list(raw_adds) if isinstance(raw_adds, list) else [])
@@ -1372,5 +1440,6 @@ class BindingStore:
             kept = [r for r in records if r.get("binding_id") != binding_id]
             if len(kept) == len(records):
                 return False
+            self._fence(binding_id)
             self._write_raw(kept)
             return True

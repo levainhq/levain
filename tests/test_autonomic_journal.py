@@ -184,3 +184,78 @@ def test_a_torn_final_line_is_ignored_and_a_corrupt_middle_fails_closed(j, tmp_p
     path.write_text("\n".join([lines[0], "not json"] + lines[1:]) + "\n")
     with pytest.raises(JournalCorruptError):
         j.effect("r1", "other", digest="d", fn=Effect())
+
+
+# --- the API the fire path uses (2026-10-07 wiring) ------------------------------------------
+
+def test_an_effect_with_its_own_approved_hold_runs_while_a_sibling_decision_is_open(j):
+    # a person approved exactly these bytes; only UNDECIDED effects wait on a sibling's open decision
+    j.start("r1", binding_id="b", generation=1)
+    j.start("r2", binding_id="b", generation=1)
+    h1 = j.hold("r1", "pay", digest="p1")
+    h2 = j.hold("r2", "pay", digest="p2")
+    assert j.decide(h2.hold_id, approve=True, digest="p2").ok
+    pay = Effect()
+    assert j.effect("r2", "pay", digest="p2", fn=pay, needs_decision=True).status is EffectStatus.DONE
+    assert j.effect("r2", "after", digest="a", fn=Effect()).status is EffectStatus.HELD   # h1 still open
+    assert pay.calls == 1 and h1.status is EffectStatus.HELD
+
+
+def test_proposing_the_same_effect_again_finds_the_same_decision(j):
+    j.start("r1", binding_id="b")
+    first = j.hold("r1", "send", digest="d")
+    again = j.hold("r1", "send", digest="d")
+    assert first.new_hold and not again.new_hold and first.hold_id == again.hold_id
+    assert len(j.open_holds()) == 1
+    j.decide(first.hold_id, approve=True, digest="d", by="human")
+    approved = j.hold("r1", "send", digest="d")
+    assert approved.status is EffectStatus.APPROVED and approved.decided_by == "human"
+
+
+def test_proposing_different_bytes_under_an_open_decision_cancels_the_run(j):
+    j.start("r1", binding_id="b")
+    j.hold("r1", "send", digest="d1")
+    assert j.hold("r1", "send", digest="d2").status is EffectStatus.CANCELLED
+    assert j.effect("r1", "send", digest="d1", fn=Effect()).status is EffectStatus.CANCELLED
+
+
+def test_admission_reads_the_current_generation_and_a_fence_bumps_it(j):
+    assert j.generation("b") == 0
+    j.start("old", binding_id="b")                 # admitted at 0
+    assert j.fence("b") == 1
+    j.start("new", binding_id="b")                 # admitted at 1
+    assert j.effect("old", "x", digest="d", fn=Effect()).status is EffectStatus.FENCED
+    assert j.effect("new", "x", digest="d", fn=Effect()).status is EffectStatus.DONE
+
+
+def test_peek_runs_nothing_and_reports_the_barrier(j):
+    j.start("r1", binding_id="b")
+    assert j.peek("r1", "x") is None
+    j.effect("r1", "x", digest="d", fn=Effect("v"))
+    seen = j.peek("r1", "x")
+    assert seen.status is EffectStatus.REPLAYED and seen.result == "v" and seen.receipt_id is None
+    j.note_receipt("r1", "x", "rcpt-1")
+    assert j.peek("r1", "x").receipt_id == "rcpt-1"
+    j.cancel("r1", reason="killed")
+    assert j.peek("r1", "y").status is EffectStatus.CANCELLED
+    with pytest.raises(KeyError):
+        j.peek("never", "x")
+
+
+def test_a_run_id_is_a_content_address_over_the_binding_and_the_event():
+    from levain.autonomic.journal import run_id_for
+    e = {"type": "email", "id": "1", "fields": {"a": 1}}
+    assert run_id_for("b", e) == run_id_for("b", dict(e))
+    assert run_id_for("b", e) != run_id_for("c", e)
+    assert run_id_for("b", e) != run_id_for("b", dict(e, id="2"))
+    for bad in ({"x": float("nan")}, {1: "x"}, {"t": (1, 2)}, {"o": object()}):
+        with pytest.raises(ValueError):
+            run_id_for("b", bad)
+
+
+def test_a_malformed_record_fails_closed(j, tmp_path):
+    j.start("r1", binding_id="b")
+    with open(tmp_path / "journal.jsonl", "a") as f:
+        f.write('{"t":"result","run_id":"r1"}\n')     # parses, but is missing effect_id
+    with pytest.raises(JournalCorruptError):
+        j.effect("r1", "x", digest="d", fn=Effect())

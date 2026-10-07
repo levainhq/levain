@@ -272,7 +272,7 @@ def test_ratify_refuses_seal_broken(tmp_path):
     raw = json.loads(st.path.read_text())
     next(iter(raw.values()))["posture"] = "ABOVE_LOOP"          # tamper the sealed core, leave the id stale
     st.path.write_text(json.dumps(raw))
-    with pytest.raises(ValueError, match="seal-broken"):
+    with pytest.raises(ValueError, match="seals to"):          # the registry is corrupt: no write
         st.ratify(b.binding_id)
 
 
@@ -301,7 +301,9 @@ def test_claim_one_shot_ignores_seal_broken(tmp_path):
     raw = json.loads(st.path.read_text())
     next(iter(raw.values()))["posture"] = "ABOVE_LOOP"
     st.path.write_text(json.dumps(raw))
-    assert st.claim_one_shot(b.binding_id) is None                       # tampered → not claimable
+    with pytest.raises(ValueError, match="seals to"):                     # tampered → not claimable
+        st.claim_one_shot(b.binding_id)
+    assert st.list_active() == []
 
 
 # =====================================================================================
@@ -543,14 +545,14 @@ def test_dispatch_picks_up_a_freshly_tightened_kill(tmp_path):
 
 
 def test_ratify_refuses_seal_broken_even_when_already_active(tmp_path):
-    """codex LOW: ratify re-checks fireability BEFORE the already-ACTIVE idempotence return — a
-    seal-broken ACTIVE grant is REFUSED (a clear error), never blessed as 'already ACTIVE'."""
+    """codex LOW: a seal-broken ACTIVE grant is REFUSED (a clear error), never blessed as 'already
+    ACTIVE'. Since S1h-4 the refusal comes from the read: the registry's identity check fails."""
     import json
     st, b = _mk_binding(tmp_path, status=BindingStatus.ACTIVE)
     raw = json.loads(st.path.read_text())
     next(iter(raw.values()))["posture"] = "ABOVE_LOOP"          # tamper the sealed core of an ACTIVE binding
     st.path.write_text(json.dumps(raw))
-    with pytest.raises(ValueError, match="seal-broken"):
+    with pytest.raises(ValueError, match="seals to"):
         st.ratify(b.binding_id)
 
 

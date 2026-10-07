@@ -400,12 +400,13 @@ def test_a_stale_re_add_cannot_wipe_evidence(tmp_path):
 
 def test_replace_atomic_adds_new_and_revokes_old(tmp_path):
     s = store(tmp_path)
-    old = make_binding(posture=Posture.CONFIRM)
+    old = make_binding(posture=Posture.CONFIRM, guard=(_kill_guard(),))
     s.add(old)
-    s.record_fire(old.binding_id, clean=True, fired_at=FIRED_AT)
+    read = s.record_fire(old.binding_id, clean=True, fired_at=FIRED_AT)
     promoted = make_binding(posture=Posture.ON_LOOP)   # a re-ratification = different core = new id
     assert promoted.binding_id != old.binding_id
-    assert s.replace_atomic(old.binding_id, promoted) is True
+    result = s.replace_atomic(read, promoted)
+    assert result and result.reason == "replaced"
     old_got = s.get(old.binding_id)
     assert old_got is not None and old_got.status is BindingStatus.REVOKED   # superseded
     active = {x.binding_id for x in s.list_active()}
@@ -425,18 +426,42 @@ def test_list_active_excludes_inactive_status(tmp_path):
     assert {b.binding_id for b in s.list_active()} == {active.binding_id, one_shot.binding_id}
 
 
-def test_list_active_excludes_seal_mismatched_binding(tmp_path, caplog):
+def test_a_record_whose_core_does_not_seal_to_its_key_makes_the_registry_corrupt(tmp_path, caplog):
+    """S1h-4: identity is derived on read. A core edited on disk while its key stayed stale is not the
+    grant its key names, so the registry reads as corrupt: nothing in it fires (the other binding
+    included), every write refuses, and integrity() says which entry and why."""
+    s = store(tmp_path)
+    b, other = make_binding(), make_binding(created_at="2026-05-02T09:00:00")
+    s.add(b)
+    s.add(other)
+    raw = json.loads(s.path.read_text())
+    raw[b.binding_id]["posture"] = "ON_LOOP"              # tamper on disk, leave binding_id stale
+    s.path.write_text(json.dumps(raw))
+    with caplog.at_level("WARNING"):
+        assert s.list_active() == [] and s.list_all() == [] and s.get(other.binding_id) is None
+    problem = s.integrity()
+    assert problem is not None and b.binding_id in problem and "seals to" in problem
+    with pytest.raises(ValueError, match="seals to"):
+        s.set_status(other.binding_id, BindingStatus.PAUSED)
+
+
+def test_a_tombstone_whose_stored_id_was_changed_still_collides_with_its_grant(tmp_path):
+    """codex S1h-3 HIGH (collision identity): a revoked tombstone whose stored id (key and field) is
+    rewritten to something else no longer names its grant, so ``add`` of the original grant would
+    not collide with it and would mint a live copy of a revoked grant. With derived identity the
+    rewritten record seals to the original id, not its key: the registry is corrupt and the add refuses."""
     s = store(tmp_path)
     b = make_binding()
     s.add(b)
+    s.set_status(b.binding_id, BindingStatus.REVOKED)
     raw = json.loads(s.path.read_text())
-    next(iter(raw.values()))["posture"] = "ON_LOOP"              # tamper on disk, leave binding_id stale
+    rec = raw.pop(b.binding_id)
+    rec["binding_id"] = "bind-renamed"
+    raw["bind-renamed"] = rec
     s.path.write_text(json.dumps(raw))
-    with caplog.at_level("WARNING"):
-        assert s.list_active() == []           # fail-closed: tampered grant cannot fire
-    assert "SEAL MISMATCH" in caplog.text
-    got = s.get(b.binding_id)                  # inspection path still sees it
-    assert got is not None and not got.seal_matches()
+    with pytest.raises(ValueError, match="seals to"):
+        s.add(b)
+    assert s.get(b.binding_id) is None and s.list_active() == []
 
 
 # --- the PredicateValidator seam (injected at construction, L2-M1) --------------------
@@ -490,9 +515,9 @@ def test_the_validator_runs_outside_the_store_lock(tmp_path):
 
     probe = _LockProbe()
     s = BindingStore(tmp_path / "b.json", validator=probe)
-    a = make_binding()
+    a = make_binding(posture=Posture.ON_LOOP)
     s.add(a)
-    s.replace_atomic(a.binding_id, make_binding(posture=Posture.ON_LOOP))
+    assert s.replace_atomic(a, make_binding(posture=Posture.ABOVE_LOOP))
     assert probe.held == [False, False]
 
 
@@ -543,17 +568,34 @@ def test_an_entry_whose_id_is_not_its_key_reads_empty_and_refuses_writes(tmp_pat
     assert s.path.read_text() == before
 
 
-def test_malformed_record_is_skipped_loudly(tmp_path, caplog):
+def test_a_record_with_malformed_bookkeeping_is_skipped_loudly(tmp_path, caplog):
+    """A record whose sealed core is intact keeps its identity even when its unsealed bookkeeping
+    does not parse: it is skipped (never fires), the rest of the registry reads, and it still
+    collides with its id."""
     s = store(tmp_path)
-    good = make_binding()
+    good, bad = make_binding(), make_binding(created_at="2026-05-02T09:00:00")
     s.add(good)
+    s.add(bad)
     raw = json.loads(s.path.read_text())
-    raw["bind-bad"] = {"binding_id": "bind-bad", "posture": "NONSENSE"}  # malformed
+    raw[bad.binding_id]["status"] = "NONSENSE"
     s.path.write_text(json.dumps(raw))
     with caplog.at_level("WARNING"):
         listed = s.list_all()
     assert [b.binding_id for b in listed] == [good.binding_id]
     assert "malformed" in caplog.text
+    assert s.integrity() is None
+    assert s.add(bad) is False            # its identity still collides
+
+
+def test_a_record_whose_core_does_not_parse_proves_no_identity(tmp_path):
+    s = store(tmp_path)
+    good = make_binding()
+    s.add(good)
+    raw = json.loads(s.path.read_text())
+    raw["bind-bad"] = {"binding_id": "bind-bad", "posture": "NONSENSE"}
+    s.path.write_text(json.dumps(raw))
+    assert s.list_all() == []
+    assert "proves no identity" in (s.integrity() or "")
 
 
 # === L3 fixes ========================================================================
@@ -586,7 +628,9 @@ def test_replace_atomic_rejects_same_id(tmp_path):
     b = make_binding()
     s.add(b)
     with pytest.raises(ValueError):
-        s.replace_atomic(b.binding_id, b)      # identical core = identical id = not a re-ratification
+        s.replace_atomic(b, b)                 # identical core = identical id = not a re-ratification
+    with pytest.raises(TypeError):
+        s.replace_atomic(b.binding_id, b)      # the old signature: an id says nothing about what was read
 
 
 def test_replace_atomic_aborts_without_write_when_old_absent(tmp_path):
@@ -594,9 +638,58 @@ def test_replace_atomic_aborts_without_write_when_old_absent(tmp_path):
     existing = make_binding(created_at="t-existing")
     s.add(existing)
     promoted = make_binding(posture=Posture.ON_LOOP)
-    assert s.replace_atomic("bind-does-not-exist", promoted) is False
+    never_stored = make_binding(posture=Posture.ABOVE_LOOP, created_at="t-never")
+    result = s.replace_atomic(never_stored, promoted)
+    assert not result and result.reason == "old_absent"
     assert s.get(promoted.binding_id) is None                       # NOTHING written — no orphan grant
     assert {x.binding_id for x in s.list_all()} == {existing.binding_id}
+
+
+# --- replace_atomic: the write states what it expects (S1h-4, etcd Txn shape) ---------
+
+@pytest.mark.parametrize("make_dead", [
+    pytest.param(lambda s, b: s.set_status(b.binding_id, BindingStatus.REVOKED), id="revoked"),
+    pytest.param(lambda s, b: s.set_status(b.binding_id, BindingStatus.EXPIRED), id="expired"),
+    pytest.param(lambda s, b: s.set_status(b.binding_id, BindingStatus.PAUSED), id="paused"),
+])
+def test_replace_atomic_never_supersedes_a_grant_that_is_not_live(tmp_path, make_dead):
+    """All three S1h-3 L3 seats: with no precondition, replace_atomic superseded a revoked, expired or
+    paused old grant into a live new one. The live-old check is now part of the write, not optional."""
+    s = store(tmp_path)
+    old = make_binding(posture=Posture.ON_LOOP)
+    s.add(old)
+    make_dead(s, old)
+    current = s.get(old.binding_id)
+    result = s.replace_atomic(current, make_binding(posture=Posture.ABOVE_LOOP))
+    assert not result and result.reason == "old_not_fireable"
+    assert s.list_active() == []
+
+
+def test_replace_atomic_refuses_a_confirm_class_old_grant_with_no_sealed_kill(tmp_path):
+    s = store(tmp_path)
+    old = make_binding(posture=Posture.CONFIRM)        # barred from the fire view: no sealed kill
+    s.add(old)
+    result = s.replace_atomic(old, make_binding(posture=Posture.ON_LOOP))
+    assert not result and result.reason == "old_not_fireable"
+
+
+def test_replace_atomic_refuses_when_the_old_grant_changed_since_the_read(tmp_path):
+    s = store(tmp_path)
+    old = make_binding(posture=Posture.ON_LOOP)
+    s.add(old)
+    stale = s.get(old.binding_id)
+    s.tighten_guard(old.binding_id, _kill_guard())     # a concurrent tightening the caller never saw
+    result = s.replace_atomic(stale, make_binding(posture=Posture.ABOVE_LOOP))
+    assert not result and result.reason == "old_changed"
+    assert [b.binding_id for b in s.list_active()] == [old.binding_id]
+
+
+def test_replace_atomic_precondition_is_an_extra_compare(tmp_path):
+    s = store(tmp_path)
+    old = make_binding(posture=Posture.ON_LOOP)
+    s.add(old)
+    result = s.replace_atomic(old, make_binding(posture=Posture.ABOVE_LOOP), precondition=lambda b: False)
+    assert not result and result.reason == "precondition_failed"
 
 
 # --- record_fire type check (codex-M1) ----------------------------------------------

@@ -15,6 +15,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.gates import DEFAULT_CONFIDENCE_FLOOR
+from levain.autonomic.journal import RunRef
 from levain.autonomic.posture import Posture
 from levain.autonomic.risk import ActionRisk
 from levain.autonomic.trust import TrustContext
@@ -80,6 +81,10 @@ class ActionRequest:
     # (a manual fire carries no guard).
     kill_predicates: tuple[dict[str, Any], ...] = ()
     trigger_event: dict[str, Any] | None = None
+    # ``run`` — the journaled run + effect this action is (S8). The fire path sets it for every binding
+    # fire; the gate then runs the effect through the run journal (at most once, held while a decision
+    # on the binding is open, stopped by a fence or a cancel). None ⇒ a manual action, not journaled.
+    run: RunRef | None = None
 
 
 @dataclass(frozen=True)

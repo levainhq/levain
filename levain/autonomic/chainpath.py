@@ -59,6 +59,13 @@ sweep-evidence ``record_fire`` gap), NO staleness (4d). The per-link ``predicted
 4a-equivalent (the binding's first guard's envelope) — link-indexed trajectories need a guard-schema
 evolution (flagged, not built).
 
+**The run journal (S8).** With a journal on the gate, a chain is ONE journaled run (the dispatcher
+admits it; its id is :func:`~levain.autonomic.journal.run_id_for` over the binding and the trigger
+event, so a resume and a re-delivery address the same run) and link ``i`` is its effect ``link-<i>``.
+A re-delivered event walks the chain again: links that already ran replay their recorded output into
+the data flow without running, and the first link that has not run continues the chain. A link HELD by
+an open decision on the binding ends this walk in state ``held`` (re-deliver after the decision).
+
 Stdlib-only core; pure of I/O beyond the injected stores' own reads/writes; imports NOTHING from flow
 (the anti-cycle rule).
 """
@@ -80,6 +87,7 @@ from typing import Any, Iterator
 from levain.autonomic.binding import Binding, BindingStore, binding_invocation
 from levain.autonomic.executor import ActionRequest, ExecutionResult
 from levain.autonomic.gate import EfferentGate, GateOutcome
+from levain.autonomic.journal import RunRef, run_id_for
 from levain.autonomic.risk import ActionRisk
 from levain.autonomic.transport import ConfirmDecision
 from levain.autonomic.trust import TrustContext
@@ -239,6 +247,8 @@ class ChainOutcome:
     - ``aborted``   — a link was KILLED / REFUSED / DEFERRED (no transport) or a link's EFFECT failed, or
                       a denied resume, or a barred ratification-drift; ``reason`` says which, ``paused_at``
                       names the link it stopped at (when applicable). No further links ran.
+    - ``held``      — (journaled runs) a link did not run because a decision is open on the binding;
+                      ``paused_at`` names it. Not terminal: re-delivering the event resumes the run.
     ``links`` are the per-link rulings produced in THIS call (the resume segment's rulings on a resume)."""
 
     binding_id: str
@@ -260,6 +270,10 @@ class ChainOutcome:
     @property
     def aborted(self) -> bool:
         return self.state == "aborted"
+
+    @property
+    def held(self) -> bool:
+        return self.state == "held"
 
 
 # =================================================================================================
@@ -719,6 +733,11 @@ class ChainExecutor:
                 ctx = ctx.with_link(CompletedLink.of(i, binding.goal[i], request.payload, outcome.execution))
                 continue
 
+            if outcome.held:
+                _log.info("chainpath: binding %s HELD at link %d — %s", binding.binding_id, i, outcome.reason)
+                return ChainOutcome(binding_id=binding.binding_id, state="held", links=tuple(results),
+                                    paused_at=i, reason=outcome.reason)
+
             if outcome.pending:
                 # PAUSE — persist the in-flight chain state for the operator's resolve. Both the seal
                 # (``ChainState.create`` → ``seal_chain_id`` can raise on a non-canonical trigger event,
@@ -771,6 +790,10 @@ class ChainExecutor:
         exists yet). Fail-soft: the chain already completed; a bookkeeping fault never propagates."""
         if self._binding_store is None or binding.one_shot:
             return
+        if results and results[-1].outcome.replayed:
+            # the terminal link replayed: this chain completed before, and its fire was recorded then
+            # (or the process stopped first: an under-count, the safe direction for evidence).
+            return
         clean = all(r.outcome.is_clean_fire for r in results)
         try:
             self._binding_store.record_fire(binding.binding_id, clean=clean,
@@ -808,6 +831,8 @@ class ChainExecutor:
             predicted_trajectory=_predicted_trajectory(binding),
             trigger_event=event,
             ratified_posture=(binding.posture if is_terminal else None),
+            run=(RunRef(run_id_for(binding.binding_id, event), f"link-{i}")
+                 if self._gate.journal is not None else None),
         )
         return request, self._gate.gate(request)
 
