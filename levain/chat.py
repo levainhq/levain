@@ -11,7 +11,7 @@ holds one driver, made by entity name (:class:`~levain.chat_driver.OpenHandsDriv
 session cap, the deadline watcher and the decision id and digest an approval binds to stay here, because
 they are the same whatever the harness is; how a session is opened, how a turn is sent and how the
 harness's own consent surfaces are the driver's. Every outcome is checked against the contract before it
-is recorded (:func:`~levain.chat_driver.check_outcome`).
+is recorded (:func:`~levain.chat_driver.snapshot_outcome`).
 
 **The client never supplies an agent, a tool spec, a model or a mode.** It names an entity the
 OPERATOR registered at startup, and it sends message text. Everything that shapes the agent comes
@@ -111,7 +111,9 @@ from levain.chat_driver import (
     DriverEvent,
     HarnessDriver,
     OpenHandsDriver,
-    check_outcome,
+    TurnSnapshot,
+    read_outcome,
+    snapshot_outcome,
 )
 from levain.firing.gate import shown_in_full
 
@@ -249,26 +251,31 @@ class _Session:
 
 
 def _turn_payload(result: Any) -> dict[str, Any]:
-    """A :class:`~levain.session.TurnResult` as JSON-shaped data. ``ok`` and ``exit_code`` are the
-    result's own derived properties, so a client reads the harness's classification rather than
+    """A :class:`~levain.session.TurnResult` as JSON-shaped data: it reads ``result`` once
+    (:func:`~levain.chat_driver.read_outcome`) and serialises that snapshot. ``ok`` and ``exit_code`` are
+    the result's own derived properties, so a client reads the harness's classification rather than
     re-deriving it."""
-    activity = [_cap_line(x) for x in result.tool_activity]
+    return _snapshot_payload(read_outcome(result, strict=False))
+
+
+def _snapshot_payload(snap: TurnSnapshot) -> dict[str, Any]:
+    activity = [_cap_line(x) for x in snap.tool_activity]
     pending = [
-        {"tool": p.tool_name, "detail": p.detail, "full": getattr(p, "full", ""), "reason": p.reason,
+        {"tool": p.tool_name, "detail": p.detail, "full": p.full, "reason": p.reason,
          "recognized": p.recognized}
-        for p in result.pending
+        for p in snap.pending
     ]
     return {
-        "reply": result.reply,
-        "unreadable_call": bool(getattr(result, "unreadable_call", False)),
+        "reply": snap.reply,
+        "unreadable_call": snap.unreadable_call,
         "tool_activity": activity[-MAX_ACTIVITY_LINES:],
-        "error": result.error,
-        "nudged": result.nudged,
-        "gated": result.gated,
-        "timed_out": result.timed_out,
+        "error": snap.error,
+        "nudged": snap.nudged,
+        "gated": snap.gated,
+        "timed_out": snap.timed_out,
         "pending": pending,
-        "ok": result.ok,
-        "exit_code": result.exit_code,
+        "ok": snap.ok,
+        "exit_code": snap.exit_code,
     }
 
 
@@ -767,7 +774,7 @@ class ChatHost:
         A kind of event this host does not know is ignored (the contract says a consumer must)."""
 
         def _emit(event: DriverEvent) -> None:
-            if event.kind != "activity":
+            if not isinstance(event, DriverEvent) or event.kind != "activity":
                 return
             line = event.text
             with self._lock:
@@ -797,11 +804,10 @@ class ChatHost:
             try:
                 driver = rec.driver
                 assert driver is not None
-                result = call(driver)
-                check_outcome(driver, result)
-                payload = _turn_payload(result)
-                digest = getattr(result, "held_digest", None)
-                cut = max(0, len(result.tool_activity) - MAX_ACTIVITY_LINES)
+                snap = snapshot_outcome(driver, call(driver))   # read once; what is checked is what is recorded
+                payload = _snapshot_payload(snap)
+                digest = snap.held_digest
+                cut = max(0, len(snap.tool_activity) - MAX_ACTIVITY_LINES)
             except BaseException as exc:  # noqa: BLE001 — the turn methods return results; this is a backstop
                 error = f"{type(exc).__name__}: {exc}"
         finally:

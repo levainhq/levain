@@ -8,6 +8,7 @@ whose consent needs a state machine the host does not have.
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,6 +26,7 @@ from levain.chat_driver import (
     HarnessDriver,
     OpenHandsDriver,
     check_outcome,
+    snapshot_outcome,
 )
 from levain.firing.gate import PendingEfferent
 
@@ -398,3 +400,159 @@ def test_the_openhands_driver_is_not_driveable_when_closed_and_keeps_an_errored_
         d.send_turn("x")
     assert d.state == "closed"
     d.interrupt()                            # tolerated after close
+
+
+# -- 1007+19: the driver life cycle is a forward-only state machine; the outcome is read once ------------
+
+
+class _Hands:
+    """A session whose turn blocks until a stop request arrives, recording the order of events."""
+
+    def __init__(self):
+        self.log: list[str] = []
+        self.entered = threading.Event()
+        self.stop = threading.Event()
+
+    def run_turn(self, message):
+        self.log.append("turn-start")
+        self.entered.set()
+        assert self.stop.wait(5)
+        self.log.append("turn-end")
+        return _Out(reply="stopped")
+
+    def request_stop(self):
+        self.log.append("stop")
+        self.stop.set()
+
+    def close(self):
+        self.log.append("close")
+
+
+def test_close_during_a_running_turn_ends_the_turn_and_only_then_releases_the_session(tmp_path):
+    hands = _Hands()
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: hands)
+    d.open(lambda e: None)
+    t = threading.Thread(target=lambda: d.send_turn("x"))
+    t.start()
+    assert hands.entered.wait(5)
+    d.close()                      # returns only after the turn's own return and the release
+    t.join(5)
+    assert hands.log.index("turn-end") < hands.log.index("close") and hands.log.count("close") == 1
+    assert d.state == "closed" and d.native is None
+
+
+def test_a_turn_cannot_start_while_closing_or_overlap_another(tmp_path):
+    hands = _Hands()
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: hands)
+    d.open(lambda e: None)
+    t = threading.Thread(target=lambda: d.send_turn("x"))
+    t.start()
+    assert hands.entered.wait(5)
+    with pytest.raises(RuntimeError, match="already running"):
+        d.send_turn("y")
+    d.close()
+    t.join(5)
+    with pytest.raises(RuntimeError, match="not open"):
+        d.send_turn("z")
+
+
+def test_close_racing_open_leaves_no_published_session(tmp_path):
+    gate, built = threading.Event(), threading.Event()
+    sess = _Hands()
+
+    def opener(path, on_event):
+        built.set()
+        assert gate.wait(5)
+        return sess
+
+    d = OpenHandsDriver(tmp_path, opener)
+    errors: list[BaseException] = []
+
+    def _open():
+        try:
+            d.open(lambda e: None)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    o = threading.Thread(target=_open)
+    o.start()
+    assert built.wait(5)
+    c = threading.Thread(target=d.close)
+    c.start()
+    time.sleep(0.05)
+    assert c.is_alive() and "close" not in sess.log      # close waits for the opener; nothing released yet
+    gate.set()
+    o.join(5), c.join(5)
+    assert not c.is_alive() and sess.log == ["close"]    # released exactly once, by the opener that lost
+    assert errors and "closed while it opened" in str(errors[0])
+    assert d.native is None and d.state == "closed"
+
+
+def test_a_driver_opens_once_and_a_failed_opener_leaves_it_closed(tmp_path):
+    d = OpenHandsDriver(tmp_path, lambda p, on_event: _Hands())
+    d.open(lambda e: None)
+    with pytest.raises(RuntimeError, match="opens once"):
+        d.open(lambda e: None)
+    d.close()
+    with pytest.raises(RuntimeError, match="opens once"):
+        d.open(lambda e: None)
+
+    def boom(p, on_event):
+        raise ValueError("no hands")
+
+    f = OpenHandsDriver(tmp_path, boom)
+    with pytest.raises(ValueError):
+        f.open(lambda e: None)
+    f.close()
+    assert f.state == "closed"
+
+
+def test_the_outcome_is_read_once_and_the_snapshot_is_what_gets_recorded():
+    reads: list[str] = []
+
+    class Flip:
+        reply, tool_activity, error, nudged, timed_out, ok, exit_code = "r", [], None, False, False, False, 0
+        held_digest = "d1"
+        pending = (_HELD,)
+
+        @property
+        def gated(self):
+            reads.append("gated")
+            return len(reads) == 1          # True on the first read, False on any later one
+
+    d = _Fake([])
+    d._state = "awaiting_approval"
+    snap = snapshot_outcome(d, Flip())
+    assert snap.gated is True and reads == ["gated"]       # one read; the check and the record agree
+    assert snap.pending[0].tool_name == "terminal" and snap.held_digest == "d1"
+    with pytest.raises(Exception):
+        snap.gated = False                                  # type: ignore[misc]  # frozen
+
+
+def test_outcome_value_shapes_and_the_idle_rule_are_enforced():
+    d = _Fake([])
+    d._state = "idle"
+
+    class Meth(_Out):
+        def ok(self):                                      # a method where a value was meant
+            return True
+
+    with pytest.raises(DriverContractError, match="bool and an int"):
+        snapshot_outcome(d, Meth())
+    d._state = "awaiting_approval"
+    nameless = PendingEfferent("", "x", "r", full="{}")
+    with pytest.raises(DriverContractError, match="names no tool"):
+        snapshot_outcome(d, _Out(reply=None, gated=True, pending=(nameless,), held_digest="d"))
+    for bad in ("active", "closed"):
+        d._state = bad
+        with pytest.raises(DriverContractError, match="not 'idle'"):
+            snapshot_outcome(d, _Out())
+
+
+def test_the_host_ignores_a_driver_event_that_is_not_a_driver_event(tmp_path):
+    d = _Fake([_Out(reply="ok")])
+    host = _host(tmp_path, {"alpha": d})
+    sid, _ = _open(host, "alpha")
+    d.sink("a plain string, not a DriverEvent")            # type: ignore[misc]
+    st = _wait(host, host.turn(sid, "go")["job_id"])
+    assert st["status"] == "done"

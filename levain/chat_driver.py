@@ -23,7 +23,9 @@ outcome before the host records it):
   it and refuses an approve when the two differ or either is missing, so a driver with no digest has a
   hold that can only be rejected (not a contract violation: it fails closed).
 * The driver's :attr:`~HarnessDriver.state` agrees with the outcome: ``awaiting_approval`` exactly
-  when the outcome halted.
+  when the outcome halted, ``idle`` otherwise.
+* The outcome is read ONCE (:func:`snapshot_outcome` returns a :class:`TurnSnapshot`); the host records
+  that snapshot, never the driver's live result.
 
 **``approval_timing`` is where this contract is deliberately not finished.** ``after_turn`` is what
 OpenHands does and what the host implements: the turn RETURNS halted, the session is not busy, and a
@@ -74,9 +76,12 @@ __all__ = [
     "DriverUnsupported",
     "HarnessDriver",
     "OpenHandsDriver",
+    "PendingApproval",
     "TurnOptions",
     "TurnOutcome",
+    "TurnSnapshot",
     "check_outcome",
+    "snapshot_outcome",
 ]
 
 DriverState = Literal["idle", "active", "awaiting_approval", "closed"]
@@ -151,31 +156,115 @@ class TurnOutcome(Protocol):
     def exit_code(self) -> int: ...
 
 
-def check_outcome(driver: "HarnessDriver", outcome: Any) -> None:
-    """Raise :class:`DriverContractError` unless ``outcome`` keeps the contract's guarantees about a
-    hold (module docstring). An outcome that already failed (``error`` set) is not checked: the host
-    breaks that session and decides nothing on it."""
-    if not isinstance(outcome, TurnOutcome):
+@dataclass(frozen=True)
+class PendingApproval:
+    """One held call as the host shows it. ``tool_name`` is never empty (a consent row that names no tool
+    cannot be judged); ``full`` is the raw call, ``""`` when it could not be read."""
+
+    tool_name: str
+    detail: str
+    full: str
+    reason: str
+    recognized: bool
+
+
+@dataclass(frozen=True)
+class TurnSnapshot:
+    """A turn's outcome read ONCE, into plain immutable values. The host validates this object and then
+    serialises this same object, so what was checked is what is recorded: nothing is read from the
+    driver's live result a second time (a result that changed between the check and the record, or whose
+    fields are computed, could otherwise pass one and differ at the other)."""
+
+    reply: str | None
+    tool_activity: tuple[Any, ...]
+    error: str | None
+    nudged: bool
+    gated: bool
+    timed_out: bool
+    pending: tuple[PendingApproval, ...]
+    held_digest: str | None
+    unreadable_call: bool
+    ok: bool
+    exit_code: int
+
+
+_ABSENT = object()
+_OUTCOME_FIELDS = ("reply", "tool_activity", "error", "nudged", "gated", "timed_out", "pending",
+                   "held_digest", "ok", "exit_code")
+
+
+def read_outcome(outcome: Any, *, strict: bool = True) -> TurnSnapshot:
+    """Read ``outcome`` once. ``strict`` (the driver path) requires every field of :class:`TurnOutcome`;
+    otherwise a missing ``held_digest`` reads as ``None`` (a hold that can only be rejected)."""
+    got: dict[str, Any] = {n: getattr(outcome, n, _ABSENT) for n in _OUTCOME_FIELDS}   # ONE read of each field
+    missing = [n for n, v in got.items() if v is _ABSENT and (strict or n != "held_digest")]
+    if missing:
         raise DriverContractError(
             "the driver's outcome does not carry the fields the host reads (reply, tool_activity, error, "
             "nudged, gated, timed_out, pending, held_digest, ok, exit_code); a missing `gated` or "
-            "`pending` would read as 'nothing held'")
-    if outcome.error is not None:
-        return
-    pending = tuple(outcome.pending or ())
-    gated = bool(outcome.gated)
-    if gated and not pending:
+            f"`pending` would read as 'nothing held' (missing: {', '.join(missing)})")
+    ok, exit_code, error = got["ok"], got["exit_code"], got["error"]
+    digest = got["held_digest"] if got["held_digest"] is not _ABSENT else None
+    unreadable = getattr(outcome, "unreadable_call", False)
+    if not isinstance(ok, bool) or isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        raise DriverContractError(
+            "the driver's outcome reports `ok` / `exit_code` as something other than a bool and an int "
+            "(a method where a value was meant)")
+    if error is not None and not isinstance(error, str):
+        raise DriverContractError("the driver's outcome reports `error` as something other than text")
+    pending = tuple(
+        PendingApproval(
+            tool_name=p.tool_name if isinstance(getattr(p, "tool_name", None), str) else "",
+            detail=str(getattr(p, "detail", "")),
+            full=getattr(p, "full", "") if isinstance(getattr(p, "full", ""), str) else "",
+            reason=str(getattr(p, "reason", "")),
+            recognized=bool(getattr(p, "recognized", False)),
+        )
+        for p in (got["pending"] or ())
+    )
+    return TurnSnapshot(
+        reply=got["reply"],
+        tool_activity=tuple(got["tool_activity"] or ()),
+        error=error,
+        nudged=bool(got["nudged"]),
+        gated=bool(got["gated"]),
+        timed_out=bool(got["timed_out"]),
+        pending=pending,
+        held_digest=digest if isinstance(digest, str) else None,
+        unreadable_call=bool(unreadable),
+        ok=ok,
+        exit_code=exit_code,
+    )
+
+
+def snapshot_outcome(driver: "HarnessDriver", outcome: Any) -> TurnSnapshot:
+    """Read ``outcome`` once and raise :class:`DriverContractError` unless that snapshot keeps the
+    contract's guarantees about a hold (module docstring); return the snapshot for the host to record.
+    An outcome that already failed (``error`` set) is not held to them: the host breaks that session and
+    decides nothing on it."""
+    snap = read_outcome(outcome)
+    if snap.error is not None:
+        return snap
+    if snap.gated and not snap.pending:
         raise DriverContractError(
             "the driver reported a halted turn with no held action: there is no consent row to show")
-    if pending and not gated:
+    if snap.pending and not snap.gated:
         raise DriverContractError(
             "the driver returned held actions on a turn it did not report as halted: "
             "nothing would stop them being run")
+    if any(not p.tool_name for p in snap.pending):
+        raise DriverContractError("a held action names no tool: there is no consent row to judge")
     state = driver.state
-    if gated and state != "awaiting_approval":
+    if snap.gated and state != "awaiting_approval":
         raise DriverContractError(f"the outcome is halted but the driver reads {state!r}")
-    if not gated and state == "awaiting_approval":
-        raise DriverContractError("the driver reads 'awaiting_approval' but the outcome is not halted")
+    if not snap.gated and state != "idle":
+        raise DriverContractError(f"the outcome is not halted but the driver reads {state!r}, not 'idle'")
+    return snap
+
+
+def check_outcome(driver: "HarnessDriver", outcome: Any) -> None:
+    """:func:`snapshot_outcome` for a caller that only wants the verdict."""
+    snapshot_outcome(driver, outcome)
 
 
 class HarnessDriver(abc.ABC):
@@ -265,32 +354,66 @@ SessionOpener = Callable[..., Any]
 (or anything shaped like one). It is where this entity's refusals live."""
 
 
+_Phase = Literal["new", "opening", "open", "closing", "closed"]
+
+
 @dataclass
 class OpenHandsDriver(HarnessDriver):
     """Today's chat turn loop behind the contract: an :class:`~levain.session.EntitySession` driven
     through ``run_turn`` / ``resume_turn`` / ``reject_turn``. The opener builds the hands itself from
-    the operator's command line; this class never sees a client-supplied agent or spec."""
+    the operator's command line; this class never sees a client-supplied agent or spec.
+
+    **Life cycle is a forward-only state machine, and the phase is the guard** (LSP's
+    initialize/shutdown/exit, ACP's cancel-ends-the-turn): ``new -> opening -> open -> closing -> closed``,
+    every transition made once under one condition lock, nothing checked and then acted on outside it.
+    :meth:`open` is accepted only from ``new``; it publishes the session it built only if the phase is
+    still ``opening`` when it arrives, otherwise a :meth:`close` won and the session is released there.
+    A turn starts only from ``open`` and at most one runs. :meth:`close` never releases a session under a
+    running turn: it stops the turn and waits for the turn's own return, then releases (the turn is ended,
+    not torn down). When :meth:`close` returns, nothing is held and no turn runs."""
 
     entity_dir: Path
     opener: SessionOpener
     harness: str = field(default="openhands", init=False)
     caps: DriverCaps = field(default=DriverCaps(), init=False)
     _session: Any = field(default=None, init=False, repr=False)
-    _state: DriverState = field(default="closed", init=False, repr=False)
-    _lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
+    _phase: _Phase = field(default="new", init=False, repr=False)
+    _running: bool = field(default=False, init=False, repr=False)
+    _halted: bool = field(default=False, init=False, repr=False)
+    _cond: Any = field(default_factory=threading.Condition, init=False, repr=False)
 
     def open(self, on_event: Callable[[DriverEvent], None], *, resume: str | None = None) -> None:
         if resume is not None:
             raise DriverUnsupported(
                 "openhands conversations live in server memory only; resume across a restart is not offered")
+        with self._cond:
+            if self._phase != "new":
+                raise RuntimeError(f"the driver cannot open from {self._phase!r}: it opens once")
+            self._phase = "opening"
 
         def _sink(line: str) -> None:
             on_event(DriverEvent("activity", line))
 
-        session = self.opener(self.entity_dir, on_event=_sink)
-        with self._lock:
-            self._session = session
-            self._state = "idle"
+        try:
+            session = self.opener(self.entity_dir, on_event=_sink)
+        except BaseException:
+            with self._cond:
+                self._phase = "closed"
+                self._cond.notify_all()
+            raise
+        with self._cond:
+            won = self._phase == "opening"
+            if won:
+                self._session, self._phase = session, "open"
+        if not won:
+            # close() ran while the opener was building: it is waiting for this release.
+            try:
+                session.close()
+            finally:
+                with self._cond:
+                    self._phase = "closed"
+                    self._cond.notify_all()
+            raise RuntimeError("the driver was closed while it opened")
 
     @property
     def native(self) -> Any:
@@ -298,23 +421,28 @@ class OpenHandsDriver(HarnessDriver):
 
     @property
     def state(self) -> DriverState:
-        return self._state
+        with self._cond:
+            if self._phase != "open":
+                return "closed"
+            return "active" if self._running else ("awaiting_approval" if self._halted else "idle")
 
     def _run(self, call: Callable[[Any], Any]) -> Any:
-        with self._lock:
-            session = self._session
-            if session is None:
+        with self._cond:
+            if self._phase != "open":
                 raise RuntimeError("the driver is not open")
-            self._state = "active"
+            if self._running:
+                raise RuntimeError("a turn is already running on this driver")
+            session = self._session
+            self._running = True
         result: Any = None
         try:
             result = call(session)
             return result
         finally:
             gated = bool(getattr(result, "gated", False))   # an errored halt still holds its actions
-            with self._lock:
-                if self._state == "active":
-                    self._state = "awaiting_approval" if gated else "idle"
+            with self._cond:
+                self._running, self._halted = False, gated
+                self._cond.notify_all()
 
     def send_turn(self, message: str, *, options: TurnOptions | None = None) -> TurnOutcome:
         if options is not None and (options.model is not None or options.effort is not None):
@@ -332,16 +460,48 @@ class OpenHandsDriver(HarnessDriver):
         return s.held_digest() if s is not None else None
 
     def interrupt(self) -> None:
-        s = self._session
-        if s is not None:
-            s.request_stop()
+        # The stop request runs OUTSIDE the lock: it may block (the SDK's pause waits for a step's state
+        # lock), and `state` / `held_digest` must not wait on it.
+        with self._cond:
+            session = self._session
+        if session is not None:
+            session.request_stop()
 
     def close(self) -> None:
-        with self._lock:
-            s, self._session = self._session, None
-            self._state = "closed"
-        if s is not None:
-            s.close()
+        with self._cond:
+            if self._phase == "new":
+                self._phase = "closed"
+                return
+            if self._phase in ("opening", "closing"):
+                # an opener in flight releases its own session on arrival (open()); another closer
+                # is mid-release. Either way, wait until the release is done.
+                if self._phase == "opening":
+                    self._phase = "closing"
+                self._cond.wait_for(lambda: self._phase == "closed")
+                return
+            if self._phase == "closed":
+                return
+            self._phase = "closing"      # no new turn can start from here
+        while True:
+            with self._cond:
+                if not self._running:
+                    break
+            try:
+                self.interrupt()
+            except Exception:  # noqa: BLE001 — keep asking; the turn's own return is what we wait for
+                pass
+            with self._cond:
+                if self._running:
+                    # repeated: a stop request landing before the run loop starts is undone by it
+                    self._cond.wait(1.0)
+        with self._cond:
+            session, self._session = self._session, None
+        try:
+            session.close()
+        finally:
+            with self._cond:
+                self._phase = "closed"
+                self._cond.notify_all()
 
     def describe(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
