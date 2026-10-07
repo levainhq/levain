@@ -27,7 +27,6 @@ import secrets
 import stat
 import subprocess
 import tempfile
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,7 +68,8 @@ _NO_HOOKS = ["-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/n
 # The only names levain writes under ledger/: <handle>/<device>.jsonl (file_for, _new_device). Compared as bytes.
 _LEDGER_PATH_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}/[0-9a-f]{16}\.jsonl")
 _LEDGER_DIR_RE = re.compile(rb"ledger/[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-_TOP_FILES = (b"team.toml", b"PROJECT.md")     # with `ledger`, the whole top level of the ledger branch
+_TOP_FILES = (b"team.toml", b"PROJECT.md")
+_MISSING_TEAM = b"\0team.toml is missing"     # a marker no tree path can equal (paths hold no NUL)     # with `ledger`, the whole top level of the ledger branch
 
 
 # One quarantine ref and one accepted ref per clone, under refs/levain/ where no refspec of the user's writes. The
@@ -77,6 +77,8 @@ _TOP_FILES = (b"team.toml", b"PROJECT.md")     # with `ledger`, the whole top le
 # it unjudged, so nothing levain decides reads it.
 _INCOMING = f"refs/levain/incoming/{BRANCH}"
 _ACCEPTED = f"refs/levain/accepted/{BRANCH}"
+_MAX_LEDGER_FILE = 64 << 20        # one ledger file; an entry is ~1 KB, so this is tens of thousands of entries
+_MAX_LEDGER_TOTAL = 512 << 20      # every ledger file read for one judgement
 _PINS_MAX_BYTES = 8 << 20          # a pins file holds ~120 bytes per ledger file
 _READ_ATTEMPTS = 3
 _PIN_RACE_TEXT = ("the ledger kept moving while this clone recorded what it accepted (a concurrent read pinned a newer "
@@ -165,12 +167,9 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
     return cp
 
 
-_UMASK_LOCK = threading.Lock()
-
-
-def _umask() -> int:
-    """The process umask. Linux reports it in /proc; elsewhere it can only be read by setting it, so that is done
-    under a lock and restored at once."""
+def _read_umask() -> int:
+    """The process umask. Linux reports it in /proc; elsewhere it can only be read by setting it, which is done once,
+    at import, before any thread of levain's exists."""
     try:
         with open("/proc/self/status", encoding="ascii") as fh:
             for line in fh:
@@ -178,16 +177,12 @@ def _umask() -> int:
                     return int(line.split()[1], 8)
     except (OSError, ValueError):
         pass
-    with _UMASK_LOCK:
-        mask = os.umask(0o022)
-        os.umask(mask)
+    mask = os.umask(0o022)
+    os.umask(mask)
     return mask
 
 
-def _write_all(fd: int, data: bytes) -> None:
-    view = memoryview(data)
-    while view:
-        view = view[os.write(fd, view):]
+_UMASK = _read_umask()
 
 
 def _atomic_write(path: Path, text: str, *, sync_dir: bool = False) -> None:
@@ -391,19 +386,28 @@ class GitLedger:
         cp = git(["show", f"{rev}:{path}"], self.repo.toplevel, check=False, timeout=30)
         return cp.stdout if cp.returncode == 0 else None
 
+    def _parse_team_at(self, rev: str) -> R.Team:
+        """team.toml at ``rev``, decoded STRICTLY: bytes that are not UTF-8 never become a configuration with
+        replacement characters in it."""
+        cp = git(["show", f"{rev}:team.toml"], self.repo.toplevel, check=False, timeout=30)
+        try:
+            text = cp.stdout_bytes.decode("utf-8") if cp.returncode == 0 else ""
+        except UnicodeDecodeError:
+            raise R.RolesError("team.toml is not valid UTF-8") from None
+        return R.parse_team(text, "team.toml")
+
     def team(self, rev: str | None = None) -> R.Team:
         """team.toml at ``rev`` (default: the branch tip); if that version does not parse, the newest one before it
         that does (reported)."""
         rev = rev or REF
-        text = self._show("team.toml", rev)
         try:
-            return R.parse_team(text or "", "team.toml")
+            return self._parse_team_at(rev)
         except R.RolesError as exc:
             first = exc
         cp = git(["log", "--format=%H", rev, "--", "team.toml"], self.repo.toplevel, check=False, timeout=30)
         for sha in cp.stdout.split()[1:]:
             try:
-                t = R.parse_team(self._show("team.toml", sha) or "", "team.toml")
+                t = self._parse_team_at(sha)
             except R.RolesError:
                 continue
             self.warnings.append(f"team.toml at the tip is unusable ({first}); using the version from {sha[:10]}")
@@ -421,7 +425,7 @@ class GitLedger:
             try:
                 return sha, team, self._read(team, sha)
             except _PinRace:
-                continue                       # the tip moved under a concurrent reader's pin advance: read it again
+                time.sleep(random.uniform(0.02, 0.2))  # the tip moved under a concurrent reader's pin advance
         raise LedgerReadError(_PIN_RACE_TEXT)
 
     def ledger(self, team: R.Team | None = None, rev: str | None = None) -> I.Ledger:
@@ -438,7 +442,7 @@ class GitLedger:
             try:
                 return self._read(t, head)
             except _PinRace:
-                continue
+                time.sleep(random.uniform(0.02, 0.2))
         raise LedgerReadError(_PIN_RACE_TEXT)
 
     def _read(self, team: R.Team | None, rev: str) -> I.Ledger:
@@ -496,6 +500,9 @@ class GitLedger:
         bad_paths, leaves = self._structure(rev)
         tamper: list[str] = []
         for n, path in enumerate(bad_paths):
+            if path is _MISSING_TEAM:
+                tamper.append(f"team.toml is missing from the {BRANCH} branch; the team owner restores it")
+                continue
             who = ""
             if n < 20:                                                    # names a commit author only
                 try:
@@ -587,6 +594,8 @@ class GitLedger:
                 ok = False
             if not ok:
                 bad_paths.append(path)
+        if b"team.toml" not in seen_paths:            # the team is part of the ledger: a tip without it is refused
+            bad_paths.append(_MISSING_TEAM)
         return bad_paths, leaves
 
     # ---- rewrite protection: this clone's pins (trust on first use) ---------------------------------------------
@@ -663,6 +672,9 @@ class GitLedger:
                 if self._pin_violations(stored, datas):
                     raise _PinRace()
                 text = json.dumps(new, sort_keys=True)
+                if len(text.encode("utf-8")) > _PINS_MAX_BYTES:   # it could never be read back: refuse, change nothing
+                    raise LedgerReadError(f"the ledger has too many files for this clone to pin ({len(new)}); the team "
+                                          "owner removes the extra ledger files")
                 digest = self._pins_digest()
                 if stored != new or digest is None or digest != hashlib.sha256(text.encode()).hexdigest():
                     _atomic_write(self.base / "pins.json", text, sync_dir=True)
@@ -707,6 +719,23 @@ class GitLedger:
         if not shas:
             return {}
         order = sorted(shas)
+        # Sizes first, so no ledger file is ever read whole into memory past the limits (a hook killed for memory
+        # would answer nothing at all).
+        cp = git(["cat-file", "--batch-check"], self.repo.toplevel, input_text="".join(f"{s}\n" for s in order),
+                 check=False, timeout=60)
+        rows = cp.stdout_bytes.split(b"\n")
+        if cp.returncode != 0 or len(rows) != len(order) + 1 or rows[-1]:
+            raise LedgerReadError(f"could not read ledger sizes: {_tail(cp)}")
+        total = 0
+        for want, row in zip(order, rows):
+            head = row.split(b" ")
+            if len(head) != 3 or head[0] != want.encode("ascii") or head[1] != b"blob" or not head[2].isdigit():
+                raise LedgerReadError(f"git cat-file gave an answer levain cannot read for {want[:10]}")
+            total += int(head[2])
+            if int(head[2]) > _MAX_LEDGER_FILE or total > _MAX_LEDGER_TOTAL:
+                raise LedgerReadError(f"a ledger file ({want[:10]}, {int(head[2])} bytes) is past levain's limits "
+                                      f"({_MAX_LEDGER_FILE >> 20} MiB a file, {_MAX_LEDGER_TOTAL >> 20} MiB in all); the "
+                                      "team owner removes it from the ledger branch")
         cp = git(["cat-file", "--batch"], self.repo.toplevel, input_text="".join(f"{s}\n" for s in order),
                  check=False, timeout=60)
         if cp.returncode != 0:
@@ -749,7 +778,7 @@ class GitLedger:
             sha, _, raw_mail = row.partition("\t")
             mail = E._printable(" ⏎ ".join(raw_mail.splitlines()))   # shown; matching uses raw_mail
             try:
-                cur = R.parse_team(self._show("team.toml", sha) or "", "team.toml")
+                cur = self._parse_team_at(sha)
             except R.RolesError:
                 out.append(f"team.toml at {sha[:10]} (by {mail}) does not parse")
                 continue
@@ -927,7 +956,7 @@ class GitLedger:
         if mine:
             head = self.head()
             pins, problem = self._pins()
-            if self.judge(head, self._team_or_none(head), pins, problem).ledger.tamper:
+            if self._incoming_refusal() or self.judge(head, self._team_or_none(head), pins, problem).ledger.tamper:
                 # Nothing is committed onto a refused ledger. The interrupted write is set aside, not lost, and the
                 # worktree goes back to the committed state so a sync can still bring the repair.
                 kept = self._set_aside(mine)
@@ -945,7 +974,12 @@ class GitLedger:
         for rel in rels:
             src = self.wt / rel
             with contextlib.suppress(FileNotFoundError):
-                (dest / f"{rel.replace('/', '__')}.{stamp}").write_bytes(src.read_bytes())
+                data = src.read_bytes()
+                fd, kept = tempfile.mkstemp(dir=dest, prefix=f"{rel.replace('/', '__')}.{stamp}.")
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+                    fh.flush()
+                    os.fsync(fh.fileno())
             if git(["checkout", "-q", "HEAD", "--", rel], self.wt, check=False).returncode != 0:
                 with contextlib.suppress(FileNotFoundError):
                     src.unlink()                          # a new file the branch does not hold
@@ -954,14 +988,18 @@ class GitLedger:
     def _commit(self, message: str) -> None:
         git(["-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", message], self.wt)
 
-    def _open_own_file(self, handle_dir: str, name: str) -> int:
-        """Open ``ledger/<handle_dir>/<name>`` in the worktree for appending, walking one directory at a time from an
-        open descriptor (``dir_fd``) with O_NOFOLLOW at every step: a component that is, or is swapped for, a
-        symlink fails the open instead of being followed, so no check-then-use window exists between a test of a
-        parent directory and the write. The walk starts at the worktree, which sits inside levain's own state directory."""
+    def _append_own(self, handle_dir: str, name: str, line: bytes) -> None:
+        """Append ``line`` to ``ledger/<handle_dir>/<name>`` by COPY-ON-WRITE: the current bytes are read, the whole new
+        file is written to a fresh temp file in levain's state directory (same filesystem), fsynced, and renamed over
+        the entry. The old inode is never written, so a link to it (hard or symbolic, made before or after any check)
+        never carries the write anywhere. The walk to the directory goes one component at a time from open
+        descriptors with O_NOFOLLOW, so a parent swapped for a symlink fails instead of redirecting the rename."""
         rel = f"ledger/{handle_dir}/{name}"
         fds: list[int] = []
+        tmp = f".{name}.{secrets.token_hex(8)}.tmp"
+        base_fd = None
         try:
+            base_fd = os.open(self.base, os.O_RDONLY | os.O_DIRECTORY)
             fds.append(os.open(self.wt, os.O_RDONLY | os.O_DIRECTORY))
             for comp in ("ledger", handle_dir):
                 try:
@@ -969,13 +1007,34 @@ class GitLedger:
                 except FileExistsError:
                     pass
                 fds.append(os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fds[-1]))
-            return os.open(name, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o666, dir_fd=fds[-1])
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fds[-1])
+            except FileNotFoundError:
+                old = b""
+            else:
+                with os.fdopen(fd, "rb") as fh:
+                    if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                        raise TeamError(f"{rel} in the ledger worktree is not a regular file; refusing to write to it")
+                    old = fh.read()
+            if old and not old.endswith(b"\n"):
+                line = b"\n" + line   # a torn last line stays torn (and reported); it must not swallow this one
+            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666, dir_fd=base_fd)
+            with os.fdopen(out, "wb") as fh:
+                fh.write(old + line)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.rename(tmp, name, src_dir_fd=base_fd, dst_dir_fd=fds[-1])
+            os.fsync(fds[-1])
         except OSError as exc:
-            raise TeamError(f"{rel} in the ledger worktree cannot be opened for writing ({exc.strerror}); levain "
-                            "never writes through a symlink or a non-directory") from None
+            with contextlib.suppress(OSError, TypeError):
+                os.unlink(tmp, dir_fd=base_fd)
+            raise TeamError(f"{rel} in the ledger worktree cannot be written ({exc.strerror}); levain never writes "
+                            "through a symlink or a non-directory") from None
         finally:
             for fd in fds:
                 os.close(fd)
+            if base_fd is not None:
+                os.close(base_fd)
 
     def append(self, entry: dict, *, push: bool = True, lock_timeout: float = 30.0) -> dict:
         """Validate, seal and append one entry to this author's file for this clone; commit; push.
@@ -1000,19 +1059,7 @@ class GitLedger:
             prev = next((f.last_hash for f in ledger.files if f.rel == rel), "")
             sealed = E.seal(entry, prev)
             line = json.dumps(sealed, ensure_ascii=False, sort_keys=True) + "\n"
-            fd = self._open_own_file(path.parent.name, path.name)
-            try:
-                st = os.fstat(fd)
-                if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
-                    raise TeamError(f"{path.relative_to(self.wt).as_posix()} in the ledger worktree is not a plain "
-                                    "single-link file; refusing to write to it")
-                data = line.encode("utf-8")
-                if st.st_size > 0 and os.pread(fd, 1, st.st_size - 1) != b"\n":
-                    data = b"\n" + data  # a torn last line stays torn (and reported); it must not swallow this one
-                _write_all(fd, data)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            self._append_own(path.parent.name, path.name, line.encode("utf-8"))
             git(["add", "--", str(path.relative_to(self.wt))], self.wt)
             self._commit(f"levain team: {sealed['type']} {sealed['id']}")
             if sealed["id"] not in self.ledger().by_id:
@@ -1422,7 +1469,7 @@ class GitLedger:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(text)
                 fh.flush()
-                os.fchmod(fh.fileno(), 0o666 & ~_umask())   # what git's own checkout would give it
+                os.fchmod(fh.fileno(), 0o666 & ~_UMASK)   # what git's own checkout would give it
                 os.fsync(fh.fileno())
             os.replace(tmp, self.wt / name)
         except BaseException:

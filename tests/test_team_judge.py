@@ -244,6 +244,7 @@ def test_a_rewrite_of_an_accepted_file_denies_with_the_file_and_the_recovery_unt
 
 
 def _plant_stray(gl):
+    (gl.wt / "ledger" / "ana").mkdir(parents=True, exist_ok=True)
     (gl.wt / "ledger" / "ana" / "notes.txt").write_text("x\n")
     _push_wt(gl, "plant")
 
@@ -469,15 +470,13 @@ def test_read_plain_closes_its_descriptor_when_fdopen_fails(two, monkeypatch):
     assert len(os.listdir("/dev/fd")) - before <= 1
 
 
-def test_a_rewritten_top_level_file_gets_the_mode_git_checkout_would_give_it(two):
+def test_a_rewritten_top_level_file_gets_the_mode_git_checkout_would_give_it(two, monkeypatch):
     # E review (gemini LOW d), RUN: under umask 002 _replace_plain forced 0o644 where git's checkout gives 0o664.
     tmp, ana, ben = two
     ga = _gl(ana)
-    old = os.umask(0o002)
-    try:
-        ga._replace_plain("PROJECT.md", "x\n")
-    finally:
-        os.umask(old)
+    from levain.team import transport as T
+    monkeypatch.setattr(T, "_UMASK", 0o002)                  # read once at import, before any thread exists
+    ga._replace_plain("PROJECT.md", "x\n")
     assert os.stat(ga.wt / "PROJECT.md").st_mode & 0o777 == 0o664
 
 
@@ -614,3 +613,135 @@ def test_sync_on_a_refused_tip_sets_an_interrupted_write_aside_instead_of_commit
     assert git("rev-parse", "HEAD", cwd=gb.wt) == head
     kept = list((gb.base / "set-aside").iterdir())
     assert kept and b"interrupted" in kept[0].read_bytes()
+
+
+@pytest.mark.parametrize("plant", ["unreadable", "nested_repo"])
+def test_a_git_dir_planted_in_a_subdirectory_does_not_take_an_edit_out_of_the_ledger(two, plant):
+    # L3 r1 gemini HIGH (and its wider class), RUN: an unreadable src/.git made discovery fail and the hook fail open;
+    # a real nested repository at src/ made the edit belong to a repository with no ledger. The pack governs
+    # src/settlement.py, so the edit must be denied either way.
+    tmp, ana, ben = two
+    if plant == "unreadable":
+        (ben / "src" / ".git").write_text("gitdir: /nowhere\n")
+        os.chmod(ben / "src" / ".git", 0)
+    else:
+        git("init", "-q", cwd=ben / "src")
+    try:
+        out = edit(ben, "src/settlement.py", session="pl")["hookSpecificOutput"]
+    finally:
+        if plant == "unreadable":
+            os.chmod(ben / "src" / ".git", 0o644)
+    assert out["permissionDecision"] == "deny"
+
+
+def test_a_remote_tip_without_team_toml_is_refused(two):
+    # L3 r1 codex HIGH 1, RUN: a tip that deleted team.toml was accepted (team() fell back to an older version), and
+    # the clone then read as not joined.
+    tmp, ana, ben = two
+    ga = _gl(ana)
+    git("rm", "-q", "team.toml", cwd=ga.wt)
+    git("commit", "-qm", "no team", cwd=ga.wt)
+    git("push", "-q", "origin", "HEAD:levain-ledger", cwd=ga.wt)
+    assert team("sync", repo=ben) == 2
+    assert any("team.toml is missing" in t for t in ledger(ben).tamper)
+
+
+def test_a_ledger_file_past_the_size_limit_is_denied_before_it_is_read(two, monkeypatch):
+    # L3 r1 codex HIGH 2: every blob was read into memory before any check; a huge one could OOM-kill the hook.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    (_gl(ben).base / "history.json").unlink(missing_ok=True)
+    monkeypatch.setattr(T, "_MAX_LEDGER_FILE", 100)
+    with pytest.raises(T.LedgerReadError, match="past levain's limits"):
+        _gl(ben).ledger()
+
+
+def test_a_hard_link_to_this_clones_file_never_receives_its_write(two):
+    # L3 r1 codex HIGH 3: the single-link check could be raced (a link made after fstat got the append). The append is
+    # copy-on-write now: the linked inode is never written, whenever the link was made.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "first") == 0
+    gb = _gl(ben)
+    own = gb.wt / "ledger" / "ben" / f"{gb.device}.jsonl"
+    victim = tmp / "victim.jsonl"
+    os.link(own, victim)
+    before = victim.read_bytes()
+    assert record_ruling(ben, "src/b.py", "second") == 0
+    assert victim.read_bytes() == before and own.read_bytes() != before
+
+
+def test_pins_that_could_not_be_read_back_are_never_written(two, monkeypatch):
+    # L3 r1 codex MED 4, RUN: enough ledger files made a pins.json over the read cap; it was written anyway and every
+    # later read refused it, with no way back.
+    from levain.team import transport as T
+    tmp, ana, ben = two
+    assert record_ruling(ana, "src/a.py", "first") == 0
+    assert team("sync", repo=ben) == 0
+    _pins_file(ben).unlink(missing_ok=True)
+    (_gl(ben).base / "history.json").unlink(missing_ok=True)
+    monkeypatch.setattr(T, "_PINS_MAX_BYTES", 50)
+    with pytest.raises(T.LedgerReadError, match="too many files"):
+        _gl(ben).ledger()
+    assert not _pins_file(ben).exists()
+
+
+def test_recovery_sets_an_interrupted_write_aside_while_the_remote_is_refused(two):
+    # L3 r1 codex MED 5, RUN: recovery judged only the local tip and committed onto a ledger refused by its quarantine.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "ben's first") == 0
+    assert team("sync", repo=ana) == 0
+    _plant_stray(_gl(ana))
+    assert team("sync", repo=ben) == 2                                       # the remote is quarantined, refused
+    gb = _gl(ben)
+    own = gb.wt / "ledger" / "ben" / f"{gb.device}.jsonl"
+    with open(own, "a") as fh:
+        fh.write('{"interrupted": true}\n')
+    head = git("rev-parse", "HEAD", cwd=gb.wt)
+    team("sync", repo=ben)
+    assert git("rev-parse", "HEAD", cwd=gb.wt) == head
+    assert any(b"interrupted" in p.read_bytes() for p in (gb.base / "set-aside").iterdir())
+
+
+def test_a_team_toml_that_is_not_utf8_never_becomes_a_configuration(two):
+    # L3 r1 codex MED 7, RUN: git output was decoded with replacement, so project = "p\xff" parsed as "p�".
+    tmp, ana, ben = two
+    ga = _gl(ana)
+    text = (ga.wt / "team.toml").read_bytes()
+    (ga.wt / "team.toml").write_bytes(text.replace(b'project = "ledgerline"', b'project = "ledger\xffline"'))
+    git("add", "--", "team.toml", cwd=ga.wt)
+    git("commit", "-qm", "not utf-8", cwd=ga.wt)
+    assert "�" not in ga.team().project
+
+
+def test_two_set_asides_of_one_file_in_one_second_are_both_kept(two):
+    # L3 r1 codex LOW 8: one-second names let the second set-aside overwrite the first.
+    tmp, ana, ben = two
+    assert record_ruling(ben, "src/a.py", "first") == 0
+    gb = _gl(ben)
+    rel = f"ledger/ben/{gb.device}.jsonl"
+    for n in range(2):
+        with open(gb.wt / rel, "a") as fh:
+            fh.write(f'{{"try": {n}}}\n')
+        gb._set_aside([rel])
+    assert len(list((gb.base / "set-aside").iterdir())) == 2
+
+
+def test_a_refusal_quarantined_before_the_remote_branch_was_deleted_heals_with_a_sync(two):
+    # L3 r1 complement MED 2, checked: the quarantine ref outlives a deleted remote branch, but `levain team sync`
+    # pushes this clone's accepted tip, the refresh judges it accepted, and the record clears.
+    tmp, ana, ben = two
+    _plant_stray(_gl(ana))
+    assert team("sync", repo=ben) == 2
+    git("push", "-q", "origin", ":levain-ledger", cwd=ana)
+    assert ledger(ben).tamper
+    assert team("sync", repo=ben) == 0
+    assert not ledger(ben).tamper
+
+
+def test_repin_outside_a_joined_clone_says_so(tmp_path, capsys):
+    # L3 r1 glm LOW: repin ran in an unjoined clone and printed "no pins to drop".
+    git("init", "-q", cwd=tmp_path)
+    assert team("repin", repo=tmp_path) == 2
+    assert "has not joined" in capsys.readouterr().err

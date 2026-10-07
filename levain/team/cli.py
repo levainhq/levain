@@ -220,6 +220,7 @@ def cmd_status(args) -> int:
 
 def cmd_repin(args) -> int:
     gl = GitLedger(_repo(args))
+    gl.require_joined()
     dropped = gl.repin(args.file)
     if not dropped:
         print("no pins to drop" + (f" for {args.file}" if args.file else ""))
