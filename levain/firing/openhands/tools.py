@@ -276,6 +276,17 @@ def _floored_move(src, dst, *args, **kwargs):
     policy = _EDITOR_FLOOR.get()
     if policy is None:
         return shutil.move(src, dst, *args, **kwargs)
+    try:
+        return _floored_move_impl(policy, src, dst)
+    except _FloorRefusedWalk:
+        try:
+            os.unlink(src)   # the editor's own temp file, holding the refused edit (L1 r3)
+        except OSError:
+            pass
+        raise
+
+
+def _floored_move_impl(policy: CrownJewelsPolicy, src, dst) -> str:
     dst = os.path.abspath(os.path.expanduser(str(dst)))
     name = os.path.basename(dst)
     pfd, walked = _judged_dir(os.path.dirname(dst))
@@ -298,11 +309,22 @@ def _floored_move(src, dst, *args, **kwargs):
         except OSError as exc:
             if exc.errno != errno.EXDEV:
                 raise
-            # The temp file is on another filesystem: copied into the held directory, then dropped.
-            out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o666,
+            # The temp file is on another filesystem: copied to a new name in the held directory and
+            # renamed over the target there, so the target name is replaced, never opened (a FIFO
+            # or a hardlink planted at it is not written through; L1 r3).
+            tmp = f".{name}.levain-{os.urandom(6).hex()}"
+            out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666,
                           dir_fd=pfd)
-            with builtins.open(src, "rb") as fin, os.fdopen(out, "wb") as fout:
-                shutil.copyfileobj(fin, fout)
+            try:
+                with builtins.open(src, "rb") as fin, os.fdopen(out, "wb") as fout:
+                    shutil.copyfileobj(fin, fout)
+                os.rename(tmp, name, src_dir_fd=pfd, dst_dir_fd=pfd)
+            except BaseException:
+                try:
+                    os.unlink(tmp, dir_fd=pfd)
+                except OSError:
+                    pass
+                raise
             os.unlink(src)
         # Re-judged by what is now there, as an open is judged by the object it opened.
         st = os.stat(name, dir_fd=pfd, follow_symlinks=False)

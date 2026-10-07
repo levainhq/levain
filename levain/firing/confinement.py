@@ -4389,9 +4389,12 @@ def _mount_plan_paths(
     def hidden(q: str) -> bool:
         # Strictly inside a tmpfs, and not strictly inside a host directory bound back into it (a
         # tool view's ~/.aws/sso: what lies below it is the host's again; codex, L3 r3).
+        # The NEAREST covering mount decides, so a tmpfs or mask nested inside a window is hidden
+        # again (L1 r3: ~/.aws/sso/cache's contents under the ~/.aws/sso window).
         pq = Path(q)
-        return (any(pq != r and pq.is_relative_to(r) for r in tmpfs)
-                and not any(pq != w and pq.is_relative_to(w) for w in windows))
+        covers = [(len(r.parts), 1) for r in tmpfs if pq != r and pq.is_relative_to(r)]
+        covers += [(len(w.parts), 0) for w in windows if pq != w and pq.is_relative_to(w)]
+        return bool(covers) and max(covers)[1] == 1
 
     mounted = {q: k for q, k in mounted.items() if not hidden(q)}
     unmounted = [q for q in _named_jewel_paths(policy) if q not in mounted and not hidden(q)]

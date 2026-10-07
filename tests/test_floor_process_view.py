@@ -463,3 +463,40 @@ def test_insert_and_view_still_work_on_ordinary_paths(tmp_path: Path, monkeypatc
         T._EDITOR_FLOOR.reset(token)
     assert f.read_text() == "one\ninserted\ntwo\n"
     assert "a.txt" in out and "sub/" in out and "deep.txt" in out
+
+
+def test_a_cross_filesystem_insert_replaces_the_name_and_a_refused_one_leaves_no_temp(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """L1 r3: the EXDEV copy opened the target in place (a FIFO hung it, a hardlink was written
+    through), and a refused move left the edit behind in the temp file."""
+    from openhands.tools.file_editor import editor as E
+
+    T, token = _under_floor(tmp_path, monkeypatch)
+    ws = tmp_path / "w"
+    ws.mkdir()
+    other = tmp_path / "other"
+    other.write_text("UNTOUCHED\n")
+    target = ws / "t.txt"
+    os.link(other, target)                    # a hardlink at the target name
+    src = tmp_path / "src"
+    src.write_text("NEW\n")
+    real_rename = os.rename
+
+    def exdev_once(a, b, *args, **kw):
+        if str(a) == str(src):
+            raise OSError(18, "Invalid cross-device link")
+        return real_rename(a, b, *args, **kw)
+
+    monkeypatch.setattr(T.os, "rename", exdev_once)
+    try:
+        E.shutil.move(str(src), target)
+        _, _, link = _jewel_dir_and_link(tmp_path)
+        refused_src = tmp_path / "src2"
+        refused_src.write_text("EDIT\n")
+        with pytest.raises(T._FloorRefusedWalk):
+            E.shutil.move(str(refused_src), link / "x")
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+    assert target.read_text() == "NEW\n" and other.read_text() == "UNTOUCHED\n"
+    assert not src.exists() and not refused_src.exists()

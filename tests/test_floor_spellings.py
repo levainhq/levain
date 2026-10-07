@@ -686,3 +686,22 @@ def test_a_workspace_that_is_home_itself_is_refused(home: Path) -> None:
     written at its root."""
     with pytest.raises(ConfinementError, match="workspace"):
         C._bwrap_plan(build_policy(_entity(home), workspace=home))
+
+
+def test_a_mask_nested_under_a_window_stays_hidden() -> None:
+    """L1 r3: a tmpfs inside a window hides what is under it again; only the nearest mount counts."""
+    class _P:
+        own_memory_files = deny_files = deny_read_write = deny_write_files = sqlite_sidecars = ()
+        socket_spellings = deny_sockets = ()
+        config_file = None
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        aws = Path(d).resolve() / "aws"
+        (aws / "sso").mkdir(parents=True)
+        argv = ["--tmpfs", str(aws), "--bind-try", str(aws / "sso"), str(aws / "sso"),
+                "--tmpfs", str(aws / "sso" / "cache"),
+                "--ro-bind", "/dev/null", str(aws / "sso" / "cache" / "tok.json")]
+        mounted, _ = C._mount_plan_paths(argv, _P())
+    assert str(aws / "sso" / "cache") in mounted
+    assert str(aws / "sso" / "cache" / "tok.json") not in mounted
