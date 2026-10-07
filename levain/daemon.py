@@ -257,10 +257,12 @@ def _prepare_private_logs(spec: "DaemonSpec") -> None:
             os.chmod(d, 0o700)   # mkdir's mode is masked by the umask
         elif platform.system() != "Darwin" and d == _default_log_dir().expanduser().resolve():
             os.chmod(d, 0o700)
+        if log.is_symlink():
+            continue   # never follow a link here: a dangling one would create, or chmod, its target
         if not log.exists():
-            os.close(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
+            os.close(os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600))
             os.chmod(log, 0o600)
-        elif not log.is_symlink() and log.stat().st_uid == os.getuid():
+        elif log.stat().st_uid == os.getuid():
             os.chmod(log, 0o600)   # a log an older unit created wider (its old token lines, since dead)
 
 

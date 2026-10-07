@@ -97,6 +97,11 @@ def _token_shaped(value: str) -> bool:
     return bool(value) and all(c.isascii() and (c.isalnum() or c in "-_") for c in value)
 
 
+# A token must fit comfortably in one request header line (codex L3: an over-long one would be refused by the
+# stdlib's line limit before any handler ran, bricking the server). The generated ones are 43 characters.
+_TOKEN_LEN = (8, 256)
+
+
 def check_launch_token(token: "str | None") -> None:
     """Refuse a launch token the page could not carry. ``None`` means "make one up". Anything else must be
     non-empty URL-safe base64 (``secrets.token_urlsafe``'s alphabet), the only shape token.js takes from a URL
@@ -104,9 +109,9 @@ def check_launch_token(token: "str | None") -> None:
     or a symbol would print an unlocked link the page refuses (codex L3 r1)."""
     if token is None:
         return
-    if not _token_shaped(token):
-        raise ValueError("a launch token must be non-empty and use only A-Z, a-z, 0-9, '-' and '_'; "
-                         "omit it to have one generated.")
+    if not _token_shaped(token) or not _TOKEN_LEN[0] <= len(token) <= _TOKEN_LEN[1]:
+        raise ValueError(f"a launch token must be {_TOKEN_LEN[0]} to {_TOKEN_LEN[1]} characters of A-Z, a-z, 0-9, "
+                         "'-' and '_'; omit it to have one generated.")
 
 # A write only ever legitimately originates from our own dashboard page (which sends
 # ``Sec-Fetch-Site: same-origin``) or a non-browser client that sends NO Sec-Fetch-
@@ -446,6 +451,8 @@ class GuardedHandler(BaseHTTPRequestHandler):
                 or not hmac.compare_digest(proof.encode("utf-8"),
                                            _link_proof(token, "levain-link-request", nonce).encode("utf-8"))):
             return self._send_json({"error": "link_proof", "message": "a link needs proof of this server's token"}, 403)
+        if not _first_use_of_nonce(self.server, nonce):
+            return self._send_json({"error": "link_proof", "message": "that request was already answered"}, 403)
         code = mint_link_code(self.server)
         self._send_json({"code": code, "expires_in": LINK_CODE_SECONDS,
                          "proof": _link_proof(token, "levain-link-reply", nonce, code)})
@@ -504,6 +511,23 @@ def _link_clock() -> float:
     return time.time()
 
 
+def _first_use_of_nonce(server: Any, nonce: str) -> bool:
+    """True the first time ``nonce`` proves a /link request on this server (within LINK_CODE_SECONDS), so a request
+    seen once cannot be replayed to mint more codes (complement L3)."""
+    _codes, lock = _link_state(server)
+    seen = getattr(server, "link_nonces", None)
+    if seen is None:
+        seen = server.link_nonces = {}
+    now = _link_clock()
+    with lock:
+        for n in [n for n, exp in seen.items() if exp <= now]:
+            del seen[n]
+        if nonce in seen:
+            return False
+        seen[nonce] = now + LINK_CODE_SECONDS
+        return True
+
+
 def mint_link_code(server: Any) -> str:
     """A fresh single-use link code for ``server`` (see ``LINK_CODE_HEADER``)."""
     codes, lock = _link_state(server)
@@ -554,13 +578,16 @@ class PublishedToken:
 
     unlocked: str
     path: "Path | None"
+    token: str = ""
 
     def close(self) -> None:
-        """Remove this server's runtime file, if it is still ours (a later server on the port may have replaced it)."""
+        """Remove this server's runtime file, if it is still this server's: a later server on the port (even one in
+        the same process) may have replaced it, so both the pid and the token must match (codex L3)."""
         if self.path is None:
             return
         try:
-            if json.loads(self.path.read_text(encoding="utf-8")).get("pid") == os.getpid():
+            rec = json.loads(self.path.read_text(encoding="utf-8"))
+            if rec.get("pid") == os.getpid() and rec.get("token") == self.token:
                 self.path.unlink()
         except (OSError, ValueError):
             pass
@@ -601,12 +628,15 @@ def publish_launch_token(server: Any, url: str, *, port: int, kind: str,
     if tty:
         print(f"  token (send as {LAUNCH_TOKEN_HEADER}; valid until this server stops): {token}", file=out, flush=True)
         print(f"  open it unlocked (the link works once): {unlocked}", file=out, flush=True)
+        if err is not None:
+            print(f"  (could not write {runtime_dir()}: {err}; `levain serve --open-running` will not find this "
+                  "server)", file=out, flush=True)
     elif err is not None:
         raise err
     else:
         print(f"  token: not printed here (this output is not a terminal); it is in {path} (0600). "
               f"Open the page with: levain serve --open-running --port {int(port)}", file=out, flush=True)
-    return PublishedToken(unlocked, path)
+    return PublishedToken(unlocked, path, token)
 
 
 def read_running(port: int) -> dict[str, Any]:
@@ -651,6 +681,8 @@ def request_link_code(url: str, token: str, *, timeout: float = 5.0) -> str:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open(req, timeout=timeout) as r:  # noqa: S310 — a loopback origin, checked above
         reply = json.loads(r.read())
+    if not isinstance(reply, dict):
+        raise ValueError("the answer on that port was not a link; not opening it")
     code, proof = reply.get("code"), reply.get("proof")
     if not (isinstance(code, str) and _token_shaped(code) and isinstance(proof, str)
             and hmac.compare_digest(proof.encode("utf-8"),
@@ -691,6 +723,7 @@ def stop_on_sigterm() -> "Callable[[], None]":
         return lambda: None
 
     def _stop(signum: int, frame: Any) -> None:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)   # one stop: a second SIGTERM must not cut the cleanup short
         raise KeyboardInterrupt
 
     previous = signal.signal(signal.SIGTERM, _stop)

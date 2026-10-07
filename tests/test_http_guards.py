@@ -612,3 +612,73 @@ def test_a_record_whose_pid_now_belongs_to_another_user_is_stale(tmp_path, monke
     (rt / "7490.json").write_text(json.dumps({"pid": 1, "token": "t", "url": "http://127.0.0.1:7490/"}))
     with pytest.raises(ValueError, match="no longer running"):
         read_running(7490)
+
+
+def test_link_round_one_review_fixes(tmp_path, monkeypatch):
+    """L3 a1b7e75430a7c14d: a /link request cannot be replayed; a non-object answer is refused cleanly; a token too
+    long for a header line is refused at construction; close() leaves a newer server's record alone."""
+    import io
+    import json
+    from types import SimpleNamespace
+
+    import levain.http_guards as hg
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    srv = SimpleNamespace(launch_token=_TOKEN)
+    assert hg._first_use_of_nonce(srv, "n" * 24) is True
+    assert hg._first_use_of_nonce(srv, "n" * 24) is False
+    with pytest.raises(ValueError, match="launch token must be"):
+        hg.check_launch_token("a" * 257)
+    hg.check_launch_token("a" * 256)
+    first = hg.publish_launch_token(srv, "http://127.0.0.1:7489/", port=7489, kind="serve", stream=io.StringIO())
+    srv2 = SimpleNamespace(launch_token="another-token-xyz")
+    second = hg.publish_launch_token(srv2, "http://127.0.0.1:7489/", port=7489, kind="serve", stream=io.StringIO())
+    first.close()                                  # same pid, different token: the newer record stays
+    assert json.loads((tmp_path / ".levain-runtime" / "7489.json").read_text())["token"] == "another-token-xyz"
+    second.close()
+    assert not (tmp_path / ".levain-runtime" / "7489.json").exists()
+
+
+def test_request_link_code_refuses_a_non_object_answer(tmp_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from levain.http_guards import request_link_code
+
+    class _List(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"[]")
+
+        def log_message(self, *a):
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _List)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        with pytest.raises(ValueError, match="not a link"):
+            request_link_code(f"http://127.0.0.1:{httpd.server_address[1]}/", _TOKEN)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=5)
+
+
+def test_a_terminal_hears_when_the_runtime_file_could_not_be_written(tmp_path, monkeypatch):
+    import io
+    from types import SimpleNamespace
+
+    from levain.http_guards import publish_launch_token
+
+    class _Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".levain-runtime").write_text("not a directory")
+    out = _Tty()
+    publish_launch_token(SimpleNamespace(launch_token=_TOKEN), "http://127.0.0.1:7488/", port=7488, kind="serve",
+                         stream=out)
+    assert _TOKEN in out.getvalue() and "could not write" in out.getvalue()

@@ -237,7 +237,11 @@ const IDS = process.argv[3] === "init"
 IDS.forEach((i) => { const n = new N(i === "init-form" ? "form" : "div"); n.id = i; body.appendChild(n); });
 if (process.argv[3] === "init") {
   find(body, (n) => n.id === "submit").disabled = true;              // as init.html ships it
-  find(body, (n) => n.id === "init-form").querySelector = () => ({ value: "claude-code" });   // the checked adapter
+  // the checked adapter: the first radio rendered checked, or what the test picked
+  find(body, (n) => n.id === "init-form").querySelector = () => {
+    const r = all(body, (n) => n.tagName === "input" && n.type === "radio" && n.checked)[0];
+    return globalThis.__picked ? { value: globalThis.__picked } : (r || { value: "claude-code" });
+  };
 }
 const document = { body: body, createElement: (t) => new N(t),
   getElementById: (i) => find(body, (n) => n.id === i) };
@@ -247,13 +251,18 @@ let serverToken = TOKEN, target = "/inst/A";
 const calls = [];
 const reply = (status, json) => Promise.resolve({ status, ok: status < 400, json: () => Promise.resolve(json) });
 function plan() {
-  return { install: target, force: false, target_status: "empty", packs: [], adapters: ["claude-code"], default_adapter: "claude-code",
+  return { install: target, force: false, target_status: "empty", packs: [], adapters: ["claude-code", "codex"], default_adapter: "claude-code",
     fields: [{ slot: "OPERATOR_NAME", section_index: 0, section_title: "Identity", spec_name: "world.md", style: "line", current: "" },
              { slot: "AGE", section_index: 0, section_title: "Identity", spec_name: "world.md", style: "line", current: "" }] };
 }
 function fetch(path, init) {
   init = init || {}; const hdr = init.headers || {};
   calls.push({ path: path, token: hdr["X-Levain-Token"] });
+  if (path === "/init" && MODE === "initinflight" && !globalThis.__postHeld) {
+    globalThis.__postHeld = true;
+    return new Promise((res) => { globalThis.__releasePost = () => res(null); })
+      .then(() => reply(403, { error: "launch_token", message: "needs token" }));
+  }
   if (MODE.endsWith("late") && !hdr["X-Levain-Token"] && !globalThis.__staleSent) {
     globalThis.__staleSent = true;
     return new Promise((res) => { globalThis.__releaseStale = () => res(null); })
@@ -299,6 +308,26 @@ const byId = (i) => document.getElementById(i);
     ok(byId("target").textContent === "/inst/B", "the plan was read again: the new target shows");
     ok(byId("f_OPERATOR_NAME").value === "Kept" && /2 of 2 answers kept/.test(byId("status").textContent), "answers kept");
     ok(!byId("submit").disabled, "Install is back once the plan is current");
+  } else if (MODE === "initadapter") {
+    // codex L3: a plan read again after a refused install must keep the adapter the operator chose
+    await unlock(TOKEN);
+    globalThis.__picked = "codex";
+    serverToken = "tok-page-2"; target = "/inst/B";
+    byId("init-form").fire("submit", {}); await sleep(40);
+    globalThis.__picked = null;
+    await unlock("tok-page-2");
+    const codex = find(body, (n) => n.tagName === "input" && n.type === "radio" && n.value === "codex");
+    ok(codex && codex.checked === true, "the chosen adapter is still selected");
+  } else if (MODE === "initinflight") {
+    // complement L3: an unlock lands while the install is in flight; that install's refusal (for the old token)
+    // must still bring the plan back, not leave Install off with a token held
+    await unlock(TOKEN);
+    serverToken = "tok-page-2";
+    byId("init-form").fire("submit", {}); await sleep(20);    // the POST, carrying TOKEN, is held
+    ctx.LevainToken.lock(null, TOKEN);                         // the page learns its token is stale another way
+    await unlock("tok-page-2");
+    globalThis.__releasePost(); await sleep(60);
+    ok(!byId("submit").disabled && /read again/.test(byId("status").textContent), "the plan is read again; Install is back");
   } else if (MODE === "initlate") {
     ctx.LevainToken.lock(null, null);
     await unlock(TOKEN);
@@ -323,6 +352,7 @@ const byId = (i) => document.getElementById(i);
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
 @pytest.mark.parametrize("page,mode", [("init", "initlock"), ("init", "initrestart"), ("init", "initlate"),
+                                       ("init", "initadapter"), ("init", "initinflight"),
                                        ("docs", "docslock"), ("docs", "docslate")])
 def test_init_and_docs_pages_unlock_and_reload_in_place(tmp_path, page, mode):
     h = tmp_path / "harness.js"

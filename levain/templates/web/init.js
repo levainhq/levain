@@ -126,7 +126,11 @@
       "codex": "OpenAI Codex CLI — AGENTS.md, global ~/.codex hooks + config.",
     };
     clear(adaptersEl);
-    var selected = p.default_adapter || p.adapters[0];
+    // A plan read again after a refused install keeps the operator's choice when it is still offered (codex L3:
+    // falling back to the default could install a different integration than the one they picked).
+    var selected = (keptAdapter && p.adapters.indexOf(keptAdapter) >= 0) ? keptAdapter
+      : (p.default_adapter || p.adapters[0]);
+    keptAdapter = null;
     p.adapters.forEach(function (name) {
       var radio = el("input", { type: "radio", name: "adapter", value: name });
       if (name === selected) radio.checked = true;
@@ -327,7 +331,10 @@
         // is dropped and read again after the unlock, keeping the answers whose fields still exist.
         auth.lock(sent ? "That token was not accepted." : null, sent);
         invalidatePlan();
-        setNote("locked: enter the token at the top of the page; the plan is read again, then check the target and Install", true);
+        setNote("locked: unlock the page; the plan is read again, then check the target and Install", true);
+        // An unlock that landed while this install was in flight already holds a newer token, and its own
+        // load() returned early because the plan was loaded then (complement L3): read the plan again now.
+        if (auth.get() && auth.get() !== sent) load();
       } else if (res.ok) {
         renderResult(data);
         setNote(data.ok ? "done" : "partial — see below", !data.ok);
@@ -354,7 +361,9 @@
 
   // ---- a plan that may belong to another server ----
   var keptAnswers = null;
+  var keptAdapter = null;   // the adapter the operator had chosen; restored if the new plan still offers it
   function invalidatePlan() {
+    keptAdapter = selectedAdapter();
     keptAnswers = {};
     fieldControls.forEach(function (fc) { keptAnswers[fc.field.slot] = fc.control.value; });
     loaded = false;

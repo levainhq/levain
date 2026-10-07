@@ -710,13 +710,14 @@ def run_init_web(
     if open_browser:
         open_unlocked(url, published.unlocked)
 
-    restore_sigterm = stop_on_sigterm()
+    restore_sigterm = lambda: None  # noqa: E731
     try:
+        restore_sigterm = stop_on_sigterm()   # inside the try, so a SIGTERM that lands at once still runs the cleanup
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped.")
     finally:
-        restore_sigterm()
         published.close()
         httpd.server_close()
+        restore_sigterm()
     return 0

@@ -1242,3 +1242,16 @@ def test_the_threat_model_note_no_longer_says_there_is_no_token():
     from levain.daemon import THREAT_MODEL_NOTE
 
     assert "no token" not in THREAT_MODEL_NOTE and "--open-running" in THREAT_MODEL_NOTE
+
+
+def test_a_symlinked_log_path_is_never_followed(tmp_path, monkeypatch):
+    """complement L3: a dangling symlink at a log path made the O_CREAT follow it and create its target."""
+    import levain.daemon as d
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = build_spec(install_path=Path("/tmp/inst"), label="com.levainhq.t", log_dir=tmp_path / "logs")
+    (tmp_path / "logs").mkdir(mode=0o700)
+    target = tmp_path / "elsewhere.txt"
+    spec.stdout_log.symlink_to(target)
+    d._prepare_private_logs(spec)
+    assert not target.exists()
