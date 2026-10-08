@@ -159,6 +159,13 @@ def cmd_revoke(gl: GitLedger, args) -> int:
         raise TeamError("that is an owner key, which the ledger never revokes (whoever stole it could revoke yours "
                         "the same way); a stolen owner key is recovered with `levain team regenesis`")
     after = git(["rev-parse", "--verify", args.after + "^{commit}"], gl.repo.toplevel).stdout.strip()
+    spell = next((s_ for s_ in d.spells if s_.role == "owner" and s_.end is None), None)
+    if spell is not None and (after not in d.walk or d.walk.index(after) < spell.start):
+        # the derivation counts a revoke only from inside the current owner's spell (tenure._apply); say so instead of
+        # the generic "would not count" (docs L3 r1 complement + anansi)
+        raise TeamError(f"--after must name a commit on this ledger at or after {spell.start_sha[:10]}, where "
+                        f"{d.team.owner}'s spell as owner began; a revoke voids only what the key signed after it. For "
+                        "lines a key signed in an earlier spell, `levain team veto` withdraws that spell's authority")
 
     def revoke(team: R.Team, ten: T.Tenure) -> None:
         ten.revokes.append({"key": args.fingerprint, "after": after})
@@ -481,10 +488,16 @@ def status_lines(gl: GitLedger) -> list[str]:
             roots = git(["rev-list", "--max-parents=0", ref], gl.repo.toplevel, check=False).stdout.split()
             ten = gl._show(T.TENURE_FILE, roots[0]) if roots else None
             try:
-                prior = T.parse_tenure(ten or "", "x").prior
+                rt = T.parse_tenure(ten or "", "x")
+                rteam = R.parse_team(gl._show(T.TEAM_FILE, roots[0]) or "", "x")
+                prior, rowner = rt.prior, rteam.owner
+                rfps = ", ".join(sorted(T.key_fps(rt, rowner))) or "none"
             except Exception:  # noqa: BLE001 - a display line; a foreign ledger's bad file is not this clone's problem
                 prior = None
             if prior and prior.get("root") == d.walk[0]:
-                out.append(f"a RE-GENESIS of this team exists on {name}; to move: "
-                           f"`levain team join --root {name.rsplit('-', 1)[-1]}`")
+                # anyone who can push can make one, so the line names its owner and keys and claims nothing for it
+                # (docs L3 r1 anansi: an unqualified "to move" line advertised whatever branch was pushed)
+                out.append(f"a branch {name} claims to RE-GENESIS this team, owner {rowner} (keys {rfps}); UNVERIFIED: "
+                           f"move only if your owner confirms those keys out of band "
+                           f"(`levain team join --root {name.rsplit('-', 1)[-1]}`)")
     return out
