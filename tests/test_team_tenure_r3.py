@@ -131,3 +131,70 @@ def test_codex6_a_join_that_fails_after_choosing_a_ledger_restores_the_whole_sta
     before = gl(ben).state()
     assert team("join", "--remote", "evil", "--root", root[:12], "--new-device", "--no-install", repo=ben) == 2
     assert gl(ben).state() == before
+
+
+def test_r4_a_host_rewind_before_a_removal_never_re_authorises_a_held_entry(two, keys):
+    """RUN (code L3 r4 codex HIGH + complement MED): ben records E offline; ana removes ben; ben syncs (E held, the
+    removal is his anchor); the host force-pushes to before the removal; ben syncs. The anchor-less view saw ben's
+    key in force again and E was re-signed and published. Now a frozen replay needs the key in force in BOTH views."""
+    tmp, ana, ben = two
+    assert ruling_np(ben, "src/a.py", "ben: before removal") == 0
+    before = sh("git", "ls-remote", str(tmp / "origin.git"), f"refs/heads/{LB}", cwd=tmp).split()[0]
+    assert team("member", "remove", "ben", repo=ana) == 0
+    gl(ben).sync()
+    assert "ben: before removal" not in sh("git", "--git-dir", str(tmp / "origin.git"), "log", "-p", LB)
+    assert sh("git", "for-each-ref", "refs/levain/held/", cwd=gl(ben).wt).strip(), "E was not held"
+    sh("git", "--git-dir", str(tmp / "origin.git"), "update-ref", f"refs/heads/{LB}", before, cwd=tmp)
+    try:
+        gl(ben).sync()
+    except Exception:       # a refusal is fine; publishing is not
+        pass
+    assert "ben: before removal" not in sh("git", "--git-dir", str(tmp / "origin.git"), "log", "-p", LB)
+
+
+def test_r4_a_join_whose_destination_branch_is_checked_out_elsewhere_leaves_the_old_ledger_working(two, keys):
+    """RUN (code L3 r4 codex MED): the re-genesis branch is checked out in another worktree of ben's repository;
+    `join --root <it>` removed ben's private ledger worktree, then failed to add the new one, and the state roll-back
+    could not bring the worktree back: ben's clone was no longer joined. Now it is refused before anything moves."""
+    tmp, ana, ben = two
+    gl(ana).sync(push=False)
+    tip = sh("git", "rev-parse", LB, cwd=gl(ana).wt).strip()
+    before = _heads(tmp)
+    assert team("regenesis", "--from", tip, "--owner", "ana", "--member", "ana=ana@ex.com",
+                "--member", f"ben=ben@ex.com={keys['ben']}", repo=ana) == 0
+    b_root, b_name = _new_genesis(tmp, before)
+    gl(ben).sync(push=False)
+    sh("git", "branch", b_name, f"refs/remotes/origin/{b_name}", cwd=ben)
+    sh("git", "worktree", "add", "-q", str(tmp / "ben_other"), b_name, cwd=ben)
+    state = gl(ben).state()
+    assert team("join", "--root", b_root[:12], "--no-install", repo=ben) == 2
+    assert gl(ben).joined() and gl(ben).state() == state
+
+
+def test_r4_accept_merge_persists_nothing_when_the_chosen_history_cannot_be_judged(tmp_path, keys):
+    """RUN (code L3 r4 codex MED): on a local-only ledger (no anchor) an unrelated orphan is merged in;
+    `accept-merge M --parent 2` saved {M: 2}, then failed to judge the walk (it no longer begins at the pinned
+    genesis), leaving the bad acceptance installed. Now the acceptance is judged on a prospective clone first."""
+    repo = tmp_path / "solo"
+    sh("git", "init", "-q", str(repo), cwd=tmp_path)
+    sh("git", "config", "user.email", "ana@ex.com", cwd=repo)
+    sh("git", "config", "user.name", "ana", cwd=repo)
+    (repo / "f").write_text("x\n")
+    sh("git", "add", "f", cwd=repo)
+    sh("git", "commit", "-qm", "init", cwd=repo)
+    assert team("init", "--project", "demo", "--owner", "ana", "--member", "ana=ana@ex.com",
+                "--signing-key", str(keys["ana"]), "--no-install", repo=repo) == 0
+    assert not gl(repo).state().get("anchor")
+    wt = gl(repo).wt
+    sh("git", "checkout", "-q", "--orphan", "stray", cwd=wt)
+    sh("git", "rm", "-rq", "--cached", ".", cwd=wt)
+    (wt / "stray.txt").write_text("x\n")
+    sh("git", "add", "stray.txt", cwd=wt)
+    sh("git", "-c", "commit.gpgsign=false", "commit", "-qm", "stray", cwd=wt)
+    sh("git", "checkout", "-q", "-f", LB, cwd=wt)
+    sh("git", "clean", "-qfd", cwd=wt)
+    sh("git", "-c", "commit.gpgsign=false", "merge", "-q", "--allow-unrelated-histories", "--no-edit", "stray",
+       cwd=wt)
+    merge = sh("git", "rev-parse", "HEAD", cwd=wt).strip()
+    assert team("accept-merge", merge, "--parent", "2", repo=repo) == 2
+    assert merge not in (gl(repo).state().get("accepted") or {})

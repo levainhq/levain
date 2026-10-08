@@ -943,33 +943,40 @@ class GitLedger:
         """Re-signed by this clone's key, would commit ``c`` count in ``d``? The key must be in force for every folder
         it writes, by the derivation's own rule (the owner for ``pack-*`` lines and PROJECT.md, else the member whose
         folder it is), not merely for some member (docs L3 r1 anansi: a held pack line replayed after this clone
-        stopped being owner published without counting). Only a derivation judged in FULL can say. A frozen one
-        answers with the anchor's tenure, where a key can be in force that is only pending at the tip (code L3 r3
-        codex 4 + glm 1, RUN: a re-signed entry was published onto a rewritten remote, in force on no fresh clone),
-        so the question goes to the tip as a clone joining now judges it (no anchor); if that is frozen too, no."""
+        stopped being owner published without counting). A frozen ``d`` answers with the anchor's tenure, so it is
+        ALSO asked of the tip as a clone joining now judges it (no anchor), which must be judged in full: the key must
+        count in both. Either view alone was a hole: the anchor's alone re-signed with a key only pending at a
+        rewritten tip (code L3 r3 codex 4, RUN); the anchor-less alone let a host rewind to before a removal decide
+        (code L3 r4 codex HIGH + complement MED, RUN)."""
         from . import signing as S
         from . import tenure as T
+        views = [d]
         if d.judged != "full":
             c0 = self.clone()
             try:
-                d = T.derive(self.repo.toplevel, d.tip, T.Clone(pinned_root=c0.pinned_root, accepted=c0.accepted,
-                                                                distrust=c0.distrust),
-                             S.SigCache(self.base / "sigcache.json"))
+                fresh = T.derive(self.repo.toplevel, d.tip, T.Clone(pinned_root=c0.pinned_root, accepted=c0.accepted,
+                                                                    distrust=c0.distrust),
+                                 S.SigCache(self.base / "sigcache.json"))
             except T.Unjudgeable:
                 return False
-            if d.judged != "full":
+            if fresh.judged != "full":
                 return False
+            views.append(fresh)
         fp = self.own_fingerprint()
-        holders: set[str | None] = set()
-        for f in git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split():
-            parts = f.split("/")
-            if parts[0] == "ledger" and len(parts) >= 3:
-                top = parts[1]
-                holders.add(d.team.owner if top.startswith("pack-") else
-                            next((h for h in d.team.members if E.safe_handle(h) == top), None))
-            elif f == CANON_FILE:
-                holders.add(d.team.owner)
-        return all(h is not None and fp in T.key_fps(d.tenure, h) for h in holders)
+        files = git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split()
+        for v in views:
+            holders: set[str | None] = set()
+            for f in files:
+                parts = f.split("/")
+                if parts[0] == "ledger" and len(parts) >= 3:
+                    top = parts[1]
+                    holders.add(v.team.owner if top.startswith("pack-") else
+                                next((h for h in v.team.members if E.safe_handle(h) == top), None))
+                elif f == CANON_FILE:
+                    holders.add(v.team.owner)
+            if not all(h is not None and fp in T.key_fps(v.tenure, h) for h in holders):
+                return False
+        return True
 
     def _replay_held(self, timeout: float, lock_timeout: float) -> None:
         """Replay entries held back by ``_rebase_moves`` (T42) once this machine's key is IN FORCE at the tip, so the
