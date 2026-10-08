@@ -513,3 +513,12 @@ def test_codex_code_paths_refuse_shell_composition(ent):
 def test_codex_spawn_env():
     env = hg.codex_spawn_env("/c", {"PATH": "/bin", "OPENAI_API_KEY": "k"})
     assert env == {"PATH": "/bin", "CODEX_HOME": "/c"}
+
+
+def test_repin_entry_point(ent, home, monkeypatch, capsys, entity_only_roots):
+    monkeypatch.setattr(hg.os.path, "expanduser", lambda p: str(home) if p == "~" else p)
+    monkeypatch.setattr(hg.sys, "platform", "darwin")
+    assert hg.main(["repin", str(ent)]) == 0
+    assert "(none) ->" in capsys.readouterr().out
+    assert hg.main(["repin", str(ent)]) == 0
+    assert "(none)" not in capsys.readouterr().out

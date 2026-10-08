@@ -321,11 +321,13 @@ def check_or_record_pin(entity: str | os.PathLike[str], state_dir: Path) -> Lite
     try:
         recorded = json.loads(pf.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise HostRefusal(f"the hook pin at {os.fspath(pf)!r} is unreadable ({exc}); repin from the terminal") from None
+        raise HostRefusal(f"the hook pin at {os.fspath(pf)!r} is unreadable ({exc}); repin from your terminal: "
+                          f"python -m levain.host_guard repin {shlex.quote(str(ent))}") from None
     if recorded.get("entity") != str(ent) or recorded.get("pin") != current:
         raise HostRefusal(
             f"the entity's hook code changed since it was pinned ({os.fspath(ent / 'activation' / 'hooks')}). "
-            "If you changed it, repin from the terminal; until then this entity is not hosted.")
+            f"If you changed it, repin from your terminal: python -m levain.host_guard repin {shlex.quote(str(ent))} "
+            "; until then this entity is not hosted.")
     return "match"
 
 
@@ -725,3 +727,30 @@ def codex_spawn_env(codex_home: str | os.PathLike[str],
     env = host_env(environ)
     env["CODEX_HOME"] = os.fspath(codex_home)
     return env
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """``python -m levain.host_guard repin <entity>``: the operator's explicit repin after changing
+    an entity's hook code (D9). Prints the old and new pin so the change is on the record."""
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="python -m levain.host_guard")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    rp = sub.add_parser("repin", help="re-record the hook-tree pin for an entity")
+    rp.add_argument("entity")
+    a = ap.parse_args(argv)
+    ent = _real(a.entity)
+    try:
+        state = host_dir(ent, "state", roots=cc_writable_roots(ent))
+        pf = _pin_file(state)
+        old = json.loads(pf.read_text(encoding="utf-8")).get("pin") if pf.exists() else None
+        new = repin(ent, state)
+    except (HostRefusal, OSError, ValueError) as exc:
+        print(f"repin refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"{ent}: hook pin {old or '(none)'} -> {new}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
