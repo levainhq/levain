@@ -1248,6 +1248,16 @@ class LevainFileEditorTool(FileEditorTool):
         resources" and STILL RUNS the executor, which then returns the real refusal Observation. Never
         raises."""
         assert isinstance(action, FileEditorAction)
+        assert isinstance(self.executor, CrownJewelsFileEditorExecutor)
+        if self.executor._floor.hands is not None:
+            # A hands entity: the lock key is the path as given, normalised lexically; resolving it
+            # would follow the entity's links with the operator's rights (S2 L3 r1, the same class
+            # as the executor's own checks).
+            try:
+                key = os.path.normpath(os.path.abspath(str(action.path)))
+            except (ValueError, OSError):
+                return DeclaredResources(keys=(), declared=True)
+            return DeclaredResources(keys=(f"file:{key}",), declared=True)
         try:
             resolved = Path(action.path).expanduser().resolve()
         # RuntimeError too — `expanduser()` raises it for a `~user` with no passwd entry, and

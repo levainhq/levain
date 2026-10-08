@@ -426,3 +426,19 @@ def test_the_hands_write_buffer_flushes_and_refuses_unencodable_text(tmp_path):
     with pytest.raises(T._HandsIOError, match="encoded"):
         f.close()
     assert got == []
+
+
+def test_the_hands_editors_lock_key_does_not_resolve_the_path_as_the_operator(tmp_path, monkeypatch):
+    """S2 L3 r1 sibling: the tool's declared_resources resolved the entity's path (following its
+    links) as the operator before the executor ran."""
+    from openhands.tools.file_editor.definition import FileEditorAction
+
+    from levain.firing.openhands import tools as T
+
+    hands = _hands(tmp_path)
+    floor = T._SharedFloor(build_policy(_entity(tmp_path), workspace=hands.workspace), hands)
+    tool = object.__new__(T.LevainFileEditorTool)
+    object.__setattr__(tool, "executor", T.CrownJewelsFileEditorExecutor(floor=floor))
+    monkeypatch.setattr(T.Path, "resolve", lambda self, *a, **k: pytest.fail("resolved as the operator"))
+    got = tool.declared_resources(FileEditorAction(command="view", path=str(hands.workspace / "l" / "x")))
+    assert got.keys == (f"file:{hands.workspace / 'l' / 'x'}",)
