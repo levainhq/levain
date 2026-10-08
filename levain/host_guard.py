@@ -30,7 +30,6 @@ import stat
 import sys
 import subprocess
 import tempfile
-import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
@@ -39,8 +38,9 @@ __all__ = [
     "HostRefusal", "CCHostProfile", "cc_host_profile", "cc_writable_roots", "is_within",
     "host_dir", "cc_sandbox_block", "check_sandbox_types", "cc_hook_settings", "cc_mcp_config",
     "hook_pin", "check_or_record_pin", "repin", "check_managed_settings", "host_env",
-    "file_write_decision", "parse_cc_version", "CC_HOSTED_TOOLS", "CC_VERSION_FLOOR",
-    "check_shared_code", "codex_initialize_params",
+    "parse_cc_version", "CC_HOSTED_TOOLS", "CC_VERSION_FLOOR",
+    "check_shared_code", "codex_initialize_params", "codex_config_overrides",
+    "trust_managed", "load_managed_trust",
     "broker_method_allowed", "codex_sandbox_policy", "overwrite_codex_policy",
     "check_codex_effective_policy", "check_codex_hooks", "check_codex_code_paths",
     "codex_spawn_env",
@@ -55,14 +55,19 @@ class HostRefusal(Exception):
 # repository's loosening keys only from 2.1.285 (CC docs: cli-reference, sandboxing).
 CC_VERSION_FLOOR = (2, 1, 285)
 
-# D4: the exact hosted tool set, compared by string equality. Bash runs inside the sandbox; Read,
-# Edit and Write are confined to the working directories by --restricted, and Edit/Write prompts
-# reach the host (file_write_decision). Anything else is re-admitted one tool at a time, behind a
-# canary arm that proves it inherits the gate and the confinement.
-CC_HOSTED_TOOLS = ("Bash", "Read", "Edit", "Write")
+# D4 + D12: the exact hosted tool set, compared by string equality, and the ONE place it is set.
+# Bash runs inside the kernel sandbox; Read is confined to the working directories by
+# --restricted. Edit and Write are OUT (D12, proposed to Phill, 10-07): the host approving a
+# file-tool PATH that Claude Code resolves and writes LATER is a race that sandboxed Bash can
+# win by swapping a workspace symlink to activation/hooks (L3 r1, codex 1), so every write the
+# entity makes goes through Bash, where denyWrite holds at the syscall. Restoring them is a
+# change to this tuple plus a write broker that is itself the writer (openat under a held
+# directory fd, O_NOFOLLOW at every component), never a path policy in front of CC's own tool.
+# Any other tool is re-admitted the same way: one at a time, behind a canary arm that proves it
+# inherits the gate and the confinement.
+CC_HOSTED_TOOLS = ("Bash", "Read")
 
-# Workspace names whose contents something outside the sandbox reads or runs: the hooks and their
-# content (activation), Levain's own state and memory (.levain), Claude Code and git config.
+
 PROTECTED_NAMES = frozenset({"activation", ".levain", ".claude", ".git", ".mcp.json"})
 
 _ENV_ALLOW = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR"})
@@ -86,9 +91,23 @@ def _real(p: str | os.PathLike[str]) -> Path:
 
 
 def is_within(path: str | os.PathLike[str], root: str | os.PathLike[str]) -> bool:
-    """True when ``path`` resolves to ``root`` or below it (symlinks resolved on both sides)."""
-    rp, rr = _real(path), _real(root)
-    return rp == rr or rr in rp.parents
+    """True when ``path`` is ``root`` or below it, decided by FILE IDENTITY: each existing
+    ancestor of the resolved path is compared with ``root`` by device and inode, so a case- or
+    normalization-variant spelling on APFS cannot read as outside (L3 r1, codex 5). A path whose
+    tail does not exist yet is judged by its deepest existing ancestor."""
+    try:
+        rid = _ident(os.stat(root))
+    except OSError:
+        rp, rr = _real(path), _real(root)
+        return rp == rr or rr in rp.parents
+    p = _real(path)
+    for a in (p, *p.parents):
+        try:
+            if _ident(os.stat(a)) == rid:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def cc_writable_roots(entity: str | os.PathLike[str]) -> tuple[Path, ...]:
@@ -292,10 +311,12 @@ def _hook_tree(entity: Path) -> Path:
 
 def hook_pin(entity: str | os.PathLike[str]) -> str:
     """sha256 over every file under ``activation/hooks`` except ``__pycache__`` (relative path and
-    bytes). Any symlink or non-regular file in the tree refuses: a link points at code the pin
-    cannot see, and a FIFO would hang the host. ``__pycache__`` is never read by a hosted hook:
-    the host env sets PYTHONPYCACHEPREFIX, so even a hook's own child interpreter uses the
-    host-owned cache."""
+    bytes). Refuses: any symlink or non-regular file (a link points at code the pin cannot see, a
+    FIFO would hang the host) and any file with a second hard link, because an alias elsewhere in
+    the workspace would let sandboxed Bash rewrite the hook's inode through a path denyWrite does
+    not cover (L3 r1, codex 2). Each file is read through an O_NOFOLLOW descriptor whose fstat
+    must match the lstat that vetted it. ``__pycache__`` is never read by a hosted hook: the host
+    env sets PYTHONPYCACHEPREFIX, so a hook's own child interpreter uses the host-owned cache."""
     tree = _hook_tree(_real(entity))
     h = hashlib.sha256()
     for root, dirs, files in os.walk(tree, followlinks=False):
@@ -308,9 +329,18 @@ def hook_pin(entity: str | os.PathLike[str]) -> str:
             st = os.lstat(p)
             if not stat.S_ISREG(st.st_mode):
                 raise HostRefusal(f"not a regular file in the hook tree: {p!r}")
+            if st.st_nlink != 1:
+                raise HostRefusal(f"hook file {p!r} has {st.st_nlink} hard links; another name for it "
+                                  "could be rewritten from the workspace")
+            fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                if _ident(os.fstat(fd)) != _ident(st):
+                    raise HostRefusal(f"hook file {p!r} changed while it was being pinned")
+                with os.fdopen(fd, "rb", closefd=False) as fh:
+                    data = fh.read()
+            finally:
+                os.close(fd)
             rel = os.path.relpath(p, tree)
-            with open(p, "rb") as fh:
-                data = fh.read()
             h.update(os.fsencode(rel) + b"\0" + hashlib.sha256(data).digest())
     return h.hexdigest()
 
@@ -391,11 +421,16 @@ def cc_mcp_config(entity: str | os.PathLike[str], python: str) -> dict[str, Any]
 
 
 def _check_mcp(cfg: Mapping[str, Any], entity: Path, roots: Sequence[Path]) -> list[str]:
+    """The one MCP server runs outside the sandbox with the entity as its cwd, so it must start
+    isolated from the cwd (`-P` or `-I` first, L3 r1 complement 11), from an interpreter outside
+    the roots, and the only workspace path it may name is its own store."""
     server = cfg["mcpServers"]["anneal_memory"]
     problems = _check_exec(server.get("command", ""), roots, "the MCP server's interpreter")
     if set(server) - {"type", "command", "args"}:
         problems.append(f"the MCP server carries keys this check does not vet: {sorted(set(server) - {'type', 'command', 'args'})}")
     args = list(server.get("args", []))
+    if not args or args[0] not in ("-P", "-I"):
+        problems.append(f"the MCP server does not start isolated from its cwd (-P or -I first): {args!r}")
     db = str(entity / ".levain" / "memory.db")
     for i, a in enumerate(args):
         if i > 0 and args[i - 1] == "--db":
@@ -444,17 +479,18 @@ def load_managed_settings(platform: str = sys.platform) -> list[tuple[str, Any]]
     return docs
 
 
-def check_managed_settings(docs: Sequence[tuple[str, Any]], roots: Sequence[Path]) -> list[str]:
+def check_managed_settings(docs: Sequence[tuple[str, Any]], roots: Sequence[Path], *,
+                           trusted_hooks: frozenset[str] = frozenset()) -> list[str]:
     """Managed settings still load under --restricted and their arrays merge with ours, so they
     can loosen the sandbox or add code that runs outside it. ACCEPTED, by allowlist: top-level
     keys hooks/sandbox/permissions; permission deny/ask lists only (an allow rule would answer a
-    Write before the host does); sandbox keys this module pins, with values that do not loosen;
-    and hook commands whose code is fixed outside the writable roots. Everything else refuses,
-    an unknown key included (L1 r1 #7: the list form failed open on keys it did not know).
+    Bash prompt before the host does); sandbox keys this module pins, each with its exact type
+    (L3 r1, codex 7: `"enabled": 0` is not False) and a value that does not loosen.
 
-    A hook command may be shell (the 10-07 flow guard under /Library is), so it is read as shell
-    words: every word containing a slash must be an absolute path outside the roots, a script-
-    looking word must be absolute, and nothing may name a cwd- or home-relative variable."""
+    Managed HOOK commands are not judged by reading their shell text: every reading of shell
+    text found a new form that ran workspace code (`$(pwd)/x.py`, `python3 -c 'import x'` with
+    the entity as cwd). D13: each command must be in the operator's trust pin
+    (`python -m levain.host_guard trust-managed`), by exact sha256."""
     problems: list[str] = []
     for path, doc in docs:
         if doc is _MISSING:
@@ -466,7 +502,7 @@ def check_managed_settings(docs: Sequence[tuple[str, Any]], roots: Sequence[Path
         if doc.get("__managed_mcp__"):
             problems.append(f"managed MCP servers ({path!r}) would load into the hosted session")
             continue
-        for k in set(doc) - _MANAGED_TOP_KEYS:
+        for k in sorted(set(doc) - _MANAGED_TOP_KEYS):
             problems.append(f"{path}: managed key {k!r} is not one hosting can vet")
         perms = doc.get("permissions", {})
         if not isinstance(perms, Mapping) or set(perms) - _MANAGED_PERMISSION_KEYS:
@@ -475,12 +511,16 @@ def check_managed_settings(docs: Sequence[tuple[str, Any]], roots: Sequence[Path
         if not isinstance(sb, Mapping):
             problems.append(f"{path}: sandbox is not an object")
             sb = {}
-        for k in set(sb) - _MANAGED_SANDBOX_KEYS:
+        for k in sorted(set(sb) - _MANAGED_SANDBOX_KEYS):
             problems.append(f"{path}: sandbox.{k} is not a key hosting can vet")
         for sub, allowed in (("network", _MANAGED_NETWORK_KEYS), ("filesystem", _MANAGED_FILESYSTEM_KEYS)):
             node = sb.get(sub, {})
-            for k in (set(node) - allowed) if isinstance(node, Mapping) else {"<not an object>"}:
+            for k in sorted((set(node) - allowed) if isinstance(node, Mapping) else {"<not an object>"}):
                 problems.append(f"{path}: sandbox.{sub}.{k} is not a key hosting can vet")
+        for keys, typ in {**_SANDBOX_TYPES, ("filesystem", "denyRead"): list}.items():
+            v = _get(sb, keys)
+            if v is not _MISSING and type(v) is not typ:
+                problems.append(f"{path}: sandbox.{'.'.join(keys)} must be {typ.__name__}, got {type(v).__name__}")
         for keys in _LOOSENING_TRUE:
             if _get(sb, keys) is True:
                 problems.append(f"{path}: sandbox.{'.'.join(keys)} is true")
@@ -495,19 +535,10 @@ def check_managed_settings(docs: Sequence[tuple[str, Any]], roots: Sequence[Path
             v = _get(sb, keys)
             if v is not _MISSING and v:
                 problems.append(f"{path}: sandbox.{'.'.join(keys)} is not empty")
-        hooks = doc.get("hooks", {})
-        if not isinstance(hooks, Mapping):
-            problems.append(f"{path}: hooks is not an object")
-            continue
-        for event, groups in hooks.items():
-            for group in groups if isinstance(groups, list) else [None]:
-                hs = group.get("hooks") if isinstance(group, Mapping) else None
-                for h in hs if isinstance(hs, list) else [None]:
-                    cmd = h.get("command") if isinstance(h, Mapping) else None
-                    if not isinstance(cmd, str) or not isinstance(h, Mapping) or h.get("type") != "command":
-                        problems.append(f"{path}: {event} hook is not a plain command")
-                        continue
-                    problems += [f"{path}: {event} hook: {p}" for p in _vet_shell_words(cmd, roots)]
+        for event, cmd in _managed_hook_commands(path, doc, problems):
+            if _sha(cmd) not in trusted_hooks:
+                problems.append(f"{path}: {event} hook is not in the operator's trust pin "
+                                f"(run: python -m levain.host_guard trust-managed): {cmd!r}")
     return problems
 
 
@@ -576,14 +607,23 @@ class CCHostProfile:
         return argv
 
     def digest(self) -> str:
-        blob = json.dumps([self.argv(), sorted(self.env)], sort_keys=True)
+        """What a canary verdict is bound to: the exact argv, every env value, and the claude
+        binary's identity (device, inode, size, mtime), so a binary replaced in place or a changed
+        PATH never reuses a verdict (L3 r1, complement 10)."""
+        try:
+            st = os.stat(_real(self.claude_bin))
+            binary: list[int] = [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns]
+        except OSError:
+            binary = []
+        blob = json.dumps([self.argv(), sorted(self.env.items()), binary], sort_keys=True)
         return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def cc_host_profile(entity: str | os.PathLike[str], *, claude_bin: str, python: str | None = None,
                     platform: str = sys.platform, environ: Mapping[str, str] | None = None,
                     home: Path | None = None,
-                    managed: Sequence[tuple[str, Any]] | None = None) -> CCHostProfile:
+                    managed: Sequence[tuple[str, Any]] | None = None,
+                    check_shared: bool = True) -> CCHostProfile:
     """Build the hosted profile, or raise HostRefusal naming every problem found."""
     ent = _real(entity)
     if not (ent / ".levain").is_dir():
@@ -609,8 +649,10 @@ def cc_host_profile(entity: str | os.PathLike[str], *, claude_bin: str, python: 
     problems += _check_hook_executables(ent, roots)
     problems += _check_mcp(mcp, ent, roots)
     problems += _check_python_paths(py, roots, host_env(environ, roots=roots))
-    problems += check_managed_settings(load_managed_settings(platform) if managed is None else managed, roots)
-    if managed is None:
+    problems += check_managed_settings(
+        load_managed_settings(platform) if managed is None else managed, roots,
+        trusted_hooks=load_managed_trust(platform, environ, home))
+    if check_shared:
         problems += check_shared_code(ent, roots, home=home)
     if problems:
         raise HostRefusal("; ".join(problems))
@@ -619,60 +661,6 @@ def cc_host_profile(entity: str | os.PathLike[str], *, claude_bin: str, python: 
                          env={**host_env(environ, roots=roots, pycache=pycache),
                               "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1"}, run_dir=run,
                          state_dir=state, pin_status=pin_status, roots=roots)
-
-
-def file_write_decision(entity: str | os.PathLike[str], tool_name: str,
-                        tool_input: Mapping[str, Any]) -> Literal["allow", "refuse", "ask"]:
-    """D2, the host's answer to an Edit/Write prompt: refuse anything that is, or is inside, a
-    protected name; allow other paths inside the workspace; send everything else to the human.
-
-    Decided by FILE IDENTITY, not spelling (L1 r1 #1, #3): APFS is case- and normalization-
-    insensitive, so `ACTIVATION/hooks/x.py` is the hook, and `link/../x` resolves through the
-    link. So a path with a `..` component refuses outright; the deepest existing ancestor is
-    resolved by the OS; "inside the workspace" means some ancestor IS the entity directory
-    (same device and inode); "protected" means some ancestor IS a protected directory, or a
-    component below the entity folds to a protected name. A hard-linked target refuses too: its
-    other name may be a hook. CC performs the write after this answer, so a symlink swapped in
-    between is CC's confinement's to stop (D10, residue R4)."""
-    if tool_name not in ("Edit", "Write"):
-        return "ask"
-    raw = tool_input.get("file_path")
-    if not isinstance(raw, str) or not raw or "\0" in raw:
-        return "refuse"
-    ent = _real(entity)
-    p = Path(raw) if os.path.isabs(raw) else ent / raw
-    if ".." in p.parts:
-        return "refuse"
-    try:
-        ent_id = _ident(os.stat(ent))
-        protected_ids = {_ident(os.stat(ent / n)) for n in PROTECTED_NAMES if os.path.lexists(ent / n)}
-        tail: list[str] = []
-        q = p
-        while not os.path.lexists(q):
-            tail.insert(0, q.name)
-            if q.parent == q:
-                return "ask"
-            q = q.parent
-        if tail == [] and os.lstat(q).st_nlink > 1 and stat.S_ISREG(os.lstat(q).st_mode):
-            return "refuse"
-        anc = _real(q)
-        below: list[str] = list(tail)
-        inside = False
-        for a in (anc, *anc.parents):
-            ident = _ident(os.stat(a))
-            if ident in protected_ids:
-                return "refuse"
-            if ident == ent_id:
-                inside = True
-                break
-            below.insert(0, a.name)
-    except OSError:
-        return "refuse"
-    if not inside:
-        return "ask"
-    if any(_fold(part) in _PROTECTED_FOLDED for part in below):
-        return "refuse"
-    return "allow"
 
 
 _BROKER_METHODS = frozenset({
@@ -772,9 +760,11 @@ def check_codex_code_paths(hooks_json: Mapping[str, Any], mcp_servers: Mapping[s
     """Code a Codex entity runs outside its sandbox (hooks, MCP servers) must be an exact argv:
     an interpreter outside every writable root, its isolating flags BEFORE the script (a flag
     after the script is the script's argument, L1 r1 #5b), a script outside the writable roots,
-    no shell composition, no relative path. MCP servers get the same rule and may not carry
-    env or cwd keys (L1 r1 #5c). Today's Codex install puts its hooks under the entity's own
-    writable root, so this refuses it by design (plan D6: S4/S5 move them)."""
+    no shell composition, no relative path. MCP servers get the same rule, may not carry env or
+    cwd keys (L1 r1 #5c), and only the single value right after `--db` is exempt, by POSITION
+    (L3 r1, codex 4: removing it by value also removed an identical script argument). Today's
+    Codex install puts its hooks under the entity's own writable root, so this refuses it by
+    design (plan D6: S4/S5 move them)."""
     problems: list[str] = []
     for event, groups in (hooks_json.get("hooks") or {}).items():
         for group in groups or []:
@@ -785,8 +775,8 @@ def check_codex_code_paths(hooks_json: Mapping[str, Any], mcp_servers: Mapping[s
         if extra:
             problems.append(f"Codex MCP server {name!r} carries keys hosting cannot vet: {sorted(extra)}")
         args = [str(a) for a in server.get("args", [])]
-        db_values = {args[i + 1] for i, a in enumerate(args[:-1]) if a == "--db"}
-        argv = [str(server.get("command", ""))] + [a for a in args if a not in db_values]
+        kept = [a for i, a in enumerate(args) if not (i > 0 and args[i - 1] == "--db")]
+        argv = [str(server.get("command", ""))] + kept
         problems += _vet_codex_argv(shlex.join(argv), roots, f"Codex MCP server {name!r}", ("-I",))
     return problems
 
@@ -837,56 +827,15 @@ _MANAGED_NETWORK_KEYS = frozenset({"allowLocalBinding", "allowUnixSockets", "all
 _MANAGED_FILESYSTEM_KEYS = frozenset({"denyWrite", "denyRead", "disabled"})
 
 
-_CWD_VARS = re.compile(r"\$\{?(CLAUDE_PROJECT_DIR|PWD|OLDPWD|HOME)\b|~")
-
-
 _SCRIPT_EXT = re.compile(r"\.(py|sh|bash|zsh|js|mjs|ts|rb|pl)$")
-
-
-def _vet_shell_words(cmd: str, roots: Sequence[Path]) -> list[str]:
-    if _CWD_VARS.search(cmd):
-        return [f"names a cwd- or home-relative location: {cmd!r}"]
-    try:
-        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
-        lex.whitespace_split = True
-        words = list(lex)
-    except ValueError:
-        return [f"cannot be parsed as shell words: {cmd!r}"]
-    problems = []
-    for w in words:
-        if set(w) <= set("();<>|&"):
-            continue  # an operator, split off by punctuation_chars
-        cand = w.split("=", 1)[1] if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", w) else w
-        if not cand:
-            continue
-        if "/" in cand and not cand.startswith("/"):
-            problems.append(f"names a relative path {cand!r}")
-        elif cand.startswith("/"):
-            problems += _outside(cand, roots, "a path")
-        elif _SCRIPT_EXT.search(cand):
-            problems.append(f"runs a script by relative name {cand!r}")
-    return problems
 
 
 def _outside_problems(p: str, roots: Sequence[Path]) -> bool:
     return any(is_within(p, r) for r in roots)
 
 
-def _fold(name: str) -> str:
-    return unicodedata.normalize("NFC", name).casefold()
-
-
-_PROTECTED_FOLDED = frozenset(_fold(n) for n in PROTECTED_NAMES)
-
-
 def _ident(st: os.stat_result) -> tuple[int, int]:
     return (st.st_dev, st.st_ino)
-
-
-# Client params the broker forwards, per method (codex 0.146.1 schema: ThreadStartParams,
-# ThreadResumeParams, TurnStartParams). Everything else a client sends is dropped, and the
-# broker writes cwd, sandbox and approval policy itself (L1 r1 #5d: a key denylist forwarded
-# cwd, approvalPolicy and config untouched).
 
 
 _CODEX_FORWARD = {
@@ -932,41 +881,43 @@ def codex_initialize_params() -> dict[str, Any]:
 def _check_python_paths(python: str, roots: Sequence[Path], env: Mapping[str, str]) -> list[str]:
     """Hooks and the MCP server run Python outside the sandbox, so everything that Python imports
     from must be outside the writable roots: the interpreter path is not enough (L2 r1 #9: .pth
-    files, editable installs and site dirs add code). Asks the interpreter itself, the way the
-    MCP server starts (`-P`), with the hosted env. Fails closed."""
-    code = ("import json, sys\n"
-            "import anneal_memory\n"
-            "print(json.dumps([anneal_memory.__file__] + [p for p in sys.path if p]))")
-    try:
-        out = subprocess.run([python, "-P", "-c", code], env=dict(env), capture_output=True,
-                             text=True, timeout=30, check=True).stdout
-        paths = json.loads(out.strip().splitlines()[-1])
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
-        return [f"could not read the hook interpreter's import path: {exc}"]
-    problems = []
-    for p in paths:
-        if os.path.isabs(p) and os.path.exists(p):
-            problems += _outside(p, roots, "a directory the hook interpreter imports from")
+    files, editable installs and site dirs add code). Two steps, so nothing is imported before it
+    is vetted (L3 r1, complement 9): first sys.path alone, then where anneal_memory resolves.
+    Fails closed."""
+    problems: list[str] = []
+    for code in ("import json, sys\nprint(json.dumps([p for p in sys.path if p]))",
+                 "import json, anneal_memory\nprint(json.dumps([anneal_memory.__file__]))"):
+        try:
+            out = subprocess.run([python, "-P", "-c", code], env=dict(env), capture_output=True,
+                                 text=True, timeout=30, check=True, cwd="/").stdout
+            paths = json.loads(out.strip().splitlines()[-1])
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
+            return [f"could not read the hook interpreter's import path: {exc}"]
+        for p in paths:
+            if os.path.isabs(p) and os.path.exists(p):
+                problems += _outside(p, roots, "a directory the hook interpreter imports from")
+        if problems:
+            return problems
     return problems
 
 
 def check_shared_code(entity: Path, roots: Sequence[Path], *, home: Path | None = None) -> list[str]:
     """Code that OTHER processes run outside any sandbox must not live where the hosted entity
     can write it: the targets of the operator's ~/.claude entries (skills, agents, plugins,
-    settings), the scripts their user-level hooks run, and personal plugins (L2 r1 #4). An
-    entity whose directory holds the operator's own tooling is refused: hosting it would let the
-    entity rewrite what the operator's next terminal session runs. Launchd/cron scripts and
-    shell rc files are outside this check (stated residue)."""
+    settings) and the scripts their user-level hooks name (L2 r1 #4). An entity whose directory
+    holds the operator's own tooling is refused: hosting it would let the entity rewrite what the
+    operator's next terminal session runs. Launchd/cron scripts and shell rc files are outside
+    this check (stated residue)."""
     home = Path(os.path.expanduser("~")) if home is None else home
     cc = home / ".claude"
     problems: list[str] = []
     if not cc.is_dir():
         return problems
     for entry in sorted(cc.iterdir()):
-        if entry.name in ("projects", "jobs", "todos", "shell-snapshots", "statsig", "logs", "cache"):
+        if entry.name.startswith(".") or entry.name in ("projects", "jobs", "todos", "shell-snapshots",
+                                                         "statsig", "logs", "cache"):
             continue  # Claude Code's own data, not code it loads
-        problems += [p for p in _outside(_real(entry), roots, f"~/.claude/{entry.name}")
-                     if not entry.name.startswith(".")]
+        problems += _outside(_real(entry), roots, f"~/.claude/{entry.name}")
     settings = cc / "settings.json"
     try:
         doc = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
@@ -978,27 +929,107 @@ def check_shared_code(entity: Path, roots: Sequence[Path], *, home: Path | None 
                 cmd = h.get("command") if isinstance(h, Mapping) else None
                 if not isinstance(cmd, str):
                     continue
+                cmd = cmd.replace("${HOME}", os.fspath(home)).replace("$HOME", os.fspath(home))
                 try:
                     words = shlex.split(cmd)
                 except ValueError:
                     continue
                 for w in words:
-                    w = os.path.expanduser(w.replace("$HOME", os.fspath(home)))
-                    if os.path.isabs(w) and os.path.exists(w):
-                        problems += _outside(_real(w), roots, f"a script the operator's {event} hook runs")
+                    for cand in (w, w.split("=", 1)[1] if "=" in w else ""):
+                        cand = os.path.expanduser(cand)
+                        if os.path.isabs(cand) and os.path.exists(cand):
+                            problems += _outside(_real(cand), roots, f"a script the operator's {event} hook runs")
     return problems
 
 
+def _managed_hook_commands(path: str, doc: Mapping[str, Any], problems: list[str]) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    hooks = doc.get("hooks", {})
+    if not isinstance(hooks, Mapping):
+        problems.append(f"{path}: hooks is not an object")
+        return out
+    for event, groups in hooks.items():
+        for group in groups if isinstance(groups, list) else [None]:
+            hs = group.get("hooks") if isinstance(group, Mapping) else None
+            for h in hs if isinstance(hs, list) else [None]:
+                cmd = h.get("command") if isinstance(h, Mapping) else None
+                if not isinstance(cmd, str) or not isinstance(h, Mapping) or h.get("type") != "command":
+                    problems.append(f"{path}: {event} hook is not a plain command")
+                    continue
+                out.append((str(event), cmd))
+    return out
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _managed_trust_file(platform: str, environ: Mapping[str, str] | None, home: Path | None) -> Path:
+    environ = os.environ if environ is None else environ
+    home = Path(os.path.expanduser("~")) if home is None else home
+    return _base_dir("state", platform, environ, home) / "managed_trust.json"
+
+
+def load_managed_trust(platform: str = sys.platform, environ: Mapping[str, str] | None = None,
+                       home: Path | None = None) -> frozenset[str]:
+    f = _managed_trust_file(platform, environ, home)
+    try:
+        data = json.loads(f.read_text(encoding="utf-8"))
+        return frozenset(str(x) for x in data.get("hooks", []))
+    except (OSError, ValueError, AttributeError):
+        return frozenset()
+
+
+def trust_managed(platform: str = sys.platform, environ: Mapping[str, str] | None = None,
+                  home: Path | None = None) -> list[str]:
+    """D13, the operator's explicit act: record the exact managed hook commands now in force.
+    Returns the commands it recorded, so the operator sees what they vouched for."""
+    problems: list[str] = []
+    cmds = [c for p, d in load_managed_settings(platform) if isinstance(d, Mapping)
+            for _, c in _managed_hook_commands(p, d, problems)]
+    f = _managed_trust_file(platform, environ, home)
+    f.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = f.with_name(f".managed_trust.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"hooks": sorted(_sha(c) for c in cmds)}, fh)
+    os.replace(tmp, f)
+    return cmds
+
+
+def codex_config_overrides() -> dict[str, Any]:
+    """What S4's broker writes into the entity's CODEX_HOME config.toml before it accepts a client.
+    thread/start and thread/resume take only a sandbox MODE string (codex 0.146.1 schema), so the
+    detailed workspace-write policy that check_codex_effective_policy requires (no /tmp, no
+    $TMPDIR, no network) has to come from config, not from the request (L3 r1, codex 8)."""
+    return {"sandbox_mode": "workspace-write",
+            "sandbox_workspace_write": {"network_access": False, "exclude_slash_tmp": True,
+                                        "exclude_tmpdir_env_var": True, "writable_roots": []}}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """``python -m levain.host_guard repin <entity>``: the operator's explicit repin after changing
-    an entity's hook code (D9). Prints the old and new pin so the change is on the record."""
+    """The operator's two explicit acts, run from their own terminal:
+    ``python -m levain.host_guard repin <entity>`` after changing an entity's hook code (D9), and
+    ``python -m levain.host_guard trust-managed`` to vouch for the machine's managed-settings hook
+    commands exactly as they are now (D13). Each prints what it recorded."""
     import argparse
 
     ap = argparse.ArgumentParser(prog="python -m levain.host_guard")
     sub = ap.add_subparsers(dest="cmd", required=True)
     rp = sub.add_parser("repin", help="re-record the hook-tree pin for an entity")
     rp.add_argument("entity")
+    sub.add_parser("trust-managed", help="vouch for the managed-settings hook commands now in force")
     a = ap.parse_args(argv)
+    if a.cmd == "trust-managed":
+        try:
+            cmds = trust_managed()
+        except (HostRefusal, OSError) as exc:
+            print(f"trust-managed refused: {exc}", file=sys.stderr)
+            return 1
+        print(f"trusted {len(cmds)} managed hook command(s):")
+        for c in cmds:
+            print(f"  {c}")
+        return 0
     ent = _real(a.entity)
     try:
         state = host_dir(ent, "state", roots=cc_writable_roots(ent))

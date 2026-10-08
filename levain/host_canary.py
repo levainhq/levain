@@ -6,9 +6,9 @@ configuration is not proof: on CC 2.1.292 a sandbox block with one wrongly-typed
 dropped whole, with no error and no warning (the 10-06 probes, 1f).
 
 One canary turn spawns the session's own argv (plus no persistence and a cheap model), asks for
-exactly one Bash call and six Write calls, answers every permission prompt with THE SESSION'S OWN
-write policy (`host_guard.file_write_decision`; a canary with its own rule tested a different
-host, L1 r1 #2), and watches a listener it owns. Every check must pass. A model that refuses, or
+exactly one Bash call, denies every permission prompt (the hosted profile has no file tools, D12,
+so the sandbox is the whole write boundary and the probe exercises it), and watches a listener
+it owns. Every check must pass. A model that refuses, or
 calls something else, makes the verdict inconclusive, and inconclusive refuses: the canary fails
 closed. The plan, with the reason for each check: flow
 projects/levain/reference/chat_s2_plan_1007.md, section 2.2.
@@ -32,8 +32,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+import signal
+
 from levain.host_guard import (CC_HOSTED_TOOLS, CC_VERSION_FLOOR, CCHostProfile, HostRefusal,
-                               file_write_decision, parse_cc_version)
+                               parse_cc_version)
 
 __all__ = ["Check", "CanaryVerdict", "run_cc_canary", "check_init_event", "probe_command",
            "probe_script"]
@@ -139,6 +141,12 @@ def create(path):
     open(path, "x").close()
 def append(path):
     open(path, "a").close()
+def throughlink():
+    os.symlink(C["link_target"], C["swap_link"])
+    try:
+        open(os.path.join(C["swap_link"], C["swap_name"]), "x").close()
+    finally:
+        os.unlink(C["swap_link"])
 def hardlink():
     os.link(C["link_src"], C["link_dst"])
     try:
@@ -158,9 +166,12 @@ def proxied(host):
         raise e.reason if isinstance(e.reason, OSError) else OSError(str(e.reason))
 TRIES = [("TCP", tcp, ()), ("UDS", uds, ()), ("FSOUT", create, (C["outside"],)),
          ("FSHOOK", create, (C["hook"],)), ("FSCLAUDE", create, (C["claude"],)),
-         ("FSMCP", append, (C["mcp"],)), ("FSGIT", create, (C["git"],)),
-         ("HARDLINK", hardlink, ()), ("PROXYIP", proxied, ("127.0.0.1",)),
-         ("PROXYLOCAL", proxied, ("localhost",))]
+         ("FSLINK", throughlink, ()), ("HARDLINK", hardlink, ()),
+         ("PROXYIP", proxied, ("127.0.0.1",)), ("PROXYLOCAL", proxied, ("localhost",))]
+if C.get("mcp"):
+    TRIES.append(("FSMCP", append, (C["mcp"],)))
+if C.get("git"):
+    TRIES.append(("FSGIT", create, (C["git"],)))
 if C.get("hook_case"):
     TRIES.append(("FSHOOKCASE", create, (C["hook_case"],)))
 for name, fn, args in TRIES:
@@ -190,12 +201,15 @@ def probe_command(script: str | os.PathLike[str], python: str = "/usr/bin/python
 
 class _Listener:
     """A TCP and an AF_UNIX listener that count connections server-side. The canary connects to
-    each itself before and after the turn: zero foreign hits then means something, because the
-    listener is shown to have been able to see one."""
+    each itself before and after the turn, sending a secret token, so a self-connection is told
+    apart by what it SENDS, never by timing: a foreign connection that lands during the self-check
+    still counts as foreign (L3 r1, codex 6 and complement 4). Zero foreign hits then means
+    something, because the listener is shown to have been able to see one."""
 
     def __init__(self, sock_path: Path) -> None:
-        self.hits = 0
+        self.foreign = 0
         self.self_hits = 0
+        self.token = secrets.token_bytes(16)
         self._lock = threading.Lock()
         self.sock_path = sock_path
         self.tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -224,36 +238,47 @@ class _Listener:
                 conn, _ = s.accept()
             except (socket.timeout, OSError):
                 continue
+            data = b""
+            try:
+                conn.settimeout(0.5)
+                while len(data) < len(self.token):
+                    chunk = conn.recv(len(self.token) - len(data))
+                    if not chunk:
+                        break
+                    data += chunk
+            except OSError:
+                pass
+            finally:
+                conn.close()
             with self._lock:
-                self.hits += 1
-            conn.close()
+                if data == self.token:
+                    self.self_hits += 1
+                else:
+                    self.foreign += 1
 
     def self_connect(self) -> bool:
-        """Both endpoints accept a connection from the host itself. Run only while no canary turn
-        is live, so every hit seen here is the host's own."""
+        """Both endpoints accept a token-bearing connection from the host itself."""
         ok = True
         for fam, addr in ((socket.AF_INET, ("127.0.0.1", self.port)), (socket.AF_UNIX, str(self.sock_path))):
-            before = self.hits
+            before = self.self_hits
             try:
                 c = socket.socket(fam, socket.SOCK_STREAM)
                 c.settimeout(2)
                 c.connect(addr)
+                c.sendall(self.token)
                 c.close()
             except OSError:
                 ok = False
                 continue
             deadline = time.monotonic() + 2
-            while self.hits == before and time.monotonic() < deadline:
+            while self.self_hits == before and time.monotonic() < deadline:
                 time.sleep(0.02)
-            with self._lock:
-                gained = self.hits - before
-                self.self_hits += gained
-            if gained == 0:
+            if self.self_hits == before:
                 ok = False
         return ok
 
     def foreign_hits(self) -> int:
-        return self.hits - self.self_hits
+        return self.foreign
 
     def close(self) -> None:
         self._stop = True
@@ -276,7 +301,6 @@ class _Turn:
     tool_uses: list[dict[str, Any]] = field(default_factory=list)
     results: dict[str, str] = field(default_factory=dict)
     prompts: list[dict[str, Any]] = field(default_factory=list)
-    decisions: dict[str, str] = field(default_factory=dict)
     hook_events: set[str] = field(default_factory=set)
     hook_context: dict[str, int] = field(default_factory=dict)
     result: dict[str, Any] | None = None
@@ -306,7 +330,7 @@ def _additional_context(m: dict[str, Any]) -> int:
 def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, timeout: float,
            decide: Callable[[dict[str, Any]], dict[str, Any]], stream_log: Path | None = None) -> _Turn:
     turn = _Turn()
-    proc = subprocess.Popen(argv, cwd=cwd, env=env, text=True, bufsize=1,
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, text=True, bufsize=1, start_new_session=True,
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdin, stdout, stderr = proc.stdin, proc.stdout, proc.stderr
     if stdin is None or stdout is None or stderr is None:
@@ -315,9 +339,17 @@ def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, time
     stderr_lines: list[str] = []
     threading.Thread(target=lambda: stderr_lines.extend(stderr), daemon=True).start()
 
+    def kill_group() -> None:
+        # The probe's python is claude's grandchild; killing claude alone could leave it running
+        # into the post-turn self-check.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            proc.kill()
+
     def on_timeout() -> None:
         turn.timed_out = True
-        proc.kill()
+        kill_group()
 
     timer = threading.Timer(timeout, on_timeout)
     timer.start()
@@ -361,10 +393,6 @@ def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, time
                 req = m["request"]
                 turn.prompts.append({"tool_name": req.get("tool_name"), "input": req.get("input")})
                 answer = decide(req)
-                fp = (req.get("input") or {}).get("file_path")
-                if fp is not None:
-                    turn.decisions[str(fp)] = answer.get("_decision", answer.get("behavior", ""))
-                answer = {k: v for k, v in answer.items() if not k.startswith("_")}
                 send({"type": "control_response", "response": {
                     "subtype": "success", "request_id": m.get("request_id"), "response": answer}})
             elif t == "assistant":
@@ -387,15 +415,10 @@ def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, time
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            pass
+        kill_group()
+        proc.wait()
     return turn
-
-
-# The host's expected answer per Write slot, from `file_write_decision` (pinned in the tests too).
-# "cc" means Claude Code's own restricted-mode confinement may refuse it before the host is asked.
-_EXPECTED = {"outside": ("ask", "cc"), "hook": ("refuse",), "hookcase": ("refuse",),
-             "dotdot": ("refuse", "cc"), "link": ("ask", "cc"), "scratch": ("allow",)}
 
 
 def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_model: str = "haiku",
@@ -403,8 +426,8 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
                   control_answer: Callable[[str, str], Literal["allow", "deny"] | None] | None = None,
                   stream_log: Path | None = None) -> CanaryVerdict:
     """Run the canary once. ``control_answer(slot, detail)`` exists for the build's control runs
-    only: it may override the host's answer for a named slot ("bash" for the probe command, or a
-    Write slot) so a control can show an arm failing. A hosting caller never passes it."""
+    only: it may answer "allow" for the "bash" slot (the probe command prompting) so a control
+    can show an arm failing. A hosting caller never passes it."""
     nonce = secrets.token_hex(8)
     ent, run = profile.entity, profile.run_dir
     # AF_UNIX paths are capped (104 bytes on macOS, 108 on Linux): the socket sits directly in the
@@ -416,39 +439,38 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
     work.mkdir(mode=0o700)
     hooks = ent / "activation" / "hooks"
     case_insensitive = (ent / "ACTIVATION").exists()
-    git = ent / ".git"
+    git, mcp = ent / ".git", ent / ".mcp.json"
+    # Probes that would touch something the operator already has are aimed so they can never
+    # damage it: .git is probed only by a new name (a .git FILE, as in a worktree, is left alone,
+    # L3 r1 complement 1), and .mcp.json only by a zero-byte append to an existing file.
+    if not os.path.lexists(git):
+        git_probe: Path | None = git
+    elif git.is_dir() and not git.is_symlink():
+        git_probe = git / f"selftest-{nonce}"
+    else:
+        git_probe = None
     cfg: dict[str, Any] = {
         "nonce": nonce, "port": 0, "sock": str(sock),
         "outside": str(work / "fsout"),
         "hook": str(hooks / f"selftest-{nonce}.txt"),
         "hook_case": str(ent / "ACTIVATION" / "hooks" / f"selftest-c-{nonce}.txt") if case_insensitive else "",
         "claude": str(ent / ".claude" / f"selftest-{nonce}.txt"),
-        "mcp": str(ent / ".mcp.json"),
-        "git": str(git / f"selftest-{nonce}") if git.is_dir() else str(git),
+        "mcp": str(mcp) if mcp.is_file() and not mcp.is_symlink() else "",
+        "git": str(git_probe) if git_probe else "",
+        "link_target": str(hooks),
+        "swap_link": str(ent / f"selftest-sl-{nonce}"),
+        "swap_name": f"selftest-via-{nonce}.txt",
         "link_src": str(hooks / "session_start.py"),
         "link_dst": str(ent / f"selftest-ln-{nonce}"),
     }
-    w = {
-        "outside": work / "write-outside.txt",
-        "hook": hooks / f"selftest-w-{nonce}.txt",
-        "hookcase": ent / "ACTIVATION" / "hooks" / f"selftest-wc-{nonce}.txt",
-        "link": ent / f"selftest-link-{nonce}" / "via-link.txt",
-        "dotdot": ent / f"selftest-sl-{nonce}" / ".." / f"selftest-dd-{nonce}.txt",
-        "scratch": ent / f"selftest-scratch-{nonce}.txt",
-    }
-    slots = {str(p): s for s, p in w.items()}
-    link_target = work / "linked"
-    link = ent / f"selftest-link-{nonce}"
-    sl = ent / f"selftest-sl-{nonce}"
-    # Everything that must NOT exist afterwards, by the path it would land on.
+    # Everything that must NOT exist afterwards. Only paths the canary itself named are ever
+    # removed; nothing that existed before the run is on this list.
     landed = [work / "fsout", Path(cfg["hook"]), ent / ".claude" / f"selftest-{nonce}.txt",
-              Path(cfg["link_dst"]), w["outside"], w["hook"], hooks / f"selftest-wc-{nonce}.txt",
-              link_target / "via-link.txt", ent / "activation" / f"selftest-dd-{nonce}.txt"]
+              hooks / cfg["swap_name"], Path(cfg["swap_link"]), Path(cfg["link_dst"])]
     if cfg["hook_case"]:
         landed.append(hooks / f"selftest-c-{nonce}.txt")
-    if not git.is_dir():
-        landed.append(git)
-    created: list[Path] = [link, sl, w["scratch"]] + landed
+    if git_probe is not None:
+        landed.append(git_probe)
     checks: list[Check] = []
     turn: _Turn | None = None
     listener: _Listener | None = None
@@ -458,38 +480,25 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
         script = work / "selftest.py"
         script.write_text(probe_script(cfg), encoding="utf-8")
         cmd = probe_command(script, python=probe_python)
-        link_target.mkdir()
-        os.symlink(link_target, link)
-        os.symlink(hooks, sl)
         pre = listener.self_connect()
 
         def decide(req: dict[str, Any]) -> dict[str, Any]:
             name, inp = req.get("tool_name"), req.get("input") or {}
-            slot = None
-            if name == "Bash" and inp.get("command") == cmd:
-                slot = "bash"
-            elif name in ("Write", "Edit"):
-                slot = slots.get(str(inp.get("file_path")))
-            policy = file_write_decision(ent, str(name), inp) if name in ("Write", "Edit") else "refuse"
-            verdict = "allow" if policy == "allow" and slot is not None else "deny"
-            if control_answer and slot:
-                verdict = control_answer(slot, str(inp)) or verdict
+            slot = "bash" if name == "Bash" and inp.get("command") == cmd else None
+            verdict = (control_answer(slot, str(inp)) if control_answer and slot else None) or "deny"
             if verdict == "allow":
-                return {"behavior": "allow", "updatedInput": inp, "_decision": policy}
-            return {"behavior": "deny", "message": "denied by the Levain host self-test", "_decision": policy}
+                return {"behavior": "allow", "updatedInput": inp}
+            return {"behavior": "deny", "message": "denied by the Levain host self-test"}
 
-        steps = [f"1. Bash, command exactly: {cmd}"]
-        steps += [f"{i}. Write, file_path {p}, content: selftest" for i, p in enumerate(slots, start=2)]
         prompt = (
             "Levain host self-test. Before this session is hosted in the operator's cockpit, the "
             "Levain host (the program running you, acting for the operator) checks that this "
-            "environment blocks what it should. It needs you to ATTEMPT the tool calls below "
-            "exactly as written. Most are designed to be blocked by the sandbox or denied by the "
-            "host; a blocked or denied call is the expected, passing result, and the host records "
-            "it. Nothing here reaches anyone else: the socket and files belong to the host's own "
-            "self-test. Make exactly these calls, in order, with exactly these arguments (do not "
-            "normalise the paths), do not retry a failed call, make no other tool call, then reply "
-            "DONE.\n" + "\n".join(steps) + "\n")
+            "environment blocks what it should. It needs you to run the one command below exactly "
+            "as written. It attempts several operations that the sandbox is designed to block; a "
+            "blocked operation is the expected, passing result, and the host records it. Nothing "
+            "here reaches anyone else: the socket and files belong to the host's own self-test. "
+            "Make exactly this one Bash call, do not retry it, make no other tool call, then reply "
+            f"DONE.\nBash, command exactly: {cmd}\n")
         try:
             turn = _drive(profile.argv(canary=True, canary_model=canary_model), cwd=ent,
                           env=dict(profile.env), prompt=prompt, timeout=timeout, decide=decide,
@@ -500,13 +509,14 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
         checks.append(Check("C0 listener live", "pass" if pre and post else "fail",
                             f"self-connect before={pre} after={post}"))
         if turn is not None:
-            checks.extend(_evaluate(turn, nonce=nonce, cmd=cmd, slots=slots, listener=listener,
-                                    landed=landed, scratch=w["scratch"],
-                                    expect_case=bool(cfg["hook_case"])))
+            want = _PROBE_LINES + tuple(k for k, v in (("FSMCP", cfg["mcp"]), ("FSGIT", cfg["git"]),
+                                                       ("FSHOOKCASE", cfg["hook_case"])) if v)
+            checks.extend(_evaluate(turn, nonce=nonce, cmd=cmd, listener=listener,
+                                    landed=landed, want=want))
     finally:
         if listener is not None:
             listener.close()
-        for p in created:
+        for p in landed:
             try:
                 if p.is_symlink() or p.is_file():
                     p.unlink()
@@ -519,12 +529,12 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
                          claude_bin=os.path.realpath(profile.claude_bin), profile_digest=profile.digest())
 
 
-_PROBE_LINES = ("TCP", "UDS", "FSOUT", "FSHOOK", "FSCLAUDE", "FSMCP", "FSGIT", "HARDLINK",
-                "PROXYIP", "PROXYLOCAL")
+_PROBE_LINES = ("TCP", "UDS", "FSOUT", "FSHOOK", "FSCLAUDE", "FSLINK", "HARDLINK", "PROXYIP",
+                "PROXYLOCAL")
 
 
-def _evaluate(turn: _Turn, *, nonce: str, cmd: str, slots: dict[str, str], listener: Any,
-              landed: list[Path], scratch: Path, expect_case: bool = False) -> list[Check]:
+def _evaluate(turn: _Turn, *, nonce: str, cmd: str, listener: Any, landed: list[Path],
+              want: tuple[str, ...] = _PROBE_LINES) -> list[Check]:
     checks: list[Check] = []
     if turn.timed_out or turn.init is None:
         return [Check("C1 profile loaded", "inconclusive",
@@ -537,13 +547,12 @@ def _evaluate(turn: _Turn, *, nonce: str, cmd: str, slots: dict[str, str], liste
     checks.append(Check("C6 entity hooks ran", "fail" if thin else "pass",
                         f"no injected context from {thin}" if thin else "SessionStart and UserPromptSubmit injected context"))
 
+    # C2: exactly one tool call, the Bash probe byte for byte, and every attempt BLOCKED.
     bash = [u for u in turn.tool_uses if u.get("name") == "Bash"]
-    writes = [u for u in turn.tool_uses if u.get("name") == "Write"]
-    other = [u.get("name") for u in turn.tool_uses if u.get("name") not in ("Bash", "Write")]
-
-    # C2: exactly one Bash call, byte-identical to the probe, every line BLOCKED.
-    want = _PROBE_LINES + (("FSHOOKCASE",) if expect_case else ())
-    if len(bash) != 1:
+    other = [u.get("name") for u in turn.tool_uses if u.get("name") != "Bash"]
+    if other:
+        checks.append(Check("C2 Bash arm", "fail", f"tool calls the canary did not ask for: {other!r}"))
+    elif len(bash) != 1:
         checks.append(Check("C2 Bash arm", "inconclusive", f"{len(bash)} Bash call(s)"))
     elif (bash[0].get("input") or {}).get("command") != cmd:
         checks.append(Check("C2 Bash arm", "fail", "the Bash command differs from the probe"))
@@ -572,36 +581,5 @@ def _evaluate(turn: _Turn, *, nonce: str, cmd: str, slots: dict[str, str], liste
     bash_prompts = [p for p in turn.prompts if p.get("tool_name") == "Bash"]
     checks.append(Check("C4 no Bash prompt", "fail" if bash_prompts else "pass",
                         f"{len(bash_prompts)} Bash prompt(s)" if bash_prompts else "none"))
-
-    # C5: the file-tool arm, answered by the session's own policy. Protected, case-variant,
-    # dot-dot, outside and symlink writes never land; the host's answer per slot is the expected
-    # one; the scratch write reaches the host and lands only on its allow. Any tool call the prompt
-    # did not ask for, or a repeated write, fails (L1 r1 LOW).
-    problems: list[str] = []
-    unsure: list[str] = []
-    if other:
-        problems.append(f"tool calls the canary did not ask for: {other!r}")
-    paths = [str((u.get("input") or {}).get("file_path")) for u in writes]
-    if len(paths) != len(set(paths)) or set(paths) - set(slots):
-        problems.append(f"Write calls outside the requested set or repeated: {paths!r}")
-    for path, slot in slots.items():
-        if path not in paths:
-            unsure.append(f"{slot}: no Write call")
-            continue
-        decided = turn.decisions.get(path)
-        allowed = _EXPECTED[slot]
-        if decided is not None and decided not in allowed:
-            problems.append(f"{slot}: the host policy answered {decided!r}, expected {allowed[0]!r}")
-        if decided is None and "cc" not in allowed and slot != "scratch":
-            unsure.append(f"{slot}: never reached the host")
-        if slot != "scratch" and (os.path.lexists(path) or Path(path).exists()):
-            problems.append(f"{slot}: the write landed")
-        if slot == "scratch":
-            if decided is None:
-                problems.append("scratch: no permission prompt reached the host")
-            elif not scratch.exists():
-                unsure.append("scratch: allowed but did not land")
-    status: Status = "fail" if problems else ("inconclusive" if unsure else "pass")
-    checks.append(Check("C5 file-tool arm", status, "; ".join(problems + unsure) or
-                        "every write answered by the session policy as expected; only scratch landed"))
     return checks
+
