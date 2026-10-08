@@ -165,6 +165,41 @@ levain wrap ./ada                   # consolidate what it learned into its own l
 
 It runs against Ollama by default, through `--model`/`--base-url` — or any OpenAI-compatible or Anthropic-style endpoint you point it at instead. The out-of-the-box default, `glm-5.2:cloud`, is served through Ollama Cloud, so by default the episode content does leave your machine; point `--model` at a plain Ollama model name (no `:cloud`) to keep the whole conversation local. Either way it's an open model you chose, never a frontier vendor's hosted assistant. Give it hands and, on macOS or Linux, it works your real repos through a file editor and a sandboxed shell (`sandbox-exec` on macOS, `bwrap` on Linux, where bash has no IP network by default), both fenced to the same crown-jewels floor described below — `~/.anneal-memory`, sibling stores, and your SSH key material stay off-limits no matter what it's asked to do. Where there is no sandbox, or the host refuses one, it gets the file editor only, never an unconfined shell — see *Boundaries*. `--no-tools` runs it as a pure conversational partner with no hands at all. `levain wrap` is what makes the entity's identity compound instead of just accumulating transcripts: it metabolizes its own raw episodes into its own six-section memory, composed on its own model by default, so the entity that answers you tomorrow has actually learned from today.
 
+### Running the entity's bash as its own user
+
+On macOS, any program can read the command line and environment of every other program running as the same user. That includes tokens passed in an environment variable. No sandbox rule changes that: independent tests on current macOS found no rule that does, and our own test confirmed it. So an entity whose bash runs as you can read the secrets your other programs were started with.
+
+`sudo levain setup-isolation --path <entity>` closes that. It creates a dedicated user for the entity, and from then on, on macOS, headless chat turns, `--task` runs and scheduled seats execute bash as that user, and the file editor writes as it:
+
+- the kernel refuses to give that user the environment of your processes;
+- files only you can read are out of its reach, and so is your home directory;
+- the sandbox floor still applies on top, unchanged.
+
+The interactive `levain run` REPL still runs bash as you, because you drive it and read each turn before the next. On Linux, setup creates the user and its workspace, and bash keeps running as you there for now; `levain run` and `levain doctor` say which one is in force.
+
+**The workspace.** The entity works in a directory outside your home, `/Users/Shared/levain/<user>/workspace` on macOS or `/var/lib/levain/<user>/workspace` on Linux.
+
+<!-- FOR PHILL'S WORDS: the paragraph below is a draft in his register, not final copy -->
+**You change the workspace through the entity.** Everything in it belongs to the entity's user. You can read all of it, but you don't write there yourself, and I think that's the right way to work anyway: you're the operator, so you tell the entity what to change, it changes it, and you review what it did. When you need to hand something over directly, there's a door for it. `levain ws-put` copies a file in. `levain ws-adopt` brings one of your repositories in as a copy the entity owns, with every branch, and leaves yours where it is. `levain ws-git` runs git on the entity's repositories as the entity's user, so you can look at its work and drive it. And there's the remote, where the entity pushes a branch with its own key and you review and merge it like any other contributor's.
+
+It closes a real hole, too. Git refuses to read the settings of, or run the hooks of, a repository you don't own, so your git refuses every repository in there, and nothing the entity writes into one can run as you. But for a bare repository git only checks who owns that one folder. If any folder in the workspace were yours and the entity could write to it, the entity could build a repository there that your git would trust. Nothing in the workspace is yours, so there's no folder like that. `levain doctor` fails if one ever shows up, and warns you to set `safe.bareRepository = explicit` and to drop any `safe.directory = *`.
+<!-- END FOR PHILL'S WORDS -->
+
+**The entity's ssh key.** The ssh agent refuses a different user, so the entity cannot use your keys, and levain does not pass your agent to it. Setup prints the entity's public key; add it as a deploy key on each repository the entity should push to.
+
+What setup creates, all undone by `--undo`:
+- the user, with no password and no login shell, and its own group (undo keeps it, disabled, so its id is never reused; `--reenable` brings it back);
+- one sudoers rule that lets your account start commands as that user, and nothing else;
+- the entity's ssh key;
+- the workspace and its permissions (removed only if empty);
+- a refusal of remote login for that user (`DenyUsers`), and an entry in your cron and at deny lists where those exist.
+
+When it undoes, everything the entity created stays owned by its retired user id, readable by your group: never yours and never root's, so no git, yours or one run with sudo, trusts anything it wrote. Clone its repositories to keep the work.
+
+**What a separate user does not hide.** The settings of your LaunchAgents are visible to every local user through `launchctl print gui/<your uid>/<label>`, including any environment variables written in a LaunchAgent's plist. Do not put secrets in a LaunchAgent plist on a machine an entity runs on. Other programs' command lines are visible through `pgrep -fl` (the environment is not); do not pass secrets on a command line on a machine an entity runs on.
+
+**What carries between commands.** Each command runs in a fresh bash. The working directory, `cd -` and exported variables carry to the next command; functions, aliases, `set` options, traps and unexported variables do not, as in a new terminal. levain learns that a command finished, and its exit status, from the operating system, never from anything the shell prints.
+
 ## Hand it a schedule — the governed seat
 
 `levain daemon install-seat` takes the sovereign entity above and runs it unattended, on a cadence, while you're away.

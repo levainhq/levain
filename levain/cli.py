@@ -1002,8 +1002,10 @@ def main(argv: list[str] | None = None) -> int:
             "/var/lib/levain on Linux) that you can read and that you change through the entity "
             "(or ws-git, ws-put and ws-adopt), an ssh key of its own, and one sudoers rule that "
             "lets your account start commands as that user. A process running as that user cannot "
-            "read the environment of your processes or files only you can read. Needs root once: "
-            "run it with sudo. --undo removes what it created."
+            "read the environment of your processes or files only you can read. On macOS, headless "
+            "chat turns, --task runs and scheduled seats then execute bash as that user, and the file "
+            "editor writes as it; the interactive `levain run` REPL keeps using your account. Needs "
+            "root once: run it with sudo. --undo removes what it created."
         ),
     )
     iso_p.add_argument(
