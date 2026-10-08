@@ -340,6 +340,43 @@ def test_unrecognised_ssh_keygen_output_is_indeterminate(repo, keys, monkeypatch
     assert v.kind == "indeterminate" and "Good-ish" in v.reason
 
 
+def _sig_file_vanishes(monkeypatch, *, canary_too: bool):
+    """A tmp cleaner deletes the signature file just before ssh-keygen reads it: the REAL ssh-keygen then exits 255 with
+    "Could not verify signature.", the same exit and text as a garbled signature (measured, OpenSSH 10.3)."""
+    real = subprocess.run
+    calls = {"n": 0}
+
+    def fake(argv, *a, **kw):
+        if argv and argv[0] == "ssh-keygen" and "-s" in argv:
+            calls["n"] += 1
+            if calls["n"] == 1 or canary_too:
+                Path(argv[argv.index("-s") + 1]).unlink(missing_ok=True)
+        return real(argv, *a, **kw)
+
+    monkeypatch.setattr(S.subprocess, "run", fake)
+
+
+def test_a_255_from_this_machine_is_indeterminate_and_never_cached(repo, keys, tmp_path, monkeypatch):
+    """RUN: a valid signature whose check fails for an environment reason (exit 255) is NOT filed as unsigned: the
+    canary fails the same way, so the verdict is indeterminate and nothing is cached. Failed on 9c9513b (cached
+    "unsigned" forever, so a good commit stopped counting on this clone)."""
+    sha = commit(repo, "signed", key=keys["ed25519"])
+    cache_path = tmp_path / "cache" / "sigcache.json"
+    _sig_file_vanishes(monkeypatch, canary_too=True)
+    got = S.SigCache(cache_path).verify(repo, [sha])
+    assert got[sha].kind == "indeterminate", got[sha]
+    assert not cache_path.exists() or sha not in json.loads(cache_path.read_text())["entries"]
+    monkeypatch.undo()
+    assert S.SigCache(cache_path).verify(repo, [sha])[sha].kind == "signed"
+
+
+def test_a_255_on_a_garbled_signature_stays_unsigned_when_the_canary_verifies(repo, keys, monkeypatch):
+    """RUN: when only the commit's check fails and the canary verifies, the 255 is the commit's fault: unsigned."""
+    sha = commit(repo, "signed", key=keys["ed25519"])
+    _sig_file_vanishes(monkeypatch, canary_too=False)
+    assert S.verify_commit(repo, sha).kind == "unsigned"
+
+
 @pytest.mark.parametrize("config", [
     [],
     [("gpg.ssh.allowedSignersFile", "/nonexistent/allowed_signers")],
