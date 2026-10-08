@@ -265,7 +265,7 @@ def test_t1_hand_off_by_offer_and_signed_accept_keeps_the_old_owners_links(two, 
     first = gl(ana).ledger().in_force[0]["id"]
     assert team("record", "decision", "--kind", "ruling", "--owner", "lead", "--paths", "src/a.py", "--words",
                 "ana: v2", "--supersedes", first, repo=ana) == 0
-    assert team("owner", "ben", "--key", str(keys["ben"]), repo=ana) == 0
+    assert team("owner", "ben", repo=ana) == 0
     assert team("accept", repo=ben) == 0
     g = gl(ana)
     g.sync(push=False)
@@ -276,13 +276,96 @@ def test_t1_hand_off_by_offer_and_signed_accept_keeps_the_old_owners_links(two, 
 
 def test_t48_an_offer_dies_with_the_offerees_membership(two, keys):
     tmp, ana, ben = two
-    assert team("owner", "ben", "--key", str(keys["ben"]), repo=ana) == 0
+    assert team("owner", "ben", repo=ana) == 0
     assert team("member", "remove", "ben", repo=ana) == 0
-    assert team("member", "add", "ben", "ben@ex.com", "--key", str(keys["ben"]), repo=ana) == 0
+    assert team("member", "add", "ben", "ben@ex.com", "--key", str(keys["ben"]), repo=ana) == 2   # a retired handle
     g = gl(ben)
     g.sync(push=False)
     assert g.derivation().tenure.offer is None
     assert team("accept", repo=ben) == 2
+
+
+def test_owner_impersonation_a_key_the_owner_proposes_for_an_existing_member_never_comes_into_force(two, keys):
+    """1007+25's traced path, RUN: the owner proposes a key she holds into ben's pending and confirms it herself.
+    The CLI refuses; the same commits written past the CLI are refused by the derivation, and a line signed with that
+    key under ben's folder is not enforced."""
+    from levain.team import signing as S
+    from levain.team import tenure as T
+    tmp, ana, ben = two
+    assert team("key", "add", "ben", str(keys["ana2"]), repo=ana) == 2         # the CLI refuses the owner
+    g = gl(ana)
+    line = Path(keys["ana2"]).read_text().strip()
+    g.update_counted(lambda t, n: n.pending_keys.setdefault("ben", []).append(line),
+                     "forged: propose ana2 for ben", push=False)
+    g._dcache = None
+    assert S.fingerprint(line) not in {T._fp_or_none(x) for x in g.derivation().tenure.pending_keys.get("ben", [])}
+    assert S.fingerprint(line) not in T.key_fps(g.derivation().tenure, "ben")
+
+
+def test_owner_impersonation_an_accept_needs_a_key_already_the_offerees(two, keys):
+    """The offer names a member, not a key: an accept signed by a key the owner chose (ana2) does not move ownership,
+    and a ``keys`` list in a hand-written offer is dropped at parse."""
+    from levain.team import tenure as T
+    tmp, ana, ben = two
+    assert team("owner", "ben", repo=ana) == 0
+    g = gl(ana)
+    g.save_state(signing_key=str(keys["ana2"]))
+    assert team("accept", repo=ana) == 2                                          # ana2 holds no key of ben's
+
+    def forged(t, n) -> None:
+        t.owner = "ben"
+        n.offer = None
+    g.update_counted(forged, "forged: accept as ben with ana2", push=False)
+    g._dcache = None
+    assert g.derivation().team.owner == "ana"
+    parsed = T.parse_tenure('rules = 1\noffer = { handle = "ben", email = "b@x", keys = ["ssh-ed25519 AAAA x"] }\n')
+    assert parsed.offer == {"handle": "ben", "email": "b@x"}
+    assert team("accept", repo=ben) == 0                                          # ben's own in-force key: accepted
+    gb = gl(ben)
+    gb.sync(push=False)
+    assert gb.derivation().team.owner == "ben"
+
+
+def test_the_owner_proposes_only_a_members_first_key(two, keys):
+    """A member with no key yet: the owner proposes it (after the add, too); once that key is in force, only the
+    member proposes, and the owner's proposal written past the CLI is refused by the derivation."""
+    from levain.team import signing as S
+    from levain.team import tenure as T
+    tmp, ana, ben = two
+    assert team("member", "add", "cy", "cy@ex.com", repo=ana) == 0                  # no key yet
+    assert team("key", "add", "cy", str(keys["cy"]), repo=ana) == 0                 # the owner: cy's first key
+    cy = clone(tmp, "cy", "cy@ex.com")
+    assert team("join", "--signing-key", str(keys["cy"]), "--no-install", repo=cy) == 0
+    g = gl(ana)
+    g.sync(push=False)
+    g._dcache = None
+    d = g.derivation()
+    assert S.fingerprint(Path(keys["cy"]).read_text()) in T.key_fps(d.tenure, "cy") and "cy" in d.ever_keyed
+    assert team("key", "add", "cy", str(keys["mal"]), repo=ana) == 2                # cy has a key now: refused
+    assert team("member", "add", "cy", "cy@ex.com", "--key", str(keys["mal"]), repo=ana) == 2
+    mal = Path(keys["mal"]).read_text().strip()
+    g.update_counted(lambda t, n: n.pending_keys.setdefault("cy", []).append(mal), "forged: mal for cy", push=False)
+    g._dcache = None
+    assert "cy" not in g.derivation().tenure.pending_keys
+
+
+def test_a_removed_handle_is_never_re_added(two, keys):
+    """remove + re-add under the same handle would give the owner a key signing as a handle that signed before (L1 W1,
+    L2 A1, 1007+25): the CLI refuses it, and the same commit written past the CLI is refused by the derivation."""
+    tmp, ana, ben = two
+    assert team("member", "remove", "ben", repo=ana) == 0
+    assert team("member", "add", "ben", "ben@ex.com", "--key", str(keys["ana2"]), repo=ana) == 2
+    g = gl(ana)
+    ana2 = Path(keys["ana2"]).read_text().strip()
+
+    def readd(t, n) -> None:
+        t.members["ben"] = "ben@ex.com"
+        n.pending_keys["ben"] = [ana2]
+    g.update_counted(readd, "forged: re-add ben", push=False)
+    g._dcache = None
+    d = g.derivation()
+    assert "ben" not in d.team.members and "ben" not in d.tenure.pending_keys and d.retired("ben")
+    assert team("member", "add", "ben2", "ben@ex.com", "--key", str(keys["ana2"]), repo=ana) == 0   # a new handle
 
 
 # ---- merges: frozen, then accept-merge --parent --------------------------------------------------------------
@@ -488,7 +571,7 @@ def test_l2_f1_a_revocation_reaching_before_the_revokers_own_ownership_does_not_
     from levain.team import signing as S
     tmp, ana, ben = two
     cutoff = sh("git", "rev-parse", "levain-team-ledger", cwd=gl(ben).wt).strip()
-    assert team("owner", "ben", "--key", str(keys["ben"]), repo=ana) == 0
+    assert team("owner", "ben", repo=ana) == 0
     assert team("accept", repo=ben) == 0
     g = gl(ben)
     g.sync(push=False)

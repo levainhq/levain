@@ -40,6 +40,10 @@ def _require_owner(gl: GitLedger) -> T.Derivation:
     return d
 
 
+LOST = ("a member who lost every key is invited again under a new handle (a removed handle is never re-used); "
+        "a stolen key is also revoked with `levain team revoke`")
+
+
 def cmd_owner(gl: GitLedger, args) -> int:
     gl.require_joined()
     d = _require_owner(gl)
@@ -50,17 +54,20 @@ def cmd_owner(gl: GitLedger, args) -> int:
         print(gl.update_counted(lambda t, n: setattr(n, "offer", None), "levain team: cancel the ownership offer",
                                 push=not args.no_push))
         return 0
-    if not args.handle or not args.key:
-        raise TeamError("levain team owner <handle> --key <their public key> [--email E]   (or --cancel)")
+    if not args.handle:
+        raise TeamError("levain team owner <handle> [--email E]   (or --cancel)")
     if args.handle not in d.team.members:
         raise TeamError(f"{args.handle} is not a member")
-    line = _key_line(args.key)
+    if not d.tenure.keys.get(args.handle):
+        raise TeamError(f"{args.handle} has no key in force yet, so they could not sign the accept: their pending "
+                        "key comes into force when they run `levain team sync` (or `join`) on its machine")
     email = args.email or d.team.members[args.handle]
 
     def offer(team: R.Team, ten: T.Tenure) -> None:
-        ten.offer = {"handle": args.handle, "email": email, "keys": [line]}
+        ten.offer = {"handle": args.handle, "email": email}
     print(gl.update_counted(offer, f"levain team: offer ownership to {args.handle}", push=not args.no_push))
-    print(f"offered ownership to {args.handle}; it takes effect when they run `levain team accept` with that key")
+    print(f"offered ownership to {args.handle}; it takes effect when they run `levain team accept` with a key already "
+          "in force for them")
     return 0
 
 
@@ -69,13 +76,12 @@ def cmd_accept(gl: GitLedger, args) -> int:
     d = gl.derivation()
     off = d.tenure.offer
     fp = gl.own_fingerprint()
-    if not off or fp not in {T._fp_or_none(k) for k in off.get("keys", [])}:
-        raise TeamError("there is no live ownership offer for this machine's key")
+    if not off or fp not in T.key_fps(d.tenure, off["handle"]):
+        raise TeamError("there is no live ownership offer to a member whose key in force is this machine's")
 
     def accept(team: R.Team, ten: T.Tenure) -> None:
         team.owner = off["handle"]
         team.members[off["handle"]] = off.get("email") or team.members[off["handle"]]
-        ten.keys[off["handle"]] = sorted(set(ten.keys.get(off["handle"], [])) | set(off["keys"]))
         ten.offer = None
     print(gl.update_counted(accept, f"levain team: {off['handle']} accepts ownership", push=not args.no_push))
     return 0
@@ -103,8 +109,12 @@ def cmd_key_add(gl: GitLedger, args) -> int:
     gl.require_joined()
     d = gl.derivation()
     me = gl.handle()
-    if me not in (d.team.owner, args.handle):
-        raise TeamError(f"only the owner ({d.team.owner}) or {args.handle} may propose {args.handle}'s keys")
+    owner_first_key = me == d.team.owner and args.handle in d.team.members and args.handle not in d.ever_keyed
+    if me != args.handle and not owner_first_key:
+        # the owner proposes a member's key only until that member's first key is in force: after that, a key she
+        # holds confirmed under their handle would sign as them (owner-impersonation fix)
+        raise TeamError(f"only {args.handle}, signing with a key already in force for them, may propose "
+                        f"{args.handle}'s keys (the owner proposes only a member's first key); {LOST}")
     line = _key_line(args.key)
     fp = S.fingerprint(line)
     for h, lines in list(d.tenure.keys.items()) + list(d.tenure.pending_keys.items()):
@@ -352,19 +362,20 @@ def register(sub, add) -> None:
             return fn(g, args)
         return run
 
-    p = add("owner", wrap(cmd_owner), "Owner only: offer ownership to a member (they accept with their key).")
+    p = add("owner", wrap(cmd_owner), "Owner only: offer ownership to a member (they accept with a key already "
+            "in force for them).")
     p.add_argument("handle", nargs="?")
-    p.add_argument("--key", help="the public key the new owner will sign with (a line or a .pub file)")
     p.add_argument("--email")
     p.add_argument("--cancel", action="store_true", help="withdraw the pending offer")
     p.add_argument("--no-push", action="store_true")
 
-    p = add("accept", wrap(cmd_accept), "Accept a pending ownership offer made to this machine's key.")
+    p = add("accept", wrap(cmd_accept), "Accept a pending ownership offer made to the member whose key this "
+            "machine holds.")
     p.add_argument("--no-push", action="store_true")
 
     p = add("key", None, "Signing keys: add (pending until proven), confirm, remove.")
     ksub = p.add_subparsers(dest="key_command", required=True)
-    for name, fn, help_ in (("add", cmd_key_add, "propose a key for a member (the owner, or the member)"),
+    for name, fn, help_ in (("add", cmd_key_add, "propose a key: the member's own, or the owner's for a member with no key yet"),
                             ("confirm", cmd_key_confirm, "prove this machine's pending key"),
                             ("remove", cmd_key_remove, "remove one of a member's keys by fingerprint")):
         kp = ksub.add_parser(name, help=help_)
