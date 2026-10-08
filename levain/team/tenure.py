@@ -44,7 +44,8 @@ class Unjudgeable(TeamError):
 class Tenure:
     rules: int = RULES
     past_owner_links: bool = True                         # G (ruled yes 10-05)
-    offer: dict | None = None                             # {handle, email, keys: [..]} while a hand-off waits
+    offer: dict | None = None                             # {handle, email} while a hand-off waits (no keys: the
+                                                          # offeree accepts with a key already theirs)
     vetoes: list[dict] = field(default_factory=list)      # {handle, role, since, links}
     keys: dict[str, list[str]] = field(default_factory=dict)          # handle -> public key lines in force
     pending_keys: dict[str, list[str]] = field(default_factory=dict)  # handle -> proposed, not yet proven
@@ -60,9 +61,7 @@ def dump_tenure(t: Tenure) -> str:
     """Canonical text: sorted, every string JSON-quoted, so two writers of one state write one byte sequence."""
     out = [f"rules = {int(t.rules)}", f"past_owner_links = {'true' if t.past_owner_links else 'false'}"]
     if t.offer:
-        keys = ", ".join(_q(k) for k in t.offer.get("keys", []))
-        out.append(f"offer = {{ handle = {_q(t.offer['handle'])}, email = {_q(t.offer.get('email', ''))}, "
-                   f"keys = [{keys}] }}")
+        out.append(f"offer = {{ handle = {_q(t.offer['handle'])}, email = {_q(t.offer.get('email', ''))} }}")
     for title, table in (("keys", t.keys), ("pending_keys", t.pending_keys)):
         rows = {h: v for h, v in table.items() if v}
         if rows:
@@ -89,8 +88,8 @@ def parse_tenure(text: str, where: str = TENURE_FILE) -> Tenure:
         if off is not None:
             if not isinstance(off, dict) or not isinstance(off.get("handle"), str):
                 raise ValueError("offer needs a handle")
-            t.offer = {"handle": off["handle"], "email": str(off.get("email", "")),
-                       "keys": [str(k) for k in off.get("keys", [])]}
+            # a ``keys`` list from a pre-fix writer is dropped: an offer grants no key (owner-impersonation fix)
+            t.offer = {"handle": off["handle"], "email": str(off.get("email", ""))}
         for title in ("keys", "pending_keys"):
             table = raw.get(title, {})
             if not isinstance(table, dict):
@@ -395,6 +394,11 @@ class Derivation:
     touched: dict[tuple, str] = field(default_factory=dict)   # field -> the last counted commit that changed it
     canon_sha: str | None = None                    # the last PROJECT.md commit signed by the owner in force
     state: dict[tuple, object] = field(default_factory=dict)  # the counted flat state at the tip
+    ever_keyed: set[str] = field(default_factory=set)         # handles that have held a key in force, at any point
+
+    def retired(self, handle: str) -> bool:
+        """A handle whose membership ended is never a member again: a re-invite takes a new handle."""
+        return any(s.handle == handle for s in self.spells) and handle not in self.team.members
 
     def owner_authority(self, entry: dict) -> bool:
         """Did ``entry``'s author hold owner authority at its own line (§3c rule 2, G and vetoes applied)?"""
@@ -545,6 +549,7 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
     canon_sha: str | None = None
     stranger: dict[str, int] = {}            # rel -> lines in its chain not written by the member (owner) in force
     touched: dict[tuple, str] = {k: g for k in state}
+    ever_keyed: set[str] = {k[1] for k in state if k[0] == "key"}
 
     def keys_of(f: dict, handle: str) -> set[str]:
         return {k[2] for k in f if k[0] == "key" and k[1] == handle}
@@ -636,7 +641,8 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
         run_start = next((s_.start for s_ in spells if s_.role == "owner" and s_.end is None), 0)
         new_rev: dict[str, str] = {}
         applied, refused = _apply(state, before, after, changed, fp, sha, i, new_rev, problems, where=where,
-                                  owner_since=run_start)
+                                  owner_since=run_start, ever_members={s_.handle for s_ in spells},
+                                  ever_keyed=ever_keyed)
         if sha in void:
             # a distrusted or revoked commit STAYS the Levain-Base link it would have been (so the commits naming it
             # still count; the 1007+19 run of L1's r5 caught a void confirm breaking every later team commit), while
@@ -670,6 +676,7 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
             if state.get(k) != applied.get(k):
                 touched[k] = sha
         state = applied
+        ever_keyed |= {k[1] for k in state if k[0] == "key"}
         cur_owner = str(state[("owner",)])
         cur_members = {k[1] for k in state if k[0] == "member"}
         if cur_owner != prev_owner:
@@ -725,7 +732,7 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
     return Derivation(tip=tip, walk=walk, team=t, tenure=n, counted_head=base, files=lines, unenforced=unenforced,
                       line_pos=line_pos, spells=spells, problems=problems, role_changes=role_changes,
                       waiting=sum(len(ch.get(s, Change()).added) for s in walk[freeze_end:]), void=new_void,
-                      touched=touched, state=dict(state), canon_sha=canon_sha)
+                      touched=touched, state=dict(state), canon_sha=canon_sha, ever_keyed=set(ever_keyed))
 
 
 def _hash_of(text: str) -> str | None:
@@ -739,8 +746,14 @@ def _hash_of(text: str) -> str | None:
 
 def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: str, pos: int,
            revoked: dict[str, str], problems: list[str], *, where: dict[str, int] | None = None,
-           owner_since: int | None = None) -> tuple[dict | None, list[str]]:
-    """Apply each changed field the signer may change (signing doc §3), field by field. Returns (new state, refused)."""
+           owner_since: int | None = None, ever_members: set[str] | frozenset[str] = frozenset(),
+           ever_keyed: set[str] | frozenset[str] = frozenset()) -> tuple[dict | None, list[str]]:
+    """Apply each changed field the signer may change (signing doc §3), field by field. Returns (new state, refused).
+
+    ``ever_members``: every handle that has had a spell; ``ever_keyed``: every handle that has held a key in force.
+    The owner-impersonation rule (1007+25, traced) reads both: the owner may propose a key for a handle only while
+    that handle has never held one, and a handle whose membership ended is never added again, so no key the owner
+    holds can come to sign under a handle that has signed before."""
     new = dict(state)
     refused: list[str] = []
     where = where or {}
@@ -752,8 +765,9 @@ def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: s
 
     is_owner = holds(owner)
     offer = json.loads(str(state[("offer",)])) if ("offer",) in state else None
-    offeree = offer is not None and fp in {_fp_or_none(k) for k in offer.get("keys", [])} \
-        and offer["handle"] in members
+    # the offeree signs the accept with a key ALREADY in force for the offered handle: an offer names a member, never
+    # a key, so the owner cannot hand ownership (or a member's handle) to a key she chose
+    offeree = offer is not None and offer["handle"] in members and holds(offer["handle"])
     any_applied = False
     for k in sorted(changed, key=lambda k: tuple(map(str, k))):
         old, val = state.get(k), after.get(k)
@@ -768,7 +782,7 @@ def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: s
             if val is None:
                 allowed = is_owner and h != owner
             elif old is None:
-                allowed = is_owner
+                allowed = is_owner and h not in ever_members      # a removed handle is retired, never re-used
             else:
                 allowed = is_owner or holds(h)          # an email is display: the owner, or the member themself
         elif kind == "owner":
@@ -777,16 +791,21 @@ def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: s
             allowed = is_owner or (offeree and val is None)
         elif kind == "pending":
             h = k[1]
-            allowed = (is_owner or holds(h)) if val is not None else (is_owner or holds(h) or fp == k[2])
+            if val is not None:
+                # a member's new key is proposed by that member; the owner proposes one only for a member (or a
+                # member this commit adds) that has never held a key, so a key she holds never signs as a handle
+                # that has signed before (owner-impersonation fix)
+                allowed = holds(h) or (is_owner and h not in ever_keyed and after.get(("member", h)) is not None)
+            else:
+                allowed = is_owner or holds(h) or fp == k[2]
             if val is not None and any(kk[0] in ("key", "pending") and kk[2] == k[2] and kk[1] != h
                                        for kk in list(state) + list(new)):
                 allowed = False     # one fingerprint, one handle (also within one commit: code L3 r1 glm)
         elif kind == "key":
             h = k[1]
             if val is not None:
-                # added: a confirm (signed by that very pending key), or an accept setting the offeree's offered keys
-                allowed = (fp == k[2] and ("pending", h, k[2]) in state) or (
-                    offeree and h == offer["handle"] and k[2] in {_fp_or_none(x) for x in offer.get("keys", [])})
+                # added: only a confirm, signed by that very pending key
+                allowed = fp == k[2] and ("pending", h, k[2]) in state
                 if any(kk[0] in ("key",) and kk[2] == k[2] and kk[1] != h for kk in list(state) + list(new)):
                     allowed = False
             else:

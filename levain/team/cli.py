@@ -113,9 +113,10 @@ def _actor(gl: GitLedger) -> tuple[R.Team, str]:
     team = gl.team()
     handle = gl.handle(team)
     if handle is None:
-        raise TeamError(f"this machine's signing key is not a member's key in force in {team.project}; ask "
-                        f"{team.owner} to run `levain team key add <your handle> <this machine's public key>`, then "
-                        "`levain team sync` here")
+        raise TeamError(f"this machine's signing key is not a member's key in force in {team.project}: from one of "
+                        "your machines whose key is in force, run `levain team key add <your handle> <this machine's "
+                        f"public key>`; if you have none yet, {team.owner} proposes your first key (`levain team key add "
+                        "<your handle> <your public key>`); then `levain team sync` here")
     return team, handle
 
 
@@ -293,6 +294,13 @@ def cmd_member_add(args) -> int:
         raise TeamError(f"only the owner ({team.owner}) changes membership")
     from .cli_tenure import _key_line
     line = _key_line(args.key) if args.key else None
+    d = gl.derivation()
+    if d.retired(args.handle):
+        raise TeamError(f"{args.handle} was a member of this ledger and was removed; a handle is never re-used, so "
+                        "invite them under a new handle")
+    if line and args.handle in d.ever_keyed:
+        raise TeamError(f"{args.handle} already has had a key in force, so only {args.handle} proposes their keys "
+                        f"(`levain team key add {args.handle} <public key>` from a machine whose key is in force)")
 
     def add(t, ten) -> None:
         t.members[args.handle] = args.email
@@ -301,7 +309,7 @@ def cmd_member_add(args) -> int:
     print(gl.update_counted(add, f"levain team: add member {args.handle}", push=not args.no_push))
     if not line:
         print(f"{args.handle} has no key yet: their lines are not enforced until `levain team key add {args.handle} "
-              "<their public key>` and their machine confirms it")
+              "<their public key>` (the owner may propose a member's first key) and their machine confirms it")
     return 0
 
 

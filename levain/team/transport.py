@@ -594,8 +594,10 @@ class GitLedger:
         handle = self.handle(d.team)
         if handle is None:
             fp = self.own_fingerprint()
-            return (tofu + f"\njoined {d.team.project}, but this machine's key ({fp}) is not a member's key yet: ask "
-                    f"{owner} to run `levain team key add <your handle> <your public key>`, then `levain team sync`")
+            return (tofu + f"\njoined {d.team.project}, but this machine's key ({fp}) is not a member's key yet: from "
+                    "one of your machines whose key is in force, run `levain team key add <your handle> <this public "
+                    f"key>`; if you have none yet, {owner} proposes your first key (`levain team key add <your "
+                    "handle> <your public key>`); then `levain team sync`")
         return tofu + f"\njoined {d.team.project} as {handle} (device {self.device})" + (
             f"; confirmed this machine's key" if confirmed else "")
 
@@ -678,8 +680,9 @@ class GitLedger:
         holder = d.team.owner if author.startswith("pack:") else author   # pack lines are the owner's (pack-* folders)
         if self.own_fingerprint() not in T.key_fps(d.tenure, holder):
             raise TeamError(f"this machine's key is not confirmed for {author}, so a line it signs would not be "
-                            f"enforced: ask the owner to run `levain team key add {author} <this machine's public key>`, "
-                            "then `levain team sync` here")
+                            f"enforced: from a machine whose key is in force for {author}, run `levain team key add "
+                            f"{author} <this machine's public key>`, then `levain team sync` here (a member who lost "
+                            "every key is invited again under a new handle)")
 
     def append(self, entry: dict, *, push: bool = True, lock_timeout: float = 30.0) -> dict:
         """Validate, seal and append one entry to this author's file for this clone; commit; push.
