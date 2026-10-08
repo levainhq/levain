@@ -61,7 +61,7 @@ def test_h2_held_entries_are_never_replayed_onto_another_genesis(two, keys):
     assert "ben: old ledger entry" not in sh("git", "--git-dir", str(tmp / "origin.git"), "log", "-p", b_name)
     assert "ben: old ledger entry" not in in_force(ben)
     assert sh("git", "for-each-ref", "refs/levain/held/", cwd=gl(ben).wt).strip(), "the held entry was dropped"
-    assert any("held" in w and "genesis" in w for w in WARNINGS), WARNINGS
+    assert any("held entr" in w and "another genesis" in w for w in WARNINGS), WARNINGS
 
 
 def test_h3_pending_team_ops_never_re_land_on_another_genesis(two, keys):
@@ -81,12 +81,12 @@ def test_h3_pending_team_ops_never_re_land_on_another_genesis(two, keys):
     assert team("regenesis", "--from", seen, "--owner", "ana", "--member", "ana=ana@ex.com",
                 "--member", "ben=ben@ex.com", repo=ana) == 0
     b_root, _ = _new_genesis(tmp, before)
-    assert team("join", "--root", b_root[:12], "--no-install", repo=ana) == 0
     WARNINGS.clear()
+    assert team("join", "--root", b_root[:12], "--no-install", repo=ana) == 0
+    assert any("offline team change" in w and "another genesis" in w for w in WARNINGS), WARNINGS
     assert team("sync", repo=ana) == 0
     assert "cy" not in fresh(ana).team.members
     assert gl(ana).state().get("pending_ops"), "the old ledger's ops were dropped, not kept"
-    assert any("genesis" in w for w in WARNINGS), WARNINGS
 
 
 def test_h4_a_frozen_derivation_never_authorises_a_replay(two, keys):
