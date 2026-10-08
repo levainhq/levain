@@ -5,7 +5,7 @@ builds them, and it builds them so the (less-trusted, open-model) entity can wor
 Codex on the operator's REAL repos while the sovereignty CROWN JEWELS stay structurally off-limits no
 matter what the model is told to do:
 
-  - :class:`LevainBashTool` — a persistent, stateful bash confined by an OS sandbox (spore-311's
+  - :class:`LevainBashTool` — a stateful bash confined by an OS sandbox (spore-311's
     :class:`~levain.firing.confinement.SandboxedShell`), NOT the SDK's un-confinable host
     ``TerminalExecutor``. This is the CC/Codex-replacement hand: `cd` anywhere, run builds, SSH out,
     hit the network — everything you use bash for — with the crown jewels fenced at the syscall level.
@@ -69,6 +69,7 @@ import errno
 import logging
 import os
 import shutil
+import signal
 import stat
 import threading
 import weakref
@@ -622,14 +623,14 @@ def _close_candidate_shell(candidate: SandboxedShell) -> None:
     ⛔ codex L3 MED, 2026-09-04. Two defects in the previous one-liner: a raising `close()` MASKED
     the original `ConfinementError` (a caller matching on type saw "close failed" rather than "no
     effective policy"), and — worse — an OVERRIDDEN `close()` that raises before doing any cleanup
-    left the subprocess, FIFO and descriptors alive, held by the shell's own reader thread, after
+    left its processes and descriptors alive, held by the shell's own reader threads, after
     the only application reference was dropped. Repeated refusals could then exhaust resources.
     ▶ So: try the object's own `close()`, and if that fails fall back to the base-class teardown.
     Nothing here is allowed to propagate.
 
     ⚠ **AND THE FALLBACK'S GUARANTEE IS NARROWER THAN AN EARLIER VERSION OF THIS DOCSTRING CLAIMED**
     (glm-5.2 L3 LOW, 2026-09-04). It said the base path is one "a subclass cannot have replaced".
-    Not exactly: `SandboxedShell.close` dispatches to `self._signal_group()`, an ordinary overridable
+    Not exactly: `SandboxedShell.close` dispatches to `self._signal()`, an ordinary overridable
     method, so a subclass that overrode BOTH could still defeat the fallback. What is actually
     guaranteed is that the base `close` BODY runs rather than the override's — which is what matters
     for the case this exists for, an override that raises before doing any teardown.
@@ -639,7 +640,7 @@ def _close_candidate_shell(candidate: SandboxedShell) -> None:
     # ⛔ THE BASE TEARDOWN RUNS UNCONDITIONALLY — codex L3 round 9, 2026-09-05. This used to
     # `return` when the override's `close()` did not RAISE, so an override that silently NO-OPS
     # (returns cleanly having torn down nothing) skipped the base path entirely and leaked the
-    # subprocess, its process group, the FIFO dir and the reader thread on every rejected spawn.
+    # processes, their process groups, the state dir and the reader threads on every rejected spawn.
     # The fallback covered overrides that raise and not overrides that lie, and the docstring
     # above already conceded that narrowness rather than fixing it.
     # ⚠ SAFE BECAUSE IT IS VERIFIED, NOT BECAUSE IT IS ASSERTED: read `SandboxedShell.close` in
@@ -1043,11 +1044,11 @@ class LevainFileEditorTool(FileEditorTool):
             raise
 
 
-# --- the bash hand (a persistent OS-sandboxed shell) -----------------------------------------
+# --- the bash hand (a stateful OS-sandboxed shell) -----------------------------------------
 
 
 class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
-    """Drives spore-311's :class:`~levain.firing.confinement.SandboxedShell` (a persistent
+    """Drives spore-311's :class:`~levain.firing.confinement.SandboxedShell` (a stateful
     OS-confined bash — ``sandbox-exec`` on macOS, ``bwrap`` on Linux since K4c) instead of the SDK's
     un-confinable host ``TerminalExecutor``.
 
@@ -1056,7 +1057,7 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
     never a conversation-build crash (fail-closed: no floor → no unconfined shell). The
     ``SandboxedShell`` is SINGLE-CALLER; :meth:`LevainBashTool.declared_resources` serializes bash calls
     against each other so two never race the one shell. ``reset`` closes + respawns a fresh shell;
-    ``exit`` inside a command closes it and the next command respawns; ``is_input`` (interactive stdin)
+    ``exit N`` ends only that command (its status is reported); ``is_input`` (interactive stdin)
     is refused — the confined shell is a non-interactive dev shell + agent-auth SSH, no PTY."""
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "SandboxedBashExecutor":
@@ -1099,7 +1100,7 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
 
     def _ensure_shell(self) -> SandboxedShell:
         """The live shell — spawning a fresh one on first use OR after the previous one exited
-        (``exit``/reset). Raises :class:`ConfinementError` (caught by :meth:`__call__` → in-band
+        (reset). Raises :class:`ConfinementError` (caught by :meth:`__call__` → in-band
         refusal) if no OS confinement floor can be established here."""
         with self._lock:
             if self._shell is None or self._shell.closed:
@@ -1234,8 +1235,9 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         if result.timed_out:
             limit = action.timeout if action.timeout is not None else self._default_timeout
             text = (
-                f"{result.output}\n[command timed out after {limit:.0f}s and is STILL RUNNING; "
-                "send reset=True to recover the shell if it stays wedged]"
+                f"{result.output}\n[command timed out after {limit:.0f}s; levain killed it and every "
+                "process it started in its session. The next command starts from the shell state "
+                "saved by the last command that finished]"
             )
             return TerminalObservation.from_text(
                 text=text,
@@ -1248,19 +1250,19 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
 
         code = result.exit_code
         if code is None:
-            # The command ended the shell (an ``exit``): bash reached EOF BEFORE the sentinel printf, so
-            # the exit STATUS is unrecoverable (the sentinel that carries ``$?`` never ran). Surface
-            # that the shell exited + is_error so a silent empty result isn't misread as success (a
-            # non-zero ``exit N`` would otherwise vanish — apparatus L1); the next command transparently
-            # respawns a fresh confined shell.
+            # A signal ended the command's bash (levain's waitpid says which). Reported the way a
+            # shell reports it, 128 + the signal number, and as an error; the shell itself is fine
+            # and the next command starts from the last saved state.
+            sig = result.signal or 0
+            try:
+                name = signal.Signals(sig).name
+            except ValueError:
+                name = f"signal {sig}"
             return TerminalObservation.from_text(
-                text=(
-                    f"{result.output}\n[the shell exited (a command ran `exit`); its exit status is "
-                    "unrecoverable — a fresh confined shell starts on the next command]"
-                ),
+                text=f"{result.output}\n[the command was ended by {name}]",
                 command=action.command,
-                exit_code=None,
-                metadata=CmdOutputMetadata(exit_code=-1),
+                exit_code=128 + sig,
+                metadata=CmdOutputMetadata(exit_code=128 + sig),
                 is_error=True,
             )
         return TerminalObservation.from_text(

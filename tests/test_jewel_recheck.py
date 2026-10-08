@@ -480,7 +480,7 @@ def test_the_shell_never_runs_startup_code_from_its_env(tmp_path, monkeypatch):
     conf.BwrapProvider()._spawn_shell_impl(
         build_policy(_entity(tmp_path)), env={"PATH": "/usr/bin", **hostile})
     assert not set(hostile) & set(seen["env"]) and seen["env"]["PATH"] == "/usr/bin"
-    assert seen["argv"][-4:] == ["/bin/bash", "--noprofile", "--norc", "-p"]
+    assert seen["argv"][-5:] == ["--as-pid-1", "/bin/bash", "--noprofile", "--norc", "-p"]
 
 
 def test_a_filesystem_error_in_the_post_start_recheck_is_a_refusal(tmp_path, monkeypatch):
@@ -593,7 +593,7 @@ def test_a_retag_that_does_not_reach_the_disk_closes_the_shell(tmp_path, monkeyp
         pid = 4242
 
     def start(self):
-        self._proc = _P()
+        self._after_spawn(_P.pid)   # each command tags the claim with its group, the probe first
         return self
 
     closed = []

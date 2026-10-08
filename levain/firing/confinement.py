@@ -5,7 +5,7 @@ complete CC/Codex REPLACEMENT — a stateful networked shell that works on the o
 not a workspace jail. The file-editor slice (step 6) confined the entity's file hands IN-PROCESS;
 bash cannot be confined that way (a persistent host shell's ``cd ~`` / absolute paths escape any
 Python check), so the shell needs an OS sandbox. This module is that sandbox — SLICE 1: the
-confinement CORE (the policy + the profile + the persistent sandboxed shell), behind a provider seam.
+confinement CORE (the policy + the profile + the stateful sandboxed shell), behind a provider seam.
 
 **The polarity FLIPS (Phill-ratified 2026-07-10).** The step-6 file jail was ``(deny default) →
 allow the workspace`` — a JAIL. A CC replacement inverts it: ``(allow default) → DENY the crown
@@ -58,7 +58,7 @@ per-command.
 **The provider seam (``canonical_object_model_plus_replaceable_surfaces``, mirroring
 ``levain.daemon.DaemonProvider``).** ONE OS-agnostic :class:`CrownJewelsPolicy` behind a
 :class:`ConfinementProvider` interface (``render_profile`` PURE → the platform's sandbox text;
-``spawn_shell`` I/O → a persistent confined shell). macOS (:class:`SeatbeltProvider`) shipped first;
+``spawn_shell`` I/O → a stateful confined shell). macOS (:class:`SeatbeltProvider`) shipped first;
 Linux (:class:`BwrapProvider`, K4c) shipped second against the same contract; a container backend
 remains a PURE ADDITION — and the macOS denylist IS their requirements spec (macOS-first was the
 de-risk pass, and it held: the contract needed ONE addition, ``available()``, and no reshaping).
@@ -106,7 +106,9 @@ is tabulated above :func:`_bwrap_argv`.
     wrapper) is a later polish, not a floor concern.
   - DAEMONIZED SURVIVOR (apparatus L3 codex): a child that ``setsid``/``nohup``/double-forks into a NEW
     session escapes the shell's process-group teardown (:meth:`SandboxedShell.close`) and outlives the
-    run — the same behavior a normal shell / CC / Codex has. It stays SANDBOX-CONFINED (crown jewels
+    run — the same behavior a normal shell / CC / Codex has (macOS; under bwrap each command's bash is
+    pid 1 of its own pid namespace, and the kernel ends everything in it when bash exits, measured by
+    ``test_linux_a_setsid_child_ends_with_its_command``). It stays SANDBOX-CONFINED (crown jewels
     remain off-limits), so it is not a confinement breach, but it is unattended code with network +
     broad non-jewel authority. ⚠ **The K3 efferent gate does NOT bound this one** — it halts actions
     BEFORE they run, and a setsid survivor is already running. Since K4a ships scheduled seats, the
@@ -224,12 +226,13 @@ is allowed to land).
 from __future__ import annotations
 
 import atexit
+import codecs
 import json
 import os
 import platform
-import queue
 import re
 import shlex
+import shutil
 import signal
 import stat
 import subprocess
@@ -241,7 +244,7 @@ import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import IO, Literal, NoReturn
+from typing import Literal, NoReturn
 
 # The efferent gate's accepted settings, imported rather than restated: the config loader and the
 # gate must agree on the vocabulary by construction, not by two lists staying in sync. Both modules
@@ -289,7 +292,6 @@ SshMode = Literal["agent", "raw"]
 # Backpressure bounds so a runaway producer (``yes``, ``tail -f`` left after a timeout) can't grow the
 # PARENT process's memory without limit (apparatus L3 complement #4). Normal commands never hit these.
 _MAX_OUTPUT_CHARS = 8 * 1024 * 1024   # per-command returned output cap (then truncate + mark)
-_MAX_QUEUE_LINES = 200_000            # reader-queue depth; oldest dropped past this (runaway only)
 
 # The ssh files WRITE-denied in EVERY ssh_mode — the persistence/exec-vector floor (slice 3, Phill-
 # ratified 2026-07-12; expanded from authorized_keys-only after apparatus L1 caught the config/rc gap +
@@ -2260,56 +2262,175 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
     )
 
 
-# --- the persistent sandboxed shell (the I/O primitive) --------------------------------------
+# --- the sandboxed shell (the I/O primitive) -------------------------------------------------
 
 @dataclass(frozen=True)
 class ShellResult:
     """One command's result from a :class:`SandboxedShell`. ``output`` merges stdout+stderr (a
-    terminal shows both interleaved); ``exit_code`` is the command's ``$?``. ``timed_out`` is True
-    when the command did not complete within the deadline (``exit_code`` is then ``None``)."""
+    terminal shows both interleaved). ``exit_code`` is the status levain's ``waitpid`` returned for the
+    process it spawned; ``signal`` is set instead when a signal ended it. Under bwrap that process is
+    bwrap, which waits on bash and exits with bash's status, a signal death as 128 + its number, so
+    there it arrives in ``exit_code``. ``timed_out`` is True when the
+    command did not finish within the deadline and levain killed its process group (``exit_code`` and
+    ``signal`` are then ``None``)."""
 
     output: str
     exit_code: int | None
     timed_out: bool = False
+    signal: int | None = None
+
+
+# The fixed program each command's bash runs (``bash -c _RUNNER bash <state dir>``). The command text
+# arrives on stdin, never on argv; stdin is /dev/null by the time it runs. The state a persistent shell
+# would keep (variables, exported or not, functions, aliases, shell options, cwd) is written to
+# ``<state dir>/state.sh`` by an EXIT trap and read back by the next command's bash. The trap also runs
+# after ``exit N`` and after an errexit failure; it does not run when a signal kills bash or when the
+# command replaces bash (``exec prog``), and then the next command starts from the last saved state.
+# The entity can rewrite its own state file; that changes only what its next command starts from.
+# Nothing here reports completion or a status: levain learns both from waitpid.
+# xtrace and verbose are switched back on inside the eval, so the runner's own lines are never traced
+# into the command's output. The options go to a file first, never through ``$(...)``: bash clears
+# ``-e`` in a command substitution's subshell (outside posix mode), so an errexit the command set
+# would read as off.
+# Bash 3.2 (macOS /bin/bash) is the floor: no mapfile, no ${x@Q}, no associative-array syntax here.
+_RUNNER = r"""__levain_d=$1
+IFS= builtin read -r -d '' __levain_c
+builtin exec </dev/null
+if [ -f "$__levain_d/state.sh" ]; then builtin . "$__levain_d/state.sh"; fi
+__levain_save() {
+  __levain_n=
+  __levain_k=' '
+  while IFS= builtin read -r __levain_n; do __levain_k="$__levain_k$__levain_n "; done < <(builtin compgen -e)
+  __levain_v=()
+  while IFS= builtin read -r __levain_n; do
+    case $__levain_n in
+      __levain_*|BASH|BASH_*|BASHOPTS|BASHPID|COLUMNS|LINES|COMP_*|DIRSTACK|EPOCHREALTIME|EPOCHSECONDS|EUID|FUNCNAME|GROUPS|HISTCMD|HOSTNAME|HOSTTYPE|LINENO|MACHTYPE|OPTERR|OPTIND|OSTYPE|PIPESTATUS|PPID|PWD|RANDOM|SECONDS|SHELLOPTS|SHLVL|SRANDOM|UID|_) ;;
+      *) __levain_v[${#__levain_v[@]}]=$__levain_n ;;
+    esac
+  done < <(builtin compgen -v)
+  {
+    builtin printf '__levain_k=%q\n' "$__levain_k"
+    builtin printf '%s\n' 'for __levain_n in $(builtin compgen -e); do case $__levain_k in *" $__levain_n "*) ;; *) builtin unset -v "$__levain_n" 2>/dev/null ;; esac; done'
+    if [ ${#__levain_v[@]} -gt 0 ]; then builtin declare -p "${__levain_v[@]}" 2>/dev/null; fi
+    builtin declare -f
+    while IFS= builtin read -r __levain_n; do
+      case $__levain_n in "declare -f"*x*" "*) builtin printf 'builtin export -f %s\n' "${__levain_n##* }" ;; esac
+    done < <(builtin declare -F)
+    builtin alias -p
+    builtin printf 'builtin cd -- %q\n' "$PWD"
+    __levain_x=
+    while IFS= builtin read -r __levain_n; do
+      case $__levain_n in
+        *" privileged"|*" login_shell"|*" restricted_shell"|*" noexec"|*" onecmd") ;;
+        "set -o xtrace") __levain_x="${__levain_x}x" ;;
+        "set -o verbose") __levain_x="${__levain_x}v" ;;
+        *" xtrace"|*" verbose") ;;
+        *) builtin printf '%s\n' "$__levain_n" ;;
+      esac
+    done < "$__levain_d/options.new"
+    builtin printf '__levain_x=%s\n' "$__levain_x"
+  } >| "$__levain_d/state.sh.new" 2>/dev/null && /bin/mv -f "$__levain_d/state.sh.new" "$__levain_d/state.sh"
+}
+builtin trap '{ builtin set +o; builtin shopt -p; } >| "$__levain_d/options.new" 2>/dev/null; { builtin set +euxv; } 2>/dev/null; __levain_save' EXIT
+builtin eval "${__levain_x:+builtin set -$__levain_x; }$__levain_c"
+"""
+
+# After a command's bash exits, how long its output pipe may stay open before the result is returned:
+# a background job (``server &``) holds the pipe, and its later output is reported with the next run.
+_DRAIN_GRACE = 0.2
+# A killed group's members get this long after SIGTERM before SIGKILL.
+_KILL_GRACE = 1.0
+# The start probe's deadline.
+_START_TIMEOUT = 20.0
+
+
+class _Output:
+    """One command's merged stdout+stderr, read by its own thread until every writer has closed the
+    pipe. Bounded: past ``_MAX_OUTPUT_CHARS`` it keeps a single truncation note and drops the rest."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._lock = threading.Lock()
+        self._parts: list[str] = []
+        self._kept = 0
+        self._truncated = False
+        self.eof = threading.Event()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _add(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            if self._kept < _MAX_OUTPUT_CHARS:
+                room = _MAX_OUTPUT_CHARS - self._kept
+                self._parts.append(text[:room])
+                self._kept += min(len(text), room)
+                if len(text) <= room:
+                    return
+            if not self._truncated:
+                self._parts.append(f"\n[output truncated at {_MAX_OUTPUT_CHARS} chars]\n")
+                self._truncated = True
+
+    def _pump(self) -> None:
+        try:
+            while True:
+                try:
+                    chunk = os.read(self._fd, 65536)
+                except InterruptedError:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                self._add(self._decoder.decode(chunk))
+            self._add(self._decoder.decode(b"", final=True))
+        finally:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self.eof.set()
+
+    def take(self) -> str:
+        """Everything read since the last ``take`` (the bound counts the whole command's output)."""
+        with self._lock:
+            text, self._parts = "".join(self._parts), []
+        return text
 
 
 class SandboxedShell:
-    """A persistent, stateful ``/bin/bash`` running UNDER the platform sandbox.
+    """A stateful ``/bin/bash`` under the platform sandbox, one bash process PER COMMAND.
 
-    ONE bash process reads sequential commands from a PRIVATE FIFO command channel, so cwd / env /
-    shell functions PERSIST across :meth:`run` calls — a real stateful shell, not per-command exec
-    (Phill: real dev work + SSH sessions need state). The sandbox profile fences by PATH at the syscall
-    level, so even after the shell ``cd``\\ s into ``$HOME`` it still cannot read a denied crown jewel
-    (the exact property an in-process fence cannot give a shell).
+    :meth:`run` spawns ``<driver argv> -c <runner> bash <state dir>`` in a new session, writes the
+    command to its stdin and waits for it. **Completion is levain's ``waitpid`` on that process and the
+    status is its waitpid status** (spore-1385, Phill's ruling): nothing the shell prints is parsed for
+    either, so code the entity runs cannot end a command early or forge its status. The model this
+    replaced ran one bash reading commands from a pipe and took completion and ``$?`` from a line bash
+    printed; bash read that pipe one byte at a time on fd 255, so a builtin in a command could read the
+    status line ahead of bash and print one of its own (reproduced:
+    ``tests/test_shell_oob_status.py``).
 
-    Non-interactive (``bash --noprofile --norc`` reading a FIFO as its script): no PS1, no job control,
-    no prompt noise. The command channel is a FIFO bash OPENS ITSELF (close-on-exec → children can't
-    inherit/read it) and children get ``/dev/null`` stdin (so ``ssh host cmd`` / ``cat`` / a REPL can't
-    hijack the channel — apparatus L1+L3). Per-command completion + exit code are read via an
-    UNGUESSABLE, SPLIT sentinel (``<h1><h2> <$?>``): the joined output matches, but a ``set -x`` /
-    DEBUG-trap trace of the sentinel line shows the halves separated, so a trace can't spoof
-    end-of-command. A reader thread drains stdout into a bounded queue so :meth:`run` can enforce a
-    wall-clock timeout without blocking on a hung command.
+    State still persists across :meth:`run` calls (cwd, variables, functions, aliases, options) through
+    a private state directory the runner writes after each command (see ``_RUNNER``). The sandbox
+    profile fences by PATH at the syscall level, so a ``cd`` into ``$HOME`` still cannot read a denied
+    crown jewel.
 
-    KNOWN v1 LIMITS (documented, not hidden):
-      1. **Single-caller.** :meth:`run` is NOT re-entrant/concurrent (it shares the sentinel counter +
-         the stdout queue); a concurrent call fails FAST with :class:`ConfinementError`. ``close()`` /
-         ``interrupt()`` are the only methods safe from another thread while a ``run()`` is in flight.
-      2. **A NON-TERMINATING timed-out command wedges the shell.** ``timed_out`` leaves the command
-         RUNNING; the sentinel self-heal recovers only when that command EVENTUALLY ends (its late
-         sentinel is drained by the next ``run()``). A command that never returns (``nc -l``, an
-         infinite loop) leaves its sentinel outstanding forever → later ``run()``\\ s time out draining
-         it. Recovery is :meth:`close` + a fresh :meth:`SeatbeltProvider.spawn_shell`; this core does
-         not auto-kill (that policy is the tool's). ``interrupt()`` SIGINTs the group, which a
-         non-interactive bash treats as fatal — so it effectively ends the shell too.
-      3. **Truly interactive programs** (``vim``, an interactive password prompt) need a PTY this
-         core does not provide — the entity is an LLM driving non-interactive dev commands + agent-auth
-         SSH, so a PTY is a later slice if ever needed.
-      4. **A command that leaves the parser mid-statement** (unterminated heredoc/quote, a trailing
-         ``\\``) fuses with the sentinel line → the split-token turns most such cases into a TIMEOUT
-         (detectable) rather than silently-wrong output; the caller resets on timeout.
-      5. A runaway producer left after a timeout has its output BOUNDED (per-command cap + a bounded
-         reader queue that drops oldest); the loss is only under a runaway that will be ``close()``\\ d."""
+    - **Output**: one pipe per command, stdout and stderr merged, bounded at ``_MAX_OUTPUT_CHARS``.
+      After waitpid the pipe gets ``_DRAIN_GRACE`` to close; a background job that keeps it open
+      (``server &``) has its later output returned, labelled, with the next result.
+    - **Timeout**: the command's whole process group is killed (SIGTERM, then SIGKILL) and reaped, and
+      the shell stays usable: the next command starts from the last saved state.
+    - **Background jobs** outlive the command that started them where the sandbox allows it (macOS).
+      Under bwrap the command's bash is pid 1 of its pid namespace, so the namespace, and every
+      background job in it, ends with the command.
+    - **close()** kills every process group this shell started, waits for them to empty, and removes
+      the state directory.
+    - :meth:`run` is single-caller (a concurrent call fails fast); ``close()`` and ``interrupt()`` are
+      safe from another thread while a ``run()`` is in flight.
+    - No PTY: truly interactive programs (``vim``, a password prompt) see /dev/null on stdin.
+    - A child that leaves the command's session (``setsid``, a double fork into a new session) escapes
+      the group kill on macOS, as from any shell; it stays under the sandbox profile it inherited."""
 
     def __init__(
         self,
@@ -2323,17 +2444,7 @@ class SandboxedShell:
         self._cwd = cwd
         self._env = env
         self._default_timeout = default_timeout
-        # An unguessable per-shell sentinel so no command's own output can spoof end-of-command.
-        # The end-of-command marker. SPLIT into two halves emitted as separate printf args ('%s%s'):
-        # the joined OUTPUT equals `_sentinel` (matched), but bash's own trace of the sentinel line
-        # (`set -x` / `set -v` / a DEBUG trap echoing $BASH_COMMAND) shows the two halves SEPARATED by
-        # whitespace, so a trace can't spoof end-of-command (apparatus L3 consensus — verified live:
-        # unsplit, `set -x` silently corrupted the protocol).
-        sentinel = f"__LEVAIN_SENTINEL_{os.urandom(12).hex()}__"
-        self._sentinel = sentinel
-        self._sent_h1 = sentinel[: len(sentinel) // 2]
-        self._sent_h2 = sentinel[len(sentinel) // 2 :]
-        self._proc: subprocess.Popen[str] | None = None
+        self._proc: subprocess.Popen[bytes] | None = None   # the command running now, if any
         # ⛔ THE POLICY THIS SHELL WAS ACTUALLY CONFINED BY — set by the provider seam, so the
         # caller can cache the EXACT set that got rendered (codex L3 #1, 2026-09-04). Without it the
         # executor refreshed once and `spawn_shell` refreshed AGAIN, discarding the second result:
@@ -2345,338 +2456,244 @@ class SandboxedShell:
         # nothing"; that is true only if the filesystem is identical at both instants, which is
         # precisely what a TOCTOU fix may not assume.
         self.effective_policy: CrownJewelsPolicy | None = None
-        self._cmd_w: IO[str] | None = None   # the FIFO command channel write end (see start())
-        self._stdout_q: "queue.Queue[str | None]" = queue.Queue(maxsize=_MAX_QUEUE_LINES)
-        self._reader: threading.Thread | None = None
-        self._run_lock = threading.Lock()    # serialize run(); fail-fast on concurrent misuse
+        self._state_dir: Path | None = None
+        self._started = False
         self._closed = False
-        # OUTSTANDING sentinels: incremented per command written, decremented per sentinel seen. A
-        # timed-out command leaves its sentinel outstanding (it fires late, when the command finally
-        # ends), so the NEXT run() must first DRAIN the stale sentinel(s) + their late output before
-        # reading its own — otherwise it would return the stale command's result. This makes the shell
-        # SELF-HEAL across a timeout instead of desyncing (the caller can keep using it).
-        self._pending = 0
+        self._run_lock = threading.Lock()    # serialize run(); fail-fast on concurrent misuse
+        self._lock = threading.Lock()        # guards _groups / _late across run() and close()
+        # Process groups this shell started that may still have members (a command's own group while
+        # it runs, a finished command's background jobs after), pgid -> that command's Popen.
+        self._groups: dict[int, subprocess.Popen[bytes]] = {}
+        # Finished commands whose pipe a background job still holds: their later output.
+        self._late: list[_Output] = []
 
     # -- lifecycle -----------------------------------------------------------------------------
 
     @property
     def closed(self) -> bool:
-        """True once this shell has been closed — either explicitly (:meth:`close`) or because a
-        command ended it (an ``exit`` gives EOF → :meth:`run` self-closes). A consumer that reuses one
-        shell across commands checks this to RESPAWN a fresh shell after the entity ran ``exit``,
-        rather than handing the next command a dead channel (which would raise ``ConfinementError``)."""
+        """True once :meth:`close` ran. A command never closes the shell: ``exit N`` ends that
+        command's bash with status N and the next command starts from the saved state."""
         return self._closed
 
     def start(self) -> "SandboxedShell":
-        """Spawn the sandboxed bash and its stdout reader thread. Returns self (chainable)."""
-        if self._proc is not None:
+        """Make the private state directory and prove the driver runs bash, with a probe command that
+        must print a random token and exit 0 (a dead or misconfigured sandbox driver fails the spawn
+        here, never as a live-looking shell). Returns self (chainable)."""
+        if self._started:
             return self
-        # The command channel is a PIPE. bash is given its read end as the script, by fd number
-        # (``bash /dev/fd/N``), and the FIRST line levain writes is ``exec N<&-``, before anything the
-        # entity sends. bash reads its script through a descriptor of its OWN, which it marks
-        # close-on-exec, so once that line has run no child holds the channel at any number. (A bare
-        # inherited fd was rejected once because children saw it at a known number and could read
-        # the command stream and the sentinel: apparatus L3 codex HIGH, verified live. Closing it
-        # before the first command is what answers that.)
-        # ⛔ WHY NOT A NAMED FIFO ANY MORE (lane M's M2 design, 8c, 2026-10-07): the FIFO was
-        # unlinked after the startup handshake, which kept it from the shell's own children
-        # (codex R2 #1: bash discloses its script path as ``$0``), but during the handshake its path
-        # existed and was on bash's argv, readable by every process of this user
-        # (``KERN_PROCARGS2``, ``/proc/<pid>/cmdline``). Another session's process could open it and
-        # write commands into this shell, or read them. A pipe has no name.
-        # Children's stdin is ``/dev/null`` (no stdin hijack — apparatus L1).
-        rd, wr = os.pipe()
+        if self._closed:
+            raise ConfinementError("shell is closed")
+        self._started = True
         try:
-            self._proc = subprocess.Popen(
-                [*self._argv, f"/dev/fd/{rd}"],
-                stdin=subprocess.DEVNULL,   # children get /dev/null, NOT the command channel
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,   # merge stderr into stdout (terminal-like)
-                cwd=str(self._cwd),
-                env=self._env,
-                text=True,
-                encoding="utf-8",
-                errors="replace",           # a tool emitting non-UTF-8 bytes (binary `git diff`, a
-                                            # latin-1 tool) must NOT crash the reader thread with a
-                                            # UnicodeDecodeError + brick the shell (apparatus L3 —
-                                            # verified live: strict decode killed the reader).
-                bufsize=1,                  # line-buffered
-                # A NEW session/process group (pgid == the shell's pid), so close()/interrupt() can
-                # signal the WHOLE tree: a persistent shell spawns children (git, python, a timed-out
-                # `sleep`) that a bare terminate() of bash alone would ORPHAN — reparented to init,
-                # still running (verified live: a timed-out `sleep` survived close()). Signaling the
-                # group reaps them; it also makes interrupt() reach a running child.
-                start_new_session=True,
-                # WELD (apparatus L2 HIGH): no INHERITED fd may bypass the profile (seatbelt checks
-                # open(), not read() of an already-open fd). CALLER CONTRACT: no crown-jewel fd may be
-                # open in this process at spawn time. The one passed fd is the command pipe's read
-                # end, which bash closes before it runs anything else.
-                close_fds=True,
-                pass_fds=(rd,),
-            )
-            os.close(rd)
-            rd_in_bash, rd = rd, -1
-            # The write end is levain's alone: a dead bash gives EPIPE on write, not a block.
-            self._cmd_w = os.fdopen(wr, "w")
-            wr = -1
-            self._cmd_w.write(f"exec {rd_in_bash}<&-\n")
-            # Drain bash's stdout from the start so the handshake below can observe its output (incl. a
-            # `sandbox-exec` startup error).
-            self._reader = threading.Thread(target=self._drain_stdout, daemon=True)
-            self._reader.start()
-            # HANDSHAKE proves bash actually started and is reading — else the sandbox driver or bash
-            # died at startup and spawn must FAIL, not hand back a dead shell (codex R2 #2).
-            self._handshake()
-        except BaseException as exc:  # noqa: BLE001 — cleanup must survive Ctrl-C/SystemExit too, else
-            # a cancellation during _handshake() leaks the pipe ends and the process (apparatus L3
-            # codex R3).
-            for fd in (rd, wr):
-                if fd >= 0:
-                    try:
-                        os.close(fd)
-                    except OSError:
-                        pass
-            self._teardown_failed_start()
+            self._state_dir = Path(tempfile.mkdtemp(prefix="levain-shell-"))
+            token = f"__LEVAIN_READY_{os.urandom(8).hex()}__"
+            r = self._execute(f"printf '%s\\n' '{token}'", _START_TIMEOUT)
+            if r.timed_out or r.exit_code != 0 or token not in r.output:
+                driver = os.path.basename(self._argv[0]) if self._argv else "the sandbox driver"
+                said = " | ".join(x.strip() for x in r.output.splitlines()[-5:] if x.strip())
+                how = "timed out" if r.timed_out else (
+                    f"was killed by signal {r.signal}" if r.signal else f"exited {r.exit_code}"
+                )
+                raise ConfinementError(
+                    f"the shell's start probe {how} — {driver} / bash did not run"
+                    + (f": {said}" if said else ".")
+                )
+        except BaseException as exc:  # noqa: BLE001 — cleanup must survive Ctrl-C/SystemExit too
+            self.close()
             if not isinstance(exc, Exception):
-                raise  # a cancellation (KeyboardInterrupt / SystemExit) propagates UNCHANGED
+                raise
             reason = exc if isinstance(exc, ConfinementError) else (
                 f"could not spawn the sandboxed shell ({exc}); argv={self._argv[:2]}…"
             )
             raise ConfinementError(str(reason)) from exc
         return self
 
-    def _handshake(self, timeout: float = 10.0) -> None:
-        """Prove bash opened the FIFO + is executing commands: send a token, wait for it on stdout.
-        Raise :class:`ConfinementError` if the shell exited / never responded (a dead sandbox driver
-        must fail spawn, not masquerade as a live shell — apparatus L3 codex round-2 #2)."""
-        cmd_w = self._cmd_w
-        assert cmd_w is not None
-        token = f"__LEVAIN_READY_{os.urandom(8).hex()}__"
-        try:
-            cmd_w.write(f"printf '%s\\n' '{token}'\n")
-            cmd_w.flush()
-        except (BrokenPipeError, OSError, ValueError) as exc:
-            raise ConfinementError(f"shell exited before the startup handshake ({exc})") from exc
-        deadline = time.monotonic() + timeout
-        # stderr is merged into stdout, so whatever the driver printed before dying (bwrap's
-        # "Can't remount readonly on ...", say) arrives here; keep it for the error.
-        early: list[str] = []
-        while time.monotonic() < deadline:
-            try:
-                line = self._stdout_q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if line is None:
-                driver = os.path.basename(self._argv[0]) if self._argv else "the sandbox driver"
-                said = " | ".join(x.strip() for x in early[-5:] if x.strip())
-                raise ConfinementError(
-                    f"shell exited during startup — {driver} / bash did not start"
-                    + (f": {said}" if said else ".")
-                )
-            if token in line:
-                return
-            early = [*early[-19:], line]
-        raise ConfinementError("timed out waiting for the shell startup handshake.")
+    # -- one command ---------------------------------------------------------------------------
 
-    def _teardown_failed_start(self) -> None:
-        """Best-effort cleanup for a start() that raised: close the write end, kill the group. Leaves
-        ``_proc``/``_cmd_w`` None so a later close() is a no-op (this path already cleaned up)."""
-        if self._cmd_w is not None:
+    def _after_spawn(self, pgid: int) -> None:
+        """Hook: a command's process group now exists (the bwrap shell records it in its claim)."""
+
+    def _after_command(self, pgid: int) -> None:
+        """Hook: a command's bash has been reaped and its result is about to be returned."""
+
+    def _spawn(self, command: str) -> tuple[subprocess.Popen[bytes], _Output]:
+        assert self._state_dir is not None
+        rd, wr = os.pipe()
+        try:
+            proc = subprocess.Popen(
+                [*self._argv, "-c", _RUNNER, "bash", str(self._state_dir)],
+                stdin=subprocess.PIPE,
+                stdout=wr,
+                stderr=wr,                  # merged, as a terminal shows them
+                cwd=str(self._cwd),
+                env=self._env,
+                # A NEW session, so this command's process group (pgid == its pid) can be signalled
+                # as a whole: its children, and a timed-out command's, would otherwise be orphaned.
+                start_new_session=True,
+                # WELD (apparatus L2 HIGH): no INHERITED fd may bypass the profile (seatbelt checks
+                # open(), not read() of an already-open fd). CALLER CONTRACT: no crown-jewel fd may be
+                # open in this process at spawn time.
+                close_fds=True,
+            )
+        except BaseException:
+            os.close(rd)
+            os.close(wr)
+            raise
+        os.close(wr)
+        out = _Output(rd)
+        with self._lock:
+            self._groups[proc.pid] = proc
+        self._proc = proc
+        # The command text is written by a thread: a driver that never reads stdin must not block
+        # run() past its deadline on a command larger than the pipe buffer.
+        data = command.encode("utf-8", "surrogateescape")
+        stdin = proc.stdin
+        assert stdin is not None
+
+        def feed() -> None:
             try:
-                self._cmd_w.close()
-            except Exception:  # noqa: BLE001 — teardown must never raise
+                stdin.write(data)
+            except (BrokenPipeError, OSError, ValueError):
                 pass
-            self._cmd_w = None
-        if self._proc is not None and self._proc.poll() is None:
-            self._signal_group(signal.SIGKILL)
-        self._proc = None
-
-    def _drain_stdout(self) -> None:
-        """Read stdout line by line into the queue; enqueue ``None`` at EOF (shell exited).
-
-        Uses ``readline()`` in a loop, NOT ``for line in stdout`` — the iterator protocol read-aheads
-        into an ~8KB buffer and won't yield a line until that buffer fills or EOF, which DEADLOCKS a
-        persistent shell whose output never fills a block and whose stdin stays open (no EOF). Verified
-        live: the iterator form hangs, ``readline()`` streams per line."""
-        # Capture proc/stdout ONCE at entry into locals (apparatus L3 complement #3): close() nulls
-        # self._proc from another thread, so re-reading self._proc.stdout mid-loop could AttributeError.
-        proc = self._proc
-        if proc is None or proc.stdout is None:
-            self._stdout_q.put(None)
-            return
-        stdout: IO[str] = proc.stdout
-
-        def enqueue(item: str | None) -> None:
-            # Non-blocking put that DROPS the oldest line when full, so a runaway producer can't grow
-            # memory AND the reader never blocks (a blocking put(None) at EOF could hang forever if no
-            # consumer is draining). Lossy only under a runaway that will be close()d anyway.
-            try:
-                self._stdout_q.put_nowait(item)
-            except queue.Full:
+            finally:
                 try:
-                    self._stdout_q.get_nowait()
-                except queue.Empty:
+                    stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
                     pass
-                try:
-                    self._stdout_q.put_nowait(item)
-                except queue.Full:
-                    pass
+        threading.Thread(target=feed, daemon=True).start()
+        return proc, out
 
+    def _kill_group(self, pgid: int, proc: subprocess.Popen[bytes]) -> None:
+        """SIGTERM the group, give it ``_KILL_GRACE``, SIGKILL what is left, reap ``proc``, and wait
+        for the group to empty."""
+        self._signal(pgid, signal.SIGTERM)
         try:
-            while True:
-                line = stdout.readline()
-                if line == "":  # EOF — the shell exited
-                    break
-                enqueue(line)
+            proc.wait(timeout=_KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            pass
+        if not _group_gone(pgid, timeout=0.2):
+            self._signal(pgid, signal.SIGKILL)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        _group_gone(pgid, timeout=5.0)
+
+    @staticmethod
+    def _signal(pgid: int, sig: int) -> None:
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    def _prune_groups(self) -> None:
+        with self._lock:
+            for pgid, proc in list(self._groups.items()):
+                if proc.poll() is not None and _group_gone(pgid, timeout=0):
+                    del self._groups[pgid]
+
+    def _late_output(self) -> str:
+        with self._lock:
+            late, still = self._late, []
+            text = []
+            for out in late:
+                t = out.take()
+                if t:
+                    text.append(t)
+                if not out.eof.is_set():
+                    still.append(out)
+            self._late = still
+        joined = "".join(text)
+        if not joined:
+            return ""
+        if not joined.endswith("\n"):
+            joined += "\n"
+        return f"[output from background jobs of earlier commands]\n{joined}[end of background output]\n"
+
+    def _execute(self, command: str, deadline_s: float) -> ShellResult:
+        proc, out = self._spawn(command)
+        pgid = proc.pid
+        try:
+            self._after_spawn(pgid)
+            timed_out = False
+            try:
+                proc.wait(timeout=deadline_s)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                self._kill_group(pgid, proc)
+        except BaseException:
+            self._kill_group(pgid, proc)
+            out.eof.wait(_DRAIN_GRACE)
+            raise
         finally:
-            enqueue(None)
+            self._proc = None
+        out.eof.wait(_DRAIN_GRACE)
+        self._after_command(pgid)
+        text = out.take()
+        if not out.eof.is_set():
+            with self._lock:
+                self._late.append(out)
+        if timed_out:
+            return ShellResult(output=text, exit_code=None, timed_out=True)
+        rc = proc.returncode
+        if rc is not None and rc < 0:
+            return ShellResult(output=text, exit_code=None, signal=-rc)
+        return ShellResult(output=text, exit_code=rc)
 
     def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
-        """Run ``command`` in the persistent shell; return its output + exit code.
-
-        Writes the command, then a sentinel echo carrying ``$?``, and reads stdout until the sentinel
-        line appears (or the deadline lapses → ``timed_out``). Because it is ONE long-lived bash, state
-        set by a prior command (cwd, exported vars, functions) is visible here."""
-        # run() is single-caller: it shares _pending + the stdout queue as ONE state machine, so
-        # concurrent calls would corrupt output attribution + the sentinel counter. Fail FAST on
-        # concurrent misuse (apparatus L3 consensus) rather than silently mis-attribute. close() /
-        # interrupt() deliberately do NOT take this lock — they must work cross-thread while a run()
-        # (possibly a long one) is in flight.
+        """Run ``command`` in a fresh bash that starts from the saved state; return its output, and
+        the exit status levain's waitpid reported (or the signal that ended it, or a timeout)."""
+        # Single-caller: a concurrent call would race the state file and the late-output buffer.
+        # close() / interrupt() deliberately do NOT take this lock.
         if not self._run_lock.acquire(blocking=False):
             raise ConfinementError(
                 "SandboxedShell.run() is single-caller; a command is already running on this shell."
             )
         try:
-            # Local capture: close() may null self._cmd_w from another thread between this check and the
-            # write; the local then fails with ValueError (write on a closed file) → clean refusal, not
-            # an uncaught AttributeError (apparatus L3 consensus).
-            cmd_w = self._cmd_w
-            if self._closed or self._proc is None or cmd_w is None:
+            if self._closed or not self._started or self._state_dir is None:
                 raise ConfinementError(
                     "shell is not running (call start() first, and not after close())"
                 )
-            deadline_s = self._default_timeout if timeout is None else timeout
-
-            # `command`, then the sentinel printf. The sentinel is SPLIT into two printf args ('%s%s')
-            # whose OUTPUT joins to the token but whose SOURCE (what a `set -x` / DEBUG-trap trace
-            # echoes) shows the halves separated — so a trace can't spoof end-of-command (apparatus L3).
-            payload = (
-                f"{command}\n"
-                f"printf '%s%s %d\\n' '{self._sent_h1}' '{self._sent_h2}' \"$?\"\n"
-            )
-            try:
-                cmd_w.write(payload)
-                cmd_w.flush()
-            except (BrokenPipeError, OSError, ValueError) as exc:
-                raise ConfinementError(
-                    f"sandboxed shell command channel is closed ({exc})"
-                ) from exc
-            self._pending += 1  # this command's sentinel is now outstanding
-
-            deadline = time.monotonic() + deadline_s
-            collected: list[str] = []
-            total = 0
-            truncated = False
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    # My sentinel stays outstanding (it fires when the command finally ends); the NEXT
-                    # run() drains it. Collected so far is this (timed-out) command's partial output.
-                    return ShellResult(output="".join(collected), exit_code=None, timed_out=True)
-                try:
-                    line = self._stdout_q.get(timeout=min(remaining, 0.5))
-                except queue.Empty:
-                    continue
-                if line is None:  # EOF — the shell exited (e.g. the command ran `exit`)
-                    self._pending = 0
-                    self.close()  # reap + release (unlinks the profile for _SeatbeltShell)
-                    return ShellResult(output="".join(collected), exit_code=None, timed_out=False)
-                # Find the sentinel as a SUBSTRING, not a line-prefix: a command whose output has no
-                # trailing newline (``head -c 60``, ``printf`` without ``\n``) concatenates the sentinel
-                # onto its last output line, so a ``startswith`` check would miss it and the shell would
-                # hang (verified live). The sentinel is an unguessable random token, so real command
-                # output cannot spoof it.
-                idx = line.find(self._sentinel)
-                if idx != -1:
-                    self._pending -= 1
-                    if self._pending > 0:
-                        # A STALE sentinel from a prior timed-out command — discard its (now-complete)
-                        # output + keep reading for MY sentinel (self-heal the desync).
-                        collected, total, truncated = [], 0, False
-                        continue
-                    if idx:
-                        collected.append(line[:idx])  # output that shared the sentinel's line
-                    tail = line[idx + len(self._sentinel):].strip()
-                    try:
-                        code = int(tail)
-                    except ValueError:
-                        code = None
-                    return ShellResult(output="".join(collected), exit_code=code, timed_out=False)
-                # Bound the per-command returned output (apparatus L3 complement #4): past the cap, stop
-                # accumulating so a huge/runaway output can't grow the parent heap without limit.
-                if total < _MAX_OUTPUT_CHARS:
-                    collected.append(line)
-                    total += len(line)
-                elif not truncated:
-                    collected.append(f"\n[output truncated at {_MAX_OUTPUT_CHARS} chars]\n")
-                    truncated = True
+            self._prune_groups()
+            late = self._late_output()
+            r = self._execute(command, self._default_timeout if timeout is None else timeout)
+            if late:
+                r = replace(r, output=late + r.output)
+            return r
         finally:
             self._run_lock.release()
 
-    def _signal_group(self, sig: int) -> None:
-        """Send ``sig`` to the shell's whole process GROUP (the shell + every child it spawned).
-        Best-effort — a dead process / a platform without ``killpg`` is a no-op, never a raise."""
-        proc = self._proc
-        if proc is None:
-            return
-        try:
-            os.killpg(os.getpgid(proc.pid), sig)
-        except (ProcessLookupError, OSError, AttributeError):
-            pass
-
     def interrupt(self) -> None:
-        """Best-effort SIGINT to the shell's process GROUP (Ctrl-C a hung command AND its children).
-        Never raises. Signals the group, not just bash, because a running child (``sleep``, a build)
-        is the process actually blocking — bash is asleep waiting on it."""
-        if self._proc is None or self._proc.poll() is not None:
-            return
-        self._signal_group(signal.SIGINT)
+        """Best-effort SIGINT to the running command's process GROUP (Ctrl-C it and its children).
+        Never raises."""
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            self._signal(proc.pid, signal.SIGINT)
 
     def close(self) -> None:
-        """Terminate the shell + its process GROUP, then release resources. Idempotent, never raises.
-        Signals the group (SIGTERM → SIGKILL) so a timed-out / backgrounded child in the shell's pgid
-        is reaped, not orphaned to init.
-
-        LIMIT (apparatus L3 codex, welded not hidden): a child that DAEMONIZES into a NEW session/pgid
-        (``setsid`` / ``nohup`` / a double-fork) escapes ``killpg`` and SURVIVES close — the same
-        behavior a normal shell (and CC/Codex) has. The survivor stays SANDBOX-CONFINED (the seatbelt
-        is inherited, so crown jewels remain off-limits), but it is unattended code with network + broad
-        non-jewel authority after the operator thinks the run ended. Reaping arbitrary setsid escapees
-        is racy and out of scope here; the crown-jewels floor bounds it, and the per-domain network
-        policy (``spore-417``) is the real answer. ⚠ Since K4a ships scheduled seats, do NOT read the
-        old "human-in-the-loop v1 posture" as covering this — an unattended seat has no human, and the
-        K3 gate cannot help because the survivor is ALREADY running."""
+        """Kill every process group this shell started (SIGTERM, then SIGKILL), reap, wait for the
+        groups to empty, and remove the state directory. Idempotent, never raises."""
         self._closed = True
-        proc = self._proc
-        if self._cmd_w is not None:
-            try:
-                self._cmd_w.close()  # EOF on bash's script → it exits gracefully
-            except Exception:  # noqa: BLE001 — already-closed / teardown must never raise
-                pass
-            self._cmd_w = None
+        with self._lock:
+            groups = list(self._groups.items())
+            self._groups.clear()
         try:
-            if proc is not None and proc.poll() is None:
-                self._signal_group(signal.SIGTERM)
+            for pgid, _ in groups:
+                self._signal(pgid, signal.SIGTERM)
+            deadline = time.monotonic() + _KILL_GRACE
+            for pgid, proc in groups:
+                if not _group_gone(pgid, timeout=max(0.0, deadline - time.monotonic())):
+                    self._signal(pgid, signal.SIGKILL)
+            for pgid, proc in groups:
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    self._signal_group(signal.SIGKILL)
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
+                    pass
+                _group_gone(pgid, timeout=5.0)
         finally:
-            self._proc = None
+            d, self._state_dir = self._state_dir, None
+            if d is not None:
+                shutil.rmtree(d, ignore_errors=True)
 
     def __enter__(self) -> "SandboxedShell":
         return self.start()
@@ -4956,10 +4973,11 @@ class _BwrapShell(SandboxedShell):
     The manifest is recorded once, before bwrap runs, after the provider has created every absent
     host mountpoint itself (:func:`_prepare_mountpoints`), so nothing is adopted after the start. It
     covers every mounted path and every jewel the plan leaves unmounted (:func:`_mount_plan_paths`).
-    NOT covered: a command already running when something changes, or one backgrounded earlier, keeps
-    its access for as long as it runs; so does a command whose path changes between this check and
-    its start; a ``setsid`` child survives the group kill (the module's known slice-2 limit); a store
-    with no recognisable header (SQLCipher) is never classified as a database."""
+    NOT covered: a command already running when something changes keeps its access for as long as it
+    runs; so does a command whose path changes between this check and its start; a store with no
+    recognisable header (SQLCipher) is never classified as a database. Each command is its own bwrap
+    whose bash is pid 1 of its pid namespace, so nothing a command starts (a background job, a
+    ``setsid`` child) outlives it to hold access past the next check."""
 
     def __init__(
         self,
@@ -4975,25 +4993,50 @@ class _BwrapShell(SandboxedShell):
         self._jewel_policy = policy
         self._manifest = dict(manifest)   # recorded before the start; never updated
         self._ledger_claim: str | None = None   # this shell's claim on the placeholder ledger
+        self._claim_base: str | None = None     # the claim before a command's group is added to it
 
     def close(self) -> None:
         # The claim is released only once the sandbox's namespace is GONE, never while any process of
         # it lives: a host-side unlink of a placeholder still mounted in a live namespace detaches that
-        # mount (Linux 3.18+, 8ed936b), and the shell could then plant the file (L1 + L2 r1). Reaping
-        # bwrap's monitor is not enough: on SIGTERM it dies at once, while the namespace's pid 1 (in
-        # the same process group, no --new-session) and everything under it go down asynchronously.
-        # So the release waits until no process of the group is left; with --unshare-pid, pid 1's
-        # exit kills and waits for every process of its namespace first, so an empty group means an
-        # empty namespace. If it is not empty in time, the claim stays, and the sweep at the next spawn
-        # or at launch releases it once this levain is gone. `finally`, as `_SeatbeltShell.close`.
-        pgid = self._proc.pid if self._proc is not None else None
+        # mount (Linux 3.18+, 8ed936b), and the shell could then plant the file (L1 + L2 r1). Each
+        # command is its own bwrap, in its own process group, and its bash is pid 1 of its pid
+        # namespace (``--as-pid-1``), so an empty group means an empty namespace. If one is not empty
+        # in time, the claim stays, and the sweep at the next spawn or at launch releases it once this
+        # levain is gone. `finally`, as `_SeatbeltShell.close`.
+        with self._lock:
+            pgids = list(self._groups)
         try:
             super().close()
         finally:
             claim, self._ledger_claim = self._ledger_claim, None
             _LIVE_BWRAP_SHELLS.discard(self)
-            if claim is not None and (pgid is None or _group_gone(pgid, timeout=5.0)):
+            if claim is not None and all(_group_gone(g, timeout=5.0) for g in pgids):
                 _ledger_release(claim)
+
+    def _after_spawn(self, pgid: int) -> None:
+        # The claim names the running command's process group (see `_claim_alive`): after a levain
+        # crash the sweep keeps it until that group, and so that namespace, is empty. One group at a
+        # time: `_after_command` waits for the previous command's namespace to be gone.
+        claim = self._ledger_claim
+        if claim is None or self._claim_base is None:
+            return
+        tagged = f"{self._claim_base}:g{pgid}"
+        with _LedgerTxn() as txn:
+            if txn.ok:
+                txn.retag(claim, tagged)
+        if not txn.ok or txn.problem is not None:
+            # Unwritten, the claim names only levain's pid (or an older group): after a levain crash
+            # a sweep would drop it while this sandbox lives on its mounts (codex, L3 r3).
+            raise ConfinementError(
+                f"{txn.problem} — refusing to run the command (fail-closed): the shell's claim on "
+                "the floor's files could not be recorded."
+            )
+        self._ledger_claim = tagged
+
+    def _after_command(self, pgid: int) -> None:
+        # The command's bash was pid 1 of its namespace, so the kernel is killing everything left
+        # in it; wait for that, so the next command's group is the only one the claim needs to name.
+        _group_gone(pgid, timeout=5.0)
 
     def _recheck(self) -> None:
         _refuse_plantable_sqlite_jewels(self._jewel_policy)
@@ -5048,8 +5091,9 @@ class BwrapProvider(ConfinementProvider):
     new procfs shows only the namespace's processes (asserted live by
     ``test_linux_live_bash_sees_no_host_process``, which the CI workflow's live job runs), and "If
     the "init" process of a PID namespace terminates, the kernel terminates all of the processes in
-    the namespace via a SIGKILL signal", which on paper also ends a ``setsid`` survivor when bash's
-    shell ends; that second effect is not claimed until a test measures it."""
+    the namespace via a SIGKILL signal". Each command now runs as its own bwrap with bash as that
+    pid 1 (``--as-pid-1``), so a ``setsid`` child ends with its command
+    (``test_linux_a_setsid_child_ends_with_its_command`` measures it)."""
 
     #: Enforced by ``--unshare-net`` (no IP network in bash), not by a per-destination rule; what it
     #: does not close is ``OFFLINE_RESIDUAL``.
@@ -5084,7 +5128,12 @@ class BwrapProvider(ConfinementProvider):
         mounted, unmounted = _mount_plan_paths(argv, policy)
         # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
         # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
-        argv = argv + ["/bin/bash", "--noprofile", "--norc", "-p"]
+        # `--as-pid-1`: bash itself is pid 1 of the namespace and the bwrap process levain waits on
+        # is its parent, so the status levain reads is bash's own waitpid status. Without it bwrap's
+        # reaper is pid 1 and reports bash's status through an eventfd that the reaper holds, and the
+        # reaper is dumpable and runs as bash's user, so bash could write a status of its own choosing
+        # into it through /proc/1/fd (bubblewrap.c: do_init, monitor_child, PR_SET_DUMPABLE; spore-1385).
+        argv = argv + ["--as-pid-1", "/bin/bash", "--noprofile", "--norc", "-p"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
         # Each one this process made is levain's, recorded in the placeholder ledger and removed once
@@ -5191,23 +5240,11 @@ class BwrapProvider(ConfinementProvider):
             default_timeout=default_timeout,
         )
         shell._ledger_claim = claim
+        shell._claim_base = claim
         _LIVE_BWRAP_SHELLS.add(shell)
         try:
+            # Each command, the start probe included, tags the claim with its process group.
             shell.start()
-            if shell._proc is not None:
-                # The claim now names the shell's process group as well (see `_claim_alive`).
-                tagged = f"{claim}:g{shell._proc.pid}"
-                with _LedgerTxn() as txn:
-                    if txn.ok:
-                        txn.retag(claim, tagged)
-                if not txn.ok or txn.problem is not None:
-                    # Unwritten, the claim names only levain's pid: after a levain crash a sweep
-                    # would drop it while the sandbox lives on its mounts (codex, L3 r3).
-                    raise ConfinementError(
-                        f"{txn.problem} — refusing to grant bash hands (fail-closed): the shell's "
-                        "claim on the floor's files could not be recorded."
-                    )
-                shell._ledger_claim = tagged
             shell._recheck()   # whatever changed during the start closes it before any command
         except ConfinementError:   # a RuntimeError subclass: the recheck's own refusal, unchanged
             shell.close()

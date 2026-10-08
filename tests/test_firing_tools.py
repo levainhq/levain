@@ -14,6 +14,7 @@ confinement floor). The pure ``tool_action_summary`` render helper is tested in 
 """
 from __future__ import annotations
 
+import platform
 from pathlib import Path
 
 import pytest
@@ -522,7 +523,7 @@ def test_bash_runs_keeps_state_and_refuses_crown_jewels(tmp_path: Path, monkeypa
     try:
         ok = ex(TerminalAction(command="echo alive"))
         assert ok.exit_code == 0 and "alive" in ok.text and not ok.is_error
-        # state persists (one long-lived shell, not per-command exec)
+        # state persists across commands (each command's bash starts from the saved state)
         ex(TerminalAction(command="export FOO=persisted"))
         got = ex(TerminalAction(command="echo $FOO"))
         assert got.text.strip() == "persisted"
@@ -535,18 +536,19 @@ def test_bash_runs_keeps_state_and_refuses_crown_jewels(tmp_path: Path, monkeypa
 
 
 @_needs_sandbox
-def test_bash_respawns_a_fresh_shell_after_exit(tmp_path: Path):
-    # `exit` ends the shell (EOF); the next command must transparently respawn a fresh confined shell
-    # rather than hand a dead channel.
+def test_bash_reports_exit_n_and_keeps_the_shell(tmp_path: Path):
+    # `exit N` ends that command's bash: levain's waitpid reports N (it was unrecoverable while the
+    # status came from a line the shell printed), and the next command runs from the saved state.
     ent, ws = _entity(tmp_path)
     ex = SandboxedBashExecutor(build_policy(ent, workspace=ws))
     try:
-        # the exit itself is surfaced (is_error + a note) so a silent empty result / a swallowed
-        # non-zero `exit N` isn't misread as success (apparatus L1 finding 2)
-        exited = ex(TerminalAction(command="exit 7"))
-        assert exited.is_error and "shell exited" in exited.text
-        after = ex(TerminalAction(command="echo respawned"))
-        assert after.exit_code == 0 and "respawned" in after.text
+        exited = ex(TerminalAction(command="export KEPT=yes; exit 7"))
+        assert exited.exit_code == 7 and exited.is_error
+        after = ex(TerminalAction(command="echo after-$KEPT"))
+        assert after.exit_code == 0 and "after-yes" in after.text
+        if platform.system() == "Darwin":   # under bwrap bash is pid 1, which ignores it from inside
+            killed = ex(TerminalAction(command="kill -9 $$"))
+            assert killed.exit_code == 137 and killed.is_error and "SIGKILL" in killed.text
     finally:
         ex.close()
 

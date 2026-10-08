@@ -327,13 +327,16 @@ def test_a_shell_releases_its_claim_only_once_its_process_group_is_gone(home: Pa
 
         def poll(self):
             return 0
-    shell._proc = _P()
+
+        def wait(self, timeout=None):
+            return 0
+    shell._groups = {4242: _P()}
     monkeypatch.setattr(C, "_group_gone", lambda pgid, timeout: False)
     shell.close()
     assert f.exists(), "the namespace may still hold the mount: keep the claim"
     shell2 = C._BwrapShell(policy=None, manifest={}, argv=["/bin/true"], cwd=home, env={})  # type: ignore[arg-type]
     shell2._ledger_claim = f"{os.getpid()}:-:-:k"
-    shell2._proc = _P()
+    shell2._groups = {4242: _P()}
     monkeypatch.setattr(C, "_group_gone", lambda pgid, timeout: True)
     shell2.close()
     assert not f.exists()

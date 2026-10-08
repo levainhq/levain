@@ -356,8 +356,8 @@ def test_live_real_tool_runs_under_default_allow(tmp_path: Path) -> None:
 
 @live
 def test_live_state_persists_across_commands(tmp_path: Path) -> None:
-    """ONE long-lived shell: an export in one command is visible in the next (real stateful shell,
-    not per-command exec)."""
+    """A stateful shell: an export in one command is visible in the next (each command's bash
+    starts from the state the previous one saved)."""
     with select_provider().spawn_shell(build_policy(_entity(tmp_path))) as sh:
         assert sh.run("export FOO=bar", timeout=10).exit_code == 0
         r = sh.run("echo val=$FOO", timeout=10)
@@ -373,9 +373,8 @@ def test_live_exit_codes_propagate(tmp_path: Path) -> None:
 
 @live
 def test_live_output_without_trailing_newline(tmp_path: Path) -> None:
-    """REGRESSION for the sentinel-substring fix: a command whose output has NO trailing newline
-    (``printf`` w/o ``\\n``) once concatenated the sentinel onto the last line and hung the shell.
-    Now the sentinel is matched as a substring, so this returns cleanly."""
+    """REGRESSION: a command whose output has NO trailing newline (``printf`` w/o ``\\n``) once
+    hung the shell. Output is read in raw chunks and completion is waitpid, so it returns whole."""
     with select_provider().spawn_shell(build_policy(_entity(tmp_path))) as sh:
         r = sh.run("printf abc", timeout=10)
         assert r.exit_code == 0 and r.timed_out is False
@@ -403,24 +402,24 @@ def test_live_crown_jewel_denied_even_after_cwd_wanders(tmp_path: Path, monkeypa
 
 @live
 def test_live_set_x_does_not_corrupt_protocol(tmp_path: Path) -> None:
-    """REGRESSION (apparatus L3 consensus, verified live): ``set -x`` echoes the sentinel ``printf``
-    line into the merged stream; with a naive token that trace was read as end-of-command and silently
-    corrupted every later result. The SPLIT token makes the trace un-matchable, so the protocol holds:
-    exit codes stay correct and later commands run normally even with xtrace on."""
+    """REGRESSION (apparatus L3 consensus, verified live): ``set -x`` once traced levain's own status
+    line into the stream and corrupted every later result. Status is now waitpid's, and xtrace
+    (which persists in the saved state) must neither change it nor trace levain's state save."""
     with select_provider().spawn_shell(build_policy(_entity(tmp_path))) as sh:
         assert sh.run("set -x", timeout=8).exit_code == 0
         r = sh.run("false", timeout=8)          # xtrace ON — exit code must still be the REAL one
         assert r.exit_code == 1
         r2 = sh.run("echo traced_ok", timeout=8)
         assert r2.exit_code == 0 and "traced_ok" in r2.output
+        assert "__levain" not in r.output + r2.output
 
 
 @live
 def test_live_command_channel_private_from_children(tmp_path: Path) -> None:
-    """REGRESSION (apparatus L3 codex round-1+2, verified live): a child must NOT be able to read the
-    command channel. Two vectors, both closed: (a) an inherited fd (``/dev/fd/N``) — the FIFO bash
-    opens is close-on-exec so children don't inherit it; (b) the FIFO PATH via bash's ``$0`` — the fifo
-    is UNLINKED after the startup handshake, so ``open($0)`` hits ENOENT."""
+    """REGRESSION (apparatus L3 codex round-1+2, verified live): a child must NOT be able to read
+    levain's channel to the shell. The command text now reaches bash on stdin, which is /dev/null
+    before the command runs, and no other descriptor is passed: (a) no fd 3..9 is readable; (b) ``$0``
+    names no file at all."""
     with select_provider().spawn_shell(build_policy(_entity(tmp_path))) as sh:
         # (a) inherited-fd probe: read any fd 3..9 — must find no readable channel
         fd_probe = (
@@ -430,20 +429,18 @@ def test_live_command_channel_private_from_children(tmp_path: Path) -> None:
         )
         r = sh.run(fd_probe, timeout=15)
         assert "STOLE" not in r.output and "probe_done" in r.output
-        # (b) $0-path probe: bash discloses its script as $0, now ``/dev/fd/N`` of a pipe it closed
-        # before running anything. A child opening it gets nothing (EBADF on macOS, ENOENT on Linux).
-        assert sh.run('echo "$0"', timeout=8).output.strip().startswith("/dev/fd/")
-        r0 = sh.run('python3 -c "import sys; open(sys.argv[1]).read()" "$0" 2>&1', timeout=10)
-        assert r0.exit_code != 0 and ("Bad file descriptor" in r0.output or "FileNotFoundError" in r0.output)
+        # (b) $0 is the plain name `bash -c` was given, not a path to the channel.
+        assert sh.run('echo "$0"', timeout=8).output.strip() == "bash"
+        assert sh.run("cat; echo rc=$?", timeout=8).output.strip() == "rc=0"
         # the shell itself is still perfectly usable afterward:
         assert sh.run("echo ok", timeout=8).output.strip() == "ok"
 
 
 def test_spawn_raises_when_shell_never_reads_the_channel(tmp_path: Path) -> None:
-    """REGRESSION (apparatus L3 codex round-2 #2): if the shell process dies / never reads the command
-    channel at startup, spawn must FAIL CLOSED — a dead driver must not masquerade as a live shell.
-    Hermetic (no sandbox): ``/usr/bin/true`` exits immediately without reading the fifo, so the startup
-    handshake gets EOF and raises."""
+    """REGRESSION (apparatus L3 codex round-2 #2): if the shell process dies / never runs the command
+    at startup, spawn must FAIL CLOSED — a dead driver must not masquerade as a live shell.
+    Hermetic (no sandbox): ``/usr/bin/true`` exits 0 without running the start probe, so the probe's
+    token never appears and start raises."""
     from levain.firing.confinement import SandboxedShell
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -456,7 +453,7 @@ def test_spawn_raises_when_shell_never_reads_the_channel(tmp_path: Path) -> None
 @live
 def test_live_concurrent_run_fails_fast(tmp_path: Path) -> None:
     """REGRESSION (apparatus L3 consensus): ``run()`` is single-caller; a concurrent call must fail
-    FAST rather than silently corrupt ``_pending`` + output attribution."""
+    FAST rather than race the saved state and the late-output buffer."""
     import threading as _th
     sh = select_provider().spawn_shell(build_policy(_entity(tmp_path)))
     started = _th.Event()
@@ -646,12 +643,11 @@ def test_live_timeout_leaves_result_flagged(tmp_path: Path) -> None:
 
 @live
 def test_live_shell_self_heals_after_timeout(tmp_path: Path) -> None:
-    """REGRESSION: a timed-out command's sentinel fires LATE; without pending-sentinel draining, the
-    next run() would consume the STALE sentinel and return the wrong result. The next command must
-    resync and return ITS OWN output/exit."""
+    """REGRESSION: after a timeout the next run() once read the timed-out command's late result. The
+    timed-out command is now killed with its group, and the next command returns ITS OWN output/exit."""
     with select_provider().spawn_shell(build_policy(_entity(tmp_path))) as sh:
         assert sh.run("sleep 2 && echo late", timeout=1).timed_out is True
-        # the sleep is still running; the next command must not pick up the stale sentinel:
+        # the timed-out command must leave nothing behind for the next result:
         r = sh.run("echo fresh_result", timeout=8)
         assert r.timed_out is False
         assert r.exit_code == 0
@@ -660,12 +656,12 @@ def test_live_shell_self_heals_after_timeout(tmp_path: Path) -> None:
 
 @live
 def test_live_close_reaps_child_processes(tmp_path: Path) -> None:
-    """REGRESSION (verified live 2026-07-11): a persistent shell spawns children; a bare terminate()
-    of bash alone ORPHANED a timed-out ``sleep`` (reparented to init, still running). close() now
-    signals the whole process GROUP, so the child is reaped."""
+    """REGRESSION (verified live 2026-07-11): a bare terminate() of bash alone ORPHANED its ``sleep``
+    child (reparented to init, still running). close() signals every process GROUP the shell started,
+    so a background job that outlived its command is reaped."""
     dur = "18237"  # a unique sleep duration = the marker for pgrep
     sh = select_provider().spawn_shell(build_policy(_entity(tmp_path)))
-    assert sh.run(f"sleep {dur}", timeout=1).timed_out is True
+    assert sh.run(f"sleep {dur} > /dev/null 2>&1 &", timeout=5).exit_code == 0
     before = subprocess.run(["pgrep", "-f", f"sleep {dur}"], capture_output=True, text=True)
     assert before.stdout.split(), "the sleep child should be running before close()"
     sh.close()
@@ -1256,14 +1252,15 @@ def test_sandboxed_shell_closed_reflects_lifecycle(tmp_path: Path, monkeypatch) 
 
 
 @live
-def test_sandboxed_shell_closed_after_a_command_runs_exit(tmp_path: Path, monkeypatch) -> None:
-    # A command that ends the shell (`exit`) closes it → `.closed` becomes True (the signal the bash
-    # executor uses to respawn a fresh shell for the next command).
+def test_sandboxed_shell_stays_open_after_a_command_runs_exit(tmp_path: Path, monkeypatch) -> None:
+    # `exit N` ends that command's bash only: its status is N (levain's waitpid) and the shell stays
+    # open for the next command.
     monkeypatch.setenv("HOME", str(tmp_path))
     shell = SeatbeltProvider().spawn_shell(build_policy(_entity(tmp_path)))
     try:
-        shell.run("exit 0")
-        assert shell.closed is True
+        assert shell.run("exit 4").exit_code == 4
+        assert shell.closed is False
+        assert shell.run("echo again").output.strip() == "again"
     finally:
         shell.close()
 
