@@ -313,10 +313,16 @@ def cmd_regenesis(gl: GitLedger, args) -> int:
     # the ledger re-genesised is the one this clone is pinned to: a --from on another ledger was derived against this
     # pin by anchor fallback, and the identity guard below read the WRONG roster (code L3 r3 codex 1, RUN: ben, pinned
     # to A, filed his key as alice's owner key from re-genesis B's tip)
+    # and on the history this clone itself holds: an ancestor of its head or of its anchor, never a commit it never
+    # judged (code L3 r4 complement LOW 5: any descendant of the genesis, host-forged or unsynced, became the record)
     old_root = gl.pinned_root or ""
-    if git(["merge-base", "--is-ancestor", old_root, old_tip], gl.repo.toplevel, check=False).returncode != 0:
-        raise TeamError(f"--from {args.from_} is not on the ledger this clone is pinned to (genesis {old_root[:12]}); "
-                        "a re-genesis starts from the pinned ledger. To re-genesis another, join it first")
+    ours = [r for r in (gl.head(), gl.state().get("anchor")) if r]
+    if git(["merge-base", "--is-ancestor", old_root, old_tip], gl.repo.toplevel, check=False).returncode != 0 or \
+            not any(git(["merge-base", "--is-ancestor", old_tip, r], gl.repo.toplevel, check=False).returncode == 0
+                    for r in ours):
+        raise TeamError(f"--from {args.from_} is not on the ledger this clone is pinned to (genesis {old_root[:12]}) "
+                        "as this clone holds it (an ancestor of its head or its last judged commit); a re-genesis "
+                        "starts from the pinned ledger. To re-genesis another, join it first")
     members: dict[str, str] = {}
     keys: dict[str, str] = {}
     for v in args.member or []:
@@ -500,7 +506,7 @@ def register(sub, add) -> None:
     p = add("regenesis", wrap(cmd_regenesis), "After a permanently lost owner: a fresh strict genesis on a new "
                                               "branch, carrying the old ledger as a read-only record.")
     p.add_argument("--from", dest="from_", required=True,
-                   help="the old ledger tip to carry (a commit of the ledger this clone is pinned to)")
+                   help="the old ledger tip to carry (a commit of the pinned ledger this clone holds)")
     p.add_argument("--owner", required=True)
     p.add_argument("--member", action="append", required=True, metavar="HANDLE=EMAIL[=PUBKEY]")
     p.add_argument("--project")
