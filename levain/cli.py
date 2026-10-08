@@ -1,6 +1,7 @@
 """Levain CLI — `levain init`, `levain doctor`, `levain verify-hooks`.
 
-The entry point declared by `pyproject.toml` ([project.scripts] levain).
+The CLI that `levain.launch.main` (the entry point declared by `pyproject.toml`, [project.scripts]
+levain) hands over to.
 Subcommand handlers live in sibling modules; this file is dispatch only.
 Lazy imports keep `levain --help` fast and isolate import errors per command.
 """
@@ -9,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -369,6 +372,15 @@ def main(argv: list[str] | None = None) -> int:
         help="The model endpoint (default: http://localhost:11434, local Ollama).",
     )
     run_p.add_argument(
+        "--api-key-file",
+        default=None,
+        dest="api_key_file",
+        metavar="PATH",
+        help="Read the endpoint's API key from PATH (refused if other users can read or write it, or if it is a symlink). "
+             "Or set LEVAIN_API_KEY. Either keeps the key off the command line, where other "
+             "processes can read it; the file is also denied to the entity's own hands.",
+    )
+    run_p.add_argument(
         "--api-key",
         default=None,
         dest="api_key",
@@ -516,6 +528,15 @@ def main(argv: list[str] | None = None) -> int:
         help="The compose-model endpoint (default: http://localhost:11434, local Ollama).",
     )
     wrap_p.add_argument(
+        "--api-key-file",
+        default=None,
+        dest="api_key_file",
+        metavar="PATH",
+        help="Read the endpoint's API key from PATH (refused if other users can read or write it, or if it is a symlink). "
+             "Or set LEVAIN_API_KEY. Either keeps the key off the command line, where other "
+             "processes can read it; the file is also denied to the entity's own hands.",
+    )
+    wrap_p.add_argument(
         "--api-key",
         default=None,
         dest="api_key",
@@ -654,6 +675,15 @@ def main(argv: list[str] | None = None) -> int:
         default="http://localhost:11434",
         dest="base_url",
         help="With --chat: the model endpoint (default: http://localhost:11434, local Ollama).",
+    )
+    web_p.add_argument(
+        "--api-key-file",
+        default=None,
+        dest="api_key_file",
+        metavar="PATH",
+        help="With --chat: Read the endpoint's API key from PATH (refused if other users can read or write it, or if it is a symlink). "
+             "Or set LEVAIN_API_KEY. Either keeps the key off the command line, where other "
+             "processes can read it; the file is also denied to the entity's own hands.",
     )
     web_p.add_argument(
         "--api-key",
@@ -1063,6 +1093,12 @@ def main(argv: list[str] | None = None) -> int:
     _register_team(subparsers)
 
     args = parser.parse_args(argv)
+    from levain.launch import api_key_lifted
+
+    if api_key_lifted() and not hasattr(args, "api_key"):
+        # The re-exec lifts --api-key before argparse sees it; a command without that option would
+        # otherwise drop the key silently instead of rejecting it (L3 r2).
+        parser.error("unrecognized arguments: --api-key")
     return args.func(args)
 
 
@@ -1161,7 +1197,51 @@ def _cmd_focus(args: argparse.Namespace) -> int:
     )
 
 
+def _resolve_api_key(args: argparse.Namespace) -> bool:
+    """Settle ``args.api_key`` from, in order: ``--api-key`` (in-process callers; the console entry
+    lifts it out of the command line, see :mod:`levain.launch`), the value so lifted,
+    ``--api-key-file``, then ``LEVAIN_API_KEY`` (removed from the environment once read, so no child
+    inherits it). False, with the reason printed, when the key cannot be used."""
+    from levain.launch import API_KEY_ENV, add_secret_file, take_lifted_api_key
+
+    given = getattr(args, "api_key", None) or take_lifted_api_key()
+    path = getattr(args, "api_key_file", None)
+    env_key = os.environ.pop(API_KEY_ENV, None)
+    if given is not None and path is not None:
+        print("levain: give the API key once: --api-key or --api-key-file, not both.", file=sys.stderr)
+        return False
+    if path is not None:
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError("not a regular file")
+                if st.st_mode & 0o077:
+                    print(f"levain: {path} is readable or writable by other users "
+                          f"(mode {stat.S_IMODE(st.st_mode):o}); run `chmod 600 {path}`. The key was "
+                          "not used.", file=sys.stderr)
+                    return False
+                with os.fdopen(fd, encoding="utf-8") as fh:
+                    fd = -1
+                    given = fh.read().strip()
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"levain: could not read the API key file {path}: {exc}", file=sys.stderr)
+            return False
+        if not given:
+            print(f"levain: the API key file {path} is empty.", file=sys.stderr)
+            return False
+        add_secret_file(path)   # the floor denies it to the entity, both ways
+    args.api_key = given if given is not None else env_key
+    return True
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
+    if not _resolve_api_key(args):
+        return 2
     # Two drivers over ONE session (the K1 seam, `levain.session`): `--task` is the
     # non-interactive runner (one spec, exit-when-done, an exit code a caller can branch on);
     # without it, the interactive REPL. `--quiet`/`--max-iterations` only shape a task run.
@@ -1339,6 +1419,9 @@ def _resolve_unattended_consolidate_bound(
 def _cmd_wrap(args: argparse.Namespace) -> int:
     from levain.wrap import wrap_entity
 
+    if not _resolve_api_key(args):
+        return 2
+
     max_seconds = getattr(args, "max_seconds", None)
     if _reject_bad_max_seconds(max_seconds, command="wrap"):
         return 2
@@ -1368,6 +1451,9 @@ def _cmd_wrap(args: argparse.Namespace) -> int:
 
 def _cmd_serve(args: argparse.Namespace) -> int:
     from levain.web_server import run_web_server
+
+    if not _resolve_api_key(args):
+        return 2
 
     return run_web_server(
         path=args.path,
@@ -1905,4 +1991,7 @@ def _cmd_daemon_restart(args: argparse.Namespace) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Through the console entry, so `python -m levain.cli` gets the launch re-exec too.
+    from levain.launch import main as _launch_main
+
+    sys.exit(_launch_main())

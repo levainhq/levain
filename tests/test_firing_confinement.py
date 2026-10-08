@@ -430,10 +430,11 @@ def test_live_command_channel_private_from_children(tmp_path: Path) -> None:
         )
         r = sh.run(fd_probe, timeout=15)
         assert "STOLE" not in r.output and "probe_done" in r.output
-        # (b) $0-path probe: bash discloses the script path as $0; opening it must fail (unlinked).
-        # If the attack SUCCEEDED, open() returns → exit 0; unlinked → FileNotFoundError → nonzero.
-        r0 = sh.run('python3 -c "import sys; open(sys.argv[1])" "$0" 2>&1', timeout=10)
-        assert r0.exit_code != 0 and "FileNotFoundError" in r0.output
+        # (b) $0-path probe: bash discloses its script as $0, now ``/dev/fd/N`` of a pipe it closed
+        # before running anything. A child opening it gets nothing (EBADF on macOS, ENOENT on Linux).
+        assert sh.run('echo "$0"', timeout=8).output.strip().startswith("/dev/fd/")
+        r0 = sh.run('python3 -c "import sys; open(sys.argv[1]).read()" "$0" 2>&1', timeout=10)
+        assert r0.exit_code != 0 and ("Bad file descriptor" in r0.output or "FileNotFoundError" in r0.output)
         # the shell itself is still perfectly usable afterward:
         assert sh.run("echo ok", timeout=8).output.strip() == "ok"
 
@@ -1961,9 +1962,13 @@ def test_bwrap_uses_a_dev_null_mount_for_a_socket_in_a_shared_dir(tmp_path, monk
     sock.touch()
     argv = _bwrap_argv(_bwrap_socket_policy(tmp_path, monkeypatch, sock))
     assert ["--ro-bind", "/dev/null", str(sock.resolve())] in [argv[k:k + 3] for k in range(len(argv))]
-    assert "--tmpfs" not in argv or str(tmp_path.resolve()) not in [
-        argv[k + 1] for k, a in enumerate(argv) if a == "--tmpfs"
-    ]
+    # $HOME's only tmpfs is step (0)'s view, which carries its entries; the socket is left out of it
+    # (a denied name) and masked there, never hidden by a read-only tmpfs over its directory.
+    h = str(tmp_path.resolve())
+    assert ["--ro-bind-try", str(sock.resolve()), str(sock.resolve())] not in [
+        argv[k:k + 3] for k in range(len(argv))]
+    assert [h] == [argv[k + 1] for k, a in enumerate(argv) if a == "--remount-ro" and argv[k + 1] == h]
+    assert argv[-2:] == ["--remount-ro", h], "the view is made read-only last"
 
 
 def test_bwrap_absent_daemon_dirs_cost_nothing_and_mount_nothing(tmp_path, monkeypatch) -> None:
@@ -2457,6 +2462,9 @@ def test_bwrap_subtrees_are_tmpfs_AND_remount_ro(tmp_path, monkeypatch) -> None:
     the refusal honest (EROFS). Both measured; the pairing is the contract."""
     policy = _lin_policy(tmp_path, monkeypatch)
     assert policy.deny_read_write, "fixture must produce at least one crown-jewel subtree"
+    # Existing subtrees: an absent one directly in $HOME is simply absent from step (0)'s view.
+    for sub in policy.deny_read_write:
+        sub.mkdir(parents=True, exist_ok=True)
     argv = _bwrap_argv(policy)
     for sub in policy.deny_read_write:
         assert ("--tmpfs", str(sub)) in _pairs(argv, "--tmpfs")
@@ -2490,8 +2498,10 @@ def test_bwrap_ancestor_dirs_are_self_bound_parents_before_children(tmp_path, mo
     policy = _lin_policy(tmp_path, monkeypatch)
     assert policy.deny_write_dirs, "fixture must produce ancestor dirs"
     argv = _bwrap_argv(policy)
-    self_binds = [(s, d) for s, d in _triples(argv, "--bind") if s == d]
-    bound = [d for _, d in self_binds]
+    # $HOME is pinned by its own view (step (0)'s tmpfs), not by a second self-bind.
+    home = str(Path.home().resolve())
+    bound = [argv[k + 2] if a == "--bind" else home for k, a in enumerate(argv[:-2])
+             if (a == "--bind" and argv[k + 1] == argv[k + 2]) or (a == "--tmpfs" and argv[k + 1] == home)]
     for anc in policy.deny_write_dirs:
         # Pinned when it exists (at its RESOLVED path: a mount cannot land on a symlink, /var/run,
         # macOS's /var) or when the argv will CREATE something under it; an absent ancestor nothing
@@ -2509,12 +2519,16 @@ def test_bwrap_cred_files_and_config_deny_both_directions(tmp_path, monkeypatch)
     """``--ro-bind /dev/null`` denies READ (EACCES) as well as write — the closest analogue of macOS's
     ``(deny file-read* file-write* (literal ...))``. Measured to hold with AND without ``--dev``, so
     it does not depend on the device tree."""
-    secret = tmp_path / "secret.env"
+    (tmp_path / "creds").mkdir()
+    secret = tmp_path / "creds" / "secret.env"     # below a subdirectory of $HOME: on the host tree
     secret.write_text("TOKEN")
-    policy = _lin_policy(tmp_path, monkeypatch, deny_files=(secret,))
+    top = tmp_path / "top.env"                      # directly in $HOME: left out of the step (0) view
+    top.write_text("TOKEN")
+    policy = _lin_policy(tmp_path, monkeypatch, deny_files=(secret, top))
     argv = _bwrap_argv(policy)
     devnull_targets = [d for s, d in _triples(argv, "--ro-bind") if s == "/dev/null"]
     assert str(secret.resolve()) in devnull_targets
+    assert str(top.resolve()) not in argv, "absent inside bash, not an empty file"
     if policy.config_file is not None:
         # An ABSENT config gets no mount (a /dev/null mountpoint would leave an empty JSON stub the
         # next session refuses); the read-only store dir is what stops the shell creating it.
@@ -2532,30 +2546,37 @@ def _store_policy(tmp_path, monkeypatch):
     return build_policy(ent), lv
 
 
-def test_bwrap_creates_and_pins_an_absent_ssh_dir_before_planting_anything_in_it(tmp_path, monkeypatch) -> None:
-    """L1 H1 / L2 (2026-09-30): raw mode with no ~/.ssh. The argv makes bwrap CREATE ~/.ssh to hold
-    the vector mounts; unpinned, the entity could rename it away, make a fresh one and plant
-    ``authorized_keys`` on the host. It must be created and pinned BEFORE any mount inside it."""
+def test_bwrap_an_absent_ssh_dir_needs_nothing_in_the_home_view(tmp_path, monkeypatch) -> None:
+    """L1 H1 / L2 (2026-09-30): raw mode with no ~/.ssh. The argv used to make bwrap CREATE ~/.ssh
+    to hold the vector mounts, pinned so it could not be renamed away and replaced with a planted
+    ``authorized_keys``. In step (0)'s read-only $HOME view an absent ~/.ssh cannot be created at
+    all, so nothing is created on the host and nothing is mounted under it (ruling 2026-10-07)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     assert not (tmp_path / ".ssh").exists()
     from levain.firing.confinement import _bwrap_plan
 
     argv, create_first = _bwrap_plan(build_policy(_entity(tmp_path), ssh_mode="raw"))
     ssh = str(tmp_path / ".ssh")
-    assert ssh in create_first, "bwrap cannot pin a dir it creates; the provider must create it first"
-    i_pin = [argv[k:k + 3] for k in range(len(argv))].index(["--bind", ssh, ssh])
-    inside = [k for k, a in enumerate(argv) if a.startswith(ssh + "/")]
-    assert inside and min(inside) > i_pin, "a mount inside ~/.ssh landed before ~/.ssh was pinned"
+    assert ssh not in create_first
+    assert not [a for a in argv if a == ssh or a.startswith(ssh + "/")]
+    assert argv[-2:] == ["--remount-ro", str(tmp_path.resolve())]
 
 
-def test_bwrap_refuses_a_replaceable_symlinked_jewel_ancestor(tmp_path, monkeypatch) -> None:
-    """A mount cannot pin a symlink; pinning its target leaves the link swappable. Fail closed."""
+def test_bwrap_pins_a_home_level_symlinked_jewel_ancestor_at_its_target(tmp_path, monkeypatch) -> None:
+    """A mount cannot pin a symlink. A link directly in $HOME cannot be swapped from inside bash
+    ($HOME's top level is read-only there, ruling 2026-10-07), so its target is pinned instead; a
+    deeper link still refuses (test_bwrap_refuses_a_replaceable_symlinked_protected_file)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     real = tmp_path / "dotfiles-ssh"
     real.mkdir()
     (tmp_path / ".ssh").symlink_to(real)
-    with pytest.raises(ConfinementError, match="symlink"):
-        _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw"))
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw"))
+    assert ["--bind", str(real.resolve()), str(real.resolve())] in [argv[k:k + 3] for k in range(len(argv))]
+    # In the view the link is recreated as the same link; nothing is mounted at or through it.
+    link = str(tmp_path / ".ssh")
+    assert ["--symlink", str(real), link] in [argv[k:k + 3] for k in range(len(argv))]
+    assert argv.count(link) == 1
+    assert not any(a.startswith(link + "/") for a in argv)
 
 
 def test_bwrap_refuses_a_replaceable_symlinked_protected_file(tmp_path, monkeypatch) -> None:
@@ -2632,6 +2653,8 @@ def test_bwrap_distinct_roots_differing_only_in_case_both_keep_their_tmpfs(tmp_p
     swallowed the distinct /x/secret/inner and left it readable. Containment must be exact."""
     monkeypatch.setenv("HOME", str(tmp_path))
     a, b = tmp_path / "Secret", tmp_path / "secret" / "inner"
+    a.mkdir()
+    b.mkdir(parents=True)
     argv = _bwrap_argv(build_policy(_entity(tmp_path), extra_deny_read_write=(a, b)))
     tmpfs = [argv[k + 1] for k, x in enumerate(argv) if x == "--tmpfs"]
     assert str(a) in tmpfs and str(b) in tmpfs

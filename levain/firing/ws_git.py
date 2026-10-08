@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from levain.firing.hands import SECURE_PATH, WORKSPACE_ROOT, _abs
+from levain.launch import child_env
 
 #: The only config keys ``ws-git`` accepts in a repository's own config. Every other key (fsmonitor,
 #: hooksPath, pager, editor, sshCommand, alias.*, filter.*, diff.*, include*, credential.*, ...) can
@@ -65,7 +66,7 @@ def _real_git() -> str:
     import stat
 
     if platform.system() == "Darwin":
-        r = subprocess.run(["/usr/bin/xcrun", "--find", "git"], capture_output=True, text=True, cwd="/")
+        r = subprocess.run(["/usr/bin/xcrun", "--find", "git"], capture_output=True, text=True, cwd="/", env=child_env())
         cand = r.stdout.strip()
         if r.returncode == 0 and cand:
             try:
@@ -181,7 +182,7 @@ def _run_relayed(argv: list[str]) -> int:
     import sys
 
     proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            start_new_session=True, cwd="/")
+                            start_new_session=True, cwd="/", env=child_env())
     assert proc.stdout is not None
     for chunk in iter(lambda: proc.stdout.read(65536), b""):
         sys.stdout.buffer.write(_sanitise(chunk))
@@ -230,7 +231,7 @@ def entity_session_live(hands_uid: int) -> bool:
             raise WsGitError("cannot tell whether the entity is running (/proc hides other users' "
                              "processes); refusing")
     def pids() -> set[str]:
-        r = subprocess.run([_abs("pgrep"), "-U", str(hands_uid)], capture_output=True, text=True, cwd="/")
+        r = subprocess.run([_abs("pgrep"), "-U", str(hands_uid)], capture_output=True, text=True, cwd="/", env=child_env())
         if r.returncode not in (0, 1):
             raise WsGitError(f"cannot tell whether the entity is running (pgrep: {r.stderr.strip() or r.returncode}); "
                              "refusing")
@@ -246,7 +247,7 @@ def entity_session_live(hands_uid: int) -> bool:
     # entity's is. The pid set is read again after ps: a process that exited and forked in between
     # would otherwise leave only agents in view.
     ps = subprocess.run(["/bin/ps", "-o", "pid=,ppid=,comm=", "-p", ",".join(sorted(found))],
-                        capture_output=True, text=True, cwd="/")
+                        capture_output=True, text=True, cwd="/", env=child_env())
     rows = {}
     for ln in ps.stdout.splitlines():
         parts = ln.split(None, 2)
@@ -477,7 +478,7 @@ def _hands_python(hands: Hands) -> str:
         if _under_a_workspace_root(Path(cand)):
             continue
         r = subprocess.run(_as_hands(hands, cand, "-I", "-S", "-c", ""), capture_output=True,
-                           stdin=subprocess.DEVNULL, cwd="/")
+                           stdin=subprocess.DEVNULL, cwd="/", env=child_env())
         if r.returncode == 0:
             return cand
     raise WsGitError(f"no Python that the entity's user {hands.user} can run was found")
@@ -517,7 +518,7 @@ def _put(entity_dir: Path | str, src: Path | str, dest: Path | str) -> int:
             print(f"ws-put: {exc}")
             return 1
         r = subprocess.run(_as_hands(hands, py, "-I", "-S", "-c", _PUT_SCRIPT, str(hands.workspace), *parts),
-                           stdin=fd, capture_output=True, start_new_session=True, cwd="/")
+                           stdin=fd, capture_output=True, start_new_session=True, cwd="/", env=child_env())
     finally:
         os.close(fd)
     if r.returncode != 0:
@@ -607,7 +608,7 @@ def _hands_can_write(hands: Hands, tree: Path) -> str | None:
     asked of the hands user itself (``test -w``, which answers for modes and ACLs alike), or None.
     Raises when the question could not be answered."""
     probe = subprocess.run(_as_hands(hands, "/bin/sh", "-c", _CAN_WRITE_SCRIPT, "sh", str(tree), str(tree.parent)),
-                           capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/")
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env())
     if probe.returncode != 0:
         raise WsGitError(f"could not ask the entity's user what it can write in {tree}; refusing")
     first = probe.stdout.split("\n", 1)[0].strip()
@@ -618,7 +619,7 @@ def _operator_git(rfd: int, *args: str) -> subprocess.CompletedProcess:
     """The operator's git on the operator's own repository, run inside the pinned directory ``rfd``
     (never by its name again)."""
     return subprocess.run([_abs("git"), *_NEUTRALISE, *args], capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, pass_fds=(rfd,), preexec_fn=lambda: os.fchdir(rfd))
+                          stdin=subprocess.DEVNULL, pass_fds=(rfd,), preexec_fn=lambda: os.fchdir(rfd), env=child_env())
 
 
 def _remote_ok(rname: str, url: str) -> bool:
@@ -706,12 +707,12 @@ def _adopt_pinned(hands: Hands, src: Path, rfd: int, name: str | None) -> int:
     with tempfile.TemporaryFile() as bundle_err:
         bundle = subprocess.Popen([_abs("git"), *_NEUTRALISE, "bundle", "create", "-", "--branches", "--tags"],
                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=bundle_err,
-                                  pass_fds=(rfd,), preexec_fn=lambda: os.fchdir(rfd))
+                                  pass_fds=(rfd,), preexec_fn=lambda: os.fchdir(rfd), env=child_env())
         assert bundle.stdout is not None
         imp = subprocess.run(
             _as_hands(hands, "/bin/sh", "-c", _IMPORT_SCRIPT, "sh", _real_git(), str(dest), head_branch, fmt,
                       *_NEUTRALISE, env=("GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")),
-            stdin=bundle.stdout, capture_output=True, start_new_session=True, cwd="/")
+            stdin=bundle.stdout, capture_output=True, start_new_session=True, cwd="/", env=child_env())
         bundle.stdout.close()
         bundle_rc = bundle.wait()
         bundle_err.seek(0)
@@ -726,7 +727,7 @@ def _adopt_pinned(hands: Hands, src: Path, rfd: int, name: str | None) -> int:
             check_repo(dest / ".git", hands.uid)
             got = subprocess.run(ws_git_argv(hands, dest / ".git", ["for-each-ref", "--format=%(objectname) %(refname)",
                                                                    "refs/heads", "refs/tags"]),
-                                 capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/")
+                                 capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env())
             have = _heads(got.stdout)
             if got.returncode != 0 or have != want:
                 missing = sorted(set(want) - set(have)) or sorted(r for r in want if want[r] != have.get(r))
@@ -734,14 +735,14 @@ def _adopt_pinned(hands: Hands, src: Path, rfd: int, name: str | None) -> int:
         except (WsGitError, OSError) as exc:
             problem = str(exc)
     if problem:
-        rm = subprocess.run(_as_hands(hands, "/bin/rm", "-rf", "--", str(dest)), capture_output=True, cwd="/")
+        rm = subprocess.run(_as_hands(hands, "/bin/rm", "-rf", "--", str(dest)), capture_output=True, cwd="/", env=child_env())
         kept = ("Nothing was kept in the workspace" if rm.returncode == 0 and not os.path.lexists(dest)
                 else f"The partial import at {dest} could not be removed")
         print(f"ws-adopt: {problem}. {kept}; your repository is unchanged.")
         return 1
     for rname, url in remotes.items():
         if subprocess.run(ws_git_argv(hands, dest / ".git", ["remote", "add", "--", rname, url]), capture_output=True,
-                          stdin=subprocess.DEVNULL, cwd="/").returncode != 0:
+                          stdin=subprocess.DEVNULL, cwd="/", env=child_env()).returncode != 0:
             dropped.append(rname)
     try:
         check_repo(dest / ".git", hands.uid)          # what ws-git will check: it must still pass
@@ -774,7 +775,7 @@ def foreign_entries(hands: Hands) -> list[Path]:
 
     def walk(*predicate: str) -> list[Path]:
         r = subprocess.run(_as_hands(hands, find, str(hands.workspace), *predicate, "-print0"),
-                           capture_output=True, stdin=subprocess.DEVNULL, cwd="/")
+                           capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env())
         if r.returncode != 0:
             why = _sanitise(r.stderr).decode("utf-8", "replace").strip().splitlines()[-1:] or [str(r.returncode)]
             raise WsGitError(f"the scan of the workspace as {hands.user} failed: {why[0]}")
@@ -806,12 +807,12 @@ def bare_repository_explicit() -> bool:
     """Whether the operator's git uses a bare repository only when told to (``safe.bareRepository =
     explicit``), so a bare repository planted anywhere is never picked up by discovery. Read only."""
     r = subprocess.run([_abs("git"), "config", "--get", "safe.bareRepository"], capture_output=True, text=True,
-                       stdin=subprocess.DEVNULL, cwd="/")
+                       stdin=subprocess.DEVNULL, cwd="/", env=child_env(prefixes=("GIT_CONFIG",)))
     if r.stdout.strip().lower() != "explicit":
         return False
     # Before git 2.38 the key does not exist, so a value in it protects nothing.
     m = re.search(r"(\d+)\.(\d+)", subprocess.run([_abs("git"), "--version"], capture_output=True, text=True,
-                                                   cwd="/").stdout)
+                                                   cwd="/", env=child_env(prefixes=("GIT_CONFIG",))).stdout)
     return bool(m) and (int(m.group(1)), int(m.group(2))) >= (2, 38)
 
 
@@ -820,7 +821,7 @@ def wildcard_safe_directory(roots: tuple[Path, ...] = ()) -> list[str]:
     under a workspace root (a ``<dir>/*`` entry covering it, or an entry inside it). Either switches
     off git's ownership check for the entity's repositories. Read only; nothing is executed."""
     r = subprocess.run([_abs("git"), "config", "--show-origin", "--get-all", "safe.directory"],
-                       capture_output=True, text=True, cwd="/")
+                       capture_output=True, text=True, cwd="/", env=child_env(prefixes=("GIT_CONFIG",)))
     hits = []
     for ln in r.stdout.splitlines():
         origin, _, value = ln.partition("\t")

@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ..launch import child_env
 from . import canon as C
 from . import entry as E
 from . import index as I
@@ -314,7 +315,8 @@ def cmd_doctor(args) -> int:
                      + (I.age(_iso(st.get('last_fetch_ok'))) if st.get("last_fetch_ok") else "never")
                      + (f"; last error: {err}" if err else "")))
         ahead = subprocess.run(["git", "log", "--format=%s", f"refs/remotes/{gl.remote}/levain-ledger..HEAD"],
-                               cwd=gl.wt, capture_output=True, text=True)
+                               cwd=gl.wt, capture_output=True, text=True,
+                               env=child_env(prefixes=("GIT_",)))
         subjects = ahead.stdout.splitlines() if ahead.returncode == 0 else ["?"]
         real = [s for s in subjects if not s.startswith("levain team: ack ")]
         rows.append((not real, f"{len(subjects)} local ledger commit(s) not pushed"
@@ -351,7 +353,7 @@ def _hook_import_check(repo: Repo) -> tuple[bool, str]:
     except (OSError, ValueError, KeyError, IndexError, TypeError):
         return False, "cannot read the wired PreToolUse command"
     cp = subprocess.run([py, "-P", "-c", "import levain.team.hook"], capture_output=True, text=True,
-                        cwd=str(repo.toplevel), timeout=30)
+                        cwd=str(repo.toplevel), timeout=30, env=child_env())
     if cp.returncode != 0:
         return False, f"the wired interpreter cannot import levain.team.hook: {cp.stderr.strip()[-200:]}"
     return True, "the wired interpreter imports levain.team.hook"

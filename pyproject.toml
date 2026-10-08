@@ -148,7 +148,7 @@ openhands = ["openhands-sdk==1.26.0", "openhands-tools==1.26.0", "mcp>=1.27,<2"]
 dev = ["pytest>=7.4", "mcp>=1.27,<2"]
 
 [project.scripts]
-levain = "levain.cli:main"
+levain = "levain.launch:main"
 
 [project.urls]
 Homepage = "https://levainhq.com"

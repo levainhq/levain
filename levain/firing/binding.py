@@ -89,7 +89,7 @@ def _policy_to_params(policy: CrownJewelsPolicy) -> dict[str, Any]:
         if isinstance(v, Path):
             out[f.name] = str(v)
         elif isinstance(v, tuple):
-            out[f.name] = [str(p) for p in v]
+            out[f.name] = [[str(x) for x in p] if isinstance(p, tuple) else str(p) for p in v]
         else:
             out[f.name] = v
     return out
@@ -99,6 +99,7 @@ def _policy_to_params(policy: CrownJewelsPolicy) -> dict[str, Any]:
 # whose type is not listed here REFUSES rather than passing through unchecked (and a dropped
 # `from __future__ import annotations` in confinement.py cannot quietly move fields to "unchecked").
 _PATH, _OPT_PATH, _PATHS, _BOOL, _SSH_MODE = "path", "optional_path", "paths", "bool", "ssh_mode"
+_PATH_PAIRS = "path_pairs"
 
 
 def _field_kinds() -> dict[str, str]:
@@ -107,6 +108,7 @@ def _field_kinds() -> dict[str, str]:
         Path: _PATH,
         Optional[Path]: _OPT_PATH,
         tuple[Path, ...]: _PATHS,
+        tuple[tuple[Path, Path], ...]: _PATH_PAIRS,
         bool: _BOOL,
         SshMode: _SSH_MODE,
     }
@@ -146,6 +148,10 @@ def _policy_from_params(data: Any) -> CrownJewelsPolicy:
             if not isinstance(v, list):
                 raise BindingError(f"floor field {name!r} is not a list of paths (fail-closed).")
             kwargs[name] = tuple(_abs_path(name, x) for x in v)
+        elif kind == _PATH_PAIRS:
+            if not isinstance(v, list) or not all(isinstance(x, list) and len(x) == 2 for x in v):
+                raise BindingError(f"floor field {name!r} is not a list of path pairs (fail-closed).")
+            kwargs[name] = tuple((_abs_path(name, a), _abs_path(name, b)) for a, b in v)
         elif kind == _PATH:
             kwargs[name] = _abs_path(name, v)
         elif kind == _OPT_PATH:

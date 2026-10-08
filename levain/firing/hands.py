@@ -65,6 +65,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Literal
 
+from levain.launch import child_env
+
 HostOS = Literal["darwin", "linux"]
 
 #: Every name this module creates or deletes matches this; anything else is refused.
@@ -325,7 +327,7 @@ def _darwin_group_with_id(name: str, gid: int) -> tuple[bool, str]:
     """The group ``name`` with PrimaryGroupID ``gid``: created if absent; if present, it must
     already hold that id (another id is refused, never overwritten)."""
     r = subprocess.run(["/usr/bin/dscl", ".", "-read", f"/Groups/{name}", "PrimaryGroupID"],
-                       capture_output=True, text=True, cwd="/")
+                       capture_output=True, text=True, cwd="/", env=child_env())
     if r.returncode == 0:
         have = r.stdout.split()[-1] if r.stdout.split() else ""
         return (True, "") if have == str(gid) else (False, f"group {name} exists with id {have!r}, not {gid}")
@@ -340,7 +342,7 @@ def _darwin_group_with_id(name: str, gid: int) -> tuple[bool, str]:
 def _darwin_leave_groups(user: str) -> tuple[bool, str]:
     """Remove ``user`` from every group that lists it as a member."""
     out = subprocess.run(["/usr/bin/dscl", ".", "-list", "/Groups", "GroupMembership"], capture_output=True,
-                         text=True, cwd="/")
+                         text=True, cwd="/", env=child_env())
     if out.returncode != 0:
         return False, out.stderr.strip()
     for line in out.stdout.splitlines():
@@ -471,14 +473,14 @@ def plan_undo(
 def _run_ok(argv: tuple[str, ...], *, missing_ok: bool = False) -> tuple[bool, str]:
     if missing_ok and not os.path.lexists(argv[-1]):
         return True, "already gone"
-    r = subprocess.run(argv, capture_output=True, text=True, cwd="/")
+    r = subprocess.run(argv, capture_output=True, text=True, cwd="/", env=child_env())
     return r.returncode == 0, (r.stderr or r.stdout).strip()
 
 
 def _kill_all(uid: int, *, attempts: int = 20) -> tuple[bool, str]:
     for _ in range(attempts):
-        subprocess.run([_abs("pkill"), "-KILL", "-U", str(uid)], capture_output=True, cwd="/")
-        if subprocess.run([_abs("pgrep"), "-U", str(uid)], capture_output=True, cwd="/").returncode == 1:
+        subprocess.run([_abs("pkill"), "-KILL", "-U", str(uid)], capture_output=True, cwd="/", env=child_env())
+        if subprocess.run([_abs("pgrep"), "-U", str(uid)], capture_output=True, cwd="/", env=child_env()).returncode == 1:
             return True, ""
         time.sleep(0.25)
     return False, f"processes of uid {uid} are still running"
@@ -564,7 +566,7 @@ def _readable_and_sanitised(tree: Path, operator_gid: int, *, owner_uid: int | N
             kept = [(k, v) for k, v in kept if CONFIG_ALLOWLIST.match(k)]
             cfg.unlink()
             for k, v in kept:
-                subprocess.run([_abs("git"), "config", "--file", str(cfg), "--add", k, v], capture_output=True, cwd="/")
+                subprocess.run([_abs("git"), "config", "--file", str(cfg), "--add", k, v], capture_output=True, cwd="/", env=child_env())
             if cfg.exists():
                 os.chown(cfg, cfg_uid, operator_gid)
                 os.chmod(cfg, 0o640)
@@ -662,12 +664,12 @@ def used_ids(host: HostOS) -> set[int]:
     if host == "darwin":
         for kind, attr in (("/Users", "UniqueID"), ("/Groups", "PrimaryGroupID")):
             out = subprocess.run(["/usr/bin/dscl", ".", "-list", kind, attr],
-                                 capture_output=True, text=True, check=True).stdout
+                                 capture_output=True, text=True, check=True, env=child_env()).stdout
             used.update(int(p[-1]) for p in (ln.split() for ln in out.splitlines())
                         if p and p[-1].lstrip("-").isdigit())
         return used
     for db in ("passwd", "group"):
-        out = subprocess.run([_abs("getent"), db], capture_output=True, text=True, check=True).stdout
+        out = subprocess.run([_abs("getent"), db], capture_output=True, text=True, check=True, env=child_env()).stdout
         used.update(int(f[2]) for f in (ln.split(":") for ln in out.splitlines()) if len(f) > 2 and f[2].isdigit())
     return used
 
@@ -711,7 +713,7 @@ def git_checks_gitdir_ownership(version_text: str) -> bool:
 
 
 def git_version() -> str:
-    return subprocess.run([_abs("git"), "--version"], capture_output=True, text=True, cwd="/").stdout.strip()
+    return subprocess.run([_abs("git"), "--version"], capture_output=True, text=True, cwd="/", env=child_env()).stdout.strip()
 
 
 def git_refuses_foreign_gitdir(operator: str) -> bool:
@@ -734,7 +736,7 @@ def git_refuses_foreign_gitdir(operator: str) -> bool:
         os.chown(repo / ".git", nobody.pw_uid, nobody.pw_gid)
         os.chown(repo, op.pw_uid, op.pw_gid)
         r = subprocess.run(["/usr/bin/sudo", "-u", operator, "/usr/bin/env", "-i", *[f"{k}={v}" for k, v in env.items()],
-                            _abs("git"), "-C", str(repo), "status"], capture_output=True, text=True, cwd="/")
+                            _abs("git"), "-C", str(repo), "status"], capture_output=True, text=True, cwd="/", env=child_env())
         return r.returncode != 0 and "dubious ownership" in (r.stderr + r.stdout)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
@@ -791,7 +793,7 @@ def operator_git_identity(operator: str) -> dict[str, str]:
     run_as = ["/usr/bin/sudo", "-u", operator] if os.geteuid() == 0 else []
     for key in ("user.name", "user.email"):
         r = subprocess.run([*run_as, "/usr/bin/env", f"HOME={_home_of(operator)}", _abs("git"),
-                            "config", "--global", "--get", key], capture_output=True, text=True, cwd="/")
+                            "config", "--global", "--get", key], capture_output=True, text=True, cwd="/", env=child_env())
         if r.returncode == 0 and r.stdout.strip():
             found[key] = r.stdout.strip()
     return found
@@ -806,7 +808,7 @@ def user_record_is_ours(hands_user: str, host: HostOS) -> bool:
     if host == "linux":
         return entry.pw_gecos.split(",")[0] == HANDS_MARKER
     out = subprocess.run(["/usr/bin/dscl", ".", "-read", f"/Users/{hands_user}", "RealName"],
-                         capture_output=True, text=True).stdout
+                         capture_output=True, text=True, env=child_env()).stdout
     return HANDS_MARKER in out
 
 
@@ -814,11 +816,11 @@ def user_is_retired(hands_user: str, host: HostOS) -> bool:
     """True when ``hands_user`` exists as an undo tombstone (:data:`RETIRED_MARKER`), asked of the
     directory service in a fresh process (this process's cache can lag a change just made)."""
     if host == "linux":
-        r = subprocess.run([_abs("getent"), "passwd", hands_user], capture_output=True, text=True, cwd="/")
+        r = subprocess.run([_abs("getent"), "passwd", hands_user], capture_output=True, text=True, cwd="/", env=child_env())
         fields = r.stdout.strip().split(":")
         return r.returncode == 0 and len(fields) > 4 and fields[4] == RETIRED_MARKER[host]
     r = subprocess.run(["/usr/bin/dscl", ".", "-read", f"/Users/{hands_user}", "RealName"],
-                       capture_output=True, text=True, cwd="/")
+                       capture_output=True, text=True, cwd="/", env=child_env())
     return r.returncode == 0 and RETIRED_MARKER[host] in r.stdout
 
 
@@ -848,7 +850,7 @@ def run_plan(plan: Plan, *, dry_run: bool, emit: Callable[[str], None] = print) 
             continue
         # cwd "/": a command run as the hands user dies on a working directory it cannot read
         # (measured: git fatals on the operator's home).
-        if step.skip_if and subprocess.run(step.skip_if, capture_output=True, cwd="/").returncode == 0:
+        if step.skip_if and subprocess.run(step.skip_if, capture_output=True, cwd="/", env=child_env()).returncode == 0:
             emit("      already done")
             continue
         if step.write is not None:
@@ -859,7 +861,7 @@ def run_plan(plan: Plan, *, dry_run: bool, emit: Callable[[str], None] = print) 
             except Exception as exc:  # noqa: BLE001 — a step that raises is a failed step, not a crash mid-undo
                 ok, why = False, f"{type(exc).__name__}: {exc}"
         else:
-            r = subprocess.run(step.argv, capture_output=True, text=True, cwd="/")
+            r = subprocess.run(step.argv, capture_output=True, text=True, cwd="/", env=child_env())
             ok, why = r.returncode == 0, (r.stderr or r.stdout).strip()
         if ok and why:
             emit(f"      {why}")
@@ -887,7 +889,7 @@ def _install_file(path: Path, content: str, mode: int, *, validate: tuple[str, .
             fh.write(content)
         os.chmod(tmp, mode)
         if validate:
-            r = subprocess.run([*validate, tmp], capture_output=True, text=True)
+            r = subprocess.run([*validate, tmp], capture_output=True, text=True, env=child_env())
             if r.returncode != 0:
                 return False, (r.stderr or r.stdout).strip()
         os.chown(tmp, 0, 0)

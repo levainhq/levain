@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..launch import NETWORK, child_env
 from . import entry as E
 from . import index as I
 from . import roles as R
@@ -63,7 +64,12 @@ _REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false",
 
 def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         input_text: str | None = None) -> subprocess.CompletedProcess:
-    env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
+    # The allowlist plus what a fetch or push needs: proxies and CA bundles, git's own settings,
+    # and the tokens gh's credential helper reads (levain.launch: never a copy of os.environ).
+    env = child_env(*NETWORK, "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
+                    "GITHUB_ENTERPRISE_TOKEN", prefixes=("GIT_",))
+    for k in _SCRUB_ENV:
+        env.pop(k, None)
     env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true")
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
     try:

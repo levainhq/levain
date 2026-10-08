@@ -129,13 +129,16 @@ def test_a_jewel_replaced_by_a_symlink_refuses(tmp_path, monkeypatch):
 
 
 def test_a_hidden_directory_swapped_for_a_link_refuses(tmp_path, monkeypatch):
-    """L3 r2 codex: a tmpfs-covered directory renamed away and replaced by a symlink."""
-    secrets = tmp_path / "secrets"
+    """L3 r2 codex: a tmpfs-covered directory renamed away and replaced by a symlink. Below a
+    subdirectory of $HOME: directly in $HOME the host rename is not even visible to bash (the
+    step (0) view), so there is nothing to recheck."""
+    (tmp_path / "sub").mkdir()
+    secrets = tmp_path / "sub" / "secrets"
     secrets.mkdir()
     (secrets / "token").write_text("x")
     sh = _shell(tmp_path, monkeypatch, extra=(secrets,))
-    secrets.rename(tmp_path / "moved")
-    secrets.symlink_to(tmp_path / "moved")
+    secrets.rename(tmp_path / "sub" / "moved")
+    secrets.symlink_to(tmp_path / "sub" / "moved")
     with pytest.raises(ConfinementError, match=_CHANGED):
         sh.run("echo x")
 
@@ -214,7 +217,7 @@ def test_an_error_recording_the_manifest_refuses_before_any_start(tmp_path, monk
         raise PermissionError(13, "Permission denied", str(p))
 
     monkeypatch.setattr(conf, "_identity", boom)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)   # fail in _identity only
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)   # fail in _identity only
     started = []
     monkeypatch.setattr(conf._BwrapShell, "start", lambda self: started.append(1) or self)
     with pytest.raises(ConfinementError, match="could not (prepare or record|inspect)"):
@@ -230,7 +233,8 @@ def test_paths_inside_a_tmpfs_root_are_not_tracked(tmp_path, monkeypatch):
     policy = build_policy(_entity(tmp_path))
     mounted, unmounted = _mount_plan_paths(_bwrap_argv(policy), policy)
     ssh = str((tmp_path / ".ssh").resolve())
-    assert ssh in mounted
+    # ~/.ssh itself is inside step (0)'s $HOME view now: hidden from the host like what is in it.
+    assert ssh not in mounted
     assert not [q for q in [*mounted, *unmounted] if q.startswith(ssh + "/")]
 
 
@@ -384,7 +388,7 @@ def test_a_jewel_that_changes_while_the_floor_is_planned_refuses_the_spawn(tmp_p
     import levain.firing.confinement as conf
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
     entity = _entity(tmp_path)
     vault = entity / ".levain" / "vaultdir"
     real_plan = conf._bwrap_plan
@@ -422,7 +426,7 @@ def test_the_shell_env_never_carries_bash_env(tmp_path, monkeypatch):
     import levain.firing.confinement as conf
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
     seen = {}
 
     def fake_start(self):
@@ -440,7 +444,7 @@ def test_a_change_during_the_start_closes_the_shell_before_any_command(tmp_path,
     import levain.firing.confinement as conf
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
     entity = _entity(tmp_path)
     late = tmp_path / "creds" / "late-token"
     late.parent.mkdir()
@@ -458,7 +462,7 @@ def test_the_shell_never_runs_startup_code_from_its_env(tmp_path, monkeypatch):
     import levain.firing.confinement as conf
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
     seen = {}
 
     def fake_start(self):
@@ -484,7 +488,7 @@ def test_a_filesystem_error_in_the_post_start_recheck_is_a_refusal(tmp_path, mon
     import levain.firing.confinement as conf
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
-    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted: None)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
     closed = []
     monkeypatch.setattr(conf._BwrapShell, "start", lambda self: self)
     monkeypatch.setattr(conf._BwrapShell, "close", lambda self: closed.append(1))
@@ -510,3 +514,92 @@ def test_live_a_hostile_env_runs_nothing_and_the_shell_still_works(tmp_path, mon
         r = sh.run("printf 'ok\\n'", timeout=20)
         assert "ok" in r.output
         assert "HOSTILE" not in r.output
+
+
+def test_a_ledger_that_cannot_be_written_refuses_before_any_start(tmp_path, monkeypatch):
+    """codex (L3 r2 frozen tip): the claim commit failing (ENOSPC, say) was ignored and the shell
+    started, while the ledger on disk did not carry its claim; another session's close could then
+    remove a placeholder this shell's mask stands on."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    real_replace = os.replace
+
+    def full_disk(src, dst):
+        if str(dst).endswith(conf._LEDGER_NAME):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(conf.os, "replace", full_disk)
+    started = []
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: started.append(1) or self)
+    with pytest.raises(ConfinementError, match="cannot be written"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)))
+    assert not started
+
+
+def test_a_failed_ledger_commit_removes_what_the_spawn_made(tmp_path, monkeypatch):
+    """complement + codex r3: the refusal left the 0444 placeholders it had made, in no ledger."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    real_replace = os.replace
+
+    def full_disk(src, dst):
+        if str(dst).endswith(conf._LEDGER_NAME):
+            raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(conf.os, "replace", full_disk)
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: self)
+    with pytest.raises(ConfinementError, match="cannot be written"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path), deny_standard_creds=True))
+    assert not (tmp_path / ".netrc").exists()
+
+
+def test_an_unreadable_ledger_refuses_before_anything_is_made(tmp_path, monkeypatch):
+    """codex r3: with the ledger unreadable the spawn went ahead with no claim on disk."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    d = conf._ledger_dir()
+    d.mkdir(parents=True, mode=0o700)
+    d.parent.chmod(0o700)
+    (d / conf._LEDGER_NAME).write_text("{not json")
+    started = []
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: started.append(1) or self)
+    with pytest.raises(ConfinementError, match="cannot be read"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path), deny_standard_creds=True))
+    assert not started and not (tmp_path / ".netrc").exists()
+
+
+def test_a_retag_that_does_not_reach_the_disk_closes_the_shell(tmp_path, monkeypatch):
+    """codex r3: the process-group retag was assumed durable; unwritten, a sweep after a levain crash
+    would see only the dead parent's claim and remove a mountpoint the live sandbox stands on."""
+    import levain.firing.confinement as conf
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    real_replace = os.replace
+    commits = []
+
+    def second_commit_fails(src, dst):
+        if str(dst).endswith(conf._LEDGER_NAME):
+            commits.append(1)
+            if len(commits) == 2:
+                raise OSError(28, "No space left on device")
+        return real_replace(src, dst)
+
+    class _P:
+        pid = 4242
+
+    def start(self):
+        self._proc = _P()
+        return self
+
+    closed = []
+    monkeypatch.setattr(conf.os, "replace", second_commit_fails)
+    monkeypatch.setattr(conf._BwrapShell, "start", start)
+    monkeypatch.setattr(conf._BwrapShell, "close", lambda self: closed.append(1))
+    with pytest.raises(ConfinementError, match="cannot be written"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)))
+    assert closed

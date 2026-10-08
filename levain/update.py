@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Callable
 
 from levain import manifest, reconcile
+from levain.launch import NETWORK, child_env
 from levain.install import InstallLockError, install_lock, refresh_adapter
 from levain.manifest import AxisVerdict, CompatSet, InstalledSet
 
@@ -352,7 +353,8 @@ def _reconcile_anneal(
         return
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600
+            cmd, capture_output=True, text=True, timeout=600,
+            env=child_env(*NETWORK, prefixes=("PIP_", "UV_")),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         emit(f"  pip failed to launch: {exc}\n    Run it yourself: {printable}")
@@ -441,7 +443,7 @@ def _run_anneal(
         try:
             r = subprocess.run(
                 cmd, capture_output=True, text=True,
-                errors="replace", timeout=timeout,
+                errors="replace", timeout=timeout, env=child_env(),
             )
         except subprocess.TimeoutExpired:
             return False, f"{cmd[0]}: timed out"

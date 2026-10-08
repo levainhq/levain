@@ -11,7 +11,9 @@ confinement CORE (the policy + the profile + the persistent sandboxed shell), be
 allow the workspace`` — a JAIL. A CC replacement inverts it: ``(allow default) → DENY the crown
 jewels``. The OS sandbox stops being a jail and becomes a **structural FLOOR** that keeps the
 (less-trusted, open-model) entity out of the sovereignty crown jewels no matter what it is told to
-do, while it otherwise works like CC on real repos. This inversion also DISSOLVES the hardest part
+do, while it otherwise works like CC on real repos (one stated exception, Linux only: inside bash
+the entries directly in ``$HOME`` are read-only; see step (0) of :func:`_bwrap_plan_impl`). This
+inversion also DISSOLVES the hardest part
 of the old design — a default-DENY profile blocked ``cat``/``python`` from loading their own libs, so
 it needed an empirically-hunted "system allow-set"; a default-ALLOW profile needs NO allow-set at all
 (every tool loads its libs freely), so the profile is JUST the denylist.
@@ -221,12 +223,13 @@ is allowed to land).
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import platform
 import queue
+import re
 import shlex
-import shutil
 import signal
 import stat
 import subprocess
@@ -234,6 +237,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -356,7 +360,99 @@ def cred_floor_label(system: str | None = None) -> str:
     return base + (" · the Keychain" if (system or _platform.system()) == "Darwin" else "")
 
 
-_STANDARD_CRED_SUBTREES = ("~/.config/gh",)   # gh OAuth token (hosts.yml) → repo push/admin
+_STANDARD_CRED_SUBTREES = (
+    "~/.config/gh",                 # gh OAuth token (hosts.yml) → repo push/admin
+    # Cloud CLI credential caches (lane P2 item 4). Each holds a live token the CLI writes itself:
+    "~/.aws/sso/cache",             # IAM Identity Center tokens (botocore _SSO_TOKEN_CACHE_DIR)
+    "~/.aws/cli/cache",             # assumed-role temporary credentials (aws-cli assumerole CACHE_DIR);
+                                    # not ~/.aws/cli itself, which holds `alias`
+    "~/.aws/login/cache",           # `aws login` tokens (or $AWS_LOGIN_CACHE_DIRECTORY, below)
+    "~/.aws/boto/cache",            # botocore JSONFileCache (assume-role / SSO credentials)
+    "~/.config/gcloud",             # gcloud's credential databases and ADC (or $CLOUDSDK_CONFIG)
+    "~/.azure",                     # az's MSAL token cache and service principals (or $AZURE_CONFIG_DIR)
+)
+# Credential directories that are a tool's WHOLE home. On Linux an absent one is created (0700,
+# recorded in the placeholder ledger and removed at close if still empty) and masked like every
+# other absent jewel directory, so the shell can neither plant a config there nor read what an
+# operator's `gcloud auth login` writes there mid-session (L2 r1). One whose parent this user cannot
+# write is skipped: the shell cannot create it either. macOS denies them whether or not they exist.
+_PRESENT_ONLY_CRED_DIRS = ("~/.config/gcloud", "~/.azure")
+# The tools' own credential-location overrides (L1 r1), read from the environment when the policy
+# is built: (variable, "dir" | "file", the path(s) its value names). Each is denied IN ADDITION to
+# the default location, which can still hold what was written before the override was set.
+_CRED_OVERRIDES: tuple[tuple[str, str, str], ...] = (
+    ("AWS_LOGIN_CACHE_DIRECTORY", "dir", "{}"),
+    ("CLOUDSDK_CONFIG", "dir", "{}"),
+    ("AZURE_CONFIG_DIR", "dir", "{}"),
+    ("GH_CONFIG_DIR", "dir", "{}"),
+    ("XDG_CONFIG_HOME", "dir", "{}/gh"),
+    ("XDG_CONFIG_HOME", "file", "{}/git/credentials"),
+    ("AWS_SHARED_CREDENTIALS_FILE", "file", "{}"),
+    ("NETRC", "file", "{}"),
+    ("NPM_CONFIG_USERCONFIG", "file", "{}"),
+    ("DOCKER_CONFIG", "file", "{}/config.json"),
+    ("KUBECONFIG", "file", "{list}"),       # a colon-separated list: every entry
+)
+_CRED_DIR_ENV = tuple(v for v, kind, _ in _CRED_OVERRIDES if kind == "dir")
+
+
+def _git_store_files(config: Path) -> list[Path]:
+    """The files a ``credential.helper = store --file <path>`` in git config ``config`` names."""
+    try:
+        text = config.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"\s*helper\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        value = m.group(1).strip()
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            value = value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            continue
+        if not words or words[0] != "store":
+            continue
+        for k, w in enumerate(words):
+            if w.startswith("--file="):
+                out.append(Path(os.path.expanduser(w[len("--file="):])))
+            elif w == "--file" and k + 1 < len(words):
+                out.append(Path(os.path.expanduser(words[k + 1])))
+    return out
+
+
+def _cred_overrides(environ=None) -> tuple[list[Path], list[Path]]:
+    """``(dirs, files)`` the credential-location overrides in ``environ`` name: absolute paths only (a
+    relative value would be resolved against whatever directory levain was started in). Includes the
+    store files a ``GIT_CONFIG_GLOBAL`` config names."""
+    env = os.environ if environ is None else environ
+    dirs: list[Path] = []
+    files: list[Path] = []
+    for var, kind, form in _CRED_OVERRIDES:
+        value = env.get(var, "")
+        values = value.split(os.pathsep) if form == "{list}" else [value]
+        for v in values:
+            v = os.path.expanduser(v)
+            if not v or not os.path.isabs(v):
+                continue
+            path = Path(v if form == "{list}" else form.format(v))
+            (dirs if kind == "dir" else files).append(path)
+    git_global = os.path.expanduser(env.get("GIT_CONFIG_GLOBAL", ""))
+    if git_global and os.path.isabs(git_global):
+        files += [f for f in _git_store_files(Path(git_global)) if f.is_absolute()]
+    return list(_dedup_paths(dirs)), list(_dedup_paths(files))
+
+
+def _cred_dir_sources() -> list[Path]:
+    """The credential directories that are a tool's whole home, lexical: the defaults and every
+    override (:data:`_CRED_DIR_ENV`)."""
+    home = Path.home()
+    return list(_dedup_paths([home / d[2:] for d in _PRESENT_ONLY_CRED_DIRS] + _cred_overrides()[0]))
+
+
 _STANDARD_CRED_FILES = (
     "~/.aws/credentials",           # aws access key/secret. NOT ~/.aws/config — it holds region /
                                     # profile / SSO the entity legitimately needs; an operator whose
@@ -369,6 +465,68 @@ _STANDARD_CRED_FILES = (
     "~/.docker/config.json",        # registry `auths` when no credsStore helper holds them
     "~/.kube/config",               # cluster credentials (client certs, bearer tokens, exec plugins)
 )
+
+# The tool directories that hold a standard cred file. On Linux each is mounted READ-ONLY with its
+# existing subdirectories bound back read-write (step (2a) of the bwrap plan, the construct the
+# entity's own .levain store uses), so an absent cred file in one needs no mountpoint on the host
+# and a link in one cannot be swapped from inside. A file planted at an absent cred path is a real
+# vector: kubeconfig ``users[].exec`` and docker ``credHelpers`` run a command when the operator
+# next uses the tool. Cost: inside a confined session the entity cannot create or rewrite a top-
+# level file in these directories (``aws configure set``, ``kubectl config use-context``,
+# ``git config --global`` for an XDG git user). macOS denies a path string whether it exists or
+# not, so it needs none of this. $HOME itself is such a view on Linux (step (0) of the bwrap plan),
+# so an absent $HOME-level cred file needs no placeholder either.
+_CRED_TOOL_DIRS = ("~/.kube", "~/.docker", "~/.aws", "~/.config/git")
+
+
+def floor_roots(specs) -> list[Path]:
+    """THE way a list of jewel roots enters the floor, as data: each ``~/rel`` or absolute path at
+    its three spellings (:func:`_spellings`). The standard cred stores, the cloud directories, the
+    credential overrides and the ledger go through it; a new list (browser profiles) is one more
+    tuple passed here, and the plan's absent-path handling (a tool directory read-only, an absent
+    directory created and ledgered, a $HOME-level file absent from the $HOME view, a link refused
+    where it could be swapped) applies to it unchanged."""
+    return [p for spec in specs for p in _spellings(spec)]
+
+
+def _secret_files() -> list[Path]:
+    try:
+        from levain.launch import secret_files
+    except ImportError as exc:   # fail closed: a key file the floor cannot learn of is not left open
+        raise ConfinementError(f"could not learn which secret files to deny ({exc})") from exc
+    return secret_files()
+
+
+def _spellings(spec: str | Path) -> list[Path]:
+    """A jewel path at the three spellings the ssh vectors have used since 2026-08-21: the raw
+    ``Path.home()`` form (the true lexical path), resolved HOME plus the unresolved rest, and the
+    fully resolved target. ``spec`` is ``~/rel`` or an absolute path (then the middle spelling is the
+    resolved parent plus the unresolved final component). Duplicates collapse, so in the ordinary
+    no-symlink case this is one path.
+
+    Why all three: Seatbelt canonicalises a path for data operations, but ``unlink``/``rename``/``ln``
+    act on the LINK and are matched lexically, so under a resolved-only deny ``rm -f <link>`` succeeds
+    and the recreated file is an object nothing names (the ssh finding, see ``build_policy`` (3)). On
+    Linux the lexical spelling is what lets the bwrap plan see that a jewel is a link at all.
+    Use it for every list of home-relative jewels (ssh, the standard cred stores, browser profiles),
+    so the next list cannot repeat the resolved-only miss."""
+    s = str(spec)
+    if s == "~" or s.startswith("~/"):
+        raw = Path.home() / s[2:]
+        candidates = [lambda: Path.home().resolve() / s[2:], raw.resolve]
+    else:
+        raw = Path(s)
+        candidates = [lambda: raw.parent.resolve() / raw.name, raw.resolve]
+    out = [raw]
+    for spell in candidates:
+        # A symlink loop must not crash the policy build (L1 r1). The raw spelling stays denied (on
+        # macOS a literal deny of a path no lookup can finish), and the Linux plan, which resolves
+        # every root again, refuses bash with the reason.
+        try:
+            out.append(spell())
+        except (OSError, RuntimeError):
+            pass
+    return list(_dedup_paths(out))
 
 # CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (spore-725).
 #
@@ -498,12 +656,13 @@ class CrownJewelsPolicy:
     stores + ssh keys) is shared across OSes and is the load-bearing security surface.
 
     Paths are stored ABSOLUTE, and MOSTLY resolved (symlink-followed) so the rendered denies match
-    what the kernel sees. ⚠ ``deny_write_files`` IS THE DELIBERATE EXCEPTION AND THIS SENTENCE USED
-    TO DENY IT (it read "Every path is stored RESOLVED", which my own 2026-08-21 change falsified and
-    codex L3 caught): each ssh vector is stored at up to THREE spellings — raw ``Path.home()``,
-    resolved-HOME, and fully resolved — because resolving alone LOSES the lexical path that sshd
-    honours through ``realpath()``. ``deny_write_dirs`` carries the same exception for the ~/.ssh
-    anchor. See ``build_policy`` (3). ``workspace`` is the shell's starting cwd + a definitely-writable root; it is NOT a
+    what the kernel sees. ⚠ THE EXCEPTIONS ARE DELIBERATE (it once read "Every path is stored
+    RESOLVED", which the 2026-08-21 change falsified and codex L3 caught): each ssh vector in
+    ``deny_write_files``, and each standard cred store in ``deny_files`` / ``deny_read_write``, is
+    stored at up to THREE spellings (:func:`_spellings`) — raw ``Path.home()``, resolved-HOME, and
+    fully resolved — because resolving alone LOSES the lexical path, which link operations match
+    and which sshd honours through ``realpath()``. ``deny_write_dirs`` carries the lexical ancestors
+    too. See ``build_policy`` (3). ``workspace`` is the shell's starting cwd + a definitely-writable root; it is NOT a
     jail (the entity may read/write broadly under default-allow) — it is just where a fresh entity's
     work lands by convention."""
 
@@ -671,6 +830,31 @@ class CrownJewelsPolicy:
     # `deny_write_files`. ⚠ NEW FIELDS GO AT THE END: one inserted earlier shifts every later field
     # for a positional caller (codex, L3 2026-10-02, reproduced; repeated by spore-1308's first cut,
     # L1 2026-10-03). tests/test_floor_project_memory.py freezes the order.
+    ro_tool_dirs: tuple[Path, ...] = ()  # the standard cred files' tool directories
+    # (:data:`_CRED_TOOL_DIRS`, raw ``Path.home()`` spelling), set with ``deny_standard_creds``. Linux
+    # only: the bwrap plan mounts each read-only and binds its existing subdirectories back read-write,
+    # creating an absent one at 0700 first. Seatbelt needs no counterpart (it denies absent paths).
+    cred_dir_sources: tuple[Path, ...] = ()  # the credential directories that are a tool's whole home
+    # (:func:`_cred_dir_sources`: ~/.config/gcloud, ~/.azure, and every directory override), lexical.
+    # Their spellings are in ``deny_read_write``; this tells the Linux plan which absent roots may be
+    # skipped when this user cannot create them. Empty unless ``deny_standard_creds``.
+    trusted_roots: tuple[tuple[Path, Path], ...] = ()  # (as spelled, real path) for the workspace,
+    # the entity dir and $HOME, resolved ONCE here. A symlink above one of them is the operator's,
+    # not the entity's: the file editor's walk (levain.firing.openhands.tools) maps a path under one
+    # to its real spelling and then follows no symlink below it (head ruling 2026-10-07).
+
+
+def _trusted_roots(entity_dir, workspace) -> tuple[tuple[Path, Path], ...]:
+    """``(as spelled, real)`` for the workspace, the entity dir and $HOME, longest first."""
+    ed = Path(os.path.abspath(os.path.expanduser(str(entity_dir))))
+    ws = (Path(os.path.abspath(os.path.expanduser(str(workspace)))) if workspace is not None
+          else ed / "workspace")
+    out: dict[Path, Path] = {}
+    for lex in (ws, ed, Path(os.path.abspath(os.path.expanduser("~")))):
+        real = lex.resolve()
+        out[lex] = real
+        out[real] = real
+    return tuple(sorted(out.items(), key=lambda kv: len(str(kv[0])), reverse=True))
 
 
 def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
@@ -993,11 +1177,14 @@ def build_policy(
       - ``~/.ssh/authorized_keys`` (+ ``authorized_keys2``) WRITE — denied in BOTH ssh_modes: planting
         a key is a persistent SSH backdoor with zero legit entity use (in agent-mode the whole ~/.ssh
         subtree already covers it; in raw-mode this is the sole guard). Surgical (literal, not ancestor-
-        expanded), so raw-mode keeps ~/.ssh otherwise writable.
+        expanded), so raw-mode keeps ~/.ssh otherwise writable;
+      - levain's ledger of the Linux floor's session placeholders, ``~/.levain-runtime/floor/``
+        (subtree): it decides what levain deletes from the operator's home.
 
     **``deny_standard_creds=True``:** fold the standard tool-canonical cred stores
-    (:data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES`) into the floor. These are knowable
-    locations (not the false-security guessing the module refuses). This parameter's own default is
+    (:data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES`) into the floor, each at its three
+    spellings, and name their tool directories (:data:`_CRED_TOOL_DIRS`) for the Linux plan. These
+    are knowable locations (not the false-security guessing the module refuses). This parameter's own default is
     False; the product default comes from :func:`levain.firing.drive.resolve_cred_floor`, which passes
     True in every drive except the interactive REPL unless the entity declares ``false``. Wired from ``confinement.json`` via :meth:`levain.firing.binding.ConversationBinding.create`.
 
@@ -1014,7 +1201,20 @@ def build_policy(
     Every crown jewel's ancestor dirs are additionally write-denied (:func:`_write_deny_ancestors`) to
     close the rename-relocation bypass (apparatus L2). NOTE the entity's OWN ``<entity>/.levain/``
     store is NOT denied — the entity's memory is its own to read/write. Only the operator's memory
-    store and SIBLING stores are the structural crown jewels."""
+    store and SIBLING stores are the structural crown jewels.
+
+    **What the floor confines (its definition, head ruling 2026-10-07).** The floor confines the
+    ENTITY'S SHELL and the entity's file editor. The operator's own unconfined processes (their
+    terminal, their tools, a session they started with the cred floor off) are trusted: running as
+    the operator's user, outside any sandbox, they already hold every crown jewel directly, so
+    nothing the floor does is meant to stand between them and it. This is why the Linux plan binds
+    host paths BY NAME: :func:`_bwrap_plan` classifies each entry it carries into a view ($HOME, a
+    tool directory, the entity's store) and emits a bind of that name, which bwrap resolves when it
+    starts. Between the two only an unconfined process of the same user can swap the source, since
+    inside any confined shell those names sit in read-only views and cannot be renamed, and that
+    process gains nothing by the swap that it does not already have. Under a separate hands user,
+    bwrap runs as that user, so a source reached through a swapped link is still access-checked as
+    the hands user."""
     # ⛔ TYPE-CHECK THE OPT-OUT AT THIS BOUNDARY — IT FAILS **OPEN**, WHICH IS THE ONE
     # DIRECTION A SECURITY FLAG MUST NOT FAIL (codex L3, 2026-09-04; MEASURED HERE).
     # Passing the STRING "false" for this flag — exactly what an env-var-backed or
@@ -1066,9 +1266,24 @@ def build_policy(
     # (resolved by levain.firing.drive.resolve_cred_floor: True except at the interactive REPL, unless
     # the entity declares ``deny_standard_creds: false`` in confinement.json). They flow through the SAME subtree/file machinery (read+write deny + ancestor
     # write-deny), so no separate rendering path is needed.
+    # Each at all three spellings (:func:`_spellings`): resolved-only left a stow-style
+    # ``~/.kube/config -> ~/dotfiles/kube/config`` link out of the floor, so ``rm`` + recreate of the
+    # link planted a kubeconfig the operator's next kubectl would run (codex L3, 2026-10-07).
+    tool_dirs: list[Path] = []
+    cred_dir_sources: list[Path] = []
     if deny_standard_creds:
-        subtrees.extend(Path(s).expanduser().resolve() for s in _STANDARD_CRED_SUBTREES)
-        files.extend(Path(f).expanduser().resolve() for f in _STANDARD_CRED_FILES)
+        cred_dir_sources = _cred_dir_sources()
+        subtrees.extend(floor_roots([*_STANDARD_CRED_SUBTREES, *cred_dir_sources]))
+        files.extend(floor_roots([*_STANDARD_CRED_FILES, *_cred_overrides()[1]]))
+        tool_dirs = [home / d[2:] for d in _CRED_TOOL_DIRS]
+    # The model API key file levain was given (`--api-key-file`): denied both ways, so the key the
+    # flag keeps off the command line is not left readable to the entity instead (L2 r1).
+    files.extend(floor_roots(_secret_files()))
+    # The ledger of the session-scoped Linux placeholders (:func:`_ledger_enter`) decides what levain
+    # deletes from the operator's home, so the entity may neither read nor write it.
+    # At all three spellings, like every other jewel (L1 r1): a link at ~/.levain-runtime must not
+    # leave the ledger reachable by a name the floor does not hold.
+    subtrees.extend(_spellings("~/.levain-runtime/floor"))
 
     ssh_dir = (home / ".ssh").resolve() if ssh_mode == "agent" else None
 
@@ -1149,14 +1364,12 @@ def build_policy(
     #           target. Denying more endpoints does not fix resolve-first.
     #       (e) HARDLINKS — a pre-existing outside hardlink to a vector: refused at spawn and by the
     #           file editor (see the honest limits above).
-    ssh_home = home / ".ssh"
-    ssh_home_lexical = home.resolve() / ".ssh"      # resolved HOME + un-deref'd .ssh, as ``ssh_anchor``
     deny_write_files_l: list[Path] = []
     for n in _SSH_WRITE_DENIED:
-        # THREE SPELLINGS, and the first one is easy to miss (apparatus L3 codex, 2026-08-21).
-        deny_write_files_l.append(ssh_home / n)               # RAW ``Path.home()`` — the true lexical
-        deny_write_files_l.append(ssh_home_lexical / n)       # resolved HOME + un-deref'd .ssh
-        deny_write_files_l.append((ssh_home / n).resolve())   # the real content target, thru symlinks
+        # THREE SPELLINGS, and the first one is easy to miss (apparatus L3 codex, 2026-08-21): RAW
+        # ``Path.home()`` (the true lexical path), resolved HOME + un-deref'd .ssh, and the real
+        # content target through symlinks. One helper now builds them for every jewel list.
+        deny_write_files_l.extend(_spellings(f"~/.ssh/{n}"))
     # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
     # A trust spelling whose own location (final component unresolved) is already denied both ways
@@ -1241,8 +1454,9 @@ def build_policy(
     # on macOS and nothing on Linux. The paths are the RESOLVED ones, which is what SQLite names its
     # sidecars after.
     sidecars: list[Path] = []
+    known_dirs = {*listed_dirs, *_spellings("~/.levain-runtime/floor")}
     for jewel in _dedup(subtrees + files):
-        if jewel in listed_dirs and not jewel.is_file():
+        if jewel in known_dirs and not jewel.is_file():
             continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
         # Not a directory, rather than is a file: a jewel absent when the policy is built can be
         # created as a SQLite store before the shell starts (codex, L3 2026-10-02).
@@ -1325,8 +1539,8 @@ def build_policy(
     # by this anchor and by nothing else."
     # ▶ MEASURED, NOT ARGUED (2026-09-03): ``_write_deny_ancestors`` walks ``jewel.parents`` and does
     # NOT resolve, so the DIRECTORY is produced by the FILES' own ancestors. Both lexical spellings
-    # are in ``all_jewels`` by construction thirty lines up — ``ssh_home / n`` (raw ``Path.home()``)
-    # and ``ssh_home_lexical / n`` (``home.resolve()`` + un-deref'd ``.ssh``) — so their parents are
+    # are in ``all_jewels`` by construction thirty lines up — ``Path.home() / ".ssh" / n`` and
+    # ``home.resolve() / ".ssh" / n``, the first two :func:`_spellings` — so their parents are
     # exactly ``home / ".ssh"`` AND ``home.resolve() / ".ssh"``. The second of those IS
     # ``ssh_anchor``. It is therefore already denied whether or not HOME is itself a symlink, which
     # is the one case the rebuttal's "and by nothing else" needed in order to be true.
@@ -1365,6 +1579,9 @@ def build_policy(
         deny_localhost_outbound=deny_localhost_outbound,
         deny_keychain=deny_standard_creds,
         sqlite_sidecars=sqlite_sidecars_t,
+        ro_tool_dirs=tuple(tool_dirs),
+        cred_dir_sources=tuple(cred_dir_sources),
+        trusted_roots=_trusted_roots(entity_dir, workspace),
     )
 
 
@@ -1474,7 +1691,7 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     # (spore-1308 follow-on, codex L3 2026-10-03): a store anneal starts trusting after the binding
     # was built is covered from the next spawn on. Raises ConfinementError on an unsafe store.
     listed = _trust_listed_stores(Path.home(), policy.entity_dir, policy.workspace)
-    new_dirs = [d for d in listed if d not in policy.deny_read_write]
+    new_dirs = list(_dedup_paths([d for d in listed if d not in policy.deny_read_write]))
     if new_dirs:
         policy = replace(
             policy,
@@ -1557,6 +1774,106 @@ def _ci_within(path: Path, root: Path) -> bool:
     return p == r or p.startswith(r.rstrip(os.sep) + os.sep)
 
 
+# Paths that are views of a PROCESS rather than files (lane P2 item 2c). The file editor runs inside
+# levain's own process, so on Linux ``/proc/self/mem`` is levain's memory (a process may always read
+# itself), with the carried environment and the model API key in it, and ``/proc/<pid>/environ`` is
+# any same-user process's exec-time environment. ``/dev/fd/N`` and ``/dev/std*`` are levain's own open
+# files on both OSes (an open SQLite store, say). The editor has no reason to touch any of them.
+_PROCESS_VIEW_ROOTS = (Path("/proc"), Path("/dev/fd"))
+_PROCESS_VIEW_FILES = (Path("/dev/stdin"), Path("/dev/stdout"), Path("/dev/stderr"))
+
+
+def _process_view_reason(given: Path | str, resolved: Path) -> str | None:
+    """Why ``given`` (as the caller spelled it, and as it resolves) is a process view, or None. The
+    given spelling matters on Linux: ``/proc/self/fd/N`` resolves to wherever fd N points, which is
+    the file it exposes and may be an ordinary path."""
+    try:
+        spelled = Path(os.path.abspath(os.path.expanduser(str(given))))
+    except (ValueError, OSError, RuntimeError):
+        spelled = resolved
+    roots = list(_PROCESS_VIEW_ROOTS)
+    if platform.system() == "Linux":
+        # Any other procfs on the host is the same view (a chroot's or a container's /proc): the
+        # editor runs in levain's own mount namespace, where step (8) of the bash plan does not reach.
+        try:
+            roots += _extra_procfs_mounts()
+        except OSError as exc:
+            return f"{given}: the mount table could not be read to rule out a process view ({exc}) — refused"
+    for q in (spelled, resolved):
+        if any(_ci_within(q, r) for r in roots) or any(_canon(str(q)) == _canon(str(f))
+                                                       for f in _PROCESS_VIEW_FILES):
+            return (f"{given} is a view of a running process (/proc, /dev/fd, /dev/std*), which "
+                    "would expose levain's own memory, open files and environment — refused")
+    return None
+
+
+def _procfs_devices() -> set[int]:
+    devs: set[int] = set()
+    for mp in [Path("/proc"), *_extra_procfs_mounts()]:
+        try:
+            devs.add(os.stat(mp).st_dev)
+        except OSError:
+            pass
+    return devs
+
+
+def opened_file_path(fd: int) -> str:
+    """The path of the file ``fd`` has open, as the kernel names it: ``/proc/self/fd/<fd>`` on Linux
+    (a process may always read its own), ``F_GETPATH`` on macOS. Raises OSError when there is none
+    (a pipe, a socket) or it cannot be read."""
+    if platform.system() == "Linux":
+        path = os.readlink(f"/proc/self/fd/{fd}")
+        if not path.startswith("/"):   # "pipe:[123]", "socket:[456]", "anon_inode:...": no file
+            raise OSError(f"fd {fd} is not a file ({path})")
+        return path
+    import fcntl
+
+    getpath = getattr(fcntl, "F_GETPATH", None)
+    if getpath is None:
+        raise OSError("this platform cannot name an open file")
+    raw = fcntl.fcntl(fd, getpath, bytes(1024))
+    return os.fsdecode(raw.split(b"\0", 1)[0])
+
+
+def opened_file_reason(policy: CrownJewelsPolicy, fd: int) -> str | None:
+    """Why the file ALREADY OPEN on ``fd`` must not be read or written through the file editor, or
+    None. The editor's path check runs before the editor opens the path, so a link the shell flips in
+    between (to ``/proc/<pid>/environ``, or to any jewel) passed it (L2 r1). This judges the object
+    actually opened, by its device (any procfs) and by the name the kernel gives it, before a byte
+    is read. Fail-closed: a file whose name cannot be learnt is refused."""
+    try:
+        st = os.fstat(fd)
+        if platform.system() == "Linux" and st.st_dev in _procfs_devices():
+            return "the opened file is in a /proc filesystem, a view of a running process"
+        if stat.S_ISDIR(st.st_mode):
+            return None
+        path = opened_file_path(fd)
+    except OSError as exc:
+        return f"the opened file could not be identified ({exc}) — refused (fail-closed)"
+    reason = crown_jewel_reason(policy, path)
+    if reason is not None:
+        return reason
+    # The opened object's own identity, never a second stat of its name: the shell can unlink or
+    # replace that name between the open and this check (codex, L3 r2), and then the name leads to
+    # another file. The jewel walk runs when the object has other names or its name no longer leads
+    # to it; a single-name file still at its name is judged by the name, as above.
+    try:
+        named = os.stat(path)
+        moved = (named.st_dev, named.st_ino) != (st.st_dev, st.st_ino)
+    except (OSError, ValueError):
+        moved = True
+    if st.st_nlink < 2 and not moved:
+        return None
+    try:
+        jewels = _jewel_inodes(policy)
+    except ConfinementError as exc:
+        return f"the opened file could not be checked against the crown jewels: {exc}"
+    hit = jewels.get((st.st_dev, st.st_ino))
+    if hit is not None:
+        return f"the opened file is another name for the crown jewel {hit[1]}, which the floor denies"
+    return None
+
+
 def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | None:
     """Return a human reason if ``path`` is a crown jewel the floor denies, else ``None``.
 
@@ -1580,10 +1897,11 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     SHELL's ssh can record host keys): the file editor has no legitimate need to touch ssh files (that
     is bash's job via ``ssh``), so denying all of ``~/.ssh`` here is fail-closed and avoids a read/write-
     polarity subtlety. Ancestor write-dirs are NOT checked — they exist to block ``mv``-relocation of a
-    jewel, and the file editor has no rename primitive (its commands are ``view``/``create``/
-    ``str_replace``/``insert``/``undo_edit``). Also denies the entity's OWN memory STORE files
-    (``own_memory_files`` — continuity/crystal/db + sidecars): the file editor has no rename primitive
-    and no legit reason to touch the store (the wrap composes it in-process), so it is denied OUTRIGHT
+    jewel, and the file editor never renames an existing file or directory: its only rename is
+    ``insert`` moving its own temp file onto the target, which walks the target's parents by directory
+    fd and refuses a symlink among them (``levain.firing.openhands.tools._floored_move``). Also denies
+    the entity's OWN memory STORE files (``own_memory_files`` — continuity/crystal/db + sidecars): the
+    file editor has no legit reason to touch the store (the wrap composes it in-process), so it is denied OUTRIGHT
     here (read included), while the seatbelt hand still allows bash to READ it — spore-359, so a hand-
     write can't poison the always-loaded memory the wrap alone composes. The rest of ``<entity>/.levain/``
     is NOT a jewel (the entity's memory is its own to read); the firing's ``assert_entity_isolated``
@@ -1605,6 +1923,8 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     # whose row was in verdicts.jsonl the whole time. Every claim re-verified here by execution.)
     except (ValueError, OSError, RuntimeError) as exc:
         return f"path {path!r} could not be resolved ({exc}) — refused (fail-closed)"
+    if (why := _process_view_reason(path, p)) is not None:
+        return why
     for sub in policy.deny_read_write:
         if _ci_within(p, sub):
             return f"{p} is under the crown-jewel store {sub}"
@@ -1689,7 +2009,8 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
                         f"the operator's project memory re-derives against (spore-1308)")
             return f"{p} is a write-protected ssh persistence/exec vector (authorized_keys/config/rc)"
     for mf in policy.own_memory_files:
-        # The file editor has no rename primitive and no legit reason to touch the entity's own store
+        # The file editor renames nothing but its own temp file, and has no legit reason to touch the
+        # entity's own store
         # (its memory is composed by the host-process wrap, never edited by hand) → denied OUTRIGHT
         # here (read included), same fail-closed stance as the ssh write-files. The SEATBELT hand still
         # allows the READ (bash may `cat` it); denying both hands the WRITE is what closes the poison-
@@ -2025,7 +2346,6 @@ class SandboxedShell:
         # precisely what a TOCTOU fix may not assume.
         self.effective_policy: CrownJewelsPolicy | None = None
         self._cmd_w: IO[str] | None = None   # the FIFO command channel write end (see start())
-        self._fifo_dir: str | None = None    # the tempdir holding the command FIFO (cleaned on close)
         self._stdout_q: "queue.Queue[str | None]" = queue.Queue(maxsize=_MAX_QUEUE_LINES)
         self._reader: threading.Thread | None = None
         self._run_lock = threading.Lock()    # serialize run(); fail-fast on concurrent misuse
@@ -2051,20 +2371,24 @@ class SandboxedShell:
         """Spawn the sandboxed bash and its stdout reader thread. Returns self (chainable)."""
         if self._proc is not None:
             return self
-        # The command channel is a FIFO that BASH OPENS ITSELF as its script. Why a FIFO and not an
-        # inherited pipe fd (``pass_fds`` + ``/dev/fd/N``): an inherited fd is visible to bash's
-        # CHILDREN at a known number, so a command can ``os.read(3, …)`` and steal the command stream /
-        # learn the sentinel (apparatus L3 codex HIGH, verified live). A fd bash OPENS is CLOSE-ON-EXEC,
-        # so children never inherit it — the command channel is private from the commands. Children's
-        # stdin is ``/dev/null`` (no stdin hijack — apparatus L1). The fifo lives in an unguessable
-        # mkdtemp dir (a child would have to guess the path to interfere).
-        fifo_dir = tempfile.mkdtemp(prefix="levain-cmd-")
-        fifo = os.path.join(fifo_dir, "cmd")
-        rendezvous = -1
+        # The command channel is a PIPE. bash is given its read end as the script, by fd number
+        # (``bash /dev/fd/N``), and the FIRST line levain writes is ``exec N<&-``, before anything the
+        # entity sends. bash reads its script through a descriptor of its OWN, which it marks
+        # close-on-exec, so once that line has run no child holds the channel at any number. (A bare
+        # inherited fd was rejected once because children saw it at a known number and could read
+        # the command stream and the sentinel: apparatus L3 codex HIGH, verified live. Closing it
+        # before the first command is what answers that.)
+        # ⛔ WHY NOT A NAMED FIFO ANY MORE (lane M's M2 design, 8c, 2026-10-07): the FIFO was
+        # unlinked after the startup handshake, which kept it from the shell's own children
+        # (codex R2 #1: bash discloses its script path as ``$0``), but during the handshake its path
+        # existed and was on bash's argv, readable by every process of this user
+        # (``KERN_PROCARGS2``, ``/proc/<pid>/cmdline``). Another session's process could open it and
+        # write commands into this shell, or read them. A pipe has no name.
+        # Children's stdin is ``/dev/null`` (no stdin hijack — apparatus L1).
+        rd, wr = os.pipe()
         try:
-            os.mkfifo(fifo)
             self._proc = subprocess.Popen(
-                [*self._argv, fifo],
+                [*self._argv, f"/dev/fd/{rd}"],
                 stdin=subprocess.DEVNULL,   # children get /dev/null, NOT the command channel
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,   # merge stderr into stdout (terminal-like)
@@ -2085,46 +2409,40 @@ class SandboxedShell:
                 start_new_session=True,
                 # WELD (apparatus L2 HIGH): no INHERITED fd may bypass the profile (seatbelt checks
                 # open(), not read() of an already-open fd). CALLER CONTRACT: no crown-jewel fd may be
-                # open in this process at spawn time. With the FIFO channel there is NO passed fd.
+                # open in this process at spawn time. The one passed fd is the command pipe's read
+                # end, which bash closes before it runs anything else.
                 close_fds=True,
+                pass_fds=(rd,),
             )
+            os.close(rd)
+            rd_in_bash, rd = rd, -1
+            # The write end is levain's alone: a dead bash gives EPIPE on write, not a block.
+            self._cmd_w = os.fdopen(wr, "w")
+            wr = -1
+            self._cmd_w.write(f"exec {rd_in_bash}<&-\n")
             # Drain bash's stdout from the start so the handshake below can observe its output (incl. a
             # `sandbox-exec` startup error).
             self._reader = threading.Thread(target=self._drain_stdout, daemon=True)
             self._reader.start()
-            # FIFO open dance (apparatus L3 codex round-2). O_RDWR RENDEZVOUS opens without blocking and
-            # provides a reader so (a) bash's own blocking O_RDONLY script-open unblocks and (b) the real
-            # O_WRONLY command channel opens without blocking. Then:
-            #   - HANDSHAKE proves bash actually opened + is reading — else sandbox-exec/bash died at
-            #     startup and spawn must FAIL, not hand back a dead shell (codex R2 #2);
-            #   - close the rendezvous so the parent is WRITER-ONLY → a dead bash gives EPIPE on write,
-            #     not an unbounded block (O_RDWR left the parent a reader → a big write could wedge; codex R2 #3);
-            #   - UNLINK the fifo so a child's ``open($0)`` (bash discloses the script PATH as ``$0``,
-            #     so "unguessable mkdtemp path" was NOT enough) hits ENOENT — the channel is truly
-            #     private from the commands (codex R2 #1). bash keeps reading via its open fd.
-            rendezvous = os.open(fifo, os.O_RDWR)
-            self._cmd_w = os.fdopen(os.open(fifo, os.O_WRONLY), "w")
+            # HANDSHAKE proves bash actually started and is reading — else the sandbox driver or bash
+            # died at startup and spawn must FAIL, not hand back a dead shell (codex R2 #2).
             self._handshake()
-            os.close(rendezvous)
-            rendezvous = -1
-            os.unlink(fifo)
         except BaseException as exc:  # noqa: BLE001 — cleanup must survive Ctrl-C/SystemExit too, else
-            # a cancellation during _handshake() leaks the rendezvous fd + fifo dir (close() can't
-            # reach them: rendezvous is a local, _fifo_dir is unset until success — apparatus L3 codex R3).
-            if rendezvous >= 0:
-                try:
-                    os.close(rendezvous)
-                except OSError:
-                    pass
-                rendezvous = -1
-            self._teardown_failed_start(fifo_dir)
+            # a cancellation during _handshake() leaks the pipe ends and the process (apparatus L3
+            # codex R3).
+            for fd in (rd, wr):
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+            self._teardown_failed_start()
             if not isinstance(exc, Exception):
                 raise  # a cancellation (KeyboardInterrupt / SystemExit) propagates UNCHANGED
             reason = exc if isinstance(exc, ConfinementError) else (
                 f"could not spawn the sandboxed shell ({exc}); argv={self._argv[:2]}…"
             )
             raise ConfinementError(str(reason)) from exc
-        self._fifo_dir = fifo_dir
         return self
 
     def _handshake(self, timeout: float = 10.0) -> None:
@@ -2160,10 +2478,9 @@ class SandboxedShell:
             early = [*early[-19:], line]
         raise ConfinementError("timed out waiting for the shell startup handshake.")
 
-    def _teardown_failed_start(self, fifo_dir: str) -> None:
-        """Best-effort cleanup for a start() that raised: close the write end, kill the group, remove
-        the fifo dir. Leaves ``_proc``/``_cmd_w`` None + ``_fifo_dir`` unset so a later close() is a
-        no-op (this path already cleaned up)."""
+    def _teardown_failed_start(self) -> None:
+        """Best-effort cleanup for a start() that raised: close the write end, kill the group. Leaves
+        ``_proc``/``_cmd_w`` None so a later close() is a no-op (this path already cleaned up)."""
         if self._cmd_w is not None:
             try:
                 self._cmd_w.close()
@@ -2173,7 +2490,6 @@ class SandboxedShell:
         if self._proc is not None and self._proc.poll() is None:
             self._signal_group(signal.SIGKILL)
         self._proc = None
-        shutil.rmtree(fifo_dir, ignore_errors=True)
 
     def _drain_stdout(self) -> None:
         """Read stdout line by line into the queue; enqueue ``None`` at EOF (shell exited).
@@ -2361,9 +2677,6 @@ class SandboxedShell:
                         pass
         finally:
             self._proc = None
-            if self._fifo_dir is not None:
-                shutil.rmtree(self._fifo_dir, ignore_errors=True)  # always remove the command FIFO
-                self._fifo_dir = None
 
     def __enter__(self) -> "SandboxedShell":
         return self.start()
@@ -3199,21 +3512,66 @@ def _reachable(p: Path) -> bool:
         return False
 
 
-def _bwrap_file_target(f: Path) -> Path:
+def _host_spelling(p: Path) -> Path:
+    """``p`` with its parent resolved. A mount destination is spelled this way: bwrap resolves a
+    destination inside its new root, where an absolute link in a parent (``~/.config`` pointing
+    elsewhere) does not lead where it leads on the host, so a mount spelled through one cannot land."""
+    return p.parent.resolve() / p.name
+
+
+def _home_read_only_root() -> Path | None:
+    """The real ``$HOME`` the bwrap plan binds read-only (step (0) of :func:`_bwrap_plan_impl`), or
+    None when it binds none ($HOME unresolvable, the filesystem root, or not a directory)."""
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        return None
+    if home == Path(home.anchor) or not home.is_dir():
+        return None
+    return home
+
+
+def _bwrap_file_target(f: Path, frozen: tuple[Path, ...] = ()) -> Path:
     """Where a mount for the protected FILE ``f`` must land. A mount cannot land on a symlink (bwrap
     aborts; measured 2026-09-30 with a stow-style ~/.ssh/config). A link this user can replace is
     REFUSED, because masking its target leaves the link free to be swapped for a planted file; one
-    they cannot replace is masked at its real path."""
+    they cannot replace, or one in a directory of ``frozen`` (mounted read-only by the plan, so the
+    link cannot be replaced from inside), is masked at its real path."""
     if not f.is_symlink():
-        return f
+        return _host_spelling(f)
+    _refuse_replaceable_link(f, frozen)
+    return _link_target(f)
+
+
+def _link_target(f: Path) -> Path:
+    """The real path of the link ``f``, refusing one that leads nowhere. ``resolve()`` alone returns
+    a loop's own path on Python 3.13 (it raised on 3.12), and a mask aimed there, or at a dangling
+    link's absent target, would make bwrap abort or create the target on the host."""
+    try:
+        return f.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ConfinementError(
+            f"{f} is a symlink that leads nowhere (dangling, or a loop). The Linux floor masks a "
+            "link at its target, and this one has none. Refusing to grant bash hands (fail-closed). "
+            "Remove or fix the link."
+        ) from None
+
+
+def _refuse_replaceable_link(f: Path, frozen: tuple[Path, ...] = ()) -> None:
+    """Refuse bash when the jewel spelling ``f`` is a symlink in a directory this user can write,
+    unless that directory is one of ``frozen``: the plan mounts it read-only, so inside bash the link
+    can be neither removed nor replaced (``$HOME`` itself, step (0); a store or tool directory)."""
+    if f.parent.resolve() in frozen:
+        return
     if os.access(f.parent, os.W_OK):
         raise ConfinementError(
             f"{f} is a symlink in a directory this user can write. The Linux floor protects files "
             "with mounts, and a mount cannot cover a symlink, so the link could be replaced by a "
             "planted file. Refusing to grant bash hands (fail-closed). Replace the symlink with the "
-            "real file to use bash."
+            "real file to use bash (for a standard credential store, setting "
+            "\"deny_standard_creds\": false in .levain/confinement.json also does it). A link "
+            "directly in a home directory bash sees read-only (the usual case) is accepted."
         )
-    return f.resolve()
 
 
 _MASK_OPS = ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try")
@@ -3244,6 +3602,35 @@ def _refuse_bind_after_mask(argv: list[str]) -> None:
                 f"{argv[first_mask + 2]}, which could re-expose a masked file. Refusing to grant "
                 "bash hands (fail-closed)."
             )
+
+
+def _unescape_mountinfo(field: str) -> str:
+    """mountinfo octal-escapes space, tab, newline and backslash as ``\\ooo`` (proc_pid_mountinfo(5))."""
+    import re
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _extra_procfs_mounts(mountinfo: str = "/proc/self/mountinfo") -> list[Path]:
+    """Every ``proc`` filesystem mounted outside ``/proc`` on this host, from ``mountinfo``. Empty
+    where the file does not exist (macOS). An unreadable or malformed table raises OSError, which
+    :func:`_bwrap_plan` turns into a refusal: a procfs it could not look for is not known absent."""
+    try:
+        text = Path(mountinfo).read_text(encoding="utf-8", errors="surrogateescape")
+    except FileNotFoundError:
+        return []
+    out: list[Path] = []
+    for line in text.splitlines():
+        pre, sep, post = line.partition(" - ")
+        fields = pre.split(" ")
+        if not sep or len(fields) < 5 or not post:
+            raise OSError(f"unreadable mount table line in {mountinfo}: {line!r}")
+        if post.split(" ")[0] != "proc":
+            continue
+        mp = Path(_unescape_mountinfo(fields[4]))
+        if mp == Path("/proc") or mp.is_relative_to("/proc"):
+            continue
+        out.append(mp)
+    return list(_dedup_paths(out))
 
 
 def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
@@ -3291,6 +3678,15 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # The sandbox dies with the levain process that owns it. Complements — never replaces —
         # SandboxedShell.close()'s process-group teardown.
         "--die-with-parent",
+        # A new PID namespace (lane P2 item 2c), so the ``--proc /proc`` above shows only the
+        # sandbox's own processes: "A /proc filesystem shows (in the /proc/pid directories) only
+        # processes visible in the PID namespace of the process that performed the mount"
+        # (pid_namespaces(7)). Without it, bash read ``/proc/<pid>/environ`` and ``cmdline`` of levain
+        # and of every other process of this user, which is where their secrets live. Costs: bash
+        # cannot see or signal host processes (``ps``, ``kill`` of a server started outside), and
+        # bwrap runs a reaping pid 1. SIGINT/SIGTERM from ``_signal_group`` still reach bash, which is
+        # in the same process group; when pid 1 exits the kernel kills the rest of the namespace.
+        "--unshare-pid",
     ]
     if policy.deny_localhost_outbound:
         # spore-755 on Linux (option B, see LINUX_LOCALHOST_REFUSAL's comment): a new, empty network
@@ -3318,6 +3714,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # identity check between the plan and bwrap instead; five review rounds each found a different
     # way past it.
     masks: list[str] = []
+    # $HOME as step (0) binds it read-only. A link directly in it cannot be removed or replaced from
+    # inside bash, so it is masked at its target instead of refused (desk ruling 2026-10-07, after
+    # the CI live job showed $HOME's top level read-only). Deeper links keep the refusal.
+    home_ro = _home_read_only_root()
+    frozen_home: tuple[Path, ...] = (home_ro,) if home_ro is not None else ()
 
     # (2a) THE ENTITY'S OWN STORE DIR (``.levain``) IS MOUNTED READ-ONLY, and every existing ordinary
     # entry in it is bound back read-write. The confined shell can then CREATE nothing at the top of
@@ -3328,9 +3729,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # that the HOST's own readers then failed on — anneal cannot open a 0444 memory.db ("attempt to
     # write a readonly database"), and an absent confinement.json (what ``init`` produces) came back
     # as empty JSON that the next session's ``load_confinement_config`` refuses.
-    # ⛔ IT COMES FIRST IN THE BODY, before the jewel tmpfs of step (2): a bind takes its source from
-    # the real host tree, so emitted after a tmpfs at or under .levain it re-exposed that jewel
-    # (complement + codex, L3 r1). Emitted first, any deny inside .levain lands on top of it.
+    # ⛔ IT COMES BEFORE the jewel tmpfs of step (2): a bind takes its source from the real host
+    # tree, so emitted after a tmpfs at or under .levain it re-exposed that jewel (complement +
+    # codex, L3 r1). Emitted before them, any deny inside .levain lands on top of it. It comes AFTER
+    # the tool-directory views below: an entity inside a tool directory (~/.kube/project) sits under
+    # a child the view binds back read-write, and that bind emitted later covered this read-only
+    # one (codex, L3 r3).
     # ⚖ STRICTER THAN macOS, STATED: on macOS the confined shell may create new files in .levain
     # other than the denied literals and edit the ones it may write; here it may do neither for a
     # top-level file. Its subdirectories stay writable.
@@ -3338,6 +3742,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     if policy.config_file is not None:
         protected.add(policy.config_file)
     ro_store_dirs: list[Path] = []
+    store_argv: list[str] = []
     for d in sorted({p.parent for p in protected}, key=lambda p: str(p)):
         if d.is_symlink() or not d.is_dir():
             # `levain run` refuses an entity with no .levain/ before it gets here; anything else
@@ -3347,7 +3752,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 f"the entity store {d} is missing or a symlink — refusing to grant bash hands "
                 "(fail-closed)."
             )
-        argv += ["--ro-bind", str(d), str(d)]
+        store_argv += ["--ro-bind", str(d), str(d)]
         ro_store_dirs.append(d)
         # Only DIRECTORIES come back read-write. A per-FILE bind pins the file's inode, so a host
         # write by rename (anneal and levain write that way) would leave the shell reading and
@@ -3359,22 +3764,97 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # This is the opposite case: an ordinary subdirectory the host removed between planning
             # and spawn should cost that subdirectory, not the whole shell. It stays pinned by inode
             # for the shell's life, so a host-side replacement of it is not seen (complement, r2).
-            argv += ["--bind-try", str(child), str(child)]
+            store_argv += ["--bind-try", str(child), str(child)]
+    entity_store_dirs = list(ro_store_dirs)
 
-    def _absent_in_ro_store(f: Path) -> bool:
+    def _nearest_existing(q: Path) -> Path:
+        q = q.parent.resolve() / q.name
+        while not os.path.lexists(q) and q != q.parent:
+            q = q.parent
+        return q
+
+    # The standard cred files' TOOL directories (lane P2, items 5 and 6) get a VIEW, not the host
+    # directory: a read-only tmpfs holding the real directory's existing entries except the cred
+    # names. Subdirectories come back read-write, files read-only, links as the same links. A cred
+    # file absent at spawn then needs no mountpoint, so no 0444 stub lands on the host, and it stays
+    # absent inside bash even when the operator's tool creates it on the host mid-session: the host
+    # directory is not what bash sees (desk ruling 2026-10-07; a read-only bind of the host directory
+    # showed such a file). bash cannot create one either, the tmpfs being read-only. A
+    # cred file that is a link is masked at its target (step 4); any other link is recreated as the
+    # same link, which cannot be replaced from inside. The cost: an entry the
+    # host adds or replaces at the top of a tool directory after spawn is not seen (a per-file bind
+    # pins the inode). An absent tool directory is created first (0700, by the provider: step (1)
+    # puts it in ``create_first``) and recorded in the placeholder ledger, which removes it at close
+    # if it is still empty. The ops are bwrap(1)'s --tmpfs, --bind-try, --ro-bind-try, --symlink and
+    # --remount-ro. A mountpoint inside the view is made in the tmpfs, except under a subdirectory
+    # bound back from the host (a "window", ~/.aws/sso): there it is on the host, so it is prepared,
+    # ledgered and watched like any other (:func:`_mount_plan_paths`; codex, L3 r3).
+    # The names a view (a tool directory, or $HOME in step (0)) leaves out. A denied socket is one:
+    # absent from the view, it stays unreachable across a daemon restart too.
+    secret_names = {_host_spelling(p) for p in (*policy.deny_files, *policy.deny_read_write,
+                                               *policy.deny_write_files, *policy.sqlite_sidecars,
+                                               *policy.deny_sockets)}
+    tool_views: list[Path] = []
+    tool_windows: list[Path] = []
+    for t in sorted(policy.ro_tool_dirs, key=lambda p: str(p)):
+        real = t.parent.resolve() / t.name
+        if real.is_symlink():
+            _refuse_replaceable_link(real, (*frozen_home, *entity_store_dirs))
+            real = _link_target(real)
+        if os.path.lexists(real) and not real.is_dir():
+            continue   # a file where the tool's directory should be: nothing can live under it
+        if real in ro_store_dirs:
+            continue
+        if not os.path.lexists(real) and _nearest_existing(real) in frozen_home:
+            continue   # absent, and not creatable in step (0)'s $HOME view: nothing to show or hide
+        argv += ["--tmpfs", str(real)]
+        remount_ro.append(str(real))
+        ro_store_dirs.append(real)
+        tool_views.append(real)
+        if not real.is_dir():
+            continue
+        for child in sorted(real.iterdir(), key=lambda p: p.name):
+            if child in secret_names:
+                continue
+            if child.is_symlink():
+                argv += ["--symlink", os.readlink(child), str(child)]
+            elif child.is_dir():
+                argv += ["--bind-try", str(child), str(child)]
+                tool_windows.append(child)
+            else:
+                argv += ["--ro-bind-try", str(child), str(child)]
+    argv += store_argv
+    # $HOME is a read-only view too (step (0)): an absent path directly in it needs no mount.
+    ro_store_dirs += list(frozen_home)
+
+    view_roots = {*tool_views, *frozen_home}
+
+    def _left_out_of_a_view(f: Path) -> bool:
+        # A credential name directly in a view ($HOME, a tool directory) is not carried into it, so
+        # inside bash it is ABSENT, not an empty file: no mask (head ruling 2026-10-07). A link there
+        # still has its target masked, through the target's own spelling.
+        h = _host_spelling(f)
+        return h.parent in view_roots and h in secret_names and not f.is_symlink()
+
+    def _absent_in_ro_store(f: Path, dirs: list[Path] | None = None) -> bool:
         # Nothing to hide and nothing the shell can create: no mount, so no host stub. Decided by
         # the NEAREST EXISTING ancestor, not the parent: an absent `.levain/vault` (or a path
         # deeper under an absent dir) cannot be created from inside a read-only store dir, and
         # mounting it made bwrap mkdir inside that read-only mount, so bash never started
         # (Diogenes LOW 2026-10-02, run in the Linux container). An existing subdirectory is bound
         # back read-write in (2a), so a path under one is still mounted. ⚠ SPAWN-TIME, like step
-        # (6): a path the HOST creates there after spawn is visible through the read-only bind.
+        # (6): in the entity's store a path the HOST creates after spawn is visible through the
+        # read-only bind (a tool directory is a tmpfs view, where it is not).
+        # A read-only tool directory may not exist yet (the provider creates it just before
+        # bwrap), so the walk stops at one whether or not it exists. Compared at the real parent,
+        # because the read-only mounts are spelled that way.
+        dirs = ro_store_dirs if dirs is None else dirs
         if f.exists():
             return False
-        anc = f.parent
-        while not anc.exists() and anc != anc.parent:
+        anc = f.parent.resolve()
+        while anc not in dirs and not anc.exists() and anc != anc.parent:
             anc = anc.parent
-        return anc in ro_store_dirs
+        return anc in dirs
 
     # (2) CROWN-JEWEL SUBTREES — hidden AND honest about refusing writes.
     # Parent-first, and a root already inside another is dropped: a parent tmpfs emitted after its
@@ -3391,7 +3871,25 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     masked_both: list[str] = []
     nested_in_ssh: list[Path] = []
     ssh_dir = policy.ssh_dir
+    cred_dir_spellings = set(floor_roots(policy.cred_dir_sources))
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
+        # A subtree root spelled lexically (:func:`_spellings`) may be a link, and bwrap refuses to
+        # mount on one (it resolves the path and aborts; measured 2026-09-30). Its resolved spelling is
+        # in the policy too and gets the tmpfs; the link itself is safe only where it cannot be
+        # replaced from inside, so a link this user can write the directory of refuses bash, as a
+        # cred FILE link does, unless that directory is $HOME itself (read-only in bash, step 0). Any other root is mounted at its real parent.
+        real = sub.parent.resolve() / sub.name
+        if real.is_symlink():
+            _refuse_replaceable_link(real, (*frozen_home, *ro_store_dirs))
+            # Skipped only because its target is mounted under its own spelling, which is checked
+            # here rather than assumed (L2 r1): a list that added a link root alone is refused.
+            if real.resolve() not in policy.deny_read_write:
+                raise ConfinementError(
+                    f"{real} is a symlink to {real.resolve()}, which the floor does not name, so the "
+                    "Linux plan cannot cover it. Refusing to grant bash hands (fail-closed)."
+                )
+            continue
+        sub = real
         if any(sub == r or sub.is_relative_to(r) for r in tmpfs_roots):
             continue
         # A root STRICTLY inside the ssh dir cannot be mounted here: step (3)'s ssh tmpfs, emitted
@@ -3402,14 +3900,21 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
             nested_in_ssh.append(sub)   # mounted after step (3)'s ssh tmpfs, see there
             continue
-        if not sub.exists() and not _absent_in_ro_store(sub) and not _mountpoint_creatable(sub):
+        # An absent root under a TOOL directory is mounted all the same, inside that directory's
+        # tmpfs view, so nothing is created on the host: what the operator's tool writes there
+        # mid-session must stay unreadable (the aws caches, research §4; L2 r1), and in the view it
+        # is not even present. Only the entity's own store dirs skip absent roots.
+        absent_in_store = _absent_in_ro_store(sub, [*entity_store_dirs, *frozen_home])
+        if not sub.exists() and not absent_in_store and not _mountpoint_creatable(sub):
+            if sub in cred_dir_spellings:
+                continue   # a tool's home this user cannot create: the shell cannot create it either
             raise ConfinementError(
                 f"{sub} is a crown-jewel directory that does not exist, and bwrap cannot create it to "
                 "cover it (its nearest existing parent is not writable). If an anneal trust file lists "
                 "a store there that no longer exists, remove that entry. Refusing to grant bash hands "
                 "(fail-closed)."
             )
-        if _absent_in_ro_store(sub):
+        if absent_in_store:
             continue
         if sub.exists() and not sub.is_dir():
             # A subtree root that is a FILE (argushub's ~/.anneal-memory is a SQLite file, measured
@@ -3484,7 +3989,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # "SELECTS THE FORM rather than skipping the path" and points at the write-only block "for
         # why it is applied rather than skipping outright". It described step (5) while step (4),
         # its other call site, did the opposite. The helper was right; one caller was not.
-        if _absent_in_ro_store(f):
+        if _absent_in_ro_store(f) or _left_out_of_a_view(f):
             continue
         if f in policy.sqlite_sidecars and not f.exists():
             # A sidecar absent at spawn is not mounted: its mountpoint would be a 0444 stub that
@@ -3494,7 +3999,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue
         # Under a jewel tmpfs the mount lands in the ephemeral tmpfs, where a host symlink at that
         # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
-        dest = str(f if _shadowed_by(f, roots) else _bwrap_file_target(f))
+        if _shadowed_by(f, roots):
+            dest = str(f)
+        else:
+            # A link in a read-only store or tool dir, or directly in $HOME: masked at its target.
+            dest = str(_bwrap_file_target(f, (*frozen_home, *ro_store_dirs)))
         masks.append(dest)
         masked_both.append(dest)
 
@@ -3516,7 +4025,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # through, which a control run confirmed it does.
     # The entity's own store files never reach the missing-file branch: an absent one is covered by
     # the read-only store dir in step (2a), because the stub this branch would leave broke the
-    # host's own store when it was tried there (measured 2026-09-30).
+    # host's own store when it was tried there (measured 2026-09-30). The same holds for a cred
+    # file in a tool directory (step 2a); a $HOME-level cred file's stub from step (4) lasts only
+    # for the session (:func:`_ledger_enter`), as does every stub this step creates: the provider
+    # records whatever it creates in the placeholder ledger, which removes it once no session needs it.
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
     # Targets steps (2) and (4) already mask, as those steps EMITTED them (codex, L3 r2: a second
     # resolve of the policy paths can observe a symlink retargeted after step (4) ran). EXACT
@@ -3525,7 +4037,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # a distinct, write-only file on a case-sensitive volume (0.5.4 known open issue).
     denied_both_targets = set(masked_both)
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
-        if _absent_in_ro_store(f):
+        if _absent_in_ro_store(f) or _left_out_of_a_view(f):
             continue
         if f in deny_both or f in file_roots:
             # Step (4) (or step (2), for a subtree root that is a file) already denies it BOTH ways. A self-bind here would take its source from the
@@ -3560,7 +4072,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 "its target. Refusing to grant bash hands (fail-closed). Remove or fix the link."
             )
         elif f.exists():
-            target = _bwrap_file_target(f)
+            target = _bwrap_file_target(f, frozen_home)
             if _shadowed_by(target, roots) or str(target) in denied_both_targets:
                 # The spelling is outside every hidden subtree but its TARGET is inside one: a
                 # self-bind takes its source from the host tree, so it would put the hidden file
@@ -3573,7 +4085,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             else:
                 argv += ["--ro-bind", str(target), str(target)]
         else:
-            masks.append(str(f))
+            masks.append(str(_host_spelling(f)))
 
     # (6) CONTAINER-DAEMON SOCKETS (spore-725) — THE CONNECT ARM, MEASURED 2026-09-30 on a Linux
     # kernel (6.12, bubblewrap 0.9.0, in Docker with the namespace restrictions relaxed):
@@ -3644,10 +4156,25 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if _reachable(bus) and bus.exists():
             masks.append(str(bus))
 
+    # (8) ANY OTHER procfs MOUNT. ``--bind / /`` is recursive, so a procfs mounted elsewhere on the
+    # host (a container runtime's, a chroot's) would still show the host's processes after
+    # ``--unshare-pid``. Each is hidden by a read-only tmpfs. Read from this process's own
+    # /proc/self/mountinfo, which is the host mount namespace bwrap copies.
+    for mp in _extra_procfs_mounts():
+        if not _reachable(mp) or _shadowed_by(mp, tuple(tmpfs_roots)):
+            continue
+        if not mp.is_dir():
+            masks.append(str(mp))   # a bind of one procfs FILE: a tmpfs cannot cover a file (L2 r1)
+            continue
+        argv += ["--tmpfs", str(mp)]
+        remount_ro.append(str(mp))
+
     # The masks close the body (the masks-last rule above). They are appended BEFORE step (1), which
     # pins every directory the body makes bwrap create, so a mask's absent parent is pinned too
     # ("test_bwrap_creates_and_pins_an_absent_ssh_dir_before_planting_anything_in_it" fails if not).
-    for m in masks:
+    # One mask per destination: a link and its target are both in the policy (:func:`_spellings`)
+    # and can name the same file.
+    for m in dict.fromkeys(masks):
         argv += ["--ro-bind", "/dev/null", m]
 
     # (1) ANCESTOR DIRS, EMITTED FIRST. Parent-before-child is a HARD ordering requirement (bwrap
@@ -3657,13 +4184,15 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # finding below. Three cases, all measured or reviewed on 2026-09-30:
     #   · PRESENT: pinned at its RESOLVED path. A mount cannot land on a symlink, so /var/run (a
     #     symlink to /run) aborted bwrap until it was resolved.
-    #   · A SYMLINK THIS USER CAN REPLACE (its parent is writable): REFUSED. Pinning the target leaves
+    #   · A SYMLINK THIS USER CAN REPLACE (its parent is writable, and not $HOME, which step (0)
+    #     makes read-only inside bash): REFUSED. Pinning the target leaves
     #     the link itself free to be swapped for a real directory holding a planted file, and macOS
     #     covers that link by name while a mount cannot. Fail closed, as bwrap itself used to.
     #   · ABSENT: pinned only if the body will CREATE something under it — then it is created here
     #     first (by the provider on the host, 0700, just before bwrap runs: bwrap resolves a bind's
     #     SOURCE before it applies ``--dir``, so it cannot pin a directory it creates itself —
-    #     measured) and pinned, because an unpinned directory that bwrap creates on the
+    #     measured; recorded in the placeholder ledger, which removes it at close if it is still
+    #     empty) and pinned, because an unpinned directory that bwrap creates on the
     #     host can be renamed away and replaced with a planted one (L1 + L2 review: raw mode with no
     #     ~/.ssh, plant ``authorized_keys``). An absent ancestor nothing will be created under holds
     #     nothing and is skipped — a self-bind of a missing source aborts bwrap, which is how the
@@ -3677,34 +4206,111 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     pins: list[tuple[str, bool]] = []   # (path, needs creating)
     for d in sorted(policy.deny_write_dirs, key=lambda p: str(p)):
         if d.is_symlink():
-            if os.access(d.parent, os.W_OK):
+            # A link directly in $HOME is frozen by step (0)'s read-only bind: pin its target.
+            if os.access(d.parent, os.W_OK) and d.parent.resolve() not in frozen_home:
                 raise ConfinementError(
                     f"{d} is a symlink in a directory this user can write. The Linux floor pins a "
                     "jewel's parent directories with mounts, and a mount cannot pin a symlink, so "
                     "the link could be swapped for a planted directory. Refusing to grant bash "
                     "hands (fail-closed). Replace the symlink with the real directory to use bash."
                 )
-            entry = (str(d.resolve()), False)
+            entry = (str(_link_target(d)), False)
         elif d.is_dir():
             entry = (str(d.resolve()), False)
-        elif any(c == str(d) or c.startswith(str(d) + "/") for c in created):
-            entry = (str(d), True)
+        elif any(c == str(_host_spelling(d)) or c.startswith(str(_host_spelling(d)) + "/")
+                 for c in created):
+            entry = (str(_host_spelling(d)), True)
         else:
+            continue
+        e = Path(entry[0])
+        if (any(e != v and e.is_relative_to(v) for v in tool_views)
+                and not any(e != w and e.is_relative_to(w) for w in tool_windows)):
+            # In a tool directory's view and not below a window into the host: the view is read-only
+            # and each window is itself a mountpoint, so nothing here can be renamed, and a pin would
+            # only create a directory on the host for nothing. Below a window it is pinned as usual
+            # (complement, L3 r3).
             continue
         if entry[0] not in [p for p, _ in pins]:
             pins.append(entry)
+    # (0) $HOME's OWN ENTRIES ARE READ-ONLY (desk ruling 2026-10-07, option (c)), AS A VIEW (head
+    # ruling, same day, (b)). $HOME is a read-only tmpfs holding its existing entries except the
+    # credential names: each subdirectory bound back read-write, each file read-only, each link as
+    # the same link. Inside bash nothing can be created, removed, renamed or swapped directly in
+    # $HOME, while everything below a subdirectory (the workspace, a repo, ~/.cache) is as writable
+    # as before; every link at the top level (a dotfile manager's ~/.config, ~/.netrc) is
+    # unswappable from inside. And a credential file at the top level (~/.netrc, ~/.npmrc, ...) that
+    # the operator's tool creates on the host mid-session lands in the host directory, which bash
+    # never sees, not even in a command already running; an absent one needs no placeholder. It goes
+    # after the pins of $HOME's own ancestors and BEFORE every deeper mount: a later tmpfs on $HOME
+    # would hide the mounts beneath it, and the deeper pins and the body land on top of it. $HOME's
+    # own pin is dropped: the tmpfs is itself a mountpoint, so $HOME still cannot be renamed.
+    # Costs: a tool that creates a NEW top-level file or directory in $HOME (a first ~/.npm, say)
+    # fails inside bash; a top-level file the host replaces after spawn is not seen (a per-file bind
+    # pins the inode).
+    home_ops: list[str] = []
+    home_real = home_ro
+    if home_real is not None and policy.workspace.resolve() == home_real:
+        raise ConfinementError(
+            f"the workspace is {home_real} itself, whose own entries are read-only inside bash on "
+            "Linux, so the entity could not write at its workspace root. Refusing to grant bash "
+            "hands (fail-closed). Use a subdirectory of your home as the workspace."
+        )
+    if home_real is not None:
+        home_ops = ["--tmpfs", str(home_real)]
+        for child in sorted(home_real.iterdir(), key=lambda p: p.name):
+            if child in secret_names:
+                continue
+            if child.is_symlink():
+                home_ops += ["--symlink", os.readlink(child), str(child)]
+            elif child.is_dir():
+                # Not `-try`: a subdirectory removed between the plan and the spawn aborts bwrap (a
+                # refusal; the next spawn plans again) rather than starting with it silently missing.
+                home_ops += ["--bind", str(child), str(child)]
+            else:
+                home_ops += ["--ro-bind-try", str(child), str(child)]
+    outer: list[str] = []
     ancestors: list[str] = []
     create_first: list[str] = []
     for path, create in sorted(pins):
         if create:
             create_first.append(path)
-        ancestors += ["--bind", path, path]
+        if home_ops and Path(path) == home_real:
+            continue
+        if home_ops and home_real.is_relative_to(path):
+            outer += ["--bind", path, path]
+        else:
+            ancestors += ["--bind", path, path]
 
-    out = head + ancestors + argv
+    out = head + outer + home_ops + ancestors + argv
     for r in remount_ro:
         out += ["--remount-ro", r]
+    if home_ops:
+        out += ["--remount-ro", str(home_real)]
     _refuse_bind_after_mask(out)
     return out, create_first
+
+
+def _bwrap_runs_without_a_pid_namespace() -> bool:
+    """True when bwrap starts WITHOUT ``--unshare-pid`` and fails WITH it, which pins a refusal on the
+    PID namespace rather than on user namespaces in general. Both probes run here, so the answer
+    never rests on another check's result."""
+    def runs(*extra: str) -> bool:
+        try:
+            proc = subprocess.run(
+                [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", *extra, "/bin/true"],
+                capture_output=True, timeout=10, env=_probe_env(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0
+
+    return runs() and not runs("--unshare-pid")
+
+
+def _probe_env() -> dict[str, str]:
+    from levain.launch import child_env   # stdlib-only, so this module stays a dependency leaf
+
+    return child_env()
 
 
 def bwrap_available() -> bool:
@@ -3725,9 +4331,11 @@ def bwrap_available() -> bool:
         return False
     try:
         proc = subprocess.run(
-            [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "/bin/true"],
+            [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--unshare-pid",
+             "/bin/true"],
             capture_output=True,
             timeout=10,
+            env=_probe_env(),
         )
     except (OSError, subprocess.SubprocessError):
         # Cannot even attempt it -> not available. FAIL CLOSED; never let an exception here read as
@@ -3749,9 +4357,10 @@ def bwrap_netns_available() -> bool:
     try:
         proc = subprocess.run(
             [BWRAP, "--unshare-net", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
-             "/bin/true"],
+             "--unshare-pid", "/bin/true"],
             capture_output=True,
             timeout=10,
+            env=_probe_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -3868,9 +4477,11 @@ def _mount_plan_paths(
     self-bind comes first; its source exists, so nothing is created). A path strictly inside a tmpfs
     root is left out of both, by EXACT containment: the tmpfs hides the
     host tree there, and a case-folded match would drop a distinct path on a case-sensitive filesystem
-    (L3 2026-10-03)."""
+    (L3 2026-10-03). Unless it is strictly inside a host directory self-bound into that tmpfs after it
+    (a tool view's window): below one the host tree is back (L3 r3)."""
     mounted: dict[str, str | None] = {}
     tmpfs: list[Path] = []
+    windows: list[Path] = []   # host directories bound back inside a tmpfs: host-backed again below
     i = 0
     while i < len(argv):
         op = argv[i]
@@ -3883,15 +4494,27 @@ def _mount_plan_paths(
             if dst != "/":
                 kind = "file" if src == "/dev/null" else None   # /dev/null always exists (codex L3 r5)
                 mounted.setdefault(dst, kind)
+                pd = Path(dst)
+                if (src == dst and any(pd != t and pd.is_relative_to(t) for t in tmpfs)
+                        and os.path.isdir(dst)):
+                    windows.append(pd)
             i += 3
         elif op in ("--proc", "--dev", "--remount-ro", "--dir"):
             i += 2
+        elif op == "--symlink":   # a link made in a tmpfs view (a tool directory): nothing on the host
+            i += 3
         else:
             i += 1
 
     def hidden(q: str) -> bool:
+        # Strictly inside a tmpfs, and not strictly inside a host directory bound back into it (a
+        # tool view's ~/.aws/sso: what lies below it is the host's again; codex, L3 r3).
+        # The NEAREST covering mount decides, so a tmpfs or mask nested inside a window is hidden
+        # again (L1 r3: ~/.aws/sso/cache's contents under the ~/.aws/sso window).
         pq = Path(q)
-        return any(pq != r and pq.is_relative_to(r) for r in tmpfs)
+        covers = [(len(r.parts), 1) for r in tmpfs if pq != r and pq.is_relative_to(r)]
+        covers += [(len(w.parts), 0) for w in windows if pq != w and pq.is_relative_to(w)]
+        return bool(covers) and max(covers)[1] == 1
 
     mounted = {q: k for q, k in mounted.items() if not hidden(q)}
     unmounted = [q for q in _named_jewel_paths(policy) if q not in mounted and not hidden(q)]
@@ -3916,29 +4539,400 @@ def _named_jewel_paths(policy: CrownJewelsPolicy) -> list[str]:
     return list(dict.fromkeys(spelled(Path(p)) for p in named))
 
 
-def _prepare_mountpoints(mounted: dict[str, str | None]) -> None:
+def _prepare_mountpoints(mounted: dict[str, str | None],
+                         created: list[tuple[str, str]] | None = None) -> list[tuple[str, str]]:
     """Create every absent host mountpoint before bwrap runs, so the manifest can be recorded before
     the start and nothing is adopted afterwards. bwrap would create the same things (an empty 0444
     file for a ``/dev/null`` bind, a directory for a tmpfs); creating them here first means the object
     it mounts over is the one recorded. An exclusive create that loses a race keeps whatever is there,
-    which is still recorded before bwrap mounts over it."""
+    which is still recorded before bwrap mounts over it. Returns every object THIS call created,
+    parents included, as ``(path, "file" | "dir")``: the ledger owns exactly those (its own
+    successful ``mkdir`` or ``O_EXCL`` create, never a path merely seen absent), and removes them
+    once no session needs them. Each is appended to ``created`` (the caller's list, when given) as it
+    is made, so a failure part-way still leaves the caller holding what was already created."""
+    if created is None:
+        created = []
+
+    def mkdir(a: Path) -> None:
+        try:
+            a.mkdir(mode=0o700)   # each level 0700: mkdir(parents=True) gives the umask (glm L3 r5)
+        except FileExistsError:
+            return                # someone else's (or a racing spawn's): not levain's to remove
+        created.append((str(a), "dir"))
+
     for q, kind in mounted.items():
         p = Path(q)
         if kind is None or os.path.lexists(p):
             continue
         # bwrap would create missing parents too; without them a jewel under an absent directory
         # (~/.config/gh/hosts.yml on a host with no ~/.config/gh) refused bash (complement L3 r4).
-        missing = [a for a in reversed(p.parents) if not os.path.lexists(a)]
-        for a in missing:   # each level 0700: mkdir(parents=True) gives intermediates the umask (glm L3 r5)
-            a.mkdir(mode=0o700, exist_ok=True)
+        for a in [a for a in reversed(p.parents) if not os.path.lexists(a)]:
+            mkdir(a)
         if kind == "dir":
-            p.mkdir(mode=0o700, exist_ok=True)
+            mkdir(p)
         else:
             try:
-                os.close(os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY
-                                 | getattr(os, "O_NOFOLLOW", 0), 0o444))
+                fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                             0o444)
+            except FileExistsError:
+                continue
+            try:
+                os.fchmod(fd, 0o444)   # exactly 0444 whatever the umask: the ledger checks the mode
+            except OSError:
+                # Not the 0444 file the ledger knows how to remove (under umask 077 it is 0400), so it
+                # is removed now, while this call still holds it and knows it is the one it made.
+                try:
+                    st, lst = os.fstat(fd), os.lstat(p)
+                    if (st.st_dev, st.st_ino) == (lst.st_dev, lst.st_ino):
+                        os.unlink(p)
+                finally:
+                    os.close(fd)
+                raise
+            os.close(fd)
+            created.append((q, "file"))
+    return created
+
+
+# --- the session-scoped placeholder ledger (Linux) -----------------------------------------------
+#
+# A mount needs a mountpoint, so an absent jewel under a writable directory (a cred directory under
+# an existing ~/.config, say) is masked over a placeholder the provider creates. Skipping it would let
+# the shell PLANT the file, so the placeholder stays, but only while a session needs it: before this
+# ledger such placeholders were left on the host for good, and ``npm login`` / ``docker login`` then
+# failed on a 0444 file. (A $HOME-level cred file needs none since $HOME became a view, step (0).)
+# ⛔ Never unlinked while a session might rely on it. Since Linux 3.18 a host-side unlink of a
+# file that is a mountpoint in ANOTHER mount namespace succeeds and lazily DETACHES that mount
+# (torvalds/linux 8ed936b, "vfs: Lazily remove mounts on unlinked files and directories"), which
+# would let a live shell create the file. So each object carries the claims of the shells that mask
+# it, and is removed only when none is left: at close, at levain exit, and by the sweep that runs
+# before every Linux spawn, at levain's launch and in ``levain doctor`` (a crash or SIGKILL leaves
+# claims whose process is gone).
+# ⛔ Removed only while it is still the object created: same device and inode, and for a file still
+# empty and 0444, for a directory still empty. An operator's ``npm login`` that replaced it by rename
+# leaves a different inode, which this keeps (and the replacement closed the live shell, through the
+# manifest check in :class:`_BwrapShell`).
+# The ledger directory is a crown jewel (``build_policy``), so the entity can neither read it nor
+# forge a claim. Directories the provider creates to pin them (an absent ~/.kube, say) are recorded
+# the same way.
+
+_LEDGER_NAME = "placeholders.json"
+
+
+def _ledger_dir() -> Path:
+    return Path.home() / ".levain-runtime" / "floor"
+
+
+def _ledger_dir_problem(create: bool) -> str | None:
+    """Why the ledger directory cannot be trusted, or None. It must be a real directory (no link at
+    ``~/.levain-runtime`` or at ``floor``), owned by this user, and ``floor`` must be 0700: a link there
+    could point the ledger at a file someone else wrote, and the ledger decides what levain deletes.
+    With ``create``, absent levels are made 0700 first."""
+    d = _ledger_dir()
+    for level in (d.parent, d):
+        if create and not os.path.lexists(level):
+            try:
+                level.mkdir(mode=0o700)
             except FileExistsError:
                 pass
+            except OSError as exc:
+                return f"cannot create {level} ({exc})"
+        try:
+            st = os.lstat(level)
+        except FileNotFoundError:
+            return f"{level} does not exist"
+        except OSError as exc:
+            return f"cannot inspect {level} ({exc})"
+        if not stat.S_ISDIR(st.st_mode):
+            return f"{level} is not a directory (a link or a file)"
+        if st.st_uid != os.geteuid():
+            return f"{level} is owned by another user"
+    if stat.S_IMODE(os.lstat(d).st_mode) != 0o700:
+        return f"{d} is not mode 0700"
+    return None
+
+
+def _proc_start_time(pid: int) -> str | None:
+    """The kernel's start time of ``pid`` (Linux, field 22 of /proc/<pid>/stat), or None elsewhere or
+    when unreadable. Part of a claim, so a reused pid does not keep a dead session's claim alive."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return data.rsplit(")", 1)[-1].split()[19]
+
+
+def _pidns() -> str:
+    try:
+        return str(os.stat("/proc/self/ns/pid").st_ino)
+    except OSError:
+        return "-"
+
+
+def _new_claim() -> str:
+    """``pid:starttime:pidns:token``. A claim made in another pid namespace (a container sharing this
+    home) cannot be judged from here, so :func:`_claim_alive` keeps it."""
+    pid = os.getpid()
+    return f"{pid}:{_proc_start_time(pid) or '-'}:{_pidns()}:{os.urandom(6).hex()}"
+
+
+def _claim_alive(claim: str) -> bool:
+    parts = claim.split(":")
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    if len(parts) >= 4 and parts[2] != _pidns():
+        return True   # made in another pid namespace: not ours to judge, so kept
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        # levain is gone, but its sandbox may still be dying (bwrap's pid 1 goes down after a
+        # SIGKILLed levain only when PDEATHSIG reaches it): the shell's process group, recorded in
+        # the claim once the shell started, keeps the claim until it is empty (L3 r1).
+        if len(parts) >= 5 and parts[4].startswith("g"):
+            try:
+                os.killpg(int(parts[4][1:]), 0)
+                return True
+            except (ValueError, ProcessLookupError):
+                return False
+            except PermissionError:
+                return True
+        return False
+    except PermissionError:
+        return True   # someone else's process with that pid: alive, so the claim is kept
+    except OSError:
+        return False
+    if len(parts) >= 4 and parts[1] != "-":
+        now = _proc_start_time(pid)
+        if now is not None and now != parts[1]:
+            return False   # the pid was reused by a process that started later
+    return True
+
+
+def _object_unchanged(entry: dict) -> bool:
+    try:
+        st = os.lstat(entry["path"])
+    except OSError:
+        return False
+    if (st.st_dev, st.st_ino) != (entry.get("dev"), entry.get("ino")):
+        return False
+    if entry.get("kind") == "dir":
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        try:
+            return not os.listdir(entry["path"])
+        except OSError:
+            return False
+    return stat.S_ISREG(st.st_mode) and st.st_size == 0 and stat.S_IMODE(st.st_mode) == 0o444
+
+
+def _identity_matches(entry: dict) -> bool:
+    try:
+        st = os.lstat(entry["path"])
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == (entry.get("dev"), entry.get("ino"))
+
+
+class _LedgerTxn:
+    """One transaction on the ledger, under its exclusive lock: everything a spawn does to the objects
+    it relies on (sweep, plan, create, record, claim) happens inside one, so another session's release
+    or sweep cannot remove an object between this spawn deciding to use it and claiming it (L1 r1).
+    On exit, every entry no live claim holds is dropped, and its object removed when it is still the
+    one levain made. ``ok`` is False when the ledger cannot be trusted or read; then nothing is
+    recorded and nothing removed, which leaves objects where they are rather than guessing."""
+
+    def __init__(self) -> None:
+        self.ok = False
+        self.problem: str | None = None
+        self.entries: list[dict] = []
+        self.removed: list[str] = []
+        self.rollback: set[str] = set()   # objects to remove at once if this commit fails
+        self._lock = None
+
+    def __enter__(self) -> "_LedgerTxn":
+        import fcntl
+
+        self.problem = _ledger_dir_problem(create=True)
+        if self.problem is not None:
+            return self
+        d = _ledger_dir()
+        try:
+            self._lock = open(d / (_LEDGER_NAME + ".lock"), "a")
+            fcntl.flock(self._lock, fcntl.LOCK_EX)
+            try:
+                data = json.loads((d / _LEDGER_NAME).read_text(encoding="utf-8"))
+                entries = data["entries"]
+            except FileNotFoundError:
+                entries = []
+            if not isinstance(entries, list):
+                raise ValueError("entries is not a list")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.problem = f"the ledger {d / _LEDGER_NAME} cannot be read ({exc})"
+            return self
+        self.entries = [e for e in entries if isinstance(e, dict) and isinstance(e.get("path"), str)]
+        for e in self.entries:
+            e["claims"] = [c for c in e.get("claims", []) if isinstance(c, str)]
+        self.ok = True
+        return self
+
+    def sweep(self) -> None:
+        """Drop the claims of processes that no longer exist."""
+        for e in self.entries:
+            e["claims"] = [c for c in e["claims"] if _claim_alive(c)]
+
+    def record(self, created: list[tuple[str, str]]) -> None:
+        """Record objects levain itself just created (its own successful ``mkdir`` or ``O_EXCL``
+        create, never "absent when looked at"), with their identity, unclaimed."""
+        for path, kind in created:
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            self.entries = [e for e in self.entries if e["path"] != path]
+            self.entries.append({"path": path, "kind": kind, "dev": st.st_dev, "ino": st.st_ino,
+                                 "claims": []})
+
+    def claim(self, paths: set[str], claim: str) -> None:
+        """Add ``claim`` to every entry at one of ``paths`` whose object is still the one recorded."""
+        for e in self.entries:
+            if e["path"] in paths and _identity_matches(e):
+                e["claims"].append(claim)
+
+    def retag(self, old: str, new: str) -> None:
+        for e in self.entries:
+            e["claims"] = [new if c == old else c for c in e["claims"]]
+
+    def drop(self, claim: str) -> None:
+        for e in self.entries:
+            e["claims"] = [c for c in e["claims"] if c != claim]
+
+    def __exit__(self, *exc: object) -> None:
+        try:
+            if not self.ok:
+                return
+            kept: list[dict] = []
+            # Children before parents, so a created ~/.config/git goes before a created ~/.config.
+            for e in sorted(self.entries, key=lambda e: len(e["path"]), reverse=True):
+                if e["claims"]:
+                    kept.append(e)
+                    continue
+                if _object_unchanged(e):
+                    try:
+                        if e.get("kind") == "dir":
+                            os.rmdir(e["path"])
+                        else:
+                            os.unlink(e["path"])
+                        self.removed.append(e["path"])
+                    except OSError:
+                        kept.append(e)   # still there: try again next time
+                elif e.get("kind") == "dir" and _identity_matches(e):
+                    # Still levain's directory, only not empty yet (another session's object inside
+                    # it, say): kept, so it goes once that is gone (L3 r1).
+                    kept.append(e)
+                # else: it is no longer the object levain made (the operator's now); forget it
+            path = _ledger_dir() / _LEDGER_NAME
+            tmp = path.with_name(path.name + ".tmp")
+            try:
+                tmp.write_text(json.dumps({"entries": sorted(kept, key=lambda e: e["path"])}, indent=1),
+                               encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError as exc:
+                self.problem = f"the ledger {path} cannot be written ({exc})"
+                # What this transaction's spawn made is in no ledger on disk and no shell will use
+                # it: removed now, still under the lock, if it is still the object made (L3 r3).
+                for e in sorted(self.entries, key=lambda e: len(e["path"]), reverse=True):
+                    if e["path"] in self.rollback and _object_unchanged(e):
+                        try:
+                            os.rmdir(e["path"]) if e.get("kind") == "dir" else os.unlink(e["path"])
+                        except OSError:
+                            pass
+        finally:
+            if self._lock is not None:
+                self._lock.close()   # releases the flock
+
+
+def _ledger_enter(created: list[tuple[str, str]], mounted: set[str], claim: str) -> None:
+    """Record ``created`` and claim every entry at a path in ``mounted`` (one transaction)."""
+    with _LedgerTxn() as txn:
+        if txn.ok:
+            txn.record(created)
+            txn.claim(mounted, claim)
+
+
+def _ledger_release(claim: str) -> list[str]:
+    """Drop ``claim`` and remove what no session holds any more. Called only once the claiming
+    shell's namespace is gone (:meth:`_BwrapShell.close`)."""
+    with _LedgerTxn() as txn:
+        if txn.ok:
+            txn.drop(claim)
+    return txn.removed
+
+
+def sweep_floor_placeholders() -> list[str]:
+    """Drop the claims of processes that no longer exist and remove the objects nobody holds. Run
+    inside every Linux spawn's own transaction, at launch (:mod:`levain.launch`) and by
+    ``levain doctor``. Returns the paths removed."""
+    if not (_ledger_dir() / _LEDGER_NAME).exists():
+        return []
+    with _LedgerTxn() as txn:
+        if txn.ok:
+            txn.sweep()
+    return txn.removed
+
+
+def ledger_problem() -> str | None:
+    """Why the placeholder ledger cannot be used, or None (for ``levain doctor``: a ledger levain
+    cannot read or trust leaves every placeholder on disk, so it must be said, not swallowed)."""
+    d = _ledger_dir()
+    if not os.path.lexists(d) and not os.path.lexists(d.parent):
+        return None   # never used on this host
+    with _LedgerTxn() as txn:
+        pass
+    return txn.problem
+
+
+def live_floor_placeholders() -> list[Path]:
+    """The placeholder FILES a live session holds on this host right now (for the banner)."""
+    try:
+        entries = json.loads((_ledger_dir() / _LEDGER_NAME).read_text(encoding="utf-8"))["entries"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    return [Path(e["path"]) for e in entries
+            if isinstance(e, dict) and e.get("kind") == "file"
+            and any(isinstance(c, str) and _claim_alive(c) for c in e.get("claims", []))]
+
+
+_LIVE_BWRAP_SHELLS: "weakref.WeakSet[_BwrapShell]" = weakref.WeakSet()
+
+
+@atexit.register
+def _close_live_shells() -> None:
+    """At levain's exit, close every Linux shell still open, so each releases its placeholders the
+    normal way, after its namespace is gone. Releasing a claim while its shell lived would let the
+    release unlink a placeholder still mounted in that shell, which detaches the mount."""
+    for shell in list(_LIVE_BWRAP_SHELLS):
+        try:
+            shell.close()
+        except Exception:  # noqa: BLE001 — exit must go on
+            pass
+
+
+def _group_gone(pgid: int, *, timeout: float) -> bool:
+    """True once no process is left in process group ``pgid`` (polled until ``timeout``)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass   # a member exists that this user may not signal: not gone
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 class _BwrapShell(SandboxedShell):
@@ -3980,6 +4974,26 @@ class _BwrapShell(SandboxedShell):
         super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
         self._jewel_policy = policy
         self._manifest = dict(manifest)   # recorded before the start; never updated
+        self._ledger_claim: str | None = None   # this shell's claim on the placeholder ledger
+
+    def close(self) -> None:
+        # The claim is released only once the sandbox's namespace is GONE, never while any process of
+        # it lives: a host-side unlink of a placeholder still mounted in a live namespace detaches that
+        # mount (Linux 3.18+, 8ed936b), and the shell could then plant the file (L1 + L2 r1). Reaping
+        # bwrap's monitor is not enough: on SIGTERM it dies at once, while the namespace's pid 1 (in
+        # the same process group, no --new-session) and everything under it go down asynchronously.
+        # So the release waits until no process of the group is left; with --unshare-pid, pid 1's
+        # exit kills and waits for every process of its namespace first, so an empty group means an
+        # empty namespace. If it is not empty in time, the claim stays, and the sweep at the next spawn
+        # or at launch releases it once this levain is gone. `finally`, as `_SeatbeltShell.close`.
+        pgid = self._proc.pid if self._proc is not None else None
+        try:
+            super().close()
+        finally:
+            claim, self._ledger_claim = self._ledger_claim, None
+            _LIVE_BWRAP_SHELLS.discard(self)
+            if claim is not None and (pgid is None or _group_gone(pgid, timeout=5.0)):
+                _ledger_release(claim)
 
     def _recheck(self) -> None:
         _refuse_plantable_sqlite_jewels(self._jewel_policy)
@@ -4028,12 +5042,14 @@ class BwrapProvider(ConfinementProvider):
     message a human reads will say "No such file or directory", and anything matching on EPERM to
     detect a denial will not fire.
 
-    ⚠ NOT CLAIMED, BECAUSE NOT MEASURED: whether ``--unshare-pid`` would close the DAEMONIZED
-    SURVIVOR limit the module docstring documents as open on macOS. It plausibly would (a pid
-    namespace reaps its children when its init exits), it is one flag, and it is deliberately NOT
-    built here — K4c is PARITY, and the one attempt to measure it was invalidated by a container
-    artifact (procfs cannot be mounted under Docker's default caps). It needs a real Linux host
-    before it is either claimed or shipped."""
+    ``--unshare-pid`` IS NOW BUILT (lane P2 item 2c, 2026-10-07), for a different reason than the one
+    this paragraph once weighed it for: without it the sandbox's procfs showed every process of this
+    user, so bash could read ``/proc/<pid>/environ`` of levain and the rest. pid_namespaces(7): the
+    new procfs shows only the namespace's processes (asserted live by
+    ``test_linux_live_bash_sees_no_host_process``, which the CI workflow's live job runs), and "If
+    the "init" process of a PID namespace terminates, the kernel terminates all of the processes in
+    the namespace via a SIGKILL signal", which on paper also ends a ``setsid`` survivor when bash's
+    shell ends; that second effect is not claimed until a test measures it."""
 
     #: Enforced by ``--unshare-net`` (no IP network in bash), not by a per-destination rule; what it
     #: does not close is ``OFFLINE_RESIDUAL``.
@@ -4045,6 +5061,60 @@ class BwrapProvider(ConfinementProvider):
 
     def localhost_deny_ready(self) -> bool:
         return bwrap_netns_available()
+
+    def _prepare(self, policy: CrownJewelsPolicy, made: list[tuple[str, str]]):
+        """Plan the floor and put on the host what it needs, inside the caller's ledger transaction:
+        ``(argv, create_first, mounted, unmounted, manifest)``. Every object it creates is appended to
+        ``made`` as it goes, so a refusal part-way still hands the ledger everything made."""
+        # The named jewels' state BEFORE the plan reads the disk: a path that changes between the plan
+        # and the manifest (an absent root created as a directory, say) would be recorded in its new
+        # state, unmounted and never "changed" again, so the spawn refuses instead (codex L3 r4).
+        try:
+            before_plan = {q: _identity(Path(q)) for q in _named_jewel_paths(policy)}
+        except (OSError, RuntimeError) as exc:
+            raise ConfinementError(
+                f"could not inspect the floor's jewels ({exc}) — refusing to grant bash hands "
+                "(fail-closed)."
+            ) from exc
+        # The workspace exists BEFORE the plan reads $HOME: one directly in $HOME made later would
+        # be missing from the step (0) view (codex, closing pass). Not a jail — reach is
+        # default-allowed; Popen needs it to exist.
+        policy.workspace.mkdir(parents=True, exist_ok=True)
+        argv, create_first = _bwrap_plan(policy)
+        mounted, unmounted = _mount_plan_paths(argv, policy)
+        # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
+        # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
+        argv = argv + ["/bin/bash", "--noprofile", "--norc", "-p"]
+        # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
+        # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
+        # Each one this process made is levain's, recorded in the placeholder ledger and removed once
+        # no session needs it; one that appeared meanwhile is someone else's and is left alone.
+        for d in create_first:
+            try:
+                Path(d).mkdir(mode=0o700)
+                made.append((d, "dir"))
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise ConfinementError(
+                    f"could not create {d} to pin it before sandboxing ({exc}) — refusing to grant "
+                    "bash hands (fail-closed)."
+                ) from exc
+        try:
+            _prepare_mountpoints(mounted, made)
+            manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
+        except (OSError, RuntimeError) as exc:
+            raise ConfinementError(
+                f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
+                "bash hands (fail-closed)."
+            ) from exc
+        moved = [q for q in unmounted if q not in before_plan or manifest.get(q) != before_plan[q]]
+        if moved:
+            raise ConfinementError(
+                f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
+                "— refusing to grant bash hands (fail-closed). Try again."
+            )
+        return argv, create_first, mounted, unmounted, manifest
 
     def render_profile(self, policy: CrownJewelsPolicy) -> str:
         """The bwrap invocation as shell-quoted text.
@@ -4066,56 +5136,44 @@ class BwrapProvider(ConfinementProvider):
         default_timeout: float = 120.0,
     ) -> SandboxedShell:
         if not bwrap_available():
+            d = diagnose_confinement("Linux")
             raise ConfinementError(
-                f"{BWRAP} cannot establish a namespace on this host — refusing to grant bash hands "
-                "without a confinement floor (fail-closed). The usual cause on Ubuntu 23.10+ is "
-                "`kernel.apparmor_restrict_unprivileged_userns=1`, which blocks unprivileged user "
-                "namespaces for unconfined programs; an AppArmor profile granting `userns` to "
-                f"{BWRAP} is the narrow fix. Note that `bwrap` being INSTALLED and "
-                "`kernel.unprivileged_userns_clone=1` can BOTH be true on a host where this still "
-                "fails — which is why this is probed by running bwrap, not by reading either."
+                f"{BWRAP} cannot establish the floor's namespaces on this host — refusing to grant "
+                f"bash hands without a confinement floor (fail-closed). {d.reason}."
+                + (f" To fix: {d.remedy}." if d.remedy else "")
+                + " The usual cause on Ubuntu 23.10+ is `kernel.apparmor_restrict_unprivileged_userns=1`; "
+                "`bwrap` being installed and `kernel.unprivileged_userns_clone=1` can both be true on "
+                "a host where this still fails, which is why it is probed by running bwrap."
             )
-        # The named jewels' state BEFORE the plan reads the disk: a path that changes between the plan
-        # and the manifest (an absent root created as a directory, say) would be recorded in its new
-        # state, unmounted and never "changed" again, so the spawn refuses instead (codex L3 r4).
-        try:
-            before_plan = {q: _identity(Path(q)) for q in _named_jewel_paths(policy)}
-        except (OSError, RuntimeError) as exc:
-            raise ConfinementError(
-                f"could not inspect the floor's jewels ({exc}) — refusing to grant bash hands "
-                "(fail-closed)."
-            ) from exc
-        argv, create_first = _bwrap_plan(policy)
-        mounted, unmounted = _mount_plan_paths(argv, policy)
-        # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
-        # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
-        argv = argv + ["/bin/bash", "--noprofile", "--norc", "-p"]
-        # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
-        # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
-        for d in create_first:
-            try:
-                Path(d).mkdir(mode=0o700, exist_ok=True)
-            except OSError as exc:
+        # ONE ledger transaction from the sweep to the claim (L1 r1): another session's release or sweep
+        # cannot remove an object this plan relies on between the plan and the claim. The sweep runs
+        # FIRST, so a crashed session's objects are either gone before the plan looks or claimed by it.
+        claim = _new_claim()
+        made: list[tuple[str, str]] = []
+        with _LedgerTxn() as txn:
+            if not txn.ok:
+                # Without a ledger this shell's claims cannot reach the disk, and another session
+                # that can read it later would remove what this shell's masks stand on (codex, L3 r3).
                 raise ConfinementError(
-                    f"could not create {d} to pin it before sandboxing ({exc}) — refusing to grant "
-                    "bash hands (fail-closed)."
-                ) from exc
-        # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
-        # needs it to exist. Not a jail — reach is default-allowed.
-        policy.workspace.mkdir(parents=True, exist_ok=True)
-        try:
-            _prepare_mountpoints(mounted)
-            manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
-        except (OSError, RuntimeError) as exc:
+                    f"{txn.problem} — refusing to grant bash hands (fail-closed): the floor's "
+                    "placeholder ledger is needed to keep its files in place for this shell."
+                )
+            txn.sweep()
+            try:
+                argv, create_first, mounted, unmounted, manifest = self._prepare(policy, made)
+            finally:
+                # Recorded even on a refusal: unclaimed, it is removed as the transaction ends.
+                txn.record(made)
+                txn.rollback = {p for p, _ in made}
+            # Everything this spawn made is claimed too, parents included (an absent ~/.config
+            # made for ~/.config/gh): unclaimed and non-empty, it would otherwise be forgotten.
+            txn.claim({*mounted, *create_first, *(p for p, _ in made)}, claim)
+        if txn.problem is not None:
+            # The claim never reached the disk, so another session's close could remove a placeholder
+            # this shell's mask would stand on, and the shell could then plant it (codex, L3 r2).
             raise ConfinementError(
-                f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
-                "bash hands (fail-closed)."
-            ) from exc
-        moved = [q for q in unmounted if q not in before_plan or manifest.get(q) != before_plan[q]]
-        if moved:
-            raise ConfinementError(
-                f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
-                "— refusing to grant bash hands (fail-closed). Try again."
+                f"{txn.problem} — refusing to grant bash hands (fail-closed): without its claim on "
+                "disk, another session could remove a file this shell's floor relies on."
             )
         # Startup-execution controls stripped as well as ignored by `-p`: bash would source, import or
         # expand these before the first per-command check, so a jewel that appeared after the manifest
@@ -4132,8 +5190,24 @@ class BwrapProvider(ConfinementProvider):
             env=shell_env,
             default_timeout=default_timeout,
         )
+        shell._ledger_claim = claim
+        _LIVE_BWRAP_SHELLS.add(shell)
         try:
             shell.start()
+            if shell._proc is not None:
+                # The claim now names the shell's process group as well (see `_claim_alive`).
+                tagged = f"{claim}:g{shell._proc.pid}"
+                with _LedgerTxn() as txn:
+                    if txn.ok:
+                        txn.retag(claim, tagged)
+                if not txn.ok or txn.problem is not None:
+                    # Unwritten, the claim names only levain's pid: after a levain crash a sweep
+                    # would drop it while the sandbox lives on its mounts (codex, L3 r3).
+                    raise ConfinementError(
+                        f"{txn.problem} — refusing to grant bash hands (fail-closed): the shell's "
+                        "claim on the floor's files could not be recorded."
+                    )
+                shell._ledger_claim = tagged
             shell._recheck()   # whatever changed during the start closes it before any command
         except ConfinementError:   # a RuntimeError subclass: the recheck's own refusal, unchanged
             shell.close()
@@ -4318,6 +5392,18 @@ def diagnose_confinement(system: str | None = None) -> ConfinementDiagnosis:
     if provider.available():
         return ConfinementDiagnosis(True, "bwrap (Linux mount namespace)",
                                     "Linux bwrap floor active", None)
+    if _bwrap_runs_without_a_pid_namespace():
+        # The floor needs `--unshare-pid` (so bash cannot read other processes' environments), and
+        # a new PID namespace needs a fresh /proc mount, which the kernel refuses where /proc has
+        # masked or covered paths: the default inside Docker and podman (L2 r1, from bubblewrap.c).
+        # Never dropped to make bash start: fail closed, with the cause and the fix.
+        return ConfinementDiagnosis(
+            False, "bwrap (Linux mount namespace)",
+            "bwrap runs here, but cannot give bash its own PID namespace: a fresh /proc cannot be "
+            "mounted (usually because this is a container whose /proc has masked paths)",
+            "run levain on the host, or start the container with an unmasked /proc (Docker and "
+            "podman: `--security-opt systempaths=unconfined`)",
+        )
     if _apparmor_restricts_userns():
         return ConfinementDiagnosis(
             False, "bwrap (Linux mount namespace)",

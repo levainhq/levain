@@ -62,10 +62,14 @@ Requires the ``openhands`` extra.
 """
 from __future__ import annotations
 
+import builtins
+import contextvars
 import dataclasses
+import errno
 import logging
 import os
 import shutil
+import stat
 import threading
 import weakref
 from pathlib import Path
@@ -97,12 +101,481 @@ from levain.firing.confinement import (
     SandboxedShell,
     crown_jewel_reason,
     linked_jewel_reason,
+    opened_file_path,
+    opened_file_reason,
     refresh_socket_denies,
     select_provider,
 )
 from levain.firing.binding import ConversationBinding
 
 _log = logging.getLogger("levain.firing.tools")  # module convention: see levain/wrap.py, jobs.py
+
+# THE EDITOR'S OPENS ARE JUDGED AFTER THEY OPEN, BEFORE ANYTHING IS READ (L2 r1). The executor's path
+# check runs before the stock editor opens the path, so a link the shell flips in between (benign at
+# the check, /proc/<pid>/environ or a jewel at the open) passed it. The stock editor opens files with
+# the module-global ``open`` of two modules; each is given this wrapper, which, while a floored
+# executor call is running in this context, asks :func:`opened_file_reason` about the object actually
+# opened and refuses (closing it) before the editor reads a byte. Outside such a call it is ``open``.
+_EDITOR_FLOOR: contextvars.ContextVar[CrownJewelsPolicy | None] = contextvars.ContextVar(
+    "levain_editor_floor", default=None)
+
+
+class _FloorRefusedOpen(PermissionError):
+    """An editor open the floor refused after opening (see :func:`_floored_open`)."""
+
+
+def _floored_open(file, *args, **kwargs):
+    policy = _EDITOR_FLOOR.get()
+    if policy is None or "opener" in kwargs:
+        return builtins.open(file, *args, **kwargs)
+
+    def opener(path, flags):
+        # Judged BEFORE any byte moves: without O_TRUNC (truncating first would already have emptied a
+        # jewel), and a file this call creates is created O_EXCL, so a refusal knows it may remove it.
+        # O_NONBLOCK on the way in: a FIFO the shell planted must be refused, not block the editor.
+        created = False
+        probe = (flags & ~(os.O_TRUNC | os.O_CREAT | os.O_EXCL)) | os.O_NONBLOCK
+        if flags & os.O_CREAT and flags & os.O_EXCL:
+            # `open(path, "x")`: the caller asked to fail on an existing file, so no first open.
+            fd = os.open(path, (flags & ~os.O_TRUNC) | os.O_NONBLOCK, 0o666)
+            created = True
+        else:
+            for _ in range(3):
+                try:
+                    fd = os.open(path, probe, 0o666)
+                    break
+                except FileNotFoundError:
+                    if not flags & os.O_CREAT:
+                        raise
+                try:
+                    fd = os.open(path, (flags & ~os.O_TRUNC) | os.O_EXCL | os.O_NONBLOCK, 0o666)
+                    created = True
+                    break
+                except FileExistsError:
+                    if os.path.islink(path):
+                        # A dangling link: creating would make a file wherever it points.
+                        raise _FloorRefusedOpen(
+                            f"{path} is a dangling symlink; the floor does not create its target"
+                        ) from None
+                    # Another process created it between the two opens (L3 r2): open it again.
+            else:
+                raise _FloorRefusedOpen(f"{path} kept appearing and vanishing between opens; not opened")
+        try:
+            st = os.fstat(fd)
+            if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+                reason = "the opened path is not a regular file (a FIFO, device or socket)"
+            else:
+                reason = opened_file_reason(policy, fd)
+        except Exception as exc:  # noqa: BLE001 — a check that cannot run refuses
+            reason = f"the opened file could not be checked ({exc})"
+        if reason is not None:
+            if created:
+                try:
+                    real = opened_file_path(fd)
+                    lst = os.lstat(real)
+                    if (lst.st_dev, lst.st_ino) == (st.st_dev, st.st_ino):
+                        os.unlink(real)
+                except OSError:
+                    pass
+            os.close(fd)
+            raise _FloorRefusedOpen(reason)
+        os.set_blocking(fd, not flags & os.O_NONBLOCK)
+        if flags & os.O_TRUNC:
+            os.ftruncate(fd, 0)
+        return fd
+
+    return builtins.open(file, *args, opener=opener, **kwargs)
+
+
+# THE EDITOR'S OTHER PRIMITIVES WALK BY DIRECTORY FD (codex, L3 r2 on the frozen tip). ``insert`` moves
+# a temp file onto its target with ``shutil.move`` and a directory ``view`` lists with ``Path.iterdir``,
+# neither through ``open``, so a parent link the shell flips after the executor's path check led the
+# move onto a jewel, or the listing into a denied subtree. Both now walk the path one component at a
+# time from ``/`` with O_NOFOLLOW, REFUSE any component that is a symlink (head ruling 2026-10-07:
+# never follow one), judge the directory they end up holding by its name and by the identity of it
+# and each of its ancestors, and then act relative to that held fd. A path under one of the policy's
+# trusted roots (the workspace, the entity dir, $HOME) is first mapped to that root's real spelling,
+# resolved once when the policy was built: a link ABOVE such a root (macOS /tmp, a symlinked $HOME)
+# is the operator's, and only links below it are refused (head ruling, same day).
+
+
+class _FloorRefusedWalk(Exception):
+    """A non-open editor primitive the floor refused. Not an OSError, so the stock editor's own
+    ``except OSError`` around a directory listing does not turn it into a plain error message."""
+
+
+def _trusted_spelling(p: str) -> str:
+    """``p`` with a trusted root it lies under replaced by that root's real path (the policy's
+    ``trusted_roots``, longest first), else ``p`` unchanged."""
+    policy = _EDITOR_FLOOR.get()
+    for lex, real in (policy.trusted_roots if policy is not None else ()):
+        lx = str(lex)
+        if p == lx or p.startswith(lx.rstrip("/") + "/"):
+            return str(real) + p[len(lx):]
+    return p
+
+
+def _held_dir(path: str | Path) -> tuple[int, str]:
+    """``(fd, path)`` of the directory ``path``, opened component by component from ``/`` without
+    following a symlink anywhere. Refuses a symlink component; other errors propagate."""
+    p = _trusted_spelling(os.path.abspath(os.path.expanduser(str(path))))
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    walked = "/"
+    try:
+        for part in [c for c in p.split("/") if c]:
+            st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            walked = os.path.join(walked, part)
+            if stat.S_ISLNK(st.st_mode):
+                raise _FloorRefusedWalk(
+                    f"{walked} is a symlink, and the editor does not follow a link it would act "
+                    "through (it could be repointed between the check and the act)"
+                )
+            try:
+                nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    # Swapped for a link (or a file) after the stat above: the same refusal.
+                    raise _FloorRefusedWalk(f"{walked} changed into a link or a file during the walk "
+                                            "— refused") from None
+                raise
+            os.close(fd)
+            fd = nfd
+        return fd, walked
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _held_dir_reason(policy: CrownJewelsPolicy, fd: int, walked: str) -> str | None:
+    """Why the held directory must not be used: its name is a jewel or inside one, or it or any
+    ancestor (reached through ``..`` from the fd itself, so a rename since the walk is seen) is a
+    denied subtree root by identity."""
+    reason = crown_jewel_reason(policy, walked)
+    if reason is not None:
+        return reason
+    roots: dict[tuple[int, int], str] = {}
+    for r in (*policy.deny_read_write, *((policy.ssh_dir,) if policy.ssh_dir else ())):
+        try:
+            rs = os.stat(r)
+        except OSError:
+            continue
+        roots[(rs.st_dev, rs.st_ino)] = str(r)
+    cur = os.dup(fd)
+    try:
+        for _ in range(4096):
+            st = os.fstat(cur)
+            hit = roots.get((st.st_dev, st.st_ino))
+            if hit is not None:
+                return f"{walked} is inside the crown-jewel directory {hit}, which the floor denies"
+            up = os.open("..", os.O_RDONLY | os.O_DIRECTORY, dir_fd=cur)
+            os.close(cur)
+            cur = up
+            ust = os.fstat(cur)
+            if (ust.st_dev, ust.st_ino) == (st.st_dev, st.st_ino):
+                return None   # the root is its own parent
+        return f"{walked}: the walk up to / did not end — refused"
+    finally:
+        os.close(cur)
+
+
+def _judged_dir(path: str | Path) -> tuple[int, str]:
+    """:func:`_held_dir`, refused unless :func:`_held_dir_reason` passes it."""
+    fd, walked = _held_dir(path)
+    try:
+        reason = _held_dir_reason(_EDITOR_FLOOR.get(), fd, walked)
+    except OSError as exc:
+        reason = f"{walked} could not be checked ({exc}) — refused"
+    if reason is not None:
+        os.close(fd)
+        raise _FloorRefusedWalk(reason)
+    return fd, walked
+
+
+def _floored_move(src, dst, *args, **kwargs):
+    """``shutil.move`` for the editor's ``insert``: its own temp file renamed onto ``dst`` relative to
+    the held, judged parent directory, with the target name judged too and never a link."""
+    policy = _EDITOR_FLOOR.get()
+    if policy is None:
+        return shutil.move(src, dst, *args, **kwargs)
+    try:
+        return _floored_move_impl(policy, src, dst)
+    except BaseException:
+        try:
+            os.unlink(src)   # the editor's temp file, holding the edit, on any failed move (L1 r3)
+        except OSError:
+            pass
+        raise
+
+
+def _floored_move_impl(policy: CrownJewelsPolicy, src, dst) -> str:
+    dst = _trusted_spelling(os.path.abspath(os.path.expanduser(str(dst))))
+    name = os.path.basename(dst)
+    pfd, walked = _judged_dir(os.path.dirname(dst))
+    try:
+        target = os.path.join(walked, name)
+        reason = crown_jewel_reason(policy, target)
+        if reason is None:
+            try:
+                st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
+            except FileNotFoundError:
+                st = None
+            if st is not None and stat.S_ISLNK(st.st_mode):
+                reason = f"{target} is a symlink; the editor does not replace a link it wrote through"
+            elif st is not None and st.st_nlink > 1:
+                reason = linked_jewel_reason(policy, target)
+        if reason is not None:
+            raise _FloorRefusedWalk(reason)
+        try:
+            os.rename(src, name, dst_dir_fd=pfd)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            # The temp file is on another filesystem: copied to a new name in the held directory and
+            # renamed over the target there, so the target name is replaced, never opened (a FIFO
+            # or a hardlink planted at it is not written through; L1 r3).
+            # The source is opened once, without following a link, and judged like any editor
+            # open: the temp file sits in a directory the sandbox shares, so its name may have been
+            # swapped for a link to a jewel (codex, closing pass).
+            sfd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(sfd, "rb") as fin:
+                sst = os.fstat(sfd)
+                if not stat.S_ISREG(sst.st_mode) or sst.st_uid != os.geteuid():
+                    raise _FloorRefusedWalk(f"{src}: the editor's temp file was replaced")
+                why = opened_file_reason(policy, sfd)
+                if why is not None:
+                    raise _FloorRefusedWalk(why)
+                tmp = f".{name}.levain-{os.urandom(6).hex()}"
+                out = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666,
+                              dir_fd=pfd)
+                try:
+                    with os.fdopen(out, "wb") as fout:   # owns `out` from here, closed on any exit
+                        shutil.copyfileobj(fin, fout)
+                    os.rename(tmp, name, src_dir_fd=pfd, dst_dir_fd=pfd)
+                except BaseException:
+                    try:
+                        os.unlink(tmp, dir_fd=pfd)
+                    except OSError:
+                        pass
+                    raise
+            os.unlink(src)
+        # Re-judged by what is now there, as an open is judged by the object it opened. A swapped
+        # source moved in by the rename (a link, say) is removed again, not left in the workspace.
+        st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+            try:
+                os.unlink(name, dir_fd=pfd)
+            except OSError:
+                pass
+            raise _FloorRefusedWalk(f"{target}: what the move put there is not the editor's file")
+        return target
+    finally:
+        os.close(pfd)
+
+
+def _entries(fd: int) -> list[os.DirEntry]:
+    with os.scandir(fd) as it:
+        return sorted(it, key=lambda e: e.name)
+
+
+def _install_floored_dir_view(editor_cls) -> None:
+    """The directory ``view``, counted and listed through a held, judged fd. A child directory is
+    listed only when it is a real directory (a link is shown, never entered) that passes the same
+    judgement. Lines are formatted by the stock editor's own formatter."""
+    stock_count = editor_cls._count_hidden_children
+    stock_list = editor_cls._list_directory_for_view
+
+    def count(self, path):
+        if _EDITOR_FLOOR.get() is None:
+            return stock_count(self, path)
+        fd, _ = _judged_dir(path)
+        try:
+            return sum(1 for e in _entries(fd) if e.name.startswith("."))
+        finally:
+            os.close(fd)
+
+    def listing(self, path):
+        policy = _EDITOR_FLOOR.get()
+        if policy is None:
+            return stock_list(self, path)
+        fd, walked = _judged_dir(path)
+        shown = [path]
+        try:
+            for e in _entries(fd):
+                if e.name.startswith("."):
+                    continue
+                shown.append(path / e.name)
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    cfd = os.open(e.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except OSError:
+                    continue
+                try:
+                    if _held_dir_reason(policy, cfd, os.path.join(walked, e.name)) is None:
+                        shown += [path / e.name / c.name for c in _entries(cfd)
+                                  if not c.name.startswith(".")]
+                except OSError:
+                    pass
+                finally:
+                    os.close(cfd)
+        finally:
+            os.close(fd)
+        return [self._format_directory_entry(path, entry) for entry in shown]
+
+    editor_cls._count_hidden_children = count
+    editor_cls._list_directory_for_view = listing
+
+
+class _FlooredShutil:
+    """The editor module's ``shutil`` with ``move`` floored; everything else is the real module."""
+
+    move = staticmethod(_floored_move)
+
+    def __getattr__(self, name):
+        return getattr(shutil, name)
+
+
+# THE EDITOR'S NAME-BASED STATS (head ruling 2026-10-07). exists / is_dir / is_file / getsize /
+# getmtime / is_binary run in levain's own process, outside the sandbox, and by NAME, so a parent link
+# flipped after the executor's check revealed a denied path's existence, type and size. They now go
+# through the same walk: the parent is held and judged, the last name is opened from it (a link there
+# is followed, and the object reached is judged as the floored open judges it), and the answer comes
+# from that fd. Anything the floor would refuse answers exactly as a missing path does.
+
+
+def _floored_stat(path) -> os.stat_result | None:
+    """The stat of ``path`` through the floor, or None when it is missing, unreachable without
+    following a link the walk refuses, or something the floor denies (all three look the same)."""
+    policy = _EDITOR_FLOOR.get()
+    # Mapped whole first: the trusted root may be the path itself (the workspace dir).
+    p = _trusted_spelling(os.path.abspath(os.path.expanduser(str(path))))
+    try:
+        pfd, walked = _judged_dir(os.path.dirname(p))
+    except (_FloorRefusedWalk, OSError):
+        return None
+    try:
+        name = os.path.basename(p)
+        if not name:
+            return os.fstat(pfd)
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY, dir_fd=pfd)
+        except PermissionError:
+            # Unreadable, so not opened: stat it, and judge it by identity against the jewels.
+            st = os.stat(name, dir_fd=pfd)
+            if crown_jewel_reason(policy, os.path.join(walked, name)) is not None:
+                return None
+            try:
+                jewels = _jewel_inodes(policy)
+            except ConfinementError:
+                return None
+            return None if (st.st_dev, st.st_ino) in jewels else st
+        try:
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode):
+                reason = _held_dir_reason(policy, fd, os.path.join(walked, name))
+            else:
+                reason = opened_file_reason(policy, fd)
+            return None if reason is not None else st
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(pfd)
+
+
+class _FlooredPath(type(Path())):
+    """The editor module's ``Path``: while a floored call runs, ``exists`` / ``is_dir`` / ``is_file``
+    / ``stat`` answer through :func:`_floored_stat`; otherwise they are ``Path``'s own."""
+
+    def exists(self, *args, **kwargs):
+        if _EDITOR_FLOOR.get() is None:
+            return super().exists(*args, **kwargs)
+        return _floored_stat(self) is not None
+
+    def is_dir(self, *args, **kwargs):
+        if _EDITOR_FLOOR.get() is None:
+            return super().is_dir(*args, **kwargs)
+        st = _floored_stat(self)
+        return st is not None and stat.S_ISDIR(st.st_mode)
+
+    def is_file(self, *args, **kwargs):
+        if _EDITOR_FLOOR.get() is None:
+            return super().is_file(*args, **kwargs)
+        st = _floored_stat(self)
+        return st is not None and stat.S_ISREG(st.st_mode)
+
+    def stat(self, *args, **kwargs):
+        if _EDITOR_FLOOR.get() is None:
+            return super().stat(*args, **kwargs)
+        st = _floored_stat(self)
+        if st is None:
+            raise FileNotFoundError(2, "No such file or directory", str(self))
+        return st
+
+
+def _floored_size_or_mtime(attr: str, stock):
+    def fn(path):
+        if _EDITOR_FLOOR.get() is None:
+            return stock(path)
+        st = _floored_stat(path)
+        if st is None:
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return getattr(st, attr)
+    return fn
+
+
+class _FlooredOsPath:
+    """``os.path`` for the editor modules, with ``getsize`` and ``getmtime`` floored."""
+
+    getsize = staticmethod(_floored_size_or_mtime("st_size", os.path.getsize))
+    getmtime = staticmethod(_floored_size_or_mtime("st_mtime", os.path.getmtime))
+
+    def __getattr__(self, name):
+        return getattr(os.path, name)
+
+
+class _FlooredOs:
+    """``os`` for the editor modules: the real module with ``path`` floored."""
+
+    path = _FlooredOsPath()
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
+def _floored_is_binary(stock):
+    def fn(filename, *args, **kwargs):
+        if _EDITOR_FLOOR.get() is None:
+            return stock(filename, *args, **kwargs)
+        from binaryornot.helpers import is_binary_string
+
+        if kwargs.get("check_extensions", True):
+            from binaryornot.check import has_binary_extension
+
+            if has_binary_extension(filename):
+                return True
+        from binaryornot import check as _check
+
+        with _floored_open(filename, "rb") as fh:   # judged by the object opened
+            return is_binary_string(fh.read(getattr(_check, "CHUNK_SIZE", 512)))
+    return fn
+
+
+def _install_floored_open() -> None:
+    from openhands.tools.file_editor import editor as _editor_mod
+    from openhands.tools.file_editor.utils import encoding as _encoding_mod
+
+    for mod in (_editor_mod, _encoding_mod):
+        mod.open = _floored_open   # type: ignore[attr-defined]
+        mod.Path = _FlooredPath   # type: ignore[attr-defined]
+        mod.os = _FlooredOs()   # type: ignore[attr-defined]
+    _editor_mod.shutil = _FlooredShutil()   # type: ignore[attr-defined]
+    _editor_mod.is_binary = _floored_is_binary(_editor_mod.is_binary)   # type: ignore[attr-defined]
+    _install_floored_dir_view(_editor_mod.FileEditor)
+
+
+_install_floored_open()
 
 if TYPE_CHECKING:
     from openhands.sdk.conversation.state import ConversationState
@@ -472,7 +945,20 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
                 command=action.command,
                 is_error=True,
             )
-        return super().__call__(action, conversation)
+        token = _EDITOR_FLOOR.set(policy)
+        try:
+            return super().__call__(action, conversation)
+        except (_FloorRefusedOpen, _FloorRefusedWalk) as exc:
+            return FileEditorObservation.from_text(
+                text=(
+                    f"REFUSED (crown-jewels floor): {exc}. Your hands reach the rest of the "
+                    "filesystem, but the sovereignty crown jewels are structurally off-limits."
+                ),
+                command=action.command,
+                is_error=True,
+            )
+        finally:
+            _EDITOR_FLOOR.reset(token)
 
 
 class LevainFileEditorTool(FileEditorTool):

@@ -122,7 +122,7 @@ class _FakeRun:
         self._rc_for = rc_for or {}
         self._stdout_for = stdout_for or {}
 
-    def __call__(self, cmd, capture_output=True, text=True):  # noqa: ANN001
+    def __call__(self, cmd, capture_output=True, text=True, env=None):  # noqa: ANN001
         self.calls.append(cmd)
         sub = cmd[1] if len(cmd) > 1 else ""
         key = sub

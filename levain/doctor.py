@@ -119,6 +119,7 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     core.extend(_check_confinement(install))
     if hookless:
         core.extend(_check_hands_isolation(install))
+    core.extend(_check_floor_placeholders())
     core.extend(_check_store(install))
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
@@ -801,7 +802,10 @@ def _probe(cmd: list[str], timeout: float = 5.0) -> tuple[bool, str]:
     happens to invoke a Levain-aware tool isn't silenced by a parent shell
     that set the var for an unrelated reason.
     """
-    env = {k: v for k, v in os.environ.items() if k != "LEVAIN_HOOK_SUPPRESS"}
+    from levain.launch import child_env
+
+    env = child_env()
+    env.pop("LEVAIN_HOOK_SUPPRESS", None)
     try:
         r = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, env=env
@@ -977,6 +981,37 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
         hint="the change that starts bash as the hands user is not in this build yet",
         warn=True,
     ), *extra]
+def _check_floor_placeholders() -> list[CheckResult]:
+    """Sweep the Linux floor's session placeholders (an absent ``~/.netrc`` the bash floor masks over
+    an empty 0444 file while a session runs): remove the ones whose session is gone, which a crash
+    or SIGKILL leaves behind, and name the ones a live session still holds. Silent where there are
+    none, which is every macOS host."""
+    try:
+        from levain.firing.confinement import (
+            ledger_problem,
+            live_floor_placeholders,
+            sweep_floor_placeholders,
+        )
+        problem = ledger_problem()
+        if problem is not None:
+            return [CheckResult(
+                "floor placeholders", False,
+                f"{problem}: levain cannot tell which placeholders are its own, so it removes none",
+                hint="move the file or link aside; levain makes a fresh ledger at the next bash start",
+            )]
+        removed = sweep_floor_placeholders()
+        live = live_floor_placeholders()
+    except Exception as exc:  # noqa: BLE001 — never let the sweep break the whole doctor run
+        return [CheckResult("floor placeholders", True, f"not determinable ({exc})")]
+    if not removed and not live:
+        return []
+    parts = []
+    if removed:
+        parts.append("removed, their session gone: " + ", ".join(removed))
+    if live:
+        parts.append("held by a running session (removed when it ends): "
+                     + ", ".join(str(p) for p in live))
+    return [CheckResult("floor placeholders", True, "; ".join(parts))]
 
 
 def _check_store(install: Path) -> list[CheckResult]:
