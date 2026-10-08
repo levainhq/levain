@@ -17,7 +17,7 @@ from levain.team import entry as E
 from levain.team import roles as R
 from levain.team import signing as S
 from levain.team import tenure as T
-from levain.team.transport import WARNINGS, GitLedger, Repo, TeamError
+from levain.team.transport import WARNINGS, GitLedger, JoinIncomplete, Repo, TeamError
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None or shutil.which("ssh-keygen") is None
                                 or os.name != "posix", reason="needs git + ssh-keygen + POSIX")
@@ -120,7 +120,10 @@ def test_t17_a_0_6_ledger_is_refused_and_init_needs_replace_legacy(tmp_path, key
     assert sh("git", "show", "levain-ledger:team.toml", cwd=a).startswith('project = "old"')
     # BOTH: a joiner reads only the strict ledger (no member key yet, so not a member, but pinned to it)
     b = clone(tmp_path, "b", "ben@ex.com")
-    out = GitLedger(Repo.discover(b)).join(remote="origin", signing_key=str(keys["ben"]))
+    # pinned, but no member key: a JoinIncomplete since code L3 r5 (complement 2), its message the join's own output
+    with pytest.raises(JoinIncomplete, match="an owner must add this machine's key") as exc:
+        GitLedger(Repo.discover(b)).join(remote="origin", signing_key=str(keys["ben"]))
+    out = str(exc.value)
     assert "levain-team-ledger" in out and gl(b).branch == "levain-team-ledger"
 
 
@@ -597,7 +600,9 @@ def test_s14_s15_regenesis_is_a_fresh_genesis_on_a_new_branch_and_join_makes_you
     with pytest.raises(TeamError, match="team ledgers"):
         gl(c).join(signing_key=str(keys["cy"]))
     new = [r.split("/")[-1] for r in branches.split() if "levain-team-ledger-" in r][0].rsplit("-", 1)[-1]
-    out = gl(c).join(signing_key=str(keys["cy"]), root=new)
+    with pytest.raises(JoinIncomplete, match="an owner must add this machine's key") as exc:   # cy: no member key
+        gl(c).join(signing_key=str(keys["cy"]), root=new)
+    out = str(exc.value)
     assert "owner in force ben" in out
     # the old history is a READ-ONLY record: nothing from it is enforced on the new ledger
     assert "ana: old ruling" not in {e.get("words") for e in gl(c).ledger().in_force}

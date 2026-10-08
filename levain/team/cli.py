@@ -109,10 +109,17 @@ def cmd_join(args) -> int:
                       accept_merges=accepted))
     except JoinIncomplete as exc:
         incomplete = exc        # joined: the clone's own setup below still runs, then the command fails
-    if args.anneal_db:
-        gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
-    if not args.no_install:
-        _install_all(repo)
+    try:
+        if args.anneal_db:
+            gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
+        if not args.no_install:
+            _install_all(repo)
+    except Exception as exc:
+        # the pending-steps message is the one a person must read: a setup failure is chained to it, never in its
+        # place (code L3 r5 complement 7)
+        if incomplete is not None:
+            raise incomplete from exc
+        raise
     if incomplete is not None:
         raise incomplete
     return 0

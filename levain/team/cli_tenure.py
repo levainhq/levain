@@ -313,16 +313,19 @@ def cmd_regenesis(gl: GitLedger, args) -> int:
     # the ledger re-genesised is the one this clone is pinned to: a --from on another ledger was derived against this
     # pin by anchor fallback, and the identity guard below read the WRONG roster (code L3 r3 codex 1, RUN: ben, pinned
     # to A, filed his key as alice's owner key from re-genesis B's tip)
-    # and on the history this clone itself holds: an ancestor of its head or of its anchor, never a commit it never
-    # judged (code L3 r4 complement LOW 5: any descendant of the genesis, host-forged or unsynced, became the record)
+    # and on the history this clone has JUDGED: an ancestor of its anchor or of its counted head (as accept-merge
+    # uses), never of the local branch head, which a sync moves onto a host-rewritten tip while frozen (code L3 r4
+    # complement LOW 5, then r5 complement 1: a fetched forged descendant of the genesis became the signed record)
     old_root = gl.pinned_root or ""
-    ours = [r for r in (gl.head(), gl.state().get("anchor")) if r]
+    # Judged on this clone's CURRENT derivation of its pinned ledger (frozen: its last full one), never on --from's
+    d_old = gl.derivation()
+    judged = [r for r in (gl.state().get("anchor"), d_old.counted_head) if r]
     if git(["merge-base", "--is-ancestor", old_root, old_tip], gl.repo.toplevel, check=False).returncode != 0 or \
             not any(git(["merge-base", "--is-ancestor", old_tip, r], gl.repo.toplevel, check=False).returncode == 0
-                    for r in ours):
+                    for r in judged):
         raise TeamError(f"--from {args.from_} is not on the ledger this clone is pinned to (genesis {old_root[:12]}) "
-                        "as this clone holds it (an ancestor of its head or its last judged commit); a re-genesis "
-                        "starts from the pinned ledger. To re-genesis another, join it first")
+                        "as this clone has judged it (an ancestor of its anchor or of its last counted team change); "
+                        "a re-genesis starts from the pinned ledger. To re-genesis another, join it first")
     members: dict[str, str] = {}
     keys: dict[str, str] = {}
     for v in args.member or []:
@@ -342,9 +345,7 @@ def cmd_regenesis(gl: GitLedger, args) -> int:
     # by identity, not by "who am I": the runner may not name a handle the old ledger knows unless the runner's key is
     # in force for it there (residue run 1008, RUN: with a rotated key not yet in force, handle() was None and ben
     # filed his key as ana's). A new handle is fine: a member who lost every key comes back under a new handle.
-    # Judged on this clone's CURRENT derivation of its pinned ledger (frozen: its last full one), never on --from's: an
-    # older --from would not know a handle added since
-    d_old = gl.derivation()
+    # (d_old, above: an older --from would not know a handle added since)
     known = set(d_old.team.members) | {s_.handle for s_ in d_old.spells}
     if args.owner in known and gl.own_fingerprint() not in T.key_fps(d_old.tenure, args.owner):
         raise TeamError(f"{args.owner} is a handle on this ledger and this machine's key is not in force for it, so a "

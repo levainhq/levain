@@ -4,6 +4,9 @@ pinning, branch states. Each test RUNS the row's path on real git with real SSH 
 Where the built rules of 1007+25 (retired handles, first-key-only owner proposals, keyless offers) change a row, the
 test runs the BUILT rule and its docstring says so. A row the build does not meet is kept as a strict xfail naming
 the FINDING (expected vs observed).
+
+cy below joins as an observer whose key is no member's: since code L3 r5 (complement 2) that join pins and
+persists but exits 2 (JoinIncomplete, "an owner must add this machine's key"), so those joins assert 2.
 """
 import json
 import subprocess
@@ -117,7 +120,7 @@ def test_t45_join_accept_merge_sha_2_pins_along_the_named_parent(two, keys):
     c = clone(tmp, "cy", "cy@ex.com")
     assert team("join", "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
     assert gl(c).pinned_root is None
-    assert team("join", "--signing-key", str(keys["cy"]), "--no-install", "--accept-merge", f"{merge}:2", repo=c) == 0
+    assert team("join", "--signing-key", str(keys["cy"]), "--no-install", "--accept-merge", f"{merge}:2", repo=c) == 2
     g = gl(c)
     stale = sh("git", "rev-parse", f"{merge}^1", cwd=c).strip()
     published = sh("git", "rev-parse", f"{merge}^2", cwd=c).strip()
@@ -141,7 +144,7 @@ def test_t38_a_fresh_clone_pins_through_an_owner_named_merge_with_root_and_accep
     assert team("join", "--root", root[:12], "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
     assert gl(c).pinned_root is None
     assert team("join", "--root", root[:12], "--accept-merge", f"{merge}:1", "--signing-key", str(keys["cy"]),
-                "--no-install", repo=c) == 0
+                "--no-install", repo=c) == 2
     assert gl(c).pinned_root == root
     d = _fresh(c)
     assert d.judged == "full"
@@ -150,7 +153,7 @@ def test_t38_a_fresh_clone_pins_through_an_owner_named_merge_with_root_and_accep
     # control: the side's line IS a valid ana line, enforced when its parent is the one followed
     c2 = clone(tmp, "cy2", "cy@ex.com")
     assert team("join", "--root", root[:12], "--accept-merge", f"{merge}:2", "--signing-key", str(keys["cy"]),
-                "--no-install", repo=c2) == 0
+                "--no-install", repo=c2) == 2
     assert "ana: only on the side" in _words(c2)
 
 
@@ -181,7 +184,7 @@ def test_t24_accept_merge_continues_on_parent_1_reads_nothing_from_parent_2_and_
     tip = _remote_tip(tmp)
     assert _is_ancestor(ana, merge, tip)                                   # pushed on top of M: no force-push
     c = clone(tmp, "cy", "cy@ex.com")
-    assert team("join", "--accept-merge", f"{merge}:1", "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 0
+    assert team("join", "--accept-merge", f"{merge}:1", "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
     words = _words(c)
     assert {"ana: published", "ana: after the accept"} <= words and "ana: only on the side" not in words
     assert _remote_tip(tmp) == tip
@@ -219,7 +222,7 @@ def test_t10_join_refuses_a_merged_first_parent_chain_until_the_merge_is_named(t
     assert team("join", "--root", _genesis(ana)[:12], "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
     assert gl(c).pinned_root is None
     assert team("join", "--root", _genesis(ana)[:12], "--accept-merge", f"{merge}:2", "--signing-key",
-                str(keys["cy"]), "--no-install", repo=c) == 0
+                str(keys["cy"]), "--no-install", repo=c) == 2
     assert gl(c).pinned_root == _genesis(ana)
 
 
@@ -255,7 +258,7 @@ def test_t10_orphan_first_parent_join_pins_with_root_naming_the_genesis(two, key
     merge, orphan = _orphan_first_parent_merge(tmp)
     c = clone(tmp, "cy", "cy@ex.com")
     assert team("join", "--root", root[:12], "--accept-merge", f"{merge}:2", "--signing-key", str(keys["cy"]),
-                "--no-install", repo=c) == 0
+                "--no-install", repo=c) == 2
     assert gl(c).pinned_root == root
     assert _fresh(c).team.owner == "ana"                         # the genesis side is what counts, never the orphan
     c2 = clone(tmp, "cy2", "cy@ex.com")                          # naming the genesis but following the orphan: refused
@@ -307,7 +310,7 @@ def test_t23_after_a_hand_off_and_a_merge_a_lagging_clone_honours_nothing_after_
     assert ruling(ana, "src/a.py", "ana: v1") == 0
     first = next(e["id"] for e in gl(ana).ledger().in_force if e["words"] == "ana: v1")
     c = clone(tmp, "cy", "cy@ex.com")
-    assert team("join", "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 0
+    assert team("join", "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
     anchor = gl(c).state()["anchor"]
     p = _side(tmp)
     _line(p, "ben", "ben: on the side", keys["ben"])
@@ -358,7 +361,7 @@ def test_t29_a_removed_members_merge_is_waiting_on_a_lagging_clone_and_never_enf
     gl(ben).sync(push=False)
     assert "mal: after the anchor" not in _words(ben)
     c = clone(tmp, "cy", "cy@ex.com")
-    assert team("join", "--accept-merge", f"{merge}:1", "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 0
+    assert team("join", "--accept-merge", f"{merge}:1", "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
     assert "mal: after the anchor" in _words(c)                           # the line is real; only the parent decides
 
 
@@ -485,7 +488,7 @@ def test_t33_after_a_host_repair_nothing_from_the_merge_reappears_and_no_side_te
     gb.sync(push=False)
     assert _fresh(ben).judged == "partial" and _is_ancestor(ben, merge, _sha(gb.wt, "HEAD"))
     c = clone(tmp, "cy", "cy@ex.com")
-    assert team("join", "--accept-merge", f"{merge}:2", "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 0
+    assert team("join", "--accept-merge", f"{merge}:2", "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
     assert _fresh(c).team.members["ben"] == "ben@new.ex"                  # the side commit is a real counted change
     repaired = _sha(p, f"{merge}^1")
     sh("git", "push", "-q", "-f", "origin", f"{repaired}:levain-team-ledger", cwd=p)
@@ -657,7 +660,7 @@ def test_t44_an_accept_on_the_second_side_of_a_cancelled_offer_is_listed_and_the
     merge = _sha(p, "HEAD")
     assert _sha(p, f"{merge}^2") == a
     c = clone(tmp, "cy", "cy@ex.com")
-    assert team("join", "--accept-merge", f"{merge}:2", "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 0
+    assert team("join", "--accept-merge", f"{merge}:2", "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
     assert _fresh(c).team.owner == "ben"                                  # the side's accept is a real counted change
     for repo in (ana, ben):
         gl(repo).sync(push=False)
@@ -769,5 +772,5 @@ def test_join_accept_merge_takes_an_abbreviated_id(two, keys):
     merge = _merge_side_onto_published(p)
     c = clone(tmp, "cy", "cy@ex.com")
     assert team("join", "--accept-merge", f"{merge[:12]}:2", "--signing-key", str(keys["cy"]), "--no-install",
-                repo=c) == 0
+                repo=c) == 2
     assert merge in gl(c).state()["accepted"]

@@ -441,6 +441,46 @@ def sign_config(key: str) -> list[str]:
     return ["-c", "gpg.format=ssh", "-c", f"user.signingkey={key}", "-c", "commit.gpgsign=true"]
 
 
+_PROOF_NONCE = b"levain signing-key proof\n"
+
+
+def prove_can_sign(key: str, pubkey_line: str, *, timeout: float = 15.0) -> None:
+    """Sign a fixed nonce with ``key`` the way git does (``ssh-keygen -Y sign -n git``: a ``key::`` literal through the
+    agent, else the key file as given) and verify it: the signature must be good and made by ``pubkey_line``'s key.
+    Raises SigningError otherwise. Run before a key is saved, so a key that cannot sign is never persisted."""
+    sign_config(key)
+    want = fingerprint(pubkey_line)
+    with tempfile.TemporaryDirectory(prefix="levain-proof-") as d:
+        msg = Path(d) / "nonce"
+        msg.write_bytes(_PROOF_NONCE)
+        args = ["ssh-keygen", "-Y", "sign", "-n", "git"]
+        if key.startswith("key::"):
+            lit = Path(d) / "key.pub"
+            lit.write_text(key[len("key::"):].strip() + "\n", encoding="utf-8")
+            args += ["-U", "-f", str(lit)]
+        else:
+            args += ["-f", os.path.expanduser(key)]
+        try:
+            cp = subprocess.run([*args, str(msg)], capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                                env=_env(**signing_env()))
+        except FileNotFoundError:
+            raise SigningError("ssh-keygen is not on PATH") from None
+        except subprocess.TimeoutExpired:
+            raise SigningError(f"signing timed out after {timeout:.0f}s") from None
+        sig_path = Path(str(msg) + ".sig")
+        if cp.returncode != 0 or not sig_path.exists():
+            raise SigningError(f"it cannot sign here ({_output_tail(cp)}); the private key must be in ssh-agent or "
+                               "next to the public key, without a passphrase")
+        sig = sig_path.read_bytes().rstrip(b"\n")
+    check = _check_novalidate(sig, _PROOF_NONCE, timeout)
+    if isinstance(check, Verdict):
+        raise SigningError(f"its test signature could not be checked ({check.reason})")
+    out = (check.stdout or b"").decode("utf-8", "replace") + "\n" + (check.stderr or b"").decode("utf-8", "replace")
+    got = [m.group(1) for line in out.splitlines() if (m := _GOOD.match(line.strip()))]
+    if check.returncode != 0 or got != [want]:
+        raise SigningError(f"its test signature is not a good signature by {want} ({_output_tail(check)})")
+
+
 def signing_env() -> dict[str, str]:
     """Environment additions so signing fails instead of prompting: a passphrase is asked of ``false``, not a tty."""
     return {"SSH_ASKPASS_REQUIRE": "force", "SSH_ASKPASS": shutil.which("false") or "/usr/bin/false"}

@@ -288,9 +288,9 @@ class GitLedger:
         key = git(["config", "user.signingkey"], self.repo.toplevel, check=False, timeout=10).stdout.strip()
         return key if fmt == "ssh" and key else None
 
-    def signing_pubkey(self) -> str:
-        """The public key line of this clone's signing key (a ``key::`` literal or a ``.pub`` file)."""
-        k = self.signing_key
+    def signing_pubkey(self, key: str | None = None) -> str:
+        """The public key line of ``key`` (default: this clone's signing key), a ``key::`` literal or a ``.pub`` file."""
+        k = key or self.signing_key
         if not k:
             raise TeamError("no signing key: set one with `levain team join --signing-key ~/.ssh/<key>.pub` (an ssh "
                             "key in ssh-agent, or one without a passphrase), or git's gpg.format=ssh + user.signingkey")
@@ -310,6 +310,19 @@ class GitLedger:
             return S.fingerprint(self.signing_pubkey())
         except S.SigningError as exc:
             raise TeamError(f"the signing key cannot be used: {exc}") from None
+
+    def prove_signing_key(self, key: str | None) -> str:
+        """Read, fingerprint and test-sign ``key`` (default: this clone's signing key) BEFORE it is relied on or saved;
+        returns its fingerprint. A key that cannot be read or cannot sign here raises, naming the key path (code L3 r5
+        codex 3, RUN: `join --signing-key /missing/key.pub` persisted the path, then failed reading it)."""
+        from . import signing as S
+        k = key or self.signing_key
+        line = self.signing_pubkey(k)
+        try:
+            S.prove_can_sign(k, line)
+            return S.fingerprint(line)
+        except S.SigningError as exc:
+            raise TeamError(f"the signing key {k} cannot be used: {exc}; nothing was changed") from None
 
     def _sign_cfg(self) -> list[str]:
         """The one signing wrapper's git config. Every commit levain writes passes through it."""
@@ -542,7 +555,10 @@ class GitLedger:
                 found[name] = roots[0]
             elif roots:
                 multi[name] = roots     # a merge brought in a second root: only an explicit --root may choose (T10)
-        pinned = self.state().get("pinned_root") or ""
+        # ONE snapshot of the clone's trust state: everything below is judged on it, and the persist is a
+        # compare-and-swap against it (code L3 r5 codex 4 + complement 3)
+        old = self.state()
+        pinned = old.get("pinned_root") or ""
         if root:
             # a branch with two roots is joinable only by naming the genesis: the derivation below must then reach it
             # through the parents accepted with --accept-merge, or nothing is pinned (T10, RUN: no fresh clone could
@@ -578,7 +594,6 @@ class GitLedger:
             full = git(["rev-parse", "--verify", "-q", sha + "^{commit}"], self.repo.toplevel, check=False).stdout.strip()
             resolved[full or sha] = n
         accept_merges = resolved
-        old = self.state()
         keep = bool(pinned) and found[name] == pinned
         moved = bool(pinned) and not keep
         # a same-ledger re-join keeps what this clone decided: its accepted merges and its anchor (resetting the anchor
@@ -610,6 +625,9 @@ class GitLedger:
             if git(["merge-base", "--is-ancestor", here, tip0], self.repo.toplevel, check=False).returncode != 0 and \
                     git(["merge-base", "--is-ancestor", tip0, here], self.repo.toplevel, check=False).returncode != 0:
                 raise TeamError(f"the local {name} branch has diverged from {remote}'s; nothing was changed")
+        # The proposed signing key is read, fingerprinted and made to sign a nonce BEFORE anything is persisted (code L3
+        # r5 codex 3, RUN: a missing key's path was saved, then failed reading; a key that cannot sign here joined)
+        self.prove_signing_key(signing_key)
         # PROSPECTIVE: the chosen ledger is judged on a candidate trust state, and the destination worktree checked,
         # before anything is written. Nothing is rolled back afterwards, because nothing is written before both pass
         # (code L3 r3 codex 6 + r4 codex/complement: a roll-back restored the state file but clobbered a concurrent
@@ -618,46 +636,62 @@ class GitLedger:
         from . import tenure as T
         anchor = (old.get("anchor") or None) if keep else None
         cand = T.Clone(pinned_root=found[name], anchor=anchor, accepted={k: int(v) for k, v in accepted.items()},
-                       distrust=set(self.state().get("distrust") or []))
-        try:
-            d = T.derive(self.repo.toplevel, tip0, cand, S.SigCache(self.base / "sigcache.json"))
-        except T.Unjudgeable as exc:
-            raise TeamError(f"cannot judge the team ledger on this clone: {exc}; nothing was changed") from None
-        if (self.wt / ".git").exists():
-            # a COPIED clone lists its own private worktree under the original's path until git relinks it (a repair,
-            # not a change: it touches no branch or state)
-            self._repair_if_moved()
-        wt_real = os.path.realpath(self.wt)
-        path = ""
-        for row in git(["worktree", "list", "--porcelain"], self.repo.toplevel, check=False).stdout.splitlines():
-            if row.startswith("worktree "):
-                path = row[len("worktree "):]
-            elif row == f"branch refs/heads/{name}" and os.path.realpath(path) != wt_real:
-                raise TeamError(f"{name} is checked out in another worktree ({path}); levain keeps its own private "
-                                "checkout of the ledger. Nothing was changed: remove that worktree, then join again")
-        device = secrets.token_hex(8) if new_device else self._new_device()
+                       distrust=set(old.get("distrust") or []))
+        # the worktree lock (the one sync and every worktree writer take) is held from this validation through the
+        # worktree attach, so no sync or writer ever runs against a half-moved pin (code L3 r5 codex 1)
+        with self.lock():
+            try:
+                d = T.derive(self.repo.toplevel, tip0, cand, S.SigCache(self.base / "sigcache.json"))
+            except T.Unjudgeable as exc:
+                raise TeamError(f"cannot judge the team ledger on this clone: {exc}; nothing was changed") from None
+            if (self.wt / ".git").exists():
+                # a COPIED clone lists its own private worktree under the original's path until git relinks it (a
+                # repair, not a change: it touches no branch or state)
+                self._repair_if_moved()
+            wt_real = os.path.realpath(self.wt)
+            path = ""
+            for row in git(["worktree", "list", "--porcelain"], self.repo.toplevel, check=False).stdout.splitlines():
+                if row.startswith("worktree "):
+                    path = row[len("worktree "):]
+                elif row == f"branch refs/heads/{name}" and os.path.realpath(path) != wt_real:
+                    raise TeamError(f"{name} is checked out in another worktree ({path}); levain keeps its own private "
+                                    "checkout of the ledger. Nothing was changed: remove that worktree, then join again")
+            device = secrets.token_hex(8) if new_device else self._new_device()
+            # a re-join advances the anchor only as a sync would (_advance_anchor); it is written in the same CAS
+            new_anchor = tip0 if (not keep or d.judged == "full") else anchor
+            seen = {k: old.get(k) for k in ("pinned_root", "anchor", "accepted")}
 
-        def persist(st: dict) -> None:
-            # ONE write, under the state lock every trust-state change takes (distrust, accept-merge, repin and the
-            # key commands all write through save_state), of the join's own fields only: a concurrent `distrust` stays
-            st.update(branch=name, pinned_root=found[name], anchor=anchor, accepted=accepted, remote=remote,
-                      device=device)
-            if signing_key:
-                st["signing_key"] = signing_key
-        self.save_state(_mutate=persist)
-        self._dcache = None
-        tip = tip0
-        if not self._local_branch_exists():
-            git(["branch", name, rref], self.repo.toplevel)
-        if not keep or d.judged == "full":
-            self.save_state(anchor=tip)     # a re-join advances the anchor only as a sync would (_advance_anchor)
-        self._dcache = None
-        self._record_seen_sha(tip)       # the joined tip was published: never movable (code L3 r1 codex HIGH)
-        self._remember_own_key()
-        self._attach_worktree()
+            def persist(st: dict) -> None:
+                # ONE write, under the state lock every trust-state change takes (distrust, accept-merge, repin and the
+                # key commands all write through save_state), of the join's own fields only: a concurrent `distrust`
+                # stays. A compare-and-swap: if the pin, anchor or accepted merges are no longer what was validated
+                # above, nothing is written (code L3 r5 codex 4 + complement 3: a stale snapshot erased a completed
+                # `accept-merge` / `repin --anchor`)
+                if {k: st.get(k) for k in seen} != seen:
+                    raise TeamError("another team operation changed the pin state (pin, anchor or accepted merges) "
+                                    "during this join; nothing was changed by the join: run `levain team join` again")
+                st.update(branch=name, pinned_root=found[name], anchor=new_anchor, accepted=accepted, remote=remote,
+                          device=device)
+                if signing_key:
+                    st["signing_key"] = signing_key
+            self.save_state(_mutate=persist)
+            self._dcache = None
+            tip = tip0
+            # persisted: a failure from here keeps the new state and says what is still needed, never a plain
+            # "failed" (code L3 r5 complement 8)
+            try:
+                if not self._local_branch_exists():
+                    git(["branch", name, rref], self.repo.toplevel)
+                self._record_seen_sha(tip)       # the joined tip was published: never movable (code L3 r1 codex HIGH)
+                self._remember_own_key()
+                self._attach_worktree()
+            except TeamError as exc:
+                raise JoinIncomplete(f"joined and pinned to {name} (genesis {found[name][:12]}), still needs: {exc}; "
+                                     "run `levain team join` again to finish it") from exc
         # from here the clone IS joined: a later failure (a slow remote, a refused push) keeps the new state and says
         # what is still pending; nothing rolls back
         pending: list[str] = []
+        confirm_failed = False
         said = len(self.warnings)
         if keep:
             # the re-join reconciles as a sync would: own unpublished commits go on top of the remote (held when this
@@ -681,8 +715,10 @@ class GitLedger:
             confirmed = self._confirm_own_key(d)
         except TeamError as exc:
             confirmed = False
+            confirm_failed = True
             pending.append(f"confirming this machine's key ({exc}): `levain team key confirm`")
-        if not git(["for-each-ref", "--count=1", self._held_ref()], self.repo.toplevel, check=False).stdout.strip():
+        if not git(["for-each-ref", "--count=1", self._held_ref(found[name])], self.repo.toplevel,
+                   check=False).stdout.strip():
             # the confirm above replayed what the rebase held: its "kept back, confirm the key" line is no longer true
             self.warnings[said:] = [w for w in self.warnings[said:] if "refs/levain/held/" not in w]
         left = self.other_genesis_items() if moved else ""
@@ -695,6 +731,10 @@ class GitLedger:
                    "one of your machines whose key is in force, run `levain team key add <your handle> <this public "
                    f"key>`; if you have none yet, {owner} proposes your first key (`levain team key add <your "
                    "handle> <your public key>`); then `levain team sync`")
+            if not confirm_failed:
+                # pinned, but no line this clone signs will count: not a success (code L3 r5 complement 2, the r4
+                # ruling "a join that persisted but did not complete exits non-zero")
+                pending.append(f"an owner must add this machine's key: {fp}")
         else:
             out = tofu + f"\njoined {d.team.project} as {handle} (device {self.device})" + (
                 f"; confirmed this machine's key" if confirmed else "")
@@ -1008,11 +1048,15 @@ class GitLedger:
     def _replay_held(self, timeout: float, lock_timeout: float) -> None:
         """Replay entries held back by ``_rebase_moves`` (T42) once this machine's key is IN FORCE at the tip, so the
         re-signed copies count. Each held ref is deleted only after its commit is on the branch; a crash leaves the
-        ref, and the next sync retries it (an already-applied pick comes out empty and is skipped)."""
-        held = git(["for-each-ref", "--format=%(objectname)", self._held_ref()], self.wt, check=False).stdout.split()
-        if not held:
-            return
+        ref, and the next sync retries it (an already-applied pick comes out empty and is skipped). The root is read
+        ONCE, first under the worktree lock (which `join` holds while it moves the pin and the worktree): every held ref
+        this call lists or deletes is under that root (code L3 r5 codex 1)."""
         with self.lock(timeout=lock_timeout):
+            root = self.pinned_root
+            held = git(["for-each-ref", "--format=%(objectname)", self._held_ref(root)], self.wt,
+                       check=False).stdout.split()
+            if not held:
+                return
             self._recover_dirty()
             self._dcache = None
             d = self.derivation()
@@ -1020,7 +1064,7 @@ class GitLedger:
             cp = git(["rev-list", "--reverse", "--topo-order", "--no-merges", *held, "--not", "HEAD"], self.wt,
                      check=False)
             if cp.returncode != 0:     # a held object this git cannot read: kept, and the next sync retries
-                self.warnings.append(f"held entries under {self._held_ref()} could not be listed ({_tail(cp)}); "
+                self.warnings.append(f"held entries under {self._held_ref(root)} could not be listed ({_tail(cp)}); "
                                      "nothing was replayed")
                 return
             order = [c for c in cp.stdout.split() if c in want]
@@ -1049,7 +1093,7 @@ class GitLedger:
                         self.warnings.append(f"a held entry {c[:10]} could not be replayed ({_tail(cp)}); it stays "
                                              "under refs/levain/held/ and the next sync retries it")
                         return
-                git(["update-ref", "-d", self._held_ref(c)], self.wt, check=False)
+                git(["update-ref", "-d", self._held_ref(root, c)], self.wt, check=False)
             self._dcache = None
 
     def _rebase_moves(self, rref: str, timeout: float, lock_timeout: float) -> None:
@@ -1059,9 +1103,12 @@ class GitLedger:
         commits are cherry-picked (and re-signed) onto the remote tip. Team/tenure commits are never replayed as
         text: they are stripped into pending ops and re-landed from the COUNTED state at the new tip, each field only
         if no other counted commit touched it since (history-keyed), so an offline change never overwrites a newer
-        decision. Nothing that came from the remote is ever re-published.
+        decision. Nothing that came from the remote is ever re-published. The pinned root is read ONCE, first under the
+        worktree lock (which `join` holds while it moves the pin and the worktree): a held ref and a pending op carry
+        that value, never a later read of a pin that may have moved (code L3 r5 codex 1).
         """
         with self.lock(timeout=lock_timeout):
+            root = self.pinned_root
             self._recover_dirty()
             orig = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
             remote_tip = git(["rev-parse", rref], self.wt).stdout.strip()
@@ -1104,7 +1151,7 @@ class GitLedger:
                                              "trailer, or its parent cannot be judged here) and was dropped; re-run "
                                              "it with the levain CLI")
                     elif not op.get("restore"):
-                        pending.append({**op, "root": self.pinned_root})
+                        pending.append({**op, "root": root})
                     rest = touched - {"team.toml", "tenure.toml", CANON_FILE}
                     if rest:
                         self.warnings.append(f"local commit {c[:10]} mixes team and ledger changes; only its team "
@@ -1120,7 +1167,7 @@ class GitLedger:
                 # codex 4, RAN). Held under a ref instead; `_replay_held` replays them
                 # after the held team ops (the confirm) re-land, and only once the key counts.
                 for c in picks:
-                    git(["update-ref", self._held_ref(c), c], self.wt)
+                    git(["update-ref", self._held_ref(root, c), c], self.wt)
                 picks = []
             published = False
             try:
@@ -1197,18 +1244,22 @@ class GitLedger:
                 git(["update-ref", "-d", name], self.wt, check=False)
         self._record_seen_sha(remote_tip)
 
-    def _held_ref(self, sha: str = "") -> str:
+    @staticmethod
+    def _held_ref(root: str | None, sha: str = "") -> str:
         """Held entries are bound to the genesis they were held on: only a clone pinned to THAT genesis replays them
-        (code L3 r3 codex 2, RUN: a `join --root` to a re-genesis replayed the old ledger's held entry into it)."""
-        return f"refs/levain/held/{self.pinned_root}/{sha}"
+        (code L3 r3 codex 2, RUN: a `join --root` to a re-genesis replayed the old ledger's held entry into it). The
+        caller passes the root it captured ONCE at entry, never a fresh read of the pin (code L3 r5 codex 1: a pin moved
+        mid-sync filed genesis A's entry under B's refs)."""
+        return f"refs/levain/held/{root}/{sha}"
 
     def other_genesis_items(self) -> str:
         """Held entries and offline team ops made on ANOTHER genesis than the pinned one: kept (never replayed or
         re-landed here, never deleted), and named, for the move that left them behind."""
+        root = self.pinned_root
         held = [r.split("/")[3] for r in git(["for-each-ref", "--format=%(refname)", "refs/levain/held/"],
                                              self.repo.toplevel, check=False).stdout.split()
-                if not r.startswith(self._held_ref())]
-        ops = [op for op in self.state().get("pending_ops") or [] if op.get("root") != self.pinned_root]
+                if not r.startswith(self._held_ref(root))]
+        ops = [op for op in self.state().get("pending_ops") or [] if op.get("root") != root]
         if not held and not ops:
             return ""
         roots = sorted({str(x)[:12] for x in held} | {str(op.get("root"))[:12] for op in ops})
@@ -1225,9 +1276,10 @@ class GitLedger:
         from . import tenure as T
         # bound to the genesis they were made on (code L3 r3 codex 3, RUN: after `join --root` to a re-genesis that
         # left cy out, an old-ledger `member add cy` re-landed there); the others stay kept, never applied here
+        root = self.pinned_root     # read ONCE (code L3 r5 codex 1)
         every = list(self.state().get("pending_ops") or [])
-        ops = [op for op in every if op.get("root") == self.pinned_root]
-        kept = [op for op in every if op.get("root") != self.pinned_root]
+        ops = [op for op in every if op.get("root") == root]
+        kept = [op for op in every if op.get("root") != root]
         if not ops:
             return
         try:
