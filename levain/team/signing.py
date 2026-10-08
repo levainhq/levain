@@ -255,7 +255,7 @@ def verify_commit(repo_dir: Path, sha: str, *, timeout: float = 10.0) -> Verdict
         # not read prints the same "Could not verify signature." as a garbled blob; measured, OpenSSH 10.3). The
         # canary, a known-good signature checked the same way right now, tells them apart: it verifies -> the commit
         # is at fault (unsigned, cached); it fails -> this machine is (indeterminate, never cached).
-        if _canary_verifies(timeout):
+        if _canary_verifies(timeout, _sig_keytype(sig)):
             return _unsigned(f"bad signature ({_output_tail(cp)})")
         return _indeterminate(f"ssh-keygen exit 255 and a known-good signature failed the same way, so this machine "
                               f"cannot verify signatures right now ({_output_tail(cp)})")
@@ -280,24 +280,72 @@ def _check_novalidate(sig: bytes, payload: bytes, timeout: float) -> subprocess.
             os.unlink(sig_path)
 
 
-# A throwaway ed25519 key's signature over _CANARY_PAYLOAD in the "git" namespace (the private key was discarded).
+# One throwaway key per accepted key type, each signing _CANARY_PAYLOAD in the "git" namespace (the private keys were
+# discarded). Per type, because whether ssh-keygen can verify a type depends on how OpenSSH was built (one without
+# OpenSSL verifies ed25519 only): an ecdsa commit's 255 is judged by the ecdsa canary (docs L3 r2 anansi).
 _CANARY_PAYLOAD = b"levain signature canary\n"
-_CANARY_FP = "SHA256:7GEimz+e4X7xTq2zh/NyCVNxhyLjzEjuqTLCaLHW/7Y"
-_CANARY_SIG = (b"-----BEGIN SSH SIGNATURE-----\n"
+_CANARIES: dict[str, tuple[str, bytes]] = {
+    "ssh-ed25519": ("SHA256:7GEimz+e4X7xTq2zh/NyCVNxhyLjzEjuqTLCaLHW/7Y",
+                    (b"-----BEGIN SSH SIGNATURE-----\n"
                b"U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgUkNXxWwLZ8QPL3IB+MXY7BkA2p\n"
                b"YNNw+W7thPQg4FZisAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5\n"
                b"AAAAQE81IUj2pafo7S2pHrIlzkzvmQLgLLji/H2p7alsXYgKszDDTkkhKLFn5PJlgeG30k\n"
                b"N2oQI7bfoDYZN2ZGHQfgU=\n"
-               b"-----END SSH SIGNATURE-----")
+               b"-----END SSH SIGNATURE-----")),
+    "ecdsa-sha2-nistp256": ("SHA256:Yi05QuWQoFE2H4eqPyvUe2/qGLLOxVbRWbAdPFJ/GYQ",
+                            (b"-----BEGIN SSH SIGNATURE-----\n"
+               b"U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAE\n"
+               b"EE/WngJFUFWt13bmJ2TIeRVN5YNdBXIwCRLJKQSvfhNsboWMbJMsr8hHmj8XwKm2CChlm+\n"
+               b"gwrbTRSrfSsIarbZJwAAAANnaXQAAAAAAAAABnNoYTUxMgAAAGUAAAATZWNkc2Etc2hhMi\n"
+               b"1uaXN0cDI1NgAAAEoAAAAhALnRvC5sySCTHQEVvrqAD01AkXFbh0/yumNYD3DEbmWHAAAA\n"
+               b"IQCoL5J0HcFRlvAoi/B3tlzQADD41/TgN7OecR0qNd9zGg==\n"
+               b"-----END SSH SIGNATURE-----")),
+    "ecdsa-sha2-nistp384": ("SHA256:+ahwi9yO3/QtLWtnq/whZeYkgIes9gZyBuHp4XmTiGk",
+                            (b"-----BEGIN SSH SIGNATURE-----\n"
+               b"U1NIU0lHAAAAAQAAAIgAAAATZWNkc2Etc2hhMi1uaXN0cDM4NAAAAAhuaXN0cDM4NAAAAG\n"
+               b"EESziQCA6hhd85nD6ZZxiNwgmuajATRMDkT/8FXs3avHV1ZCRwXUjr8nRo29964Hx/jvQ5\n"
+               b"HGk55Gh8XouQwdleYzF9Qe0fSJp3iJTxlxGGgvrDgVhpxJ+AQKYDRM6j2kf2AAAAA2dpdA\n"
+               b"AAAAAAAAAGc2hhNTEyAAAAhQAAABNlY2RzYS1zaGEyLW5pc3RwMzg0AAAAagAAADEAznYu\n"
+               b"ReicFgQ7cb2ifFXdgsCjXk5fG+Pj5huYeFI0/TrDzVDVL9wLSG1qCEUqStKGAAAAMQDQBh\n"
+               b"A8Pd6eT2Ua9GAIZwhbTlle4mehQRgmMdcBXd32G0vnQnZZMugl6s+l+yf6yHY=\n"
+               b"-----END SSH SIGNATURE-----")),
+    "ecdsa-sha2-nistp521": ("SHA256:S/9MMwMod0AFnQWQ6A2HbTnJyT8I2EVW0Lla9UBg0RM",
+                            (b"-----BEGIN SSH SIGNATURE-----\n"
+               b"U1NIU0lHAAAAAQAAAKwAAAATZWNkc2Etc2hhMi1uaXN0cDUyMQAAAAhuaXN0cDUyMQAAAI\n"
+               b"UEAGKlE6OJbOOxcibGKC2XMsZrpVuT5l5ZO1cZg6XOvhBG1+EWAfYAItR2WYJnGT2FPf19\n"
+               b"chYJZRDnDZmaPnZrhuVTAYwkMtt0Q9BDeDNlCvFJ605E6gLcN7wFwEOfcdFXehZzXW/G8T\n"
+               b"iUSLQXFcp10qHG52oehFyxI9By+A/bCt+X7jXlAAAAA2dpdAAAAAAAAAAGc2hhNTEyAAAA\n"
+               b"pQAAABNlY2RzYS1zaGEyLW5pc3RwNTIxAAAAigAAAEFIpUKNJen0Im7ClTo9scLVCFzQcs\n"
+               b"WRaoFJlivcF5VT3FiD7pNHYU0hUL98nC9rKvc7EKIK8fEwbA3tyDqu77YNUQAAAEEszhZd\n"
+               b"DfnWc8uMpxh6gfSNNFYAfbSYMNZatX3AGg0HjWDkVT5GQ1OmctJ5+fQ1jLT4ic41x5qEch\n"
+               b"26Rcun4biDRw==\n"
+               b"-----END SSH SIGNATURE-----")),
+}
 
 
-def _canary_verifies(timeout: float) -> bool:
-    """Run every time it is asked (never memoised): the question is whether THIS check environment works NOW."""
-    cp = _check_novalidate(_CANARY_SIG, _CANARY_PAYLOAD, timeout)
+def _sig_keytype(sig: bytes) -> str | None:
+    """The key type inside an armored SSHSIG blob (``SSHSIG``, uint32 version, string publickey, ...)."""
+    try:
+        body = base64.b64decode(b"".join(l for l in sig.splitlines() if l and not l.startswith(b"-----")))
+        if not body.startswith(b"SSHSIG"):
+            return None
+        n = int.from_bytes(body[10:14], "big")
+        blob = body[14:14 + n]
+        k = int.from_bytes(blob[:4], "big")
+        return blob[4:4 + k].decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _canary_verifies(timeout: float, keytype: str | None = None) -> bool:
+    """Run every time it is asked (never memoised): the question is whether THIS check environment works NOW, for the
+    signature's own key type (ed25519 when the type is not one levain accepts)."""
+    fp_want, sig = _CANARIES.get(keytype or "", _CANARIES["ssh-ed25519"])
+    cp = _check_novalidate(sig, _CANARY_PAYLOAD, timeout)
     if isinstance(cp, Verdict) or cp.returncode != 0:
         return False
     out = (cp.stdout or b"").decode("utf-8", "replace") + "\n" + (cp.stderr or b"").decode("utf-8", "replace")
-    return any((m := _GOOD.match(line.strip())) is not None and m.group(1) == _CANARY_FP for line in out.splitlines())
+    return any((m := _GOOD.match(line.strip())) is not None and m.group(1) == fp_want for line in out.splitlines())
 
 
 # ---- the cache --------------------------------------------------------------------------------------------
