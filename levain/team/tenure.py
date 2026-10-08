@@ -400,14 +400,15 @@ class Clone:
     distrust: set[str] = field(default_factory=set)
 
 
-def derive(top: Path, tip: str, clone: Clone, cache: S.SigCache) -> Derivation:
+def derive(top: Path, tip: str, clone: Clone, cache: S.SigCache, *, _fallback: bool = True) -> Derivation:
     """The derivation for ``tip`` as this clone judges it. Raises ``Unjudgeable`` when a signature cannot be checked."""
     parents = parents_of(top, tip)
     walk = effective_walk(parents, tip, clone.accepted)
     if not walk or walk[0] != clone.pinned_root:
-        # a rewrite: the tip's chain does not reach the pinned genesis. Judge the anchor's own chain, frozen.
-        if clone.anchor and clone.anchor in parents_of_safe(top, clone.anchor):
-            d = derive(top, clone.anchor, clone, cache)
+        # a rewrite: the tip's chain does not reach the pinned genesis. Judge the anchor's own chain, frozen (once:
+        # if the anchor's chain does not reach the pin either, nothing here can be judged)
+        if _fallback and clone.anchor and clone.anchor != tip and clone.anchor in parents_of_safe(top, clone.anchor):
+            d = derive(top, clone.anchor, clone, cache, _fallback=False)
             d.tip, d.judged = tip, "partial"
             d.frozen_at, d.frozen_why = clone.anchor, "the ledger history was rewritten (its chain no longer reaches the pinned genesis)"
             return d
@@ -426,8 +427,8 @@ def derive(top: Path, tip: str, clone: Clone, cache: S.SigCache) -> Derivation:
                 freeze_end, why = cut, f"merge {sha[:10]} on the ledger is not accepted (`levain team accept-merge`)"
             break
     if freeze_end == -1:
-        if clone.anchor and clone.anchor in parents_of_safe(top, clone.anchor):
-            d = derive(top, clone.anchor, clone, cache)
+        if _fallback and clone.anchor and clone.anchor in parents_of_safe(top, clone.anchor):
+            d = derive(top, clone.anchor, clone, cache, _fallback=False)
             d.tip, d.judged, d.frozen_at, d.frozen_why = tip, "partial", clone.anchor, why
             return d
         raise Unjudgeable(why)

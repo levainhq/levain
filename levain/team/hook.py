@@ -195,8 +195,8 @@ def pretooluse(payload: dict) -> None:
     fetch_note = gl.fetch_if_due(_interval(gl), timeout=5.0)
     try:
         _, team, ledger = gl.snapshot()
-    except (R.RolesError, TeamError) as exc:
-        _deny_unjudged(str(exc))
+    except Exception as exc:  # noqa: BLE001 - any failure to JUDGE a joined ledger halts the gate (§3f), never allows
+        _deny_unjudged(str(exc) if isinstance(exc, (R.RolesError, TeamError)) else f"{type(exc).__name__}: {exc}")
         return
     rel = Path(os.path.realpath(target)).relative_to(os.path.realpath(repo.toplevel)).as_posix() \
         if _within(target, repo.toplevel) else None
