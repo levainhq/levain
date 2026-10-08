@@ -450,6 +450,7 @@ def derive(top: Path, tip: str, clone: Clone, cache: S.SigCache, *, _fallback: b
             d = derive(top, clone.anchor, clone, cache, _fallback=False)
             d.tip, d.judged = tip, "partial"
             d.frozen_at, d.frozen_why = clone.anchor, "the ledger history was rewritten (its chain no longer reaches the pinned genesis)"
+            d.waiting = _lines_beyond(top, tip, clone.anchor)
             return d
         raise Unjudgeable("the ledger's history does not reach this clone's pinned genesis and there is no earlier "
                           "derivation to keep")
@@ -471,6 +472,7 @@ def derive(top: Path, tip: str, clone: Clone, cache: S.SigCache, *, _fallback: b
         if _fallback and clone.anchor in parents_of_safe(top, clone.anchor):
             d = derive(top, clone.anchor, clone, cache, _fallback=False)
             d.tip, d.judged, d.frozen_at, d.frozen_why = tip, "partial", clone.anchor, why
+            d.waiting = _lines_beyond(top, tip, clone.anchor)
             return d
         raise Unjudgeable(why)
     for i, sha in enumerate(walk):
@@ -500,6 +502,17 @@ def derive(top: Path, tip: str, clone: Clone, cache: S.SigCache, *, _fallback: b
     if freeze_end < len(walk):
         d.judged, d.frozen_at, d.frozen_why = "partial", walk[freeze_end - 1], why
     return d
+
+
+def _lines_beyond(top: Path, tip: str, anchor: str) -> int:
+    """Ledger lines the tip's history added that the anchor's chain does not have: what a frozen clone lists as WAITING
+    after a rewrite (T32, RUN: the anchor fallback reported 0 and the new lines appeared nowhere)."""
+    try:
+        out = _git(top, ["log", "--no-merges", "--format=", "--numstat", "--no-renames", tip, f"^{anchor}", "--",
+                         "ledger/"])
+    except Unjudgeable:
+        return 0
+    return sum(int(f[0]) for f in (l.split("\t") for l in out.splitlines()) if len(f) == 3 and f[0].isdigit())
 
 
 def parents_of_safe(top: Path, sha: str) -> dict[str, list[str]]:

@@ -421,9 +421,6 @@ def _rewrite_with_held_delta_and_frozen_append(two, keys):
     assert "ana: while frozen" not in _words(ana)
 
 
-@pytest.mark.xfail(strict=True, reason="FINDING T32: expected the frozen clone's own append LISTED as waiting; observed "
-                                       "Derivation.waiting == 0 after a rewrite (the anchor fallback derives the "
-                                       "anchor's walk, so status prints '0 line(s) after it are waiting')")
 def test_t32_after_a_rewrite_own_appends_are_listed_as_waiting(two, keys, capsys):
     """RUN: the rewrite, the held delta and the frozen append (above): the append is not enforced (asserted in the
     setup) and it is LISTED: the derivation's waiting count and `levain team status` show it."""
@@ -433,6 +430,7 @@ def test_t32_after_a_rewrite_own_appends_are_listed_as_waiting(two, keys, capsys
     assert team("status", repo=ana) == 0
     out = capsys.readouterr().out
     assert _fresh(ana).waiting >= 1, out
+    assert "0 line(s)" not in out, out
 
 
 def test_a_rejoin_does_not_lift_a_rewrite_freeze(two, keys):
