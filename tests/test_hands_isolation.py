@@ -726,3 +726,58 @@ def test_setup_isolation_can_still_undo_an_entity_that_was_moved(tmp_path: Path,
     hands.cmd_setup_isolation(moved, undo=True, dry_run=True)
     out = capsys.readouterr().out
     assert "another entity directory" not in out and hands_user_name(old) in out
+
+
+def test_undo_with_nothing_set_up_makes_no_tombstone(tmp_path: Path) -> None:
+    for host in ("darwin", "linux"):
+        joined = _joined(_undo(tmp_path / host, host=host, hands_id=None))
+        assert "UserShell" not in joined and "usermod" not in joined and "useradd" not in joined
+
+
+def test_the_undo_lock_is_made_only_inside_the_operators_own_store_directory(tmp_path: Path) -> None:
+    ed = _entity(tmp_path)
+    elsewhere = tmp_path / "privileged"
+    elsewhere.mkdir()
+    (ed / ".levain").rename(tmp_path / "moved-store")
+    (ed / ".levain").symlink_to(elsewhere)                  # swapped for a link to somewhere else
+    with pytest.raises(OSError):
+        hands._undo_lock(ed, os.getuid(), os.getgid())
+    assert list(elsewhere.iterdir()) == []
+    (ed / ".levain").unlink()
+    (ed / ".levain").mkdir()
+    with pytest.raises(HandsSetupError, match="not yours"):
+        hands._undo_lock(ed, os.getuid() + 1, os.getgid())
+
+
+def test_undo_of_another_paths_hands_user_refuses_while_it_runs_anything(tmp_path: Path, monkeypatch, capsys) -> None:
+    from levain.firing import ws_git
+
+    old, here = _entity(tmp_path, "old"), _entity(tmp_path, "here")
+    (here / ".levain" / "confinement.json").write_text(json.dumps({**_record(old), "hands_uid": 4_000_017}))
+    monkeypatch.setattr(hands, "host_os", lambda: "darwin")
+    monkeypatch.setattr(hands, "_user_exists", lambda n: n == hands_user_name(old))
+    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: type("E", (), {"pw_uid": 4_000_017, "pw_gid": 20})()
+                        if n == hands_user_name(old) else hands.pwd.getpwuid(os.getuid()))
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: True)
+    assert hands.cmd_setup_isolation(here, undo=True, dry_run=True) == 1
+    assert "processes running" in capsys.readouterr().out
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: False)
+    assert hands.cmd_setup_isolation(here, undo=True, dry_run=True) == 0
+    assert "a setup here makes a new hands user" in capsys.readouterr().out
+
+
+def test_a_remade_macos_group_holds_its_id_and_a_group_with_another_id_is_refused(monkeypatch) -> None:
+    import subprocess as sp
+
+    made = []
+    monkeypatch.setattr(hands, "_run_ok", lambda argv, **kw: made.append(argv) or (True, ""))
+    for existing, expect_ok in (("PrimaryGroupID: 499\n", True), ("PrimaryGroupID: 20\n", False), (None, True)):
+        made.clear()
+        monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: sp.CompletedProcess(
+            argv, 0 if existing else 56, existing or "", ""))
+        ok, _ = hands._darwin_group_with_id("_levain_x_abcdef", 499)
+        assert ok is expect_ok, existing
+        if existing is None:
+            assert made[-1][-2:] == ("PrimaryGroupID", "499")
+        else:
+            assert made == []

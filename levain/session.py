@@ -836,7 +836,7 @@ class EntitySession:
             if not started and conversation is not None:
                 try:
                     conversation.close()
-                except Exception:  # noqa: BLE001
+                except BaseException:  # noqa: BLE001 — a TurnTimeout too: the start error wins
                     torn_down = False
                     logging.getLogger("levain.session").warning(
                         "closing a conversation from a failed start raised", exc_info=True

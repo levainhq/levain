@@ -668,12 +668,35 @@ def test_ws_adopt_lets_your_git_read_only_a_repository_nobody_else_could_have_wr
 def test_the_hands_user_is_asked_itself_whether_it_can_write_the_repository(tmp_path: Path, monkeypatch) -> None:
     src = _src_repo(tmp_path)
     _no_sudo(monkeypatch)                                   # "the hands user" is me: it owns, so it can write
-    assert ws_git._hands_can_write(_hands(tmp_path), src / ".git") == str(src / ".git")
-    _read_only(src / ".git")
+    h = _hands(tmp_path)
+    assert ws_git._hands_can_write(h, src / ".git") == str(src)          # the parent first: it could rename .git
+    _read_only(src)
     try:
-        assert ws_git._hands_can_write(_hands(tmp_path), src / ".git") is None
+        assert ws_git._hands_can_write(h, src / ".git") is None
+        (src / ".git" / "refs").chmod(0o755)
+        assert ws_git._hands_can_write(h, src / ".git") == str(src / ".git" / "refs")
+        (src / ".git" / "refs").chmod(0o555)
+        (src / ".git" / "objects").chmod(0o311)                       # it can see in, but not walk: no answer
+        with pytest.raises(WsGitError, match="could not ask"):
+            ws_git._hands_can_write(h, src / ".git")
     finally:
-        _writable(src / ".git")
+        _writable(src)
+    assert ws_git._hands_can_write(h, tmp_path / "nowhere" / ".git") is None   # cannot see it: cannot write it
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_ws_adopt_refuses_when_the_name_no_longer_leads_to_the_pinned_repository(tmp_path: Path, monkeypatch) -> None:
+    src = _src_repo(tmp_path)
+    rfd = os.open(src, os.O_RDONLY | os.O_DIRECTORY)
+
+    def swap(hands, tree):                                   # during the probe, the repository is renamed away
+        os.rename(src, tmp_path / "away")
+        _repo(src)
+        return None
+
+    monkeypatch.setattr(ws_git, "_hands_can_write", swap)
+    with pytest.raises(WsGitError, match="changed while it was being checked"):
+        ws_git._check_source_repo(rfd, src, _hands(tmp_path, uid=4_000_017))
 
 
 @pytest.mark.parametrize("name,url,ok", [

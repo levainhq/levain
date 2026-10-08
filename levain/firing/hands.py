@@ -321,6 +321,22 @@ def _present(kind: Literal["user", "group"], host: HostOS, name: str) -> tuple[s
     return ("/bin/sh", "-c", _absent(kind, host, name)[2][2:])
 
 
+def _darwin_group_with_id(name: str, gid: int) -> tuple[bool, str]:
+    """The group ``name`` with PrimaryGroupID ``gid``: created if absent; if present, it must
+    already hold that id (another id is refused, never overwritten)."""
+    r = subprocess.run(["/usr/bin/dscl", ".", "-read", f"/Groups/{name}", "PrimaryGroupID"],
+                       capture_output=True, text=True, cwd="/")
+    if r.returncode == 0:
+        have = r.stdout.split()[-1] if r.stdout.split() else ""
+        return (True, "") if have == str(gid) else (False, f"group {name} exists with id {have!r}, not {gid}")
+    for argv in (("/usr/bin/dscl", ".", "-create", f"/Groups/{name}"),
+                 ("/usr/bin/dscl", ".", "-create", f"/Groups/{name}", "PrimaryGroupID", str(gid))):
+        ok, why = _run_ok(argv)
+        if not ok:
+            return False, why
+    return True, ""
+
+
 def _darwin_leave_groups(user: str) -> tuple[bool, str]:
     """Remove ``user`` from every group that lists it as a member."""
     out = subprocess.run(["/usr/bin/dscl", ".", "-list", "/Groups", "GroupMembership"], capture_output=True,
@@ -396,15 +412,15 @@ def plan_undo(
         Step("let your group read it, and empty the hooks and settings of the entity's repositories",
              call=lambda: _readable_and_sanitised(tree, operator_gid, owner_uid=hands_id)),
     ]
-    if host == "darwin":
+    if hands_id is None:
+        pass   # no account and no id anything vouches for: no tombstone to keep or make
+    elif host == "darwin":
         dscl, u, g = ("/usr/bin/dscl", "."), f"/Users/{hands_user}", f"/Groups/{hands_user}"
         if account_gone:
             # Someone deleted the account: make the tombstone, so the id is reserved again.
             steps += [
-                Step("create the hands group again, to hold its id", (*dscl, "-create", g),
-                     skip_if=_present("group", host, hands_user)),
-                Step("give it its id", (*dscl, "-create", g, "PrimaryGroupID", str(hands_id)),
-                     skip_if=_present("group", host, hands_user)),
+                Step("create the hands group again, holding its id (or check the one there holds it)",
+                     call=lambda: _darwin_group_with_id(hands_user, hands_id)),
                 Step("create the hands user again, to hold its id", (*dscl, "-create", u)),
                 Step("give it its id", (*dscl, "-create", u, "UniqueID", str(hands_id))),
                 Step("and its own group", (*dscl, "-create", u, "PrimaryGroupID", str(hands_id))),
@@ -946,13 +962,21 @@ def _undo_lock(entity_dir: Path, owner_uid: int, owner_gid: int) -> int:
 
     from levain.firing.ws_git import HANDS_LOCK
 
-    path = entity_dir / ".levain" / HANDS_LOCK
-    flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    # Root, in a tree the operator controls: .levain is opened without following a link and must be
+    # the operator's directory, and the lock is made relative to that fd, never by a path again.
+    dfd = os.open(entity_dir / ".levain", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec)
     try:
-        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
-        os.fchown(fd, owner_uid, owner_gid)
-    except FileExistsError:
-        fd = os.open(path, flags)
+        if os.fstat(dfd).st_uid != owner_uid:
+            raise HandsSetupError(f"{entity_dir}/.levain is not yours; refusing to create the lock in it")
+        flags = os.O_RDWR | os.O_NOFOLLOW | cloexec
+        try:
+            fd = os.open(HANDS_LOCK, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dfd)
+            os.fchown(fd, owner_uid, owner_gid)
+        except FileExistsError:
+            fd = os.open(HANDS_LOCK, flags, dir_fd=dfd)
+    finally:
+        os.close(dfd)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -1037,6 +1061,23 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
                 print(f"setup-isolation: {hands} has id {hands_id}, but confinement.json records "
                       f"{cfg.hands_uid}; refusing.")
                 return 1
+        if hands != derived and hands_id is not None:
+            # A record from another path (the entity was moved, or the config copied). That entity's
+            # sessions hold a hands lock in ITS directory, which this undo cannot take; so refuse
+            # while anything at all runs as that hands user.
+            from levain.firing.ws_git import WsGitError, entity_session_live
+
+            try:
+                live = entity_session_live(hands_id)
+            except WsGitError as exc:
+                print(f"setup-isolation: {exc}")
+                return 1
+            if live:
+                print(f"setup-isolation: {hands} was set up for another entity directory and has processes "
+                      "running; refusing to undo it from here while it is in use.")
+                return 1
+            print(f"Note: {hands} was set up for this entity at another path. After this undo, a setup here "
+                  "makes a new hands user; the old one stays retired.")
         try:
             plan = plan_undo(entity_dir, operator=operator, host=host, hands_user=hands, hands_id=hands_id,
                              operator_gid=op.pw_gid, account_gone=account_gone)
@@ -1044,7 +1085,11 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
             print(f"setup-isolation: {exc}")
             return 1
         print(f"Removing hands isolation for {entity_dir} (user {hands}).")
-        lock_fd = None if dry_run else _undo_lock(entity_dir, op.pw_uid, op.pw_gid)
+        try:
+            lock_fd = None if dry_run else _undo_lock(entity_dir, op.pw_uid, op.pw_gid)
+        except (HandsSetupError, OSError) as exc:
+            print(f"setup-isolation: {exc}")
+            return 1
         if lock_fd == -1:
             print("setup-isolation: a session of this entity, or levain ws-git / ws-put / ws-adopt, is "
                   "running; refusing to undo under it.")
@@ -1060,7 +1105,7 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
         # returning a just-deleted macOS account (measured on a CI runner).
         retired = user_is_retired(hands, host)
         leftovers = [what for what, there in (
-            (f"the user {hands} as a live account (not retired)", not retired),
+            (f"the user {hands} as a live account (not retired)", hands_id is not None and not retired),
             (f"the sudoers rule {sudoers_path(hands)}", sudoers_path(hands).exists()),
         ) if there]
         if leftovers:

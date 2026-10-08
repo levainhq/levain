@@ -582,17 +582,34 @@ def _check_source_repo(rfd: int, src: Path, hands: Hands) -> None:
     keys = _operator_git(rfd, "config", "--file", ".git/config", "--list", "--name-only").stdout.splitlines()
     if any(k.startswith(("include.", "includeif.")) for k in keys):
         raise WsGitError(f"{src}/.git/config includes another file; refusing")
-    writable = _hands_can_write(hands, Path(os.path.abspath(src)) / ".git")
+    named = Path(os.path.abspath(src))
+    writable = _hands_can_write(hands, named / ".git")
     if writable:
         raise WsGitError(f"the entity's user can write {writable}; refusing to let your git read this repository")
+    # The probe went by name; it answered for the pinned repository only if the name still leads to it.
+    pinned, now = os.stat(".git", dir_fd=rfd, follow_symlinks=False), os.stat(named / ".git", follow_symlinks=False)
+    if (pinned.st_dev, pinned.st_ino) != (now.st_dev, now.st_ino):
+        raise WsGitError(f"{src}/.git changed while it was being checked; refusing")
+
+
+#: Run as the hands user. argv: the tree, its parent. Prints what it can write (the parent first: a
+#: writable parent could rename the tree away), exits 0; exits 4 if the walk itself fails on what
+#: it can see. What it cannot see at all it cannot write.
+_CAN_WRITE_SCRIPT = r"""
+[ -w "$2" ] && { printf '%s\n' "$2"; exit 0; }
+[ -e "$1" ] || exit 0
+find "$1" -exec test -w {} \; -print || exit 4
+"""
 
 
 def _hands_can_write(hands: Hands, tree: Path) -> str | None:
-    """The first entry under ``tree`` the hands user can write, asked of the hands user itself
-    (``test -w``, which answers for modes and ACLs alike), or None. What it cannot reach it cannot
-    write, so a walk it is refused into prints nothing."""
-    probe = subprocess.run(_as_hands(hands, _abs("find"), str(tree), "-exec", "/bin/test", "-w", "{}", ";", "-print"),
+    """The first entry the hands user can write, among ``tree``, everything in it, and its parent,
+    asked of the hands user itself (``test -w``, which answers for modes and ACLs alike), or None.
+    Raises when the question could not be answered."""
+    probe = subprocess.run(_as_hands(hands, "/bin/sh", "-c", _CAN_WRITE_SCRIPT, "sh", str(tree), str(tree.parent)),
                            capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/")
+    if probe.returncode != 0:
+        raise WsGitError(f"could not ask the entity's user what it can write in {tree}; refusing")
     first = probe.stdout.split("\n", 1)[0].strip()
     return first or None
 

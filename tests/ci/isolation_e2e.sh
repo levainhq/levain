@@ -211,7 +211,7 @@ setup --undo || fail "undo exited nonzero"
 check "the hands user stays, as a tombstone holding its id" test "$(id -u "$H" 2>/dev/null)" = "$HID"
 if [ "$(uname)" = Darwin ]; then
   check "it is marked retired" bash -c "dscl . -read '/Users/$H' RealName | grep -q retired"
-  check "it is disabled for login" bash -c "dscl . -read '/Users/$H' AuthenticationAuthority | grep -q DisabledUser"
+  check "it is disabled for login" bash -c "sudo dscl . -read '/Users/$H' AuthenticationAuthority | grep -q DisabledUser"   # root-readable only
   check "its shell is /usr/bin/false" bash -c "dscl . -read '/Users/$H' UserShell | grep -q /usr/bin/false"
 else
   check "it is marked retired" bash -c "getent passwd '$H' | cut -d: -f5 | grep -q retired"
@@ -219,7 +219,9 @@ else
   check "it is expired" bash -c "sudo chage -l '$H' | grep -i 'account expires' | grep -vq never"
   refused "root's su to it with an explicit shell (expired)" sudo su -s /bin/sh "$H" -c /bin/true
 fi
-refused "the operator's sudo as it" sudo -n -u "$H" /usr/bin/true
+# The operator's own `sudo -u` cannot be probed here: the runner account may run anything as anyone.
+# What the rule granted is gone, which is what that would show:
+refused "its sudoers rule is gone" sudo test -e "/etc/sudoers.d/levain-$H"
 refused "root's su to it" sudo su "$H" -c /usr/bin/true
 check "its home and ssh key are gone" bash -c "! sudo test -e '$HHOME/.ssh/id_ed25519'"
 refused "a hands process survived" pgrep -U "$HID"
