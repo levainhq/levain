@@ -28,6 +28,10 @@ from levain.autonomic import (
     manual_invocation,
 )
 
+# TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal
+pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
+
+
 # --- test doubles -------------------------------------------------------------------
 
 MANIFEST = ActionManifest({
@@ -46,7 +50,6 @@ FROZEN_FACE_KEYS = {
 
 @dataclass
 class RecordingExecutor:
-    confined = True   # a test double: declares the floor a real binding executor runs under
     name: str = "recording"
     result: ExecutionResult = field(
         default_factory=lambda: ExecutionResult(ok=True, detail="wrote /tmp/digest.md", downstream_id="doc-123")

@@ -30,7 +30,8 @@ from levain.autonomic import (
     SignalAuth, SubGoal, TightnessVector, TriggerSpec, TrustContext, hold_id_for, manual_invocation,
     run_id_for,
 )
-from tests.autonomic_confirm_keys import confirm_signers, signed_yes
+from tests.autonomic_confirm_keys import SIGNER, confirm_signers, sign, signed_yes
+from tests.autonomic_test_only_confinement import assume_confined_for_this_test
 from levain.autonomic.journal import EffectStatus
 from tests.test_autonomic_rawstore import registry_of, write_raw
 
@@ -39,12 +40,15 @@ LOW = ActionRisk(cls=RiskClass.LOW, reversible=True, external=False, financial=F
 HIGH = ActionRisk(cls=RiskClass.HIGH, reversible=False, external=True, financial=False)
 TIGHT = TightnessVector(goal_spec=0.9, tool_min=0.9, pattern_precision=0.9, output_bound=0.9)
 
+# TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal
+pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
+
+
 
 class OutboxExecutor:
     """The effect: append one line to the outbox file. ``CRASH_AFTER_EFFECT=<action>`` in the
     environment makes the process die right after that action's write (a real crash, mid-run)."""
 
-    confined = True   # a test double: declares the floor a real binding executor runs under
 
     name = "outbox"
 
@@ -163,6 +167,22 @@ class World:
         return got.graduation.fire_count
 
 
+def _signed_decide(w: "World", pending_id: str):
+    """The decision a verified resolve writes for a person's signed approval (the signature, the signer, the
+    challenge it signed and its fence), written straight into the journal: a resolve that stopped before
+    its effect ran."""
+    from levain.autonomic import effect_digest
+    hold = w.journal.find_pending(pending_id)
+    p = w.gate.get_pending(pending_id)
+    message = w.gate.confirm_challenge(pending_id)
+    body = json.loads(message)
+    return w.journal.decide(hold["hold_id"], approve=True, by="human", posture=body["rung"],
+                            digest=effect_digest(action_name=p.action_name, payload=p.payload,
+                                                 context_id=p.context_id),
+                            signer=SIGNER, signature=sign(message), challenge=message.decode("utf-8"),
+                            fence=body["fence"])
+
+
 def _child(work: Path, body: str, crash_after: str) -> int:
     """Run ``body`` in a fresh interpreter against ``World(work)``; the executor dies after
     ``crash_after``'s effect. Returns the exit code."""
@@ -171,6 +191,8 @@ def _child(work: Path, body: str, crash_after: str) -> int:
         sys.path.insert(0, {str(Path(__file__).parent)!r})
         from pathlib import Path
         from test_autonomic_journal_wiring import World
+        import levain.autonomic.gate as _g
+        _g._executor_is_confined = lambda executor: True   # TEST ONLY (tests/autonomic_test_only_confinement.py)
         w = World(Path({str(work)!r}))
     """) + textwrap.dedent(body)
     env = dict(os.environ, CRASH_AFTER_EFFECT=crash_after)
@@ -250,9 +272,7 @@ def test_an_approval_whose_effect_never_ran_resumes_on_redelivery(tmp_path):
     w.dispatch("h1")
     [p] = w.gate.open_pendings()
     from levain.autonomic import effect_digest
-    assert w.journal.decide(w.journal.find_pending(p.pending_id)["hold_id"], approve=True, by="human",
-                            digest=effect_digest(action_name=p.action_name, payload=p.payload,
-                                                 context_id=p.context_id)).ok
+    assert _signed_decide(w, p.pending_id).ok
     out = World(tmp_path).dispatch("h1")
     assert out.chain.completed and out.chain.links[-1].outcome.fired
     assert w.outbox() == [("link0", "h1-0"), ("link1", "h1-1")]
@@ -457,6 +477,7 @@ def test_a_pause_and_its_fence_commit_together_or_not_at_all(tmp_path, monkeypat
     with pytest.raises(OSError):
         w.store.set_status(b.binding_id, BindingStatus.PAUSED)
     monkeypatch.undo()
+    assume_confined_for_this_test(monkeypatch)                     # (the undo removed the test seam too)
     assert w.store.get(b.binding_id).status is BindingStatus.ACTIVE   # nothing committed
     assert w.store.set_status(b.binding_id, BindingStatus.PAUSED)      # and when it commits, it fences
     w.store.ratify(b.binding_id)
@@ -550,8 +571,7 @@ def test_a_claimed_one_shot_resumes_its_own_run_on_redelivery(tmp_path):
     w.dispatch("o1")                                               # claimed; link0 ran; link1 proposed
     [p] = w.gate.open_pendings()
     from levain.autonomic import effect_digest
-    w.journal.decide(w.journal.find_pending(p.pending_id)["hold_id"], approve=True, by="human",
-                     digest=effect_digest(action_name=p.action_name, payload=p.payload, context_id=p.context_id))
+    _signed_decide(w, p.pending_id)
     assert World(tmp_path).dispatch("o1").chain.completed          # resumed: link0 replays, link1 runs
     assert World(tmp_path).dispatch("o1").chain.completed          # and again: everything replays
     assert w.outbox() == [("link0", "o1-0"), ("link1", "o1-1")]
@@ -898,8 +918,7 @@ def test_a_deny_after_an_approval_writes_no_receipt_and_the_approval_runs(tmp_pa
     w.dispatch("c1")
     [p] = w.gate.open_pendings()
     from levain.autonomic import effect_digest
-    w.journal.decide(w.journal.find_pending(p.pending_id)["hold_id"], approve=True, by="human",
-                     digest=effect_digest(action_name=p.action_name, payload=p.payload, context_id=p.context_id))
+    _signed_decide(w, p.pending_id)
     before = len(list(w.receipts.read()))
     out = w.chains.resume(p.pending_id, ConfirmDecision(approved=False, by="human"))
     assert out.links[-1].outcome.reason == "journal:already_decided"
@@ -1013,8 +1032,7 @@ def test_a_receipt_names_the_decider_whose_approval_fired(tmp_path):
     w.dispatch("c1")
     [p] = w.gate.open_pendings()
     from levain.autonomic import effect_digest
-    w.journal.decide(w.journal.find_pending(p.pending_id)["hold_id"], approve=True, by="human",
-                     digest=effect_digest(action_name=p.action_name, payload=p.payload, context_id=p.context_id))
+    _signed_decide(w, p.pending_id)
     out = w.gate._resolve_hold(w.journal.find_pending(p.pending_id),
                                ConfirmDecision(approved=True, by="on-loop"), chain_owned=True)
     assert out.fired
@@ -1126,6 +1144,8 @@ def test_many_processes_delivering_one_event_produce_one_effect(tmp_path):
         sys.path.insert(0, {str(Path(__file__).parent)!r})
         from pathlib import Path
         from test_autonomic_journal_wiring import World
+        import levain.autonomic.gate as _g
+        _g._executor_is_confined = lambda executor: True   # TEST ONLY (tests/autonomic_test_only_confinement.py)
         World(Path({str(tmp_path)!r})).dispatch('race')
     """)
     procs = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1479,9 +1499,10 @@ def test_a_risk_that_rose_since_the_proposal_asks_again_at_the_raised_rung(tmp_p
     assert fired.posture == "CONFIRM_ELEVATED"                     # fired at the raised rung
 
 
-def test_an_approval_recorded_before_the_risk_rose_ends_its_run(tmp_path):
-    # the decision is write-once, so an approval given at the lower rung cannot be asked again: the run
-    # is cancelled, with a receipt, and the effect never runs
+def test_an_approval_recorded_before_the_risk_rose_reopens_for_a_new_signature(tmp_path):
+    # the signature named the risk inputs of the lower rung; at admission they digest to another fence, so
+    # the signature is not authority for this effect any more: the hold reopens (seat 1008+13 ruling 1;
+    # this test asserted the run was cancelled before that ruling)
     w = World(tmp_path)
     w.mint(chain=True)
     w.dispatch("a1")
@@ -1492,11 +1513,13 @@ def test_an_approval_recorded_before_the_risk_rose_ends_its_run(tmp_path):
     w.journal.effect = real
     w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
     [h] = w.journal.approved_unrun()
-    out = w.chains.resume(h["pending"]["pending_id"], signed_yes(w.chains.gate, h["pending"]["pending_id"]))
-    assert out.aborted and out.reason == "revalidate:risk_floor_rose"
+    pid = h["pending"]["pending_id"]
+    out = w.chains.resume(pid, signed_yes(w.chains.gate, pid))
+    assert out.paused and out.reason == "journal:reopened:signed_under_another_fence"
     assert ("link1", "a1-1") not in w.outbox() and w.journal.approved_unrun() == []
-    [stop] = [r for r in w.receipts.read() if r.action_face["context_id"] == "a1-1"]
-    assert not stop.fired and stop.action_face["gate"]["verdict"] == "denied"
+    assert w.journal.find_pending(pid)["decided"] is None
+    assert b'"rung":"CONFIRM_ELEVATED"' in w.gate.confirm_challenge(pid)
+    assert _approve(w).completed and ("link1", "a1-1") in w.outbox()   # signed at the raised rung
 
 
 def test_a_bindings_pending_found_in_the_manual_store_is_refused(tmp_path):
@@ -1533,7 +1556,7 @@ def test_a_redelivery_does_not_fire_an_approval_given_before_the_risk_rose(tmp_p
     _approved_unrun(w, "d1")
     w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
     out = w.dispatch("d1")
-    assert out.chain.aborted and out.chain.reason == "revalidate:risk_floor_rose"
+    assert out.chain.paused and out.chain.reason == "journal:reopened:signed_under_another_fence"
     assert ("link1", "d1-1") not in w.outbox() and w.journal.approved_unrun() == []
 
 
@@ -1777,18 +1800,21 @@ def test_a_rise_whose_effect_starts_between_the_check_and_the_cancel_cancels_not
     assert [r.fired for r in w.receipts.read() if r.action_face["context_id"] == "c3-1"] == [True]
 
 
-def test_a_rise_seen_while_the_run_is_barred_still_ends_it(tmp_path):
+def test_a_rise_seen_while_the_run_is_barred_still_does_not_run_at_the_old_rung(tmp_path):
     # complement r2 LOW 4: a barrier read at the check (BARRED: the registry, for a moment) fell through
-    # to the fire at the old rung, and the effect ran if the barrier had cleared by then
+    # to the fire at the old rung, and the effect ran if the barrier had cleared by then. A person's
+    # approval is now verified at admission, so the risen fence reopens it whatever the check read.
     from levain.autonomic.journal import EffectOutcome
     w = World(tmp_path)
     w.mint(chain=True)
     _approved_unrun(w, "b4")
     w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
     w.journal.peek = lambda *a, **k: EffectOutcome(EffectStatus.BARRED, "registry")
-    out = w.chains.resume(_decided_pending_id(w), ConfirmDecision(approved=True, by="human"))
+    pid = _decided_pending_id(w)
+    out = w.chains.resume(pid, ConfirmDecision(approved=True, by="human"))
     assert ("link1", "b4-1") not in w.outbox()
-    assert out.aborted and out.reason == "revalidate:risk_floor_rose"
+    assert out.paused and out.reason == "journal:reopened:signed_under_another_fence"
+    assert w.journal.find_pending(pid)["decided"] is None
 
 
 def test_an_approval_given_at_the_raised_rung_survives_a_stop_before_its_effect(tmp_path):
@@ -1943,7 +1969,10 @@ def test_a_resolver_that_loses_the_decision_fires_under_the_winners(tmp_path):
     def raced(hold_id, **kw):
         # the other resolver saw the raised rung and approved there, with its typed proof, first
         w.tool_risk[1] = FINANCIAL
-        assert real(hold_id, approve=True, digest=kw["digest"], by="human", posture="CONFIRM_ELEVATED").ok
+        message = w.gate.confirm_challenge(w.journal.get_hold(hold_id)["pending"]["pending_id"])
+        assert real(hold_id, approve=True, digest=kw["digest"], by="human", posture="CONFIRM_ELEVATED",
+                    signer=SIGNER, signature=sign(message), challenge=message.decode("utf-8"),
+                    fence=json.loads(message)["fence"]).ok
         return HoldResult(False, "already_decided")
     w.journal.decide = raced
     out = _approve(w, first_estimate=0.3)
@@ -1968,7 +1997,8 @@ def test_a_replayed_receipt_never_takes_a_field_the_effect_did_not_record_from_t
     assert r.action_face["actor_first_estimate"] is None
 
 
-# --- Phill's ruling C#9 (10-08): the fencing token, signed confirms, confined effects ---------------------
+# --- Phill's ruling C#9 (10-08): the fencing token, signed confirms ------------------------------------
+# (the confined-effects half is tests/test_autonomic_l3_fixes.py: every binding effect is refused up front)
 # Each reproduced first on e3917e1 by driving the real engine (the lane's residue run).
 
 def test_a_tool_reclassified_after_its_rung_was_decided_is_not_run_at_that_rung(tmp_path):
@@ -1979,19 +2009,19 @@ def test_a_tool_reclassified_after_its_rung_was_decided_is_not_run_at_that_rung(
     real = w.journal.effect
 
     def reclassify_then_admit(*a, **k):
-        w.journal.revise_risk(lambda: w.tool_risk.__setitem__(0, HIGH))
+        w.tool_risk[0] = HIGH                                     # no call to announce it: the fence sees it
         return real(*a, **k)
     w.journal.effect = reclassify_then_admit
     first = w.dispatch("f1")
     assert first.outcome.held and first.outcome.reason == "journal:stale" and w.outbox() == []
     w.journal.effect = real
-    again = w.dispatch("f1")                                       # decided again under the new revision
+    again = w.dispatch("f1")                                       # decided again under the new risk
     assert again.outcome.pending and again.outcome.posture is Posture.CONFIRM and w.outbox() == []
 
 
-def test_an_approval_whose_tool_was_reclassified_before_its_effect_is_decided_again(tmp_path):
+def test_an_approval_whose_tool_was_reclassified_before_its_effect_is_asked_again(tmp_path):
     # (a), residue R2: link1 was approved at CONFIRM, its tool became financial before the effect was
-    # admitted, and it ran at CONFIRM
+    # admitted, and it ran at CONFIRM. The signature named the old fence: the hold reopens.
     w = World(tmp_path)
     w.mint(chain=True)
     w.dispatch("f2")
@@ -2001,11 +2031,11 @@ def test_an_approval_whose_tool_was_reclassified_before_its_effect_is_decided_ag
     def reclassify_then_admit(run_id, effect_id, **k):
         if effect_id == "link-1" and not once:
             once.append(1)
-            w.journal.revise_risk(lambda: w.tool_risk.__setitem__(1, FINANCIAL))
+            w.tool_risk[1] = FINANCIAL
         return real(run_id, effect_id, **k)
     w.journal.effect = reclassify_then_admit
     out = w.resolve_open_as(yes)
-    assert out.aborted and out.reason == "revalidate:risk_floor_rose"
+    assert out.paused and out.reason == "journal:reopened:signed_under_another_fence"
     assert ("link1", "f2-1") not in w.outbox() and w.journal.approved_unrun() == []
 
 
@@ -2027,14 +2057,3 @@ def test_a_yes_is_authority_only_when_an_enrolled_key_signed_it(tmp_path):
         assert out.paused and out.reason == "confirm:not_signed_by_an_enrolled_key"
         assert w.open_pending_id() == pid and w.outbox() == [("link0", "f3-0")]   # still open, not sent
     assert w.resolve_open(approve=True).completed and ("link1", "f3-1") in w.outbox()
-
-
-def test_a_bindings_effect_never_runs_on_an_executor_not_declared_confined(tmp_path):
-    # (b), the unconfined probe: a binding's effect ran on an executor that never declared the floor
-    class Unconfined(OutboxExecutor):
-        confined = False
-    w = World(tmp_path)
-    w.gate._executor = Unconfined(tmp_path / "outbox.jsonl")
-    w.mint(chain=False)
-    out = w.dispatch("f4").outcome
-    assert out.refused and out.reason == "executor_not_confined" and w.outbox() == []

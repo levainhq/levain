@@ -52,7 +52,8 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS holds (hold_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, "
     "effect_id TEXT NOT NULL, binding_id TEXT NOT NULL, digest TEXT NOT NULL, at TEXT, "
     "pending TEXT, pending_id TEXT, chain TEXT, chained INTEGER NOT NULL DEFAULT 0, "
-    "decided INTEGER, decided_by TEXT, decided_posture TEXT, seq INTEGER NOT NULL)",
+    "decided INTEGER, decided_by TEXT, decided_posture TEXT, seq INTEGER NOT NULL, "
+    "signer TEXT, signature TEXT, challenge TEXT, fence TEXT)",
     # one hold per pending id: a resolve finds a decision by its pending id, so a second hold sharing one
     # could never be decided and would hold its binding. A run's pending seals its hold id, so two holds
     # do not share one; were they to, the second insert fails instead
@@ -60,6 +61,14 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS effects (run_id TEXT NOT NULL, effect_id TEXT NOT NULL, "
     "digest TEXT NOT NULL, pid INTEGER, state TEXT NOT NULL CHECK (state IN ('intent','done','unknown')), "
     "result TEXT, receipt_id TEXT, PRIMARY KEY (run_id, effect_id))",
+)
+
+
+# Columns a store made before they existed lacks; added in place (a hold without them reads as unsigned,
+# which is what such a hold is). (table, column, type)
+_ADDED_COLUMNS = (
+    ("holds", "signer", "TEXT"), ("holds", "signature", "TEXT"), ("holds", "challenge", "TEXT"),
+    ("holds", "fence", "TEXT"),
 )
 
 
@@ -130,6 +139,13 @@ class AutonomicDB:
                                        "an autonomic store, and is not taken over")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
+            for table, column, kind in _ADDED_COLUMNS:
+                have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+                if column not in have:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+            # this store's identity, named in every confirm challenge so a signature is good in one store
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('store_id', ?)",
+                         ("store-" + os.urandom(16).hex(),))
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
             if row is None:
                 conn.execute("INSERT INTO meta (key, value) VALUES ('format', ?)", (STORE_FORMAT,))

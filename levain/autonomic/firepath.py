@@ -254,6 +254,16 @@ class FireDispatcher:
         # the fresh fireability check, the admission under the current generation and a one-shot's
         # claim happen in one step under the store lock, which every fencing verb also holds, so a
         # pause or tighten is ordered entirely before the admission or entirely after it.
+        # 2b. no binding effect can run until an executor can prove it runs through the confinement floor
+        # (none can yet): refused HERE, before the run is admitted and before a one-shot is claimed, so
+        # nothing is spent on an effect that cannot run.
+        refusal = self._gate.binding_effect_refusal()
+        if refusal is not None:
+            _log.error("firepath: binding %s matched but not admitted (%s)", binding.binding_id, refusal)
+            return FireDispatch(binding_id=binding.binding_id, outcome=GateOutcome(
+                posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False, reason=refusal,
+                receipt_id=None, execution=None, binding_id=binding.binding_id))
+
         one_shot = binding.one_shot
         try:
             run_id = run_id_for(binding.binding_id, event)
@@ -283,13 +293,9 @@ class FireDispatcher:
         snapshot (the one-shot claim returns its pre-claim ACTIVE form), so it mints cleanly; hops=0 for
         a single link (the binding fires directly on the trigger)."""
         base = self._request_builder(fresh, event)
-        journal = self._gate.journal
-        assert journal is not None   # checked at construction
-        revision = journal.risk_revision()   # before the risk is derived: the journal fences on it
         request = dataclasses.replace(
             base,
             risk=self._binding_risk(fresh),
-            risk_revision=revision,
             authority=binding_invocation(fresh, hops=0),
             kill_predicates=_kill_predicates(fresh),
             predicted_trajectory=guard_trajectory(fresh.effective_guard),

@@ -6,6 +6,9 @@ import os
 
 import pytest
 
+# TEST ONLY: the per-test seam that lets a binding's effect run on a test executor (see the module).
+from tests.autonomic_test_only_confinement import test_only_confined_executor  # noqa: F401
+
 
 @pytest.fixture(autouse=True)
 def _isolate_activation_env(monkeypatch):

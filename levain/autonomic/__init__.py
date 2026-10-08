@@ -39,8 +39,10 @@ Architecture:
   The orchestration layer (the gated edge + its trace):
   - ``AuthorityScope`` / ``manual_invocation`` — the grant in force (the receipt's authority_scope).
   - ``Executor`` (Protocol) / ``ActionRequest`` / ``ExecutionResult`` — the trusted action seam. A
-    binding's effect runs only on an executor that declares ``confined`` (it runs effects through the
-    confinement floor, as the entity's hands user); the gate refuses any other.
+    binding's effect may run only on an executor that provably runs it through the confinement floor, as
+    the entity's separate hands user. None can prove that until the M2 hands wiring exists (a declaration
+    is not proof), so the gate and the fire path refuse every binding effect up front
+    (``executor_not_confined``), before a run is admitted, a one-shot claimed or a hold opened.
   - ``ConfirmTransport`` (Protocol) / ``ConfirmProposal`` / ``ConfirmDecision`` — the confirm-rung
     propose→reply seam (the human gate, injected; the decision returns out-of-band via ``resolve``).
   - ``PendingAction`` / ``PendingActionStore`` — the sealed record a person is asked about, and the
@@ -61,12 +63,16 @@ Architecture:
     the binding is open, cancelled by a rejection, fenced by a pause/revoke/tighten, poisoned (never
     retried) when the outcome is unknown, replayed (never re-run) when delivered again. The journal is
     the only durable home of a journaled decision: open pendings and paused chains are read from it.
-    An effect is also stopped (STALE, decided again) when the risk catalog was revised after its rung
-    was decided: ``RunJournal.revise_risk`` commits a reclassification by bumping a monotonic revision.
-  Who answered a confirm (Phill's ruling B, 2026-10-08):
+    An effect is also stopped (STALE, decided again) when its risk FENCE, a digest of the risk inputs
+    its rung was decided from, differs from the same inputs read again at its admission (any change to
+    them, made any way), and held (UNCLASSIFIED) when they cannot be read there.
+  Who answered a confirm (Phill's ruling B, 2026-10-08; "a delivered 'yes' is never authority"):
   - ``confirm`` (``challenge`` / ``verify_signature``) + ``EfferentGate.confirm_challenge`` — a person's
-    approval is an SSH signature by an enrolled key over the pending's content, the risk-catalog
-    revision and the rung, never a delivered "yes"; without one the decision stays open.
+    approval is an SSH signature by an enrolled key over the store's identity, the pending and hold ids,
+    the pending's content, the risk fence and the rung, never a delivered "yes"; without one the
+    decision stays open. The hold stores the signature, and the journal verifies it again at the
+    effect's admission over the challenge for the CURRENT fence: an approval with no signature, or
+    signed under another fence, does not run, and its hold reopens for a new signed decision.
 
 A lesson the fold carries for the surface that will put these decisions in front of a person:
   a perception layer that sees counts and not context asks about tuning, not decisions; LevainConnect's decision surface must not relearn it.

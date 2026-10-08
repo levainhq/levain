@@ -14,7 +14,8 @@ The journal is the ONLY durable home of a decision about a run's effect. A hold 
 decision itself: one row carries the sealed record a person is asked about and, for a link of a
 chain, the state that resumes the chain after the decision. Open pendings and paused chains are read
 from the open holds, never written anywhere else, and a decision is one write-once update (a
-rejection's cancel of the run is in the same transaction).
+rejection's cancel of the run is in the same transaction). The one way back: a person's approval that
+does not verify where it is used reopens its hold (signed-at-the-point-of-use, below).
 
 Identity is derived, never assigned: a run's id is a content address over the binding and the
 exact triggering event (:func:`run_id_for`), so delivering the same event again resumes the same
@@ -22,7 +23,7 @@ run; an effect's id is its position in the run (``link-<i>``); a hold's id is de
 run and effect it guards (:func:`hold_id_for`), so proposing the same effect again finds the same
 hold instead of opening a second one.
 
-Five properties, each one a run that fails without it:
+Six properties, each one a run that fails without it:
 
   - **hold-until-decided** — while a hold is open on a binding (undecided, and its run neither
     cancelled nor fenced: a dead run's hold can never fire, so it stops nothing), no effect of that binding runs
@@ -34,10 +35,17 @@ Five properties, each one a run that fails without it:
     returned instead;
   - **fence-on-cancel** — a fence on a binding (a pause, a revoke, a demotion) stops every run
     admitted under an older governance generation at its next effect;
-  - **fence-on-reclassify** — an effect is admitted only under the risk-catalog revision its rung was
-    decided at. A change to risk classification commits by bumping that revision
-    (:meth:`RunJournal.revise_risk`); an effect decided before the bump and admitted after it is not run
-    at the rung decided under the old classification: the caller decides it again.
+  - **fence-on-reclassify** — an effect is admitted only if its risk FENCE (a digest of the risk inputs
+    its rung was decided from: the caller computes it, :meth:`RunJournal.effect` takes it) equals the fence
+    read again from those inputs inside the admission's transaction. A classification changed in any way
+    after the rung was decided stops the effect (STALE: the caller decides it again); inputs that cannot be
+    read stop it too (UNCLASSIFIED), and nothing is recorded;
+  - **signed-at-the-point-of-use** — an effect that runs under a person's approval (any decider but
+    ``on-loop``, the silence default) is admitted only if the signature stored with the decision verifies,
+    at admission, over the challenge rebuilt for the CURRENT fence (the caller's ``verify_approval``). A
+    decision with no signature (one written before signatures were stored, or by anything but a verified
+    resolve), one signed under another fence, or one nothing can verify here, does not run: the hold
+    REOPENS (undecided, its signature cleared) for a new signed decision.
 
 And one rule that is not a property but follows from "at most once": an effect whose intent was
 recorded and whose result was not (the process died mid-call, or the call raised) has an UNKNOWN
@@ -72,8 +80,8 @@ from levain.autonomic.db import AutonomicDB
 
 __all__ = [
     "EffectStatus", "EffectOutcome", "HoldResult", "RunJournal", "RunRef", "JournalCorruptError",
-    "JournalConflictError",
-    "run_id_for", "hold_id_for", "effect_digest",
+    "JournalConflictError", "UNSIGNED_DECIDER",
+    "run_id_for", "hold_id_for", "effect_digest", "needs_signature",
 ]
 
 _log = logging.getLogger(__name__)
@@ -100,7 +108,9 @@ class EffectStatus(str, enum.Enum):
     FENCED = "fenced"        # the binding was fenced past this run's generation; ``fn`` NOT called
     BARRED = "barred"        # the registry no longer grants this run (corrupt, absent, not fireable)
     CANCELLED = "cancelled"  # the run was cancelled (a rejected hold); ``fn`` NOT called
-    STALE = "stale"          # the risk catalog was revised since the rung was decided; ``fn`` NOT called
+    STALE = "stale"          # the risk inputs changed since the rung was decided; ``fn`` NOT called
+    UNCLASSIFIED = "unclassified"   # the risk inputs could not be read at admission; ``fn`` NOT called
+    REOPENED = "reopened"    # the approval did not verify at admission: the hold is open again; ``fn`` NOT called
 
 
 @dataclass(frozen=True)
@@ -114,6 +124,8 @@ class EffectOutcome:
     decided_by: str | None = None
     # HELD from ``hold`` only: True iff this call opened the hold (False: it was already open).
     new_hold: bool = False
+    # REOPENED / UNCLASSIFIED only: why.
+    why: str | None = None
 
     @property
     def ran_now(self) -> bool:
@@ -175,6 +187,20 @@ _RUN_LIVE = (
 # An OPEN hold: undecided, of a live run. The one definition used by the open-decision list and by
 # hold-until-decided.
 _OPEN_HOLD = f"decided IS NULL AND {_RUN_LIVE}"
+
+
+# The columns of a hold record, in :meth:`RunJournal._hold_dict`'s order.
+_HOLD_COLUMNS = ("hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, chained, decided, "
+                 "decided_by, decided_posture, signer, signature, challenge, fence")
+# A decider whose approval needs no signature: the silence default, decided by the gate itself.
+UNSIGNED_DECIDER = "on-loop"
+
+
+def needs_signature(by: str | None) -> bool:
+    """Whether an approval by ``by`` is a person's, and so is authority only with a verified signature.
+    Every decider but :data:`UNSIGNED_DECIDER` is (``"human"``, and also an absent or unknown label: a
+    decision that does not say it was the silence default is not treated as one)."""
+    return by != UNSIGNED_DECIDER
 
 
 def hold_id_for(run_id: str, effect_id: str) -> str:
@@ -358,40 +384,14 @@ class RunJournal:
             conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)", (run_id, reason))
             return None
 
-    # --- the risk-catalog revision (the fence on classification) -------------------------------
-    @staticmethod
-    def _risk_revision_in(conn: sqlite3.Connection) -> int:
-        row = conn.execute("SELECT value FROM meta WHERE key = 'risk_revision'").fetchone()
-        return int(row[0]) if row else 0
-
-    def risk_revision(self) -> int:
-        """The current risk-catalog revision (0 if classification was never revised here). A caller
-        reads it BEFORE it derives a risk, and passes it to :meth:`effect` as the revision its rung was
-        decided under."""
-        with self._read() as conn:
-            return self._risk_revision_in(conn)
-
-    def revise_risk(self, apply: Callable[[], Any] | None = None) -> int:
-        """Commit a change to risk classification: run ``apply`` (the edit to whatever the binding risk
-        resolver or the manifest reads) and bump the revision, in one write transaction, so no effect is
-        admitted while the change is half made. The bump is the change's commit point: an effect whose
-        rung was decided under an earlier revision is not admitted after it (STALE). The bump commits even
-        if ``apply`` raises (a half-made change still makes earlier decisions stale), and the error is
-        raised after it. ``apply`` must not write this store. Returns the new revision, which never
-        decreases. A change to classification made any other way is not fenced."""
-        failed: BaseException | None = None
-        with self._write() as conn:
-            if apply is not None:
-                try:
-                    apply()
-                except BaseException as e:  # noqa: BLE001 — re-raised once the bump is committed
-                    failed = e
-            revision = self._risk_revision_in(conn) + 1
-            conn.execute("INSERT INTO meta (key, value) VALUES ('risk_revision', ?) ON CONFLICT(key) "
-                         "DO UPDATE SET value = excluded.value", (str(revision),))
-        if failed is not None:
-            raise failed
-        return revision
+    @property
+    def store_id(self) -> str:
+        """This store's identity (random, made with the store): every confirm challenge names it, so a
+        signature given in one store is not authority in another."""
+        value = self.db.meta("store_id")
+        if not value:
+            raise JournalCorruptError(f"run journal {self.db.path}: the store has no identity")
+        return value
 
     # --- effects ---------------------------------------------------------------------------
     def _barrier(self, conn: sqlite3.Connection, run_id: str, effect_id: str,
@@ -443,17 +443,17 @@ class RunJournal:
 
     @staticmethod
     def _hold_row(conn: sqlite3.Connection, hold_id: str) -> tuple | None:
-        return conn.execute("SELECT hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, "
-                            "chained, decided, decided_by, decided_posture FROM holds WHERE hold_id = ?",
-                            (hold_id,)).fetchone()
+        return conn.execute(f"SELECT {_HOLD_COLUMNS} FROM holds WHERE hold_id = ?", (hold_id,)).fetchone()
 
     @staticmethod
     def _hold_dict(row: tuple) -> dict[str, Any]:
-        hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, chained, decided, by, rung = row
+        (hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, chained, decided, by, rung,
+         signer, signature, challenge, fence) = row
         return {"hold_id": hold_id, "binding_id": binding_id, "run_id": run_id, "effect_id": effect_id,
                 "digest": digest, "at": at, "pending": json.loads(pending) if pending else None,
                 "chain": json.loads(chain) if chain else None, "chained": bool(chained),
-                "decided": None if decided is None else bool(decided), "by": by, "decided_posture": rung}
+                "decided": None if decided is None else bool(decided), "by": by, "decided_posture": rung,
+                "signer": signer, "signature": signature, "challenge": challenge, "fence": fence}
 
     def hold(self, run_id: str, effect_id: str, *, digest: str, pending: dict[str, Any],
              at: str | None = None, chain: dict[str, Any] | None = None,
@@ -498,26 +498,33 @@ class RunJournal:
                  json.dumps(chain, sort_keys=True) if chain is not None else None, 1 if chained else 0))
             return EffectOutcome(EffectStatus.HELD, hold_id=hold_id, new_hold=True)
 
-    def effect(self, run_id: str, effect_id: str, *, digest: str, risk_revision: int,
-               fn: Callable[[], Any], needs_decision: bool = False) -> EffectOutcome:
+    def effect(self, run_id: str, effect_id: str, *, digest: str, fence: str,
+               fence_now: Callable[[sqlite3.Connection], str], fn: Callable[[], Any],
+               needs_decision: bool = False,
+               verify_approval: Callable[[dict[str, Any], str], bool] | None = None) -> EffectOutcome:
         """Run one effect at most once.
 
         ``digest`` identifies exactly what the effect will do (the bytes a person approves). It is
         recorded with the intent and with any hold, and a decision must echo it.
-        ``risk_revision`` is the risk-catalog revision (:meth:`risk_revision`) read before the rung this
-        effect runs at was derived. If the catalog has been revised since, the effect is STALE: nothing
-        runs or is recorded, and the caller decides it again.
+        ``fence`` is the digest of the risk inputs the rung this effect runs at was decided from;
+        ``fence_now`` reads those inputs again and digests them, inside the admission's transaction (the
+        connection is passed so a registry read is made in it). A different fence is STALE, one that
+        cannot be read (``fence_now`` raises) is UNCLASSIFIED: nothing runs or is recorded either way.
         ``needs_decision`` is the gate's verdict for this effect: True means the effect runs only
         under an APPROVED hold of its own (one is opened if there is none). An effect with no
-        approved hold of its own is HELD while any hold on its binding is open."""
-        if isinstance(risk_revision, bool) or not isinstance(risk_revision, int):
-            raise TypeError("risk_revision must be an int")
+        approved hold of its own is HELD while any hold on its binding is open.
+        ``verify_approval(hold, fence_now)`` checks a person's approval of this effect's own hold at
+        admission: True only if the hold's stored signature verifies over the challenge rebuilt for the
+        current fence. An approval that needs a signature (:func:`needs_signature`) and does not verify
+        (or with no ``verify_approval`` to check it) is not run: the hold reopens (REOPENED)."""
+        if not isinstance(fence, str) or not fence:
+            raise TypeError("fence must be a non-empty string")
         hold_id = hold_id_for(run_id, effect_id)
         taken: list[int] = []   # the lease, once taken: released here if the admission does not commit
         try:
             with self._write() as conn:
                 admitted = self._admit_in(conn, run_id, effect_id, hold_id, digest, needs_decision, taken,
-                                          risk_revision)
+                                          fence, fence_now, verify_approval)
         except BaseException:
             for fd in taken:
                 self._drop_lease(run_id, effect_id, fd)
@@ -527,7 +534,9 @@ class RunJournal:
         return self._run_effect(run_id, effect_id, fn, admitted)
 
     def _admit_in(self, conn: sqlite3.Connection, run_id: str, effect_id: str, hold_id: str, digest: str,
-                  needs_decision: bool, taken: list[int], risk_revision: int) -> EffectOutcome | int:
+                  needs_decision: bool, taken: list[int], fence: str,
+                  fence_now: Callable[[sqlite3.Connection], str],
+                  verify_approval: Callable[[dict[str, Any], str], bool] | None) -> EffectOutcome | int:
         """The admission of an effect, in the caller's transaction: the barrier, the hold rules, and
         the intent (the lease is taken just before it and appended to ``taken``). Returns the outcome
         that stops the effect, or the lease fd."""
@@ -559,9 +568,36 @@ class RunJournal:
             conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)",
                          (run_id, "digest_changed"))
             return EffectOutcome(EffectStatus.CANCELLED)
-        if self._risk_revision_in(conn) > risk_revision:
-            # classification changed after this effect's rung was decided: that rung is not the one the
-            # catalog gives now, so nothing is admitted or recorded until it is decided again
+        try:
+            live = fence_now(conn)   # the risk inputs, read again at the point of use
+            if not isinstance(live, str) or not live:
+                raise TypeError(f"fence_now returned {type(live).__name__}, not a fence")
+        except Exception as e:  # noqa: BLE001 — inputs that cannot be read admit nothing (and crash nothing)
+            _log.warning("run journal: risk fence of %s/%s unreadable (%s): %s", run_id, effect_id,
+                         type(e).__name__, e)
+            return EffectOutcome(EffectStatus.UNCLASSIFIED, why=f"fence_unreadable:{type(e).__name__}")
+        if approved and own is not None and needs_signature(own["by"]):
+            # a person's approval is authority here only if its signature verifies NOW, over the challenge
+            # for the current fence; anything else reopens the decision for a new signed one
+            why = None
+            if not own.get("signature") or not own.get("signer") or not own.get("challenge"):
+                why = "unsigned_approval"
+            elif verify_approval is None:
+                why = "approval_not_verifiable_here"
+            else:
+                try:
+                    verified = verify_approval(own, live) is True
+                except Exception:  # noqa: BLE001 — a check that could not run verifies nothing
+                    verified = False
+                if not verified:
+                    why = ("signed_under_another_fence" if own.get("fence") != live
+                           else "signature_not_verified")
+            if why is not None:
+                self._reopen_in(conn, hold_id)
+                return EffectOutcome(EffectStatus.REOPENED, hold_id=hold_id, why=why)
+        if live != fence:
+            # the risk inputs changed after this effect's rung was decided: that rung is not the one they
+            # give now, so nothing is admitted or recorded until it is decided again
             return EffectOutcome(EffectStatus.STALE)
         lease = self._take_lease(run_id, effect_id)   # before the intent commits: see "leases"
         taken.append(lease)
@@ -595,13 +631,30 @@ class RunJournal:
                          (receipt_id, run_id, effect_id))
 
     # --- decisions -------------------------------------------------------------------------
+    @staticmethod
+    def _reopen_in(conn: sqlite3.Connection, hold_id: str) -> None:
+        """Make an approved hold undecided again, its signature cleared: it is an open decision once more
+        (and stops its binding's undecided effects until someone decides it)."""
+        conn.execute("UPDATE holds SET decided = NULL, decided_by = NULL, decided_posture = NULL, signer = NULL, "
+                     "signature = NULL, challenge = NULL, fence = NULL WHERE hold_id = ? AND decided = 1",
+                     (hold_id,))
+
     def decide(self, hold_id: str, *, approve: bool, digest: str, by: str | None = None,
-               posture: str | None = None) -> HoldResult:
+               posture: str | None = None, signer: str | None = None, signature: str | None = None,
+               challenge: str | None = None, fence: str | None = None) -> HoldResult:
         """Resolve a hold. ``digest`` must equal the one recorded with the hold (the decision is
         bound to what was shown). A hold decides once: this write-once update IS the claim, so of any
-        number of resolvers exactly one decision counts. A rejection cancels the hold's run in the same
-        transaction. ``by`` names the decider; ``posture`` names the rung the decision met, which can be
-        above the rung the hold's pending was proposed at."""
+        number of resolvers exactly one decision counts (a person's approval that does not verify at its
+        effect's admission reopens the hold, see :meth:`effect`). A rejection cancels the hold's run in
+        the same transaction. ``by`` names the decider; ``posture`` names the rung the decision met, which
+        can be above the rung the hold's pending was proposed at.
+
+        A person's approval (:func:`needs_signature`) is stored with what makes it authority: the
+        ``signer``, the SSHSIG ``signature``, the ``challenge`` it signed and the risk ``fence`` the
+        challenge named. Without them it is refused here (``unsigned_approval``), and nothing is written;
+        the signature is verified again where it is used, at the effect's admission."""
+        if approve and needs_signature(by) and not (signer and signature and challenge and fence):
+            return HoldResult(False, "unsigned_approval")
         with self._write() as conn:
             row = self._hold_row(conn, hold_id)
             if row is None:
@@ -611,8 +664,12 @@ class RunJournal:
                 return HoldResult(False, "already_decided")
             if h["digest"] != digest:
                 return HoldResult(False, "digest_mismatch")
-            conn.execute("UPDATE holds SET decided = ?, decided_by = ?, decided_posture = ? WHERE hold_id = ? "
-                         "AND decided IS NULL", (1 if approve else 0, by, posture, hold_id))
+            signed = approve and needs_signature(by)
+            conn.execute("UPDATE holds SET decided = ?, decided_by = ?, decided_posture = ?, signer = ?, "
+                         "signature = ?, challenge = ?, fence = ? WHERE hold_id = ? AND decided IS NULL",
+                         (1 if approve else 0, by, posture, signer if signed else None,
+                          signature if signed else None, challenge if signed else None,
+                          fence if signed else None, hold_id))
             if not approve:
                 conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)",
                              (h["run_id"], "rejected"))
@@ -620,9 +677,7 @@ class RunJournal:
 
     def _holds(self, where: str, args: tuple = ()) -> list[dict[str, Any]]:
         with self._read() as conn:
-            rows = conn.execute("SELECT hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, "
-                                f"chained, decided, decided_by, decided_posture FROM holds {where} ORDER BY seq",
-                                args).fetchall()
+            rows = conn.execute(f"SELECT {_HOLD_COLUMNS} FROM holds {where} ORDER BY seq", args).fetchall()
         return [self._hold_dict(r) for r in rows]
 
     def open_holds(self) -> list[dict[str, Any]]:

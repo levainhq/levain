@@ -111,7 +111,7 @@ _log = logging.getLogger("levain.autonomic.chainpath")
 # Gate refusals of a journaled link's resolve that RECORD NOTHING: the hold is still open, so the chain
 # is still paused at that link (a signed approval or a person may still come).
 _STILL_OPEN = frozenset({"unattended_approval_not_allowed", "confirm:not_signed_by_an_enrolled_key",
-                         "run_not_admitted", "journal:barred"})
+                         "run_not_admitted", "journal:barred", "executor_not_confined"})
 
 
 # The seams the adapter injects (per-link variants of the 4a single-link seams).
@@ -630,13 +630,9 @@ class ChainExecutor:
             completed=ctx.completed, paused_at_link=i, paused_payload=base.payload,
             pending_id=hold_id_for(run.run_id, run.effect_id),
         ).to_dict()
-        journal = self._gate.journal
-        assert journal is not None   # checked at construction
-        revision = journal.risk_revision()   # before the risk is derived: the journal fences on it
         request = dataclasses.replace(
             base,
             risk=self._link_risk(binding, i),
-            risk_revision=revision,
             trust=self._trust_resolver(binding, i),
             authority=binding_invocation(binding, hops=i),
             kill_predicates=_kill_predicates(binding),
@@ -708,6 +704,12 @@ class ChainExecutor:
         link_outcome = self._gate.resolve(pending_id, decision, chain_owned=True)
         results = [ChainLinkResult(link_index=state.paused_at_link, outcome=link_outcome)]
         if not link_outcome.fired:
+            if link_outcome.pending:
+                # the decision is open again (an approval that did not verify at admission reopened it):
+                # the chain is paused at this link, awaiting a new signed decision
+                return ChainOutcome(binding_id=binding.binding_id, state="paused", links=tuple(results),
+                                    paused_at=state.paused_at_link, pending_id=pending_id,
+                                    chain_id=state.chain_id, reason=link_outcome.reason)
             if link_outcome.refused and link_outcome.reason in _STILL_OPEN:
                 # nothing was decided: the chain is still paused at this link, awaiting a decision
                 return ChainOutcome(binding_id=binding.binding_id, state="paused", links=tuple(results),

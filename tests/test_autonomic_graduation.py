@@ -39,6 +39,10 @@ from levain.autonomic import (
     propose_graduation,
 )
 
+# TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal
+pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
+
+
 FIXED = _dt.datetime(2026, 6, 30, 12, 0, 0, tzinfo=_dt.timezone.utc)
 LOW_INTERNAL = ActionRisk(cls=RiskClass.LOW, reversible=True, external=False, financial=False)
 EXTERNAL = ActionRisk(cls=RiskClass.MEDIUM, reversible=False, external=True, financial=False)
@@ -246,7 +250,6 @@ def test_replace_atomic_promotion_revokes_old_persists_new(tmp_path):
 # =====================================================================================
 @dataclass
 class _Exec:
-    confined = True   # a test double: declares the floor a real binding executor runs under
     name: str = "rec"
     ok: bool = True
     def execute(self, action_name, payload, *, context_id):
@@ -256,7 +259,10 @@ class _Exec:
 def _gate(tmp_path):
     from tests.test_autonomic_rawstore import rig
     return EfferentGate(manifest=ActionManifest({}), store=GateReceiptStore(tmp_path / "r.jsonl"),
-                        executor=_Exec(), clock=lambda: FIXED, journal=rig(tmp_path / "store")[0])
+                        executor=_Exec(), clock=lambda: FIXED, journal=rig(tmp_path / "store")[0],
+                        # the binding's risk as the journal reads it again at admission (the fence): the
+                        # risk the one firing test's request carries
+                        binding_risk=lambda b, i: LOW_INTERNAL)
 
 
 def _req(gate, *, risk, ratified):
@@ -270,7 +276,6 @@ def _req(gate, *, risk, ratified):
                            hops=0, human_present=False),
         grounded=True, authority=AuthorityScope(grantor="binding", grant="g", binding_id=binding_id, hops=0),
         overall_confidence=1.0, directive_confidence=1.0, risk=risk, ratified_posture=ratified, run=run,
-        risk_revision=gate.journal.risk_revision(),
     )
 
 

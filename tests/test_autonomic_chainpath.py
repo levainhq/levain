@@ -51,6 +51,10 @@ from levain.autonomic import (
 from tests.autonomic_confirm_keys import confirm_signers, signed_yes
 from tests.test_autonomic_rawstore import rewrite_holds
 
+# TEST ONLY: these tests exercise the binding fire path behind the up-front executor_not_confined refusal
+pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
+
+
 FIXED = _dt.datetime(2026, 6, 30, 12, 0, 0, tzinfo=_dt.timezone.utc)
 LOW_INTERNAL = ActionRisk(cls=RiskClass.LOW, reversible=True, external=False, financial=False)
 HIGH_EXTERNAL = ActionRisk(cls=RiskClass.HIGH, reversible=False, external=True, financial=False)
@@ -61,7 +65,6 @@ EVENT = {"type": "email", "id": "evt-1", "fields": {"from": "x@y.example", "dmar
 # --- test doubles --------------------------------------------------------------------------------
 @dataclass
 class RecordingExecutor:
-    confined = True   # a test double: declares the floor a real binding executor runs under
     name: str = "recording"
     ok: bool = True
     calls: list = field(default_factory=list)
