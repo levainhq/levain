@@ -12,7 +12,7 @@ from pathlib import Path
 from . import roles as R
 from . import signing as S
 from . import tenure as T
-from .transport import BRANCH, GitLedger, TeamError, git
+from .transport import BRANCH, LEGACY_BRANCH, GitLedger, TeamError, git
 
 
 def _key_line(value: str) -> str:
@@ -505,6 +505,10 @@ def status_lines(gl: GitLedger) -> list[str]:
     if gl.remote:
         refs = git(["for-each-ref", "--format=%(refname)", f"refs/remotes/{gl.remote}/"], gl.repo.toplevel,
                    check=False).stdout.split()
+        if f"refs/remotes/{gl.remote}/{LEGACY_BRANCH}" in refs:
+            # T46, RUN: a 0.6.x ledger beside the strict one was never mentioned
+            out.append(f"a 0.6.x {LEGACY_BRANCH} branch was on {gl.remote} at this clone's last fetch: this levain never "
+                       "reads it (nothing in it is enforced); the owner deletes it with `levain team retire-legacy`")
         for ref in refs:
             name = ref.rsplit("/", 1)[-1]
             if not name.startswith(BRANCH + "-") or name == gl.branch:
