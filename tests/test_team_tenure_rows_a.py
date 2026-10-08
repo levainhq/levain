@@ -755,3 +755,41 @@ def test_a_pack_line_is_never_replayed_by_a_clone_that_stopped_being_owner(two, 
     gl(ana).sync()
     assert "heldpack: never rename" not in sh("git", "--git-dir", str(tmp / "origin.git"), "log", "-p", LB)
     assert any("refs/levain/held/" in w for w in WARNINGS), WARNINGS
+
+
+def test_t42_a_rotation_by_rejoining_with_the_new_key_publishes_the_offline_entries_in_force(two, keys):
+    """RUN (residue run 1008): the path a person takes to rotate, `join --signing-key <new>` on the pinned clone, with
+    entries recorded offline under the old key while a teammate pushed. It refused as "diverged" (and had already
+    switched the key while saying "nothing was changed"). Now the re-join confirms the new key and the entries are
+    published in force on every clone."""
+    tmp, ana, ben = two
+    assert team("key", "add", "ben", str(keys["mal"]), repo=ben) == 0
+    assert ruling_np(ben, "src/a.py", "ben: old key 1") == 0
+    assert ruling(ana, "src/c.py", "ana: meanwhile") == 0
+    WARNINGS.clear()
+    assert team("join", "--signing-key", str(keys["mal"]), "--no-install", repo=ben) == 0
+    assert not any("refs/levain/held/" in w for w in WARNINGS), WARNINGS     # replayed by the same command
+    for repo in (ana, ben):
+        assert {"ana: meanwhile", "ben: old key 1"} <= in_force(repo)
+    assert S.fingerprint(keys["mal"].read_text()) in T.key_fps(fresh(ana).tenure, "ben")
+
+
+def test_a_refused_join_does_not_switch_the_signing_key(two, keys):
+    """RUN (residue run 1008): a join that refuses must leave the signing key as it was ("nothing was changed")."""
+    tmp, ana, ben = two
+    before = gl(ben).state().get("signing_key")
+    assert team("join", "--root", "deadbeef", "--signing-key", str(keys["mal"]), "--no-install", repo=ben) == 2
+    assert gl(ben).state().get("signing_key") == before
+
+
+def test_regenesis_refuses_an_owner_handle_the_runners_key_is_not_in_force_for(two, keys):
+    """RUN (residue run 1008): ben, signing with a rotated key not yet in force, ran `regenesis --owner ana` and filed
+    that key as ana's owner key (the guard asked "who am I", which was nobody). Refused now; nothing is pushed."""
+    tmp, ana, ben = two
+    tip = sh("git", "rev-parse", LB, cwd=ana).strip()
+    assert team("key", "add", "ben", str(keys["mal"]), repo=ben) == 0
+    gl(ben).save_state(signing_key=str(keys["mal"]))
+    heads = sh("git", "ls-remote", "--heads", str(tmp / "origin.git"), cwd=tmp)
+    assert team("regenesis", "--from", tip, "--owner", "ana", "--member", "ana=ana@ex.com", repo=ben) == 2
+    assert team("regenesis", "--from", tip, "--owner", "ben", "--member", "ben=ben@ex.com", repo=ben) == 2
+    assert sh("git", "ls-remote", "--heads", str(tmp / "origin.git"), cwd=tmp) == heads

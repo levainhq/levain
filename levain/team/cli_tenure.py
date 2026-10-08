@@ -313,13 +313,16 @@ def cmd_regenesis(gl: GitLedger, args) -> int:
     if args.owner in keys:
         raise TeamError(f"--member {args.owner}=...=<key>: the owner's key in a re-genesis is the key of whoever runs "
                         "it; run it on the owner's machine, without a key for the owner")
-    try:
-        me = gl.handle() if gl.joined() else None
-    except TeamError:
-        me = None
-    if me is not None and me != args.owner:
-        raise TeamError(f"you are {me} on this ledger and a re-genesis makes its runner the owner (your key signs it): "
-                        f"run it with --owner {me}, then offer ownership with `levain team owner {args.owner}`, or let "
+    # by identity, not by "who am I": the runner may not name a handle the old ledger knows unless the runner's key is
+    # in force for it there (residue run 1008, RUN: with a rotated key not yet in force, handle() was None and ben
+    # filed his key as ana's). A new handle is fine: a member who lost every key comes back under a new handle.
+    gl.require_joined()
+    d_old = gl.derivation(old_tip)
+    known = set(d_old.team.members) | {s_.handle for s_ in d_old.spells}
+    if args.owner in known and gl.own_fingerprint() not in T.key_fps(d_old.tenure, args.owner):
+        raise TeamError(f"{args.owner} is a handle on this ledger and this machine's key is not in force for it, so a "
+                        "re-genesis with --owner " + args.owner + " would file your key under their name. Name your own "
+                        "handle (one your key is in force for) or a new one, then offer ownership; or let "
                         f"{args.owner} run it")
     own = gl.signing_pubkey()
     ten = T.Tenure(keys={team.owner: [own]}, pending_keys={h: [k] for h, k in keys.items() if h != team.owner},
