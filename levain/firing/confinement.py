@@ -5898,6 +5898,10 @@ class _Leader:
                 elif step > 0:
                     time.sleep(step)   # the watch is gone: another thread reaped the leader
             except (ChildProcessError, OSError, ValueError):
+                # Another thread's reap() may be between the kernel's reap and its flags: it holds
+                # the reap lock across both, so taking it once settles which this was.
+                with self._reap_lock:
+                    pass
                 if not (self.reaped or self.exited):
                     raise
             if self.exited:
