@@ -924,12 +924,22 @@ class GitLedger:
         """Re-signed by this clone's key, would commit ``c`` count in ``d``? The key must be in force for every folder
         it writes, by the derivation's own rule (the owner for ``pack-*`` lines and PROJECT.md, else the member whose
         folder it is), not merely for some member (docs L3 r1 anansi: a held pack line replayed after this clone
-        stopped being owner published without counting). Only a derivation judged in FULL can say: a frozen one
+        stopped being owner published without counting). Only a derivation judged in FULL can say. A frozen one
         answers with the anchor's tenure, where a key can be in force that is only pending at the tip (code L3 r3
-        codex 4 + glm 1, RUN: a re-signed entry was published onto a rewritten remote, in force on no fresh clone)."""
+        codex 4 + glm 1, RUN: a re-signed entry was published onto a rewritten remote, in force on no fresh clone),
+        so the question goes to the tip as a clone joining now judges it (no anchor); if that is frozen too, no."""
+        from . import signing as S
         from . import tenure as T
         if d.judged != "full":
-            return False
+            c0 = self.clone()
+            try:
+                d = T.derive(self.repo.toplevel, d.tip, T.Clone(pinned_root=c0.pinned_root, accepted=c0.accepted,
+                                                                distrust=c0.distrust),
+                             S.SigCache(self.base / "sigcache.json"))
+            except T.Unjudgeable:
+                return False
+            if d.judged != "full":
+                return False
         fp = self.own_fingerprint()
         holders: set[str | None] = set()
         for f in git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split():
@@ -965,8 +975,9 @@ class GitLedger:
                 if not self._pick_counts(d, c):
                     # in order: a later entry may supersede an earlier one, so nothing is replayed past the first
                     # that would not count
-                    why = (f"the ledger is frozen ({d.frozen_why}), so whether they would count cannot be judged; they "
-                           "are replayed on the first sync after the owner resolves it" if d.judged != "full" else
+                    why = (f"the ledger is frozen ({d.frozen_why}) and, replayed now, they would not count on the "
+                           "published history (this machine's key is not in force there, or it cannot be judged); "
+                           "the next sync retries them" if d.judged != "full" else
                            "replayed now they would be re-signed with this machine's key, which is not in force for "
                            "the folder they are filed under, and publish without counting. Confirm the key (`levain "
                            "team key confirm`) from this machine, then `levain team sync`")
