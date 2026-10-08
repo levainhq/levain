@@ -555,9 +555,6 @@ def _accept_and_list(repo, merge, capsys, parent=1):
     return rc, capsys.readouterr().out
 
 
-@pytest.mark.xfail(strict=True, reason="FINDING T40: expected an uncounted side cherry-pick NOT listed by accept-merge; "
-                                       "observed it listed (the list is every side commit touching team.toml/"
-                                       "tenure.toml, not the side's counted decisions)")
 def test_t40_an_uncounted_side_cherry_pick_is_accepted_and_not_listed(two, keys, capsys):
     """RUN: ana adds cy (C1) and removes cy (C2); a plain clone forks AFTER both, cherry-picks C1 onto its side (stale
     Levain-Base: uncounted), and it is merged as parent 2. ana `accept-merge M`: accepted, cy not a member, and the
