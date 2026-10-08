@@ -289,11 +289,19 @@ def cmd_accept_merge(gl: GitLedger, args) -> int:
     if len(touched_team) > len(team_side):
         listing.append(f"  ({len(touched_team) - len(team_side)} other commit(s) there changed team.toml/tenure.toml "
                        "and never counted, even on that side)")
+    # judged on a PROSPECTIVE clone that already follows this parent, and saved only if that judges: an acceptance
+    # whose walk cannot be judged was saved, then failed (code L3 r4 codex MED, RUN: a local-only ledger, an orphan
+    # merged in, `--parent 2`)
+    c0 = gl.clone()
+    try:
+        d = T.derive(gl.repo.toplevel, gl.head(), dataclasses.replace(c0, accepted={**c0.accepted, sha: n}), cache)
+    except T.Unjudgeable as exc:
+        raise TeamError(f"following parent {n} of {sha[:10]} leaves a history this clone cannot judge ({exc}); "
+                        "nothing was accepted") from None
     gl.save_state(_mutate=lambda st: st.__setitem__("accepted", {**dict(st.get("accepted") or {}), sha: n}))
     gl._dcache = None
     print("\n".join(listing))
     print(f"Every member runs exactly: levain team accept-merge {sha} --parent {n}")
-    d = gl.derivation()
     print(f"now judged {d.judged}; owner in force {d.team.owner}")
     return 0
 
