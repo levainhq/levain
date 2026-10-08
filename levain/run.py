@@ -817,7 +817,11 @@ def _print_banner(
                 print("             run `levain doctor` for the full confinement diagnosis")
         print("  floor:     DENIES ~/.anneal-memory/ (flow store) · sibling entity stores ·")
         print("             operator creds + the confinement config (.levain/confinement.json)")
-        if ssh_mode == "agent":
+        if hands_user is not None:
+            # M2 S3 (slice 4): the ssh-agent refuses another uid, and levain does not pass its socket.
+            print("             ~/.ssh: not reachable; the entity's ssh uses its own key")
+            print(f"               (~{hands_user}/.ssh/id_ed25519); your ssh-agent is not passed to it")
+        elif ssh_mode == "agent":
             print("             ~/.ssh key material (agent-auth only — keys usable, not readable)")
         else:
             print("             ⚠ ~/.ssh NOT confined (ssh_mode=raw — raw key reads ALLOWED;")

@@ -105,6 +105,8 @@ with provider.spawn_shell(policy, hands=hands) as sh:
     assert run("export KEEP=1; cd /tmp", timeout=30).exit_code == 0
     assert run('echo "$KEEP $PWD"', timeout=30).output.strip() in ("1 /tmp", "1 /private/tmp")
     assert run("sleep 611 & sleep 612", timeout=2).timed_out
+    assert run("ssh-add -l", timeout=30).exit_code not in (None, 0), "the hands shell reached an ssh-agent"
+    assert run("test -r ~/.ssh/id_ed25519", timeout=30).exit_code == 0, "the entity cannot read its own key"
 provider.hands_write(policy, hands, str(hands.workspace / "from-editor"), b"edited\n")
 st = os.stat(hands.workspace / "from-editor")
 assert st.st_uid == hands.uid, f"the editor's write is owned by {st.st_uid}, not the hands user"

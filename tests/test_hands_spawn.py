@@ -177,6 +177,16 @@ def test_the_editor_write_helper_is_fixed_and_runs_under_the_profile(tmp_path, m
         SeatbeltProvider().hands_write(policy, hands, target, b"x")
 
 
+def test_a_hands_shell_is_not_given_the_ssh_agent(tmp_path, monkeypatch):
+    """M2 S3: the agent refuses another uid anyway; levain does not pass its socket, and the shell's
+    ssh finds the entity's own key under the hands home."""
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/operator-agent.sock")
+    hands = _hands(tmp_path)
+    assert "SSH_AUTH_SOCK" not in confinement._hands_env(hands)
+    assert not any("SSH_AUTH_SOCK" in a for a in hands_prefix(hands))
+    assert confinement._hands_env(hands)["HOME"] == _NOBODY.pw_dir
+
+
 # --- the binding --------------------------------------------------------------------------------
 
 
@@ -282,6 +292,7 @@ def test_a_hands_session_banner_names_the_user(capsys, tmp_path):
                   hands_user="_levain_coyote_abc123", workspace=Path("/Users/Shared/levain/x/workspace"))
     out = capsys.readouterr().out
     assert "bash runs as the entity's own user _levain_coyote_abc123" in out
+    assert "~_levain_coyote_abc123/.ssh/id_ed25519" in out and "agent-auth only" not in out
     assert "workspace: /Users/Shared/levain/x/workspace" in out
     _print_banner(tmp_path / "coyote", binding, model="m", with_tools=True, bash_ok=True)
     assert "entity's own user" not in capsys.readouterr().out
