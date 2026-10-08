@@ -1201,7 +1201,20 @@ def build_policy(
     Every crown jewel's ancestor dirs are additionally write-denied (:func:`_write_deny_ancestors`) to
     close the rename-relocation bypass (apparatus L2). NOTE the entity's OWN ``<entity>/.levain/``
     store is NOT denied — the entity's memory is its own to read/write. Only the operator's memory
-    store and SIBLING stores are the structural crown jewels."""
+    store and SIBLING stores are the structural crown jewels.
+
+    **What the floor confines (its definition, head ruling 2026-10-07).** The floor confines the
+    ENTITY'S SHELL and the entity's file editor. The operator's own unconfined processes (their
+    terminal, their tools, a session they started with the cred floor off) are trusted: running as
+    the operator's user, outside any sandbox, they already hold every crown jewel directly, so
+    nothing the floor does is meant to stand between them and it. This is why the Linux plan binds
+    host paths BY NAME: :func:`_bwrap_plan` classifies each entry it carries into a view ($HOME, a
+    tool directory, the entity's store) and emits a bind of that name, which bwrap resolves when it
+    starts. Between the two only an unconfined process of the same user can swap the source, since
+    inside any confined shell those names sit in read-only views and cannot be renamed, and that
+    process gains nothing by the swap that it does not already have. Under a separate hands user,
+    bwrap runs as that user, so a source reached through a swapped link is still access-checked as
+    the hands user."""
     # ⛔ TYPE-CHECK THE OPT-OUT AT THIS BOUNDARY — IT FAILS **OPEN**, WHICH IS THE ONE
     # DIRECTION A SECURITY FLAG MUST NOT FAIL (codex L3, 2026-09-04; MEASURED HERE).
     # Passing the STRING "false" for this flag — exactly what an env-var-backed or
