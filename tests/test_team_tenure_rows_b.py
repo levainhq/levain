@@ -435,6 +435,20 @@ def test_t32_after_a_rewrite_own_appends_are_listed_as_waiting(two, keys, capsys
     assert _fresh(ana).waiting >= 1, out
 
 
+def test_a_rejoin_does_not_lift_a_rewrite_freeze(two, keys):
+    """RUN (docs L3 r1 anansi HIGH): a clone frozen by a host rewrite is still frozen after `levain team join`; only
+    `repin` on the owner's word lifts it. Failed on 1ed15ed (the re-join reset the anchor and judged the rewritten
+    history in full)."""
+    tmp, ana, ben = two
+    _rewrite_with_held_delta_and_frozen_append(two, keys)
+    assert _fresh(ana).judged != "full"
+    anchor = gl(ana).state().get("anchor")
+    assert team("join", "--no-install", repo=ana) == 0
+    assert _fresh(ana).judged != "full"
+    assert gl(ana).state().get("anchor") == anchor
+    assert "ana: while frozen" not in _words(ana)
+
+
 def test_t32_held_deltas_re_land_after_the_repair(two, keys):
     """RUN: the rewrite, the held delta and the frozen append (above). The owner names the repair (`repin --anchor
     <remote tip>`): the frozen-time ruling is now enforced; then a sync re-lands the held `member add cy`."""

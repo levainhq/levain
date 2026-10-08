@@ -725,3 +725,33 @@ def test_t42_a_sync_with_a_pending_key_holds_the_entries_and_the_confirm_publish
     assert not sh("git", "for-each-ref", "refs/levain/held/", cwd=gl(ben).wt).strip()
     for repo in (ana, ben):
         assert {"ana: meanwhile", "ben: old key 1"} <= in_force(repo)
+
+
+_PACK = """[pack]
+name = "heldpack"
+version = "1.0"
+[[rule]]
+id = "keep-batch"
+paths = ["src/settlement.py"]
+owner = "lead"
+words = "heldpack: never rename write_batch."
+"""
+
+
+def test_a_pack_line_is_never_replayed_by_a_clone_that_stopped_being_owner(two, keys, tmp_path):
+    """RUN (docs L3 r1 anansi): ana syncs a pack offline on one machine; from her second machine ownership moves to ben.
+    Her first machine's sync must not re-sign and publish the pack line (pack lines count only for the owner): it is
+    held and reported. Failed on 6a3c2e5 (the replay checked her key in force for SOME member, so it published)."""
+    tmp, ana, ben = two
+    b = second_owner_clone(tmp, ana, keys)
+    pack = tmp_path / "heldpack"
+    pack.mkdir()
+    (pack / "judgment.toml").write_text(_PACK)
+    assert team("pack-sync", str(pack), "--no-push", repo=ana) == 0
+    assert team("owner", "ben", repo=b) == 0
+    assert team("accept", repo=ben) == 0
+    assert fresh(ben).team.owner == "ben"
+    WARNINGS.clear()
+    gl(ana).sync()
+    assert "heldpack: never rename" not in sh("git", "--git-dir", str(tmp / "origin.git"), "log", "-p", LB)
+    assert any("refs/levain/held/" in w for w in WARNINGS), WARNINGS
