@@ -643,9 +643,12 @@ class GitLedger:
         if moved:
             tofu = f"re-pinned from genesis {pinned[:12]} to {found[name][:12]} on your --root.\n" + tofu
         confirmed = self._confirm_own_key(d)
-        if not git(["for-each-ref", "--count=1", "refs/levain/held/"], self.repo.toplevel, check=False).stdout.strip():
+        if not git(["for-each-ref", "--count=1", self._held_ref()], self.repo.toplevel, check=False).stdout.strip():
             # the confirm above replayed what the rebase held: its "kept back, confirm the key" line is no longer true
             self.warnings[said:] = [w for w in self.warnings[said:] if "refs/levain/held/" not in w]
+        left = self.other_genesis_items() if moved else ""
+        if left:
+            self.warnings.append(left)
         handle = self.handle(d.team)
         if handle is None:
             fp = self.own_fingerprint()
@@ -943,7 +946,7 @@ class GitLedger:
         """Replay entries held back by ``_rebase_moves`` (T42) once this machine's key is IN FORCE at the tip, so the
         re-signed copies count. Each held ref is deleted only after its commit is on the branch; a crash leaves the
         ref, and the next sync retries it (an already-applied pick comes out empty and is skipped)."""
-        held = git(["for-each-ref", "--format=%(objectname)", "refs/levain/held/"], self.wt, check=False).stdout.split()
+        held = git(["for-each-ref", "--format=%(objectname)", self._held_ref()], self.wt, check=False).stdout.split()
         if not held:
             return
         with self.lock(timeout=lock_timeout):
@@ -951,8 +954,13 @@ class GitLedger:
             self._dcache = None
             d = self.derivation()
             want = set(held)
-            order = [c for c in git(["rev-list", "--reverse", "--topo-order", "--no-merges", *held, "--not", "HEAD"],
-                                    self.wt).stdout.split() if c in want]
+            cp = git(["rev-list", "--reverse", "--topo-order", "--no-merges", *held, "--not", "HEAD"], self.wt,
+                     check=False)
+            if cp.returncode != 0:     # a held object this git cannot read: kept, and the next sync retries
+                self.warnings.append(f"held entries under {self._held_ref()} could not be listed ({_tail(cp)}); "
+                                     "nothing was replayed")
+                return
+            order = [c for c in cp.stdout.split() if c in want]
             for n, c in enumerate(order):
                 if not self._pick_counts(d, c):
                     # in order: a later entry may supersede an earlier one, so nothing is replayed past the first
@@ -977,7 +985,7 @@ class GitLedger:
                         self.warnings.append(f"a held entry {c[:10]} could not be replayed ({_tail(cp)}); it stays "
                                              "under refs/levain/held/ and the next sync retries it")
                         return
-                git(["update-ref", "-d", f"refs/levain/held/{c}"], self.wt, check=False)
+                git(["update-ref", "-d", self._held_ref(c)], self.wt, check=False)
             self._dcache = None
 
     def _rebase_moves(self, rref: str, timeout: float, lock_timeout: float) -> None:
@@ -1032,7 +1040,7 @@ class GitLedger:
                                              "trailer, or its parent cannot be judged here) and was dropped; re-run "
                                              "it with the levain CLI")
                     elif not op.get("restore"):
-                        pending.append(op)
+                        pending.append({**op, "root": self.pinned_root})
                     rest = touched - {"team.toml", "tenure.toml", CANON_FILE}
                     if rest:
                         self.warnings.append(f"local commit {c[:10]} mixes team and ledger changes; only its team "
@@ -1048,7 +1056,7 @@ class GitLedger:
                 # codex 4, RAN). Held under a ref instead; `_replay_held` replays them
                 # after the held team ops (the confirm) re-land, and only once the key counts.
                 for c in picks:
-                    git(["update-ref", f"refs/levain/held/{c}", c], self.wt)
+                    git(["update-ref", self._held_ref(c), c], self.wt)
                 picks = []
             published = False
             try:
@@ -1125,13 +1133,37 @@ class GitLedger:
                 git(["update-ref", "-d", name], self.wt, check=False)
         self._record_seen_sha(remote_tip)
 
+    def _held_ref(self, sha: str = "") -> str:
+        """Held entries are bound to the genesis they were held on: only a clone pinned to THAT genesis replays them
+        (code L3 r3 codex 2, RUN: a `join --root` to a re-genesis replayed the old ledger's held entry into it)."""
+        return f"refs/levain/held/{self.pinned_root}/{sha}"
+
+    def other_genesis_items(self) -> str:
+        """Held entries and offline team ops made on ANOTHER genesis than the pinned one: kept (never replayed or
+        re-landed here, never deleted), and named, for the move that left them behind."""
+        held = [r.split("/")[3] for r in git(["for-each-ref", "--format=%(refname)", "refs/levain/held/"],
+                                             self.repo.toplevel, check=False).stdout.split()
+                if not r.startswith(self._held_ref())]
+        ops = [op for op in self.state().get("pending_ops") or [] if op.get("root") != self.pinned_root]
+        if not held and not ops:
+            return ""
+        roots = sorted({str(x)[:12] for x in held} | {str(op.get("root"))[:12] for op in ops})
+        return (f"{len(held)} held entr(y/ies) under refs/levain/held/ and {len(ops)} offline team change(s) were made "
+                f"on another genesis ({', '.join(roots)}) than the one this clone is now pinned to; they are kept, "
+                f"never replayed or re-landed here (pending_ops in {self.state_path}). Re-record what is still wanted "
+                "on this ledger")
+
     def _record_seen_sha(self, tip: str) -> None:
         git(["update-ref", f"refs/levain/seen/{self.branch}/{tip}", tip], self.repo.toplevel, check=False)
 
     def _reland(self) -> None:
         """Re-apply stripped team ops to the counted state at the new tip: net per field, history-keyed."""
         from . import tenure as T
-        ops = list(self.state().get("pending_ops") or [])
+        # bound to the genesis they were made on (code L3 r3 codex 3, RUN: after `join --root` to a re-genesis that
+        # left cy out, an old-ledger `member add cy` re-landed there); the others stay kept, never applied here
+        every = list(self.state().get("pending_ops") or [])
+        ops = [op for op in every if op.get("root") == self.pinned_root]
+        kept = [op for op in every if op.get("root") != self.pinned_root]
         if not ops:
             return
         try:
@@ -1162,7 +1194,7 @@ class GitLedger:
             elif f["old"] != f["new"]:
                 apply[k] = f["new"]
         if not apply:
-            self.save_state(pending_ops=[])
+            self.save_state(pending_ops=kept)
             return
 
         def change(team: R.Team, ten) -> None:
@@ -1183,7 +1215,7 @@ class GitLedger:
             if "would not count" not in str(exc):
                 raise          # a signing failure keeps the ops for the next sync
             self.warnings.append(f"your offline team change(s) were NOT re-applied, none of them: {exc}")
-        self.save_state(pending_ops=[])     # only after the re-land is committed or refused whole
+        self.save_state(pending_ops=kept)     # only after the re-land is committed or refused whole
         self._dcache = None
 
     def _reattach(self) -> None:

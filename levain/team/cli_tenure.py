@@ -225,6 +225,9 @@ def cmd_repin(gl: GitLedger, args) -> int:
         if git(["rev-list", "--parents", "-n", "1", sha], gl.repo.toplevel).stdout.split()[1:]:
             raise TeamError("a genesis has no parents; that commit does")
         gl.save_state(pinned_root=sha, anchor=None, repin_n=int(gl.state().get("repin_n") or 0) + 1)
+        left = gl.other_genesis_items()
+        if left:
+            gl.warnings.append(left)
     if args.anchor:
         sha = git(["rev-parse", "--verify", args.anchor + "^{commit}"], gl.repo.toplevel).stdout.strip()
         if git(["merge-base", "--is-ancestor", sha, gl.head()], gl.repo.toplevel, check=False).returncode != 0:
