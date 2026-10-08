@@ -67,6 +67,9 @@ Architecture:
   - ``confirm`` (``challenge`` / ``verify_signature``) + ``EfferentGate.confirm_challenge`` — a person's
     approval is an SSH signature by an enrolled key over the pending's content, the risk-catalog
     revision and the rung, never a delivered "yes"; without one the decision stays open.
+
+A lesson the fold carries for the surface that will put these decisions in front of a person:
+  a perception layer that sees counts and not context asks about tuning, not decisions; LevainConnect's decision surface must not relearn it.
 """
 from __future__ import annotations
 
