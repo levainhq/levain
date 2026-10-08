@@ -1648,3 +1648,145 @@ def test_the_fire_path_needs_a_gate_that_can_re_derive_binding_risk(tmp_path):
     with pytest.raises(ValueError, match="binding_risk"):
         ChainExecutor(gate=gate, request_builder=_chain_builder, risk_resolver=lambda b, i: LOW,
                       trust_resolver=_trust, clock=lambda: FIXED)
+
+
+# --- slice L3 r2 (input on dfd7164) -------------------------------------------------------------------
+
+def _mint_single(w, tag):
+    b = Binding.create(created_by="operator", created_at=f"2026-10-07T09:00:00{tag}",
+                       trigger=TriggerSpec(type="email", pattern={"field": "from", "value": "a@x.example"}),
+                       goal=(SubGoal(goal="send", tools=("mail.send",), output="email:x"),), tightness=TIGHT,
+                       posture=Posture.CONFIRM,
+                       guard=(Guard(rationale="r", dissent_author="codex",
+                                    kill_predicate={"op": "==", "field": "dmarc", "value": "fail"},
+                                    kill_drill={"dmarc": "fail"}, kill_authored_by="operator"),),
+                       status=BindingStatus.PAUSED)
+    w.store.add(b)
+    w.store.ratify(b.binding_id)
+    return b
+
+
+def test_a_journaled_pending_without_a_sealed_floor_fails_closed(tmp_path):
+    # codex r2 HIGH 1: a hold's pending with no risk_floor (a store written before the floor was sealed)
+    # was resolved like a manual pending, skipping the binding's tools now, so a reclassified tool fired
+    # on a plain approval
+    from levain.autonomic.pending import PendingAction
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("x1")
+    with w.journal.db.read() as conn:
+        [(hold_id, raw)] = conn.execute("SELECT hold_id, pending FROM holds WHERE decided IS NULL").fetchall()
+    p = PendingAction.from_dict(json.loads(raw))
+    legacy = PendingAction.create(
+        created_at=p.created_at, action_name=p.action_name, payload=p.payload, context_id=p.context_id,
+        query_text=p.query_text, query_date=p.query_date, posture=p.posture, fail_open=p.fail_open,
+        requires_typed=p.requires_typed, authority=p.authority, producers=p.producers,
+        proposal_id=p.proposal_id, expires_at=p.expires_at)
+    assert legacy.risk_floor is None and legacy.seal_matches()
+    with w.journal.db.write() as conn:
+        conn.execute("UPDATE holds SET pending = ?, pending_id = ? WHERE hold_id = ?",
+                     (json.dumps(legacy.to_dict(), sort_keys=True), legacy.pending_id, hold_id))
+    w.tool_risk[1] = FINANCIAL
+    out = _approve(w)
+    assert out.aborted and out.reason == "revalidate:unsealed_risk_floor"
+    assert ("link1", "x1-1") not in w.outbox()
+
+
+def _locked_registry(monkeypatch):
+    import sqlite3
+
+    def locked(self, conn=None):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(BindingStore, "_scan", locked)
+
+
+def test_a_registry_that_cannot_be_read_at_the_resolve_leaves_the_decision_open(tmp_path, monkeypatch):
+    # complement r2 MED 2: a locked or unreadable registry read as an absent binding, so the person's
+    # approval was rejected for good; like BARRED, it is a condition a repair clears
+    w = World(tmp_path)
+    _mint_single(w, "u1")
+    w.dispatch("u1")
+    [p] = w.gate.open_pendings()
+    with monkeypatch.context() as m:
+        _locked_registry(m)
+        out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+        assert out.refused and out.reason == "revalidate:registry_unreadable" and w.outbox() == []
+        assert w.gate.silence_decision(w.journal.get_hold(hold_id_for(*_run_of(w))),
+                                       FIXED + _dt.timedelta(days=30)) is None
+    assert [q.pending_id for q in w.gate.open_pendings()] == [p.pending_id]
+    assert w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human")).fired
+
+
+def _run_of(w):
+    with w.journal.db.read() as conn:
+        [(run_id, effect_id)] = conn.execute("SELECT run_id, effect_id FROM holds").fetchall()
+    return run_id, effect_id
+
+
+def test_a_registry_that_cannot_be_read_does_not_end_an_approved_run(tmp_path, monkeypatch):
+    w = World(tmp_path)
+    _mint_single(w, "u2")
+    w.dispatch("u2")
+    [p] = w.gate.open_pendings()
+    real = w.journal.effect
+    w.journal.effect = lambda *a, **k: (_ for _ in ()).throw(OSError("EIO"))
+    assert w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human")).held
+    w.journal.effect = real
+    with monkeypatch.context() as m:
+        _locked_registry(m)
+        out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+        assert not out.fired and out.reason == "revalidate:registry_unreadable"
+    with w.journal.db.read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cancels").fetchone()[0] == 0
+    assert w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human")).fired
+
+
+def _decided_pending_id(w):
+    with w.journal.db.read() as conn:
+        [(pid,)] = conn.execute("SELECT pending_id FROM holds WHERE decided = 1").fetchall()
+    return pid
+
+
+def test_a_rise_whose_effect_starts_between_the_check_and_the_cancel_cancels_nothing(tmp_path):
+    # complement r2 MED 3: peek then cancel were two transactions, so an effect that ran between them was
+    # cancelled after the fact and receipted as denied. The check and the cancel are one transaction now.
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("c3")
+    [p] = w.gate.open_pendings()
+    assert w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human")).completed
+    w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
+    w.journal.peek = lambda *a, **k: None                          # the read made before the effect ran
+    w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    with w.journal.db.read() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM cancels").fetchone()[0] == 0
+    assert [r.fired for r in w.receipts.read() if r.action_face["context_id"] == "c3-1"] == [True]
+
+
+def test_a_rise_seen_while_the_run_is_barred_still_ends_it(tmp_path):
+    # complement r2 LOW 4: a barrier read at the check (BARRED: the registry, for a moment) fell through
+    # to the fire at the old rung, and the effect ran if the barrier had cleared by then
+    from levain.autonomic.journal import EffectOutcome
+    w = World(tmp_path)
+    w.mint(chain=True)
+    _approved_unrun(w, "b4")
+    w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
+    w.journal.peek = lambda *a, **k: EffectOutcome(EffectStatus.BARRED, "registry")
+    out = w.chains.resume(_decided_pending_id(w), ConfirmDecision(approved=True, by="human"))
+    assert ("link1", "b4-1") not in w.outbox()
+    assert out.aborted and out.reason == "revalidate:risk_floor_rose"
+
+
+def test_an_approval_given_at_the_raised_rung_survives_a_stop_before_its_effect(tmp_path):
+    # codex r2 MED 4: the journal did not record the rung an approval met, so a typed approval given at
+    # the raised rung, then a stop before the effect, read as an approval at the old rung and was cancelled
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("e4")
+    w.tool_risk[1] = FINANCIAL
+    real = w.journal.effect
+    w.journal.effect = lambda *a, **k: (_ for _ in ()).throw(OSError("EIO"))
+    held = _approve(w, typed_proof="I approve e4")               # approved at CONFIRM_ELEVATED, not run
+    assert held.reason.startswith("approved_not_yet_run")
+    w.journal.effect = real
+    assert w.dispatch("e4").chain.completed and ("link1", "e4-1") in w.outbox()

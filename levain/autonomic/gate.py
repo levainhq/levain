@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import sqlite3
 from collections.abc import Callable
 from typing import Any
 from dataclasses import dataclass
@@ -75,6 +76,11 @@ _RESOLVED_TRUST = TrustContext(
     signal_auth=SignalAuth.STRONG, intent_provenance=IntentProvenance.INTENT_BEARING,
     hops=0, human_present=True,
 )
+
+
+# why a binding's risk could not be re-derived when the registry itself could not be read (a lock, a
+# damaged store): unlike an absent binding, a repair clears it, so the decision stays open
+_REGISTRY_UNREADABLE = "revalidate:registry_unreadable"
 
 
 def _default_summary(request: ActionRequest) -> str:
@@ -630,26 +636,29 @@ class EfferentGate:
         # meet that rung (its typed-proof and unattended checks below leave the decision open), and
         # silence takes that rung's default (``silence_decision``).
         effective, why = self._resolve_posture(pending, posture, hold)
+        if effective is None:
+            # the store the risk is re-derived from cannot be read now: as BARRED, a repair clears it, so
+            # nothing is recorded (an approval that stands, stands)
+            return self._refuse_open(why or "revalidate:registry_unreadable", binding_id)
         stop_reason = why or "revalidate:risk_floor_rose"
-        if effective > posture and hold.get("decided") is True:
-            # Approved at the lower rung, and a decision is write-once, so it cannot be asked again at
-            # the raised one: the run ends instead, with a receipt. Only while the effect has not
-            # started: one that ran (or is running, or was stopped since) is the journal's to report.
+        if hold.get("decided") is True and effective > self._decided_rung(hold, posture):
+            # Approved at a lower rung, and a decision is write-once, so it cannot be asked again at the
+            # raised one: the run ends instead, with a receipt. Only while the effect has not started,
+            # checked in the cancel's own transaction: one that ran (or is running) is the journal's to
+            # report, and the fire below reports it without running anything.
             try:
-                started = self._journal.peek(hold["run_id"], hold["effect_id"], digest=hold["digest"])
+                started = self._journal.cancel_unstarted(hold["run_id"], hold["effect_id"], reason=stop_reason)
             except KeyError:
                 return self._refuse_open("run_not_admitted", binding_id)
+            except Exception as e:  # noqa: BLE001
+                _log.error("efferent gate resolve: could not cancel run %s (%s): %s", hold["run_id"],
+                           type(e).__name__, e)
+                return GateOutcome(
+                    posture=effective, fired=False, refused=False, deferred=False, held=True,
+                    reason=f"cancel_unrecorded:{stop_reason}", receipt_id=None,
+                    execution=None, binding_id=binding_id,
+                )
             if started is None:
-                try:
-                    self._journal.cancel(hold["run_id"], reason=stop_reason)
-                except Exception as e:  # noqa: BLE001
-                    _log.error("efferent gate resolve: could not cancel run %s (%s): %s", hold["run_id"],
-                               type(e).__name__, e)
-                    return GateOutcome(
-                        posture=effective, fired=False, refused=False, deferred=False, held=True,
-                        reason=f"cancel_unrecorded:{stop_reason}", receipt_id=None,
-                        execution=None, binding_id=binding_id,
-                    )
                 return deny(effective, stop_reason, by="on-loop")
         elif effective is Posture.REFUSE_ESCALATE:
             return reject(posture, stop_reason)   # no rung may approve it: a decision, recorded
@@ -698,9 +707,11 @@ class EfferentGate:
                 if barrier.status in (EffectStatus.FENCED, EffectStatus.CANCELLED):
                     return reject(posture, f"journal:{barrier.status.value}")
                 # BARRED (the registry cannot be read, or no longer grants the run) is a condition a
-                # repair can clear, as at the gate's entry: the decision stays open
+                # repair can clear: the decision stays open (the gate's entry refuses it and ends
+                # nothing either, so the event can be delivered again)
                 return self._refuse_open(f"journal:{barrier.status.value}", binding_id)
-            d = self._journal.decide(hold_id, approve=True, digest=self._digest_of(request), by=decision.by)
+            d = self._journal.decide(hold_id, approve=True, digest=self._digest_of(request), by=decision.by,
+                                     posture=posture.name)
             if not d.ok:
                 if d.reason == "already_decided" and self._journal_hold_approved(hold_id):
                     pass   # another resolver approved first: the journal runs the effect at most once
@@ -846,15 +857,25 @@ class EfferentGate:
             verdict=verdict, by=by, actor_first_estimate=decision.first_estimate,
         )
 
+    @staticmethod
+    def _decided_rung(hold: dict[str, Any], posture: Posture) -> Posture:
+        """The rung an approved hold's decision met: the rung recorded with it, never below the
+        proposal's own."""
+        rung = hold.get("decided_posture")
+        if isinstance(rung, str) and rung in Posture.__members__:
+            return max(posture, Posture[rung])
+        return posture
+
     def _resolve_posture(self, pending: PendingAction, posture: Posture,
-                         hold: dict[str, Any]) -> tuple[Posture, str | None]:
-        """The rung a binding's pending must be approved at now, and why when that rung is
-        REFUSE_ESCALATE because something could not be re-derived (fail closed to the highest rung,
-        never the lowest). A manual pending (no sealed floor) keeps its posture; its manifest check is
-        in :meth:`_guard_resolve_fire`. For a binding's: ``max(posture, the sealed floor, the manifest's
-        current floor for the action if it declares one, the floor of the binding's tools now)``."""
+                         hold: dict[str, Any]) -> tuple[Posture | None, str | None]:
+        """The rung a run's pending (a binding's) must be approved at now: ``max(posture, the sealed
+        floor, the manifest's current floor for the action if it declares one, the floor of the
+        binding's tools now)``, with why when that rung is REFUSE_ESCALATE because something could not
+        be re-derived (fail closed to the highest rung, never the lowest). A run's pending without a
+        sealed floor is one of those. ``(None, why)`` when the registry the risk is re-derived from
+        cannot be read now: no rung, and no decision, until it can."""
         if pending.risk_floor is None:
-            return posture, None
+            return Posture.REFUSE_ESCALATE, "revalidate:unsealed_risk_floor"
         try:
             floor = Posture[pending.risk_floor]
         except KeyError:
@@ -865,14 +886,15 @@ class EfferentGate:
             pass   # the action name is not declared: the binding's own risk stands
         now, why = self._binding_floor_now(pending, hold)
         if now is None:
-            return Posture.REFUSE_ESCALATE, why
+            return (None if why == _REGISTRY_UNREADABLE else Posture.REFUSE_ESCALATE), why
         return max(posture, floor, now), None
 
     def _binding_floor_now(self, pending: PendingAction, hold: dict[str, Any]) -> tuple[Posture | None, str]:
         """The risk floor of the hold's link as the binding's risk resolver derives it NOW, from the sealed
         binding: the chain continuation's snapshot for a link of a chain, the registry's record for a
         single link. ``(None, why)`` when it cannot be derived (no resolver, the binding is absent or does
-        not seal, the resolver raises): the caller fails closed."""
+        not seal, the resolver raises): the caller fails closed; ``why`` is :data:`_REGISTRY_UNREADABLE`
+        when the registry could not be read, which a repair clears."""
         if self._binding_risk is None:
             return None, "revalidate:binding_risk_unavailable:no_resolver"
         binding_id = pending.authority.get("binding_id")
@@ -881,7 +903,15 @@ class EfferentGate:
             if hold.get("chain") is not None:
                 binding = Binding.from_dict(hold["chain"]["binding"])
             else:
-                binding = BindingStore(self._journal.db.directory, journal=self._journal).get(binding_id)  # type: ignore[union-attr]
+                try:
+                    store = BindingStore(self._journal.db.directory, journal=self._journal)  # type: ignore[union-attr]
+                    binding = store.get(binding_id)
+                    # a read fault reads as an empty registry: tell it from an absent binding
+                    unreadable = binding is None and store.integrity() is not None
+                except (OSError, sqlite3.DatabaseError):
+                    unreadable = True
+                if unreadable:
+                    return None, _REGISTRY_UNREADABLE
             if binding is None or binding.binding_id != binding_id or not binding.seal_matches():
                 return None, "revalidate:binding_risk_unavailable:binding"
             return risk_floor(self._binding_risk(binding, link)), ""
@@ -1045,7 +1075,8 @@ class EfferentGate:
         return out
 
     def silence_decision(self, hold: dict[str, Any], now: _dt.datetime) -> ConfirmDecision | None:
-        """The silence-default decision for an expired journaled pending, or ``None`` (not expired). A
+        """The silence-default decision for an expired journaled pending, or ``None`` (not expired, or the
+        registry its rung is re-derived from cannot be read now: the next sweep decides). A
         record that does not read, a posture that does not parse, or a fail-open flag that disagrees with
         the posture is a DROP; cooling-off auto-fires only for an allowlisted action."""
         try:
@@ -1057,6 +1088,8 @@ class EfferentGate:
         posture = self._posture_of(pending)
         if posture is not None and pending.seal_matches():
             effective, why = self._resolve_posture(pending, posture, hold)
+            if effective is None:
+                return None   # no rung can be read now: the next sweep decides
             if effective > posture:
                 # the rung rose since the proposal (or cannot be re-derived): silence takes the RAISED
                 # rung's default, and a rung above cooling-off never fires on silence

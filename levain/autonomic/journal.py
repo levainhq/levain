@@ -339,6 +339,20 @@ class RunJournal:
         with self._write() as conn:
             conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)", (run_id, reason))
 
+    def cancel_unstarted(self, run_id: str, effect_id: str, *, reason: str) -> EffectOutcome | None:
+        """End a run unless ``effect_id`` has started, in one transaction: the check and the cancel cannot
+        be split by an effect that starts between them. Returns ``None`` when the run was cancelled, or
+        the barrier that reports the started effect (done, in flight, unknown) and cancels nothing.
+        ``KeyError`` if the run was never started."""
+        with self._write() as conn:
+            if conn.execute("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)).fetchone() is None:
+                raise KeyError(f"run {run_id!r} was never started")
+            if conn.execute("SELECT 1 FROM effects WHERE run_id = ? AND effect_id = ?",
+                            (run_id, effect_id)).fetchone() is not None:
+                return self._barrier(conn, run_id, effect_id, None)
+            conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)", (run_id, reason))
+            return None
+
     # --- effects ---------------------------------------------------------------------------
     def _barrier(self, conn: sqlite3.Connection, run_id: str, effect_id: str,
                  digest: str | None) -> EffectOutcome | None:
@@ -390,15 +404,16 @@ class RunJournal:
     @staticmethod
     def _hold_row(conn: sqlite3.Connection, hold_id: str) -> tuple | None:
         return conn.execute("SELECT hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, "
-                            "chained, decided, decided_by FROM holds WHERE hold_id = ?", (hold_id,)).fetchone()
+                            "chained, decided, decided_by, decided_posture FROM holds WHERE hold_id = ?",
+                            (hold_id,)).fetchone()
 
     @staticmethod
     def _hold_dict(row: tuple) -> dict[str, Any]:
-        hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, chained, decided, by = row
+        hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, chained, decided, by, rung = row
         return {"hold_id": hold_id, "binding_id": binding_id, "run_id": run_id, "effect_id": effect_id,
                 "digest": digest, "at": at, "pending": json.loads(pending) if pending else None,
                 "chain": json.loads(chain) if chain else None, "chained": bool(chained),
-                "decided": None if decided is None else bool(decided), "by": by}
+                "decided": None if decided is None else bool(decided), "by": by, "decided_posture": rung}
 
     def hold(self, run_id: str, effect_id: str, *, digest: str, pending: dict[str, Any],
              at: str | None = None, chain: dict[str, Any] | None = None,
@@ -530,11 +545,13 @@ class RunJournal:
                          (receipt_id, run_id, effect_id))
 
     # --- decisions -------------------------------------------------------------------------
-    def decide(self, hold_id: str, *, approve: bool, digest: str, by: str | None = None) -> HoldResult:
+    def decide(self, hold_id: str, *, approve: bool, digest: str, by: str | None = None,
+               posture: str | None = None) -> HoldResult:
         """Resolve a hold. ``digest`` must equal the one recorded with the hold (the decision is
         bound to what was shown). A hold decides once: this write-once update IS the claim, so of any
         number of resolvers exactly one decision counts. A rejection cancels the hold's run in the same
-        transaction. ``by`` names the decider."""
+        transaction. ``by`` names the decider; ``posture`` names the rung the decision met, which can be
+        above the rung the hold's pending was proposed at."""
         with self._write() as conn:
             row = self._hold_row(conn, hold_id)
             if row is None:
@@ -544,8 +561,8 @@ class RunJournal:
                 return HoldResult(False, "already_decided")
             if h["digest"] != digest:
                 return HoldResult(False, "digest_mismatch")
-            conn.execute("UPDATE holds SET decided = ?, decided_by = ? WHERE hold_id = ? AND decided IS NULL",
-                         (1 if approve else 0, by, hold_id))
+            conn.execute("UPDATE holds SET decided = ?, decided_by = ?, decided_posture = ? WHERE hold_id = ? "
+                         "AND decided IS NULL", (1 if approve else 0, by, posture, hold_id))
             if not approve:
                 conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)",
                              (h["run_id"], "rejected"))
@@ -554,7 +571,8 @@ class RunJournal:
     def _holds(self, where: str, args: tuple = ()) -> list[dict[str, Any]]:
         with self._read() as conn:
             rows = conn.execute("SELECT hold_id, binding_id, run_id, effect_id, digest, at, pending, chain, "
-                                f"chained, decided, decided_by FROM holds {where} ORDER BY seq", args).fetchall()
+                                f"chained, decided, decided_by, decided_posture FROM holds {where} ORDER BY seq",
+                                args).fetchall()
         return [self._hold_dict(r) for r in rows]
 
     def open_holds(self) -> list[dict[str, Any]]:
