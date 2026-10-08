@@ -111,3 +111,23 @@ def test_h4_a_frozen_derivation_never_authorises_a_replay(two, keys):
     assert "ben: after the confirm" not in sh("git", "--git-dir", str(tmp / "origin.git"), "log", "-p", LB)
     assert sh("git", "for-each-ref", "refs/levain/held/", cwd=gl(ben).wt).strip(), "the entry was dropped, not held"
     assert any("kept back" in w and "frozen" in w for w in WARNINGS), WARNINGS
+
+
+def test_codex6_a_join_that_fails_after_choosing_a_ledger_restores_the_whole_state(two, keys):
+    """RUN (code L3 r3 codex 6): a pinned clone runs `join --remote evil --root <a malformed genesis> --new-device`.
+    The derivation refuses it, and the rollback restored the pin but left ``remote`` pointing at evil and a new device
+    id (so this clone's unpublished commits would read as foreign). Now any failure restores the whole state."""
+    tmp, ana, ben = two
+    sh("git", "init", "-q", "--bare", "evil.git", cwd=tmp)
+    junk = tmp / "junk"
+    sh("git", "init", "-q", str(junk), cwd=tmp)
+    (junk / "team.toml").write_text("not a team\n")
+    sh("git", "add", ".", cwd=junk)
+    sh("git", "-c", "user.email=x@ex.com", "-c", "user.name=x", "-c", "commit.gpgsign=false", "commit", "-qm", "junk",
+       cwd=junk)
+    sh("git", "push", "-q", str(tmp / "evil.git"), f"HEAD:refs/heads/{LB}-evil", cwd=junk)
+    root = sh("git", "rev-parse", "HEAD", cwd=junk).strip()
+    sh("git", "remote", "add", "evil", str(tmp / "evil.git"), cwd=ben)
+    before = gl(ben).state()
+    assert team("join", "--remote", "evil", "--root", root[:12], "--new-device", "--no-install", repo=ben) == 2
+    assert gl(ben).state() == before
