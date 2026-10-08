@@ -695,15 +695,33 @@ def test_t42_a_key_rotation_publishes_old_key_entries_and_never_moves_an_unsigne
         assert T.key_fps(fresh(repo).tenure, "ben") == {new_fp}
 
 
-@pytest.mark.xfail(strict=True, reason="FINDING T42: the replay re-signs the old-key entries with the NEW key while it is "
-                   "still pending (`key confirm`'s pre-sync replays them, then writes the confirm after them), so at "
-                   "their position the new key is not in force: published but NOT enforced on any clone (in force: "
-                   "only 'ana: meanwhile'); already true before the old key is removed")
 def test_t42_old_key_entries_moved_by_a_rotation_stay_in_force(two, keys):
-    """RUN (_t42_rotate): "not stranded" means the moved entries still count: both are in force on every clone."""
+    """RUN (_t42_rotate): "not stranded" means the moved entries still count: both are in force on every clone.
+    Failed on 9c9513b (re-signed with the still-pending key, published, in force nowhere)."""
     tmp, ana, ben = two
     _t42_rotate(tmp, ana, ben, keys)
     for repo in (ana, ben):
         words = in_force(repo)
         assert "ana: meanwhile" in words
         assert {"ben: old key 1", "ben: old key 2"} <= words, sorted(words)
+
+
+def test_t42_a_sync_with_a_pending_key_holds_the_entries_and_the_confirm_publishes_them_in_force(two, keys):
+    """RUN: ben switches to his still-PENDING new key and syncs BEFORE confirming. His old-key entry is held back
+    (never published unenforced) and reported; `key confirm` then publishes it after the confirm, in force on every
+    clone, and the held ref is gone."""
+    tmp, ana, ben = two
+    assert team("key", "add", "ben", str(keys["mal"]), repo=ben) == 0
+    assert ruling_np(ben, "src/a.py", "ben: old key 1") == 0
+    assert ruling(ana, "src/c.py", "ana: meanwhile") == 0
+    g = gl(ben)
+    g.save_state(signing_key=str(keys["mal"]))
+    WARNINGS.clear()
+    g.sync()
+    assert "ben: old key 1" not in sh("git", "--git-dir", str(tmp / "origin.git"), "log", "-p", LB)
+    assert any("refs/levain/held/" in w for w in WARNINGS), WARNINGS
+    assert sh("git", "for-each-ref", "refs/levain/held/", cwd=g.wt).strip()
+    assert team("key", "confirm", repo=ben) == 0
+    assert not sh("git", "for-each-ref", "refs/levain/held/", cwd=gl(ben).wt).strip()
+    for repo in (ana, ben):
+        assert {"ana: meanwhile", "ben: old key 1"} <= in_force(repo)

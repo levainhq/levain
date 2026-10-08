@@ -860,6 +860,47 @@ class GitLedger:
         self._rebase_moves(rref, timeout, lock_timeout)
         self._dcache = None
         self._reland()
+        self._replay_held(timeout, lock_timeout)
+
+    def _key_counts_somewhere(self, d) -> bool:
+        from . import tenure as T
+        fp = self.own_fingerprint()
+        return any(fp in T.key_fps(d.tenure, h) for h in d.team.members)
+
+    def _replay_held(self, timeout: float, lock_timeout: float) -> None:
+        """Replay entries held back by ``_rebase_moves`` (T42) once this machine's key is IN FORCE at the tip, so the
+        re-signed copies count. Each held ref is deleted only after its commit is on the branch; a crash leaves the
+        ref, and the next sync retries it (an already-applied pick comes out empty and is skipped)."""
+        held = git(["for-each-ref", "--format=%(objectname)", "refs/levain/held/"], self.wt, check=False).stdout.split()
+        if not held:
+            return
+        with self.lock(timeout=lock_timeout):
+            self._recover_dirty()
+            self._dcache = None
+            if not self._key_counts_somewhere(self.derivation()):
+                self.warnings.append(f"{len(held)} unpublished entr(y/ies) kept back under refs/levain/held/: replayed "
+                                     "now they would be re-signed with this machine's key, which is not in force, and "
+                                     "publish without counting. Confirm it (`levain team key confirm`) from this "
+                                     "machine, then `levain team sync`")
+                return
+            want = set(held)
+            order = [c for c in git(["rev-list", "--reverse", "--topo-order", "--no-merges", *held, "--not", "HEAD"],
+                                    self.wt).stdout.split() if c in want]
+            for c in order:
+                cp = git([*_REPLAY_CONFIG, *self._sign_cfg(), "cherry-pick", "--allow-empty", c], self.wt,
+                         check=False, timeout=timeout)
+                if cp.returncode != 0:
+                    if cp.returncode == 1 and not git(["diff", "--name-only", "--diff-filter=U"], self.wt,
+                                                      check=False).stdout.split() and \
+                            git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode == 0:
+                        git(["cherry-pick", "--skip"], self.wt, timeout=60)     # already on the branch
+                    else:
+                        git(["cherry-pick", "--abort"], self.wt, check=False)
+                        self.warnings.append(f"a held entry {c[:10]} could not be replayed ({_tail(cp)}); it stays "
+                                             "under refs/levain/held/ and the next sync retries it")
+                        return
+                git(["update-ref", "-d", f"refs/levain/held/{c}"], self.wt, check=False)
+            self._dcache = None
 
     def _rebase_moves(self, rref: str, timeout: float, lock_timeout: float) -> None:
         """Put this clone's OWN unpublished commits on top of the remote, under the worktree lock.
@@ -922,6 +963,13 @@ class GitLedger:
                     picks.append(c)    # PROJECT.md: replayed; dropped below only if it conflicts
                 else:
                     picks.append(c)
+            if picks and not self._key_counts_somewhere(self.derivation(remote_tip)):
+                # re-signed now, with a key not in force at the remote (a rotation's still-PENDING key), the entries
+                # would publish without counting (T42, RAN). Held under a ref instead; `_replay_held` replays them
+                # after the held team ops (the confirm) re-land, and only once the key counts.
+                for c in picks:
+                    git(["update-ref", f"refs/levain/held/{c}", c], self.wt)
+                picks = []
             published = False
             try:
                 git(["checkout", "-q", "--detach", remote_tip], self.wt, timeout=timeout)
