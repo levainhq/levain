@@ -169,6 +169,16 @@ def test_r4_a_join_whose_destination_branch_is_checked_out_elsewhere_leaves_the_
     state = gl(ben).state()
     assert team("join", "--root", b_root[:12], "--no-install", repo=ben) == 2
     assert gl(ben).joined() and gl(ben).state() == state
+    # the persisted half (code L3 r4 ruling): with the destination free and the remote refusing pushes, the join pins
+    # and keeps B, but its key confirm cannot publish, so the command must NOT exit as a success
+    sh("git", "worktree", "remove", "--force", str(tmp / "ben_other"), cwd=ben)
+    refs = tmp / "origin.git" / "refs" / "heads"
+    refs.chmod(0o555)          # the remote refuses every ref update (a server hook would be skipped: levain runs git
+    try:                       # with hooks disabled, and a local push carries that config to the receiving side)
+        assert team("join", "--root", b_root[:12], "--no-install", repo=ben) == 2
+    finally:
+        refs.chmod(0o755)
+    assert gl(ben).joined() and gl(ben).state()["pinned_root"] == b_root
 
 
 def test_r4_accept_merge_persists_nothing_when_the_chosen_history_cannot_be_judged(tmp_path, keys):
