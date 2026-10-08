@@ -537,11 +537,21 @@ class GitLedger:
                         timeout=60).stdout.split()
             if len(roots) == 1:
                 found[name] = roots[0]
+        pinned = self.state().get("pinned_root") or ""
         if root:
             pick = [n for n, r in found.items() if r.startswith(root)]
             if len(pick) != 1:
                 raise TeamError(f"no single team ledger on {remote} has genesis {root}")
             name = pick[0]
+        elif pinned and pinned in found.values():
+            name = next(n for n, r in found.items() if r == pinned)      # a re-join stays on the ledger it trusts
+        elif pinned:
+            # a pinned clone never moves to another genesis by itself: that would be trust on first use a second time,
+            # silently, on whatever the host now serves (code L3 r2 complement MED, RUN)
+            listing = "; ".join(f"{n}: genesis {r[:12]}" for n, r in sorted(found.items()))
+            raise TeamError(f"this clone is pinned to genesis {pinned[:12]}, which {remote} no longer has ({listing}). "
+                            "Nothing was changed. Ask the owner out of band; to move to a re-genesis they name, run "
+                            "`levain team join --root <its genesis>`")
         elif len(found) == 1:
             name = next(iter(found))
         else:
@@ -571,8 +581,14 @@ class GitLedger:
                     git(["merge-base", "--is-ancestor", tip0, here], self.repo.toplevel, check=False).returncode != 0:
                 raise TeamError(f"the local {name} branch has diverged from {remote}'s; nothing was changed")
         old = self.state()
-        self.save_state(branch=name, pinned_root=found[name], anchor=None, accepted=dict(accept_merges or {}),
-                        distrust=[], remote=remote, device=secrets.token_hex(8) if new_device else self._new_device())
+        keep = bool(pinned) and found[name] == pinned
+        moved = bool(pinned) and not keep
+        # a re-join keeps what this clone decided: its accepted merges (on the same ledger) and its distrust list
+        # (always: it is the person's own judgement, never wiped by a join; `distrust --clear` does that)
+        self.save_state(branch=name, pinned_root=found[name], anchor=None,
+                        accepted={**((old.get("accepted") or {}) if keep else {}), **(accept_merges or {})},
+                        distrust=list(old.get("distrust") or []), remote=remote,
+                        device=secrets.token_hex(8) if new_device else self._new_device())
         self._dcache = None
         try:
             d = self.derivation(git(["rev-parse", rref], self.repo.toplevel).stdout.strip())
@@ -590,6 +606,8 @@ class GitLedger:
         fps = ", ".join(sorted(T.key_fps(d.tenure, owner))) or "none"
         tofu = (f"TEAM LEDGER {name}: genesis {found[name]}, owner in force {owner} (keys {fps}). Check these with "
                 "the owner out of band before relying on it.")
+        if moved:
+            tofu = f"re-pinned from genesis {pinned[:12]} to {found[name][:12]} on your --root.\n" + tofu
         confirmed = self._confirm_own_key(d)
         handle = self.handle(d.team)
         if handle is None:
