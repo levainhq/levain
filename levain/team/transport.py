@@ -559,6 +559,13 @@ class GitLedger:
             raise TeamError(f"{remote} has {len(found)} team ledgers ({listing}). Choose the team to trust with "
                             "`levain team join --root <genesis>` (a re-genesis lives beside the ledger it replaced)")
         rref = f"refs/remotes/{remote}/{name}"
+        # abbreviated ids resolved after the fetch: the linearity check compares full ids, so a short one never matched
+        # and `join` refused the very merge it named (docs L3 r2 anansi LOW)
+        resolved: dict[str, int] = {}
+        for sha, n in (accept_merges or {}).items():
+            full = git(["rev-parse", "--verify", "-q", sha + "^{commit}"], self.repo.toplevel, check=False).stdout.strip()
+            resolved[full or sha] = n
+        accept_merges = resolved
         old = self.state()
         keep = bool(pinned) and found[name] == pinned
         moved = bool(pinned) and not keep
