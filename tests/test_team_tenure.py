@@ -15,6 +15,7 @@ import pytest
 from levain.cli import main as levain_main
 from levain.team import entry as E
 from levain.team import roles as R
+from levain.team import signing as S
 from levain.team import tenure as T
 from levain.team.transport import WARNINGS, GitLedger, Repo, TeamError
 
@@ -644,6 +645,39 @@ def test_rejoin_never_moves_a_pinned_clone_to_another_genesis_unless_root_names_
     assert "re-pinned" in out and old_root[:12] in out
     st = gl(ben).state()
     assert st["pinned_root"] == new_root and tip in st["distrust"]
+
+
+def test_revoke_after_a_commit_before_the_owners_spell_is_refused_with_the_reason(two, keys, capsys):
+    """RUN (docs L3 r1): the derivation counts a revoke only inside the current owner's spell. The CLI refused it with
+    a generic "would not count"; now it names the spell start and points to veto. Nothing is written either way."""
+    tmp, ana, ben = two
+    assert team("member", "add", "cy", "cy@ex.com", "--key", str(keys["cy"]), repo=ana) == 0
+    early = sh("git", "ls-remote", str(tmp / "origin.git"), "refs/heads/levain-team-ledger", cwd=tmp).split()[0]
+    assert team("owner", "ben", repo=ana) == 0
+    assert team("accept", repo=ben) == 0
+    before = sh("git", "ls-remote", str(tmp / "origin.git"), "refs/heads/levain-team-ledger", cwd=tmp).split()[0]
+    capsys.readouterr()
+    assert team("revoke", S.fingerprint(keys["cy"].read_text()), "--after", early, repo=ben) == 2
+    err = capsys.readouterr().err
+    assert "spell as owner began" in err and "veto" in err, err
+    assert sh("git", "ls-remote", str(tmp / "origin.git"), "refs/heads/levain-team-ledger", cwd=tmp).split()[0] == before
+
+
+def test_status_names_a_regenesis_branch_owner_and_keys_and_calls_it_unverified(two, keys, capsys):
+    """RUN (docs L3 r1 anansi): anyone who can push can make a re-genesis branch; status used to say only "to move:
+    join --root". It now names the claimed owner and key fingerprints and says UNVERIFIED."""
+    tmp, ana, ben = two
+    tip = sh("git", "rev-parse", "levain-team-ledger", cwd=ana).strip()
+    g = gl(ben)
+    g.sync(push=False)
+    g.save_state(signing_key=str(keys["ben"]))
+    assert team("regenesis", "--from", tip, "--owner", "ben", "--member", "ben=ben@ex.com", repo=ben) == 0
+    gl(ana).sync()
+    capsys.readouterr()
+    assert team("status", repo=ana) == 0
+    out = capsys.readouterr().out
+    line = next(x for x in out.splitlines() if "RE-GENESIS" in x)
+    assert "owner ben" in line and S.fingerprint(keys["ben"].read_text()) in line and "UNVERIFIED" in line, line
 
 
 # ---- the hook halts when it cannot judge ----------------------------------------------------------------------
