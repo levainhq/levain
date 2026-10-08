@@ -5822,6 +5822,7 @@ class _Leader:
         self.status: int | None = None   # Popen.returncode-style, once seen exited
         self.exited = False
         self.reaped = False
+        self._reap_lock = threading.Lock()
         self._kq: Any = None
         self._pidfd: int | None = None
         if hasattr(os, "waitid"):
@@ -5851,40 +5852,53 @@ class _Leader:
                 self.status = os.waitstatus_to_exitcode(e.data)
 
     def wait(self, timeout: float) -> bool:
-        """True once the leader has exited (it stays unreaped), polled up to ``timeout`` seconds."""
-        if self.exited:
-            return True
+        """True once the leader has exited (it stays unreaped), polled up to ``timeout`` seconds.
+
+        Safe from two threads at once (run() and a close() from another thread): the kqueue reports
+        the exit to one of them, so each blocks in short slices and rechecks what the other saw, and
+        a watch the other thread released by reaping the leader ends the wait instead of raising."""
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
+            if self.exited:
+                return True
             left = max(0.0, deadline - time.monotonic())
-            if self._kq is not None:
-                self._take(self._kq.control(None, 1, left))
-            else:
-                r = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)  # type: ignore[attr-defined]
-                if r is not None and r.si_pid == self.pid:
-                    self.exited = True
-                    self.status = (r.si_status if r.si_code == os.CLD_EXITED  # type: ignore[attr-defined]
-                                   else -r.si_status)
-                elif left > 0:
-                    if self._pidfd is not None:
-                        select.select([self._pidfd], [], [], left)
-                    else:
-                        time.sleep(min(left, 0.01))
-                    continue
-            if self.exited or left <= 0:
-                return self.exited
-            # kqueue returned without the exit within `left`: loop to recheck the deadline
+            step = min(left, 0.05)
+            kq, pidfd = self._kq, self._pidfd
+            try:
+                if kq is not None:
+                    self._take(kq.control(None, 1, step))
+                elif hasattr(os, "waitid"):
+                    r = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)  # type: ignore[attr-defined]
+                    if r is not None and r.si_pid == self.pid:
+                        self.status = (r.si_status if r.si_code == os.CLD_EXITED  # type: ignore[attr-defined]
+                                       else -r.si_status)
+                        self.exited = True
+                    elif step > 0:
+                        if pidfd is not None:
+                            select.select([pidfd], [], [], step)
+                        else:
+                            time.sleep(step)
+                elif step > 0:
+                    time.sleep(step)   # the watch is gone: another thread reaped the leader
+            except (ChildProcessError, OSError, ValueError):
+                if not (self.reaped or self.exited):
+                    raise
+            if self.exited:
+                return True
+            if left <= 0:
+                return False
 
     def reap(self) -> None:
         """Reap the leader (only once its group has no live member) and free the watch."""
-        if self.reaped:
-            return
-        self.proc.wait()
-        self.reaped = True
-        self.exited = True
-        if self.status is None:
-            self.status = self.proc.returncode
-        self._release()
+        with self._reap_lock:
+            if self.reaped:
+                return
+            self.proc.wait()
+            if self.status is None:
+                self.status = self.proc.returncode
+            self.exited = True
+            self.reaped = True
+            self._release()
 
     def _release(self) -> None:
         if self._kq is not None:

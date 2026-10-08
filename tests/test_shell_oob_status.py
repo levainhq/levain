@@ -12,6 +12,7 @@ import platform
 import random
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -890,3 +891,86 @@ def test_a_driver_that_exits_before_its_watch_still_reports_its_status(tmp_path,
     with pytest.raises(ConfinementError, match="exited 9"):
         sh.start()
     assert sh.unemptied_groups == ()
+
+
+def test_close_from_another_thread_does_not_strand_the_running_command(tmp_path):
+    """close() (a revoke, an interrupt teardown) runs on another thread while run() waits on the same
+    leader. The leader's exit is seen by one waiter; the other must not then wait out its whole
+    deadline, nor fail because the first reaped the leader under it."""
+    sh = _plain(tmp_path).start()
+    try:
+        threading.Timer(0.5, sh.close).start()
+        t0 = time.monotonic()
+        try:
+            sh.run("sleep 20", timeout=60)
+        except ConfinementError:
+            pass   # a closed shell may refuse the late result; it must not hang
+        assert time.monotonic() - t0 < 15
+    finally:
+        sh.close()
+
+
+def test_two_waiters_on_one_leader_both_see_its_exit_and_a_reap_under_one_is_not_an_error():
+    """The kqueue delivers a process's exit once; a second waiter must still return promptly, and a
+    waiter whose leader another thread reaped meanwhile returns instead of raising."""
+    from levain.firing import confinement as C
+
+    def run_waiters(leader, n, then=None):
+        done: list[float] = []
+        errors: list[BaseException] = []
+
+        def waiter() -> None:
+            try:
+                assert leader.wait(30)
+                done.append(time.monotonic())
+            except BaseException as exc:   # noqa: BLE001
+                errors.append(exc)
+
+        t0 = time.monotonic()
+        ts = [threading.Thread(target=waiter) for _ in range(n)]
+        for t in ts:
+            t.start()
+        if then is not None:
+            then()
+        for t in ts:
+            t.join(40)
+        return errors, [d - t0 for d in done]
+
+    leader = C._Leader(subprocess.Popen(["/bin/sleep", "0.5"], start_new_session=True))
+    errors, took = run_waiters(leader, 2)
+    assert not errors and len(took) == 2 and max(took) < 5, (errors, took)
+    assert leader.status == 0
+    leader.reap()
+
+    # Another thread reaps it under the waiter (close() does, once its group is empty).
+    leader2 = C._Leader(subprocess.Popen(["/bin/sleep", "0.5"], start_new_session=True))
+    errors, took = run_waiters(leader2, 1, then=leader2.reap)
+    assert not errors and len(took) == 1 and took[0] < 5, (errors, took)
+
+
+def test_a_waiter_whose_leader_is_reaped_under_it_returns(monkeypatch):
+    """The other thread's reap() closes the watch (the kqueue, or the pid stops being waitable) while
+    this one is inside it: that ends the wait, it is not an error."""
+    from levain.firing import confinement as C
+
+    proc = subprocess.Popen(["/bin/sleep", "0.3"], start_new_session=True)
+    leader = C._Leader(proc)
+
+    def reaped_meanwhile(*_a, **_k):
+        leader.exited = leader.reaped = True   # what reap() on another thread has done by now
+        raise (ValueError("I/O operation on closed kqueue object") if kq is not None
+               else ChildProcessError(10, "No child processes"))
+
+    kq = leader._kq
+    if kq is not None:
+        class Closed:
+            control = staticmethod(reaped_meanwhile)
+        leader._kq = Closed()
+    else:
+        monkeypatch.setattr(C.os, "waitid", reaped_meanwhile)
+    try:
+        assert leader.wait(5) is True
+    finally:
+        if kq is not None:
+            kq.close()
+        proc.wait()
