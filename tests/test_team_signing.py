@@ -89,7 +89,7 @@ def write_object(repo: Path, raw: bytes) -> str:
 # ---- fingerprint ------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["ed25519", "ecdsa", "rsa"])
+@pytest.mark.parametrize("kind", ["ed25519", "ecdsa"])
 def test_fingerprint_matches_ssh_keygen(keys, kind):
     key = keys[kind]
     assert S.fingerprint(pub_line(key)) == keygen_fp(Path(str(key) + ".pub"))
@@ -113,7 +113,7 @@ def _ed_blob(keys) -> bytes:
     (lambda k: "ssh-ed25519 " + pub_line(k["ed25519"]).split()[1].rstrip("=") + "x", "base64"),
     (lambda k: "ssh-ed25519 " + base64.b64encode(_ed_blob(k) + b"\x00").decode(), "trailing"),
     (lambda k: "ssh-ed25519 " + base64.b64encode(_ed_blob(k) + sstr(b"extra")).decode(), "trailing"),
-    (lambda k: "ssh-rsa " + pub_line(k["ed25519"]).split()[1], "blob says"),
+    (lambda k: pub_line(k["rsa"]), "unaccepted"),
     (lambda k: "ecdsa-sha2-nistp384 " + pub_line(k["ecdsa"]).split()[1], "blob says"),
     (lambda k: "ssh-ed25519 " + base64.b64encode(sstr(b"ssh-ed25519") + sstr(b"\x01" * 31)).decode(), "32 bytes"),
     (lambda k: "ssh-ed25519 " + base64.b64encode(sstr(b"ssh-ed25519") + b"\x00\x00").decode(), "truncated"),
@@ -141,7 +141,7 @@ def test_signing_error_is_a_value_error():
 # ---- split_signed -----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["ed25519", "ecdsa", "rsa"])
+@pytest.mark.parametrize("kind", ["ed25519", "ecdsa"])
 def test_split_signed_round_trip(repo, keys, kind):
     sha = commit(repo, f"signed by {kind}", key=keys[kind])
     raw = run("git", "cat-file", "commit", sha, cwd=repo).stdout
@@ -152,6 +152,30 @@ def test_split_signed_round_trip(repo, keys, kind):
     rebuilt = head + b"\ngpgsig " + sig.replace(b"\n", b"\n ") + b"\n\n" + body
     assert rebuilt == raw
     assert b"gpgsig" not in payload
+
+
+def test_sha256_repository_signature_verifies(tmp_path, keys):
+    """A SHA-256 repository writes ``gpgsig-sha256``; reading only ``gpgsig`` made every valid signature "no signature"
+    (L3 r2 codex, RAN on git 2.50.1)."""
+    r = tmp_path / "r256"
+    r.mkdir()
+    git("init", "-q", "--object-format=sha256", "--initial-branch=main", cwd=r)
+    git("config", "user.email", "ana@ex.com", cwd=r)
+    git("config", "user.name", "ana", cwd=r)
+    sha = commit(r, "signed in sha256", key=keys["ed25519"])
+    assert len(sha) == 64
+    v = S.verify_commit(r, sha)
+    assert v.kind == "signed" and v.fingerprint == keygen_fp(Path(str(keys["ed25519"]) + ".pub")), v
+    assert S.verify_commit(r, commit(r, "plain")).kind == "unsigned"
+
+
+def test_replace_objects_are_ignored(repo, keys):
+    """``git replace U S`` must not make the unsigned U verify as S's signer (L3 r2 codex, measured)."""
+    u = commit(repo, "unsigned")
+    s_ = commit(repo, "signed", key=keys["ed25519"])
+    git("replace", u, s_, cwd=repo)
+    assert S.verify_commit(repo, u).kind == "unsigned"
+    assert S.verify_commit(repo, s_).kind == "signed"
 
 
 def test_split_signed_unsigned_is_identity(repo):
@@ -183,7 +207,7 @@ def test_split_signed_cr_is_content():
 # ---- verify_commit ----------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["ed25519", "ecdsa", "rsa"])
+@pytest.mark.parametrize("kind", ["ed25519", "ecdsa"])
 def test_signed_commit_names_its_key(repo, keys, kind):
     sha = commit(repo, f"signed by {kind}", key=keys[kind])
     v = S.verify_commit(repo, sha)
@@ -292,7 +316,7 @@ def test_no_ssh_keygen_is_indeterminate_and_never_cached(repo, keys, tmp_path, m
     assert got[sha].kind == "indeterminate" and got[sha].fingerprint is None
     assert got[plain].kind == "unsigned"  # needs no ssh-keygen, so it is definitive and stored
     stored = json.loads(cache_path.read_text())
-    assert stored["schema"] == "sigcache-v1"
+    assert stored["schema"] == S.CACHE_SCHEMA
     assert sha not in stored["entries"] and plain in stored["entries"]
     leftovers = [p for p in Path(tempfile.gettempdir()).glob("levain-sig-*")]
     monkeypatch.undo()
@@ -324,7 +348,7 @@ def test_unrecognised_ssh_keygen_output_is_indeterminate(repo, keys, monkeypatch
      ("gpg.ssh.program", "/nonexistent/ssh-keygen"), ("gpg.format", "openpgp")],
 ])
 def test_verdicts_ignore_repo_config(repo, keys, config):
-    signed = commit(repo, "signed", key=keys["rsa"])
+    signed = commit(repo, "signed", key=keys["ecdsa"])
     plain = commit(repo, "plain")
     before = {s: S.verify_commit(repo, s) for s in (signed, plain)}
     for k, val in config:
@@ -351,7 +375,7 @@ def test_cache_hits_skip_verification(repo, keys, tmp_path, monkeypatch):
     json.dumps({"schema": "sigcache-v0", "entries": {}}),
     json.dumps({"entries": {}}),
     "not json",
-    json.dumps(["sigcache-v1"]),
+    json.dumps([S.CACHE_SCHEMA]),
 ])
 def test_cache_with_wrong_or_missing_tag_reads_empty(repo, keys, tmp_path, content):
     sha = commit(repo, "signed", key=keys["ed25519"])
@@ -364,13 +388,13 @@ def test_cache_with_wrong_or_missing_tag_reads_empty(repo, keys, tmp_path, conte
     cache = S.SigCache(path)
     assert cache.get(sha) is None
     assert cache.verify(repo, [sha])[sha].kind == "signed"
-    assert json.loads(path.read_text())["schema"] == "sigcache-v1"
+    assert json.loads(path.read_text())["schema"] == S.CACHE_SCHEMA
 
 
 def test_cache_drops_malformed_and_indeterminate_entries(tmp_path):
     path = tmp_path / "c.json"
     a, b, c, d = "a" * 40, "b" * 40, "c" * 40, "d" * 40
-    path.write_text(json.dumps({"schema": "sigcache-v1", "entries": {
+    path.write_text(json.dumps({"schema": S.CACHE_SCHEMA, "entries": {
         a: {"kind": "indeterminate", "fp": None},
         b: {"kind": "signed", "fp": None},
         c: {"kind": "signed", "fp": "SHA256:abc/+9"},
