@@ -457,19 +457,27 @@ def derive(top: Path, tip: str, clone: Clone, cache: S.SigCache, *, _fallback: b
     why = ""
     anchor_pos = pos.get(clone.anchor) if clone.anchor else None
     if clone.anchor and anchor_pos is None:
-        freeze_end, why = -1, "the ledger history was rewritten since this clone's last derivation"
-    for i, sha in enumerate(walk):
-        if len(parents.get(sha, [])) > 1 and sha not in clone.accepted:
-            cut = anchor_pos + 1 if anchor_pos is not None and anchor_pos < i else i
-            if cut < freeze_end or freeze_end == -1:
-                freeze_end, why = cut, f"merge {sha[:10]} on the ledger is not accepted (`levain team accept-merge`)"
-            break
-    if freeze_end == -1:
-        if _fallback and clone.anchor and clone.anchor in parents_of_safe(top, clone.anchor):
+        # this clone's anchor is not on the chain it follows: a rewrite (the anchor is no ancestor of the tip), or a
+        # merge whose followed parent is not the anchor's side. Either way the verdicts are the ANCHOR's, never a
+        # prefix of the walk: a prefix the host chose can lack a revocation the anchor counted (code L3 r2 complement
+        # HIGH, RUN: a merge on a rewritten walk overwrote the rewrite marker and the rewritten prefix was judged)
+        if clone.anchor in parents:
+            m = next((sha for sha in walk if len(parents.get(sha, [])) > 1 and sha not in clone.accepted), None)
+            why = (f"merge {m[:10]} on the ledger is not accepted (`levain team accept-merge`)" if m else
+                   "this clone's last judged commit is not on the chain the ledger follows")
+        else:
+            why = "the ledger history was rewritten since this clone's last derivation"
+        if _fallback and clone.anchor in parents_of_safe(top, clone.anchor):
             d = derive(top, clone.anchor, clone, cache, _fallback=False)
             d.tip, d.judged, d.frozen_at, d.frozen_why = tip, "partial", clone.anchor, why
             return d
         raise Unjudgeable(why)
+    for i, sha in enumerate(walk):
+        if len(parents.get(sha, [])) > 1 and sha not in clone.accepted:
+            cut = anchor_pos + 1 if anchor_pos is not None and anchor_pos < i else i
+            if cut < freeze_end:
+                freeze_end, why = cut, f"merge {sha[:10]} on the ledger is not accepted (`levain team accept-merge`)"
+            break
     # The void set is RECOMPUTED each pass: the distrust set plus the voids of the revocations that count in THAT pass,
     # until it is stable. It must not only grow: a revocation whose own commit a LATER revocation voids takes nothing
     # with it (the 1007+19 run of L1's r5: an accumulated set kept a thief's voided revocation and stripped a member's
@@ -676,6 +684,13 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
             if state.get(k) != applied.get(k):
                 touched[k] = sha
         state = applied
+        # a revoked fingerprint is never in force or pending, whatever the commit that revoked it removed: a void
+        # recomputation can bring back a pending entry the revoking commit never saw (code L3 r2 codex HIGH, RUN)
+        # and a key belongs to a member: a removed member's keys go with the membership, whatever the removing
+        # commit saw (a key the member confirmed on the remote meanwhile included; lane A T16, RUN)
+        for k in [k for k in state if k[0] in ("key", "pending")
+                  and (("revoke", k[2]) in state or ("member", k[1]) not in state)]:
+            del state[k]
         ever_keyed |= {k[1] for k in state if k[0] == "key"}
         cur_owner = str(state[("owner",)])
         cur_members = {k[1] for k in state if k[0] == "member"}
@@ -795,7 +810,10 @@ def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: s
                 # a member's new key is proposed by that member; the owner proposes one only for a member (or a
                 # member this commit adds) that has never held a key, so a key she holds never signs as a handle
                 # that has signed before (owner-impersonation fix)
-                allowed = holds(h) or (is_owner and h not in ever_keyed and after.get(("member", h)) is not None)
+                # ...and only while no key is pending for it: a second, owner-held pending key beside the member's
+                # own would confirm silently (code L3 r2 complement LOW-MED); she removes a wrong one first
+                allowed = holds(h) or (is_owner and h not in ever_keyed and after.get(("member", h)) is not None
+                                       and not any(kk[0] == "pending" and kk[1] == h for kk in state))
             else:
                 allowed = is_owner or holds(h) or fp == k[2]
             if val is not None and any(kk[0] in ("key", "pending") and kk[2] == k[2] and kk[1] != h
@@ -804,7 +822,7 @@ def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: s
         elif kind == "key":
             h = k[1]
             if val is not None:
-                # added: only a confirm, signed by that very pending key
+                # added: only a confirm, signed by that very pending key (a revoked key is purged after each commit)
                 allowed = fp == k[2] and ("pending", h, k[2]) in state
                 if any(kk[0] in ("key",) and kk[2] == k[2] and kk[1] != h for kk in list(state) + list(new)):
                     allowed = False

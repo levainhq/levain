@@ -60,7 +60,7 @@ def cmd_owner(gl: GitLedger, args) -> int:
         raise TeamError(f"{args.handle} is not a member")
     if not d.tenure.keys.get(args.handle):
         raise TeamError(f"{args.handle} has no key in force yet, so they could not sign the accept: their pending "
-                        "key comes into force when they run `levain team sync` (or `join`) on its machine")
+                        "key comes into force when they run `levain team key confirm` (or `join`) on its machine")
     email = args.email or d.team.members[args.handle]
 
     def offer(team: R.Team, ten: T.Tenure) -> None:
@@ -109,12 +109,14 @@ def cmd_key_add(gl: GitLedger, args) -> int:
     gl.require_joined()
     d = gl.derivation()
     me = gl.handle()
-    owner_first_key = me == d.team.owner and args.handle in d.team.members and args.handle not in d.ever_keyed
+    owner_first_key = (me == d.team.owner and args.handle in d.team.members and args.handle not in d.ever_keyed
+                       and not d.tenure.pending_keys.get(args.handle))
     if me != args.handle and not owner_first_key:
         # the owner proposes a member's key only until that member's first key is in force: after that, a key she
         # holds confirmed under their handle would sign as them (owner-impersonation fix)
         raise TeamError(f"only {args.handle}, signing with a key already in force for them, may propose "
-                        f"{args.handle}'s keys (the owner proposes only a member's first key); {LOST}")
+                        f"{args.handle}'s keys (the owner proposes only a member's first key, while none is pending: `levain team key remove` a wrong "
+                        f"pending one first); {LOST}")
     line = _key_line(args.key)
     fp = S.fingerprint(line)
     for h, lines in list(d.tenure.keys.items()) + list(d.tenure.pending_keys.items()):
@@ -124,7 +126,7 @@ def cmd_key_add(gl: GitLedger, args) -> int:
     def add(team: R.Team, ten: T.Tenure) -> None:
         ten.pending_keys.setdefault(args.handle, []).append(line)
     print(gl.update_counted(add, f"levain team: propose a key for {args.handle}", push=not args.no_push))
-    print(f"pending: the key comes into force when {args.handle} runs `levain team sync` (or `join`) on the machine "
+    print(f"pending: the key comes into force when {args.handle} runs `levain team key confirm` (or `join`) on the machine "
           "that holds it")
     return 0
 
@@ -150,7 +152,12 @@ def cmd_key_remove(gl: GitLedger, args) -> int:
 
 def cmd_revoke(gl: GitLedger, args) -> int:
     gl.require_joined()
-    _require_owner(gl)
+    d = _require_owner(gl)
+    if args.fingerprint in T.key_fps(d.tenure, d.team.owner):
+        # an owner key is never revoked in the ledger: a thief holding it could revoke the owner's other keys the same
+        # way. A stolen owner key is recovered by re-genesis (signing doc §7)
+        raise TeamError("that is an owner key, which the ledger never revokes (whoever stole it could revoke yours "
+                        "the same way); a stolen owner key is recovered with `levain team regenesis`")
     after = git(["rev-parse", "--verify", args.after + "^{commit}"], gl.repo.toplevel).stdout.strip()
 
     def revoke(team: R.Team, ten: T.Tenure) -> None:

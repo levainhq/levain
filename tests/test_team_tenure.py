@@ -230,6 +230,54 @@ def test_force_push_is_never_republished_and_the_clone_freezes(two, keys):
     assert sh("git", "ls-remote", str(tmp / "origin.git"), "refs/heads/levain-team-ledger", cwd=tmp).split()[0] == before
 
 
+def test_r2_a_merge_in_a_rewritten_history_does_not_hide_the_rewrite(two, keys):
+    """Code L3 r2 complement HIGH, RUN: the host rewrites the ledger to an older prefix plus a merge. The merge loop
+    overwrote the "rewritten" sentinel, so the clone judged the rewritten prefix (dropping a later ruling) and blamed
+    the merge. It must freeze at its anchor as a rewrite, with the anchor's verdicts."""
+    tmp, ana, ben = two
+    assert ruling(ana, "src/a.py", "ana: keep a") == 0
+    assert ruling(ana, "src/b.py", "ana: keep b") == 0
+    g = gl(ana)
+    g.sync(push=False)
+    p = plain_clone(tmp, "hostplain", "host@ex.com")
+    sh("git", "reset", "-q", "--hard", "levain-team-ledger~1", cwd=p)
+    sh("git", "checkout", "-q", "-b", "side", cwd=p)
+    (p / "x.txt").write_text("x\n")
+    sh("git", "add", "x.txt", cwd=p)
+    sh("git", "commit", "-qm", "side", cwd=p)
+    sh("git", "checkout", "-q", "levain-team-ledger", cwd=p)
+    sh("git", "merge", "-q", "--no-ff", "--no-edit", "side", cwd=p)
+    sh("git", "push", "-q", "-f", "origin", "levain-team-ledger", cwd=p)
+    g.sync(push=False)
+    g._dcache = None
+    d = g.derivation()
+    assert d.judged == "partial" and "rewritten" in d.frozen_why, d.frozen_why
+    assert {"ana: keep a", "ana: keep b"} <= {e["words"] for e in g.ledger().in_force}
+
+
+def test_r2_an_anchor_kept_only_as_a_merges_second_parent_keeps_the_anchors_verdicts(two, keys):
+    """The same class with the anchor still reachable: the host's first-parent chain drops a ruling and a merge brings
+    the old tip in as parent 2. A freeze AT the merge judged the host's prefix; the verdicts must be the anchor's."""
+    tmp, ana, ben = two
+    assert ruling(ana, "src/a.py", "ana: keep a") == 0
+    assert ruling(ana, "src/b.py", "ana: keep b") == 0
+    g = gl(ana)
+    g.sync(push=False)
+    p = plain_clone(tmp, "hostplain", "host@ex.com")
+    old = sh("git", "rev-parse", "levain-team-ledger", cwd=p).strip()
+    sh("git", "reset", "-q", "--hard", "levain-team-ledger~1", cwd=p)
+    (p / "x.txt").write_text("x\n")
+    sh("git", "add", "x.txt", cwd=p)
+    sh("git", "commit", "-qm", "host side", cwd=p)
+    sh("git", "merge", "-q", "--no-ff", "--no-edit", old, cwd=p)
+    sh("git", "push", "-q", "-f", "origin", "levain-team-ledger", cwd=p)
+    g.sync(push=False)
+    g._dcache = None
+    d = g.derivation()
+    assert d.judged == "partial" and "merge" in d.frozen_why, d.frozen_why
+    assert {"ana: keep a", "ana: keep b"} <= {e["words"] for e in g.ledger().in_force}
+
+
 def test_a_pinned_clone_never_recreates_a_deleted_remote_ledger(two):
     tmp, ana, ben = two
     sh("git", "push", "-q", str(tmp / "origin.git"), ":levain-team-ledger", cwd=ana)
@@ -296,7 +344,7 @@ def test_owner_impersonation_a_key_the_owner_proposes_for_an_existing_member_nev
     g = gl(ana)
     line = Path(keys["ana2"]).read_text().strip()
     g.update_counted(lambda t, n: n.pending_keys.setdefault("ben", []).append(line),
-                     "forged: propose ana2 for ben", push=False)
+                     "forged: propose ana2 for ben", push=False, _check=False)
     g._dcache = None
     assert S.fingerprint(line) not in {T._fp_or_none(x) for x in g.derivation().tenure.pending_keys.get("ben", [])}
     assert S.fingerprint(line) not in T.key_fps(g.derivation().tenure, "ben")
@@ -315,7 +363,7 @@ def test_owner_impersonation_an_accept_needs_a_key_already_the_offerees(two, key
     def forged(t, n) -> None:
         t.owner = "ben"
         n.offer = None
-    g.update_counted(forged, "forged: accept as ben with ana2", push=False)
+    g.update_counted(forged, "forged: accept as ben with ana2", push=False, _check=False)
     g._dcache = None
     assert g.derivation().team.owner == "ana"
     parsed = T.parse_tenure('rules = 1\noffer = { handle = "ben", email = "b@x", keys = ["ssh-ed25519 AAAA x"] }\n')
@@ -342,9 +390,11 @@ def test_the_owner_proposes_only_a_members_first_key(two, keys):
     d = g.derivation()
     assert S.fingerprint(Path(keys["cy"]).read_text()) in T.key_fps(d.tenure, "cy") and "cy" in d.ever_keyed
     assert team("key", "add", "cy", str(keys["mal"]), repo=ana) == 2                # cy has a key now: refused
+    assert team("member", "add", "dee", "dee@ex.com", "--key", str(keys["ana2"]), repo=ana) == 0
+    assert team("key", "add", "dee", str(keys["mal"]), repo=ana) == 2               # dee's own key is pending
     assert team("member", "add", "cy", "cy@ex.com", "--key", str(keys["mal"]), repo=ana) == 2
     mal = Path(keys["mal"]).read_text().strip()
-    g.update_counted(lambda t, n: n.pending_keys.setdefault("cy", []).append(mal), "forged: mal for cy", push=False)
+    g.update_counted(lambda t, n: n.pending_keys.setdefault("cy", []).append(mal), "forged: mal for cy", push=False, _check=False)
     g._dcache = None
     assert "cy" not in g.derivation().tenure.pending_keys
 
@@ -361,11 +411,66 @@ def test_a_removed_handle_is_never_re_added(two, keys):
     def readd(t, n) -> None:
         t.members["ben"] = "ben@ex.com"
         n.pending_keys["ben"] = [ana2]
-    g.update_counted(readd, "forged: re-add ben", push=False)
+    g.update_counted(readd, "forged: re-add ben", push=False, _check=False)
     g._dcache = None
     d = g.derivation()
     assert "ben" not in d.team.members and "ben" not in d.tenure.pending_keys and d.retired("ben")
     assert team("member", "add", "ben2", "ben@ex.com", "--key", str(keys["ana2"]), repo=ana) == 0   # a new handle
+
+
+def test_r2_a_revoked_key_never_comes_back_and_an_owner_key_is_never_revoked(two, keys):
+    """Code L3 r2 codex HIGHs, RUN: ben's remaining key re-proposed a key the owner had revoked and it confirmed itself
+    back into force; an owner's revoke of her own (stolen) key landed the key removal, lost the revocation, and printed
+    success. A refused field now rolls the whole change back with an error."""
+    from levain.team import signing as S
+    from levain.team import tenure as T
+    tmp, ana, ben = two
+    gb = gl(ben)
+    assert team("key", "add", "ben", str(keys["mal"]), repo=ben) == 0
+    gb.save_state(signing_key=str(keys["mal"]))
+    assert team("key", "confirm", repo=ben) == 0
+    gb.save_state(signing_key=str(keys["ben"]))
+    mal_fp = S.fingerprint(Path(keys["mal"]).read_text())
+    cutoff = sh("git", "rev-parse", "levain-team-ledger", cwd=gl(ana).wt).strip()
+    assert team("revoke", mal_fp, "--after", cutoff, repo=ana) == 0
+    gb = gl(ben)
+    gb.sync(push=False)
+    assert team("key", "add", "ben", str(keys["mal"]), repo=ben) == 2           # rolled back: it would not count
+    mal = Path(keys["mal"]).read_text().strip()
+    gb.update_counted(lambda t, n: n.pending_keys.setdefault("ben", []).append(mal), "forged: re-propose mal",
+                      push=False, _check=False)
+    gb._dcache = None
+    assert "ben" not in gb.derivation().tenure.pending_keys
+    assert mal_fp not in T.key_fps(gb.derivation().tenure, "ben")
+    # an owner key: refused up front, nothing written
+    ga = gl(ana)
+    assert team("key", "add", "ana", str(keys["ana2"]), repo=ana) == 0
+    ga.save_state(signing_key=str(keys["ana2"]))
+    assert team("key", "confirm", repo=ana) == 0
+    ga.save_state(signing_key=str(keys["ana"]))
+    head = sh("git", "rev-parse", "levain-team-ledger", cwd=ga.wt).strip()
+    ana2_fp = S.fingerprint(Path(keys["ana2"]).read_text())
+    assert team("revoke", ana2_fp, "--after", cutoff, repo=ana) == 2
+    assert sh("git", "rev-parse", "levain-team-ledger", cwd=ga.wt).strip() == head
+    ga._dcache = None
+    assert ana2_fp in T.key_fps(ga.derivation().tenure, "ana")
+
+
+def test_r2_a_change_with_a_refused_field_writes_nothing(two, keys):
+    """complement r2 LOW: `member add --key` whose key is already another handle's printed success and dropped the key."""
+    tmp, ana, ben = two
+    g = gl(ana)
+    head = sh("git", "rev-parse", "levain-team-ledger", cwd=g.wt).strip()
+    ben_line = Path(keys["ben"]).read_text().strip()
+
+    def dup(t, n) -> None:
+        t.members["cy"] = "cy@ex.com"
+        n.pending_keys["cy"] = [ben_line]
+    with pytest.raises(TeamError, match="would not count"):
+        g.update_counted(dup, "member add cy with ben's key", push=False)
+    assert sh("git", "rev-parse", "levain-team-ledger", cwd=g.wt).strip() == head
+    g._dcache = None
+    assert "cy" not in g.derivation().team.members
 
 
 # ---- merges: frozen, then accept-merge --parent --------------------------------------------------------------
@@ -404,6 +509,54 @@ def test_t9_an_unaccepted_merge_freezes_and_t27_accept_merge_parent_2_follows_th
     assert team("member", "add", "cy", "cy@ex.com", "--key", str(keys["cy"]), repo=ana) == 0
     g._dcache = None
     assert "cy" in g.derivation().team.members
+
+
+def test_r2_an_offline_team_change_held_by_a_freeze_re_lands_after_accept_merge(two, keys):
+    """Code L3 r2 codex HIGH + complement MED, RUN: an offline owner change stripped while a merge froze the clone was
+    held in pending_ops, and every later sync took a fast-forward or already-on-top return that skipped the re-land."""
+    tmp, ana, ben = two
+    p = plain_clone(tmp, "benplain", "ben@ex.com")
+    assert ruling(ana, "src/a.py", "ana: after the fork") == 0
+    assert team("member", "add", "cy", "cy@ex.com", "--key", str(keys["cy"]), "--no-push", repo=ana) == 0
+    line = json.dumps(E.seal(E.build("ben", "finding", summary="ben on the stale side"), ""), sort_keys=True)
+    f = p / "ledger" / "ben" / "stale.jsonl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(line + "\n")
+    sh("git", "add", ".", cwd=p)
+    sh("git", "-c", "gpg.format=ssh", "-c", f"user.signingkey={keys['ben']}", "commit", "-S", "-qm", "stale side", cwd=p)
+    sh("git", "pull", "-q", "--no-rebase", "--no-edit", "origin", "levain-team-ledger", cwd=p)
+    sh("git", "push", "-q", "origin", "levain-team-ledger", cwd=p)
+    merge = sh("git", "rev-parse", "HEAD", cwd=p).strip()
+    g = gl(ana)
+    g.sync(push=False)
+    assert g.state().get("pending_ops"), "the offline member add was not held while frozen"
+    assert team("accept-merge", merge, "--parent", "2", repo=ana) == 0
+    g = gl(ana)
+    g.sync(push=False)
+    g._dcache = None
+    assert "cy" in g.derivation().team.members
+    assert not g.state().get("pending_ops")
+
+
+def test_r2_a_symlink_pushed_at_a_members_ledger_file_is_never_followed(two, keys):
+    """Code L3 r2 codex HIGH, RUN: another member pushes a symlink at ana's own ledger file; ana's next record opened
+    it with "a+b" and appended ledger data to the file it points at, outside the worktree."""
+    tmp, ana, ben = two
+    assert ruling(ana, "src/a.py", "ana: first") == 0
+    g = gl(ana)
+    rel = g.file_for("ana").relative_to(g.wt).as_posix()
+    outside = tmp / "outside.txt"
+    outside.write_text("untouched\n")
+    p = plain_clone(tmp, "benplain", "ben@ex.com")
+    (p / rel).unlink()
+    (p / rel).symlink_to(outside)
+    sh("git", "add", "-A", rel, cwd=p)
+    sh("git", "-c", "gpg.format=ssh", "-c", f"user.signingkey={keys['ben']}", "commit", "-S", "-qm", "link", cwd=p)
+    sh("git", "push", "-q", "origin", "levain-team-ledger", cwd=p)
+    g.sync(push=False)
+    assert (g.wt / rel).is_symlink(), "the setup did not land a symlink in ana's worktree"
+    assert ruling(ana, "src/b.py", "ana: second") != 0
+    assert outside.read_text() == "untouched\n"
 
 
 # ---- revocation ---------------------------------------------------------------------------------------------
@@ -460,6 +613,31 @@ def _hook(repo, rel):
                         env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])})
     assert cp.returncode == 0, cp.stderr
     return json.loads(cp.stdout) if cp.stdout.strip() else {}
+
+
+def test_r2_a_pinned_clone_that_lost_its_ledger_worktree_and_refs_denies(two):
+    """Code L3 r2 codex MED, RUN: joined() went false (worktree and refs gone) and the hook allowed the edit."""
+    import shutil
+    tmp, ana, ben = two
+    assert ruling(ana, "src/a.py", "ana: governs a") == 0
+    g = gl(ben)
+    g.sync(push=False)
+    shutil.rmtree(g.wt)
+    for ref in sh("git", "for-each-ref", "--format=%(refname)", cwd=ben).split():
+        if "levain" in ref:
+            sh("git", "update-ref", "-d", ref, cwd=ben)
+    assert not gl(ben).joined() and gl(ben).pinned_root
+    out = _hook(ben, "src/a.py")
+    assert out.get("hookSpecificOutput", {}).get("permissionDecision") == "deny", out
+
+
+def test_r2_an_interrupted_tenure_write_is_recovered_not_wedged(two):
+    """Code L3 r2 codex MED, RUN: a dirty tenure.toml (a signing failure mid-update) was refused as foreign forever."""
+    tmp, ana, ben = two
+    g = gl(ana)
+    (g.wt / "tenure.toml").write_text((g.wt / "tenure.toml").read_text() + "\n# interrupted\n")
+    assert ruling(ana, "src/a.py", "ana: after the interruption") == 0
+    assert "ana: after the interruption" in in_force(ana)
 
 
 def test_t8_unjudgeable_denies_and_the_override_allows(two, monkeypatch):
