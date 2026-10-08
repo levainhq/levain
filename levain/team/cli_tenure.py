@@ -263,14 +263,30 @@ def cmd_accept_merge(gl: GitLedger, args) -> int:
     others = [p for i, p in enumerate(parents, 1) if i != n]
     base = git(["merge-base", follow, *others], gl.repo.toplevel, check=False).stdout.strip()
     left = git(["rev-list", "--reverse", *others, f"^{follow}"], gl.repo.toplevel).stdout.split()
-    team_side = [c for c in left if set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", c],
-                                            gl.repo.toplevel).stdout.split()) & {T.TEAM_FILE, T.TENURE_FILE}]
+    touched_team = [c for c in left if set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", c],
+                                               gl.repo.toplevel).stdout.split()) & {T.TEAM_FILE, T.TENURE_FILE}]
+    # list the side's team DECISIONS, judged on the side's own chain (this clone's anchor is not on it): a commit that
+    # never counted even there is not a decision being left out (T40, RUN). A commit that cannot be judged is listed.
+    import dataclasses
+    side_clone = dataclasses.replace(gl.clone(), anchor=None)
+    cache = S.SigCache(gl.base / "sigcache.json")
+
+    def counted_on_its_side(c: str) -> bool:
+        try:
+            dc = T.derive(gl.repo.toplevel, c, side_clone, cache)
+        except T.Unjudgeable:
+            return True
+        return dc.judged != "full" or dc.counted_head == c
+    team_side = [c for c in touched_team if counted_on_its_side(c)]
     gl.save_state(_mutate=lambda st: st.__setitem__("accepted", {**dict(st.get("accepted") or {}), sha: n}))
     gl._dcache = None
     print(f"accepted merge {sha[:10]} on THIS clone, following parent {n}. Commits on the other side are NOT read:")
     print(f"  {len(left)} commit(s) since the merge-base {base[:10]}; team decisions among them NOT in force:")
     for c in team_side:
         print("   ", git(["log", "-1", "--format=%h %ae %s", c], gl.repo.toplevel).stdout.strip())
+    if len(touched_team) > len(team_side):
+        print(f"  ({len(touched_team) - len(team_side)} other commit(s) there changed team.toml/tenure.toml and never "
+              "counted, even on that side)")
     print(f"Every member runs exactly: levain team accept-merge {sha} --parent {n}")
     d = gl.derivation()
     print(f"now judged {d.judged}; owner in force {d.team.owner}")
