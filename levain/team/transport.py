@@ -921,8 +921,12 @@ class GitLedger:
         """Re-signed by this clone's key, would commit ``c`` count in ``d``? The key must be in force for every folder
         it writes, by the derivation's own rule (the owner for ``pack-*`` lines and PROJECT.md, else the member whose
         folder it is), not merely for some member (docs L3 r1 anansi: a held pack line replayed after this clone
-        stopped being owner published without counting)."""
+        stopped being owner published without counting). Only a derivation judged in FULL can say: a frozen one
+        answers with the anchor's tenure, where a key can be in force that is only pending at the tip (code L3 r3
+        codex 4 + glm 1, RUN: a re-signed entry was published onto a rewritten remote, in force on no fresh clone)."""
         from . import tenure as T
+        if d.judged != "full":
+            return False
         fp = self.own_fingerprint()
         holders: set[str | None] = set()
         for f in git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split():
@@ -953,11 +957,13 @@ class GitLedger:
                 if not self._pick_counts(d, c):
                     # in order: a later entry may supersede an earlier one, so nothing is replayed past the first
                     # that would not count
+                    why = (f"the ledger is frozen ({d.frozen_why}), so whether they would count cannot be judged; they "
+                           "are replayed on the first sync after the owner resolves it" if d.judged != "full" else
+                           "replayed now they would be re-signed with this machine's key, which is not in force for "
+                           "the folder they are filed under, and publish without counting. Confirm the key (`levain "
+                           "team key confirm`) from this machine, then `levain team sync`")
                     self.warnings.append(f"{len(order) - n} unpublished entr(y/ies) kept back under refs/levain/held/: "
-                                         "replayed now they would be re-signed with this machine's key, which is not in "
-                                         "force for the folder they are filed under, and publish without counting. "
-                                         "Confirm the key (`levain team key confirm`) from this machine, then "
-                                         "`levain team sync`")
+                                         + why)
                     return
                 cp = git([*_REPLAY_CONFIG, *self._sign_cfg(), "cherry-pick", "--allow-empty", c], self.wt,
                          check=False, timeout=timeout)
@@ -1037,8 +1043,9 @@ class GitLedger:
                     picks.append(c)
             d_remote = self.derivation(remote_tip) if picks else None
             if picks and not all(self._pick_counts(d_remote, c) for c in picks):
-                # re-signed now, with a key not in force at the remote (a rotation's still-PENDING key), the entries
-                # would publish without counting (T42, RAN). Held under a ref instead; `_replay_held` replays them
+                # re-signed now, with a key not in force at the remote (a rotation's still-PENDING key) or onto a remote
+                # this clone cannot judge in full, the entries could publish without counting (T42, RAN; code L3 r3
+                # codex 4, RAN). Held under a ref instead; `_replay_held` replays them
                 # after the held team ops (the confirm) re-land, and only once the key counts.
                 for c in picks:
                     git(["update-ref", f"refs/levain/held/{c}", c], self.wt)
