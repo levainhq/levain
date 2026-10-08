@@ -169,7 +169,7 @@ def test_t24_accept_merge_continues_on_parent_1_reads_nothing_from_parent_2_and_
     g = gl(ana)
     g.sync(push=False)
     assert _fresh(ana).judged == "partial"
-    assert team("accept-merge", merge, repo=ana) == 0
+    assert team("accept-merge", merge, "--parent", "1", repo=ana) == 0
     out = capsys.readouterr().out
     assert "following parent 1" in out
     d = _fresh(ana)
@@ -323,9 +323,9 @@ def test_t23_after_a_hand_off_and_a_merge_a_lagging_clone_honours_nothing_after_
     assert "ana: v1" in words and "ana: v2 post-K" not in words
     assert d.waiting >= 1
     # control: the same history accepted is judged past the anchor, and cy then agrees with ana
-    assert team("accept-merge", merge, repo=c) == 0
+    assert team("accept-merge", merge, "--parent", "1", repo=c) == 0
     gl(ana).sync(push=False)
-    assert team("accept-merge", merge, repo=ana) == 0
+    assert team("accept-merge", merge, "--parent", "1", repo=ana) == 0
     assert _fresh(c).team.owner == "ben" and _words(c) == _words(ana)
 
 
@@ -742,3 +742,18 @@ def test_t46_a_pinned_clone_whose_strict_ledger_is_deleted_beside_a_legacy_one_l
         gl(ben).sync()
     assert "no longer has" in str(exc.value) and "predates strict mode" not in str(exc.value)
     assert not sh("git", "ls-remote", str(tmp / "origin.git"), "refs/heads/levain-team-ledger", cwd=tmp).strip()
+
+
+def test_the_merge_parent_is_always_named_never_defaulted(two, keys):
+    """RUN (docs L3 r1): `accept-merge` without `--parent`, and `join --accept-merge SHA` without `:N`, are refused:
+    which parent to follow is the owner's trust decision. Both silently followed parent 1 on de2a4de."""
+    tmp, ana, ben = two
+    head = sh("git", "rev-parse", "HEAD", cwd=ana).strip()
+    try:
+        rc = team("accept-merge", head, repo=ana)
+    except SystemExit as exc:      # argparse refuses a missing required option before levain runs
+        rc = exc.code
+    assert rc == 2
+    c = clone(tmp, "cy", "cy@ex.com")
+    assert team("join", "--accept-merge", head, "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
+    assert not gl(c).state().get("pinned_root")
