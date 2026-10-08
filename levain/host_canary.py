@@ -161,10 +161,16 @@ def proxied(host):
     try:
         opener.open("http://%s:%d/" % (host, C["port"]), timeout=8).close()
     except urllib.error.HTTPError as e:
-        raise PermissionError(errno.EACCES, "the sandbox proxy answered %d" % e.code)
+        if e.code == 403:
+            raise PermissionError(errno.EACCES, "the sandbox proxy refused (403)")
+        raise LookupError("the sandbox proxy answered %d" % e.code)
     except urllib.error.URLError as e:
         raise e.reason if isinstance(e.reason, OSError) else OSError(str(e.reason))
+def rename_activation():
+    os.rename(C["activation"], C["activation"] + "-moved")
+    os.rename(C["activation"] + "-moved", C["activation"])
 TRIES = [("TCP", tcp, ()), ("UDS", uds, ()), ("FSOUT", create, (C["outside"],)),
+         ("RENAME", rename_activation, ()),
          ("FSHOOK", create, (C["hook"],)), ("FSCLAUDE", create, (C["claude"],)),
          ("FSLINK", throughlink, ()), ("HARDLINK", hardlink, ()),
          ("PROXYIP", proxied, ("127.0.0.1",)), ("PROXYLOCAL", proxied, ("localhost",))]
@@ -412,10 +418,9 @@ def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, time
         timer.cancel()
         if log:
             log.close()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            pass
+        # The turn is over (result read, timed out, or the stream ended). Signal the whole group
+        # BEFORE reaping the leader: an exited-but-unreaped leader still holds its pid, so the
+        # pgid cannot have been reused by an unrelated process (L3 r2, codex 8).
         kill_group()
         proc.wait()
     return turn
@@ -438,7 +443,8 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
     work = run / f"canary-{nonce}"
     work.mkdir(mode=0o700)
     hooks = ent / "activation" / "hooks"
-    case_insensitive = (ent / "ACTIVATION").exists()
+    # Case-insensitive only if the upper-case spelling IS the activation dir (L3 r2, codex 7).
+    case_insensitive = os.path.exists(ent / "ACTIVATION") and os.path.samefile(ent / "ACTIVATION", ent / "activation")
     git, mcp = ent / ".git", ent / ".mcp.json"
     # Probes that would touch something the operator already has are aimed so they can never
     # damage it: .git is probed only by a new name (a .git FILE, as in a worktree, is left alone,
@@ -458,6 +464,7 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
         "mcp": str(mcp) if mcp.is_file() and not mcp.is_symlink() else "",
         "git": str(git_probe) if git_probe else "",
         "link_target": str(hooks),
+        "activation": str(ent / "activation"),
         "swap_link": str(ent / f"selftest-sl-{nonce}"),
         "swap_name": f"selftest-via-{nonce}.txt",
         "link_src": str(hooks / "session_start.py"),
@@ -483,7 +490,9 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
         pre = listener.self_connect()
 
         def decide(req: dict[str, Any]) -> dict[str, Any]:
-            name, inp = req.get("tool_name"), req.get("input") or {}
+            name, inp = req.get("tool_name"), req.get("input")
+            if not isinstance(inp, dict):
+                inp = {}
             slot = "bash" if name == "Bash" and inp.get("command") == cmd else None
             verdict = (control_answer(slot, str(inp)) if control_answer and slot else None) or "deny"
             if verdict == "allow":
@@ -529,8 +538,8 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
                          claude_bin=os.path.realpath(profile.claude_bin), profile_digest=profile.digest())
 
 
-_PROBE_LINES = ("TCP", "UDS", "FSOUT", "FSHOOK", "FSCLAUDE", "FSLINK", "HARDLINK", "PROXYIP",
-                "PROXYLOCAL")
+_PROBE_LINES = ("TCP", "UDS", "FSOUT", "RENAME", "FSHOOK", "FSCLAUDE", "FSLINK", "HARDLINK",
+                "PROXYIP", "PROXYLOCAL")
 
 
 def _evaluate(turn: _Turn, *, nonce: str, cmd: str, listener: Any, landed: list[Path],
@@ -542,7 +551,9 @@ def _evaluate(turn: _Turn, *, nonce: str, cmd: str, listener: Any, landed: list[
     checks.append(check_init_event(turn.init))
 
     # C6: Levain's own hooks ran AND injected their context, so the hosted session is the entity.
-    # An event alone proves nothing: the hooks exit 0 silently on failure (L1 r1 #10).
+    # An event alone proves nothing: the hooks exit 0 silently on failure (L1 r1 #10). Stated
+    # limit (L3 r2, codex 6): context is attributed by EVENT, not by hook, so a managed hook that
+    # emits context on the same events would satisfy it; managed hooks are operator-pinned (D13).
     thin = [e for e in ("SessionStart", "UserPromptSubmit") if not turn.hook_context.get(e)]
     checks.append(Check("C6 entity hooks ran", "fail" if thin else "pass",
                         f"no injected context from {thin}" if thin else "SessionStart and UserPromptSubmit injected context"))

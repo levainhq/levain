@@ -664,3 +664,65 @@ def test_digest_binds_env_values_and_the_binary(ent, home, entity_only_roots):
     p = hg.cc_host_profile(ent, claude_bin=sys.executable, home=home, platform="darwin", managed=[])
     q = dataclasses.replace(p, env={**p.env, "PATH": "/somewhere/else"})
     assert p.digest() != q.digest()
+
+
+# ---------------------------------------------------------------------------- L3 r2 named fixes (after the closing round)
+
+
+def test_python_path_check_locates_without_importing(tmp_path):
+    # L3 r2, codex 1: the check must not run the package it is vetting
+    pkg = tmp_path / "site" / "anneal_memory"
+    pkg.mkdir(parents=True)
+    marker = tmp_path / "ran"
+    (pkg / "__init__.py").write_text(f"open({str(marker)!r}, 'w').close()\n")
+    env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(tmp_path / "site")}
+    probs = hg._check_python_paths(sys.executable, (Path(os.path.realpath(tmp_path)),), env)
+    assert not marker.exists()
+    assert probs and "imports from" in probs[0]
+
+
+def test_codex_argv_refuses_a_value_taking_flag():
+    # L3 r2, complement 1: `-X` would swallow `--db` and make the next word the real script
+    probs = hg.check_codex_code_paths({}, {"m": {"command": "/usr/bin/python3",
+                                                 "args": ["-I", "-X", "--db", "/ent/evil.py"]}}, ())
+    assert any("interpreter option" in p for p in probs)
+    assert any("names no script" in p for p in hg.check_codex_code_paths(
+        {}, {"m": {"command": "/usr/bin/python3", "args": ["-I"]}}, ()))
+
+
+def test_codex_hooks_must_be_exactly_levains():
+    data = {"data": [{"hooks": [{"key": "k1", "sourcePath": "/h/hooks.json", "trustStatus": "trusted"},
+                                {"key": "k2", "sourcePath": "/etc/managed.json", "trustStatus": "managed"}]}]}
+    assert any("did not install" in p for p in hg.check_codex_hooks(data, ["/h/hooks.json"]))
+
+
+def test_codex_effective_cwd_must_be_the_entity(ent, tmp_path):
+    good = {"type": "workspaceWrite", "writableRoots": [], "networkAccess": False,
+            "excludeTmpdirEnvVar": True, "excludeSlashTmp": True}
+    assert hg.check_codex_effective_policy(good, forbidden=[], cwd=str(ent), entity=ent) == []
+    home = tmp_path / "codex_home"
+    home.mkdir()
+    probs = hg.check_codex_effective_policy(good, forbidden=[home], cwd=str(home), entity=ent)
+    assert any("not the entity" in p for p in probs) and any("overlaps" in p for p in probs)
+
+
+def test_codex_spawn_env_filters_path(ent):
+    env = hg.codex_spawn_env("/c", {"PATH": f"{ent}/bin:/usr/bin"}, roots=(Path(os.path.realpath(ent)),))
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_security_inputs_digest_moves_with_managed_settings(ent, home, monkeypatch):
+    monkeypatch.setattr(hg, "load_managed_settings", lambda platform=None: [])
+    a = hg.security_inputs_digest(Path(os.path.realpath(ent)), sys.executable, sys.executable, "darwin", {}, home)
+    monkeypatch.setattr(hg, "load_managed_settings",
+                        lambda platform=None: [("m.json", {"sandbox": {"enabled": False}})])
+    b = hg.security_inputs_digest(Path(os.path.realpath(ent)), sys.executable, sys.executable, "darwin", {}, home)
+    assert a != b
+
+
+def test_pin_file_that_is_not_an_object_refuses(ent, tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "hook_pin.json").write_text("[]")
+    with pytest.raises(hg.HostRefusal, match="unreadable"):
+        hg.check_or_record_pin(ent, state)

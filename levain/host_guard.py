@@ -40,6 +40,7 @@ __all__ = [
     "hook_pin", "check_or_record_pin", "repin", "check_managed_settings", "host_env",
     "parse_cc_version", "CC_HOSTED_TOOLS", "CC_VERSION_FLOOR",
     "check_shared_code", "codex_initialize_params", "codex_config_overrides",
+    "security_inputs_digest",
     "trust_managed", "load_managed_trust",
     "broker_method_allowed", "codex_sandbox_policy", "overwrite_codex_policy",
     "check_codex_effective_policy", "check_codex_hooks", "check_codex_code_paths",
@@ -367,7 +368,16 @@ def check_or_record_pin(entity: str | os.PathLike[str], state_dir: Path) -> Lite
         _write_pin(state_dir, ent, current)
         return "recorded"
     try:
-        recorded = json.loads(pf.read_text(encoding="utf-8"))
+        fd = os.open(pf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ValueError("not a regular file")
+            with os.fdopen(fd, "r", encoding="utf-8", closefd=False) as fh:
+                recorded = json.loads(fh.read())
+        finally:
+            os.close(fd)
+        if not isinstance(recorded, dict):
+            raise ValueError("not a JSON object")
     except (OSError, ValueError) as exc:
         raise HostRefusal(f"the hook pin at {os.fspath(pf)!r} is unreadable ({exc}); repin from your terminal: "
                           f"python -m levain.host_guard repin {shlex.quote(str(ent))}") from None
@@ -588,6 +598,7 @@ class CCHostProfile:
     pin_status: str
     tools: tuple[str, ...] = CC_HOSTED_TOOLS
     roots: tuple[Path, ...] = field(default=())
+    inputs_digest: str = ""
 
     def argv(self, *, canary: bool = False, canary_model: str = "haiku") -> list[str]:
         argv = [
@@ -615,7 +626,7 @@ class CCHostProfile:
             binary: list[int] = [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns]
         except OSError:
             binary = []
-        blob = json.dumps([self.argv(), sorted(self.env.items()), binary], sort_keys=True)
+        blob = json.dumps([self.argv(), sorted(self.env.items()), binary, self.inputs_digest], sort_keys=True)
         return hashlib.sha256(blob.encode()).hexdigest()
 
 
@@ -657,10 +668,11 @@ def cc_host_profile(entity: str | os.PathLike[str], *, claude_bin: str, python: 
     if problems:
         raise HostRefusal("; ".join(problems))
     pin_status = check_or_record_pin(ent, state)
+    inputs = security_inputs_digest(ent, py, claude_bin, platform, environ, home)
     return CCHostProfile(entity=ent, claude_bin=claude_bin, settings=settings, mcp_config=mcp,
                          env={**host_env(environ, roots=roots, pycache=pycache),
                               "CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS": "1"}, run_dir=run,
-                         state_dir=state, pin_status=pin_status, roots=roots)
+                         state_dir=state, pin_status=pin_status, roots=roots, inputs_digest=inputs)
 
 
 _BROKER_METHODS = frozenset({
@@ -703,16 +715,21 @@ def overwrite_codex_policy(method: str, params: Mapping[str, Any], *,
     return out
 
 
-def check_codex_effective_policy(sandbox: Mapping[str, Any], *,
-                                 forbidden: Sequence[Path]) -> list[str]:
+def check_codex_effective_policy(sandbox: Mapping[str, Any], *, forbidden: Sequence[Path],
+                                 cwd: str | None = None,
+                                 entity: str | os.PathLike[str] | None = None) -> list[str]:
     """Run on what the server REPORTS back (thread/start and thread/resume results). Network must be
     explicitly false for every type, readOnly included; no writable root may contain, or sit
-    inside, the host run dir, CODEX_HOME or the hook and MCP code (L1 r1 #5a: one direction
-    let a root inside CODEX_HOME through)."""
+    inside, the host run dir, CODEX_HOME or the hook and MCP code (L1 r1 #5a). The reported cwd
+    is an implicit writable root, so it must be the entity itself (L3 r2, codex 2: a cwd of
+    CODEX_HOME passed every explicit check)."""
     t = sandbox.get("type")
     if t not in ("readOnly", "workspaceWrite"):
         return [f"Codex sandbox type {t!r} is not hostable"]
     problems = []
+    if entity is not None:
+        if cwd is None or not (is_within(cwd, entity) and is_within(entity, cwd)):
+            problems.append(f"Codex reports cwd {cwd!r}, which is not the entity directory")
     if sandbox.get("networkAccess", _MISSING) is not False:
         problems.append(f"Codex sandbox networkAccess is {sandbox.get('networkAccess', 'absent')!r}, must be false")
     if t == "workspaceWrite":
@@ -720,7 +737,7 @@ def check_codex_effective_policy(sandbox: Mapping[str, Any], *,
         if not isinstance(roots, list):
             problems.append("Codex sandbox writableRoots is missing")
         else:
-            for r in roots:
+            for r in list(roots) + ([cwd] if cwd else []):
                 if not isinstance(r, str) or not os.path.isabs(r):
                     problems.append(f"Codex writable root {r!r} is not an absolute path")
                     continue
@@ -734,18 +751,21 @@ def check_codex_effective_policy(sandbox: Mapping[str, Any], *,
 
 
 def check_codex_hooks(hooks_list: Mapping[str, Any], required_sources: Sequence[str]) -> list[str]:
-    """``hooks/list``: every hook whose source file is one of Levain's must be ``trusted`` (an
-    untrusted hook is skipped silently in headless, so "same entity" would fail invisibly). Writing
-    the trust stays the operator's act in the TUI."""
+    """``hooks/list``: the hooks Codex will run are EXACTLY Levain's, each ``trusted``. An extra
+    hook from any other source refuses (L3 r2, codex 5: it runs outside Codex's sandbox and
+    nothing else here vets it), and an untrusted Levain hook refuses because headless skips it
+    silently, so "same entity" would fail invisibly. Writing the trust stays the operator's act."""
     problems = []
     seen = set()
-    for entry in hooks_list.get("data", []):
-        for h in entry.get("hooks", []):
-            src = h.get("sourcePath")
-            if src in required_sources:
-                seen.add(src)
-                if h.get("trustStatus") not in ("trusted", "managed"):
-                    problems.append(f"Codex hook {h.get('key')!r} is {h.get('trustStatus')!r}, not trusted")
+    for entry in hooks_list.get("data", []) if isinstance(hooks_list, Mapping) else []:
+        for h in entry.get("hooks", []) if isinstance(entry, Mapping) else []:
+            src = h.get("sourcePath") if isinstance(h, Mapping) else None
+            if src not in required_sources:
+                problems.append(f"Codex lists a hook Levain did not install: {src!r} ({h.get('key') if isinstance(h, Mapping) else h!r})")
+                continue
+            seen.add(src)
+            if h.get("trustStatus") != "trusted":
+                problems.append(f"Codex hook {h.get('key')!r} is {h.get('trustStatus')!r}, not trusted")
     for src in required_sources:
         if src not in seen:
             problems.append(f"Codex does not list Levain's hooks from {src!r}")
@@ -781,9 +801,11 @@ def check_codex_code_paths(hooks_json: Mapping[str, Any], mcp_servers: Mapping[s
     return problems
 
 
-def codex_spawn_env(codex_home: str | os.PathLike[str],
-                    environ: Mapping[str, str] | None = None) -> dict[str, str]:
-    env = host_env(environ)
+def codex_spawn_env(codex_home: str | os.PathLike[str], environ: Mapping[str, str] | None = None, *,
+                    roots: Sequence[Path] = ()) -> dict[str, str]:
+    """The Codex app-server's env: the same allowlist, PATH filtered against the entity's roots
+    (L3 r2, complement 4), plus the entity's own CODEX_HOME."""
+    env = host_env(environ, roots=roots)
     env["CODEX_HOME"] = os.fspath(codex_home)
     return env
 
@@ -846,6 +868,11 @@ _CODEX_FORWARD = {
 
 
 def _vet_codex_argv(cmd: str, roots: Sequence[Path], what: str, flags: tuple[str, ...]) -> list[str]:
+    """A strict grammar, not a scan: interpreter, then only argument-free isolating flags, then
+    exactly one absolute script outside the roots, then plain arguments (MCP `--db <path>` pairs
+    have already been removed by position). A flag that takes a value (`-X`, `-W`, `-m`, `-c`,
+    `--anything`) refuses, because it can swallow the next word and turn a vetted-looking argument
+    into the real script (L3 r2, complement 1: `-I -X --db /ent/evil.py`)."""
     if _SHELL_META.search(cmd):
         return [f"{what} uses shell syntax: {cmd!r}"]
     argv = shlex.split(cmd)
@@ -854,19 +881,26 @@ def _vet_codex_argv(cmd: str, roots: Sequence[Path], what: str, flags: tuple[str
     problems = _check_exec(argv[0], roots, f"{what} interpreter")
     i = 1
     seen: set[str] = set()
-    while i < len(argv) and argv[i].startswith("-") and argv[i] not in ("-m", "-c"):
+    while i < len(argv) and argv[i].startswith("-"):
+        if argv[i] not in _ISOLATING_FLAGS:
+            return problems + [f"{what} passes interpreter option {argv[i]!r}, which hosting cannot vet: {cmd!r}"]
         seen.add(argv[i])
         i += 1
     missing = [f for f in flags if f not in seen]
     if missing:
         problems.append(f"{what} does not run with {' '.join(missing)} before its script: {cmd!r}")
-    for a in argv[i:]:
+    if i >= len(argv):
+        return problems + [f"{what} names no script: {cmd!r}"]
+    script = argv[i]
+    if not os.path.isabs(script):
+        problems.append(f"{what} script is not an absolute path: {script!r}")
+    else:
+        problems += _outside(script, roots, f"{what} script")
+    for a in argv[i + 1:]:
         if "/" in a and not os.path.isabs(a):
             problems.append(f"{what} names a relative path {a!r}")
         elif os.path.isabs(a):
             problems += _outside(a, roots, f"{what} path")
-        elif _SCRIPT_EXT.search(a):
-            problems.append(f"{what} runs a script by relative name {a!r}")
     return problems
 
 
@@ -881,23 +915,28 @@ def codex_initialize_params() -> dict[str, Any]:
 def _check_python_paths(python: str, roots: Sequence[Path], env: Mapping[str, str]) -> list[str]:
     """Hooks and the MCP server run Python outside the sandbox, so everything that Python imports
     from must be outside the writable roots: the interpreter path is not enough (L2 r1 #9: .pth
-    files, editable installs and site dirs add code). Two steps, so nothing is imported before it
-    is vetted (L3 r1, complement 9): first sys.path alone, then where anneal_memory resolves.
-    Fails closed."""
+    files, editable installs and site dirs add code). The probe LOCATES anneal_memory with
+    importlib.util.find_spec and never imports it, so no package code runs before it is vetted
+    (L3 r2, codex 1). It runs the host's own interpreter, the one levain itself is running in,
+    so a .pth line it executes at startup is code the host process already executed. Fails
+    closed."""
+    code = ("import json, sys, importlib.util\n"
+            "spec = importlib.util.find_spec('anneal_memory')\n"
+            "origins = [spec.origin] if spec and spec.origin else []\n"
+            "origins += list(spec.submodule_search_locations or []) if spec else []\n"
+            "print(json.dumps([p for p in sys.path if p] + origins))")
+    try:
+        out = subprocess.run([python, "-P", "-c", code], env=dict(env), capture_output=True,
+                             text=True, timeout=30, check=True, cwd="/").stdout
+        paths = json.loads(out.strip().splitlines()[-1])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
+        return [f"could not read the hook interpreter's import path: {exc}"]
+    if not isinstance(paths, list) or len(paths) < 1:
+        return ["the hook interpreter reported no import path"]
     problems: list[str] = []
-    for code in ("import json, sys\nprint(json.dumps([p for p in sys.path if p]))",
-                 "import json, anneal_memory\nprint(json.dumps([anneal_memory.__file__]))"):
-        try:
-            out = subprocess.run([python, "-P", "-c", code], env=dict(env), capture_output=True,
-                                 text=True, timeout=30, check=True, cwd="/").stdout
-            paths = json.loads(out.strip().splitlines()[-1])
-        except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
-            return [f"could not read the hook interpreter's import path: {exc}"]
-        for p in paths:
-            if os.path.isabs(p) and os.path.exists(p):
-                problems += _outside(p, roots, "a directory the hook interpreter imports from")
-        if problems:
-            return problems
+    for p in paths:
+        if isinstance(p, str) and os.path.isabs(p) and os.path.exists(p):
+            problems += _outside(p, roots, "a directory the hook interpreter imports from")
     return problems
 
 
@@ -906,8 +945,15 @@ def check_shared_code(entity: Path, roots: Sequence[Path], *, home: Path | None 
     can write it: the targets of the operator's ~/.claude entries (skills, agents, plugins,
     settings) and the scripts their user-level hooks name (L2 r1 #4). An entity whose directory
     holds the operator's own tooling is refused: hosting it would let the entity rewrite what the
-    operator's next terminal session runs. Launchd/cron scripts and shell rc files are outside
-    this check (stated residue)."""
+    operator's next terminal session runs.
+
+    BOUND, stated: this is a misconfiguration catch, not a boundary. It sees symlinks under
+    ~/.claude (recursively under plugins/ and skills/) and absolute script paths written literally
+    in user hook commands. A path a hook command COMPUTES in shell (`$(pwd)/x.py`), launchd and cron
+    scripts, and shell rc files are not seen (L3 r2, codex 3). Reading shell text is the construct
+    D13 deleted for managed hooks; it is not rebuilt here. The boundary for the hosted session
+    itself is the sandbox; this only guards the operator's OTHER sessions from a badly placed
+    entity."""
     home = Path(os.path.expanduser("~")) if home is None else home
     cc = home / ".claude"
     problems: list[str] = []
@@ -918,6 +964,12 @@ def check_shared_code(entity: Path, roots: Sequence[Path], *, home: Path | None 
                                                          "statsig", "logs", "cache"):
             continue  # Claude Code's own data, not code it loads
         problems += _outside(_real(entry), roots, f"~/.claude/{entry.name}")
+        if entry.name in ("plugins", "skills", "agents", "commands") and entry.is_dir():
+            for root, dirs, files in os.walk(entry, followlinks=False):
+                for n in dirs + files:
+                    q = os.path.join(root, n)
+                    if os.path.islink(q):
+                        problems += _outside(_real(q), roots, f"a link under ~/.claude/{entry.name}")
     settings = cc / "settings.json"
     try:
         doc = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
@@ -1005,6 +1057,28 @@ def codex_config_overrides() -> dict[str, Any]:
     return {"sandbox_mode": "workspace-write",
             "sandbox_workspace_write": {"network_access": False, "exclude_slash_tmp": True,
                                         "exclude_tmpdir_env_var": True, "writable_roots": []}}
+
+
+_ISOLATING_FLAGS = frozenset({"-I", "-B", "-E", "-P", "-s", "-S", "-u"})
+
+
+def security_inputs_digest(entity: Path, python: str, claude_bin: str, platform: str,
+                           environ: Mapping[str, str] | None, home: Path | None) -> str:
+    """Everything outside the argv that changes what a hosted spawn runs, hashed: the managed
+    settings documents, the operator's managed-hook trust pin, the hook-tree pin, and the identity
+    of the interpreter and the claude binary. S3 rebuilds the profile before EVERY spawn and
+    refuses when this differs from the canaried value (L3 r2, codex 4: a managed-settings change
+    after a passing canary left the old digest standing)."""
+    parts: list[Any] = [load_managed_settings(platform), sorted(load_managed_trust(platform, environ, home)),
+                        hook_pin(entity)]
+    for p in (python, claude_bin):
+        try:
+            st = os.stat(_real(p))
+            parts.append([os.fspath(_real(p)), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns])
+        except OSError:
+            parts.append([p, None])
+    blob = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
