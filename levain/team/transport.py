@@ -530,6 +530,7 @@ class GitLedger:
                 raise TeamError(LEGACY_MESSAGE)
             raise TeamError(f"{remote} has no team ledger")
         found: dict[str, str] = {}
+        multi: dict[str, list[str]] = {}
         for name in names:
             git(["fetch", "-q", remote, f"+refs/heads/{name}:refs/remotes/{remote}/{name}"], self.repo.toplevel,
                 timeout=120)
@@ -537,8 +538,17 @@ class GitLedger:
                         timeout=60).stdout.split()
             if len(roots) == 1:
                 found[name] = roots[0]
+            elif roots:
+                multi[name] = roots     # a merge brought in a second root: only an explicit --root may choose (T10)
         pinned = self.state().get("pinned_root") or ""
         if root:
+            # a branch with two roots is joinable only by naming the genesis: the derivation below must then reach it
+            # through the parents accepted with --accept-merge, or nothing is pinned (T10, RUN: no fresh clone could
+            # join a ledger after an orphan-first-parent push, whatever it named)
+            for n, rs in multi.items():
+                hit = [r for r in rs if r.startswith(root)]
+                if len(hit) == 1:
+                    found[n] = hit[0]
             pick = [n for n, r in found.items() if r.startswith(root)]
             if len(pick) != 1:
                 raise TeamError(f"no single team ledger on {remote} has genesis {root}")
