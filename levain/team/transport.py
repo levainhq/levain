@@ -559,12 +559,19 @@ class GitLedger:
             raise TeamError(f"{remote} has {len(found)} team ledgers ({listing}). Choose the team to trust with "
                             "`levain team join --root <genesis>` (a re-genesis lives beside the ledger it replaced)")
         rref = f"refs/remotes/{remote}/{name}"
+        old = self.state()
+        keep = bool(pinned) and found[name] == pinned
+        moved = bool(pinned) and not keep
+        # a same-ledger re-join keeps what this clone decided: its accepted merges and its anchor (resetting the anchor
+        # judged a host-rewritten history in full and lifted the freeze that only `repin` may lift: docs L3 r1 anansi
+        # HIGH, RUN). The distrust list survives every join: it is the person's own judgement (`distrust --clear`).
+        accepted = {**((old.get("accepted") or {}) if keep else {}), **(accept_merges or {})}
         for sha, n in list((accept_merges or {}).items()):
             ps = git(["rev-list", "--parents", "-n", "1", sha], self.repo.toplevel, check=False).stdout.split()[1:]
             if len(ps) < 2 or not 1 <= int(n) <= len(ps):
                 raise TeamError(f"--accept-merge {sha[:10]}:{n} does not name a merge and one of its parents")
         merges = git(["rev-list", "--first-parent", "--merges", rref], self.repo.toplevel, timeout=60).stdout.split()
-        unaccepted = [m for m in merges if m not in (accept_merges or {})]
+        unaccepted = [m for m in merges if m not in accepted]
         if unaccepted:
             raise TeamError(f"the ledger's history is not linear ({len(unaccepted)} merge(s), first {unaccepted[0][:10]}); "
                             "join with `--accept-merge <sha>:<parent>` for each merge the owner names")
@@ -580,14 +587,8 @@ class GitLedger:
             if git(["merge-base", "--is-ancestor", here, tip0], self.repo.toplevel, check=False).returncode != 0 and \
                     git(["merge-base", "--is-ancestor", tip0, here], self.repo.toplevel, check=False).returncode != 0:
                 raise TeamError(f"the local {name} branch has diverged from {remote}'s; nothing was changed")
-        old = self.state()
-        keep = bool(pinned) and found[name] == pinned
-        moved = bool(pinned) and not keep
-        # a re-join keeps what this clone decided: its accepted merges (on the same ledger) and its distrust list
-        # (always: it is the person's own judgement, never wiped by a join; `distrust --clear` does that)
-        self.save_state(branch=name, pinned_root=found[name], anchor=None,
-                        accepted={**((old.get("accepted") or {}) if keep else {}), **(accept_merges or {})},
-                        distrust=list(old.get("distrust") or []), remote=remote,
+        self.save_state(branch=name, pinned_root=found[name], anchor=old.get("anchor") if keep else None,
+                        accepted=accepted, distrust=list(old.get("distrust") or []), remote=remote,
                         device=secrets.token_hex(8) if new_device else self._new_device())
         self._dcache = None
         try:
@@ -598,7 +599,8 @@ class GitLedger:
         tip = git(["rev-parse", rref], self.repo.toplevel).stdout.strip()
         if not self._local_branch_exists():
             git(["branch", name, rref], self.repo.toplevel)
-        self.save_state(anchor=tip)
+        if not keep or d.judged == "full":
+            self.save_state(anchor=tip)     # a re-join advances the anchor only as a sync would (_advance_anchor)
         self._record_seen_sha(tip)       # the joined tip was published: never movable (code L3 r1 codex HIGH)
         self._remember_own_key()
         self._attach_worktree()
@@ -880,10 +882,23 @@ class GitLedger:
         self._reland()
         self._replay_held(timeout, lock_timeout)
 
-    def _key_counts_somewhere(self, d) -> bool:
+    def _pick_counts(self, d, c: str) -> bool:
+        """Re-signed by this clone's key, would commit ``c`` count in ``d``? The key must be in force for every folder
+        it writes, by the derivation's own rule (the owner for ``pack-*`` lines and PROJECT.md, else the member whose
+        folder it is), not merely for some member (docs L3 r1 anansi: a held pack line replayed after this clone
+        stopped being owner published without counting)."""
         from . import tenure as T
         fp = self.own_fingerprint()
-        return any(fp in T.key_fps(d.tenure, h) for h in d.team.members)
+        holders: set[str | None] = set()
+        for f in git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split():
+            parts = f.split("/")
+            if parts[0] == "ledger" and len(parts) >= 3:
+                top = parts[1]
+                holders.add(d.team.owner if top.startswith("pack-") else
+                            next((h for h in d.team.members if E.safe_handle(h) == top), None))
+            elif f == CANON_FILE:
+                holders.add(d.team.owner)
+        return all(h is not None and fp in T.key_fps(d.tenure, h) for h in holders)
 
     def _replay_held(self, timeout: float, lock_timeout: float) -> None:
         """Replay entries held back by ``_rebase_moves`` (T42) once this machine's key is IN FORCE at the tip, so the
@@ -895,16 +910,20 @@ class GitLedger:
         with self.lock(timeout=lock_timeout):
             self._recover_dirty()
             self._dcache = None
-            if not self._key_counts_somewhere(self.derivation()):
-                self.warnings.append(f"{len(held)} unpublished entr(y/ies) kept back under refs/levain/held/: replayed "
-                                     "now they would be re-signed with this machine's key, which is not in force, and "
-                                     "publish without counting. Confirm it (`levain team key confirm`) from this "
-                                     "machine, then `levain team sync`")
-                return
+            d = self.derivation()
             want = set(held)
             order = [c for c in git(["rev-list", "--reverse", "--topo-order", "--no-merges", *held, "--not", "HEAD"],
                                     self.wt).stdout.split() if c in want]
-            for c in order:
+            for n, c in enumerate(order):
+                if not self._pick_counts(d, c):
+                    # in order: a later entry may supersede an earlier one, so nothing is replayed past the first
+                    # that would not count
+                    self.warnings.append(f"{len(order) - n} unpublished entr(y/ies) kept back under refs/levain/held/: "
+                                         "replayed now they would be re-signed with this machine's key, which is not in "
+                                         "force for the folder they are filed under, and publish without counting. "
+                                         "Confirm the key (`levain team key confirm`) from this machine, then "
+                                         "`levain team sync`")
+                    return
                 cp = git([*_REPLAY_CONFIG, *self._sign_cfg(), "cherry-pick", "--allow-empty", c], self.wt,
                          check=False, timeout=timeout)
                 if cp.returncode != 0:
@@ -981,7 +1000,8 @@ class GitLedger:
                     picks.append(c)    # PROJECT.md: replayed; dropped below only if it conflicts
                 else:
                     picks.append(c)
-            if picks and not self._key_counts_somewhere(self.derivation(remote_tip)):
+            d_remote = self.derivation(remote_tip) if picks else None
+            if picks and not all(self._pick_counts(d_remote, c) for c in picks):
                 # re-signed now, with a key not in force at the remote (a rotation's still-PENDING key), the entries
                 # would publish without counting (T42, RAN). Held under a ref instead; `_replay_held` replays them
                 # after the held team ops (the confirm) re-land, and only once the key counts.
