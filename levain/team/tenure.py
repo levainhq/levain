@@ -353,6 +353,8 @@ class Derivation:
     waiting: int = 0                                # lines after the frozen point (listed, not enforced)
     role_changes: list[tuple[str, str, str]] = field(default_factory=list)   # (sha, date, text)
     void: set[str] = field(default_factory=set)
+    touched: dict[tuple, str] = field(default_factory=dict)   # field -> the last counted commit that changed it
+    state: dict[tuple, object] = field(default_factory=dict)  # the counted flat state at the tip
 
     def owner_authority(self, entry: dict) -> bool:
         """Did ``entry``'s author hold owner authority at its own line (§3c rule 2, G and vetoes applied)?"""
@@ -487,6 +489,7 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
     role_changes: list[tuple[str, str, str]] = []
     new_void: set[str] = set()
     revoked: dict[str, str] = {}             # fp -> after (counted revocations)
+    touched: dict[tuple, str] = {k: g for k in state}
 
     def keys_of(f: dict, handle: str) -> set[str]:
         return {k[2] for k in f if k[0] == "key" and k[1] == handle}
@@ -586,6 +589,9 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
         # spells and role changes
         prev_owner = str(state[("owner",)])
         prev_members = {k[1] for k in state if k[0] == "member"}
+        for k in set(state) | set(applied):
+            if state.get(k) != applied.get(k):
+                touched[k] = sha
         state = applied
         cur_owner = str(state[("owner",)])
         cur_members = {k[1] for k in state if k[0] == "member"}
@@ -617,7 +623,8 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
     t, n = unflat(state)
     return Derivation(tip=tip, walk=walk, team=t, tenure=n, counted_head=base, files=lines, unenforced=unenforced,
                       line_pos=line_pos, spells=spells, problems=problems, role_changes=role_changes,
-                      waiting=sum(len(ch.get(s, Change()).added) for s in walk[freeze_end:]), void=new_void)
+                      waiting=sum(len(ch.get(s, Change()).added) for s in walk[freeze_end:]), void=new_void,
+                      touched=touched, state=dict(state))
 
 
 def _hash_of(text: str) -> str | None:
