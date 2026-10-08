@@ -46,7 +46,7 @@ from levain.autonomic.binding import Binding, BindingStore
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
 from levain.autonomic.journal import (
-    EffectOutcome, EffectStatus, JournalCorruptError, RunJournal, RunRef, effect_digest,
+    EffectOutcome, EffectStatus, JournalCorruptError, RunJournal, RunRef, effect_digest, hold_id_for,
 )
 from levain.autonomic.kill import kill_trips
 from levain.autonomic.monitor import TrajectoryObserver, prediction_diverged
@@ -479,6 +479,7 @@ class EfferentGate:
             # a binding's risk came from its sealed tools, not from the manifest's entry for the action
             # name: seal the floor it was proposed at, for the resolve to re-validate against
             risk_floor=risk_floor(risk).name if run is not None else None,
+            hold_id=hold_id_for(run.run_id, run.effect_id) if run is not None else None,
         )
         if run is not None:
             assert self._journal is not None   # _journal_entry refused a run without a journal
@@ -592,7 +593,7 @@ class EfferentGate:
         except (KeyError, TypeError, ValueError, AttributeError):
             pending = None
         binding_id = pending.authority.get("binding_id") if pending is not None else hold.get("binding_id")
-        if pending is None or not pending.seal_matches():
+        if pending is None or not pending.seal_matches() or pending.hold_id != hold_id:
             # the record a person was asked about is unreadable or altered: never fire it. Reject the
             # hold (with the digest it was opened with; the record's own bytes are not trusted).
             _log.error("efferent gate resolve: INTEGRITY failure on hold %s — REJECTED (no fire)", hold_id)

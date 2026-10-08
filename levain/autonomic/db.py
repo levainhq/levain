@@ -54,7 +54,8 @@ _SCHEMA = (
     "pending TEXT, pending_id TEXT, chain TEXT, chained INTEGER NOT NULL DEFAULT 0, "
     "decided INTEGER, decided_by TEXT, decided_posture TEXT, seq INTEGER NOT NULL)",
     # one hold per pending id: a resolve finds a decision by its pending id, so a second hold sharing one
-    # could never be decided and would hold its binding; the second insert fails instead
+    # could never be decided and would hold its binding. A run's pending seals its hold id, so two holds
+    # do not share one; were they to, the second insert fails instead
     "CREATE UNIQUE INDEX IF NOT EXISTS holds_pending_id ON holds (pending_id)",
     "CREATE TABLE IF NOT EXISTS effects (run_id TEXT NOT NULL, effect_id TEXT NOT NULL, "
     "digest TEXT NOT NULL, pid INTEGER, state TEXT NOT NULL CHECK (state IN ('intent','done','unknown')), "

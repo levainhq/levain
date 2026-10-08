@@ -1681,7 +1681,7 @@ def test_a_journaled_pending_without_a_sealed_floor_fails_closed(tmp_path):
         created_at=p.created_at, action_name=p.action_name, payload=p.payload, context_id=p.context_id,
         query_text=p.query_text, query_date=p.query_date, posture=p.posture, fail_open=p.fail_open,
         requires_typed=p.requires_typed, authority=p.authority, producers=p.producers,
-        proposal_id=p.proposal_id, expires_at=p.expires_at)
+        proposal_id=p.proposal_id, expires_at=p.expires_at, hold_id=p.hold_id)
     assert legacy.risk_floor is None and legacy.seal_matches()
     with w.journal.db.write() as conn:
         conn.execute("UPDATE holds SET pending = ?, pending_id = ? WHERE hold_id = ?",
@@ -1808,3 +1808,40 @@ def test_a_proposal_is_made_from_the_gates_own_risk_resolver(tmp_path):
     v.dispatch("r2")
     [q] = v.gate.open_pendings()
     assert q.posture == "CONFIRM_ELEVATED"
+
+
+def test_two_runs_whose_requests_coincide_each_get_their_own_pending(tmp_path):
+    # codex r2 MED 5 / complement LOW 5: a pending id fingerprinted only content and created_at, so two
+    # runs whose built requests were identical at one clock reading shared it, and the unique index
+    # refused the second run's hold: that event was never proposed. A run's pending seals its hold.
+    w = World(tmp_path)
+    _mint_single(w, "k5")
+    w.dispatcher._request_builder = lambda b, e: dataclasses.replace(_single_builder(b, e), context_id="digest")
+    first, second = w.dispatch("k5a"), w.dispatch("k5b")
+    assert first.outcome.pending and second.outcome.pending, second.outcome.reason
+    assert len({p.pending_id for p in w.gate.open_pendings()}) == 2
+
+
+def test_a_pending_sealed_for_another_hold_is_refused(tmp_path):
+    # the hold id is inside the seal; a pending that names a different hold than the one it sits in was
+    # not written there by the gate, and is rejected rather than resolved
+    from levain.autonomic.pending import PendingAction
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("h6")
+    with w.journal.db.read() as conn:
+        [(hold_id, raw)] = conn.execute("SELECT hold_id, pending FROM holds WHERE decided IS NULL").fetchall()
+    p = PendingAction.from_dict(json.loads(raw))
+    assert p.hold_id == hold_id
+    moved = PendingAction.create(
+        created_at=p.created_at, action_name=p.action_name, payload=p.payload, context_id=p.context_id,
+        query_text=p.query_text, query_date=p.query_date, posture=p.posture, fail_open=p.fail_open,
+        requires_typed=p.requires_typed, authority=p.authority, producers=p.producers,
+        proposal_id=p.proposal_id, expires_at=p.expires_at, risk_floor=p.risk_floor,
+        hold_id=hold_id_for("run-elsewhere", "link-1"))
+    with w.journal.db.write() as conn:
+        conn.execute("UPDATE holds SET pending = ?, pending_id = ? WHERE hold_id = ?",
+                     (json.dumps(moved.to_dict(), sort_keys=True), moved.pending_id, hold_id))
+    out = _approve(w)
+    assert out.aborted and out.reason == "integrity:seal_mismatch"
+    assert ("link1", "h6-1") not in w.outbox()

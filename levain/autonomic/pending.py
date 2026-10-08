@@ -46,7 +46,7 @@ def seal_pending_id(
     *, created_at: str, context_id: str, action_name: str, payload: str, proposal_id: str | None,
     posture: str, fail_open: bool, requires_typed: bool, expires_at: str | None,
     authority: dict[str, Any], query_text: str, query_date: str, producers: tuple[str, ...],
-    risk_floor: str | None = None,
+    risk_floor: str | None = None, hold_id: str | None = None,
 ) -> str:
     """The content-FINGERPRINT pending id: ``pend-<created_at>-<16hex>`` over EVERY governance-relevant
     field of a pending record (L3 codex HIGH-1/2 + complement MED-1 — the cross-substrate consensus).
@@ -77,6 +77,8 @@ def seal_pending_id(
     }
     if risk_floor is not None:   # only a binding's pending carries one; a manual pending's id is unchanged
         body["risk_floor"] = risk_floor
+    if hold_id is not None:      # a run's pending names its hold, so no two holds share a pending id
+        body["hold_id"] = hold_id
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     h = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
     return f"pend-{created_at}-{h}"
@@ -133,7 +135,9 @@ class PendingAction:
     by the posture the human SAW). ``expires_at`` (None ⇒ wait indefinitely) is when the silence
     default fires. ``risk_floor`` (a binding's pending only) is the posture name of the risk floor the
     proposal was made at, derived from the binding's sealed tools: the resolve re-validates against it,
-    since the manifest's entry for the action name is not where a binding's risk comes from."""
+    since the manifest's entry for the action name is not where a binding's risk comes from.
+    ``hold_id`` (a run's pending only) is the run-journal hold it is the decision of, inside the seal,
+    so two runs that propose identical content at one clock reading still get two pending ids."""
 
     pending_id: str
     created_at: str
@@ -150,13 +154,14 @@ class PendingAction:
     proposal_id: str | None = None
     expires_at: str | None = None
     risk_floor: str | None = None
+    hold_id: str | None = None
 
     @classmethod
     def create(
         cls, *, created_at: str, action_name: str, payload: str, context_id: str, query_text: str,
         query_date: str, posture: str, fail_open: bool, requires_typed: bool, authority: dict[str, Any],
         producers: tuple[str, ...] = (), proposal_id: str | None = None, expires_at: str | None = None,
-        risk_floor: str | None = None,
+        risk_floor: str | None = None, hold_id: str | None = None,
     ) -> "PendingAction":
         """Build a SEALED pending action — the ``pending_id`` is the content fingerprint over all the
         governance fields (:func:`seal_pending_id`), so any later alteration is detectable via
@@ -167,13 +172,14 @@ class PendingAction:
             created_at=created_at, context_id=context_id, action_name=action_name, payload=payload,
             proposal_id=proposal_id, posture=posture, fail_open=fail_open, requires_typed=requires_typed,
             expires_at=expires_at, authority=authority, query_text=query_text, query_date=query_date,
-            producers=producers, risk_floor=risk_floor,
+            producers=producers, risk_floor=risk_floor, hold_id=hold_id,
         )
         return cls(
             pending_id=pid, created_at=created_at, action_name=action_name, payload=payload,
             context_id=context_id, query_text=query_text, query_date=query_date, posture=posture,
             fail_open=fail_open, requires_typed=requires_typed, authority=authority,
             producers=producers, proposal_id=proposal_id, expires_at=expires_at, risk_floor=risk_floor,
+            hold_id=hold_id,
         )
 
     def seal_matches(self) -> bool:
@@ -185,7 +191,7 @@ class PendingAction:
             payload=self.payload, proposal_id=self.proposal_id, posture=self.posture,
             fail_open=self.fail_open, requires_typed=self.requires_typed, expires_at=self.expires_at,
             authority=self.authority, query_text=self.query_text, query_date=self.query_date,
-            producers=self.producers, risk_floor=self.risk_floor,
+            producers=self.producers, risk_floor=self.risk_floor, hold_id=self.hold_id,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -205,6 +211,7 @@ class PendingAction:
             "proposal_id": self.proposal_id,
             "expires_at": self.expires_at,
             **({"risk_floor": self.risk_floor} if self.risk_floor is not None else {}),
+            **({"hold_id": self.hold_id} if self.hold_id is not None else {}),
         }
 
     @classmethod
@@ -234,6 +241,7 @@ class PendingAction:
             proposal_id=d.get("proposal_id"),
             expires_at=d.get("expires_at"),
             risk_floor=_opt_str(d, "risk_floor"),
+            hold_id=_opt_str(d, "hold_id"),
         )
 
 
