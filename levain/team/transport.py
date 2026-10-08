@@ -518,8 +518,6 @@ class GitLedger:
         """Pin this clone to a strict ledger on the remote (trust on first use: the genesis, its owner in force and
         her key fingerprints are printed for the person to check out of band), then confirm this clone's key."""
         from . import tenure as T
-        if signing_key:
-            self.save_state(signing_key=signing_key)
         remote = remote or self._default_remote()
         if not remote:
             raise TeamError("no git remote to join from")
@@ -599,11 +597,17 @@ class GitLedger:
                 # a shallow cut-off reads as a root: pinning it would trust a commit that is not the genesis (L2 F3)
                 raise TeamError("this clone is shallow and could not be deepened; join from a full clone")
         tip0 = git(["rev-parse", rref], self.repo.toplevel).stdout.strip()
-        if git(["rev-parse", "-q", "--verify", f"refs/heads/{name}"], self.repo.toplevel, check=False).returncode == 0:
+        # a re-join on the ledger this clone already trusts keeps its unpublished work: that branch is AHEAD-and-behind
+        # by design and sync reconciles it (residue run 1008, RUN: a key rotation by `join --signing-key` refused as
+        # "diverged" and, the key already saved, said "nothing was changed")
+        if not keep and git(["rev-parse", "-q", "--verify", f"refs/heads/{name}"], self.repo.toplevel,
+                            check=False).returncode == 0:
             here = git(["rev-parse", f"refs/heads/{name}"], self.repo.toplevel).stdout.strip()
             if git(["merge-base", "--is-ancestor", here, tip0], self.repo.toplevel, check=False).returncode != 0 and \
                     git(["merge-base", "--is-ancestor", tip0, here], self.repo.toplevel, check=False).returncode != 0:
                 raise TeamError(f"the local {name} branch has diverged from {remote}'s; nothing was changed")
+        if signing_key:
+            self.save_state(signing_key=signing_key)     # only once nothing above refused
         self.save_state(branch=name, pinned_root=found[name], anchor=old.get("anchor") if keep else None,
                         accepted=accepted, distrust=list(old.get("distrust") or []), remote=remote,
                         device=secrets.token_hex(8) if new_device else self._new_device())
@@ -611,7 +615,8 @@ class GitLedger:
         try:
             d = self.derivation(git(["rev-parse", rref], self.repo.toplevel).stdout.strip())
         except TeamError:
-            self.save_state(**{k: old.get(k) for k in ("branch", "pinned_root", "anchor", "accepted", "distrust")})
+            self.save_state(**{k: old.get(k) for k in ("branch", "pinned_root", "anchor", "accepted", "distrust",
+                                                        "signing_key")})
             raise
         tip = git(["rev-parse", rref], self.repo.toplevel).stdout.strip()
         if not self._local_branch_exists():
@@ -621,6 +626,12 @@ class GitLedger:
         self._record_seen_sha(tip)       # the joined tip was published: never movable (code L3 r1 codex HIGH)
         self._remember_own_key()
         self._attach_worktree()
+        said = len(self.warnings)
+        if keep:
+            # the re-join reconciles as a sync would: own unpublished commits go on top of the remote (held when this
+            # machine's key does not count yet), so the confirm below lands on the remote's line (residue run 1008)
+            self._rebase(rref, 120, 30.0)
+            self._dcache = None
         owner = d.team.owner
         fps = ", ".join(sorted(T.key_fps(d.tenure, owner))) or "none"
         tofu = (f"TEAM LEDGER {name}: genesis {found[name]}, owner in force {owner} (keys {fps}). Check these with "
@@ -632,6 +643,9 @@ class GitLedger:
         if moved:
             tofu = f"re-pinned from genesis {pinned[:12]} to {found[name][:12]} on your --root.\n" + tofu
         confirmed = self._confirm_own_key(d)
+        if not git(["for-each-ref", "--count=1", "refs/levain/held/"], self.repo.toplevel, check=False).stdout.strip():
+            # the confirm above replayed what the rebase held: its "kept back, confirm the key" line is no longer true
+            self.warnings[said:] = [w for w in self.warnings[said:] if "refs/levain/held/" not in w]
         handle = self.handle(d.team)
         if handle is None:
             fp = self.own_fingerprint()
