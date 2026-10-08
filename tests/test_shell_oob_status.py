@@ -1212,3 +1212,86 @@ def test_an_undelivered_sigkill_or_a_signal_still_out_keeps_the_group(tmp_path):
     finally:
         lead.proc.kill()
         lead.reap()
+
+
+# --- S2 L3 r6 (codex, complement on e0a86c7..99424c4) ------------------------------------------
+
+
+class _ExitedLeader:
+    """A bwrap leader that has exited (unreaped), for the bwrap shell's bookkeeping alone."""
+
+    def __init__(self, status: int = 0) -> None:
+        self.pid, self.status, self.exited, self.reaped = 777, status, True, False
+
+    def wait(self, timeout):
+        return True
+
+    def reap(self, timeout=None):
+        self.reaped = True
+        return True
+
+    def hold_for_signal(self):
+        return False   # never signal a number this test does not own
+
+    def signal_sent(self):
+        pass
+
+    def release_watch(self):
+        pass
+
+
+def _bwrap_books(tmp_path):
+    from levain.firing import confinement as C
+
+    return C._BwrapShell(policy=None, manifest={}, argv=["/bin/true"], cwd=tmp_path, env={})  # type: ignore[arg-type]
+
+
+def test_a_bash_record_belongs_to_its_leader_not_to_a_reused_group_number(tmp_path, monkeypatch):
+    """r6 codex HIGH: a gone bash's record stayed under its group NUMBER, so a later bwrap that got
+    the same number after pid wraparound was judged empty by it, and reaped and forgotten while its
+    namespace could live. A record is now its leader's, and is deleted when that leader is reaped."""
+    from levain.firing import confinement as C
+
+    sh = _bwrap_books(tmp_path)
+    monkeypatch.setattr(C, "_proc_start_time", lambda pid: "1")
+    monkeypatch.setattr(C, "_bash_gone", lambda pid, start, timeout: True)
+    sh._read_child_pid = lambda: 4242   # type: ignore[method-assign]
+    first, later = _ExitedLeader(), _ExitedLeader()
+    sh._groups[777] = first   # type: ignore[attr-defined]
+    sh._after_spawn(777)   # type: ignore[attr-defined]
+    assert sh._group_emptied(777, first, 0.0) and sh._reap(777, first)   # type: ignore[attr-defined]
+    sh._groups[777] = later   # type: ignore[attr-defined]  # the number again, its bash not yet reported
+    assert sh._group_emptied(777, later, 0.0) is False   # type: ignore[attr-defined]
+
+
+def test_a_bwrap_that_started_no_bash_is_reaped_and_an_unreported_one_keeps_the_claim(tmp_path, monkeypatch):
+    """r6 MED (codex + complement): when bwrap reported no bash, its exited leader was never reaped
+    and the claim never released. A bwrap that exited by itself without a pid started none: its
+    group may go. One interrupted before it answered may have: its leader is reaped, the claim kept."""
+    from levain.firing import confinement as C
+
+    sh = _bwrap_books(tmp_path)
+    failed = _ExitedLeader(status=1)
+    sh._groups[777] = failed   # type: ignore[attr-defined]
+    r, w = os.pipe()
+    os.close(w)                # bwrap exited, closing its --info-fd without writing a pid
+    sh._info_r = r   # type: ignore[attr-defined]
+    with pytest.raises(ConfinementError):
+        sh._after_spawn(777)   # type: ignore[attr-defined]
+    assert sh._group_emptied(777, failed, 0.0) and sh._reap(777, failed)   # type: ignore[attr-defined]
+
+    sh2 = _bwrap_books(tmp_path)
+    cut = _ExitedLeader()
+    sh2._groups[778] = cut   # type: ignore[attr-defined]
+
+    def interrupted():
+        raise KeyboardInterrupt
+
+    sh2._read_child_pid = interrupted   # type: ignore[method-assign]
+    with pytest.raises(KeyboardInterrupt):
+        sh2._after_spawn(778)   # type: ignore[attr-defined]
+    released: list[str] = []
+    monkeypatch.setattr(C, "_ledger_release", released.append)
+    sh2._ledger_claim = "c"   # type: ignore[attr-defined]
+    sh2.close()
+    assert cut.reaped and sh2.unemptied_groups == () and released == []

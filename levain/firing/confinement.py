@@ -4065,17 +4065,23 @@ class _HandsSeatbeltShell(_SeatbeltShell):
         # The group's members run as the hands user, except sudo, the group leader, whose REAL uid is
         # the operator's: only levain can signal it, and only the hands user the rest. A command that
         # stops itself (`kill -STOP $$`) stops sudo too, so after the signal both get SIGCONT, or a
-        # stopped sudo would outlive the timeout, close() and levain (S2 L2b M2). Delivered only when
-        # the hands user's kill says so: a refused or stalled sudo is not a delivery (S2 L3 r5).
+        # stopped sudo would outlive the timeout, close() and levain (S2 L2b M2).
         delivered = _hands_signal(self.hands, pgid, sig)
         if sig != signal.SIGCONT:
             _hands_signal(self.hands, pgid, signal.SIGCONT)
+        gone = False
         for s_ in (sig, signal.SIGCONT):
             try:
                 os.killpg(pgid, s_)
+            except ProcessLookupError:
+                gone = True
             except OSError:
                 pass
-        return delivered
+        # Three answers (S2 L3 r6): delivered (the hands user's kill said so), confirmed gone, or
+        # unconfirmed. A kill that found nothing left exits non-zero like a refused or stalled sudo,
+        # so "gone" is confirmed apart from it: ESRCH, or, since ESRCH cannot come while the leader is
+        # held unreaped, macOS's one-call process table showing no live member (`_group_live`).
+        return delivered or gone or not _group_live(pgid)
 
 
 # --- Linux: bwrap (mount-namespace) provider -------------------------------------------------
@@ -6069,24 +6075,42 @@ class _BwrapShell(SandboxedShell):
         self._ledger_claim: str | None = None   # this shell's claim on the placeholder ledger
         self._claim_base: str | None = None     # the claim before a command's bash is added to it
         self._info_r: int | None = None         # read end of the running command's --info-fd pipe
-        # Each command's bash (pid, kernel start time) by its process group, None once seen gone. bash
-        # is pid 1 of its pid namespace, and pid 1 finishes exiting only once the namespace is empty
+        # Each command's bash by its process group: (its leader, (pid, kernel start time)), the second
+        # None once seen gone or when bwrap started none. Bound to the leader OBJECT, not its number,
+        # so a later group that reuses the number is never judged by an earlier one's record (S2 L3
+        # r6, codex HIGH); deleted when that leader is reaped. bash is pid 1 of its pid namespace, and pid 1 finishes exiting only once the namespace is empty
         # ("the kernel terminates all of the processes in the namespace via a SIGKILL signal",
         # pid_namespaces(7)), so "bash gone" means "namespace gone". With --new-session bash is NOT in
         # the bwrap process's group, so the group alone cannot say that.
-        self._bashes: dict[int, tuple[int, str] | None] = {}
+        self._bashes: dict[int, tuple[_Leader, tuple[int, str] | None]] = {}
+        # Leaders whose bash levain never learned, though bwrap may have started one (a close or an
+        # interrupt during the spawn): the leader may be reaped once it exits, but the shell's claim
+        # stays, since a namespace may still hold its mounts (S2 L3 r6).
+        self._unverified: list[tuple[int, _Leader]] = []
 
     # Each command runs in a pid namespace of its own (``--unshare-pid --as-pid-1``).
     _own_pid_namespace = True
 
     def _group_emptied(self, pgid: int, leader: _Leader, timeout: float) -> bool:
         """The command's group is empty once its bwrap process (the leader) has exited and its bash,
-        the namespace's pid 1, is gone: the kernel's answer, not a read of /proc's listing. A group
-        whose bash levain never learned (bwrap reported no pid) is never called empty."""
+        the namespace's pid 1, is gone (or bwrap started none): the kernel's answer, not a read of
+        /proc's listing. Only THIS leader's record counts. A leader whose bash is unverified is
+        called empty once it exits, so it is reaped, and its namespace stays on the claim."""
         deadline = time.monotonic() + timeout
-        if not leader.wait(timeout) or pgid not in self._bashes:
+        if not leader.wait(timeout):
             return False
-        return self._bashes_gone(max(0.0, deadline - time.monotonic()), only=pgid)
+        rec = self._bashes.get(pgid)
+        if rec is not None and rec[0] is leader:
+            return self._bashes_gone(max(0.0, deadline - time.monotonic()), only=pgid)
+        return any(lead is leader for _, lead in self._unverified)
+
+    def _reap(self, pgid: int, leader: _Leader) -> bool:
+        if not super()._reap(pgid, leader):
+            return False
+        rec = self._bashes.get(pgid)
+        if rec is not None and rec[0] is leader:
+            del self._bashes[pgid]
+        return True
 
     def close(self) -> None:
         # The claim is released only once the sandbox's namespace is GONE, never while any process of
@@ -6102,7 +6126,12 @@ class _BwrapShell(SandboxedShell):
             self._close_info()
             claim, self._ledger_claim = self._ledger_claim, None
             _LIVE_BWRAP_SHELLS.discard(self)
-            if claim is not None and not self.unemptied_groups and self._bashes_gone(5.0):
+            if self._unverified:
+                _log.warning("levain: a sandbox of process group(s) %s may still exist (its bash was "
+                             "never reported); the shell's claim is kept",
+                             sorted({g for g, _ in self._unverified}))
+            if (claim is not None and not self.unemptied_groups and not self._unverified
+                    and self._bashes_gone(5.0)):
                 _ledger_release(claim)
 
     def _close_info(self) -> None:
@@ -6123,13 +6152,16 @@ class _BwrapShell(SandboxedShell):
         at = argv.index("--as-pid-1")
         return argv[:at] + ["--info-fd", str(wr)] + argv[at:], (wr,)
 
-    def _read_child_pid(self) -> int:
+    def _read_child_pid(self) -> int | None:
+        # The pid bwrap reports for the command's bash; None when bwrap closed the pipe without one
+        # (EOF), and a refusal when the read ran out of time or had no pipe to read.
         # This thread takes the read end, so close() from another thread can no longer close it
         # under the read, and a reused fd number is never read from (S2 L2b L7). A close() meanwhile
         # kills bwrap, whose exit ends the read with EOF.
         with self._lock:
             fd, self._info_r = self._info_r, None
         data = b""
+        eof = False
         deadline = time.monotonic() + _START_TIMEOUT
         try:
             while fd is not None and time.monotonic() < deadline:
@@ -6138,6 +6170,7 @@ class _BwrapShell(SandboxedShell):
                     break
                 chunk = os.read(fd, 4096)
                 if not chunk:
+                    eof = True
                     break
                 data += chunk
                 # bwrap writes the whole object at once; stop there rather than wait for EOF, which
@@ -6152,10 +6185,12 @@ class _BwrapShell(SandboxedShell):
                     pass
         m = re.search(rb'"child-pid"\s*:\s*(\d+)', data)
         pid = int(m.group(1)) if m else 0
+        if pid <= 0 and eof:
+            return None
         if pid <= 0:
             raise ConfinementError(
-                "bwrap did not report the pid of the command's bash (it exited before starting it) — "
-                "refusing to run the command (fail-closed)."
+                "bwrap did not report the pid of the command's bash in time — refusing to run the "
+                "command (fail-closed)."
             )
         return pid
 
@@ -6164,11 +6199,11 @@ class _BwrapShell(SandboxedShell):
         gone, polled up to ``timeout``."""
         deadline = time.monotonic() + timeout
         gone = True
-        for pgid, b in list(self._bashes.items()):
+        for pgid, (leader, b) in list(self._bashes.items()):
             if b is None or pgid == but or (only is not None and pgid != only):
                 continue
             if _bash_gone(*b, timeout=max(0.0, deadline - time.monotonic())):
-                self._bashes[pgid] = None
+                self._bashes[pgid] = (leader, None)
             else:
                 gone = False
         return gone
@@ -6179,9 +6214,33 @@ class _BwrapShell(SandboxedShell):
         # the claim until that bash, and so its namespace, is gone. One bash at a time: an earlier
         # command's bash that is still not gone refuses this command, because the retag would stop
         # the claim covering it.
-        pid = self._read_child_pid()
+        with self._lock:
+            leader = self._groups.get(pgid)
+        try:
+            pid = self._read_child_pid()
+        except BaseException:
+            # Interrupted or timed out before bwrap answered: it may have started a bash. The leader
+            # can be reaped once it exits; the namespace stays unverified, on the claim.
+            if leader is not None:
+                self._unverified.append((pgid, leader))
+            raise
+        if pid is None:
+            # bwrap closed the pipe without a pid. It writes the pid right after it clones bash, so
+            # an exit by itself (a status, not a signal) with the shell still open means it cloned
+            # none: no namespace exists. Anything else (killed, or a close() under way) cannot say.
+            if (leader is not None and not self._closed and leader.wait(5.0)
+                    and leader.status is not None and leader.status >= 0):
+                self._bashes[pgid] = (leader, None)
+            elif leader is not None:
+                self._unverified.append((pgid, leader))
+            raise ConfinementError(
+                "bwrap did not report the pid of the command's bash (it exited before starting it) — "
+                "refusing to run the command (fail-closed)."
+            )
         start = _proc_start_time(pid) or "-"
-        self._bashes[pgid] = (pid, start)   # recorded first: it is how this group is known empty
+        if leader is not None:
+            # Recorded first: it is how this group is known empty.
+            self._bashes[pgid] = (leader, (pid, start))
         if not self._bashes_gone(5.0, but=pgid):
             raise ConfinementError(
                 "an earlier command's sandbox is still exiting — refusing to run the command "

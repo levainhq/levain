@@ -537,6 +537,28 @@ def test_the_sweep_takes_the_known_uid_and_says_when_it_ran_out_of_time(monkeypa
     assert confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017) is None and checked == [4_000_017]
 
 
+@pytest.mark.skipif(platform.system() != "Darwin", reason="the hands shell is macOS only")
+def test_a_hands_signal_that_found_the_group_gone_is_not_unconfirmed(tmp_path, monkeypatch):
+    """r6 MED (codex + complement): the hands user's kill exits non-zero when it finds nothing left,
+    as it does when sudo refuses or stalls, so a group that had just emptied read as an unconfirmed
+    SIGKILL and a stopped command as unstoppable. A group with no live member is confirmed gone."""
+    import time
+
+    monkeypatch.setattr(confinement, "_hands_signal", lambda hands, pgid, sig: False)
+    sh = confinement._HandsSeatbeltShell(hands=_hands(tmp_path), argv=["/bin/true"], cwd=tmp_path, env={})
+    done = confinement._Leader(subprocess.Popen(["/usr/bin/true"], start_new_session=True))
+    live = subprocess.Popen(["/bin/sleep", "5"], start_new_session=True)
+    try:
+        assert done.wait(5)
+        time.sleep(0.1)
+        assert sh._signal(done.pid, signal.SIGKILL) is True    # only its leader, a zombie: gone
+        assert sh._signal(live.pid, signal.SIGCONT) is False   # still there, the kill unconfirmed
+    finally:
+        done.reap()
+        live.kill()
+        live.wait()
+
+
 def test_the_sweep_refuses_levains_own_account_and_root(monkeypatch):
     """r3 complement LOW: a config naming the operator's account (or root) would have the sweep kill
     every process of it, levain included. Refused before anything runs."""
