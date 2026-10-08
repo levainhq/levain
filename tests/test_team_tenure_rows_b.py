@@ -763,3 +763,16 @@ def test_the_merge_parent_is_always_named_never_defaulted(two, keys):
     c = clone(tmp, "cy", "cy@ex.com")
     assert team("join", "--accept-merge", merge, "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
     assert not gl(c).state().get("pinned_root")
+
+
+def test_join_accept_merge_takes_an_abbreviated_id(two, keys):
+    """RUN (docs L3 r2 anansi LOW): `join --accept-merge <12-char id>:2` refused as "not linear"; it now resolves."""
+    tmp, ana, ben = two
+    p = _side(tmp)
+    _line(p, "ana", "ana: only on the side", keys["ana"])
+    assert ruling(ana, "src/a.py", "ana: published") == 0
+    merge = _merge_side_onto_published(p)
+    c = clone(tmp, "cy", "cy@ex.com")
+    assert team("join", "--accept-merge", f"{merge[:12]}:2", "--signing-key", str(keys["cy"]), "--no-install",
+                repo=c) == 0
+    assert merge in gl(c).state()["accepted"]
