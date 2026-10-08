@@ -148,9 +148,10 @@ class Ledger:
         return {e["id"]: e for e in self.entries}
 
     @functools.cached_property
-    def _links(self) -> tuple[set[str], list[str]]:
+    def _links(self) -> tuple[set[str], list[str], set[tuple[str, str]]]:
         honoured: set[str] = set()
         refused: list[str] = []
+        pairs: set[tuple[str, str]] = set()
         for e in self.entries:
             if e.get("type") == "ack":
                 continue
@@ -162,13 +163,20 @@ class Ledger:
                 why = may_link(e, target, self.owner, self.authority)
                 if why is None:
                     honoured.add(s)
+                    pairs.add((s, e["id"]))
                 else:
                     refused.append(f"{e['id']} by {e.get('author')}: {why}; ignored, {s} stays in force")
-        return honoured, refused
+        return honoured, refused, pairs
 
     @property
     def superseded(self) -> set[str]:
         return self._links[0]
+
+    @property
+    def honoured_pairs(self) -> set[tuple[str, str]]:
+        """Every honoured link as ``(target_id, linker_id)`` (seam §3a item 1's order: ``supersessions(old, new)``).
+        ``superseded`` is exactly the set of their targets."""
+        return self._links[2]
 
     @property
     def problems(self) -> list[str]:

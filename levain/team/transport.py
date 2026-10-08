@@ -68,7 +68,8 @@ def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         input_text: str | None = None) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
     # GIT_NO_REPLACE_OBJECTS: a `git replace` must never make one ledger commit read as another
-    env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true", GIT_NO_REPLACE_OBJECTS="1")
+    env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C", GIT_EDITOR="true", GIT_NO_REPLACE_OBJECTS="1",
+               GIT_GRAFT_FILE="/dev/null")
     env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")  # never prompt on /dev/tty from a hook
     try:
         cp = subprocess.run(["git", *_NO_HOOKS, *args], cwd=str(cwd), env=env, capture_output=True, text=True,
@@ -363,7 +364,7 @@ class GitLedger:
                     return h
         except TeamError:
             pass
-        return (team or self.team()).handle_for_email(self.email())
+        return None     # identity is the key: an email never makes this clone a member (L1 1007+19 #6)
 
     def snapshot(self) -> tuple[str, R.Team, I.Ledger]:
         """(sha, team, ledger), all derived from ONE commit of the ledger branch."""
@@ -542,6 +543,9 @@ class GitLedger:
         if git(["rev-parse", "--is-shallow-repository"], self.repo.toplevel).stdout.strip() == "true":
             git(["fetch", "-q", "--unshallow", remote, f"+refs/heads/{name}:{rref}"], self.repo.toplevel,
                 check=False, timeout=300)
+            if git(["rev-parse", "--is-shallow-repository"], self.repo.toplevel).stdout.strip() == "true":
+                # a shallow cut-off reads as a root: pinning it would trust a commit that is not the genesis (L2 F3)
+                raise TeamError("this clone is shallow and could not be deepened; join from a full clone")
         old = self.state()
         self.save_state(branch=name, pinned_root=found[name], anchor=None, accepted=dict(accept_merges or {}),
                         distrust=[], remote=remote, device=secrets.token_hex(8) if new_device else self._new_device())
@@ -651,7 +655,8 @@ class GitLedger:
     def _require_own_key_in_force(self, author: str) -> None:
         from . import tenure as T
         d = self.derivation()
-        if self.own_fingerprint() not in T.key_fps(d.tenure, author):
+        holder = d.team.owner if author.startswith("pack:") else author   # pack lines are the owner's (pack-* folders)
+        if self.own_fingerprint() not in T.key_fps(d.tenure, holder):
             raise TeamError(f"this machine's key is not confirmed for {author}, so a line it signs would not be "
                             f"enforced: ask the owner to run `levain team key add {author} <this machine's public key>`, "
                             "then `levain team sync` here")
@@ -738,15 +743,15 @@ class GitLedger:
         tip = git(["rev-parse", "-q", "--verify", rref], self.repo.toplevel, check=False).stdout.strip()
         if not tip:
             return
-        refs = git(["for-each-ref", "--format=%(refname) %(objectname)", "refs/levain/seen/"], self.repo.toplevel,
-                   check=False).stdout.split("\n")
+        refs = git(["for-each-ref", "--format=%(refname) %(objectname)", f"refs/levain/seen/{self.branch}/"],
+                   self.repo.toplevel, check=False).stdout.split("\n")
         seen = {r.split()[0]: r.split()[1] for r in refs if r.strip()}
         if tip in seen.values():
             return
         for name, sha in seen.items():
             if git(["merge-base", "--is-ancestor", sha, tip], self.repo.toplevel, check=False).returncode == 0:
                 git(["update-ref", "-d", name], self.repo.toplevel, check=False)
-        git(["update-ref", f"refs/levain/seen/{tip}", tip], self.repo.toplevel)
+        git(["update-ref", f"refs/levain/seen/{self.branch}/{tip}", tip], self.repo.toplevel)
 
     def _seen_tips(self) -> list[str]:
         out = git(["for-each-ref", "--format=%(objectname)", "refs/levain/seen/", "refs/levain/gone/", "refs/remotes/"],
@@ -763,6 +768,11 @@ class GitLedger:
                    check=False).stdout.split()
         verdicts = S.SigCache(self.base / "sigcache.json").verify(self.repo.toplevel, shas) if shas else {}
         mine = self.own_keys() | {self.own_fingerprint()}
+        try:
+            revoked = {r["key"] for r in self.derivation().tenure.revokes}
+        except TeamError:
+            revoked = set()
+        mine -= revoked          # a revoked own key's commits are never re-signed with the new key (L2 Q6)
         own = [c for c in shas if verdicts[c].kind == "signed" and verdicts[c].fingerprint in mine]
         return own, [c for c in shas if c not in own]
 
@@ -807,8 +817,8 @@ class GitLedger:
             # from it. Then nothing that came from the remote may go back up (r13 daemon M1; the 1007+19 residue run
             # caught a fast-forward push that re-published a force-pushed-away history): the branch is rebuilt on the
             # remote tip from this clone's OWN unseen commits only, and lost published entries are reported.
-            gone = [t for t in git(["for-each-ref", "--format=%(objectname)", "refs/levain/seen/"], self.wt,
-                                   check=False).stdout.split()
+            gone = [t for t in git(["for-each-ref", "--format=%(objectname)", f"refs/levain/seen/{self.branch}/"],
+                                   self.wt, check=False).stdout.split()
                     if git(["merge-base", "--is-ancestor", t, remote_tip], self.wt, check=False).returncode != 0]
             if gone:
                 self._report_lost(gone, remote_tip)
@@ -821,9 +831,11 @@ class GitLedger:
                 self.warnings.append(f"{len(foreign)} unpublished ledger commit(s) here are not signed by this "
                                      "clone's key and were NOT moved or re-signed: "
                                      + ", ".join(c[:10] for c in foreign[:5]))
-            if not gone and not own and \
+            for c in foreign:   # kept reachable for a person to inspect, never pushed (L1 1007+19 #5, RAN)
+                git(["update-ref", f"refs/levain/foreign/{c}", c], self.wt, check=False)
+            if not gone and not foreign and \
                     git(["merge-base", "--is-ancestor", remote_tip, orig], self.wt, check=False).returncode == 0:
-                return     # already on top of the remote, and the remote was not rewritten
+                return     # own commits already on top of an unrewritten remote: nothing to replay
             pending = list(self.state().get("pending_ops") or [])
             picks: list[str] = []
             for c in own:
@@ -831,8 +843,9 @@ class GitLedger:
                 if touched & {"team.toml", "tenure.toml"}:
                     op = self._delta(c)
                     if op is None:
-                        self.warnings.append(f"a local team change {c[:10]} carries no levain trailer (a hand "
-                                             "edit?) and was dropped; re-run it with the levain CLI")
+                        self.warnings.append(f"a local team change {c[:10]} could not be re-applied (no levain "
+                                             "trailer, or its parent cannot be judged here) and was dropped; re-run "
+                                             "it with the levain CLI")
                     elif not op.get("restore"):
                         pending.append(op)
                     rest = touched - {"team.toml", "tenure.toml", CANON_FILE}
@@ -895,16 +908,16 @@ class GitLedger:
                              "(`levain team repin --anchor <commit>`); re-record any of your entries still wanted")
         # the gone tips stay EXCLUDED from every later sync (moved under refs/levain/gone/, so this report fires once
         # per rewrite): a commit that came from the remote is never re-published, even after the remote dropped it
-        for name in git(["for-each-ref", "--format=%(refname)", "refs/levain/seen/"], self.wt,
+        for name in git(["for-each-ref", "--format=%(refname)", f"refs/levain/seen/{self.branch}/"], self.wt,
                         check=False).stdout.split():
             sha = name.rsplit("/", 1)[-1]
             if sha in gone:
-                git(["update-ref", f"refs/levain/gone/{sha}", sha], self.wt, check=False)
+                git(["update-ref", f"refs/levain/gone/{self.branch}/{sha}", sha], self.wt, check=False)
                 git(["update-ref", "-d", name], self.wt, check=False)
         self._record_seen_sha(remote_tip)
 
     def _record_seen_sha(self, tip: str) -> None:
-        git(["update-ref", f"refs/levain/seen/{tip}", tip], self.repo.toplevel, check=False)
+        git(["update-ref", f"refs/levain/seen/{self.branch}/{tip}", tip], self.repo.toplevel, check=False)
 
     def _reland(self) -> None:
         """Re-apply stripped team ops to the counted state at the new tip: net per field, history-keyed."""
@@ -938,8 +951,8 @@ class GitLedger:
                                      "re-applied: a newer counted change touched it; re-issue it if still wanted")
                 continue
             apply[k] = f["new"]
-        self.save_state(pending_ops=[])
         if not apply:
+            self.save_state(pending_ops=[])
             return
 
         def change(team: R.Team, ten) -> None:
@@ -953,6 +966,7 @@ class GitLedger:
             team.__dict__.update(t2.__dict__)
             ten.__dict__.update(n2.__dict__)
         self.update_counted(change, "levain team: re-land an offline team change", push=False)
+        self.save_state(pending_ops=[])     # only after the re-land is committed: a signing failure loses nothing
         self._dcache = None
         after = self.derivation()
         lost = [k for k, v in apply.items() if after.state.get(k) != v]
@@ -987,7 +1001,11 @@ class GitLedger:
         with self.lock(name="net", timeout=net_timeout):
             for attempt in range(_PUSH_RETRIES):
                 if not self._fetch(remote, rref, timeout):
-                    if self.pinned_root and self._has(rref):
+                    published = bool(self.state().get("anchor")) or bool(git(
+                        ["for-each-ref", "--count=1", f"refs/levain/seen/{self.branch}/", f"refs/levain/gone/{self.branch}/"],
+                        self.repo.toplevel, check=False).stdout.strip())
+                    if self.pinned_root and (published or self._has(rref)):
+                        # durable state, not the tracking ref: `git fetch --prune` deletes that (L1 1007+19 #4, RAN)
                         # a PINNED clone never recreates a deleted ledger: pushing would republish every commit the
                         # host removed (T r22-2 codex HIGH). Only `init` (or a re-genesis, on its own new branch) creates one.
                         raise TeamError(f"{remote} no longer has {self.branch} (deleted or moved); nothing was "
@@ -1176,7 +1194,10 @@ class GitLedger:
             pair = secrets.token_hex(6)
             base = d.counted_head
             tip_files = {n: (self._read_plain(n) if os.path.lexists(self.wt / n) else "") for n in want}
-            if tip_files != counted:
+            # only the OWNER writes a restore: a member's restore changes nothing it may change, so it would not be a
+            # Levain-Base link and would stale the member's own change behind it (L1 1007+19 #3, RAN). A member's change
+            # is judged field-wise against the tip file instead; the junk fields it reverts are reported, not counted.
+            if tip_files != counted and self.own_fingerprint() in T.key_fps(d.tenure, d.team.owner):
                 for n, text in counted.items():
                     self._replace_plain(n, text)
                 git(["add", "--", *counted], self.wt)

@@ -155,6 +155,15 @@ def split_signed(raw: bytes, header: bytes = _HEADERS[40]) -> tuple[bytes, bytes
     return b"".join(payload), (b"\n".join(sig) if found else None)
 
 
+def _sig_is_last_header(raw: bytes, header: bytes) -> bool:
+    head = raw.split(b"\n\n", 1)[0].split(b"\n")
+    starts = [i for i, ln in enumerate(head) if ln.startswith(header)]
+    if len(starts) != 1:
+        return False
+    rest = head[starts[0] + 1:]
+    return all(ln.startswith(b" ") for ln in rest)
+
+
 # ---- verification -----------------------------------------------------------------------------------------
 
 
@@ -188,7 +197,7 @@ def _env(**extra: str) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
     # GIT_NO_REPLACE_OBJECTS: `git replace` would make one id read as another object's bytes, so an unsigned commit
     # could verify as a signed one (L3 r2 codex, measured)
-    env.update(LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1", **extra)
+    env.update(LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/dev/null", **extra)
     return env
 
 
@@ -225,6 +234,10 @@ def verify_commit(repo_dir: Path, sha: str, *, timeout: float = 10.0) -> Verdict
     payload, sig = split_signed(raw, _HEADERS[len(sha)])
     if sig is None:
         return _unsigned("no signature")
+    if not _sig_is_last_header(raw, _HEADERS[len(sha)]):
+        # git writes the signature as the LAST header. One moved between `tree` and `parent` still verifies (the
+        # whole block is stripped) while hiding the parent from git: refused (L2 1007+19 F2, RAN)
+        return _unsigned("the signature is not the last header")
     if not sig.startswith(SSH_SIG_BEGIN.encode()):
         return _unsigned("not an SSH signature")
     fd, sig_path = tempfile.mkstemp(prefix="levain-sig-", suffix=".sig")

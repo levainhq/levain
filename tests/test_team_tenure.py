@@ -390,3 +390,116 @@ def test_t8_unjudgeable_denies_and_the_override_allows(two, monkeypatch):
     monkeypatch.setenv("LEVAIN_TEAM_UNJUDGED", "allow")
     out = _hook(ana, "src/a.py")
     assert out.get("hookSpecificOutput", {}).get("permissionDecision") != "deny"
+
+
+# ---- regressions from the L1/L2 code reviews (each was RUN against the branch and failed before its fix) ---------
+
+def test_l1_1_an_unsigned_duplicate_of_a_members_line_cannot_unenforce_it(two):
+    tmp, ana, ben = two
+    assert ruling(ben, "src/a.py", "ben: real") == 0
+    assert "ben: real" in in_force(ana)
+    p = plain_clone(tmp, "malplain", "mal@ex.com")
+    f = next((p / "ledger" / "ben").glob("*.jsonl"))
+    text = f.read_text()
+    f.write_text(text + text.splitlines()[0] + "\n")
+    sh("git", "add", ".", cwd=p)
+    sh("git", "-c", "commit.gpgsign=false", "commit", "-qm", "dup", cwd=p)
+    sh("git", "push", "-q", "origin", "levain-team-ledger", cwd=p)
+    assert "ben: real" in in_force(ana)
+
+
+def test_l1_2_a_void_commits_revocation_has_no_effect_and_it_stays_a_base_link(two, keys):
+    tmp, ana, ben = two
+    assert team("key", "add", "ana", str(keys["ana2"]), repo=ana) == 0
+    a2 = clone(tmp, "ana2", "ana@ex.com")
+    GitLedger(Repo.discover(a2)).join(remote="origin", signing_key=str(keys["ana2"]))
+    assert ruling(ben, "src/a.py", "ben: legit") == 0
+    cut = sh("git", "rev-parse", "levain-team-ledger", cwd=gl(ben).wt).strip()
+    genesis = gl(ana).derivation().walk[0]
+    ben_fp = T.key_fps(gl(ben).derivation().tenure, "ben").pop()
+    gl(a2).sync(push=False)
+    assert team("revoke", ben_fp, "--after", genesis, repo=a2) == 0          # a thief holding ana2
+    assert "ben: legit" not in in_force(ana)
+    g = gl(ana)
+    g.sync(push=False)
+    ana2_fp = (T.key_fps(g.derivation().tenure, "ana") - {g.own_fingerprint()}).pop()
+    assert team("key", "remove", "ana", ana2_fp, repo=ana) == 0
+    assert team("revoke", ana2_fp, "--after", cut, repo=ana) == 0           # the owner voids the thief's commit
+    assert "ben: legit" in in_force(ana)
+    g = gl(ana)
+    g._dcache = None
+    assert T.key_fps(g.derivation().tenure, "ben") == {ben_fp}
+
+
+def test_l1_3_a_member_cannot_propose_another_members_key_and_a_confirm_still_counts(two, keys):
+    tmp, ana, ben = two
+    assert team("member", "add", "cy", "cy@ex.com", "--key", str(keys["cy"]), repo=ana) == 0
+    assert team("key", "add", "cy", str(keys["mal"]), repo=ben) == 2
+    cy = clone(tmp, "cy", "cy@ex.com")
+    GitLedger(Repo.discover(cy)).join(remote="origin", signing_key=str(keys["cy"]))
+    g = gl(ana)
+    g.sync(push=False)
+    g._dcache = None
+    assert T.key_fps(g.derivation().tenure, "cy")
+
+
+def test_l1_4_fetch_prune_never_lets_a_pinned_clone_recreate_a_deleted_ledger(two):
+    tmp, ana, ben = two
+    assert ruling(ben, "src/a.py", "ben: x") == 0
+    sh("git", "push", "-q", str(tmp / "origin.git"), ":levain-team-ledger", cwd=ana)
+    sh("git", "fetch", "-q", "--prune", "origin", cwd=ben)
+    ruling(ben, "src/b.py", "ben: y")
+    assert not sh("git", "ls-remote", str(tmp / "origin.git"), "refs/heads/levain-team-ledger", cwd=tmp).strip()
+
+
+def test_l1_5_an_unsigned_local_commit_is_never_pushed_even_when_the_remote_has_not_moved(two):
+    tmp, ana, ben = two
+    g = gl(ben)
+    f = g.wt / "ledger" / "ben" / "planted.jsonl"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(E.seal(E.build("ben", "finding", summary="planted"), ""), sort_keys=True) + "\n")
+    sh("git", "add", ".", cwd=g.wt)
+    sh("git", "-c", "commit.gpgsign=false", "commit", "-qm", "planted, unsigned", cwd=g.wt)
+    g.sync()
+    assert "planted" not in sh("git", "--git-dir", str(tmp / "origin.git"), "log", "--format=%s", "levain-team-ledger")
+
+
+def test_l2_f2_a_signature_moved_before_parent_is_not_a_signature(two, keys):
+    from levain.team import signing as S
+    tmp, ana, ben = two
+    assert team("member", "add", "cy", "cy@ex.com", "--key", str(keys["cy"]), repo=ana) == 0
+    wt = gl(ana).wt
+    c = sh("git", "rev-parse", "levain-team-ledger", cwd=wt).strip()
+    raw = subprocess.run(["git", "cat-file", "commit", c], cwd=wt, capture_output=True, check=True).stdout
+    head, body = raw.split(b"\n\n", 1)
+    lines = head.split(b"\n")
+    a = next(i for i, ln in enumerate(lines) if ln.startswith(b"gpgsig "))
+    b = a + 1
+    while b < len(lines) and lines[b].startswith(b" "):
+        b += 1
+    rest = lines[:a] + lines[b:]
+    raw2 = b"\n".join([rest[0]] + lines[a:b] + rest[1:]) + b"\n\n" + body
+    c2 = subprocess.run(["git", "hash-object", "-t", "commit", "-w", "--literally", "--stdin"], cwd=wt, input=raw2,
+                        capture_output=True, check=True).stdout.decode().strip()
+    assert S.verify_commit(Path(wt), c2).kind == "unsigned"
+
+
+def test_l2_f1_a_revocation_reaching_before_the_revokers_own_ownership_does_not_count(two, keys):
+    from levain.team import signing as S
+    tmp, ana, ben = two
+    cutoff = sh("git", "rev-parse", "levain-team-ledger", cwd=gl(ben).wt).strip()
+    assert team("owner", "ben", "--key", str(keys["ben"]), repo=ana) == 0
+    assert team("accept", repo=ben) == 0
+    g = gl(ben)
+    g.sync(push=False)
+    assert team("key", "add", "ben", str(keys["mal"]), repo=ben) == 0
+    g.save_state(signing_key=str(keys["mal"]))
+    assert team("key", "confirm", repo=ben) == 0
+    ben_fp = S.fingerprint(Path(keys["ben"]).read_text())
+    assert team("key", "remove", "ben", ben_fp, repo=ben) == 0
+    team("revoke", ben_fp, "--after", cutoff, repo=ben)        # reaches back before ben's own accept
+    g = gl(ben)
+    g.sync(push=False)
+    g._dcache = None
+    d = g.derivation()                                          # stable, judged, never a cap-picked answer
+    assert d.team.owner == "ben" and d.judged == "full"

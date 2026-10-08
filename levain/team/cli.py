@@ -113,8 +113,9 @@ def _actor(gl: GitLedger) -> tuple[R.Team, str]:
     team = gl.team()
     handle = gl.handle(team)
     if handle is None:
-        raise TeamError(f"your git user.email ({gl.email() or 'unset'}) is not a member of {team.project}; "
-                        f"ask {team.owner} to run `levain team member add <handle> <email>`")
+        raise TeamError(f"this machine's signing key is not a member's key in force in {team.project}; ask "
+                        f"{team.owner} to run `levain team key add <your handle> <this machine's public key>`, then "
+                        "`levain team sync` here")
     return team, handle
 
 
@@ -248,8 +249,11 @@ def cmd_consolidate(args) -> int:
 def cmd_export(args) -> int:
     gl = GitLedger(_repo(args))
     gl.require_joined()
-    ledger = gl.ledger()
-    sys.stdout.writelines(export_stream(ledger, in_force=args.in_force))
+    if args.in_force:
+        sys.stdout.writelines(export_stream(gl.ledger(), in_force=True))
+        return 0
+    from .export import export_v3
+    sys.stdout.writelines(export_v3(gl))   # contract v3, strict profile (seam doc §3a item 3)
     return 0
 
 

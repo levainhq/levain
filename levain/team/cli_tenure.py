@@ -102,6 +102,9 @@ def cmd_member_remove(gl: GitLedger, args) -> int:
 def cmd_key_add(gl: GitLedger, args) -> int:
     gl.require_joined()
     d = gl.derivation()
+    me = gl.handle()
+    if me not in (d.team.owner, args.handle):
+        raise TeamError(f"only the owner ({d.team.owner}) or {args.handle} may propose {args.handle}'s keys")
     line = _key_line(args.key)
     fp = S.fingerprint(line)
     for h, lines in list(d.tenure.keys.items()) + list(d.tenure.pending_keys.items()):
@@ -124,6 +127,9 @@ def cmd_key_confirm(gl: GitLedger, args) -> int:
 
 def cmd_key_remove(gl: GitLedger, args) -> int:
     gl.require_joined()
+    d = gl.derivation()
+    if gl.handle() not in (d.team.owner, args.handle):
+        raise TeamError(f"only the owner ({d.team.owner}) or {args.handle} may remove {args.handle}'s keys")
 
     def remove(team: R.Team, ten: T.Tenure) -> None:
         for table in (ten.keys, ten.pending_keys):
@@ -189,6 +195,12 @@ def cmd_repin(gl: GitLedger, args) -> int:
         sha = git(["rev-parse", "--verify", args.anchor + "^{commit}"], gl.repo.toplevel).stdout.strip()
         if git(["merge-base", "--is-ancestor", sha, gl.head()], gl.repo.toplevel, check=False).returncode != 0:
             raise TeamError("the anchor must be on this ledger's history")
+        root = gl.pinned_root or ""
+        merges = git(["rev-list", "--first-parent", "--merges", sha, f"^{root}"], gl.repo.toplevel,
+                     check=False).stdout.split()
+        unaccepted = [m for m in merges if m not in (gl.state().get("accepted") or {})]
+        if unaccepted:
+            raise TeamError(f"the anchor is past merge {unaccepted[0][:10]}, which this clone has not accepted")
         # the repair point (the commit the owner named) feeds the export epoch, so honest clones that apply the same
         # repair agree; repin_n makes this clone's next export win over its own stored high-water mark (seam §3a)
         gl.save_state(anchor=sha, repair_point=sha, repin_n=int(gl.state().get("repin_n") or 0) + 1)
@@ -430,6 +442,14 @@ def status_lines(gl: GitLedger) -> list[str]:
             continue
         if when >= cutoff:
             out.append(f"role change {when.date()}: {text} ({sha[:10]})")
+    last = gl.state().get("last_fetch_ok")
+    if gl.remote:
+        import time
+        age = (time.time() - float(last)) if last else None
+        newest = git(["log", "-1", "--format=%cr", gl.ref], gl.repo.toplevel, check=False).stdout.strip()
+        out.append(f"last fetched {('%d min ago' % (age // 60)) if age is not None else 'never'}; newest ledger "
+                   f"commit {newest or 'unknown'}. A host can withhold newer commits without any signal: compare "
+                   "the tip id with a teammate if anything looks stale")
     if d.tenure.offer:
         out.append(f"pending ownership offer to {d.tenure.offer['handle']} (`levain team owner --cancel` withdraws it)")
     for h, lines in sorted(d.tenure.pending_keys.items()):

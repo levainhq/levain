@@ -177,7 +177,8 @@ def key_fps(ten: Tenure, handle: str) -> set[str]:
 
 def _env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
-    env.update(LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1")
+    # replace refs and grafts both rewrite what git reports as a commit's parents; neither may reach the derivation
+    env.update(LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/dev/null")
     return env
 
 
@@ -315,6 +316,8 @@ def file_texts(top: Path, specs: list[str]) -> dict[str, str | None]:
                             input="\n".join(specs).encode() + b"\n", timeout=120)
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         raise Unjudgeable(f"git cat-file failed: {exc}") from None
+    if cp.returncode != 0:
+        raise Unjudgeable(f"git cat-file failed: {cp.stderr.decode('utf-8', 'replace').strip()[-200:]}")
     data, out, pos = cp.stdout, {}, 0
     for spec in specs:
         nl = data.index(b"\n", pos)
@@ -432,12 +435,23 @@ def derive(top: Path, tip: str, clone: Clone, cache: S.SigCache, *, _fallback: b
             d.tip, d.judged, d.frozen_at, d.frozen_why = tip, "partial", clone.anchor, why
             return d
         raise Unjudgeable(why)
+    # The void set is RECOMPUTED each pass: the distrust set plus the voids of the revocations that count in THAT pass,
+    # until it is stable. It must not only grow: a revocation whose own commit a LATER revocation voids takes nothing
+    # with it (the 1007+19 run of L1's r5: an accumulated set kept a thief's voided revocation and stripped a member's
+    # key). A revocation voids only commits BEFORE it, so a later revocation is never undone by an earlier one; when
+    # revocations still contradict each other (a cycle), the ledger is not judged: never an answer the cap picked
+    # (L2 1007+19 F1, RAN).
     void = set(clone.distrust)
-    for _ in range(64):
+    tried: set[frozenset] = set()
+    while True:
         d = _derive_once(top, tip, walk, parents, freeze_end, void, cache)
         new = set(clone.distrust) | d.void
         if new == void:
             break
+        tried.add(frozenset(void))
+        if frozenset(new) in tried:
+            raise Unjudgeable("the ledger's key revocations contradict each other (each one, counted, voids another); "
+                              "the owner resolves it")
         void = new
     if freeze_end < len(walk):
         d.judged, d.frozen_at, d.frozen_why = "partial", walk[freeze_end - 1], why
@@ -496,6 +510,7 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
     role_changes: list[tuple[str, str, str]] = []
     new_void: set[str] = set()
     revoked: dict[str, str] = {}             # fp -> after (counted revocations)
+    decided: dict[str, set[str]] = {}        # rel -> line hashes already judged (first occurrence decides)
     touched: dict[tuple, str] = {k: g for k in state}
 
     def keys_of(f: dict, handle: str) -> set[str]:
@@ -511,7 +526,8 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
             for rel, text in c.added:
                 lines.setdefault(rel, []).append(text)
                 h = _hash_of(text)
-                if h:
+                if h and h not in decided.setdefault(rel, set()):
+                    decided[rel].add(h)
                     unenforced.setdefault(rel, set()).add(h)
             continue
         owner = str(state[("owner",)])
@@ -521,6 +537,11 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
             h = _hash_of(text)
             if not h:
                 continue
+            # the FIRST occurrence of a line decides it: a later copy (someone re-adding a member's line in an unsigned
+            # commit) can neither enforce nor un-enforce it (L1 1007+19 #1 CRITICAL, RAN)
+            if h in decided.setdefault(rel, set()):
+                continue
+            decided[rel].add(h)
             line_pos.setdefault(h, i)
             top_dir = rel.split("/", 1)[0]
             handle = next((k[1] for k in state if k[0] == "member" and E.safe_handle(k[1]) == top_dir), None)
@@ -571,29 +592,36 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
             problems.append(f"{sha[:10]} by {m.email} is not validly signed: its team changes do not count")
             continue
         changed = {k for k in set(before) | set(after) if before.get(k) != after.get(k)}
-        applied, refused = _apply(state, before, after, changed, fp, sha, i, revoked, problems)
-        if refused:
-            problems.append(f"{sha[:10]} by {m.email}: not in force: {', '.join(refused[:6])}"
-                            + (" ..." if len(refused) > 6 else ""))
-        # COUNTED (it advances the Levain-Base chain) iff its signer is the owner in force, or at least one of its
-        # changes was its signer's to make: a stranger's commit must not stale the owner's next one. A distrusted
-        # or revoked commit stays a link (its base is consumed) with its fields void (§3b, signing doc §2).
+        run_start = next((s_.start for s_ in spells if s_.role == "owner" and s_.end is None), 0)
+        new_rev: dict[str, str] = {}
+        applied, refused = _apply(state, before, after, changed, fp, sha, i, new_rev, problems, where=where,
+                                  owner_since=run_start)
         if sha in void:
+            # a distrusted or revoked commit STAYS the Levain-Base link it would have been (so the commits naming it
+            # still count; the 1007+19 run of L1's r5 caught a void confirm breaking every later team commit), while
+            # its fields, its revocations included, have no effect at all (L1 1007+19 #2 CRITICAL, RAN)
             if fp in keys_of(state, owner) or applied:
                 base = sha
             problems.append(f"{sha[:10]} by {m.email} is void (distrusted or signed by a revoked key): "
                             "its changes do not count")
             continue
+        if refused:
+            problems.append(f"{sha[:10]} by {m.email}: not in force: {', '.join(refused[:6])}"
+                            + (" ..." if len(refused) > 6 else ""))
+        if applied:
+            nt, _ = unflat(applied)
+            try:
+                R.validate_team(nt)
+            except R.RolesError as exc:
+                problems.append(f"{sha[:10]} by {m.email}: the resulting team would be invalid ({exc}); not counted")
+                continue
+        # COUNTED (it advances the Levain-Base chain) iff its signer is the owner in force, or at least one of its
+        # changes was its signer's to make: a stranger's commit must not stale the owner's next one.
         if fp in keys_of(state, owner) or applied:
             base = sha
         if not applied:
             continue
-        nt, _ = unflat(applied)
-        try:
-            R.validate_team(nt)
-        except R.RolesError as exc:
-            problems.append(f"{sha[:10]} by {m.email}: the resulting team would be invalid ({exc}); not counted")
-            continue
+        revoked.update(new_rev)     # only now: a refused or invalid commit's revocation never takes effect
         # spells and role changes
         prev_owner = str(state[("owner",)])
         prev_members = {k[1] for k in state if k[0] == "member"}
@@ -646,10 +674,12 @@ def _hash_of(text: str) -> str | None:
 
 
 def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: str, pos: int,
-           revoked: dict[str, str], problems: list[str]) -> tuple[dict | None, list[str]]:
+           revoked: dict[str, str], problems: list[str], *, where: dict[str, int] | None = None,
+           owner_since: int | None = None) -> tuple[dict | None, list[str]]:
     """Apply each changed field the signer may change (signing doc §3), field by field. Returns (new state, refused)."""
     new = dict(state)
     refused: list[str] = []
+    where = where or {}
     owner = str(state[("owner",)])
     members = {k[1] for k in state if k[0] == "member"}
 
@@ -702,7 +732,8 @@ def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: s
                     allowed = is_owner or holds(h)
         elif kind == "revoke":
             target_owner = k[1] in {kk[2] for kk in state if kk[0] == "key" and kk[1] == owner}
-            allowed = is_owner and val is not None and old is None and not target_owner
+            allowed = is_owner and val is not None and old is None and not target_owner \
+                and owner_since is not None and where.get(str(val), -1) >= owner_since
             if allowed:
                 revoked[k[1]] = str(val)
         elif kind == "rules":

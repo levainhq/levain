@@ -251,11 +251,131 @@ def _anneal_db(gl: GitLedger) -> Path | None:
     return p if p.exists() else None
 
 
-def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str | None:  # tree: state hash
-    """Optional seam: feed every ledger entry to anneal's team import, once per ledger tree.
+# The anneal-memory release that first reads team stream v3. Not released when this was written: set it to that
+# version when levain's floor and KNOWN_GOOD move to it (seam §3a item 4).
+ANNEAL_V3_FLOOR = "the first anneal-memory release that reads team stream v3"
 
-    Runs only when the installed anneal-memory ships ``anneal_memory.team`` and a store is known.
-    Returns a one-line note when it ran or failed, None when it did not apply.
+# Run as ``python -P -c`` (never the cwd on sys.path): which team stream versions the INSTALLED anneal reads, and the
+# exact v3 key sets it checks, so a reader of another v3 shape (the 10-05 header without prev_root) is never sent one.
+_PROBE = (
+    "import json\n"
+    "try:\n"
+    "    import anneal_memory as a, anneal_memory.team as t\n"
+    "except Exception as exc:\n"
+    "    print(json.dumps({'error': type(exc).__name__}))\n"
+    "else:\n"
+    "    print(json.dumps({'version': str(getattr(a, '__version__', '?')),\n"
+    "                      'versions': [v for v in (getattr(t, 'STREAM_VERSION', None),\n"
+    "                                               getattr(t, 'SNAPSHOT_STREAM_VERSION', None)) if type(v) is int],\n"
+    "                      'header': sorted(getattr(t, '_V3_HEADER', ()) or ()),\n"
+    "                      'envelope': sorted(getattr(t, '_V3_ENVELOPE', ()) or ())}))\n"
+)
+
+
+def _anneal_probe() -> dict:
+    """``{"version", "v3": bool}`` for the installed anneal-memory; ``v3`` False when it cannot be told."""
+    from . import export as X
+    try:
+        cp = subprocess.run([sys.executable, "-P", "-c", _PROBE], capture_output=True, text=True, timeout=15)
+        got = json.loads(cp.stdout.strip().splitlines()[-1]) if cp.returncode == 0 and cp.stdout.strip() else {}
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
+        got = {}
+    got = got if isinstance(got, dict) else {}
+    v3 = (X.SNAPSHOT_VERSION in (got.get("versions") or []) and got.get("header") == sorted(X.V3_HEADER)
+          and got.get("envelope") == sorted(X.V3_ENVELOPE))
+    return {"version": str(got.get("version") or "?"), "v3": v3}
+
+
+def _store_view(db: Path, key: str) -> list | None:
+    """The store's record of this key, ``[repin_n, pos, seq, active]``, read through ``python -P``; None when the store
+    holds no record of it or could not be read. A store reset or restored from backup therefore changes the import
+    key, and so does a takeover (``active``)."""
+    try:
+        cp = subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db), "team-status", "--json"],
+                            capture_output=True, text=True, timeout=20)
+        data = json.loads(cp.stdout) if cp.returncode == 0 else {}
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    for k in (data.get("keys") or []) if isinstance(data, dict) else []:
+        if isinstance(k, dict) and k.get("key") == key:
+            return [k.get("repin_n"), k.get("pos"), k.get("seq"), bool(k.get("active"))]
+    return None
+
+
+def _v3_import_key(snap, db: Path, store: list | None, anneal_version: str) -> str:
+    """seam §3a item 5: the verdict (state hash, honoured pairs, enforced lines, judged), the stream version, this
+    clone's trust state (root, epoch, repin_n), the installed anneal, and the STORE's identity (its path and its record
+    of this key), so a restored, reset or repointed store, a takeover, an upgrade or any verdict change imports once.
+    ``prev_root`` and ``seq`` are left out: neither is a change to mirror."""
+    from . import export as X
+    h = snap.head
+    blob = ["levain-anneal-import-v3", X.SNAPSHOT_VERSION, snap.state_hash, snap.honoured, sorted(snap.enforced),
+            h["judged"], h["root"], h["epoch"], h["repin_n"], anneal_version, os.path.realpath(db), store]
+    return hashlib.sha256(json.dumps(blob, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _anneal_import_v3(gl: GitLedger, db: Path, anneal_version: str) -> str | None:
+    """Send this clone's complete verdict (contract v3) and mark it imported only when anneal REPLACED with it."""
+    from . import export as X
+    try:
+        d = gl.derivation()
+        snap = X.snapshot(gl, d)
+    except (R.RolesError, TeamError, OSError) as exc:
+        return f"[team] anneal import did not run: {exc}"
+    if gl.state().get("anneal_v3_imported") == _v3_import_key(snap, db, _store_view(db, str(snap.head["key"])),
+                                                               anneal_version):
+        return None
+    body = "".join(snap.lines(X.next_seq(gl)))
+    try:
+        cp = subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db), "team-import", "--json",
+                             "-"], input=body, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"[team] anneal import did not run: {exc}"
+    try:
+        data = json.loads(cp.stdout)
+    except ValueError:
+        data = None
+    if not isinstance(data, dict) or data.get("framing") != "v3" or "snapshot" not in data:
+        tail = ((cp.stderr or cp.stdout).strip().splitlines() or ["exit " + str(cp.returncode)])[-1]
+        gl.save_state(anneal_last=f"failed: {tail}")
+        return f"[team] anneal import failed: {tail}"
+    outcome = str(data["snapshot"])
+    added = len(data.get("links_added") or []) + len(data.get("links_added_legacy") or [])
+    removed = len(data.get("links_removed") or [])
+    unmappable = len(data.get("unmappable") or [])
+    if outcome == "replaced":
+        # the marker is computed from the store's state AFTER the import, so the next session's key matches it
+        X.record_exported(gl, snap)
+        mark = _v3_import_key(snap, db, _store_view(db, str(snap.head["key"])), anneal_version)
+        gl.save_state(anneal_v3_imported=mark, anneal_last="ok" if cp.returncode == 0 else "replaced, with findings")
+        text = (f"[team] team links in your memory store ({db.name}) now match the ledger: {added} added, {removed} "
+                "removed")
+        if unmappable:
+            text += f"; {unmappable} enforced entr{'y' if unmappable == 1 else 'ies'} could not be imported " \
+                    "(`anneal-memory team-status`)"
+        return text
+    reasons = [str(x) for x in (data.get("chain_problems") or []) + (data.get("snapshot_notes") or [])]
+    if outcome == "partial_stream" and any("copied or reused state file" in r for r in reasons):
+        why = ("this clone's export key is held by the store for another ledger (a copied or reused levain state "
+               f"file); remove `anneal_key` from {gl.state_path} so this clone makes a key of its own")
+    elif outcome == "partial_stream" and snap.head["judged"] != "full":
+        why = (f"levain judges this ledger only in part on this clone ({d.frozen_why or 'see `levain team doctor`'}), "
+               "so the store keeps its last view")
+    elif outcome == "stale_stream":
+        why = reasons[-1] if reasons else "the store already holds a later view of this ledger"
+    else:
+        why = reasons[-1] if reasons else f"exit {cp.returncode}"
+    gl.save_state(anneal_last=f"{outcome}: {why}")
+    return f"[team] team links in your memory store were NOT updated ({outcome}): {why}"
+
+
+def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str | None:  # tree: state hash
+    """Optional seam: mirror levain's verdict into anneal's store.
+
+    Runs only when the installed anneal-memory ships ``anneal_memory.team`` and a store is known. An anneal that
+    reads team stream v3 gets this clone's complete verdict (seam §3a items 4-7) and replaces its team links with it,
+    once per change; an older one gets the v2 stream, once per ledger tree, exactly as before, and the line says that
+    it keeps links as first imported. Returns a one-line note when it ran, failed or needs saying, else None.
     """
     import importlib.util
 
@@ -267,8 +387,15 @@ def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str
     except (ImportError, ValueError):
         return None
     db = _anneal_db(gl)
-    if db is None or gl.state().get("anneal_imported_tree") == tree:
+    if db is None:
         return None
+    probe = _anneal_probe()
+    if probe["v3"]:
+        return _anneal_import_v3(gl, db, probe["version"])
+    upgrade = (f"[team] anneal-memory {probe['version']} keeps links as first imported; upgrade to "
+               f"{ANNEAL_V3_FLOOR}")
+    if gl.state().get("anneal_imported_tree") == tree:
+        return upgrade
     from .export import export_stream
 
     body = "".join(export_stream(ledger))
@@ -278,17 +405,17 @@ def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str
                              "--link-authority", owner, "-"],
                             input=body, capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"[team] anneal import did not run: {exc}"
+        return f"[team] anneal import did not run: {exc}; {upgrade[7:]}"
     tail = ((cp.stderr or cp.stdout).strip().splitlines() or ["exit " + str(cp.returncode)])[-1]
     if cp.returncode == 3:
         # anneal imported what verified and refused the rest; not a crash, but a person should see it
         gl.save_state(anneal_imported_tree=tree, anneal_last=f"partial: {tail}")
-        return f"[team] anneal import refused some entries: {tail}"
+        return f"[team] anneal import refused some entries: {tail}; {upgrade[7:]}"
     if cp.returncode != 0:
         gl.save_state(anneal_last=f"failed: {tail}")
-        return f"[team] anneal import failed: {tail}"
+        return f"[team] anneal import failed: {tail}; {upgrade[7:]}"
     gl.save_state(anneal_imported_tree=tree, anneal_last="ok")
-    return f"[team] ledger imported into your memory store ({db.name})"
+    return f"[team] ledger imported into your memory store ({db.name}); {upgrade[7:]}"
 
 
 def sessionstart(payload: dict) -> None:
