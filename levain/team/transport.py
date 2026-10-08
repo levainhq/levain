@@ -517,7 +517,6 @@ class GitLedger:
              signing_key: str | None = None, accept_merges: dict[str, int] | None = None) -> str:
         """Pin this clone to a strict ledger on the remote (trust on first use: the genesis, its owner in force and
         her key fingerprints are printed for the person to check out of band), then confirm this clone's key."""
-        from . import tenure as T
         remote = remote or self._default_remote()
         if not remote:
             raise TeamError("no git remote to join from")
@@ -606,18 +605,37 @@ class GitLedger:
             if git(["merge-base", "--is-ancestor", here, tip0], self.repo.toplevel, check=False).returncode != 0 and \
                     git(["merge-base", "--is-ancestor", tip0, here], self.repo.toplevel, check=False).returncode != 0:
                 raise TeamError(f"the local {name} branch has diverged from {remote}'s; nothing was changed")
+        # everything past this point changes this clone's state: ANY failure puts the WHOLE state back as it was, the
+        # remote and device id included (code L3 r3 codex 6, RUN: a refused derivation left `remote` on the refused
+        # host and a new device id, so this clone's own unpublished commits read as foreign)
+        try:
+            return self._join_chosen(signing_key=signing_key, name=name, found=found, keep=keep, old=old,
+                                     accepted=accepted, remote=remote, new_device=new_device, rref=rref, moved=moved,
+                                     pinned=pinned)
+        except BaseException:
+            def put_back(st: dict) -> None:
+                # own_keys only grows: a key that already signed a commit here stays this clone's, or that commit would
+                # read as foreign after the roll-back
+                grown = sorted(set(old.get("own_keys") or []) | set(st.get("own_keys") or []))
+                st.clear()
+                st.update(old)
+                if grown:
+                    st["own_keys"] = grown
+            self.save_state(_mutate=put_back)
+            self._dcache = None
+            raise
+
+    def _join_chosen(self, *, signing_key, name, found, keep, old, accepted, remote, new_device, rref, moved,
+                     pinned) -> str:
+        """`join` once the ledger is chosen and nothing has refused: pin, judge, attach, reconcile, confirm."""
+        from . import tenure as T
         if signing_key:
             self.save_state(signing_key=signing_key)     # only once nothing above refused
         self.save_state(branch=name, pinned_root=found[name], anchor=old.get("anchor") if keep else None,
                         accepted=accepted, distrust=list(old.get("distrust") or []), remote=remote,
                         device=secrets.token_hex(8) if new_device else self._new_device())
         self._dcache = None
-        try:
-            d = self.derivation(git(["rev-parse", rref], self.repo.toplevel).stdout.strip())
-        except TeamError:
-            self.save_state(**{k: old.get(k) for k in ("branch", "pinned_root", "anchor", "accepted", "distrust",
-                                                        "signing_key")})
-            raise
+        d = self.derivation(git(["rev-parse", rref], self.repo.toplevel).stdout.strip())
         tip = git(["rev-parse", rref], self.repo.toplevel).stdout.strip()
         if not self._local_branch_exists():
             git(["branch", name, rref], self.repo.toplevel)
@@ -658,6 +676,7 @@ class GitLedger:
                     "handle> <your public key>`); then `levain team sync`")
         return tofu + f"\njoined {d.team.project} as {handle} (device {self.device})" + (
             f"; confirmed this machine's key" if confirmed else "")
+
 
     # ---- write path ----------------------------------------------------------------------------------------
 
@@ -1524,11 +1543,15 @@ class GitLedger:
             # succeeds only if what it meant to set is in force at the published tip (design §3b; T16 lane A, RUN)
             self._dcache = None
             now = self.derivation().state
-            missing = sorted(".".join(str(x)[:16] for x in k) for k in set(want_f) | set(had_f)
-                             if want_f.get(k) != had_f.get(k) and now.get(k) != want_f.get(k))
+            meant = [k for k in set(want_f) | set(had_f) if want_f.get(k) != had_f.get(k)]
+            missing = sorted(".".join(str(x)[:16] for x in k) for k in meant if now.get(k) != want_f.get(k))
+            landed = sorted(".".join(str(x)[:16] for x in k) for k in meant if now.get(k) == want_f.get(k))
             if missing and _check:
+                # a re-land is field by field, so name both halves (code L3 r3 glm MED 4: a partial landing read as
+                # nothing in force)
                 raise TeamError(f"{out}; but after syncing with the remote this change is NOT in force for: "
-                                f"{', '.join(missing)} (a newer change landed first); re-issue it if still wanted")
+                                f"{', '.join(missing)} (a newer change landed first); re-issue it if still wanted. "
+                                + (f"In force: {', '.join(landed)}" if landed else "None of it is in force"))
         self._dcache = None
         return out
 
