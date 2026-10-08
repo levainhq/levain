@@ -159,15 +159,20 @@ class _HandsFiles:
     def __init__(self, provider: Any, policy: CrownJewelsPolicy, hands: HandsIdentity) -> None:
         self._provider, self._policy, self.hands = provider, policy, hands
         ws = str(hands.workspace)
-        self._roots = tuple({ws.rstrip("/") or "/", os.path.realpath(ws).rstrip("/") or "/"})
+        self._recorded = ws.rstrip("/") or "/"
+        self._roots = tuple({self._recorded, os.path.realpath(ws).rstrip("/") or "/"})
         self._stats: dict[str, os.stat_result | None] = {}
         self._reads: dict[str, bytes] = {}
         self._lists: dict[str, list[tuple[str, str]]] = {}
 
     def inside(self, path: Any) -> str | None:
-        """``path`` made absolute (lexically), or None when it is not in the hands workspace."""
+        """``path`` made absolute (lexically) and spelled under the workspace as recorded, or None when
+        it is not in the hands workspace."""
         p = os.path.normpath(os.path.abspath(os.path.expanduser(str(path))))
-        return p if any(p == r or p.startswith(r + "/") for r in self._roots) else None
+        for r in self._roots:
+            if p == r or p.startswith(r + "/"):
+                return self._recorded + p[len(r):]
+        return None
 
     def outside_reason(self, path: Any) -> str:
         return (f"{path} is outside the workspace {self.hands.workspace}: for an entity with its own "
@@ -200,7 +205,9 @@ class _HandsFiles:
         if p not in self._stats:
             try:
                 fields = [int(f) for f in self._call("stat", p).split()]
-                self._stats[p] = os.stat_result(tuple(fields[:10]))
+                if len(fields) != 10:
+                    raise ValueError(f"{len(fields)} fields")
+                self._stats[p] = os.stat_result(tuple(fields))
             except (FileNotFoundError, HandsFileRefused):
                 self._stats[p] = None
             except ValueError as exc:
@@ -249,6 +256,9 @@ class _HandsWriteFile:
     def write(self, data: Any) -> int:
         return self._buf.write(data)
 
+    def flush(self) -> None:
+        """Nothing to flush: the content is handed over on close."""
+
     def writelines(self, lines: Any) -> None:
         for line in lines:
             self._buf.write(line)
@@ -267,7 +277,10 @@ class _HandsWriteFile:
             return
         self.closed = True
         value = self._buf.getvalue()
-        data = value if self._binary else value.encode(self._encoding, self._errors)
+        try:
+            data = value if self._binary else value.encode(self._encoding, self._errors)
+        except UnicodeError as exc:
+            raise _HandsIOError(f"{self._path}: the text cannot be encoded as {self._encoding} ({exc})") from exc
         self._writer(self._path, data)
 
 
@@ -300,11 +313,18 @@ def _hands_open(hands: _HandsFiles, file: Any, args: tuple, kwargs: dict) -> Any
 
 def _floored_open(file, *args, **kwargs):
     policy = _EDITOR_FLOOR.get()
-    if policy is None or "opener" in kwargs:
+    if policy is None:
         return builtins.open(file, *args, **kwargs)
     hands = _EDITOR_HANDS.get()
     if hands is not None:
+        # Before the opener pass-through below: a caller's own opener would open as the operator
+        # (S2 L3 r1, glm MED).
+        if "opener" in kwargs:
+            raise _FloorRefusedOpen(f"the editor opened {file} with its own opener; for an entity with "
+                                    "its own user every open goes through that user")
         return _hands_open(hands, file, args, kwargs)
+    if "opener" in kwargs:
+        return builtins.open(file, *args, **kwargs)
 
     def opener(path, flags):
         # Judged BEFORE any byte moves: without O_TRUNC (truncating first would already have emptied a
@@ -1158,7 +1178,12 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
                     command=action.command,
                     is_error=True,
                 )
-        reason = crown_jewel_reason(policy, action.path) or linked_jewel_reason(policy, action.path)
+        # For a hands entity nothing here looks at the path as the operator (S2 L3 r1, codex MED): the
+        # name checks below resolve links and stat with the operator's rights, so a link the entity
+        # planted in its workspace would be followed into the operator's files. The helper refuses a
+        # link and runs under the floor's profile, which denies every jewel to the hands user.
+        reason = None if self._floor.hands is not None else (
+            crown_jewel_reason(policy, action.path) or linked_jewel_reason(policy, action.path))
         if reason is not None:
             return FileEditorObservation.from_text(
                 text=(

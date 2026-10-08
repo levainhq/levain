@@ -211,11 +211,11 @@ def test_the_editor_write_goes_through_the_hands_file_helper(tmp_path, monkeypat
     hands = _hands(tmp_path)
     seen: dict = {}
 
-    def fake_run(argv, **kw):
-        seen.update(argv=argv, input=kw.get("input"))
+    def fake_run(argv, h, data, timeout):
+        seen.update(argv=argv, input=data)
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
-    monkeypatch.setattr(confinement.subprocess, "run", fake_run)
+    monkeypatch.setattr(confinement, "_run_hands_helper", fake_run)
     policy = build_policy(_entity(tmp_path), workspace=hands.workspace)
     target = str(hands.workspace / "a.txt")
     SeatbeltProvider().hands_write(policy, hands, target, b"data; $(rm -rf ~)")
@@ -224,8 +224,8 @@ def test_the_editor_write_goes_through_the_hands_file_helper(tmp_path, monkeypat
     assert argv[argv.index("zsh") + 1:argv.index("zsh") + 4] == ["write", str(hands.workspace), target]
     assert seen["input"] == b"data; $(rm -rf ~)"
 
-    monkeypatch.setattr(confinement.subprocess, "run",
-                        lambda argv, **kw: subprocess.CompletedProcess(argv, 3, b"", b"cannot write: Permission denied"))
+    monkeypatch.setattr(confinement, "_run_hands_helper",
+                        lambda argv, h, d, t: subprocess.CompletedProcess(argv, 3, b"", b"cannot write: Permission denied"))
     with pytest.raises(OSError, match="Permission denied"):
         SeatbeltProvider().hands_write(policy, hands, target, b"x")
 

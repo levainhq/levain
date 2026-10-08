@@ -230,6 +230,7 @@ import codecs
 import errno
 import inspect
 import json
+import logging
 import os
 import platform
 import re
@@ -282,6 +283,8 @@ __all__ = [
 
 # The macOS seatbelt driver. An ABSOLUTE path (never a PATH lookup — a confined child must resolve
 # the sandbox binary deterministically, and this is the OS-shipped location).
+_log = logging.getLogger("levain.firing.confinement")
+
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 
 # The Linux sandbox driver. ABSOLUTE for the same reason as ``SANDBOX_EXEC`` — a confined child must
@@ -2918,7 +2921,17 @@ class SandboxedShell:
         out = _Output(rd)
         carry = _Carry(ours)
         with self._lock:
-            self._groups[proc.pid] = proc
+            # Registered under the lock, against a close() that ran meanwhile (S2 L3 r1, codex HIGH):
+            # close() sets `_closed` before it takes its snapshot of the groups, so either it sees
+            # this group and kills it, or this sees `_closed` and kills it here.
+            closed = self._closed
+            if not closed:
+                self._groups[proc.pid] = proc
+        if closed:
+            self._kill_group(proc.pid, proc)
+            out.abandon()
+            carry.stop()
+            raise ConfinementError("shell is closed")
         self._proc = proc
         return proc, out, carry
 
@@ -3004,7 +3017,8 @@ class SandboxedShell:
         except BaseException:
             self._kill_group(pgid, proc)
             carry.stop()
-            out.eof.wait(_DRAIN_GRACE)
+            if not out.eof.wait(_DRAIN_GRACE):
+                out.abandon()   # a survivor holding the pipe must not keep the reader (S2 L3 r1)
             raise
         finally:
             self._proc = None
@@ -3012,6 +3026,10 @@ class SandboxedShell:
         carry.done.wait(_DRAIN_GRACE)
         out.eof.wait(max(0.0, until - time.monotonic()))
         carry.stop()
+        # The reader takes what is queued and closes within its poll interval; the frame is read
+        # only after that, or a background job holding the state fd would leave it half-read
+        # (S2 L3 r1, codex LOW).
+        carry.done.wait(1.0)
         self._after_command(pgid)
         text = out.take()
         if not out.eof.is_set():
@@ -3085,7 +3103,9 @@ class SandboxedShell:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
-            _group_gone(pgid, timeout=5.0)
+            if not _group_gone(pgid, timeout=5.0):
+                # close() never raises; a group it could not empty is said, not hidden (S2 L3 r1).
+                _log.warning("levain: the shell's process group %d is still running after close()", pgid)
 
     def __enter__(self) -> "SandboxedShell":
         return self.start()
@@ -3612,17 +3632,23 @@ HANDS_ZSH = "/bin/zsh"
 # that user (sudo -n -u, env -i, no terminal) under the same sandbox profile as its bash, so every read
 # and write is made with that user's rights and the floor's, never the operator's. zsh because it
 # ships with every macOS and its zsh/system module opens with O_NOFOLLOW and O_NONBLOCK, which no
-# stock shell utility can. Its input is data only: the operation, the workspace and the path are
-# arguments, a written file's content is stdin; nothing given to it is evaluated.
-# Every path must lie in the workspace: the directory holding it, symlinks resolved, is the workspace or
-# under it (the workspace itself may be named). The last component is never followed: a symlink there
-# is refused, or, for a write, replaced. That bounds where the editor looks; what it may touch is the
-# kernel's to say, by the hands user's rights and the profile.
-#   read   the regular file's bytes on stdout; a FIFO, device or directory is refused, not opened
-#          for long (O_NONBLOCK), and so is a file over the limit ($4)
+# stock shell utility can. Its input is data only: the operation, the workspace, the path, the size
+# limit and the workspace's identity are arguments, a written file's content is stdin; nothing given
+# to it is evaluated.
+# Confinement (S2 L3 r1, codex HIGH + glm MED): the workspace must not be a symlink and must still be
+# the directory levain recorded (device:inode, $5), and the helper ENTERS it. The path, lexically
+# inside the workspace, is then walked one directory at a time with cd, refusing a symlink component
+# and checking after every step that the physical working directory (getcwd) is still the workspace
+# or under it, so a component swapped for a link between the check and the cd is caught. Everything
+# after the walk is relative to the directory the helper is IN, which a later rename cannot move it
+# out of. The last component is never followed: a symlink there is refused, or, for a write,
+# replaced. That bounds where the editor looks; what it may touch is the kernel's to say, by the
+# hands user's rights and the profile.
+#   read   the regular file's bytes on stdout, at most limit+1 of them (levain refuses more); a FIFO,
+#          device or directory is refused, not opened for long (O_NONBLOCK)
 #   stat   lstat as "mode ino dev nlink uid gid size atime mtime ctime"
 #   list   the directory's entries, then each non-hidden real subdirectory's non-hidden entries, as
-#          NUL-terminated pairs "<l|d|f|o>" "<name or sub/name>"
+#          NUL-terminated pairs "<l|d|f|o>" "<name or sub/name>", at most limit+1 bytes
 #   write  stdin into a new file beside the target (O_CREAT|O_EXCL|O_NOFOLLOW), given the target's
 #          permissions (0644 when new), then renamed over it: atomic, and a link or FIFO at the
 #          target is replaced, never written through
@@ -3633,71 +3659,90 @@ HANDS_ZSH = "/bin/zsh"
 _HANDS_FILE_HELPER = r"""emulate -R zsh
 zmodload zsh/system zsh/stat 2>/dev/null || { print -ru2 -- 'zsh modules are unavailable'; exit 70 }
 refuse() { print -rnu2 -- "$1"; exit 3 }
-op=$1 ws=$2 p=$3
+op=$1 ws=$2 p=$3 lim=$4 wsid=$5
 [[ $ws == /* && $p == /* ]] || refuse "not an absolute path: $p"
-wsr=${ws:A}
-p=${p:a}
-if [[ $p == ${ws:a} || $p == $wsr ]]; then
-  p=$wsr top=1
-else
-  top=
-  par=${p:h:A}
-  [[ $par == $wsr || $par == $wsr/* ]] || refuse "$3 is outside the workspace $ws"
-  p=$par/${p:t}
-fi
+[[ -L $ws ]] && refuse "the workspace $ws is a symlink"
+zstat -L -H st -- $ws 2>/dev/null || refuse "the workspace $ws is gone"
+[[ "$st[device]:$st[inode]" == $wsid ]] || refuse "the workspace $ws is not the directory levain recorded"
+builtin cd -q -- $ws 2>/dev/null || refuse "cannot enter the workspace $ws"
+zstat -L -H st -- . 2>/dev/null && [[ "$st[device]:$st[inode]" == $wsid ]] || refuse "the workspace $ws changed while it was entered"
+wsr=$(builtin pwd -P)
+inside() { local here; here=$(builtin pwd -P); [[ $here == $wsr || $here == $wsr/* ]] }
 absent() { [[ -e $1 || -L $1 ]] || exit 2 }
+enter() {
+  [[ -L $1 ]] && refuse "$3 runs through a symlink; the editor does not follow links for an entity with its own user"
+  [[ -d $1 ]] || { absent $1; refuse "$3: a component is not a directory" }
+  builtin cd -q -- $1 2>/dev/null || refuse "cannot enter a directory of $3: permission denied"
+  inside || refuse "$3 left the workspace while it was walked"
+}
+p=${p:a}
+wsa=${ws:a}
+if [[ $p == $wsa ]]; then
+  parts=()
+elif [[ $p == $wsa/* ]]; then
+  parts=(${(s:/:)${p#$wsa/}})
+else
+  refuse "$3 is outside the workspace $ws"
+fi
+n=
+if (( $#parts )); then
+  n=$parts[-1]
+  for c in $parts[1,-2]; do enter $c x $3; done
+fi
 kind() {
   if [[ -L $1 ]]; then REPLY=l; elif [[ -d $1 ]]; then REPLY=d; elif [[ -f $1 ]]; then REPLY=f; else REPLY=o; fi
 }
 case $op in
   stat)
-    zstat -L -H st -- $p 2>/dev/null || { absent $p; refuse "cannot stat $3: permission denied" }
+    t=${n:-.}
+    zstat -L -H st -- ./$t 2>/dev/null || { absent ./$t; refuse "cannot stat $3: permission denied" }
     print -rn -- "$st[mode] $st[inode] $st[device] $st[nlink] $st[uid] $st[gid] $st[size] $st[atime] $st[mtime] $st[ctime]"
     ;;
   read)
-    [[ -z $top ]] || refuse "$3 is a directory"
-    if ! sysopen -r -o nofollow,nonblock -u 5 -- $p 2>/dev/null; then
-      absent $p
-      [[ -L $p ]] && refuse "$3 is a symlink; the editor does not follow links for an entity with its own user"
+    [[ -n $n ]] || refuse "$3 is a directory"
+    if ! sysopen -r -o nofollow,nonblock -u 5 -- ./$n 2>/dev/null; then
+      absent ./$n
+      [[ -L ./$n ]] && refuse "$3 is a symlink; the editor does not follow links for an entity with its own user"
       refuse "cannot open $3: permission denied"
     fi
     zstat -f 5 -H st 2>/dev/null || refuse "cannot stat $3"
     (( (st[mode] & 8#170000) == 8#100000 )) || refuse "$3 is not a regular file"
-    (( st[size] <= $4 )) || refuse "$3 is larger than $4 bytes"
-    /bin/cat <&5
+    (( st[size] <= lim )) || refuse "$3 is larger than $lim bytes"
+    /usr/bin/head -c $(( lim + 1 )) <&5
     ;;
   list)
-    if [[ -z $top && -L $p ]]; then refuse "$3 is a symlink; the editor does not follow links for an entity with its own user"; fi
-    [[ -d $p ]] || { absent $p; refuse "$3 is not a directory" }
-    [[ -r $p && -x $p ]] || refuse "cannot list $3: permission denied"
+    [[ -n $n ]] && enter $n x $3
+    [[ -r . && -x . ]] || refuse "cannot list $3: permission denied"
     setopt null_glob glob_dots
-    for e in $p/*; do
-      kind $e
-      print -rn -- "$REPLY"$'\0'"${e:t}"$'\0'
-      if [[ $REPLY == d && ${e:t} != .* ]]; then
-        for c in $e/*; do
-          [[ ${c:t} == .* ]] && continue
-          kind $c
-          print -rn -- "$REPLY"$'\0'"${e:t}/${c:t}"$'\0'
-        done
-      fi
-    done
+    {
+      for e in ./*; do
+        kind $e
+        print -rn -- "$REPLY"$'\0'"${e:t}"$'\0'
+        if [[ $REPLY == d && ${e:t} != .* ]]; then
+          (
+            builtin cd -q -- $e 2>/dev/null && inside || exit 0
+            for c in ./*; do
+              [[ ${c:t} == .* ]] && continue
+              kind $c
+              print -rn -- "$REPLY"$'\0'"${e:t}/${c:t}"$'\0'
+            done
+          )
+        fi
+      done
+    } | /usr/bin/head -c $(( lim + 1 ))
     ;;
   write)
-    [[ -z $top ]] || refuse "$3 is a directory"
-    [[ -d $p && ! -L $p ]] && refuse "$3 is a directory"
+    [[ -n $n ]] || refuse "$3 is a directory"
+    [[ -d ./$n && ! -L ./$n ]] && refuse "$3 is a directory"
     mode=644
-    if [[ -f $p && ! -L $p ]] && zstat -L -H st -- $p 2>/dev/null; then
+    if [[ -f ./$n && ! -L ./$n ]] && zstat -L -H st -- ./$n 2>/dev/null; then
       mode=$(( [##8] st[mode] & 8#7777 ))
     fi
-    t=${p:h}/.${p:t}.levain-$$-$RANDOM
-    if ! sysopen -w -o create,excl,nofollow -m 600 -u 6 -- $t 2>/dev/null; then
-      [[ -d ${p:h} ]] || exit 2
-      refuse "cannot write in ${3:h}: permission denied"
-    fi
+    t=./.$n.levain-$$-$RANDOM
+    sysopen -w -o create,excl,nofollow -m 600 -u 6 -- $t 2>/dev/null || refuse "cannot write in the directory of $3: permission denied"
     if ! /bin/cat >&6; then exec 6>&-; /bin/rm -f -- $t; refuse "writing $3 failed"; fi
     exec 6>&-
-    if ! /bin/chmod $mode $t || ! /bin/mv -f -- $t $p; then /bin/rm -f -- $t; refuse "could not replace $3"; fi
+    if ! /bin/chmod $mode $t || ! /bin/mv -f -- $t ./$n; then /bin/rm -f -- $t; refuse "could not replace $3"; fi
     ;;
   *) refuse "unknown operation $op" ;;
 esac
@@ -3705,30 +3750,73 @@ esac
 _HANDS_FILE_OPS = ("read", "stat", "list", "write")
 
 
-def _hands_file_argv(profile_text: str, hands: HandsIdentity, op: str, path: str) -> list[str]:
+def _hands_file_argv(profile_text: str, hands: HandsIdentity, op: str, path: str, ws_id: str) -> list[str]:
     return [*hands_prefix(hands), SANDBOX_EXEC, "-p", profile_text,
             HANDS_ZSH, "-f", "-c", _HANDS_FILE_HELPER, "zsh", op, str(hands.workspace), path,
-            str(_HANDS_READ_LIMIT)]
+            str(_HANDS_READ_LIMIT), ws_id]
+
+
+def _workspace_id(hands: HandsIdentity) -> str:
+    """``device:inode`` of the hands workspace as levain sees it now; refuses a symlink there."""
+    st = os.lstat(hands.workspace)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise HandsFileRefused(f"the hands workspace {hands.workspace} is not a directory (a symlink?)")
+    return f"{st.st_dev}:{st.st_ino}"
+
+
+def _stop_hands_group(hands: HandsIdentity, proc: subprocess.Popen[bytes]) -> bool:
+    """SIGKILL a hands helper's whole session group: its members as the hands user, sudo (the leader,
+    the operator's real uid) as levain. True once the group is gone and sudo reaped."""
+    _hands_signal(hands, proc.pid, signal.SIGKILL)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    return _group_gone(proc.pid, timeout=5.0) and proc.poll() is not None
+
+
+def _run_hands_helper(argv: list[str], hands: HandsIdentity, data: bytes,
+                      timeout: float) -> subprocess.CompletedProcess[bytes]:
+    """Run the helper in a new session (no controlling terminal) and, on a timeout or any error,
+    kill its WHOLE group, not only sudo: ``subprocess.run`` kills just the child it started (S2 L3 r1,
+    codex + glm)."""
+    from levain.launch import child_env
+
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            cwd="/", env=child_env(), start_new_session=True)
+    try:
+        out, err = proc.communicate(data, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        gone = _stop_hands_group(hands, proc)
+        raise OSError(f"the editor's file operation as {hands.user} timed out"
+                      + ("" if gone else f"; its process group {proc.pid} could not be stopped")) from None
+    except BaseException:
+        _stop_hands_group(hands, proc)
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def _seatbelt_hands_file(provider: "SeatbeltProvider", policy: CrownJewelsPolicy, hands: HandsIdentity,
                          op: str, path: str, data: bytes, timeout: float) -> bytes:
-    from levain.launch import child_env
-
     if op not in _HANDS_FILE_OPS:
         raise ValueError(f"unknown hands file operation {op!r}")
     text = provider.render_profile(policy)
     _refuse_kernel_mask_rules(text)
-    argv = _hands_file_argv(text, hands, op, path)
     try:
-        # A new session: no controlling terminal for sudo or the helper. stdin is the content for a
-        # write and empty otherwise.
-        r = subprocess.run(argv, input=data if op == "write" else b"", capture_output=True, cwd="/",
-                           env=child_env(), start_new_session=True, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        raise OSError(f"{op} of {path} as {hands.user} timed out") from exc
+        ws_id = _workspace_id(hands)
+    except FileNotFoundError:
+        raise HandsFileRefused(f"the hands workspace {hands.workspace} is gone") from None
+    argv = _hands_file_argv(text, hands, op, path, ws_id)
+    # stdin is the content for a write and empty otherwise.
+    r = _run_hands_helper(argv, hands, data if op == "write" else b"", timeout)
     said = r.stderr.decode("utf-8", "replace").strip()
     if r.returncode == 0:
+        if op in ("read", "list") and len(r.stdout) > _HANDS_READ_LIMIT:
+            raise HandsFileRefused(f"{path}: more than {_HANDS_READ_LIMIT} bytes; not read")
         return r.stdout
     if r.returncode == 2:
         raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)

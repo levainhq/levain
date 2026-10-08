@@ -41,11 +41,16 @@ def _ws(tmp_path: Path) -> Path:
     return ws.resolve()
 
 
-def _helper(ws: Path, op: str, path, data: bytes = b"", limit: int = 1 << 20):
+def _wsid(ws: Path) -> str:
+    st = os.lstat(ws)
+    return f"{st.st_dev}:{st.st_ino}"
+
+
+def _helper(ws: Path, op: str, path, data: bytes = b"", limit: int = 1 << 20, wsid: str | None = None):
     """The helper exactly as the provider runs it, minus sudo and the sandbox driver."""
     return subprocess.run([HANDS_ZSH, "-f", "-c", _HANDS_FILE_HELPER, "zsh", op, str(ws), str(path),
-                           str(limit)], input=data, capture_output=True, timeout=30, cwd="/",
-                          env={"PATH": "/usr/bin:/bin"})
+                           str(limit), wsid or _wsid(ws)], input=data, capture_output=True, timeout=30,
+                          cwd="/", env={"PATH": "/usr/bin:/bin"})
 
 
 # --- the helper program -------------------------------------------------------------------------
@@ -70,9 +75,11 @@ def test_read_returns_a_regular_files_bytes_and_refuses_everything_else(tmp_path
         assert r.returncode == 3 and why in r.stderr, (name, r)
         assert time.monotonic() - t0 < 10 and r.stdout == b""
     assert _helper(ws, "read", ws / "nope").returncode == 2
-    for escape in (outside, ws / "up" / "operator-secret.txt", f"{ws}/sub/../../operator-secret.txt"):
+    for escape in (outside, f"{ws}/sub/../../operator-secret.txt"):
         r = _helper(ws, "read", escape)
         assert r.returncode == 3 and b"outside the workspace" in r.stderr and b"do-not-leak" not in r.stdout
+    r = _helper(ws, "read", ws / "up" / "operator-secret.txt")
+    assert r.returncode == 3 and b"symlink" in r.stderr and b"do-not-leak" not in r.stdout
     r = _helper(ws, "read", ws / "big", limit=1024)
     assert r.returncode == 3 and b"larger" in r.stderr
     assert _helper(ws, "read", ws).returncode == 3
@@ -159,11 +166,11 @@ def test_the_provider_runs_the_fixed_helper_as_the_hands_user_under_the_profile(
     hands = _hands(tmp_path)
     seen: dict = {}
 
-    def fake_run(argv, **kw):
-        seen.update(argv=argv, kw=kw)
+    def fake_run(argv, h, data, timeout):
+        seen.update(argv=argv, data=data, hands=h)
         return subprocess.CompletedProcess(argv, 0, b"out", b"")
 
-    monkeypatch.setattr(confinement.subprocess, "run", fake_run)
+    monkeypatch.setattr(confinement, "_run_hands_helper", fake_run)
     policy = build_policy(_entity(tmp_path), workspace=hands.workspace)
     target = str(hands.workspace / "a.txt")
     assert SeatbeltProvider().hands_file(policy, hands, op, target, b"$(rm -rf ~)") == b"out"
@@ -172,9 +179,8 @@ def test_the_provider_runs_the_fixed_helper_as_the_hands_user_under_the_profile(
     at = argv.index(confinement.SANDBOX_EXEC)
     assert argv[at + 1] == "-p" and argv[at + 2] == SeatbeltProvider().render_profile(policy)
     assert argv[at + 3:] == [HANDS_ZSH, "-f", "-c", _HANDS_FILE_HELPER, "zsh", op, str(hands.workspace),
-                             target, str(confinement._HANDS_READ_LIMIT)]
-    assert seen["kw"]["start_new_session"] is True and seen["kw"]["cwd"] == "/"
-    assert seen["kw"]["input"] == (b"$(rm -rf ~)" if op == "write" else b"")
+                             target, str(confinement._HANDS_READ_LIMIT), _wsid(hands.workspace)]
+    assert seen["data"] == (b"$(rm -rf ~)" if op == "write" else b"") and seen["hands"] == hands
 
 
 def test_the_providers_answers_map_to_the_helpers_statuses(tmp_path, monkeypatch):
@@ -182,13 +188,70 @@ def test_the_providers_answers_map_to_the_helpers_statuses(tmp_path, monkeypatch
     policy = build_policy(_entity(tmp_path), workspace=hands.workspace)
     for rc, err, exc in [(2, b"", FileNotFoundError), (3, b"x is a symlink", HandsFileRefused),
                          (1, b"sudo: a password is required", OSError)]:
-        monkeypatch.setattr(confinement.subprocess, "run",
-                            lambda argv, rc=rc, err=err, **kw: subprocess.CompletedProcess(argv, rc, b"", err))
+        monkeypatch.setattr(confinement, "_run_hands_helper",
+                            lambda argv, h, d, t, rc=rc, err=err: subprocess.CompletedProcess(argv, rc, b"", err))
         with pytest.raises(exc) as got:
             SeatbeltProvider().hands_file(policy, hands, "read", str(hands.workspace / "x"))
         if rc == 1:
             assert not isinstance(got.value, (FileNotFoundError, HandsFileRefused))
             assert "password is required" in str(got.value)
+
+
+def test_the_workspace_must_be_the_recorded_directory_and_not_a_link(tmp_path):
+    """S2 L3 r1 (glm MED): the entity's bash could swap the workspace for a symlink between calls."""
+    ws = _ws(tmp_path)
+    (ws / "a").write_text("x")
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "a").write_text("elsewhere")
+    r = _helper(ws, "read", ws / "a", wsid=_wsid(other))
+    assert r.returncode == 3 and b"not the directory levain recorded" in r.stderr
+    wsid = _wsid(ws)
+    os.rename(ws, tmp_path / "moved")
+    os.symlink(other, ws)
+    r = _helper(ws, "read", ws / "a", wsid=wsid)
+    assert r.returncode == 3 and b"elsewhere" not in r.stdout
+
+
+def test_a_symlinked_directory_inside_the_workspace_is_never_walked(tmp_path):
+    """S2 L3 r1 (codex HIGH): the helper validated a resolved parent, then acted by pathname, so a
+    component swapped for a link afterwards led it outside. It now walks with cd, refusing a link
+    component and checking the physical directory after each step."""
+    ws = _ws(tmp_path)
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "f").write_text("outside")
+    os.symlink(tmp_path / "out", ws / "d")
+    for op in ("read", "stat", "write", "list"):
+        target = ws / "d" if op == "list" else ws / "d" / "f"
+        r = _helper(ws, op, target, b"new")
+        assert r.returncode == 3 and b"runs through a symlink" in r.stderr, (op, r)
+    assert (tmp_path / "out" / "f").read_text() == "outside"
+
+
+def test_the_providers_refuse_more_than_the_limit(tmp_path, monkeypatch):
+    """S2 L3 r1 (complement MED): the size was checked once and the read was unbounded; a growing file
+    or a huge listing streamed into levain's memory. The helper caps at limit+1, levain refuses past it."""
+    hands = _hands(tmp_path)
+    policy = build_policy(_entity(tmp_path), workspace=hands.workspace)
+    monkeypatch.setattr(confinement, "_HANDS_READ_LIMIT", 10)
+    monkeypatch.setattr(confinement, "_run_hands_helper",
+                        lambda argv, h, d, t: subprocess.CompletedProcess(argv, 0, b"x" * 11, b""))
+    for op in ("read", "list"):
+        with pytest.raises(HandsFileRefused, match="more than 10 bytes"):
+            SeatbeltProvider().hands_file(policy, hands, op, str(hands.workspace / "big"))
+
+
+def test_a_timed_out_helper_has_its_whole_group_killed(tmp_path):
+    """S2 L3 r1 (codex HIGH, glm LOW): ``subprocess.run`` killed only the direct child on a timeout,
+    so the helper's descendants kept going after levain returned an error."""
+    marker = f"{30 + os.getpid() % 900}.{int(time.time()) % 100000}"
+    hands = _hands(tmp_path)
+    with pytest.raises(OSError, match="timed out"):
+        confinement._run_hands_helper(["/bin/sh", "-c", f"/bin/sleep {marker} & /bin/sleep {marker}"],
+                                      hands, b"", 1.0)
+    time.sleep(0.3)
+    left = subprocess.run(["/usr/bin/pgrep", "-f", f"sleep {marker}"], capture_output=True, text=True).stdout
+    assert left == "", left
 
 
 # --- the editor ---------------------------------------------------------------------------------------
@@ -326,3 +389,40 @@ def test_the_editor_fails_closed_when_the_hands_helper_cannot_run(tmp_path, monk
     assert "password is required" in str(obs)
     monkeypatch.undo()
     ed.close()
+
+
+def test_a_hands_editor_never_opens_with_its_own_opener_or_checks_paths_as_the_operator(tmp_path, monkeypatch):
+    """S2 L3 r1: an ``opener=`` passed through to ``builtins.open`` would open as the operator (glm
+    MED); and the executor's jewel name checks resolved and stat'd the entity's path as the operator,
+    following a link it planted (codex MED)."""
+    from openhands.tools.file_editor.definition import FileEditorAction
+
+    T, hands, provider, ed = _editor(tmp_path, monkeypatch)
+    policy = build_policy(_entity(tmp_path), workspace=hands.workspace)
+    ftok, htok = T._EDITOR_FLOOR.set(policy), T._EDITOR_HANDS.set(T._HandsFiles(provider, policy, hands))
+    try:
+        with pytest.raises(T._FloorRefusedOpen, match="opener"):
+            T._floored_open(str(hands.workspace / "x"), "r", opener=lambda p, f: os.open(p, f))
+    finally:
+        T._EDITOR_HANDS.reset(htok)
+        T._EDITOR_FLOOR.reset(ftok)
+    (tmp_path / "private").mkdir()
+    (tmp_path / "private" / "x").write_text("do-not-leak")
+    os.symlink(tmp_path / "private", hands.workspace / "l")
+    monkeypatch.setattr(T, "crown_jewel_reason", lambda *a: pytest.fail("an operator-side path check ran"))
+    monkeypatch.setattr(T, "linked_jewel_reason", lambda *a: pytest.fail("an operator-side path check ran"))
+    obs = ed(FileEditorAction(command="view", path=str(hands.workspace / "l" / "x")))
+    assert obs.is_error and "do-not-leak" not in str(obs), obs
+
+
+def test_the_hands_write_buffer_flushes_and_refuses_unencodable_text(tmp_path):
+    from levain.firing.openhands import tools as T
+
+    got = []
+    f = T._HandsWriteFile("/w/x", binary=False, encoding="ascii", errors=None,
+                          writer=lambda p, d: got.append(d))
+    f.write("café")
+    f.flush()
+    with pytest.raises(T._HandsIOError, match="encoded"):
+        f.close()
+    assert got == []

@@ -722,3 +722,27 @@ def test_bwrap_child_pid_is_read_without_waiting_for_eof_and_owned_by_the_reader
         assert time.monotonic() - t0 < 5
     finally:
         os.close(wr)
+
+
+def test_a_close_during_a_spawn_runs_none_of_the_command(tmp_path):
+    """S2 L3 r1 (codex HIGH): run() checked `_closed` without the lock and registered its group later,
+    so a close() in between left a command running with nobody to kill it."""
+    marker = tmp_path / "ran"
+
+    class Racing(SandboxedShell):
+        race = False
+
+        def _spawn_argv(self):
+            if self.race:
+                self.close()   # what another thread's close() does between run()'s check and the spawn
+            return super()._spawn_argv()
+
+    sh = _plain(tmp_path, Racing).start()
+    try:
+        sh.race = True
+        with pytest.raises(ConfinementError, match="closed"):
+            sh.run(f"touch {marker}", timeout=10)
+        time.sleep(0.3)
+        assert not marker.exists() and not sh._groups   # type: ignore[attr-defined]
+    finally:
+        sh.close()
