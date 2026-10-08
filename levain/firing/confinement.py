@@ -3027,7 +3027,7 @@ class SandboxedShell:
             delivered = self._signal_group(pgid, leader, signal.SIGKILL)
         leader.wait(5.0)
         # A SIGKILL that may not have landed leaves the group held, whatever it looks like (r5).
-        return (delivered and leader.exited and self._group_emptied(pgid, leader, 5.0)
+        return (delivered and leader.exited and self._reapable(pgid, leader, 5.0)
                 and self._reap(pgid, leader))
 
     def _signal_group(self, pgid: int, leader: _Leader, sig: int) -> bool:
@@ -3076,6 +3076,13 @@ class SandboxedShell:
             return False
         return _group_gone(pgid, timeout=timeout)
 
+    def _reapable(self, pgid: int, leader: _Leader, timeout: float) -> bool:
+        """Whether ``leader`` may be reaped now: its group is empty, which is all that ever allows it
+        here. The bwrap shell also allows a leader whose sandbox is unverified (not empty, see
+        :meth:`_BwrapShell._group_emptied`). Every reap decision asks this; every "may something of
+        this command still run" decision asks :meth:`_group_emptied`."""
+        return self._group_emptied(pgid, leader, timeout)
+
     def _prune_groups(self) -> None:
         """Reap the leader of each group that has emptied (:meth:`_group_emptied`), and forget the
         group. Only then may its number be reused, and it is no longer signalled."""
@@ -3083,7 +3090,7 @@ class SandboxedShell:
             groups = list(self._groups.items())
         # Decided outside the lock: `_group_emptied` may run pgrep (S2 L3 r3).
         for pgid, leader in groups:
-            if leader.reaped or (leader.wait(0) and self._group_emptied(pgid, leader, 0.0)):
+            if leader.reaped or (leader.wait(0) and self._reapable(pgid, leader, 0.0)):
                 self._reap(pgid, leader)
             elif leader.exited:
                 leader.release_watch()
@@ -3237,7 +3244,7 @@ class SandboxedShell:
         for pgid, leader in groups:
             leader.wait(5.0)
             emptied = leader.reaped or (pgid not in undelivered and leader.exited
-                                        and self._group_emptied(pgid, leader, 5.0))
+                                        and self._reapable(pgid, leader, 5.0))
             if not (emptied and self._reap(pgid, leader)):
                 # close() never raises; a group it could not empty is said, not hidden, and the
                 # session keeps the workspace lock while it lives (S2 L3 r2, codex HIGH).
@@ -6083,9 +6090,10 @@ class _BwrapShell(SandboxedShell):
         # pid_namespaces(7)), so "bash gone" means "namespace gone". With --new-session bash is NOT in
         # the bwrap process's group, so the group alone cannot say that.
         self._bashes: dict[int, tuple[_Leader, tuple[int, str] | None]] = {}
-        # Leaders whose bash levain never learned, though bwrap may have started one (a close or an
-        # interrupt during the spawn): the leader may be reaped once it exits, but the shell's claim
-        # stays, since a namespace may still hold its mounts (S2 L3 r6).
+        # Leaders whose bash levain never learned, though bwrap may have cloned a namespace init (an
+        # interrupt, a timeout, or a pipe closed without a pid): the leader may be reaped once it
+        # exits, but the shell's claim stays, since a namespace may still hold its mounts, and the
+        # shell refuses every later command (S2 L3 r6, r7). So at most one entry per shell.
         self._unverified: list[tuple[int, _Leader]] = []
 
     # Each command runs in a pid namespace of its own (``--unshare-pid --as-pid-1``).
@@ -6094,15 +6102,22 @@ class _BwrapShell(SandboxedShell):
     def _group_emptied(self, pgid: int, leader: _Leader, timeout: float) -> bool:
         """The command's group is empty once its bwrap process (the leader) has exited and its bash,
         the namespace's pid 1, is gone (or bwrap started none): the kernel's answer, not a read of
-        /proc's listing. Only THIS leader's record counts. A leader whose bash is unverified is
-        called empty once it exits, so it is reaped, and its namespace stays on the claim."""
+        /proc's listing. Only THIS leader's record counts. A leader whose bash is unverified is NEVER
+        empty (a namespace may live); it is only reapable (:meth:`_reapable`), and its namespace stays
+        on the claim (S2 L3 r7)."""
         deadline = time.monotonic() + timeout
         if not leader.wait(timeout):
             return False
         rec = self._bashes.get(pgid)
         if rec is not None and rec[0] is leader:
             return self._bashes_gone(max(0.0, deadline - time.monotonic()), only=pgid)
-        return any(lead is leader for _, lead in self._unverified)
+        return False
+
+    def _reapable(self, pgid: int, leader: _Leader, timeout: float) -> bool:
+        """Empty, or an exited leader whose sandbox is unverified: its number may go, its claim stays."""
+        if self._group_emptied(pgid, leader, timeout):
+            return True
+        return leader.exited and any(lead is leader for _, lead in self._unverified)
 
     def _reap(self, pgid: int, leader: _Leader) -> bool:
         if not super()._reap(pgid, leader):
@@ -6144,6 +6159,13 @@ class _BwrapShell(SandboxedShell):
                 pass
 
     def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
+        # Before any bwrap is started: with an earlier sandbox unverified the claim must keep naming
+        # it, and a later command's retag would not (S2 L3 r7).
+        if self._unverified:
+            raise ConfinementError(
+                "an earlier command's sandbox could not be verified gone — refusing to run the command "
+                "(fail-closed): the shell's claim must keep covering it, so close this shell."
+            )
         argv, _ = super()._spawn_argv()
         self._close_info()
         rd, wr = os.pipe()
@@ -6203,7 +6225,10 @@ class _BwrapShell(SandboxedShell):
             if b is None or pgid == but or (only is not None and pgid != only):
                 continue
             if _bash_gone(*b, timeout=max(0.0, deadline - time.monotonic())):
-                self._bashes[pgid] = (leader, None)
+                # Only while the record is still this leader's: a `_reap` between the check and the
+                # write has deleted it, and it must not come back (S2 L3 r7).
+                if self._bashes.get(pgid, (None,))[0] is leader:
+                    self._bashes[pgid] = (leader, None)
             else:
                 gone = False
         return gone
@@ -6225,22 +6250,28 @@ class _BwrapShell(SandboxedShell):
                 self._unverified.append((pgid, leader))
             raise
         if pid is None:
-            # bwrap closed the pipe without a pid. It writes the pid right after it clones bash, so
-            # an exit by itself (a status, not a signal) with the shell still open means it cloned
-            # none: no namespace exists. Anything else (killed, or a close() under way) cannot say.
-            if (leader is not None and not self._closed and leader.wait(5.0)
-                    and leader.status is not None and leader.status >= 0):
-                self._bashes[pgid] = (leader, None)
-            elif leader is not None:
+            # bwrap closed its info pipe without a pid. That proves no bash was released, not that no
+            # namespace process exists: bwrap clones the namespace init BEFORE it writes child-pid and
+            # releases it only afterwards, and an init blocked there ignores SIGTERM. So whatever the
+            # exit status: SIGKILL the command's group (a namespace init always takes a SIGKILL from
+            # its parent namespace), leave the leader unverified, and refuse (S2 L3 r7).
+            if leader is not None:
+                self._signal_group(pgid, leader, signal.SIGKILL)
                 self._unverified.append((pgid, leader))
             raise ConfinementError(
-                "bwrap did not report the pid of the command's bash (it exited before starting it) — "
-                "refusing to run the command (fail-closed)."
+                "bwrap closed its info pipe without reporting the pid of the command's bash — "
+                "refusing to run the command (fail-closed); this shell refuses further commands."
+            )
+        if leader is None:
+            # A pid was read but the group is no longer this shell's (a close() reaped it meanwhile):
+            # nothing records that bash, so the command does not run.
+            raise ConfinementError(
+                "bwrap reported the command's bash, but its process group is no longer tracked by "
+                "this shell — refusing to run the command (fail-closed)."
             )
         start = _proc_start_time(pid) or "-"
-        if leader is not None:
-            # Recorded first: it is how this group is known empty.
-            self._bashes[pgid] = (leader, (pid, start))
+        # Recorded first: it is how this group is known empty.
+        self._bashes[pgid] = (leader, (pid, start))
         if not self._bashes_gone(5.0, but=pgid):
             raise ConfinementError(
                 "an earlier command's sandbox is still exiting — refusing to run the command "

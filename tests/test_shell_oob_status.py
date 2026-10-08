@@ -1266,8 +1266,9 @@ def test_a_bash_record_belongs_to_its_leader_not_to_a_reused_group_number(tmp_pa
 
 def test_a_bwrap_that_started_no_bash_is_reaped_and_an_unreported_one_keeps_the_claim(tmp_path, monkeypatch):
     """r6 MED (codex + complement): when bwrap reported no bash, its exited leader was never reaped
-    and the claim never released. A bwrap that exited by itself without a pid started none: its
-    group may go. One interrupted before it answered may have: its leader is reaped, the claim kept."""
+    and the claim never released. r7: a bwrap that exited without a pid is NOT known to have started
+    none (it may have cloned its namespace init), so it is unverified like one interrupted before it
+    answered: its leader is reapable, never empty, and the claim is kept."""
     from levain.firing import confinement as C
 
     sh = _bwrap_books(tmp_path)
@@ -1278,7 +1279,9 @@ def test_a_bwrap_that_started_no_bash_is_reaped_and_an_unreported_one_keeps_the_
     sh._info_r = r   # type: ignore[attr-defined]
     with pytest.raises(ConfinementError):
         sh._after_spawn(777)   # type: ignore[attr-defined]
-    assert sh._group_emptied(777, failed, 0.0) and sh._reap(777, failed)   # type: ignore[attr-defined]
+    # r7: no longer "bwrap started none": a no-pid spawn is unverified, so reapable and never empty.
+    assert (not sh._group_emptied(777, failed, 0.0)   # type: ignore[attr-defined]
+            and sh._reapable(777, failed, 0.0) and sh._reap(777, failed))   # type: ignore[attr-defined]
 
     sh2 = _bwrap_books(tmp_path)
     cut = _ExitedLeader()
@@ -1295,3 +1298,95 @@ def test_a_bwrap_that_started_no_bash_is_reaped_and_an_unreported_one_keeps_the_
     sh2._ledger_claim = "c"   # type: ignore[attr-defined]
     sh2.close()
     assert cut.reaped and sh2.unemptied_groups == () and released == []
+
+
+# --- S2 L3 r7 (codex, complement on 99424c4..285f402) ------------------------------------------
+
+
+class _LiveSignalLeader(_ExitedLeader):
+    """An exited bwrap leader whose group is still signalled (a cloned namespace init may live in it)."""
+
+    def hold_for_signal(self):
+        return True
+
+
+def _eof_info_pipe(sh):
+    r, w = os.pipe()
+    os.close(w)   # bwrap exited and closed its --info-fd without writing a pid
+    sh._info_r = r
+
+
+def test_r7_a_no_pid_spawn_is_killed_as_a_group_and_left_unverified(tmp_path):
+    """r7 codex MED: EOF on the info pipe proves no bash ran, not that no namespace init exists (bwrap
+    clones it before it writes child-pid and releases it after), and a blocked pid-ns init ignores
+    SIGTERM. Whatever the exit status, the group gets a SIGKILL and the leader goes to `_unverified`."""
+    sh = _bwrap_books(tmp_path)
+    lead = _LiveSignalLeader(status=1)   # exited by itself, EOF, and a still-live group member
+    sent: list[tuple[int, int]] = []
+    sh._signal = lambda pgid, sig: sent.append((pgid, sig)) or True   # type: ignore[method-assign]
+    sh._groups[777] = lead   # type: ignore[attr-defined]
+    _eof_info_pipe(sh)
+    with pytest.raises(ConfinementError, match="closed its info pipe"):
+        sh._after_spawn(777)   # type: ignore[attr-defined]
+    assert (777, signal.SIGKILL) in sent
+    assert [(g, ld) for g, ld in sh._unverified] == [(777, lead)]   # type: ignore[attr-defined]
+    assert (777 not in sh._bashes)   # type: ignore[attr-defined]
+
+
+def test_r7_an_unverified_shell_refuses_every_later_command_before_it_spawns(tmp_path, monkeypatch):
+    """r7 codex + complement MED: the next command must not retag the claim away from the unverified
+    namespace. `_spawn` refuses before any bwrap is started."""
+    from levain.firing import confinement as C
+
+    sh = C._BwrapShell(policy=None, manifest={}, argv=["/bin/true", "--as-pid-1"], cwd=tmp_path,  # type: ignore[arg-type]
+                       env={})
+    sh._unverified.append((777, _ExitedLeader()))   # type: ignore[attr-defined]
+
+    def no_spawn(*a, **k):
+        raise AssertionError("a bwrap was spawned on a poisoned shell")
+
+    monkeypatch.setattr(subprocess, "Popen", no_spawn)
+    with pytest.raises(ConfinementError, match="could not be verified gone"):
+        sh._spawn()   # type: ignore[attr-defined]
+    assert len(sh._unverified) == 1   # type: ignore[attr-defined]
+
+
+def test_r7_an_unverified_leader_is_reapable_but_never_reported_empty(tmp_path):
+    """r7 complement MED: `_group_emptied` called an unverified leader empty once it exited. It is
+    now reapable (`_reapable`) and not empty, so a SIGKILL gate still fires and a caller reading
+    'empty' never takes it for 'nothing of this command runs'."""
+    sh = _bwrap_books(tmp_path)
+    lead = _LiveSignalLeader()
+    sent: list[tuple[int, int]] = []
+    sh._signal = lambda pgid, sig: sent.append((pgid, sig)) or True   # type: ignore[method-assign]
+    sh._groups[777] = lead   # type: ignore[attr-defined]
+    sh._unverified.append((777, lead))   # type: ignore[attr-defined]
+    assert sh._group_emptied(777, lead, 0.0) is False   # type: ignore[attr-defined]
+    assert sh._reapable(777, lead, 0.0) is True   # type: ignore[attr-defined]
+    assert sh._kill_group(777, lead) is True   # type: ignore[attr-defined]  # reaped...
+    assert (777, signal.SIGKILL) in sent                # ...but only after a SIGKILL
+    assert lead.reaped and sh._unverified            # type: ignore[attr-defined]  # claim stays covered
+
+
+def test_r7_a_pid_with_no_leader_is_not_silently_dropped(tmp_path):
+    """r7 complement LOW: a pid was read but the group is not in `_groups`: refuse, do not fall through."""
+    sh = _bwrap_books(tmp_path)
+    sh._read_child_pid = lambda: 4242   # type: ignore[method-assign]
+    with pytest.raises(ConfinementError, match="no longer"):
+        sh._after_spawn(999)   # type: ignore[attr-defined]
+
+
+def test_r7_bashes_gone_does_not_resurrect_a_reaped_record(tmp_path, monkeypatch):
+    from levain.firing import confinement as C
+
+    sh = _bwrap_books(tmp_path)
+    lead = _ExitedLeader()
+    sh._bashes[777] = (lead, (4243, "1"))   # type: ignore[attr-defined]
+
+    def gone_and_reaped(pid, start, timeout):
+        del sh._bashes[777]   # type: ignore[attr-defined]  # _reap ran meanwhile
+        return True
+
+    monkeypatch.setattr(C, "_bash_gone", gone_and_reaped)
+    assert sh._bashes_gone(1.0) is True   # type: ignore[attr-defined]
+    assert 777 not in sh._bashes   # type: ignore[attr-defined]

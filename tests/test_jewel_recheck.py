@@ -593,6 +593,8 @@ def test_a_retag_that_does_not_reach_the_disk_closes_the_shell(tmp_path, monkeyp
         pid = 4242
 
     def start(self):
+        # r7: `_after_spawn` refuses a pid whose group this shell does not track, so register one.
+        self._groups[_P.pid] = object()   # type: ignore[assignment]
         self._after_spawn(_P.pid)   # each command tags the claim with its bash, the probe first
         return self
 
