@@ -1069,6 +1069,13 @@ class GitLedger:
                             git(["diff", "--cached", "--quiet"], self.wt, check=False).returncode == 0:
                         git(["cherry-pick", "--skip"], self.wt, timeout=60)
                         continue
+                    if foreign:
+                        # the entry builds on a commit sync does not move (T36): name THAT, not a device clash (the
+                        # 1007+30 suite run printed "two clones share a device id" for a hand-made commit)
+                        raise TeamError(f"an unpushed entry cannot be replayed onto the remote ledger: it builds on "
+                                        f"{len(foreign)} local commit(s) levain did not write on this clone (listed as "
+                                        "NOT moved: " + ", ".join(c[:10] for c in foreign[:5]) + "). Nothing was "
+                                        "changed locally; publish or drop those commits with git, then sync")
                     raise TeamError("an unpushed entry cannot be replayed onto the remote ledger (two clones share "
                                     f"a device id, or git could not run: {_tail(cp)}). Nothing was changed locally; "
                                     "if this clone's .git was copied from another, see `levain team join --new-device`")

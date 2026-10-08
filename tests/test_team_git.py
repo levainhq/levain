@@ -585,6 +585,25 @@ def test_torn_last_line_does_not_swallow_the_next_record(two):
     assert "t stays" in [e.get("words") for e in gl.ledger().in_force]
 
 
+def test_a_replay_blocked_by_a_hand_made_commit_names_it(two, capsys):
+    """RUN (1007+30 suite run): a hand-made signed commit in the ledger worktree is not moved by sync (T36); a levain
+    entry built on it then cannot replay. The message named a device-id clash; it now names the hand-made commit."""
+    tmp, ana, ben = two
+    gl = GitLedger(Repo.discover(ana))
+    gl.file_for("ana").parent.mkdir(parents=True, exist_ok=True)
+    with open(gl.file_for("ana"), "a") as fh:
+        fh.write('{"v":1,"id":"ana-2026')
+    git("add", ".", cwd=gl.wt)
+    signed_commit(gl.wt, "by hand", "ana")
+    hand = git("rev-parse", "HEAD", cwd=gl.wt).strip()
+    assert record_ruling(ben, "src/q.py", "q stays") == 0          # the remote moves on
+    capsys.readouterr()
+    record_ruling(ana, "src/t.py", "t stays")                      # recorded locally; its push cannot replay
+    c = capsys.readouterr()
+    joined = c.out + c.err
+    assert hand[:10] in joined and "levain did not write" in joined and "device id" not in joined, joined
+
+
 def test_hook_reads_while_another_process_syncs(two):
     tmp, ana, ben = two
     assert record_ruling(ben, "src/q.py", "q stays") == 0
