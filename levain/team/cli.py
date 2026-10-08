@@ -16,7 +16,7 @@ from . import roles as R
 from . import wire as W
 from .export import export_stream
 from .hook import decide
-from .transport import GitLedger, Repo, TeamError
+from .transport import GitLedger, JoinIncomplete, Repo, TeamError
 
 
 def _repo(args) -> Repo:
@@ -103,12 +103,18 @@ def cmd_join(args) -> int:
             raise TeamError(f"--accept-merge takes SHA:PARENT, got {v!r}: name the parent the owner chose (a trust "
                             "decision, never a default)")
         accepted[sha] = int(n)
-    print(gl.join(remote=args.remote, new_device=args.new_device, root=args.root, signing_key=args.signing_key,
-                  accept_merges=accepted))
+    incomplete = None
+    try:
+        print(gl.join(remote=args.remote, new_device=args.new_device, root=args.root, signing_key=args.signing_key,
+                      accept_merges=accepted))
+    except JoinIncomplete as exc:
+        incomplete = exc        # joined: the clone's own setup below still runs, then the command fails
     if args.anneal_db:
         gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
     if not args.no_install:
         _install_all(repo)
+    if incomplete is not None:
+        raise incomplete
     return 0
 
 

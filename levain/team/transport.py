@@ -51,6 +51,11 @@ class TeamError(RuntimeError):
     """A team operation could not complete. The message is meant for a person to read."""
 
 
+class JoinIncomplete(TeamError):
+    """`join` pinned and persisted the ledger, but a step it was asked to complete (the key confirm, the reconcile)
+    did not: the clone IS joined and its state stays; the command still does not report success."""
+
+
 class TeamBusy(TeamError):
     """A lock was not acquired in time."""
 
@@ -683,17 +688,22 @@ class GitLedger:
         left = self.other_genesis_items() if moved else ""
         if left:
             self.warnings.append(left)
-        for p in pending:
-            self.warnings.append(f"joined and pinned to {name}, but this is still pending: {p}")
         handle = self.handle(d.team)
         if handle is None:
             fp = self.own_fingerprint()
-            return (tofu + f"\njoined {d.team.project}, but this machine's key ({fp}) is not a member's key yet: from "
-                    "one of your machines whose key is in force, run `levain team key add <your handle> <this public "
-                    f"key>`; if you have none yet, {owner} proposes your first key (`levain team key add <your "
-                    "handle> <your public key>`); then `levain team sync`")
-        return tofu + f"\njoined {d.team.project} as {handle} (device {self.device})" + (
-            f"; confirmed this machine's key" if confirmed else "")
+            out = (tofu + f"\njoined {d.team.project}, but this machine's key ({fp}) is not a member's key yet: from "
+                   "one of your machines whose key is in force, run `levain team key add <your handle> <this public "
+                   f"key>`; if you have none yet, {owner} proposes your first key (`levain team key add <your "
+                   "handle> <your public key>`); then `levain team sync`")
+        else:
+            out = tofu + f"\njoined {d.team.project} as {handle} (device {self.device})" + (
+                f"; confirmed this machine's key" if confirmed else "")
+        if pending:
+            # joined, and the state stays; but a part it was asked to do did not complete, so it is NOT reported as a
+            # success (the CLI exits 2, as for an entry recorded locally whose push failed)
+            raise JoinIncomplete(out + "\n" + "\n".join(f"joined and pinned to {name}, but this is still pending: {p}"
+                                                          for p in pending))
+        return out
 
     # ---- write path ----------------------------------------------------------------------------------------
 
