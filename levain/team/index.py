@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -110,16 +111,20 @@ class LedgerFile:
     last_hash: str
 
 
-def may_link(linker: dict, target: dict, owner: str | None) -> str | None:
+def may_link(linker: dict, target: dict, owner: str | None,
+             authority: Callable[[dict], bool] | None = None) -> str | None:
     """None if ``linker`` may supersede or retire ``target``, else the reason it may not.
 
     The same rules the write path checks, enforced again here, at read: a line pushed by hand must not
-    get further than one written through ``levain team record``.
+    get further than one written through ``levain team record``. ``authority``, when given, decides whether the
+    linker held owner authority AT ITS OWN LINE (tenure: the owner then, not the owner now); without it, the
+    linker must be today's ``owner``.
     """
     if target.get("type") in ("ack", "retire"):
         return f"{target['id']} is an {target['type']}; it cannot be superseded"
     la, ta = linker.get("author", ""), target.get("author", "")
-    if la != ta and not (owner is not None and la == owner):
+    cross_ok = authority(linker) if authority is not None else (owner is not None and la == owner)
+    if la != ta and not cross_ok:
         return f"only {ta} or the owner ({owner}) may supersede {target['id']}"
     if target.get("kind") == "ruling":
         if not (linker.get("words") or "").strip():
@@ -135,6 +140,8 @@ class Ledger:
     file_problems: list[str]       # chain breaks, bad lines, misfiled or stranger-written entries
     files: list[LedgerFile] = field(default_factory=list)
     owner: str | None = None       # team.toml owner: the one author whose links cross authors
+    # tenure: did this linker hold owner authority at its own line? (replaces the ``owner`` test when set)
+    authority: Callable[[dict], bool] | None = None
 
     @functools.cached_property
     def by_id(self) -> dict[str, dict]:
@@ -152,7 +159,7 @@ class Ledger:
                 if target is None:
                     refused.append(f"{e['id']} supersedes {s}, which is not in the ledger (ignored)")
                     continue
-                why = may_link(e, target, self.owner)
+                why = may_link(e, target, self.owner, self.authority)
                 if why is None:
                     honoured.add(s)
                 else:
@@ -203,10 +210,15 @@ class Ledger:
 
 
 def build(files: list[tuple[str, list[str]]], owner: str | None = None,
-          problems: list[str] | None = None) -> Ledger:
+          problems: list[str] | None = None, *, unenforced: dict[str, set[str]] | None = None,
+          authority: Callable[[dict], bool] | None = None) -> Ledger:
     """A ledger from (rel path under ledger/, lines) pairs. Callers split on "\\n" only:
     ``str.splitlines()`` also splits on U+2028/U+2029/U+0085, which JSON written with ensure_ascii=False
-    carries unescaped inside a string."""
+    carries unescaped inside a string.
+
+    ``unenforced`` maps a file to the hashes of lines that are in its chain but not enforced (tenure: a line not
+    written by the member, or the owner, in force where it landed). They are verified as part of the chain, then
+    kept out of the entries, so a stranger's line never breaks a member's chain and never counts either."""
     entries: list[dict] = []
     problems = list(problems or [])
     out_files: list[LedgerFile] = []
@@ -217,7 +229,8 @@ def build(files: list[tuple[str, list[str]]], owner: str | None = None,
         probs += [E._printable(f"{e['id']}: author {e.get('author')!r} is filed under {owner_dir}/ (not enforced)")
                   for e in misfiled]
         bad = {id(e) for e in misfiled}  # identity, not dict equality: a list scan here is quadratic in a hostile file
-        got = [e for e in got if id(e) not in bad]
+        skip = (unenforced or {}).get(rel, set())
+        got = [e for e in got if id(e) not in bad and e.get("hash") not in skip]
         raw = []
         for line in lines:
             try:
@@ -237,7 +250,7 @@ def build(files: list[tuple[str, list[str]]], owner: str | None = None,
         seen.add(e["id"])
         uniq.append(e)
     uniq.sort(key=lambda e: (e.get("ts", ""), e.get("id", "")))
-    return Ledger(uniq, problems, out_files, owner)
+    return Ledger(uniq, problems, out_files, owner, authority)
 
 
 def load_dir(ledger_dir: Path, owner: str | None = None) -> Ledger:
