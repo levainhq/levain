@@ -618,6 +618,10 @@ class GitLedger:
             d = T.derive(self.repo.toplevel, tip0, cand, S.SigCache(self.base / "sigcache.json"))
         except T.Unjudgeable as exc:
             raise TeamError(f"cannot judge the team ledger on this clone: {exc}; nothing was changed") from None
+        if (self.wt / ".git").exists():
+            # a COPIED clone lists its own private worktree under the original's path until git relinks it (a repair,
+            # not a change: it touches no branch or state)
+            self._repair_if_moved()
         wt_real = os.path.realpath(self.wt)
         path = ""
         for row in git(["worktree", "list", "--porcelain"], self.repo.toplevel, check=False).stdout.splitlines():
