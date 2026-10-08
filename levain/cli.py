@@ -986,10 +986,19 @@ def main(argv: list[str] | None = None) -> int:
         "--undo",
         action="store_true",
         help=(
-            "Remove the user, its group, its ssh key, its sudoers rule and the workspace "
-            "permissions. Files it created keep its retired id as owner and become readable by "
+            "Retire the user (its account stays, disabled: no login, no password, no home, so its id "
+            "is never given to another account) and remove its ssh key, its sudoers rule and the "
+            "workspace permissions. Files it created keep its retired id as owner and become readable by "
             "your group (never yours, never root's: a git that owned them would trust a repository "
             "it filled); the workspace is removed only if empty."
+        ),
+    )
+    iso_p.add_argument(
+        "--reenable",
+        action="store_true",
+        help=(
+            "Give this entity its hands back after an --undo: the retired hands user (undo keeps the "
+            "account, disabled, so its id is never reused) is brought back with the same id."
         ),
     )
     iso_p.add_argument(
@@ -1859,7 +1868,7 @@ def _cmd_adopt_answers(args: argparse.Namespace) -> int:
 def _cmd_setup_isolation(args: argparse.Namespace) -> int:
     from levain.firing.hands import cmd_setup_isolation
 
-    return cmd_setup_isolation(args.path, undo=args.undo, dry_run=args.dry_run)
+    return cmd_setup_isolation(args.path, undo=args.undo, dry_run=args.dry_run, reenable=args.reenable)
 
 
 def _cmd_ws_git(args: argparse.Namespace) -> int:

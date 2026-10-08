@@ -208,7 +208,20 @@ sudo -n -u "$H" /bin/sleep 600 >/dev/null 2>&1 &
 sleep 1
 SUDOERS="/etc/sudoers.d/levain-$H"
 setup --undo || fail "undo exited nonzero"
-refused "hands user still exists" id "$H"
+check "the hands user stays, as a tombstone holding its id" test "$(id -u "$H" 2>/dev/null)" = "$HID"
+if [ "$(uname)" = Darwin ]; then
+  check "it is marked retired" bash -c "dscl . -read '/Users/$H' RealName | grep -q retired"
+  check "it is disabled for login" bash -c "dscl . -read '/Users/$H' AuthenticationAuthority | grep -q DisabledUser"
+  check "its shell is /usr/bin/false" bash -c "dscl . -read '/Users/$H' UserShell | grep -q /usr/bin/false"
+else
+  check "it is marked retired" bash -c "getent passwd '$H' | cut -d: -f5 | grep -q retired"
+  check "its password is locked" bash -c "sudo passwd -S '$H' | awk '{print \$2}' | grep -qx L"
+  check "it is expired" bash -c "sudo chage -l '$H' | grep -i 'account expires' | grep -vq never"
+  refused "root's su to it with an explicit shell (expired)" sudo su -s /bin/sh "$H" -c /bin/true
+fi
+refused "the operator's sudo as it" sudo -n -u "$H" /usr/bin/true
+refused "root's su to it" sudo su "$H" -c /usr/bin/true
+check "its home and ssh key are gone" bash -c "! sudo test -e '$HHOME/.ssh/id_ed25519'"
 refused "a hands process survived" pgrep -U "$HID"
 refused "sudoers drop-in still exists" sudo test -e "$SUDOERS"
 refused "sshd drop-in still exists" sudo test -e "/etc/ssh/sshd_config.d/levain-$H.conf"
@@ -235,12 +248,17 @@ else
   if getfacl -Rp "$(dirname "$WS")" 2>/dev/null | grep -qE '^(default:)?user:[^:]+:'; then fail "ACL entries left in the workspace"; else pass "no ACL entries left in the workspace"; fi
 fi
 
-echo "== a second setup gets a new id (the first one is retired)"
+echo "== setup again: refused while the tombstone stands, then re-enabled with the same id"
 sudo rm -rf "$(dirname "$WS")"
-setup >/dev/null || fail "second setup failed"
+if setup >/tmp/levain-iso-again.log 2>&1; then fail "a plain setup over the tombstone was allowed"; else pass "a plain setup over the tombstone is refused"; fi
+check "and it points at --reenable" grep -q -- "--reenable" /tmp/levain-iso-again.log
+setup --reenable >/dev/null || fail "setup --reenable failed"
 HID2="$(cfgval hands_uid)"
-if [ -n "$HID2" ] && [ "$HID2" != "$HID" ]; then pass "new id $HID2 (was $HID)"; else fail "id reused or missing: '$HID2'"; fi
+if [ "$HID2" = "$HID" ]; then pass "re-enabled with the same id $HID"; else fail "re-enabled with id '$HID2', not $HID"; fi
+check "it can run again" sudo -n -u "$H" /usr/bin/true
+check "doctor sees it set up" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'is set up'"
 setup --undo >/dev/null || fail "second undo failed"
+check "a tombstone again, same id" test "$(id -u "$H" 2>/dev/null)" = "$HID"
 check "operator still has sudo" sudo -n /usr/bin/true
 rm -f "$SECRET"
 

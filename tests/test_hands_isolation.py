@@ -256,16 +256,68 @@ def test_undo_order_rule_retire_jobs_kill_then_files_then_account(tmp_path: Path
     first = lambda text: next(i for i, w in enumerate(why) if text in w)  # noqa: E731
     assert first("sudoers") == 0
     order = ["sudoers", "retire the user id", "cron jobs", "at jobs", "stop every process", "your group (its owner stays",
-             "remove the workspace ACLs", "let your group read", "delete the hands user"]
+             "remove the workspace ACLs", "let your group read", "keep the account as a tombstone"]
     assert [first(t) for t in order] == sorted(first(t) for t in order)
 
 
 @pytest.mark.parametrize("host", ["darwin", "linux"])
-def test_undo_account_deletion_fails_loudly_and_skips_only_when_already_gone(tmp_path: Path, host) -> None:
+def test_undo_keeps_the_account_as_a_disabled_tombstone_and_never_deletes_it(tmp_path: Path, host) -> None:
+    # Head ruling (a), 2026-10-07: the id stays reserved where the OS allocator looks.
     plan = _undo(tmp_path, host=host)
-    for s in plan.steps:
-        if s.why.startswith(("delete the hands user", "delete the hands group")):
-            assert not s.allow_fail and s.skip_if and s.skip_if[:2] == ("/bin/sh", "-c") and "!" in s.skip_if[2]
+    joined = _joined(plan)
+    assert "-delete /Users" not in joined and "-delete /Groups" not in joined
+    assert "userdel" not in joined and "groupdel" not in joined
+    h = plan.hands_user
+    if host == "darwin":
+        for attr in (("UserShell", "/usr/bin/false"), ("Password", "*"), ("AuthenticationAuthority", ";DisabledUser;"),
+                     ("IsHidden", "1"), ("RealName", hands.RETIRED_MARKER["darwin"])):
+            assert f"-create /Users/{h} {attr[0]} {attr[1]}" in joined, attr
+        assert any(s.call is not None and "every group" in s.why for s in plan.steps)
+    else:
+        (usermod,) = [a for a in _argvs(plan) if a[0].endswith("usermod")]
+        assert "--lock" in usermod and usermod[usermod.index("--groups") + 1] == ""
+        assert usermod[usermod.index("--shell") + 1].endswith(("nologin", "false"))
+        assert any(a[0].endswith("chage") and a[1:3] == ("--expiredate", "0") for a in _argvs(plan))
+    assert not any(s.allow_fail for s in plan.steps if "tombstone" in s.why)
+
+
+@pytest.mark.parametrize("host", ["darwin", "linux"])
+def test_undo_of_a_deleted_account_makes_the_tombstone_again(tmp_path: Path, host) -> None:
+    plan = _undo(tmp_path, host=host, account_gone=True)
+    joined = _joined(plan)
+    if host == "darwin":
+        assert f"-create /Users/{plan.hands_user} UniqueID 499" in joined
+    else:
+        assert "useradd --system --uid 499" in joined and hands.RETIRED_MARKER["linux"] in joined
+
+
+def _setup_dry(tmp_path: Path, monkeypatch, capsys, *, retired: bool, reenable: bool, host: str = "linux"):
+    ed = _entity(tmp_path)
+    monkeypatch.setattr(hands, "host_os", lambda: host)
+    monkeypatch.setattr(hands, "_user_exists", lambda n: n == hands_user_name(ed) and retired is not None)
+    monkeypatch.setattr(hands, "user_record_is_ours", lambda n, h: True)
+    monkeypatch.setattr(hands, "user_is_retired", lambda n, h: bool(retired))
+    real = hands.pwd.getpwnam
+    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: type("E", (), {"pw_uid": 450})() if n == hands_user_name(ed) else real(n))
+    monkeypatch.setattr(hands, "shared_root_problem", lambda h: None)
+    monkeypatch.setattr(hands, "operator_git_identity", lambda op: {})
+    rc = hands.cmd_setup_isolation(ed, undo=False, dry_run=True, reenable=reenable)
+    return rc, capsys.readouterr().out
+
+
+@pytest.mark.parametrize("host", ["darwin", "linux"])
+def test_setup_refuses_a_retired_tombstone_unless_told_to_reenable_it_with_its_own_id(tmp_path: Path, monkeypatch, capsys, host) -> None:
+    rc, out = _setup_dry(tmp_path, monkeypatch, capsys, retired=True, reenable=False, host=host)
+    assert rc == 1 and "--reenable" in out
+    rc, out = _setup_dry(tmp_path / "b", monkeypatch, capsys, retired=True, reenable=True, host=host)
+    assert rc == 0 and "(id 450)" in out
+    if host == "linux":
+        assert "useradd" not in out and "bring the retired hands user back" in out and "--expiredate -1" in out
+
+
+def test_reenable_with_nothing_retired_refuses(tmp_path: Path, monkeypatch, capsys) -> None:
+    rc, out = _setup_dry(tmp_path, monkeypatch, capsys, retired=None, reenable=True)
+    assert rc == 1 and "no retired hands user" in out
 
 
 def test_undo_without_a_verified_id_kills_nothing_and_reowns_only_ownerless_files(tmp_path: Path) -> None:

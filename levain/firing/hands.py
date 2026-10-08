@@ -77,6 +77,11 @@ OPERATOR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
 #: command created, even if a name collides.
 HANDS_MARKER = "Levain hands user"
 
+#: What undo leaves: the account, disabled in place, so its id stays reserved in the directory
+#: service the OS allocates from (Phill's head, 2026-10-07, ruling (a): a tombstone, never a
+#: deletion). Starts with :data:`HANDS_MARKER`, so it is still recognisably Levain's.
+RETIRED_MARKER = {"darwin": "Levain hands user (retired)", "linux": "Levain hands user,retired"}
+
 #: Where root resolves a bare program name: root-owned directories only.
 SECURE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -198,6 +203,7 @@ def plan_setup(
     operator: str,
     host: HostOS,
     hands_id: int,
+    reenable: bool = False,
     git_identity: dict[str, str] | None = None,
     sshd_dropins: bool = False,
     deny_lists: tuple[Path, ...] = (),
@@ -244,13 +250,27 @@ def plan_setup(
         ]
     elif host == "linux":
         home = _LINUX_HANDS_HOME_ROOT / hands
+        steps.append(Step("create the hands homes directory",
+                          (_abs("mkdir"), "-p", "-m", "755", str(_LINUX_HANDS_HOME_ROOT))))
+        if reenable:
+            # The tombstone undo left: the same account and id, brought back.
+            steps += [
+                Step("bring the retired hands user back (its own home, still no login shell, no other groups)",
+                     (_abs("usermod"), "--home", str(home), "--shell", _nologin(), "--comment", HANDS_MARKER,
+                      "--groups", "", hands)),
+                Step("lift its expiry", (_abs("chage"), "--expiredate", "-1", hands)),
+                Step("create its home", (_abs("mkdir"), "-m", "700", str(home))),
+                Step("give it the home", (_abs("chown"), f"{hands}:{hands_id}", str(home))),
+            ]
+        else:
+            steps += [
+                Step("create the hands group", (_abs("groupadd"), "--system", "--gid", str(hands_id), hands)),
+                Step("create the hands user (no password, no login shell)",
+                     (_abs("useradd"), "--system", "--uid", str(hands_id), "--gid", str(hands_id),
+                      "--home-dir", str(home), "--create-home", "--shell", _nologin(),
+                      "--comment", HANDS_MARKER, hands)),
+            ]
         steps += [
-            Step("create the hands homes directory", (_abs("mkdir"), "-p", "-m", "755", str(_LINUX_HANDS_HOME_ROOT))),
-            Step("create the hands group", (_abs("groupadd"), "--system", "--gid", str(hands_id), hands)),
-            Step("create the hands user (no password, no login shell)",
-                 (_abs("useradd"), "--system", "--uid", str(hands_id), "--gid", str(hands_id),
-                  "--home-dir", str(home), "--create-home", "--shell", _nologin(),
-                  "--comment", HANDS_MARKER, hands)),
             Step("make the home private", (_abs("chmod"), "700", str(home))),
             Step("create the shared workspace root", (_abs("mkdir"), "-p", "-m", "755", str(root))),
             Step("check the shared root is still root's alone", call=lambda: _still_roots(host)),
@@ -296,6 +316,26 @@ def plan_setup(
     return Plan(host, operator, hands, hands_id, ed, ws, tuple(steps))
 
 
+def _present(kind: Literal["user", "group"], host: HostOS, name: str) -> tuple[str, ...]:
+    """A ``skip_if`` that exits 0 when the account exists."""
+    return ("/bin/sh", "-c", _absent(kind, host, name)[2][2:])
+
+
+def _darwin_leave_groups(user: str) -> tuple[bool, str]:
+    """Remove ``user`` from every group that lists it as a member."""
+    out = subprocess.run(["/usr/bin/dscl", ".", "-list", "/Groups", "GroupMembership"], capture_output=True,
+                         text=True, cwd="/")
+    if out.returncode != 0:
+        return False, out.stderr.strip()
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if parts and user in parts[1:]:
+            ok, why = _run_ok(("/usr/sbin/dseditgroup", "-o", "edit", "-d", user, "-t", "user", parts[0]))
+            if not ok:
+                return False, why
+    return True, ""
+
+
 def _absent(kind: Literal["user", "group"], host: HostOS, name: str) -> tuple[str, ...]:
     """A ``skip_if`` that exits 0 when the account is already gone."""
     if host == "darwin":
@@ -319,10 +359,13 @@ def plan_undo(
     """The reverse of :func:`plan_setup`, ordered so nothing acts on the tree while the hands user
     can still change it: the sudoers rule goes first (no new processes), the id is retired, cron and
     at jobs are removed, and every process of the hands user is killed and the kill verified. Only
-    then are files given the operator's group and the account deleted. A step that fails stops the undo.
+    then are files given the operator's group and the account retired in place (a tombstone that keeps
+    its id reserved where the OS allocates ids; it is never deleted). A step that fails stops the undo.
 
-    ``hands_id`` is the id the DIRECTORY SERVICE gives the user (never the config's, which the
-    operator account can write); ``None`` when the user is already gone, and then nothing is killed
+    ``hands_id`` is the id the DIRECTORY SERVICE gives the user (never the config's alone, which the
+    operator account can write: with ``account_gone`` the caller takes the config's id only because
+    the workspace setup made still carries it, and then nothing is killed and the tombstone is made
+    again); ``None`` when the user is already gone, and then nothing is killed
     and only files with no owner left are touched. The workspace is always the derived one."""
     if not HANDS_USER_RE.match(hands_user):
         raise HandsSetupError(f"refusing to remove {hands_user!r}: not a Levain hands user name")
@@ -354,18 +397,46 @@ def plan_undo(
              call=lambda: _readable_and_sanitised(tree, operator_gid, owner_uid=hands_id)),
     ]
     if host == "darwin":
+        dscl, u, g = ("/usr/bin/dscl", "."), f"/Users/{hands_user}", f"/Groups/{hands_user}"
+        if account_gone:
+            # Someone deleted the account: make the tombstone, so the id is reserved again.
+            steps += [
+                Step("create the hands group again, to hold its id", (*dscl, "-create", g),
+                     skip_if=_present("group", host, hands_user)),
+                Step("give it its id", (*dscl, "-create", g, "PrimaryGroupID", str(hands_id)),
+                     skip_if=_present("group", host, hands_user)),
+                Step("create the hands user again, to hold its id", (*dscl, "-create", u)),
+                Step("give it its id", (*dscl, "-create", u, "UniqueID", str(hands_id))),
+                Step("and its own group", (*dscl, "-create", u, "PrimaryGroupID", str(hands_id))),
+            ]
         steps += [
-            Step("delete the hands user", ("/usr/bin/dscl", ".", "-delete", f"/Users/{hands_user}"),
-                 skip_if=_absent("user", host, hands_user)),
-            Step("delete the hands group", ("/usr/bin/dscl", ".", "-delete", f"/Groups/{hands_user}"),
-                 skip_if=_absent("group", host, hands_user)),
-            Step("delete the hands home", ("/bin/rm", "-rf", str(Path("/Users") / hands_user))),
+            Step("keep the account as a tombstone: no login shell", (*dscl, "-create", u, "UserShell", "/usr/bin/false")),
+            Step("no password", (*dscl, "-create", u, "Password", "*")),
+            Step("disabled for login", (*dscl, "-create", u, "AuthenticationAuthority", ";DisabledUser;")),
+            Step("hidden", (*dscl, "-create", u, "IsHidden", "1")),
+            Step("no home", (*dscl, "-create", u, "NFSHomeDirectory", "/var/empty")),
+            Step("labelled as a tombstone", (*dscl, "-create", u, "RealName", RETIRED_MARKER[host])),
+            Step("take it out of every group", call=lambda: _darwin_leave_groups(hands_user)),
+            Step("delete the hands home (its ssh key goes with it)", ("/bin/rm", "-rf", str(Path("/Users") / hands_user))),
         ]
     else:
+        home = _LINUX_HANDS_HOME_ROOT / hands_user
+        if account_gone:
+            steps += [
+                Step("create the hands group again, to hold its id",
+                     (_abs("groupadd"), "--system", "--gid", str(hands_id), hands_user),
+                     skip_if=_present("group", host, hands_user)),
+                Step("create the hands user again, to hold its id",
+                     (_abs("useradd"), "--system", "--uid", str(hands_id), "--gid", str(hands_id),
+                      "--no-create-home", "--home-dir", "/nonexistent", "--shell", _nologin(),
+                      "--comment", RETIRED_MARKER[host], hands_user)),
+            ]
         steps += [
-            Step("delete the hands user and its home", (_abs("userdel"), "--remove", hands_user),
-                 skip_if=_absent("user", host, hands_user)),
-            Step("delete the hands group", (_abs("groupdel"), hands_user), skip_if=_absent("group", host, hands_user)),
+            Step("keep the account as a tombstone: locked, no login shell, no home, no other groups",
+                 (_abs("usermod"), "--lock", "--shell", _nologin(), "--home", "/nonexistent",
+                  "--comment", RETIRED_MARKER[host], "--groups", "", hands_user)),
+            Step("expired", (_abs("chage"), "--expiredate", "0", hands_user)),
+            Step("delete the hands home (its ssh key goes with it)", (_abs("rm"), "-rf", str(home))),
             Step("remove the hands homes directory if empty", (_abs("rmdir"), str(_LINUX_HANDS_HOME_ROOT)),
                  allow_fail=True),
         ]
@@ -723,6 +794,18 @@ def user_record_is_ours(hands_user: str, host: HostOS) -> bool:
     return HANDS_MARKER in out
 
 
+def user_is_retired(hands_user: str, host: HostOS) -> bool:
+    """True when ``hands_user`` exists as an undo tombstone (:data:`RETIRED_MARKER`), asked of the
+    directory service in a fresh process (this process's cache can lag a change just made)."""
+    if host == "linux":
+        r = subprocess.run([_abs("getent"), "passwd", hands_user], capture_output=True, text=True, cwd="/")
+        fields = r.stdout.strip().split(":")
+        return r.returncode == 0 and len(fields) > 4 and fields[4] == RETIRED_MARKER[host]
+    r = subprocess.run(["/usr/bin/dscl", ".", "-read", f"/Users/{hands_user}", "RealName"],
+                       capture_output=True, text=True, cwd="/")
+    return r.returncode == 0 and RETIRED_MARKER[host] in r.stdout
+
+
 def _user_exists(name: str) -> bool:
     try:
         pwd.getpwnam(name)
@@ -887,7 +970,7 @@ def _operator_path_under_home(operator: str) -> list[str]:
 # --- the command ----------------------------------------------------------------------------------
 
 
-def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
+def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable: bool = False) -> int:
     """``levain setup-isolation [--undo] [--dry-run]``. Returns a process exit code."""
     from levain.firing.confinement import ConfinementError, load_confinement_config
     from levain.firing.isolation import IsolationError, guard_entity
@@ -975,27 +1058,41 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
             return rc
         # Asked of the directory service in a fresh process: this process's getpwnam can keep
         # returning a just-deleted macOS account (measured on a CI runner).
-        gone = subprocess.run(_absent("user", host, hands), capture_output=True, cwd="/").returncode == 0
+        retired = user_is_retired(hands, host)
         leftovers = [what for what, there in (
-            (f"the user {hands}", not gone),
+            (f"the user {hands} as a live account (not retired)", not retired),
             (f"the sudoers rule {sudoers_path(hands)}", sudoers_path(hands).exists()),
         ) if there]
         if leftovers:
             print("setup-isolation: undo did not finish: " + "; ".join(leftovers) + " still present.")
             return 1
         record_hands(entity_dir, None, owner_uid=op.pw_uid, owner_gid=op.pw_gid)
-        print("Done. The hands user is gone.")
+        print(f"Done. The hands user {hands} is retired: its account stays, disabled (no login, no password, no "
+              "sudo rule, no home), so its id can never be given to another account. To give this entity hands "
+              "again later: sudo levain setup-isolation --reenable")
         return 0
 
     if cfg.hands_user is not None:
         print(f"setup-isolation: {entity_dir} is already set up (user {cfg.hands_user}). "
               "Run with --undo first to set it up again.")
         return 1
+    reenable_id: int | None = None
     if _user_exists(derived):
         ours = user_record_is_ours(derived, host)
-        print(f"setup-isolation: the user {derived} already exists "
-              + ("(a previous setup that did not finish). Run with --undo, then again." if ours
-                 else "(an account Levain did not create). Remove or rename it first."))
+        if ours and user_is_retired(derived, host):
+            if not reenable:
+                print(f"setup-isolation: this entity's hands user {derived} is retired (an earlier --undo; "
+                      "its id stays reserved). To give the entity its hands back with that same account: "
+                      "sudo levain setup-isolation --reenable")
+                return 1
+            reenable_id = pwd.getpwnam(derived).pw_uid
+        else:
+            print(f"setup-isolation: the user {derived} already exists "
+                  + ("(a previous setup that did not finish). Run with --undo, then again." if ours
+                     else "(an account Levain did not create). Remove or rename it first."))
+            return 1
+    elif reenable:
+        print(f"setup-isolation: there is no retired hands user {derived} to re-enable; run it without --reenable.")
         return 1
     problem = shared_root_problem(host)
     if problem:
@@ -1012,8 +1109,8 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
               "Move or delete it, then run setup again.")
         return 1
     try:
-        hands_id = choose_id(host, used_ids(host), retired_ids(host))
-        plan = plan_setup(entity_dir, operator=operator, host=host, hands_id=hands_id,
+        hands_id = reenable_id if reenable_id is not None else choose_id(host, used_ids(host), retired_ids(host))
+        plan = plan_setup(entity_dir, operator=operator, host=host, hands_id=hands_id, reenable=reenable_id is not None,
                           git_identity=operator_git_identity(operator),
                           sshd_dropins=sshd_reads_dropins(), deny_lists=existing_deny_lists(host))
     except (HandsSetupError, subprocess.CalledProcessError) as exc:
