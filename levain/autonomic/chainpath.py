@@ -22,7 +22,7 @@ human is distance from grounding. Each link's trust carries ``hops=link_index`` 
 ``trust_resolver``), so the posture climbs the deeper the chain, and the outbound tail confirms.
 
 The seams (committed in ``projects/vagus/slice4_scope.md`` § "4b — the chain executor"):
-  1. **Per-link risk** — an injected ``risk_resolver(binding, link_index)`` derives link i's risk from
+  1. **Per-link risk** — the gate's ``binding_risk(binding, link_index)`` derives link i's risk from
      its SEALED tools alone (``aggregate_risk((goal[i],), manifest)``). Core-overlaid; fail-closed.
   2. **Per-link posture + the seam-#2 fail-UP (the TERMINAL-link ratified floor)** — INTERMEDIATE links
      fire at their natural ``policy(risk_i, trust_i)`` (no floor — §A's early-links-fire); the LAST link
@@ -121,7 +121,9 @@ _STILL_OPEN = frozenset({"unattended_approval_not_allowed", "elevated_requires_t
 #     OVERLAYS the governance-critical fields afterward (risk / trust / authority / kills / trajectory /
 #     trigger event), so the builder cannot forge them.
 #   ChainRiskResolver: (binding, link_index) -> ActionRisk. DERIVES link i's risk from its SEALED tools
-#     alone (the adapter wires aggregate_risk((goal[i],), manifest)). Core-overlaid (seam #1).
+#     alone (the adapter wires aggregate_risk((goal[i],), manifest)). Core-overlaid (seam #1). It is the
+#     shape of the GATE's ``binding_risk``, which the executor reads, so a link is proposed from the same
+#     resolver its resolve re-derives with.
 #   ChainTrustResolver: (binding, link_index) -> TrustContext. DERIVES link i's trust structurally from
 #     the trigger type + hops=link_index (§B), human-absent, intent-free. Core-overlaid (seam #5) — so
 #     trust is NOT adapter-payload-sourced; it is a pure (binding, index) function the executor controls.
@@ -440,8 +442,8 @@ def _kill_predicates(binding: Binding) -> tuple[dict[str, Any], ...]:
 
 class ChainExecutor:
     """Walk a multi-link binding's goal chain with the gate travelling with it (Slice 4b). Construct
-    with the wired efferent gate, the injected per-link ``request_builder`` / ``risk_resolver`` /
-    ``trust_resolver`` (the adapter's seams), and a ``clock``. The gate must carry a run journal: a chain
+    with the wired efferent gate (whose ``binding_risk`` derives each link's risk), the injected
+    per-link ``request_builder`` / ``trust_resolver`` (the adapter's seams), and a ``clock``. The gate must carry a run journal: a chain
     is a journaled run, and its pause/resume state lives in the run's holds."""
 
     def __init__(
@@ -449,21 +451,19 @@ class ChainExecutor:
         *,
         gate: EfferentGate,
         request_builder: ChainRequestBuilder,
-        risk_resolver: ChainRiskResolver,
         trust_resolver: ChainTrustResolver,
         clock: Callable[[], _dt.datetime],
         binding_store: BindingStore | None = None,
     ) -> None:
         self._gate = gate
         self._request_builder = request_builder
-        self._risk_resolver = risk_resolver
         self._trust_resolver = trust_resolver
         self._clock = clock
         if gate.journal is None:
             raise ValueError("ChainExecutor: the gate must carry a run journal (a binding fire is journaled)")
         if gate.binding_risk is None:
             raise ValueError("ChainExecutor: the gate needs binding_risk (the binding's risk resolver), to "
-                             "re-derive a link's risk when its pending is resolved")
+                             "derive a link's risk when it fires and when its pending is resolved")
         # The registry, for the §2.6 graduation evidence of a completed chain (``record_fire``) only. A
         # revoke or pause of the grant mid-chain is stopped by the run journal's fence at the next link.
         self._binding_store = binding_store
@@ -510,11 +510,17 @@ class ChainExecutor:
         the only drift vector is a reviewed code edit to the manifest)."""
         for i in range(len(binding.goal)):
             try:
-                self._risk_resolver(binding, i)
+                self._link_risk(binding, i)
                 self._trust_resolver(binding, i)
             except Exception as e:  # noqa: BLE001 — an unclassifiable link (undeclared tool) bars, fail-closed
                 return f"unclassifiable_link_{i}:{type(e).__name__}"
         return None
+
+    def _link_risk(self, binding: Binding, i: int) -> ActionRisk:
+        """Link i's risk, from the gate's ``binding_risk`` (non-None: checked at construction)."""
+        resolver = self._gate.binding_risk
+        assert resolver is not None
+        return resolver(binding, i)
 
     def _walk(self, binding: Binding, event: dict[str, Any], *, start: int, ctx: ChainContext,
               prior: tuple[ChainLinkResult, ...]) -> ChainOutcome:
@@ -626,7 +632,7 @@ class ChainExecutor:
         ).to_dict()
         request = dataclasses.replace(
             base,
-            risk=self._risk_resolver(binding, i),
+            risk=self._link_risk(binding, i),
             trust=self._trust_resolver(binding, i),
             authority=binding_invocation(binding, hops=i),
             kill_predicates=_kill_predicates(binding),

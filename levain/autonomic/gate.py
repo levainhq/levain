@@ -46,7 +46,7 @@ from levain.autonomic.binding import Binding, BindingStore
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
 from levain.autonomic.journal import (
-    EffectOutcome, EffectStatus, JournalCorruptError, RunJournal, RunRef, effect_digest, hold_id_for,
+    EffectOutcome, EffectStatus, JournalCorruptError, RunJournal, RunRef, effect_digest,
 )
 from levain.autonomic.kill import kill_trips
 from levain.autonomic.monitor import TrajectoryObserver, prediction_diverged
@@ -900,12 +900,13 @@ class EfferentGate:
         binding_id = pending.authority.get("binding_id")
         try:
             link = int(str(hold["effect_id"]).removeprefix("link-"))
+            binding: Binding | None
             if hold.get("chain") is not None:
                 binding = Binding.from_dict(hold["chain"]["binding"])
             else:
                 try:
                     store = BindingStore(self._journal.db.directory, journal=self._journal)  # type: ignore[union-attr]
-                    binding = store.get(binding_id)
+                    binding = store.get(binding_id) if isinstance(binding_id, str) else None
                     # a read fault reads as an empty registry: tell it from an absent binding
                     unreadable = binding is None and store.integrity() is not None
                 except (OSError, sqlite3.DatabaseError):

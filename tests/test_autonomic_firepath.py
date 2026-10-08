@@ -77,7 +77,7 @@ def _store(tmp_path) -> BindingStore:
     return rig(tmp_path / "store")[1]
 
 
-def _gate(tmp_path, *, executor=None, observer=None, auto_fire=None):
+def _gate(tmp_path, *, executor=None, observer=None, auto_fire=None, binding_risk=None):
     return EfferentGate(
         manifest=ActionManifest({}),                  # binding fires thread risk → manifest unused
         store=GateReceiptStore(tmp_path / "r.jsonl"),
@@ -86,7 +86,8 @@ def _gate(tmp_path, *, executor=None, observer=None, auto_fire=None):
         trajectory_observer=observer,
         auto_fire_actions=auto_fire,
         journal=rig(tmp_path / "store")[0],
-        binding_risk=lambda binding, i: LOW_INTERNAL,   # every binding here is a single low-risk link
+        # every binding here is a single low-risk link
+        binding_risk=binding_risk or (lambda binding, i: LOW_INTERNAL),
     )
 
 
@@ -346,7 +347,7 @@ def _match_field_eq(pattern, event):
 
 def _builder(*, signal=SignalAuth.STRONG, action="deliver", builder_risk=None):
     """A test request_builder. ``builder_risk`` (default None) is what the builder puts on the request —
-    the dispatcher OVERLAYS it from the risk_resolver, so a non-None value here proves the overlay wins."""
+    the dispatcher OVERLAYS it from the gate's binding_risk, so a non-None value here proves the overlay wins."""
     def build(binding, event):
         return ActionRequest(
             action_name=action, payload="fire", context_id=event.get("id", "ctx"),
@@ -374,12 +375,11 @@ def _active_binding(tmp_path, *, pattern, posture=Posture.ON_LOOP, one_shot=Fals
     return st, b
 
 
-def _dispatcher(tmp_path, st, *, executor=None, observer=None, request_builder=None,
-                risk_resolver=None):
+def _dispatcher(tmp_path, st, *, executor=None, observer=None, request_builder=None):
     return FireDispatcher(
         store=st, gate=_gate(tmp_path, executor=executor, observer=observer),
         predicate_match=_match_field_eq, request_builder=request_builder or _builder(),
-        risk_resolver=risk_resolver or (lambda b: LOW_INTERNAL), clock=lambda: FIXED,
+        clock=lambda: FIXED,
     )
 
 
@@ -487,15 +487,14 @@ def test_dispatch_event_without_type_is_safe(tmp_path):
 
 def test_risk_is_overlaid_from_resolver_not_the_request_builder(tmp_path):
     """Seam #1 made structural (codex/complement/nemotron L3): the dispatcher overlays risk from the
-    injected risk_resolver, so a request_builder that sets a HIGH/external risk is IGNORED — the binding
+    gate's binding_risk, so a request_builder that sets a HIGH/external risk is IGNORED — the binding
     fires at the LOW (resolver) risk's ON_LOOP, not the HIGH risk's CONFIRM-defer."""
     ex = RecordingExecutor()
     st, b = _active_binding(tmp_path, pattern={"op": "==", "field": "tick", "value": "1"})
     fd = FireDispatcher(
-        store=st, gate=_gate(tmp_path, executor=ex),
+        store=st, gate=_gate(tmp_path, executor=ex),            # the gate's resolver derives low (wins)
         predicate_match=_match_field_eq,
         request_builder=_builder(builder_risk=HIGH_EXTERNAL),   # the builder LIES high...
-        risk_resolver=lambda binding: LOW_INTERNAL,             # ...the resolver derives low (wins)
         clock=lambda: FIXED,
     )
     out = fd.dispatch({"type": "time", "id": "e", "fields": {"tick": "1"}})
@@ -503,16 +502,16 @@ def test_risk_is_overlaid_from_resolver_not_the_request_builder(tmp_path):
     assert ex.calls
 
 
-def test_risk_resolver_raise_skips_the_binding_fail_closed(tmp_path):
+def test_binding_risk_raise_skips_the_binding_fail_closed(tmp_path):
     """An undeclared-tool binding: the resolver raises (UnknownAction-equivalent) → the dispatcher's
     per-binding net SKIPS it (never fires an unclassifiable grant)."""
     ex = RecordingExecutor()
     st, b = _active_binding(tmp_path, pattern={"op": "==", "field": "tick", "value": "1"})
 
-    def _boom(binding):
+    def _boom(binding, i):
         raise KeyError("undeclared tool")
-    fd = FireDispatcher(store=st, gate=_gate(tmp_path, executor=ex), predicate_match=_match_field_eq,
-                        request_builder=_builder(), risk_resolver=_boom, clock=lambda: FIXED)
+    fd = FireDispatcher(store=st, gate=_gate(tmp_path, executor=ex, binding_risk=_boom),
+                        predicate_match=_match_field_eq, request_builder=_builder(), clock=lambda: FIXED)
     out = fd.dispatch({"type": "time", "fields": {"tick": "1"}})
     assert out == [] and ex.calls == []
 
@@ -540,8 +539,7 @@ def test_dispatch_skips_standing_binding_revoked_after_list_active(tmp_path):
         def record_fire(self, *a, **k):
             return st.record_fire(*a, **k)
     fd = FireDispatcher(store=_RevokedAfterList(), gate=_gate(tmp_path, executor=ex),
-                        predicate_match=_match_field_eq, request_builder=_builder(),
-                        risk_resolver=lambda binding: LOW_INTERNAL, clock=lambda: FIXED)
+                        predicate_match=_match_field_eq, request_builder=_builder(), clock=lambda: FIXED)
     out = fd.dispatch({"type": "time", "fields": {"tick": "1"}})
     assert out == [] and ex.calls == []                          # the stale binding did NOT fire
 

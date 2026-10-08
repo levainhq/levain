@@ -64,7 +64,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import sqlite3
 from collections.abc import Callable
 from contextlib import contextmanager

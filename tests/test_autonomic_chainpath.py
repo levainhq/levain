@@ -173,7 +173,7 @@ def _executor(tmp_path, *, transport=None, auto_fire=None, executor=None, bindin
     gate = _gate(tmp_path, executor=executor, transport=transport, auto_fire=auto_fire, manifest=manifest,
                  binding_risk=risk_resolver)
     return ChainExecutor(
-        gate=gate, request_builder=_request_builder, risk_resolver=risk_resolver,
+        gate=gate, request_builder=_request_builder,
         trust_resolver=trust_resolver, clock=lambda: FIXED, binding_store=binding_store,
     ), gate
 
@@ -327,7 +327,7 @@ def test_a_chain_executor_needs_a_journaled_gate(tmp_path):
     bare = EfferentGate(manifest=_RESOLVE_MANIFEST, store=GateReceiptStore(tmp_path / "r.jsonl"),
                         executor=RecordingExecutor(), clock=lambda: FIXED)
     with pytest.raises(ValueError, match="run journal"):
-        ChainExecutor(gate=bare, request_builder=_request_builder, risk_resolver=_risk_resolver,
+        ChainExecutor(gate=bare, request_builder=_request_builder,
                       trust_resolver=_trust_resolver, clock=lambda: FIXED)
 
 
@@ -485,12 +485,12 @@ def test_a_claimed_one_shot_resumes_its_own_run(tmp_path):
 # =================================================================================================
 # Block 5 — FireDispatcher delegation
 # =================================================================================================
-def _dispatcher(tmp_path, gate, chain_exec, *, risk=HIGH_EXTERNAL):
+def _dispatcher(tmp_path, gate, chain_exec):
     return FireDispatcher(
         store=_registry(tmp_path), gate=gate,
         predicate_match=lambda pattern, event: True,  # the registry binding matches
         request_builder=lambda binding, event: _request_builder(binding, ChainContext(trigger_event=event), 0),
-        risk_resolver=lambda binding: risk, clock=lambda: FIXED, chain_executor=chain_exec,
+        clock=lambda: FIXED, chain_executor=chain_exec,
     )
 
 
@@ -582,6 +582,6 @@ def test_dispatcher_chain_completion_records_once_no_double_count(tmp_path):
     b = _on_loop_chain()
     registry.add(b)
     chain_exec = _on_loop_executor(tmp_path, registry)
-    results = _dispatcher(tmp_path, chain_exec.gate, chain_exec, risk=LOW_INTERNAL).dispatch(EVENT)
+    results = _dispatcher(tmp_path, chain_exec.gate, chain_exec).dispatch(EVENT)
     assert len(results) == 1 and results[0].chain.completed
     assert registry.get(b.binding_id).graduation.fire_count == 1  # once, not twice

@@ -105,13 +105,13 @@ class World:
             binding_risk=lambda b, i: self.tool_risk[i],
         )
         self.chains = ChainExecutor(gate=self.gate, request_builder=_chain_builder,
-                                    risk_resolver=lambda b, i: self.tool_risk[i], trust_resolver=_trust,
+                                    trust_resolver=_trust,
                                     clock=lambda: FIXED,
                                     binding_store=self.store)
         self.dispatcher = FireDispatcher(
             store=self.store, gate=self.gate,
             predicate_match=lambda p, e: e.get("fields", {}).get(p["field"]) == p["value"],
-            request_builder=_single_builder, risk_resolver=lambda b: self.tool_risk[0], clock=lambda: FIXED,
+            request_builder=_single_builder, clock=lambda: FIXED,
             chain_executor=self.chains)
 
     def mint(self, *, chain: bool) -> Binding:
@@ -358,7 +358,7 @@ def test_the_dispatcher_refuses_a_store_and_gate_on_different_journals(tmp_path)
     with pytest.raises(ValueError, match="same|SAME|must be"):
         FireDispatcher(store=BindingStore(tmp_path / "other"), gate=w.gate,
                        predicate_match=lambda p, e: True, request_builder=_single_builder,
-                       risk_resolver=lambda b: LOW, clock=lambda: FIXED)
+                       clock=lambda: FIXED)
 
 
 def test_a_killed_effect_cancels_its_run(tmp_path):
@@ -798,18 +798,18 @@ def test_the_dispatcher_and_chain_executor_share_one_journal_and_one_gate(tmp_pa
                              executor=OutboxExecutor(tmp_path / "o.jsonl"))
     with pytest.raises(ValueError):
         FireDispatcher(store=w.store, gate=bare_gate, predicate_match=lambda p, e: True,
-                       request_builder=_single_builder, risk_resolver=lambda b: LOW, clock=lambda: FIXED)
+                       request_builder=_single_builder, clock=lambda: FIXED)
     with pytest.raises(ValueError):                                # a chain is a journaled run
-        ChainExecutor(gate=bare_gate, request_builder=_chain_builder, risk_resolver=lambda b, i: LOW,
+        ChainExecutor(gate=bare_gate, request_builder=_chain_builder,
                       trust_resolver=_trust, clock=lambda: FIXED)
     other_gate = EfferentGate(manifest=ActionManifest({}), store=w.receipts,
                               executor=OutboxExecutor(tmp_path / "o.jsonl"), journal=w.journal,
                               binding_risk=lambda b, i: LOW)
-    other = ChainExecutor(gate=other_gate, request_builder=_chain_builder, risk_resolver=lambda b, i: LOW,
+    other = ChainExecutor(gate=other_gate, request_builder=_chain_builder,
                           trust_resolver=_trust, clock=lambda: FIXED)
     with pytest.raises(ValueError):
         FireDispatcher(store=w.store, gate=w.gate, predicate_match=lambda p, e: True,
-                       request_builder=_single_builder, risk_resolver=lambda b: LOW, clock=lambda: FIXED,
+                       request_builder=_single_builder, clock=lambda: FIXED,
                        chain_executor=other)
 
 
@@ -1644,9 +1644,9 @@ def test_the_fire_path_needs_a_gate_that_can_re_derive_binding_risk(tmp_path):
                         journal=w.journal)                         # no binding_risk
     with pytest.raises(ValueError, match="binding_risk"):
         FireDispatcher(store=w.store, gate=gate, predicate_match=lambda p, e: True,
-                       request_builder=_single_builder, risk_resolver=lambda b: LOW, clock=lambda: FIXED)
+                       request_builder=_single_builder, clock=lambda: FIXED)
     with pytest.raises(ValueError, match="binding_risk"):
-        ChainExecutor(gate=gate, request_builder=_chain_builder, risk_resolver=lambda b, i: LOW,
+        ChainExecutor(gate=gate, request_builder=_chain_builder,
                       trust_resolver=_trust, clock=lambda: FIXED)
 
 
@@ -1790,3 +1790,21 @@ def test_an_approval_given_at_the_raised_rung_survives_a_stop_before_its_effect(
     assert held.reason.startswith("approved_not_yet_run")
     w.journal.effect = real
     assert w.dispatch("e4").chain.completed and ("link1", "e4-1") in w.outbox()
+
+
+def test_a_proposal_is_made_from_the_gates_own_risk_resolver(tmp_path):
+    # codex r2 HIGH 2: the dispatcher and the chain executor took a risk resolver of their own, so a
+    # proposal could be made from one catalog and resolved against another. Both read the gate's
+    # binding_risk now, the one the resolve re-derives with.
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.gate._binding_risk = lambda b, i: [LOW, FINANCIAL][i]
+    w.dispatch("r1")
+    [p] = w.gate.open_pendings()
+    assert p.posture == "CONFIRM_ELEVATED"
+    v = World(tmp_path / "single")
+    _mint_single(v, "r2")
+    v.gate._binding_risk = lambda b, i: FINANCIAL
+    v.dispatch("r2")
+    [q] = v.gate.open_pendings()
+    assert q.posture == "CONFIRM_ELEVATED"

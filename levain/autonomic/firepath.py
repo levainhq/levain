@@ -25,9 +25,9 @@ in the adapter's TCB, and the unforgeable safety backstop for any too-trusting v
 rung the human ratified.
 
 The four design seams (resolved at the 4a build, `projects/vagus/slice4_scope.md`):
-  1. **Risk = the sealed tools, OVERLAID by the core.** An injected ``RiskResolver`` derives the
+  1. **Risk = the sealed tools, OVERLAID by the core.** The gate's ``binding_risk`` derives the
      binding's risk from its SEALED binding ALONE (the SAME aggregation it was ratified at); the
-     dispatcher OVERLAYS ``risk = risk_resolver(binding)`` (the request_builder's risk is ignored), so
+     dispatcher OVERLAYS ``risk = gate.binding_risk(binding, 0)`` (the request_builder's risk is ignored), so
      the gate resolves against the sealed-tool risk — structurally BOUND to the seal, never an
      adapter-chosen label (codex/complement/nemotron L3 made this an overlay, not a convention).
   2. **Fail-UP.** The dispatcher floors the gate at the binding's SEALED posture
@@ -82,16 +82,15 @@ _log = logging.getLogger("levain.autonomic.firepath")
 #   RequestBuilder: (binding, event) -> ActionRequest. Builds the ACTION-specific shape (action_name,
 #     the payload rendered from the event, the trust fossil, the receipt provenance). The dispatcher
 #     OVERLAYS the governance-critical fields afterward — including ``risk`` (below), so the
-#     request_builder's ``risk`` is IGNORED (it is the RiskResolver's job, structurally).
-#   RiskResolver: (binding) -> ActionRisk. DERIVES the binding's risk from its SEALED binding ALONE
-#     (flow wires ``_aggregate_risk(binding.goal, TOOL_RISK_MANIFEST)`` — the same aggregation the
-#     binding was ratified at). A SEPARATE seam from the request_builder (which also sees the event) so
-#     risk derivation is structurally BOUND to the sealed binding and cannot be event-derived/forged
-#     (seam #1, codex/complement/nemotron L3): the dispatcher overlays ``risk = risk_resolver(binding)``
-#     so the gate resolves against the sealed-tool risk, never an adapter-chosen value.
+#     request_builder's ``risk`` is IGNORED (the binding's risk resolver derives it, structurally).
+#   The binding's risk resolver is the GATE's ``binding_risk``: (binding, link_index) -> ActionRisk,
+#     from the SEALED binding ALONE (flow wires ``_aggregate_risk(binding.goal, TOOL_RISK_MANIFEST)`` —
+#     the same aggregation the binding was ratified at). A SEPARATE seam from the request_builder (which
+#     also sees the event) so risk derivation is structurally BOUND to the sealed binding and cannot be
+#     event-derived/forged (seam #1, codex/complement/nemotron L3). It is the gate's, not the
+#     dispatcher's, so a proposal is made from the same resolver its resolve re-derives with.
 PredicateMatch = Callable[[dict[str, Any], dict[str, Any]], bool]
 RequestBuilder = Callable[[Binding, dict[str, Any]], ActionRequest]
-RiskResolver = Callable[[Binding], ActionRisk]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,8 +120,7 @@ def _kill_predicates(binding: Binding) -> tuple[dict[str, Any], ...]:
 class FireDispatcher:
     """Dispatch an event to the bindings it could fire (Slice 4a, single-link). Construct with the
     binding registry, the wired efferent gate, the injected ``predicate_match`` (the deterministic
-    evaluator the core never imports), ``request_builder`` (the adapter's action fossil), ``risk_resolver``
-    (the sealed-binding→risk derivation the core overlays — seam #1), and a ``clock`` (for the
+    evaluator the core never imports), ``request_builder`` (the adapter's action fossil), and a ``clock`` (for the
     ``record_fire`` dormancy timestamp — there is no ambient clock in the core)."""
 
     def __init__(
@@ -132,7 +130,6 @@ class FireDispatcher:
         gate: EfferentGate,
         predicate_match: PredicateMatch,
         request_builder: RequestBuilder,
-        risk_resolver: RiskResolver,
         clock: Callable[[], _dt.datetime],
         chain_executor: ChainExecutor | None = None,
     ) -> None:
@@ -140,7 +137,6 @@ class FireDispatcher:
         self._gate = gate
         self._predicate_match = predicate_match
         self._request_builder = request_builder
-        self._risk_resolver = risk_resolver
         self._clock = clock
         # The Slice-4b chain executor: a MULTI-link binding (``len(goal) > 1``) is delegated to it AFTER
         # the dispatcher re-acquires the fresh fireable snapshot + claims a one-shot (the chain IS the
@@ -154,9 +150,15 @@ class FireDispatcher:
                              "store's journal")
         if gate.binding_risk is None:
             raise ValueError("FireDispatcher: the gate needs binding_risk (the binding's risk resolver), "
-                             "to re-derive a binding's risk when its pending is resolved")
+                             "to derive a binding's risk when it fires and when its pending is resolved")
         if chain_executor is not None and chain_executor.gate is not gate:
             raise ValueError("FireDispatcher: the chain executor must fire through the same gate")
+
+    def _binding_risk(self, binding: Binding) -> ActionRisk:
+        """The single link's risk, from the gate's ``binding_risk`` (non-None: checked at construction)."""
+        resolver = self._gate.binding_risk
+        assert resolver is not None
+        return resolver(binding, 0)
 
     def dispatch(self, event: dict[str, Any]) -> list[FireDispatch]:
         """Fire every ACTIVE binding the ``event`` matches. For each candidate from
@@ -283,7 +285,7 @@ class FireDispatcher:
         base = self._request_builder(fresh, event)
         request = dataclasses.replace(
             base,
-            risk=self._risk_resolver(fresh),
+            risk=self._binding_risk(fresh),
             authority=binding_invocation(fresh, hops=0),
             kill_predicates=_kill_predicates(fresh),
             predicted_trajectory=guard_trajectory(fresh.effective_guard),
