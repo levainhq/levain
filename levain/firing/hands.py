@@ -1070,10 +1070,10 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
             # A record from another path (the entity was moved, or the config copied). That entity's
             # sessions hold a hands lock in ITS directory, which this undo cannot take; so refuse
             # while anything at all runs as that hands user.
-            from levain.firing.ws_git import WsGitError, entity_session_live
+            from levain.firing.ws_git import LIVENESS_TIMEOUT, WsGitError, entity_session_live
 
             try:
-                live = entity_session_live(hands_id)
+                live = entity_session_live(hands_id, timeout=LIVENESS_TIMEOUT)
             except WsGitError as exc:
                 print(f"setup-isolation: {exc}")
                 return 1

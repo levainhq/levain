@@ -391,7 +391,7 @@ def test_a_headless_session_binds_the_hands_user_and_the_repl_does_not(tmp_path,
     from levain.firing import confinement
 
     swept: list[str] = []
-    monkeypatch.setattr(confinement, "sweep_hands_user", lambda user: swept.append(user))
+    monkeypatch.setattr(confinement, "sweep_hands_user", lambda user, **kw: swept.append(user))
     s = EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="headless")
     try:
         # S2d codex HIGH: anything of the hands user left by an earlier levain is stopped at the start.
@@ -429,7 +429,7 @@ def test_a_hands_session_does_not_start_over_processes_it_cannot_stop(tmp_path, 
     (ent / ".levain").mkdir(parents=True)
     (ent / ".levain" / "config.json").write_text(json.dumps({"adapter": "openhands"}))
     monkeypatch.setattr(session_mod, "hands_for", lambda cfg, mode: _hands(tmp_path))
-    monkeypatch.setattr(confinement, "sweep_hands_user", lambda user: "processes of nobody are still running (pid 4242)")
+    monkeypatch.setattr(confinement, "sweep_hands_user", lambda user, **kw: "processes of nobody are still running (pid 4242)")
     with pytest.raises(SessionStartError, match="could not be stopped"):
         EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="headless")
     # The failed start keeps its locks while the processes live.
@@ -440,23 +440,21 @@ def test_a_hands_session_does_not_start_over_processes_it_cannot_stop(tmp_path, 
 def test_the_session_end_sweep_kills_every_process_of_the_hands_user_and_verifies(monkeypatch):
     """(d): a command can leave its process group (`setsid`), so the end of a session stops every
     process of the hands user, as that user, and checks that none of the entity's is left."""
-    import pwd as _pwd
     import subprocess as sp
 
     from levain.firing import confinement, ws_git
 
-    monkeypatch.setattr(_pwd, "getpwnam", lambda u: type("P", (), {"pw_uid": 4_000_017})())
     calls: list[list[str]] = []
     monkeypatch.setattr(confinement.subprocess, "run",
                         lambda argv, **kw: calls.append(list(argv)) or sp.CompletedProcess(argv, 0, "", ""))
     live = iter([True, False])
     monkeypatch.setattr(ws_git, "entity_session_live", lambda uid, **kw: next(live))
-    assert confinement.sweep_hands_user("_levain_x_000000") is None
+    assert confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017) is None
     kill = [confinement.SUDO, "-n", "-u", "_levain_x_000000", "/bin/kill", "-9", "--", "-1"]
     assert calls == [kill, kill]
 
     monkeypatch.setattr(ws_git, "entity_session_live", lambda uid, **kw: True)
-    said = confinement.sweep_hands_user("_levain_x_000000", timeout=0.3)
+    said = confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017, timeout=0.3)
     assert said is not None and "still running" in said
 
 
@@ -475,15 +473,13 @@ def test_the_sweep_never_waits_longer_than_its_timeout_on_a_stalled_step(monkeyp
         raise sp.TimeoutExpired(argv, kw["timeout"])
 
     monkeypatch.setattr(confinement.subprocess, "run", stalled)
-    import pwd as _pwd
     import time
 
-    monkeypatch.setattr(_pwd, "getpwnam", lambda u: type("P", (), {"pw_uid": 4_000_017})())
     from levain.firing import ws_git
 
     monkeypatch.setattr(ws_git, "entity_session_live", lambda uid, **kw: True)
     t0 = time.monotonic()
-    confinement.sweep_hands_user("_levain_x_000000", timeout=0.1)   # r3: no 0.5 s floor per step
+    confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017, timeout=0.1)   # r3: no 0.5 s floor per step
     assert timeouts and max(timeouts) <= 0.1 and time.monotonic() - t0 < 0.5
 
 
@@ -491,12 +487,10 @@ def test_the_sweeps_liveness_check_is_bounded_by_the_sweeps_timeout(monkeypatch)
     """r4 codex MED + complement MED: the check (`entity_session_live`) ran pgrep and ps with no
     timeout and stdin inherited, so a stalled one held a session's start or end, and its locks, with
     no bound. Each now gets what is left of the sweep's deadline, and one that stalls is "cannot tell"."""
-    import pwd as _pwd
     import subprocess as sp
 
     from levain.firing import confinement, ws_git
 
-    monkeypatch.setattr(_pwd, "getpwnam", lambda u: type("P", (), {"pw_uid": 4_000_017})())
     monkeypatch.setattr(ws_git.platform, "system", lambda: "Darwin")
     checks: list[dict] = []
 
@@ -509,10 +503,38 @@ def test_the_sweeps_liveness_check_is_bounded_by_the_sweeps_timeout(monkeypatch)
         raise sp.TimeoutExpired(argv, kw["timeout"])
 
     monkeypatch.setattr(confinement.subprocess, "run", run)
-    said = confinement.sweep_hands_user("_levain_x_000000", timeout=0.2)
+    said = confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017, timeout=0.2)
     assert checks and all(0 <= kw.get("timeout", 99) <= 0.2 for kw in checks)
     assert all(kw.get("stdin") is sp.DEVNULL for kw in checks)
     assert said is not None and "cannot tell" in said
+
+
+def test_the_sweep_takes_the_known_uid_and_says_when_it_ran_out_of_time(monkeypatch):
+    """r5 codex MED: the sweep looked the hands user up by name, which can block in NSS with no bound;
+    it takes the uid setup recorded. complement LOW 5: a sweep whose time ran out before it could
+    check said "cannot tell"; it says it ran out of time."""
+    import pwd as _pwd
+    import subprocess as sp
+    import time
+
+    from levain.firing import confinement, ws_git
+
+    def no_lookup(name):
+        raise AssertionError("the sweep looked the user up by name")
+
+    monkeypatch.setattr(_pwd, "getpwnam", no_lookup)
+    checked: list[int] = []
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid, **kw: checked.append(uid) or False)
+
+    def stalled(argv, **kw):
+        time.sleep(kw["timeout"])
+        raise sp.TimeoutExpired(argv, kw["timeout"])
+
+    monkeypatch.setattr(confinement.subprocess, "run", stalled)
+    said = confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017, timeout=0.2)
+    assert said is not None and "ran out" in said and checked == []
+    monkeypatch.setattr(confinement.subprocess, "run", lambda argv, **kw: sp.CompletedProcess(argv, 0, "", ""))
+    assert confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017) is None and checked == [4_000_017]
 
 
 def test_the_sweep_refuses_levains_own_account_and_root(monkeypatch):
@@ -525,8 +547,8 @@ def test_the_sweep_refuses_levains_own_account_and_root(monkeypatch):
 
     ran: list[list[str]] = []
     monkeypatch.setattr(confinement.subprocess, "run", lambda argv, **kw: ran.append(argv) or sp.CompletedProcess(argv, 1, "", ""))
-    for user in (getpass.getuser(), "root"):
-        said = confinement.sweep_hands_user(user)
+    for user, uid in ((getpass.getuser(), os.getuid()), ("root", 0)):
+        said = confinement.sweep_hands_user(user, uid=uid)
         assert said is not None and "refusing" in said
     assert ran == []
 
@@ -535,19 +557,17 @@ def test_the_sweep_leaves_macos_per_user_agents_and_counts_only_the_entitys(monk
     """r3 codex HIGH: launchd starts per-user agents (cfprefsd, XPC services) for any uid that ran
     Apple code and restarts them, so raw `pgrep -U` never emptied. The check is the one ws-git
     already uses (`entity_session_live`), which tells those agents from the entity's processes."""
-    import pwd as _pwd
     import subprocess as sp
 
     from levain.firing import confinement, ws_git
 
-    monkeypatch.setattr(_pwd, "getpwnam", lambda u: type("P", (), {"pw_uid": 4_000_017})())
     monkeypatch.setattr(confinement.subprocess, "run", lambda argv, **kw: sp.CompletedProcess(argv, 0, "4242\n", ""))
     checked: list[int] = []
     monkeypatch.setattr(ws_git, "entity_session_live", lambda uid, **kw: checked.append(uid) or False)
-    assert confinement.sweep_hands_user("_levain_x_000000") is None and checked == [4_000_017]
+    assert confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017) is None and checked == [4_000_017]
 
     def cannot_tell(uid, **kw):
         raise ws_git.WsGitError("cannot tell whether the entity is running (its processes changed while being read)")
     monkeypatch.setattr(ws_git, "entity_session_live", cannot_tell)
-    said = confinement.sweep_hands_user("_levain_x_000000", timeout=0.2)
+    said = confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017, timeout=0.2)
     assert said is not None and "cannot tell" in said

@@ -200,7 +200,7 @@ class SessionStartError(Exception):
         self.code = code
 
 
-def _stop_hands_user(user: str) -> str | None:
+def _stop_hands_user(user: str, uid: int | None) -> str | None:
     """At the end of a session whose bash ran as ``user``: stop every process of that user (a command
     can leave its process group with ``setsid``), then empty and reap the groups the shells could not
     empty. None when nothing is left; else what is, which is also logged, and the caller keeps its
@@ -208,7 +208,7 @@ def _stop_hands_user(user: str) -> str | None:
     from levain.firing.confinement import sweep_hands_user, unemptied_shell_groups
 
     try:
-        swept = sweep_hands_user(user)
+        swept = sweep_hands_user(user, uid=uid)
         groups = unemptied_shell_groups(user)
     except BaseException as exc:  # noqa: BLE001 — a TurnTimeout too: teardown must not raise (S2d codex)
         swept, groups = f"the stop was interrupted ({type(exc).__name__})", []
@@ -600,6 +600,8 @@ class EntitySession:
     hands_user: str | None = None
     """The separate user this session's bash runs as (and its file editor writes as), or None when
     bash runs as the operator (no setup, the interactive REPL, or Linux): the banner says which."""
+    hands_uid: int | None = None
+    """That user's id as setup recorded it, for the stop at the session's end (no name lookup)."""
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
@@ -774,7 +776,7 @@ class EntitySession:
                 hands_session_fd = hold_hands_session(entity_dir)
                 # Nothing of the hands user may outlive an earlier session into this one (a setsid
                 # process of a levain that was killed before its end ran, S2d codex): stop it first.
-                if (stale := _stop_hands_user(hands_id.user)) is not None:
+                if (stale := _stop_hands_user(hands_id.user, hands_id.uid)) is not None:
                     raise WsGitError(f"processes of the entity's user from an earlier session could not "
                                      f"be stopped ({stale}); refusing to start")
                 workspace = hands_id.workspace
@@ -912,7 +914,7 @@ class EntitySession:
             # After the conversation, and only if it closed and nothing of the hands user is left: a
             # shell or process still alive must keep ws-git out.
             if not started and hands_session_fd is not None and hands_id is not None:
-                torn_down = _stop_hands_user(hands_id.user) is None and torn_down
+                torn_down = _stop_hands_user(hands_id.user, hands_id.uid) is None and torn_down
             if not started and torn_down:
                 for lock in (hands_session_fd, hands_lock_fd):
                     if lock is not None:
@@ -935,6 +937,7 @@ class EntitySession:
             hands_lock_fd=hands_lock_fd,
             hands_session_fd=hands_session_fd,
             hands_user=hands_id.user if (with_tools and hands_id is not None) else None,
+            hands_uid=hands_id.uid if (with_tools and hands_id is not None) else None,
         )
 
     # -- the one operation ---------------------------------------------------
@@ -1502,7 +1505,7 @@ class EntitySession:
             # The stop runs whether or not the teardown did: a setsid child is not reached by the
             # conversation's close, and must not outlive a session whose close failed (S2 L3 r3).
             if self.hands_session_fd is not None and self.hands_user is not None:
-                self.left_running = _stop_hands_user(self.hands_user)
+                self.left_running = _stop_hands_user(self.hands_user, self.hands_uid)
                 torn_down = torn_down and self.left_running is None
             for name in ("hands_session_fd", "hands_lock_fd"):
                 fd = getattr(self, name)

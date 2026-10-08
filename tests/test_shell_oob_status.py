@@ -428,6 +428,8 @@ def test_start_fails_closed_when_the_driver_cannot_run_bash(tmp_path):
 
 
 def _plain(tmp_path: Path, cls=SandboxedShell) -> SandboxedShell:
+    if _SYSTEM == "Linux":
+        pytest.skip("on Linux only a shell with a pid namespace per command runs (bwrap, S2 L3 r5)")
     ws = tmp_path / "ws"
     ws.mkdir(exist_ok=True)
     return cls(argv=["/bin/bash", "--noprofile", "--norc"], cwd=ws,
@@ -498,13 +500,6 @@ def test_close_does_not_signal_a_group_that_already_emptied(tmp_path):
     sh = _plain(tmp_path, Recording).start()
     sh.run("true", timeout=10)
     finished = set(started)
-    if _SYSTEM == "Linux":
-        # Not pruned on a /proc scan (S2 L3 r4): held, leader unreaped, so the number is still its own.
-        assert set(sh._groups) == finished   # type: ignore[attr-defined]
-        assert not any(lead.reaped for lead in sh._groups.values())   # type: ignore[attr-defined]
-        sh.close()
-        assert not sh._groups   # type: ignore[attr-defined]
-        return
     assert not sh._groups   # type: ignore[attr-defined]  # emptied: reaped and forgotten at once
     sent: list[int] = []
     sh._signal = lambda pgid, sig: sent.append(pgid)   # type: ignore[method-assign]
@@ -834,9 +829,6 @@ def test_a_background_groups_leader_stays_unreaped_until_its_group_is_empty(tmp_
         while _pids_with(m) and time.monotonic() < deadline:
             time.sleep(0.05)
         sh.run("true", timeout=10)
-        if _SYSTEM == "Linux":   # held until close() (S2 L3 r4)
-            assert pgid in sh._groups   # type: ignore[attr-defined]
-            sh.close()
         assert _stat_of(pgid) == "" and pgid not in sh._groups   # type: ignore[attr-defined]
     finally:
         _kill_all(_pids_with(m))
@@ -887,6 +879,8 @@ def test_a_driver_that_exits_before_its_watch_still_reports_its_status(tmp_path,
     reaped for its status, after its group is emptied, and the start probe names that status."""
     from levain.firing import confinement as C
 
+    if _SYSTEM == "Linux":
+        pytest.skip("a base shell is refused on Linux (S2 L3 r5)")
     real_init = C._Leader.__init__
 
     def late(self, proc):
@@ -995,7 +989,6 @@ def test_a_timed_out_commands_group_is_forgotten_when_its_leader_is_reaped(tmp_p
         r = sh.run("sleep 30", timeout=0.5)
         assert r.timed_out
         pgid = sh.started[-1]   # type: ignore[attr-defined]
-        # (On Linux the start-up command's finished group is still held until close(), S2 L3 r4.)
         assert pgid not in sh._groups   # type: ignore[attr-defined]
         sent: list[int] = []
         sh._signal = lambda pgid, sig: sent.append(pgid)   # type: ignore[method-assign]
@@ -1122,33 +1115,6 @@ def test_a_watch_that_cannot_be_set_for_a_live_process_is_an_error_not_an_exit(m
 # --- S2 L3 r4 (codex, complement on 0cb85b7..f942ee1) ------------------------------------------
 
 
-def test_on_linux_a_proc_scan_never_drops_a_group_or_spares_it_the_sigkill(monkeypatch, tmp_path):
-    """r4 codex HIGH: /proc is read one entry at a time, so a member that keeps forking and exiting
-    can be missed by any number of scans; the group was then called empty, its leader reaped and the
-    group forgotten while the member ran (or, on a timeout, spared the SIGKILL). An empty scan is now
-    no reason to drop an unreaped leader's group, and the SIGKILL is always sent on Linux."""
-    from levain.firing import confinement as C
-
-    lead = C._Leader(subprocess.Popen(["/usr/bin/true"], start_new_session=True))
-    assert lead.wait(5)
-    monkeypatch.setattr(C.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(C.os, "killpg", lambda pgid, sig: None)   # the group has a member
-    monkeypatch.setattr(C.os, "listdir", lambda p: [])            # that no scan catches
-    monkeypatch.setattr(C.time, "sleep", lambda s: None)
-    sh = _plain(tmp_path)
-    try:
-        sh._groups[lead.pid] = lead   # type: ignore[attr-defined]
-        sh._prune_groups()   # type: ignore[attr-defined]
-        assert not lead.reaped and sh._groups == {lead.pid: lead}   # type: ignore[attr-defined]
-
-        sent: list[int] = []
-        sh._signal = lambda pgid, sig: sent.append(sig)   # type: ignore[method-assign]
-        sh._kill_group(lead.pid, lead)   # type: ignore[attr-defined]
-        assert signal.SIGKILL in sent
-    finally:
-        lead.reap()
-
-
 def test_no_lock_is_held_across_a_signal_and_no_reap_runs_during_one(tmp_path):
     """r4 codex MED + complement MED: the per-leader reap lock was held across the signal (two sudo
     calls for a hands shell), so a Ctrl-C of that same command, and its reap, waited behind it. The
@@ -1190,3 +1156,59 @@ def test_no_lock_is_held_across_a_signal_and_no_reap_runs_during_one(tmp_path):
         lead.proc.kill()
         lead.reap()
     assert lead.reaped
+
+
+# --- S2 L3 r5 (codex, glm, complement on f942ee1..e0a86c7) -------------------------------------
+
+
+@pytest.mark.skipif(not (_SYSTEM == "Linux" and _LIVE), reason="bwrap's pid namespace, Linux only")
+def test_a_linux_shell_reaps_each_commands_leader_once_its_namespace_is_gone(tmp_path):
+    """r5 codex HIGH + glm HIGH: r4 held every Linux command's leader, a zombie, until close(), so a
+    long session ran into RLIMIT_NPROC. Each command runs in a pid namespace of its own, and its
+    init gone means the kernel has killed the rest (pid_namespaces(7)): the leader is reaped then."""
+    sh = _shell(tmp_path)
+    try:
+        for _ in range(20):
+            assert sh.run("true", timeout=10).exit_code == 0
+        zombies = []
+        for d in os.listdir("/proc"):
+            if d.isdigit():
+                try:
+                    f = Path(f"/proc/{d}/stat").read_text().rsplit(")", 1)[-1].split()
+                except OSError:
+                    continue
+                if f[0] == "Z" and f[1] == str(os.getpid()):
+                    zombies.append(d)
+        assert len(sh._groups) == 0 and zombies == []   # type: ignore[attr-defined]
+    finally:
+        sh.close()
+
+
+def test_an_undelivered_sigkill_or_a_signal_still_out_keeps_the_group(tmp_path):
+    """r5 complement MED 2 + 3: a SIGKILL whose delivery was not confirmed (sudo timed out after the
+    kill ran) let the group be called empty and its leader reaped; and a reap waited without end on a
+    signal still out. Both now leave the leader unreaped and the group kept."""
+    from levain.firing import confinement as C
+
+    sh = _plain(tmp_path)
+    lead = C._Leader(subprocess.Popen(["/bin/sleep", "5"], start_new_session=True))
+
+    def unconfirmed(pgid, sig):
+        if sig == signal.SIGKILL:
+            os.killpg(pgid, signal.SIGKILL)   # it landed, but the answer did not come back
+            return False
+        return True
+
+    sh._signal = unconfirmed   # type: ignore[method-assign]
+    sh._groups[lead.pid] = lead   # type: ignore[attr-defined]
+    try:
+        assert sh._kill_group(lead.pid, lead) is False   # type: ignore[attr-defined]
+        assert not lead.reaped and lead.pid in sh._groups   # type: ignore[attr-defined]
+        assert lead.hold_for_signal()
+        t0 = time.monotonic()
+        assert lead.reap(timeout=0.2) is False and not lead.reaped
+        assert time.monotonic() - t0 < 1.0
+        lead.signal_sent()
+    finally:
+        lead.proc.kill()
+        lead.reap()

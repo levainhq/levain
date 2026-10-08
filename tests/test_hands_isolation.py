@@ -769,10 +769,10 @@ def test_undo_of_another_paths_hands_user_refuses_while_it_runs_anything(tmp_pat
     monkeypatch.setattr(hands, "_user_exists", lambda n: n == hands_user_name(old))
     monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: type("E", (), {"pw_uid": 4_000_017, "pw_gid": 20})()
                         if n == hands_user_name(old) else hands.pwd.getpwuid(os.getuid()))
-    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: True)
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid, **kw: True)
     assert hands.cmd_setup_isolation(here, undo=True, dry_run=True) == 1
     assert "processes running" in capsys.readouterr().out
-    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: False)
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid, **kw: False)
     assert hands.cmd_setup_isolation(here, undo=True, dry_run=True) == 0
     assert "a setup here makes a new hands user" in capsys.readouterr().out
 

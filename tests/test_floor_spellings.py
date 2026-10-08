@@ -315,7 +315,7 @@ def test_a_corrupt_ledger_is_reported(home: Path) -> None:
     assert row.ok is False and "cannot be read" in row.detail
 
 
-def test_a_shell_releases_its_claim_only_once_its_process_group_is_gone(home: Path, monkeypatch) -> None:
+def test_a_shell_releases_its_claim_only_once_its_pid_namespace_is_gone(home: Path, monkeypatch) -> None:
     f = home / ".netrc"
     C._prepare_mountpoints({str(f): "file"})
     C._ledger_enter([(str(f), "file")], {str(f)}, f"{os.getpid()}:-:-:k")
@@ -330,8 +330,8 @@ def test_a_shell_releases_its_claim_only_once_its_process_group_is_gone(home: Pa
         def wait(self, timeout=None):
             return True
 
-        def reap(self):
-            pass
+        def reap(self, timeout=None):
+            return True
 
         def release_watch(self):
             pass
@@ -339,13 +339,15 @@ def test_a_shell_releases_its_claim_only_once_its_process_group_is_gone(home: Pa
         def hold_for_signal(self):
             return False   # 4242 is not a group of this test's: send it nothing
     shell._groups = {4242: _P()}
-    monkeypatch.setattr(C, "_group_gone", lambda pgid, timeout: False)
+    shell._bashes = {4242: (4243, "1")}   # the command's bash, pid 1 of its namespace
+    monkeypatch.setattr(C, "_bash_gone", lambda pid, start, timeout: False)
     shell.close()
     assert f.exists(), "the namespace may still hold the mount: keep the claim"
     shell2 = C._BwrapShell(policy=None, manifest={}, argv=["/bin/true"], cwd=home, env={})  # type: ignore[arg-type]
     shell2._ledger_claim = f"{os.getpid()}:-:-:k"
     shell2._groups = {4242: _P()}
-    monkeypatch.setattr(C, "_group_gone", lambda pgid, timeout: True)
+    shell2._bashes = {4242: (4243, "1")}
+    monkeypatch.setattr(C, "_bash_gone", lambda pid, start, timeout: True)
     shell2.close()
     assert not f.exists()
 

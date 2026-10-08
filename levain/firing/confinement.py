@@ -2496,7 +2496,7 @@ def _hands_signal(hands: HandsIdentity, pgid: int, sig: int) -> bool:
     return r.returncode == 0
 
 
-def sweep_hands_user(user: str, *, timeout: float = 5.0) -> str | None:
+def sweep_hands_user(user: str, *, uid: int | None, timeout: float = 5.0) -> str | None:
     """Stop every process of the hands user ``user`` (SIGKILL to all it may signal, sent as it), and
     verify none of the entity's is left. For a session's start and end: a command can leave its
     process group (``setsid``), so killing the groups levain started does not reach everything the
@@ -2505,19 +2505,18 @@ def sweep_hands_user(user: str, *, timeout: float = 5.0) -> str | None:
 
     The check is :func:`levain.firing.ws_git.entity_session_live`, the one ws-git uses: on macOS
     launchd starts (and restarts) per-user system agents for a uid that ran Apple code, and those
-    are not the entity's (S2 L3 r3, codex HIGH). Root and levain's own account are refused."""
-    import pwd
-
+    are not the entity's (S2 L3 r3, codex HIGH). Root and levain's own account are refused. ``uid`` is
+    the hands user's id as setup recorded it: no name lookup runs here, since one can block in NSS
+    with no bound (S2 L3 r5, codex MED); None (not known) is refused."""
     from levain.firing.ws_git import WsGitError, entity_session_live
     from levain.launch import child_env
 
     deadline = time.monotonic() + timeout
-    try:
-        uid = pwd.getpwnam(user).pw_uid
-    except KeyError:
-        return f"there is no user {user}, so its processes cannot be checked"
+    if uid is None:
+        return f"the id of {user} is not known, so its processes cannot be checked"
     if uid in (0, os.getuid()):
         return f"refusing to stop every process of {user} (uid {uid}): it is root or levain's own account"
+    said: str | None = None
     while True:
         # Every step, the check's pgrep and ps included, is bounded by what is left of `timeout`, with
         # no floor, so a stalled one cannot stretch the sweep (S2d codex MED, r3, r4).
@@ -2528,8 +2527,12 @@ def sweep_hands_user(user: str, *, timeout: float = 5.0) -> str | None:
                                stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=left)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+        left = deadline - time.monotonic()
+        if left <= 0:   # what the last check found, or that none could run (S2 L3 r5)
+            return said or (f"the stop of {user}'s processes ran out of its {timeout:g} s before it "
+                            "could check that none is left")
         try:
-            if not entity_session_live(uid, timeout=max(0.0, deadline - time.monotonic())):
+            if not entity_session_live(uid, timeout=left):
                 return None
             said = f"processes of {user} are still running"
         except WsGitError as exc:
@@ -2562,6 +2565,10 @@ _MAX_LATE = 32
 _DRAIN_GRACE = 0.2
 # A killed group's members get this long after SIGTERM before SIGKILL.
 _KILL_GRACE = 1.0
+# How long a reap waits for a signal still being sent to the leader's group, longer than a hands
+# shell's signal (`_hands_signal`, two sudo runs) takes at its slowest. Past it the leader is left
+# unreaped and its group kept.
+_REAP_WAIT = 30.0
 # The start probe's deadline.
 _START_TIMEOUT = 20.0
 
@@ -2830,6 +2837,10 @@ class SandboxedShell:
         command's bash with status N and the next command starts from the carried state."""
         return self._closed
 
+    # Whether each command runs in a pid namespace of its own, whose init gone means its group is
+    # empty (:meth:`_group_emptied`). Required on Linux.
+    _own_pid_namespace = False
+
     def start(self) -> "SandboxedShell":
         """Prove the driver runs bash, with a probe command that must print a random token and exit 0
         (a dead or misconfigured sandbox driver fails the spawn here, never as a live-looking shell).
@@ -2929,6 +2940,11 @@ class SandboxedShell:
         argv, pass_fds = self._spawn_argv()
         made: list[int] = []
         try:
+            if platform.system() == "Linux" and not self._own_pid_namespace:
+                raise ConfinementError(
+                    "on Linux a shell must run each command in a pid namespace of its own (bwrap), the "
+                    "only way levain can tell that a command left nothing running — refusing (fail-closed)."
+                )
             rd, wr = os.pipe()
             made += (rd, wr)
             ours, theirs = socket.socketpair()
@@ -3000,56 +3016,74 @@ class SandboxedShell:
         return leader, out, carry
 
     def _kill_group(self, pgid: int, leader: _Leader) -> bool:
-        """SIGTERM the group, give it ``_KILL_GRACE``, SIGKILL what is left (on Linux, always), and wait
-        for the group to empty; then reap its leader. False when it did not empty: the leader stays
-        unreaped (the number stays this group's) and the caller must not report it killed."""
+        """SIGTERM the group, give it ``_KILL_GRACE``, SIGKILL what is left, and wait for the group
+        to empty; then reap its leader. False when it did not empty, when the SIGKILL was not
+        delivered, or when the reap had to wait too long: the leader stays unreaped (the number stays
+        this group's) and the caller must not report it killed."""
         self._signal_group(pgid, leader, signal.SIGTERM)
         leader.wait(_KILL_GRACE)
-        if _empty_is_a_snapshot() or not _group_gone(pgid, timeout=0.2):
-            self._signal_group(pgid, leader, signal.SIGKILL)
+        delivered = True
+        if not self._group_emptied(pgid, leader, 0.2):
+            delivered = self._signal_group(pgid, leader, signal.SIGKILL)
         leader.wait(5.0)
-        if leader.exited and _group_gone(pgid, timeout=5.0):
-            self._reap(pgid, leader)
-            return True
-        return False
+        # A SIGKILL that may not have landed leaves the group held, whatever it looks like (r5).
+        return (delivered and leader.exited and self._group_emptied(pgid, leader, 5.0)
+                and self._reap(pgid, leader))
 
-    def _signal_group(self, pgid: int, leader: _Leader, sig: int) -> None:
+    def _signal_group(self, pgid: int, leader: _Leader, sig: int) -> bool:
         """Signal a group only while its leader is unreaped: the leader is held unreaped for the send
         (:meth:`_Leader.hold_for_signal`), so a number another thread has just freed is never
         signalled (S2d codex HIGH). No lock is held across the send, which for a hands shell is sudo,
-        so a slow one never holds up a Ctrl-C or the shell's bookkeeping (S2 L3 r3, r4)."""
-        if leader.hold_for_signal():
-            try:
-                self._signal(pgid, sig)
-            finally:
-                leader.signal_sent()
+        so a slow one never holds up a Ctrl-C or the shell's bookkeeping (S2 L3 r3, r4). True when
+        the signal was delivered, or there was nothing left to deliver it to (see :meth:`_signal`)."""
+        if not leader.hold_for_signal():
+            return True   # reaped: its group was emptied and is not this shell's any more
+        try:
+            return self._signal(pgid, sig)
+        finally:
+            leader.signal_sent()
 
-    def _reap(self, pgid: int, leader: _Leader) -> None:
+    def _reap(self, pgid: int, leader: _Leader) -> bool:
         """Reap a leader whose group is empty, then forget the group. A signal between the two finds
-        the leader reaped and is not sent."""
-        leader.reap()
+        the leader reaped and is not sent. False, the group kept, when a signal to it is still being
+        sent after ``_REAP_WAIT``."""
+        if not leader.reap(timeout=_REAP_WAIT):
+            return False
         with self._lock:
             if self._groups.get(pgid) is leader:
                 del self._groups[pgid]
+        return True
 
     @staticmethod
-    def _signal(pgid: int, sig: int) -> None:
+    def _signal(pgid: int, sig: int) -> bool:
+        """Send ``sig`` to group ``pgid``. True when it was delivered or the group is gone (ESRCH)."""
         try:
             os.killpg(pgid, sig)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _group_emptied(self, pgid: int, leader: _Leader, timeout: float) -> bool:
+        """Whether group ``pgid`` has no live member (polled up to ``timeout``): THE authority every
+        reap of a leader rests on. Here, macOS's: a process table read in one call
+        (:func:`_group_gone`). Linux has no such call and /proc is read one entry at a time, which a
+        member that keeps forking can evade (S2 L3 r3, r4, r5), so a Linux shell must run each command
+        in a pid namespace of its own and answer from that (:class:`_BwrapShell`); any other shell is
+        refused there at its spawn."""
+        if platform.system() != "Darwin":
+            return False
+        return _group_gone(pgid, timeout=timeout)
 
     def _prune_groups(self) -> None:
-        """Reap the leader of each group that has emptied, and forget the group. Only then may its
-        number be reused, and it is no longer signalled. On Linux, where "emptied" could only be read
-        from /proc snapshots, no group is pruned: each is kept, leader unreaped, until close() (or a
-        timeout's kill) has sent it SIGKILL (S2 L3 r4, codex HIGH). The cost: a zombie leader per
-        command until then."""
+        """Reap the leader of each group that has emptied (:meth:`_group_emptied`), and forget the
+        group. Only then may its number be reused, and it is no longer signalled."""
         with self._lock:
             groups = list(self._groups.items())
-        # Decided outside the lock: `_group_live` may run pgrep (S2 L3 r3).
+        # Decided outside the lock: `_group_emptied` may run pgrep (S2 L3 r3).
         for pgid, leader in groups:
-            if leader.reaped or (leader.wait(0) and not _empty_is_a_snapshot() and not _group_live(pgid)):
+            if leader.reaped or (leader.wait(0) and self._group_emptied(pgid, leader, 0.0)):
                 self._reap(pgid, leader)
             elif leader.exited:
                 leader.release_watch()
@@ -3195,14 +3229,16 @@ class SandboxedShell:
         for pgid, leader in groups:
             self._signal_group(pgid, leader, signal.SIGTERM)
         deadline = time.monotonic() + _KILL_GRACE
+        undelivered: set[int] = set()
         for pgid, leader in groups:
-            if _empty_is_a_snapshot() or not _group_gone(pgid, timeout=max(0.0, deadline - time.monotonic())):
-                self._signal_group(pgid, leader, signal.SIGKILL)
+            if not self._group_emptied(pgid, leader, max(0.0, deadline - time.monotonic())):
+                if not self._signal_group(pgid, leader, signal.SIGKILL):
+                    undelivered.add(pgid)   # kept, whatever it looks like (r5)
         for pgid, leader in groups:
             leader.wait(5.0)
-            if leader.reaped or (leader.exited and _group_gone(pgid, timeout=5.0)):
-                self._reap(pgid, leader)
-            else:
+            emptied = leader.reaped or (pgid not in undelivered and leader.exited
+                                        and self._group_emptied(pgid, leader, 5.0))
+            if not (emptied and self._reap(pgid, leader)):
                 # close() never raises; a group it could not empty is said, not hidden, and the
                 # session keeps the workspace lock while it lives (S2 L3 r2, codex HIGH).
                 _log.warning("levain: the shell's process group %d is still running after close()", pgid)
@@ -4025,12 +4061,13 @@ class _HandsSeatbeltShell(_SeatbeltShell):
     def hands_user(self) -> str | None:
         return self.hands.user
 
-    def _signal(self, pgid: int, sig: int) -> None:   # type: ignore[override]
+    def _signal(self, pgid: int, sig: int) -> bool:   # type: ignore[override]
         # The group's members run as the hands user, except sudo, the group leader, whose REAL uid is
         # the operator's: only levain can signal it, and only the hands user the rest. A command that
         # stops itself (`kill -STOP $$`) stops sudo too, so after the signal both get SIGCONT, or a
-        # stopped sudo would outlive the timeout, close() and levain (S2 L2b M2).
-        _hands_signal(self.hands, pgid, sig)
+        # stopped sudo would outlive the timeout, close() and levain (S2 L2b M2). Delivered only when
+        # the hands user's kill says so: a refused or stalled sudo is not a delivery (S2 L3 r5).
+        delivered = _hands_signal(self.hands, pgid, sig)
         if sig != signal.SIGCONT:
             _hands_signal(self.hands, pgid, signal.SIGCONT)
         for s_ in (sig, signal.SIGCONT):
@@ -4038,6 +4075,7 @@ class _HandsSeatbeltShell(_SeatbeltShell):
                 os.killpg(pgid, s_)
             except OSError:
                 pass
+        return delivered
 
 
 # --- Linux: bwrap (mount-namespace) provider -------------------------------------------------
@@ -5789,9 +5827,8 @@ def _group_live(pgid: int) -> bool:
     """Whether process group ``pgid`` has a member that is not a zombie. The shell keeps each group's
     leader unreaped while its group lives (:class:`_Leader`), so a zombie must not count.
 
-    On Linux the answer is a scan of /proc, read one entry at a time, so a member that keeps forking
-    and exiting can be missed by any number of scans: there an empty answer is trusted only once the
-    group has been sent SIGKILL (a killed process forks nothing), see :func:`_empty_is_a_snapshot`."""
+    macOS only: elsewhere a group that ``killpg`` still finds is called live, since Linux has no one-call
+    process table to tell its members from a zombie leader (see :meth:`SandboxedShell._group_emptied`)."""
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -5801,25 +5838,8 @@ def _group_live(pgid: int) -> bool:
     else:
         if platform.system() == "Darwin":
             return True   # macOS signals no zombie, so a success is a live member (measured)
-    if platform.system() == "Linux":
-        for d in os.listdir("/proc"):
-            if not d.isdigit():
-                continue
-            try:
-                f = Path(f"/proc/{d}/stat").read_text().rsplit(")", 1)[-1].split()
-            except OSError:
-                continue
-            if len(f) > 2 and f[2] == str(pgid) and f[0] not in ("Z", "X", "x"):
-                return True
-        # Nothing live is visible. A member of another uid hidden by /proc's hidepid still answers
-        # EPERM, and is not called gone.
-        try:
-            os.killpg(pgid, 0)
-        except PermissionError:
-            return True
-        except OSError:
-            pass
-        return False
+    if platform.system() != "Darwin":
+        return True
     # macOS (and other BSDs): pgrep lists no zombie (measured), and lists every user's processes.
     from levain.launch import child_env
 
@@ -5829,12 +5849,6 @@ def _group_live(pgid: int) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return True   # cannot tell: not gone
     return r.returncode != 1
-
-
-def _empty_is_a_snapshot() -> bool:
-    """Whether :func:`_group_live` saying "empty" is only a snapshot (Linux /proc), so a group not yet
-    sent SIGKILL must not be dropped, or spared the SIGKILL, on its say (S2 L3 r4, codex HIGH)."""
-    return platform.system() == "Linux"
 
 
 def _group_gone(pgid: int, *, timeout: float) -> bool:
@@ -5970,20 +5984,26 @@ class _Leader:
             self._signalling -= 1
             self._signals_done.notify_all()
 
-    def reap(self) -> None:
+    def reap(self, timeout: float | None = None) -> bool:
         """Reap the leader (only once its group has no live member) and free the watch. Waits for any
-        signal still being sent to the group (S2 L3 r4)."""
+        signal still being sent to the group (S2 L3 r4), up to ``timeout``: False, still unreaped,
+        when one is still out then (r5)."""
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._reap_lock:
             while self._signalling:
-                self._signals_done.wait()
+                left = None if deadline is None else deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    return False
+                self._signals_done.wait(left)
             if self.reaped:
-                return
+                return True
             self.proc.wait()
             if self.status is None:
                 self.status = self.proc.returncode
             self.exited = True
             self.reaped = True
             self._release()
+            return True
 
     def release_watch(self) -> None:
         """Free the watch of a leader seen exited and kept unreaped (its group still held): its exit is
@@ -6047,11 +6067,24 @@ class _BwrapShell(SandboxedShell):
         self._ledger_claim: str | None = None   # this shell's claim on the placeholder ledger
         self._claim_base: str | None = None     # the claim before a command's bash is added to it
         self._info_r: int | None = None         # read end of the running command's --info-fd pipe
-        # Each command's bash (pid, kernel start time) not yet seen gone. bash is pid 1 of its pid
-        # namespace, and pid 1 finishes exiting only once the namespace is empty, so "bash gone" means
-        # "namespace gone". With --new-session bash is NOT in the bwrap process's group, so the group
-        # alone cannot say that.
-        self._bashes: list[tuple[int, str]] = []
+        # Each command's bash (pid, kernel start time) by its process group, None once seen gone. bash
+        # is pid 1 of its pid namespace, and pid 1 finishes exiting only once the namespace is empty
+        # ("the kernel terminates all of the processes in the namespace via a SIGKILL signal",
+        # pid_namespaces(7)), so "bash gone" means "namespace gone". With --new-session bash is NOT in
+        # the bwrap process's group, so the group alone cannot say that.
+        self._bashes: dict[int, tuple[int, str] | None] = {}
+
+    # Each command runs in a pid namespace of its own (``--unshare-pid --as-pid-1``).
+    _own_pid_namespace = True
+
+    def _group_emptied(self, pgid: int, leader: _Leader, timeout: float) -> bool:
+        """The command's group is empty once its bwrap process (the leader) has exited and its bash,
+        the namespace's pid 1, is gone: the kernel's answer, not a read of /proc's listing. A group
+        whose bash levain never learned (bwrap reported no pid) is never called empty."""
+        deadline = time.monotonic() + timeout
+        if not leader.wait(timeout) or pgid not in self._bashes:
+            return False
+        return self._bashes_gone(max(0.0, deadline - time.monotonic()), only=pgid)
 
     def close(self) -> None:
         # The claim is released only once the sandbox's namespace is GONE, never while any process of
@@ -6061,16 +6094,13 @@ class _BwrapShell(SandboxedShell):
         # namespace empty. If one is not gone in time, the claim stays, and the sweep at the next spawn
         # or at launch releases it once this levain is gone. Released in `finally`, whatever the base
         # teardown did.
-        with self._lock:
-            pgids = list(self._groups)
         try:
             super().close()
         finally:
             self._close_info()
             claim, self._ledger_claim = self._ledger_claim, None
             _LIVE_BWRAP_SHELLS.discard(self)
-            if (claim is not None and all(_group_gone(g, timeout=5.0) for g in pgids)
-                    and self._bashes_gone(5.0)):
+            if claim is not None and not self.unemptied_groups and self._bashes_gone(5.0):
                 _ledger_release(claim)
 
     def _close_info(self) -> None:
@@ -6127,11 +6157,19 @@ class _BwrapShell(SandboxedShell):
             )
         return pid
 
-    def _bashes_gone(self, timeout: float) -> bool:
+    def _bashes_gone(self, timeout: float, *, only: int | None = None, but: int | None = None) -> bool:
+        """Whether every recorded bash (or the one of group ``only``; or all but group ``but``'s) is
+        gone, polled up to ``timeout``."""
         deadline = time.monotonic() + timeout
-        self._bashes = [b for b in self._bashes
-                        if not _bash_gone(*b, timeout=max(0.0, deadline - time.monotonic()))]
-        return not self._bashes
+        gone = True
+        for pgid, b in list(self._bashes.items()):
+            if b is None or pgid == but or (only is not None and pgid != only):
+                continue
+            if _bash_gone(*b, timeout=max(0.0, deadline - time.monotonic())):
+                self._bashes[pgid] = None
+            else:
+                gone = False
+        return gone
 
     def _after_spawn(self, pgid: int) -> None:
         # bash is blocked reading its input, so nothing of the command has run yet. Learn its pid,
@@ -6141,12 +6179,12 @@ class _BwrapShell(SandboxedShell):
         # the claim covering it.
         pid = self._read_child_pid()
         start = _proc_start_time(pid) or "-"
-        if not self._bashes_gone(5.0):
+        self._bashes[pgid] = (pid, start)   # recorded first: it is how this group is known empty
+        if not self._bashes_gone(5.0, but=pgid):
             raise ConfinementError(
                 "an earlier command's sandbox is still exiting — refusing to run the command "
                 "(fail-closed): the shell's claim on the floor's files must cover it until it is gone."
             )
-        self._bashes.append((pid, start))
         claim = self._ledger_claim
         if claim is None or self._claim_base is None:
             return
@@ -6166,8 +6204,7 @@ class _BwrapShell(SandboxedShell):
     def _after_command(self, pgid: int) -> None:
         # The command's bash was pid 1 of its namespace, so the kernel is killing everything left
         # in it; wait for that, so the next command's bash is the only one the claim needs to name.
-        _group_gone(pgid, timeout=5.0)
-        self._bashes_gone(5.0)
+        self._bashes_gone(5.0, only=pgid)
 
     def _recheck(self) -> None:
         _refuse_plantable_sqlite_jewels(self._jewel_policy)

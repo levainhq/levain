@@ -313,7 +313,7 @@ def test_ws_git_refuses_while_the_entitys_user_runs_anything(tmp_path: Path, mon
     monkeypatch.setattr(ws_git, "_run_relayed", lambda argv: ran.append(argv) or 0)
     assert ws_git.cmd_ws_git(tmp_path, h.workspace / "r", ["status"]) == 1
     assert "processes running" in capsys.readouterr().out and ran == []
-    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: False)
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid, **kw: False)
     assert ws_git.cmd_ws_git(tmp_path, h.workspace / "r", ["status"]) == 0 and len(ran) == 1
 
 
@@ -430,7 +430,7 @@ def adopt_env(tmp_path: Path, monkeypatch):
     h = _hands(tmp_path)
     _no_sudo(monkeypatch)
     monkeypatch.setattr(ws_git, "load_hands", lambda e: h)
-    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: False)
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid, **kw: False)
     # here "the hands user" is this test's own uid, which owns the source too; the source check has
     # its own test above
     monkeypatch.setattr(ws_git, "_pin_operator_source",
@@ -488,7 +488,7 @@ def test_ws_adopt_refuses_a_repository_inside_a_workspace_and_while_live(adopt_e
     monkeypatch.setitem(ws_git.WORKSPACE_ROOT, "darwin", src.parent)
     assert ws_git.cmd_ws_adopt(h.home, src) == 1 and "inside an entity's workspace" in capsys.readouterr().out
     monkeypatch.setitem(ws_git.WORKSPACE_ROOT, "darwin", Path("/Users/Shared/levain"))
-    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: True)
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid, **kw: True)
     assert ws_git.cmd_ws_adopt(h.home, src) == 1 and "processes running" in capsys.readouterr().out
     assert not (h.workspace / "mine").exists()
 
@@ -628,7 +628,7 @@ def test_ws_put_takes_the_hands_lock_and_the_liveness_gate(put_env, tmp_path: Pa
         assert _put(h, src, "x") == 1 and "session of this entity is open" in capsys.readouterr().out
     finally:
         os.close(fd)
-    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: True)
+    monkeypatch.setattr(ws_git, "entity_session_live", lambda uid, **kw: True)
     assert _put(h, src, "x") == 1 and "processes running" in capsys.readouterr().out
     assert not (h.workspace / "x").exists()
 
@@ -785,7 +785,7 @@ def test_a_hands_session_keeps_its_locks_while_anything_of_its_user_runs(tmp_pat
     from levain.session import EntitySession
 
     calls: list[str] = []
-    monkeypatch.setattr(C, "sweep_hands_user", lambda user: calls.append(user) or left)
+    monkeypatch.setattr(C, "sweep_hands_user", lambda user, **kw: calls.append(user) or left)
     monkeypatch.setattr(C, "unemptied_shell_groups", lambda user: [])
 
     class Conv:
@@ -825,11 +825,11 @@ def test_unemptied_shell_groups_keep_a_hands_session_locked(tmp_path: Path, monk
         def close(self):
             pass
 
-    monkeypatch.setattr(C, "sweep_hands_user", lambda user: None)
+    monkeypatch.setattr(C, "sweep_hands_user", lambda user, **kw: None)
     mine, theirs = Shell("_levain_a_000000", (4242,)), Shell("_levain_b_000000", (4343,))
     monkeypatch.setattr(C, "_UNEMPTIED_SHELLS", {mine, theirs})
-    assert "4242" in (_stop_hands_user("_levain_a_000000") or "")
-    assert _stop_hands_user("_levain_c_000000") is None
+    assert "4242" in (_stop_hands_user("_levain_a_000000", 4_000_017) or "")
+    assert _stop_hands_user("_levain_c_000000", 4_000_018) is None
 
 
 def test_a_second_session_running_as_the_hands_user_is_refused(tmp_path: Path) -> None:
@@ -854,7 +854,7 @@ def test_an_interrupted_stop_keeps_the_locks_and_close_does_not_raise(tmp_path: 
     from levain.firing.deadline import TurnTimeout
     from levain.session import EntitySession
 
-    def interrupted(user):
+    def interrupted(user, **kw):
         raise TurnTimeout(30)
 
     monkeypatch.setattr(C, "sweep_hands_user", interrupted)
@@ -883,7 +883,7 @@ def test_a_failed_teardown_still_stops_the_hands_user_and_keeps_the_locks(tmp_pa
     from levain.session import EntitySession
 
     swept: list[str] = []
-    monkeypatch.setattr(C, "sweep_hands_user", lambda user: swept.append(user))
+    monkeypatch.setattr(C, "sweep_hands_user", lambda user, **kw: swept.append(user))
     monkeypatch.setattr(C, "unemptied_shell_groups", lambda user: [])
 
     class Conv:

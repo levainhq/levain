@@ -216,6 +216,11 @@ def proc_hides_processes(mountinfo: str) -> bool:
     return False
 
 
+#: How long a caller outside the session-end sweep gives :func:`entity_session_live` before it
+#: cannot tell (a refusal).
+LIVENESS_TIMEOUT = 10.0
+
+
 def entity_session_live(hands_uid: int, *, timeout: float | None = None) -> bool:
     """Whether anything runs as the hands user right now. The workspace is the hands user's and the
     operator can only read it, so whatever can change it while ws-git works (an entity session's
@@ -360,7 +365,7 @@ class _exclusive:
 
 
 def _refuse_while_live(hands: Hands, what: str) -> None:
-    if entity_session_live(hands.uid):
+    if entity_session_live(hands.uid, timeout=LIVENESS_TIMEOUT):
         raise WsGitError(
             f"the entity's user {hands.user} has processes running (a session is live, or something it "
             f"left running); {what} waits until it stops, so the entity cannot rewrite what was checked")
