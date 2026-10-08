@@ -845,3 +845,32 @@ def test_a_second_session_running_as_the_hands_user_is_refused(tmp_path: Path) -
     finally:
         os.close(fd)
     os.close(ws_git.hold_hands_session(tmp_path))
+
+
+def test_an_interrupted_stop_keeps_the_locks_and_close_does_not_raise(tmp_path: Path, monkeypatch) -> None:
+    """S2d codex HIGH: the wall-clock TurnTimeout (a BaseException) landing inside the end-of-session
+    stop escaped close(), skipped the lock handling, and close() could not be retried."""
+    from levain.firing import confinement as C
+    from levain.firing.deadline import TurnTimeout
+    from levain.session import EntitySession
+
+    def interrupted(user):
+        raise TurnTimeout(30)
+
+    monkeypatch.setattr(C, "sweep_hands_user", interrupted)
+
+    class Conv:
+        def close(self):
+            pass
+
+    (tmp_path / ".levain").mkdir()
+    s = EntitySession(entity_dir=tmp_path, binding=None, conversation=Conv(), workspace=tmp_path,
+                      model_label="m", with_tools=True, bash_ok=True,
+                      hands_lock_fd=ws_git.hold_session_lock(tmp_path),
+                      hands_session_fd=ws_git.hold_hands_session(tmp_path), hands_user="_levain_x_000000")
+    s.close()
+    assert "interrupted (TurnTimeout)" in (s.left_running or "")
+    with pytest.raises(WsGitError, match="one runs at a time"):
+        ws_git.hold_hands_session(tmp_path)
+    os.close(s.hands_lock_fd)
+    os.close(s.hands_session_fd)

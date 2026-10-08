@@ -382,20 +382,54 @@ def test_a_headless_session_binds_the_hands_user_and_the_repl_does_not(tmp_path,
     hands = _hands(tmp_path)
     monkeypatch.setattr(session_mod, "hands_for",
                         lambda cfg, mode: None if mode == "interactive" else hands)
+    # Never a real UID-wide kill from the suite (a CI runner's sudo needs no password).
+    from levain.firing import confinement
+
+    swept: list[str] = []
+    monkeypatch.setattr(confinement, "sweep_hands_user", lambda user: swept.append(user))
     s = EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="headless")
     try:
+        # S2d codex HIGH: anything of the hands user left by an earlier levain is stopped at the start.
+        assert swept == ["nobody"]
         assert s.hands_user == "nobody" and s.workspace == hands.workspace
         tools = s.conversation.agent.tools_map
         assert tools["file_editor"].executor._floor.hands == hands
         assert tools["file_editor"].executor._policy.workspace == hands.workspace
     finally:
         s.close()
+    assert swept == ["nobody", "nobody"] and s.left_running is None
     s = EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="interactive")
     try:
         assert s.hands_user is None and s.workspace == (ent / "workspace").resolve()
         assert s.conversation.agent.tools_map["file_editor"].executor._floor.hands is None
     finally:
         s.close()
+    assert swept == ["nobody", "nobody"]   # the REPL runs nothing as the hands user
+
+
+def test_a_hands_session_does_not_start_over_processes_it_cannot_stop(tmp_path, monkeypatch):
+    """S2d codex HIGH: a levain killed before its session's end leaves a setsid process of the hands
+    user running; the next session stops it first, and refuses to start if it cannot."""
+    import json
+
+    from levain import session as session_mod
+    from levain.firing import confinement
+    from levain.firing import ws_git
+    from levain.session import EntitySession, SessionStartError
+
+    (tmp_path / "home").mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("LEVAIN_ENTITY_DIR", raising=False)
+    ent = tmp_path / "e"
+    (ent / ".levain").mkdir(parents=True)
+    (ent / ".levain" / "config.json").write_text(json.dumps({"adapter": "openhands"}))
+    monkeypatch.setattr(session_mod, "hands_for", lambda cfg, mode: _hands(tmp_path))
+    monkeypatch.setattr(confinement, "sweep_hands_user", lambda user: "processes of nobody are still running (pid 4242)")
+    with pytest.raises(SessionStartError, match="could not be stopped"):
+        EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="headless")
+    # The failed start keeps its locks while the processes live.
+    with pytest.raises(ws_git.WsGitError, match="one runs at a time"):
+        ws_git.hold_hands_session(ent)
 
 
 def test_the_session_end_sweep_kills_every_process_of_the_hands_user_and_verifies(monkeypatch):
@@ -422,3 +456,22 @@ def test_the_session_end_sweep_kills_every_process_of_the_hands_user_and_verifie
                         lambda argv, **kw: sp.CompletedProcess(argv, 0, "4242\n", ""))
     said = confinement.sweep_hands_user("_levain_x_000000", timeout=0.3)
     assert said is not None and "4242" in said and "still running" in said
+
+
+def test_the_sweep_never_waits_longer_than_its_timeout_on_a_stalled_step(monkeypatch):
+    """S2d codex MED: each sudo/pgrep step had its own 10 s timeout, so a 5 s sweep could take 20 s."""
+    import subprocess as sp
+
+    from levain.firing import confinement
+
+    timeouts: list[float] = []
+
+    def stalled(argv, **kw):
+        timeouts.append(kw["timeout"])
+        if argv[0].endswith("pgrep"):
+            return sp.CompletedProcess(argv, 0, "4242\n", "")
+        raise sp.TimeoutExpired(argv, kw["timeout"])
+
+    monkeypatch.setattr(confinement.subprocess, "run", stalled)
+    confinement.sweep_hands_user("_levain_x_000000", timeout=1.0)
+    assert timeouts and max(timeouts) <= 1.0

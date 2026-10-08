@@ -974,3 +974,37 @@ def test_a_waiter_whose_leader_is_reaped_under_it_returns(monkeypatch):
         if kq is not None:
             kq.close()
         proc.wait()
+
+
+def test_a_timed_out_commands_group_is_forgotten_when_its_leader_is_reaped(tmp_path):
+    """S2d codex HIGH: the timeout path reaped the leader but left its group in the shell's table, so
+    a later close() could signal that number after the system reused it."""
+    sh = _plain(tmp_path).start()
+    try:
+        r = sh.run("sleep 30", timeout=0.5)
+        assert r.timed_out
+        assert not sh._groups   # type: ignore[attr-defined]
+        sent: list[int] = []
+        sh._signal = lambda pgid, sig: sent.append(pgid)   # type: ignore[method-assign]
+        sh.close()
+        assert not sent
+    finally:
+        sh.close()
+
+
+def test_a_reaped_leaders_group_is_never_signalled(tmp_path):
+    """The check that a leader is unreaped and the signal happen under the lock every reap holds."""
+    from levain.firing import confinement as C
+
+    sh = _plain(tmp_path).start()
+    proc = subprocess.Popen(["/bin/sleep", "0.1"], start_new_session=True)
+    leader = C._Leader(proc)
+    leader.wait(5)
+    leader.reap()
+    sent: list[int] = []
+    sh._signal = lambda pgid, sig: sent.append(pgid)   # type: ignore[method-assign]
+    sh._signal_group(proc.pid, leader, signal.SIGKILL)   # type: ignore[attr-defined]
+    sh._leader = leader   # type: ignore[attr-defined]
+    sh.interrupt()
+    assert not sent
+    sh.close()

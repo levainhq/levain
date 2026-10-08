@@ -325,6 +325,7 @@ def test_a_shell_releases_its_claim_only_once_its_process_group_is_gone(home: Pa
     class _P:   # a command's leader (`_Leader`), already exited
         pid = 4242
         exited = True
+        reaped = False
 
         def wait(self, timeout=None):
             return True

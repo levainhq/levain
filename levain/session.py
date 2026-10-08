@@ -200,7 +200,6 @@ class SessionStartError(Exception):
         self.code = code
 
 
-
 def _stop_hands_user(user: str) -> str | None:
     """At the end of a session whose bash ran as ``user``: stop every process of that user (a command
     can leave its process group with ``setsid``), then empty and reap the groups the shells could not
@@ -208,15 +207,22 @@ def _stop_hands_user(user: str) -> str | None:
     workspace locks."""
     from levain.firing.confinement import sweep_hands_user, unemptied_shell_groups
 
-    swept = sweep_hands_user(user)
-    groups = unemptied_shell_groups(user)
+    try:
+        swept = sweep_hands_user(user)
+        groups = unemptied_shell_groups(user)
+    except BaseException as exc:  # noqa: BLE001 — a TurnTimeout too: teardown must not raise (S2d codex)
+        swept, groups = f"the stop was interrupted ({type(exc).__name__})", []
     said = "; ".join(x for x in (swept, f"process groups {groups} not empty" if groups else None) if x)
     if not said:
         return None
-    logging.getLogger("levain.session").warning(
-        "levain: this session of %s could not stop everything it ran (%s); the workspace stays locked "
-        "for ws-git until this process ends", user, said)
+    try:
+        logging.getLogger("levain.session").warning(
+            "levain: could not stop every process of %s (%s); the workspace stays locked for ws-git "
+            "until this process ends", user, said)
+    except BaseException:  # noqa: BLE001 — a raising log handler must not undo the answer
+        pass
     return said
+
 
 @dataclass(frozen=True)
 class TurnResult:
@@ -766,6 +772,11 @@ class EntitySession:
             hands_id = hands_for(cfg, mode) if cfg is not None else None
             if hands_id is not None:
                 hands_session_fd = hold_hands_session(entity_dir)
+                # Nothing of the hands user may outlive an earlier session into this one (a setsid
+                # process of a levain that was killed before its end ran, S2d codex): stop it first.
+                if (stale := _stop_hands_user(hands_id.user)) is not None:
+                    raise WsGitError(f"processes of the entity's user from an earlier session could not "
+                                     f"be stopped ({stale}); refusing to start")
                 workspace = hands_id.workspace
                 _check_hands_workspace(workspace)
             else:

@@ -2506,14 +2506,17 @@ def sweep_hands_user(user: str, *, timeout: float = 5.0) -> str | None:
 
     deadline = time.monotonic() + timeout
     while True:
+        # Every step is bounded by what is left of `timeout`, so a stalled sudo or pgrep cannot
+        # stretch the sweep (S2d codex MED).
+        left = lambda: max(0.5, deadline - time.monotonic())   # noqa: E731
         try:
             subprocess.run([SUDO, "-n", "-u", user, "/bin/kill", "-9", "--", "-1"], capture_output=True,
-                           stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=10)
+                           stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=left())
         except (OSError, subprocess.TimeoutExpired):
             pass
         try:
             r = subprocess.run(["/usr/bin/pgrep", "-U", user], capture_output=True, text=True,
-                               stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=10)
+                               stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=left())
         except (OSError, subprocess.TimeoutExpired) as exc:
             return f"could not list {user}'s processes ({exc})"
         if r.returncode == 1:
@@ -2988,15 +2991,29 @@ class SandboxedShell:
         """SIGTERM the group, give it ``_KILL_GRACE``, SIGKILL what is left, and wait for the group
         to empty; then reap its leader. False when it did not empty: the leader stays unreaped (the
         number stays this group's) and the caller must not report it killed."""
-        self._signal(pgid, signal.SIGTERM)
+        self._signal_group(pgid, leader, signal.SIGTERM)
         leader.wait(_KILL_GRACE)
         if not _group_gone(pgid, timeout=0.2):
-            self._signal(pgid, signal.SIGKILL)
+            self._signal_group(pgid, leader, signal.SIGKILL)
         leader.wait(5.0)
         if leader.exited and _group_gone(pgid, timeout=5.0):
-            leader.reap()
+            self._reap(pgid, leader)
             return True
         return False
+
+    def _signal_group(self, pgid: int, leader: _Leader, sig: int) -> None:
+        """Signal a group only while its leader is unreaped, checked and sent under the lock every
+        reap holds, so a number another thread has just freed is never signalled (S2d codex HIGH)."""
+        with self._lock:
+            if not leader.reaped:
+                self._signal(pgid, sig)
+
+    def _reap(self, pgid: int, leader: _Leader) -> None:
+        """Reap a leader whose group is empty and forget the group, in one step under the lock."""
+        with self._lock:
+            leader.reap()
+            if self._groups.get(pgid) is leader:
+                del self._groups[pgid]
 
     @staticmethod
     def _signal(pgid: int, sig: int) -> None:
@@ -3010,7 +3027,7 @@ class SandboxedShell:
         number be reused, and it is no longer signalled."""
         with self._lock:
             for pgid, leader in list(self._groups.items()):
-                if leader.wait(0) and not _group_live(pgid):
+                if leader.reaped or (leader.wait(0) and not _group_live(pgid)):
                     leader.reap()
                     del self._groups[pgid]
 
@@ -3135,8 +3152,10 @@ class SandboxedShell:
         """Best-effort SIGINT to the running command's process GROUP (Ctrl-C it and its children).
         Never raises."""
         leader = self._leader
-        if leader is not None and not leader.exited:
-            self._signal(leader.pid, signal.SIGINT)
+        if leader is not None:
+            with self._lock:
+                if not leader.exited:   # an exited leader is unreaped or gone; neither is Ctrl-C'd
+                    self._signal(leader.pid, signal.SIGINT)
 
     def close(self) -> None:
         """Kill every process group this shell started (SIGTERM, then SIGKILL), wait for each to
@@ -3151,18 +3170,16 @@ class SandboxedShell:
         for out in late:
             out.abandon()
         # Each leader is still unreaped, so each number is still this shell's group (see `_Leader`).
-        for pgid, _ in groups:
-            self._signal(pgid, signal.SIGTERM)
+        for pgid, leader in groups:
+            self._signal_group(pgid, leader, signal.SIGTERM)
         deadline = time.monotonic() + _KILL_GRACE
-        for pgid, _ in groups:
+        for pgid, leader in groups:
             if not _group_gone(pgid, timeout=max(0.0, deadline - time.monotonic())):
-                self._signal(pgid, signal.SIGKILL)
+                self._signal_group(pgid, leader, signal.SIGKILL)
         for pgid, leader in groups:
             leader.wait(5.0)
-            if leader.exited and _group_gone(pgid, timeout=5.0):
-                leader.reap()
-                with self._lock:
-                    self._groups.pop(pgid, None)
+            if leader.reaped or (leader.exited and _group_gone(pgid, timeout=5.0)):
+                self._reap(pgid, leader)
             else:
                 # close() never raises; a group it could not empty is said, not hidden, and the
                 # session keeps the workspace lock while it lives (S2 L3 r2, codex HIGH).
