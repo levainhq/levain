@@ -318,6 +318,26 @@ def test_x_mode_still_refuses_an_existing_file(tmp_path: Path, monkeypatch) -> N
     assert f.read_text() == "KEEP" and (tmp_path / "new.txt").read_text() == "ok"
 
 
+def test_the_floored_stat_of_an_unreadable_file_answers_instead_of_crashing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A file the editor's process may not open (mode 000, or under ruling A a hands file the
+    operator cannot read) is stat'ed and judged by identity; that path once named a function this
+    module never imported, so it raised NameError instead of answering."""
+    if os.geteuid() == 0:
+        pytest.skip("root opens a mode-000 file")
+    T, token = _under_floor(tmp_path, monkeypatch)
+    f = tmp_path / "locked.txt"
+    f.write_text("x")
+    f.chmod(0)
+    try:
+        st = T._floored_stat(f)
+    finally:
+        T._EDITOR_FLOOR.reset(token)
+        f.chmod(0o600)
+    assert st is not None and st.st_size == 1
+
+
 def test_a_planted_fifo_is_refused_without_blocking(tmp_path: Path, monkeypatch) -> None:
     T, token = _under_floor(tmp_path, monkeypatch)
     fifo = tmp_path / "pipe"

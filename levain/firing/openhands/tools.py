@@ -99,6 +99,7 @@ from levain.firing.confinement import (
     FloorRefreshError,
     CrownJewelsPolicy,
     SandboxedShell,
+    _jewel_inodes,
     crown_jewel_reason,
     linked_jewel_reason,
     opened_file_path,
