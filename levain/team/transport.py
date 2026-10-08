@@ -615,6 +615,10 @@ class GitLedger:
         fps = ", ".join(sorted(T.key_fps(d.tenure, owner))) or "none"
         tofu = (f"TEAM LEDGER {name}: genesis {found[name]}, owner in force {owner} (keys {fps}). Check these with "
                 "the owner out of band before relying on it.")
+        if git(["ls-remote", "--heads", remote, f"refs/heads/{LEGACY_BRANCH}"], self.repo.toplevel, check=False,
+               timeout=60).stdout.strip():
+            tofu += (f"\n{remote} also has a 0.6.x {LEGACY_BRANCH} branch: this levain never reads it (nothing in it "
+                     "is enforced); the owner deletes it with `levain team retire-legacy`")
         if moved:
             tofu = f"re-pinned from genesis {pinned[:12]} to {found[name][:12]} on your --root.\n" + tofu
         confirmed = self._confirm_own_key(d)

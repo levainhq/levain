@@ -702,8 +702,6 @@ def test_t46_init_from_legacy_only_needs_replace_legacy_through_the_cli(tmp_path
     assert sh("git", "ls-remote", str(tmp_path / "origin.git"), "refs/heads/levain-ledger", cwd=tmp_path).split()[0] == old
 
 
-@pytest.mark.xfail(strict=True, reason="FINDING T46: expected a warning in BOTH (levain-ledger beside the strict "
-                                       "ledger); observed none in join, sync or status output")
 def test_t46_both_reads_only_the_strict_branch_and_warns(tmp_path, keys, capsys):
     """RUN: BOTH (levain-ledger and levain-team-ledger on the remote). A joiner pins the strict ledger and reads only
     it (the 0.6.x member 'old' is never a member); join, sync or status says the 0.6.x branch is there."""
