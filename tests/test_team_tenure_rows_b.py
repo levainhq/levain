@@ -520,19 +520,19 @@ def test_t36_a_hand_git_pull_then_a_host_repair_republishes_no_foreign_commit_an
     assert any("NOT moved" in w or "REWRITTEN" in w for w in WARNINGS), WARNINGS
 
 
-@pytest.mark.xfail(strict=True, reason="FINDING T36: expected nothing from the removed history re-published; observed "
-                                       "ana's sync RE-SIGNED AND RE-PUBLISHED 'ana_b: E' (a commit signed by her own key, "
-                                       "published from her second clone, fetched by a hand git pull, removed by the "
-                                       "host): seen tips do not include the remote-tracking reflog (§3a), and no "
-                                       "REWRITTEN report fires")
 def test_t36_a_hand_git_pull_then_a_host_repair_never_republishes_an_own_key_commit(two, keys):
     """RUN (ana has a second clone with the SAME key, ana_b, whose entry E the hand pull brought in): after the repair,
-    ana's sync re-publishes neither E nor B, and the loss is reported."""
+    ana's sync re-publishes neither E nor B and names E as not moved; ana_b, the device that published E, reports the
+    rewrite on its own sync and re-publishes nothing either. Failed on 9c9513b (E re-signed and re-published)."""
     tmp = two[0]
     s, patch = _hand_pull_then_repair(two, keys, same_key_clone=True)
     assert "ana_b: E" not in patch and "ben: B" not in patch
     assert _remote_tip(tmp) == s
-    assert any("REWRITTEN" in w or "no longer" in w for w in WARNINGS), WARNINGS
+    assert any("NOT moved" in w for w in WARNINGS), WARNINGS
+    WARNINGS.clear()
+    gl(tmp / "ana_b").sync()
+    assert any("REWRITTEN" in w for w in WARNINGS), WARNINGS
+    assert _remote_tip(tmp) == s
 
 
 def _accept_and_list(repo, merge, capsys, parent=1):

@@ -645,7 +645,17 @@ class GitLedger:
             self._commit("levain team: recover an interrupted write")
 
     def _commit(self, message: str) -> None:
-        """Every commit levain writes is SIGNED here (signing doc §5): no unsigned ledger commit is ever written."""
+        """Every commit levain writes is SIGNED here (signing doc §5): no unsigned ledger commit is ever written.
+
+        Each also carries this clone's ``Levain-Device`` trailer: a sync re-publishes only commits this DEVICE wrote,
+        never one another clone holding the same key published and a hand ``git pull`` brought in (T36, RAN)."""
+        from . import tenure as T
+        if not self.device:
+            raise TeamError("this clone has no device id, so a commit it writes could not be told from another "
+                            "clone's: run `levain team join`")
+        last = message.rstrip("\n").rsplit("\n\n", 1)[-1]
+        sep = "\n" if T._TRAILER_RE.search(last) else "\n\n"
+        message = f"{message.rstrip(chr(10))}{sep}{T.DEVICE_TRAILER}: {self.device}\n"
         cp = subprocess.run(["git", *_NO_HOOKS, *self._sign_cfg(), "commit", "-q", "--no-verify", "-F", "-"],
                             cwd=str(self.wt), capture_output=True, text=True, timeout=60, input=message,
                             env={**{k: v for k, v in os.environ.items() if k not in _SCRUB_ENV},
@@ -807,7 +817,16 @@ class GitLedger:
                 if rev == remote_tip:
                     raise TeamError(f"cannot judge the remote ledger, so nothing is replayed onto it: {exc}") from None
         mine -= revoked          # a revoked own key's commits are never re-signed with the new key (L2 Q6)
-        own = [c for c in shas if verdicts[c].kind == "signed" and verdicts[c].fingerprint in mine]
+        # signed by this clone's key AND written by this device: the same key on another clone is another writer, and
+        # its commits reach here only by a hand pull (T36, RAN: a host repair then got them re-published). The device
+        # is read from the raw object, inside what the signature covers.
+        from . import tenure as T
+        try:
+            meta = T.metas(self.repo.toplevel, shas)
+        except T.Unjudgeable as exc:
+            raise TeamError(f"cannot read the unpublished commits, so nothing was replayed: {exc}") from None
+        own = [c for c in shas if verdicts[c].kind == "signed" and verdicts[c].fingerprint in mine
+               and meta[c].trailer(T.DEVICE_TRAILER) == self.device]
         return own, [c for c in shas if c not in own]
 
     def _delta(self, sha: str) -> dict | None:
@@ -873,8 +892,9 @@ class GitLedger:
                 return
             own, foreign = self._movable(orig, remote_tip)
             if foreign:
-                self.warnings.append(f"{len(foreign)} unpublished ledger commit(s) here are not signed by this "
-                                     "clone's key and were NOT moved or re-signed: "
+                self.warnings.append(f"{len(foreign)} unpublished ledger commit(s) here were not written by this "
+                                     "clone (another key, or another clone of the same key) and were NOT moved or "
+                                     "re-signed: "
                                      + ", ".join(c[:10] for c in foreign[:5]))
             for c in foreign:   # kept reachable for a person to inspect, never pushed (L1 1007+19 #5, RAN)
                 git(["update-ref", f"refs/levain/foreign/{c}", c], self.wt, check=False)
