@@ -6,7 +6,8 @@ any email). This module answers one question per commit, "which key signed this?
 * ``signed``: the signature is cryptographically valid for the key it carries; ``fingerprint`` names that key.
   Whether that key belongs to a member is the caller's question, not this module's.
 * ``unsigned``: there is no signature, it is not an SSH signature, or ``ssh-keygen`` ran and rejected it (exit 255:
-  a changed payload, a wrong namespace, a truncated, garbled or oversized signature all end there).
+  a changed payload, a wrong namespace, a truncated, garbled or oversized signature all end there) while a
+  known-good canary signature, checked the same way, still verifies.
 * ``indeterminate``: the check could not run (no ``ssh-keygen``, a timeout, an unreadable object, an exit code or
   output we do not recognise). It is never cached and never read as either of the other two.
 
@@ -240,21 +241,9 @@ def verify_commit(repo_dir: Path, sha: str, *, timeout: float = 10.0) -> Verdict
         return _unsigned("the signature is not the last header")
     if not sig.startswith(SSH_SIG_BEGIN.encode()):
         return _unsigned("not an SSH signature")
-    fd, sig_path = tempfile.mkstemp(prefix="levain-sig-", suffix=".sig")
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(sig + b"\n")
-        try:
-            cp = subprocess.run(["ssh-keygen", "-Y", "check-novalidate", "-n", "git", "-s", sig_path],
-                                input=payload, capture_output=True, timeout=timeout,
-                                env=_env(SSH_ASKPASS_REQUIRE="never"))
-        except FileNotFoundError:
-            return _indeterminate("ssh-keygen is not on PATH")
-        except subprocess.TimeoutExpired:
-            return _indeterminate(f"ssh-keygen timed out after {timeout:.0f}s")
-    finally:
-        with contextlib.suppress(OSError):
-            os.unlink(sig_path)
+    cp = _check_novalidate(sig, payload, timeout)
+    if isinstance(cp, Verdict):
+        return cp
     out = (cp.stdout or b"").decode("utf-8", "replace") + "\n" + (cp.stderr or b"").decode("utf-8", "replace")
     if cp.returncode == 0:
         for line in out.splitlines():
@@ -262,10 +251,53 @@ def verify_commit(repo_dir: Path, sha: str, *, timeout: float = 10.0) -> Verdict
             if m:
                 return _signed(m.group(1))
     elif cp.returncode == 255:
-        # ssh-keygen ran and refused the signature. It says "incorrect signature" for a changed payload and "Could not
-        # verify signature." for a wrong namespace or a malformed blob; both are the commit's fault, not this machine's.
-        return _unsigned(f"bad signature ({_output_tail(cp)})")
+        # 255 is ssh-keygen's fatal(): a rejected signature, but ALSO this machine failing (a signature file it could
+        # not read prints the same "Could not verify signature." as a garbled blob; measured, OpenSSH 10.3). The
+        # canary, a known-good signature checked the same way right now, tells them apart: it verifies -> the commit
+        # is at fault (unsigned, cached); it fails -> this machine is (indeterminate, never cached).
+        if _canary_verifies(timeout):
+            return _unsigned(f"bad signature ({_output_tail(cp)})")
+        return _indeterminate(f"ssh-keygen exit 255 and a known-good signature failed the same way, so this machine "
+                              f"cannot verify signatures right now ({_output_tail(cp)})")
     return _indeterminate(f"ssh-keygen exit {cp.returncode}: {_output_tail(cp)}")
+
+
+def _check_novalidate(sig: bytes, payload: bytes, timeout: float) -> subprocess.CompletedProcess | Verdict:
+    fd, sig_path = tempfile.mkstemp(prefix="levain-sig-", suffix=".sig")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(sig + b"\n")
+        try:
+            return subprocess.run(["ssh-keygen", "-Y", "check-novalidate", "-n", "git", "-s", sig_path],
+                                  input=payload, capture_output=True, timeout=timeout,
+                                  env=_env(SSH_ASKPASS_REQUIRE="never"))
+        except FileNotFoundError:
+            return _indeterminate("ssh-keygen is not on PATH")
+        except subprocess.TimeoutExpired:
+            return _indeterminate(f"ssh-keygen timed out after {timeout:.0f}s")
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(sig_path)
+
+
+# A throwaway ed25519 key's signature over _CANARY_PAYLOAD in the "git" namespace (the private key was discarded).
+_CANARY_PAYLOAD = b"levain signature canary\n"
+_CANARY_FP = "SHA256:7GEimz+e4X7xTq2zh/NyCVNxhyLjzEjuqTLCaLHW/7Y"
+_CANARY_SIG = (b"-----BEGIN SSH SIGNATURE-----\n"
+               b"U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgUkNXxWwLZ8QPL3IB+MXY7BkA2p\n"
+               b"YNNw+W7thPQg4FZisAAAADZ2l0AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5\n"
+               b"AAAAQE81IUj2pafo7S2pHrIlzkzvmQLgLLji/H2p7alsXYgKszDDTkkhKLFn5PJlgeG30k\n"
+               b"N2oQI7bfoDYZN2ZGHQfgU=\n"
+               b"-----END SSH SIGNATURE-----")
+
+
+def _canary_verifies(timeout: float) -> bool:
+    """Run every time it is asked (never memoised): the question is whether THIS check environment works NOW."""
+    cp = _check_novalidate(_CANARY_SIG, _CANARY_PAYLOAD, timeout)
+    if isinstance(cp, Verdict) or cp.returncode != 0:
+        return False
+    out = (cp.stdout or b"").decode("utf-8", "replace") + "\n" + (cp.stderr or b"").decode("utf-8", "replace")
+    return any((m := _GOOD.match(line.strip())) is not None and m.group(1) == _CANARY_FP for line in out.splitlines())
 
 
 # ---- the cache --------------------------------------------------------------------------------------------
