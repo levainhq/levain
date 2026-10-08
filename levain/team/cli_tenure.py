@@ -184,12 +184,14 @@ def cmd_repin(gl: GitLedger, args) -> int:
         sha = git(["rev-parse", "--verify", args.root + "^{commit}"], gl.repo.toplevel).stdout.strip()
         if git(["rev-list", "--parents", "-n", "1", sha], gl.repo.toplevel).stdout.split()[1:]:
             raise TeamError("a genesis has no parents; that commit does")
-        gl.save_state(pinned_root=sha, anchor=None)
+        gl.save_state(pinned_root=sha, anchor=None, repin_n=int(gl.state().get("repin_n") or 0) + 1)
     if args.anchor:
         sha = git(["rev-parse", "--verify", args.anchor + "^{commit}"], gl.repo.toplevel).stdout.strip()
         if git(["merge-base", "--is-ancestor", sha, gl.head()], gl.repo.toplevel, check=False).returncode != 0:
             raise TeamError("the anchor must be on this ledger's history")
-        gl.save_state(anchor=sha)
+        # the repair point (the commit the owner named) feeds the export epoch, so honest clones that apply the same
+        # repair agree; repin_n makes this clone's next export win over its own stored high-water mark (seam §3a)
+        gl.save_state(anchor=sha, repair_point=sha, repin_n=int(gl.state().get("repin_n") or 0) + 1)
     gl._dcache = None
     d = gl.derivation()
     print(f"re-pinned; judged {d.judged}, owner in force {d.team.owner}")
