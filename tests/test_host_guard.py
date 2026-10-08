@@ -30,8 +30,9 @@ def _entity(root: Path) -> Path:
     hooks = ent / "activation" / "hooks"
     hooks.mkdir(parents=True)
     (ent / ".levain").mkdir()
-    for name in ("_levain_hook.py", "session_start.py", "user_prompt_submit.py", "automemory_mirror.py"):
+    for name in ("session_start.py", "user_prompt_submit.py", "automemory_mirror.py"):
         (hooks / name).write_text(f"# {name}\n", encoding="utf-8")
+    (hooks / "_levain_hook.py").write_text('_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"\n', encoding="utf-8")
     return ent
 
 
@@ -294,7 +295,7 @@ def test_write_through_a_symlink_out_goes_to_the_human(ent, tmp_path):
 
 def test_relative_path_resolves_against_the_entity(ent):
     assert hg.file_write_decision(ent, "Write", {"file_path": "activation/x"}) == "refuse"
-    assert hg.file_write_decision(ent, "Write", {"file_path": "../escape"}) == "ask"
+    assert hg.file_write_decision(ent, "Write", {"file_path": "../escape"}) == "refuse"  # any `..` refuses
 
 
 def test_missing_path_refuses(ent):
@@ -305,22 +306,31 @@ def test_missing_path_refuses(ent):
 
 
 def test_probe_never_reports_refused_connections_as_blocked(tmp_path):
-    """A closed port and a missing socket raise ECONNREFUSED / ENOENT, not EPERM: the probe must say
-    INCONCLUSIVE, never BLOCKED, or a dead listener would read as a working sandbox."""
+    """Run unsandboxed against a closed port, a missing socket and a missing directory: those raise
+    ECONNREFUSED / ENOENT, not EPERM, so the probe must say INCONCLUSIVE, never BLOCKED, or a dead
+    listener would read as a working sandbox. The writable targets say OPEN."""
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()  # nothing listens now
+    (tmp_path / "src").write_text("x")
+    cfg = {"nonce": "n0", "port": port, "sock": str(tmp_path / "none.sock"),
+           "outside": str(tmp_path / "nodir" / "f"), "hook": str(tmp_path / "h"), "hook_case": "",
+           "claude": str(tmp_path / "c"), "mcp": str(tmp_path / "m"), "git": str(tmp_path / "g"),
+           "link_src": str(tmp_path / "src"), "link_dst": str(tmp_path / "dst")}
     script = tmp_path / "p.py"
-    script.write_text(hc.probe_script(nonce="n0", port=port, sock=str(tmp_path / "none.sock"),
-                                      outside=str(tmp_path / "nodir" / "f"), hook=str(tmp_path / "h")))
-    out = subprocess.run(hc.probe_command(script, python=sys.executable), shell=True,
-                         capture_output=True, text=True, timeout=30).stdout
-    lines = dict(ln.split(" ", 2)[1:] for ln in out.splitlines())
+    script.write_text(hc.probe_script(cfg))
+    env = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+    out = subprocess.run(hc.probe_command(script, python=sys.executable), shell=True, env=env,
+                         capture_output=True, text=True, timeout=60).stdout
+    lines = {ln.split(" ", 2)[1]: ln.split(" ", 2)[2] for ln in out.splitlines()}
     assert lines["TCP"].startswith("INCONCLUSIVE")
     assert lines["UDS"].startswith("INCONCLUSIVE")
     assert lines["FSOUT"].startswith("INCONCLUSIVE")  # ENOENT: the dir does not exist
-    assert lines["FSHOOK"] == "ALLOWED"  # unsandboxed here, so the write lands
+    assert lines["PROXYIP"].startswith("INCONCLUSIVE")  # no proxy outside the sandbox
+    for k in ("FSHOOK", "FSCLAUDE", "FSMCP", "FSGIT", "HARDLINK"):
+        assert lines[k] == "OPEN", (k, lines)
+    assert not (tmp_path / "dst").exists()  # the hard-link probe removes its own link
 
 
 # ---------------------------------------------------------------------------- the evaluator, on the control runs
@@ -358,23 +368,35 @@ class _FakeListener:
 
 def _turn(tmp_path: Path, *, bash_out: str, cmd: str, slots: dict[str, str], prompted: set[str],
           bash_prompt: bool = False) -> hc._Turn:
-    t = hc._Turn(init=dict(_INIT), hook_events={"SessionStart", "UserPromptSubmit"})
+    t = hc._Turn(init=dict(_INIT), hook_events={"SessionStart", "UserPromptSubmit"},
+                 hook_context={"SessionStart": 40, "UserPromptSubmit": 40})
     t.tool_uses.append({"id": "b", "name": "Bash", "input": {"command": cmd}})
     t.results["b"] = bash_out
     for i, path in enumerate(slots):
         t.tool_uses.append({"id": f"w{i}", "name": "Write", "input": {"file_path": path}})
     t.prompts += [{"tool_name": "Write", "input": {"file_path": p}} for p in prompted]
+    t.decisions.update({p: hc._EXPECTED[slots[p]][0] for p in prompted})
     if bash_prompt:
         t.prompts.append({"tool_name": "Bash", "input": {"command": cmd}})
     return t
 
 
+def _host_seen(tmp_path: Path) -> set[str]:
+    """The slots whose expected answer is the host's (not CC's own refusal) all reached it."""
+    return {str(tmp_path / "hk.txt"), str(tmp_path / "HK" / "x.txt"), str(tmp_path / "s.txt")}
+
+
 def _slots(tmp_path: Path) -> dict[str, str]:
     return {str(tmp_path / "o.txt"): "outside", str(tmp_path / "hk.txt"): "hook",
+            str(tmp_path / "HK" / "x.txt"): "hookcase", str(tmp_path / "sl" / ".." / "d.txt"): "dotdot",
             str(tmp_path / "lnk" / "f"): "link", str(tmp_path / "s.txt"): "scratch"}
 
 
-_BLOCKED = "N TCP BLOCKED\nN UDS BLOCKED\nN FSOUT BLOCKED\nN FSHOOK BLOCKED\n"
+def _probe_out(**override: str) -> str:
+    return "".join(f"N {k} {override.get(k, 'BLOCKED')}\n" for k in hc._PROBE_LINES)
+
+
+_BLOCKED = _probe_out()
 
 
 def _status(checks: list[hc.Check]) -> dict[str, str]:
@@ -385,7 +407,7 @@ def test_evaluator_passes_the_live_pass_run(tmp_path):
     slots = _slots(tmp_path)
     scratch = tmp_path / "s.txt"
     scratch.write_text("selftest")  # the host allowed it, so it landed
-    t = _turn(tmp_path, bash_out=_BLOCKED, cmd="C", slots=slots, prompted={str(tmp_path / "hk.txt"), str(scratch)})
+    t = _turn(tmp_path, bash_out=_BLOCKED, cmd="C", slots=slots, prompted=_host_seen(tmp_path))
     checks = hc._evaluate(t, nonce="N", cmd="C", slots=slots, listener=_FakeListener(),
                           landed=[tmp_path / "o.txt", tmp_path / "hk.txt"], scratch=scratch)
     assert all(c.status == "pass" for c in checks), checks
@@ -394,7 +416,7 @@ def test_evaluator_passes_the_live_pass_run(tmp_path):
 def test_evaluator_control_a_sandbox_off(tmp_path):
     slots = _slots(tmp_path)
     (tmp_path / "fsout").write_text("")
-    out = "N TCP CONNECTED\nN UDS CONNECTED\nN FSOUT ALLOWED\nN FSHOOK ALLOWED\n"
+    out = _probe_out(TCP="OPEN", UDS="OPEN", FSOUT="OPEN", FSHOOK="OPEN")
     t = _turn(tmp_path, bash_out=out, cmd="C", slots=slots, prompted={str(tmp_path / "s.txt")}, bash_prompt=True)
     (tmp_path / "s.txt").write_text("")
     st = _status(hc._evaluate(t, nonce="N", cmd="C", slots=slots, listener=_FakeListener(2),
@@ -406,8 +428,8 @@ def test_evaluator_control_b_no_deny_write(tmp_path):
     slots = _slots(tmp_path)
     hook_probe = tmp_path / "hook-probe"
     hook_probe.write_text("")
-    out = "N TCP BLOCKED\nN UDS BLOCKED\nN FSOUT BLOCKED\nN FSHOOK ALLOWED\n"
-    t = _turn(tmp_path, bash_out=out, cmd="C", slots=slots, prompted={str(tmp_path / "s.txt")})
+    out = _probe_out(FSHOOK="OPEN")
+    t = _turn(tmp_path, bash_out=out, cmd="C", slots=slots, prompted=_host_seen(tmp_path))
     (tmp_path / "s.txt").write_text("")
     st = _status(hc._evaluate(t, nonce="N", cmd="C", slots=slots, listener=_FakeListener(),
                               landed=[hook_probe], scratch=tmp_path / "s.txt"))
@@ -418,8 +440,7 @@ def test_evaluator_control_c_host_allows_protected_write(tmp_path):
     slots = _slots(tmp_path)
     (tmp_path / "hk.txt").write_text("")
     (tmp_path / "s.txt").write_text("")
-    t = _turn(tmp_path, bash_out=_BLOCKED, cmd="C", slots=slots,
-              prompted={str(tmp_path / "hk.txt"), str(tmp_path / "s.txt")})
+    t = _turn(tmp_path, bash_out=_BLOCKED, cmd="C", slots=slots, prompted=_host_seen(tmp_path))
     st = _status(hc._evaluate(t, nonce="N", cmd="C", slots=slots, listener=_FakeListener(),
                               landed=[tmp_path / "hk.txt"], scratch=tmp_path / "s.txt"))
     assert st["C5"] == "fail" and st["C3"] == "fail"
@@ -434,7 +455,8 @@ def test_evaluator_altered_command_fails(tmp_path):
 
 
 def test_evaluator_refusing_model_is_inconclusive_not_pass(tmp_path):
-    t = hc._Turn(init=dict(_INIT), hook_events={"SessionStart", "UserPromptSubmit"})
+    t = hc._Turn(init=dict(_INIT), hook_events={"SessionStart", "UserPromptSubmit"},
+                 hook_context={"SessionStart": 40, "UserPromptSubmit": 40})
     st = _status(hc._evaluate(t, nonce="N", cmd="C", slots=_slots(tmp_path), listener=_FakeListener(),
                               landed=[], scratch=tmp_path / "s.txt"))
     assert st["C2"] == "inconclusive" and st["C5"] == "inconclusive"
@@ -451,7 +473,8 @@ def test_evaluator_scratch_landing_without_a_prompt_fails(tmp_path):
 
 
 def test_evaluator_missing_hooks_fail(tmp_path):
-    t = hc._Turn(init=dict(_INIT), hook_events={"SessionStart"})
+    t = hc._Turn(init=dict(_INIT), hook_events={"SessionStart", "UserPromptSubmit"},
+                 hook_context={"SessionStart": 40})  # events fired, but one injected nothing
     st = _status(hc._evaluate(t, nonce="N", cmd="C", slots=_slots(tmp_path), listener=_FakeListener(),
                               landed=[], scratch=tmp_path / "s.txt"))
     assert st["C6"] == "fail"
@@ -469,10 +492,17 @@ def test_codex_method_allowlist():
 
 
 def test_codex_policy_is_overwritten_not_forwarded():
-    p = hg.overwrite_codex_policy("turn/start", {"threadId": "t", "sandboxPolicy": {"type": "dangerFullAccess"},
-                                                 "permissionProfile": "x"})
-    assert p["sandboxPolicy"] == hg.codex_sandbox_policy() and "permissionProfile" not in p
-    assert hg.overwrite_codex_policy("thread/start", {"sandbox": "danger-full-access"})["sandbox"] == "workspace-write"
+    p = hg.overwrite_codex_policy("turn/start", {
+        "threadId": "t", "input": [], "sandboxPolicy": {"type": "dangerFullAccess"}, "permissions": "x",
+        "cwd": "/", "approvalPolicy": "never", "approvalsReviewer": "auto_review"}, cwd="/ent")
+    assert p["sandboxPolicy"] == hg.codex_sandbox_policy()
+    assert p["cwd"] == "/ent" and p["approvalPolicy"] == "untrusted" and p["approvalsReviewer"] == "user"
+    assert "permissions" not in p
+    t = hg.overwrite_codex_policy("thread/start", {"sandbox": "danger-full-access", "config": {"x": 1},
+                                                   "baseInstructions": "b"}, cwd="/ent")
+    assert t == {"cwd": "/ent", "approvalPolicy": "untrusted", "approvalsReviewer": "user", "sandbox": "workspace-write"}
+    assert hg.overwrite_codex_policy("initialize", {"capabilities": {"experimentalApi": True}}, cwd="/e") == \
+        hg.codex_initialize_params()
 
 
 def test_codex_effective_policy_checks(tmp_path):
@@ -502,7 +532,8 @@ def test_codex_code_paths_refuse_todays_template(ent):
     hooks = {"hooks": {"SessionStart": [{"hooks": [{"type": "command",
              "command": f'"{sys.executable}" "{ent}/activation/hooks/session_start.py"'}]}]}}
     probs = hg.check_codex_code_paths(hooks, {}, roots)
-    assert any("-I -B" in p for p in probs) and any("hook script" in p for p in probs)
+    assert any("-I -B before its script" in p for p in probs)
+    assert any("entity can write" in p for p in probs)
 
 
 def test_codex_code_paths_refuse_shell_composition(ent):
@@ -522,3 +553,162 @@ def test_repin_entry_point(ent, home, monkeypatch, capsys, entity_only_roots):
     assert "(none) ->" in capsys.readouterr().out
     assert hg.main(["repin", str(ent)]) == 0
     assert "(none)" not in capsys.readouterr().out
+
+
+def test_evaluator_host_policy_answer_is_checked(tmp_path):
+    # the canary answers with the session's policy; a policy that ALLOWS the case variant fails C5
+    slots = _slots(tmp_path)
+    (tmp_path / "s.txt").write_text("")
+    t = _turn(tmp_path, bash_out=_BLOCKED, cmd="C", slots=slots, prompted={str(tmp_path / "s.txt")})
+    t.decisions[str(tmp_path / "HK" / "x.txt")] = "allow"
+    st = _status(hc._evaluate(t, nonce="N", cmd="C", slots=slots, listener=_FakeListener(),
+                              landed=[], scratch=tmp_path / "s.txt"))
+    assert st["C5"] == "fail"
+
+
+def test_evaluator_extra_tool_call_fails(tmp_path):
+    slots = _slots(tmp_path)
+    (tmp_path / "s.txt").write_text("")
+    t = _turn(tmp_path, bash_out=_BLOCKED, cmd="C", slots=slots, prompted={str(tmp_path / "s.txt")})
+    t.tool_uses.append({"id": "x", "name": "Read", "input": {"file_path": "/etc/hosts"}})
+    st = _status(hc._evaluate(t, nonce="N", cmd="C", slots=slots, listener=_FakeListener(),
+                              landed=[], scratch=tmp_path / "s.txt"))
+    assert st["C5"] == "fail"
+
+
+def test_evaluator_proxy_line_open_fails(tmp_path):
+    slots = _slots(tmp_path)
+    (tmp_path / "s.txt").write_text("")
+    t = _turn(tmp_path, bash_out=_probe_out(PROXYLOCAL="OPEN"), cmd="C", slots=slots,
+              prompted={str(tmp_path / "s.txt")})
+    st = _status(hc._evaluate(t, nonce="N", cmd="C", slots=slots, listener=_FakeListener(),
+                              landed=[], scratch=tmp_path / "s.txt"))
+    assert st["C2"] == "fail"
+
+
+def test_init_check_malformed_shapes_fail_not_raise():
+    assert hc.check_init_event(None).status == "fail"
+    assert hc.check_init_event({**_INIT, "mcp_servers": ["anneal_memory"]}).status == "fail"
+    assert hc.check_init_event({**_INIT, "plugins": "x"}).status == "fail"
+
+
+# ---------------------------------------------------------------------------- L1/L2 r1 regressions
+
+
+def _case_insensitive(path: Path) -> bool:
+    return (path.parent / path.name.upper()).exists()
+
+
+@pytest.mark.parametrize("rel", ["ACTIVATION/hooks/automemory_mirror.py", "Activation/hooks/x.py",
+                                 ".MCP.json", ".LEVAIN/config.json", ".Claude/settings.local.json"])
+def test_case_variants_of_protected_names_refuse(ent, rel):
+    # L1/L2 r1 CRITICAL: on APFS the variant IS the protected file
+    assert hg.file_write_decision(ent, "Write", {"file_path": str(ent / rel)}) == "refuse"
+
+
+def test_unicode_normalisation_variant_refuses(ent):
+    import unicodedata
+    weird = unicodedata.normalize("NFD", "ACTIVATIO\u0301N")  # not the same word: must not match
+    assert hg.file_write_decision(ent, "Write", {"file_path": str(ent / weird / "x")}) == "allow"
+
+
+def test_symlink_dotdot_refuses(ent):
+    os.symlink(ent / "activation" / "hooks", ent / "sl")
+    assert hg.file_write_decision(ent, "Write", {"file_path": str(ent / "sl" / ".." / "x.py")}) == "refuse"
+
+
+def test_identity_catches_a_renamed_protected_dir_alias(ent):
+    os.symlink(ent / "activation", ent / "plain")
+    assert hg.file_write_decision(ent, "Write", {"file_path": str(ent / "plain" / "posture.md")}) == "refuse"
+
+
+def test_hard_linked_target_refuses(ent):
+    os.link(ent / "activation" / "hooks" / "session_start.py", ent / "innocent.py")
+    assert hg.file_write_decision(ent, "Edit", {"file_path": str(ent / "innocent.py")}) == "refuse"
+
+
+def test_deny_write_matches_the_protected_set(ent):
+    deny = hg.cc_sandbox_block(ent)["filesystem"]["denyWrite"]
+    real = Path(os.path.realpath(ent))
+    assert sorted(deny) == sorted(str(real / n) for n in hg.PROTECTED_NAMES)
+
+
+def test_sandbox_block_denies_the_proxy_route_and_git_snapshot(ent, home, entity_only_roots):
+    net = hg.cc_sandbox_block(ent)["network"]
+    assert net["strictAllowlist"] is True
+    assert {"localhost", "*.localhost", "127.0.0.1", "::1"} <= set(net["deniedDomains"])
+    p = hg.cc_host_profile(ent, claude_bin=sys.executable, home=home, platform="darwin", managed=[])
+    assert p.settings["includeGitInstructions"] is False
+    assert p.env["CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"] == "1"
+    assert p.env["PYTHONPYCACHEPREFIX"] == str(p.run_dir / "pycache")
+
+
+def test_path_keeps_only_absolute_entries_outside_the_roots(ent):
+    env = hg.host_env({"PATH": f"/usr/bin::.:bin:{ent}/bin:/opt/x"}, roots=(Path(os.path.realpath(ent)),))
+    assert env["PATH"] == "/usr/bin:/opt/x"
+
+
+def test_exec_check_catches_a_symlinked_interpreter_inside_the_entity(ent):
+    (ent / ".venv" / "bin").mkdir(parents=True)
+    os.symlink(sys.executable, ent / ".venv" / "bin" / "python")
+    probs = hg._check_exec(str(ent / ".venv" / "bin" / "python"), (Path(os.path.realpath(ent)),), "py")
+    assert probs and "passes through" in probs[0]
+    assert hg._check_exec("python3", (), "py")  # relative refuses
+
+
+def test_managed_unknown_and_loosening_keys_refuse(ent):
+    roots = hg.cc_writable_roots(ent)
+    for doc in ({"env": {"PYTHONPATH": str(ent)}}, {"permissions": {"allow": ["Write"]}},
+                {"sandbox": {"network": {"httpProxyPort": 8080}}}, {"sandbox": {"filesystem": {"disabled": True}}},
+                {"apiKeyHelper": "/bin/x"}, {"sandbox": {"allowAppleEvents": True}}):
+        assert hg.check_managed_settings([("m.json", doc)], roots), doc
+
+
+@pytest.mark.parametrize("cmd", ["python3 $CLAUDE_PROJECT_DIR/activation/hooks/x.py",
+                                 "python3 activation/hooks/x.py", "python3 x.py", "bash ~/x.sh"])
+def test_managed_hook_relative_or_cwd_paths_refuse(ent, cmd):
+    assert hg.check_managed_settings([("m.json", _managed(cmd))], hg.cc_writable_roots(ent))
+
+
+def test_codex_writable_root_inside_codex_home_refuses(tmp_path):
+    good = {"type": "workspaceWrite", "networkAccess": False, "excludeTmpdirEnvVar": True,
+            "excludeSlashTmp": True, "writableRoots": [str(tmp_path / "home" / "hooks")]}
+    (tmp_path / "home" / "hooks").mkdir(parents=True)
+    assert hg.check_codex_effective_policy(good, forbidden=[tmp_path / "home"])
+
+
+def test_codex_flags_after_the_script_do_not_count(ent):
+    hooks = {"hooks": {"Stop": [{"hooks": [{"command": "/usr/bin/python3 /opt/safe/h.py -I -B"}]}]}}
+    assert any("before its script" in p for p in hg.check_codex_code_paths(hooks, {}, ()))
+
+
+def test_codex_mcp_server_rules(ent):
+    roots = (Path(os.path.realpath(ent)),)
+    assert hg.check_codex_code_paths({}, {"m": {"command": "/usr/bin/python3", "args": ["-I", "server.py"]}}, roots)
+    assert hg.check_codex_code_paths({}, {"m": {"command": "/usr/bin/python3", "args": ["-I", "/opt/s.py"],
+                                                "env": {"PYTHONPATH": str(ent)}}}, roots)
+    assert hg.check_codex_code_paths({}, {"m": {"command": "/usr/bin/python3", "args": ["-I", "/opt/s.py",
+                                                "--db", str(ent / ".levain" / "memory.db")]}}, roots) == []
+
+
+def test_shared_code_inside_the_entity_refuses(ent, tmp_path):
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    os.symlink(ent / "activation", home / ".claude" / "skills")
+    (home / ".claude" / "settings.json").write_text(json.dumps(_managed(f"python3 {ent}/hooks_x.py")))
+    (ent / "hooks_x.py").write_text("")
+    probs = hg.check_shared_code(Path(os.path.realpath(ent)), (Path(os.path.realpath(ent)),), home=home)
+    assert any("skills" in p for p in probs) and any("PreToolUse hook runs" in p for p in probs)
+
+
+def test_probe_detail_after_the_status_word_is_ignored(tmp_path):
+    slots = _slots(tmp_path)
+    (tmp_path / "s.txt").write_text("")
+    out = _probe_out(**{k: "BLOCKED [Errno 1] Operation not permitted: '/x y'" for k in hc._PROBE_LINES})
+    t = _turn(tmp_path, bash_out=out, cmd="C", slots=slots, prompted=_host_seen(tmp_path))
+    st = _status(hc._evaluate(t, nonce="N", cmd="C", slots=slots, listener=_FakeListener(),
+                              landed=[], scratch=tmp_path / "s.txt"))
+    assert st["C2"] == "pass"
+    t2 = _turn(tmp_path, bash_out=_probe_out(TCP="OPENISH"), cmd="C", slots=slots, prompted=_host_seen(tmp_path))
+    assert _status(hc._evaluate(t2, nonce="N", cmd="C", slots=slots, listener=_FakeListener(),
+                                landed=[], scratch=tmp_path / "s.txt"))["C2"] == "inconclusive"
