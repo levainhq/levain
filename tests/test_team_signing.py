@@ -377,6 +377,32 @@ def test_a_255_on_a_garbled_signature_stays_unsigned_when_the_canary_verifies(re
     assert S.verify_commit(repo, sha).kind == "unsigned"
 
 
+def test_an_ecdsa_255_on_an_ssh_keygen_that_cannot_verify_ecdsa_is_indeterminate(repo, keys, tmp_path, monkeypatch):
+    """RUN (docs L3 r2 anansi): an OpenSSH built without OpenSSL verifies ed25519 only; every ecdsa check exits 255.
+    Simulated here. The ed25519 canary still passed, so an ecdsa commit was cached "unsigned"; the ecdsa canary now
+    judges it: indeterminate, never cached. An ed25519 commit on the same machine still verifies."""
+    real = subprocess.run
+
+    def is_ecdsa(sig_file):     # the test's own reading of the SSHSIG blob, independent of the module under test
+        import base64
+        body = base64.b64decode(b"".join(l for l in Path(sig_file).read_bytes().splitlines() if not l.startswith(b"--")))
+        return b"ecdsa-sha2-" in body[:64]
+
+    def fake(argv, *a, **kw):
+        if argv and argv[0] == "ssh-keygen" and "-s" in argv and is_ecdsa(argv[argv.index("-s") + 1]):
+            return subprocess.CompletedProcess(argv, 255, b"", b"Could not verify signature.\n")
+        return real(argv, *a, **kw)
+
+    ec = commit(repo, "ecdsa", key=keys["ecdsa"])
+    ed = commit(repo, "ed", key=keys["ed25519"])
+    cache_path = tmp_path / "cache" / "sigcache.json"
+    monkeypatch.setattr(S.subprocess, "run", fake)
+    got = S.SigCache(cache_path).verify(repo, [ec, ed])
+    assert got[ec].kind == "indeterminate", got[ec]
+    assert got[ed].kind == "signed"
+    assert ec not in json.loads(cache_path.read_text())["entries"]
+
+
 @pytest.mark.parametrize("config", [
     [],
     [("gpg.ssh.allowedSignersFile", "/nonexistent/allowed_signers")],
