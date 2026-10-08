@@ -602,6 +602,50 @@ def test_s14_s15_regenesis_is_a_fresh_genesis_on_a_new_branch_and_join_makes_you
     assert "ana: old ruling" not in {e.get("words") for e in gl(c).ledger().in_force}
 
 
+# ---- re-running join on a pinned clone (code L3 r2 complement MED) -------------------------------------------
+
+
+def test_rejoin_on_the_same_ledger_keeps_the_pin_the_distrust_list_and_the_accepted_merges(two):
+    """RUN: re-running `join` on a pinned clone re-pinned silently and wiped the distrust list (failed on 0f48765)."""
+    tmp, ana, ben = two
+    assert ruling(ana, "src/a.py", "ana: one") == 0
+    g = gl(ben)
+    g.sync(push=False)
+    head = sh("git", "rev-parse", "levain-team-ledger", cwd=ben).strip()
+    assert team("distrust", head, repo=ben) == 0
+    before = {k: g.state().get(k) for k in ("pinned_root", "distrust", "accepted", "device")}
+    assert team("join", "--no-install", repo=ben) == 0
+    after = {k: gl(ben).state().get(k) for k in before}
+    assert after == before and head in after["distrust"]
+
+
+def test_rejoin_never_moves_a_pinned_clone_to_another_genesis_unless_root_names_it(two, keys):
+    """RUN: the host deletes the pinned ledger and leaves one with ANOTHER genesis. A plain `join` re-pinned to it
+    (trust on first use, a second time, silently: failed on 0f48765). Now it refuses; `join --root <it>` moves the clone
+    on the person's word, says so, and keeps the distrust list."""
+    tmp, ana, ben = two
+    tip = sh("git", "rev-parse", "levain-team-ledger", cwd=ana).strip()
+    g = gl(ben)
+    g.sync(push=False)
+    old_root = g.state()["pinned_root"]
+    assert team("distrust", tip, repo=ben) == 0
+    g.save_state(signing_key=str(keys["ben"]))
+    assert team("regenesis", "--from", tip, "--owner", "ben", "--member", "ben=ben@ex.com", repo=ben) == 0
+    new_branch = [r.split("refs/heads/")[-1] for r in sh("git", "ls-remote", "--heads", str(tmp / "origin.git"),
+                                                         cwd=tmp).split() if "levain-team-ledger-" in r][0]
+    sh("git", "--git-dir", str(tmp / "origin.git"), "update-ref", "-d", "refs/heads/levain-team-ledger", cwd=tmp)
+    new_root = sh("git", "--git-dir", str(tmp / "origin.git"), "rev-list", "--max-parents=0", new_branch,
+                  cwd=tmp).strip()
+    assert new_root != old_root
+    with pytest.raises(TeamError, match="pinned to genesis"):
+        gl(ben).join()
+    assert gl(ben).state()["pinned_root"] == old_root
+    out = gl(ben).join(root=new_root[:12])
+    assert "re-pinned" in out and old_root[:12] in out
+    st = gl(ben).state()
+    assert st["pinned_root"] == new_root and tip in st["distrust"]
+
+
 # ---- the hook halts when it cannot judge ----------------------------------------------------------------------
 
 
