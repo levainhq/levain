@@ -2286,7 +2286,8 @@ class ShellResult:
 
 # The fixed program each command's bash runs (``bash -c _RUNNER bash``). Everything it is given arrives
 # on stdin, a socket levain holds the other end of, as NUL-terminated DATA: the directory to start in,
-# ``o<OLDPWD>`` or ``-``, the exported variables as ``NAME=value`` fields ended by an empty field, then
+# the shell's home directory (its workspace, used when the first is gone; the process itself starts in
+# ``/``), ``o<OLDPWD>`` or ``-``, the exported variables as ``NAME=value`` fields ended by an empty field, then
 # the command. Each is applied with ``builtin cd`` / ``builtin export`` / an assignment; nothing levain
 # carries is ever sourced or evaluated, only the command itself. The socket is then moved to fd 9 and
 # stdin becomes /dev/null.
@@ -2299,7 +2300,8 @@ class ShellResult:
 # Nothing here reports completion or a status: levain learns both from waitpid.
 # bash 3.2 (macOS /bin/bash): with errexit on and an EXIT trap set, a shell that exits through the
 # errexit path exits 0 and ``$?`` in the trap is already 0 (an unbound variable under ``-u``, ``${x?}``,
-# a syntax error inside ``eval``). The trap turns that case into exit 1: ``$?`` is 0, the command did
+# a syntax error inside ``eval``; bash 5.2 reports them correctly, so the fix applies to bash < 4
+# only, where ``BASH_COMMAND`` also behaves as described). The trap turns that case into exit 1: ``$?`` is 0, the command did
 # not run to its end (``__levain_done`` unset), ``-e`` is on and ``BASH_COMMAND`` is not an ``exit``
 # (read before any command in the trap: ``[[`` and other commands there overwrite it; assignments do
 # not). A
@@ -2308,6 +2310,7 @@ class ShellResult:
 # a pid namespace, which cannot signal itself.
 # Bash 3.2 is the floor: no mapfile, no ${x@Q}, no associative arrays, no {fd} redirections.
 _RUNNER = r"""IFS= builtin read -r -d '' __levain_w
+IFS= builtin read -r -d '' __levain_h
 IFS= builtin read -r -d '' __levain_o
 __levain_k=' PWD OLDPWD SHLVL _ '
 while IFS= builtin read -r -d '' __levain_e && [[ -n $__levain_e ]]; do
@@ -2319,10 +2322,12 @@ exec 9<&0 </dev/null
 for __levain_n in $(builtin compgen -e); do
   case $__levain_k in *" $__levain_n "*) ;; *) builtin unset -v -- "$__levain_n" 2>/dev/null ;; esac
 done
-builtin cd -- "$__levain_w" 2>/dev/null ||
+builtin cd -- "$__levain_w" 2>/dev/null || {
+  builtin cd -- "$__levain_h" 2>/dev/null
   builtin printf 'levain: %s is gone; this command starts in %s\n' "$__levain_w" "$PWD" >&2
+}
 case $__levain_o in o*) OLDPWD=${__levain_o#o} ;; *) builtin unset -v OLDPWD ;; esac
-builtin unset -v __levain_w __levain_o __levain_k __levain_e __levain_n
+builtin unset -v __levain_w __levain_h __levain_o __levain_k __levain_e __levain_n
 __levain_exit() {
   __levain_s=$?
   __levain_f=$-
@@ -2332,7 +2337,7 @@ __levain_exit() {
   IFS=$' \t\n'
   if [[ -n ${__levain_g-} ]]; then builtin return; fi
   __levain_b=
-  if [[ $__levain_s == 0 && -z ${__levain_done-} && $__levain_f == *e* ]]; then
+  if [[ $__levain_s == 0 && -z ${__levain_done-} && $__levain_f == *e* && ${BASH_VERSINFO[0]} -lt 4 ]]; then
     case $__levain_m in exit|exit[[:space:]]*|builtin[[:space:]]exit*) ;; *) __levain_b=1 ;; esac
   fi
   {
@@ -2354,6 +2359,99 @@ builtin eval "$__levain_c"
 __levain_done=$?
 builtin exit "$__levain_done"
 """
+
+# The PATH a hands-user bash starts with: system and package-manager directories only, never a
+# directory under the operator's home (which the hands user cannot enter anyway).
+HANDS_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+SUDO = "/usr/bin/sudo"
+
+
+@dataclass(frozen=True)
+class HandsIdentity:
+    """The separate, unprivileged OS user an entity's bash runs as (``levain setup-isolation``,
+    :mod:`levain.firing.hands`): its name, uid, home and workspace."""
+
+    user: str
+    uid: int
+    home: str
+    workspace: Path
+
+
+def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None) -> HandsIdentity | None:
+    """The hands user bash runs as for a session in drive ``mode``, or None (bash runs as the
+    operator). The ONE place this is decided, so the binding, the banner and doctor agree.
+
+    - No hands user set up: None.
+    - The interactive REPL: None, by design (design §8 i, D4): a human reads every turn there.
+    - Linux: None for now. Two pieces are not built yet: sudo closes every fd above 2, which the
+      bwrap shell's ``--info-fd`` needs, and bwrap run as the hands user cannot mount over a jewel
+      under the operator's home, which it cannot enter. The banner and doctor say bash runs as you.
+    - macOS, headless or unattended: the hands user. A setup whose account is gone raises
+      (fail-closed): never a silent fall-back to the operator."""
+    if cfg.hands_user is None or cfg.hands_uid is None or cfg.hands_workspace is None:
+        return None
+    if mode == "interactive":
+        return None
+    if (system or platform.system()) != "Darwin":
+        return None
+    import pwd
+
+    try:
+        home = pwd.getpwnam(cfg.hands_user).pw_dir
+    except KeyError:
+        raise ConfinementError(
+            f"the entity's hands user {cfg.hands_user} does not exist — refusing to run bash as you "
+            "instead (fail-closed). Set it up again: sudo levain setup-isolation --undo, then "
+            "sudo levain setup-isolation."
+        ) from None
+    return HandsIdentity(cfg.hands_user, cfg.hands_uid, home, cfg.hands_workspace)
+
+
+def _hands_env(hands: HandsIdentity) -> dict[str, str]:
+    """The whole environment a hands-user bash starts with (``env -i`` drops everything else, sudo's
+    own variables included)."""
+    return {"HOME": hands.home, "PATH": HANDS_PATH, "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+            "TERM": "dumb", "USER": hands.user, "LOGNAME": hands.user}
+
+
+def hands_prefix(hands: HandsIdentity) -> list[str]:
+    """``sudo -n -u <hands> /usr/bin/env -i <env>``: what goes in front of the sandbox driver. sudo is
+    OUTSIDE the sandbox: the shipped profile refuses to exec a setuid binary (measured in the M1 VM
+    run), so the profile applies to the hands process, which is the point. ``-n``: never prompt."""
+    return [SUDO, "-n", "-u", hands.user, "/usr/bin/env", "-i",
+            *(f"{k}={v}" for k, v in _hands_env(hands).items())]
+
+
+def _require_hands_sudo(hands: HandsIdentity) -> None:
+    """Fail closed when the operator can no longer run commands as the hands user (the sudoers rule
+    removed, the account retired): bash never falls back to the operator."""
+    from levain.launch import child_env
+
+    try:
+        r = subprocess.run([SUDO, "-n", "-u", hands.user, "/usr/bin/true"], capture_output=True,
+                           stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=30)
+        ok, said = r.returncode == 0, r.stderr.decode("utf-8", "replace").strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        ok, said = False, str(exc)
+    if not ok:
+        raise ConfinementError(
+            f"bash runs as the entity's own user {hands.user} here, but sudo refused to start it "
+            f"({said or 'no reason given'}) — refusing to run bash as you instead (fail-closed). "
+            "Set it up again: sudo levain setup-isolation --undo, then sudo levain setup-isolation."
+        )
+
+
+def _hands_signal(hands: HandsIdentity, pgid: int, sig: int) -> None:
+    """Signal a hands-user process group. levain (the operator) may not signal another uid's
+    processes, so the signal is sent AS the hands user (the same sudoers rule allows it)."""
+    from levain.launch import child_env
+
+    try:
+        subprocess.run([SUDO, "-n", "-u", hands.user, "/bin/kill", f"-{int(sig)}", "--", f"-{int(pgid)}"],
+                       capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
 
 # Names never carried from one command to the next, whatever the entity set them to: each makes a
 # shell (or the dynamic loader) run code or reparse input at startup, or is bash's own bookkeeping.
@@ -2653,7 +2751,7 @@ class SandboxedShell:
     def _input(self, command: str) -> bytes:
         """The runner's stdin: the carried state as NUL-terminated data, then the command."""
         enc = lambda s: s.encode("utf-8", "surrogateescape")   # noqa: E731
-        parts = [enc(self._carried_cwd), b"-" if self._carried_oldpwd is None
+        parts = [enc(self._carried_cwd), enc(str(self._cwd)), b"-" if self._carried_oldpwd is None
                  else b"o" + enc(self._carried_oldpwd)]
         parts += [enc(f"{k}={v}") for k, v in self._carried_env.items()]
         parts += [b"", enc(command)]
@@ -2710,7 +2808,9 @@ class SandboxedShell:
                 stdin=theirs.fileno(),
                 stdout=wr,
                 stderr=wr,                  # merged, as a terminal shows them
-                cwd=str(self._cwd),
+                # `/`, which every user can enter: the runner then changes to the carried directory,
+                # so the spawning process never needs access to it (a hands-user workspace).
+                cwd="/",
                 env=self._env,
                 # A NEW session, so this command's process group (pgid == its pid) can be signalled
                 # as a whole: its children, and a timed-out command's, would otherwise be orphaned.
@@ -2949,9 +3049,12 @@ class ConfinementProvider(ABC):
         *,
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
+        hands: HandsIdentity | None = None,
     ) -> SandboxedShell:
         """Start a persistent shell confined by ``policy``. The returned :class:`SandboxedShell` is
         already ``start()``\\ ed and carries the policy it was confined by in ``effective_policy``.
+        With ``hands`` (see :func:`hands_for`), bash runs as that user; a provider that cannot do
+        that refuses, never runs bash as the operator instead.
 
         ⛔⛔ **THE CALLER REFRESHES THE SOCKET FLOOR, NOT THIS METHOD — AND A METACLASS GUARD THAT
         TRIED TO ENFORCE THE OPPOSITE WAS DELETED AFTER FIVE VERSIONS AND SEVEN BYPASSES**
@@ -3018,7 +3121,20 @@ class ConfinementProvider(ABC):
         except Exception as exc:
             raise FloorRefreshError(str(exc)) from exc
         _refuse_multiply_linked_jewels(refreshed)
-        shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
+        # `hands` is passed only when set, so a provider written before it existed still works for
+        # every operator-uid shell, and refuses (TypeError -> ConfinementError) a hands one.
+        try:
+            shell = self._spawn_shell_impl(
+                refreshed, env=env, default_timeout=default_timeout,
+                **({"hands": hands} if hands is not None else {}),
+            )
+        except TypeError as exc:
+            if hands is None:
+                raise
+            raise ConfinementError(
+                f"{type(self).__name__} cannot run bash as the entity's own user ({exc}) — refusing "
+                "to run it as you instead (fail-closed)."
+            ) from exc
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
         # only MOVED the crash to the caller's `.run`, as an AttributeError that `__call__` does not
         # convert into an in-band refusal.
@@ -3038,9 +3154,21 @@ class ConfinementProvider(ABC):
         *,
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
+        hands: HandsIdentity | None = None,
     ) -> SandboxedShell:
         """Platform half of :meth:`spawn_shell`. ``policy`` arrives with its socket connect arm
         ALREADY re-resolved for this spawn — render it as given; do not re-derive it here."""
+
+    def hands_write(self, policy: CrownJewelsPolicy, hands: HandsIdentity, path: str, data: bytes,
+                    *, timeout: float = 120.0) -> None:
+        """Write ``data`` to ``path`` AS the hands user, under this provider's floor: the file
+        editor's writes for an entity whose bash runs as that user (D3). Raises :class:`OSError`
+        with the reason when the hands user may not write there; a provider that cannot run as
+        another user raises :class:`ConfinementError`."""
+        raise ConfinementError(
+            f"{type(self).__name__} cannot write as the entity's own user — refusing to write as you "
+            "instead (fail-closed)."
+        )
 
 
 def _reject_control_chars(value: str) -> None:
@@ -3314,6 +3442,7 @@ class SeatbeltProvider(ConfinementProvider):
         *,
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
+        hands: HandsIdentity | None = None,
     ) -> SandboxedShell:
         if not sandbox_exec_available():
             raise ConfinementError(
@@ -3322,6 +3451,19 @@ class SeatbeltProvider(ConfinementProvider):
             )
         profile_text = self.render_profile(policy)
         _refuse_kernel_mask_rules(profile_text)
+        if hands is not None:
+            # The floor is rendered for the hands workspace (the binding fenced it there), and the
+            # profile is applied to the hands process: sudo -> env -i -> sandbox driver -> bash.
+            _require_hands_sudo(hands)
+            hands_shell = _HandsSeatbeltShell(
+                hands=hands,
+                argv=[*hands_prefix(hands), SANDBOX_EXEC, "-p", profile_text,
+                      "/bin/bash", "--noprofile", "--norc"],
+                cwd=hands.workspace,
+                env=_hands_env(hands),
+                default_timeout=default_timeout,
+            )
+            return hands_shell.start()
         # The profile goes on argv as TEXT (`-p`), never as a file. Each command is its own driver
         # process, so a profile file would be read again at every command, and the file (owned by this
         # uid, in its temp dir, outside every deny) could be rewritten by the entity between two
@@ -3340,6 +3482,31 @@ class SeatbeltProvider(ConfinementProvider):
             default_timeout=default_timeout,
         )
         return shell.start()
+
+    def hands_write(self, policy: CrownJewelsPolicy, hands: HandsIdentity, path: str, data: bytes,
+                    *, timeout: float = 120.0) -> None:
+        _seatbelt_hands_write(self, policy, hands, path, data, timeout)
+
+
+def _seatbelt_hands_write(provider: "SeatbeltProvider", policy: CrownJewelsPolicy,
+                          hands: HandsIdentity, path: str, data: bytes, timeout: float) -> None:
+    from levain.launch import child_env
+
+    text = provider.render_profile(policy)
+    _refuse_kernel_mask_rules(text)
+    # A fixed program; the path is an argument and the content arrives on stdin, so nothing the entity
+    # wrote is ever run. Truncate-and-write in place, like the editor's own open(path, "w"): an
+    # existing file keeps its mode, a new one is 0644.
+    argv = [*hands_prefix(hands), SANDBOX_EXEC, "-p", text,
+            "/bin/sh", "-c", 'umask 022; exec /bin/cat > "$1"', "sh", path]
+    try:
+        r = subprocess.run(argv, input=data, capture_output=True, cwd="/", env=child_env(),
+                           start_new_session=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise OSError(f"writing {path} as {hands.user} timed out") from exc
+    if r.returncode != 0:
+        said = r.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or ["refused"]
+        raise OSError(f"{hands.user} could not write {path}: {said[0]}")
 
 
 def _default_shell_env() -> dict[str, str]:
@@ -3378,8 +3545,23 @@ class _SeatbeltShell(SandboxedShell):
     def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
         argv, fds = super()._spawn_argv()
         # The exact argv element the driver will read.
-        _refuse_kernel_mask_rules(argv[argv.index("-p") + 1])
+        _refuse_kernel_mask_rules(argv[argv.index(SANDBOX_EXEC) + 2])
         return argv, fds
+
+
+class _HandsSeatbeltShell(_SeatbeltShell):
+    """A seatbelt shell whose bash runs as the entity's hands user (``sudo -n -u``, outside the
+    sandbox driver). levain cannot signal another uid's processes, so every signal (timeout, close,
+    interrupt) is sent as the hands user; checking that a group is empty still works from levain
+    (``killpg(pgid, 0)`` answers EPERM while a member lives)."""
+
+    def __init__(self, *, hands: HandsIdentity, argv: list[str], cwd: Path, env: dict[str, str],
+                 default_timeout: float = 120.0) -> None:
+        super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
+        self.hands = hands
+
+    def _signal(self, pgid: int, sig: int) -> None:   # type: ignore[override]
+        _hands_signal(self.hands, pgid, sig)
 
 
 # --- Linux: bwrap (mount-namespace) provider -------------------------------------------------
@@ -5444,7 +5626,15 @@ class BwrapProvider(ConfinementProvider):
         *,
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
+        hands: HandsIdentity | None = None,
     ) -> SandboxedShell:
+        if hands is not None:
+            # Not built on Linux yet (see `hands_for`, which never asks for it here): refused rather
+            # than run as the operator.
+            raise ConfinementError(
+                "running bash as the entity's own user is not built for Linux yet — refusing to run it "
+                "as you instead (fail-closed)."
+            )
         if not bwrap_available():
             d = diagnose_confinement("Linux")
             raise ConfinementError(

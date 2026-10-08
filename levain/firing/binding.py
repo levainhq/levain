@@ -36,6 +36,7 @@ from typing import Any, Optional, get_args, get_type_hints
 from levain.firing.confinement import (
     ConfinementConfig,
     CrownJewelsPolicy,
+    HandsIdentity,
     SshMode,
     build_policy,
     load_confinement_config,
@@ -181,6 +182,9 @@ class ConversationBinding:
     mode: DriveMode
     floor: CrownJewelsPolicy
     deny_standard_creds: bool
+    hands: HandsIdentity | None = None
+    """The separate user bash runs as (:func:`~levain.firing.confinement.hands_for`), or None for the
+    operator. When set, the floor is fenced around the hands user's workspace."""
 
     @classmethod
     def create(
@@ -190,6 +194,7 @@ class ConversationBinding:
         mode: DriveMode,
         workspace: Path | str,
         config: ConfinementConfig | None = None,
+        hands: HandsIdentity | None = None,
     ) -> "ConversationBinding":
         """Resolve the floor ONCE, from a live entity.
 
@@ -222,26 +227,43 @@ class ConversationBinding:
             # does not close are documented on levain.firing.confinement (spore-1005).
             deny_localhost_outbound=(not cfg.allow_localhost_outbound),
         )
-        return cls(entity_dir=ed, mode=mode, floor=floor, deny_standard_creds=deny_creds)
+        if hands is not None and Path(workspace).expanduser().resolve() != hands.workspace:
+            raise BindingError(
+                "a hands-user binding must fence the hands user's own workspace (fail-closed)."
+            )
+        return cls(entity_dir=ed, mode=mode, floor=floor, deny_standard_creds=deny_creds,
+                   hands=hands)
 
     def to_params(self) -> dict[str, Any]:
         """JSON-shaped, so it survives the SDK's fork (``model_dump`` → ``model_validate``) and its
         state autosave."""
-        return {
+        out: dict[str, Any] = {
             "entity_dir": str(self.entity_dir),
             "mode": self.mode,
             "floor": _policy_to_params(self.floor),
             "deny_standard_creds": self.deny_standard_creds,
         }
+        if self.hands is not None:
+            out["hands"] = {"user": self.hands.user, "uid": self.hands.uid, "home": self.hands.home,
+                            "workspace": str(self.hands.workspace)}
+        return out
 
     @classmethod
     def from_params(cls, data: Any) -> "ConversationBinding":
         """Deserialize only — no file is read and nothing is re-resolved, so the floor a tool is built
         with is the one the session resolved. Fails closed on any shape it did not write."""
-        if not isinstance(data, dict) or set(data) != {
+        if not isinstance(data, dict) or set(data) - {"hands"} != {
             "entity_dir", "mode", "floor", "deny_standard_creds"
         }:
             raise BindingError("not a serialized conversation binding (fail-closed).")
+        hands = None
+        if "hands" in data:
+            h = data["hands"]
+            if not (isinstance(h, dict) and set(h) == {"user", "uid", "home", "workspace"}
+                    and all(isinstance(h[k], str) and h[k] for k in ("user", "home", "workspace"))
+                    and isinstance(h["uid"], int) and not isinstance(h["uid"], bool) and h["uid"] > 0):
+                raise BindingError("a serialized conversation binding has a malformed hands user (fail-closed).")
+            hands = HandsIdentity(h["user"], h["uid"], h["home"], Path(h["workspace"]))
         ed, mode, creds = data["entity_dir"], data["mode"], data["deny_standard_creds"]
         if not (isinstance(ed, str) and ed) or mode not in DRIVE_MODES or not isinstance(creds, bool):
             raise BindingError("a serialized conversation binding has a malformed field (fail-closed).")
@@ -250,4 +272,10 @@ class ConversationBinding:
             raise BindingError(
                 "a serialized conversation binding's floor fences a different entity (fail-closed)."
             )
-        return cls(entity_dir=Path(ed), mode=mode, floor=floor, deny_standard_creds=creds)
+        if hands is not None and floor.workspace != hands.workspace:
+            raise BindingError(
+                "a serialized conversation binding's floor fences another workspace than its hands "
+                "user's (fail-closed)."
+            )
+        return cls(entity_dir=Path(ed), mode=mode, floor=floor, deny_standard_creds=creds,
+                   hands=hands)

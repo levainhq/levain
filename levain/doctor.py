@@ -974,12 +974,24 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
             hint="remove what is yours with `sudo rm -r`, take write away from you (`sudo chmod o-w`, or the "
                  "ACL entry that grants it), or set the entity up again; import a repository with `levain ws-adopt`",
         ), *extra]
+    from levain.firing.confinement import hands_for
+
+    try:
+        separated = hands_for(cfg, "headless") is not None
+    except Exception:  # noqa: BLE001 — the account check above already passed
+        separated = False
+    if not separated:
+        return [CheckResult(
+            name, True,
+            f"hands user {cfg.hands_user} is set up (workspace {cfg.hands_workspace}), but on this OS "
+            "levain still runs the entity's bash as you",
+            hint="running bash as the entity's own user is built for macOS so far",
+            warn=True,
+        ), *extra]
     return [CheckResult(
         name, True,
-        f"hands user {cfg.hands_user} is set up (workspace {cfg.hands_workspace}), but this version of "
-        "levain still runs the entity's bash as you",
-        hint="the change that starts bash as the hands user is not in this build yet",
-        warn=True,
+        f"hands user {cfg.hands_user} is set up: headless chat, --task and seats run the entity's bash "
+        f"as it, in {cfg.hands_workspace}; the interactive REPL runs bash as you, since you read every turn",
     ), *extra]
 def _check_floor_placeholders() -> list[CheckResult]:
     """Sweep the Linux floor's session placeholders (an absent ``~/.netrc`` the bash floor masks over

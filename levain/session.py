@@ -61,6 +61,7 @@ from levain.firing.agent_reply import (
 from levain.firing.confinement import (
     ConfinementError,
     confinement_supported,
+    hands_for,
     load_confinement_config,
     resolve_localhost_deny,
 )
@@ -312,6 +313,22 @@ def _apply_drive_policy(cfg: Any, mode: DriveMode) -> bool:
     )
 
 
+def _check_hands_workspace(workspace: Path) -> None:
+    """The hands user's workspace is the path setup recorded (``load_confinement_config`` checked it
+    is under the workspace root and outside the operator's home): it must be a real directory, not a
+    link, so the floor and the conversation name the directory that is there."""
+    try:
+        st = os.lstat(workspace)
+    except OSError as exc:
+        raise IsolationError(f"the entity's workspace {workspace} is not there ({exc}); set the "
+                             "entity's user up again: sudo levain setup-isolation") from exc
+    import stat as _stat
+
+    if not _stat.S_ISDIR(st.st_mode) or Path(os.path.realpath(workspace)) != Path(workspace):
+        raise IsolationError(f"the entity's workspace {workspace} is not a plain directory (a link?) "
+                             "— refusing (fail-closed).")
+
+
 def require_openhands_entity(entity_dir: Path) -> str | None:
     """Return an error message if ``entity_dir`` is not a clean, initialized OpenHands entity,
     else ``None``.
@@ -550,6 +567,9 @@ class EntitySession:
     # A hands entity's session holds the hands lock SHARED for its whole life, so `levain ws-git` and
     # `ws-adopt` (which take it exclusive) never run while it is open (levain.firing.ws_git).
     hands_lock_fd: int | None = field(default=None, repr=False, compare=False)
+    hands_user: str | None = None
+    """The separate user this session's bash runs as (and its file editor writes as), or None when
+    bash runs as the operator (no setup, the interactive REPL, or Linux): the banner says which."""
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
@@ -715,16 +735,24 @@ class EntitySession:
             # against it (complement L3). That floor and conversation name the same directory comes
             # from the reassignment below, not from this order.
             guard_entity(entity_dir)
-            workspace = entity_dir / WORKSPACE_SUBDIR
-            assert_workspace_isolated(workspace, entity_dir=entity_dir)
-            workspace.mkdir(parents=True, exist_ok=True)
-            assert_workspace_isolated(workspace, entity_dir=entity_dir)
+            # Bash runs as the entity's own user outside the interactive REPL, when one is set up
+            # (`hands_for` is the one place that decides). Its workspace is the one setup made and
+            # recorded, outside the entity dir, owned by that user: the floor is fenced around it.
+            hands_id = hands_for(cfg, mode) if cfg is not None else None
+            if hands_id is not None:
+                workspace = hands_id.workspace
+                _check_hands_workspace(workspace)
+            else:
+                workspace = entity_dir / WORKSPACE_SUBDIR
+                assert_workspace_isolated(workspace, entity_dir=entity_dir)
+                workspace.mkdir(parents=True, exist_ok=True)
+                assert_workspace_isolated(workspace, entity_dir=entity_dir)
             # spore-438: THIS conversation's entity + drive mode + floor, resolved ONCE from the
             # config read above and carried into both hands as data (the tool spec), which are
             # built from it below before open returns. Another session's binding is another object.
             conv_binding = (
                 ConversationBinding.create(
-                    entity_dir, mode=mode, workspace=workspace, config=cfg
+                    entity_dir, mode=mode, workspace=workspace, config=cfg, hands=hands_id
                 )
                 if cfg is not None
                 else None
@@ -737,7 +765,10 @@ class EntitySession:
             workspace = (
                 conv_binding.floor.workspace if conv_binding is not None else workspace.resolve()
             )
-            assert_workspace_isolated(workspace, entity_dir=entity_dir)
+            if hands_id is not None:
+                _check_hands_workspace(workspace)
+            else:
+                assert_workspace_isolated(workspace, entity_dir=entity_dir)
             entity_tools = (
                 build_entity_tools(conv_binding, with_bash=bash_ok)
                 if conv_binding is not None
@@ -860,6 +891,7 @@ class EntitySession:
             bash_refusal=bash_refusal if with_tools else None,
             bash_offline=with_tools and bash_ok and bash_offline,
             hands_lock_fd=hands_lock_fd,
+            hands_user=hands_id.user if (with_tools and hands_id is not None) else None,
         )
 
     # -- the one operation ---------------------------------------------------

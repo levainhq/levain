@@ -79,6 +79,40 @@ sys.exit(0 if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) == 0 else 1)
 PYEOF
   check "operator reads its own process's KERN_PROCARGS2 (control)" /usr/bin/python3 "$RD" "$CPID"
   refused "hands reads the operator's KERN_PROCARGS2" sudo -n -u "$H" /usr/bin/python3 "$RD" "$CPID"
+
+  echo "== the entity's bash runs as the hands user (M2 S2 slice 2), through levain's own spawn"
+  SH="$(mktemp /tmp/levain-iso-shell-XXXXXX.py)"; chmod 644 "$SH"
+  cat > "$SH" <<'PYEOF'
+import os, sys
+from pathlib import Path
+from levain.firing.confinement import build_policy, hands_for, load_confinement_config, select_provider
+e, cpid, rd = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+cfg = load_confinement_config(e)
+hands = hands_for(cfg, "headless")
+assert hands is not None, "no hands user for a headless session"
+assert hands_for(cfg, "interactive") is None, "the REPL must keep the operator's account"
+policy = build_policy(e, workspace=hands.workspace)
+provider = select_provider()
+with provider.spawn_shell(policy, hands=hands) as sh:
+    def run(cmd, **kw):
+        r = sh.run(cmd, **kw)
+        print(f"  $ {cmd} -> {r.exit_code} {r.output.strip()[:200]!r}")
+        return r
+    assert run("id -un", timeout=30).output.strip() == hands.user
+    assert run("pwd", timeout=30).output.strip() == str(hands.workspace)
+    assert run(f"/usr/bin/python3 {rd} {cpid}", timeout=30).exit_code != 0, "read the operator's KERN_PROCARGS2"
+    assert run(f"ls {Path.home()}", timeout=30).exit_code != 0, "listed the operator's home"
+    assert run("export KEEP=1; cd /tmp", timeout=30).exit_code == 0
+    assert run('echo "$KEEP $PWD"', timeout=30).output.strip() in ("1 /tmp", "1 /private/tmp")
+    assert run("sleep 611 & sleep 612", timeout=2).timed_out
+provider.hands_write(policy, hands, str(hands.workspace / "from-editor"), b"edited\n")
+st = os.stat(hands.workspace / "from-editor")
+assert st.st_uid == hands.uid, f"the editor's write is owned by {st.st_uid}, not the hands user"
+print("ok")
+PYEOF
+  if "$PY" "$SH" "$E" "$CPID" "$RD"; then pass "a headless shell runs as the hands user and reaches neither the operator's process args nor home; the editor writes as it"; else fail "the hands-user shell"; fi
+  sleep 1
+  refused "a timed-out hands command left a process running" pgrep -u "$HID" -f "sleep 61[12]"
 fi
 kill "$CPID" 2>/dev/null
 

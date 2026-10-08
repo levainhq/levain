@@ -606,10 +606,11 @@ def test_a_hands_entitys_session_holds_the_lock_from_open_to_close(tmp_path: Pat
            "hands_workspace": str(hands_workspace(host_os(), hands_user_name(ent)))}
     (ent / ".levain" / "confinement.json").write_text(json.dumps(rec))
     monkeypatch.setattr(session_mod, "hold_session_lock", functools.partial(ws_git.hold_session_lock, wait=0.3))
+    # The REPL holds the lock too; a headless session would need the (here nonexistent) hands account.
     with ws_git._exclusive(ent):                                # ws-git running: the session refuses
         with pytest.raises(SessionStartError, match="working in this entity's workspace"):
-            EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="headless")
-    s = EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="headless")
+            EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="interactive")
+    s = EntitySession.open(ent, model="m", base_url="http://127.0.0.1:9", with_tools=True, mode="interactive")
     try:
         with pytest.raises(WsGitError, match="session of this entity is open"):
             with ws_git._exclusive(ent):

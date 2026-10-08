@@ -533,9 +533,14 @@ def test_doctor_fails_when_the_os_took_the_recorded_id(tmp_path: Path, monkeypat
     assert not r.ok and "not the recorded 499" in r.detail
 
 
-def test_doctor_stays_a_warning_while_bash_does_not_use_the_hands_user(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+def test_doctor_says_who_bash_runs_as(tmp_path: Path, monkeypatch, system) -> None:
+    """M2 S2 slice 2: on macOS headless bash runs as the hands user (a pass); on Linux it does not
+    yet, which stays a warning."""
     from levain import doctor
+    from levain.firing import confinement
 
+    monkeypatch.setattr(confinement.platform, "system", lambda: system)
     monkeypatch.setattr(hands, "host_os", lambda: "darwin")
     ed = _entity(tmp_path)
     me = hands.pwd.getpwuid(os.getuid())
@@ -552,7 +557,10 @@ def test_doctor_stays_a_warning_while_bash_does_not_use_the_hands_user(tmp_path:
     import pwd as _pwd
     monkeypatch.setattr(_pwd, "getpwnam", lambda n: me)
     (r,) = doctor._check_hands_isolation(ed)
-    assert r.ok and r.warn and "still runs the entity's bash as you" in r.detail
+    if system == "Darwin":
+        assert r.ok and not r.warn and "headless chat, --task and seats run the entity's bash" in r.detail
+    else:
+        assert r.ok and r.warn and "still runs the entity's bash as you" in r.detail
     assert probes == [["sudo", "-n", "-u", rec["hands_user"], "/bin/test", "-w", rec["hands_workspace"]]]
 
 

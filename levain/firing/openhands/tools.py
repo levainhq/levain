@@ -66,6 +66,7 @@ import builtins
 import contextvars
 import dataclasses
 import errno
+import io
 import logging
 import os
 import shutil
@@ -99,6 +100,7 @@ from levain.firing.confinement import (
     ConfinementError,
     FloorRefreshError,
     CrownJewelsPolicy,
+    HandsIdentity,
     SandboxedShell,
     _jewel_inodes,
     crown_jewel_reason,
@@ -126,10 +128,74 @@ class _FloorRefusedOpen(PermissionError):
     """An editor open the floor refused after opening (see :func:`_floored_open`)."""
 
 
+# WHEN BASH RUNS AS THE ENTITY'S OWN USER, SO DO THE EDITOR'S WRITES (D3, head ruling 2026-10-08).
+# Under ruling A the operator may only read the hands workspace, and an editor writing as the operator
+# would be a second, stronger pair of hands. While a hands executor call runs, this holds the writer
+# (the provider's ``hands_write``: a fixed program run as the hands user under the same floor, the file
+# content on its stdin); an editor open for writing collects the text and hands it over on close, and
+# the ``insert`` move hands over its temp file's content. Reads stay in this process, under the floor.
+_EDITOR_HANDS_WRITE: contextvars.ContextVar[Callable[[str, bytes], None] | None] = contextvars.ContextVar(
+    "levain_editor_hands_write", default=None)
+
+
+class _HandsWriteError(OSError):
+    """The entity's user could not write a file the editor wrote (see :data:`_EDITOR_HANDS_WRITE`)."""
+
+
+class _HandsWriteFile:
+    """What the editor's ``open(path, "w")`` returns for a hands entity: a buffer whose content the
+    entity's user writes to ``path`` on close (not on an exception inside ``with``)."""
+
+    def __init__(self, path: str, *, binary: bool, encoding: str | None, errors: str | None,
+                 writer: Callable[[str, bytes], None]) -> None:
+        self._path, self._binary, self._writer = path, binary, writer
+        self._encoding, self._errors = encoding or "utf-8", errors or "strict"
+        self._buf: Any = io.BytesIO() if binary else io.StringIO()
+        self.closed = False
+
+    def write(self, data: Any) -> int:
+        return self._buf.write(data)
+
+    def writelines(self, lines: Any) -> None:
+        for line in lines:
+            self._buf.write(line)
+
+    def __enter__(self) -> "_HandsWriteFile":
+        return self
+
+    def __exit__(self, exc_type: Any, *exc: Any) -> None:
+        if exc_type is None:
+            self.close()
+        else:
+            self.closed = True
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        value = self._buf.getvalue()
+        data = value if self._binary else value.encode(self._encoding, self._errors)
+        try:
+            self._writer(self._path, data)
+        except OSError as exc:
+            raise _HandsWriteError(str(exc)) from exc
+
+
 def _floored_open(file, *args, **kwargs):
     policy = _EDITOR_FLOOR.get()
     if policy is None or "opener" in kwargs:
         return builtins.open(file, *args, **kwargs)
+    writer = _EDITOR_HANDS_WRITE.get()
+    mode = args[0] if args else kwargs.get("mode", "r")
+    if writer is not None and any(c in mode for c in "wax+"):
+        if mode.replace("t", "").replace("b", "") != "w":
+            raise _FloorRefusedOpen(
+                f"the editor opened {file} with mode {mode!r}; for an entity with its own user only "
+                "a whole-file write is supported")
+        return _HandsWriteFile(
+            os.path.abspath(os.path.expanduser(str(file))), binary="b" in mode,
+            encoding=kwargs.get("encoding", args[2] if len(args) > 2 else None),
+            errors=kwargs.get("errors", args[3] if len(args) > 3 else None), writer=writer)
 
     def opener(path, flags):
         # Judged BEFORE any byte moves: without O_TRUNC (truncating first would already have emptied a
@@ -299,6 +365,23 @@ def _floored_move(src, dst, *args, **kwargs):
     policy = _EDITOR_FLOOR.get()
     if policy is None:
         return shutil.move(src, dst, *args, **kwargs)
+    writer = _EDITOR_HANDS_WRITE.get()
+    if writer is not None:
+        # The temp file is the editor's own, in this process's temp dir: its content is written onto
+        # `dst` by the entity's user (in place, so `dst` keeps its mode), and the temp file removed.
+        try:
+            with builtins.open(src, "rb") as fh:
+                data = fh.read()
+            try:
+                writer(os.path.abspath(os.path.expanduser(str(dst))), data)
+            except OSError as exc:
+                raise _HandsWriteError(str(exc)) from exc
+            return str(dst)
+        finally:
+            try:
+                os.unlink(src)
+            except OSError:
+                pass
     try:
         return _floored_move_impl(policy, src, dst)
     except BaseException:
@@ -714,7 +797,7 @@ class _SharedFloor:
     correct because of who happens to call it is a contract, and this file's own history says
     contracts drift."""
 
-    __slots__ = ("_policy", "_lock", "_refusal", "_on_refuse")
+    __slots__ = ("_policy", "hands", "_lock", "_refusal", "_on_refuse")
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "_SharedFloor":
         # The SDK's fork deep-copies a conversation's events, and the system-prompt event holds the
@@ -722,8 +805,10 @@ class _SharedFloor:
         # (and floor) from its tool spec. A lock cannot be copied, so the record shares this object.
         return self
 
-    def __init__(self, policy: CrownJewelsPolicy) -> None:
+    def __init__(self, policy: CrownJewelsPolicy, hands: HandsIdentity | None = None) -> None:
         self._policy = policy
+        # The separate user both hands act as (bash runs as it; the editor writes as it), or None.
+        self.hands = hands
         self._lock = threading.Lock()
         self._refusal: str | None = None
         self._on_refuse: list[Any] = []   # weak references to hands' revoke callbacks
@@ -948,8 +1033,20 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
                 is_error=True,
             )
         token = _EDITOR_FLOOR.set(policy)
+        hands = self._floor.hands
+        writer = None
+        if hands is not None:
+            provider = select_provider()
+            writer = lambda path, data: provider.hands_write(policy, hands, path, data)  # noqa: E731
+        wtoken = _EDITOR_HANDS_WRITE.set(writer)
         try:
             return super().__call__(action, conversation)
+        except _HandsWriteError as exc:
+            return FileEditorObservation.from_text(
+                text=f"the entity's own user could not write the file: {exc}",
+                command=action.command,
+                is_error=True,
+            )
         except (_FloorRefusedOpen, _FloorRefusedWalk) as exc:
             return FileEditorObservation.from_text(
                 text=(
@@ -960,6 +1057,7 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
                 is_error=True,
             )
         finally:
+            _EDITOR_HANDS_WRITE.reset(wtoken)
             _EDITOR_FLOOR.reset(token)
 
 
@@ -1129,7 +1227,8 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 refreshed = self._floor.refresh()
                 try:
                     candidate = provider.spawn_shell(
-                        refreshed, default_timeout=self._default_timeout
+                        refreshed, default_timeout=self._default_timeout,
+                        **({"hands": self._floor.hands} if self._floor.hands is not None else {}),
                     )
                 except FloorRefreshError as exc:
                     # The provider's own refresh failed: a refusal of the floor for both hands,
@@ -1363,7 +1462,8 @@ class LevainHands(ToolDefinition[Action, Observation]):
         binding: dict[str, Any],
         with_bash: bool = True,
     ) -> list[ToolDefinition[Any, Any]]:
-        floor = _SharedFloor(ConversationBinding.from_params(binding).floor)
+        resolved = ConversationBinding.from_params(binding)
+        floor = _SharedFloor(resolved.floor, resolved.hands)
         tools: list[ToolDefinition[Any, Any]] = [
             *LevainFileEditorTool.create(conv_state, floor=floor)
         ]

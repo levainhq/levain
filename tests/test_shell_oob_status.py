@@ -242,7 +242,8 @@ def test_a_timed_out_command_carries_nothing(tmp_path):
         # before it hung, or before a signal ended it, is not adopted either.
         frame = f"printf 'P%s\\0EKEEP=3\\0Z\\0' {tmp_path}/far >&9"
         assert sh.run(f"{frame}; sleep 30", timeout=1).timed_out
-        assert sh.run(f"{frame}; kill -9 $$", timeout=10).exit_code != 0
+        if _SYSTEM == "Darwin":   # bash as pid 1 of bwrap's namespace cannot SIGKILL itself
+            assert sh.run(f"{frame}; kill -9 $$", timeout=10).exit_code != 0
         r = sh.run('echo "$PWD $KEEP"', timeout=10)
         assert r.output.strip() in (f"{tmp_path} 1", f"{Path(tmp_path).resolve()} 1")
         # The trap writes last, so its frame wins over one the command wrote...
