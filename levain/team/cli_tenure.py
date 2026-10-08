@@ -277,19 +277,21 @@ def cmd_accept_merge(gl: GitLedger, args) -> int:
     def counted_on_its_side(c: str) -> bool:
         try:
             dc = T.derive(gl.repo.toplevel, c, side_clone, cache)
-        except T.Unjudgeable:
-            return True
+        except (T.Unjudgeable, TeamError):
+            return True     # cannot be judged: listed, never a crash after the merge is accepted (code L3 r3)
         return dc.judged != "full" or dc.counted_head == c
     team_side = [c for c in touched_team if counted_on_its_side(c)]
+    # the whole listing is built BEFORE the merge is accepted: a failure while building it leaves nothing accepted
+    # (code L3 r3 complement 6 + glm MED 2)
+    listing = [f"accepted merge {sha[:10]} on THIS clone, following parent {n}. Commits on the other side are NOT read:",
+               f"  {len(left)} commit(s) since the merge-base {base[:10]}; team decisions among them NOT in force:"]
+    listing += ["    " + git(["log", "-1", "--format=%h %ae %s", c], gl.repo.toplevel).stdout.strip() for c in team_side]
+    if len(touched_team) > len(team_side):
+        listing.append(f"  ({len(touched_team) - len(team_side)} other commit(s) there changed team.toml/tenure.toml "
+                       "and never counted, even on that side)")
     gl.save_state(_mutate=lambda st: st.__setitem__("accepted", {**dict(st.get("accepted") or {}), sha: n}))
     gl._dcache = None
-    print(f"accepted merge {sha[:10]} on THIS clone, following parent {n}. Commits on the other side are NOT read:")
-    print(f"  {len(left)} commit(s) since the merge-base {base[:10]}; team decisions among them NOT in force:")
-    for c in team_side:
-        print("   ", git(["log", "-1", "--format=%h %ae %s", c], gl.repo.toplevel).stdout.strip())
-    if len(touched_team) > len(team_side):
-        print(f"  ({len(touched_team) - len(team_side)} other commit(s) there changed team.toml/tenure.toml and never "
-              "counted, even on that side)")
+    print("\n".join(listing))
     print(f"Every member runs exactly: levain team accept-merge {sha} --parent {n}")
     d = gl.derivation()
     print(f"now judged {d.judged}; owner in force {d.team.owner}")
