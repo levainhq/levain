@@ -35,11 +35,10 @@ from pathlib import Path
 from .transport import _NO_HOOKS, _SCRUB_ENV
 
 SSH_SIG_BEGIN = "-----BEGIN SSH SIGNATURE-----"
-CACHE_SCHEMA = "sigcache-v1"
+CACHE_SCHEMA = "sigcache-v2"   # bump whenever a verdict rule or the accepted key set changes
 # key type -> the curve name an ecdsa blob must carry (None for the non-ecdsa types)
 KEY_TYPES = {
     "ssh-ed25519": None,
-    "ssh-rsa": None,
     "ecdsa-sha2-nistp256": "nistp256",
     "ecdsa-sha2-nistp384": "nistp384",
     "ecdsa-sha2-nistp521": "nistp521",
@@ -50,7 +49,8 @@ _ED25519_LEN = 32
 _GOOD = re.compile(r'^Good "git" signature with \S+ key (SHA256:[A-Za-z0-9+/]+)$')
 _FP = re.compile(r"^SHA256:[A-Za-z0-9+/]+$")
 _OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-_HEADER = b"gpgsig "
+# the signature header git writes for each object format: a SHA-256 repository's commits carry ``gpgsig-sha256``
+_HEADERS = {40: b"gpgsig ", 64: b"gpgsig-sha256 "}
 
 
 class SigningError(ValueError):
@@ -88,11 +88,6 @@ def _check_blob(declared: str, blob: bytes) -> None:
         point, off = _read_string(blob, off, "public point")
         if len(point) != _EC_POINT_LEN[curve] or point[:1] != b"\x04":
             raise SigningError(f"the {curve} public point is not an uncompressed point of the curve's size")
-    else:  # ssh-rsa: mpint e, mpint n
-        e, off = _read_string(blob, off, "exponent")
-        n, off = _read_string(blob, off, "modulus")
-        if not e or not n:
-            raise SigningError("an RSA key needs a non-zero exponent and modulus")
     if off != len(blob):
         raise SigningError(f"the key blob has {len(blob) - off} unexpected trailing bytes")
 
@@ -100,7 +95,9 @@ def _check_blob(declared: str, blob: bytes) -> None:
 def fingerprint(pubkey_line: str) -> str:
     """The ``SHA256:...`` fingerprint ``ssh-keygen -lf`` prints for one OpenSSH public key line.
 
-    Accepts ``ssh-ed25519``, ``ecdsa-sha2-nistp{256,384,521}`` and ``ssh-rsa`` only. Hardware-backed ``sk-*`` keys
+    Accepts ``ssh-ed25519`` and ``ecdsa-sha2-nistp{256,384,521}`` only. ``ssh-rsa`` is refused: whether an RSA
+    signature verifies depends on the OpenSSH build (SHA-1 RSA signatures are disabled in newer ones), so two clones
+    could disagree about the same commit. Hardware-backed ``sk-*`` keys
     and ``*-cert-v01@openssh.com`` certificates are refused on purpose: a member is one plain key, and a
     certificate would make the verdict depend on a CA this module does not judge.
     """
@@ -125,14 +122,15 @@ def fingerprint(pubkey_line: str) -> str:
 # ---- commit objects ---------------------------------------------------------------------------------------
 
 
-def split_signed(raw: bytes) -> tuple[bytes, bytes | None]:
+def split_signed(raw: bytes, header: bytes = _HEADERS[40]) -> tuple[bytes, bytes | None]:
     """Split ``git cat-file commit`` output into (the bytes that were signed, the signature or None).
 
     The signature is the ``gpgsig`` header: its first line plus the continuation lines (those starting with one
     space, which is stripped), joined with ``\\n``. The payload is the object with every line of that header
     removed and every other byte left alone. Only the header block (before the first blank line) is searched, so
-    a message that mentions ``gpgsig`` is not a signature. ``gpgsig-sha256`` is NOT the signature here: in a
-    SHA-1 repository it is part of the signed content and stays in the payload. If the header appears more than
+    a message that mentions ``gpgsig`` is not a signature. ``header`` is the object format's signature header
+    (``_HEADERS``): in a SHA-1 repository ``gpgsig-sha256`` is part of the signed content and stays in the payload,
+    and in a SHA-256 repository the reverse. If the header appears more than
     once, every copy is removed and their lines are concatenated, as git does.
     """
     parts = raw.split(b"\n")  # only LF ends a line in a git object; a CR is content
@@ -149,9 +147,9 @@ def split_signed(raw: bytes) -> tuple[bytes, bytes | None]:
             sig.append(line[1:].rstrip(b"\n"))
             continue
         in_sig = False
-        if in_headers and line.startswith(_HEADER):
+        if in_headers and line.startswith(header):
             in_sig = found = True
-            sig.append(line[len(_HEADER):].rstrip(b"\n"))
+            sig.append(line[len(header):].rstrip(b"\n"))
             continue
         payload.append(line)
     return b"".join(payload), (b"\n".join(sig) if found else None)
@@ -188,7 +186,9 @@ def _indeterminate(reason: str) -> Verdict:
 
 def _env(**extra: str) -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
-    env.update(LC_ALL="C", GIT_TERMINAL_PROMPT="0", **extra)
+    # GIT_NO_REPLACE_OBJECTS: `git replace` would make one id read as another object's bytes, so an unsigned commit
+    # could verify as a signed one (L3 r2 codex, measured)
+    env.update(LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1", **extra)
     return env
 
 
@@ -222,7 +222,7 @@ def verify_commit(repo_dir: Path, sha: str, *, timeout: float = 10.0) -> Verdict
     raw = _cat_commit(repo_dir, sha, timeout)
     if isinstance(raw, Verdict):
         return raw
-    payload, sig = split_signed(raw)
+    payload, sig = split_signed(raw, _HEADERS[len(sha)])
     if sig is None:
         return _unsigned("no signature")
     if not sig.startswith(SSH_SIG_BEGIN.encode()):
