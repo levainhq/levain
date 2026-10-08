@@ -635,12 +635,12 @@ def _close_candidate_shell(candidate: SandboxedShell) -> None:
     guaranteed is that the base `close` BODY runs rather than the override's — which is what matters
     for the case this exists for, an override that raises before doing any teardown.
     ⚠ It also cannot run a subclass's ADDITIVE cleanup, because it does not know about it. That is
-    the subclass's problem to solve locally, and `_SeatbeltShell.close` now unlinks its profile in a
+    the subclass's problem to solve locally, and `_BwrapShell.close` releases its ledger claim in a
     `finally` for exactly this reason."""
     # ⛔ THE BASE TEARDOWN RUNS UNCONDITIONALLY — codex L3 round 9, 2026-09-05. This used to
     # `return` when the override's `close()` did not RAISE, so an override that silently NO-OPS
     # (returns cleanly having torn down nothing) skipped the base path entirely and leaked the
-    # processes, their process groups, the state dir and the reader threads on every rejected spawn.
+    # processes, their process groups and the reader threads on every rejected spawn.
     # The fallback covered overrides that raise and not overrides that lie, and the docstring
     # above already conceded that narrowness rather than fixing it.
     # ⚠ SAFE BECAUSE IT IS VERIFIED, NOT BECAUSE IT IS ASSERTED: read `SandboxedShell.close` in
@@ -1236,8 +1236,8 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
             limit = action.timeout if action.timeout is not None else self._default_timeout
             text = (
                 f"{result.output}\n[command timed out after {limit:.0f}s; levain killed it and every "
-                "process it started in its session. The next command starts from the shell state "
-                "saved by the last command that finished]"
+                "process it started in its session. The next command starts in the directory and "
+                "with the exported variables of the last command that ended by itself]"
             )
             return TerminalObservation.from_text(
                 text=text,
@@ -1252,7 +1252,7 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
         if code is None:
             # A signal ended the command's bash (levain's waitpid says which). Reported the way a
             # shell reports it, 128 + the signal number, and as an error; the shell itself is fine
-            # and the next command starts from the last saved state.
+            # and the next command starts from the last command that ended by itself.
             sig = result.signal or 0
             try:
                 name = signal.Signals(sig).name

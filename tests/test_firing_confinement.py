@@ -677,12 +677,13 @@ def test_live_close_reaps_child_processes(tmp_path: Path) -> None:
 
 
 @live
-def test_live_close_unlinks_profile_and_is_idempotent(tmp_path: Path) -> None:
+def test_live_close_is_idempotent_and_leaves_no_profile_file(tmp_path: Path) -> None:
+    """The profile goes on the driver's argv as text (S2 L2 C1), so there is no file to leak or to
+    rewrite between two commands."""
     sh = select_provider().spawn_shell(build_policy(_entity(tmp_path)))
-    profile = sh._profile_path  # type: ignore[attr-defined]
-    assert profile.exists()
+    if platform.system() == "Darwin":
+        assert "-f" not in sh._argv and "-p" in sh._argv  # type: ignore[attr-defined]
     sh.close()
-    assert not profile.exists()  # the temp seatbelt profile is cleaned up
     sh.close()  # idempotent — no raise
 
 
@@ -2194,29 +2195,20 @@ def test_spawn_shell_refreshes_so_every_consumer_gets_it_not_just_one_call_site(
     )
 
 
-def test_a_seatbelt_shell_unlinks_its_profile_even_if_the_base_close_raises(tmp_path) -> None:
-    """⛔ complement L3 LOW. `_SeatbeltShell.close` ran `super().close()` and THEN unlinked its temp
-    SBPL profile, so a raising base teardown leaked one profile file per failed shell — and nothing
-    upstream can compensate, because a generic fallback has never heard of that file.
-    ⚡ The general form: a subclass's ADDITIVE cleanup must be robust to its parent's failure."""
-    from levain.firing.confinement import SandboxedShell, _SeatbeltShell
+def test_a_seatbelt_shell_rescans_its_profile_text_before_every_spawn(tmp_path, monkeypatch) -> None:
+    """The kernel-mask refusal runs on the exact ``-p`` argv element before each command's spawn, not
+    only when the provider rendered it: nothing reaches Popen with a mask rule in it. The text here is
+    never executed; the scan refuses first."""
+    from levain.firing import confinement
+    from levain.firing.confinement import _SeatbeltShell
 
-    prof = tmp_path / "levain-seatbelt-test.sb"
-    prof.write_text("(version 1)")
-    sh = _SeatbeltShell(argv=["/bin/true"], cwd=tmp_path, env={}, profile_path=prof)
-
-    def _boom(self):
-        raise OSError("base teardown failed")
-
-    original = SandboxedShell.close
-    try:
-        SandboxedShell.close = _boom  # type: ignore[method-assign]
-        with pytest.raises(OSError):
-            sh.close()
-    finally:
-        SandboxedShell.close = original  # type: ignore[method-assign]
-
-    assert not prof.exists(), "the temp seatbelt profile leaked when the base close raised"
+    spawned: list = []
+    monkeypatch.setattr(confinement.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    bad = "(version 1)\n(allow default)\n(deny " + "syscall" + "-unix)\n"
+    sh = _SeatbeltShell(argv=[confinement.SANDBOX_EXEC, "-p", bad, "/bin/bash"], cwd=tmp_path, env={})
+    with pytest.raises(confinement.ConfinementError, match="syscall mask"):
+        sh.start()
+    assert spawned == []
 
 
 # =============================================================================================

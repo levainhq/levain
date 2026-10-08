@@ -593,10 +593,11 @@ def test_a_retag_that_does_not_reach_the_disk_closes_the_shell(tmp_path, monkeyp
         pid = 4242
 
     def start(self):
-        self._after_spawn(_P.pid)   # each command tags the claim with its group, the probe first
+        self._after_spawn(_P.pid)   # each command tags the claim with its bash, the probe first
         return self
 
     closed = []
+    monkeypatch.setattr(conf._BwrapShell, "_read_child_pid", lambda self: _P.pid)   # bwrap's --info-fd
     monkeypatch.setattr(conf.os, "replace", second_commit_fails)
     monkeypatch.setattr(conf._BwrapShell, "start", start)
     monkeypatch.setattr(conf._BwrapShell, "close", lambda self: closed.append(1))

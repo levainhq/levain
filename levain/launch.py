@@ -106,6 +106,13 @@ def allowed(name: str) -> bool:
     return name.startswith(_ALLOW_PREFIXES) and not _TOKEN_SHAPED.search(name)
 
 
+def refused_by_rule(name: str) -> bool:
+    """Whether :func:`allowed` refuses ``name`` by a rule rather than by its absence from the list:
+    one of levain's own never-names, or credential-shaped. The confined shell drops such a name from
+    the environment it carries between commands when the entity introduced it."""
+    return name in _NEVER or bool(_TOKEN_SHAPED.search(name))
+
+
 def allowed_env(environ) -> dict:
     """The allowlisted part of ``environ`` (a ``str`` or ``bytes`` mapping), the one list every exec
     levain makes goes through: its own re-exec, :func:`child_env`, and a shell run as another user."""

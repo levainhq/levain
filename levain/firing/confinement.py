@@ -231,9 +231,11 @@ import json
 import os
 import platform
 import re
+import select
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import tempfile
@@ -2269,8 +2271,10 @@ class ShellResult:
     """One command's result from a :class:`SandboxedShell`. ``output`` merges stdout+stderr (a
     terminal shows both interleaved). ``exit_code`` is the status levain's ``waitpid`` returned for the
     process it spawned; ``signal`` is set instead when a signal ended it. Under bwrap that process is
-    bwrap, which waits on bash and exits with bash's status, a signal death as 128 + its number, so
-    there it arrives in ``exit_code``. ``timed_out`` is True when the
+    bwrap, which waits on bash and exits with bash's status, a signal death of bash as 128 + its
+    number, so that arrives in ``exit_code``; a signal levain sends (``interrupt()``) ends bwrap
+    itself, the kernel then kills bash (``--die-with-parent``), and it arrives in ``signal``.
+    ``timed_out`` is True when the
     command did not finish within the deadline and levain killed its process group (``exit_code`` and
     ``signal`` are then ``None``)."""
 
@@ -2280,60 +2284,92 @@ class ShellResult:
     signal: int | None = None
 
 
-# The fixed program each command's bash runs (``bash -c _RUNNER bash <state dir>``). The command text
-# arrives on stdin, never on argv; stdin is /dev/null by the time it runs. The state a persistent shell
-# would keep (variables, exported or not, functions, aliases, shell options, cwd) is written to
-# ``<state dir>/state.sh`` by an EXIT trap and read back by the next command's bash. The trap also runs
-# after ``exit N`` and after an errexit failure; it does not run when a signal kills bash or when the
-# command replaces bash (``exec prog``), and then the next command starts from the last saved state.
-# The entity can rewrite its own state file; that changes only what its next command starts from.
+# The fixed program each command's bash runs (``bash -c _RUNNER bash``). Everything it is given arrives
+# on stdin, a socket levain holds the other end of, as NUL-terminated DATA: the directory to start in,
+# ``o<OLDPWD>`` or ``-``, the exported variables as ``NAME=value`` fields ended by an empty field, then
+# the command. Each is applied with ``builtin cd`` / ``builtin export`` / an assignment; nothing levain
+# carries is ever sourced or evaluated, only the command itself. The socket is then moved to fd 9 and
+# stdin becomes /dev/null.
+# The EXIT trap writes back, on fd 9: ``P<pwd -P>``, ``O<OLDPWD>`` when set, ``E<NAME>=<value>`` per
+# exported variable, and ``Z``, each NUL-terminated. levain parses that as data (see
+# ``SandboxedShell._carry``) and drops it when the command timed out or waitpid reports a signal; the
+# trap itself writes nothing after HUP, INT, QUIT or TERM. The command (or a background job of it) can
+# write to fd 9 too; what it writes can only become its own next directory and environment, which
+# ``cd`` and ``export`` already give it.
 # Nothing here reports completion or a status: levain learns both from waitpid.
-# xtrace and verbose are switched back on inside the eval, so the runner's own lines are never traced
-# into the command's output. The options go to a file first, never through ``$(...)``: bash clears
-# ``-e`` in a command substitution's subshell (outside posix mode), so an errexit the command set
-# would read as off.
-# Bash 3.2 (macOS /bin/bash) is the floor: no mapfile, no ${x@Q}, no associative-array syntax here.
-_RUNNER = r"""__levain_d=$1
+# bash 3.2 (macOS /bin/bash): with errexit on and an EXIT trap set, a shell that exits through the
+# errexit path exits 0 and ``$?`` in the trap is already 0 (an unbound variable under ``-u``, ``${x?}``,
+# a syntax error inside ``eval``). The trap turns that case into exit 1: ``$?`` is 0, the command did
+# not run to its end (``__levain_done`` unset), ``-e`` is on and ``BASH_COMMAND`` is not an ``exit``
+# (read before any command in the trap: ``[[`` and other commands there overwrite it; assignments do
+# not). A
+# signal looks the same from inside the trap, so HUP/INT/QUIT/TERM are trapped to mark it
+# (``__levain_g``), skip the capture, and re-raise; ``exit 128+n`` is the fallback for bash as pid 1 of
+# a pid namespace, which cannot signal itself.
+# Bash 3.2 is the floor: no mapfile, no ${x@Q}, no associative arrays, no {fd} redirections.
+_RUNNER = r"""IFS= builtin read -r -d '' __levain_w
+IFS= builtin read -r -d '' __levain_o
+__levain_k=' PWD OLDPWD SHLVL _ '
+while IFS= builtin read -r -d '' __levain_e && [[ -n $__levain_e ]]; do
+  __levain_k="$__levain_k${__levain_e%%=*} "
+  builtin export -- "$__levain_e"
+done
 IFS= builtin read -r -d '' __levain_c
-builtin exec </dev/null
-if [ -f "$__levain_d/state.sh" ]; then builtin . "$__levain_d/state.sh"; fi
-__levain_save() {
-  __levain_n=
-  __levain_k=' '
-  while IFS= builtin read -r __levain_n; do __levain_k="$__levain_k$__levain_n "; done < <(builtin compgen -e)
-  __levain_v=()
-  while IFS= builtin read -r __levain_n; do
-    case $__levain_n in
-      __levain_*|BASH|BASH_*|BASHOPTS|BASHPID|COLUMNS|LINES|COMP_*|DIRSTACK|EPOCHREALTIME|EPOCHSECONDS|EUID|FUNCNAME|GROUPS|HISTCMD|HOSTNAME|HOSTTYPE|LINENO|MACHTYPE|OPTERR|OPTIND|OSTYPE|PIPESTATUS|PPID|PWD|RANDOM|SECONDS|SHELLOPTS|SHLVL|SRANDOM|UID|_) ;;
-      *) __levain_v[${#__levain_v[@]}]=$__levain_n ;;
-    esac
-  done < <(builtin compgen -v)
+exec 9<&0 </dev/null
+for __levain_n in $(builtin compgen -e); do
+  case $__levain_k in *" $__levain_n "*) ;; *) builtin unset -v -- "$__levain_n" 2>/dev/null ;; esac
+done
+builtin cd -- "$__levain_w" 2>/dev/null ||
+  builtin printf 'levain: %s is gone; this command starts in %s\n' "$__levain_w" "$PWD" >&2
+case $__levain_o in o*) OLDPWD=${__levain_o#o} ;; *) builtin unset -v OLDPWD ;; esac
+builtin unset -v __levain_w __levain_o __levain_k __levain_e __levain_n
+__levain_exit() {
+  __levain_s=$?
+  __levain_f=$-
+  __levain_m=$BASH_COMMAND
+  { builtin set +euxv; } 2>/dev/null
+  builtin trap '' PIPE
+  IFS=$' \t\n'
+  if [[ -n ${__levain_g-} ]]; then builtin return; fi
+  __levain_b=
+  if [[ $__levain_s == 0 && -z ${__levain_done-} && $__levain_f == *e* ]]; then
+    case $__levain_m in exit|exit[[:space:]]*|builtin[[:space:]]exit*) ;; *) __levain_b=1 ;; esac
+  fi
   {
-    builtin printf '__levain_k=%q\n' "$__levain_k"
-    builtin printf '%s\n' 'for __levain_n in $(builtin compgen -e); do case $__levain_k in *" $__levain_n "*) ;; *) builtin unset -v "$__levain_n" 2>/dev/null ;; esac; done'
-    if [ ${#__levain_v[@]} -gt 0 ]; then builtin declare -p "${__levain_v[@]}" 2>/dev/null; fi
-    builtin declare -f
-    while IFS= builtin read -r __levain_n; do
-      case $__levain_n in "declare -f"*x*" "*) builtin printf 'builtin export -f %s\n' "${__levain_n##* }" ;; esac
-    done < <(builtin declare -F)
-    builtin alias -p
-    builtin printf 'builtin cd -- %q\n' "$PWD"
-    __levain_x=
-    while IFS= builtin read -r __levain_n; do
-      case $__levain_n in
-        *" privileged"|*" login_shell"|*" restricted_shell"|*" noexec"|*" onecmd") ;;
-        "set -o xtrace") __levain_x="${__levain_x}x" ;;
-        "set -o verbose") __levain_x="${__levain_x}v" ;;
-        *" xtrace"|*" verbose") ;;
-        *) builtin printf '%s\n' "$__levain_n" ;;
-      esac
-    done < "$__levain_d/options.new"
-    builtin printf '__levain_x=%s\n' "$__levain_x"
-  } >| "$__levain_d/state.sh.new" 2>/dev/null && /bin/mv -f "$__levain_d/state.sh.new" "$__levain_d/state.sh"
+    builtin printf 'P%s\0' "$(builtin pwd -P 2>/dev/null)"
+    if [[ -n ${OLDPWD+x} ]]; then builtin printf 'O%s\0' "$OLDPWD"; fi
+    for __levain_n in $(builtin compgen -e); do
+      builtin printf 'E%s=%s\0' "$__levain_n" "${!__levain_n}"
+    done
+    builtin printf 'Z\0'
+  } >&9 2>/dev/null
+  if [[ -n $__levain_b ]]; then builtin exit 1; fi
 }
-builtin trap '{ builtin set +o; builtin shopt -p; } >| "$__levain_d/options.new" 2>/dev/null; { builtin set +euxv; } 2>/dev/null; __levain_save' EXIT
-builtin eval "${__levain_x:+builtin set -$__levain_x; }$__levain_c"
+builtin trap __levain_exit EXIT
+builtin trap '__levain_g=1; builtin trap - HUP; builtin kill -HUP $$; builtin exit 129' HUP
+builtin trap '__levain_g=1; builtin trap - INT; builtin kill -INT $$; builtin exit 130' INT
+builtin trap '__levain_g=1; builtin trap - QUIT; builtin kill -QUIT $$; builtin exit 131' QUIT
+builtin trap '__levain_g=1; builtin trap - TERM; builtin kill -TERM $$; builtin exit 143' TERM
+builtin eval "$__levain_c"
+__levain_done=$?
+builtin exit "$__levain_done"
 """
+
+# Names never carried from one command to the next, whatever the entity set them to: each makes a
+# shell (or the dynamic loader) run code or reparse input at startup, or is bash's own bookkeeping.
+_NEVER_CARRIED = frozenset({
+    "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4", "IFS", "CDPATH",
+    "GLOBIGNORE", "EXECIGNORE", "POSIXLY_CORRECT", "TMOUT", "PWD", "OLDPWD", "SHLVL", "_",
+})
+# ``BASH_`` covers BASH_FUNC_* (an exported function), BASH_ENV, BASH_XTRACEFD, BASH_LOADABLES_PATH.
+_NEVER_CARRIED_PREFIXES = ("BASH_", "LD_", "DYLD_")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# The most levain reads back from one command's state channel.
+_MAX_CARRY_BYTES = 4 * 1024 * 1024
+# Finished commands whose output pipe a background job still holds, kept for their later output. Past
+# this many, the oldest pipe's read end is closed (its writer then gets EPIPE), so background jobs
+# cannot use up levain's file descriptors.
+_MAX_LATE = 32
 
 # After a command's bash exits, how long its output pipe may stay open before the result is returned:
 # a background job (``server &``) holds the pipe, and its later output is reported with the next run.
@@ -2346,7 +2382,8 @@ _START_TIMEOUT = 20.0
 
 class _Output:
     """One command's merged stdout+stderr, read by its own thread until every writer has closed the
-    pipe. Bounded: past ``_MAX_OUTPUT_CHARS`` it keeps a single truncation note and drops the rest."""
+    pipe, or until :meth:`abandon`. Bounded: past ``_MAX_OUTPUT_CHARS`` it keeps a single truncation
+    note and drops the rest."""
 
     def __init__(self, fd: int) -> None:
         self._fd = fd
@@ -2355,6 +2392,7 @@ class _Output:
         self._parts: list[str] = []
         self._kept = 0
         self._truncated = False
+        self._abandoned = threading.Event()
         self.eof = threading.Event()
         threading.Thread(target=self._pump, daemon=True).start()
 
@@ -2373,9 +2411,15 @@ class _Output:
                 self._truncated = True
 
     def _pump(self) -> None:
+        # poll() with a timeout, not a bare read: the fd is closed only by this thread, so closing it
+        # from another thread can never race a read on a reused fd number.
+        poller = select.poll()
+        poller.register(self._fd, select.POLLIN)
         try:
-            while True:
+            while not self._abandoned.is_set():
                 try:
+                    if not poller.poll(250):
+                        continue
                     chunk = os.read(self._fd, 65536)
                 except InterruptedError:
                     continue
@@ -2392,6 +2436,10 @@ class _Output:
                 pass
             self.eof.set()
 
+    def abandon(self) -> None:
+        """Stop reading and close the read end (within the poll interval); a writer then gets EPIPE."""
+        self._abandoned.set()
+
     def take(self) -> str:
         """Everything read since the last ``take`` (the bound counts the whole command's output)."""
         with self._lock:
@@ -2399,38 +2447,125 @@ class _Output:
         return text
 
 
+class _Carry:
+    """The state channel of one command: levain's end of the socket that is bash's stdin. Reads what
+    the runner's EXIT trap writes back (see ``_RUNNER``) until EOF, :meth:`stop`, or the bound, and
+    keeps the LAST complete frame: the trap writes after everything the command itself wrote. (A
+    background job still holding fd 9 can write later; that, too, is only data.)"""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+        self._lock = threading.Lock()
+        self._buf = bytearray()
+        self.done = threading.Event()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self) -> None:
+        try:
+            while True:
+                try:
+                    chunk = self._sock.recv(65536)
+                except InterruptedError:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                with self._lock:
+                    if len(self._buf) + len(chunk) > _MAX_CARRY_BYTES:
+                        self._buf = bytearray()   # over the bound: carry nothing
+                        break
+                    self._buf += chunk
+        finally:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self.done.set()
+
+    @property
+    def frame(self) -> bytes | None:
+        """The last ``...\\0Z\\0``-ended frame read, without its ``Z`` field, or None."""
+        with self._lock:
+            buf = bytes(self._buf)
+        end = buf.rfind(b"\0Z\0")
+        if end < 0:
+            return b"" if buf.startswith(b"Z\0") else None
+        start = buf.rfind(b"\0Z\0", 0, end)
+        return buf[start + 3 if start >= 0 else 0: end + 1]
+
+    def send(self, data: bytes) -> None:
+        """Write the runner's input from a thread (a driver that never reads stdin must not block
+        ``run()``), then half-close, so a read of fd 9 by the command gets EOF."""
+        sock = self._sock
+
+        def feed() -> None:
+            try:
+                sock.sendall(data)
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+        threading.Thread(target=feed, daemon=True).start()
+
+    def stop(self) -> None:
+        """Wake the reader (shutdown, never close, from another thread); it closes the socket."""
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
+def _never_carried(name: str) -> bool:
+    return (not _ENV_NAME.fullmatch(name) or name in _NEVER_CARRIED
+            or name.startswith(_NEVER_CARRIED_PREFIXES))
+
+
 class SandboxedShell:
-    """A stateful ``/bin/bash`` under the platform sandbox, one bash process PER COMMAND.
+    """A ``/bin/bash`` under the platform sandbox, one bash process PER COMMAND.
 
-    :meth:`run` spawns ``<driver argv> -c <runner> bash <state dir>`` in a new session, writes the
-    command to its stdin and waits for it. **Completion is levain's ``waitpid`` on that process and the
-    status is its waitpid status** (spore-1385, Phill's ruling): nothing the shell prints is parsed for
-    either, so code the entity runs cannot end a command early or forge its status. The model this
-    replaced ran one bash reading commands from a pipe and took completion and ``$?`` from a line bash
-    printed; bash read that pipe one byte at a time on fd 255, so a builtin in a command could read the
-    status line ahead of bash and print one of its own (reproduced:
-    ``tests/test_shell_oob_status.py``).
+    :meth:`run` spawns ``<driver argv> -c <runner> bash`` in a new session, writes its input to its
+    stdin and waits for it. **Completion is levain's ``waitpid`` on that process and the status is its
+    waitpid status** (spore-1385, Phill's ruling): nothing the shell prints is parsed for either, so
+    code the entity runs cannot end a command early or forge its status. The model this replaced ran
+    one bash reading commands from a pipe and took completion and ``$?`` from a line bash printed; bash
+    read that pipe one byte at a time on fd 255, so a builtin in a command could read the status line
+    ahead of bash and print one of its own (reproduced: ``tests/test_shell_oob_status.py``).
 
-    State still persists across :meth:`run` calls (cwd, variables, functions, aliases, options) through
-    a private state directory the runner writes after each command (see ``_RUNNER``). The sandbox
-    profile fences by PATH at the syscall level, so a ``cd`` into ``$HOME`` still cannot read a denied
-    crown jewel.
+    **What carries from one command to the next, by design: the working directory, ``OLDPWD`` (so
+    ``cd -`` works) and the exported variables.** levain holds them in memory, hands them to the next
+    command's bash as data on its stdin, and reads them back from the command's EXIT trap over the same
+    socket (see ``_RUNNER``). Nothing carried is ever sourced or evaluated, and there is no state file:
+    a file another process could write would run code in this shell. Never carried: names that make a
+    shell or the loader run code at startup (``_NEVER_CARRIED``; ``BASH_*``, ``LD_*``, ``DYLD_*``), and
+    a variable the entity introduced whose name the launch allowlist refuses by rule (credential-shaped,
+    or one of levain's own), see :meth:`_carry`. **Nothing else carries:** unexported variables,
+    functions, aliases, traps, ``set``/``shopt`` options (``set -e`` included), ``umask``, ``ulimit``,
+    the directory stack, ``$?``, ``$!`` and the job table all start fresh in each command, the way they
+    do in a new terminal. A command that timed out, or that waitpid reports as ended by a signal,
+    carries nothing, and the runner writes nothing back after HUP, INT, QUIT or TERM; the next command
+    then starts from the last one that ended by itself. A command that replaces the EXIT trap
+    (``trap ... EXIT``, ``exec prog``) writes nothing back either.
+
+    The sandbox profile fences by PATH at the syscall level, so a ``cd`` into ``$HOME`` still cannot
+    read a denied crown jewel.
 
     - **Output**: one pipe per command, stdout and stderr merged, bounded at ``_MAX_OUTPUT_CHARS``.
       After waitpid the pipe gets ``_DRAIN_GRACE`` to close; a background job that keeps it open
-      (``server &``) has its later output returned, labelled, with the next result.
+      (``server &``) has its later output returned, labelled, with the next result. At most
+      ``_MAX_LATE`` such pipes are kept; past that the oldest is closed and its writer gets EPIPE.
     - **Timeout**: the command's whole process group is killed (SIGTERM, then SIGKILL) and reaped, and
-      the shell stays usable: the next command starts from the last saved state.
+      the shell stays usable.
     - **Background jobs** outlive the command that started them where the sandbox allows it (macOS).
       Under bwrap the command's bash is pid 1 of its pid namespace, so the namespace, and every
       background job in it, ends with the command.
-    - **close()** kills every process group this shell started, waits for them to empty, and removes
-      the state directory.
+    - **close()** kills every process group this shell started and waits for them to empty.
     - :meth:`run` is single-caller (a concurrent call fails fast); ``close()`` and ``interrupt()`` are
-      safe from another thread while a ``run()`` is in flight.
+      safe from another thread while a ``run()`` is in flight. A command containing a NUL byte is
+      refused (bash could not receive it whole).
     - No PTY: truly interactive programs (``vim``, a password prompt) see /dev/null on stdin.
-    - A child that leaves the command's session (``setsid``, a double fork into a new session) escapes
-      the group kill on macOS, as from any shell; it stays under the sandbox profile it inherited."""
+    - A child that leaves the command's session or process group (``setsid``, ``set -m``, a double
+      fork into a new session) escapes the group kill on macOS, as from any shell; it stays under the
+      sandbox profile it inherited."""
 
     def __init__(
         self,
@@ -2442,7 +2577,9 @@ class SandboxedShell:
     ) -> None:
         self._argv = argv
         self._cwd = cwd
-        self._env = env
+        # The env bash STARTS with: levain's, never one the entity shaped (startup-execution names
+        # stripped, so nothing runs before the runner). The entity's exports arrive as data.
+        self._env = {k: v for k, v in env.items() if not _never_carried(k)}
         self._default_timeout = default_timeout
         self._proc: subprocess.Popen[bytes] | None = None   # the command running now, if any
         # ⛔ THE POLICY THIS SHELL WAS ACTUALLY CONFINED BY — set by the provider seam, so the
@@ -2456,7 +2593,11 @@ class SandboxedShell:
         # nothing"; that is true only if the filesystem is identical at both instants, which is
         # precisely what a TOCTOU fix may not assume.
         self.effective_policy: CrownJewelsPolicy | None = None
-        self._state_dir: Path | None = None
+        # The carried state (see the class docstring), applied to each command and replaced by what
+        # a command that ended by itself writes back.
+        self._carried_cwd = str(cwd)
+        self._carried_oldpwd: str | None = None
+        self._carried_env: dict[str, str] = dict(self._env)
         self._started = False
         self._closed = False
         self._run_lock = threading.Lock()    # serialize run(); fail-fast on concurrent misuse
@@ -2472,20 +2613,19 @@ class SandboxedShell:
     @property
     def closed(self) -> bool:
         """True once :meth:`close` ran. A command never closes the shell: ``exit N`` ends that
-        command's bash with status N and the next command starts from the saved state."""
+        command's bash with status N and the next command starts from the carried state."""
         return self._closed
 
     def start(self) -> "SandboxedShell":
-        """Make the private state directory and prove the driver runs bash, with a probe command that
-        must print a random token and exit 0 (a dead or misconfigured sandbox driver fails the spawn
-        here, never as a live-looking shell). Returns self (chainable)."""
+        """Prove the driver runs bash, with a probe command that must print a random token and exit 0
+        (a dead or misconfigured sandbox driver fails the spawn here, never as a live-looking shell).
+        Returns self (chainable)."""
         if self._started:
             return self
         if self._closed:
             raise ConfinementError("shell is closed")
         self._started = True
         try:
-            self._state_dir = Path(tempfile.mkdtemp(prefix="levain-shell-"))
             token = f"__LEVAIN_READY_{os.urandom(8).hex()}__"
             r = self._execute(f"printf '%s\\n' '{token}'", _START_TIMEOUT)
             if r.timed_out or r.exit_code != 0 or token not in r.output:
@@ -2508,21 +2648,66 @@ class SandboxedShell:
             raise ConfinementError(str(reason)) from exc
         return self
 
+    # -- the carried state ---------------------------------------------------------------------
+
+    def _input(self, command: str) -> bytes:
+        """The runner's stdin: the carried state as NUL-terminated data, then the command."""
+        enc = lambda s: s.encode("utf-8", "surrogateescape")   # noqa: E731
+        parts = [enc(self._carried_cwd), b"-" if self._carried_oldpwd is None
+                 else b"o" + enc(self._carried_oldpwd)]
+        parts += [enc(f"{k}={v}") for k, v in self._carried_env.items()]
+        parts += [b"", enc(command)]
+        return b"\0".join(parts) + b"\0"
+
+    def _carry(self, frame: bytes) -> None:
+        """Adopt what a command's EXIT trap wrote back, as data: ``P<cwd>``, ``O<OLDPWD>``,
+        ``E<NAME>=<value>`` fields. A malformed frame carries nothing (the previous state stays).
+        Kept: every name levain started bash with, and any other name except ``_NEVER_CARRIED`` and
+        the ones :func:`levain.launch.refused_by_rule` refuses (credential-shaped, levain's own)."""
+        from levain.launch import refused_by_rule
+
+        fields = [f.decode("utf-8", "surrogateescape") for f in frame.split(b"\0")[:-1]]
+        if not fields or not fields[0].startswith("P"):
+            return
+        cwd, oldpwd, env = fields[0][1:], None, {}
+        for f in fields[1:]:
+            if f.startswith("O") and oldpwd is None:
+                oldpwd = f[1:]
+            elif f.startswith("E") and "=" in f:
+                name, value = f[1:].split("=", 1)
+                if _never_carried(name):
+                    continue
+                if name not in self._env and refused_by_rule(name):
+                    continue
+                env[name] = value
+            else:
+                return
+        if cwd:
+            self._carried_cwd = cwd
+        self._carried_oldpwd = oldpwd
+        self._carried_env = env
+
     # -- one command ---------------------------------------------------------------------------
 
+    def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
+        """The argv for one command's driver, and fds it inherits (closed here after the spawn)."""
+        return [*self._argv, "-c", _RUNNER, "bash"], ()
+
     def _after_spawn(self, pgid: int) -> None:
-        """Hook: a command's process group now exists (the bwrap shell records it in its claim)."""
+        """Hook: a command's process group exists and its bash is waiting for its input (the bwrap
+        shell records it in its claim). Raising here refuses the command before it can run."""
 
     def _after_command(self, pgid: int) -> None:
         """Hook: a command's bash has been reaped and its result is about to be returned."""
 
-    def _spawn(self, command: str) -> tuple[subprocess.Popen[bytes], _Output]:
-        assert self._state_dir is not None
+    def _spawn(self) -> tuple[subprocess.Popen[bytes], _Output, _Carry]:
         rd, wr = os.pipe()
+        ours, theirs = socket.socketpair()
+        argv, pass_fds = self._spawn_argv()
         try:
             proc = subprocess.Popen(
-                [*self._argv, "-c", _RUNNER, "bash", str(self._state_dir)],
-                stdin=subprocess.PIPE,
+                argv,
+                stdin=theirs.fileno(),
                 stdout=wr,
                 stderr=wr,                  # merged, as a terminal shows them
                 cwd=str(self._cwd),
@@ -2534,34 +2719,26 @@ class SandboxedShell:
                 # open(), not read() of an already-open fd). CALLER CONTRACT: no crown-jewel fd may be
                 # open in this process at spawn time.
                 close_fds=True,
+                pass_fds=pass_fds,
             )
         except BaseException:
             os.close(rd)
-            os.close(wr)
+            ours.close()
             raise
-        os.close(wr)
+        finally:
+            os.close(wr)
+            theirs.close()
+            for fd in pass_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         out = _Output(rd)
+        carry = _Carry(ours)
         with self._lock:
             self._groups[proc.pid] = proc
         self._proc = proc
-        # The command text is written by a thread: a driver that never reads stdin must not block
-        # run() past its deadline on a command larger than the pipe buffer.
-        data = command.encode("utf-8", "surrogateescape")
-        stdin = proc.stdin
-        assert stdin is not None
-
-        def feed() -> None:
-            try:
-                stdin.write(data)
-            except (BrokenPipeError, OSError, ValueError):
-                pass
-            finally:
-                try:
-                    stdin.close()
-                except (BrokenPipeError, OSError, ValueError):
-                    pass
-        threading.Thread(target=feed, daemon=True).start()
-        return proc, out
+        return proc, out, carry
 
     def _kill_group(self, pgid: int, proc: subprocess.Popen[bytes]) -> None:
         """SIGTERM the group, give it ``_KILL_GRACE``, SIGKILL what is left, reap ``proc``, and wait
@@ -2592,6 +2769,12 @@ class SandboxedShell:
                 if proc.poll() is not None and _group_gone(pgid, timeout=0):
                     del self._groups[pgid]
 
+    def _keep_late(self, out: _Output) -> None:
+        with self._lock:
+            self._late.append(out)
+            while len(self._late) > _MAX_LATE:
+                self._late.pop(0).abandon()
+
     def _late_output(self) -> str:
         with self._lock:
             late, still = self._late, []
@@ -2611,11 +2794,15 @@ class SandboxedShell:
         return f"[output from background jobs of earlier commands]\n{joined}[end of background output]\n"
 
     def _execute(self, command: str, deadline_s: float) -> ShellResult:
-        proc, out = self._spawn(command)
+        data = self._input(command)
+        proc, out, carry = self._spawn()
         pgid = proc.pid
+        timed_out = False
         try:
+            # bash waits on its stdin until the input arrives, so a refusal here (the claim could not
+            # be recorded) stops the command before any of it runs.
             self._after_spawn(pgid)
-            timed_out = False
+            carry.send(data)
             try:
                 proc.wait(timeout=deadline_s)
             except subprocess.TimeoutExpired:
@@ -2623,36 +2810,45 @@ class SandboxedShell:
                 self._kill_group(pgid, proc)
         except BaseException:
             self._kill_group(pgid, proc)
+            carry.stop()
             out.eof.wait(_DRAIN_GRACE)
             raise
         finally:
             self._proc = None
-        out.eof.wait(_DRAIN_GRACE)
+        until = time.monotonic() + _DRAIN_GRACE
+        carry.done.wait(_DRAIN_GRACE)
+        out.eof.wait(max(0.0, until - time.monotonic()))
+        carry.stop()
         self._after_command(pgid)
         text = out.take()
         if not out.eof.is_set():
-            with self._lock:
-                self._late.append(out)
+            self._keep_late(out)
         if timed_out:
             return ShellResult(output=text, exit_code=None, timed_out=True)
         rc = proc.returncode
         if rc is not None and rc < 0:
             return ShellResult(output=text, exit_code=None, signal=-rc)
+        if carry.frame is not None:
+            self._carry(carry.frame)
         return ShellResult(output=text, exit_code=rc)
 
     def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
-        """Run ``command`` in a fresh bash that starts from the saved state; return its output, and
+        """Run ``command`` in a fresh bash that starts from the carried state; return its output, and
         the exit status levain's waitpid reported (or the signal that ended it, or a timeout)."""
-        # Single-caller: a concurrent call would race the state file and the late-output buffer.
+        # Single-caller: a concurrent call would race the carried state and the late-output buffer.
         # close() / interrupt() deliberately do NOT take this lock.
         if not self._run_lock.acquire(blocking=False):
             raise ConfinementError(
                 "SandboxedShell.run() is single-caller; a command is already running on this shell."
             )
         try:
-            if self._closed or not self._started or self._state_dir is None:
+            if self._closed or not self._started:
                 raise ConfinementError(
                     "shell is not running (call start() first, and not after close())"
+                )
+            if "\0" in command:
+                raise ConfinementError(
+                    "refusing a command that contains a NUL byte: bash cannot receive it whole."
                 )
             self._prune_groups()
             late = self._late_output()
@@ -2671,29 +2867,30 @@ class SandboxedShell:
             self._signal(proc.pid, signal.SIGINT)
 
     def close(self) -> None:
-        """Kill every process group this shell started (SIGTERM, then SIGKILL), reap, wait for the
-        groups to empty, and remove the state directory. Idempotent, never raises."""
+        """Kill every process group this shell started (SIGTERM, then SIGKILL), reap, and wait for
+        the groups to empty. Idempotent, never raises."""
         self._closed = True
+        # Prune first: a group that emptied after its command was reaped may have had its number
+        # reused by an unrelated process group, which must not be signalled.
+        self._prune_groups()
         with self._lock:
             groups = list(self._groups.items())
             self._groups.clear()
-        try:
-            for pgid, _ in groups:
-                self._signal(pgid, signal.SIGTERM)
-            deadline = time.monotonic() + _KILL_GRACE
-            for pgid, proc in groups:
-                if not _group_gone(pgid, timeout=max(0.0, deadline - time.monotonic())):
-                    self._signal(pgid, signal.SIGKILL)
-            for pgid, proc in groups:
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-                _group_gone(pgid, timeout=5.0)
-        finally:
-            d, self._state_dir = self._state_dir, None
-            if d is not None:
-                shutil.rmtree(d, ignore_errors=True)
+            late, self._late = self._late, []
+        for out in late:
+            out.abandon()
+        for pgid, _ in groups:
+            self._signal(pgid, signal.SIGTERM)
+        deadline = time.monotonic() + _KILL_GRACE
+        for pgid, proc in groups:
+            if not _group_gone(pgid, timeout=max(0.0, deadline - time.monotonic())):
+                self._signal(pgid, signal.SIGKILL)
+        for pgid, proc in groups:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            _group_gone(pgid, timeout=5.0)
 
     def __enter__(self) -> "SandboxedShell":
         return self.start()
@@ -3125,18 +3322,12 @@ class SeatbeltProvider(ConfinementProvider):
             )
         profile_text = self.render_profile(policy)
         _refuse_kernel_mask_rules(profile_text)
-        # A temp profile file for the shell's lifetime — `sandbox-exec -f` reads it before the sandbox
-        # applies, so it need not be inside the allow-set. The SandboxedShell owns unlink on close.
-        fd, profile_path = tempfile.mkstemp(prefix="levain-seatbelt-", suffix=".sb")
-        try:
-            with os.fdopen(fd, "w") as fh:
-                fh.write(profile_text)
-        except OSError as exc:
-            os.unlink(profile_path)
-            raise ConfinementError(f"could not write the seatbelt profile ({exc})") from exc
-
+        # The profile goes on argv as TEXT (`-p`), never as a file. Each command is its own driver
+        # process, so a profile file would be read again at every command, and the file (owned by this
+        # uid, in its temp dir, outside every deny) could be rewritten by the entity between two
+        # commands to drop every deny (S2 L2 C1). The text lives only in this process's memory.
         argv = [
-            SANDBOX_EXEC, "-f", profile_path,
+            SANDBOX_EXEC, "-p", profile_text,
             "/bin/bash", "--noprofile", "--norc",
         ]
         # A fresh entity's cwd is its workspace; ensure it exists (the shell's Popen(cwd=) needs a real
@@ -3147,15 +3338,8 @@ class SeatbeltProvider(ConfinementProvider):
             cwd=policy.workspace,
             env=env if env is not None else _default_shell_env(),
             default_timeout=default_timeout,
-            profile_path=Path(profile_path),
         )
-        try:
-            return shell.start()
-        except Exception:
-            # start() raised (a bad spawn) → the profile file would otherwise leak (close() is never
-            # reached). shell.close() unlinks it even though _proc is None (apparatus L1 #4a).
-            shell.close()
-            raise
+        return shell.start()
 
 
 def _default_shell_env() -> dict[str, str]:
@@ -3187,38 +3371,15 @@ def _default_shell_env() -> dict[str, str]:
 
 
 class _SeatbeltShell(SandboxedShell):
-    """A :class:`SandboxedShell` that also unlinks its seatbelt profile file on close. Kept private —
-    callers get a :class:`SandboxedShell` from :meth:`SeatbeltProvider.spawn_shell`."""
+    """A :class:`SandboxedShell` that re-runs the kernel-mask refusal, before every command, on the
+    profile text it is about to hand the driver's ``-p``. Kept private — callers get a
+    :class:`SandboxedShell` from :meth:`SeatbeltProvider.spawn_shell`."""
 
-    def __init__(
-        self,
-        *,
-        profile_path: Path,
-        argv: list[str],
-        cwd: Path,
-        env: dict[str, str],
-        default_timeout: float = 120.0,
-    ) -> None:
-        # Explicit params forwarded to super (NOT **kwargs: object, which would erase the signature so
-        # mypy couldn't catch a wrong/renamed kwarg — apparatus L1 #9).
-        super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
-        self._profile_path = profile_path
-
-    def close(self) -> None:
-        # ⛔ `finally`, NOT sequential (complement L3 LOW, 2026-09-04). This unlink is ADDITIVE
-        # cleanup that only this subclass knows about, and `super().close()` above it can raise —
-        # at which point the temp SBPL profile leaked, one per rejected or failed shell. Nothing
-        # upstream can compensate: a caller falling back to `SandboxedShell.close` runs the BASE
-        # teardown, which has never heard of this file.
-        # ⚡ The general form: a subclass's own additive cleanup has to be robust to its parent's
-        # failure, because no generic fallback can know what the subclass added.
-        try:
-            super().close()
-        finally:
-            try:
-                self._profile_path.unlink()
-            except OSError:
-                pass
+    def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
+        argv, fds = super()._spawn_argv()
+        # The exact argv element the driver will read.
+        _refuse_kernel_mask_rules(argv[argv.index("-p") + 1])
+        return argv, fds
 
 
 # --- Linux: bwrap (mount-namespace) provider -------------------------------------------------
@@ -4706,8 +4867,15 @@ def _claim_alive(claim: str) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         # levain is gone, but its sandbox may still be dying (bwrap's pid 1 goes down after a
-        # SIGKILLed levain only when PDEATHSIG reaches it): the shell's process group, recorded in
-        # the claim once the shell started, keeps the claim until it is empty (L3 r1).
+        # SIGKILLed levain only when PDEATHSIG reaches it): the running command's bash, recorded in
+        # the claim before the command ran, keeps the claim until it is gone (L3 r1, S2 L2 M5).
+        if len(parts) >= 5 and parts[4].startswith("b"):
+            pid_s, _, start = parts[4][1:].partition("@")
+            try:
+                return _bash_alive(int(pid_s), start or "-")
+            except ValueError:
+                return False
+        # A claim tagged by an earlier build names the command's process group.
         if len(parts) >= 5 and parts[4].startswith("g"):
             try:
                 os.killpg(int(parts[4][1:]), 0)
@@ -4937,6 +5105,28 @@ def _close_live_shells() -> None:
             pass
 
 
+def _bash_alive(pid: int, start: str) -> bool:
+    """Whether ``pid`` is still the process that started at ``start`` (Linux /proc) and has not yet
+    finished exiting. A zombie counts as gone: a pid 1 becomes one only after its namespace is empty."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    fields = data.rsplit(")", 1)[-1].split()
+    if len(fields) < 20 or fields[0] in ("Z", "X", "x"):
+        return False
+    return start == "-" or fields[19] == start
+
+
+def _bash_gone(pid: int, start: str, *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _bash_alive(pid, start):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
 def _group_gone(pgid: int, *, timeout: float) -> bool:
     """True once no process is left in process group ``pgid`` (polled until ``timeout``)."""
     deadline = time.monotonic() + timeout
@@ -4993,39 +5183,104 @@ class _BwrapShell(SandboxedShell):
         self._jewel_policy = policy
         self._manifest = dict(manifest)   # recorded before the start; never updated
         self._ledger_claim: str | None = None   # this shell's claim on the placeholder ledger
-        self._claim_base: str | None = None     # the claim before a command's group is added to it
+        self._claim_base: str | None = None     # the claim before a command's bash is added to it
+        self._info_r: int | None = None         # read end of the running command's --info-fd pipe
+        # Each command's bash (pid, kernel start time) not yet seen gone. bash is pid 1 of its pid
+        # namespace, and pid 1 finishes exiting only once the namespace is empty, so "bash gone" means
+        # "namespace gone". With --new-session bash is NOT in the bwrap process's group, so the group
+        # alone cannot say that.
+        self._bashes: list[tuple[int, str]] = []
 
     def close(self) -> None:
         # The claim is released only once the sandbox's namespace is GONE, never while any process of
         # it lives: a host-side unlink of a placeholder still mounted in a live namespace detaches that
         # mount (Linux 3.18+, 8ed936b), and the shell could then plant the file (L1 + L2 r1). Each
-        # command is its own bwrap, in its own process group, and its bash is pid 1 of its pid
-        # namespace (``--as-pid-1``), so an empty group means an empty namespace. If one is not empty
-        # in time, the claim stays, and the sweep at the next spawn or at launch releases it once this
-        # levain is gone. `finally`, as `_SeatbeltShell.close`.
+        # command's bash is pid 1 of its pid namespace (``--as-pid-1``), so that bash gone means that
+        # namespace empty. If one is not gone in time, the claim stays, and the sweep at the next spawn
+        # or at launch releases it once this levain is gone. Released in `finally`, whatever the base
+        # teardown did.
         with self._lock:
             pgids = list(self._groups)
         try:
             super().close()
         finally:
+            self._close_info()
             claim, self._ledger_claim = self._ledger_claim, None
             _LIVE_BWRAP_SHELLS.discard(self)
-            if claim is not None and all(_group_gone(g, timeout=5.0) for g in pgids):
+            if (claim is not None and all(_group_gone(g, timeout=5.0) for g in pgids)
+                    and self._bashes_gone(5.0)):
                 _ledger_release(claim)
 
+    def _close_info(self) -> None:
+        fd, self._info_r = self._info_r, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
+        argv, _ = super()._spawn_argv()
+        self._close_info()
+        rd, wr = os.pipe()
+        self._info_r = rd
+        # bwrap writes {"child-pid": N} here once it has cloned bash (bubblewrap.c, opt_info_fd).
+        at = argv.index("--as-pid-1")
+        return argv[:at] + ["--info-fd", str(wr)] + argv[at:], (wr,)
+
+    def _read_child_pid(self) -> int:
+        fd = self._info_r
+        data = b""
+        deadline = time.monotonic() + _START_TIMEOUT
+        try:
+            while fd is not None and time.monotonic() < deadline:
+                ready, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
+                if not ready:
+                    break
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                data += chunk
+        finally:
+            self._close_info()
+        m = re.search(rb'"child-pid"\s*:\s*(\d+)', data)
+        pid = int(m.group(1)) if m else 0
+        if pid <= 0:
+            raise ConfinementError(
+                "bwrap did not report the pid of the command's bash (it exited before starting it) — "
+                "refusing to run the command (fail-closed)."
+            )
+        return pid
+
+    def _bashes_gone(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        self._bashes = [b for b in self._bashes
+                        if not _bash_gone(*b, timeout=max(0.0, deadline - time.monotonic()))]
+        return not self._bashes
+
     def _after_spawn(self, pgid: int) -> None:
-        # The claim names the running command's process group (see `_claim_alive`): after a levain
-        # crash the sweep keeps it until that group, and so that namespace, is empty. One group at a
-        # time: `_after_command` waits for the previous command's namespace to be gone.
+        # bash is blocked reading its input, so nothing of the command has run yet. Learn its pid,
+        # then retag the claim to name it (see `_claim_alive`): after a levain crash the sweep keeps
+        # the claim until that bash, and so its namespace, is gone. One bash at a time: an earlier
+        # command's bash that is still not gone refuses this command, because the retag would stop
+        # the claim covering it.
+        pid = self._read_child_pid()
+        start = _proc_start_time(pid) or "-"
+        if not self._bashes_gone(5.0):
+            raise ConfinementError(
+                "an earlier command's sandbox is still exiting — refusing to run the command "
+                "(fail-closed): the shell's claim on the floor's files must cover it until it is gone."
+            )
+        self._bashes.append((pid, start))
         claim = self._ledger_claim
         if claim is None or self._claim_base is None:
             return
-        tagged = f"{self._claim_base}:g{pgid}"
+        tagged = f"{self._claim_base}:b{pid}@{start}"
         with _LedgerTxn() as txn:
             if txn.ok:
                 txn.retag(claim, tagged)
         if not txn.ok or txn.problem is not None:
-            # Unwritten, the claim names only levain's pid (or an older group): after a levain crash
+            # Unwritten, the claim names only levain's pid (or an older bash): after a levain crash
             # a sweep would drop it while this sandbox lives on its mounts (codex, L3 r3).
             raise ConfinementError(
                 f"{txn.problem} — refusing to run the command (fail-closed): the shell's claim on "
@@ -5035,8 +5290,9 @@ class _BwrapShell(SandboxedShell):
 
     def _after_command(self, pgid: int) -> None:
         # The command's bash was pid 1 of its namespace, so the kernel is killing everything left
-        # in it; wait for that, so the next command's group is the only one the claim needs to name.
+        # in it; wait for that, so the next command's bash is the only one the claim needs to name.
         _group_gone(pgid, timeout=5.0)
+        self._bashes_gone(5.0)
 
     def _recheck(self) -> None:
         _refuse_plantable_sqlite_jewels(self._jewel_policy)
@@ -5130,10 +5386,15 @@ class BwrapProvider(ConfinementProvider):
         # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
         # `--as-pid-1`: bash itself is pid 1 of the namespace and the bwrap process levain waits on
         # is its parent, so the status levain reads is bash's own waitpid status. Without it bwrap's
-        # reaper is pid 1 and reports bash's status through an eventfd that the reaper holds, and the
-        # reaper is dumpable and runs as bash's user, so bash could write a status of its own choosing
-        # into it through /proc/1/fd (bubblewrap.c: do_init, monitor_child, PR_SET_DUMPABLE; spore-1385).
-        argv = argv + ["--as-pid-1", "/bin/bash", "--noprofile", "--norc", "-p"]
+        # reaper is pid 1 and passes bash's status on through an eventfd the reaper holds; the reaper
+        # runs as bash's user and stays dumpable (bubblewrap.c: do_init, monitor_child), so code in the
+        # sandbox that could take that fd from it (ptrace, or pidfd_getfd where Yama allows) could
+        # write a status of its choosing (spore-1385). With bash as pid 1 there is no such channel.
+        # `--new-session`: bash calls setsid(), so it and everything it starts are in a process group
+        # of their own, apart from the bwrap process levain waits on. Without it a `kill 0` inside the
+        # sandbox reached bwrap too (a group signal crosses pid namespaces), so a command could stop or
+        # kill the process that reports its status (S2 L2 M5).
+        argv = argv + ["--new-session", "--as-pid-1", "/bin/bash", "--noprofile", "--norc", "-p"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
         # Each one this process made is levain's, recorded in the placeholder ledger and removed once

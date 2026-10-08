@@ -131,32 +131,162 @@ def test_a_signal_death_is_reported_as_a_signal(tmp_path):
 
 
 @live
-def test_errexit_failure_still_saves_the_state(tmp_path):
+def test_errexit_failure_still_carries_the_exports_but_not_errexit(tmp_path):
     with _shell(tmp_path) as sh:
         assert sh.run("set -e; export E1=yes; false; echo unreachable", timeout=10).exit_code == 1
         r = sh.run('echo "E1=$E1"; case $- in *e*) echo errexit-on;; esac', timeout=10)
-        assert "E1=yes" in r.output and "errexit-on" in r.output
+        assert "E1=yes" in r.output and "errexit-on" not in r.output
 
 
 @live
-def test_cwd_env_functions_aliases_options_and_plain_variables_persist(tmp_path):
+def test_only_the_directory_and_the_exports_carry(tmp_path):
+    """By design (S2 L2 ruling): cwd, OLDPWD and exported variables carry, as data; functions,
+    aliases, options, traps and plain variables start fresh, as in a new terminal."""
     with _shell(tmp_path) as sh:
         setup = (
-            f"cd {tmp_path} && export EXP='a b' && PLAIN=$'two\\nlines' && arr=(x 'y z') && "
+            f"cd {tmp_path} && export EXP=$'a b\\nc=d' && PLAIN=1 && "
             "greet() { echo \"hi $1\"; } && shopt -s expand_aliases && alias ll='echo aliased' && "
-            "set -o pipefail && unset -v PATH_UNSET_PROBE"
+            "set -o pipefail && umask 077"
         )
         assert sh.run(setup, timeout=10).exit_code == 0
         r = sh.run(
-            'echo "pwd=$PWD"; echo "exp=$EXP"; printf "plain=%s|\\n" "$PLAIN"; echo "arr=${arr[1]}"; '
-            "greet you; ll; set -o | grep pipefail",
+            'echo "pwd=$PWD"; printf "exp=%s|\\n" "$EXP"; echo "plain=${PLAIN-unset}"; '
+            "type greet >/dev/null 2>&1 || echo no-function; alias ll >/dev/null 2>&1 || echo no-alias; "
+            "set -o | grep pipefail; umask",
             timeout=10,
         )
         out = r.output
-        assert f"pwd={tmp_path}" in out or f"pwd={Path(tmp_path).resolve()}" in out
-        assert "exp=a b" in out and "plain=two\nlines|" in out and "arr=y z" in out
-        assert "hi you" in out and "aliased" in out
-        assert "pipefail" in out and "on" in out.split("pipefail", 1)[1].split("\n", 1)[0]
+        assert out.splitlines()[0] in (f"pwd={tmp_path}", f"pwd={Path(tmp_path).resolve()}")
+        assert "exp=a b\nc=d|" in out and "plain=unset" in out
+        assert "no-function" in out and "no-alias" in out
+        assert "off" in out.split("pipefail", 1)[1].split("\n", 1)[0]
+        assert "0077" not in out
+
+
+@live
+def test_a_command_that_replaces_the_exit_trap_carries_nothing(tmp_path):
+    """Documented: the runner's EXIT trap writes the state back, so a command that sets its own
+    leaves the next command where the previous one ended; its trap does not carry either."""
+    (tmp_path / "far").mkdir()
+    with _shell(tmp_path) as sh:
+        assert sh.run(f"cd {tmp_path}; export KEEP=1", timeout=10).exit_code == 0
+        r = sh.run(f"trap 'echo TRAPPED' EXIT; cd {tmp_path}/far; export KEEP=2", timeout=10)
+        assert "TRAPPED" in r.output
+        r = sh.run('echo "$PWD $KEEP"', timeout=10)
+        assert r.output.strip() in (f"{tmp_path} 1", f"{Path(tmp_path).resolve()} 1")
+        assert "TRAPPED" not in r.output
+
+
+@live
+def test_cd_dash_round_trips(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    real = lambda p: {str(p), str(p.resolve())}   # noqa: E731
+    with _shell(tmp_path) as sh:
+        assert sh.run(f"cd {a}", timeout=10).exit_code == 0
+        assert sh.run(f"cd {b}", timeout=10).exit_code == 0
+        assert sh.run("cd - >/dev/null", timeout=10).exit_code == 0
+        assert sh.run("pwd", timeout=10).output.strip() in real(a)
+        assert sh.run("cd - >/dev/null; pwd", timeout=10).output.strip() in real(b)
+
+
+_PLANTS = {
+    "startup-names": (
+        "export BASH_ENV={hook} ENV={hook} PROMPT_COMMAND='echo PLANTED-PC' PS4='$(echo PLANTED-PS4)' "
+        "CDPATH=/ GLOBIGNORE='*' POSIXLY_CORRECT=1 LD_PRELOAD=/nonexistent.so "
+        "DYLD_INSERT_LIBRARIES=/nonexistent.dylib BASH_XTRACEFD=1 GITHUB_TOKEN=planted-token; "
+        "set -o errexit; export SHELLOPTS; true"
+    ),
+    "ifs-and-tmout": "export IFS=x TMOUT=1; true",
+    "functions-aliases-options": (
+        "ls() { echo PLANTED-LS; }; export -f ls; shopt -s extglob; "
+        "eval 'xg() { case $1 in @(a|b)) echo m;; esac; }'; shopt -s expand_aliases; alias false=true; "
+        "set -e; set -m; true"
+    ),
+    "shadowed-builtin": "builtin() { return 0; }; ls() { echo PLANTED-LS; }; set -e; true",
+}
+
+
+@live
+@pytest.mark.parametrize("plant", list(_PLANTS))
+def test_a_planted_startup_variable_or_function_never_reaches_the_next_command(tmp_path, plant):
+    """S2 L2 H1/M1/L1/L2/L4/L5: nothing a command leaves behind runs as code in the next one. Each
+    name that makes bash or the loader run code at startup is planted; so are a function shadowing
+    ``ls`` (and ``builtin``, which broke the old save), an extglob function, an alias, errexit and job
+    control. The next command still fails as it should and sees none of them."""
+    hook = tmp_path / "hook.sh"
+    hook.write_text("echo PLANTED-HOOK\ntrap 'exit 0' EXIT\n")
+    with _shell(tmp_path) as sh:
+        assert sh.run(_PLANTS[plant].replace("{hook}", str(hook)), timeout=10).exit_code == 0
+        r = sh.run("ls / >/dev/null && echo real-ls; env; false", timeout=10)
+        assert r.exit_code == 1, r.output
+        assert "PLANTED" not in r.output and "real-ls" in r.output
+        for name in ("BASH_ENV", "ENV", "PROMPT_COMMAND", "PS4", "IFS", "CDPATH", "GLOBIGNORE",
+                     "POSIXLY_CORRECT", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "BASH_XTRACEFD",
+                     "TMOUT", "SHELLOPTS", "BASHOPTS", "GITHUB_TOKEN", "BASH_FUNC_ls"):
+            assert f"\n{name}=" not in "\n" + r.output and f"\n{name}%%=" not in "\n" + r.output, name
+        assert sh.run("echo still-fine", timeout=10).output.strip() == "still-fine"
+
+
+@live
+def test_a_timed_out_command_carries_nothing(tmp_path):
+    """S2 L2 M2: a command levain had to kill leaves the next one where the last finished one ended."""
+    (tmp_path / "far").mkdir()
+    with _shell(tmp_path) as sh:
+        assert sh.run(f"cd {tmp_path}; export KEEP=1", timeout=10).exit_code == 0
+        assert sh.run(f"cd {tmp_path}/far; export KEEP=2; sleep 30", timeout=1).timed_out
+        r = sh.run('echo "$PWD $KEEP"', timeout=10)
+        assert r.output.strip() in (f"{tmp_path} 1", f"{Path(tmp_path).resolve()} 1")
+        # levain's own discard, apart from the runner's: a frame the command wrote back itself (fd 9)
+        # before it hung, or before a signal ended it, is not adopted either.
+        frame = f"printf 'P%s\\0EKEEP=3\\0Z\\0' {tmp_path}/far >&9"
+        assert sh.run(f"{frame}; sleep 30", timeout=1).timed_out
+        assert sh.run(f"{frame}; kill -9 $$", timeout=10).exit_code != 0
+        r = sh.run('echo "$PWD $KEEP"', timeout=10)
+        assert r.output.strip() in (f"{tmp_path} 1", f"{Path(tmp_path).resolve()} 1")
+        # The trap writes last, so its frame wins over one the command wrote...
+        assert sh.run(f"{frame}; exit 0", timeout=10).exit_code == 0
+        assert sh.run('echo "$KEEP"', timeout=10).output.strip() == "1"
+        # ...and with no trap (`exec` replaced bash) the command's own frame is adopted: data, which
+        # can only set its own next directory and environment.
+        assert sh.run(f"{frame}; exec true", timeout=10).exit_code == 0
+        assert sh.run('echo "$KEEP"', timeout=10).output.strip() == "3"
+
+
+@live
+@pytest.mark.parametrize("command,status", [
+    ("set -eu; echo $u_never_set", 1),
+    ("set -e; echo ${x_never_set?boom}", 1),
+    ("set -e; eval 'echo \"unterminated'", 1),
+    ("set -e; true", 0),
+    ("set -e; exit 0", 0),
+    ("set -e; false || exit 0", 0),
+    ("set -e; exit 4", 4),
+])
+def test_an_errexit_failure_is_not_reported_as_success(tmp_path, command, status):
+    """S2 L2 H2: bash 3.2 exits 0 from an errexit failure when an EXIT trap is set, which the runner
+    always has. The runner turns that case into exit 1; a real exit 0 stays 0. (bash 5 on Linux has
+    no such bug: the same rows hold with bash's own statuses, which are non-zero for the failures.)"""
+    with _shell(tmp_path) as sh:
+        r = sh.run(command, timeout=10)
+        if status == 0:
+            assert r.exit_code == 0, r.output
+        elif status == 1:
+            assert r.exit_code not in (None, 0), r.output
+        else:
+            assert r.exit_code == status
+
+
+@live
+def test_a_signal_under_errexit_is_still_a_signal(tmp_path):
+    """The H2 fix must not turn a signal into exit 1: the signal traps mark it."""
+    with _shell(tmp_path) as sh:
+        r = sh.run("set -e; kill -TERM $$; sleep 5", timeout=10)
+        if _SYSTEM == "Darwin":
+            assert (r.exit_code, r.signal) == (None, signal.SIGTERM), r
+        else:   # bash is pid 1 of its namespace and cannot signal itself: the fallback exit
+            assert r.exit_code == 143, r
 
 
 @live
@@ -246,18 +376,15 @@ def test_a_timeout_kills_the_commands_whole_group(tmp_path):
 
 
 @live
-def test_close_leaves_nothing_running_and_removes_its_state(tmp_path):
+def test_close_leaves_nothing_running(tmp_path):
     marker = _marker()
     sh = _shell(tmp_path)
-    state_dir = sh._state_dir   # type: ignore[attr-defined]
-    assert state_dir is not None and Path(state_dir).is_dir()
     sh.run(f"sleep {marker} > /dev/null 2>&1 &", timeout=10)
     sh.close()
     time.sleep(0.3)
     leaked = _pids_with(f"sleep {marker}")
     _kill_all(leaked)
     assert not leaked
-    assert not Path(state_dir).exists()
     sh.close()   # idempotent
     with pytest.raises(ConfinementError):
         sh.run("echo nope")
@@ -292,3 +419,115 @@ def test_start_fails_closed_when_the_driver_cannot_run_bash(tmp_path):
     with pytest.raises(ConfinementError):
         shell.start()
     shell.close()
+
+
+# --- hermetic: the runner on plain bash, no sandbox ---------------------------------------------
+
+
+def _plain(tmp_path: Path, cls=SandboxedShell) -> SandboxedShell:
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    return cls(argv=["/bin/bash", "--noprofile", "--norc"], cwd=ws,
+               env={"PATH": "/usr/bin:/bin", "SSH_AUTH_SOCK": "/tmp/agent.sock"})
+
+
+def test_a_refused_spawn_runs_none_of_the_command(tmp_path):
+    """S2 L2 M3: when the post-spawn hook refuses (the bwrap claim could not be recorded), bash has
+    not been given the command yet, so none of it ran."""
+    marker = tmp_path / "ran"
+
+    class Refusing(SandboxedShell):
+        refuse = False
+
+        def _after_spawn(self, pgid):
+            if self.refuse:
+                time.sleep(0.5)   # a command fed early would have run by now
+                raise ConfinementError("claim not recorded")
+
+    sh = _plain(tmp_path, Refusing).start()
+    try:
+        sh.refuse = True
+        with pytest.raises(ConfinementError):
+            sh.run(f"touch {marker}", timeout=10)
+        assert not marker.exists()
+    finally:
+        sh.close()
+
+
+def test_background_pipes_are_capped(tmp_path):
+    """S2 L2 M4: each command whose pipe a background job holds keeps a read end; past _MAX_LATE the
+    oldest is closed, so background jobs cannot exhaust levain's file descriptors."""
+    from levain.firing.confinement import _MAX_LATE
+
+    marker = _marker()
+    sh = _plain(tmp_path).start()
+    try:
+        outs = []
+        for _ in range(_MAX_LATE + 5):
+            assert sh.run(f"sleep {marker} &", timeout=10).exit_code == 0
+            outs.extend(o for o in sh._late if o not in outs)   # type: ignore[attr-defined]
+        assert len(sh._late) <= _MAX_LATE   # type: ignore[attr-defined]
+        dropped = [o for o in outs if o not in sh._late]   # type: ignore[attr-defined]
+        assert len(dropped) >= 5
+        assert all(o.eof.wait(2.0) for o in dropped), "an abandoned pipe's read end was not closed"
+    finally:
+        sh.close()
+        _kill_all(_pids_with(f"sleep {marker}"))
+
+
+def test_a_nul_byte_in_a_command_is_refused(tmp_path):
+    """S2 L2 L6: bash reads the command up to a NUL, so the rest would be silently dropped."""
+    with _plain(tmp_path) as sh:
+        with pytest.raises(ConfinementError, match="NUL"):
+            sh.run("echo a\0rm -rf x", timeout=10)
+        assert sh.run("echo fine", timeout=10).output.strip() == "fine"
+
+
+def test_close_does_not_signal_a_group_that_already_emptied(tmp_path):
+    """S2 L2 L7: a finished command's group number can be reused by an unrelated group, so close()
+    prunes emptied groups before it signals."""
+    sh = _plain(tmp_path).start()
+    sh.run("true", timeout=10)
+    finished = set(sh._groups)   # type: ignore[attr-defined]
+    sent: list[int] = []
+    sh._signal = lambda pgid, sig: sent.append(pgid)   # type: ignore[method-assign]
+    sh.close()
+    assert finished and not (finished & set(sent))
+
+
+def test_the_carried_environment_is_data_with_a_denylist(tmp_path):
+    """The frame a command writes back is parsed as data: denylisted and credential-shaped names the
+    entity introduced are dropped, a name levain started bash with stays, and a malformed frame
+    carries nothing."""
+    sh = _plain(tmp_path)
+    frame = (b"P/x\0O/y\0EKEEP=1\0EBASH_ENV=/h\0ELD_PRELOAD=/l\0EDYLD_X=1\0EGITHUB_TOKEN=t\0"
+             b"ESSH_AUTH_SOCK=/new\0Ebad name=1\0EPATH=/bin\0")
+    sh._carry(frame)   # type: ignore[attr-defined]
+    assert sh._carried_cwd == "/x" and sh._carried_oldpwd == "/y"   # type: ignore[attr-defined]
+    assert sh._carried_env == {"KEEP": "1", "SSH_AUTH_SOCK": "/new", "PATH": "/bin"}   # type: ignore[attr-defined]
+    sh._carry(b"junk\0Z\0")   # type: ignore[attr-defined]
+    assert sh._carried_cwd == "/x"   # type: ignore[attr-defined]
+
+
+# --- the Seatbelt profile is never a file --------------------------------------------------------
+
+
+@pytest.mark.skipif(not (_SYSTEM == "Darwin" and _LIVE), reason="macOS Seatbelt only")
+def test_the_seatbelt_profile_is_not_a_file_the_entity_could_rewrite(tmp_path):
+    """S2 L2 C1: each command is its own driver process, so a profile FILE would be read again at
+    every command, and the entity could rewrite it between two commands. The profile goes on argv as
+    text; no argument of the driver names a file, and a jewel stays denied across commands."""
+    from levain.firing.confinement import SANDBOX_EXEC, SeatbeltProvider
+
+    secret = tmp_path / "creds.env"
+    secret.write_text("SECRET=do-not-leak")
+    policy = build_policy(_entity(tmp_path), deny_files=(secret,))
+    with select_provider().spawn_shell(policy) as sh:
+        argv = sh._argv   # type: ignore[attr-defined]
+        assert "-f" not in argv
+        assert argv[argv.index("-p") + 1] == SeatbeltProvider().render_profile(sh.effective_policy)
+        assert not [a for a in argv if a.startswith("/") and Path(a).is_file()
+                    and a not in ("/bin/bash", SANDBOX_EXEC)]
+        for _ in range(2):
+            r = sh.run(f"cat {secret} 2>&1", timeout=10)
+            assert r.exit_code != 0 and "do-not-leak" not in r.output
