@@ -301,10 +301,14 @@ def _nested_genesis(gl: GitLedger, files: dict[str, str], message: str) -> str:
 
 def register(sub, add) -> None:
     """Add the tenure commands to ``levain team``. ``add`` is cli.register's helper (it wires --repo and guarding)."""
-    def wrap(fn):
+    def wrap(fn, fetch: bool = True):
         def run(args):
             from .cli import _repo
-            return fn(GitLedger(_repo(args)), args)
+            g = GitLedger(_repo(args))
+            if fetch and g.joined() and g.remote:
+                g.sync(push=False)     # act on the team as it is now, not as this clone last saw it
+                g._dcache = None
+            return fn(g, args)
         return run
 
     p = add("owner", wrap(cmd_owner), "Owner only: offer ownership to a member (they accept with their key).")
@@ -345,16 +349,16 @@ def register(sub, add) -> None:
     p.add_argument("--since", required=True, help="the counted commit that began the spell")
     p.add_argument("--no-push", action="store_true")
 
-    p = add("distrust", wrap(cmd_distrust), "This clone only: stop counting one commit (an emergency act).")
+    p = add("distrust", wrap(cmd_distrust, fetch=False), "This clone only: stop counting one commit (an emergency act).")
     p.add_argument("commit", nargs="?")
     p.add_argument("--list", action="store_true")
     p.add_argument("--clear", action="store_true")
 
-    p = add("repin", wrap(cmd_repin), "This clone only: re-pin the genesis or the anchor the owner names.")
+    p = add("repin", wrap(cmd_repin, fetch=False), "This clone only: re-pin the genesis or the anchor the owner names.")
     p.add_argument("--root")
     p.add_argument("--anchor")
 
-    p = add("accept-merge", wrap(cmd_accept_merge), "This clone only, on the owner's word: follow one parent of a "
+    p = add("accept-merge", wrap(cmd_accept_merge, fetch=False), "This clone only, on the owner's word: follow one parent of a "
                                                     "merge on the ledger; lists what it leaves out.")
     p.add_argument("merge")
     p.add_argument("--parent", type=int, default=1)
