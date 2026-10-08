@@ -30,7 +30,8 @@ CANON_FILE = "PROJECT.md"
 RULES = 1                                  # the derivation-rules version a genesis names; a release derives only its own
 BASE_TRAILER = "Levain-Base"
 PAIR_TRAILER = "Levain-Pair"
-_TRAILER_RE = re.compile(r"^(Levain-Base|Levain-Pair): *(\S+) *$", re.M)
+DEVICE_TRAILER = "Levain-Device"   # the clone that wrote the commit: sync moves only its own (T36)
+_TRAILER_RE = re.compile(r"^(Levain-Base|Levain-Pair|Levain-Device): *(\S+) *$", re.M)
 
 
 class Unjudgeable(TeamError):
