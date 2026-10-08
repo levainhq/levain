@@ -46,10 +46,11 @@ def _wsid(ws: Path) -> str:
     return f"{st.st_dev}:{st.st_ino}"
 
 
-def _helper(ws: Path, op: str, path, data: bytes = b"", limit: int = 1 << 20, wsid: str | None = None):
+def _helper(ws: Path, op: str, path, data: bytes = b"", limit: int = 1 << 20, wsid: str | None = None,
+            cap: int = 100_000):
     """The helper exactly as the provider runs it, minus sudo and the sandbox driver."""
     return subprocess.run([HANDS_ZSH, "-f", "-c", _HANDS_FILE_HELPER, "zsh", op, str(ws), str(path),
-                           str(limit), wsid or _wsid(ws)], input=data, capture_output=True, timeout=30,
+                           str(limit), wsid or _wsid(ws), str(cap)], input=data, capture_output=True, timeout=30,
                           cwd="/", env={"PATH": "/usr/bin:/bin"})
 
 
@@ -123,6 +124,29 @@ def test_list_gives_one_level_and_the_non_hidden_children_of_real_subdirectories
     assert _helper(ws, "list", ws / "gone").returncode == 2
 
 
+def test_list_reads_no_further_than_its_entry_cap(tmp_path):
+    """S2 L3 r2 (codex MED): the listing's glob expanded the whole directory in the helper before the
+    output was capped. The glob now stops one past the cap (zsh's (Y) qualifier) and a directory over
+    it, or a subdirectory over it, is refused; under it the listing is whole and in name order."""
+    ws = _ws(tmp_path)
+    for n in ("c", "a", "b"):
+        (ws / n).write_text("")
+    (ws / "sub").mkdir()
+    for n in ("z", "y", ".h"):
+        (ws / "sub" / n).write_text("")
+    r = _helper(ws, "list", ws, cap=4)
+    assert r.returncode == 0, r
+    parts = r.stdout.split(b"\0")[:-1]
+    assert parts[1::2] == [b"a", b"b", b"c", b"sub", b"sub/y", b"sub/z"]
+    r = _helper(ws, "list", ws, cap=3)
+    assert r.returncode == 3 and b"more than 3 entries" in r.stderr and r.stdout == b""
+    for n in ("x", "w", "v"):
+        (ws / "sub" / n).write_text("")
+    r = _helper(ws, "list", ws, cap=4)   # sub's five visible children are one past the cap
+    assert r.returncode == 3 and b"sub has more than 4 entries" in r.stderr, r
+    assert _helper(ws, "list", ws / "sub", cap=6).returncode == 0   # its own six, .h included, fit
+
+
 def test_write_is_atomic_keeps_the_mode_and_never_writes_through_a_link(tmp_path):
     ws = _ws(tmp_path)
     assert _helper(ws, "write", ws / "new.txt", b"hello").returncode == 0
@@ -179,7 +203,8 @@ def test_the_provider_runs_the_fixed_helper_as_the_hands_user_under_the_profile(
     at = argv.index(confinement.SANDBOX_EXEC)
     assert argv[at + 1] == "-p" and argv[at + 2] == SeatbeltProvider().render_profile(policy)
     assert argv[at + 3:] == [HANDS_ZSH, "-f", "-c", _HANDS_FILE_HELPER, "zsh", op, str(hands.workspace),
-                             target, str(confinement._HANDS_READ_LIMIT), _wsid(hands.workspace)]
+                             target, str(confinement._HANDS_READ_LIMIT), _wsid(hands.workspace),
+                             str(confinement._HANDS_LIST_MAX)]
     assert seen["data"] == (b"$(rm -rf ~)" if op == "write" else b"") and seen["hands"] == hands
 
 

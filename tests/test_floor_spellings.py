@@ -322,14 +322,15 @@ def test_a_shell_releases_its_claim_only_once_its_process_group_is_gone(home: Pa
     shell = C._BwrapShell(policy=None, manifest={}, argv=["/bin/true"], cwd=home, env={})  # type: ignore[arg-type]
     shell._ledger_claim = f"{os.getpid()}:-:-:k"
 
-    class _P:
+    class _P:   # a command's leader (`_Leader`), already exited
         pid = 4242
-
-        def poll(self):
-            return 0
+        exited = True
 
         def wait(self, timeout=None):
-            return 0
+            return True
+
+        def reap(self):
+            pass
     shell._groups = {4242: _P()}
     monkeypatch.setattr(C, "_group_gone", lambda pgid, timeout: False)
     shell.close()

@@ -396,3 +396,29 @@ def test_a_headless_session_binds_the_hands_user_and_the_repl_does_not(tmp_path,
         assert s.conversation.agent.tools_map["file_editor"].executor._floor.hands is None
     finally:
         s.close()
+
+
+def test_the_session_end_sweep_kills_every_process_of_the_hands_user_and_verifies(monkeypatch):
+    """(d): a command can leave its process group (`setsid`), so the end of a session stops every
+    process of the hands user, as that user, and checks that none is left."""
+    import subprocess as sp
+
+    from levain.firing import confinement
+
+    calls: list[list[str]] = []
+    left = iter([0, 1])
+
+    def fake_run(argv, **kw):
+        calls.append(list(argv))
+        rc = next(left) if argv[0].endswith("pgrep") else 0
+        return sp.CompletedProcess(argv, rc, "4242\n" if rc == 0 else "", "")
+
+    monkeypatch.setattr(confinement.subprocess, "run", fake_run)
+    assert confinement.sweep_hands_user("_levain_x_000000") is None
+    assert calls[0] == [confinement.SUDO, "-n", "-u", "_levain_x_000000", "/bin/kill", "-9", "--", "-1"]
+    assert calls[1] == ["/usr/bin/pgrep", "-U", "_levain_x_000000"] and len(calls) == 4
+
+    monkeypatch.setattr(confinement.subprocess, "run",
+                        lambda argv, **kw: sp.CompletedProcess(argv, 0, "4242\n", ""))
+    said = confinement.sweep_hands_user("_levain_x_000000", timeout=0.3)
+    assert said is not None and "4242" in said and "still running" in said

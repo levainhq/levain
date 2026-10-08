@@ -185,6 +185,8 @@ The interactive `levain run` REPL still runs bash as you, because you drive it a
 It closes a real hole, too. Git refuses to read the settings of, or run the hooks of, a repository you don't own, so your git refuses every repository in there, and nothing the entity writes into one can run as you. But for a bare repository git only checks who owns that one folder. If any folder in the workspace were yours and the entity could write to it, the entity could build a repository there that your git would trust. Nothing in the workspace is yours, so there's no folder like that. `levain doctor` fails if one ever shows up, and warns you to set `safe.bareRepository = explicit` and to drop any `safe.directory = *`.
 <!-- END FOR PHILL'S WORDS -->
 
+**One session at a time, and nothing left running.** Only one session of the entity runs bash as its user at a time; a second is refused until the first ends. When a session ends, levain stops every process of the entity's user, including anything a command started in its own session. If something can't be stopped, the session says so, and `ws-git` and `ws-adopt` wait until levain exits.
+
 **The entity's ssh key.** The ssh agent refuses a different user, so the entity cannot use your keys, and levain does not pass your agent to it. Setup prints the entity's public key; add it as a deploy key on each repository the entity should push to.
 
 What setup creates, all undone by `--undo`:

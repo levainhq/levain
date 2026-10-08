@@ -774,3 +774,74 @@ def test_a_session_keeps_the_hands_lock_until_its_teardown_has_succeeded(tmp_pat
             with ws_git._exclusive(tmp_path):
                 pass
         os.close(s.hands_lock_fd)
+
+
+@pytest.mark.parametrize("left", [None, "processes of _levain_x_000000 are still running (pid 4242)"])
+def test_a_hands_session_keeps_its_locks_while_anything_of_its_user_runs(tmp_path: Path, monkeypatch, left) -> None:
+    """S2 L3 r2 (codex HIGH): close() of the shell dropped a group it could not empty, and the session
+    then released the workspace lock. The session's end now stops the hands user's processes and
+    empties the shells' groups; while anything is left, both locks stay held."""
+    from levain.firing import confinement as C
+    from levain.session import EntitySession
+
+    calls: list[str] = []
+    monkeypatch.setattr(C, "sweep_hands_user", lambda user: calls.append(user) or left)
+    monkeypatch.setattr(C, "unemptied_shell_groups", lambda user: [])
+
+    class Conv:
+        def close(self):
+            pass
+
+    (tmp_path / ".levain").mkdir()
+    s = EntitySession(entity_dir=tmp_path, binding=None, conversation=Conv(), workspace=tmp_path,
+                      model_label="m", with_tools=True, bash_ok=True,
+                      hands_lock_fd=ws_git.hold_session_lock(tmp_path),
+                      hands_session_fd=ws_git.hold_hands_session(tmp_path), hands_user="_levain_x_000000")
+    s.close()
+    assert calls == ["_levain_x_000000"] and s.left_running == left
+    if left is None:
+        with ws_git._exclusive(tmp_path):
+            pass
+        os.close(ws_git.hold_hands_session(tmp_path))
+    else:
+        with pytest.raises(WsGitError, match="session of this entity is open"):
+            with ws_git._exclusive(tmp_path):
+                pass
+        with pytest.raises(WsGitError, match="one runs at a time"):
+            ws_git.hold_hands_session(tmp_path)
+        os.close(s.hands_lock_fd)
+        os.close(s.hands_session_fd)
+
+
+def test_unemptied_shell_groups_keep_a_hands_session_locked(tmp_path: Path, monkeypatch) -> None:
+    """A closed shell of this hands user still holding a group keeps the lock; another user's does not."""
+    from levain.firing import confinement as C
+    from levain.session import _stop_hands_user
+
+    class Shell:
+        def __init__(self, user, groups):
+            self.hands_user, self.unemptied_groups = user, groups
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(C, "sweep_hands_user", lambda user: None)
+    mine, theirs = Shell("_levain_a_000000", (4242,)), Shell("_levain_b_000000", (4343,))
+    monkeypatch.setattr(C, "_UNEMPTIED_SHELLS", {mine, theirs})
+    assert "4242" in (_stop_hands_user("_levain_a_000000") or "")
+    assert _stop_hands_user("_levain_c_000000") is None
+
+
+def test_a_second_session_running_as_the_hands_user_is_refused(tmp_path: Path) -> None:
+    """(d): the session's end stops every process of the hands user, which is safe only while one
+    session owns it, so a second is refused rather than having its processes killed by the first."""
+    (tmp_path / ".levain").mkdir()
+    fd = ws_git.hold_hands_session(tmp_path)
+    try:
+        with pytest.raises(WsGitError, match="one runs at a time"):
+            ws_git.hold_hands_session(tmp_path)
+        # The REPL's shared hands lock is a different lock: it is not refused.
+        os.close(ws_git.hold_session_lock(tmp_path))
+    finally:
+        os.close(fd)
+    os.close(ws_git.hold_hands_session(tmp_path))

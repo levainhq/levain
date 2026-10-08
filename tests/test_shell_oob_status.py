@@ -487,9 +487,16 @@ def test_a_nul_byte_in_a_command_is_refused(tmp_path):
 def test_close_does_not_signal_a_group_that_already_emptied(tmp_path):
     """S2 L2 L7: a finished command's group number can be reused by an unrelated group, so close()
     prunes emptied groups before it signals."""
-    sh = _plain(tmp_path).start()
+    started: list[int] = []
+
+    class Recording(SandboxedShell):
+        def _after_spawn(self, pgid):
+            started.append(pgid)
+
+    sh = _plain(tmp_path, Recording).start()
     sh.run("true", timeout=10)
-    finished = set(sh._groups)   # type: ignore[attr-defined]
+    finished = set(started)
+    assert not sh._groups   # type: ignore[attr-defined]  # emptied: reaped and forgotten at once
     sent: list[int] = []
     sh._signal = lambda pgid, sig: sent.append(pgid)   # type: ignore[method-assign]
     sh.close()
@@ -790,3 +797,96 @@ def test_a_failed_socketpair_leaks_no_pipe(tmp_path, monkeypatch):
     finally:
         monkeypatch.undo()
         sh.close()
+
+
+def _stat_of(pid: int) -> str:
+    """``ps``'s state letters for ``pid``, or "" once it is reaped (gone from the process table)."""
+    return subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+
+
+class _Recording(SandboxedShell):
+    def _after_spawn(self, pgid):
+        self.__dict__.setdefault("started", []).append(pgid)
+
+
+def test_a_background_groups_leader_stays_unreaped_until_its_group_is_empty(tmp_path):
+    """S2 L3 r2 (codex HIGH): a retained group is known by its number, and a number is reusable once
+    the group's leader is reaped and its last member exits. The leader is held as a zombie until the
+    group is empty (POSIX.1-2024 XBD 4.17), so a later kill can only reach this command's processes."""
+    m = _marker()
+    sh = _plain(tmp_path, _Recording).start()
+    try:
+        sh.run(f"sleep {m} >/dev/null 2>&1 &", timeout=10)
+        pgid = sh.started[-1]   # type: ignore[attr-defined]
+        assert _stat_of(pgid).startswith("Z"), "the leader was reaped while its group lives"
+        assert pgid in sh._groups   # type: ignore[attr-defined]
+        _kill_all(_pids_with(m))
+        deadline = time.monotonic() + 5
+        while _pids_with(m) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        sh.run("true", timeout=10)
+        assert _stat_of(pgid) == "" and pgid not in sh._groups   # type: ignore[attr-defined]
+    finally:
+        _kill_all(_pids_with(m))
+        sh.close()
+
+
+def test_close_keeps_a_group_it_could_not_empty_and_retries_it(tmp_path):
+    """S2 L3 r2 (codex HIGH): close() used to forget a group its signals did not empty, and the
+    session then released the workspace lock. Now the group stays held (leader unreaped), close() says
+    which, and a later close() retries it."""
+    from levain.firing import confinement as C
+
+    m = _marker()
+    sh = _plain(tmp_path, _Recording).start()
+    try:
+        sh.run(f"sleep {m} >/dev/null 2>&1 &", timeout=10)
+        pgid = sh.started[-1]   # type: ignore[attr-defined]
+        sh._signal = lambda pgid, sig: None   # type: ignore[method-assign]  # the signals do not land
+        sh.close()
+        assert sh.unemptied_groups == (pgid,)
+        assert _pids_with(m) and _stat_of(pgid).startswith("Z")
+        assert sh in C._UNEMPTIED_SHELLS
+        del sh._signal                        # they land again
+        sh.close()
+        assert sh.unemptied_groups == () and not _pids_with(m) and _stat_of(pgid) == ""
+        assert sh not in C._UNEMPTIED_SHELLS
+    finally:
+        _kill_all(_pids_with(m))
+        sh.close()
+
+
+def test_a_finished_commands_status_is_read_without_reaping_it(tmp_path):
+    """The status comes from the watch on the leader (waitid WNOWAIT / kqueue NOTE_EXITSTATUS), so a
+    leader held for its background job still reports its own status."""
+    m = _marker()
+    sh = _plain(tmp_path).start()
+    try:
+        r = sh.run(f"sleep {m} >/dev/null 2>&1 & exit 5", timeout=10)
+        assert r.exit_code == 5 and not r.timed_out
+        assert sh.run("kill -9 $$", timeout=10).signal == 9
+    finally:
+        _kill_all(_pids_with(m))
+        sh.close()
+
+
+def test_a_driver_that_exits_before_its_watch_still_reports_its_status(tmp_path, monkeypatch):
+    """A leader that exited before levain's watch on it was set up (a driver that fails at once) is
+    reaped for its status, after its group is emptied, and the start probe names that status."""
+    from levain.firing import confinement as C
+
+    real_init = C._Leader.__init__
+
+    def late(self, proc):
+        proc_gone = time.monotonic() + 5
+        while time.monotonic() < proc_gone and _stat_of(proc.pid)[:1] not in ("Z", ""):
+            time.sleep(0.02)
+        real_init(self, proc)   # registered only after the driver exited
+
+    monkeypatch.setattr(C._Leader, "__init__", late)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sh = SandboxedShell(argv=["/bin/sh", "-c", "exit 9", "x"], cwd=ws, env={"PATH": "/usr/bin:/bin"})
+    with pytest.raises(ConfinementError, match="exited 9"):
+        sh.start()
+    assert sh.unemptied_groups == ()

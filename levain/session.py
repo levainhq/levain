@@ -78,7 +78,7 @@ from levain.firing.gate import (
     resolve_gate_mode,
 )
 from levain.firing.binding import BindingError, ConversationBinding, mark_entity_process
-from levain.firing.ws_git import WsGitError, hold_session_lock
+from levain.firing.ws_git import WsGitError, hold_hands_session, hold_session_lock
 from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
@@ -199,6 +199,24 @@ class SessionStartError(Exception):
         self.message = message
         self.code = code
 
+
+
+def _stop_hands_user(user: str) -> str | None:
+    """At the end of a session whose bash ran as ``user``: stop every process of that user (a command
+    can leave its process group with ``setsid``), then empty and reap the groups the shells could not
+    empty. None when nothing is left; else what is, which is also logged, and the caller keeps its
+    workspace locks."""
+    from levain.firing.confinement import sweep_hands_user, unemptied_shell_groups
+
+    swept = sweep_hands_user(user)
+    groups = unemptied_shell_groups(user)
+    said = "; ".join(x for x in (swept, f"process groups {groups} not empty" if groups else None) if x)
+    if not said:
+        return None
+    logging.getLogger("levain.session").warning(
+        "levain: this session of %s could not stop everything it ran (%s); the workspace stays locked "
+        "for ws-git until this process ends", user, said)
+    return said
 
 @dataclass(frozen=True)
 class TurnResult:
@@ -567,6 +585,12 @@ class EntitySession:
     # A hands entity's session holds the hands lock SHARED for its whole life, so `levain ws-git` and
     # `ws-adopt` (which take it exclusive) never run while it is open (levain.firing.ws_git).
     hands_lock_fd: int | None = field(default=None, repr=False, compare=False)
+    # A session whose bash runs as the hands user also holds that entity's one-session lock,
+    # exclusive (`hold_hands_session`): its end stops every process of the hands user.
+    hands_session_fd: int | None = field(default=None, repr=False, compare=False)
+    left_running: str | None = field(default=None, init=False, compare=False)
+    """Set by :meth:`close` when something of the hands user could not be stopped; the workspace
+    lock is then kept until this process ends."""
     hands_user: str | None = None
     """The separate user this session's bash runs as (and its file editor writes as), or None when
     bash runs as the operator (no setup, the interactive REPL, or Linux): the banner says which."""
@@ -701,6 +725,7 @@ class EntitySession:
         conversation: Any = None
         started = False
         hands_lock_fd: int | None = None
+        hands_session_fd: int | None = None
         try:
             llm = LLM(usage_id="levain-run", **resolve_llm_kwargs(model, base_url, api_key))
             # Fail CLOSED if support cannot be determined: an undetermined sandbox means NO
@@ -740,6 +765,7 @@ class EntitySession:
             # recorded, outside the entity dir, owned by that user: the floor is fenced around it.
             hands_id = hands_for(cfg, mode) if cfg is not None else None
             if hands_id is not None:
+                hands_session_fd = hold_hands_session(entity_dir)
                 workspace = hands_id.workspace
                 _check_hands_workspace(workspace)
             else:
@@ -872,9 +898,14 @@ class EntitySession:
                     logging.getLogger("levain.session").warning(
                         "closing a conversation from a failed start raised", exc_info=True
                     )
-            # After the conversation, and only if it closed: a shell still alive must keep ws-git out.
-            if not started and hands_lock_fd is not None and torn_down:
-                os.close(hands_lock_fd)
+            # After the conversation, and only if it closed and nothing of the hands user is left: a
+            # shell or process still alive must keep ws-git out.
+            if not started and torn_down and hands_session_fd is not None and hands_id is not None:
+                torn_down = _stop_hands_user(hands_id.user) is None
+            if not started and torn_down:
+                for lock in (hands_session_fd, hands_lock_fd):
+                    if lock is not None:
+                        os.close(lock)
 
         return cls(
             entity_dir=entity_dir,
@@ -891,6 +922,7 @@ class EntitySession:
             bash_refusal=bash_refusal if with_tools else None,
             bash_offline=with_tools and bash_ok and bash_offline,
             hands_lock_fd=hands_lock_fd,
+            hands_session_fd=hands_session_fd,
             hands_user=hands_id.user if (with_tools and hands_id is not None) else None,
         )
 
@@ -1452,18 +1484,21 @@ class EntitySession:
         except BaseException:  # noqa: BLE001 — teardown must never raise; see the docstring
             pass
         finally:
-            # After the conversation (and its shell), and only if it closed: ws-git may run once
-            # nothing of this session can still act in the workspace. A teardown that failed keeps
-            # the lock until this process ends, which releases it.
-            fd, self.hands_lock_fd = self.hands_lock_fd, None
-            if fd is not None:
-                if torn_down:
+            # After the conversation (and its shell), and only once nothing of the hands user is left
+            # running: ws-git may run once nothing of this session can still act in the workspace. A
+            # teardown that failed, or a process that could not be stopped, keeps the locks until
+            # this process ends, which releases them (S2 L3 r2, codex HIGH).
+            if torn_down and self.hands_session_fd is not None and self.hands_user is not None:
+                self.left_running = _stop_hands_user(self.hands_user)
+                torn_down = self.left_running is None
+            for name in ("hands_session_fd", "hands_lock_fd"):
+                fd = getattr(self, name)
+                if fd is not None and torn_down:
+                    setattr(self, name, None)
                     try:
                         os.close(fd)
                     except OSError:
                         pass
-                else:
-                    self.hands_lock_fd = fd
 
     @property
     def closed(self) -> bool:

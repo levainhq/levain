@@ -2496,6 +2496,35 @@ def _hands_signal(hands: HandsIdentity, pgid: int, sig: int) -> bool:
     return r.returncode == 0
 
 
+def sweep_hands_user(user: str, *, timeout: float = 5.0) -> str | None:
+    """Stop every process of the hands user ``user`` (SIGKILL to all it may signal, sent as it), and
+    verify none is left. For a session's end: a command can leave its process group (``setsid``), so
+    killing the groups levain started does not reach everything the entity left running. Safe only
+    while one session owns the user (:func:`levain.firing.ws_git.hold_hands_session`). None when none
+    is left, else what is."""
+    from levain.launch import child_env
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            subprocess.run([SUDO, "-n", "-u", user, "/bin/kill", "-9", "--", "-1"], capture_output=True,
+                           stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        try:
+            r = subprocess.run(["/usr/bin/pgrep", "-U", user], capture_output=True, text=True,
+                               stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"could not list {user}'s processes ({exc})"
+        if r.returncode == 1:
+            return None
+        if time.monotonic() >= deadline:
+            pids = " ".join(r.stdout.split()[:20])
+            return (f"processes of {user} are still running (pid {pids})" if r.returncode == 0
+                    else f"could not list {user}'s processes (pgrep exited {r.returncode})")
+        time.sleep(0.2)
+
+
 # Names never carried from one command to the next, whatever the entity set them to: each makes a
 # shell (or the dynamic loader) run code or reparse input at startup, or is bash's own bookkeeping.
 _NEVER_CARRIED = frozenset({
@@ -2749,7 +2778,7 @@ class SandboxedShell:
         # stripped, so nothing runs before the runner). The entity's exports arrive as data.
         self._env = {k: v for k, v in env.items() if not _never_carried(k)}
         self._default_timeout = default_timeout
-        self._proc: subprocess.Popen[bytes] | None = None   # the command running now, if any
+        self._leader: _Leader | None = None   # the command running now, if any
         # ⛔ THE POLICY THIS SHELL WAS ACTUALLY CONFINED BY — set by the provider seam, so the
         # caller can cache the EXACT set that got rendered (codex L3 #1, 2026-09-04). Without it the
         # executor refreshed once and `spawn_shell` refreshed AGAIN, discarding the second result:
@@ -2772,8 +2801,9 @@ class SandboxedShell:
         self._run_lock = threading.Lock()    # serialize run(); fail-fast on concurrent misuse
         self._lock = threading.Lock()        # guards _groups / _late across run() and close()
         # Process groups this shell started that may still have members (a command's own group while
-        # it runs, a finished command's background jobs after), pgid -> that command's Popen.
-        self._groups: dict[int, subprocess.Popen[bytes]] = {}
+        # it runs, a finished command's background jobs after), pgid -> that command's leader, held
+        # unreaped until the group is empty so the number cannot be reused (see `_Leader`).
+        self._groups: dict[int, _Leader] = {}
         # Finished commands whose pipe a background job still holds: their later output.
         self._late: list[_Output] = []
 
@@ -2878,7 +2908,7 @@ class SandboxedShell:
     def _after_command(self, pgid: int) -> None:
         """Hook: a command's bash has been reaped and its result is about to be returned."""
 
-    def _spawn(self) -> tuple[subprocess.Popen[bytes], _Output, _Carry]:
+    def _spawn(self) -> tuple[_Leader, _Output, _Carry]:
         # The argv first: it may raise (and the bwrap shell's makes the --info-fd pipe itself), and
         # nothing below exists yet to leak (S2 L2b L6).
         argv, pass_fds = self._spawn_argv()
@@ -2894,6 +2924,7 @@ class SandboxedShell:
                 except OSError:
                     pass
             raise
+        proc: subprocess.Popen[bytes] | None = None
         try:
             proc = subprocess.Popen(
                 argv,
@@ -2913,9 +2944,17 @@ class SandboxedShell:
                 close_fds=True,
                 pass_fds=pass_fds,
             )
+            # Watched from here on, never reaped by Popen until its group is empty (see `_Leader`).
+            leader = _Leader(proc)
         except BaseException:
             os.close(rd)
             ours.close()
+            if proc is not None:   # the watch could not be set up; no input was sent, nothing ran
+                self._signal(proc.pid, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
             raise
         finally:
             os.close(wr)
@@ -2933,30 +2972,31 @@ class SandboxedShell:
             # this group and kills it, or this sees `_closed` and kills it here.
             closed = self._closed
             if not closed:
-                self._groups[proc.pid] = proc
+                self._groups[proc.pid] = leader
         if closed:
-            self._kill_group(proc.pid, proc)
+            if not self._kill_group(proc.pid, leader):
+                with self._lock:
+                    self._groups[proc.pid] = leader   # kept for close() to report, never dropped
+                self._note_leftovers()
             out.abandon()
             carry.stop()
             raise ConfinementError("shell is closed")
-        self._proc = proc
-        return proc, out, carry
+        self._leader = leader
+        return leader, out, carry
 
-    def _kill_group(self, pgid: int, proc: subprocess.Popen[bytes]) -> bool:
-        """SIGTERM the group, give it ``_KILL_GRACE``, SIGKILL what is left, reap ``proc``, and wait
-        for the group to empty. False when it did not empty: the caller must not report it killed."""
+    def _kill_group(self, pgid: int, leader: _Leader) -> bool:
+        """SIGTERM the group, give it ``_KILL_GRACE``, SIGKILL what is left, and wait for the group
+        to empty; then reap its leader. False when it did not empty: the leader stays unreaped (the
+        number stays this group's) and the caller must not report it killed."""
         self._signal(pgid, signal.SIGTERM)
-        try:
-            proc.wait(timeout=_KILL_GRACE)
-        except subprocess.TimeoutExpired:
-            pass
+        leader.wait(_KILL_GRACE)
         if not _group_gone(pgid, timeout=0.2):
             self._signal(pgid, signal.SIGKILL)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        return _group_gone(pgid, timeout=5.0) and proc.poll() is not None
+        leader.wait(5.0)
+        if leader.exited and _group_gone(pgid, timeout=5.0):
+            leader.reap()
+            return True
+        return False
 
     @staticmethod
     def _signal(pgid: int, sig: int) -> None:
@@ -2966,9 +3006,12 @@ class SandboxedShell:
             pass
 
     def _prune_groups(self) -> None:
+        """Reap the leader of each group that has emptied, and forget the group. Only then may its
+        number be reused, and it is no longer signalled."""
         with self._lock:
-            for pgid, proc in list(self._groups.items()):
-                if proc.poll() is not None and _group_gone(pgid, timeout=0):
+            for pgid, leader in list(self._groups.items()):
+                if leader.wait(0) and not _group_live(pgid):
+                    leader.reap()
                     del self._groups[pgid]
 
     def _keep_late(self, out: _Output) -> None:
@@ -2997,19 +3040,17 @@ class SandboxedShell:
 
     def _execute(self, command: str, deadline_s: float) -> ShellResult:
         data = self._input(command)
-        proc, out, carry = self._spawn()
-        pgid = proc.pid
+        leader, out, carry = self._spawn()
+        pgid = leader.pid
         timed_out = False
         try:
             # bash waits on its stdin until the input arrives, so a refusal here (the claim could not
             # be recorded) stops the command before any of it runs.
             self._after_spawn(pgid)
             carry.send(data)
-            try:
-                proc.wait(timeout=deadline_s)
-            except subprocess.TimeoutExpired:
+            if not leader.wait(deadline_s):
                 timed_out = True
-                if not self._kill_group(pgid, proc):
+                if not self._kill_group(pgid, leader):
                     # The signals did not land (sudo refused or stalled, say): the command may still
                     # be running, so it is not reported as killed, and the shell is closed (S2 L1b
                     # MED-2, L2b L4).
@@ -3022,13 +3063,13 @@ class SandboxedShell:
                         f"(process group {pgid})."
                     )
         except BaseException:
-            self._kill_group(pgid, proc)
+            self._kill_group(pgid, leader)
             carry.stop()
             if not out.eof.wait(_DRAIN_GRACE):
                 out.abandon()   # a survivor holding the pipe must not keep the reader (S2 L3 r1)
             raise
         finally:
-            self._proc = None
+            self._leader = None
         until = time.monotonic() + _DRAIN_GRACE
         carry.done.wait(_DRAIN_GRACE)
         out.eof.wait(max(0.0, until - time.monotonic()))
@@ -3043,7 +3084,18 @@ class SandboxedShell:
             self._keep_late(out)
         if timed_out:
             return ShellResult(output=text, exit_code=None, timed_out=True)
-        rc = proc.returncode
+        rc = leader.status
+        if rc is None:
+            # The leader exited before its watch was set up (its driver failed before the input was
+            # sent), so its status comes from reaping it: the group is stopped and emptied first.
+            if not self._kill_group(pgid, leader):
+                self.close()
+                raise ConfinementError(
+                    "the shell's driver exited at once and levain could not stop what it left "
+                    f"running (process group {pgid}). The shell was closed."
+                )
+            rc = leader.status
+        self._prune_groups()
         if rc is not None and rc < 0:
             return ShellResult(output=text, exit_code=None, signal=-rc)
         frame = carry.frame
@@ -3082,43 +3134,82 @@ class SandboxedShell:
     def interrupt(self) -> None:
         """Best-effort SIGINT to the running command's process GROUP (Ctrl-C it and its children).
         Never raises."""
-        proc = self._proc
-        if proc is not None and proc.poll() is None:
-            self._signal(proc.pid, signal.SIGINT)
+        leader = self._leader
+        if leader is not None and not leader.exited:
+            self._signal(leader.pid, signal.SIGINT)
 
     def close(self) -> None:
-        """Kill every process group this shell started (SIGTERM, then SIGKILL), reap, and wait for
-        the groups to empty. Idempotent, never raises."""
+        """Kill every process group this shell started (SIGTERM, then SIGKILL), wait for each to
+        empty, and reap its leader. A group that does not empty is KEPT, leader unreaped, and named
+        by :attr:`unemptied_groups`; calling close() again retries it. Never raises."""
         self._closed = True
-        # Prune first: a group that emptied after its command was reaped may have had its number
-        # reused by an unrelated process group, which must not be signalled.
+        # Reap what already emptied: those are not signalled.
         self._prune_groups()
         with self._lock:
             groups = list(self._groups.items())
-            self._groups.clear()
             late, self._late = self._late, []
         for out in late:
             out.abandon()
+        # Each leader is still unreaped, so each number is still this shell's group (see `_Leader`).
         for pgid, _ in groups:
             self._signal(pgid, signal.SIGTERM)
         deadline = time.monotonic() + _KILL_GRACE
-        for pgid, proc in groups:
+        for pgid, _ in groups:
             if not _group_gone(pgid, timeout=max(0.0, deadline - time.monotonic())):
                 self._signal(pgid, signal.SIGKILL)
-        for pgid, proc in groups:
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            if not _group_gone(pgid, timeout=5.0):
-                # close() never raises; a group it could not empty is said, not hidden (S2 L3 r1).
+        for pgid, leader in groups:
+            leader.wait(5.0)
+            if leader.exited and _group_gone(pgid, timeout=5.0):
+                leader.reap()
+                with self._lock:
+                    self._groups.pop(pgid, None)
+            else:
+                # close() never raises; a group it could not empty is said, not hidden, and the
+                # session keeps the workspace lock while it lives (S2 L3 r2, codex HIGH).
                 _log.warning("levain: the shell's process group %d is still running after close()", pgid)
+        self._note_leftovers()
+
+    @property
+    def unemptied_groups(self) -> tuple[int, ...]:
+        """After :meth:`close`: the process groups it could not empty (their leaders still held)."""
+        with self._lock:
+            return tuple(sorted(self._groups)) if self._closed else ()
+
+    @property
+    def hands_user(self) -> str | None:
+        """The account this shell's commands run as, when it is not levain's own."""
+        return None
+
+    def _note_leftovers(self) -> None:
+        with _UNEMPTIED_LOCK:
+            if self.unemptied_groups:
+                _UNEMPTIED_SHELLS.add(self)
+            else:
+                _UNEMPTIED_SHELLS.discard(self)
 
     def __enter__(self) -> "SandboxedShell":
         return self.start()
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+# Closed shells holding a group they could not empty, kept (strongly: each holds its groups' unreaped
+# leaders) until a retry empties them. A session asks before it lets go of its workspace lock.
+_UNEMPTIED_SHELLS: "set[SandboxedShell]" = set()
+_UNEMPTIED_LOCK = threading.Lock()
+
+
+def unemptied_shell_groups(hands_user: str) -> list[int]:
+    """Process groups of closed shells running as ``hands_user`` that are still not empty, after one
+    more close() of each (which kills and reaps what it can now)."""
+    with _UNEMPTIED_LOCK:
+        shells = [s for s in _UNEMPTIED_SHELLS if s.hands_user == hands_user]
+    left: list[int] = []
+    for s in shells:
+        s.close()
+        left += s.unemptied_groups
+    return left
 
 
 # --- the provider seam (mirrors levain.daemon.DaemonProvider) --------------------------------
@@ -3633,6 +3724,8 @@ class HandsFileRefused(PermissionError):
 
 # The largest file the editor reads through the hands helper.
 _HANDS_READ_LIMIT = 64 * 1024 * 1024
+# The most entries the editor lists in one directory (the helper reads no further than one past it).
+_HANDS_LIST_MAX = 100_000
 HANDS_ZSH = "/bin/zsh"
 
 # The file editor's hands for an entity whose bash runs as its own user: ONE fixed zsh program, run as
@@ -3666,7 +3759,7 @@ HANDS_ZSH = "/bin/zsh"
 _HANDS_FILE_HELPER = r"""emulate -R zsh
 zmodload zsh/system zsh/stat 2>/dev/null || { print -ru2 -- 'zsh modules are unavailable'; exit 70 }
 refuse() { print -rnu2 -- "$1"; exit 3 }
-op=$1 ws=$2 p=$3 lim=$4 wsid=$5
+op=$1 ws=$2 p=$3 lim=$4 wsid=$5 cap=$6
 [[ $ws == /* && $p == /* ]] || refuse "not an absolute path: $p"
 [[ -L $ws ]] && refuse "the workspace $ws is a symlink"
 zstat -L -H st -- $ws 2>/dev/null || refuse "the workspace $ws is gone"
@@ -3721,22 +3814,27 @@ case $op in
     [[ -n $n ]] && enter $n x $3
     [[ -r . && -x . ]] || refuse "cannot list $3: permission denied"
     setopt null_glob glob_dots
+    # (Y): the glob stops reading the directory after cap+1 matches, so a huge one costs no more.
+    es=( ./*(Y$(( cap + 1 ))) )
+    (( $#es > cap )) && refuse "$3 has more than $cap entries; not listed"
     {
-      for e in ./*; do
+      for e in ${(o)es}; do
         kind $e
         print -rn -- "$REPLY"$'\0'"${e:t}"$'\0'
         if [[ $REPLY == d && ${e:t} != .* ]]; then
           (
             builtin cd -q -- $e 2>/dev/null && inside || exit 0
-            for c in ./*; do
-              [[ ${c:t} == .* ]] && continue
+            cs=( ./[^.]*(Y$(( cap + 1 ))) )
+            (( $#cs > cap )) && refuse "$3/${e:t} has more than $cap entries; not listed"
+            for c in ${(o)cs}; do
               kind $c
               print -rn -- "$REPLY"$'\0'"${e:t}/${c:t}"$'\0'
             done
-          )
+          ) || exit $?
         fi
       done
     } | /usr/bin/head -c $(( lim + 1 ))
+    if (( pipestatus[1] == 3 )); then exit 3; fi
     ;;
   write)
     [[ -n $n ]] || refuse "$3 is a directory"
@@ -3760,7 +3858,7 @@ _HANDS_FILE_OPS = ("read", "stat", "list", "write")
 def _hands_file_argv(profile_text: str, hands: HandsIdentity, op: str, path: str, ws_id: str) -> list[str]:
     return [*hands_prefix(hands), SANDBOX_EXEC, "-p", profile_text,
             HANDS_ZSH, "-f", "-c", _HANDS_FILE_HELPER, "zsh", op, str(hands.workspace), path,
-            str(_HANDS_READ_LIMIT), ws_id]
+            str(_HANDS_READ_LIMIT), ws_id, str(_HANDS_LIST_MAX)]
 
 
 def _workspace_id(hands: HandsIdentity) -> str:
@@ -3883,6 +3981,10 @@ class _HandsSeatbeltShell(_SeatbeltShell):
                  default_timeout: float = 120.0) -> None:
         super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
         self.hands = hands
+
+    @property
+    def hands_user(self) -> str | None:
+        return self.hands.user
 
     def _signal(self, pgid: int, sig: int) -> None:   # type: ignore[override]
         # The group's members run as the hands user, except sudo, the group leader, whose REAL uid is
@@ -5644,19 +5746,156 @@ def _bash_gone(pid: int, start: str, *, timeout: float) -> bool:
     return True
 
 
-def _group_gone(pgid: int, *, timeout: float) -> bool:
-    """True once no process is left in process group ``pgid`` (polled until ``timeout``)."""
-    deadline = time.monotonic() + timeout
-    while True:
+def _group_live(pgid: int) -> bool:
+    """Whether process group ``pgid`` has a member that is not a zombie. The shell keeps each group's
+    leader unreaped while its group lives (:class:`_Leader`), so a zombie must not count."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass   # a zombie (macOS answers EPERM for one, measured), or a member of another uid
+    else:
+        if platform.system() == "Darwin":
+            return True   # macOS signals no zombie, so a success is a live member (measured)
+    if platform.system() == "Linux":
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                f = Path(f"/proc/{d}/stat").read_text().rsplit(")", 1)[-1].split()
+            except OSError:
+                continue
+            if len(f) > 2 and f[2] == str(pgid) and f[0] not in ("Z", "X", "x"):
+                return True
+        # Nothing live is visible. A member of another uid hidden by /proc's hidepid still answers
+        # EPERM, and is not called gone.
         try:
             os.killpg(pgid, 0)
-        except ProcessLookupError:
-            return True
         except PermissionError:
-            pass   # a member exists that this user may not signal: not gone
+            return True
+        except OSError:
+            pass
+        return False
+    # macOS (and other BSDs): pgrep lists no zombie (measured), and lists every user's processes.
+    from levain.launch import child_env
+
+    try:
+        r = subprocess.run(["/usr/bin/pgrep", "-g", str(int(pgid))], capture_output=True,
+                           stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return True   # cannot tell: not gone
+    return r.returncode != 1
+
+
+def _group_gone(pgid: int, *, timeout: float) -> bool:
+    """True once no live process is left in process group ``pgid`` (polled until ``timeout``)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if not _group_live(pgid):
+            return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.05)
+
+
+_NOTE_EXITSTATUS = 0x04000000   # <sys/event.h>: NOTE_EXIT's data carries the wait status
+
+
+class _Leader:
+    """A command's driver process, the leader of its process group, watched WITHOUT being reaped.
+
+    A pid is not reused until its process is reaped, and a process group's id is its leader's pid
+    (POSIX.1-2024 Base Definitions 4.17), so while the leader stays an unreaped zombie no new process
+    group can take its number and a signal to it can reach only this command's processes. The shell
+    reaps the leader only once its group has no live member (S2 L3 r2, codex HIGH: a background job's
+    group was kept by number after its leader was reaped, and could be recycled under a later kill).
+
+    The exit status is read without reaping: ``waitid(WNOWAIT)`` where Python has it (Linux; CPython
+    leaves it out on macOS), else a kqueue ``NOTE_EXIT | NOTE_EXITSTATUS`` registered right after the
+    spawn. A leader that exited before that registration (its driver failed before the command's input
+    was sent) has its status read when it is reaped."""
+
+    def __init__(self, proc: subprocess.Popen[bytes]) -> None:
+        self.proc = proc
+        self.pid = proc.pid
+        self.status: int | None = None   # Popen.returncode-style, once seen exited
+        self.exited = False
+        self.reaped = False
+        self._kq: Any = None
+        self._pidfd: int | None = None
+        if hasattr(os, "waitid"):
+            try:
+                self._pidfd = os.pidfd_open(self.pid)   # type: ignore[attr-defined]
+            except (AttributeError, OSError):
+                self._pidfd = None
+            return
+        kq = select.kqueue()
+        ev = select.kevent(self.pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD,
+                           fflags=select.KQ_NOTE_EXIT | _NOTE_EXITSTATUS)
+        try:
+            got = kq.control([ev], 1, 0)
+        except OSError:
+            got = None   # ESRCH: it has already exited
+        if got is None or any(e.flags & select.KQ_EV_ERROR for e in got):
+            kq.close()
+            self.exited = True
+            return
+        self._kq = kq
+        self._take(got)
+
+    def _take(self, events: list[Any]) -> None:
+        for e in events:
+            if e.filter == select.KQ_FILTER_PROC and e.fflags & select.KQ_NOTE_EXIT:
+                self.exited = True
+                self.status = os.waitstatus_to_exitcode(e.data)
+
+    def wait(self, timeout: float) -> bool:
+        """True once the leader has exited (it stays unreaped), polled up to ``timeout`` seconds."""
+        if self.exited:
+            return True
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            left = max(0.0, deadline - time.monotonic())
+            if self._kq is not None:
+                self._take(self._kq.control(None, 1, left))
+            else:
+                r = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)  # type: ignore[attr-defined]
+                if r is not None and r.si_pid == self.pid:
+                    self.exited = True
+                    self.status = (r.si_status if r.si_code == os.CLD_EXITED  # type: ignore[attr-defined]
+                                   else -r.si_status)
+                elif left > 0:
+                    if self._pidfd is not None:
+                        select.select([self._pidfd], [], [], left)
+                    else:
+                        time.sleep(min(left, 0.01))
+                    continue
+            if self.exited or left <= 0:
+                return self.exited
+            # kqueue returned without the exit within `left`: loop to recheck the deadline
+
+    def reap(self) -> None:
+        """Reap the leader (only once its group has no live member) and free the watch."""
+        if self.reaped:
+            return
+        self.proc.wait()
+        self.reaped = True
+        self.exited = True
+        if self.status is None:
+            self.status = self.proc.returncode
+        self._release()
+
+    def _release(self) -> None:
+        if self._kq is not None:
+            self._kq.close()
+            self._kq = None
+        if self._pidfd is not None:
+            try:
+                os.close(self._pidfd)
+            except OSError:
+                pass
+            self._pidfd = None
 
 
 class _BwrapShell(SandboxedShell):

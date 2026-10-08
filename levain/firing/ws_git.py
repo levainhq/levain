@@ -296,6 +296,30 @@ def hold_session_lock(entity_dir: Path | str, *, wait: float = 10.0) -> int:
             raise
 
 
+HANDS_SESSION_LOCK = "hands-session.lock"
+
+
+def hold_hands_session(entity_dir: Path | str) -> int:
+    """Take this entity's one-session lock, exclusive, for a session whose bash runs as the hands
+    user; returns the fd, closed when the session ends. A second such session is refused at once: the
+    session's end stops every process of the hands user (a command can leave its process group with
+    ``setsid``), which is only safe while one session owns that user."""
+    import fcntl
+
+    fd = os.open(Path(entity_dir) / ".levain" / HANDS_SESSION_LOCK,
+                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise WsGitError("another session of this entity is running as its own user; one runs at a "
+                         "time (start this one when it ends)") from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 class _exclusive:
     """ws-git / ws-adopt: the hands lock, exclusive, for the whole run, or a refusal at once."""
 
