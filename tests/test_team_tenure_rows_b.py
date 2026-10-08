@@ -745,15 +745,21 @@ def test_t46_a_pinned_clone_whose_strict_ledger_is_deleted_beside_a_legacy_one_l
 
 
 def test_the_merge_parent_is_always_named_never_defaulted(two, keys):
-    """RUN (docs L3 r1): `accept-merge` without `--parent`, and `join --accept-merge SHA` without `:N`, are refused:
-    which parent to follow is the owner's trust decision. Both silently followed parent 1 on de2a4de."""
+    """RUN (docs L3 r1): over a REAL ledger merge, `accept-merge M` without `--parent` and `join --accept-merge M`
+    without `:N` are refused: which parent to follow is the owner's trust decision. On de2a4de both silently followed
+    parent 1 and succeeded."""
     tmp, ana, ben = two
-    head = sh("git", "rev-parse", "HEAD", cwd=ana).strip()
+    p = _side(tmp)
+    _line(p, "ana", "ana: only on the side", keys["ana"])
+    assert ruling(ana, "src/a.py", "ana: published") == 0
+    merge = _merge_side_onto_published(p)
+    gl(ana).sync(push=False)
+    assert _fresh(ana).judged == "partial"
     try:
-        rc = team("accept-merge", head, repo=ana)
+        rc = team("accept-merge", merge, repo=ana)
     except SystemExit as exc:      # argparse refuses a missing required option before levain runs
         rc = exc.code
-    assert rc == 2
+    assert rc == 2 and _fresh(ana).judged == "partial"
     c = clone(tmp, "cy", "cy@ex.com")
-    assert team("join", "--accept-merge", head, "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
+    assert team("join", "--accept-merge", merge, "--signing-key", str(keys["cy"]), "--no-install", repo=c) == 2
     assert not gl(c).state().get("pinned_root")
