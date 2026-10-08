@@ -579,8 +579,8 @@ def test_torn_last_line_does_not_swallow_the_next_record(two):
     gl.file_for("ana").parent.mkdir(parents=True, exist_ok=True)
     with open(gl.file_for("ana"), "a") as fh:   # ana has no file yet; a crash left a torn fragment
         fh.write('{"v":1,"id":"ana-2026')
-    git("add", ".", cwd=gl.wt)
-    signed_commit(gl.wt, "torn", "ana")
+    # left uncommitted, as a crash leaves it: the next write's recovery commits it through levain (signed, with this
+    # device's trailer). A hand commit here would be another writer's commit to sync (T36), never replayed by it.
     assert record_ruling(ana, "src/t.py", "t stays") == 0
     assert "t stays" in [e.get("words") for e in gl.ledger().in_force]
 
