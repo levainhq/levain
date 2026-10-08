@@ -22,7 +22,7 @@ run; an effect's id is its position in the run (``link-<i>``); a hold's id is de
 run and effect it guards (:func:`hold_id_for`), so proposing the same effect again finds the same
 hold instead of opening a second one.
 
-Four properties, each one a run that fails without it:
+Five properties, each one a run that fails without it:
 
   - **hold-until-decided** — while a hold is open on a binding (undecided, and its run neither
     cancelled nor fenced: a dead run's hold can never fire, so it stops nothing), no effect of that binding runs
@@ -33,7 +33,11 @@ Four properties, each one a run that fails without it:
   - **dedup-on-replay** — an effect with a recorded result is never executed again; the record is
     returned instead;
   - **fence-on-cancel** — a fence on a binding (a pause, a revoke, a demotion) stops every run
-    admitted under an older governance generation at its next effect.
+    admitted under an older governance generation at its next effect;
+  - **fence-on-reclassify** — an effect is admitted only under the risk-catalog revision its rung was
+    decided at. A change to risk classification commits by bumping that revision
+    (:meth:`RunJournal.revise_risk`); an effect decided before the bump and admitted after it is not run
+    at the rung decided under the old classification: the caller decides it again.
 
 And one rule that is not a property but follows from "at most once": an effect whose intent was
 recorded and whose result was not (the process died mid-call, or the call raised) has an UNKNOWN
@@ -96,6 +100,7 @@ class EffectStatus(str, enum.Enum):
     FENCED = "fenced"        # the binding was fenced past this run's generation; ``fn`` NOT called
     BARRED = "barred"        # the registry no longer grants this run (corrupt, absent, not fireable)
     CANCELLED = "cancelled"  # the run was cancelled (a rejected hold); ``fn`` NOT called
+    STALE = "stale"          # the risk catalog was revised since the rung was decided; ``fn`` NOT called
 
 
 @dataclass(frozen=True)
@@ -353,6 +358,41 @@ class RunJournal:
             conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)", (run_id, reason))
             return None
 
+    # --- the risk-catalog revision (the fence on classification) -------------------------------
+    @staticmethod
+    def _risk_revision_in(conn: sqlite3.Connection) -> int:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'risk_revision'").fetchone()
+        return int(row[0]) if row else 0
+
+    def risk_revision(self) -> int:
+        """The current risk-catalog revision (0 if classification was never revised here). A caller
+        reads it BEFORE it derives a risk, and passes it to :meth:`effect` as the revision its rung was
+        decided under."""
+        with self._read() as conn:
+            return self._risk_revision_in(conn)
+
+    def revise_risk(self, apply: Callable[[], Any] | None = None) -> int:
+        """Commit a change to risk classification: run ``apply`` (the edit to whatever the binding risk
+        resolver or the manifest reads) and bump the revision, in one write transaction, so no effect is
+        admitted while the change is half made. The bump is the change's commit point: an effect whose
+        rung was decided under an earlier revision is not admitted after it (STALE). The bump commits even
+        if ``apply`` raises (a half-made change still makes earlier decisions stale), and the error is
+        raised after it. ``apply`` must not write this store. Returns the new revision, which never
+        decreases. A change to classification made any other way is not fenced."""
+        failed: BaseException | None = None
+        with self._write() as conn:
+            if apply is not None:
+                try:
+                    apply()
+                except BaseException as e:  # noqa: BLE001 — re-raised once the bump is committed
+                    failed = e
+            revision = self._risk_revision_in(conn) + 1
+            conn.execute("INSERT INTO meta (key, value) VALUES ('risk_revision', ?) ON CONFLICT(key) "
+                         "DO UPDATE SET value = excluded.value", (str(revision),))
+        if failed is not None:
+            raise failed
+        return revision
+
     # --- effects ---------------------------------------------------------------------------
     def _barrier(self, conn: sqlite3.Connection, run_id: str, effect_id: str,
                  digest: str | None) -> EffectOutcome | None:
@@ -458,20 +498,26 @@ class RunJournal:
                  json.dumps(chain, sort_keys=True) if chain is not None else None, 1 if chained else 0))
             return EffectOutcome(EffectStatus.HELD, hold_id=hold_id, new_hold=True)
 
-    def effect(self, run_id: str, effect_id: str, *, digest: str,
+    def effect(self, run_id: str, effect_id: str, *, digest: str, risk_revision: int,
                fn: Callable[[], Any], needs_decision: bool = False) -> EffectOutcome:
         """Run one effect at most once.
 
         ``digest`` identifies exactly what the effect will do (the bytes a person approves). It is
         recorded with the intent and with any hold, and a decision must echo it.
+        ``risk_revision`` is the risk-catalog revision (:meth:`risk_revision`) read before the rung this
+        effect runs at was derived. If the catalog has been revised since, the effect is STALE: nothing
+        runs or is recorded, and the caller decides it again.
         ``needs_decision`` is the gate's verdict for this effect: True means the effect runs only
         under an APPROVED hold of its own (one is opened if there is none). An effect with no
         approved hold of its own is HELD while any hold on its binding is open."""
+        if isinstance(risk_revision, bool) or not isinstance(risk_revision, int):
+            raise TypeError("risk_revision must be an int")
         hold_id = hold_id_for(run_id, effect_id)
         taken: list[int] = []   # the lease, once taken: released here if the admission does not commit
         try:
             with self._write() as conn:
-                admitted = self._admit_in(conn, run_id, effect_id, hold_id, digest, needs_decision, taken)
+                admitted = self._admit_in(conn, run_id, effect_id, hold_id, digest, needs_decision, taken,
+                                          risk_revision)
         except BaseException:
             for fd in taken:
                 self._drop_lease(run_id, effect_id, fd)
@@ -481,7 +527,7 @@ class RunJournal:
         return self._run_effect(run_id, effect_id, fn, admitted)
 
     def _admit_in(self, conn: sqlite3.Connection, run_id: str, effect_id: str, hold_id: str, digest: str,
-                  needs_decision: bool, taken: list[int]) -> EffectOutcome | int:
+                  needs_decision: bool, taken: list[int], risk_revision: int) -> EffectOutcome | int:
         """The admission of an effect, in the caller's transaction: the barrier, the hold rules, and
         the intent (the lease is taken just before it and appended to ``taken``). Returns the outcome
         that stops the effect, or the lease fd."""
@@ -513,6 +559,10 @@ class RunJournal:
             conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)",
                          (run_id, "digest_changed"))
             return EffectOutcome(EffectStatus.CANCELLED)
+        if self._risk_revision_in(conn) > risk_revision:
+            # classification changed after this effect's rung was decided: that rung is not the one the
+            # catalog gives now, so nothing is admitted or recorded until it is decided again
+            return EffectOutcome(EffectStatus.STALE)
         lease = self._take_lease(run_id, effect_id)   # before the intent commits: see "leases"
         taken.append(lease)
         conn.execute("INSERT INTO effects (run_id, effect_id, digest, pid, state) "

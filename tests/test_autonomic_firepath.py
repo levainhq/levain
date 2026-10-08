@@ -53,6 +53,7 @@ HIGH_EXTERNAL = ActionRisk(cls=RiskClass.HIGH, reversible=False, external=True, 
 
 @dataclass
 class RecordingExecutor:
+    confined = True   # a test double: declares the floor a real binding executor runs under
     name: str = "recording"
     ok: bool = True
     calls: list = field(default_factory=list)
@@ -116,6 +117,7 @@ def _fire_request(gate, *, risk=LOW_INTERNAL, ratified=None, kill_predicates=(),
         overall_confidence=confidence, directive_confidence=confidence,
         risk=risk, ratified_posture=ratified, kill_predicates=kill_predicates,
         trigger_event=trigger_event, predicted_trajectory=predicted_trajectory,
+        risk_revision=gate.journal.risk_revision(),
     )
 
 

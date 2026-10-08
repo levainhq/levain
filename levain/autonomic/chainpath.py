@@ -109,8 +109,8 @@ __all__ = [
 _log = logging.getLogger("levain.autonomic.chainpath")
 
 # Gate refusals of a journaled link's resolve that RECORD NOTHING: the hold is still open, so the chain
-# is still paused at that link (a typed proof or a person may still come).
-_STILL_OPEN = frozenset({"unattended_approval_not_allowed", "elevated_requires_typed_proof",
+# is still paused at that link (a signed approval or a person may still come).
+_STILL_OPEN = frozenset({"unattended_approval_not_allowed", "confirm:not_signed_by_an_enrolled_key",
                          "run_not_admitted", "journal:barred"})
 
 
@@ -630,9 +630,13 @@ class ChainExecutor:
             completed=ctx.completed, paused_at_link=i, paused_payload=base.payload,
             pending_id=hold_id_for(run.run_id, run.effect_id),
         ).to_dict()
+        journal = self._gate.journal
+        assert journal is not None   # checked at construction
+        revision = journal.risk_revision()   # before the risk is derived: the journal fences on it
         request = dataclasses.replace(
             base,
             risk=self._link_risk(binding, i),
+            risk_revision=revision,
             trust=self._trust_resolver(binding, i),
             authority=binding_invocation(binding, hops=i),
             kill_predicates=_kill_predicates(binding),

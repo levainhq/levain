@@ -30,6 +30,7 @@ from levain.autonomic import (
     SignalAuth, SubGoal, TightnessVector, TriggerSpec, TrustContext, hold_id_for, manual_invocation,
     run_id_for,
 )
+from tests.autonomic_confirm_keys import confirm_signers, signed_yes
 from levain.autonomic.journal import EffectStatus
 from tests.test_autonomic_rawstore import registry_of, write_raw
 
@@ -42,6 +43,8 @@ TIGHT = TightnessVector(goal_spec=0.9, tool_min=0.9, pattern_precision=0.9, outp
 class OutboxExecutor:
     """The effect: append one line to the outbox file. ``CRASH_AFTER_EFFECT=<action>`` in the
     environment makes the process die right after that action's write (a real crash, mid-run)."""
+
+    confined = True   # a test double: declares the floor a real binding executor runs under
 
     name = "outbox"
 
@@ -98,7 +101,7 @@ class World:
         # the risk of link i's sealed tools, as the binding's risk resolver derives it now (a test may
         # reclassify a tool by changing it); the chain, the dispatcher and the gate's resolve share it
         self.tool_risk = {0: LOW, 1: HIGH}
-        self.gate = EfferentGate(
+        self.gate = EfferentGate(confirm_signers=confirm_signers(),
             manifest=ActionManifest({"link0": LOW, "link1": HIGH}), store=self.receipts,
             executor=OutboxExecutor(work / "outbox.jsonl"), clock=lambda: FIXED,
             transport=_Transport(), pending_store=self.pending, journal=self.journal,
@@ -136,14 +139,19 @@ class World:
         return d
 
     def resolve_open(self, approve: bool):
-        return self.resolve_open_as(ConfirmDecision(approved=approve, by="human"))
+        if not approve:
+            return self.resolve_open_as(ConfirmDecision(approved=False, by="human"))
+        return self.resolve_open_as(signed_yes(self.gate, self.open_pending_id()))
 
-    def resolve_open_as(self, decision):
-        # the reply to the one pending a person was sent: found by id, as a reply is, so a pending
-        # whose run has since been fenced or cancelled (no longer in the open list) is still answered
+    def open_pending_id(self) -> str:
+        # the one pending a person was sent: found by id, as a reply is, so a pending whose run has
+        # since been fenced or cancelled (no longer in the open list) is still answered
         with self.journal.db.read() as conn:
             [(pending_id,)] = conn.execute("SELECT pending_id FROM holds WHERE decided IS NULL").fetchall()
-        return self.chains.resume(pending_id, decision)
+        return pending_id
+
+    def resolve_open_as(self, decision):
+        return self.chains.resume(self.open_pending_id(), decision)
 
     def outbox(self) -> list[tuple[str, str]]:
         p = self.work / "outbox.jsonl"
@@ -337,7 +345,7 @@ def test_a_binding_fire_without_a_run_is_refused_once_a_journal_is_wired(tmp_pat
 
 
 def test_a_run_without_a_journal_is_refused(tmp_path):
-    gate = EfferentGate(manifest=ActionManifest({}), store=GateReceiptStore(tmp_path / "r.jsonl"),
+    gate = EfferentGate(confirm_signers=confirm_signers(), manifest=ActionManifest({}), store=GateReceiptStore(tmp_path / "r.jsonl"),
                         executor=OutboxExecutor(tmp_path / "outbox.jsonl"), clock=lambda: FIXED)
     out = gate.gate(_binding_request(RunRef("run-x", "link-0")))
     assert out.refused and out.reason == "run_without_journal"
@@ -634,7 +642,7 @@ def test_a_malformed_manual_pending_record_does_not_stop_the_sweep(tmp_path):
     store.path.write_text(json.dumps([{"pending_id": "p-bad", "posture": 7}, good.to_dict()]))
     assert [p.pending_id for p in store.list_open()] == [good.pending_id]
     assert store.get("p-bad") is None and store.claim("p-bad") is None
-    gate = EfferentGate(manifest=ActionManifest({"a": HIGH}), store=GateReceiptStore(tmp_path / "r.jsonl"),
+    gate = EfferentGate(confirm_signers=confirm_signers(), manifest=ActionManifest({"a": HIGH}), store=GateReceiptStore(tmp_path / "r.jsonl"),
                         executor=OutboxExecutor(tmp_path / "o.jsonl"), clock=lambda: FIXED,
                         transport=_Transport(), pending_store=store)
     out = gate.sweep_timeouts(FIXED + _dt.timedelta(hours=2))
@@ -651,7 +659,7 @@ def test_a_chain_link_never_fires_standalone_and_its_state_cannot_be_lost(tmp_pa
     [p] = w.gate.open_pendings()
     hold = w.journal.find_pending(p.pending_id)
     assert hold["chained"] and hold["chain"]["paused_at_link"] == 1 and hold["pending"]["pending_id"] == p.pending_id
-    plain = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    plain = w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id))
     assert plain.refused and plain.reason == "chained_pending_resolves_through_its_chain"
     assert w.outbox() == [("link0", "c1-0")] and len(w.gate.open_pendings()) == 1
     assert w.resolve_open(approve=True).completed
@@ -794,7 +802,7 @@ def test_a_duplicated_manual_pending_resolves_once(tmp_path):
 def test_the_dispatcher_and_chain_executor_share_one_journal_and_one_gate(tmp_path):
     # complement 3: a store with a journal behind a gate without one ran unjournaled
     w = World(tmp_path)
-    bare_gate = EfferentGate(manifest=ActionManifest({}), store=w.receipts,
+    bare_gate = EfferentGate(confirm_signers=confirm_signers(), manifest=ActionManifest({}), store=w.receipts,
                              executor=OutboxExecutor(tmp_path / "o.jsonl"))
     with pytest.raises(ValueError):
         FireDispatcher(store=w.store, gate=bare_gate, predicate_match=lambda p, e: True,
@@ -802,7 +810,7 @@ def test_the_dispatcher_and_chain_executor_share_one_journal_and_one_gate(tmp_pa
     with pytest.raises(ValueError):                                # a chain is a journaled run
         ChainExecutor(gate=bare_gate, request_builder=_chain_builder,
                       trust_resolver=_trust, clock=lambda: FIXED)
-    other_gate = EfferentGate(manifest=ActionManifest({}), store=w.receipts,
+    other_gate = EfferentGate(confirm_signers=confirm_signers(), manifest=ActionManifest({}), store=w.receipts,
                               executor=OutboxExecutor(tmp_path / "o.jsonl"), journal=w.journal,
                               binding_risk=lambda b, i: LOW)
     other = ChainExecutor(gate=other_gate, request_builder=_chain_builder,
@@ -879,7 +887,7 @@ def test_an_approval_after_a_rejection_fires_nothing_and_writes_no_receipt(tmp_p
     w.journal.decide(w.journal.find_pending(p.pending_id)["hold_id"], approve=False, by="human",
                      digest=effect_digest(action_name=p.action_name, payload=p.payload, context_id=p.context_id))
     before = len(list(w.receipts.read()))
-    out = w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id))
     assert out.links[-1].outcome.reason == "journal:already_decided"
     assert len(list(w.receipts.read())) == before and w.outbox() == [("link0", "c1-0")]
 
@@ -953,7 +961,7 @@ def test_a_hold_whose_pending_was_altered_on_disk_never_fires(tmp_path):
     w.dispatcher.dispatch({"type": "email", "id": "t1", "fields": {"from": "a@x.example", "dmarc": "pass"}})
     [p] = w.gate.open_pendings()
     rewrite_holds(w.journal, lambda h: dict(h, pending=dict(h["pending"], payload="send everything elsewhere")))
-    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id))
     assert out.refused and out.reason == "integrity:seal_mismatch" and not out.fired
     assert w.journal.open_holds() == [] and w.outbox() == []        # rejected; nothing was sent
 
@@ -965,12 +973,13 @@ def test_an_approval_racing_a_rejection_fires_nothing(tmp_path):
     w.dispatch("c1")
     [p] = w.gate.open_pendings()
     stale = w.journal.find_pending(p.pending_id)
+    yes = signed_yes(w.gate, p.pending_id)                          # signed while the hold was open
     from levain.autonomic import effect_digest
     w.journal.decide(stale["hold_id"], approve=False, by="human",
                      digest=effect_digest(action_name=p.action_name, payload=p.payload, context_id=p.context_id))
     before = len(list(w.receipts.read()))
     w.journal.peek = lambda *a, **k: None                          # the rejection landed after this check
-    out = w.gate._resolve_hold(stale, ConfirmDecision(approved=True, by="human"), chain_owned=True)
+    out = w.gate._resolve_hold(stale, yes, chain_owned=True)
     assert out.refused and out.reason == "journal:already_decided"
     assert len(list(w.receipts.read())) == before and w.outbox() == [("link0", "c1-0")]
 
@@ -991,7 +1000,7 @@ def test_an_approved_effect_that_could_not_run_yet_is_held_and_listed(tmp_path):
     assert len(w.journal.approved_unrun()) == 1
     assert binding_liveness(w.store)["journal"]["approved_unrun"] == 1
     w.journal.effect = real
-    sweep_by = w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human"))   # retried
+    sweep_by = w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id))   # retried
     assert sweep_by.completed and w.journal.approved_unrun() == []
     receipts = [r for r in w.receipts.read() if r.fired]
     assert len(receipts) == 2 and w.outbox() == [("link0", "c1-0"), ("link1", "c1-1")]
@@ -1043,7 +1052,7 @@ def test_a_chain_link_whose_flag_was_altered_still_cannot_fire_alone(tmp_path):
     w.dispatch("c1")
     [p] = w.gate.open_pendings()
     rewrite_holds(w.journal, lambda h: dict(h, chained=False))
-    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id))
     assert out.reason == "chained_pending_resolves_through_its_chain" and w.outbox() == [("link0", "c1-0")]
 
 
@@ -1362,8 +1371,8 @@ def test_an_approved_effect_that_failed_is_not_reported_as_not_yet_run(tmp_path)
     w.gate._executor = _FailingLink1(tmp_path / "outbox.jsonl")
     w.dispatch("n1")
     w.receipts.append = lambda *a, **k: (_ for _ in ()).throw(OSError(28, "ENOSPC"))
-    out = w.gate.resolve(w.gate.open_pendings()[0].pending_id, ConfirmDecision(approved=True, by="human"),
-                         chain_owned=True)
+    pid = w.gate.open_pendings()[0].pending_id
+    out = w.gate.resolve(pid, signed_yes(w.gate, pid), chain_owned=True)
     assert not out.held and not out.reason.startswith("approved_not_yet_run")
     assert out.execution is not None and not out.execution.ok
 
@@ -1427,7 +1436,7 @@ FINANCIAL = ActionRisk(cls=RiskClass.HIGH, reversible=False, external=True, fina
 
 def _approve(w, **kw):
     [p] = w.gate.open_pendings()
-    return w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human", **kw))
+    return w.chains.resume(p.pending_id, signed_yes(w.gate, p.pending_id, **kw))
 
 
 def test_a_bindings_pending_carries_the_risk_floor_it_was_proposed_at(tmp_path):
@@ -1454,16 +1463,18 @@ def test_an_undeclared_action_name_resolves_on_the_sealed_floor(tmp_path):
 def test_a_risk_that_rose_since_the_proposal_asks_again_at_the_raised_rung(tmp_path):
     # codex HIGH 4: the resolve checked only the manifest's entry for the action name. Now the rung is
     # max(sealed posture, sealed floor, the manifest's current floor): a rise to the elevated rung
-    # leaves the decision open until it is given with a typed proof
+    # leaves the decision open until it is signed at that rung
     w = World(tmp_path)
     w.mint(chain=True)
     w.dispatch("r1")
+    [p] = w.gate.open_pendings()
+    shown = signed_yes(w.gate, p.pending_id)                       # signed at the rung shown: CONFIRM
     w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})   # now CONFIRM_ELEVATED
-    plain = _approve(w)
-    assert plain.paused and plain.reason == "elevated_requires_typed_proof"
+    plain = w.chains.resume(p.pending_id, shown)
+    assert plain.paused and plain.reason == "confirm:not_signed_by_an_enrolled_key"
     assert len(w.gate.open_pendings()) == 1 and ("link1", "r1-1") not in w.outbox()
-    typed = _approve(w, typed_proof="I approve r1")
-    assert typed.completed and ("link1", "r1-1") in w.outbox()
+    raised = _approve(w)                                           # signed at the raised rung
+    assert raised.completed and ("link1", "r1-1") in w.outbox()
     [fired] = [r for r in w.receipts.read() if r.fired and r.action_face["context_id"] == "r1-1"]
     assert fired.posture == "CONFIRM_ELEVATED"                     # fired at the raised rung
 
@@ -1481,7 +1492,7 @@ def test_an_approval_recorded_before_the_risk_rose_ends_its_run(tmp_path):
     w.journal.effect = real
     w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
     [h] = w.journal.approved_unrun()
-    out = w.chains.resume(h["pending"]["pending_id"], ConfirmDecision(approved=True, by="human"))
+    out = w.chains.resume(h["pending"]["pending_id"], signed_yes(w.chains.gate, h["pending"]["pending_id"]))
     assert out.aborted and out.reason == "revalidate:risk_floor_rose"
     assert ("link1", "a1-1") not in w.outbox() and w.journal.approved_unrun() == []
     [stop] = [r for r in w.receipts.read() if r.action_face["context_id"] == "a1-1"]
@@ -1498,7 +1509,7 @@ def test_a_bindings_pending_found_in_the_manual_store_is_refused(tmp_path):
         query_date="2026-10-07", posture="CONFIRM", fail_open=False, requires_typed=False,
         authority={"grantor": "binding", "grant": "g", "binding_id": b.binding_id, "hops": 0})
     w.pending.add(p)
-    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id))
     assert out.refused and out.reason == "integrity:binding_pending_outside_journal"
     assert w.outbox() == [] and w.pending.get(p.pending_id) is None   # claimed out: it cannot fire later
 
@@ -1542,9 +1553,9 @@ def test_a_rise_after_the_effect_ran_cancels_nothing(tmp_path):
     w.mint(chain=True)
     w.dispatch("c9")
     [p] = w.gate.open_pendings()
-    assert w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human")).completed
+    assert w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id)).completed
     w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
-    again = w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human"))   # a duplicate reply
+    again = w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id))   # a duplicate reply
     assert not again.aborted
     with w.journal.db.read() as conn:
         assert conn.execute("SELECT COUNT(*) FROM cancels").fetchone()[0] == 0
@@ -1597,12 +1608,14 @@ def test_a_tool_reclassified_up_raises_the_rung_though_the_manifest_name_entry_i
     w = World(tmp_path)
     w.mint(chain=True)
     w.dispatch("t1")
+    [p] = w.gate.open_pendings()
+    shown = signed_yes(w.gate, p.pending_id)                       # signed at the rung shown: CONFIRM
     w.tool_risk[1] = FINANCIAL                                     # the tool, not the action name
     assert w.gate._manifest.risk_of("link1") == HIGH               # the name entry did not move
-    plain = _approve(w)
-    assert plain.paused and plain.reason == "elevated_requires_typed_proof"
+    plain = w.chains.resume(p.pending_id, shown)
+    assert plain.paused and plain.reason == "confirm:not_signed_by_an_enrolled_key"
     assert ("link1", "t1-1") not in w.outbox()
-    assert _approve(w, typed_proof="I approve t1").completed
+    assert _approve(w).completed                                   # signed at the raised rung
 
 
 def test_a_binding_risk_that_cannot_be_derived_fails_closed(tmp_path):
@@ -1633,14 +1646,15 @@ def test_a_single_link_pending_re_derives_from_the_registry_record(tmp_path):
     w.store.ratify(b.binding_id)
     w.dispatch("t3")
     [p] = w.gate.open_pendings()
+    shown = signed_yes(w.gate, p.pending_id)                       # signed at the rung shown: CONFIRM
     w.tool_risk[0] = FINANCIAL
-    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
-    assert out.refused and out.reason == "elevated_requires_typed_proof" and w.outbox() == []
+    out = w.gate.resolve(p.pending_id, shown)
+    assert out.refused and out.reason == "confirm:not_signed_by_an_enrolled_key" and w.outbox() == []
 
 
 def test_the_fire_path_needs_a_gate_that_can_re_derive_binding_risk(tmp_path):
     w = World(tmp_path)
-    gate = EfferentGate(manifest=ActionManifest({}), store=w.receipts, executor=OutboxExecutor(tmp_path / "o"),
+    gate = EfferentGate(confirm_signers=confirm_signers(), manifest=ActionManifest({}), store=w.receipts, executor=OutboxExecutor(tmp_path / "o"),
                         journal=w.journal)                         # no binding_risk
     with pytest.raises(ValueError, match="binding_risk"):
         FireDispatcher(store=w.store, gate=gate, predicate_match=lambda p, e: True,
@@ -1709,12 +1723,12 @@ def test_a_registry_that_cannot_be_read_at_the_resolve_leaves_the_decision_open(
     [p] = w.gate.open_pendings()
     with monkeypatch.context() as m:
         _locked_registry(m)
-        out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+        out = w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id))
         assert out.refused and out.reason == "revalidate:registry_unreadable" and w.outbox() == []
         assert w.gate.silence_decision(w.journal.get_hold(hold_id_for(*_run_of(w))),
                                        FIXED + _dt.timedelta(days=30)) is None
     assert [q.pending_id for q in w.gate.open_pendings()] == [p.pending_id]
-    assert w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human")).fired
+    assert w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id)).fired
 
 
 def _run_of(w):
@@ -1730,15 +1744,15 @@ def test_a_registry_that_cannot_be_read_does_not_end_an_approved_run(tmp_path, m
     [p] = w.gate.open_pendings()
     real = w.journal.effect
     w.journal.effect = lambda *a, **k: (_ for _ in ()).throw(OSError("EIO"))
-    assert w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human")).held
+    assert w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id)).held
     w.journal.effect = real
     with monkeypatch.context() as m:
         _locked_registry(m)
-        out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+        out = w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id))
         assert not out.fired and out.reason == "revalidate:registry_unreadable"
     with w.journal.db.read() as conn:
         assert conn.execute("SELECT COUNT(*) FROM cancels").fetchone()[0] == 0
-    assert w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human")).fired
+    assert w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id)).fired
 
 
 def _decided_pending_id(w):
@@ -1754,10 +1768,10 @@ def test_a_rise_whose_effect_starts_between_the_check_and_the_cancel_cancels_not
     w.mint(chain=True)
     w.dispatch("c3")
     [p] = w.gate.open_pendings()
-    assert w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human")).completed
+    assert w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id)).completed
     w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
     w.journal.peek = lambda *a, **k: None                          # the read made before the effect ran
-    w.chains.resume(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id))
     with w.journal.db.read() as conn:
         assert conn.execute("SELECT COUNT(*) FROM cancels").fetchone()[0] == 0
     assert [r.fired for r in w.receipts.read() if r.action_face["context_id"] == "c3-1"] == [True]
@@ -1786,7 +1800,7 @@ def test_an_approval_given_at_the_raised_rung_survives_a_stop_before_its_effect(
     w.tool_risk[1] = FINANCIAL
     real = w.journal.effect
     w.journal.effect = lambda *a, **k: (_ for _ in ()).throw(OSError("EIO"))
-    held = _approve(w, typed_proof="I approve e4")               # approved at CONFIRM_ELEVATED, not run
+    held = _approve(w)                                           # approved at CONFIRM_ELEVATED, not run
     assert held.reason.startswith("approved_not_yet_run")
     w.journal.effect = real
     assert w.dispatch("e4").chain.completed and ("link1", "e4-1") in w.outbox()
@@ -1857,7 +1871,7 @@ def test_a_replayed_receipt_carries_what_the_effect_ran_with(tmp_path):
     [p] = w.gate.open_pendings()
     real = w.gate._persist
     w.gate._persist = lambda **kw: None                                # the receipt does not land
-    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human", first_estimate=0.7))
+    out = w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id, first_estimate=0.7))
     assert out.fired and out.receipt_id is None and w.receipts.read() == []
     w.gate._persist = real
     w.dispatcher._request_builder = lambda b, e: dataclasses.replace(_single_builder(b, e), query_text="other")
@@ -1874,7 +1888,7 @@ def test_a_first_estimate_that_is_not_json_does_not_make_a_sent_effect_unknown(t
     _mint_single(w, "r7")
     w.dispatch("r7")
     [p] = w.gate.open_pendings()
-    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human", first_estimate=object()))
+    out = w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id, first_estimate=object()))
     assert out.fired and w.journal.poisoned() == [] and w.outbox() == [("link0", "r7-0")]
 
 
@@ -1890,7 +1904,7 @@ def test_a_first_estimate_too_deep_to_encode_does_not_make_a_sent_effect_unknown
     deep: list = []
     for _ in range(100_000):
         deep = [deep]
-    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human", first_estimate=deep))
+    out = w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id, first_estimate=deep))
     assert out.fired and w.journal.poisoned() == [] and w.outbox() == [("link0", "q1-0")]
 
 
@@ -1902,6 +1916,7 @@ def test_a_registry_read_fault_that_clears_at_once_still_leaves_the_decision_ope
     _mint_single(w, "q3")
     w.dispatch("q3")
     [p] = w.gate.open_pendings()
+    yes = signed_yes(w.gate, p.pending_id)                         # signed before the fault
     real = BindingStore._scan
     calls = []
 
@@ -1911,9 +1926,9 @@ def test_a_registry_read_fault_that_clears_at_once_still_leaves_the_decision_ope
             raise sqlite3.OperationalError("database is locked")
         return real(self, conn)
     monkeypatch.setattr(BindingStore, "_scan", once)
-    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = w.gate.resolve(p.pending_id, yes)
     assert out.reason == "revalidate:registry_unreadable" and w.outbox() == []
-    assert w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human")).fired
+    assert w.gate.resolve(p.pending_id, yes).fired
 
 
 def test_a_resolver_that_loses_the_decision_fires_under_the_winners(tmp_path):
@@ -1945,9 +1960,81 @@ def test_a_replayed_receipt_never_takes_a_field_the_effect_did_not_record_from_t
     [p] = w.gate.open_pendings()
     real = w.gate._persist
     w.gate._persist = lambda **kw: None
-    assert w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human", first_estimate=object())).fired
+    assert w.gate.resolve(p.pending_id, signed_yes(w.gate, p.pending_id, first_estimate=object())).fired
     w.gate._persist = real
     w.dispatcher._request_builder = lambda b, e: dataclasses.replace(_single_builder(b, e), actor_first_estimate=0.9)
     assert w.dispatch("q5").outcome.replayed
     [r] = w.receipts.read()
     assert r.action_face["actor_first_estimate"] is None
+
+
+# --- Phill's ruling C#9 (10-08): the fencing token, signed confirms, confined effects ---------------------
+# Each reproduced first on e3917e1 by driving the real engine (the lane's residue run).
+
+def test_a_tool_reclassified_after_its_rung_was_decided_is_not_run_at_that_rung(tmp_path):
+    # (a), residue R1: the rung was decided at ON_LOOP, the tool became HIGH before the effect was
+    # admitted, and the effect ran at ON_LOOP
+    w = World(tmp_path)
+    w.mint(chain=False)
+    real = w.journal.effect
+
+    def reclassify_then_admit(*a, **k):
+        w.journal.revise_risk(lambda: w.tool_risk.__setitem__(0, HIGH))
+        return real(*a, **k)
+    w.journal.effect = reclassify_then_admit
+    first = w.dispatch("f1")
+    assert first.outcome.held and first.outcome.reason == "journal:stale" and w.outbox() == []
+    w.journal.effect = real
+    again = w.dispatch("f1")                                       # decided again under the new revision
+    assert again.outcome.pending and again.outcome.posture is Posture.CONFIRM and w.outbox() == []
+
+
+def test_an_approval_whose_tool_was_reclassified_before_its_effect_is_decided_again(tmp_path):
+    # (a), residue R2: link1 was approved at CONFIRM, its tool became financial before the effect was
+    # admitted, and it ran at CONFIRM
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("f2")
+    yes = signed_yes(w.gate, w.open_pending_id())
+    real, once = w.journal.effect, []
+
+    def reclassify_then_admit(run_id, effect_id, **k):
+        if effect_id == "link-1" and not once:
+            once.append(1)
+            w.journal.revise_risk(lambda: w.tool_risk.__setitem__(1, FINANCIAL))
+        return real(run_id, effect_id, **k)
+    w.journal.effect = reclassify_then_admit
+    out = w.resolve_open_as(yes)
+    assert out.aborted and out.reason == "revalidate:risk_floor_rose"
+    assert ("link1", "f2-1") not in w.outbox() and w.journal.approved_unrun() == []
+
+
+def test_a_yes_is_authority_only_when_an_enrolled_key_signed_it(tmp_path):
+    # (c), residue R3: an approval carrying nothing but by="human" fired the link
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("f3")
+    pid = w.open_pending_id()
+    key = tmp_path / "stranger"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True, timeout=30,
+                   capture_output=True)
+    forged = subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", str(key), "-n", "levain-confirm"],
+                            input=w.gate.confirm_challenge(pid), capture_output=True, timeout=30,
+                            check=True).stdout.decode()
+    for reply in (ConfirmDecision(approved=True, by="human"),
+                  ConfirmDecision(approved=True, by="human", signer="operator", signature=forged)):
+        out = w.resolve_open_as(reply)
+        assert out.paused and out.reason == "confirm:not_signed_by_an_enrolled_key"
+        assert w.open_pending_id() == pid and w.outbox() == [("link0", "f3-0")]   # still open, not sent
+    assert w.resolve_open(approve=True).completed and ("link1", "f3-1") in w.outbox()
+
+
+def test_a_bindings_effect_never_runs_on_an_executor_not_declared_confined(tmp_path):
+    # (b), the unconfined probe: a binding's effect ran on an executor that never declared the floor
+    class Unconfined(OutboxExecutor):
+        confined = False
+    w = World(tmp_path)
+    w.gate._executor = Unconfined(tmp_path / "outbox.jsonl")
+    w.mint(chain=False)
+    out = w.dispatch("f4").outcome
+    assert out.refused and out.reason == "executor_not_confined" and w.outbox() == []

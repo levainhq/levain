@@ -246,6 +246,7 @@ def test_replace_atomic_promotion_revokes_old_persists_new(tmp_path):
 # =====================================================================================
 @dataclass
 class _Exec:
+    confined = True   # a test double: declares the floor a real binding executor runs under
     name: str = "rec"
     ok: bool = True
     def execute(self, action_name, payload, *, context_id):
@@ -269,6 +270,7 @@ def _req(gate, *, risk, ratified):
                            hops=0, human_present=False),
         grounded=True, authority=AuthorityScope(grantor="binding", grant="g", binding_id=binding_id, hops=0),
         overall_confidence=1.0, directive_confidence=1.0, risk=risk, ratified_posture=ratified, run=run,
+        risk_revision=gate.journal.risk_revision(),
     )
 
 

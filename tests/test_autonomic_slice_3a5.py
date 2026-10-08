@@ -722,6 +722,7 @@ MANIFEST = ActionManifest({
 
 @dataclass
 class RecordingExecutor:
+    confined = True   # a test double: declares the floor a real binding executor runs under
     name: str = "recording"
     result: ExecutionResult = field(
         default_factory=lambda: ExecutionResult(ok=True, detail="wrote doc", downstream_id="doc-1"))

@@ -39,11 +39,13 @@ import json
 import logging
 import sqlite3
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from dataclasses import dataclass
 
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.binding import Binding, BindingStore
+from levain.autonomic.confirm import challenge as confirm_challenge_bytes, verify_signature
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
 from levain.autonomic.journal import (
@@ -227,8 +229,13 @@ class EfferentGate:
         trajectory_observer: TrajectoryObserver | None = None,
         journal: RunJournal | None = None,
         binding_risk: Callable[[Binding, int], ActionRisk] | None = None,
+        confirm_signers: str | Path | None = None,
     ) -> None:
         self._manifest = manifest
+        # The allowed-signers file naming the keys whose signature is a person's approval
+        # (:mod:`levain.autonomic.confirm`). None ⇒ no person's approval can be verified, so none is
+        # accepted.
+        self._confirm_signers = Path(confirm_signers) if confirm_signers is not None else None
         # The binding's risk resolver: (sealed binding, link index) -> the risk of that link's tools NOW
         # (the same function the fire path derives a binding fire's risk with). The resolve of a
         # binding's pending re-runs it, so a tool reclassified since the proposal raises the rung even
@@ -290,6 +297,46 @@ class EfferentGate:
         if self._pending_store is not None:
             out.extend(self._pending_store.list_open())
         return out
+
+    def confirm_challenge(self, pending_id: str) -> bytes | None:
+        """The exact bytes an enrolled key must sign (SSHSIG, namespace ``levain-confirm``) for a
+        person's approval of the undecided ``pending_id`` to count NOW: its id, a hash of its sealed record,
+        the risk-catalog revision and the rung the approval must meet. ``None`` when there is nothing a
+        signature could approve (unknown or decided, a rung no approval meets, a risk that cannot be
+        re-derived). A challenge fetched before the catalog is revised or the rung rises no longer
+        verifies: fetch it again."""
+        try:
+            if self._journal is not None:
+                hold = self._journal.find_pending(pending_id)
+                if hold is not None:
+                    if hold.get("decided") is not None:
+                        return None
+                    pending = PendingAction.from_dict(hold["pending"])
+                    posture = self._posture_of(pending)
+                    if posture is None:
+                        return None
+                    revision = self._journal.risk_revision()   # before the rung is derived
+                    effective, _ = self._resolve_posture(pending, posture, hold)
+                    if effective is None or effective is Posture.REFUSE_ESCALATE:
+                        return None
+                    return confirm_challenge_bytes(pending=pending, risk_revision=revision, rung=effective.name)
+            pending = self._pending_store.get(pending_id) if self._pending_store is not None else None
+            posture = self._posture_of(pending) if pending is not None else None
+            if pending is None or posture is None:
+                return None
+            return confirm_challenge_bytes(pending=pending, risk_revision=None, rung=posture.name)
+        except Exception as e:  # noqa: BLE001 — no challenge is the safe answer
+            _log.warning("efferent gate: no confirm challenge for %s (%s): %s", pending_id, type(e).__name__, e)
+            return None
+
+    def _signed_by_enrolled_key(self, pending: PendingAction, rung: Posture, risk_revision: int | None,
+                                decision: ConfirmDecision) -> bool:
+        """True iff the decision carries a signature by an enrolled key over the challenge for this
+        pending at ``rung`` under ``risk_revision``, rebuilt here from the stored record: the gate never
+        takes the signed bytes from the reply."""
+        message = confirm_challenge_bytes(pending=pending, risk_revision=risk_revision, rung=rung.name)
+        return verify_signature(message, signature=decision.signature, signer=decision.signer,
+                                allowed_signers=self._confirm_signers)
 
     @property
     def binding_risk(self) -> Callable[[Binding, int], ActionRisk] | None:
@@ -588,8 +635,10 @@ class EfferentGate:
         manual pending is claimed from the pending store (:meth:`_resolve_manual`).
 
         ``decision.approved`` → fire (verdict ``approved`` for a human, ``auto`` for a timeout
-        auto-fire); else → a terminal deny (verdict ``denied``). ``decision.first_estimate`` is the
-        operator's forced pre-truth read → the receipt's ``actor_first_estimate``."""
+        auto-fire); else → a terminal deny (verdict ``denied``). A person's approval counts only with a
+        signature by an enrolled key over :meth:`confirm_challenge`; without one it is refused and the
+        decision stays open. ``decision.first_estimate`` is the operator's forced pre-truth read → the
+        receipt's ``actor_first_estimate``."""
         try:
             hold = self._journal.find_pending(pending_id) if self._journal is not None else None
             if hold is not None:
@@ -604,14 +653,16 @@ class EfferentGate:
             )
 
     def _resolve_hold(self, hold: dict[str, Any], decision: ConfirmDecision, *,
-                      chain_owned: bool) -> GateOutcome:
+                      chain_owned: bool, stale_retry: bool = True) -> GateOutcome:
         """Resolve a journaled pending: its run's hold. The ONLY state change is one write-once
         ``decide`` in the run journal (which also cancels the run on a rejection, in the same record),
         so there is nothing else to keep in step with it and nothing to release. Of any number of
         resolvers, exactly one decision counts; every other resolver finds it and changes nothing.
 
-        A refusal that is not a decision (a missing typed proof, an approval nobody may give
-        unattended, an unreadable registry) records NOTHING: the decision stays open for a retry."""
+        A refusal that is not a decision (an approval without an enrolled key's signature, an approval
+        nobody may give unattended, an unreadable registry) records NOTHING: the decision stays open for
+        a retry. An approval whose effect the journal finds STALE (the risk catalog was revised after the
+        rung was derived) is re-validated once under the new revision (``stale_retry``)."""
         assert self._journal is not None
         created_at = self._clock().isoformat()
         hold_id = hold["hold_id"]
@@ -663,8 +714,10 @@ class EfferentGate:
         # The rung the approval must meet NOW: the sealed posture, raised by the risk floor the proposal
         # was sealed at, the manifest's current floor for the action and the floor of the binding's
         # tools now (REFUSE_ESCALATE when that cannot be re-derived). At a raised rung a reply must
-        # meet that rung (its typed-proof and unattended checks below leave the decision open), and
-        # silence takes that rung's default (``silence_decision``).
+        # meet that rung (its signature and unattended checks below leave the decision open), and
+        # silence takes that rung's default (``silence_decision``). The revision is read first: the
+        # effect is admitted only if the catalog is unrevised since (the journal's fence).
+        revision = self._journal.risk_revision()
         effective, why = self._resolve_posture(pending, posture, hold)
         if effective is None:
             # the store the risk is re-derived from cannot be read now: as BARRED, a repair clears it, so
@@ -695,10 +748,14 @@ class EfferentGate:
         else:
             posture = effective
 
+        if (hold.get("decided") is None and decision.by == "human"
+                and not self._signed_by_enrolled_key(pending, posture, revision, decision)):
+            # a delivered "yes" is not authority: without the signature the decision stays open
+            return self._refuse_open("confirm:not_signed_by_an_enrolled_key", binding_id)
         guard = self._guard_resolve_fire(pending, posture, decision)
         if guard is None and decision.by != "human" and not self._unattended_approval_allowed(pending, posture):
             guard = "unattended_approval_not_allowed"
-        if guard in ("elevated_requires_typed_proof", "unattended_approval_not_allowed"):
+        if guard == "unattended_approval_not_allowed":
             if hold.get("decided") is not True:
                 return self._refuse_open(guard, binding_id)   # not a decision: the hold stays open
             guard = None   # the approval that stands was given by its own decider, who met these checks
@@ -724,7 +781,7 @@ class EfferentGate:
             query_text=pending.query_text, query_date=pending.query_date,
             trust=_RESOLVED_TRUST, grounded=True, authority=authority,
             producers=pending.producers, proposal_id=pending.proposal_id,
-            actor_first_estimate=estimate, run=run,
+            actor_first_estimate=estimate, run=run, risk_revision=revision,
         )
         if not already_approved:
             # Everything that could stop this effect WITHOUT a decision is checked BEFORE the decision is
@@ -758,6 +815,13 @@ class EfferentGate:
             request=request, created_at=created_at, posture=posture,
             verdict=verdict, by=by, actor_first_estimate=estimate, decided=True,
         )
+        if stale_retry and fired.held and fired.reason == f"journal:{EffectStatus.STALE.value}":
+            # the catalog was revised after the rung above was derived: the decision now written stands,
+            # and the approved-hold path re-derives the rung under the new revision (a rung that rose
+            # past the one approved ends the run; one that did not runs the effect)
+            won = self._journal.get_hold(hold_id)
+            if won is not None and won.get("decided") is True:
+                return self._resolve_hold(won, decision, chain_owned=chain_owned, stale_retry=False)
         if fired.fired or fired.replayed or fired.receipt_id is not None or fired.execution is not None:
             return fired   # (an execution without a receipt: the effect ran and failed, the receipt did not land)
         if fired.refused and fired.reason in ("journal:fenced", "journal:cancelled", "journal:poisoned"):
@@ -802,6 +866,20 @@ class EfferentGate:
         # daemon sweep (or two resolves) can never both fire the same irreversible action, and a crash
         # mid-fire DROPS it (it is already out of the open set) rather than leaving it re-fireable.
         # There is NO post-fire remove (the get→fire→remove TOCTOU is gone).
+        # A person's approval is checked BEFORE the claim: one without an enrolled key's signature is not
+        # a decision, so the pending stays in the store, open. (An id not in the store goes on to the
+        # claim, which reports it unknown.)
+        verified: PendingAction | None = None
+        if decision.approved and decision.by == "human":
+            verified = self._pending_store.get(pending_id)
+            rung = self._posture_of(verified) if verified is not None else None
+            # (a corrupt posture has no challenge: the claim below drops it, which fires nothing)
+            if verified is not None and rung is not None and not self._signed_by_enrolled_key(
+                    verified, rung, None, decision):
+                return GateOutcome(
+                    posture=Posture.REFUSE_ESCALATE, fired=False, refused=True, deferred=False,
+                    reason="confirm:not_signed_by_an_enrolled_key", receipt_id=None, execution=None,
+                )
         pending = self._pending_store.claim(pending_id)
         if pending is None:
             # already claimed/resolved/swept, or never existed — nothing to fire; surface, don't crash.
@@ -816,6 +894,8 @@ class EfferentGate:
         # complement MED-1). A mismatch ⇒ a field was altered after propose (tampered/corrupt/drifted) ⇒
         # REFUSE + record a denied receipt; the record is already claimed-out, so it cannot re-fire.
         integrity = None if pending.seal_matches() else "integrity:seal_mismatch"
+        if integrity is None and verified is not None and pending.to_dict() != verified.to_dict():
+            integrity = "integrity:changed_after_signature"   # the record claimed is not the one signed
         if integrity is None and pending.authority.get("grantor") == "binding":
             # a binding's pending lives only in the run journal: one in the pending store was not written
             # by this gate, and a binding fire is never made without its run
@@ -857,7 +937,7 @@ class EfferentGate:
 
         # APPROVE: re-validate the (untrusted, durable) pending at the moment of fire (L1-HIGH-4 +
         # MED-7). The pending file lives across the propose→resolve gap and is editable — so re-check
-        # the elevated-typed proof, that the action is still declared, that its risk floor hasn't
+        # that the action is still declared, that its risk floor hasn't
         # RISEN above the posture the human saw, and that the payload still passes the §1.5 screen (a
         # tampered/injection payload fires NOTHING). A guard failure denies (records a denied receipt).
         guard = self._guard_resolve_fire(pending, posture, decision)
@@ -972,16 +1052,12 @@ class EfferentGate:
         if the fire may proceed. Cheap structural defenses (the deeper file-integrity HMAC is a later
         hardening):
 
-        - MED-7: an elevated rung (``requires_typed``) needs a typed / re-auth proof — the gate
-          ENFORCES the stronger affordance it promises, not just renders it.
         - HIGH-4: a MANUAL pending's action must still be DECLARED (a manifest that dropped it →
           refuse) and its risk floor must not have RISEN above the posture the human approved (a
           manifest tightening must not let a stale, less-involved approval through); a binding's pending
           is re-validated against its sealed floor by :meth:`_resolve_posture` instead. Every pending's
           payload must still pass the §1.5 injection/grounding screen (an injection smuggled into a
           tampered payload fires NOTHING)."""
-        if posture.requires_typed and not decision.typed_proof:
-            return "elevated_requires_typed_proof"
         if pending.risk_floor is None:
             # a manual pending's risk came from the manifest: it must still be declared, at no higher
             # floor (a binding's is re-validated by ``_resolve_posture`` against its sealed floor)
@@ -1401,13 +1477,14 @@ class EfferentGate:
         return self._journal_stop(request, barrier, Posture.REFUSE_ESCALATE)
 
     def _journal_stop(self, request: ActionRequest, out: EffectOutcome, posture: Posture) -> GateOutcome:
-        """The outcome for an effect the journal did not let run. HELD and IN_FLIGHT are not terminal
-        (``held``: deliver the event again later); CANCELLED, FENCED and POISONED are (``refused``).
+        """The outcome for an effect the journal did not let run. HELD, IN_FLIGHT and STALE are not
+        terminal (``held``: deliver the event again later, and a STALE one is decided again under the
+        revised catalog); CANCELLED, FENCED and POISONED are (``refused``).
         No receipt here: the journal line that stopped it (the cancel, the fence, the unknown outcome)
         is the record, and writing one per re-delivery would repeat it. (A resolve that ends here after
         its approval was recorded, because the run was fenced or cancelled since, is the exception:
         ``_resolve_hold`` writes its receipt.)"""
-        held = out.status in (EffectStatus.HELD, EffectStatus.IN_FLIGHT)
+        held = out.status in (EffectStatus.HELD, EffectStatus.IN_FLIGHT, EffectStatus.STALE)
         _log.info("efferent gate: %r stopped by the run journal (%s)", request.action_name, out.status.value)
         return GateOutcome(
             posture=posture, fired=False, refused=not held, deferred=False,
@@ -1426,6 +1503,19 @@ class EfferentGate:
         result, so a replay can write a receipt that never landed."""
         assert self._journal is not None and request.run is not None
         run = request.run
+        bar = None
+        if getattr(self._executor, "confined", False) is not True:
+            # a binding's effect runs only through the confinement floor (as the entity's hands user),
+            # never unconfined in this process: an executor that does not declare it runs nothing
+            bar = "executor_not_confined"
+        elif isinstance(request.risk_revision, bool) or not isinstance(request.risk_revision, int):
+            bar = "journal:unstamped_risk_revision"   # no revision, no fence: nothing is admitted
+        if bar is not None:
+            _log.error("efferent gate: %r not run (%s)", request.action_name, bar)
+            return GateOutcome(
+                posture=posture, fired=False, refused=True, deferred=False, reason=bar,
+                receipt_id=None, execution=None, binding_id=request.authority.binding_id,
+            )
         called = False
         face = _face_record(request)   # before the effect: what is recorded after it must encode
 
@@ -1440,7 +1530,7 @@ class EfferentGate:
 
         try:
             out = self._journal.effect(run.run_id, run.effect_id, digest=self._digest_of(request),
-                                       fn=call, needs_decision=decided)
+                                       risk_revision=request.risk_revision, fn=call, needs_decision=decided)
         except Exception as e:  # noqa: BLE001 — the gate never raises
             if not called:
                 _log.error("efferent gate: run journal FAILED before the effect (%s): %s — nothing ran",

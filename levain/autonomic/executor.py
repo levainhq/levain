@@ -89,6 +89,11 @@ class ActionRequest:
     # pauses for a decision. The gate writes it INTO the run's hold, the same row as the
     # pending, so the decision and the way to continue after it live in one record.
     continuation: dict[str, Any] | None = None
+    # ``risk_revision`` — the run journal's risk-catalog revision, read BEFORE ``risk`` was derived (the
+    # fire path stamps it). The journal admits the effect only if the catalog has not been revised since,
+    # so a reclassification committed through ``RunJournal.revise_risk`` between this decision and the
+    # effect's admission never runs it at the old rung. A journaled request without one runs nothing.
+    risk_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -112,7 +117,13 @@ class Executor(Protocol):
     ``execute`` performs the effect and returns an :class:`ExecutionResult`. A concrete Executor is
     a TRUSTED adapter (flow-side / adopter-side) — the gate only ever routes an APPROVED action to
     it. It must NEVER raise into the gate: any failure is an ``ExecutionResult(ok=False, error=…)``
-    ("a failed effect beats a crashed gate" — the fail-soft analog)."""
+    ("a failed effect beats a crashed gate" — the fail-soft analog).
+
+    A binding's effect (a ratified grant acting with no session open) runs only on an executor that
+    declares ``confined = True``: one that runs the effect through levain's confinement floor, as the
+    entity's separate hands user, never unconfined in the operator's process. The gate refuses to run a
+    binding's effect on any other executor. The attribute is the executor's own declaration; a manual
+    (human-present) action does not need it."""
 
     name: str
 

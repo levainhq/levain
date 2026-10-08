@@ -48,6 +48,7 @@ from levain.autonomic import (
     manual_invocation,
     run_id_for,
 )
+from tests.autonomic_confirm_keys import confirm_signers, signed_yes
 from tests.test_autonomic_rawstore import rewrite_holds
 
 FIXED = _dt.datetime(2026, 6, 30, 12, 0, 0, tzinfo=_dt.timezone.utc)
@@ -60,6 +61,7 @@ EVENT = {"type": "email", "id": "evt-1", "fields": {"from": "x@y.example", "dmar
 # --- test doubles --------------------------------------------------------------------------------
 @dataclass
 class RecordingExecutor:
+    confined = True   # a test double: declares the floor a real binding executor runs under
     name: str = "recording"
     ok: bool = True
     calls: list = field(default_factory=list)
@@ -132,7 +134,7 @@ def _registry(tmp_path) -> BindingStore:
 
 
 def _gate(tmp_path, *, executor=None, transport=None, auto_fire=None, manifest=None, binding_risk=None):
-    return EfferentGate(
+    return EfferentGate(confirm_signers=confirm_signers(),
         manifest=manifest if manifest is not None else _RESOLVE_MANIFEST,
         store=GateReceiptStore(tmp_path / "r.jsonl"),
         executor=executor or RecordingExecutor(),
@@ -324,7 +326,7 @@ def test_a_chain_whose_run_was_never_admitted_fires_nothing(tmp_path):
 
 
 def test_a_chain_executor_needs_a_journaled_gate(tmp_path):
-    bare = EfferentGate(manifest=_RESOLVE_MANIFEST, store=GateReceiptStore(tmp_path / "r.jsonl"),
+    bare = EfferentGate(confirm_signers=confirm_signers(), manifest=_RESOLVE_MANIFEST, store=GateReceiptStore(tmp_path / "r.jsonl"),
                         executor=RecordingExecutor(), clock=lambda: FIXED)
     with pytest.raises(ValueError, match="run journal"):
         ChainExecutor(gate=bare, request_builder=_request_builder,
@@ -339,12 +341,12 @@ def test_resume_approve_fires_paused_link_and_completes(tmp_path):
     chain, gate = _executor(tmp_path, transport=FakeTransport(), executor=ex)
     paused = _run(tmp_path, chain, _two_link_binding())
     assert paused.paused
-    out = chain.resume(paused.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = chain.resume(paused.pending_id, signed_yes(chain.gate, paused.pending_id))
     assert out is not None and out.completed
     # link 1 fired on resume (link 0 already fired at execute) → both executed exactly once.
     assert [c[0] for c in ex.calls] == ["link0", "link1"]
     assert gate.open_pendings() == []  # the decision is made
-    chain.resume(paused.pending_id, ConfirmDecision(approved=True, by="human"))   # a second reply
+    chain.resume(paused.pending_id, signed_yes(chain.gate, paused.pending_id))   # a second reply
     assert [c[0] for c in ex.calls] == ["link0", "link1"]                         # runs nothing again
 
 
@@ -359,7 +361,7 @@ def test_resume_deny_ends_chain_without_firing(tmp_path):
 
 def test_resume_unknown_pending_returns_none(tmp_path):
     chain, _g = _executor(tmp_path, transport=FakeTransport())
-    assert chain.resume("not-a-chain-pending", ConfirmDecision(approved=True, by="human")) is None
+    assert chain.resume("not-a-chain-pending", signed_yes(chain.gate, "not-a-chain-pending")) is None
 
 
 def test_resume_integrity_mismatch_rejects(tmp_path):
@@ -369,7 +371,7 @@ def test_resume_integrity_mismatch_rejects(tmp_path):
     # alter the continuation in the hold on disk (stale id → seal mismatch)
     rewrite_holds(gate.journal, lambda h: dict(h, chain=dict(h["chain"], paused_payload="INJECTED"))
                   if h["chain"] else h)
-    out = chain.resume(paused.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = chain.resume(paused.pending_id, signed_yes(chain.gate, paused.pending_id))
     assert out is not None and out.aborted and out.reason == "integrity:seal_mismatch"
     assert [c[0] for c in ex.calls] == ["link0"] and gate.open_pendings() == []   # rejected, never fired
 
@@ -383,10 +385,10 @@ def test_a_revoke_mid_chain_fences_the_resume(tmp_path):
     paused = _run(tmp_path, chain, b)
     assert paused.paused
     _registry(tmp_path).set_status(b.binding_id, BindingStatus.REVOKED)  # the human pulls the grant
-    out = chain.resume(paused.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = chain.resume(paused.pending_id, signed_yes(chain.gate, paused.pending_id))
     assert out is not None and out.aborted and out.reason == "journal:fenced"
     assert [c[0] for c in ex.calls] == ["link0"]  # link 1 never fired
-    after = gate.resolve(paused.pending_id, ConfirmDecision(approved=True, by="human"))
+    after = gate.resolve(paused.pending_id, signed_yes(gate, paused.pending_id))
     assert not after.fired
 
 
@@ -396,7 +398,7 @@ def test_a_removed_grant_fences_the_resume(tmp_path):
     b = _two_link_binding(one_shot=False)
     paused = _run(tmp_path, chain, b)
     _registry(tmp_path).remove(b.binding_id)  # hard-delete the standing grant while the chain is paused
-    out = chain.resume(paused.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = chain.resume(paused.pending_id, signed_yes(chain.gate, paused.pending_id))
     assert out is not None and out.aborted
     assert [c[0] for c in ex.calls] == ["link0"]
 
@@ -414,10 +416,10 @@ def test_an_unreadable_continuation_rejects_and_never_fires(tmp_path):
         return h
 
     rewrite_holds(gate.journal, drop_binding)
-    out = chain.resume(paused.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = chain.resume(paused.pending_id, signed_yes(chain.gate, paused.pending_id))
     assert out is not None and out.aborted and out.reason.startswith("chain_state_malformed")
     assert [c[0] for c in ex.calls] == ["link0"]
-    after = gate.resolve(paused.pending_id, ConfirmDecision(approved=True, by="human"), chain_owned=True)
+    after = gate.resolve(paused.pending_id, signed_yes(gate, paused.pending_id), chain_owned=True)
     assert not after.fired
 
 
@@ -457,14 +459,14 @@ def test_three_link_chain_multiple_pauses_and_resumed_data_flow(tmp_path):
     assert out.paused and out.paused_at == 1  # link 0 fired on-loop; link 1 cooling-off paused
     assert [c[0] for c in ex.calls] == ["link0"]
 
-    out2 = chain.resume(out.pending_id, ConfirmDecision(approved=True, by="human"))
+    out2 = chain.resume(out.pending_id, signed_yes(chain.gate, out.pending_id))
     assert out2 is not None and out2.paused and out2.paused_at == 2  # link 1 fired → link 2 confirm paused
     assert [c[0] for c in ex.calls] == ["link0", "link1"]
     # the data-flow: link 2's proposed payload carries link 1's output (built during the link-1 resume).
     link2_pending = gate.get_pending(out2.pending_id)
     assert "upstream=2" in link2_pending.payload and "from=out::link1" in link2_pending.payload
 
-    out3 = chain.resume(out2.pending_id, ConfirmDecision(approved=True, by="human"))
+    out3 = chain.resume(out2.pending_id, signed_yes(chain.gate, out2.pending_id))
     assert out3 is not None and out3.completed
     assert [c[0] for c in ex.calls] == ["link0", "link1", "link2"]
 
@@ -477,7 +479,7 @@ def test_a_claimed_one_shot_resumes_its_own_run(tmp_path):
     b = _two_link_binding(one_shot=True)
     paused = _run(tmp_path, chain, b)                     # the admission claims (revokes) the one-shot
     assert _registry(tmp_path).get(b.binding_id).status is BindingStatus.REVOKED
-    out = chain.resume(paused.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = chain.resume(paused.pending_id, signed_yes(chain.gate, paused.pending_id))
     assert out is not None and out.completed
     assert [c[0] for c in ex.calls] == ["link0", "link1"]
 
@@ -544,7 +546,7 @@ def test_completed_chain_records_on_resume_out_of_band(tmp_path):
     paused = _run(tmp_path, chain, b)
     assert paused.paused
     assert reg.get(b.binding_id).graduation.fire_count == 0  # nothing recorded at the pause
-    out = chain.resume(paused.pending_id, ConfirmDecision(approved=True, by="human"))
+    out = chain.resume(paused.pending_id, signed_yes(chain.gate, paused.pending_id))
     assert out.completed
     after = reg.get(b.binding_id)
     assert after.graduation.fire_count == 1 and after.graduation.clean_count == 1

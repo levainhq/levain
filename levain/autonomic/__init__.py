@@ -38,7 +38,9 @@ Architecture:
   - ``risk_floor`` / ``policy`` — ``posture = max(risk_floor, earned_posture)`` (floors unbuyable).
   The orchestration layer (the gated edge + its trace):
   - ``AuthorityScope`` / ``manual_invocation`` — the grant in force (the receipt's authority_scope).
-  - ``Executor`` (Protocol) / ``ActionRequest`` / ``ExecutionResult`` — the trusted action seam.
+  - ``Executor`` (Protocol) / ``ActionRequest`` / ``ExecutionResult`` — the trusted action seam. A
+    binding's effect runs only on an executor that declares ``confined`` (it runs effects through the
+    confinement floor, as the entity's hands user); the gate refuses any other.
   - ``ConfirmTransport`` (Protocol) / ``ConfirmProposal`` / ``ConfirmDecision`` — the confirm-rung
     propose→reply seam (the human gate, injected; the decision returns out-of-band via ``resolve``).
   - ``PendingAction`` / ``PendingActionStore`` — the sealed record a person is asked about, and the
@@ -59,6 +61,12 @@ Architecture:
     the binding is open, cancelled by a rejection, fenced by a pause/revoke/tighten, poisoned (never
     retried) when the outcome is unknown, replayed (never re-run) when delivered again. The journal is
     the only durable home of a journaled decision: open pendings and paused chains are read from it.
+    An effect is also stopped (STALE, decided again) when the risk catalog was revised after its rung
+    was decided: ``RunJournal.revise_risk`` commits a reclassification by bumping a monotonic revision.
+  Who answered a confirm (Phill's ruling B, 2026-10-08):
+  - ``confirm`` (``challenge`` / ``verify_signature``) + ``EfferentGate.confirm_challenge`` — a person's
+    approval is an SSH signature by an enrolled key over the pending's content, the risk-catalog
+    revision and the rung, never a delivered "yes"; without one the decision stays open.
 """
 from __future__ import annotations
 

@@ -82,16 +82,19 @@ class ConfirmDecision:
     - ``first_estimate`` is the operator's forced PRE-TRUTH read at the confirm (the forced-first-
       estimate primitive) → the receipt's ``actor_first_estimate``. ``None`` when none was supplied
       (a one-tap approve / a timeout).
-    - ``typed_proof`` is the typed / re-auth token a ``confirm_elevated`` (``requires_typed``) rung
-      demands — the gate REFUSES an approved-elevated resolve without it (the stronger affordance the
-      rung promises, enforced not just rendered). ``None`` for the one-tap ``confirm`` rung.
+    - ``signer`` + ``signature``: a ``by="human"`` APPROVAL is authority only with these, an SSH
+      signature by the enrolled key ``signer`` names over the gate's challenge for this pending
+      (:mod:`levain.autonomic.confirm`, ``EfferentGate.confirm_challenge``). ``by`` is a label, never
+      authority: an approval without a valid signature is refused and the pending stays open. A denial
+      needs no signature (it can only stop an action).
     - ``reason`` is a short human/audit string (e.g. ``"cooling_off_window_elapsed"``).
     """
 
     approved: bool
     by: str = "human"
     first_estimate: Any | None = None
-    typed_proof: str | None = None
+    signer: str | None = None
+    signature: str | None = None
     reason: str = ""
 
     def __post_init__(self) -> None:
@@ -100,8 +103,9 @@ class ConfirmDecision:
             raise TypeError(f"ConfirmDecision.approved must be a bool, got {type(self.approved).__name__}")
         if self.by not in ("human", "on-loop"):
             raise ValueError(f"ConfirmDecision.by must be 'human' or 'on-loop', got {self.by!r}")
-        if self.typed_proof is not None and not isinstance(self.typed_proof, str):
-            raise TypeError("ConfirmDecision.typed_proof must be a string or None")
+        for name in ("signer", "signature"):
+            if getattr(self, name) is not None and not isinstance(getattr(self, name), str):
+                raise TypeError(f"ConfirmDecision.{name} must be a string or None")
         if not isinstance(self.reason, str):
             raise TypeError("ConfirmDecision.reason must be a string")
 

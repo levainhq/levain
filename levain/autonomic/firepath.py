@@ -283,9 +283,13 @@ class FireDispatcher:
         snapshot (the one-shot claim returns its pre-claim ACTIVE form), so it mints cleanly; hops=0 for
         a single link (the binding fires directly on the trigger)."""
         base = self._request_builder(fresh, event)
+        journal = self._gate.journal
+        assert journal is not None   # checked at construction
+        revision = journal.risk_revision()   # before the risk is derived: the journal fences on it
         request = dataclasses.replace(
             base,
             risk=self._binding_risk(fresh),
+            risk_revision=revision,
             authority=binding_invocation(fresh, hops=0),
             kill_predicates=_kill_predicates(fresh),
             predicted_trajectory=guard_trajectory(fresh.effective_guard),
