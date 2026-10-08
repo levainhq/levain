@@ -605,50 +605,58 @@ class GitLedger:
             if git(["merge-base", "--is-ancestor", here, tip0], self.repo.toplevel, check=False).returncode != 0 and \
                     git(["merge-base", "--is-ancestor", tip0, here], self.repo.toplevel, check=False).returncode != 0:
                 raise TeamError(f"the local {name} branch has diverged from {remote}'s; nothing was changed")
-        # everything past this point changes this clone's state: ANY failure puts the WHOLE state back as it was, the
-        # remote and device id included (code L3 r3 codex 6, RUN: a refused derivation left `remote` on the refused
-        # host and a new device id, so this clone's own unpublished commits read as foreign)
-        try:
-            return self._join_chosen(signing_key=signing_key, name=name, found=found, keep=keep, old=old,
-                                     accepted=accepted, remote=remote, new_device=new_device, rref=rref, moved=moved,
-                                     pinned=pinned)
-        except BaseException:
-            def put_back(st: dict) -> None:
-                # own_keys only grows: a key that already signed a commit here stays this clone's, or that commit would
-                # read as foreign after the roll-back
-                grown = sorted(set(old.get("own_keys") or []) | set(st.get("own_keys") or []))
-                st.clear()
-                st.update(old)
-                if grown:
-                    st["own_keys"] = grown
-            self.save_state(_mutate=put_back)
-            self._dcache = None
-            raise
-
-    def _join_chosen(self, *, signing_key, name, found, keep, old, accepted, remote, new_device, rref, moved,
-                     pinned) -> str:
-        """`join` once the ledger is chosen and nothing has refused: pin, judge, attach, reconcile, confirm."""
+        # PROSPECTIVE: the chosen ledger is judged on a candidate trust state, and the destination worktree checked,
+        # before anything is written. Nothing is rolled back afterwards, because nothing is written before both pass
+        # (code L3 r3 codex 6 + r4 codex/complement: a roll-back restored the state file but clobbered a concurrent
+        # `distrust` and left branch, seen-ref and worktree changes behind, once deleting the working ledger's worktree)
+        from . import signing as S
         from . import tenure as T
-        if signing_key:
-            self.save_state(signing_key=signing_key)     # only once nothing above refused
-        self.save_state(branch=name, pinned_root=found[name], anchor=old.get("anchor") if keep else None,
-                        accepted=accepted, distrust=list(old.get("distrust") or []), remote=remote,
-                        device=secrets.token_hex(8) if new_device else self._new_device())
+        anchor = (old.get("anchor") or None) if keep else None
+        cand = T.Clone(pinned_root=found[name], anchor=anchor, accepted={k: int(v) for k, v in accepted.items()},
+                       distrust=set(self.state().get("distrust") or []))
+        try:
+            d = T.derive(self.repo.toplevel, tip0, cand, S.SigCache(self.base / "sigcache.json"))
+        except T.Unjudgeable as exc:
+            raise TeamError(f"cannot judge the team ledger on this clone: {exc}; nothing was changed") from None
+        wt_real = os.path.realpath(self.wt)
+        path = ""
+        for row in git(["worktree", "list", "--porcelain"], self.repo.toplevel, check=False).stdout.splitlines():
+            if row.startswith("worktree "):
+                path = row[len("worktree "):]
+            elif row == f"branch refs/heads/{name}" and os.path.realpath(path) != wt_real:
+                raise TeamError(f"{name} is checked out in another worktree ({path}); levain keeps its own private "
+                                "checkout of the ledger. Nothing was changed: remove that worktree, then join again")
+        device = secrets.token_hex(8) if new_device else self._new_device()
+
+        def persist(st: dict) -> None:
+            # ONE write, under the state lock every trust-state change takes (distrust, accept-merge, repin and the
+            # key commands all write through save_state), of the join's own fields only: a concurrent `distrust` stays
+            st.update(branch=name, pinned_root=found[name], anchor=anchor, accepted=accepted, remote=remote,
+                      device=device)
+            if signing_key:
+                st["signing_key"] = signing_key
+        self.save_state(_mutate=persist)
         self._dcache = None
-        d = self.derivation(git(["rev-parse", rref], self.repo.toplevel).stdout.strip())
-        tip = git(["rev-parse", rref], self.repo.toplevel).stdout.strip()
+        tip = tip0
         if not self._local_branch_exists():
             git(["branch", name, rref], self.repo.toplevel)
         if not keep or d.judged == "full":
             self.save_state(anchor=tip)     # a re-join advances the anchor only as a sync would (_advance_anchor)
+        self._dcache = None
         self._record_seen_sha(tip)       # the joined tip was published: never movable (code L3 r1 codex HIGH)
         self._remember_own_key()
         self._attach_worktree()
+        # from here the clone IS joined: a later failure (a slow remote, a refused push) keeps the new state and says
+        # what is still pending; nothing rolls back
+        pending: list[str] = []
         said = len(self.warnings)
         if keep:
             # the re-join reconciles as a sync would: own unpublished commits go on top of the remote (held when this
             # machine's key does not count yet), so the confirm below lands on the remote's line (residue run 1008)
-            self._rebase(rref, 120, 30.0)
+            try:
+                self._rebase(rref, 120, 30.0)
+            except TeamError as exc:
+                pending.append(f"reconciling this clone's unpublished commits ({exc}): `levain team sync`")
             self._dcache = None
         owner = d.team.owner
         fps = ", ".join(sorted(T.key_fps(d.tenure, owner))) or "none"
@@ -660,13 +668,19 @@ class GitLedger:
                      "is enforced); the owner deletes it with `levain team retire-legacy`")
         if moved:
             tofu = f"re-pinned from genesis {pinned[:12]} to {found[name][:12]} on your --root.\n" + tofu
-        confirmed = self._confirm_own_key(d)
+        try:
+            confirmed = self._confirm_own_key(d)
+        except TeamError as exc:
+            confirmed = False
+            pending.append(f"confirming this machine's key ({exc}): `levain team key confirm`")
         if not git(["for-each-ref", "--count=1", self._held_ref()], self.repo.toplevel, check=False).stdout.strip():
             # the confirm above replayed what the rebase held: its "kept back, confirm the key" line is no longer true
             self.warnings[said:] = [w for w in self.warnings[said:] if "refs/levain/held/" not in w]
         left = self.other_genesis_items() if moved else ""
         if left:
             self.warnings.append(left)
+        for p in pending:
+            self.warnings.append(f"joined and pinned to {name}, but this is still pending: {p}")
         handle = self.handle(d.team)
         if handle is None:
             fp = self.own_fingerprint()
@@ -676,7 +690,6 @@ class GitLedger:
                     "handle> <your public key>`); then `levain team sync`")
         return tofu + f"\njoined {d.team.project} as {handle} (device {self.device})" + (
             f"; confirmed this machine's key" if confirmed else "")
-
 
     # ---- write path ----------------------------------------------------------------------------------------
 
