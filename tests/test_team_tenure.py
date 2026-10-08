@@ -680,6 +680,39 @@ def test_status_names_a_regenesis_branch_owner_and_keys_and_calls_it_unverified(
     assert "owner ben" in line and S.fingerprint(keys["ben"].read_text()) in line and "UNVERIFIED" in line, line
 
 
+def test_veto_names_the_commit_that_began_the_spell_or_is_refused(two, keys, capsys):
+    """RUN (docs L3 r2 anansi): `veto --since <a commit that began no spell>` was counted and changed nothing, with a
+    success line. Now refused, listing the spell starts; a veto at the real start still works."""
+    tmp, ana, ben = two
+    g = gl(ana)
+    g.sync(push=False)
+    d = g.derivation()
+    start = next(sp.start_sha for sp in d.spells if sp.role == "member" and sp.handle == "ben")
+    assert ruling(ana, "src/a.py", "ana: unrelated") == 0
+    other = sh("git", "rev-parse", "levain-team-ledger", cwd=ana).strip()
+    before = sh("git", "ls-remote", str(tmp / "origin.git"), "refs/heads/levain-team-ledger", cwd=tmp).split()[0]
+    capsys.readouterr()
+    assert team("veto", "ben", "--role", "member", "--since", other, repo=ana) == 2
+    assert start[:10] in capsys.readouterr().err
+    assert sh("git", "ls-remote", str(tmp / "origin.git"), "refs/heads/levain-team-ledger", cwd=tmp).split()[0] == before
+    assert team("veto", "ben", "--role", "member", "--since", start, repo=ana) == 0
+
+
+def test_regenesis_makes_its_runner_the_owner_and_never_files_its_key_under_another_handle(two, keys):
+    """RUN (docs L3 r2 anansi): ben ran `regenesis --owner ana --member ana=...=<ana.pub>`; the genesis listed BEN's key
+    as ana's owner key and dropped ana's. Both shapes are refused now, and nothing is pushed."""
+    tmp, ana, ben = two
+    tip = sh("git", "rev-parse", "levain-team-ledger", cwd=ana).strip()
+    g = gl(ben)
+    g.sync(push=False)
+    heads = sh("git", "ls-remote", "--heads", str(tmp / "origin.git"), cwd=tmp)
+    assert team("regenesis", "--from", tip, "--owner", "ana", "--member", f"ana=ana@ex.com={keys['ana']}.pub",
+                "--member", "ben=ben@ex.com", repo=ben) == 2
+    assert team("regenesis", "--from", tip, "--owner", "ana", "--member", "ana=ana@ex.com",
+                "--member", "ben=ben@ex.com", repo=ben) == 2
+    assert sh("git", "ls-remote", "--heads", str(tmp / "origin.git"), cwd=tmp) == heads
+
+
 # ---- the hook halts when it cannot judge ----------------------------------------------------------------------
 
 
