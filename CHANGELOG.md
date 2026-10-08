@@ -4,6 +4,27 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased] — v2.0 team tier
+
+Team ledgers are signed, and the team is derived from the ledger's signed history. **Breaking: 0.6.x team ledgers are not read.**
+
+### Changed
+
+- **A member is an SSH key, not an email.** Every commit on the team ledger is signed with the writer's SSH key (ed25519 or ecdsa), and levain verifies each signature by running `ssh-keygen -Y check-novalidate` itself, so `gpg.ssh.allowedSignersFile`, `gpg.ssh.program` and similar repository settings cannot change a verdict. A signature that fails to verify reads as unsigned; a check that cannot run (no `ssh-keygen`, a timeout) is never cached and never read as signed or unsigned, and the hook then denies edits it cannot judge.
+- **New branch, `levain-team-ledger`, with `tenure.toml` beside `team.toml`.** The genesis commit carries both files and is signed by the owner's key that `tenure.toml` lists. `levain team init` and `levain team join` take `--signing-key`. `join` pins the genesis and prints the owner and key fingerprints in force, to check with the owner out of band.
+- **The team is replayed, not read off the tip.** A change to `team.toml` or `tenure.toml` counts only if the key that signed it may make that change at that point in history, and it must name the last counted change (`Levain-Base` trailer). A ledger line is enforced only if it was signed by a key in force, at that point, for the member it is filed under (the owner, for pack lines). `levain team status` shows recent role changes, a pending hand-off, keys waiting for confirmation, and the reason when verdicts are frozen.
+- **Keys:** `levain team key add | confirm | remove`. A proposed key comes into force only when a commit signed by that key confirms it (`join` and `sync` do this on the machine holding it). A member proposes their own keys from a machine already in force. The owner proposes only a member's first key, and a removed member's handle is never added again, so no key the owner holds can come to sign as a handle that has signed before. A member who lost every key is invited again under a new handle.
+- **Ownership:** `levain team owner <handle>` offers ownership to a member and `levain team accept` takes it, signed by a key already in force for that member. An offer carries no keys, and it lapses if its member is removed.
+- **Recovery:** `levain team revoke <fingerprint> --after <commit>` (the owner) voids what a stolen key signed after that commit. `levain team distrust <commit>` stops this clone counting one commit at once. `levain team veto` withdraws a past spell's authority. A merge on the ledger branch freezes verdicts at the merge until `levain team accept-merge --parent N`, run on the owner's word. A history rewrite is detected and never re-published; verdicts stay frozen at the last commit judged on the old history until `levain team repin`. `levain team regenesis` starts a fresh signed genesis on a new branch, carrying the old history read-only, when the owner is permanently gone.
+- **0.6.x ledgers:** levain v2 refuses to read the unsigned `levain-ledger` branch. The owner starts again with `levain team init --replace-legacy`, re-records the entries to keep, and deletes the old remote branch with `levain team retire-legacy`.
+- **`levain team export` writes anneal's team stream contract v3** (the `prev_root` header and the strict profile). Its import into anneal-memory waits on the anneal release that reads v3; until then the session-start import uses the earlier stream and says which anneal version to upgrade to.
+
+### Known limits
+
+- A git host can withhold newer ledger commits from a clone, and the clone cannot tell. Signatures prove who wrote what the clone sees, not that it sees everything. The planned fix is the team server's transparency log.
+- The owner can invite a new handle under any key she chooses, as with any admin-run identity system: the fingerprint check at `join` is a person's job.
+- Role-change lines in `levain team status` are filtered by the commit's author date, which the writer sets.
+
 ## [0.6.9] — 2026-10-05
 
 A memory fix for the reply classifier's size bound.
