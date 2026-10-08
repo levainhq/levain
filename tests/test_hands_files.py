@@ -442,3 +442,22 @@ def test_the_hands_editors_lock_key_does_not_resolve_the_path_as_the_operator(tm
     monkeypatch.setattr(T.Path, "resolve", lambda self, *a, **k: pytest.fail("resolved as the operator"))
     got = tool.declared_resources(FileEditorAction(command="view", path=str(hands.workspace / "l" / "x")))
     assert got.keys == (f"file:{hands.workspace / 'l' / 'x'}",)
+
+
+def test_a_component_named_dash_is_a_directory_not_oldpwd(tmp_path):
+    """S2 L3 r2 (complement): zsh's cd took a bare `-` as OLDPWD even after `--`."""
+    ws = _ws(tmp_path)
+    (ws / "a" / "-").mkdir(parents=True)
+    (ws / "a" / "-" / "f").write_text("dash")
+    (ws / "f").write_text("top")
+    r = _helper(ws, "read", ws / "a" / "-" / "f")
+    assert (r.returncode, r.stdout) == (0, b"dash"), r
+
+
+def test_a_nul_in_a_hands_editor_path_is_an_in_band_refusal(tmp_path, monkeypatch):
+    """S2 L3 r2 (codex MED): the NUL reached Popen and crashed the tool with a ValueError."""
+    from openhands.tools.file_editor.definition import FileEditorAction
+
+    T, hands, provider, ed = _editor(tmp_path, monkeypatch)
+    obs = ed(FileEditorAction(command="view", path=str(hands.workspace / "a\0b")))
+    assert obs.is_error

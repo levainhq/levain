@@ -746,3 +746,47 @@ def test_a_close_during_a_spawn_runs_none_of_the_command(tmp_path):
         assert not marker.exists() and not sh._groups   # type: ignore[attr-defined]
     finally:
         sh.close()
+
+
+def test_builtin_dash_dash_exit_reports_its_own_status(tmp_path):
+    """S2 L3 r2 (codex MED): `builtin -- exit 0` was reported as 1 on bash 3.2."""
+    with _plain(tmp_path) as sh:
+        assert sh.run("set -e; builtin -- exit 0", timeout=10).exit_code == 0
+        assert sh.run("set -e; command -- exit 0", timeout=10).exit_code == 0
+
+
+def test_a_command_that_can_enter_no_directory_does_not_run(tmp_path):
+    """S2 L3 r2 (codex MED): when neither the carried directory nor the workspace could be entered,
+    the command ran from `/`."""
+    marker = tmp_path / "ran"
+    sh = _plain(tmp_path).start()
+    ws = tmp_path / "ws"
+    try:
+        sh._carried_cwd = str(tmp_path / "gone")   # type: ignore[attr-defined]
+        os.chmod(ws, 0)
+        r = sh.run(f"touch {marker}", timeout=10)
+        assert r.exit_code == 126 and "did not run" in r.output, r
+        assert not marker.exists()
+    finally:
+        os.chmod(ws, 0o755)
+        sh.close()
+
+
+def test_a_failed_socketpair_leaks_no_pipe(tmp_path, monkeypatch):
+    """S2 L3 r2 (complement): the pipe made just before a failing socketpair() leaked."""
+    import socket as _socket
+
+    sh = _plain(tmp_path).start()
+    try:
+        def boom():
+            raise OSError(24, "Too many open files")
+
+        monkeypatch.setattr(_socket, "socketpair", boom)
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(5):
+            with pytest.raises(OSError):
+                sh.run("true", timeout=10)
+        assert len(os.listdir("/dev/fd")) <= before
+    finally:
+        monkeypatch.undo()
+        sh.close()

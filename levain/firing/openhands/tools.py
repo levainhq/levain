@@ -168,6 +168,8 @@ class _HandsFiles:
     def inside(self, path: Any) -> str | None:
         """``path`` made absolute (lexically) and spelled under the workspace as recorded, or None when
         it is not in the hands workspace."""
+        if "\0" in str(path):
+            return None   # no file has such a name, and it could not be passed on (S2 L3 r2)
         p = os.path.normpath(os.path.abspath(os.path.expanduser(str(path))))
         for r in self._roots:
             if p == r or p.startswith(r + "/"):
@@ -183,7 +185,7 @@ class _HandsFiles:
             return self._provider.hands_file(self._policy, self.hands, op, path, data)
         except (FileNotFoundError, HandsFileRefused):
             raise
-        except (OSError, ConfinementError) as exc:
+        except (OSError, ValueError, ConfinementError) as exc:
             raise _HandsIOError(str(exc)) from exc
 
     def read(self, path: Any) -> bytes:
@@ -1248,12 +1250,14 @@ class LevainFileEditorTool(FileEditorTool):
         resources" and STILL RUNS the executor, which then returns the real refusal Observation. Never
         raises."""
         assert isinstance(action, FileEditorAction)
-        assert isinstance(self.executor, CrownJewelsFileEditorExecutor)
-        if self.executor._floor.hands is not None:
+        floor = getattr(self.executor, "_floor", None)
+        if getattr(floor, "hands", None) is not None:
             # A hands entity: the lock key is the path as given, normalised lexically; resolving it
             # would follow the entity's links with the operator's rights (S2 L3 r1, the same class
             # as the executor's own checks).
             try:
+                if "\0" in str(action.path):
+                    raise ValueError("embedded NUL")
                 key = os.path.normpath(os.path.abspath(str(action.path)))
             except (ValueError, OSError):
                 return DeclaredResources(keys=(), declared=True)

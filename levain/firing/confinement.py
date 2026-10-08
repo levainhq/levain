@@ -2336,7 +2336,10 @@ for __levain_n in $(builtin compgen -e); do
   case $__levain_k in *" $__levain_n "*) ;; *) builtin unset -v -- "$__levain_n" 2>/dev/null ;; esac
 done
 builtin cd -- "$__levain_w" 2>/dev/null || {
-  builtin cd -- "$__levain_h" 2>/dev/null
+  builtin cd -- "$__levain_h" 2>/dev/null || {
+    builtin printf 'levain: cannot enter %s nor the workspace %s; the command did not run\n' "$__levain_w" "$__levain_h" >&2
+    builtin exit 126
+  }
   builtin printf 'levain: %s is gone; this command starts in %s\n' "$__levain_w" "$PWD" >&2
 }
 case $__levain_o in o*) OLDPWD=${__levain_o#o} ;; *) builtin unset -v OLDPWD ;; esac
@@ -2361,7 +2364,9 @@ __levain_exit() {
     __levain_m=${__levain_m//[\\\'\"]/}
     case $__levain_m in
       exit|exit[[:space:]]*|builtin[[:space:]]exit|builtin[[:space:]]exit[[:space:]]*) ;;
+      builtin[[:space:]]--[[:space:]]exit|builtin[[:space:]]--[[:space:]]exit[[:space:]]*) ;;
       command[[:space:]]exit|command[[:space:]]exit[[:space:]]*) ;;
+      command[[:space:]]--[[:space:]]exit|command[[:space:]]--[[:space:]]exit[[:space:]]*) ;;
       *) __levain_b=1 ;;
     esac
   fi
@@ -2877,11 +2882,13 @@ class SandboxedShell:
         # The argv first: it may raise (and the bwrap shell's makes the --info-fd pipe itself), and
         # nothing below exists yet to leak (S2 L2b L6).
         argv, pass_fds = self._spawn_argv()
+        made: list[int] = []
         try:
             rd, wr = os.pipe()
+            made += (rd, wr)
             ours, theirs = socket.socketpair()
         except BaseException:
-            for fd in pass_fds:
+            for fd in (*made, *pass_fds):
                 try:
                     os.close(fd)
                 except OSError:
@@ -3670,9 +3677,9 @@ wsr=$(builtin pwd -P)
 inside() { local here; here=$(builtin pwd -P); [[ $here == $wsr || $here == $wsr/* ]] }
 absent() { [[ -e $1 || -L $1 ]] || exit 2 }
 enter() {
-  [[ -L $1 ]] && refuse "$3 runs through a symlink; the editor does not follow links for an entity with its own user"
-  [[ -d $1 ]] || { absent $1; refuse "$3: a component is not a directory" }
-  builtin cd -q -- $1 2>/dev/null || refuse "cannot enter a directory of $3: permission denied"
+  [[ -L ./$1 ]] && refuse "$3 runs through a symlink; the editor does not follow links for an entity with its own user"
+  [[ -d ./$1 ]] || { absent ./$1; refuse "$3: a component is not a directory" }
+  builtin cd -q -- ./$1 2>/dev/null || refuse "cannot enter a directory of $3: permission denied"
   inside || refuse "$3 left the workspace while it was walked"
 }
 p=${p:a}
