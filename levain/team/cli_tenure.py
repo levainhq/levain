@@ -295,8 +295,15 @@ def cmd_accept_merge(gl: GitLedger, args) -> int:
 
 def cmd_regenesis(gl: GitLedger, args) -> int:
     """Option 2: a FRESH strict genesis on a NEW branch, carrying the old ledger as a read-only record under prior/."""
+    gl.require_joined()
     old_tip = git(["rev-parse", "--verify", args.from_ + "^{commit}"], gl.repo.toplevel).stdout.strip()
-    old_root = git(["rev-list", "--max-parents=0", old_tip], gl.repo.toplevel).stdout.split()[0]
+    # the ledger re-genesised is the one this clone is pinned to: a --from on another ledger was derived against this
+    # pin by anchor fallback, and the identity guard below read the WRONG roster (code L3 r3 codex 1, RUN: ben, pinned
+    # to A, filed his key as alice's owner key from re-genesis B's tip)
+    old_root = gl.pinned_root or ""
+    if git(["merge-base", "--is-ancestor", old_root, old_tip], gl.repo.toplevel, check=False).returncode != 0:
+        raise TeamError(f"--from {args.from_} is not on the ledger this clone is pinned to (genesis {old_root[:12]}); "
+                        "a re-genesis starts from the pinned ledger. To re-genesis another, join it first")
     members: dict[str, str] = {}
     keys: dict[str, str] = {}
     for v in args.member or []:
@@ -316,8 +323,9 @@ def cmd_regenesis(gl: GitLedger, args) -> int:
     # by identity, not by "who am I": the runner may not name a handle the old ledger knows unless the runner's key is
     # in force for it there (residue run 1008, RUN: with a rotated key not yet in force, handle() was None and ben
     # filed his key as ana's). A new handle is fine: a member who lost every key comes back under a new handle.
-    gl.require_joined()
-    d_old = gl.derivation(old_tip)
+    # Judged on this clone's CURRENT derivation of its pinned ledger (frozen: its last full one), never on --from's: an
+    # older --from would not know a handle added since
+    d_old = gl.derivation()
     known = set(d_old.team.members) | {s_.handle for s_ in d_old.spells}
     if args.owner in known and gl.own_fingerprint() not in T.key_fps(d_old.tenure, args.owner):
         raise TeamError(f"{args.owner} is a handle on this ledger and this machine's key is not in force for it, so a "
@@ -478,7 +486,8 @@ def register(sub, add) -> None:
 
     p = add("regenesis", wrap(cmd_regenesis), "After a permanently lost owner: a fresh strict genesis on a new "
                                               "branch, carrying the old ledger as a read-only record.")
-    p.add_argument("--from", dest="from_", required=True, help="the old ledger tip to carry")
+    p.add_argument("--from", dest="from_", required=True,
+                   help="the old ledger tip to carry (a commit of the ledger this clone is pinned to)")
     p.add_argument("--owner", required=True)
     p.add_argument("--member", action="append", required=True, metavar="HANDLE=EMAIL[=PUBKEY]")
     p.add_argument("--project")
