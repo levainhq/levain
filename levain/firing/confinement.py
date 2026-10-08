@@ -2498,34 +2498,46 @@ def _hands_signal(hands: HandsIdentity, pgid: int, sig: int) -> bool:
 
 def sweep_hands_user(user: str, *, timeout: float = 5.0) -> str | None:
     """Stop every process of the hands user ``user`` (SIGKILL to all it may signal, sent as it), and
-    verify none is left. For a session's end: a command can leave its process group (``setsid``), so
-    killing the groups levain started does not reach everything the entity left running. Safe only
-    while one session owns the user (:func:`levain.firing.ws_git.hold_hands_session`). None when none
-    is left, else what is."""
+    verify none of the entity's is left. For a session's start and end: a command can leave its
+    process group (``setsid``), so killing the groups levain started does not reach everything the
+    entity left running. Safe only while one session owns the user
+    (:func:`levain.firing.ws_git.hold_hands_session`). None when none is left, else what is.
+
+    The check is :func:`levain.firing.ws_git.entity_session_live`, the one ws-git uses: on macOS
+    launchd starts (and restarts) per-user system agents for a uid that ran Apple code, and those
+    are not the entity's (S2 L3 r3, codex HIGH). Root and levain's own account are refused."""
+    import pwd
+
+    from levain.firing.ws_git import WsGitError, entity_session_live
     from levain.launch import child_env
 
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        return f"there is no user {user}, so its processes cannot be checked"
+    if uid in (0, os.getuid()):
+        return f"refusing to stop every process of {user} (uid {uid}): it is root or levain's own account"
     deadline = time.monotonic() + timeout
     while True:
-        # Every step is bounded by what is left of `timeout`, so a stalled sudo or pgrep cannot
-        # stretch the sweep (S2d codex MED).
-        left = lambda: max(0.5, deadline - time.monotonic())   # noqa: E731
+        # Every step is bounded by what is left of `timeout`, with no floor, so a stalled sudo cannot
+        # stretch the sweep (S2d codex MED, r3).
+        left = deadline - time.monotonic()
+        if left > 0:
+            try:
+                subprocess.run([SUDO, "-n", "-u", user, "/bin/kill", "-9", "--", "-1"], capture_output=True,
+                               stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=left)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         try:
-            subprocess.run([SUDO, "-n", "-u", user, "/bin/kill", "-9", "--", "-1"], capture_output=True,
-                           stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=left())
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-        try:
-            r = subprocess.run(["/usr/bin/pgrep", "-U", user], capture_output=True, text=True,
-                               stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=left())
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return f"could not list {user}'s processes ({exc})"
-        if r.returncode == 1:
-            return None
-        if time.monotonic() >= deadline:
-            pids = " ".join(r.stdout.split()[:20])
-            return (f"processes of {user} are still running (pid {pids})" if r.returncode == 0
-                    else f"could not list {user}'s processes (pgrep exited {r.returncode})")
-        time.sleep(0.2)
+            if not entity_session_live(uid):
+                return None
+            said = f"processes of {user} are still running"
+        except WsGitError as exc:
+            said = str(exc)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return said
+        time.sleep(min(0.2, left))
 
 
 # Names never carried from one command to the next, whatever the entity set them to: each makes a
@@ -3002,16 +3014,19 @@ class SandboxedShell:
         return False
 
     def _signal_group(self, pgid: int, leader: _Leader, sig: int) -> None:
-        """Signal a group only while its leader is unreaped, checked and sent under the lock every
-        reap holds, so a number another thread has just freed is never signalled (S2d codex HIGH)."""
-        with self._lock:
+        """Signal a group only while its leader is unreaped, checked and sent under that leader's
+        reap lock, which every reap of it holds, so a number another thread has just freed is never
+        signalled (S2d codex HIGH). Per leader, so a slow signal to one group (two sudo calls for a
+        hands shell) never holds up a Ctrl-C or the shell's bookkeeping (S2 L3 r3)."""
+        with leader._reap_lock:
             if not leader.reaped:
                 self._signal(pgid, sig)
 
     def _reap(self, pgid: int, leader: _Leader) -> None:
-        """Reap a leader whose group is empty and forget the group, in one step under the lock."""
+        """Reap a leader whose group is empty, then forget the group. A signal between the two finds
+        the leader reaped and is not sent."""
+        leader.reap()
         with self._lock:
-            leader.reap()
             if self._groups.get(pgid) is leader:
                 del self._groups[pgid]
 
@@ -3026,10 +3041,11 @@ class SandboxedShell:
         """Reap the leader of each group that has emptied, and forget the group. Only then may its
         number be reused, and it is no longer signalled."""
         with self._lock:
-            for pgid, leader in list(self._groups.items()):
-                if leader.reaped or (leader.wait(0) and not _group_live(pgid)):
-                    leader.reap()
-                    del self._groups[pgid]
+            groups = list(self._groups.items())
+        # Decided outside the lock: `_group_live` may run pgrep (S2 L3 r3).
+        for pgid, leader in groups:
+            if leader.reaped or (leader.wait(0) and not _group_live(pgid)):
+                self._reap(pgid, leader)
 
     def _keep_late(self, out: _Output) -> None:
         with self._lock:
@@ -3153,7 +3169,7 @@ class SandboxedShell:
         Never raises."""
         leader = self._leader
         if leader is not None:
-            with self._lock:
+            with leader._reap_lock:
                 if not leader.exited:   # an exited leader is unreaped or gone; neither is Ctrl-C'd
                     self._signal(leader.pid, signal.SIGINT)
 
@@ -5776,15 +5792,25 @@ def _group_live(pgid: int) -> bool:
         if platform.system() == "Darwin":
             return True   # macOS signals no zombie, so a success is a live member (measured)
     if platform.system() == "Linux":
-        for d in os.listdir("/proc"):
-            if not d.isdigit():
-                continue
-            try:
-                f = Path(f"/proc/{d}/stat").read_text().rsplit(")", 1)[-1].split()
-            except OSError:
-                continue
-            if len(f) > 2 and f[2] == str(pgid) and f[0] not in ("Z", "X", "x"):
-                return True
+        def scan() -> bool:
+            for d in os.listdir("/proc"):
+                if not d.isdigit():
+                    continue
+                try:
+                    f = Path(f"/proc/{d}/stat").read_text().rsplit(")", 1)[-1].split()
+                except OSError:
+                    continue
+                if len(f) > 2 and f[2] == str(pgid) and f[0] not in ("Z", "X", "x"):
+                    return True
+            return False
+
+        # Two empty scans, not one: the listing is taken before the reads, so a member that forked
+        # and exited in between leaves its child out of one scan, never out of the next (S2 L3 r3).
+        if scan():
+            return True
+        time.sleep(0.01)
+        if scan():
+            return True
         # Nothing live is visible. A member of another uid hidden by /proc's hidepid still answers
         # EPERM, and is not called gone.
         try:
@@ -5853,10 +5879,19 @@ class _Leader:
                            fflags=select.KQ_NOTE_EXIT | _NOTE_EXITSTATUS)
         try:
             got = kq.control([ev], 1, 0)
-        except OSError:
-            got = None   # ESRCH: it has already exited
-        if got is None or any(e.flags & select.KQ_EV_ERROR for e in got):
+        except OSError as exc:
             kq.close()
+            if exc.errno != errno.ESRCH:
+                raise
+            self.exited = True   # ESRCH: it exited before the watch was set
+            return
+        errs = [e.data for e in got if e.flags & select.KQ_EV_ERROR]
+        if errs:
+            kq.close()
+            if any(d != errno.ESRCH for d in errs):
+                # Only ESRCH means "already exited"; anything else is a watch that could not be set,
+                # and a running command must not be read as a finished one (S2 L3 r3).
+                raise OSError(errs[0], f"cannot watch the shell's process: {os.strerror(errs[0])}")
             self.exited = True
             return
         self._kq = kq
@@ -5865,8 +5900,9 @@ class _Leader:
     def _take(self, events: list[Any]) -> None:
         for e in events:
             if e.filter == select.KQ_FILTER_PROC and e.fflags & select.KQ_NOTE_EXIT:
-                self.exited = True
+                # The status first: a waiter on another thread that sees `exited` reads it (r3).
                 self.status = os.waitstatus_to_exitcode(e.data)
+                self.exited = True
 
     def wait(self, timeout: float) -> bool:
         """True once the leader has exited (it stays unreaped), polled up to ``timeout`` seconds.

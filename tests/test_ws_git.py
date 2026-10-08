@@ -874,3 +874,30 @@ def test_an_interrupted_stop_keeps_the_locks_and_close_does_not_raise(tmp_path: 
         ws_git.hold_hands_session(tmp_path)
     os.close(s.hands_lock_fd)
     os.close(s.hands_session_fd)
+
+
+def test_a_failed_teardown_still_stops_the_hands_user_and_keeps_the_locks(tmp_path: Path, monkeypatch) -> None:
+    """r3 codex HIGH: when conversation.close() raised, the stop was skipped, so a setsid child kept
+    running past the session. The stop runs whatever the teardown did; the locks stay either way."""
+    from levain.firing import confinement as C
+    from levain.session import EntitySession
+
+    swept: list[str] = []
+    monkeypatch.setattr(C, "sweep_hands_user", lambda user: swept.append(user))
+    monkeypatch.setattr(C, "unemptied_shell_groups", lambda user: [])
+
+    class Conv:
+        def close(self):
+            raise RuntimeError("the executor did not close")
+
+    (tmp_path / ".levain").mkdir()
+    s = EntitySession(entity_dir=tmp_path, binding=None, conversation=Conv(), workspace=tmp_path,
+                      model_label="m", with_tools=True, bash_ok=True,
+                      hands_lock_fd=ws_git.hold_session_lock(tmp_path),
+                      hands_session_fd=ws_git.hold_hands_session(tmp_path), hands_user="_levain_x_000000")
+    s.close()
+    assert swept == ["_levain_x_000000"]
+    with pytest.raises(WsGitError, match="one runs at a time"):
+        ws_git.hold_hands_session(tmp_path)
+    os.close(s.hands_lock_fd)
+    os.close(s.hands_session_fd)

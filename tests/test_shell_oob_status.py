@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import platform
 import random
+import select
 import signal
 import subprocess
 import threading
@@ -1008,3 +1009,110 @@ def test_a_reaped_leaders_group_is_never_signalled(tmp_path):
     sh.interrupt()
     assert not sent
     sh.close()
+
+
+# --- S2 L3 r3 (input 1be91f8bdfc24a1b) ---------------------------------------------------------
+
+
+def test_a_slow_signal_to_one_group_does_not_block_ctrl_c(tmp_path):
+    """r3 complement MED: the unreaped-check-and-signal held the shell-wide lock across a hands
+    signal (two sudo calls), so a Ctrl-C on another thread waited behind it. The guard is per leader."""
+    from levain.firing import confinement as C
+
+    sh = _plain(tmp_path).start()
+    a = C._Leader(subprocess.Popen(["/bin/sleep", "5"], start_new_session=True))
+    b = C._Leader(subprocess.Popen(["/bin/sleep", "5"], start_new_session=True))
+    hit: list[int] = []
+
+    def slow(pgid, sig):
+        if pgid == a.pid:
+            time.sleep(2)
+        hit.append(pgid)
+
+    sh._signal = slow   # type: ignore[method-assign]
+    sh._leader = b   # type: ignore[attr-defined]
+    try:
+        t = threading.Thread(target=sh._signal_group, args=(a.pid, a, signal.SIGTERM))  # type: ignore[attr-defined]
+        t.start()
+        time.sleep(0.2)
+        t0 = time.monotonic()
+        sh.interrupt()
+        assert time.monotonic() - t0 < 1.0 and b.pid in hit
+        t.join(5)
+    finally:
+        sh._leader = None   # type: ignore[attr-defined]
+        for lead in (a, b):
+            lead.proc.kill()
+            lead.reap()
+        sh.close()
+
+
+def test_the_exit_status_is_set_before_the_leader_reads_as_exited():
+    """r3 complement LOW: a racing waiter could see `exited` with no status yet and take the
+    driver-failed path for a command that ended normally."""
+    from levain.firing import confinement as C
+
+    seen: list[object] = []
+
+    class Watched(C._Leader):
+        def __setattr__(self, name, value):
+            if name == "exited" and value:
+                seen.append(self.__dict__.get("status"))
+            object.__setattr__(self, name, value)
+
+    lead = Watched.__new__(Watched)
+    object.__setattr__(lead, "status", None)
+    object.__setattr__(lead, "exited", False)
+
+    class Ev:
+        filter = select.KQ_FILTER_PROC if hasattr(select, "KQ_FILTER_PROC") else -5
+        fflags = select.KQ_NOTE_EXIT if hasattr(select, "KQ_NOTE_EXIT") else 0x80000000
+        data = 3 << 8
+
+    if not hasattr(select, "KQ_FILTER_PROC"):
+        pytest.skip("kqueue (macOS) only")
+    lead._take([Ev()])
+    assert seen == [3]
+
+
+@pytest.mark.skipif(not hasattr(select, "kqueue"), reason="kqueue (macOS) only")
+def test_a_watch_that_cannot_be_set_for_a_live_process_is_an_error_not_an_exit(monkeypatch):
+    """r3 complement LOW: any kqueue registration error read as "already exited", so a running
+    command would be killed as a failed driver. Only ESRCH means exited."""
+    import errno as _errno
+
+    from levain.firing import confinement as C
+
+    class Ev:
+        flags = select.KQ_EV_ERROR
+        data = _errno.EACCES
+
+    class FakeKq:
+        def control(self, *a):
+            return [Ev()]
+
+        def close(self):
+            pass
+
+    proc = subprocess.Popen(["/bin/sleep", "5"], start_new_session=True)
+    try:
+        monkeypatch.setattr(C.select, "kqueue", FakeKq)
+        with pytest.raises(OSError):
+            C._Leader(proc)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_group_is_not_called_empty_on_one_scan_of_proc(monkeypatch):
+    """r3 complement LOW: /proc was listed once and read later, so a member that forked and exited in
+    between left its child out of the listing and a live group read as empty."""
+    from levain.firing import confinement as C
+
+    listings = iter([[], ["4242"], ["4242"]])
+    monkeypatch.setattr(C.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(C.os, "killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(C.os, "listdir", lambda p: next(listings))
+    monkeypatch.setattr(C.Path, "read_text", lambda self, *a, **k: "4242 (sleep) S 1 777 777 0")
+    monkeypatch.setattr(C.time, "sleep", lambda s: None)
+    assert C._group_live(777) is True

@@ -911,8 +911,8 @@ class EntitySession:
                     )
             # After the conversation, and only if it closed and nothing of the hands user is left: a
             # shell or process still alive must keep ws-git out.
-            if not started and torn_down and hands_session_fd is not None and hands_id is not None:
-                torn_down = _stop_hands_user(hands_id.user) is None
+            if not started and hands_session_fd is not None and hands_id is not None:
+                torn_down = _stop_hands_user(hands_id.user) is None and torn_down
             if not started and torn_down:
                 for lock in (hands_session_fd, hands_lock_fd):
                     if lock is not None:
@@ -1499,9 +1499,11 @@ class EntitySession:
             # running: ws-git may run once nothing of this session can still act in the workspace. A
             # teardown that failed, or a process that could not be stopped, keeps the locks until
             # this process ends, which releases them (S2 L3 r2, codex HIGH).
-            if torn_down and self.hands_session_fd is not None and self.hands_user is not None:
+            # The stop runs whether or not the teardown did: a setsid child is not reached by the
+            # conversation's close, and must not outlive a session whose close failed (S2 L3 r3).
+            if self.hands_session_fd is not None and self.hands_user is not None:
                 self.left_running = _stop_hands_user(self.hands_user)
-                torn_down = self.left_running is None
+                torn_down = torn_down and self.left_running is None
             for name in ("hands_session_fd", "hands_lock_fd"):
                 fd = getattr(self, name)
                 if fd is not None and torn_down:
