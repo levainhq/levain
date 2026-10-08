@@ -989,7 +989,7 @@ class GitLedger:
                 if not self._fetch(remote, rref, timeout):
                     if self.pinned_root and self._has(rref):
                         # a PINNED clone never recreates a deleted ledger: pushing would republish every commit the
-                        # host removed (T r22-2 codex HIGH). Only `init` creates the remote ref.
+                        # host removed (T r22-2 codex HIGH). Only `init` (or a re-genesis, on its own new branch) creates one.
                         raise TeamError(f"{remote} no longer has {self.branch} (deleted or moved); nothing was "
                                         "pushed. Ask the owner what happened before writing more")
                     if not push:
