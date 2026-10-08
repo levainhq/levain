@@ -629,9 +629,18 @@ def _undo_dry(tmp_path: Path, monkeypatch, capsys, uid: int) -> tuple[int, str]:
     return rc, capsys.readouterr().out
 
 
-def test_undo_of_an_account_someone_else_deleted_retires_and_works_on_its_recorded_id(tmp_path: Path, monkeypatch, capsys) -> None:
-    rc, out = _undo_dry(tmp_path, monkeypatch, capsys, 4_000_017)    # no account has this id
-    assert rc == 0 and "retire the user id" in out and "stop every process" in out
+def test_undo_of_an_account_someone_else_deleted_works_on_its_id_only_when_the_workspace_vouches(tmp_path: Path, monkeypatch, capsys) -> None:
+    rc, out = _undo_dry(tmp_path, monkeypatch, capsys, 4_000_017)    # no account, and no workspace of that id
+    assert rc == 1 and "not owned by the recorded id" in out
+    monkeypatch.setitem(hands.WORKSPACE_ROOT, "darwin", tmp_path / "root")
+    again = tmp_path / "again"
+    (tmp_path / "root" / hands_user_name(again / "coyote") / "workspace").mkdir(parents=True)  # owned by this test's uid
+    monkeypatch.setenv("SUDO_USER", hands.pwd.getpwuid(os.getuid()).pw_name)   # the dry run's operator, by name
+    real = hands.pwd.getpwuid
+    monkeypatch.setattr(hands.pwd, "getpwuid", lambda uid: (_ for _ in ()).throw(KeyError(uid)) if uid == os.getuid() else real(uid))
+    rc, out = _undo_dry(tmp_path / "again", monkeypatch, capsys, os.getuid())
+    assert rc == 0 and "retire the user id" in out
+    assert "stop every process" not in out                            # root kills nothing by a config-named id
 
 
 def test_undo_refuses_when_the_recorded_id_now_belongs_to_another_account(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -639,20 +648,29 @@ def test_undo_refuses_when_the_recorded_id_now_belongs_to_another_account(tmp_pa
     assert rc == 1 and "now belongs to" in out and "retire the user id" not in out
 
 
-def test_undo_takes_the_hands_lock_exclusive_and_never_creates_it(tmp_path: Path) -> None:
+def test_undo_takes_the_hands_lock_exclusive_creating_it_for_the_operator(tmp_path: Path) -> None:
     from levain.firing import ws_git
 
     ed = _entity(tmp_path)
-    assert hands._undo_lock(ed) is None and not (ed / ".levain" / ws_git.HANDS_LOCK).exists()
-    fd = ws_git.hold_session_lock(ed)                       # a session is open
+    fd = hands._undo_lock(ed, os.getuid(), os.getgid())        # absent: created, the operator's, and held
     try:
-        assert hands._undo_lock(ed) == -1
-    finally:
-        os.close(fd)
-    fd = hands._undo_lock(ed)
-    try:
-        assert fd is not None and fd >= 0
-        with pytest.raises(ws_git.WsGitError):              # and nothing starts under the undo
+        lock = ed / ".levain" / ws_git.HANDS_LOCK
+        assert fd >= 0 and lock.stat().st_uid == os.getuid()
+        with pytest.raises(ws_git.WsGitError):                  # nothing starts under the undo
             ws_git.hold_session_lock(ed, wait=0)
     finally:
         os.close(fd)
+    sfd = ws_git.hold_session_lock(ed)                          # a session is open: undo refuses
+    try:
+        assert hands._undo_lock(ed, os.getuid(), os.getgid()) == -1
+    finally:
+        os.close(sfd)
+
+
+def test_setup_isolation_can_still_undo_an_entity_that_was_moved(tmp_path: Path, monkeypatch, capsys) -> None:
+    old, moved = _entity(tmp_path, "old"), _entity(tmp_path, "moved")
+    (moved / ".levain" / "confinement.json").write_text(json.dumps({**_record(old), "hands_uid": 4_000_017}))
+    monkeypatch.setattr(hands, "host_os", lambda: "darwin")
+    hands.cmd_setup_isolation(moved, undo=True, dry_run=True)
+    out = capsys.readouterr().out
+    assert "another entity directory" not in out and hands_user_name(old) in out

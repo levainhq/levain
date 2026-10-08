@@ -394,22 +394,64 @@ except BaseException:
 """
 
 
-def _check_operator_source(src: Path, hands: Hands) -> None:
-    """A file or repository the operator hands in must be reached only through the operator's own
-    folders: the entity can leave a link (or, on macOS, a hard link) in /tmp or /Users/Shared that
-    points at a secret of the operator's, and ask for it to be copied in. So nothing on the path may
-    belong to the hands user, no part of it may be a link anyone but the operator or root made, and
-    it may not lie in any entity's workspace."""
+def _pin_operator_source(src: Path, hands: Hands, *, want_dir: bool) -> int:
+    """Open a file (or, with ``want_dir``, a directory) the operator hands in, and return its fd.
+
+    The entity can leave a link (or, on macOS, a hard link) in /tmp or /Users/Shared that points at
+    a secret of the operator's, or swap a folder on the path after it was checked. So the path is
+    resolved one component at a time through directory fds opened with O_NOFOLLOW, and the result
+    is used through the fd, never by name again. A link is followed only if root or the operator
+    made it; nothing on the way may belong to the hands user; and no directory on the way may be
+    writable by others without the sticky bit (in one, the entity could swap one of the operator's
+    entries for another). The source may not lie in any entity's workspace."""
     if _under_a_workspace_root(src):
         raise WsGitError(f"{src} is in an entity's workspace; this copies something of yours into it")
-    path = Path(os.path.abspath(src))
     me = os.getuid()
-    for p in (*reversed(path.parents), path):
-        st = p.lstat()
-        if st.st_uid == hands.uid:
-            raise WsGitError(f"{p} belongs to the entity's user; refusing a source it could have chosen for you")
-        if stat.S_ISLNK(st.st_mode) and st.st_uid not in (me, 0):
-            raise WsGitError(f"{p} is a link another user made; give the real path")
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    parts = [x for x in os.path.abspath(src).split("/") if x]
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | cloexec)
+    hops = 0
+    try:
+        while parts:
+            name = parts.pop(0)
+            if name == ".":
+                continue
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if st.st_uid == hands.uid:
+                raise WsGitError(f"{name} on the path to {src} belongs to the entity's user; refusing a source "
+                                 "it could have chosen for you")
+            if stat.S_ISLNK(st.st_mode):
+                if st.st_uid not in (me, 0):
+                    raise WsGitError(f"{name} on the path to {src} is a link another user made; give the real path")
+                hops += 1
+                if hops > 40:
+                    raise WsGitError(f"too many links on the path to {src}")
+                target = os.readlink(name, dir_fd=fd)
+                if target.startswith("/"):
+                    os.close(fd)
+                    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | cloexec)
+                parts = [x for x in target.split("/") if x] + parts
+                continue
+            last = not parts
+            flags = os.O_RDONLY | os.O_NOFOLLOW | cloexec
+            flags |= os.O_DIRECTORY if (not last or want_dir) else os.O_NONBLOCK
+            nfd = os.open(name, flags, dir_fd=fd)
+            nst = os.fstat(nfd)
+            if nst.st_uid == hands.uid or (not last and nst.st_mode & stat.S_IWOTH and not nst.st_mode & stat.S_ISVTX):
+                os.close(nfd)
+                raise WsGitError(f"{name} on the path to {src} belongs to the entity's user, or anyone can swap "
+                                 "what is in it; refusing")
+            os.close(fd)
+            fd = nfd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _check_operator_source(src: Path, hands: Hands) -> None:
+    """:func:`_pin_operator_source`, for a caller that only needs the verdict."""
+    os.close(_pin_operator_source(src, hands, want_dir=Path(src).is_dir()))
 
 
 def put_parts(workspace: Path, dest: Path | str) -> list[str]:
@@ -459,9 +501,8 @@ def _put(entity_dir: Path | str, src: Path | str, dest: Path | str) -> int:
         _refuse_while_live(hands, "ws-put")
         parts = put_parts(hands.workspace, dest)
         src = Path(src).expanduser()
-        _check_operator_source(src, hands)
-        # O_NONBLOCK: a FIFO is refused below instead of blocking the open; a regular file ignores it.
-        fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        # O_NONBLOCK (in the pin): a FIFO is refused below instead of blocking the open.
+        fd = _pin_operator_source(src, hands, want_dir=False)
     except (WsGitError, OSError) as exc:
         print(f"ws-put: {exc}")
         return 1
@@ -506,37 +547,74 @@ cat > "$t/bundle"
 """
 
 
-def _check_source_repo(src: Path, hands: Hands) -> None:
+def _check_source_repo(rfd: int, src: Path, hands: Hands) -> None:
     """Before the operator's git reads a repository to import, it must be one nobody else could have
-    written: the operator's git trusts it and would run what its config names. A plain ``.git``
-    directory; every entry in it the operator's and not writable by others; no borrowed objects, no
-    linked worktrees, no config includes."""
-    gitdir = src / ".git"
-    st = gitdir.lstat()
+    written: the operator's git trusts it and would run what its config names. Checked through the
+    pinned directory fd ``rfd``: a plain ``.git`` directory; every entry in it the operator's and
+    writable by neither group nor others; no borrowed objects, no linked worktrees, no config
+    includes. Then the hands user itself is asked (``test -w`` on every entry, as that user) whether
+    it could write any of it, which answers for ACLs as well."""
+    st = os.stat(".git", dir_fd=rfd, follow_symlinks=False)
     if not stat.S_ISDIR(st.st_mode):
-        raise WsGitError(f"{gitdir} is not a plain directory (a gitfile or a link); refusing")
+        raise WsGitError(f"{src}/.git is not a plain directory (a gitfile or a link); refusing")
     me = os.getuid()
-    for root, dirs, files in os.walk(gitdir):
+    for root, dirs, files, dfd in os.fwalk(".git", dir_fd=rfd):
         for name in (".", *dirs, *files):
-            p = Path(root) if name == "." else Path(root) / name
-            pst = p.lstat()
-            if pst.st_uid != me or pst.st_mode & stat.S_IWOTH and not stat.S_ISLNK(pst.st_mode):
-                raise WsGitError(f"{p} is not yours alone (owner {pst.st_uid}, or writable by others); refusing "
-                                 "to let your git read this repository")
+            pst = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if stat.S_ISLNK(pst.st_mode):
+                writable = False
+            else:
+                writable = bool(pst.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+            if pst.st_uid != me or writable:
+                raise WsGitError(f"{src}/{root}/{name} is not yours alone (owner {pst.st_uid}, or writable by your "
+                                 "group or others); refusing to let your git read this repository")
     for name in ("commondir", "worktrees"):
-        if os.path.lexists(gitdir / name):
-            raise WsGitError(f"{gitdir}/{name} present (linked worktrees are not imported)")
-    alt = gitdir / "objects" / "info" / "alternates"
-    if alt.exists() and alt.stat().st_size:
-        raise WsGitError(f"{gitdir} borrows objects from elsewhere (alternates); refusing")
-    if any(k.startswith(("include.", "includeif.")) for k in _config_lines(gitdir / "config", "--list", "--name-only")):
-        raise WsGitError(f"{gitdir}/config includes another file; refusing")
+        try:
+            os.stat(f".git/{name}", dir_fd=rfd, follow_symlinks=False)
+            raise WsGitError(f"{src}/.git/{name} present (linked worktrees are not imported)")
+        except FileNotFoundError:
+            pass
+    try:
+        if os.stat(".git/objects/info/alternates", dir_fd=rfd, follow_symlinks=False).st_size:
+            raise WsGitError(f"{src}/.git borrows objects from elsewhere (alternates); refusing")
+    except FileNotFoundError:
+        pass
+    keys = _operator_git(rfd, "config", "--file", ".git/config", "--list", "--name-only").stdout.splitlines()
+    if any(k.startswith(("include.", "includeif.")) for k in keys):
+        raise WsGitError(f"{src}/.git/config includes another file; refusing")
+    writable = _hands_can_write(hands, Path(os.path.abspath(src)) / ".git")
+    if writable:
+        raise WsGitError(f"the entity's user can write {writable}; refusing to let your git read this repository")
 
 
-def _operator_git(src: Path, *args: str) -> subprocess.CompletedProcess:
-    """The operator's git on the operator's own repository (outside every workspace)."""
-    return subprocess.run([_abs("git"), *_NEUTRALISE, "-C", str(src), *args], capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL, cwd="/")
+def _hands_can_write(hands: Hands, tree: Path) -> str | None:
+    """The first entry under ``tree`` the hands user can write, asked of the hands user itself
+    (``test -w``, which answers for modes and ACLs alike), or None. What it cannot reach it cannot
+    write, so a walk it is refused into prints nothing."""
+    probe = subprocess.run(_as_hands(hands, _abs("find"), str(tree), "-exec", "/bin/test", "-w", "{}", ";", "-print"),
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/")
+    first = probe.stdout.split("\n", 1)[0].strip()
+    return first or None
+
+
+def _operator_git(rfd: int, *args: str) -> subprocess.CompletedProcess:
+    """The operator's git on the operator's own repository, run inside the pinned directory ``rfd``
+    (never by its name again)."""
+    return subprocess.run([_abs("git"), *_NEUTRALISE, *args], capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, pass_fds=(rfd,), preexec_fn=lambda: os.fchdir(rfd))
+
+
+def _remote_ok(rname: str, url: str) -> bool:
+    """A remote worth copying to the entity: a name ws-git's allowlist accepts (no dot), an https or
+    ssh URL, and no login in it beyond the conventional ``git`` user (a user or token there would
+    hand the operator's credential to the entity)."""
+    if "." in rname or not _URL_OK.match(url):
+        return False
+    if url.startswith(("https://", "ssh://")):
+        authority = url.split("://", 1)[1].split("/", 1)[0]
+        user, at, _ = authority.rpartition("@")
+        return not at or (url.startswith("ssh://") and user == "git")
+    return True                                     # git@host:path (the scp form _URL_OK admits)
 
 
 def _heads(lines: str) -> dict[str, str]:
@@ -558,17 +636,24 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = No
 
 
 def _adopt(entity_dir: Path | str, repo: Path | str, name: str | None) -> int:
+    hands = load_hands(entity_dir)
+    _refuse_while_live(hands, "ws-adopt")
+    src = Path(repo).expanduser()
+    if _under_a_workspace_root(src):
+        raise WsGitError(f"{src} is inside an entity's workspace; ws-adopt imports a repository of yours "
+                         "from outside it")
+    rfd = _pin_operator_source(src, hands, want_dir=True)
     try:
-        hands = load_hands(entity_dir)
-        _refuse_while_live(hands, "ws-adopt")
-        src = Path(repo).expanduser()
-        if _under_a_workspace_root(src):
-            raise WsGitError(f"{src} is inside an entity's workspace; ws-adopt imports a repository of yours "
-                             "from outside it")
-        _check_operator_source(src, hands)
-        _check_source_repo(src, hands)
-        top = _operator_git(src, "rev-parse", "--show-toplevel")
-        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != src.resolve():
+        return _adopt_pinned(hands, src, rfd, name)
+    finally:
+        os.close(rfd)
+
+
+def _adopt_pinned(hands: Hands, src: Path, rfd: int, name: str | None) -> int:
+    try:
+        _check_source_repo(rfd, src, hands)
+        prefix = _operator_git(rfd, "rev-parse", "--show-prefix")
+        if prefix.returncode != 0 or prefix.stdout.strip():
             raise WsGitError(f"{src} is not the top of a repository")
         name = name or src.resolve().name
         if name in ("", ".", "..") or "/" in name or "\0" in name:
@@ -576,23 +661,22 @@ def _adopt(entity_dir: Path | str, repo: Path | str, name: str | None) -> int:
         dest = hands.workspace / name
         if os.path.lexists(dest):
             raise WsGitError(f"{dest} already exists")
-        head = _operator_git(src, "symbolic-ref", "-q", "HEAD")
+        head = _operator_git(rfd, "symbolic-ref", "-q", "HEAD")
         if head.returncode != 0 or not head.stdout.startswith("refs/heads/"):
             raise WsGitError(f"{src} has no branch checked out (a detached HEAD); check one out first")
         head_branch = head.stdout.strip()[len("refs/heads/"):]
-        want = _heads(_operator_git(src, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads",
+        want = _heads(_operator_git(rfd, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads",
                                     "refs/tags").stdout)
         if not any(r.startswith("refs/heads/") for r in want):
             raise WsGitError(f"{src} has no branches to import")
-        fmt = _operator_git(src, "rev-parse", "--show-object-format").stdout.strip() or "sha1"
+        fmt = _operator_git(rfd, "rev-parse", "--show-object-format").stdout.strip() or "sha1"
         if fmt not in ("sha1", "sha256"):
             raise WsGitError(f"{src} uses the object format {fmt!r}, which ws-adopt does not know")
         remotes, dropped = {}, []
-        for line in _operator_git(src, "config", "--get-regexp", r"^remote\..*\.url$").stdout.splitlines():
+        for line in _operator_git(rfd, "config", "--get-regexp", r"^remote\..*\.url$").stdout.splitlines():
             key, _, url = line.partition(" ")
             rname = key.split(".", 1)[1].rsplit(".", 1)[0]
-            # https://user:token@host would hand your token to the entity
-            if _URL_OK.match(url) and not (url.startswith("https://") and "@" in url[8:].split("/", 1)[0]):
+            if _remote_ok(rname, url):
                 remotes[rname] = url
             else:
                 dropped.append(rname)
@@ -603,8 +687,9 @@ def _adopt(entity_dir: Path | str, repo: Path | str, name: str | None) -> int:
     # The bundle's stderr goes to a file, not a pipe: nothing reads a pipe until the import ends,
     # and a full one would stall the bundle, and the import waiting on it, for good.
     with tempfile.TemporaryFile() as bundle_err:
-        bundle = subprocess.Popen([_abs("git"), *_NEUTRALISE, "-C", str(src), "bundle", "create", "-", "--branches",
-                                   "--tags"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=bundle_err, cwd="/")
+        bundle = subprocess.Popen([_abs("git"), *_NEUTRALISE, "bundle", "create", "-", "--branches", "--tags"],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=bundle_err,
+                                  pass_fds=(rfd,), preexec_fn=lambda: os.fchdir(rfd))
         assert bundle.stdout is not None
         imp = subprocess.run(
             _as_hands(hands, "/bin/sh", "-c", _IMPORT_SCRIPT, "sh", _real_git(), str(dest), head_branch, fmt,
@@ -641,11 +726,17 @@ def _adopt(entity_dir: Path | str, repo: Path | str, name: str | None) -> int:
         if subprocess.run(ws_git_argv(hands, dest / ".git", ["remote", "add", "--", rname, url]), capture_output=True,
                           stdin=subprocess.DEVNULL, cwd="/").returncode != 0:
             dropped.append(rname)
+    try:
+        check_repo(dest / ".git", hands.uid)          # what ws-git will check: it must still pass
+    except WsGitError as exc:
+        print(f"ws-adopt: imported to {dest}, but ws-git would refuse it: {exc}")
+        return 1
     n_heads = sum(r.startswith("refs/heads/") for r in want)
     print(f"Imported {src} as {dest} ({n_heads} branch(es), {len(want) - n_heads} tag(s)), owned by the entity's user. Your repository is "
           "unchanged where it is; uncommitted changes and stashes were not copied.")
     if dropped:
-        print(f"Remotes not copied (not an https or ssh URL, or one carrying a login): {', '.join(sorted(dropped))}.")
+        print("Remotes not copied (a dotted name, not an https or ssh URL, or one carrying a login): "
+              f"{', '.join(sorted(dropped))}.")
     return 0
 
 
@@ -676,8 +767,22 @@ def foreign_entries(hands: Hands) -> list[Path]:
     # (the hands user may not be able to), so only a failure inside its own tree fails the scan.
     found = set(walk("!", "-user", str(hands.uid), "-prune"))
     found.update(p for p in walk("!", "-user", str(hands.uid), "-prune", "-o", "!", "-type", "l")
-                 if p not in found and os.access(p, os.W_OK))
+                 if p not in found and _writable_or_moved(p))
     return sorted(found)
+
+
+def _writable_or_moved(p: Path) -> bool:
+    """access(W_OK) on ``p``, believed only if ``p`` is the same object before and after and its path
+    holds no link (the entity could swap a folder on the way for a link between the walk and the
+    question, and have access() answer for somewhere else). A change is itself a finding."""
+    try:
+        before = p.lstat()
+        writable = os.access(p, os.W_OK)
+        after = p.lstat()
+    except OSError:
+        return True
+    moved = (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or os.path.realpath(p) != str(p)
+    return writable or moved
 
 
 def bare_repository_explicit() -> bool:

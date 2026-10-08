@@ -550,6 +550,9 @@ class EntitySession:
     # A hands entity's session holds the hands lock SHARED for its whole life, so `levain ws-git` and
     # `ws-adopt` (which take it exclusive) never run while it is open (levain.firing.ws_git).
     hands_lock_fd: int | None = field(default=None, repr=False, compare=False)
+    _close_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     # -- construction --------------------------------------------------------
 
@@ -829,15 +832,18 @@ class EntitySession:
             # A start that failed AFTER the conversation was built must not abandon it: the SDK
             # registers each conversation's close() with atexit, so a refused open would otherwise
             # live until process exit (L3 2026-10-02, three seats). Best-effort; the start error wins.
-            if not started and hands_lock_fd is not None:
-                os.close(hands_lock_fd)
+            torn_down = True
             if not started and conversation is not None:
                 try:
                     conversation.close()
                 except Exception:  # noqa: BLE001
+                    torn_down = False
                     logging.getLogger("levain.session").warning(
                         "closing a conversation from a failed start raised", exc_info=True
                     )
+            # After the conversation, and only if it closed: a shell still alive must keep ws-git out.
+            if not started and hands_lock_fd is not None and torn_down:
+                os.close(hands_lock_fd)
 
         return cls(
             entity_dir=entity_dir,
@@ -1403,22 +1409,29 @@ class EntitySession:
         outlives the process that made it — so completing the release beats propagating the
         interruption. A genuinely hung teardown is still bounded, by layer 2 taking the whole
         process down."""
-        if self._closed:
-            return
-        self._closed = True
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        torn_down = False
         try:
             self.conversation.close()
+            torn_down = True
         except BaseException:  # noqa: BLE001 — teardown must never raise; see the docstring
             pass
         finally:
-            # After the conversation (and its shell): ws-git may run once nothing of this session can
-            # still act in the workspace.
-            if self.hands_lock_fd is not None:
-                try:
-                    os.close(self.hands_lock_fd)
-                except OSError:
-                    pass
-                self.hands_lock_fd = None
+            # After the conversation (and its shell), and only if it closed: ws-git may run once
+            # nothing of this session can still act in the workspace. A teardown that failed keeps
+            # the lock until this process ends, which releases it.
+            fd, self.hands_lock_fd = self.hands_lock_fd, None
+            if fd is not None:
+                if torn_down:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                else:
+                    self.hands_lock_fd = fd
 
     @property
     def closed(self) -> bool:

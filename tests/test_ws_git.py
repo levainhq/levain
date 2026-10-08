@@ -389,8 +389,9 @@ def test_ws_put_refuses_a_source_inside_a_workspace_and_a_non_file(put_env, tmp_
 
 def test_ws_put_refuses_a_source_reached_through_a_link_or_a_second_name(put_env, tmp_path: Path, capsys) -> None:
     h, src = put_env
-    (tmp_path / "via-link").symlink_to(src)          # e.g. one the entity left in /tmp
-    assert _put(h, tmp_path / "via-link", "a") == 1
+    (tmp_path / "via-link").symlink_to(src)          # a link of my own is followed (someone else's is not:
+    assert _put(h, tmp_path / "via-link", "a") == 0  # see the source test below)
+    (h.workspace / "a").unlink()
     os.link(src, tmp_path / "hard")                  # a hard link: the same file under a second name
     assert _put(h, tmp_path / "hard", "b") == 1 and "no hard link" in capsys.readouterr().out
     os.unlink(tmp_path / "hard")
@@ -432,7 +433,9 @@ def adopt_env(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(ws_git, "entity_session_live", lambda uid: False)
     # here "the hands user" is this test's own uid, which owns the source too; the source check has
     # its own test above
-    monkeypatch.setattr(ws_git, "_check_operator_source", lambda src, hands: None)
+    monkeypatch.setattr(ws_git, "_pin_operator_source",
+                        lambda src, hands, want_dir: os.open(src, os.O_RDONLY | os.O_DIRECTORY))
+    monkeypatch.setattr(ws_git, "_hands_can_write", lambda hands, tree: None)   # "the hands user" is me here
     src = tmp_path / "mine"
     _repo(src)
     _git(src, "checkout", "-q", "-b", "main")
@@ -476,7 +479,7 @@ def test_ws_adopt_refuses_when_a_branch_did_not_come_across_and_keeps_nothing(ad
 
 def test_ws_adopt_checks_its_source_like_ws_put(adopt_env, monkeypatch, capsys) -> None:
     h, src = adopt_env
-    monkeypatch.setattr(ws_git, "_check_operator_source", lambda s, hh: (_ for _ in ()).throw(WsGitError("chosen")))
+    monkeypatch.setattr(ws_git, "_pin_operator_source", lambda s, hh, want_dir: (_ for _ in ()).throw(WsGitError("chosen")))
     assert ws_git.cmd_ws_adopt(h.home, src) == 1 and "chosen" in capsys.readouterr().out
 
 
@@ -635,14 +638,18 @@ def _src_repo(tmp_path: Path) -> Path:
     return src
 
 
-@pytest.mark.parametrize("plant", ["other-writable", "gitfile", "alternates", "include", "worktrees"])
-def test_ws_adopt_lets_your_git_read_only_a_repository_nobody_else_could_have_written(tmp_path: Path, plant) -> None:
+@pytest.mark.parametrize("plant", ["other-writable", "group-writable", "gitfile", "alternates", "include", "worktrees"])
+def test_ws_adopt_lets_your_git_read_only_a_repository_nobody_else_could_have_written(tmp_path: Path, monkeypatch, plant) -> None:
     src = _src_repo(tmp_path)
     h = _hands(tmp_path, uid=4_000_017)
-    ws_git._check_source_repo(src, h)                                   # control: clean
+    monkeypatch.setattr(ws_git, "_hands_can_write", lambda hands, tree: None)
+    check = lambda: ws_git._check_source_repo(os.open(src, os.O_RDONLY | os.O_DIRECTORY), src, h)  # noqa: E731
+    check()                                                              # control: clean
     g = src / ".git"
     if plant == "other-writable":
-        (g / "config").chmod(0o666)
+        (g / "config").chmod(0o646)
+    elif plant == "group-writable":
+        (g / "refs").chmod(0o775)
     elif plant == "gitfile":
         shutil.rmtree(g)
         g.write_text("gitdir: /elsewhere\n")
@@ -654,7 +661,29 @@ def test_ws_adopt_lets_your_git_read_only_a_repository_nobody_else_could_have_wr
     else:
         (g / "worktrees").mkdir()
     with pytest.raises(WsGitError):
-        ws_git._check_source_repo(src, h)
+        check()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write anything")
+def test_the_hands_user_is_asked_itself_whether_it_can_write_the_repository(tmp_path: Path, monkeypatch) -> None:
+    src = _src_repo(tmp_path)
+    _no_sudo(monkeypatch)                                   # "the hands user" is me: it owns, so it can write
+    assert ws_git._hands_can_write(_hands(tmp_path), src / ".git") == str(src / ".git")
+    _read_only(src / ".git")
+    try:
+        assert ws_git._hands_can_write(_hands(tmp_path), src / ".git") is None
+    finally:
+        _writable(src / ".git")
+
+
+@pytest.mark.parametrize("name,url,ok", [
+    ("origin", "git@github.com:o/r.git", True), ("origin", "ssh://git@github.com/o/r.git", True),
+    ("origin", "https://github.com/o/r.git", True), ("origin", "https://me:tok@github.com/o/r.git", False),
+    ("origin", "ssh://oauth-token@example.com/o/r.git", False), ("corp.prod", "git@github.com:o/r.git", False),
+    ("origin", "/local/path", False),
+])
+def test_only_remotes_that_carry_no_login_and_that_ws_git_accepts_are_copied(name, url, ok) -> None:
+    assert ws_git._remote_ok(name, url) is ok
 
 
 def test_ws_adopt_checks_the_repository_before_your_git_reads_it(adopt_env, capsys) -> None:
@@ -662,3 +691,62 @@ def test_ws_adopt_checks_the_repository_before_your_git_reads_it(adopt_env, caps
     (src / ".git" / "config").chmod(0o666)
     assert ws_git.cmd_ws_adopt(h.home, src) == 1 and "not yours alone" in capsys.readouterr().out
     assert not (h.workspace / "mine").exists()
+
+
+def test_a_path_that_runs_through_a_link_is_a_finding_not_an_answer(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    (real / "d").mkdir(parents=True)
+    (real / "d").chmod(0o555)
+    (tmp_path / "via").symlink_to(real)
+    try:
+        assert ws_git._writable_or_moved(real / "d") is False      # control: same object, real path, read-only
+        assert ws_git._writable_or_moved(tmp_path / "via" / "d") is True
+    finally:
+        (real / "d").chmod(0o755)
+
+
+def test_a_source_under_a_folder_anyone_can_swap_entries_in_is_refused_unless_sticky(tmp_path: Path) -> None:
+    drop = tmp_path / "drop"
+    (drop / "job").mkdir(parents=True)
+    (drop / "job" / "input").write_text("x")
+    h = _hands(tmp_path, uid=4_000_017)
+    drop.chmod(0o777)                                   # others could rename job and put another in its place
+    try:
+        with pytest.raises(WsGitError, match="anyone can swap"):
+            ws_git._check_operator_source(drop / "job" / "input", h)
+        drop.chmod(0o1777)                              # sticky: only an entry's owner may move it
+        ws_git._check_operator_source(drop / "job" / "input", h)
+    finally:
+        drop.chmod(0o755)
+
+
+def test_ws_adopt_refuses_a_repository_the_hands_user_says_it_can_write(tmp_path: Path, monkeypatch) -> None:
+    src = _src_repo(tmp_path)
+    monkeypatch.setattr(ws_git, "_hands_can_write", lambda hands, tree: str(tree / "config"))
+    with pytest.raises(WsGitError, match="entity's user can write"):
+        ws_git._check_source_repo(os.open(src, os.O_RDONLY | os.O_DIRECTORY), src, _hands(tmp_path, uid=4_000_017))
+
+
+@pytest.mark.parametrize("teardown_ok", [True, False])
+def test_a_session_keeps_the_hands_lock_until_its_teardown_has_succeeded(tmp_path: Path, teardown_ok) -> None:
+    from levain.session import EntitySession
+
+    class Conv:
+        def close(self):
+            if not teardown_ok:
+                raise RuntimeError("the shell did not stop")
+
+    (tmp_path / ".levain").mkdir()
+    s = EntitySession(entity_dir=tmp_path, binding=None, conversation=Conv(), workspace=tmp_path,
+                      model_label="m", with_tools=True, bash_ok=True,
+                      hands_lock_fd=ws_git.hold_session_lock(tmp_path))
+    s.close()
+    s.close()                                                   # idempotent: never a second os.close
+    if teardown_ok:
+        with ws_git._exclusive(tmp_path):
+            pass
+    else:
+        with pytest.raises(WsGitError, match="session of this entity is open"):
+            with ws_git._exclusive(tmp_path):
+                pass
+        os.close(s.hands_lock_fd)

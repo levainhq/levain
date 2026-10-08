@@ -314,6 +314,7 @@ def plan_undo(
     hands_user: str,
     hands_id: int | None,
     operator_gid: int,
+    account_gone: bool = False,
 ) -> Plan:
     """The reverse of :func:`plan_setup`, ordered so nothing acts on the tree while the hands user
     can still change it: the sudoers rule goes first (no new processes), the id is retired, cron and
@@ -337,8 +338,12 @@ def plan_undo(
                  call=lambda: _ensure_line(_RETIRED_IDS[host], str(hands_id), present=True, create=True)),
             Step("remove the hands user's cron jobs", (_abs("crontab"), "-r", "-u", hands_user), allow_fail=True),
             Step("remove the hands user's at jobs", call=lambda: _remove_owned(_AT_SPOOL[host], hands_id)),
-            Step("stop every process of the hands user, and check they are gone", call=lambda: _kill_all(hands_id)),
         ]
+        if not account_gone:
+            # With the account gone there is nothing of it to stop, and root does not kill by an id
+            # that only the config names.
+            steps.append(Step("stop every process of the hands user, and check they are gone",
+                              call=lambda: _kill_all(hands_id)))
     steps += [
         Step("give what the hands user owned your group (its owner stays its old id: never you, never root)",
              call=lambda: _to_operator_group(tree, hands_id, operator_gid)),
@@ -848,19 +853,23 @@ def record_hands(entity_dir: Path, values: dict | None, *, owner_uid: int, owner
     return levain_dir / "confinement.json"
 
 
-def _undo_lock(entity_dir: Path) -> int | None:
+def _undo_lock(entity_dir: Path, owner_uid: int, owner_gid: int) -> int:
     """The hands lock, exclusive, for the whole undo: no session, ws-git, ws-put or ws-adopt runs
-    while the account and its sudoers rule go. Opened without O_CREAT: root must not create the
-    operator's lock file (it would then be root's, and refuse the operator). Absent = nobody holds
-    it. Returns the fd, None when there is no lock file, or -1 when it is held."""
+    while the account and its sudoers rule go. If the lock file does not exist yet, root creates it
+    (O_EXCL, no link followed) and gives it to the operator, so the operator's own sessions can open
+    it afterwards; absence is never taken to mean nobody can start. Returns the fd, or -1 when the
+    lock is held."""
     import fcntl
 
     from levain.firing.ws_git import HANDS_LOCK
 
+    path = entity_dir / ".levain" / HANDS_LOCK
+    flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(entity_dir / ".levain" / HANDS_LOCK, os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
-    except FileNotFoundError:
-        return None
+        fd = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+        os.fchown(fd, owner_uid, owner_gid)
+    except FileExistsError:
+        fd = os.open(path, flags)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -886,7 +895,7 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
     try:
         host = host_os()
         entity_dir, _crystal, _episodic = guard_entity(path)
-        cfg = load_confinement_config(entity_dir)
+        cfg = load_confinement_config(entity_dir, bound_hands=False)
         if dry_run:
             operator = os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
         else:
@@ -910,13 +919,26 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
                   f"creates for {hands}; refusing (fix or remove the hands keys in confinement.json).")
             return 1
         hands_id: int | None = None
+        account_gone = False
         if not _user_exists(hands) and cfg.hands_uid is not None:
             # The account was removed by someone else. Its files still carry the recorded id: retire
             # it and work on it, unless another account has it now.
             try:
                 taken = pwd.getpwuid(cfg.hands_uid).pw_name
             except KeyError:
+                # The config is the operator's to write; the id is believed only when the workspace
+                # setup made still carries it.
+                ws_now = hands_workspace(host, hands)
+                try:
+                    owner = ws_now.lstat().st_uid
+                except OSError:
+                    owner = None
+                if owner != cfg.hands_uid:
+                    print(f"setup-isolation: {hands} is gone and its workspace {ws_now} is not owned by the "
+                          f"recorded id {cfg.hands_uid}; refusing to act on that id.")
+                    return 1
                 hands_id = cfg.hands_uid
+                account_gone = True
             else:
                 print(f"setup-isolation: {hands} is gone and its id {cfg.hands_uid} now belongs to {taken}; "
                       "refusing to touch files by that id.")
@@ -934,12 +956,12 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool) -> int:
                 return 1
         try:
             plan = plan_undo(entity_dir, operator=operator, host=host, hands_user=hands, hands_id=hands_id,
-                             operator_gid=op.pw_gid)
+                             operator_gid=op.pw_gid, account_gone=account_gone)
         except HandsSetupError as exc:
             print(f"setup-isolation: {exc}")
             return 1
         print(f"Removing hands isolation for {entity_dir} (user {hands}).")
-        lock_fd = None if dry_run else _undo_lock(entity_dir)
+        lock_fd = None if dry_run else _undo_lock(entity_dir, op.pw_uid, op.pw_gid)
         if lock_fd == -1:
             print("setup-isolation: a session of this entity, or levain ws-git / ws-put / ws-adopt, is "
                   "running; refusing to undo under it.")

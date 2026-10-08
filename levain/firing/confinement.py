@@ -1771,7 +1771,7 @@ class ConfinementConfig:
 _CONFINEMENT_CONFIG_NAME = "confinement.json"
 
 
-def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
+def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True) -> ConfinementConfig:
     """Load ``<entity>/.levain/confinement.json`` if present, else the default (universal floor only).
 
     Schema (all fields optional)::
@@ -1901,7 +1901,8 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
                 f"{base}: hands_user must be the name `levain setup-isolation` recorded, got "
                 f"{hands_user!r}.{redo}"
             )
-        if hands_user != hands_user_name(entity_dir):
+        # bound_hands=False only for setup-isolation itself, so a moved entity can still be undone.
+        if bound_hands and hands_user != hands_user_name(entity_dir):
             # The name is derived from this entity's path. A record copied from another entity would
             # share its hands user while locking a different hands.lock (levain.firing.ws_git).
             raise ConfinementError(
