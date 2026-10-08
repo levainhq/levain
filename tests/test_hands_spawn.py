@@ -269,8 +269,12 @@ def test_the_binding_carries_the_hands_user_and_fences_its_workspace(tmp_path):
 
 
 openhands = pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
+# The editor's reads in these tests run the real hands helper, a zsh program: macOS ships zsh, and
+# the hands editor is macOS-only until the S2-linux slice (a Linux CI runner has no /bin/zsh).
+_needs_zsh = pytest.mark.skipif(not Path("/bin/zsh").exists(), reason="the hands helper needs /bin/zsh")
 
 
+@_needs_zsh
 def test_the_editor_writes_through_the_hands_user_and_never_as_the_operator(tmp_path, monkeypatch):
     from openhands.tools.file_editor.definition import FileEditorAction
 
@@ -316,6 +320,7 @@ def test_the_editor_writes_through_the_hands_user_and_never_as_the_operator(tmp_
     assert target.read_text() == "one\nins\n2\n"
 
 
+@_needs_zsh
 def test_an_editor_write_the_hands_user_cannot_make_is_an_in_band_error(tmp_path, monkeypatch):
     from openhands.tools.file_editor.definition import FileEditorAction
 
