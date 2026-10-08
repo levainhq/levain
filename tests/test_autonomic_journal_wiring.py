@@ -1845,3 +1845,34 @@ def test_a_pending_sealed_for_another_hold_is_refused(tmp_path):
     out = _approve(w)
     assert out.aborted and out.reason == "integrity:seal_mismatch"
     assert ("link1", "h6-1") not in w.outbox()
+
+
+def test_a_replayed_receipt_carries_what_the_effect_ran_with(tmp_path):
+    # codex r2 MED 6: when the receipt did not land after the effect, the replay wrote it from the
+    # re-delivered request, so its provenance (the query, the decider's first estimate) was whatever the
+    # new delivery carried. What the receipt needs is recorded with the effect's result now.
+    w = World(tmp_path)
+    _mint_single(w, "r6")
+    w.dispatch("r6")
+    [p] = w.gate.open_pendings()
+    real = w.gate._persist
+    w.gate._persist = lambda **kw: None                                # the receipt does not land
+    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human", first_estimate=0.7))
+    assert out.fired and out.receipt_id is None and w.receipts.read() == []
+    w.gate._persist = real
+    w.dispatcher._request_builder = lambda b, e: dataclasses.replace(_single_builder(b, e), query_text="other")
+    again = w.dispatch("r6").outcome
+    assert again.replayed and again.receipt_id is not None
+    [r] = w.receipts.read()
+    assert r.action_face["query_text"] == "q" and r.action_face["actor_first_estimate"] == 0.7
+    assert r.action_face["gate"]["by"] == "human"
+
+
+def test_a_first_estimate_that_is_not_json_does_not_make_a_sent_effect_unknown(tmp_path):
+    # the recorded provenance must encode, or the journal would read the effect's outcome as unknown
+    w = World(tmp_path)
+    _mint_single(w, "r7")
+    w.dispatch("r7")
+    [p] = w.gate.open_pendings()
+    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human", first_estimate=object()))
+    assert out.fired and w.journal.poisoned() == [] and w.outbox() == [("link0", "r7-0")]

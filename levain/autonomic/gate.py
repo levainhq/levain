@@ -35,6 +35,7 @@ The dependency arrow stays down. Stdlib-only core.
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import logging
 import sqlite3
 from collections.abc import Callable
@@ -81,6 +82,30 @@ _RESOLVED_TRUST = TrustContext(
 # why a binding's risk could not be re-derived when the registry itself could not be read (a lock, a
 # damaged store): unlike an absent binding, a repair clears it, so the decision stays open
 _REGISTRY_UNREADABLE = "revalidate:registry_unreadable"
+
+
+def _authority_from(a: dict[str, Any]) -> AuthorityScope:
+    """An :class:`AuthorityScope` from its ``to_dict`` form; ``KeyError``/``TypeError``/``ValueError`` on
+    a malformed one."""
+    return AuthorityScope(grantor=str(a["grantor"]), grant=str(a["grant"]),
+                          binding_id=a.get("binding_id"), hops=int(a.get("hops", 0)))
+
+
+def _face_record(request: ActionRequest) -> dict[str, Any]:
+    """The receipt provenance an effect runs with, recorded with its result so a replay writes the
+    receipt that did not land from it. A first estimate that is not plain JSON is left out (the
+    record must encode, or the effect's outcome would read as unknown)."""
+    rec: dict[str, Any] = {
+        "query_text": request.query_text, "query_date": request.query_date,
+        "producers": list(request.producers), "authority": request.authority.to_dict(),
+        "proposal_id": request.proposal_id,
+    }
+    try:
+        if json.loads(json.dumps(request.actor_first_estimate)) == request.actor_first_estimate:
+            rec["actor_first_estimate"] = request.actor_first_estimate
+    except (TypeError, ValueError):
+        pass
+    return rec
 
 
 def _default_summary(request: ActionRequest) -> str:
@@ -1404,7 +1429,7 @@ class EfferentGate:
             if not isinstance(result, ExecutionResult):
                 raise TypeError(f"executor returned {type(result).__name__}, not an ExecutionResult")
             return {"execution": _execution_record(result), "posture": posture.name,
-                    "verdict": verdict, "by": by}
+                    "verdict": verdict, "by": by, "face": _face_record(request)}
 
         try:
             out = self._journal.effect(run.run_id, run.effect_id, digest=self._digest_of(request),
@@ -1440,20 +1465,32 @@ class EfferentGate:
                    and recorded_posture in Posture.__members__ else Posture.REFUSE_ESCALATE)
         receipt_id = out.receipt_id
         if receipt_id is None and request.run is not None:
+            # the provenance the effect ran with, as recorded with its result (this delivery's request
+            # may carry other provenance for the same bytes)
+            recorded = rec.get("face")
+            ran: dict[str, Any] = recorded if isinstance(recorded, dict) else {}
+            try:
+                authority = (_authority_from(ran["authority"]) if isinstance(ran.get("authority"), dict)
+                             else request.authority)
+            except (KeyError, TypeError, ValueError):
+                authority = request.authority
             try:
                 face = build_gate_face(
-                    context_id=request.context_id, query_text=request.query_text,
-                    query_date=request.query_date, producers=request.producers,
+                    context_id=request.context_id, query_text=ran.get("query_text", request.query_text),
+                    query_date=ran.get("query_date", request.query_date),
+                    producers=tuple(ran.get("producers", request.producers)),
                     gate=build_gate_verdict(verdict=str(rec.get("verdict")), by=str(rec.get("by")),
-                                            binding_id=request.authority.binding_id),
-                    authority=request.authority, terminal_state="fired",
-                    downstream_id=execution.downstream_id, actor_first_estimate=request.actor_first_estimate,
+                                            binding_id=authority.binding_id),
+                    authority=authority, terminal_state="fired",
+                    downstream_id=execution.downstream_id,
+                    actor_first_estimate=ran.get("actor_first_estimate", request.actor_first_estimate),
                 )
             except Exception as e:  # noqa: BLE001 — the effect already ran; a receipt fault is not fatal
                 _log.error("efferent gate: replay receipt face FAILED (%s): %s", type(e).__name__, e)
             else:
                 receipt_id = self._persist(
-                    created_at=created_at, action_name=request.action_name, proposal_id=request.proposal_id,
+                    created_at=created_at, action_name=request.action_name,
+                    proposal_id=ran.get("proposal_id", request.proposal_id),
                     posture=posture, fired=execution.ok, face=face,
                 )
                 if receipt_id is not None:
@@ -1603,11 +1640,7 @@ class EfferentGate:
         on a malformed record (the proposed action was human-grantable by construction — it reached
         the confirm rung)."""
         try:
-            a = pending.authority
-            return AuthorityScope(
-                grantor=str(a["grantor"]), grant=str(a["grant"]),
-                binding_id=a.get("binding_id"), hops=int(a.get("hops", 0)),
-            )
+            return _authority_from(pending.authority)
         except (KeyError, TypeError, ValueError) as e:
             _log.warning("efferent gate: malformed authority on pending %s (%s) — using manual grant",
                          pending.pending_id, type(e).__name__)
