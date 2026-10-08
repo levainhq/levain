@@ -1876,3 +1876,78 @@ def test_a_first_estimate_that_is_not_json_does_not_make_a_sent_effect_unknown(t
     [p] = w.gate.open_pendings()
     out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human", first_estimate=object()))
     assert out.fired and w.journal.poisoned() == [] and w.outbox() == [("link0", "r7-0")]
+
+
+# --- the closing pass after r2 (codex, on 8fbad94) --------------------------------------------------------
+
+def test_a_first_estimate_too_deep_to_encode_does_not_make_a_sent_effect_unknown(tmp_path):
+    # codex closing HIGH 1: the face record was built inside the effect's call, after the executor ran,
+    # and a RecursionError from encoding it marked a sent effect unknown
+    w = World(tmp_path)
+    _mint_single(w, "q1")
+    w.dispatch("q1")
+    [p] = w.gate.open_pendings()
+    deep: list = []
+    for _ in range(100_000):
+        deep = [deep]
+    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human", first_estimate=deep))
+    assert out.fired and w.journal.poisoned() == [] and w.outbox() == [("link0", "q1-0")]
+
+
+def test_a_registry_read_fault_that_clears_at_once_still_leaves_the_decision_open(tmp_path, monkeypatch):
+    # codex closing MED 3: get() swallowed a one-off fault, the separate integrity() read then came back
+    # clean, and the binding was taken as absent: the approval was rejected for good
+    import sqlite3
+    w = World(tmp_path)
+    _mint_single(w, "q3")
+    w.dispatch("q3")
+    [p] = w.gate.open_pendings()
+    real = BindingStore._scan
+    calls = []
+
+    def once(self, conn=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(self, conn)
+    monkeypatch.setattr(BindingStore, "_scan", once)
+    out = w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human"))
+    assert out.reason == "revalidate:registry_unreadable" and w.outbox() == []
+    assert w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human")).fired
+
+
+def test_a_resolver_that_loses_the_decision_fires_under_the_winners(tmp_path):
+    # codex closing MED 4: a resolver whose decide lost to another's approval fired with its own stale
+    # rung and first estimate; it now fires under the decision that was recorded
+    from levain.autonomic.journal import HoldResult
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("q4")
+    real = w.journal.decide
+
+    def raced(hold_id, **kw):
+        # the other resolver saw the raised rung and approved there, with its typed proof, first
+        w.tool_risk[1] = FINANCIAL
+        assert real(hold_id, approve=True, digest=kw["digest"], by="human", posture="CONFIRM_ELEVATED").ok
+        return HoldResult(False, "already_decided")
+    w.journal.decide = raced
+    out = _approve(w, first_estimate=0.3)
+    assert out.completed and ("link1", "q4-1") in w.outbox()
+    [r] = [r for r in w.receipts.read() if r.action_face["context_id"] == "q4-1"]
+    assert r.posture == "CONFIRM_ELEVATED" and r.action_face["actor_first_estimate"] is None
+
+
+def test_a_replayed_receipt_never_takes_a_field_the_effect_did_not_record_from_the_new_delivery(tmp_path):
+    # codex closing MED 5: an estimate left out of the record was filled from the re-delivered request
+    w = World(tmp_path)
+    _mint_single(w, "q5")
+    w.dispatch("q5")
+    [p] = w.gate.open_pendings()
+    real = w.gate._persist
+    w.gate._persist = lambda **kw: None
+    assert w.gate.resolve(p.pending_id, ConfirmDecision(approved=True, by="human", first_estimate=object())).fired
+    w.gate._persist = real
+    w.dispatcher._request_builder = lambda b, e: dataclasses.replace(_single_builder(b, e), actor_first_estimate=0.9)
+    assert w.dispatch("q5").outcome.replayed
+    [r] = w.receipts.read()
+    assert r.action_face["actor_first_estimate"] is None

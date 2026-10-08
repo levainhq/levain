@@ -95,15 +95,19 @@ def _face_record(request: ActionRequest) -> dict[str, Any]:
     """The receipt provenance an effect runs with, recorded with its result so a replay writes the
     receipt that did not land from it. A first estimate that is not plain JSON is left out (the
     record must encode, or the effect's outcome would read as unknown)."""
-    rec: dict[str, Any] = {
-        "query_text": request.query_text, "query_date": request.query_date,
-        "producers": list(request.producers), "authority": request.authority.to_dict(),
-        "proposal_id": request.proposal_id,
-    }
+    try:
+        rec: dict[str, Any] = {
+            "query_text": request.query_text, "query_date": request.query_date,
+            "producers": list(request.producers), "authority": request.authority.to_dict(),
+            "proposal_id": request.proposal_id,
+        }
+        json.dumps(rec)
+    except Exception:  # noqa: BLE001 — provenance that does not encode is not recorded (a replay then
+        return {"unrecorded": True}   # has only its own delivery's to write the receipt from)
     try:
         if json.loads(json.dumps(request.actor_first_estimate)) == request.actor_first_estimate:
             rec["actor_first_estimate"] = request.actor_first_estimate
-    except (TypeError, ValueError):
+    except Exception:  # noqa: BLE001 — a RecursionError too: the estimate is then not recorded
         pass
     return rec
 
@@ -705,6 +709,8 @@ class EfferentGate:
         already_approved = hold.get("decided") is True
         # the receipt names whoever made the decision that is firing: this resolver, or the earlier one
         decider = hold["by"] if already_approved and hold.get("by") in ("human", "on-loop") else decision.by
+        # a first estimate is the decider's; one given by a resolver that did not make the decision is not
+        estimate = None if already_approved else decision.first_estimate
         verdict = "approved" if decider == "human" else "auto"
         by = decider if decider == "human" else (
             "binding" if authority.grantor == "binding" else "on-loop")
@@ -718,7 +724,7 @@ class EfferentGate:
             query_text=pending.query_text, query_date=pending.query_date,
             trust=_RESOLVED_TRUST, grounded=True, authority=authority,
             producers=pending.producers, proposal_id=pending.proposal_id,
-            actor_first_estimate=decision.first_estimate, run=run,
+            actor_first_estimate=estimate, run=run,
         )
         if not already_approved:
             # Everything that could stop this effect WITHOUT a decision is checked BEFORE the decision is
@@ -739,15 +745,18 @@ class EfferentGate:
             d = self._journal.decide(hold_id, approve=True, digest=self._digest_of(request), by=decision.by,
                                      posture=posture.name)
             if not d.ok:
-                if d.reason == "already_decided" and self._journal_hold_approved(hold_id):
-                    pass   # another resolver approved first: the journal runs the effect at most once
-                elif d.reason == "already_decided":
+                if d.reason == "already_decided":
+                    won = self._journal.get_hold(hold_id)
+                    if won is not None and won.get("decided") is True:
+                        # another resolver approved first: its decision is the one that fires (its rung,
+                        # its decider), through the decided path; the journal runs the effect at most once
+                        return self._resolve_hold(won, decision, chain_owned=chain_owned)
                     return self._refuse_open("journal:already_decided", binding_id)
                 else:   # digest_mismatch: the bytes about to fire are not the ones the hold was opened on
                     return reject(posture, f"journal:{d.reason}")
         fired = self._fire(
             request=request, created_at=created_at, posture=posture,
-            verdict=verdict, by=by, actor_first_estimate=decision.first_estimate, decided=True,
+            verdict=verdict, by=by, actor_first_estimate=estimate, decided=True,
         )
         if fired.fired or fired.replayed or fired.receipt_id is not None or fired.execution is not None:
             return fired   # (an execution without a receipt: the effect ran and failed, the receipt did not land)
@@ -764,10 +773,6 @@ class EfferentGate:
             reason=f"approved_not_yet_run:{fired.reason}", receipt_id=None, execution=None,
             binding_id=binding_id,
         )
-
-    def _journal_hold_approved(self, hold_id: str) -> bool:
-        rec = self._journal.get_hold(hold_id) if self._journal is not None else None
-        return bool(rec is not None and rec.get("decided") is True)
 
     @staticmethod
     def _refuse_open(reason: str, binding_id: str | None) -> GateOutcome:
@@ -930,14 +935,15 @@ class EfferentGate:
             if hold.get("chain") is not None:
                 binding = Binding.from_dict(hold["chain"]["binding"])
             else:
+                binding, problem = None, None
                 try:
                     store = BindingStore(self._journal.db.directory, journal=self._journal)  # type: ignore[union-attr]
-                    binding = store.get(binding_id) if isinstance(binding_id, str) else None
-                    # a read fault reads as an empty registry: tell it from an absent binding
-                    unreadable = binding is None and store.integrity() is not None
-                except (OSError, sqlite3.DatabaseError):
-                    unreadable = True
-                if unreadable:
+                    if isinstance(binding_id, str):
+                        # one read: a fault is told from an absent binding by the read that met it
+                        binding, problem = store.read_one(binding_id)
+                except (OSError, sqlite3.DatabaseError) as e:
+                    problem = type(e).__name__
+                if problem is not None:
                     return None, _REGISTRY_UNREADABLE
             if binding is None or binding.binding_id != binding_id or not binding.seal_matches():
                 return None, "revalidate:binding_risk_unavailable:binding"
@@ -1421,6 +1427,7 @@ class EfferentGate:
         assert self._journal is not None and request.run is not None
         run = request.run
         called = False
+        face = _face_record(request)   # before the effect: what is recorded after it must encode
 
         def call() -> dict[str, object]:
             nonlocal called
@@ -1429,7 +1436,7 @@ class EfferentGate:
             if not isinstance(result, ExecutionResult):
                 raise TypeError(f"executor returned {type(result).__name__}, not an ExecutionResult")
             return {"execution": _execution_record(result), "posture": posture.name,
-                    "verdict": verdict, "by": by, "face": _face_record(request)}
+                    "verdict": verdict, "by": by, "face": face}
 
         try:
             out = self._journal.effect(run.run_id, run.effect_id, digest=self._digest_of(request),
@@ -1474,23 +1481,27 @@ class EfferentGate:
                              else request.authority)
             except (KeyError, TypeError, ValueError):
                 authority = request.authority
+            # a recorded face is the only source: a field it left out is unknown, never this delivery's
+            src: dict[str, Any] = ran if ran and not ran.get("unrecorded") else {
+                "query_text": request.query_text, "query_date": request.query_date,
+                "producers": request.producers, "proposal_id": request.proposal_id,
+                "actor_first_estimate": request.actor_first_estimate}
             try:
                 face = build_gate_face(
-                    context_id=request.context_id, query_text=ran.get("query_text", request.query_text),
-                    query_date=ran.get("query_date", request.query_date),
-                    producers=tuple(ran.get("producers", request.producers)),
+                    context_id=request.context_id, query_text=str(src.get("query_text", "")),
+                    query_date=str(src.get("query_date", "")), producers=tuple(src.get("producers") or ()),
                     gate=build_gate_verdict(verdict=str(rec.get("verdict")), by=str(rec.get("by")),
                                             binding_id=authority.binding_id),
                     authority=authority, terminal_state="fired",
                     downstream_id=execution.downstream_id,
-                    actor_first_estimate=ran.get("actor_first_estimate", request.actor_first_estimate),
+                    actor_first_estimate=src.get("actor_first_estimate"),
                 )
             except Exception as e:  # noqa: BLE001 — the effect already ran; a receipt fault is not fatal
                 _log.error("efferent gate: replay receipt face FAILED (%s): %s", type(e).__name__, e)
             else:
                 receipt_id = self._persist(
                     created_at=created_at, action_name=request.action_name,
-                    proposal_id=ran.get("proposal_id", request.proposal_id),
+                    proposal_id=src.get("proposal_id"),
                     posture=posture, fired=execution.ok, face=face,
                 )
                 if receipt_id is not None:

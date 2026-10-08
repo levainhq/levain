@@ -1258,6 +1258,22 @@ class BindingStore:
                 return self._load(r)
         return None
 
+    def read_one(self, binding_id: str) -> tuple[Binding | None, str | None]:
+        """The binding by id from ONE read of the registry, and why that read was not clean:
+        ``(binding, None)``, or ``(None, None)`` when the registry read clean and has no such binding
+        (or its record is malformed); ``(None, why)`` when the registry could not be read or is corrupt.
+        Unlike :meth:`get`, a read fault is never reported as an absent binding."""
+        try:
+            records, problem = self._scan()
+        except (OSError, sqlite3.DatabaseError) as e:
+            return None, f"unreadable ({type(e).__name__}: {e})"
+        if problem is not None:
+            return None, problem
+        for r in records:
+            if r.get("binding_id") == binding_id:
+                return self._load(r), None
+        return None, None
+
     def list_all(
         self, *, status: BindingStatus | None = None, trigger_type: str | None = None
     ) -> list[Binding]:
