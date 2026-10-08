@@ -248,9 +248,6 @@ def test_t10_orphan_first_parent_join_refuses_and_never_pins_the_orphan(two, key
     assert gl(c).pinned_root is None
 
 
-@pytest.mark.xfail(strict=True, reason="FINDING T10: expected `join --root <genesis> --accept-merge M:2` to pin through "
-                                       "an orphan-first-parent merge; observed exit 2, 'no single team ledger' (join "
-                                       "drops any ledger branch with two roots, so no fresh clone can ever join)")
 def test_t10_orphan_first_parent_join_pins_with_root_naming_the_genesis(two, keys):
     """RUN: as above, then `join --root <genesis> --accept-merge <M>:2` (the genesis side): the row expects it pins."""
     tmp, ana, ben = two
@@ -260,6 +257,11 @@ def test_t10_orphan_first_parent_join_pins_with_root_naming_the_genesis(two, key
     assert team("join", "--root", root[:12], "--accept-merge", f"{merge}:2", "--signing-key", str(keys["cy"]),
                 "--no-install", repo=c) == 0
     assert gl(c).pinned_root == root
+    assert _fresh(c).team.owner == "ana"                         # the genesis side is what counts, never the orphan
+    c2 = clone(tmp, "cy2", "cy@ex.com")                          # naming the genesis but following the orphan: refused
+    assert team("join", "--root", root[:12], "--accept-merge", f"{merge}:1", "--signing-key", str(keys["cy"]),
+                "--no-install", repo=c2) == 2
+    assert gl(c2).pinned_root is None
 
 
 def test_t18_a_force_pushed_tenure_less_history_freezes_a_pinned_clone_and_stays_strict(two, keys):
