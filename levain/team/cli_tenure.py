@@ -427,7 +427,8 @@ def register(sub, add) -> None:
     p = add("accept-merge", wrap(cmd_accept_merge, fetch=False), "This clone only, on the owner's word: follow one parent of a "
                                                     "merge on the ledger; lists what it leaves out.")
     p.add_argument("merge")
-    p.add_argument("--parent", type=int, default=1)
+    p.add_argument("--parent", type=int, required=True,   # a trust decision, never a default (docs L3 r1)
+                   help="the merge parent the owner named (1 = the published line)")
 
     p = add("retire-legacy", wrap(cmd_retire_legacy), "Delete the remote 0.6.x levain-ledger (its owner only, or "
                                                       "--force); it is never read or converted.")

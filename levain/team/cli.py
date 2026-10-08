@@ -99,7 +99,10 @@ def cmd_join(args) -> int:
     accepted = {}
     for v in args.accept_merge or []:
         sha, _, n = v.partition(":")
-        accepted[sha] = int(n or 1)
+        if not n.isdigit():
+            raise TeamError(f"--accept-merge takes SHA:PARENT, got {v!r}: name the parent the owner chose (a trust "
+                            "decision, never a default)")
+        accepted[sha] = int(n)
     print(gl.join(remote=args.remote, new_device=args.new_device, root=args.root, signing_key=args.signing_key,
                   accept_merges=accepted))
     if args.anneal_db:
