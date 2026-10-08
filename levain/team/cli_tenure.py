@@ -273,6 +273,35 @@ def cmd_regenesis(gl: GitLedger, args) -> int:
     return 0
 
 
+def cmd_retire_legacy(gl: GitLedger, args) -> int:
+    """Delete the remote 0.6.x ``levain-ledger`` (never read or converted by this levain), once a strict ledger exists.
+    Only the 0.6.x ledger's owner may (0.6.x has no signatures: the user's email must equal that owner's, T r22-2
+    complement L2), or anyone with --force."""
+    from .transport import LEGACY_BRANCH
+    gl.require_joined()
+    remote = gl.remote
+    if not remote:
+        raise TeamError("no remote")
+    row = git(["ls-remote", "--heads", remote, f"refs/heads/{LEGACY_BRANCH}"], gl.repo.toplevel, timeout=60).stdout
+    if not row.strip():
+        print(f"{remote} has no {LEGACY_BRANCH}")
+        return 0
+    tip = row.split()[0]
+    git(["fetch", "-q", remote, f"+refs/heads/{LEGACY_BRANCH}:refs/remotes/{remote}/{LEGACY_BRANCH}"],
+        gl.repo.toplevel, timeout=120)
+    try:
+        old = R.parse_team(git(["show", f"{tip}:team.toml"], gl.repo.toplevel).stdout, "legacy team.toml")
+        owner_mail = old.members.get(old.owner, "")
+    except (R.RolesError, TeamError):
+        owner_mail = ""
+    if not args.force and owner_mail.strip().lower() != gl.email().strip().lower():
+        raise TeamError(f"only the 0.6.x ledger's owner ({owner_mail or 'unknown'}) retires it; --force to do it anyway")
+    git(["push", "-q", "--no-verify", remote, f"--force-with-lease=refs/heads/{LEGACY_BRANCH}:{tip}",
+         f":refs/heads/{LEGACY_BRANCH}"], gl.repo.toplevel, timeout=120)
+    print(f"deleted {remote}/{LEGACY_BRANCH} (was {tip[:12]}); 0.6.x clones keep their local copy until upgraded")
+    return 0
+
+
 def _nested_genesis(gl: GitLedger, files: dict[str, str], message: str) -> str:
     """A signed parentless commit whose tree holds ``files`` (paths may nest)."""
     top = gl.repo.toplevel
@@ -364,6 +393,10 @@ def register(sub, add) -> None:
                                                     "merge on the ledger; lists what it leaves out.")
     p.add_argument("merge")
     p.add_argument("--parent", type=int, default=1)
+
+    p = add("retire-legacy", wrap(cmd_retire_legacy), "Delete the remote 0.6.x levain-ledger (its owner only, or "
+                                                      "--force); it is never read or converted.")
+    p.add_argument("--force", action="store_true")
 
     p = add("regenesis", wrap(cmd_regenesis), "After a permanently lost owner: a fresh strict genesis on a new "
                                               "branch, carrying the old ledger as a read-only record.")
