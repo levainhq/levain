@@ -693,7 +693,16 @@ class GitLedger:
             git(["add", "--", str(path.relative_to(self.wt))], self.wt)
             self._commit(f"levain team: {sealed['type']} {sealed['id']}")
             self._dcache = None
-            if sealed["id"] not in self.ledger().by_id:
+            d = self.derivation()
+            if d.judged != "full":
+                # frozen: an append still lands (it is WAITING, not enforced, until the owner resolves the freeze); the
+                # read-back is of the committed line itself
+                shown = self._show(f"ledger/{rel}") or ""
+                if line.rstrip("\n") not in shown.split("\n"):
+                    raise TeamError(f"wrote {sealed['id']} but it is not in the committed file; run `levain team verify`")
+                self.warnings.append(f"{sealed['id']} recorded, but the ledger is frozen ({d.frozen_why}): it is "
+                                     "WAITING and not enforced until the owner resolves it")
+            elif sealed["id"] not in self.ledger().by_id:
                 raise TeamError(f"wrote {sealed['id']} but it does not read back as a valid entry; "
                                 "run `levain team verify`")
         if push and self.remote:
@@ -740,7 +749,7 @@ class GitLedger:
         git(["update-ref", f"refs/levain/seen/{tip}", tip], self.repo.toplevel)
 
     def _seen_tips(self) -> list[str]:
-        out = git(["for-each-ref", "--format=%(objectname)", "refs/levain/seen/", "refs/remotes/"],
+        out = git(["for-each-ref", "--format=%(objectname)", "refs/levain/seen/", "refs/levain/gone/", "refs/remotes/"],
                   self.repo.toplevel, check=False).stdout.split()
         return sorted(set(out))
 
@@ -794,7 +803,16 @@ class GitLedger:
             self._recover_dirty()
             orig = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
             remote_tip = git(["rev-parse", rref], self.wt).stdout.strip()
-            if git(["merge-base", "--is-ancestor", orig, remote_tip], self.wt, check=False).returncode == 0:
+            # A REWRITTEN remote (a force-push, a host repair): some tip this clone saw published is no longer reachable
+            # from it. Then nothing that came from the remote may go back up (r13 daemon M1; the 1007+19 residue run
+            # caught a fast-forward push that re-published a force-pushed-away history): the branch is rebuilt on the
+            # remote tip from this clone's OWN unseen commits only, and lost published entries are reported.
+            gone = [t for t in git(["for-each-ref", "--format=%(objectname)", "refs/levain/seen/"], self.wt,
+                                   check=False).stdout.split()
+                    if git(["merge-base", "--is-ancestor", t, remote_tip], self.wt, check=False).returncode != 0]
+            if gone:
+                self._report_lost(gone, remote_tip)
+            elif git(["merge-base", "--is-ancestor", orig, remote_tip], self.wt, check=False).returncode == 0:
                 git(["update-ref", "-m", "levain team: fast-forward", self.ref, remote_tip, orig], self.wt)
                 git(["checkout", "-q", "-f", self.branch], self.wt, timeout=60)
                 return
@@ -803,8 +821,9 @@ class GitLedger:
                 self.warnings.append(f"{len(foreign)} unpublished ledger commit(s) here are not signed by this "
                                      "clone's key and were NOT moved or re-signed: "
                                      + ", ".join(c[:10] for c in foreign[:5]))
-            if not own and git(["merge-base", "--is-ancestor", remote_tip, orig], self.wt, check=False).returncode == 0:
-                return     # already on top of the remote
+            if not gone and not own and \
+                    git(["merge-base", "--is-ancestor", remote_tip, orig], self.wt, check=False).returncode == 0:
+                return     # already on top of the remote, and the remote was not rewritten
             pending = list(self.state().get("pending_ops") or [])
             picks: list[str] = []
             for c in own:
@@ -860,6 +879,32 @@ class GitLedger:
                                              "command re-attaches it")
         self._dcache = None
         self._reland()
+
+    def _report_lost(self, gone: list[str], remote_tip: str) -> None:
+        """Own published commits the remote no longer has: reported, never re-published, never silently dropped."""
+        from . import signing as S
+        lost = git(["rev-list", "--no-merges", *gone, f"^{remote_tip}"], self.wt, check=False).stdout.split()
+        if not lost:
+            return
+        verdicts = S.SigCache(self.base / "sigcache.json").verify(self.repo.toplevel, lost)
+        mine = self.own_keys() | {self.own_fingerprint()}
+        own = [c for c in lost if verdicts[c].kind == "signed" and verdicts[c].fingerprint in mine]
+        self.warnings.append(f"the remote ledger was REWRITTEN (force-push or host repair): {len(lost)} published "
+                             f"commit(s) are no longer on it, {len(own)} of them yours. Nothing was re-published. "
+                             "This clone keeps its last full derivation until the owner names a repair "
+                             "(`levain team repin --anchor <commit>`); re-record any of your entries still wanted")
+        # the gone tips stay EXCLUDED from every later sync (moved under refs/levain/gone/, so this report fires once
+        # per rewrite): a commit that came from the remote is never re-published, even after the remote dropped it
+        for name in git(["for-each-ref", "--format=%(refname)", "refs/levain/seen/"], self.wt,
+                        check=False).stdout.split():
+            sha = name.rsplit("/", 1)[-1]
+            if sha in gone:
+                git(["update-ref", f"refs/levain/gone/{sha}", sha], self.wt, check=False)
+                git(["update-ref", "-d", name], self.wt, check=False)
+        self._record_seen_sha(remote_tip)
+
+    def _record_seen_sha(self, tip: str) -> None:
+        git(["update-ref", f"refs/levain/seen/{tip}", tip], self.repo.toplevel, check=False)
 
     def _reland(self) -> None:
         """Re-apply stripped team ops to the counted state at the new tip: net per field, history-keyed."""
@@ -951,6 +996,9 @@ class GitLedger:
                         return f"{remote} has no {self.branch} branch yet"
                 else:
                     self._record_seen(rref)
+                    # best effort: other strict ledgers on the remote (a re-genesis names this one as its prior)
+                    git(["fetch", "-q", remote, f"+refs/heads/{BRANCH}-*:refs/remotes/{remote}/{BRANCH}-*"],
+                        self.repo.toplevel, check=False, timeout=timeout)
                     self._rebase(rref, timeout, lock_timeout)
                     self._advance_anchor(rref)
                     if not push:

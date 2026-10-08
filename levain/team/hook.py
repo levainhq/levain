@@ -29,7 +29,7 @@ from . import canon as C
 from . import entry as E
 from . import index as I
 from . import roles as R
-from .transport import BRANCH, DIRNAME, GitLedger, Repo, TeamError
+from .transport import BRANCH, DIRNAME, LEGACY_MESSAGE, GitLedger, Repo, TeamError
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 TAG = "[levain team]"
@@ -105,6 +105,19 @@ def _fail_open(event: str, reason: str) -> None:
           "hookSpecificOutput": {"hookEventName": event, "additionalContext": line}})
 
 
+def _deny_unjudged(reason: str) -> None:
+    """The gate HALTS when it cannot judge (tenure_design_1005.md §3f): an empty verdict must never read as "nothing
+    governs this path". The person can override for a session with LEVAIN_TEAM_UNJUDGED=allow."""
+    if os.environ.get("LEVAIN_TEAM_UNJUDGED") == "allow":
+        _fail_open("PreToolUse", reason + " (LEVAIN_TEAM_UNJUDGED=allow: allowed for this session)")
+        return
+    _out({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "deny",
+        "permissionDecisionReason": (f"{TAG} levain cannot judge this team ledger on this clone, so it cannot tell "
+                                     f"whether a ruling governs this file: {I.oneline(reason)}. Run `levain team "
+                                     "doctor`; to edit anyway for this session, set LEVAIN_TEAM_UNJUDGED=allow.")}})
+
+
 def _target(payload: dict) -> str | None:
     ti = payload.get("tool_input") or {}
     if not isinstance(ti, dict):
@@ -170,9 +183,12 @@ def pretooluse(payload: dict) -> None:
         return
     gl = GitLedger(repo)
     if not gl.joined():
-        if _wired_but_broken(gl):
-            _fail_open("PreToolUse", f"this clone has a {BRANCH} branch but no usable ledger worktree "
-                                     "(run `levain team join`, then `levain team doctor`)")
+        if gl.legacy_only():
+            _fail_open("PreToolUse", LEGACY_MESSAGE)      # B-1: reported, nothing from it enforced
+            return
+        if _wired_but_broken(gl) or (gl.remote and gl._has(f"refs/remotes/{gl.remote}/{BRANCH}")):
+            # a strict ledger exists here and this clone never pinned it (UNPINNED): judge nothing from it, halt
+            _deny_unjudged(f"this clone has a {BRANCH} ledger it has not pinned (run `levain team join`)")
         return
     # Fetch first, then read team, ledger and identity together from the branch ref: one consistent snapshot,
     # no lock (the ref only moves when a rebase or commit completes).
@@ -180,7 +196,7 @@ def pretooluse(payload: dict) -> None:
     try:
         _, team, ledger = gl.snapshot()
     except (R.RolesError, TeamError) as exc:
-        _fail_open("PreToolUse", str(exc))
+        _deny_unjudged(str(exc))
         return
     rel = Path(os.path.realpath(target)).relative_to(os.path.realpath(repo.toplevel)).as_posix() \
         if _within(target, repo.toplevel) else None
@@ -282,8 +298,10 @@ def sessionstart(payload: dict) -> None:
         return
     gl = GitLedger(repo)
     if not gl.joined():
-        if _wired_but_broken(gl):
-            _fail_open("SessionStart", f"this clone has a {BRANCH} branch but no usable ledger worktree "
+        if gl.legacy_only():
+            _fail_open("SessionStart", LEGACY_MESSAGE)
+        elif _wired_but_broken(gl):
+            _fail_open("SessionStart", f"this clone has a {BRANCH} branch it has not pinned "
                                        "(run `levain team join`, then `levain team doctor`)")
         return
     fetch_note = gl.fetch_if_due(0, timeout=10.0)
@@ -300,7 +318,9 @@ def sessionstart(payload: dict) -> None:
     handle = gl.handle(team)
     lines = [f"[team] {I.oneline(team.project)}: {len(rulings)} ruling(s) and {len(live) - len(rulings)} other entr"
              f"{'y' if len(live) - len(rulings) == 1 else 'ies'} in force; newest entry "
-             f"{I.age(newest) if newest else 'none'}; you are {handle or 'NOT a member (git user.email unmapped)'}."]
+             f"{I.age(newest) if newest else 'none'}; you are {handle or 'NOT a member (this machine key is not in force)'}."]
+    from .cli_tenure import status_lines
+    lines += [f"[team] {x}" for x in status_lines(gl)]
     lines.append(f"[team] {C.staleness(canon_text, tree)}. Canon: {gl.wt / 'PROJECT.md'} (or `levain team status`)")
     from .transport import WARNINGS
     # A fallback to an older team.toml (or any other read warning) must reach the session, not only the edit hook.

@@ -61,23 +61,28 @@ def _repo_paths(repo: Repo, paths: list[str]) -> list[str]:
     return out
 
 
-def _members(values: list[str] | None) -> dict[str, str]:
-    out = {}
+def _members(values: list[str] | None) -> tuple[dict[str, str], dict[str, str]]:
+    """``handle=email[=public key line or .pub file]`` -> (handle->email, handle->key line)."""
+    out, keys = {}, {}
     for v in values or []:
         if "=" not in v:
-            raise TeamError(f"--member takes handle=email, got {v!r}")
-        h, mail = v.split("=", 1)
-        out[h.strip()] = mail.strip()
-    return out
+            raise TeamError(f"--member takes handle=email[=pubkey], got {v!r}")
+        parts = v.split("=", 2)
+        out[parts[0].strip()] = parts[1].strip()
+        if len(parts) == 3 and parts[2].strip():
+            from .cli_tenure import _key_line
+            keys[parts[0].strip()] = _key_line(parts[2].strip())
+    return out, keys
 
 
 def cmd_init(args) -> int:
     repo = _repo(args)
     gl = GitLedger(repo)
-    members = _members(args.member)
+    members, keys = _members(args.member)
     team = R.Team(project=args.project or repo.toplevel.name, owner=args.owner, members=members,
                   client_owners=_split(args.client_owner), mode=args.mode, fetch_interval=args.fetch_interval)
-    print(gl.init(team, remote=args.remote, push=not args.no_push))
+    print(gl.init(team, member_keys=keys, remote=args.remote, push=not args.no_push, signing_key=args.signing_key,
+                  replace_legacy=args.replace_legacy))
     if args.anneal_db:
         gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
     if args.pack:
@@ -91,7 +96,12 @@ def cmd_init(args) -> int:
 def cmd_join(args) -> int:
     repo = _repo(args)
     gl = GitLedger(repo)
-    print(gl.join(remote=args.remote, new_device=args.new_device))
+    accepted = {}
+    for v in args.accept_merge or []:
+        sha, _, n = v.partition(":")
+        accepted[sha] = int(n or 1)
+    print(gl.join(remote=args.remote, new_device=args.new_device, root=args.root, signing_key=args.signing_key,
+                  accept_merges=accepted))
     if args.anneal_db:
         gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
     if not args.no_install:
@@ -180,6 +190,9 @@ def cmd_status(args) -> int:
                          ensure_ascii=False))
         return 0
     print(f"{team.project}: owner {team.owner}, you are {handle or 'NOT a member'}, mode {team.mode}")
+    from .cli_tenure import status_lines
+    for line in status_lines(gl):
+        print(line)
     print(C.staleness(canon_text, state))
     if ledger.problems:
         print(f"{len(ledger.problems)} integrity problem(s): run `levain team verify`")
@@ -274,8 +287,17 @@ def cmd_member_add(args) -> int:
     team, handle = _actor(gl)
     if handle != team.owner:
         raise TeamError(f"only the owner ({team.owner}) changes membership")
-    print(gl.update_team(lambda t: t.members.__setitem__(args.handle, args.email),
-                         f"levain team: add member {args.handle}", push=not args.no_push))
+    from .cli_tenure import _key_line
+    line = _key_line(args.key) if args.key else None
+
+    def add(t, ten) -> None:
+        t.members[args.handle] = args.email
+        if line:
+            ten.pending_keys.setdefault(args.handle, []).append(line)
+    print(gl.update_counted(add, f"levain team: add member {args.handle}", push=not args.no_push))
+    if not line:
+        print(f"{args.handle} has no key yet: their lines are not enforced until `levain team key add {args.handle} "
+              "<their public key>` and their machine confirms it")
     return 0
 
 
@@ -313,7 +335,7 @@ def cmd_doctor(args) -> int:
         rows.append((not err, f"remote {gl.remote}: last fetch "
                      + (I.age(_iso(st.get('last_fetch_ok'))) if st.get("last_fetch_ok") else "never")
                      + (f"; last error: {err}" if err else "")))
-        ahead = subprocess.run(["git", "log", "--format=%s", f"refs/remotes/{gl.remote}/levain-ledger..HEAD"],
+        ahead = subprocess.run(["git", "log", "--format=%s", f"refs/remotes/{gl.remote}/{gl.branch}..HEAD"],
                                cwd=gl.wt, capture_output=True, text=True)
         subjects = ahead.stdout.splitlines() if ahead.returncode == 0 else ["?"]
         real = [s for s in subjects if not s.startswith("levain team: ack ")]
@@ -376,7 +398,7 @@ def _anneal_row(gl: GitLedger) -> tuple[bool, str]:
 def register(subparsers) -> None:
     team_p = subparsers.add_parser(
         "team", help="Share one project's decisions across a team of engineers (git ledger + edit-time hook).",
-        description="Team context: an append-only, hash-chained decision ledger on a `levain-ledger` branch of "
+        description="Team context: an append-only, hash-chained decision ledger on a `levain-team-ledger` branch of "
                     "the project's repo, a Claude Code PreToolUse hook that shows a recorded decision at the "
                     "edit it governs, and an owner-generated PROJECT.md canon.")
     sub = team_p.add_subparsers(dest="team_command", metavar="<team command>", required=True)
@@ -390,8 +412,12 @@ def register(subparsers) -> None:
     p = add("init", cmd_init, "Create the team ledger in this repository (first engineer; becomes the remote branch).")
     p.add_argument("--project")
     p.add_argument("--owner", required=True, help="handle of the canon owner (must be a --member)")
-    p.add_argument("--member", action="append", required=True, metavar="HANDLE=EMAIL",
-                   help="repeatable; the email is matched against each engineer's git user.email")
+    p.add_argument("--member", action="append", required=True, metavar="HANDLE=EMAIL[=PUBKEY]",
+                   help="repeatable; PUBKEY (a .pub file or key line) is the member's signing key, pending until "
+                        "their machine confirms it at join")
+    p.add_argument("--signing-key", help="your ssh public key file (in ssh-agent, or without a passphrase)")
+    p.add_argument("--replace-legacy", action="store_true",
+                   help="create a strict ledger beside a 0.6.x levain-ledger (which is never read or converted)")
     p.add_argument("--client-owner", action="append", metavar="NAME",
                    help="names allowed as client:<NAME> owners (repeatable or comma-separated)")
     p.add_argument("--mode", default="ask-once", choices=E.MODES)
@@ -404,6 +430,10 @@ def register(subparsers) -> None:
 
     p = add("join", cmd_join, "Join this clone to the team ledger already on the remote.")
     p.add_argument("--remote")
+    p.add_argument("--root", help="the genesis of the ledger to trust (required when the remote has several)")
+    p.add_argument("--signing-key", help="your ssh public key file (in ssh-agent, or without a passphrase)")
+    p.add_argument("--accept-merge", action="append", metavar="SHA:PARENT",
+                   help="pin through a merge the owner named, following that parent")
     p.add_argument("--new-device", action="store_true",
                    help="give this clone its own device id (after copying a .git directory from another machine)")
     p.add_argument("--anneal-db")
@@ -471,9 +501,17 @@ def register(subparsers) -> None:
     ma = msub.add_parser("add", help="add a member")
     ma.add_argument("handle")
     ma.add_argument("email")
+    ma.add_argument("--key", help="their signing public key (a .pub file or key line); pending until they confirm")
     ma.add_argument("--repo")
     ma.add_argument("--no-push", action="store_true")
     ma.set_defaults(func=_guarded(cmd_member_add))
+    from . import cli_tenure
+    mr = msub.add_parser("remove", help="remove a member")
+    mr.add_argument("handle")
+    mr.add_argument("--repo")
+    mr.add_argument("--no-push", action="store_true")
+    mr.set_defaults(func=_guarded(lambda a: cli_tenure.cmd_member_remove(GitLedger(_repo(a)), a)))
+    cli_tenure.register(sub, add)
 
     p = add("pack-sync", cmd_pack_sync, "Owner only: seed or upgrade a pack's judgment.toml rules into the ledger.")
     p.add_argument("pack_dir")

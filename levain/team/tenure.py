@@ -48,6 +48,7 @@ class Tenure:
     keys: dict[str, list[str]] = field(default_factory=dict)          # handle -> public key lines in force
     pending_keys: dict[str, list[str]] = field(default_factory=dict)  # handle -> proposed, not yet proven
     revokes: list[dict] = field(default_factory=list)     # {key: fingerprint, after: commit}
+    prior: dict | None = None                             # a re-genesis's {root, tip} of the ledger it carries (display)
 
 
 def _q(s: str) -> str:
@@ -71,6 +72,8 @@ def dump_tenure(t: Tenure) -> str:
                 f"links = {'true' if v.get('links', False) else 'false'}"]
     for r in sorted(t.revokes, key=lambda r: (r["key"], r["after"])):
         out += ["", "[[revoke]]", f"key = {_q(r['key'])}", f"after = {_q(r['after'])}"]
+    if t.prior:
+        out += ["", "[prior]", f"root = {_q(t.prior['root'])}", f"tip = {_q(t.prior['tip'])}"]
     return "\n".join(out) + "\n"
 
 
@@ -97,6 +100,9 @@ def parse_tenure(text: str, where: str = TENURE_FILE) -> Tenure:
                              "links": bool(v.get("links", False))})
         for r in raw.get("revoke", []):
             t.revokes.append({"key": str(r["key"]), "after": str(r["after"])})
+        pr = raw.get("prior")
+        if isinstance(pr, dict) and "root" in pr:
+            t.prior = {"root": str(pr["root"]), "tip": str(pr.get("tip", ""))}
     except (KeyError, TypeError, ValueError) as exc:
         raise R.RolesError(f"{where} is missing or has a bad field: {exc}") from None
     return t
@@ -518,9 +524,10 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
             top_dir = rel.split("/", 1)[0]
             handle = next((k[1] for k in state if k[0] == "member" and E.safe_handle(k[1]) == top_dir), None)
             if i == 0:
-                # a genesis's own tree (a re-genesis carries the old history there) is judged by the genesis: the
-                # root of trust each joiner confirms. A member's folder and pack folders are enforced.
-                good = top_dir.startswith("pack-") or handle is not None
+                # nothing levain writes puts ledger lines in a genesis (a re-genesis carries the old history under
+                # prior/, a read-only record, Phill's Option 2): a line here was signed by no member, so it is not
+                # enforced
+                good = False
             elif top_dir.startswith("pack-"):
                 good = ok(sha, state, owner)
             else:
@@ -621,6 +628,7 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
                         new_void.add(walk[j])
 
     t, n = unflat(state)
+    n.prior = ten.prior
     return Derivation(tip=tip, walk=walk, team=t, tenure=n, counted_head=base, files=lines, unenforced=unenforced,
                       line_pos=line_pos, spells=spells, problems=problems, role_changes=role_changes,
                       waiting=sum(len(ch.get(s, Change()).added) for s in walk[freeze_end:]), void=new_void,
