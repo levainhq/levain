@@ -488,8 +488,11 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(payload, dict):
             payload = {}
         (pretooluse if event == "pretooluse" else sessionstart)(payload)
-    except Exception as exc:  # noqa: BLE001 - fail open, visibly
-        _fail_open(name, f"{type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001 - SessionStart fails open, visibly; PreToolUse is the GATE and halts
+        if event == "pretooluse":
+            _deny_unjudged(f"{type(exc).__name__}: {exc}")    # code L3 r1 codex MED: a crash must not allow
+        else:
+            _fail_open(name, f"{type(exc).__name__}: {exc}")
     return 0
 
 
