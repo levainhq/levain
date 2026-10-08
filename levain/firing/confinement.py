@@ -4557,9 +4557,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # processes visible in the PID namespace of the process that performed the mount"
         # (pid_namespaces(7)). Without it, bash read ``/proc/<pid>/environ`` and ``cmdline`` of levain
         # and of every other process of this user, which is where their secrets live. Costs: bash
-        # cannot see or signal host processes (``ps``, ``kill`` of a server started outside), and
-        # bwrap runs a reaping pid 1. SIGINT/SIGTERM from ``_signal_group`` still reach bash, which is
-        # in the same process group; when pid 1 exits the kernel kills the rest of the namespace.
+        # cannot see or signal host processes (``ps``, ``kill`` of a server started outside). bash is
+        # that namespace's pid 1 (``--as-pid-1``, added in `spawn_shell`) and runs in a session of its
+        # own (``--new-session``), so it is NOT in the process group ``_signal_group`` signals: a
+        # signal there reaches bwrap, and bash dies when bwrap does (``--die-with-parent`` above).
+        # When bash, pid 1, exits, the kernel kills the rest of the namespace (pid_namespaces(7)).
         "--unshare-pid",
     ]
     if policy.deny_localhost_outbound:
