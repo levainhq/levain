@@ -179,8 +179,18 @@ def cmd_revoke(gl: GitLedger, args) -> int:
 
 def cmd_veto(gl: GitLedger, args) -> int:
     gl.require_joined()
-    _require_owner(gl)
+    d = _require_owner(gl)
     since = git(["rev-parse", "--verify", args.since + "^{commit}"], gl.repo.toplevel).stdout.strip()
+    # the derivation matches a veto to a spell by the commit that BEGAN it; any other commit was counted and did nothing
+    # (docs L3 r2 anansi, RUN)
+    if args.role == "owner":
+        starts = [first for _s, _e, first in T._owner_runs(d.spells, args.handle)]
+    else:
+        starts = [sp.start_sha for sp in d.spells if sp.role == "member" and sp.handle == args.handle]
+    if since not in starts:
+        raise TeamError(f"{since[:10]} began no {args.role} spell of {args.handle}, so this veto would change nothing; "
+                        f"--since takes the commit that began the spell: "
+                        + (", ".join(x[:10] for x in starts) or f"{args.handle} has held no {args.role} spell"))
 
     def veto(team: R.Team, ten: T.Tenure) -> None:
         ten.vetoes.append({"handle": args.handle, "role": args.role, "since": since, "links": False})
@@ -282,6 +292,19 @@ def cmd_regenesis(gl: GitLedger, args) -> int:
             keys[parts[0]] = _key_line(parts[2])
     team = R.Team(project=args.project or "", owner=args.owner, members=members)
     R.validate_team(team)
+    # the new genesis lists the RUNNER's key as the owner's (it signs it): naming someone else as owner filed the
+    # runner's key under their handle, and an owner pubkey given here was dropped without a word (docs L3 r2 anansi)
+    if args.owner in keys:
+        raise TeamError(f"--member {args.owner}=...=<key>: the owner's key in a re-genesis is the key of whoever runs "
+                        "it; run it on the owner's machine, without a key for the owner")
+    try:
+        me = gl.handle() if gl.joined() else None
+    except TeamError:
+        me = None
+    if me is not None and me != args.owner:
+        raise TeamError(f"you are {me} on this ledger and a re-genesis makes its runner the owner (your key signs it): "
+                        f"run it with --owner {me}, then offer ownership with `levain team owner {args.owner}`, or let "
+                        f"{args.owner} run it")
     own = gl.signing_pubkey()
     ten = T.Tenure(keys={team.owner: [own]}, pending_keys={h: [k] for h, k in keys.items() if h != team.owner},
                    prior={"root": old_root, "tip": old_tip})
