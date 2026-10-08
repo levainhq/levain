@@ -32,6 +32,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -215,13 +216,26 @@ def proc_hides_processes(mountinfo: str) -> bool:
     return False
 
 
-def entity_session_live(hands_uid: int) -> bool:
+def entity_session_live(hands_uid: int, *, timeout: float | None = None) -> bool:
     """Whether anything runs as the hands user right now. The workspace is the hands user's and the
     operator can only read it, so whatever can change it while ws-git works (an entity session's
     bash, anything it left running) runs as that user: this is the session's liveness measured where
     it cannot be missed, an orphaned background job included. Raises when it cannot tell (a process
     table the operator cannot see all of), so callers fail closed. It is checked once, when a command
-    starts; a session started while the command runs is not seen."""
+    starts; a session started while the command runs is not seen. With ``timeout``, the whole check
+    takes at most that long, and one that runs out cannot tell (raises)."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        left = None if deadline is None else deadline - time.monotonic()
+        try:
+            if left is not None and left <= 0:
+                raise subprocess.TimeoutExpired(argv, 0)
+            return subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                  cwd="/", env=child_env(), timeout=left)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise WsGitError(f"cannot tell whether the entity is running ({argv[0]}: {exc}); refusing") from None
+
     if platform.system() == "Linux":
         try:
             mounts = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
@@ -231,7 +245,7 @@ def entity_session_live(hands_uid: int) -> bool:
             raise WsGitError("cannot tell whether the entity is running (/proc hides other users' "
                              "processes); refusing")
     def pids() -> set[str]:
-        r = subprocess.run([_abs("pgrep"), "-U", str(hands_uid)], capture_output=True, text=True, cwd="/", env=child_env())
+        r = run([_abs("pgrep"), "-U", str(hands_uid)])
         if r.returncode not in (0, 1):
             raise WsGitError(f"cannot tell whether the entity is running (pgrep: {r.stderr.strip() or r.returncode}); "
                              "refusing")
@@ -246,8 +260,7 @@ def entity_session_live(hands_uid: int) -> bool:
     # /usr/bin are xcrun shims). Those, and only those, are not a session; an orphan of the
     # entity's is. The pid set is read again after ps: a process that exited and forked in between
     # would otherwise leave only agents in view.
-    ps = subprocess.run(["/bin/ps", "-o", "pid=,ppid=,comm=", "-p", ",".join(sorted(found))],
-                        capture_output=True, text=True, cwd="/", env=child_env())
+    ps = run(["/bin/ps", "-o", "pid=,ppid=,comm=", "-p", ",".join(sorted(found))])
     rows = {}
     for ln in ps.stdout.splitlines():
         parts = ln.split(None, 2)

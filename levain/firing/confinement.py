@@ -2511,16 +2511,16 @@ def sweep_hands_user(user: str, *, timeout: float = 5.0) -> str | None:
     from levain.firing.ws_git import WsGitError, entity_session_live
     from levain.launch import child_env
 
+    deadline = time.monotonic() + timeout
     try:
         uid = pwd.getpwnam(user).pw_uid
     except KeyError:
         return f"there is no user {user}, so its processes cannot be checked"
     if uid in (0, os.getuid()):
         return f"refusing to stop every process of {user} (uid {uid}): it is root or levain's own account"
-    deadline = time.monotonic() + timeout
     while True:
-        # Every step is bounded by what is left of `timeout`, with no floor, so a stalled sudo cannot
-        # stretch the sweep (S2d codex MED, r3).
+        # Every step, the check's pgrep and ps included, is bounded by what is left of `timeout`, with
+        # no floor, so a stalled one cannot stretch the sweep (S2d codex MED, r3, r4).
         left = deadline - time.monotonic()
         if left > 0:
             try:
@@ -2529,7 +2529,7 @@ def sweep_hands_user(user: str, *, timeout: float = 5.0) -> str | None:
             except (OSError, subprocess.TimeoutExpired):
                 pass
         try:
-            if not entity_session_live(uid):
+            if not entity_session_live(uid, timeout=max(0.0, deadline - time.monotonic())):
                 return None
             said = f"processes of {user} are still running"
         except WsGitError as exc:
@@ -3000,12 +3000,12 @@ class SandboxedShell:
         return leader, out, carry
 
     def _kill_group(self, pgid: int, leader: _Leader) -> bool:
-        """SIGTERM the group, give it ``_KILL_GRACE``, SIGKILL what is left, and wait for the group
-        to empty; then reap its leader. False when it did not empty: the leader stays unreaped (the
-        number stays this group's) and the caller must not report it killed."""
+        """SIGTERM the group, give it ``_KILL_GRACE``, SIGKILL what is left (on Linux, always), and wait
+        for the group to empty; then reap its leader. False when it did not empty: the leader stays
+        unreaped (the number stays this group's) and the caller must not report it killed."""
         self._signal_group(pgid, leader, signal.SIGTERM)
         leader.wait(_KILL_GRACE)
-        if not _group_gone(pgid, timeout=0.2):
+        if _empty_is_a_snapshot() or not _group_gone(pgid, timeout=0.2):
             self._signal_group(pgid, leader, signal.SIGKILL)
         leader.wait(5.0)
         if leader.exited and _group_gone(pgid, timeout=5.0):
@@ -3014,13 +3014,15 @@ class SandboxedShell:
         return False
 
     def _signal_group(self, pgid: int, leader: _Leader, sig: int) -> None:
-        """Signal a group only while its leader is unreaped, checked and sent under that leader's
-        reap lock, which every reap of it holds, so a number another thread has just freed is never
-        signalled (S2d codex HIGH). Per leader, so a slow signal to one group (two sudo calls for a
-        hands shell) never holds up a Ctrl-C or the shell's bookkeeping (S2 L3 r3)."""
-        with leader._reap_lock:
-            if not leader.reaped:
+        """Signal a group only while its leader is unreaped: the leader is held unreaped for the send
+        (:meth:`_Leader.hold_for_signal`), so a number another thread has just freed is never
+        signalled (S2d codex HIGH). No lock is held across the send, which for a hands shell is sudo,
+        so a slow one never holds up a Ctrl-C or the shell's bookkeeping (S2 L3 r3, r4)."""
+        if leader.hold_for_signal():
+            try:
                 self._signal(pgid, sig)
+            finally:
+                leader.signal_sent()
 
     def _reap(self, pgid: int, leader: _Leader) -> None:
         """Reap a leader whose group is empty, then forget the group. A signal between the two finds
@@ -3039,13 +3041,18 @@ class SandboxedShell:
 
     def _prune_groups(self) -> None:
         """Reap the leader of each group that has emptied, and forget the group. Only then may its
-        number be reused, and it is no longer signalled."""
+        number be reused, and it is no longer signalled. On Linux, where "emptied" could only be read
+        from /proc snapshots, no group is pruned: each is kept, leader unreaped, until close() (or a
+        timeout's kill) has sent it SIGKILL (S2 L3 r4, codex HIGH). The cost: a zombie leader per
+        command until then."""
         with self._lock:
             groups = list(self._groups.items())
         # Decided outside the lock: `_group_live` may run pgrep (S2 L3 r3).
         for pgid, leader in groups:
-            if leader.reaped or (leader.wait(0) and not _group_live(pgid)):
+            if leader.reaped or (leader.wait(0) and not _empty_is_a_snapshot() and not _group_live(pgid)):
                 self._reap(pgid, leader)
+            elif leader.exited:
+                leader.release_watch()
 
     def _keep_late(self, out: _Output) -> None:
         with self._lock:
@@ -3168,10 +3175,9 @@ class SandboxedShell:
         """Best-effort SIGINT to the running command's process GROUP (Ctrl-C it and its children).
         Never raises."""
         leader = self._leader
-        if leader is not None:
-            with leader._reap_lock:
-                if not leader.exited:   # an exited leader is unreaped or gone; neither is Ctrl-C'd
-                    self._signal(leader.pid, signal.SIGINT)
+        # An exited leader is unreaped or gone; neither is Ctrl-C'd.
+        if leader is not None and not leader.exited:
+            self._signal_group(leader.pid, leader, signal.SIGINT)
 
     def close(self) -> None:
         """Kill every process group this shell started (SIGTERM, then SIGKILL), wait for each to
@@ -3190,7 +3196,7 @@ class SandboxedShell:
             self._signal_group(pgid, leader, signal.SIGTERM)
         deadline = time.monotonic() + _KILL_GRACE
         for pgid, leader in groups:
-            if not _group_gone(pgid, timeout=max(0.0, deadline - time.monotonic())):
+            if _empty_is_a_snapshot() or not _group_gone(pgid, timeout=max(0.0, deadline - time.monotonic())):
                 self._signal_group(pgid, leader, signal.SIGKILL)
         for pgid, leader in groups:
             leader.wait(5.0)
@@ -5781,7 +5787,11 @@ def _bash_gone(pid: int, start: str, *, timeout: float) -> bool:
 
 def _group_live(pgid: int) -> bool:
     """Whether process group ``pgid`` has a member that is not a zombie. The shell keeps each group's
-    leader unreaped while its group lives (:class:`_Leader`), so a zombie must not count."""
+    leader unreaped while its group lives (:class:`_Leader`), so a zombie must not count.
+
+    On Linux the answer is a scan of /proc, read one entry at a time, so a member that keeps forking
+    and exiting can be missed by any number of scans: there an empty answer is trusted only once the
+    group has been sent SIGKILL (a killed process forks nothing), see :func:`_empty_is_a_snapshot`."""
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:
@@ -5792,25 +5802,15 @@ def _group_live(pgid: int) -> bool:
         if platform.system() == "Darwin":
             return True   # macOS signals no zombie, so a success is a live member (measured)
     if platform.system() == "Linux":
-        def scan() -> bool:
-            for d in os.listdir("/proc"):
-                if not d.isdigit():
-                    continue
-                try:
-                    f = Path(f"/proc/{d}/stat").read_text().rsplit(")", 1)[-1].split()
-                except OSError:
-                    continue
-                if len(f) > 2 and f[2] == str(pgid) and f[0] not in ("Z", "X", "x"):
-                    return True
-            return False
-
-        # Two empty scans, not one: the listing is taken before the reads, so a member that forked
-        # and exited in between leaves its child out of one scan, never out of the next (S2 L3 r3).
-        if scan():
-            return True
-        time.sleep(0.01)
-        if scan():
-            return True
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                f = Path(f"/proc/{d}/stat").read_text().rsplit(")", 1)[-1].split()
+            except OSError:
+                continue
+            if len(f) > 2 and f[2] == str(pgid) and f[0] not in ("Z", "X", "x"):
+                return True
         # Nothing live is visible. A member of another uid hidden by /proc's hidepid still answers
         # EPERM, and is not called gone.
         try:
@@ -5829,6 +5829,12 @@ def _group_live(pgid: int) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return True   # cannot tell: not gone
     return r.returncode != 1
+
+
+def _empty_is_a_snapshot() -> bool:
+    """Whether :func:`_group_live` saying "empty" is only a snapshot (Linux /proc), so a group not yet
+    sent SIGKILL must not be dropped, or spared the SIGKILL, on its say (S2 L3 r4, codex HIGH)."""
+    return platform.system() == "Linux"
 
 
 def _group_gone(pgid: int, *, timeout: float) -> bool:
@@ -5866,6 +5872,10 @@ class _Leader:
         self.exited = False
         self.reaped = False
         self._reap_lock = threading.Lock()
+        # Signals being sent to the group right now (outside the lock: a hands signal is sudo). The
+        # leader is not reaped while any is out, so the number they name stays this group's.
+        self._signalling = 0
+        self._signals_done = threading.Condition(self._reap_lock)
         self._kq: Any = None
         self._pidfd: int | None = None
         if hasattr(os, "waitid"):
@@ -5945,9 +5955,27 @@ class _Leader:
             if left <= 0:
                 return False
 
-    def reap(self) -> None:
-        """Reap the leader (only once its group has no live member) and free the watch."""
+    def hold_for_signal(self) -> bool:
+        """Keep the leader unreaped while the caller signals its group, outside the reap lock; False
+        when it is already reaped (its number may be another group's now: send nothing). Every True
+        is followed by :meth:`signal_sent`."""
         with self._reap_lock:
+            if self.reaped:
+                return False
+            self._signalling += 1
+            return True
+
+    def signal_sent(self) -> None:
+        with self._reap_lock:
+            self._signalling -= 1
+            self._signals_done.notify_all()
+
+    def reap(self) -> None:
+        """Reap the leader (only once its group has no live member) and free the watch. Waits for any
+        signal still being sent to the group (S2 L3 r4)."""
+        with self._reap_lock:
+            while self._signalling:
+                self._signals_done.wait()
             if self.reaped:
                 return
             self.proc.wait()
@@ -5956,6 +5984,13 @@ class _Leader:
             self.exited = True
             self.reaped = True
             self._release()
+
+    def release_watch(self) -> None:
+        """Free the watch of a leader seen exited and kept unreaped (its group still held): its exit is
+        known, so the watch is not needed again, and a held leader would otherwise keep an fd."""
+        with self._reap_lock:
+            if self.exited:
+                self._release()
 
     def _release(self) -> None:
         if self._kq is not None:

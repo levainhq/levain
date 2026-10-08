@@ -498,6 +498,13 @@ def test_close_does_not_signal_a_group_that_already_emptied(tmp_path):
     sh = _plain(tmp_path, Recording).start()
     sh.run("true", timeout=10)
     finished = set(started)
+    if _SYSTEM == "Linux":
+        # Not pruned on a /proc scan (S2 L3 r4): held, leader unreaped, so the number is still its own.
+        assert set(sh._groups) == finished   # type: ignore[attr-defined]
+        assert not any(lead.reaped for lead in sh._groups.values())   # type: ignore[attr-defined]
+        sh.close()
+        assert not sh._groups   # type: ignore[attr-defined]
+        return
     assert not sh._groups   # type: ignore[attr-defined]  # emptied: reaped and forgotten at once
     sent: list[int] = []
     sh._signal = lambda pgid, sig: sent.append(pgid)   # type: ignore[method-assign]
@@ -827,6 +834,9 @@ def test_a_background_groups_leader_stays_unreaped_until_its_group_is_empty(tmp_
         while _pids_with(m) and time.monotonic() < deadline:
             time.sleep(0.05)
         sh.run("true", timeout=10)
+        if _SYSTEM == "Linux":   # held until close() (S2 L3 r4)
+            assert pgid in sh._groups   # type: ignore[attr-defined]
+            sh.close()
         assert _stat_of(pgid) == "" and pgid not in sh._groups   # type: ignore[attr-defined]
     finally:
         _kill_all(_pids_with(m))
@@ -980,15 +990,17 @@ def test_a_waiter_whose_leader_is_reaped_under_it_returns(monkeypatch):
 def test_a_timed_out_commands_group_is_forgotten_when_its_leader_is_reaped(tmp_path):
     """S2d codex HIGH: the timeout path reaped the leader but left its group in the shell's table, so
     a later close() could signal that number after the system reused it."""
-    sh = _plain(tmp_path).start()
+    sh = _plain(tmp_path, _Recording).start()
     try:
         r = sh.run("sleep 30", timeout=0.5)
         assert r.timed_out
-        assert not sh._groups   # type: ignore[attr-defined]
+        pgid = sh.started[-1]   # type: ignore[attr-defined]
+        # (On Linux the start-up command's finished group is still held until close(), S2 L3 r4.)
+        assert pgid not in sh._groups   # type: ignore[attr-defined]
         sent: list[int] = []
         sh._signal = lambda pgid, sig: sent.append(pgid)   # type: ignore[method-assign]
         sh.close()
-        assert not sent
+        assert pgid not in sent
     finally:
         sh.close()
 
@@ -1097,6 +1109,9 @@ def test_a_watch_that_cannot_be_set_for_a_live_process_is_an_error_not_an_exit(m
     proc = subprocess.Popen(["/bin/sleep", "5"], start_new_session=True)
     try:
         monkeypatch.setattr(C.select, "kqueue", FakeKq)
+        # The kqueue registration itself: where Python has os.waitid (codex ran this on macOS 3.13.13,
+        # r4 LOW) that branch is taken instead, so it is taken out here.
+        monkeypatch.delattr(C.os, "waitid", raising=False)
         with pytest.raises(OSError):
             C._Leader(proc)
     finally:
@@ -1104,15 +1119,74 @@ def test_a_watch_that_cannot_be_set_for_a_live_process_is_an_error_not_an_exit(m
         proc.wait()
 
 
-def test_a_group_is_not_called_empty_on_one_scan_of_proc(monkeypatch):
-    """r3 complement LOW: /proc was listed once and read later, so a member that forked and exited in
-    between left its child out of the listing and a live group read as empty."""
+# --- S2 L3 r4 (codex, complement on 0cb85b7..f942ee1) ------------------------------------------
+
+
+def test_on_linux_a_proc_scan_never_drops_a_group_or_spares_it_the_sigkill(monkeypatch, tmp_path):
+    """r4 codex HIGH: /proc is read one entry at a time, so a member that keeps forking and exiting
+    can be missed by any number of scans; the group was then called empty, its leader reaped and the
+    group forgotten while the member ran (or, on a timeout, spared the SIGKILL). An empty scan is now
+    no reason to drop an unreaped leader's group, and the SIGKILL is always sent on Linux."""
     from levain.firing import confinement as C
 
-    listings = iter([[], ["4242"], ["4242"]])
+    lead = C._Leader(subprocess.Popen(["/usr/bin/true"], start_new_session=True))
+    assert lead.wait(5)
     monkeypatch.setattr(C.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(C.os, "killpg", lambda pgid, sig: None)
-    monkeypatch.setattr(C.os, "listdir", lambda p: next(listings))
-    monkeypatch.setattr(C.Path, "read_text", lambda self, *a, **k: "4242 (sleep) S 1 777 777 0")
+    monkeypatch.setattr(C.os, "killpg", lambda pgid, sig: None)   # the group has a member
+    monkeypatch.setattr(C.os, "listdir", lambda p: [])            # that no scan catches
     monkeypatch.setattr(C.time, "sleep", lambda s: None)
-    assert C._group_live(777) is True
+    sh = _plain(tmp_path)
+    try:
+        sh._groups[lead.pid] = lead   # type: ignore[attr-defined]
+        sh._prune_groups()   # type: ignore[attr-defined]
+        assert not lead.reaped and sh._groups == {lead.pid: lead}   # type: ignore[attr-defined]
+
+        sent: list[int] = []
+        sh._signal = lambda pgid, sig: sent.append(sig)   # type: ignore[method-assign]
+        sh._kill_group(lead.pid, lead)   # type: ignore[attr-defined]
+        assert signal.SIGKILL in sent
+    finally:
+        lead.reap()
+
+
+def test_no_lock_is_held_across_a_signal_and_no_reap_runs_during_one(tmp_path):
+    """r4 codex MED + complement MED: the per-leader reap lock was held across the signal (two sudo
+    calls for a hands shell), so a Ctrl-C of that same command, and its reap, waited behind it. The
+    signal is now sent outside the lock; a reap waits for it, so the number is never freed mid-send."""
+    from levain.firing import confinement as C
+
+    sh = _plain(tmp_path)
+    lead = C._Leader(subprocess.Popen(["/bin/sleep", "5"], start_new_session=True))
+    stalled, go = threading.Event(), threading.Event()
+    hit: list[int] = []
+
+    def slow(pgid, sig):
+        if sig == signal.SIGTERM:
+            stalled.set()
+            go.wait(5)   # a sudo that has not answered yet
+        hit.append(sig)
+
+    sh._signal = slow   # type: ignore[method-assign]
+    sh._leader = lead   # type: ignore[attr-defined]
+    t = threading.Thread(target=sh._signal_group, args=(lead.pid, lead, signal.SIGTERM))  # type: ignore[attr-defined]
+    reaper = threading.Thread(target=lead.reap)
+    try:
+        t.start()
+        assert stalled.wait(5)
+        t0 = time.monotonic()
+        sh.interrupt()   # the same command's Ctrl-C
+        assert time.monotonic() - t0 < 1.0 and signal.SIGINT in hit
+        lead.proc.kill()
+        lead.wait(5)
+        reaper.start()
+        reaper.join(0.3)
+        assert reaper.is_alive() and not lead.reaped   # held unreaped while the signal is out
+    finally:
+        go.set()
+        t.join(5)
+        if reaper.is_alive():
+            reaper.join(5)
+        sh._leader = None   # type: ignore[attr-defined]
+        lead.proc.kill()
+        lead.reap()
+    assert lead.reaped

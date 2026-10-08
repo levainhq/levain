@@ -332,6 +332,12 @@ def test_a_shell_releases_its_claim_only_once_its_process_group_is_gone(home: Pa
 
         def reap(self):
             pass
+
+        def release_watch(self):
+            pass
+
+        def hold_for_signal(self):
+            return False   # 4242 is not a group of this test's: send it nothing
     shell._groups = {4242: _P()}
     monkeypatch.setattr(C, "_group_gone", lambda pgid, timeout: False)
     shell.close()
