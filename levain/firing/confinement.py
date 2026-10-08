@@ -227,6 +227,8 @@ from __future__ import annotations
 
 import atexit
 import codecs
+import errno
+import inspect
 import json
 import os
 import platform
@@ -246,7 +248,7 @@ import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, NoReturn
+from typing import Any, Literal, NoReturn
 
 # The efferent gate's accepted settings, imported rather than restated: the config loader and the
 # gate must agree on the vocabulary by construction, not by two lists staying in sync. Both modules
@@ -2289,36 +2291,44 @@ class ShellResult:
 # the shell's home directory (its workspace, used when the first is gone; the process itself starts in
 # ``/``), ``o<OLDPWD>`` or ``-``, the exported variables as ``NAME=value`` fields ended by an empty field, then
 # the command. Each is applied with ``builtin cd`` / ``builtin export`` / an assignment; nothing levain
-# carries is ever sourced or evaluated, only the command itself. The socket is then moved to fd 9 and
-# stdin becomes /dev/null.
-# The EXIT trap writes back, on fd 9: ``P<pwd -P>``, ``O<OLDPWD>`` when set, ``E<NAME>=<value>`` per
-# exported variable, and ``Z``, each NUL-terminated. levain parses that as data (see
-# ``SandboxedShell._carry``) and drops it when the command timed out or waitpid reports a signal; the
-# trap itself writes nothing after HUP, INT, QUIT or TERM. The command (or a background job of it) can
-# write to fd 9 too; what it writes can only become its own next directory and environment, which
-# ``cd`` and ``export`` already give it.
+# carries is ever sourced or evaluated, only the command itself. A ``__levain_*`` name is never
+# exported (levain never sends one either), so nothing carried can steer the runner's own variables.
+# The socket is then moved to fd ``_STATE_FD`` (87: far from the low fds scripts use for lock files)
+# and stdin becomes /dev/null.
+# The EXIT trap writes back on that fd, and only while it is still a socket (a command that put a
+# file there gets nothing written into it): ``P<pwd -P>``, ``O<OLDPWD>`` when set, ``E<NAME>=<value>``
+# per exported variable, and ``Z``, each NUL-terminated. levain parses that as data (see
+# ``SandboxedShell._carry``) and drops it when the command timed out or waitpid reports a signal. The
+# command (or a background job of it) can write to the fd too; what it writes can only become its own
+# next directory and environment, which ``cd`` and ``export`` already give it.
 # Nothing here reports completion or a status: levain learns both from waitpid.
 # bash 3.2 (macOS /bin/bash): with errexit on and an EXIT trap set, a shell that exits through the
 # errexit path exits 0 and ``$?`` in the trap is already 0 (an unbound variable under ``-u``, ``${x?}``,
 # a syntax error inside ``eval``; bash 5.2 reports them correctly, so the fix applies to bash < 4
-# only, where ``BASH_COMMAND`` also behaves as described). The trap turns that case into exit 1: ``$?`` is 0, the command did
-# not run to its end (``__levain_done`` unset), ``-e`` is on and ``BASH_COMMAND`` is not an ``exit``
-# (read before any command in the trap: ``[[`` and other commands there overwrite it; assignments do
-# not). A
-# signal looks the same from inside the trap, so HUP/INT/QUIT/TERM are trapped to mark it
-# (``__levain_g``), skip the capture, and re-raise; ``exit 128+n`` is the fallback for bash as pid 1 of
-# a pid namespace, which cannot signal itself.
+# only). The trap turns that case into exit 1 when ``$?`` is 0, ``-e`` is on and the command neither
+# ran to its end (``__levain_done``) nor called ``exit``. A call of ``exit`` however spelled (``\exit``,
+# ``'exit'``, ``$e``, ``X=1 exit``) reaches the ``exit`` function below, which marks it
+# (``__levain_x``); ``builtin exit`` and ``command exit`` skip functions, so ``BASH_COMMAND`` (read
+# before any command in the trap: ``[[`` and other commands there overwrite it; assignments do not) is
+# matched for those, quotes and backslashes removed.
+# A signal never needs the correction: measured on bash 3.2, a shell a signal ends still dies of that
+# signal when its EXIT trap calls ``exit 1``, and levain discards what the trap wrote. So no signal is
+# trapped (a trapped INT would end the command even when its foreground program handled Ctrl-C), except
+# by bash as pid 1 of a pid namespace (bwrap ``--as-pid-1``): pid 1 ignores a signal it has no handler
+# for, so there HUP/INT/QUIT/TERM are trapped to skip the write-back (``__levain_g``) and exit 128+n.
 # Bash 3.2 is the floor: no mapfile, no ${x@Q}, no associative arrays, no {fd} redirections.
+_STATE_FD = 87
 _RUNNER = r"""IFS= builtin read -r -d '' __levain_w
 IFS= builtin read -r -d '' __levain_h
 IFS= builtin read -r -d '' __levain_o
 __levain_k=' PWD OLDPWD SHLVL _ '
 while IFS= builtin read -r -d '' __levain_e && [[ -n $__levain_e ]]; do
+  case $__levain_e in __levain_*) continue ;; esac
   __levain_k="$__levain_k${__levain_e%%=*} "
   builtin export -- "$__levain_e"
 done
 IFS= builtin read -r -d '' __levain_c
-exec 9<&0 </dev/null
+exec 87<&0 </dev/null
 for __levain_n in $(builtin compgen -e); do
   case $__levain_k in *" $__levain_n "*) ;; *) builtin unset -v -- "$__levain_n" 2>/dev/null ;; esac
 done
@@ -2327,7 +2337,14 @@ builtin cd -- "$__levain_w" 2>/dev/null || {
   builtin printf 'levain: %s is gone; this command starts in %s\n' "$__levain_w" "$PWD" >&2
 }
 case $__levain_o in o*) OLDPWD=${__levain_o#o} ;; *) builtin unset -v OLDPWD ;; esac
-builtin unset -v __levain_w __levain_h __levain_o __levain_k __levain_e __levain_n
+builtin unset -v __levain_w __levain_h __levain_o __levain_k __levain_e __levain_n \
+  __levain_done __levain_g __levain_x __levain_xs __levain_b __levain_m __levain_s __levain_f
+exit() {
+  __levain_xs=$?
+  __levain_x=1
+  if [[ $# == 0 ]]; then builtin exit "$__levain_xs"; fi
+  builtin exit "$@"
+}
 __levain_exit() {
   __levain_s=$?
   __levain_f=$-
@@ -2337,24 +2354,33 @@ __levain_exit() {
   IFS=$' \t\n'
   if [[ -n ${__levain_g-} ]]; then builtin return; fi
   __levain_b=
-  if [[ $__levain_s == 0 && -z ${__levain_done-} && $__levain_f == *e* && ${BASH_VERSINFO[0]} -lt 4 ]]; then
-    case $__levain_m in exit|exit[[:space:]]*|builtin[[:space:]]exit*) ;; *) __levain_b=1 ;; esac
+  if [[ $__levain_s == 0 && -z ${__levain_done-} && -z ${__levain_x-} && $__levain_f == *e* && ${BASH_VERSINFO[0]} -lt 4 ]]; then
+    __levain_m=${__levain_m//[\\\'\"]/}
+    case $__levain_m in
+      exit|exit[[:space:]]*|builtin[[:space:]]exit|builtin[[:space:]]exit[[:space:]]*) ;;
+      command[[:space:]]exit|command[[:space:]]exit[[:space:]]*) ;;
+      *) __levain_b=1 ;;
+    esac
   fi
-  {
-    builtin printf 'P%s\0' "$(builtin pwd -P 2>/dev/null)"
-    if [[ -n ${OLDPWD+x} ]]; then builtin printf 'O%s\0' "$OLDPWD"; fi
-    for __levain_n in $(builtin compgen -e); do
-      builtin printf 'E%s=%s\0' "$__levain_n" "${!__levain_n}"
-    done
-    builtin printf 'Z\0'
-  } >&9 2>/dev/null
+  if [[ -S /dev/fd/87 ]]; then
+    {
+      builtin printf 'P%s\0' "$(builtin pwd -P 2>/dev/null)"
+      if [[ -n ${OLDPWD+x} ]]; then builtin printf 'O%s\0' "$OLDPWD"; fi
+      for __levain_n in $(builtin compgen -e); do
+        builtin printf 'E%s=%s\0' "$__levain_n" "${!__levain_n}"
+      done
+      builtin printf 'Z\0'
+    } >&87 2>/dev/null
+  fi
   if [[ -n $__levain_b ]]; then builtin exit 1; fi
 }
 builtin trap __levain_exit EXIT
-builtin trap '__levain_g=1; builtin trap - HUP; builtin kill -HUP $$; builtin exit 129' HUP
-builtin trap '__levain_g=1; builtin trap - INT; builtin kill -INT $$; builtin exit 130' INT
-builtin trap '__levain_g=1; builtin trap - QUIT; builtin kill -QUIT $$; builtin exit 131' QUIT
-builtin trap '__levain_g=1; builtin trap - TERM; builtin kill -TERM $$; builtin exit 143' TERM
+if [[ $$ == 1 ]]; then
+  builtin trap '__levain_g=1; builtin trap - HUP; builtin kill -HUP $$; builtin exit 129' HUP
+  builtin trap '__levain_g=1; builtin trap - INT; builtin kill -INT $$; builtin exit 130' INT
+  builtin trap '__levain_g=1; builtin trap - QUIT; builtin kill -QUIT $$; builtin exit 131' QUIT
+  builtin trap '__levain_g=1; builtin trap - TERM; builtin kill -TERM $$; builtin exit 143' TERM
+fi
 builtin eval "$__levain_c"
 __levain_done=$?
 builtin exit "$__levain_done"
@@ -2396,15 +2422,22 @@ def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None)
         return None
     import pwd
 
+    redo = ("Set it up again: sudo levain setup-isolation --undo, then sudo levain setup-isolation.")
     try:
-        home = pwd.getpwnam(cfg.hands_user).pw_dir
+        entry = pwd.getpwnam(cfg.hands_user)
     except KeyError:
         raise ConfinementError(
             f"the entity's hands user {cfg.hands_user} does not exist — refusing to run bash as you "
-            "instead (fail-closed). Set it up again: sudo levain setup-isolation --undo, then "
-            "sudo levain setup-isolation."
+            f"instead (fail-closed). {redo}"
         ) from None
-    return HandsIdentity(cfg.hands_user, cfg.hands_uid, home, cfg.hands_workspace)
+    # By uid as well as by name: an account deleted and re-created under the same name is another
+    # account, and the workspace's ownership and ACLs were made for the recorded uid (S2 L1b LOW-3).
+    if entry.pw_uid != cfg.hands_uid:
+        raise ConfinementError(
+            f"the entity's hands user {cfg.hands_user} now has uid {entry.pw_uid}, not the uid "
+            f"{cfg.hands_uid} setup recorded — refusing to run bash as it (fail-closed). {redo}"
+        )
+    return HandsIdentity(cfg.hands_user, cfg.hands_uid, entry.pw_dir, cfg.hands_workspace)
 
 
 def _hands_env(hands: HandsIdentity) -> dict[str, str]:
@@ -2441,16 +2474,18 @@ def _require_hands_sudo(hands: HandsIdentity) -> None:
         )
 
 
-def _hands_signal(hands: HandsIdentity, pgid: int, sig: int) -> None:
+def _hands_signal(hands: HandsIdentity, pgid: int, sig: int) -> bool:
     """Signal a hands-user process group. levain (the operator) may not signal another uid's
-    processes, so the signal is sent AS the hands user (the same sudoers rule allows it)."""
+    processes, so the signal is sent AS the hands user (the same sudoers rule allows it). False when
+    sudo refused or stalled, or kill found nothing to signal."""
     from levain.launch import child_env
 
     try:
-        subprocess.run([SUDO, "-n", "-u", hands.user, "/bin/kill", f"-{int(sig)}", "--", f"-{int(pgid)}"],
-                       capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=10)
+        r = subprocess.run([SUDO, "-n", "-u", hands.user, "/bin/kill", f"-{int(sig)}", "--", f"-{int(pgid)}"],
+                           capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=10)
     except (OSError, subprocess.TimeoutExpired):
-        pass
+        return False
+    return r.returncode == 0
 
 
 # Names never carried from one command to the next, whatever the entity set them to: each makes a
@@ -2459,8 +2494,9 @@ _NEVER_CARRIED = frozenset({
     "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4", "IFS", "CDPATH",
     "GLOBIGNORE", "EXECIGNORE", "POSIXLY_CORRECT", "TMOUT", "PWD", "OLDPWD", "SHLVL", "_",
 })
-# ``BASH_`` covers BASH_FUNC_* (an exported function), BASH_ENV, BASH_XTRACEFD, BASH_LOADABLES_PATH.
-_NEVER_CARRIED_PREFIXES = ("BASH_", "LD_", "DYLD_")
+# ``BASH_`` covers BASH_FUNC_* (an exported function), BASH_ENV, BASH_XTRACEFD, BASH_LOADABLES_PATH;
+# ``__levain_`` the runner's own variables (the runner refuses them too).
+_NEVER_CARRIED_PREFIXES = ("BASH_", "LD_", "DYLD_", "__levain_")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # The most levain reads back from one command's state channel.
 _MAX_CARRY_BYTES = 4 * 1024 * 1024
@@ -2549,31 +2585,53 @@ class _Carry:
     """The state channel of one command: levain's end of the socket that is bash's stdin. Reads what
     the runner's EXIT trap writes back (see ``_RUNNER``) until EOF, :meth:`stop`, or the bound, and
     keeps the LAST complete frame: the trap writes after everything the command itself wrote. (A
-    background job still holding fd 9 can write later; that, too, is only data.)"""
+    background job still holding the state fd can write later; that, too, is only data.)"""
 
     def __init__(self, sock: socket.socket) -> None:
         self._sock = sock
         self._lock = threading.Lock()
         self._buf = bytearray()
+        self._stopping = threading.Event()
         self.done = threading.Event()
         threading.Thread(target=self._pump, daemon=True).start()
 
+    def _take(self, chunk: bytes) -> bool:
+        """Keep ``chunk``; False once over the bound (then nothing carries)."""
+        with self._lock:
+            if len(self._buf) + len(chunk) > _MAX_CARRY_BYTES:
+                self._buf = bytearray()
+                return False
+            self._buf += chunk
+            return True
+
     def _pump(self) -> None:
+        # poll() with a timeout, never a blocking recv: stop() only sets a flag, and this thread then
+        # reads whatever is already queued (non-blocking) before it closes. A shutdown() from another
+        # thread would wake a blocking recv, but on macOS it also discards the unread queue, the
+        # trap's frame included, when a background job keeps the socket open (S2 L2b L5).
+        poller = select.poll()
+        poller.register(self._sock.fileno(), select.POLLIN)
         try:
-            while True:
+            while not self._stopping.is_set():
                 try:
+                    if not poller.poll(50):
+                        continue
                     chunk = self._sock.recv(65536)
                 except InterruptedError:
                     continue
                 except OSError:
-                    break
-                if not chunk:
-                    break
-                with self._lock:
-                    if len(self._buf) + len(chunk) > _MAX_CARRY_BYTES:
-                        self._buf = bytearray()   # over the bound: carry nothing
-                        break
-                    self._buf += chunk
+                    return
+                if not chunk or not self._take(chunk):
+                    return
+            while True:
+                try:
+                    chunk = self._sock.recv(65536, socket.MSG_DONTWAIT)
+                except (BlockingIOError, InterruptedError):
+                    return
+                except OSError:
+                    return
+                if not chunk or not self._take(chunk):
+                    return
         finally:
             try:
                 self._sock.close()
@@ -2594,7 +2652,7 @@ class _Carry:
 
     def send(self, data: bytes) -> None:
         """Write the runner's input from a thread (a driver that never reads stdin must not block
-        ``run()``), then half-close, so a read of fd 9 by the command gets EOF."""
+        ``run()``), then half-close, so a read of the state fd by the command gets EOF."""
         sock = self._sock
 
         def feed() -> None:
@@ -2606,9 +2664,12 @@ class _Carry:
         threading.Thread(target=feed, daemon=True).start()
 
     def stop(self) -> None:
-        """Wake the reader (shutdown, never close, from another thread); it closes the socket."""
+        """Stop reading: the reader takes what is already queued, then closes the socket (within its
+        poll interval). Everything the trap wrote before bash exited is queued by then. The write side
+        is shut, which ends a feed still blocked on a driver that never read its input."""
+        self._stopping.set()
         try:
-            self._sock.shutdown(socket.SHUT_RDWR)
+            self._sock.shutdown(socket.SHUT_WR)
         except OSError:
             pass
 
@@ -2640,9 +2701,10 @@ class SandboxedShell:
     functions, aliases, traps, ``set``/``shopt`` options (``set -e`` included), ``umask``, ``ulimit``,
     the directory stack, ``$?``, ``$!`` and the job table all start fresh in each command, the way they
     do in a new terminal. A command that timed out, or that waitpid reports as ended by a signal,
-    carries nothing, and the runner writes nothing back after HUP, INT, QUIT or TERM; the next command
-    then starts from the last one that ended by itself. A command that replaces the EXIT trap
-    (``trap ... EXIT``, ``exec prog``) writes nothing back either.
+    carries nothing (levain discards what the runner wrote back); the next command then starts from
+    the last one that ended by itself. A command that replaces the EXIT trap
+    (``trap ... EXIT``, ``exec prog``) writes nothing back either, nor one that puts something other
+    than a socket on the state fd (``_STATE_FD``).
 
     The sandbox profile fences by PATH at the syscall level, so a ``cd`` into ``$HOME`` still cannot
     read a denied crown jewel.
@@ -2698,6 +2760,7 @@ class SandboxedShell:
         self._carried_env: dict[str, str] = dict(self._env)
         self._started = False
         self._closed = False
+        self._probe_carried = False          # did the last command's state frame come back
         self._run_lock = threading.Lock()    # serialize run(); fail-fast on concurrent misuse
         self._lock = threading.Lock()        # guards _groups / _late across run() and close()
         # Process groups this shell started that may still have members (a command's own group while
@@ -2726,6 +2789,15 @@ class SandboxedShell:
         try:
             token = f"__LEVAIN_READY_{os.urandom(8).hex()}__"
             r = self._execute(f"printf '%s\\n' '{token}'", _START_TIMEOUT)
+            if not (r.timed_out or r.exit_code != 0 or token not in r.output) and not self._probe_carried:
+                # bash ran, but its state frame never came back: something between levain and bash
+                # replaced the socket on its stdin (a sudoers `log_input` makes it a pipe), and nothing
+                # would carry from one command to the next, silently (S2 L2b L3).
+                raise ConfinementError(
+                    "the shell's state channel did not answer the start probe (is the socket on bash's "
+                    "stdin replaced, e.g. by a sudo log_input setting?) — refusing a shell whose "
+                    "directory and exports would silently not carry."
+                )
             if r.timed_out or r.exit_code != 0 or token not in r.output:
                 driver = os.path.basename(self._argv[0]) if self._argv else "the sandbox driver"
                 said = " | ".join(x.strip() for x in r.output.splitlines()[-5:] if x.strip())
@@ -2799,9 +2871,19 @@ class SandboxedShell:
         """Hook: a command's bash has been reaped and its result is about to be returned."""
 
     def _spawn(self) -> tuple[subprocess.Popen[bytes], _Output, _Carry]:
-        rd, wr = os.pipe()
-        ours, theirs = socket.socketpair()
+        # The argv first: it may raise (and the bwrap shell's makes the --info-fd pipe itself), and
+        # nothing below exists yet to leak (S2 L2b L6).
         argv, pass_fds = self._spawn_argv()
+        try:
+            rd, wr = os.pipe()
+            ours, theirs = socket.socketpair()
+        except BaseException:
+            for fd in pass_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
         try:
             proc = subprocess.Popen(
                 argv,
@@ -2840,9 +2922,9 @@ class SandboxedShell:
         self._proc = proc
         return proc, out, carry
 
-    def _kill_group(self, pgid: int, proc: subprocess.Popen[bytes]) -> None:
+    def _kill_group(self, pgid: int, proc: subprocess.Popen[bytes]) -> bool:
         """SIGTERM the group, give it ``_KILL_GRACE``, SIGKILL what is left, reap ``proc``, and wait
-        for the group to empty."""
+        for the group to empty. False when it did not empty: the caller must not report it killed."""
         self._signal(pgid, signal.SIGTERM)
         try:
             proc.wait(timeout=_KILL_GRACE)
@@ -2854,7 +2936,7 @@ class SandboxedShell:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
-        _group_gone(pgid, timeout=5.0)
+        return _group_gone(pgid, timeout=5.0) and proc.poll() is not None
 
     @staticmethod
     def _signal(pgid: int, sig: int) -> None:
@@ -2907,7 +2989,18 @@ class SandboxedShell:
                 proc.wait(timeout=deadline_s)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                self._kill_group(pgid, proc)
+                if not self._kill_group(pgid, proc):
+                    # The signals did not land (sudo refused or stalled, say): the command may still
+                    # be running, so it is not reported as killed, and the shell is closed (S2 L1b
+                    # MED-2, L2b L4).
+                    out.abandon()
+                    carry.stop()
+                    self.close()
+                    raise ConfinementError(
+                        "the command timed out and levain could not stop it: its process group is "
+                        "still running. The shell was closed; check for the leftover processes "
+                        f"(process group {pgid})."
+                    )
         except BaseException:
             self._kill_group(pgid, proc)
             carry.stop()
@@ -2928,8 +3021,10 @@ class SandboxedShell:
         rc = proc.returncode
         if rc is not None and rc < 0:
             return ShellResult(output=text, exit_code=None, signal=-rc)
-        if carry.frame is not None:
-            self._carry(carry.frame)
+        frame = carry.frame
+        self._probe_carried = frame is not None
+        if frame is not None:
+            self._carry(frame)
         return ShellResult(output=text, exit_code=rc)
 
     def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
@@ -3051,7 +3146,7 @@ class ConfinementProvider(ABC):
         default_timeout: float = 120.0,
         hands: HandsIdentity | None = None,
     ) -> SandboxedShell:
-        """Start a persistent shell confined by ``policy``. The returned :class:`SandboxedShell` is
+        """Start a stateful shell confined by ``policy``. The returned :class:`SandboxedShell` is
         already ``start()``\\ ed and carries the policy it was confined by in ``effective_policy``.
         With ``hands`` (see :func:`hands_for`), bash runs as that user; a provider that cannot do
         that refuses, never runs bash as the operator instead.
@@ -3122,19 +3217,17 @@ class ConfinementProvider(ABC):
             raise FloorRefreshError(str(exc)) from exc
         _refuse_multiply_linked_jewels(refreshed)
         # `hands` is passed only when set, so a provider written before it existed still works for
-        # every operator-uid shell, and refuses (TypeError -> ConfinementError) a hands one.
-        try:
-            shell = self._spawn_shell_impl(
-                refreshed, env=env, default_timeout=default_timeout,
-                **({"hands": hands} if hands is not None else {}),
-            )
-        except TypeError as exc:
-            if hands is None:
-                raise
+        # every operator-uid shell, and refuses a hands one. Decided from the signature, never from a
+        # TypeError, which a hands-capable provider can raise for any other reason (S2 L1b LOW-5).
+        if hands is not None and not _accepts_hands(self._spawn_shell_impl):
             raise ConfinementError(
-                f"{type(self).__name__} cannot run bash as the entity's own user ({exc}) — refusing "
-                "to run it as you instead (fail-closed)."
-            ) from exc
+                f"{type(self).__name__} cannot run bash as the entity's own user — refusing to run "
+                "it as you instead (fail-closed)."
+            )
+        shell = self._spawn_shell_impl(
+            refreshed, env=env, default_timeout=default_timeout,
+            **({"hands": hands} if hands is not None else {}),
+        )
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
         # only MOVED the crash to the caller's `.run`, as an AttributeError that `__call__` does not
         # convert into an in-band refusal.
@@ -3159,16 +3252,34 @@ class ConfinementProvider(ABC):
         """Platform half of :meth:`spawn_shell`. ``policy`` arrives with its socket connect arm
         ALREADY re-resolved for this spawn — render it as given; do not re-derive it here."""
 
+    def hands_file(self, policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, path: str,
+                   data: bytes = b"", *, timeout: float = 60.0) -> bytes:
+        """Run one file operation AS the hands user, under this provider's floor, inside the hands
+        workspace: the file editor's reads and writes for an entity whose bash runs as that user (the
+        editor never touches a file with the operator's rights there). ``op`` is ``read`` (returns
+        the file's bytes), ``stat``, ``list`` (see :data:`_HANDS_FILE_HELPER` for their output) or
+        ``write`` (``data`` replaces the file). Raises :class:`FileNotFoundError` for a missing path,
+        :class:`HandsFileRefused` with the reason for a refusal, :class:`OSError` when the helper
+        could not run; a provider that cannot run as another user raises :class:`ConfinementError`."""
+        raise ConfinementError(
+            f"{type(self).__name__} cannot use files as the entity's own user — refusing to use them as "
+            "you instead (fail-closed)."
+        )
+
     def hands_write(self, policy: CrownJewelsPolicy, hands: HandsIdentity, path: str, data: bytes,
                     *, timeout: float = 120.0) -> None:
-        """Write ``data`` to ``path`` AS the hands user, under this provider's floor: the file
-        editor's writes for an entity whose bash runs as that user (D3). Raises :class:`OSError`
-        with the reason when the hands user may not write there; a provider that cannot run as
-        another user raises :class:`ConfinementError`."""
-        raise ConfinementError(
-            f"{type(self).__name__} cannot write as the entity's own user — refusing to write as you "
-            "instead (fail-closed)."
-        )
+        """Write ``data`` to ``path`` as the hands user (:meth:`hands_file` ``write``)."""
+        self.hands_file(policy, hands, "write", path, data, timeout=timeout)
+
+
+def _accepts_hands(fn: Any) -> bool:
+    """Whether ``fn`` takes a ``hands`` keyword (named, or through ``**kwargs``)."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "hands" and p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD)
+               or p.kind is p.VAR_KEYWORD for p in params)
 
 
 def _reject_control_chars(value: str) -> None:
@@ -3483,30 +3594,148 @@ class SeatbeltProvider(ConfinementProvider):
         )
         return shell.start()
 
-    def hands_write(self, policy: CrownJewelsPolicy, hands: HandsIdentity, path: str, data: bytes,
-                    *, timeout: float = 120.0) -> None:
-        _seatbelt_hands_write(self, policy, hands, path, data, timeout)
+    def hands_file(self, policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, path: str,
+                   data: bytes = b"", *, timeout: float = 60.0) -> bytes:
+        return _seatbelt_hands_file(self, policy, hands, op, path, data, timeout)
 
 
-def _seatbelt_hands_write(provider: "SeatbeltProvider", policy: CrownJewelsPolicy,
-                          hands: HandsIdentity, path: str, data: bytes, timeout: float) -> None:
+class HandsFileRefused(PermissionError):
+    """The hands file helper refused an operation (outside the workspace, a symlink, not a regular
+    file, too large, permission denied); the message is its reason."""
+
+
+# The largest file the editor reads through the hands helper.
+_HANDS_READ_LIMIT = 64 * 1024 * 1024
+HANDS_ZSH = "/bin/zsh"
+
+# The file editor's hands for an entity whose bash runs as its own user: ONE fixed zsh program, run as
+# that user (sudo -n -u, env -i, no terminal) under the same sandbox profile as its bash, so every read
+# and write is made with that user's rights and the floor's, never the operator's. zsh because it
+# ships with every macOS and its zsh/system module opens with O_NOFOLLOW and O_NONBLOCK, which no
+# stock shell utility can. Its input is data only: the operation, the workspace and the path are
+# arguments, a written file's content is stdin; nothing given to it is evaluated.
+# Every path must lie in the workspace: the directory holding it, symlinks resolved, is the workspace or
+# under it (the workspace itself may be named). The last component is never followed: a symlink there
+# is refused, or, for a write, replaced. That bounds where the editor looks; what it may touch is the
+# kernel's to say, by the hands user's rights and the profile.
+#   read   the regular file's bytes on stdout; a FIFO, device or directory is refused, not opened
+#          for long (O_NONBLOCK), and so is a file over the limit ($4)
+#   stat   lstat as "mode ino dev nlink uid gid size atime mtime ctime"
+#   list   the directory's entries, then each non-hidden real subdirectory's non-hidden entries, as
+#          NUL-terminated pairs "<l|d|f|o>" "<name or sub/name>"
+#   write  stdin into a new file beside the target (O_CREAT|O_EXCL|O_NOFOLLOW), given the target's
+#          permissions (0644 when new), then renamed over it: atomic, and a link or FIFO at the
+#          target is replaced, never written through
+# Exit 0 done, 2 no such path, 3 refused (the reason on stderr); anything else is a failure. /etc/zshenv,
+# root's own file, is the one startup file `zsh -f` still reads. The descriptors are fixed numbers
+# (5, 6): zsh 5.9 can report a wrong number for ``sysopen -u var`` after a redirected command (seen on
+# macOS: the variable said 13, the file was open on 11).
+_HANDS_FILE_HELPER = r"""emulate -R zsh
+zmodload zsh/system zsh/stat 2>/dev/null || { print -ru2 -- 'zsh modules are unavailable'; exit 70 }
+refuse() { print -rnu2 -- "$1"; exit 3 }
+op=$1 ws=$2 p=$3
+[[ $ws == /* && $p == /* ]] || refuse "not an absolute path: $p"
+wsr=${ws:A}
+p=${p:a}
+if [[ $p == ${ws:a} || $p == $wsr ]]; then
+  p=$wsr top=1
+else
+  top=
+  par=${p:h:A}
+  [[ $par == $wsr || $par == $wsr/* ]] || refuse "$3 is outside the workspace $ws"
+  p=$par/${p:t}
+fi
+absent() { [[ -e $1 || -L $1 ]] || exit 2 }
+kind() {
+  if [[ -L $1 ]]; then REPLY=l; elif [[ -d $1 ]]; then REPLY=d; elif [[ -f $1 ]]; then REPLY=f; else REPLY=o; fi
+}
+case $op in
+  stat)
+    zstat -L -H st -- $p 2>/dev/null || { absent $p; refuse "cannot stat $3: permission denied" }
+    print -rn -- "$st[mode] $st[inode] $st[device] $st[nlink] $st[uid] $st[gid] $st[size] $st[atime] $st[mtime] $st[ctime]"
+    ;;
+  read)
+    [[ -z $top ]] || refuse "$3 is a directory"
+    if ! sysopen -r -o nofollow,nonblock -u 5 -- $p 2>/dev/null; then
+      absent $p
+      [[ -L $p ]] && refuse "$3 is a symlink; the editor does not follow links for an entity with its own user"
+      refuse "cannot open $3: permission denied"
+    fi
+    zstat -f 5 -H st 2>/dev/null || refuse "cannot stat $3"
+    (( (st[mode] & 8#170000) == 8#100000 )) || refuse "$3 is not a regular file"
+    (( st[size] <= $4 )) || refuse "$3 is larger than $4 bytes"
+    /bin/cat <&5
+    ;;
+  list)
+    if [[ -z $top && -L $p ]]; then refuse "$3 is a symlink; the editor does not follow links for an entity with its own user"; fi
+    [[ -d $p ]] || { absent $p; refuse "$3 is not a directory" }
+    [[ -r $p && -x $p ]] || refuse "cannot list $3: permission denied"
+    setopt null_glob glob_dots
+    for e in $p/*; do
+      kind $e
+      print -rn -- "$REPLY"$'\0'"${e:t}"$'\0'
+      if [[ $REPLY == d && ${e:t} != .* ]]; then
+        for c in $e/*; do
+          [[ ${c:t} == .* ]] && continue
+          kind $c
+          print -rn -- "$REPLY"$'\0'"${e:t}/${c:t}"$'\0'
+        done
+      fi
+    done
+    ;;
+  write)
+    [[ -z $top ]] || refuse "$3 is a directory"
+    [[ -d $p && ! -L $p ]] && refuse "$3 is a directory"
+    mode=644
+    if [[ -f $p && ! -L $p ]] && zstat -L -H st -- $p 2>/dev/null; then
+      mode=$(( [##8] st[mode] & 8#7777 ))
+    fi
+    t=${p:h}/.${p:t}.levain-$$-$RANDOM
+    if ! sysopen -w -o create,excl,nofollow -m 600 -u 6 -- $t 2>/dev/null; then
+      [[ -d ${p:h} ]] || exit 2
+      refuse "cannot write in ${3:h}: permission denied"
+    fi
+    if ! /bin/cat >&6; then exec 6>&-; /bin/rm -f -- $t; refuse "writing $3 failed"; fi
+    exec 6>&-
+    if ! /bin/chmod $mode $t || ! /bin/mv -f -- $t $p; then /bin/rm -f -- $t; refuse "could not replace $3"; fi
+    ;;
+  *) refuse "unknown operation $op" ;;
+esac
+"""
+_HANDS_FILE_OPS = ("read", "stat", "list", "write")
+
+
+def _hands_file_argv(profile_text: str, hands: HandsIdentity, op: str, path: str) -> list[str]:
+    return [*hands_prefix(hands), SANDBOX_EXEC, "-p", profile_text,
+            HANDS_ZSH, "-f", "-c", _HANDS_FILE_HELPER, "zsh", op, str(hands.workspace), path,
+            str(_HANDS_READ_LIMIT)]
+
+
+def _seatbelt_hands_file(provider: "SeatbeltProvider", policy: CrownJewelsPolicy, hands: HandsIdentity,
+                         op: str, path: str, data: bytes, timeout: float) -> bytes:
     from levain.launch import child_env
 
+    if op not in _HANDS_FILE_OPS:
+        raise ValueError(f"unknown hands file operation {op!r}")
     text = provider.render_profile(policy)
     _refuse_kernel_mask_rules(text)
-    # A fixed program; the path is an argument and the content arrives on stdin, so nothing the entity
-    # wrote is ever run. Truncate-and-write in place, like the editor's own open(path, "w"): an
-    # existing file keeps its mode, a new one is 0644.
-    argv = [*hands_prefix(hands), SANDBOX_EXEC, "-p", text,
-            "/bin/sh", "-c", 'umask 022; exec /bin/cat > "$1"', "sh", path]
+    argv = _hands_file_argv(text, hands, op, path)
     try:
-        r = subprocess.run(argv, input=data, capture_output=True, cwd="/", env=child_env(),
-                           start_new_session=True, timeout=timeout)
+        # A new session: no controlling terminal for sudo or the helper. stdin is the content for a
+        # write and empty otherwise.
+        r = subprocess.run(argv, input=data if op == "write" else b"", capture_output=True, cwd="/",
+                           env=child_env(), start_new_session=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        raise OSError(f"writing {path} as {hands.user} timed out") from exc
-    if r.returncode != 0:
-        said = r.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or ["refused"]
-        raise OSError(f"{hands.user} could not write {path}: {said[0]}")
+        raise OSError(f"{op} of {path} as {hands.user} timed out") from exc
+    said = r.stderr.decode("utf-8", "replace").strip()
+    if r.returncode == 0:
+        return r.stdout
+    if r.returncode == 2:
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+    if r.returncode == 3:
+        raise HandsFileRefused(said or f"{hands.user} may not {op} {path}")
+    raise OSError(f"{hands.user} could not {op} {path} (status {r.returncode}): "
+                  + (said.splitlines()[-1] if said else "no reason given"))
 
 
 def _default_shell_env() -> dict[str, str]:
@@ -3561,7 +3790,18 @@ class _HandsSeatbeltShell(_SeatbeltShell):
         self.hands = hands
 
     def _signal(self, pgid: int, sig: int) -> None:   # type: ignore[override]
+        # The group's members run as the hands user, except sudo, the group leader, whose REAL uid is
+        # the operator's: only levain can signal it, and only the hands user the rest. A command that
+        # stops itself (`kill -STOP $$`) stops sudo too, so after the signal both get SIGCONT, or a
+        # stopped sudo would outlive the timeout, close() and levain (S2 L2b M2).
         _hands_signal(self.hands, pgid, sig)
+        if sig != signal.SIGCONT:
+            _hands_signal(self.hands, pgid, signal.SIGCONT)
+        for s_ in (sig, signal.SIGCONT):
+            try:
+                os.killpg(pgid, s_)
+            except OSError:
+                pass
 
 
 # --- Linux: bwrap (mount-namespace) provider -------------------------------------------------
@@ -5394,7 +5634,8 @@ class _BwrapShell(SandboxedShell):
                 _ledger_release(claim)
 
     def _close_info(self) -> None:
-        fd, self._info_r = self._info_r, None
+        with self._lock:
+            fd, self._info_r = self._info_r, None
         if fd is not None:
             try:
                 os.close(fd)
@@ -5411,7 +5652,11 @@ class _BwrapShell(SandboxedShell):
         return argv[:at] + ["--info-fd", str(wr)] + argv[at:], (wr,)
 
     def _read_child_pid(self) -> int:
-        fd = self._info_r
+        # This thread takes the read end, so close() from another thread can no longer close it
+        # under the read, and a reused fd number is never read from (S2 L2b L7). A close() meanwhile
+        # kills bwrap, whose exit ends the read with EOF.
+        with self._lock:
+            fd, self._info_r = self._info_r, None
         data = b""
         deadline = time.monotonic() + _START_TIMEOUT
         try:
@@ -5423,8 +5668,16 @@ class _BwrapShell(SandboxedShell):
                 if not chunk:
                     break
                 data += chunk
+                # bwrap writes the whole object at once; stop there rather than wait for EOF, which
+                # comes only when every holder of the write end has closed it (S2 L1b).
+                if re.search(rb'"child-pid"\s*:\s*\d+\s*[,}]', data):
+                    break
         finally:
-            self._close_info()
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         m = re.search(rb'"child-pid"\s*:\s*(\d+)', data)
         pid = int(m.group(1)) if m else 0
         if pid <= 0:

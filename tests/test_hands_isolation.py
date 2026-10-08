@@ -162,7 +162,10 @@ def test_the_sudoers_step_is_validated_and_scoped_to_the_hands_user(tmp_path: Pa
     assert mode == 0o440 and step.validate[-1] == "-cf" and step.validate[0].endswith("visudo")
     rules = [ln for ln in content.splitlines() if ln and not ln.startswith("#")]
     h = plan.hands_user
-    assert rules == [f"Defaults>{h} !requiretty", f"Defaults>{h} env_reset", f"alice ALL=({h}) NOPASSWD: ALL"]
+    # The I/O options pinned off (S2 L2b L3): a log_input pipe or a pty on stdin would replace the
+    # socket levain reads the shell's state back over.
+    assert rules == [f"Defaults>{h} !requiretty", f"Defaults>{h} env_reset",
+                     f"Defaults>{h} !log_input, !log_output, !use_pty", f"alice ALL=({h}) NOPASSWD: ALL"]
 
 
 @pytest.mark.skipif(shutil.which("visudo") is None, reason="needs visudo")

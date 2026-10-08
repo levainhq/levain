@@ -1,5 +1,5 @@
 """M2 S2 slice 2: outside the interactive REPL, an entity with a hands user runs its bash AS that user
-(``sudo -n -u``, outside the sandbox driver), and its file editor writes as that user too.
+(``sudo -n -u``, outside the sandbox driver), and its file editor reads and writes as that user too.
 
 Hermetic: no hands user exists on a developer machine (setup needs root), so the spawn argv, the
 fail-closed path, the signal path and the editor's write path are checked here with fakes; the real
@@ -68,6 +68,32 @@ def test_hands_for_refuses_when_the_hands_account_is_gone(tmp_path):
         hands_for(cfg, "headless", system="Darwin")
 
 
+def test_hands_for_refuses_an_account_whose_uid_changed(tmp_path):
+    """S2 L1b LOW-3: the account was checked by name only; one deleted and re-created under the same
+    name is another account, and the workspace was set up for the recorded uid."""
+    cfg = _cfg(hands_user="nobody", hands_uid=_NOBODY.pw_uid + 1, hands_workspace=tmp_path)
+    with pytest.raises(ConfinementError, match="uid"):
+        hands_for(cfg, "headless", system="Darwin")
+
+
+def test_a_hands_capable_provider_raising_typeerror_is_not_misreported(tmp_path):
+    """S2 L1b LOW-5: any TypeError from inside a hands spawn was reported as "cannot run bash as the
+    entity's own user". The provider's signature decides that; its own errors propagate as they are."""
+
+    class Buggy(confinement.ConfinementProvider):
+        def available(self):
+            return True
+
+        def render_profile(self, policy):
+            return ""
+
+        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0, hands=None):
+            raise TypeError("a bug inside the provider")
+
+    with pytest.raises(TypeError, match="a bug inside"):
+        Buggy().spawn_shell(build_policy(_entity(tmp_path)), hands=_hands(tmp_path))
+
+
 # --- the spawn ----------------------------------------------------------------------------------
 
 
@@ -119,15 +145,44 @@ def test_a_refused_sudo_fails_closed(tmp_path, monkeypatch):
 
 def test_signals_to_a_hands_shell_are_sent_as_the_hands_user(tmp_path, monkeypatch):
     """levain may not signal another uid's processes: the timeout, close and interrupt signals go
-    through `sudo -n -u <hands> /bin/kill -- -<pgid>`."""
+    through `sudo -n -u <hands> /bin/kill -- -<pgid>`. sudo, the group leader, has the operator's real
+    uid, so levain signals it itself; and both get SIGCONT, so a command that stopped itself (and sudo
+    with it) cannot outlive the kill (S2 L2b M2)."""
     hands = _hands(tmp_path)
     sent: list = []
+    direct: list = []
     monkeypatch.setattr(confinement.subprocess, "run",
                         lambda argv, **kw: sent.append(argv) or subprocess.CompletedProcess(argv, 0))
+    monkeypatch.setattr(confinement.os, "killpg", lambda pgid, sig: direct.append((pgid, sig)))
     sh = confinement._HandsSeatbeltShell(hands=hands, argv=["/bin/true"], cwd=tmp_path, env={})
     sh._signal(4242, signal.SIGTERM)
-    assert sent == [[confinement.SUDO, "-n", "-u", "nobody", "/bin/kill", f"-{int(signal.SIGTERM)}",
-                     "--", "-4242"]]
+    kill = [confinement.SUDO, "-n", "-u", "nobody", "/bin/kill"]
+    assert sent == [[*kill, f"-{int(signal.SIGTERM)}", "--", "-4242"],
+                    [*kill, f"-{int(signal.SIGCONT)}", "--", "-4242"]]
+    assert direct == [(4242, signal.SIGTERM), (4242, signal.SIGCONT)]
+
+
+def test_a_timeout_whose_kill_did_not_land_is_not_reported_as_killed(tmp_path, monkeypatch):
+    """S2 L1b MED-2 / L2b L4: sudo refusing or stalling while signalling was swallowed, and levain
+    reported a killed command that kept running as the hands user. Now the shell is closed and the
+    run refuses, saying the group is still running."""
+    from levain.firing.confinement import SandboxedShell
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    sh = SandboxedShell(argv=["/bin/bash", "--noprofile", "--norc"], cwd=ws,
+                        env={"PATH": "/usr/bin:/bin"}).start()
+    monkeypatch.setattr(sh, "_signal", lambda pgid, sig: None)   # every signal silently lost
+    monkeypatch.setattr(confinement, "_KILL_GRACE", 0.1)
+    real_gone = confinement._group_gone
+    monkeypatch.setattr(confinement, "_group_gone", lambda pgid, timeout: real_gone(pgid, timeout=min(timeout, 0.2)))
+    try:
+        with pytest.raises(ConfinementError, match="could not stop it"):
+            sh.run("sleep 30", timeout=0.5)
+        assert sh.closed
+    finally:
+        monkeypatch.undo()
+        sh.close()
 
 
 def test_the_linux_provider_refuses_a_hands_spawn(tmp_path):
@@ -150,9 +205,9 @@ def test_a_provider_without_hands_support_refuses_rather_than_running_as_the_ope
         Old().spawn_shell(build_policy(_entity(tmp_path)), hands=_hands(tmp_path))
 
 
-def test_the_editor_write_helper_is_fixed_and_runs_under_the_profile(tmp_path, monkeypatch):
-    """D3: the editor's write is a fixed program run as the hands user under the same floor; the path
-    is an argument and the content its stdin, so nothing the entity wrote runs."""
+def test_the_editor_write_goes_through_the_hands_file_helper(tmp_path, monkeypatch):
+    """D3: ``hands_write`` is the helper's ``write`` (tests/test_hands_files.py checks the helper and
+    its argv): a fixed program as the hands user under the floor, the content its stdin."""
     hands = _hands(tmp_path)
     seen: dict = {}
 
@@ -166,13 +221,11 @@ def test_the_editor_write_helper_is_fixed_and_runs_under_the_profile(tmp_path, m
     SeatbeltProvider().hands_write(policy, hands, target, b"data; $(rm -rf ~)")
     argv = seen["argv"]
     assert argv[:4] == [confinement.SUDO, "-n", "-u", "nobody"]
-    at = argv.index(confinement.SANDBOX_EXEC)
-    assert argv[at + 1] == "-p" and argv[at + 2] == SeatbeltProvider().render_profile(policy)
-    assert argv[at + 3:] == ["/bin/sh", "-c", 'umask 022; exec /bin/cat > "$1"', "sh", target]
+    assert argv[argv.index("zsh") + 1:argv.index("zsh") + 4] == ["write", str(hands.workspace), target]
     assert seen["input"] == b"data; $(rm -rf ~)"
 
     monkeypatch.setattr(confinement.subprocess, "run",
-                        lambda argv, **kw: subprocess.CompletedProcess(argv, 1, b"", b"sh: a.txt: Permission denied"))
+                        lambda argv, **kw: subprocess.CompletedProcess(argv, 3, b"", b"cannot write: Permission denied"))
     with pytest.raises(OSError, match="Permission denied"):
         SeatbeltProvider().hands_write(policy, hands, target, b"x")
 
@@ -228,10 +281,18 @@ def test_the_editor_writes_through_the_hands_user_and_never_as_the_operator(tmp_
     writes: list = []
 
     class FakeProvider:
-        def hands_write(self, policy, h, path, data):
+        def hands_file(self, policy, h, op, path, data=b"", *, timeout=60.0):
             assert h == hands
-            writes.append((path, data))
-            Path(path).write_bytes(data)   # stands in for the hands user's write
+            if op == "write":
+                writes.append((path, data))
+                Path(path).write_bytes(data)   # stands in for the hands user's write
+                return b""
+            from tests.test_hands_files import _helper   # the real helper, as this user
+            r = _helper(hands.workspace, op, path)
+            if r.returncode == 2:
+                raise FileNotFoundError(path)
+            assert r.returncode == 0, r
+            return r.stdout
 
     monkeypatch.setattr(T, "select_provider", lambda: FakeProvider())
     floor = T._SharedFloor(build_policy(ent, workspace=hands.workspace), hands)
@@ -264,7 +325,13 @@ def test_an_editor_write_the_hands_user_cannot_make_is_an_in_band_error(tmp_path
     hands = _hands(tmp_path)
 
     class Refusing:
-        def hands_write(self, policy, h, path, data):
+        def hands_file(self, policy, h, op, path, data=b"", *, timeout=60.0):
+            if op != "write":
+                from tests.test_hands_files import _helper
+                r = _helper(hands.workspace, op, path)
+                if r.returncode == 2:
+                    raise FileNotFoundError(path)
+                return r.stdout
             raise OSError(f"nobody could not write {path}: Permission denied")
 
     monkeypatch.setattr(T, "select_provider", lambda: Refusing())

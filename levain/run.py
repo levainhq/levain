@@ -795,7 +795,8 @@ def _print_banner(
             # M2 S2: the entity's own OS user, so the kernel keeps it out of your processes'
             # environments and your files, beneath the floor.
             print(f"             bash runs as the entity's own user {hands_user} (the file editor")
-            print("             writes as it too): it cannot read your processes or your home")
+            print("             reads and writes as it too, in its workspace only): it cannot read")
+            print("             your processes or your home")
         if bash_ok and bash_offline:
             # The residual is the shared OFFLINE_RESIDUAL that doctor prints too (codex, L3 on B).
             print("             ⚠ bash has no IP network: on Linux, blocking connections back to this")

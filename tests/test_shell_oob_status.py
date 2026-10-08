@@ -238,9 +238,9 @@ def test_a_timed_out_command_carries_nothing(tmp_path):
         assert sh.run(f"cd {tmp_path}/far; export KEEP=2; sleep 30", timeout=1).timed_out
         r = sh.run('echo "$PWD $KEEP"', timeout=10)
         assert r.output.strip() in (f"{tmp_path} 1", f"{Path(tmp_path).resolve()} 1")
-        # levain's own discard, apart from the runner's: a frame the command wrote back itself (fd 9)
+        # levain's own discard, apart from the runner's: a frame the command wrote back itself (fd 87)
         # before it hung, or before a signal ended it, is not adopted either.
-        frame = f"printf 'P%s\\0EKEEP=3\\0Z\\0' {tmp_path}/far >&9"
+        frame = f"printf 'P%s\\0EKEEP=3\\0Z\\0' {tmp_path}/far >&87"
         assert sh.run(f"{frame}; sleep 30", timeout=1).timed_out
         if _SYSTEM == "Darwin":   # bash as pid 1 of bwrap's namespace cannot SIGKILL itself
             assert sh.run(f"{frame}; kill -9 $$", timeout=10).exit_code != 0
@@ -532,3 +532,193 @@ def test_the_seatbelt_profile_is_not_a_file_the_entity_could_rewrite(tmp_path):
         for _ in range(2):
             r = sh.run(f"cat {secret} 2>&1", timeout=10)
             assert r.exit_code != 0 and "do-not-leak" not in r.output
+
+
+# --- S2 review round 2 (L1b + L2b on c262aae) ------------------------------------------------------
+
+
+_IS_BASH3 = subprocess.run(["/bin/bash", "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True,
+                           text=True).stdout.strip() == "3"
+
+
+@pytest.mark.parametrize("command,status", [
+    ("set -e; \\exit 0", 0),
+    ("set -e; 'exit' 0", 0),
+    ('set -e; "exit" 0', 0),
+    ("set -e; e=exit; $e 0", 0),
+    ("set -e; X=1 exit 0", 0),
+    ("set -e; command exit 0", 0),
+    ("set -e; true; exit", 0),
+    ("set -e; (exit 3) || true; exit", 0),
+    ("set -e; \\exit 6", 6),
+    ("set -eu; echo $u_never_set", 1),
+])
+def test_an_exit_spelled_any_way_reports_its_own_status(tmp_path, command, status):
+    """L1b LOW-1 / L2b L1: the errexit correction recognised only a literal ``exit``, so on bash 3.2 a
+    real ``exit 0`` spelled ``\\exit 0``, ``'exit' 0``, ``$e 0`` or ``X=1 exit 0`` was reported as 1."""
+    with _plain(tmp_path) as sh:
+        r = sh.run(command, timeout=10)
+        if status == 1:
+            assert r.exit_code not in (None, 0), r
+        else:
+            assert r.exit_code == status, r
+
+
+def test_the_runners_own_names_never_carry(tmp_path):
+    """L1b LOW-2 / L2b M1: an exported ``__levain_done`` turned the errexit correction off in every
+    later command, and ``__levain_g`` froze the carried state."""
+    (tmp_path / "far").mkdir()
+    with _plain(tmp_path) as sh:
+        assert sh.run("export __levain_done=0 __levain_g=1 __levain_x=1 __levain_b=", timeout=10).exit_code == 0
+        assert "__levain" not in sh.run("env", timeout=10).output
+        r = sh.run("set -eu; echo $u_never_set", timeout=10)
+        assert r.exit_code not in (None, 0), r
+        assert sh.run(f"cd {tmp_path}/far; export K=2", timeout=10).exit_code == 0
+        assert sh.run('echo "$PWD $K"', timeout=10).output.strip() in (
+            f"{tmp_path}/far 2", f"{Path(tmp_path).resolve()}/far 2")
+    assert not any(k.startswith("__levain") for k in sh._carried_env)   # type: ignore[attr-defined]
+    # The runner's own guard, apart from levain's filter: a ``__levain_*`` name that reaches its input
+    # anyway is never exported into the command.
+    with _plain(tmp_path) as sh:
+        sh._carried_env.update(__levain_done="0", __levain_g="1", __levain_zz="1")   # type: ignore[attr-defined]
+        assert "__levain" not in sh.run("env", timeout=10).output
+        sh._carried_env.update(__levain_done="0", __levain_g="1", __levain_zz="1")   # type: ignore[attr-defined]
+        r = sh.run("set -eu; echo $u_never_set", timeout=10)
+        assert r.exit_code not in (None, 0), r
+
+
+@pytest.mark.parametrize("fd", ["9", "87"])
+def test_a_lockfile_on_a_low_or_the_state_fd_never_receives_the_environment(tmp_path, fd):
+    """L1b MED-1: after ``exec 9>lockfile`` (the usual flock idiom) the EXIT trap wrote every exported
+    variable into the lockfile, and the carried state was lost. The trap writes only to the socket
+    levain handed it; a command that puts a file on that fd gets nothing written into it."""
+    lock = tmp_path / "lock"
+    (tmp_path / "far").mkdir()
+    with _plain(tmp_path) as sh:
+        r = sh.run(f"export LOCKVAL=s3cr3t; cd {tmp_path}/far; exec {fd}>&-; exec {fd}>{lock}; echo locked", timeout=10)
+        assert r.exit_code == 0, r
+        assert "s3cr3t" not in lock.read_text()
+        if fd == "9":   # the flock idiom's fd is not the state channel: the state still carries
+            assert sh.run('echo "$LOCKVAL"', timeout=10).output.strip() == "s3cr3t"
+
+
+@pytest.mark.skipif(_SYSTEM != "Darwin", reason="under bwrap an interrupt ends the sandbox itself")
+def test_ctrl_c_handled_by_the_foreground_program_does_not_abort_the_command(tmp_path):
+    """L2b L2: an INT trap in the runner ran after the foreground program handled Ctrl-C and killed
+    the whole command; a shell lets the command go on when its child did not die of SIGINT."""
+    import threading
+
+    with _plain(tmp_path) as sh:
+        threading.Timer(0.7, sh.interrupt).start()
+        r = sh.run("/bin/bash -c \"trap '' INT; sleep 1.5\"; echo after", timeout=20)
+        assert (r.exit_code, r.signal) == (0, None), r
+        assert "after" in r.output
+        threading.Timer(0.7, sh.interrupt).start()
+        r = sh.run("sleep 5; echo never", timeout=20)
+        assert r.signal == signal.SIGINT and "never" not in r.output, r
+
+
+def test_stopping_the_state_channel_keeps_a_frame_already_sent(tmp_path):
+    """L2b L5: when a background job holds the state fd, levain stops the channel after the grace;
+    on macOS a shutdown() threw away what the reader had not read yet, the trap's frame included."""
+    import socket
+    import threading
+
+    from levain.firing import confinement as C
+
+    gate = threading.Event()
+    real = C._Carry._pump
+
+    def slow(self):
+        gate.wait(5)
+        real(self)
+
+    ours, theirs = socket.socketpair()
+    try:
+        orig, C._Carry._pump = C._Carry._pump, slow
+        try:
+            carry = C._Carry(ours)
+        finally:
+            C._Carry._pump = orig
+        theirs.sendall(b"P/x\0EK=1\0Z\0")   # the trap's frame; `theirs` stays open (a background job)
+        time.sleep(0.1)
+        carry.stop()
+        gate.set()
+        assert carry.done.wait(5)
+        assert carry.frame == b"P/x\0EK=1\0"
+    finally:
+        theirs.close()
+
+
+def test_a_failed_spawn_argv_leaks_no_descriptor(tmp_path):
+    """L2b L6: the pipe and socket were made before ``_spawn_argv`` ran, and leaked if it raised."""
+
+    class Failing(SandboxedShell):
+        fail = False
+
+        def _spawn_argv(self):
+            if self.fail:
+                raise ConfinementError("no argv")
+            return super()._spawn_argv()
+
+    sh = _plain(tmp_path, Failing).start()
+    try:
+        sh.fail = True
+        before = len(os.listdir("/dev/fd"))
+        for _ in range(5):
+            with pytest.raises(ConfinementError):
+                sh.run("true", timeout=10)
+        assert len(os.listdir("/dev/fd")) <= before
+    finally:
+        sh.close()
+
+
+def test_the_start_refuses_a_shell_whose_state_channel_is_broken(tmp_path):
+    """L2b L3: a sudoers ``log_input`` puts a pipe on bash's stdin instead of levain's socket, so the
+    runner's state frame has nowhere to go and nothing would carry, silently. The start probe requires
+    the frame back. Simulated by a driver that relays its stdin to bash through a pipe."""
+
+    class Piped(SandboxedShell):
+        def _spawn_argv(self):
+            argv, fds = super()._spawn_argv()
+            runner = argv[argv.index("-c") + 1]
+            relay = 'cat | /bin/bash --noprofile --norc -c "$1" bash'
+            return ["/bin/bash", "--noprofile", "--norc", "-c", relay, "sh", runner], fds
+
+    sh = _plain(tmp_path, Piped)
+    with pytest.raises(ConfinementError, match="state"):
+        sh.start()
+    sh.close()
+
+
+def test_bwrap_child_pid_is_read_without_waiting_for_eof_and_owned_by_the_reader(tmp_path, monkeypatch):
+    """S2 L1b (not checked on Linux) and L2b L7: the --info-fd read waited for EOF, which never comes
+    while another process holds the write end (each command would stall to the 20 s deadline), and
+    close() from another thread could close the fd under the read."""
+    import select as _select
+
+    from levain.firing import confinement as C
+
+    sh = object.__new__(C._BwrapShell)
+    import threading
+
+    sh._lock = threading.Lock()
+    rd, wr = os.pipe()
+    os.write(wr, b'{\n    "child-pid": 4242\n}\n')   # bwrap's whole object; `wr` stays open
+    sh._info_r = rd
+    real_select = _select.select
+    calls = []
+
+    def racing_select(r, w, x, t):
+        if not calls:
+            sh._close_info()   # a close() from another thread, mid-read
+        calls.append(1)
+        return real_select(r, w, x, t)
+
+    monkeypatch.setattr(C.select, "select", racing_select)
+    t0 = time.monotonic()
+    try:
+        assert sh._read_child_pid() == 4242
+        assert time.monotonic() - t0 < 5
+    finally:
+        os.close(wr)

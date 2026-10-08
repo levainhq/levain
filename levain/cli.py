@@ -337,7 +337,7 @@ def main(argv: list[str] | None = None) -> int:
             "carries its OWN memory, and NEVER touches this laptop's flow store "
             "(the sovereignty guard fail-closes before the first turn). It has "
             "confined HANDS — a file editor plus (where an OS sandbox exists) a "
-            "persistent bash — both fenced to a crown-jewels floor: they work on "
+            "stateful bash — both fenced to a crown-jewels floor: they work on "
             "your real repos while ~/.anneal-memory/, sibling stores, and ~/.ssh "
             "key material stay off-limits (--no-tools for a pure conversational "
             "partner). Multi-line input is ONE message: a pasted block is kept "

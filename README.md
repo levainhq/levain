@@ -169,7 +169,7 @@ It runs against Ollama by default, through `--model`/`--base-url` — or any Ope
 
 On macOS, any program can read the command line and environment of every other program running as the same user. That includes tokens passed in an environment variable. No sandbox rule changes that: independent tests on current macOS found no rule that does, and our own test confirmed it. So an entity whose bash runs as you can read the secrets your other programs were started with.
 
-`sudo levain setup-isolation --path <entity>` closes that. It creates a dedicated user for the entity, and from then on, on macOS, headless chat turns, `--task` runs and scheduled seats execute bash as that user, and the file editor writes as it:
+`sudo levain setup-isolation --path <entity>` closes that. It creates a dedicated user for the entity, and from then on, on macOS, headless chat turns, `--task` runs and scheduled seats execute bash as that user, and the file editor reads and writes as it, inside the entity's workspace only:
 
 - the kernel refuses to give that user the environment of your processes;
 - files only you can read are out of its reach, and so is your home directory;

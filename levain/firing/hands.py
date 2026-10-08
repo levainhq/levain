@@ -146,6 +146,9 @@ def sudoers_text(operator: str, hands_user: str) -> str:
         f"# {operator} may run commands as the Levain hands user {hands_user}, and nothing else.\n"
         f"Defaults>{hands_user} !requiretty\n"
         f"Defaults>{hands_user} env_reset\n"
+        # levain hands bash a socket on stdin and reads its state back over it; I/O logging and a
+        # pseudo-terminal would put sudo's own pipe or pty there instead (S2 L2b L3).
+        f"Defaults>{hands_user} !log_input, !log_output, !use_pty\n"
         f"{operator} ALL=({hands_user}) NOPASSWD: ALL\n"
     )
 

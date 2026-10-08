@@ -18,11 +18,14 @@ matter what the model is told to do:
 :class:`~levain.firing.confinement.CrownJewelsPolicy` — resolved ONCE per conversation into its
 :class:`~levain.firing.binding.ConversationBinding` and handed to both hands as one
 :class:`_SharedFloor` by :class:`LevainHands` (spore-438) — fences BOTH hands. bash rides the rendered platform sandbox — macOS
-``sandbox-exec`` or, since K4c, a Linux ``bwrap`` mount namespace (the OS fences it — a persistent
+``sandbox-exec`` or, since K4c, a Linux ``bwrap`` mount namespace (the OS fences it — a stateful
 shell whose cwd wanders can't be confined in-process, which is the whole reason bash needed an OS
 sandbox). The POLICY is identical on both; only the enforcement model differs. The file editor is ordinary in-process Python, NOT
 under the sandbox, so it calls the IN-PROCESS twin :func:`~levain.firing.confinement.crown_jewel_reason`
 on every path — the same denylist, so there is no ``claim > enforcement`` gap between the two hands.
+For an entity whose bash runs as its own user (``levain setup-isolation``) the editor touches no
+file in-process: it reads, stats, lists and writes through a fixed helper run as that user under
+the same profile, inside its workspace only (:data:`_EDITOR_HANDS`).
 
 **The crown-jewels floor (structural, never).** ``~/.anneal-memory/`` (flow's memory — the identity
 moat in file terms), sibling entities' ``.levain/`` stores, ``~/.ssh`` key material (``ssh_mode=
@@ -100,6 +103,7 @@ from levain.firing.confinement import (
     ConfinementError,
     FloorRefreshError,
     CrownJewelsPolicy,
+    HandsFileRefused,
     HandsIdentity,
     SandboxedShell,
     _jewel_inodes,
@@ -128,18 +132,107 @@ class _FloorRefusedOpen(PermissionError):
     """An editor open the floor refused after opening (see :func:`_floored_open`)."""
 
 
-# WHEN BASH RUNS AS THE ENTITY'S OWN USER, SO DO THE EDITOR'S WRITES (D3, head ruling 2026-10-08).
-# Under ruling A the operator may only read the hands workspace, and an editor writing as the operator
-# would be a second, stronger pair of hands. While a hands executor call runs, this holds the writer
-# (the provider's ``hands_write``: a fixed program run as the hands user under the same floor, the file
-# content on its stdin); an editor open for writing collects the text and hands it over on close, and
-# the ``insert`` move hands over its temp file's content. Reads stay in this process, under the floor.
-_EDITOR_HANDS_WRITE: contextvars.ContextVar[Callable[[str, bytes], None] | None] = contextvars.ContextVar(
-    "levain_editor_hands_write", default=None)
+# WHEN BASH RUNS AS THE ENTITY'S OWN USER, SO DOES THE EDITOR, FOR EVERY READ AND WRITE (D3, head
+# ruling 2026-10-08; reads added on the S2 L1b/L2b HIGH). Under ruling A the operator may only read the
+# hands workspace, and an editor touching files as the operator would be a second, stronger pair of
+# hands: it read and listed anything the operator can, outside the crown jewels, while its bash was
+# kernel-blocked from the operator's home. While a hands executor call runs, this holds the
+# entity's file access (:class:`_HandsFiles`): the provider's ``hands_file``, a fixed data-only program
+# run as the hands user under the same floor, confined to the hands workspace, never following a final
+# symlink. Every editor primitive that reads a file, stats a path or lists a directory goes through it,
+# and so does every write: an editor open for writing collects the text and hands it over on close, and
+# the ``insert`` move hands over its temp file's content. Nothing falls back to the operator: a helper
+# that cannot run is an in-band error.
+_EDITOR_HANDS: contextvars.ContextVar["_HandsFiles | None"] = contextvars.ContextVar(
+    "levain_editor_hands", default=None)
 
 
-class _HandsWriteError(OSError):
-    """The entity's user could not write a file the editor wrote (see :data:`_EDITOR_HANDS_WRITE`)."""
+class _HandsIOError(OSError):
+    """The entity's user could not run the editor's file operation (see :data:`_EDITOR_HANDS`)."""
+
+
+class _HandsFiles:
+    """One executor call's file access as the hands user. Answers are cached for the call (the stock
+    editor asks the same path's existence, size and type several times per action) and dropped on any
+    write."""
+
+    def __init__(self, provider: Any, policy: CrownJewelsPolicy, hands: HandsIdentity) -> None:
+        self._provider, self._policy, self.hands = provider, policy, hands
+        ws = str(hands.workspace)
+        self._roots = tuple({ws.rstrip("/") or "/", os.path.realpath(ws).rstrip("/") or "/"})
+        self._stats: dict[str, os.stat_result | None] = {}
+        self._reads: dict[str, bytes] = {}
+        self._lists: dict[str, list[tuple[str, str]]] = {}
+
+    def inside(self, path: Any) -> str | None:
+        """``path`` made absolute (lexically), or None when it is not in the hands workspace."""
+        p = os.path.normpath(os.path.abspath(os.path.expanduser(str(path))))
+        return p if any(p == r or p.startswith(r + "/") for r in self._roots) else None
+
+    def outside_reason(self, path: Any) -> str:
+        return (f"{path} is outside the workspace {self.hands.workspace}: for an entity with its own "
+                "user the file editor works only there (its bash reaches what that user may)")
+
+    def _call(self, op: str, path: str, data: bytes = b"") -> bytes:
+        try:
+            return self._provider.hands_file(self._policy, self.hands, op, path, data)
+        except (FileNotFoundError, HandsFileRefused):
+            raise
+        except (OSError, ConfinementError) as exc:
+            raise _HandsIOError(str(exc)) from exc
+
+    def read(self, path: Any) -> bytes:
+        p = self.inside(path)
+        if p is None:
+            raise _FloorRefusedOpen(self.outside_reason(path))
+        if p not in self._reads:
+            try:
+                self._reads[p] = self._call("read", p)
+            except HandsFileRefused as exc:
+                raise _FloorRefusedOpen(str(exc)) from None
+        return self._reads[p]
+
+    def stat(self, path: Any) -> os.stat_result | None:
+        """The lstat of ``path`` as the hands user, or None (missing, outside, refused)."""
+        p = self.inside(path)
+        if p is None:
+            return None
+        if p not in self._stats:
+            try:
+                fields = [int(f) for f in self._call("stat", p).split()]
+                self._stats[p] = os.stat_result(tuple(fields[:10]))
+            except (FileNotFoundError, HandsFileRefused):
+                self._stats[p] = None
+            except ValueError as exc:
+                raise _HandsIOError(f"the hands helper's stat of {p} was unreadable ({exc})") from exc
+        return self._stats[p]
+
+    def listing(self, path: Any) -> list[tuple[str, str]]:
+        """``(kind, relative name)`` pairs: the entries, and the non-hidden children of each non-hidden
+        real subdirectory (kind ``d``, ``f``, ``l`` for a link, ``o`` other)."""
+        p = self.inside(path)
+        if p is None:
+            raise _FloorRefusedWalk(self.outside_reason(path))
+        if p not in self._lists:
+            try:
+                raw = self._call("list", p)
+            except (FileNotFoundError, HandsFileRefused) as exc:
+                raise _FloorRefusedWalk(str(exc)) from None
+            parts = raw.decode("utf-8", "surrogateescape").split("\0")[:-1]
+            self._lists[p] = list(zip(parts[::2], parts[1::2]))
+        return self._lists[p]
+
+    def write(self, path: Any, data: bytes) -> None:
+        p = self.inside(path)
+        if p is None:
+            raise _FloorRefusedOpen(self.outside_reason(path))
+        self._stats.clear()
+        self._reads.clear()
+        self._lists.clear()
+        try:
+            self._call("write", p, data)
+        except (FileNotFoundError, HandsFileRefused) as exc:
+            raise _HandsIOError(str(exc) or f"cannot write {p}") from exc
 
 
 class _HandsWriteFile:
@@ -175,27 +268,43 @@ class _HandsWriteFile:
         self.closed = True
         value = self._buf.getvalue()
         data = value if self._binary else value.encode(self._encoding, self._errors)
-        try:
-            self._writer(self._path, data)
-        except OSError as exc:
-            raise _HandsWriteError(str(exc)) from exc
+        self._writer(self._path, data)
+
+
+def _open_arg(args: tuple, kwargs: dict, index: int, name: str, default: Any = None) -> Any:
+    return kwargs.get(name, args[index] if len(args) > index else default)
+
+
+def _hands_open(hands: _HandsFiles, file: Any, args: tuple, kwargs: dict) -> Any:
+    """The editor's ``open`` for a hands entity: a write collects and hands over on close; a read gets
+    the bytes the hands user read, in memory."""
+    mode = _open_arg(args, kwargs, 0, "mode", "r")
+    encoding = _open_arg(args, kwargs, 2, "encoding")
+    errors = _open_arg(args, kwargs, 3, "errors")
+    if any(c in mode for c in "wax+"):
+        if mode.replace("t", "").replace("b", "") != "w":
+            raise _FloorRefusedOpen(
+                f"the editor opened {file} with mode {mode!r}; for an entity with its own user only "
+                "a whole-file write is supported")
+        p = hands.inside(file)
+        if p is None:
+            raise _FloorRefusedOpen(hands.outside_reason(file))
+        return _HandsWriteFile(p, binary="b" in mode, encoding=encoding, errors=errors,
+                               writer=hands.write)
+    data = hands.read(file)
+    if "b" in mode:
+        return io.BytesIO(data)
+    return io.TextIOWrapper(io.BytesIO(data), encoding=encoding, errors=errors,
+                            newline=_open_arg(args, kwargs, 4, "newline"))
 
 
 def _floored_open(file, *args, **kwargs):
     policy = _EDITOR_FLOOR.get()
     if policy is None or "opener" in kwargs:
         return builtins.open(file, *args, **kwargs)
-    writer = _EDITOR_HANDS_WRITE.get()
-    mode = args[0] if args else kwargs.get("mode", "r")
-    if writer is not None and any(c in mode for c in "wax+"):
-        if mode.replace("t", "").replace("b", "") != "w":
-            raise _FloorRefusedOpen(
-                f"the editor opened {file} with mode {mode!r}; for an entity with its own user only "
-                "a whole-file write is supported")
-        return _HandsWriteFile(
-            os.path.abspath(os.path.expanduser(str(file))), binary="b" in mode,
-            encoding=kwargs.get("encoding", args[2] if len(args) > 2 else None),
-            errors=kwargs.get("errors", args[3] if len(args) > 3 else None), writer=writer)
+    hands = _EDITOR_HANDS.get()
+    if hands is not None:
+        return _hands_open(hands, file, args, kwargs)
 
     def opener(path, flags):
         # Judged BEFORE any byte moves: without O_TRUNC (truncating first would already have emptied a
@@ -365,17 +474,15 @@ def _floored_move(src, dst, *args, **kwargs):
     policy = _EDITOR_FLOOR.get()
     if policy is None:
         return shutil.move(src, dst, *args, **kwargs)
-    writer = _EDITOR_HANDS_WRITE.get()
-    if writer is not None:
+    hands = _EDITOR_HANDS.get()
+    if hands is not None:
         # The temp file is the editor's own, in this process's temp dir: its content is written onto
-        # `dst` by the entity's user (in place, so `dst` keeps its mode), and the temp file removed.
+        # `dst` by the entity's user (a new file renamed over it, given its mode), and the temp file
+        # removed.
         try:
             with builtins.open(src, "rb") as fh:
                 data = fh.read()
-            try:
-                writer(os.path.abspath(os.path.expanduser(str(dst))), data)
-            except OSError as exc:
-                raise _HandsWriteError(str(exc)) from exc
+            hands.write(dst, data)
             return str(dst)
         finally:
             try:
@@ -466,12 +573,18 @@ def _install_floored_dir_view(editor_cls) -> None:
     """The directory ``view``, counted and listed through a held, judged fd. A child directory is
     listed only when it is a real directory (a link is shown, never entered) that passes the same
     judgement. Lines are formatted by the stock editor's own formatter."""
+    import sys
+
     stock_count = editor_cls._count_hidden_children
     stock_list = editor_cls._list_directory_for_view
+    to_posix = getattr(sys.modules[editor_cls.__module__], "to_posix_path", lambda p: Path(p).as_posix())
 
     def count(self, path):
         if _EDITOR_FLOOR.get() is None:
             return stock_count(self, path)
+        hands = _EDITOR_HANDS.get()
+        if hands is not None:
+            return sum(1 for _, rel in hands.listing(path) if "/" not in rel and rel.startswith("."))
         fd, _ = _judged_dir(path)
         try:
             return sum(1 for e in _entries(fd) if e.name.startswith("."))
@@ -482,6 +595,16 @@ def _install_floored_dir_view(editor_cls) -> None:
         policy = _EDITOR_FLOOR.get()
         if policy is None:
             return stock_list(self, path)
+        hands = _EDITOR_HANDS.get()
+        if hands is not None:
+            # As the hands user lists it: a link is shown, never entered, and not marked a directory.
+            root = to_posix(path)
+            lines = [f"{root}/"]
+            for kind, rel in hands.listing(path):
+                if rel.startswith(".") or "/." in rel:
+                    continue
+                lines.append(f"{root}/{rel}" + ("/" if kind == "d" else ""))
+            return lines
         fd, walked = _judged_dir(path)
         shown = [path]
         try:
@@ -530,7 +653,11 @@ class _FlooredShutil:
 
 def _floored_stat(path) -> os.stat_result | None:
     """The stat of ``path`` through the floor, or None when it is missing, unreachable without
-    following a link the walk refuses, or something the floor denies (all three look the same)."""
+    following a link the walk refuses, or something the floor denies (all three look the same). For a
+    hands entity, the hands user's lstat inside its workspace (:class:`_HandsFiles`)."""
+    hands = _EDITOR_HANDS.get()
+    if hands is not None:
+        return hands.stat(path)
     policy = _EDITOR_FLOOR.get()
     # Mapped whole first: the trusted root may be the path itself (the workspace dir).
     p = _trusted_spelling(os.path.abspath(os.path.expanduser(str(path))))
@@ -1022,6 +1149,15 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
                 command=action.command,
                 is_error=True,
             )
+        if self._floor.hands is not None:
+            scope = _HandsFiles(None, policy, self._floor.hands)
+            if scope.inside(action.path) is None:
+                # Before anything looks at the path as the operator.
+                return FileEditorObservation.from_text(
+                    text=f"REFUSED: {scope.outside_reason(action.path)}.",
+                    command=action.command,
+                    is_error=True,
+                )
         reason = crown_jewel_reason(policy, action.path) or linked_jewel_reason(policy, action.path)
         if reason is not None:
             return FileEditorObservation.from_text(
@@ -1033,17 +1169,15 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
                 is_error=True,
             )
         token = _EDITOR_FLOOR.set(policy)
-        hands = self._floor.hands
-        writer = None
-        if hands is not None:
-            provider = select_provider()
-            writer = lambda path, data: provider.hands_write(policy, hands, path, data)  # noqa: E731
-        wtoken = _EDITOR_HANDS_WRITE.set(writer)
+        hands = None
+        if self._floor.hands is not None:
+            hands = _HandsFiles(select_provider(), policy, self._floor.hands)
+        htoken = _EDITOR_HANDS.set(hands)
         try:
             return super().__call__(action, conversation)
-        except _HandsWriteError as exc:
+        except _HandsIOError as exc:
             return FileEditorObservation.from_text(
-                text=f"the entity's own user could not write the file: {exc}",
+                text=f"the entity's own user could not use the file: {exc}",
                 command=action.command,
                 is_error=True,
             )
@@ -1057,7 +1191,7 @@ class CrownJewelsFileEditorExecutor(FileEditorExecutor):
                 is_error=True,
             )
         finally:
-            _EDITOR_HANDS_WRITE.reset(wtoken)
+            _EDITOR_HANDS.reset(htoken)
             _EDITOR_FLOOR.reset(token)
 
 
