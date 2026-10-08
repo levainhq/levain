@@ -464,8 +464,11 @@ def _ledger_repo(tmp_path) -> Path:
     _git("add", ".", cwd=ana)
     _git("commit", "-qm", "init", cwd=ana)
     _git("push", "-q", "origin", "HEAD:main", cwd=ana)
+    # v2 ledgers are strict and signed: the owner signs with an ssh key (no passphrase, so no prompt)
+    key = tmp_path / "ana_key"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "ana@test", "-f", str(key)], check=True)
     assert levain_main(["team", "init", "--project", "ledgerline", "--owner", "ana", "--member", "ana=ana@ex.com",
-                        "--repo", str(ana)]) == 0
+                        "--signing-key", str(key) + ".pub", "--repo", str(ana)]) == 0
     return ana
 
 

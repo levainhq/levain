@@ -180,7 +180,7 @@ def cmd_distrust(gl: GitLedger, args) -> int:
         print("distrust list cleared on this clone")
         return 0
     sha = git(["rev-parse", "--verify", args.commit + "^{commit}"], gl.repo.toplevel).stdout.strip()
-    gl.save_state(distrust=sorted(cur | {sha}))
+    gl.save_state(_mutate=lambda st: st.__setitem__("distrust", sorted(set(st.get("distrust") or []) | {sha})))
     print(f"{sha[:10]} distrusted on this clone (its changes do not count here); this is never pushed")
     return 0
 
@@ -231,9 +231,7 @@ def cmd_accept_merge(gl: GitLedger, args) -> int:
     left = git(["rev-list", "--reverse", *others, f"^{follow}"], gl.repo.toplevel).stdout.split()
     team_side = [c for c in left if set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", c],
                                             gl.repo.toplevel).stdout.split()) & {T.TEAM_FILE, T.TENURE_FILE}]
-    acc = dict(gl.state().get("accepted") or {})
-    acc[sha] = n
-    gl.save_state(accepted=acc)
+    gl.save_state(_mutate=lambda st: st.__setitem__("accepted", {**dict(st.get("accepted") or {}), sha: n}))
     gl._dcache = None
     print(f"accepted merge {sha[:10]} on THIS clone, following parent {n}. Commits on the other side are NOT read:")
     print(f"  {len(left)} commit(s) since the merge-base {base[:10]}; team decisions among them NOT in force:")

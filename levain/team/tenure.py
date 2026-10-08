@@ -26,6 +26,7 @@ from .transport import _NO_HOOKS, _SCRUB_ENV, TeamError
 
 TENURE_FILE = "tenure.toml"
 TEAM_FILE = "team.toml"
+CANON_FILE = "PROJECT.md"
 RULES = 1                                  # the derivation-rules version a genesis names; a release derives only its own
 BASE_TRAILER = "Levain-Base"
 PAIR_TRAILER = "Levain-Pair"
@@ -233,20 +234,49 @@ class Meta:
         return found[-1] if found else None
 
 
+_AUTHOR = re.compile(rb"^author .*<([^>]*)> (\d+) ([+-]\d{4})$")
+
+
 def metas(top: Path, shas: list[str]) -> dict[str, Meta]:
+    """Author email, date and message of each commit, parsed from the RAW object (``cat-file --batch``, by size): a
+    message cannot forge another commit's record the way a separator-delimited ``git log`` stream let it (code L3 r1
+    complement)."""
     if not shas:
         return {}
-    text = _git(top, ["-c", "log.mailmap=false", "log", "--no-walk=unsorted", "--stdin", "--format=%x01%H%x00%ae%x00%aI%x00%B"],
-                input_text="\n".join(shas) + "\n")
-    out = {}
-    for rec in text.split("\x01")[1:]:
-        sha, mail, date, body = (rec.split("\x00", 3) + ["", "", ""])[:4]
-        out[sha.strip()] = Meta(mail.strip(), body, date.strip())
+    from datetime import datetime, timedelta, timezone
+    try:
+        cp = subprocess.run(["git", *_NO_HOOKS, "cat-file", "--batch"], cwd=str(top), env=_env(), capture_output=True,
+                            input="\n".join(shas).encode() + b"\n", timeout=120)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        raise Unjudgeable(f"git cat-file failed: {exc}") from None
+    if cp.returncode != 0:
+        raise Unjudgeable("git cat-file failed")
+    data, out, pos = cp.stdout, {}, 0
+    for sha in shas:
+        nl = data.index(b"\n", pos)
+        head = data[pos:nl].decode()
+        pos = nl + 1
+        parts = head.split()
+        if len(parts) != 3 or parts[0] != sha or parts[1] != "commit":
+            raise Unjudgeable(f"git cat-file returned {head!r} for {sha[:10]}")
+        size = int(parts[2])
+        raw = data[pos:pos + size]
+        pos += size + 1
+        hdr, _, msg = raw.partition(b"\n\n")
+        mail, date = "", ""
+        for line in hdr.split(b"\n"):
+            m = _AUTHOR.match(line)
+            if m:
+                mail = m.group(1).decode("utf-8", "replace")
+                tz = int(m.group(3)[:3]) * 60 + (1 if m.group(3)[:1] == b"+" else -1) * int(m.group(3)[3:])
+                date = datetime.fromtimestamp(int(m.group(2)), timezone(timedelta(minutes=tz))).isoformat()
+                break
+        out[sha] = Meta(mail, msg.decode("utf-8", "replace"), date)
     return out
 
 
 _HEX = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
-_PATHS = ["ledger/", TEAM_FILE, TENURE_FILE]
+_PATHS = ["ledger/", TEAM_FILE, TENURE_FILE, CANON_FILE]
 
 
 @dataclass
@@ -363,6 +393,7 @@ class Derivation:
     role_changes: list[tuple[str, str, str]] = field(default_factory=list)   # (sha, date, text)
     void: set[str] = field(default_factory=set)
     touched: dict[tuple, str] = field(default_factory=dict)   # field -> the last counted commit that changed it
+    canon_sha: str | None = None                    # the last PROJECT.md commit signed by the owner in force
     state: dict[tuple, object] = field(default_factory=dict)  # the counted flat state at the tip
 
     def owner_authority(self, entry: dict) -> bool:
@@ -511,6 +542,8 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
     new_void: set[str] = set()
     revoked: dict[str, str] = {}             # fp -> after (counted revocations)
     decided: dict[str, set[str]] = {}        # rel -> line hashes already judged (first occurrence decides)
+    canon_sha: str | None = None
+    stranger: dict[str, int] = {}            # rel -> lines in its chain not written by the member (owner) in force
     touched: dict[tuple, str] = {k: g for k in state}
 
     def keys_of(f: dict, handle: str) -> set[str]:
@@ -556,6 +589,14 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
                 good = handle is not None and ok(sha, state, handle)
             if not good:
                 unenforced.setdefault(rel, set()).add(h)
+                stranger[rel] = stranger.get(rel, 0) + 1
+        if CANON_FILE in c.files and i > 0:
+            # the canon is the OWNER's: a member's PROJECT.md never becomes what agents read (code L3 r1 codex HIGH)
+            if ok(sha, state, owner):
+                canon_sha = sha
+            else:
+                problems.append(f"PROJECT.md changed in {sha[:10]} by someone who is not the owner in force; "
+                                "that version is not the canon")
         gone = [(r, t) for r, t in c.removed if t.strip() and (r, t) not in c.added]
         if gone:
             problems.append(f"{len(gone)} ledger line(s) removed or rewritten in {sha[:10]}; the ledger is append-only, "
@@ -656,12 +697,35 @@ def _derive_once(top: Path, tip: str, walk: list[str], parents: dict[str, list[s
                     if signer.get(walk[j]) == fpk:
                         new_void.add(walk[j])
 
+    # MEMBER vetoes: the owner un-enforces a departed member's spell (§3e). It was counted but read by nothing (code L3
+    # r1 codex HIGH): every line that member's folder gained inside the vetoed spell is unenforced, and a veto naming no
+    # spell start is reported.
+    for k, links in state.items():
+        if k[0] != "veto" or k[2] != "member":
+            continue
+        h, since = k[1], k[3]
+        spell = next((sp for sp in spells if sp.role == "member" and sp.handle == h and sp.start_sha == since), None)
+        if spell is None:
+            problems.append(f"a member veto on {h} names {since[:10]}, which began no spell of {h}; it has no effect")
+            continue
+        folder = E.safe_handle(h)
+        for rel, ls in lines.items():
+            if rel.split("/", 1)[0] != folder:
+                continue
+            for text in ls:
+                hh = _hash_of(text)
+                p_ = line_pos.get(hh) if hh else None
+                if p_ is not None and spell.start <= p_ and (spell.end is None or p_ < spell.end):
+                    unenforced.setdefault(rel, set()).add(hh)
+    for rel, n_ in sorted(stranger.items()):
+        problems.append(f"ledger/{rel}: {n_} line(s) not signed by a key in force for the member (the owner, for "
+                        "pack-*) it is filed under; those lines are not enforced")
     t, n = unflat(state)
     n.prior = ten.prior
     return Derivation(tip=tip, walk=walk, team=t, tenure=n, counted_head=base, files=lines, unenforced=unenforced,
                       line_pos=line_pos, spells=spells, problems=problems, role_changes=role_changes,
                       waiting=sum(len(ch.get(s, Change()).added) for s in walk[freeze_end:]), void=new_void,
-                      touched=touched, state=dict(state))
+                      touched=touched, state=dict(state), canon_sha=canon_sha)
 
 
 def _hash_of(text: str) -> str | None:
@@ -714,15 +778,16 @@ def _apply(state: dict, before: dict, after: dict, changed: set, fp: str, sha: s
         elif kind == "pending":
             h = k[1]
             allowed = (is_owner or holds(h)) if val is not None else (is_owner or holds(h) or fp == k[2])
-            if val is not None and any(kk[0] in ("key", "pending") and kk[2] == k[2] and kk[1] != h for kk in state):
-                allowed = False     # one fingerprint, one handle
+            if val is not None and any(kk[0] in ("key", "pending") and kk[2] == k[2] and kk[1] != h
+                                       for kk in list(state) + list(new)):
+                allowed = False     # one fingerprint, one handle (also within one commit: code L3 r1 glm)
         elif kind == "key":
             h = k[1]
             if val is not None:
                 # added: a confirm (signed by that very pending key), or an accept setting the offeree's offered keys
                 allowed = (fp == k[2] and ("pending", h, k[2]) in state) or (
                     offeree and h == offer["handle"] and k[2] in {_fp_or_none(x) for x in offer.get("keys", [])})
-                if any(kk[0] in ("key",) and kk[2] == k[2] and kk[1] != h for kk in state):
+                if any(kk[0] in ("key",) and kk[2] == k[2] and kk[1] != h for kk in list(state) + list(new)):
                     allowed = False
             else:
                 remaining = {kk[2] for kk in new if kk[0] == "key" and kk[1] == h} - {k[2]}
