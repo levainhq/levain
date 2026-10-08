@@ -186,7 +186,9 @@ def pretooluse(payload: dict) -> None:
         if gl.legacy_only():
             _fail_open("PreToolUse", LEGACY_MESSAGE)      # B-1: reported, nothing from it enforced
             return
-        if _wired_but_broken(gl) or (gl.remote and gl._has(f"refs/remotes/{gl.remote}/{BRANCH}")):
+        # a clone that pinned a ledger and lost its worktree or refs still has a ledger it cannot judge (code L3 r2
+        # codex MED: it fell through and allowed the edit)
+        if gl.pinned_root or _wired_but_broken(gl) or (gl.remote and gl._has(f"refs/remotes/{gl.remote}/{BRANCH}")):
             # a strict ledger exists here and this clone never pinned it (UNPINNED): judge nothing from it, halt
             _deny_unjudged(f"this clone has a {BRANCH} ledger it has not pinned (run `levain team join`)")
         return
