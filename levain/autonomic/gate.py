@@ -276,9 +276,7 @@ class EfferentGate:
         confirm_signers: str | Path | None = None,
         ssh_keygen: str | Path | None = None,
     ) -> None:
-        # a copy: the manifest the gate classifies with does not change under it (a deployment that edits
-        # its declarations builds a new gate), so the risk an admission reads cannot move mid-admission
-        self._manifest = manifest.copy()
+        self._manifest = manifest
         # The signature verifier: an absolute path to ``ssh-keygen`` (``/usr/bin/ssh-keygen`` unless set
         # here), never found through PATH, and refused unless root-owned and writable by nobody else.
         self._ssh_keygen = Path(ssh_keygen) if ssh_keygen is not None else DEFAULT_SSH_KEYGEN
@@ -415,6 +413,8 @@ class EfferentGate:
                 return f"unavailable:{why}"
             if fence is None or effective is Posture.REFUSE_ESCALATE:
                 return f"bad:{why or 'no_rung_may_approve'}"
+            if fence != fence_now:
+                return "retry"   # the rung above was derived from other inputs than ``fence_now``: read again
             rung = hold.get("decided_posture")
             if not isinstance(rung, str) or rung not in Posture.__members__:
                 return "bad:no_decided_rung"
@@ -864,11 +864,20 @@ class EfferentGate:
             return self._refuse_open(why or "revalidate:registry_unreadable", binding_id)
         stop_reason = why or "revalidate:risk_floor_rose"
         signed_decision = hold.get("decided") is True and needs_signature(hold.get("by"))
-        if hold.get("decided") is True and (fence is None or (
-                not signed_decision and effective > self._decided_rung(hold, posture))):
-            # An approval no rung can carry any more (the risk cannot be re-derived for good: the binding is
-            # gone or unsealed), or one the silence default gave at a lower rung (no person, no signature to
-            # ask for again): the run ends instead, with a receipt. Only while the effect has not started,
+        if signed_decision and fence is None:
+            # A person's approval whose risk cannot be re-derived now. It ends, with a receipt, only once the
+            # journal has stopped its run for good (a revoke fences it); otherwise nothing changes, since the
+            # cause may be one a repair clears.
+            try:
+                barrier = self._journal.peek(hold["run_id"], hold["effect_id"], digest=hold["digest"])
+            except KeyError:
+                return self._refuse_open("run_not_admitted", binding_id)
+            if barrier is not None and barrier.status in (EffectStatus.FENCED, EffectStatus.CANCELLED):
+                return deny(effective, f"journal:{barrier.status.value}", by="on-loop")
+            return self._refuse_open(stop_reason, binding_id)
+        elif hold.get("decided") is True and not signed_decision and effective > self._decided_rung(hold, posture):
+            # Approved at a lower rung by the silence default (no person, no signature to ask for again):
+            # the run ends instead, with a receipt. Only while the effect has not started,
             # checked in the cancel's own transaction: one that ran (or is running) is the journal's to
             # report, and the fire below reports it without running anything.
             try:
@@ -982,6 +991,13 @@ class EfferentGate:
             fence=armed, executor=executor,
         )
         reopened = self._journal.get_hold(hold_id) if fired.held else None
+        if reopened is not None and reopened.get("decided") is False:
+            # rejected by another resolver since this admission (which wrote that rejection's receipt)
+            return self._refuse_open("journal:decided_elsewhere", binding_id)
+        if reopened is not None and reopened.get("decided") is True and expect is not None \
+                and decision_key(reopened) != expect:
+            # approved again by another resolver, whose resolve fires it and reports it
+            return self._refuse_open("journal:decided_elsewhere", binding_id)
         if reopened is not None and reopened.get("decided") is None:
             # the hold is an open decision again (this admission refused the approval, or another resolver's
             # did since this one read it): it asks for a new decision at the rung needed NOW, read again

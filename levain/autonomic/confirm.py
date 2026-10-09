@@ -82,7 +82,7 @@ def trust_anchor_problem(path: Path | str, *, what: str,
     """``(why, None)`` if the file at ``path`` may not be trusted to verify a signature, else ``(None, the
     resolved path)``, which is the path to use. A trust anchor (the verifier binary, the allowed-signers
     file) must be an absolute path that resolves to a regular file owned by one of ``owners`` (root),
-    writable by neither its group nor anyone else, in directories that
+    writable by neither its group nor anyone else nor, through an ACL, this process's uid, in directories that
     are all the same, up to ``/``: the requester's uid can then neither edit it nor swap it between this
     check and its use (the rule of sshd's StrictModes and sudo's sudoers, with root as the only owner)."""
     p = Path(path)
@@ -99,6 +99,10 @@ def trust_anchor_problem(path: Path | str, *, what: str,
         return f"{what} {p} is not owned by root (uid {st.st_uid})", None
     if st.st_mode & (_S_IWGRP | _S_IWOTH):
         return f"{what} {p} is group- or world-writable", None
+    # the mode bits do not show an ACL: ask the kernel whether THIS uid may write (access(2) applies ACLs)
+    check_access = os.geteuid() not in owners
+    if check_access and os.access(real, os.W_OK):
+        return f"{what} {p} is writable by uid {os.geteuid()}", None
     parent = os.path.dirname(real)
     while True:
         try:
@@ -111,6 +115,8 @@ def trust_anchor_problem(path: Path | str, *, what: str,
             return f"{what} directory {parent} is not owned by root (uid {dst.st_uid})", None
         if dst.st_mode & (_S_IWGRP | _S_IWOTH):
             return f"{what} directory {parent} is group- or world-writable", None
+        if check_access and os.access(parent, os.W_OK):
+            return f"{what} directory {parent} is writable by uid {os.geteuid()}", None
         if parent == os.path.dirname(parent):
             return None, real
         parent = os.path.dirname(parent)
@@ -149,6 +155,8 @@ def verify_signature_status(message: bytes, *, signature: str | None, signer: st
         if problem is None:
             problem, signers_file = trust_anchor_problem(allowed_signers, what="allowed-signers file",
                                                          owners=_SIGNERS_FILE_OWNERS)
+        if problem is None and not os.access(signers_file, os.R_OK):
+            problem = f"allowed-signers file {allowed_signers} is not readable by uid {os.geteuid()}"
         if problem is not None:
             _log.error("confirm: refusing to verify a signature: %s", problem)
             return UNAVAILABLE
