@@ -684,3 +684,135 @@ def test_the_sweep_leaves_macos_per_user_agents_and_counts_only_the_entitys(monk
     monkeypatch.setattr(ws_git, "entity_session_live", cannot_tell)
     said = confinement.sweep_hands_user("_levain_x_000000", uid=4_000_017, timeout=0.2)
     assert said is not None and "cannot tell" in said
+
+
+# --- the Linux hands launch: listener sweep, editor, proxy relays ---------------------------------
+
+
+_UNIX_HEADER = "Num       RefCount Protocol Flags    Type St Inode Path\n"
+
+
+def _unix_line(path: str, flags: str = "00010000", kind: str = "0001") -> str:
+    return f"0000000000000000: 00000002 00000000 {flags} {kind} 01 4242 {path}\n".replace(" \n", "\n")
+
+
+def test_the_sweep_refuses_a_connectable_listener_outside_the_hidden_roots(tmp_path, monkeypatch):
+    """J5 RUN: a 0777 listener in /var/lib/s2probe was reached from inside the hands launch; J6: the
+    new network namespace lists none of the host's sockets, so the sweep reads the host's and every
+    readable pid's table (one bound in another namespace) and asks, as the hands user, which it may
+    reach. Hidden roots, the hands user's own relays, abstract and unnamed sockets, and a connected
+    (not listening) stream socket are never asked about."""
+    hands = _hands(tmp_path)
+    home = os.path.realpath(hands.home)
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "mountinfo").write_text("22 1 0:5 / /proc rw,nosuid shared:13 - proc proc rw\n")
+    (proc / "net").mkdir()
+    (proc / "net" / "unix").write_text(
+        _UNIX_HEADER + _unix_line("/var/lib/s2probe/sock") + _unix_line("/run/user/1000/bus")
+        + _unix_line("@/tmp/.X11-unix/X0") + _unix_line("") + _unix_line("/var/lib/connected", flags="00000000")
+        + _unix_line(f"{home}/.levain-relay-0123/18080.sock"))
+    (proc / "4242" / "net").mkdir(parents=True)
+    (proc / "4242" / "net" / "unix").write_text(_UNIX_HEADER + _unix_line("/srv/other-ns.sock", kind="0002"))
+    monkeypatch.setattr(confinement, "_PROC", str(proc))
+    monkeypatch.setattr(confinement, "_hands_hidden_roots", lambda policy: ([str(Path.home())], ["/run", "/tmp"]))
+    asked: list[list[str]] = []
+    writable: set[str] = {"/var/lib/s2probe/sock"}
+
+    def as_hands(argv, **kw):
+        assert argv[:4] == [confinement.SUDO, "-n", "-u", "nobody"] and argv[argv.index("/bin/sh") + 3] == "sh"
+        paths = argv[argv.index("/bin/sh") + 4:]
+        asked.append(paths)
+        return subprocess.CompletedProcess(argv, 0, b"".join(p.encode() + b"\0" for p in paths if p in writable), b"")
+
+    monkeypatch.setattr(confinement.subprocess, "run", as_hands)
+    policy = build_policy(_entity(tmp_path), workspace=hands.workspace)
+    said = confinement._hands_listener_problem(policy, hands)
+    assert asked == [["/srv/other-ns.sock", "/var/lib/s2probe/sock"]]
+    assert said is not None and "/var/lib/s2probe/sock" in said and "/srv" not in said
+    assert "tighten its mode" in said and "move it under /run" in said
+    writable.clear()
+    assert confinement._hands_listener_problem(policy, hands) is None
+
+
+def test_the_linux_editor_refuses_by_name_without_zsh(tmp_path, monkeypatch):
+    real_access = os.access
+    monkeypatch.setattr(confinement.os, "access",
+                        lambda p, mode, **kw: False if p == confinement.HANDS_ZSH else real_access(p, mode, **kw))
+    monkeypatch.setattr(confinement, "_run_hands_helper", lambda *a, **k: pytest.fail("the helper ran without zsh"))
+    hands = _hands(tmp_path)
+    policy = build_policy(_entity(tmp_path), workspace=hands.workspace)
+    with pytest.raises(ConfinementError, match=r"install zsh \(the editor's hands use it\)"):
+        BwrapProvider().hands_file(policy, hands, "read", str(hands.workspace / "a.txt"))
+
+
+def test_a_hands_launch_with_egress_ports_refuses_without_python3_before_any_hands_process(tmp_path, monkeypatch):
+    real_access = os.access
+    monkeypatch.setattr(confinement.os, "access",
+                        lambda p, mode, **kw: False if p == confinement.HANDS_PYTHON else real_access(p, mode, **kw))
+    monkeypatch.setattr(confinement, "_require_hands_sudo", lambda h: pytest.fail("a hands process ran first"))
+    h = _hands(tmp_path)
+    hands = HandsIdentity(h.user, h.uid, h.home, h.workspace, (18080,))
+    with pytest.raises(ConfinementError, match=r"/usr/bin/python3 is missing.*\[18080\].*fail-closed"):
+        BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)), hands=hands)
+
+
+def test_the_relays_carry_a_connection_from_the_sandbox_side_to_the_hosts_loopback():
+    """Both halves of the one relay program, run as this user on this host: a TCP client on the
+    namespace side's port -> its unix socket -> the host side -> a listener on 127.0.0.1 gets the
+    reply. Here the two sides share one network namespace, so they use two ports, the namespace side's
+    socket a symlink to the host side's."""
+    import shutil
+    import socket
+    import stat as st
+    import sys
+    import tempfile
+    import threading
+
+    target = socket.socket()
+    target.bind(("127.0.0.1", 0))
+    target.listen(1)
+    a = target.getsockname()[1]
+
+    def echo():
+        c = target.accept()[0]
+        c.sendall(b"pong:" + c.recv(100))
+        c.close()
+
+    threading.Thread(target=echo, daemon=True).start()
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    b = probe.getsockname()[1]
+    probe.close()
+    base = tempfile.mkdtemp(prefix="lvr", dir="/tmp")   # short: a unix socket path has a small limit
+    out_dir, in_dir = os.path.join(base, "o"), os.path.join(base, "i")
+    py = [sys.executable, "-I", "-S", "-c", confinement._HANDS_RELAY]
+    out = subprocess.Popen([*py, "out", out_dir, str(a)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, start_new_session=True)
+    inn = None
+    try:
+        assert out.stdout.readline() == b"ready\n"
+        sock = os.path.join(out_dir, f"{a}.sock")
+        assert st.S_IMODE(os.stat(out_dir).st_mode) == 0o700 and st.S_IMODE(os.stat(sock).st_mode) == 0o600
+        os.mkdir(in_dir)
+        os.symlink(sock, os.path.join(in_dir, f"{b}.sock"))
+        client = (f"import socket; s = socket.create_connection(('127.0.0.1', {b})); s.sendall(b'ping'); "
+                  "s.shutdown(socket.SHUT_WR); print(s.recv(100).decode())")
+        inn = subprocess.Popen([*py, "in", in_dir, str(b), "--", sys.executable, "-I", "-S", "-c", client],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True)
+        said, err = inn.communicate(timeout=30)
+        assert said.strip() == b"pong:ping", err
+        out.send_signal(signal.SIGTERM)
+        out.wait(timeout=10)
+        assert not os.path.exists(out_dir)   # the host side removes its sockets and directory
+    finally:
+        for p in (out, inn):
+            if p is not None:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)   # the namespace side's forked relay is in this group
+                except OSError:
+                    pass
+                p.wait()
+        target.close()
+        shutil.rmtree(base, ignore_errors=True)
