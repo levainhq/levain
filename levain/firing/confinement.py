@@ -2549,15 +2549,19 @@ if os.fork() == 0:
                             kids[int(pid)] = os.pidfd_open(int(pid))
                     except OSError:
                         pass
-        if held in ready:
+        if held in ready or mine in ready:
             break
-        if mine in ready:
-            os._exit(0)
+    # A child still alive is killed either way: bwrap ends on its own only after its pid 1 has, so a
+    # pid 1 that outlives it was orphaned. On the operator floor bwrap's --die-with-parent kills bwrap
+    # before levain's pidfd turns readable, so the command's end is seen first (RUN 2026-10-09: 4 of 10).
     for fd in kids.values():
-        try:
-            signal.pidfd_send_signal(fd, signal.SIGKILL)
-        except OSError:
-            pass
+        if not select.select([fd], [], [], 0)[0]:
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except OSError:
+                pass
+    if held not in ready:
+        os._exit(0)
     for sig, wait in ((signal.SIGTERM, 2), (signal.SIGKILL, None)):
         try:
             signal.pidfd_send_signal(mine, sig)
