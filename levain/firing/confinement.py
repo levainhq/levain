@@ -3373,15 +3373,18 @@ class SandboxedShell:
                 "SandboxedShell.run() is single-caller; a command is already running on this shell."
             )
         try:
-            if self._closed or not self._started:
-                raise ConfinementError(
-                    "shell is not running (call start() first, and not after close())"
-                )
+            not_running = "shell is not running (call start() first, and not after close())"
+            if self._closed:
+                raise ConfinementError(not_running)
+            # Before the started check, as the provider's checks ran before it when they lived in its own
+            # run(): an unstarted shell's floor is checked too (tests/test_jewel_recheck.py drives that).
+            self._before_command()
+            if not self._started:
+                raise ConfinementError(not_running)
             if "\0" in command:
                 raise ConfinementError(
                     "refusing a command that contains a NUL byte: bash cannot receive it whole."
                 )
-            self._before_command()
             self._prune_groups()
             late = self._late_output()
             r = self._execute(command, self._default_timeout if timeout is None else timeout)
