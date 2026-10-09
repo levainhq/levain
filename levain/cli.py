@@ -327,6 +327,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     focus_p.set_defaults(func=_cmd_focus)
 
+    state_p = subparsers.add_parser(
+        "state",
+        help="Set / show your freeform state line — how you are right now.",
+        description=(
+            "An optional, freeform line in your own words ('wiped, keep it light', "
+            "'sharp') that every session reads at start, shown verbatim with its age. "
+            "It is never parsed, scored or used to limit what the partner does; you are "
+            "the authority on your own state. With TEXT, sets it; with no argument, shows "
+            "it; --clear removes it. It expires after 8 hours: a stale state is dropped, "
+            "not shown. Lives beside the focus in .levain/context.json."
+        ),
+    )
+    state_p.add_argument(
+        "text", nargs="?", default=None,
+        help="The state to set (omit to show the current one).",
+    )
+    state_p.add_argument(
+        "--path", type=Path, default=Path.cwd(),
+        help="Install directory (default: cwd).",
+    )
+    state_p.add_argument("--clear", action="store_true", help="Remove the state.")
+    state_p.add_argument(
+        "--source", default="cli",
+        help="Provenance tag for who set it (default: cli).",
+    )
+    state_p.set_defaults(func=_cmd_state)
+
     run_p = subparsers.add_parser(
         "run",
         help="Run a sovereign entity as an interactive partner on an open model.",
@@ -1207,6 +1234,14 @@ def _cmd_focus(args: argparse.Namespace) -> int:
     from levain.dashboard import run_focus
 
     return run_focus(
+        path=args.path, text=args.text, source=args.source, clear=args.clear
+    )
+
+
+def _cmd_state(args: argparse.Namespace) -> int:
+    from levain.dashboard import run_state
+
+    return run_state(
         path=args.path, text=args.text, source=args.source, clear=args.clear
     )
 

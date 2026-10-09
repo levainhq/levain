@@ -148,6 +148,9 @@ def _loop(
             # Global write: set/edit the masthead focus (not a row-scoped verb — focus
             # isn't a selectable panel). Read-only cockpit → 'f' falls through to a no-op.
             model = _edit_focus(stdscr, model, source)
+        elif ch == ord("S") and not model.read_only:
+            # Global write: set/edit the freeform state line (shift-S: lowercase s is a verb key).
+            model = _edit_state(stdscr, model, source)
         else:
             # Verb keys — fire only if the SELECTED panel+row affords that verb
             # (the same set the footer advertised). An unbound key does nothing.
@@ -216,6 +219,25 @@ def _rebuild(model: TuiModel, source: SubstrateSource, status: str) -> TuiModel:
         return with_view(model, source.build(), status=status)
     except Exception as exc:  # noqa: BLE001 — UI liveness: never crash on a rebuild
         return replace(model, status=f"⚠ view refresh failed ({exc}) — showing last view")
+
+
+def _edit_state(
+    stdscr: "curses.window", model: TuiModel, source: SubstrateSource,
+) -> TuiModel:
+    """Set / edit the operator's freeform state line ('S'): the twin of ``_edit_focus``
+    (same ``$EDITOR`` idiom, an empty buffer clears, same governed ``apply_edit`` seam,
+    ``kind='operator_state'``). The text is the operator's own words, stored verbatim."""
+    view = model.view
+    state = getattr(view, "state", None) if view is not None else None
+    current = state.text if (state is not None and state.text) else ""
+    edited = _edit_via_editor(stdscr, current)
+    if edited is None:
+        return replace(model, status="⚠ state unchanged — $EDITOR is missing or exited non-zero")
+    new = " ".join(edited.split())
+    if new == current:
+        return replace(model, status="state — no change")
+    ok = "state cleared" if new == "" else "state set"
+    return _apply(model, source, {"kind": "operator_state", "text": new, "source": "tui"}, ok)
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +734,9 @@ def _paint(stdscr: "curses.window", model: TuiModel) -> TuiModel:
         else:
             tag = " ⊙ no focus set "
             f_attr = curses.A_DIM
+        st = view.state
+        if st is not None and st.text:  # the state line follows the focus, with its age
+            tag += f"· {st.text} · {st.age_label.replace('set ', '')} "
         _safe_addstr(stdscr, 2, 2, tag[: w - 4], f_attr)
 
     left_w = min(_LEFT_W, w // 3)
@@ -809,6 +834,7 @@ _HELP_LINES = [
     "    PgDn / PgUp    page · g / G  first / last (or top / bottom)",
     "    r              refresh (rebuild the substrate view)",
     "    f              set / edit your focus — 'what I'm on now' (writable cockpit)",
+    "    S              set / edit your state — how you are, in your words (expires in 8 h)",
     "    q / Esc        quit · ?  this help (any key dismisses)",
     "",
     "  verbs (only where the SELECTED panel + row affords them)",

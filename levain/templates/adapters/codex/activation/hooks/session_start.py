@@ -108,6 +108,11 @@ def main() -> int:
         if focus:
             sections.append(focus)
 
+        # 2d. The operator's freeform state line (verbatim, with age, dropped past 8 h).
+        state = hook.state_notice()
+        if state:
+            sections.append(state)
+
         # 3. Layer D — start-catch. Fires only on a genuinely fresh session;
         #    on `resume`/`compact` the unwrapped count reflects ongoing work,
         #    not a missed wrap. (`compact` is the most important re-injection
