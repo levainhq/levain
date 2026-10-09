@@ -153,7 +153,7 @@ def _tray_cockpit(*, fault: bool = False, stale: bool = False) -> Cockpit:
 def _view(snap: dict[str, Any]) -> dict[str, Any]:
     driver = (
         "const V=require(process.argv[1]);const snap=JSON.parse(require('fs').readFileSync(0,'utf8'));"
-        "process.stdout.write(JSON.stringify(V.fromManifest(snap, Date.parse('2026-10-09T12:00:00Z'))))")
+        "process.stdout.write(JSON.stringify(V.fromManifest(snap)))")
     res = subprocess.run([NODE, "-e", driver, str(WEB / "cockpit_view.js")], input=json.dumps(snap),
                          capture_output=True, text=True, check=True, timeout=30)
     return json.loads(res.stdout)
@@ -188,6 +188,76 @@ class TestManifestMapper:
         view = _view(snapshot(ck))
         entry = [e for e in view["layout"] if e["id"] == "old"][0]
         assert any(b["text"].startswith("STALE") for b in entry["banner"])
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+class TestManifestMapperAdversarial:
+    """The L3 findings on the redo, each as a case that fails on the pre-fix mapper."""
+
+    def _snap(self, ck: Cockpit) -> dict[str, Any]:
+        return snapshot(ck)
+
+    def test_prototype_named_group_and_panel_ids_are_data_not_prototype_keys(self) -> None:
+        try:
+            register_ordering(Ordering(name="test.proto", key=lambda r, t: (r.id,), group=lambda r, t: "constructor",
+                                       groups=(("constructor", "Ctor band"),)))
+        except Exception:  # noqa: BLE001 - registered once per process
+            pass
+        ck = Cockpit()
+        rows = [RowIn("spore:spore-1", "t", {"at": "2026-10-01T00:00:00+00:00"}, stored={"id": "spore-1"})]
+        ck.register(ProviderSpec("tray", "triage-list", "Tray", "gate", lambda c: Read(rows=tuple(rows)),
+                                 order="test.proto", facets=frozenset({"at"}), version_fields=("id",)))
+        ck.register(ProviderSpec("constructor", "line", "Odd id", "gauge",
+                                 lambda c: Read(value={"lines": [{"label": "a", "text": "b", "at": None, "source": None}]})))
+        snap = self._snap(ck)
+        del snap["panels"]["constructor"]          # a payload missing for an id that names a prototype member
+        view = _view(snap)
+        assert view["tray"][0]["group_title"] == "Ctor band"
+        odd = [e for e in view["layout"] if e["id"] == "constructor"][0]
+        assert odd["kind"] == "external" and "no payload" in view["extra_panels"]["constructor"]["error"]
+
+    def test_a_failed_header_fetch_is_an_error_and_an_extra_header_panel_is_drawn(self) -> None:
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("focus", "line", "Focus", "gauge", lambda c: Read(value={"lines": [
+            {"label": "focus", "text": "x", "at": "2026-10-09T12:00:00+00:00", "source": "s"}]}), region="header"))
+        ck.register(ProviderSpec("weather", "line", "Weather", "gauge", lambda c: Read(value={"lines": [
+            {"label": "now", "text": "cloudy", "at": None, "source": None}]}), region="header", rank=5))
+        snap = self._snap(ck)
+        snap["panels"]["focus"] = {"error": "HTTP 500"}
+        view = _view(snap)
+        assert view["focus"] is None and "HTTP 500" in view["errors"]["focus"]
+        assert view["extra_panels"]["weather"]["lines"][0]["text"] == "cloudy"
+
+    def test_an_unreadable_wraps_panel_is_an_error_not_a_never(self) -> None:
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": [
+            {"label": "wraps", "value": 4, "unit": None, "status": "ok", "read": None}], "alerts": [
+            {"message": "wrap in progress", "severity": "warn"}]})))
+        ck.register(ProviderSpec("wraps", "visual", "Projection history", "feed", lambda c: Fault("wraps unreadable")))
+        view = _view(self._snap(ck))
+        assert "wraps unreadable" in view["errors"]["wraps"]
+        assert view["health"]["last_wrap_at"] is None
+        h = [e for e in view["layout"] if e["id"] == "health"][0]
+        assert any("wrap in progress" in b["text"] for b in h["banner"])   # an alert is never dropped
+
+    def test_now_rows_keep_their_full_text_group_titles_and_hostile_characters_are_visible(self) -> None:
+        ck = Cockpit()
+        long = "x" * 200 + "\u202eEND"
+        rows = [RowIn("spore:spore-1", long, {"disposition": "seed", "due": "2020-01-01", "tier": "hot", "salience": 0,
+                                               "handoff_expired": False}, body=long, stored={"id": "spore-1"})]
+        ck.register(ProviderSpec("tray", "triage-list", "Tray", "gate", lambda c: Read(rows=tuple(rows)), order="spore.tray",
+                                 facets=frozenset({"disposition", "due", "tier", "salience", "handoff_expired"}),
+                                 version_fields=("id",)))
+        view = _view(self._snap(ck))
+        now = view["extra_panels"]["now"]["lines"][0]
+        assert now["text"].endswith("<U+202E>END") and len(now["text"]) > 160   # full body, sanitised
+        assert "Overdue" in now["meta"]                                         # the kernel's band title, not "overdue"
+
+    def test_an_unparseable_focus_stamp_is_age_unknown_not_fresh(self) -> None:
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("focus", "line", "Focus", "gauge", lambda c: Read(value={"lines": [
+            {"label": "focus", "text": "x", "at": "not-a-date", "source": "s"}]}), region="header"))
+        assert _view(self._snap(ck))["focus"]["freshness"] == "unknown"
 
 
 def _dump_dom(url: str) -> str:
