@@ -720,19 +720,21 @@ class GitLedger:
                     raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but it cannot be "
                                          f"published: {remote} {said}", outcome="lost")
                 if outcome == "unknown":
-                    # RUN (r17 residue R-D): after a lost race that sync refuses, so the drop and join are named here
+                    # RUN (r17 R-D, r19): sync refuses a lost race, and after the drop a bare join refuses too (the pin
+                    # still names this genesis) but lists the winner, so the --root form is named
                     raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but the push to "
                                          f"{remote} failed ({why}) and {said}, so whether it was published is not "
                                          "known: run `levain team sync` once the remote answers. It publishes this "
                                          "ledger, or refuses because another got there first; then drop "
-                                         f"this one: {self._init_cleanup(branch)}, and run `levain team join`",
-                                         outcome="unknown")
+                                         f"this one: {self._init_cleanup(branch)}, then `levain team join --root <its "
+                                         "genesis>` (a bare `levain team join` lists it)", outcome="unknown")
                 if outcome == "pending":
                     # absent when probed is not absent at the sync: another init can still take it (r18 codex 2)
                     raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but the push to "
                                          f"{remote} failed ({why}): run `levain team sync`. If it refuses because "
                                          f"another ledger got there first, drop this one: {self._init_cleanup(branch)}, "
-                                         "and run `levain team join`", outcome="pending")
+                                         "then `levain team join --root <its genesis>` (a bare `levain team join` lists "
+                                         "it)", outcome="pending")
                 # "published": the push landed (its report was lost), or a teammate has already built on it
             try:
                 self._sync(push=True)      # the clone's own bookkeeping of what it published
@@ -781,14 +783,16 @@ class GitLedger:
             # + complement 2: an unaccepted merge derives "partial" without raising)
             why = "it has more than one root" if len(roots) != 1 else ""
             if not why:
-                with tempfile.TemporaryDirectory() as tmp:      # a foreign ledger's verdicts stay out of this clone's cache
-                    try:
+                # the try holds the temp dir too: its creation or cleanup failing is a failure to judge (r19 codex 2 +
+                # complement 1); a foreign ledger's verdicts stay out of this clone's cache (r18 complement 3)
+                try:
+                    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
                         d = T.derive(self.repo.toplevel, tip, T.Clone(pinned_root=roots[0], anchor=None, accepted={},
                                                                       distrust=set()), S.SigCache(Path(tmp) / "c.json"))
-                        if d.judged != "full":
-                            why = f"its history is frozen: {d.frozen_why}"
-                    except Exception as exc:  # noqa: BLE001 - not judged in full: no destructive advice
-                        why = f"it could not be judged as a team ledger here: {exc}"
+                    if d.judged != "full":
+                        why = f"its history is frozen: {d.frozen_why}"
+                except Exception as exc:  # noqa: BLE001 - not judged in full: no destructive advice
+                    why = f"it could not be judged as a team ledger here: {exc}"
         except TeamError as exc:
             return "unknown", f"its branch could not be fetched ({exc})"
         finally:

@@ -102,13 +102,16 @@ def cmd_init(args) -> int:
         elif not incomplete.confirmed:
             # the remote was not seen to hold this ledger, so nothing is set up on it: it may yet be dropped for
             # another (code L3 r15 codex 2, r16 codex 1, r17 codex 1 + 2); the join that adopts another installs
-            after = "the join" if incomplete.outcome == "lost" else "a sync that succeeds, or the join after one refuses"
-            todo = [f"`levain team pack-sync {shlex.quote(args.pack)}`"] if args.pack else []
-            if not args.no_install and incomplete.outcome != "lost":
-                todo.append("`levain team install`")
-            if todo:
-                incomplete = InitIncomplete(f"{incomplete}; the clone was NOT set up: after {after}, run "
+            # a pack is seeded only into THIS ledger once a sync publishes it, never into another team's after a join
+            # (r19 complement 3); the join that adopts another installs, so install is named only for the sync path
+            todo = ([f"`levain team pack-sync {shlex.quote(args.pack)}`"] if args.pack else []) + \
+                ([] if args.no_install else ["`levain team install`"])
+            if todo and incomplete.outcome != "lost":
+                incomplete = InitIncomplete(f"{incomplete}; the clone was NOT set up: once a sync succeeds, run "
                                             + " and ".join(todo), outcome=incomplete.outcome)
+            elif args.pack and incomplete.outcome == "lost":
+                incomplete = InitIncomplete(f"{incomplete}; the pack {args.pack} was NOT seeded (this ledger is never "
+                                            "published)", outcome="lost")
         else:
             # published, only the bookkeeping sync is pending: the ledger is ours, so the setup runs, the seed locally
             if args.pack:
