@@ -150,26 +150,27 @@ def test_a_fence_that_moves_once_during_admission_checks_again_and_keeps_the_app
 
 
 def test_a_child_forked_while_the_compose_lock_is_held_can_still_compose():
-    # codex r8 1: a fork while the lock was held left the child a lock nobody could release
+    # codex r8 1: a fork while the lock was held left the child a lock nobody could release. The fork
+    # runs in a fresh single-threaded interpreter (codex r10: never fork the threaded pytest process),
+    # bounded by a timeout.
     import os
+    import subprocess
+    import sys
     import pytest
-    import levain.autonomic.risk as risk_mod
     if not hasattr(os, "fork"):
         pytest.skip("no fork on this platform")
-    import warnings
-    pid = None
-    try:
-        with risk_mod._COMPOSE_LOCK:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)    # fork in a threaded process
-                pid = os.fork()
-            if pid == 0:                                               # the child never returns
-                code = 2
-                try:
-                    code = 0 if risk_mod._COMPOSE_LOCK.acquire(timeout=2) else 1
-                finally:
-                    os._exit(code)
-    finally:
-        if pid:
-            _, status = os.waitpid(pid, 0)
-    assert os.waitstatus_to_exitcode(status) == 0
+    probe = (
+        "import os, levain.autonomic.risk as r\n"
+        "with r._COMPOSE_LOCK:\n"
+        "    pid = os.fork()\n"
+        "    if pid == 0:\n"
+        "        code = 2\n"
+        "        try:\n"
+        "            code = 0 if r._COMPOSE_LOCK.acquire(timeout=2) else 1\n"
+        "        finally:\n"
+        "            os._exit(code)\n"
+        "_, status = os.waitpid(pid, 0)\n"
+        "raise SystemExit(os.waitstatus_to_exitcode(status))\n"
+    )
+    done = subprocess.run([sys.executable, "-c", probe], timeout=30, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr

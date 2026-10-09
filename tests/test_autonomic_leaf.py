@@ -35,6 +35,7 @@ PKG = Path(levain.autonomic.__file__).parent
 ALLOWED_STDLIB = frozenset({
     "__future__", "collections", "contextlib", "copy", "dataclasses", "datetime", "enum", "fcntl",
     "hashlib", "json", "logging", "math", "os", "pathlib", "re", "sqlite3", "subprocess", "tempfile",
+    "threading",
     "typing", "unicodedata",
 })
 _LOADER_NAMES = frozenset({"__import__", "__builtins__", "exec", "eval", "compile"})
