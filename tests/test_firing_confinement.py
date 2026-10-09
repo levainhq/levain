@@ -2878,16 +2878,30 @@ linux_live = pytest.mark.skipif(
 def test_linux_live_cannot_skip_where_it_is_required() -> None:
     """The `linux_live` tests SKIP wherever bwrap cannot run, which is right on a laptop and wrong in
     the image built to run them: there a skip is a green suite that never touched the floor.
-    `tests/linux/Dockerfile` sets ``LEVAIN_REQUIRE_LINUX_LIVE=1``, so in that image a refused
-    namespace FAILS here instead of skipping eight tests quietly."""
+    The CI `linux-live` job sets ``LEVAIN_REQUIRE_LINUX_LIVE=1``, so there a refused namespace FAILS
+    here instead of skipping the live tests quietly."""
     if os.environ.get("LEVAIN_REQUIRE_LINUX_LIVE") != "1":
-        pytest.skip("only enforced where LEVAIN_REQUIRE_LINUX_LIVE=1 (the Linux test image)")
+        pytest.skip("only enforced where LEVAIN_REQUIRE_LINUX_LIVE=1 (the CI linux-live job)")
     assert platform.system() == "Linux" and bwrap_available(), (
         "LEVAIN_REQUIRE_LINUX_LIVE=1 but bwrap cannot establish a namespace here, so every "
-        "linux_live test would skip. In Docker, run with --security-opt seccomp=unconfined "
-        "--security-opt apparmor=unconfined --security-opt systempaths=unconfined "
-        "(see tests/linux/Dockerfile)."
+        "linux_live test would skip. On an Ubuntu host: "
+        "`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`."
     )
+
+
+def test_the_linux_image_is_refused_as_a_container_by_name() -> None:
+    """`tests/linux/Dockerfile` is a container, which the cgroup frame refuses by name (no fallback).
+    The image used to require the live floor, so it went red on every run, and a suite that is red by
+    design teaches its reader to ignore the run that is red for a reason. It now sets
+    ``LEVAIN_EXPECT_CONTAINER_REFUSAL=1``, and green there means the refusal holds. The live floor is
+    run on a host (the CI `linux-live` job's VM, or argushub)."""
+    if os.environ.get("LEVAIN_EXPECT_CONTAINER_REFUSAL") != "1":
+        pytest.skip("only in the Linux test image (LEVAIN_EXPECT_CONTAINER_REFUSAL=1)")
+    from levain.firing.confinement import diagnose_confinement
+    d = diagnose_confinement()
+    assert platform.system() == "Linux" and not d.supported, d
+    assert "container" in d.reason, d
+    assert not confinement_supported()
 
 
 @pytest.fixture()

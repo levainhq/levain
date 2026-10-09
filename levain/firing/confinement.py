@@ -5233,15 +5233,30 @@ def _leaf_rel(uid: int, unit: str) -> str:
     return f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/{unit}.scope"
 
 
-# A leaf's unit names the levain process that made it (pid and kernel start time), so a sweep can tell a
-# crashed levain's leaf from a live one's without any other record.
-_LEAF_UNIT = re.compile(r"levain-(\d+)-(\d+)-[0-9a-f]{12}-\d+\.scope")
+# A leaf's unit names the levain process that made it (pid namespace, pid and kernel start time), so a
+# sweep can tell a crashed levain's leaf from a live one's without any other record. A pid is only
+# meaningful inside its own namespace: a levain in another pid namespace sharing this uid's cgroupfs
+# makes leaves this sweep must leave alone (L3 r10).
+_LEAF_UNIT = re.compile(r"levain-(\d+)-(\d+)-(\d+)-[0-9a-f]{12}-\d+\.scope")
+# The name before the namespace was in it. The sweep never judges one (it cannot tell whose namespace
+# made it); the ledger claim that tagged it, which carries its namespace, still can.
+_LEGACY_LEAF_UNIT = re.compile(r"levain-(\d+)-(\d+)-[0-9a-f]{12}-\d+\.scope")
+
+
+def _leaf_unit(token: str, n: int) -> str | None:
+    """The unit name of this levain's leaf number ``n``; None when /proc cannot say who this levain is."""
+    started, ns = _proc_start_time(os.getpid()), _pidns()
+    if started is None or ns == "-":
+        return None
+    return f"levain-{ns}-{os.getpid()}-{started}-{token}-{n}"
 
 
 def _is_levain_leaf(rel: str, uid: int) -> bool:
     """Whether ``rel`` names a leaf levain makes for ``uid`` and nothing else (a crash sweep kills it)."""
     head = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/"
-    return rel.startswith(head) and _LEAF_UNIT.fullmatch(rel[len(head):]) is not None
+    name = rel[len(head):]
+    return rel.startswith(head) and (_LEAF_UNIT.fullmatch(name) is not None
+                                     or _LEGACY_LEAF_UNIT.fullmatch(name) is not None)
 
 
 def sweep_dead_leaves() -> list[str]:
@@ -5254,14 +5269,20 @@ def sweep_dead_leaves() -> list[str]:
         names = os.listdir(base)
     except OSError:
         return []
+    ns = _pidns()
     left: list[str] = []
+    killed: list[str] = []
     for name in names:
         m = _LEAF_UNIT.fullmatch(name)
-        if not m or _proc_start_time(int(m.group(1))) == m.group(2):
-            continue   # not a leaf, or its levain is alive
+        if not m or m.group(1) != ns or _proc_start_time(int(m.group(2))) == m.group(3):
+            continue   # not a leaf, another pid namespace's (not ours to judge), or its levain is alive
         rel = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/{name}"
-        _leaf_kill(rel)
-        if not _leaf_gone(rel, timeout=5.0):
+        (killed if _leaf_kill(rel) else left).append(rel)
+    # Every leaf is killed first, then all are awaited against ONE deadline: the sweep runs at every
+    # CLI start, so a wait per leaf would add up (L3 r10).
+    deadline = time.monotonic() + 5.0
+    for rel in killed:
+        if not _leaf_gone(rel, timeout=max(0.0, deadline - time.monotonic())):
             left.append(rel)
     return left
 
@@ -5330,22 +5351,38 @@ def _leaf_chain_problem() -> str | None:
     """Run the launch chain every command uses, minus the floor's mounts: a transient user scope
     around ``bwrap --unshare-pid --unshare-cgroup`` with cgroupfs read-only. None when it ran, else what
     it said. Static checks cannot see an LSM, a seccomp profile or a user manager that refuses (L3 r9)."""
-    started = _proc_start_time(os.getpid())
-    if started is None:
-        return "levain cannot read its own start time from /proc"
-    unit = f"levain-{os.getpid()}-{started}-{os.urandom(6).hex()}-0"
+    unit = _leaf_unit(os.urandom(6).hex(), 0)
+    if unit is None:
+        return "levain cannot read its own start time or pid namespace from /proc"
+    rel = _leaf_rel(os.getuid(), unit)
     argv = ["/usr/bin/env", f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}", SYSTEMD_RUN, "--user", "--scope",
             "--quiet", "--collect", f"--slice={_LEVAIN_SLICE}", f"--unit={unit}", "--",
-            BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--unshare-pid",
-            "--unshare-cgroup", "--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup", "/bin/true"]
+            BWRAP, "--die-with-parent", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+            "--unshare-pid", "--unshare-cgroup", "--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup",
+            "/bin/true"]
     try:
-        r = subprocess.run(argv, capture_output=True, timeout=20, env=_probe_env())
-    except (OSError, subprocess.SubprocessError) as exc:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, env=_probe_env())
+    except OSError as exc:
         return str(exc)
-    if r.returncode == 0:
+    try:
+        _, err = proc.communicate(timeout=20)
+    except subprocess.SubprocessError:
+        # Killing systemd-run alone would leave a stalled bwrap in its scope, owned by this live levain,
+        # so no sweep would ever reap it (L3 r10): kill the scope too and wait for it to empty.
+        proc.kill()
+        _leaf_kill(rel)
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.SubprocessError:
+            pass
+        if _leaf_gone(rel, timeout=5.0):
+            return "the launch probe did not finish within 20 s"
+        return f"the launch probe did not finish within 20 s, and its scope {rel} could not be emptied"
+    if proc.returncode == 0:
         return None
-    said = r.stderr.decode("utf-8", "replace").strip().splitlines()
-    return said[-1] if said else f"exit {r.returncode}"
+    said = err.decode("utf-8", "replace").strip().splitlines()
+    return said[-1] if said else f"exit {proc.returncode}"
 
 
 def _leaf_populated(rel: str) -> bool | None:
@@ -5764,7 +5801,12 @@ def _claim_alive(claim: str) -> bool:
     except ProcessLookupError:
         owner = False
     except PermissionError:
-        return True   # someone else's process with that pid: alive, so the claim is kept
+        # Another user's process holds the pid. Its start time, where /proc shows it, tells levain
+        # itself from a reuse (L3 r10); unreadable or unrecorded, the claim is kept.
+        now = _proc_start_time(pid)
+        if now is None or len(parts) < 4 or parts[1] == "-" or now == parts[1]:
+            return True
+        owner = False
     except OSError:
         owner = False
     if owner and len(parts) >= 4 and parts[1] != "-":
@@ -5798,8 +5840,11 @@ def _claim_alive(claim: str) -> bool:
             return False
         return start in ("", "-") or fields[19] == start
     if tag.startswith("g"):
-        # An earlier build's tag names the command's process group.
+        # An earlier build's tag names the command's process group. killpg(0) is levain's own group and
+        # 1 is init's: neither is a command's, so neither keeps a claim.
         try:
+            if int(tag[1:]) <= 1:
+                return False
             os.killpg(int(tag[1:]), 0)
             return True
         except (ValueError, ProcessLookupError):
@@ -6387,13 +6432,13 @@ class _BwrapShell(SandboxedShell):
             raise ConfinementError(f"{problem[0]} — refusing to run the command (fail-closed)."
                                    + (f" To fix: {problem[1]}." if problem[1] else ""))
         argv, pass_fds = super()._spawn_argv()
-        started = _proc_start_time(os.getpid())
-        if started is None:
-            # The unit name carries it, so a crash sweep can tell this levain's leaves from a live one's.
-            raise ConfinementError("levain cannot read its own start time from /proc — refusing to run the "
-                                   "command (fail-closed): a crash could not be told from a live levain.")
+        unit = _leaf_unit(self._unit_token, self._units + 1)
+        if unit is None:
+            # The unit name carries both, so a crash sweep can tell this levain's leaves from a live one's.
+            raise ConfinementError("levain cannot read its own start time or pid namespace from /proc — "
+                                   "refusing to run the command (fail-closed): a crash could not be told "
+                                   "from a live levain.")
         self._units += 1
-        unit = f"levain-{os.getpid()}-{started}-{self._unit_token}-{self._units}"
         leaf = _leaf_rel(os.getuid(), unit)
         # The claim names the leaf BEFORE anything is spawned in it: after a levain crash at any later
         # point the sweep finds the leaf, kills it, and keeps the claim until it is empty.
@@ -6877,12 +6922,13 @@ def diagnose_confinement(system: str | None = None) -> ConfinementDiagnosis:
     if problem is not None:
         return ConfinementDiagnosis(False, "bwrap (Linux mount namespace)", problem[0], problem[1])
     if bwrap_available():
+        # This is everything `BwrapProvider.available()` checks; asking it again would run the
+        # launch probe a second time (L3 r10).
         said = _leaf_chain_problem()
         if said is not None:
             return ConfinementDiagnosis(
                 False, "bwrap (Linux mount namespace)",
                 f"a command cannot start in its own cgroup scope here ({said})", _LINGER_REMEDY)
-    if provider.available():
         return ConfinementDiagnosis(True, "bwrap (Linux mount namespace)",
                                     "Linux bwrap floor active", None)
     if _bwrap_runs_without_a_pid_namespace():

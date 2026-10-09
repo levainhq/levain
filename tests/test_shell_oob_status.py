@@ -1270,16 +1270,46 @@ def test_linux_a_command_cannot_move_itself_out_of_its_leaf(tmp_path):
     uid = os.getuid()
     target = Path(f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/levain-escape-{os.getpid()}")
     target.mkdir()
+    checked = False
     try:
         with _shell(tmp_path) as sh:
-            r = sh.run(f"echo $$ > {target}/cgroup.procs && echo ESCAPED; "
+            # LC_ALL=C: the assert below reads bash's strerror text, which a locale would translate.
+            r = sh.run(f"export LC_ALL=C; echo $$ > {target}/cgroup.procs && echo ESCAPED; "
                        f"echo 1 > {target}/cgroup.freeze && echo FROZE; cat /proc/self/cgroup", timeout=20)
         assert "ESCAPED" not in r.output and "FROZE" not in r.output, r.output
         assert "Read-only file system" in r.output, r.output   # refused by the read-only cgroupfs
         assert not (target / "cgroup.procs").read_text().strip()
         assert (target / "cgroup.freeze").read_text().strip() == "0"
+        checked = True
     finally:
         try:
             target.rmdir()
         except OSError:
-            pass   # an escaped process keeps it busy; the asserts above already said so
+            if checked:
+                raise   # nothing escaped, so a cgroup that will not go is a real failure
+            # an assert above failed already and says why; do not mask it with this one
+
+
+def test_the_crash_sweep_leaves_another_pid_namespaces_leaves_alone(tmp_path, monkeypatch):
+    """L3 r10 consensus, RUN on argushub (1009-13_S2/r10_fix1_ns_sweep_run.txt): a pid is only meaningful
+    in its own namespace, and the sweep killed the live leaf of a levain in another one because its pid
+    was not a live process here. Only this namespace's dead levain's leaf may be killed."""
+    from levain.firing import confinement as C
+
+    uid, ns = os.getuid(), "4026531836"
+    base = tmp_path / C._user_manager_rel(uid) / C._LEVAIN_SLICE
+    names = {
+        "own_dead": f"levain-{ns}-999999-1-{'a' * 12}-1.scope",
+        "foreign": f"levain-{int(ns) + 1}-999999-1-{'b' * 12}-1.scope",
+        "legacy": f"levain-999999-1-{'c' * 12}-1.scope",
+    }
+    for n in names.values():
+        (base / n).mkdir(parents=True)
+    killed: list[str] = []
+    monkeypatch.setattr(C, "_CGROUP_ROOT", tmp_path)
+    monkeypatch.setattr(C, "_pidns", lambda: ns)
+    monkeypatch.setattr(C, "_proc_start_time", lambda pid: None)   # pid 999999 is not alive here
+    monkeypatch.setattr(C, "_leaf_kill", lambda rel: killed.append(rel.rsplit("/", 1)[-1]) or True)
+    monkeypatch.setattr(C, "_leaf_gone", lambda rel, timeout: True)
+    assert C.sweep_dead_leaves() == []
+    assert killed == [names["own_dead"]]

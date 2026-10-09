@@ -596,6 +596,7 @@ def test_a_retag_that_does_not_reach_the_disk_closes_the_shell(tmp_path, monkeyp
     closed = []
     monkeypatch.setattr(conf, "_cgroup_problem", lambda: None)
     monkeypatch.setattr(conf, "_proc_start_time", lambda pid: "1")   # no /proc off Linux
+    monkeypatch.setattr(conf, "_pidns", lambda: "4026531836")
     monkeypatch.setattr(conf.os, "replace", second_commit_fails)
     monkeypatch.setattr(conf._BwrapShell, "start", start)
     monkeypatch.setattr(conf._BwrapShell, "close", lambda self: closed.append(1))

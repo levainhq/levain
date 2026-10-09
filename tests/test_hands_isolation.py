@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -792,3 +793,19 @@ def test_a_remade_macos_group_holds_its_id_and_a_group_with_another_id_is_refuse
             assert made[-1][-2:] == ("PrimaryGroupID", "499")
         else:
             assert made == []
+
+
+def test_linger_repair_on_an_existing_linux_install_succeeds(tmp_path: Path, monkeypatch, capsys) -> None:
+    """L3 r10 (codex 4, complement 2): the repair ran and worked, then setup printed "--undo first" and
+    exited 1, so a script or an operator read a successful repair as a failure."""
+    ed = _entity(tmp_path)
+    (ed / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))
+    monkeypatch.setattr(hands, "invoking_operator", lambda: os.environ.get("USER") or "root")
+    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: hands.pwd.getpwuid(os.getuid()))
+    monkeypatch.setattr(hands, "host_os", lambda: "linux")
+    ran: list[list[str]] = []
+    monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: ran.append(argv)
+                        or subprocess.CompletedProcess(argv, 0, "", ""))
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 0
+    out = capsys.readouterr().out
+    assert any("enable-linger" in a for a in ran) and "linger is now enabled" in out and "--undo" not in out
