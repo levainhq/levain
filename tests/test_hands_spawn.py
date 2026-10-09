@@ -1002,9 +1002,8 @@ def test_a_relay_removes_a_dead_levains_relay_directory_and_keeps_a_live_ones(tm
 
 
 def test_every_path_field_of_the_policy_is_narrowed_for_a_hands_view_or_kept_on_purpose():
-    """codex + glm L3 r4: the first narrowing left ssh_dir and the hardlink check out, and a hardlinked
-    file in the operator's ~/.ssh refused every hands launch (RUN 2026-10-09). A new path field fails here
-    until it is put in one list or the other."""
+    """glm L3 r4: the first narrowing left ssh_dir out. A new path field fails here until it is put in one
+    list or the other. (The hardlink rule is NOT narrowed: see the test after the next.)"""
     import dataclasses
     import typing
 
@@ -1043,3 +1042,18 @@ def test_a_cancelled_helper_is_stopped_by_its_own_thread_once(monkeypatch, tmp_p
         confinement._run_hands_helper(["/bin/sleep", "30"], _hands(tmp_path), b"", 60, "the walk",
                                       cancelled=lambda: time.monotonic() - began > 0.3)
     assert len(stops) == 1 and time.monotonic() - began < 5
+
+
+def test_the_hardlink_rule_sees_the_whole_policy_for_a_hands_launch(tmp_path, monkeypatch):
+    """codex + complement L3 r5: narrowing the hardlink check to the view failed open: a jewel outside
+    the view with its other name inside it (/opt, the workspace) was let through. Phill 10-03: refuse
+    bash when ANY jewel inode has st_nlink > 1."""
+    seen: list[object] = []
+    monkeypatch.setattr(confinement, "_refuse_multiply_linked_jewels", lambda p: seen.append(p) or
+                        (_ for _ in ()).throw(ConfinementError("2 names")))
+    monkeypatch.setattr(confinement, "refresh_socket_denies", lambda p: p)
+    hands = _view_hands(monkeypatch)
+    policy = build_policy(_entity(tmp_path), workspace=hands.workspace)
+    with pytest.raises(ConfinementError, match="2 names"):
+        BwrapProvider().spawn_shell(policy, hands=hands)
+    assert seen == [policy]
