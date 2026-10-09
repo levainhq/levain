@@ -356,11 +356,17 @@ def egress_boundary_problem(hands_user: str, ports: tuple[int, ...] = (), *, net
 
 
 def egress_drift_problem(hands_user: str, hands_id: int, ports: tuple[int, ...]) -> str | None:
-    """Does the ruleset on disk (what boot and every reload load) say exactly what the record says? This
-    is levain's own convergence: a repair that stopped part way, or two that raced, can leave MORE allowed
-    than recorded, and the probe tests only a refused port (L3 r2). It does not try to prove the boot path
-    against root: units, drop-ins and the firewall are root's, and a root rewrite lifts the boundary until
-    it is re-asserted (Phill 2026-10-09, ruling (A)); every hands launch probes the live kernel instead."""
+    """Did levain's own steps converge: the ruleset on disk (what boot and every reload load) says exactly
+    what the record says, and the unit that loads it at boot is enabled? A repair that stopped part way,
+    or two that raced, can leave MORE allowed than recorded or the unit not enabled while the table is
+    still loaded, and the probe tests only the live kernel and one refused port (L3 r2, r5). It does not
+    try to prove the boot path against root: units, drop-ins and the firewall are root's, and a root
+    rewrite lifts the boundary until it is re-asserted (Phill 2026-10-09, ruling (A)).
+
+    The live check before a launch is the CALLER's: as of 2026-10-09 no entity code runs as the hands
+    user on Linux (``hands_for`` gives None off Darwin), and S2-linux and the fleet member runner must call
+    :func:`egress_boundary_problem` and :func:`net_group_problem` before starting a hands process and
+    refuse on a problem (carried, v2.0 must-ship; levain project_memory/1009-egress/DESIGN.md)."""
     import grp
 
     try:
@@ -371,6 +377,14 @@ def egress_drift_problem(hands_user: str, hands_id: int, ports: tuple[int, ...])
     if rules != egress_ruleset(hands_user, hands_id, ports, net_gid):
         return (f"the ruleset in {egress_rules_path(hands_user)} is not the one the record describes (allowed ports "
                 f"{list(ports) or 'none'}): a repair stopped part way, or the file was edited")
+    try:
+        r = subprocess.run([_abs("systemctl"), "is-enabled", egress_unit_name(hands_user)], capture_output=True,
+                           text=True, timeout=20, env=child_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"systemd could not say whether the boundary loads at boot ({exc})"
+    if r.stdout.strip() != "enabled":
+        return (f"{egress_unit_name(hands_user)} is {r.stdout.strip() or 'unknown'}, not enabled: the next boot "
+                "would not load the boundary (run setup again)")
     return None
 
 
