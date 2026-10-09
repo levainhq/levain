@@ -102,7 +102,7 @@ def cmd_init(args) -> int:
         elif not incomplete.confirmed:
             # the remote was not seen to hold this ledger, so nothing is set up on it: it may yet be dropped for
             # another (code L3 r15 codex 2, r16 codex 1, r17 codex 1 + 2); the join that adopts another installs
-            after = "the join" if incomplete.outcome == "lost" else "the sync"
+            after = "the join" if incomplete.outcome == "lost" else "a sync that succeeds, or the join after one refuses"
             todo = [f"`levain team pack-sync {shlex.quote(args.pack)}`"] if args.pack else []
             if not args.no_install and incomplete.outcome != "lost":
                 todo.append("`levain team install`")

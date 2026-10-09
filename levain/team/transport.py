@@ -728,8 +728,11 @@ class GitLedger:
                                          f"this one: {self._init_cleanup(branch)}, and run `levain team join`",
                                          outcome="unknown")
                 if outcome == "pending":
+                    # absent when probed is not absent at the sync: another init can still take it (r18 codex 2)
                     raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but the push to "
-                                         f"{remote} failed ({why}): run `levain team sync`", outcome="pending")
+                                         f"{remote} failed ({why}): run `levain team sync`. If it refuses because "
+                                         f"another ledger got there first, drop this one: {self._init_cleanup(branch)}, "
+                                         "and run `levain team join`", outcome="pending")
                 # "published": the push landed (its report was lost), or a teammate has already built on it
             try:
                 self._sync(push=True)      # the clone's own bookkeeping of what it published
@@ -773,19 +776,25 @@ class GitLedger:
                         timeout=60).stdout.split()
             # joinable only as join itself would judge it: a candidate pinned at its one root, derived (code L3 r17
             # codex 3: a root that merely carries team.toml sent the person to delete theirs for a join that refuses)
+            # the outcome is already decided ("lost": its history does not contain our genesis); this only decides
+            # whether the drop-then-join advice is safe, so anything short of a FULL judgment withholds it (r18 codex 1
+            # + complement 2: an unaccepted merge derives "partial" without raising)
             why = "it has more than one root" if len(roots) != 1 else ""
             if not why:
-                try:
-                    T.derive(self.repo.toplevel, tip, T.Clone(pinned_root=roots[0], anchor=None, accepted={},
-                                                              distrust=set()), S.SigCache(self.base / "sigcache.json"))
-                except Exception as exc:  # noqa: BLE001 - any failure to judge it means join would not take it as is
-                    why = f"it cannot be judged as a team ledger: {exc}"
+                with tempfile.TemporaryDirectory() as tmp:      # a foreign ledger's verdicts stay out of this clone's cache
+                    try:
+                        d = T.derive(self.repo.toplevel, tip, T.Clone(pinned_root=roots[0], anchor=None, accepted={},
+                                                                      distrust=set()), S.SigCache(Path(tmp) / "c.json"))
+                        if d.judged != "full":
+                            why = f"its history is frozen: {d.frozen_why}"
+                    except Exception as exc:  # noqa: BLE001 - not judged in full: no destructive advice
+                        why = f"it could not be judged as a team ledger here: {exc}"
         except TeamError as exc:
             return "unknown", f"its branch could not be fetched ({exc})"
         finally:
             # best effort: a leaked probe ref is overwritten by the next probe, and a raise here must never replace
             # the outcome (code L3 r17 complement 1 + codex 4)
-            with contextlib.suppress(TeamError):
+            with contextlib.suppress(Exception):
                 git(["update-ref", "-d", scratch], self.repo.toplevel, check=False, timeout=10)
         drop = f"drop this unpublished one: {self._init_cleanup(branch)}"
         if not why:
