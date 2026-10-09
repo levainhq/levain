@@ -278,6 +278,7 @@ def test_a_host_that_cannot_give_bash_a_pid_namespace_is_named_and_refused(monke
     monkeypatch.setattr(C.os, "access", lambda p, m: True if p == C.BWRAP else os.access(p, m))
     monkeypatch.setattr(C.BwrapProvider, "available", lambda self: False)
     monkeypatch.setattr(C, "_bwrap_runs_without_a_pid_namespace", lambda: True)
+    monkeypatch.setattr(C, "_cgroup_problem", lambda: None)
     d = C.diagnose_confinement("Linux")
     assert not d.supported and "PID namespace" in d.reason and "systempaths=unconfined" in d.remedy
 
