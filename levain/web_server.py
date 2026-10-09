@@ -257,12 +257,9 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/dashboard_boot.js": ("dashboard_boot.js", "text/javascript; charset=utf-8"),
     "/dashboard_team.js": ("dashboard_team.js", "text/javascript; charset=utf-8"),
     "/dashboard_chat.js": ("dashboard_chat.js", "text/javascript; charset=utf-8"),
-    # The shared cockpit's manifest renderer (levain.cockpit; design §7): a page that draws
-    # /cockpit/manifest.json and /cockpit/panel/<id>.json, beside the substrate dashboard.
-    "/cockpit": ("cockpit.html", "text/html; charset=utf-8"),
-    "/cockpit.css": ("cockpit.css", "text/css; charset=utf-8"),
-    "/cockpit.js": ("cockpit.js", "text/javascript; charset=utf-8"),
-    "/cockpit_boot.js": ("cockpit_boot.js", "text/javascript; charset=utf-8"),
+    # The manifest mapper (levain.cockpit; design §7): builds the dashboard's view from
+    # /cockpit/manifest.json, so the dashboard page is the cockpit renderer (`/?source=manifest`).
+    "/cockpit_view.js": ("cockpit_view.js", "text/javascript; charset=utf-8"),
 }
 
 

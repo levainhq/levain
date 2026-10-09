@@ -226,6 +226,24 @@
     return window.LevainDashboard.hasUnsavedEdit();
   }
 
+  // DATA SOURCE (cockpit design §7). `/?source=manifest` draws the page from the kernel's cockpit
+  // manifest + panel routes (cockpit_view.js maps them onto the same components); the default stays
+  // /substrate.json until the write verbs (K2a/K2b) and flow's provider module (M1) land, because the
+  // manifest source is READ-ONLY and would drop a writable serve's edit affordances and flow's own
+  // Bridge panels. The flip is this one constant.
+  const useManifest = new URLSearchParams(window.location.search).get("source") === "manifest";
+
+  async function loadManifestView() {
+    const manifest = await authedReadJson("/cockpit/manifest.json");
+    const ids = Object.keys(manifest.panels);
+    const panels = {};
+    await Promise.all(ids.map(async (id) => {
+      try { panels[id] = await authedReadJson("/cockpit/panel/" + encodeURIComponent(id) + ".json?profile=full"); }
+      catch (_) { /* a panel that cannot be read is drawn as unavailable by the mapper, never as empty */ }
+    }));
+    return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: panels }, Date.now());
+  }
+
   async function load(opts) {
     const passive = !!(opts && opts.passive);
     if (inflight) {
@@ -245,6 +263,13 @@
     inflight = true;
     if (btn) btn.disabled = true;
     try {
+      if (useManifest) {
+        const mview = await loadManifestView();
+        if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
+        window.LevainDashboard.render(mview, { recall });
+        status("read " + new Date().toLocaleTimeString());
+        return;
+      }
       let res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
       // OFF-BOX BOOTSTRAP (spore-220): an off-box writable surface gates the substrate READS. On the
       // first load we hold no token yet (and don't yet know one is required — that flag rides INSIDE
