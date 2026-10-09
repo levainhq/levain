@@ -53,6 +53,15 @@ def test_level_is_todays_count_against_the_median_day_and_empty_without_data(tmp
     import re
     block = css[re.search(r"prefers-reduced-motion:\s*reduce\)\s*\{\s*\.jar", css).start():]
     assert re.search(r"\.jar-bubble\s*\{\s*display:\s*none", block)
+    # a malformed timestamp row cannot hide real history, and an old-but-quiet store is judged
+    # on its zero days, not as a young one
+    odd = tmp_path / "odd.db"; _store(odd, {0: 2, 1: 4, 2: 4, 3: 4, 4: 4})
+    con = sqlite3.connect(odd); con.execute("INSERT INTO episodes VALUES ('bad','','x','x')"); con.commit(); con.close()
+    assert _read_jar(odd, NOW).status == "ok"
+    con = sqlite3.connect(odd); con.execute("INSERT INTO episodes VALUES ('zz','zzz','x','x')"); con.commit(); con.close()
+    assert _read_jar(odd, NOW).status == "ok"  # a junk row sorting INSIDE the window is skipped too
+    quiet = tmp_path / "quiet.db"; _store(quiet, {20: 3})  # old store, nothing in the window
+    assert _read_jar(quiet, NOW).label == "0 today · no typical day in the last 14 d"
     # the host zone's DST rules apply per instant: on the US fall-back day an episode at
     # 00:30 EDT is still that day's, and a path with URI metacharacters still opens
     import os
@@ -83,8 +92,3 @@ def test_level_is_todays_count_against_the_median_day_and_empty_without_data(tmp
         else:
             os.environ["TZ"] = old
         time.tzset()
-    # a malformed timestamp row cannot hide real history, and an old-but-quiet store is judged
-    # on its zero days, not as a young one
-    odd = tmp_path / "odd.db"; _store(odd, {0: 2, 1: 4, 2: 4, 3: 4, 4: 4})
-    con = sqlite3.connect(odd); con.execute("INSERT INTO episodes VALUES ('bad','','x','x')"); con.commit(); con.close()
-    assert _read_jar(odd, NOW).status == "ok"

@@ -653,8 +653,9 @@ def _read_jar(episodic_db: Path | None, now: datetime) -> "Jar":
         now = now.replace(tzinfo=timezone.utc)
     # Host-local days, resolved PER INSTANT (``astimezone()`` with no argument applies the
     # host zone's DST rules to each timestamp; a fixed offset would mis-bucket across a shift).
-    # ONE statement = one snapshot: the window's rows, each tagged with whether the store holds
-    # anything OLDER than the window (a quiet old store is not a young one). Timestamps are the
+    # ONE statement = one snapshot: the window's rows plus a flag for whether the store holds
+    # anything OLDER than the window (a sentinel row, present even when the window is empty:
+    # a quiet old store is not a young one). Timestamps are the
     # ISO-8601 UTC strings anneal writes; a row in any other shape is skipped, never misread.
     try:
         today = now.astimezone().date()
@@ -666,18 +667,26 @@ def _read_jar(episodic_db: Path | None, now: datetime) -> "Jar":
         con = sqlite3.connect(f"{episodic_db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
         try:
             rows = con.execute(
-                "SELECT timestamp, EXISTS(SELECT 1 FROM episodes WHERE timestamp < ? "
+                "SELECT NULL, EXISTS(SELECT 1 FROM episodes WHERE timestamp < ? "
                 "AND timestamp GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*') "
-                "FROM episodes WHERE timestamp >= ?", (lower, lower),
+                "UNION ALL SELECT timestamp, 0 FROM episodes WHERE timestamp >= ?",
+                (lower, lower),
             ).fetchall()
         finally:
             con.close()
     except (OSError, RuntimeError, OverflowError, sqlite3.Error, ValueError):
-        return empty
+        try:
+            present = episodic_db.exists()
+        except (OSError, RuntimeError):
+            present = False
+        return Jar("no_store", None, None, 0, 0.0,
+                   "store unreadable" if present else "no store to read", None)
     counts: dict[Any, int] = {}
     older = False
     for ts, has_older in rows:
         older = older or bool(has_older)
+        if ts is None:  # the sentinel row carrying the older-than-window flag
+            continue
         day = _local_day(ts)
         if day is not None:
             counts[day] = counts.get(day, 0) + 1
