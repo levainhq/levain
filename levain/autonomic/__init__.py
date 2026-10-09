@@ -76,11 +76,10 @@ Architecture:
 
   The manifest is FROZEN per gate (desk ruling (a), 2026-10-09): the gate freezes the manifest it is
   built with and ``register`` raises ``ManifestFrozen`` from then on. A change to the declarations, a
-  tightening included, takes effect by swapping in a NEW gate on a new manifest, atomically with respect
-  to admission (an admission in flight sees the old gate or the new, never a mix). The trust-tiering
-  fold's standing-policy change MUST use that swap. A test of the swap's atomicity is owed by that fold:
-  on e3e5010 a tightening registered mid-admission did not reproduce a mixed decision (the fence read
-  again at admission differed, so the gate re-checked and reopened the hold at the new rung).
+  tightening included, is a NEW gate on a new manifest. Today that swap is a new process; the in-process
+  swap (one handle every consumer reads the gate through, atomic with respect to admission), and a test
+  of its atomicity, are owed by the trust-tiering fold, whose standing-policy change MUST use it
+  (``ActionManifest`` says what it must hold).
 
 A lesson the fold carries for the surface that will put these decisions in front of a person:
   a perception layer that sees counts and not context asks about tuning, not decisions; LevainConnect's decision surface must not relearn it.

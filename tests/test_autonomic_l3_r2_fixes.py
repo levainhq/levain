@@ -106,6 +106,38 @@ def test_a_manifest_a_gate_holds_cannot_be_edited(tmp_path):
     assert m.frozen
     with pytest.raises(ManifestFrozen):
         m.register("link1", LOW)
+    with pytest.raises(TypeError):
+        m._actions["link1"] = LOW                                      # not through register either
     fresh = ActionManifest({"link0": LOW})
     fresh.register("link1", HIGH)                                      # composing before a gate holds it
     assert not fresh.frozen
+
+
+def test_a_fence_that_moves_once_during_admission_checks_again_and_keeps_the_approval(tmp_path, monkeypatch,
+                                                                                    test_only_confined_executor):
+    # r4 (both seats): the admission check read a fence other than the admission's once (a race); the
+    # gate's verdict for that reopened a valid signed approval instead of checking again
+    w = World(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("r1")
+    pid = w.open_pending_id()
+    yes = signed_yes(w.gate, pid)
+    real_auth, real_rp = w.gate._authorize_admission, gate_mod.EfferentGate._resolve_posture
+    moved = []
+
+    def racing(self, pending, posture, hold):
+        eff, why, fence = real_rp(self, pending, posture, hold)
+        if inside and not moved and fence:
+            moved.append(1)
+            return eff, why, "moved-" + fence
+        return eff, why, fence
+    inside = []
+
+    def auth(hold, fence_now):
+        inside.append(1)
+        return real_auth(hold, fence_now)
+    monkeypatch.setattr(gate_mod.EfferentGate, "_resolve_posture", racing)
+    w.gate._authorize_admission = auth
+    out = w.gate.resolve(pid, yes, chain_owned=True)
+    assert moved and len(inside) >= 2                                  # checked again after the move
+    assert out.fired and ("link1", "r1-1") in w.outbox()

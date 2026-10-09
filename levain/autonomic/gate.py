@@ -277,8 +277,9 @@ class EfferentGate:
         ssh_keygen: str | Path | None = None,
     ) -> None:
         # The manifest is frozen for this gate's lifetime (desk ruling (a), 2026-10-09): a change to it,
-        # a tightening included, is a NEW gate swapped in atomically w.r.t. admission (see
-        # :class:`ActionManifest`); the trust-tiering fold's standing-policy change must use that swap.
+        # a tightening included, is a NEW gate on a new manifest. The swap that exists today is a new
+        # process; the in-process handle the trust-tiering fold must build is described on
+        # :class:`ActionManifest`.
         manifest.freeze()
         self._manifest = manifest
         # The signature verifier: an absolute path to ``ssh-keygen`` (``/usr/bin/ssh-keygen`` unless set

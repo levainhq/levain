@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from types import MappingProxyType
 
 __all__ = ["RiskClass", "ActionRisk", "ActionManifest", "ManifestFrozen", "UnknownAction"]
 
@@ -77,12 +78,20 @@ class ActionManifest:
 
     FROZEN PER GATE (desk ruling (a), 2026-10-09): an :class:`~levain.autonomic.gate.EfferentGate`
     freezes the manifest it is built with, and :meth:`register` raises :class:`ManifestFrozen` from then
-    on. A change to the declarations, a TIGHTENING included, takes effect by building a new manifest and
-    swapping in a new gate built on it, ATOMICALLY with respect to admission: the holder replaces its one
-    reference to the gate, so an admission in flight on the old gate reads only the old manifest and every
-    later one only the new, never a mix of the two. The trust-tiering fold's change to a standing policy
-    MUST take effect through that same swap. A binding risk resolver that reads a manifest of its own
-    (an adapter's tool-risk manifest) freezes it too, and is swapped with the gate it serves."""
+    on, so every admission a gate makes reads one manifest. A change to the declarations, a TIGHTENING
+    included, takes effect by building a new manifest and a new gate on it, never by editing one a gate
+    holds. The only swap that exists is the process: a new process builds a new gate (flow's adapter
+    built one per CLI command when this was written, 2026-10-09: ``grep -n 'build_gate()'
+    scripts/vagus_efferent.py``). An IN-PROCESS swap needs one handle that every consumer of a
+    gate (``FireDispatcher``, ``ChainExecutor``, the sweeps) reads it through, so no caller keeps an old
+    gate after the swap and an admission in flight sees the old gate or the new, never a mix; no such
+    handle is built. The trust-tiering fold's change to a standing policy MUST build that handle and take
+    effect through it, with a test of the swap's atomicity (owed there: on e3e5010 a tightening
+    registered mid-admission did not reproduce a mixed decision, because the fence read again at
+    admission differed and the hold reopened at the new rung). A binding risk resolver that reads a
+    catalog of its own is not frozen by the gate: within one admission the fence holds it to one read
+    (the same e3e5010 run), and freezing it is the adapter's.
+    """
 
     def __init__(self, actions: dict[str, ActionRisk] | None = None) -> None:
         self._actions: dict[str, ActionRisk] = dict(actions or {})
@@ -98,8 +107,11 @@ class ActionManifest:
         self._actions[name] = risk
 
     def freeze(self) -> None:
-        """End composition: every later :meth:`register` raises. Idempotent. The gate calls it."""
+        """End composition: every later :meth:`register` raises. Idempotent. The gate calls it. The
+        declarations become a read-only view, so a write that does not go through :meth:`register` fails
+        too."""
         self._frozen = True
+        self._actions = MappingProxyType(dict(self._actions))  # type: ignore[assignment]
 
     @property
     def frozen(self) -> bool:
