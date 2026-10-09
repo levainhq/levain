@@ -189,12 +189,15 @@ It closes a real hole, too. Git refuses to read the settings of, or run the hook
 
 **The entity's ssh key.** The ssh agent refuses a different user, so the entity cannot use your keys, and levain does not pass your agent to it. Setup prints the entity's public key; add it as a deploy key on each repository the entity should push to.
 
+**Its network, on Linux.** Setup also puts the entity's user behind a network boundary of its own: an nftables rule on its user id that refuses every connection it opens, except to the loopback ports you name with `--egress-port` (where its model proxy listens) and the network git that `levain ws-git` starts (`push`, `fetch`, `pull` and `ls-remote`, which run with a group nothing else of the entity's gets). The rule loads at boot and again whenever `nftables.service` starts, restarts or reloads, and `levain doctor` checks it by trying a connection as the entity's user. An administrator who rewrites the firewall (`nft flush ruleset`, firewalld, ufw) lifts it until it is loaded again; `sudo levain setup-isolation --path <entity>` puts it back. On Linux you push the entity's work with `levain ws-git push`: the entity cannot reach a remote by itself. Setup refuses, by name, on a Linux host without nftables or without systemd running as init.
+
 What setup creates, all undone by `--undo`:
 - the user, with no password and no login shell, and its own group (undo keeps it, disabled, so its id is never reused; `--reenable` brings it back);
 - one sudoers rule that lets your account start commands as that user, and nothing else;
 - the entity's ssh key;
 - the workspace and its permissions (removed only if empty);
-- a refusal of remote login for that user (`DenyUsers`), and an entry in your cron and at deny lists where those exist.
+- a refusal of remote login for that user (`DenyUsers`), and an entry in your cron and at deny lists where those exist;
+- on Linux, the network boundary: its ruleset in `/etc/levain/egress/`, the systemd unit that loads it, and the group network git runs with (undo keeps that group's id retired, like the user's).
 
 When it undoes, everything the entity created stays owned by its retired user id, readable by your group: never yours and never root's, so no git, yours or one run with sudo, trusts anything it wrote. Clone its repositories to keep the work.
 
