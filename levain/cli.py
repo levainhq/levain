@@ -297,6 +297,14 @@ def main(argv: list[str] | None = None) -> int:
             "(the mode a cockpit over a store with no governed write target uses)."
         ),
     )
+    tui_p.add_argument(
+        "--manifest",
+        action="store_true",
+        help=(
+            "Render the shared cockpit manifest (the kernel's panels, order and groups) "
+            "instead of the substrate view. Read-only."
+        ),
+    )
     tui_p.set_defaults(func=_cmd_tui)
 
     focus_p = subparsers.add_parser(
@@ -1227,7 +1235,7 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 def _cmd_tui(args: argparse.Namespace) -> int:
     from levain.tui import run_tui
 
-    return run_tui(path=args.path, read_only=args.read_only)
+    return run_tui(path=args.path, read_only=args.read_only, manifest=args.manifest)
 
 
 def _cmd_focus(args: argparse.Namespace) -> int:

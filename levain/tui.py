@@ -777,7 +777,7 @@ def current_edit_record(model: TuiModel) -> dict[str, Any] | None:
 # never requires curses, and the pure layer stays importable for the test suite).
 # ---------------------------------------------------------------------------
 
-def run_tui(path: Path, *, read_only: bool = False) -> int:
+def run_tui(path: Path, *, read_only: bool = False, manifest: bool = False) -> int:
     """``levain tui`` entry point. Read+write control plane in the terminal.
 
     ``read_only`` runs the inspect-only variant (``--read-only``): every write verb
@@ -818,4 +818,14 @@ def run_tui(path: Path, *, read_only: bool = False) -> int:
 
     # The write target is carried on the source (SubstrateSource.local sets write_scope
     # from the install); main_loop derives read-only from write_scope + the flag.
-    return _tui_curses.main_loop(source, view, read_only=read_only)
+    cockpit = None
+    if manifest:
+        from levain.cockpit.providers import build_default_cockpit
+
+        cockpit = build_default_cockpit(source)
+        cockpit.start()
+    try:
+        return _tui_curses.main_loop(source, view, read_only=read_only, cockpit=cockpit)
+    finally:
+        if cockpit is not None:
+            cockpit.stop()
