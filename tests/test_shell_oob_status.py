@@ -1240,12 +1240,13 @@ def test_a_spawn_whose_group_is_not_tracked_is_refused(tmp_path):
 # --- S2 cgroup v2 frame (Phill 2026-10-09: "yes sorry, that is correct: A'") -------------------
 
 
-_V2 = "cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n"
+_V2 = "cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate 0 0\n"
 
 
 @pytest.mark.parametrize("host, said", [
     (dict(osrelease="5.15.153.1-microsoft-standard-WSL2"), "WSL2"),
     (dict(container=True), "container"),
+    (dict(mounts="cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n"), "nsdelegate"),
     (dict(release="5.10.0-28-amd64"), "5.14"),
     (dict(mounts="tmpfs /sys/fs/cgroup tmpfs ro 0 0\ncgroup2 /sys/fs/cgroup/unified cgroup2 rw 0 0\n"
                  "cgroup /sys/fs/cgroup/memory cgroup rw,memory 0 0\n"), "v1 or hybrid"),
@@ -1265,14 +1266,16 @@ def test_a_host_without_a_cgroup_leaf_is_refused_by_name(host, said):
 def test_linux_a_command_cannot_move_itself_out_of_its_leaf(tmp_path):
     """RUN on argushub 2026-10-09 (1009-13_S2/DESIGN.md P4): bash runs as the operator, and without a
     cgroup namespace it moved itself into another cgroup the operator owns, out of the leaf levain kills.
-    The write must fail and the command must still be in its own leaf."""
+    Neither that move nor a freeze of another operator cgroup may succeed."""
     uid = os.getuid()
     target = Path(f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/levain-escape-{os.getpid()}")
     target.mkdir()
     try:
         with _shell(tmp_path) as sh:
-            r = sh.run(f"echo $$ > {target}/cgroup.procs && echo ESCAPED; cat /proc/self/cgroup", timeout=20)
-        assert "ESCAPED" not in r.output, r.output
+            r = sh.run(f"echo $$ > {target}/cgroup.procs && echo ESCAPED; "
+                       f"echo 1 > {target}/cgroup.freeze && echo FROZE; cat /proc/self/cgroup", timeout=20)
+        assert "ESCAPED" not in r.output and "FROZE" not in r.output, r.output
         assert not (target / "cgroup.procs").read_text().strip()
+        assert (target / "cgroup.freeze").read_text().strip() == "0"
     finally:
         target.rmdir()

@@ -2931,7 +2931,7 @@ class SandboxedShell:
 
     def _after_spawn(self, pgid: int) -> None:
         """Hook: a command's process group exists and its bash is waiting for its input (the bwrap
-        shell records it in its claim). Raising here refuses the command before it can run."""
+        shell confirms it is in its cgroup leaf). Raising here refuses the command before it can run."""
 
     def _after_command(self, pgid: int) -> None:
         """Hook: a command's bash has been reaped and its result is about to be returned."""
@@ -3121,8 +3121,8 @@ class SandboxedShell:
         pgid = leader.pid
         timed_out = False
         try:
-            # bash waits on its stdin until the input arrives, so a refusal here (the claim could not
-            # be recorded) stops the command before any of it runs.
+            # bash waits on its stdin until the input arrives, so a refusal here stops the command
+            # before any of it runs.
             self._after_spawn(pgid)
             carry.send(data)
             if not leader.wait(deadline_s):
@@ -3210,7 +3210,8 @@ class SandboxedShell:
 
     def interrupt(self) -> None:
         """Best-effort SIGINT to the running command's process GROUP (Ctrl-C it and its children).
-        Never raises."""
+        On Linux every signal levain sends a command kills it (:meth:`_BwrapShell._signal`), so there
+        Ctrl-C ends the command, as bwrap's parent-death kill did before. Never raises."""
         leader = self._leader
         # An exited leader is unreaped or gone; neither is Ctrl-C'd.
         if leader is not None and not leader.exited:
@@ -4576,6 +4577,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # operator, could move itself into any other cgroup the operator owns and out of the leaf levain
         # kills (RUN on argushub 2026-10-09: ESCAPED without, refused with; 1009-13_S2/DESIGN.md P4).
         "--unshare-cgroup",
+        # cgroupfs read-only inside: `cgroup.kill` and `cgroup.freeze` check only file permission, not
+        # the cgroup namespace, so bash (the operator's uid) could otherwise stop or freeze any cgroup
+        # the operator owns, another command's leaf or the operator's own services included.
+        "--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup",
     ]
     if policy.deny_localhost_outbound:
         # spore-755 on Linux (option B, see LINUX_LOCALHOST_REFUSAL's comment): a new, empty network
@@ -5292,12 +5297,17 @@ def _cgroup_problem(*, release: str | None = None, osrelease: str | None = None,
         except OSError:
             mounts = ""
     fields = [ln.split() for ln in mounts.splitlines()]
-    unified = any(len(f) > 2 and f[1] == str(root) and f[2] == "cgroup2" for f in fields)
+    v2 = [f for f in fields if len(f) > 3 and f[1] == str(root) and f[2] == "cgroup2"]
     legacy = any(len(f) > 2 and f[2] == "cgroup" for f in fields)
-    if not unified or legacy:
+    if not v2 or legacy:
         return (f"cgroups here are not the unified v2 hierarchy at {root} (v1 or hybrid), which "
                 "levain needs to account for every process of a command",
                 "boot with the unified cgroup hierarchy (`systemd.unified_cgroup_hierarchy=1`)")
+    # Without `nsdelegate` a cgroup namespace is not a delegation boundary, and a command could move
+    # itself out of its leaf despite `--unshare-cgroup` (kernel cgroup-v2.rst, "nsdelegate").
+    if "nsdelegate" not in v2[-1][3].split(","):
+        return (f"cgroup2 at {root} is mounted without `nsdelegate`, so a command could leave its "
+                "cgroup", "mount cgroup2 with `nsdelegate` (systemd does this by default)")
     if not (os.path.isfile(SYSTEMD_RUN) and os.access(SYSTEMD_RUN, os.X_OK)):
         return (f"{SYSTEMD_RUN} is missing: levain puts each command in a systemd user scope",
                 "use a systemd host")
@@ -5310,6 +5320,9 @@ def _cgroup_problem(*, release: str | None = None, osrelease: str | None = None,
         ok = False
     if not ok:
         return (f"your systemd user manager is not running ({mgr} is absent or not yours)", _LINGER_REMEDY)
+    if root == _CGROUP_ROOT and not os.path.exists(f"/run/user/{uid}/bus"):
+        return (f"your systemd user manager has no bus at /run/user/{uid}/bus yet, which "
+                "`systemd-run --user` needs", _LINGER_REMEDY)
     return None
 
 
@@ -6223,6 +6236,10 @@ class _BwrapShell(SandboxedShell):
         # when that leader is reaped. The leaf, not a pid, answers "may anything of it still run".
         self._leaves: dict[int, tuple[_Leader, str]] = {}
         self._pending_leaf: str | None = None   # named for the spawn in progress, before its leader exists
+        # EVERY leaf named for a spawn, from the moment it is named until it is confirmed empty with its
+        # driver exited: leaf -> its driver, None while none exists yet. Nothing in between is untracked,
+        # so the claim is never released, nor retagged away, while any of them may hold a sandbox.
+        self._named: dict[str, _Leader | None] = {}
         self._unit_token = os.urandom(6).hex()
         self._units = 0
 
@@ -6270,13 +6287,44 @@ class _BwrapShell(SandboxedShell):
             rec = self._leaves.get(pgid)
             if rec is not None and rec[0] is leader:
                 del self._leaves[pgid]
+                self._named.pop(rec[1], None)   # reaped only once its leaf was confirmed empty
         return True
+
+    def _settled(self) -> bool:
+        """Every named leaf is empty and its driver has exited (a leaf with no driver yet is not)."""
+        with self._lock:
+            named = list(self._named.items())
+        for leaf, leader in named:
+            if leader is None or not leader.wait(0) or not _leaf_gone(leaf, timeout=5.0):
+                return False
+            with self._lock:
+                if self._named.get(leaf) is leader:
+                    del self._named[leaf]
+        return True
+
+    def _spawn(self) -> tuple[_Leader, _Output, _Carry]:
+        try:
+            return super()._spawn()
+        except BaseException:
+            # A spawn that failed before its driver was recorded (Popen raised, or the watch could not
+            # be set up and the driver was killed): kill whatever reached its leaf, and stop tracking
+            # it only once it is empty.
+            with self._lock:
+                leaf, self._pending_leaf = self._pending_leaf, None
+            if leaf is not None and self._named.get(leaf, False) is None:
+                _leaf_kill(leaf)
+                if _leaf_gone(leaf, timeout=5.0):
+                    with self._lock:
+                        if self._named.get(leaf, False) is None:
+                            del self._named[leaf]
+            raise
 
     def _leader_made(self, leader: _Leader) -> None:
         with self._lock:
             leaf, self._pending_leaf = self._pending_leaf, None
             if leaf is not None:
                 self._leaves[leader.pid] = (leader, leaf)
+                self._named[leaf] = leader
 
     def close(self) -> None:
         # The claim is released only once every leaf is EMPTY, never while any process of a sandbox
@@ -6290,18 +6338,13 @@ class _BwrapShell(SandboxedShell):
         finally:
             claim, self._ledger_claim = self._ledger_claim, None
             _LIVE_BWRAP_SHELLS.discard(self)
-            with self._lock:
-                leaves = [leaf for _, leaf in self._leaves.values()]
-            if claim is not None and not self.unemptied_groups and all(
-                    _leaf_gone(leaf, timeout=5.0) for leaf in leaves):
+            if claim is not None and not self.unemptied_groups and self._settled():
                 _ledger_release(claim)
 
     def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
         # One command at a time on the claim: it names one leaf, so an earlier one still populated
         # refuses this command (a retag would stop the claim covering it).
-        with self._lock:
-            leaves = [leaf for _, leaf in self._leaves.values()]
-        if not all(_leaf_gone(leaf, timeout=5.0) for leaf in leaves):
+        if not self._settled():
             raise ConfinementError(
                 "an earlier command's sandbox could not be stopped — refusing to run the command "
                 "(fail-closed): the shell's claim must keep covering it, so close this shell."
@@ -6328,7 +6371,9 @@ class _BwrapShell(SandboxedShell):
                     "the floor's files could not be recorded."
                 )
             self._ledger_claim = tagged
-        self._pending_leaf = leaf
+        with self._lock:
+            self._pending_leaf = leaf
+            self._named[leaf] = None
         # systemd-run finds the user manager through XDG_RUNTIME_DIR; bash does not get it unless the
         # caller gave it, so a second env drops it again after the move.
         scope = [SYSTEMD_RUN, "--user", "--scope", "--quiet", "--collect", f"--slice={_LEVAIN_SLICE}",
@@ -6351,6 +6396,7 @@ class _BwrapShell(SandboxedShell):
             )
         leader, leaf = rec
         want = f"0::/{leaf}"
+        unit = leaf.rsplit("/", 1)[-1]
         deadline = time.monotonic() + _START_TIMEOUT
         while True:
             try:
@@ -6359,7 +6405,19 @@ class _BwrapShell(SandboxedShell):
                 now = ""
             if now == want:
                 return
-            if leader.exited or time.monotonic() >= deadline:
+            if now.startswith("0::/") and now.endswith(f"/{unit}"):
+                # Its own scope (the unit name is unique) under a layout `_leaf_rel` did not predict:
+                # kill and wait on the path it is really in, then refuse.
+                seen = now[len("0::/"):]
+                with self._lock:
+                    self._leaves[pgid] = (leader, seen)
+                    self._named.pop(leaf, None)
+                    self._named[seen] = leader
+                raise ConfinementError(
+                    f"the command's cgroup is {seen}, not {leaf} as levain expects for this systemd — "
+                    "refusing to run the command (fail-closed)."
+                )
+            if leader.wait(0) or time.monotonic() >= deadline:
                 raise ConfinementError(
                     "the command's sandbox did not start in its cgroup (systemd-run --user failed or "
                     "stalled; `levain doctor` checks it) — refusing to run the command (fail-closed)."
