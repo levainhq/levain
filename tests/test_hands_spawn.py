@@ -1099,7 +1099,8 @@ def test_close_waits_for_an_admitted_command_until_its_spawn_is_registered(monke
 def test_a_close_whose_wait_times_out_keeps_the_claim(monkeypatch):
     """codex + glm + complement L3 r7, RUN on w23: when close()'s wait timed out with a preflight still
     outstanding (a check stuck on a hung mount), it released the claim, and the run then spawned without
-    one. The claim is now kept; once the preflight drains, a close() releases it as before."""
+    one; L3 r8, RUN on w24: kept but detached, the late spawn still saw none. The shell keeps it, and a
+    close() once the preflight drained releases it."""
     import threading
 
     shell = object.__new__(confinement._BwrapShell)
@@ -1124,9 +1125,9 @@ def test_a_close_whose_wait_times_out_keeps_the_claim(monkeypatch):
     closer = threading.Thread(target=shell.close)
     closer.start()
     closer.join(5)
-    assert not closer.is_alive() and released == []   # the wait timed out: the claim is kept
+    assert not closer.is_alive() and released == []   # the wait timed out: the claim is kept,
+    assert shell._ledger_claim == "the-claim"          # still the shell's, so a late spawn retags it
 
     shell._end_preflight()
-    shell._ledger_claim = "the-claim"
-    shell.close()                                   # drained: released as before
-    assert released == ["the-claim"]
+    shell.close()                                   # drained: the next close() releases it
+    assert released == ["the-claim"] and shell._ledger_claim is None
