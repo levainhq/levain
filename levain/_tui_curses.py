@@ -750,8 +750,8 @@ def _safe_addstr(stdscr: "curses.window", y: int, x: int, text: str, attr: int =
     s = text[:avail]
     try:
         stdscr.addstr(y, x, s, attr)
-    except curses.error:
-        pass  # last-cell write; harmless
+    except (curses.error, UnicodeError):
+        pass  # last-cell write, or a string the terminal encoding cannot carry; harmless
 
 
 def _paint(stdscr: "curses.window", model: TuiModel) -> TuiModel:

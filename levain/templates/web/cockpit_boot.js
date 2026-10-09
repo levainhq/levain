@@ -27,7 +27,7 @@
   let askedForToken = false;
   async function getJson(url) {
     let r = await fetch(url, { headers: headers(), cache: "no-cache" });
-    if (r.status === 403 && !askedForToken) {
+    if (r.status === 403 && !askedForToken) {   // reset below whenever a request succeeds or a typed token is rejected
       // an off-box writable surface gates the reads on the device token (as the dashboard does): ask
       // once, keep it in localStorage, retry. A loopback surface never reaches here.
       askedForToken = true;
@@ -35,8 +35,13 @@
       if (tok) {
         try { window.localStorage.setItem("levain_write_token", tok); } catch (_) { /* ignore */ }
         r = await fetch(url, { headers: headers(), cache: "no-cache" });
+        if (r.status === 403) {   // the typed token was wrong: forget it and let the next poll ask again
+          try { window.localStorage.removeItem("levain_write_token"); } catch (_) { /* ignore */ }
+          askedForToken = false;
+        }
       }
     }
+    if (r.ok) askedForToken = false;
     if (!r.ok) throw new Error(url + " → HTTP " + r.status);
     return r.json();
   }
