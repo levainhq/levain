@@ -15,14 +15,14 @@
   function visible(v) {
     // every Unicode Cc/Cf (controls, format and bidi characters) plus the line/paragraph separators,
     // matching the terminal renderer's category test
-    return String(v === null || v === undefined ? "" : v).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu,
+    return String(v === null || v === undefined ? "" : v).replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu,
       (ch) => "<U+" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + ">");
   }
 
   function age(iso, now) {
     if (!iso) return "never";
     // an offset-less timestamp is UTC, as in the terminal renderer
-    const t = Date.parse(/(Z|[+-]\d\d:?\d\d)$/i.test(iso) ? iso : iso + "Z");
+    const t = Date.parse((iso.indexOf("T") < 0 || /(Z|[+-]\d\d:?\d\d)$/i.test(iso)) ? iso : iso + "Z");
     if (isNaN(t)) return visible(iso);
     const s = Math.max(0, Math.floor((now - t) / 1000));
     if (s >= 86400) return Math.floor(s / 86400) + "d ago";
