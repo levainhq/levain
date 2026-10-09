@@ -1130,6 +1130,20 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
         return 0
 
     if cfg.hands_user is not None:
+        if host == "linux" and not dry_run:
+            # An install from before the cgroup frame has no linger, and "run setup again" is its
+            # remedy: the one step it is missing runs here, idempotently, without an undo (L3 r9).
+            try:
+                r = subprocess.run([_abs("loginctl"), "enable-linger", operator], capture_output=True,
+                                   text=True, timeout=30, env=child_env())
+                ok, said = r.returncode == 0, (r.stderr or "").strip()
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                ok, said = False, str(exc)
+            print(f"setup-isolation: linger for {operator}: "
+                  + ("on (each command's cgroup scope needs your systemd user manager running)." if ok
+                     else f"could not enable it ({said or 'no reason given'})."))
+            if not ok:
+                return 1
         print(f"setup-isolation: {entity_dir} is already set up (user {cfg.hands_user}). "
               "Run with --undo first to set it up again.")
         return 1

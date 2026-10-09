@@ -1275,7 +1275,11 @@ def test_linux_a_command_cannot_move_itself_out_of_its_leaf(tmp_path):
             r = sh.run(f"echo $$ > {target}/cgroup.procs && echo ESCAPED; "
                        f"echo 1 > {target}/cgroup.freeze && echo FROZE; cat /proc/self/cgroup", timeout=20)
         assert "ESCAPED" not in r.output and "FROZE" not in r.output, r.output
+        assert "Read-only file system" in r.output, r.output   # refused by the read-only cgroupfs
         assert not (target / "cgroup.procs").read_text().strip()
         assert (target / "cgroup.freeze").read_text().strip() == "0"
     finally:
-        target.rmdir()
+        try:
+            target.rmdir()
+        except OSError:
+            pass   # an escaped process keeps it busy; the asserts above already said so

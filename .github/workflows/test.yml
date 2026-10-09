@@ -76,7 +76,7 @@ jobs:
           # Each command runs in a cgroup leaf of the runner user's systemd user manager; a runner has no
           # login session, so linger starts that manager (what `sudo levain setup-isolation` does).
           sudo loginctl enable-linger "$(id -un)"
-          for i in $(seq 1 50); do test -d "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service" && break; sleep 0.2; done
+          for i in $(seq 1 50); do test -d "/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service" && test -S "/run/user/$(id -u)/bus" && break; sleep 0.2; done
           XDG_RUNTIME_DIR="/run/user/$(id -u)" systemd-run --user --scope --quiet --collect /bin/true && echo "user scope ok"
 
       - name: Make the runner's container-daemon socket directory readable

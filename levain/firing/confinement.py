@@ -5326,6 +5326,28 @@ def _cgroup_problem(*, release: str | None = None, osrelease: str | None = None,
     return None
 
 
+def _leaf_chain_problem() -> str | None:
+    """Run the launch chain every command uses, minus the floor's mounts: a transient user scope
+    around ``bwrap --unshare-pid --unshare-cgroup`` with cgroupfs read-only. None when it ran, else what
+    it said. Static checks cannot see an LSM, a seccomp profile or a user manager that refuses (L3 r9)."""
+    started = _proc_start_time(os.getpid())
+    if started is None:
+        return "levain cannot read its own start time from /proc"
+    unit = f"levain-{os.getpid()}-{started}-{os.urandom(6).hex()}-0"
+    argv = ["/usr/bin/env", f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}", SYSTEMD_RUN, "--user", "--scope",
+            "--quiet", "--collect", f"--slice={_LEVAIN_SLICE}", f"--unit={unit}", "--",
+            BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--unshare-pid",
+            "--unshare-cgroup", "--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup", "/bin/true"]
+    try:
+        r = subprocess.run(argv, capture_output=True, timeout=20, env=_probe_env())
+    except (OSError, subprocess.SubprocessError) as exc:
+        return str(exc)
+    if r.returncode == 0:
+        return None
+    said = r.stderr.decode("utf-8", "replace").strip().splitlines()
+    return said[-1] if said else f"exit {r.returncode}"
+
+
 def _leaf_populated(rel: str) -> bool | None:
     """True or False from the leaf's ``cgroup.events``; None when the leaf is absent (removed)."""
     try:
@@ -5348,7 +5370,7 @@ def _leaf_kill(rel: str) -> bool:
     try:
         (_CGROUP_ROOT / rel / "cgroup.kill").write_text("1")
     except FileNotFoundError:
-        return True
+        return not (_CGROUP_ROOT / rel).exists()   # the leaf is gone; a leaf with no cgroup.kill is not
     except OSError as exc:
         return exc.errno == errno.ENODEV
     return True
@@ -5738,45 +5760,53 @@ def _claim_alive(claim: str) -> bool:
         return True   # made in another pid namespace: not ours to judge, so kept
     try:
         os.kill(pid, 0)
+        owner = True
     except ProcessLookupError:
-        # levain is gone, but its sandbox may not be: bwrap's PDEATHSIG does not reach a namespace
-        # init cloned in the window before it is armed (bubblewrap #633, #700). The claim names the
-        # leaf of the command it covers (tagged before that command was spawned), so the sweep kills
-        # the leaf, and keeps the claim until it is empty.
-        if len(parts) >= 5 and parts[4].startswith("c"):
-            rel = parts[4][1:]
-            if not _is_levain_leaf(rel, os.getuid()):
-                return True   # not a leaf levain makes here: not ours to judge, so kept
-            _leaf_kill(rel)
-            return not _leaf_gone(rel, timeout=5.0)
-        # A claim tagged by the previous build names the command's bash: kept while that pid exists.
-        if len(parts) >= 5 and parts[4].startswith("b"):
-            try:
-                os.kill(int(parts[4][1:].partition("@")[0]), 0)
-                return True
-            except (ValueError, ProcessLookupError):
-                return False
-            except PermissionError:
-                return True
-        # A claim tagged by an earlier build names the command's process group.
-        if len(parts) >= 5 and parts[4].startswith("g"):
-            try:
-                os.killpg(int(parts[4][1:]), 0)
-                return True
-            except (ValueError, ProcessLookupError):
-                return False
-            except PermissionError:
-                return True
-        return False
+        owner = False
     except PermissionError:
         return True   # someone else's process with that pid: alive, so the claim is kept
     except OSError:
-        return False
-    if len(parts) >= 4 and parts[1] != "-":
+        owner = False
+    if owner and len(parts) >= 4 and parts[1] != "-":
         now = _proc_start_time(pid)
-        if now is not None and now != parts[1]:
-            return False   # the pid was reused by a process that started later
-    return True
+        owner = now is None or now == parts[1]   # a later start: the pid was reused
+    if owner:
+        return True
+    # levain is gone (dead, or its pid now another process's), but its sandbox may not be: bwrap's
+    # PDEATHSIG does not reach a namespace init cloned before it is armed (bubblewrap #633, #700). The
+    # tag says what the claim covers, and each kind is judged on its own (L3 r9: a reused pid dropped
+    # the claim without looking at the leaf).
+    tag = parts[4] if len(parts) >= 5 else ""
+    if tag.startswith("c"):
+        # The leaf of the command it covers, tagged before that command was spawned: kill it, and keep
+        # the claim while it is populated (the next sweep looks again; no wait under the ledger lock).
+        rel = tag[1:]
+        if not _is_levain_leaf(rel, os.getuid()):
+            return True   # not a leaf levain makes here: not ours to judge, so kept
+        _leaf_kill(rel)
+        return not _leaf_gone(rel, timeout=0.5)
+    if tag.startswith("b"):
+        # The previous build's tag: the command's bash, pid 1 of its namespace, by pid and kernel start
+        # time; a zombie pid 1 means its namespace is already empty.
+        pid_s, _, start = tag[1:].partition("@")
+        try:
+            data = Path(f"/proc/{int(pid_s)}/stat").read_text()
+        except (ValueError, OSError):
+            return False
+        fields = data.rsplit(")", 1)[-1].split()
+        if len(fields) < 20 or fields[0] in ("Z", "X", "x"):
+            return False
+        return start in ("", "-") or fields[19] == start
+    if tag.startswith("g"):
+        # An earlier build's tag names the command's process group.
+        try:
+            os.killpg(int(tag[1:]), 0)
+            return True
+        except (ValueError, ProcessLookupError):
+            return False
+        except PermissionError:
+            return True
+    return False
 
 
 def _object_unchanged(entry: dict) -> bool:
@@ -5942,7 +5972,10 @@ def _ledger_release(claim: str) -> list[str]:
 def sweep_floor_placeholders() -> list[str]:
     """Drop the claims of processes that no longer exist and remove the objects nobody holds. Run
     inside every Linux spawn's own transaction, at launch (:mod:`levain.launch`) and by
-    ``levain doctor``. Returns the paths removed."""
+    ``levain doctor``. Returns the paths removed. A crashed levain's cgroup leaves are killed first, so
+    the claims that name them are judged on leaves that are emptying (L3 r9)."""
+    if platform.system() == "Linux":
+        sweep_dead_leaves()
     if not (_ledger_dir() / _LEDGER_NAME).exists():
         return []
     with _LedgerTxn() as txn:
@@ -6354,8 +6387,13 @@ class _BwrapShell(SandboxedShell):
             raise ConfinementError(f"{problem[0]} — refusing to run the command (fail-closed)."
                                    + (f" To fix: {problem[1]}." if problem[1] else ""))
         argv, pass_fds = super()._spawn_argv()
+        started = _proc_start_time(os.getpid())
+        if started is None:
+            # The unit name carries it, so a crash sweep can tell this levain's leaves from a live one's.
+            raise ConfinementError("levain cannot read its own start time from /proc — refusing to run the "
+                                   "command (fail-closed): a crash could not be told from a live levain.")
         self._units += 1
-        unit = f"levain-{os.getpid()}-{_proc_start_time(os.getpid())}-{self._unit_token}-{self._units}"
+        unit = f"levain-{os.getpid()}-{started}-{self._unit_token}-{self._units}"
         leaf = _leaf_rel(os.getuid(), unit)
         # The claim names the leaf BEFORE anything is spawned in it: after a levain crash at any later
         # point the sweep finds the leaf, kills it, and keeps the claim until it is empty.
@@ -6495,7 +6533,7 @@ class BwrapProvider(ConfinementProvider):
     localhost_deny_removes_network = True
 
     def available(self) -> bool:
-        return _cgroup_problem() is None and bwrap_available()
+        return _cgroup_problem() is None and bwrap_available() and _leaf_chain_problem() is None
 
     def localhost_deny_ready(self) -> bool:
         return bwrap_netns_available()
@@ -6838,6 +6876,12 @@ def diagnose_confinement(system: str | None = None) -> ConfinementDiagnosis:
     problem = _cgroup_problem()
     if problem is not None:
         return ConfinementDiagnosis(False, "bwrap (Linux mount namespace)", problem[0], problem[1])
+    if bwrap_available():
+        said = _leaf_chain_problem()
+        if said is not None:
+            return ConfinementDiagnosis(
+                False, "bwrap (Linux mount namespace)",
+                f"a command cannot start in its own cgroup scope here ({said})", _LINGER_REMEDY)
     if provider.available():
         return ConfinementDiagnosis(True, "bwrap (Linux mount namespace)",
                                     "Linux bwrap floor active", None)
