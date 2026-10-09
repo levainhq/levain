@@ -20,7 +20,7 @@ def test_j1_the_hook_fetch_decides_again_under_the_op(two, monkeypatch):
     def other_refresh():
         with gl(ben).op(timeout=5):
             got.set()
-            time.sleep(0.2)
+            time.sleep(0.1)     # well inside the 0.5 s op wait (code L3 r9 complement)
             gl(ben).save_state(last_fetch_attempt=time.time(), last_fetch_ok=time.time())
     t = threading.Thread(target=other_refresh)
     t.start()

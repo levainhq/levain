@@ -16,7 +16,7 @@ from . import roles as R
 from . import wire as W
 from .export import export_stream
 from .hook import decide
-from .transport import GitLedger, JoinIncomplete, Repo, TeamError
+from .transport import GitLedger, InitIncomplete, JoinIncomplete, Repo, TeamError
 
 
 def _repo(args) -> Repo:
@@ -81,15 +81,26 @@ def cmd_init(args) -> int:
     members, keys = _members(args.member)
     team = R.Team(project=args.project or repo.toplevel.name, owner=args.owner, members=members,
                   client_owners=_split(args.client_owner), mode=args.mode, fetch_interval=args.fetch_interval)
-    print(gl.init(team, member_keys=keys, remote=args.remote, push=not args.no_push, signing_key=args.signing_key,
-                  replace_legacy=args.replace_legacy))
-    if args.anneal_db:
-        gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
-    if args.pack:
-        written = P.seed(gl, Path(args.pack), push=not args.no_push)
-        print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
-    if not args.no_install:
-        _install_all(repo)
+    incomplete = None
+    try:
+        print(gl.init(team, member_keys=keys, remote=args.remote, push=not args.no_push, signing_key=args.signing_key,
+                      replace_legacy=args.replace_legacy))
+    except InitIncomplete as exc:
+        incomplete = exc        # initialised: the clone's own setup below still runs, then the command fails
+    try:
+        if args.anneal_db:
+            gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
+        if args.pack and incomplete is None:
+            written = P.seed(gl, Path(args.pack), push=not args.no_push)
+            print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
+        if not args.no_install:
+            _install_all(repo)
+    except Exception as exc:
+        if incomplete is not None:
+            raise incomplete from exc       # what is still pending is the message a person must read (as join)
+        raise
+    if incomplete is not None:
+        raise incomplete
     return 0
 
 

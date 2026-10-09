@@ -58,6 +58,11 @@ class JoinIncomplete(TeamError):
     did not: the clone IS joined and its state stays; the command still does not report success."""
 
 
+class InitIncomplete(TeamError):
+    """`init` created and pinned the ledger, but a later step (the derivation check, the worktree, the push) did not
+    complete: the clone IS initialised and its state stays; the command still does not report success."""
+
+
 class TeamBusy(TeamError):
     """A lock was not acquired in time."""
 
@@ -255,7 +260,7 @@ class GitLedger:
     # ---- locking -----------------------------------------------------------------------------------------
 
     @contextlib.contextmanager
-    def lock(self, *, exclusive: bool = True, timeout: float = 30.0, name: str = "lock"):
+    def lock(self, *, exclusive: bool = True, timeout: float = 30.0, name: str = "lock", _lower: bool = True):
         """flock on levain-team/<name>. ``lock`` guards the worktree; ``net`` serialises fetch/push.
 
         Raises TeamBusy if not acquired within timeout.
@@ -273,7 +278,16 @@ class GitLedger:
                     if time.monotonic() >= deadline:
                         raise TeamBusy("ledger busy (another levain team operation holds the lock)") from None
                     time.sleep(0.05)
-            yield
+            if not _lower:          # the op lock itself: not one of the locks it is ordered above
+                yield
+                return
+            below = self._below()
+            key = self._op_key()
+            below[key] = below.get(key, 0) + 1
+            try:
+                yield
+            finally:
+                below[key] -= 1
         finally:
             os.close(fd)  # closing the descriptor releases the flock
 
@@ -287,12 +301,15 @@ class GitLedger:
         (the hook's lock-free bookkeeping, session denials and fetch stamps, is not one).
 
         Reentrant in the thread that holds it (join -> sync -> re-land -> update_counted nest); any other thread or
-        process waits up to ``timeout`` and then gets TeamBusy. Order: op -> net -> worktree -> state.
+        process waits up to ``timeout`` and then gets TeamBusy. Order: op -> net -> worktree -> state, and op() enforces
+        its own place in it: a fresh acquisition by a thread that already holds a lower lock of this clone raises,
+        loudly, instead of stalling behind itself (code L3 r9 codex 5).
 
         The depth is keyed by the process id too: a child forked while the op is held does not hold it (it opens a
         fresh lock, which the description it inherited keeps busy, so it is refused, never run unguarded). Levain does
         not fork under the op; r7's at-fork handler for that unrun path was DELETED (code L3 r8 codex 1+2: it was
-        already growing guards of its own)."""
+        already growing guards of its own). Accepted, not guarded (code L3 r9 codex 3): a fork child that outlives its
+        parent holds the lock until it exits."""
         held = getattr(_OP, "held", None)
         if held is None:
             held = _OP.held = {}
@@ -304,7 +321,10 @@ class GitLedger:
             finally:
                 held[key] -= 1
         else:
-            with self.lock(name="op", timeout=timeout):
+            if self._below().get(key):
+                raise TeamError("internal: the team operation lock was taken while this thread held one of the clone's "
+                                "lower locks (the order is op first); nothing was changed")
+            with self.lock(name="op", timeout=timeout, _lower=False):
                 held[key] = 1
                 try:
                     yield
@@ -313,6 +333,14 @@ class GitLedger:
 
     def _op_key(self) -> tuple[str, int]:
         return os.path.realpath(self.base), os.getpid()
+
+    @staticmethod
+    def _below() -> dict:
+        """Per thread: (clone base, pid) -> how many of the clone's locks below the op this thread holds."""
+        below = getattr(_OP, "below", None)
+        if below is None:
+            below = _OP.below = {}
+        return below
 
     def _require_op(self) -> None:
         """Fails where a step that decides from state and then writes it runs outside the op (point of use)."""
@@ -371,10 +399,11 @@ class GitLedger:
         except S.SigningError as exc:
             raise TeamError(f"the signing key {k} cannot be used: {exc}; nothing was changed") from None
 
-    def _sign_cfg(self) -> list[str]:
-        """The one signing wrapper's git config. Every commit levain writes passes through it."""
+    def _sign_cfg(self, key: str | None = None) -> list[str]:
+        """The one signing wrapper's git config. Every commit levain writes passes through it. ``key``: an explicit,
+        already-proven key not yet saved (init's genesis), else this clone's own."""
         from . import signing as S
-        key = self.signing_key
+        key = key or self.signing_key
         if not key:
             self.signing_pubkey()   # raises the how-to
         return S.sign_config(key)
@@ -517,14 +546,14 @@ class GitLedger:
                 out.append(name)
         return sorted(out)
 
-    def _genesis_commit(self, tree_text: dict[str, str], message: str) -> str:
+    def _genesis_commit(self, tree_text: dict[str, str], message: str, *, key: str | None = None) -> str:
         top = self.repo.toplevel
         rows = []
         for name, text in sorted(tree_text.items()):
             blob = git(["hash-object", "-w", "--stdin"], top, input_text=text).stdout.strip()
             rows.append(f"100644 blob {blob}\t{name}")
         tree = git(["mktree"], top, input_text="\n".join(rows) + "\n").stdout.strip()
-        cp = subprocess.run(["git", *_NO_HOOKS, *self._sign_cfg(), "commit-tree", "-S", tree, "-m", message],
+        cp = subprocess.run(["git", *_NO_HOOKS, *self._sign_cfg(key), "commit-tree", "-S", tree, "-m", message],
                             cwd=str(top), capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
                             env={**{k: v for k, v in os.environ.items() if k not in _SCRUB_ENV},
                                  "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", **self._sign_env()})
@@ -568,32 +597,35 @@ class GitLedger:
             except S.SigningError as exc:
                 raise TeamError(f"{h}'s key cannot be used: {exc}") from None
             ten.pending_keys[h] = [line.strip()]
-        # saved only now that every refusal has run (code L3 r7 complement 1 + codex 4: a refused member key left the
-        # key saved), and put back if the genesis cannot be made (the genesis signs with the saved key)
-        prior = self.state().get("signing_key")
-        if signing_key:
-            self.save_state(signing_key=signing_key)
-        commit = ""
-        try:
-            commit = self._genesis_commit({T.TEAM_FILE: R.dump_team(team), T.TENURE_FILE: T.dump_tenure(ten)},
-                                          f"levain team: init strict ledger for {team.project}")
-            git(["update-ref", self.ref, commit, ""], self.repo.toplevel)
-            self.save_state(device=self._new_device(), remote=remote or "", branch=self.branch, pinned_root=commit,
-                            anchor=None, accepted={}, distrust=[])
-        except BaseException:
-            # nothing of a failed init stays: the key, and the branch it created (code L3 r8 complement 7)
-            if commit:
-                git(["update-ref", "-d", self.ref, commit], self.repo.toplevel, check=False)
+        # join's frame (code L3 r4), not a roll-back (code L3 r9 codex 2: init's roll-back grew every round): every
+        # refusal ran above; the genesis signs with the proposed key itself, so nothing is saved to make it; the ref
+        # is created, then the key, its fingerprint and the pin are persisted in ONE save. A failure before that save
+        # leaves only an unreferenced genesis object (or a branch with no pin, which the next init refuses by name); a
+        # failure after it keeps the new state and says what is still needed.
+        fp = S.fingerprint(own)
+        commit = self._genesis_commit({T.TEAM_FILE: R.dump_team(team), T.TENURE_FILE: T.dump_tenure(ten)},
+                                      f"levain team: init strict ledger for {team.project}", key=signing_key)
+        git(["update-ref", self.ref, commit, ""], self.repo.toplevel)
+        branch, device = self.branch, self._new_device()
+
+        def persist(st: dict) -> None:
+            st.update(device=device, remote=remote or "", branch=branch, pinned_root=commit, anchor=None, accepted={},
+                      distrust=[])
             if signing_key:
-                self.save_state(_mutate=lambda st: st.pop("signing_key", None) if prior is None
-                                else st.__setitem__("signing_key", prior))
-            raise
-        self._remember_own_key()
-        self.derivation()      # proves the genesis judges, before anything is pushed
-        self._attach_worktree()
+                st["signing_key"] = signing_key
+            st["own_keys"] = list(dict.fromkeys([*(st.get("own_keys") or []), fp]))
+        self.save_state(_mutate=persist)
+        self._dcache = None
+        try:
+            self.derivation()      # proves the genesis judges, before anything is pushed
+            self._attach_worktree()
+            if remote and push:
+                self._sync(push=True)
+        except TeamError as exc:
+            raise InitIncomplete(f"initialised and pinned {branch} (genesis {commit[:12]}) on this clone, still "
+                                 f"needs: {exc}") from exc
         if remote and push:
-            self._sync(push=True)
-            return f"strict ledger created and pushed to {remote}/{self.branch} (genesis {commit[:12]})"
+            return f"strict ledger created and pushed to {remote}/{branch} (genesis {commit[:12]})"
         return f"strict ledger created locally ({'no remote' if not remote else 'not pushed'}; genesis {commit[:12]})"
 
     def join(self, *, remote: str | None = None, new_device: bool = False, root: str | None = None,
@@ -927,7 +959,11 @@ class GitLedger:
     def _append_in_op(self, entry: dict, *, push: bool, deadline: float) -> dict:
         self.require_joined()
         self._require_own_key_in_force(entry["author"])
-        with self.lock(timeout=max(0.05, deadline - time.monotonic())):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            # the budget is spent waiting for the op: busy, never a last 50 ms attempt (code L3 r9 complement 4)
+            raise TeamBusy("ledger busy (another levain team operation holds the lock)")
+        with self.lock(timeout=left):
             self._recover_dirty()
             self._dcache = None
             ledger = self.ledger()
@@ -1548,14 +1584,22 @@ class GitLedger:
             # the op first, the attempt stamped only once it is held: a busy op is NOT another sync (it may be any team
             # command), so it is reported and retried next time, never recorded as an attempt (code L3 r7 codex 3 +
             # complement 3: the hook showed the old copy with no note and did not retry for a whole interval)
+            stamp: list = []        # [prior, ours] once this call has stamped an attempt
             try:
                 with self.op(timeout=0.5):
                     # decided again under the op: another caller may have just refreshed (code L3 r8 codex 5)
-                    if time.time() - float(self.state().get("last_fetch_attempt") or 0) < interval:
+                    prior = self.state().get("last_fetch_attempt")
+                    if time.time() - float(prior or 0) < interval:
                         return None
-                    self.save_state(last_fetch_attempt=time.time())
+                    stamp[:] = [prior, time.time()]
+                    self.save_state(last_fetch_attempt=stamp[1])
                     self._sync_in_op(push=False, timeout=timeout, net_timeout=0.5, lock_timeout=3.0)
             except TeamBusy:
+                if stamp:
+                    # busy INSIDE the body (net or worktree): not an attempt either, so the prior stamp is put back
+                    # unless another caller stamped since (code L3 r9 complement 2)
+                    self.save_state(_mutate=lambda st: st.__setitem__("last_fetch_attempt", stamp[0])
+                                    if st.get("last_fetch_attempt") == stamp[1] else None)
                 # reported only when the copy shown is itself older than the interval: an overlapping refresh by
                 # another caller stays quiet (code L3 r8 complement 2)
                 if time.time() - float(self.state().get("last_fetch_ok") or 0) < max(interval, 1.0):

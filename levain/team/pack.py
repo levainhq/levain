@@ -52,13 +52,14 @@ def plan(judgment: R.Judgment, existing: dict[str, dict],
 
 def seed(gl: GitLedger, pack_dir: Path, *, push: bool = True) -> list[dict]:
     path = pack_dir / R.JUDGMENT_FILE
-    if not path.is_file():
-        raise TeamError(f"{pack_dir} has no {R.JUDGMENT_FILE}")
-    judgment = R.load_judgment(path)
     # One pack-sync at a time: two that plan from the same ledger would both supersede the same old rule.
     # the op first, then the pack lock: the CLI order (code L3 r7 codex 1: seed took pack then op, a deadlock); every
-    # check reads the team under the op (code L3 r8 codex 4 + complement 4)
+    # check reads the team under the op (code L3 r8 codex 4 + complement 4), and the pack file too: one read before
+    # the wait let a stale judgment supersede the newer one seeded meanwhile (code L3 r9 codex 1)
     with gl.op(), gl.lock(name="pack", timeout=60):
+        if not path.is_file():
+            raise TeamError(f"{pack_dir} has no {R.JUDGMENT_FILE}")
+        judgment = R.load_judgment(path)
         team = gl.team()
         handle = gl.handle(team)
         if handle != team.owner:
