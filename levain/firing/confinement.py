@@ -3595,9 +3595,10 @@ class ConfinementProvider(ABC):
             refreshed = refresh_socket_denies(policy)
         except Exception as exc:
             raise FloorRefreshError(str(exc)) from exc
-        # Against what this shell can reach: a hands view's jewels only (codex L3 r4). The shell still
-        # reports, and its caller keeps, the whole refreshed policy.
-        _refuse_multiply_linked_jewels(self._view_policy(refreshed, hands))
+        # Against the WHOLE policy, a hands launch's too: a jewel outside the view may have its other name
+        # inside it, and no check can tell where that name is (codex + complement L3 r5; Phill 10-03:
+        # refuse bash when ANY jewel inode has st_nlink > 1). The view's narrowing starts after this.
+        _refuse_multiply_linked_jewels(refreshed)
         # `hands` is passed only when set, so a provider written before it existed still works for
         # every operator-uid shell, and refuses a hands one. Decided from the signature, never from a
         # TypeError, which a hands-capable provider can raise for any other reason (S2 L1b LOW-5).
@@ -3621,11 +3622,6 @@ class ConfinementProvider(ABC):
             )
         shell.effective_policy = refreshed
         return shell
-
-    def _view_policy(self, policy: CrownJewelsPolicy, hands: HandsIdentity | None) -> CrownJewelsPolicy:
-        """The part of ``policy`` a shell of this provider, run as ``hands``, can reach: all of it, unless
-        the provider confines a hands shell to a narrower view."""
-        return policy
 
     @abstractmethod
     def _spawn_shell_impl(
@@ -6635,8 +6631,8 @@ _HANDS_POLICY_KEPT = ("entity_dir", "workspace", "socket_sources", "ro_tool_dirs
 def _hands_policy(policy: CrownJewelsPolicy, hands: HandsIdentity) -> CrownJewelsPolicy:
     """The floor's policy with only the jewels a hands view contains: what a hands launch checks, plans
     from, rechecks and edits under. A jewel outside the view is unreachable by the hands user, so a
-    refusal over it refused for nothing (RUN 2026-10-09: a SQLite file, and a hardlinked file in the
-    operator's ~/.ssh, each refused every hands launch)."""
+    refusal over it refused for nothing (RUN 2026-10-09: a SQLite file refused every hands launch). NOT
+    used for the hardlink rule, which keeps the whole policy: an outside jewel's other name may be inside."""
     changes: dict[str, object] = {}
     for name in _HANDS_POLICY_NARROWED:
         v = getattr(policy, name)
@@ -6845,7 +6841,7 @@ if mode == "out":
     os.umask(0o077)
     def maker_gone(name):
         parts = name[len(".levain-relay-"):].split("-")
-        if len(parts) != 3 or not parts[0].isdigit():
+        if len(parts) != 3 or not (parts[0].isascii() and parts[0].isdigit()) or len(parts[0]) > 7:
             return False   # no maker in the name: cannot tell, kept (L3 r4)
         try:
             with open("/proc/%s/stat" % parts[0]) as f:
@@ -6855,7 +6851,7 @@ if mode == "out":
                 os.kill(int(parts[0]), 0)   # hidepid hides it from /proc, not from kill(2)
             except ProcessLookupError:
                 return True
-            except OSError:
+            except (OSError, OverflowError, ValueError):
                 pass
             return False
         except (OSError, IndexError):
@@ -7273,8 +7269,9 @@ class _BwrapShell(SandboxedShell):
         # must not return with it alive).
         with self._lock:
             self._closed = True
-        if not self._walk_done.wait(5.0):
-            _log.warning("levain: the shell's pre-command walk did not stop within 5 s of close()")
+        # Longer than the walk's own bound plus its group stop, so close() does not return before it.
+        if not self._walk_done.wait(_HANDS_WALK_TIMEOUT + 30):
+            _log.warning("levain: the shell's pre-command walk did not stop after close()")
         try:
             super().close()
         finally:
@@ -7430,7 +7427,10 @@ class _BwrapShell(SandboxedShell):
             # A walk that could not be done says nothing about the host: that command is refused and the
             # shell stays (complement L3 r2). None starts once the shell is closed (codex L3 r2); one
             # running when it closes is stopped by this thread, its owner, and close() waits for that.
-            self._walk_done.clear()
+            with self._lock:
+                if self._closed:
+                    raise ConfinementError("the shell was closed; the command was not run")
+                self._walk_done.clear()
             try:
                 found = _hands_walk(hands, self._refuse_once_closed, lambda: self._closed)
             except OSError as exc:
@@ -7595,8 +7595,7 @@ class BwrapProvider(ConfinementProvider):
                    data: bytes = b"", *, timeout: float = 60.0) -> bytes:
         return _bwrap_hands_file(policy, hands, op, path, data, timeout)
 
-    def _view_policy(self, policy: CrownJewelsPolicy, hands: HandsIdentity | None) -> CrownJewelsPolicy:
-        return policy if hands is None else _hands_policy(policy, hands)
+
 
     def _spawn_shell_impl(
         self,
@@ -7638,8 +7637,10 @@ class BwrapProvider(ConfinementProvider):
 
     def _spawn_bwrap(self, policy: CrownJewelsPolicy, env: dict[str, str] | None, default_timeout: float,
                      hands: HandsIdentity | None, relay: _HandsRelay | None) -> SandboxedShell:
-        # Planned, claimed and rechecked under the view's jewels only (a hands launch).
-        policy = self._view_policy(policy, hands)
+        if hands is not None:
+            # Planned, claimed and rechecked under the view's jewels only; the hardlink rule ran over the
+            # whole policy before this (`spawn_shell`).
+            policy = _hands_policy(policy, hands)
         # A crashed levain's leaves first, so the ledger sweep below finds their claims empty.
         sweep_dead_leaves()
         # ONE ledger transaction from the sweep to the claim (L1 r1): another session's release or sweep
