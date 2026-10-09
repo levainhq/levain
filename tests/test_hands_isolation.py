@@ -546,10 +546,10 @@ def test_doctor_fails_when_the_os_took_the_recorded_id(tmp_path: Path, monkeypat
     assert not r.ok and "not the recorded 499" in r.detail
 
 
-@pytest.mark.parametrize("system", ["Darwin", "Linux"])
+@pytest.mark.parametrize("system", ["Darwin", "Linux", "FreeBSD"])
 def test_doctor_says_who_bash_runs_as(tmp_path: Path, monkeypatch, system) -> None:
-    """M2 S2 slice 2: on macOS headless bash runs as the hands user (a pass); on Linux it does not
-    yet, which stays a warning."""
+    """M2 S2 slice 2 and S2-linux: on macOS and Linux headless bash runs as the hands user (a pass);
+    on any other OS it does not, which stays a warning."""
     from levain import doctor
     from levain.firing import confinement
 
@@ -570,7 +570,7 @@ def test_doctor_says_who_bash_runs_as(tmp_path: Path, monkeypatch, system) -> No
     import pwd as _pwd
     monkeypatch.setattr(_pwd, "getpwnam", lambda n: me)
     (r,) = doctor._check_hands_isolation(ed)
-    if system == "Darwin":
+    if system in ("Darwin", "Linux"):
         assert r.ok and not r.warn and "headless chat, --task and seats run the entity's bash" in r.detail
     else:
         assert r.ok and r.warn and "still runs the entity's bash as you" in r.detail
