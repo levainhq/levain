@@ -213,12 +213,16 @@ def egress_unit_text(hands_user: str) -> str:
         # it, and run again whenever it is restarted, or a boot or a restart of it deletes this table.
         "After=nftables.service local-fs.target",
         "PartOf=nftables.service",
+        # PartOf carries stop and restart, never reload: a reload of nftables.service re-runs its
+        # config (a flush on Debian-family hosts), so ours reloads with it (L3 r1, codex).
+        "ReloadPropagatedFrom=nftables.service",
         "Before=sysinit.target",
         "",
         "[Service]",
         "Type=oneshot",
         "RemainAfterExit=yes",
         f"ExecStart={_abs('nft')} -f {egress_rules_path(hands_user)}",
+        f"ExecReload={_abs('nft')} -f {egress_rules_path(hands_user)}",
         "",
         "[Install]",
         "WantedBy=sysinit.target nftables.service",
@@ -256,7 +260,7 @@ def _egress_table_loaded(hands_user: str) -> tuple[bool, str]:
 
 def _egress_table_absent(hands_user: str) -> tuple[bool, str]:
     r = subprocess.run([_abs("nft"), "delete", "table", "inet", egress_table(hands_user)],
-                       capture_output=True, text=True, env=child_env())
+                       capture_output=True, text=True, env={**child_env(), "LC_ALL": "C"})
     said = (r.stderr or r.stdout).strip()
     # Only the kernel saying there is no such table is "already gone"; any other failure is a failure.
     return (True, "") if r.returncode == 0 or "No such file or directory" in said else (False, said)
@@ -303,10 +307,14 @@ def egress_boundary_problem(hands_user: str, ports: tuple[int, ...] = (), *, net
     listener = socket.socket()
     try:
         listener.bind(("127.0.0.1", 0))
-        while listener.getsockname()[1] in ports:   # never probe a port the boundary allows
+        for _ in range(64):                          # never probe a port the boundary allows
+            if listener.getsockname()[1] not in ports:
+                break
             listener.close()
             listener = socket.socket()
             listener.bind(("127.0.0.1", 0))
+        else:
+            return "the probe found no loopback port the boundary refuses (are all ports allowed?)"
         listener.listen(4)
         listener.settimeout(3)
         port = listener.getsockname()[1]
@@ -402,12 +410,19 @@ def net_group_problem(hands_user: str) -> str | None:
         pass
     # A subordinate id range lets a process map itself to other ids (newuidmap), and the rule matches
     # the hands user's own uid: setup never gives one (useradd --system), so one here was added since.
+    try:
+        owners = {hands_user, str(pwd.getpwnam(hands_user).pw_uid)}   # subuid(5): a name or a numeric uid
+    except KeyError:
+        owners = {hands_user}
     for db in (Path("/etc/subuid"), Path("/etc/subgid")):
         try:
-            if any(ln.split(":", 1)[0] == hands_user for ln in db.read_text(encoding="utf-8").splitlines()):
-                return f"{hands_user} has a range in {db}, so its processes can take ids the boundary does not match"
-        except OSError:
-            pass
+            text = db.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return f"{db} cannot be read ({exc.strerror}), so a subordinate id range for {hands_user} cannot be ruled out"
+        if any(ln.split(":", 1)[0] in owners for ln in text.splitlines()):
+            return f"{hands_user} has a range in {db}, so its processes can take ids the boundary does not match"
     return None
 
 
@@ -1350,6 +1365,12 @@ def _repair_linux(entity_dir: Path, cfg, operator: str, op: pwd.struct_passwd, p
     here, idempotently, without an undo ("run setup again" is their remedy). Linger, from before the
     cgroup frame (L3 r9); the network boundary, from before P-1 (a), or to change its ports."""
     hands = cfg.hands_user
+    if hands != hands_user_name(entity_dir) or not user_record_is_ours(hands, "linux"):
+        # The record is the operator's to write: root rewrites a sudoers rule and a ruleset only for the
+        # hands user THIS entity's path derives, and only one Levain created (L3 r1, codex).
+        print(f"setup-isolation: refusing to repair {hands}: it is not the hands user setup made for {entity_dir}. "
+              "Run with --undo, then set it up again.")
+        return 1
     try:
         hands_id = pwd.getpwnam(hands).pw_uid
     except KeyError:
@@ -1379,20 +1400,25 @@ def _repair_linux(entity_dir: Path, cfg, operator: str, op: pwd.struct_passwd, p
             return 1
         steps.append(Step("create the group network git runs with (the hands user is not a member)",
                           (_abs("groupadd"), "--system", "--gid", str(net_gid), net)))
-    steps += egress_steps(hands, hands_id, ports, net_gid)
     steps.append(Step("let you start network git as the hands user with that group (sudoers drop-in)",
                       write=(sudoers_path(hands), sudoers_text(operator, hands, net), 0o440),
                       validate=(_abs("visudo"), "-cf")))
+    steps += egress_steps(hands, hands_id, ports, net_gid)
     plan = Plan("linux", operator, hands, hands_id, entity_dir, cfg.hands_workspace, tuple(steps))
     print(f"Repairing the setup recorded in {entity_dir} (user {hands}): linger, and the network boundary "
           + (f"(loopback ports {', '.join(map(str, ports))} allowed)." if ports else "(no port allowed)."))
-    rc = run_plan(plan, dry_run=dry_run)
-    if rc != 0 or dry_run:
-        return rc
-    if ports != cfg.hands_egress_ports:
+    if ports != cfg.hands_egress_ports and not dry_run:
+        # Recorded FIRST, as the state to reach: if a step below fails part way, the ruleset on disk may
+        # already hold these ports, and a rerun (which reads the record) converges on them rather than
+        # silently reverting (L3 r1).
         record_hands(entity_dir, {"hands_user": hands, "hands_uid": hands_id,
                                   "hands_workspace": str(cfg.hands_workspace), "hands_egress_ports": list(ports)},
                      owner_uid=op.pw_uid, owner_gid=op.pw_gid)
+    rc = run_plan(plan, dry_run=dry_run)
+    if rc != 0:
+        print("setup-isolation: the repair stopped part way; run it again (it converges on the recorded ports).")
+    if rc != 0 or dry_run:
+        return rc
     # The repair was what this run was for: it succeeded, so it is not a refusal (L3 r10). This run
     # checked nothing else of the recorded setup, so it claims nothing else (L3 r11).
     print(f"setup-isolation: linger is on and the network boundary is loaded for {hands}; "

@@ -174,8 +174,11 @@ def ws_git_argv(hands: Hands, gitdir: Path, args: list[str], *, system: str | No
     ssh = ("core.sshCommand=/usr/bin/ssh -F /dev/null -i " + shlex.quote(str(deploy_key_path(hands.home)))
            + " -o IdentitiesOnly=yes")
     net = (system or platform.system()) == "Linux" and bool(args) and args[0] in NET_VERBS
+    # https and ssh only: a local-path (file) transport runs --upload-pack / --receive-pack on THIS
+    # machine, as the hands user and, for a network verb on Linux, with the net gid (L3 r1, complement).
+    transports = ("-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "protocol.ssh.allow=always")
     return _as_hands(
-        hands, _real_git(), *_NEUTRALISE, "-c", ssh, f"--git-dir={gitdir}", f"--work-tree={gitdir.parent}",
+        hands, _real_git(), *_NEUTRALISE, *transports, "-c", ssh, f"--git-dir={gitdir}", f"--work-tree={gitdir.parent}",
         "-C", str(gitdir.parent), *args,
         env=("GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0",
              "LANG=" + os.environ.get("LANG", "en_US.UTF-8")),

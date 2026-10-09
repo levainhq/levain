@@ -816,6 +816,7 @@ def test_linger_repair_on_an_existing_linux_install_succeeds(tmp_path: Path, mon
     monkeypatch.setattr(hands, "host_os", lambda: "linux")
     monkeypatch.setattr(hands, "egress_unavailable", lambda: None)
     monkeypatch.setattr(hands, "_group_exists", lambda n: False)
+    monkeypatch.setattr(hands, "user_record_is_ours", lambda n, h: True)
     monkeypatch.setattr(hands, "used_ids", lambda h: set(range(901, 1000)))
     monkeypatch.setattr(hands, "retired_ids", lambda h: set())
     written: list[Path] = []
@@ -828,8 +829,18 @@ def test_linger_repair_on_an_existing_linux_install_succeeds(tmp_path: Path, mon
     assert any("enable-linger" in a for a in ran) and "linger is on" in out and "--undo" not in out
     # P-1 (a): the repair also loads the network boundary (an install from before it has none).
     h = hands_user_name(ed)
-    assert written == [hands.egress_rules_path(h), hands.egress_unit_path(h), hands.sudoers_path(h)]
+    assert written == [hands.sudoers_path(h), hands.egress_rules_path(h), hands.egress_unit_path(h)]
     assert any(list(a[-3:]) == ["--gid", "900", f"{h}_net"] for a in ran)   # pre-D install: the group is made
+    # L3 r1 (codex): the record is the operator's to write, so a repair never rewrites root state for a
+    # hands user this entity's path does not derive (another entity's), nor for one Levain did not make.
+    written.clear()
+    other = tmp_path / "other"
+    (other / ".levain").mkdir(parents=True)
+    (other / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))   # ed's record, copied
+    assert hands.cmd_setup_isolation(other, undo=False, dry_run=False) == 1
+    monkeypatch.setattr(hands, "user_record_is_ours", lambda n, h: False)
+    assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
+    assert written == [] and "refusing to repair" in capsys.readouterr().out
     assert any(list(a[-2:]) == ["restart", hands.egress_unit_name(hands_user_name(ed))] for a in ran)
 
 
