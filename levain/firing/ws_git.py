@@ -406,7 +406,19 @@ def cmd_ws_git(entity_dir: Path | str, repo: Path | str, args: list[str]) -> int
 def _as_hands(hands: Hands, *argv: str, env: tuple[str, ...] = (), group: str | None = None) -> list[str]:
     """``argv`` run as the hands user with a clean environment (and, with ``group``, that gid)."""
     return ["/usr/bin/sudo", "-n", "-u", hands.user, *(("-g", group) if group else ()), "/usr/bin/env", "-i",
-            f"HOME={hands.home}", f"PATH={SECURE_PATH}", *env, *argv]
+            f"HOME={hands.home}", f"PATH={SECURE_PATH}", *env, *_start(), *argv]
+
+
+def _start() -> list[str]:
+    """Linux: the confinement start program in front of a hands process (a new session keyring; ended
+    with levain), as for every other hands process."""
+    import platform
+
+    if platform.system() != "Linux":
+        return []
+    from levain.firing.confinement import HANDS_PYTHON, _start_argv
+
+    return _start_argv(HANDS_PYTHON, keyring=True)
 
 
 def _under_a_workspace_root(path: Path) -> bool:
@@ -899,12 +911,14 @@ def wildcard_safe_directory(roots: tuple[Path, ...] = ()) -> list[str]:
     return hits
 
 
-def mask_repair_argv(hands: Hands) -> list[str]:
-    """Linux: restore the ACL mask on files the hands user owns in its workspace. A file created with
-    mode 0600 (an atomic write) gets a mask of ---, which cancels the operator's named read entry
-    (measured in CI). Run as the hands user, the owner; it belongs at the end of each turn once bash
-    runs as the hands user (S2), and until then the e2e is its only caller."""
+def mask_repair_argv(hands: Hands, since: float | None = None) -> list[str]:
+    """Linux: restore the ACL mask on files the hands user owns in its workspace (with ``since``, only
+    those whose status changed from that time on). A file created with mode 0600 (an atomic write), or
+    chmod 600, gets a mask of ---, which cancels the operator's named read entry (measured in CI, and
+    in a VM through a Linux hands bash). Run as the hands user, the owner, after each hands command."""
+    newer = ("-newerct", f"@{int(since)}") if since is not None else ()
     return [
-        "/usr/bin/sudo", "-n", "-u", hands.user, "/usr/bin/env", "-i", f"PATH={SECURE_PATH}",
-        _abs("find"), str(hands.workspace), "-user", hands.user, "-exec", _abs("setfacl"), "-m", "m::rX", "{}", "+",
+        "/usr/bin/sudo", "-n", "-u", hands.user, "/usr/bin/env", "-i", f"PATH={SECURE_PATH}", *_start(),
+        _abs("find"), str(hands.workspace), "-user", hands.user, *newer,
+        "-exec", _abs("setfacl"), "-m", "m::rX", "{}", "+",
     ]

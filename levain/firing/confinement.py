@@ -2302,7 +2302,8 @@ class ShellResult:
     process it spawned; ``signal`` is set instead when a signal ended it. Under bwrap that process is
     bwrap, which waits on bash and exits with bash's status, a signal death of bash as 128 + its
     number, so that arrives in ``exit_code``; a signal levain sends (``interrupt()``) ends bwrap
-    itself, the kernel then kills bash (``--die-with-parent``), and it arrives in ``signal``.
+    itself, the start program's watcher then kills bash (``_HANDS_START``; bwrap's ``--die-with-parent``
+    did not, RUN 2026-10-09), and it arrives in ``signal``.
     ``timed_out`` is True when the
     command did not finish within the deadline and levain killed its process group (``exit_code`` and
     ``signal`` are then ``None``)."""
@@ -2509,6 +2510,10 @@ libc.syscall.restype = ctypes.c_long
 if keyring and libc.syscall(ctypes.c_long(nr), ctypes.c_long(1), ctypes.c_void_p(None)) < 0:
     sys.stderr.write("levain: could not join a new session keyring: %s\n" % os.strerror(ctypes.get_errno()))
     os._exit(126)
+if not hasattr(os, "pidfd_open"):
+    sys.stderr.write("levain: this python3 (%s) has no os.pidfd_open (3.9 or later and Linux 5.3 or later "
+                     "are needed) to end the command with levain; refusing\n" % sys.version.split()[0])
+    os._exit(126)
 watch, argv, me = int(sys.argv[2]), sys.argv[3:], os.getpid()
 def parent(pid):
     with open("/proc/%d/stat" % pid) as f:
@@ -2518,30 +2523,30 @@ try:
     up = os.getppid()
     while up not in (watch, 0, 1):
         up = parent(up)
+except PermissionError as e:
+    sys.stderr.write("levain: cannot read %s: /proc hides other users' processes here (hidepid), so the "
+                     "command cannot be tied to levain; remount /proc without hidepid\n" % e.filename)
+    os._exit(126)
 except OSError as e:
     sys.stderr.write("levain: cannot watch levain (pid %d): %s\n" % (watch, e))
     os._exit(126)
 if up != watch:
     sys.stderr.write("levain: levain (pid %d) is gone; not starting\n" % watch)
     os._exit(126)
+mine = os.pidfd_open(me)
 if os.fork() == 0:
     n = os.open(os.devnull, os.O_RDWR)
     for f in (0, 1, 2):
         os.dup2(n, f)
-    try:
-        mine = os.pidfd_open(me)
-    except OSError:
-        os._exit(0)
     # A pidfd on each child of the command, taken as it appears (bwrap's: the namespace's pid 1). On the
     # operator floor bwrap's own --die-with-parent kills bwrap the moment levain dies, and its pid 1 is
     # reparented at once (RUN 2026-10-09), so it must be held before then; a pidfd outlives reparenting.
     # Looked for until the first is found, for 10 s at most: bwrap forks its one pid 1 at once, and the
     # relays fork none.
     kids, scan_until = {}, time.monotonic() + 10
+    ready = []
     while True:
-        wait = 0 if kids else scan_until - time.monotonic()
-        ready = select.select([held, mine], [], [], 0.05 if wait > 0 else None)[0]
-        if wait > 0:
+        if not kids and time.monotonic() < scan_until:
             for pid in os.listdir("/proc"):
                 if pid.isdigit() and int(pid) not in kids and int(pid) != os.getpid():
                     try:
@@ -2551,6 +2556,7 @@ if os.fork() == 0:
                         pass
         if held in ready or mine in ready:
             break
+        ready = select.select([held, mine], [], [], None if kids or time.monotonic() >= scan_until else 0.05)[0]
     # A child still alive is killed either way: bwrap ends on its own only after its pid 1 has, so a
     # pid 1 that outlives it was orphaned. On the operator floor bwrap's --die-with-parent kills bwrap
     # before levain's pidfd turns readable, so the command's end is seen first (RUN 2026-10-09: 4 of 10).
@@ -2571,6 +2577,7 @@ if os.fork() == 0:
             break
     os._exit(0)
 os.close(held)
+os.close(mine)
 os.execv(argv[0], argv)
 """
 
@@ -4743,8 +4750,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # redirections a test might be relying on.
         "--proc", "/proc",
         "--dev", "/dev",
-        # The sandbox dies with the levain process that owns it. Complements — never replaces —
-        # SandboxedShell.close()'s process-group teardown.
+        # bwrap dies with the levain thread that started it. Its pid 1 does not follow it: the start
+        # program's watcher (``_HANDS_START``) ends that. Complements, never replaces,
+        # SandboxedShell.close()'s process-group and leaf teardown.
         "--die-with-parent",
         # A new PID namespace (lane P2 item 2c), so the ``--proc /proc`` above shows only the
         # sandbox's own processes: "A /proc filesystem shows (in the /proc/pid directories) only
@@ -4754,7 +4762,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # cannot see or signal host processes (``ps``, ``kill`` of a server started outside). bash is
         # that namespace's pid 1 (``--as-pid-1``, added in `spawn_shell`) and runs in a session of its
         # own (``--new-session``), so it is NOT in the process group ``_signal_group`` signals: a
-        # signal there reaches bwrap, and bash dies when bwrap does (``--die-with-parent`` above).
+        # signal there reaches bwrap, and bash dies when bwrap does: the start program's watcher kills a
+        # pid 1 that outlives bwrap (``_HANDS_START``), which ``--die-with-parent`` above did not do
+        # (RUN 2026-10-09), and the command's cgroup leaf is killed after it.
         # When bash, pid 1, exits, the kernel kills the rest of the namespace (pid_namespaces(7)).
         "--unshare-pid",
         # A cgroup namespace rooted at the command's own leaf: without it bash, which runs as the
@@ -6507,7 +6517,7 @@ class _Leader:
 #: Host trees in a hands view, read-only (absent ones are skipped).
 _HANDS_VIEW_RO = ("/usr", "/etc", "/opt")
 #: The merged-/usr links: a symlink here becomes the same symlink in the view, a real directory (an
-#: unmerged host) is bound read-only.
+#: unmerged host) is a read-only tree like those above (:func:`_hands_view_trees`).
 _HANDS_VIEW_LINKS = ("/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
 #: Fresh, empty and writable in a hands view.
 _HANDS_VIEW_TMP = ("/tmp", "/var/tmp", "/run")
@@ -6527,14 +6537,19 @@ _HANDS_VIEW_FLAGS = ("--unshare-user", "--disable-userns", "--unshare-ipc", "--u
 def _hands_view_trees(hands: HandsIdentity) -> tuple[list[str], list[str]]:
     """``(read_only, writable)``: the host trees a hands view binds, read-only ones that exist here and
     the hands workspace and home."""
-    ro = [t for t in _HANDS_VIEW_RO if os.path.isdir(t) and not os.path.islink(t)]
-    return ro, [str(hands.workspace), os.path.realpath(hands.home)]
+    ro = [t for t in (*_HANDS_VIEW_RO, *_HANDS_VIEW_LINKS) if os.path.isdir(t) and not os.path.islink(t)]
+    home = os.path.realpath(hands.home)
+    if any(t == home or t.startswith(home.rstrip("/") + "/") for t in ("/", *ro)):
+        raise ConfinementError(f"the hands user's home is {hands.home}, which would put {home} of the host "
+                               "in its view, writable — refusing (fail-closed). Set the entity up again: sudo "
+                               "levain setup-isolation --undo, then sudo levain setup-isolation.")
+    return ro, [str(hands.workspace), home]
 
 
 def _in_hands_view(path: str | Path, hands: HandsIdentity) -> bool:
     """Whether ``path`` lies in a host tree of the hands view, so bash run as the hands user can see it."""
     ro, rw = _hands_view_trees(hands)
-    p = Path(path)
+    p = Path(os.path.normpath(path))
     return any(p == Path(t) or p.is_relative_to(t) for t in (*ro, *rw))
 
 
@@ -6554,8 +6569,6 @@ def _hands_bwrap_argv(argv: list[str], hands: HandsIdentity) -> list[str]:
     for link in _HANDS_VIEW_LINKS:
         if os.path.islink(link):
             out += ["--symlink", os.readlink(link), link]
-        elif os.path.isdir(link):
-            out += ["--ro-bind", link, link]
     out += ["--proc", "/proc", "--dev", "/dev"]
     for t in _HANDS_VIEW_TMP:
         out += ["--tmpfs", t]
@@ -6592,6 +6605,8 @@ def _hands_ns_problem(hands: HandsIdentity, timeout: float = 30.0) -> str | None
     if r.returncode == 0:
         return None
     said = r.stderr.decode("utf-8", "replace").strip().splitlines()
+    if said and said[-1].startswith("levain: "):   # the start program refused, before bwrap ran
+        return said[-1][len("levain: "):]
     return (f"bwrap cannot build the sandbox's namespaces as {hands.user} ({said[-1] if said else 'no reason given'}). "
             "On Ubuntu 23.10+ install the bwrap-userns-restrict AppArmor profile: sudo install -m 0644 "
             "/usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/ && sudo apparmor_parser "
@@ -6601,8 +6616,9 @@ def _hands_ns_problem(hands: HandsIdentity, timeout: float = 30.0) -> str | None
 
 def _hands_argv_unmade(argv: list[str]) -> str | None:
     """The first mount target of a hands bwrap ``argv`` that is not on the host, or None. bwrap would
-    create such a target itself, on the host, unless it lies in a tmpfs mounted earlier in the argv
-    (then it is made in that view only); a ``-try`` bind with no source is skipped by bwrap."""
+    create such a target itself: on the host when it lies under one of the view's host trees, in the
+    view only when it lies in a tmpfs mounted earlier in the argv; a ``-try`` bind with no source is
+    skipped by bwrap. Conservative: a target in neither is reported too."""
     views: list[Path] = []
     i = 1
     while i < len(argv):
@@ -6675,6 +6691,12 @@ def pair(c, connect):
     th.join()
     c.close()
     t.close()
+slots = threading.BoundedSemaphore(64)
+def held(c, connect):
+    try:
+        pair(c, connect)
+    finally:
+        slots.release()
 def serve(ls, connect):
     while True:
         try:
@@ -6682,7 +6704,10 @@ def serve(ls, connect):
         except OSError:
             time.sleep(0.05)
             continue
-        threading.Thread(target=pair, args=(c, connect), daemon=True).start()
+        if not slots.acquire(blocking=False):
+            c.close()
+            continue
+        threading.Thread(target=held, args=(c, connect), daemon=True).start()
 def tcp(port):
     return lambda: socket.create_connection(("127.0.0.1", port))
 def unix(path):
@@ -6861,8 +6886,9 @@ def _start_hands_relay(hands: HandsIdentity, sockdir: str) -> _HandsRelay:
 # A unix socket or FIFO the hands user may write is a deputy the network namespace does not cut. The
 # view holds no host tree but /usr, /etc and /opt read-only (and the hands user's own), so those are
 # what is walked.
-#: The walk, as the hands user inside its own view: every socket and FIFO it may write in the view's
-#: read-only host trees. bash cannot reach any other host file, and the view's writable trees are the
+#: The walk, as the hands user inside its own view: every socket it may write, FIFO it may read or
+#: write, and directory it may search but not list (RUN 2026-10-09: none on a stock Ubuntu 24.04) in
+#: the view's read-only host trees. bash cannot reach any other host file, and the view's writable trees are the
 #: hands user's own.
 _HANDS_FIND = "/usr/bin/find"
 _HANDS_WALK_TIMEOUT = 120.0
@@ -6878,8 +6904,9 @@ def _hands_listener_problem(hands: HandsIdentity) -> str | None:
     ro, _ = _hands_view_trees(hands)
     if not ro:
         return None
-    argv = [*hands_prefix(hands), *_hands_bwrap_argv([BWRAP], hands), _HANDS_FIND, *ro, "(", "-type", "s", "-o", "-type", "p", ")",
-            "-writable", "-print0"]
+    argv = [*hands_prefix(hands), *_hands_bwrap_argv([BWRAP], hands), "/usr/bin/env", "LC_ALL=C", _HANDS_FIND,
+            *ro, "(", "-type", "s", "-writable", ")", "-o", "(", "-type", "p", "(", "-writable", "-o", "-readable",
+            ")", ")", "-o", "(", "-type", "d", "-executable", "!", "-readable", ")", "-print0"]
     try:
         r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(),
                            timeout=_HANDS_WALK_TIMEOUT)
@@ -6887,9 +6914,10 @@ def _hands_listener_problem(hands: HandsIdentity) -> str | None:
         return f"levain could not walk, as {hands.user}, the host files its bash would see ({exc})"
     found = [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
     said = [x for x in r.stderr.decode("utf-8", "replace").splitlines() if x.strip()]
-    # find exits 1 when a directory cannot be listed and walks the rest. Only that is let through: a
-    # directory the hands user cannot list is one it cannot look up names in by listing, and anything
-    # else (bwrap or find failing to start) refuses.
+    # find exits 1 when a directory cannot be listed and walks the rest. Only that is let through, for
+    # a directory the hands user can neither list nor search (nothing in it is reachable): one it can
+    # search but not list is itself a hit above, since a socket in it is reachable by a known name.
+    # Anything else (bwrap or find failing to start) refuses.
     unlisted = [x for x in said if x.startswith(f"{_HANDS_FIND}: ") and x.endswith(": Permission denied")]
     if r.returncode != 0 and (not said or len(unlisted) != len(said)):
         return (f"levain could not walk, as {hands.user}, the host files its bash would see "
@@ -6897,9 +6925,9 @@ def _hands_listener_problem(hands: HandsIdentity) -> str | None:
     if not found:
         return None
     more = f" and {len(found) - 3} more" if len(found) > 3 else ""
-    return (f"{hands.user} may write to the socket or FIFO{'s' if len(found) > 1 else ''} "
-            f"{', '.join(found[:3])}{more}, which bash run as it sees: tighten its mode so the entity's "
-            "user cannot write it")
+    return (f"{hands.user} can reach {', '.join(found[:3])}{more}, which bash run as it sees (a socket it "
+            "may write, a FIFO it may read or write, or a directory it may search but not list, where such "
+            "a file could be): tighten the mode so the entity's user cannot")
 
 
 def _hands_launch_problem(hands: HandsIdentity) -> str | None:
@@ -6974,6 +7002,8 @@ class _BwrapShell(SandboxedShell):
         self._unit_token = os.urandom(6).hex()
         self._units = 0
         self._relay: _HandsRelay | None = None   # a hands launch's host-side proxy relay, if any
+        self._hands: HandsIdentity | None = None   # a hands launch's user, whose files are repaired
+        self._command_since = 0.0
 
     # Each command runs in a pid namespace of its own (``--unshare-pid --as-pid-1``), inside its leaf.
     _own_pid_namespace = True
@@ -7076,6 +7106,7 @@ class _BwrapShell(SandboxedShell):
                 _ledger_release(claim)
 
     def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
+        self._command_since = time.time()
         # One command at a time on the claim: it names one leaf, so an earlier one still populated
         # refuses this command (a retag would stop the claim covering it).
         if not self._settled():
@@ -7170,6 +7201,25 @@ class _BwrapShell(SandboxedShell):
             rec = self._leaves.get(pgid)
         if rec is not None:
             _leaf_gone(rec[1], timeout=5.0)
+        if self._hands is not None:
+            self._repair_masks()
+
+    def _repair_masks(self) -> None:
+        """A hands command's chmod 600, or a file it created 0600, leaves an ACL mask of --- that hides
+        the file from the operator (RUN in a VM 2026-10-09); restore it on what changed since the
+        command started. A failure is logged, not raised: the command already ran."""
+        from levain.firing.ws_git import mask_repair_argv
+        from levain.launch import child_env
+
+        argv = mask_repair_argv(self._hands, since=self._command_since - 2)   # type: ignore[arg-type]
+        try:
+            r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(),
+                               timeout=60)
+            if r.returncode != 0:
+                _log.warning("restoring your read access to files the entity's command changed failed: %s",
+                             r.stderr.decode("utf-8", "replace").strip()[-300:])
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _log.warning("restoring your read access to files the entity's command changed failed: %s", exc)
 
     def _recheck(self) -> None:
         _refuse_plantable_sqlite_jewels(self._jewel_policy)
@@ -7322,7 +7372,8 @@ class BwrapProvider(ConfinementProvider):
         sandbox profile text" is honoured by rendering the exact command. Quoted with
         :func:`shlex.join` so the rendered form is both diffable in a test and pasteable into a
         terminal to reproduce a floor by hand, which is how an equivalence claim gets re-checked
-        later by someone who does not trust this docstring."""
+        later by someone who does not trust this docstring. It is the OPERATOR floor's command: for a
+        hands entity bwrap runs the allowlisted view :func:`_hands_bwrap_argv` makes from it."""
         argv, create_first = _bwrap_plan(policy)
         mkdir = f"mkdir -m 700 {shlex.join(create_first)} && " if create_first else ""
         return mkdir + shlex.join(argv) + "\n"
@@ -7434,6 +7485,7 @@ class BwrapProvider(ConfinementProvider):
         shell._ledger_claim = claim
         shell._claim_base = claim
         shell._relay = relay
+        shell._hands = hands
         _LIVE_BWRAP_SHELLS.add(shell)
         try:
             # Each command, the start probe included, tags the claim with its process group.
