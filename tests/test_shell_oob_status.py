@@ -1318,3 +1318,20 @@ def test_only_the_initial_pid_namespace_makes_or_sweeps_leaves(tmp_path, monkeyp
     monkeypatch.setattr(C, "_pidns", lambda: C._INIT_PIDNS)
     assert C._leaf_unit("b" * 12, 1) == f"levain-{C._INIT_PIDNS}-{os.getpid()}-7-{'b' * 12}-1"
     assert C.sweep_dead_leaves() == [] and killed == [dead]
+
+
+def test_claim_recovery_judges_leaves_exactly_as_the_sweep_does(monkeypatch):
+    """L3 r13 (codex, reproduced): a dead claim tagged with another pid namespace's leaf reached
+    `_leaf_kill`, which the sweep refuses for that same leaf."""
+    from levain.firing import confinement as C
+
+    monkeypatch.setattr(C, "_pidns", lambda: C._INIT_PIDNS)
+    killed: list[str] = []
+    monkeypatch.setattr(C, "_leaf_kill", lambda rel: killed.append(rel) or True)
+    monkeypatch.setattr(C, "_leaf_gone", lambda rel, timeout: True)
+    head = f"{C._user_manager_rel(os.getuid())}/{C._LEVAIN_SLICE}/"
+    dead = f"{2 ** 22 + 9}:1:{C._INIT_PIDNS}:x"   # a pid no process holds
+    foreign = f"{head}levain-4026532999-4242-77-{'a' * 12}-1.scope"
+    assert C._claim_alive(f"{dead}:c{foreign}") and killed == []
+    ours = f"{head}levain-{C._INIT_PIDNS}-4242-77-{'b' * 12}-1.scope"
+    assert not C._claim_alive(f"{dead}:c{ours}") and killed == [ours]

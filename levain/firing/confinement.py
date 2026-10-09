@@ -5253,10 +5253,16 @@ def _leaf_unit(token: str, n: int) -> str | None:
     return f"levain-{_INIT_PIDNS}-{os.getpid()}-{started}-{token}-{n}"
 
 
-def _is_levain_leaf(rel: str, uid: int) -> bool:
-    """Whether ``rel`` names a leaf levain makes for ``uid`` and nothing else (a crash sweep kills it)."""
+def _judged_leaf(rel: str, uid: int) -> tuple[int, str] | None:
+    """The (pid, start time) of the levain that made leaf ``rel`` for ``uid``, when this process may
+    judge it: a levain leaf name from the initial pid namespace, read from that namespace. None means
+    never kill it. The crash sweep and the claim path both ask this, so they cannot disagree about
+    whose leaf is whose (L3 r13)."""
     head = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/"
-    return rel.startswith(head) and _LEAF_UNIT.fullmatch(rel[len(head):]) is not None
+    m = _LEAF_UNIT.fullmatch(rel[len(head):]) if rel.startswith(head) else None
+    if m is None or m.group(1) != _INIT_PIDNS or _pidns() != _INIT_PIDNS:
+        return None
+    return int(m.group(2)), m.group(3)
 
 
 def sweep_dead_leaves() -> list[str]:
@@ -5269,15 +5275,13 @@ def sweep_dead_leaves() -> list[str]:
         names = os.listdir(base)
     except OSError:
         return []
-    if _pidns() != _INIT_PIDNS:
-        return []   # the pids in leaf names are the initial namespace's; from here they name nothing
     left: list[str] = []
     killed: list[str] = []
     for name in names:
-        m = _LEAF_UNIT.fullmatch(name)
-        if not m or m.group(1) != _INIT_PIDNS or _proc_start_time(int(m.group(2))) == m.group(3):
-            continue   # not a leaf, another namespace's (not ours to judge), or its levain is alive
         rel = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/{name}"
+        owner = _judged_leaf(rel, uid)
+        if owner is None or _proc_start_time(owner[0]) == owner[1]:
+            continue   # not ours to judge, or its levain is alive
         (killed if _leaf_kill(rel) else left).append(rel)
     # Every leaf is killed first, then all are awaited against ONE deadline: the sweep runs at every
     # CLI start, so a wait per leaf would add up (L3 r10).
@@ -5831,8 +5835,8 @@ def _claim_alive(claim: str) -> bool:
         # The leaf of the command it covers, tagged before that command was spawned: kill it, and keep
         # the claim while it is populated (the next sweep looks again; no wait under the ledger lock).
         rel = tag[1:]
-        if not _is_levain_leaf(rel, os.getuid()):
-            return True   # not a leaf levain makes here: not ours to judge, so kept
+        if _judged_leaf(rel, os.getuid()) is None:
+            return True   # not a leaf this process may judge: kept
         _leaf_kill(rel)
         return not _leaf_gone(rel, timeout=0.5)
     if tag.startswith("b"):
