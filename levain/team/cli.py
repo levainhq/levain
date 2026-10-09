@@ -90,10 +90,18 @@ def cmd_init(args) -> int:
     try:
         if args.anneal_db:
             gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
-        if args.pack and (incomplete is None or gl.joined()):
-            # an init that stopped only at its push still seeds, locally, and the next sync publishes both
-            written = P.seed(gl, Path(args.pack), push=not args.no_push and incomplete is None)
+        if args.pack and incomplete is None:
+            written = P.seed(gl, Path(args.pack), push=not args.no_push)
             print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
+        elif args.pack and gl.joined():
+            # an init that stopped only at its push still seeds, locally, and the next sync publishes both; a seed
+            # that fails here is named in the pending message, never swallowed (code L3 r11 codex 5)
+            try:
+                written = P.seed(gl, Path(args.pack), push=False)
+                print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
+            except (TeamError, E.EntryError, R.RolesError, ValueError, OSError) as exc:
+                incomplete = InitIncomplete(f"{incomplete}; the pack was NOT seeded ({exc}): run `levain team "
+                                            f"pack-sync {args.pack}`")
         elif args.pack:
             # never silently skipped (code L3 r10 codex 5 + complement 1)
             incomplete = InitIncomplete(f"{incomplete}; the pack was NOT seeded: run `levain team pack-sync "

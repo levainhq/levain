@@ -575,15 +575,24 @@ class GitLedger:
         from . import signing as S
         from . import tenure as T
         R.validate_team(team)
-        # the key is resolved ONCE and that value proves, fingerprints and signs (code L3 r10 codex 1: with no
-        # --signing-key it was re-read from git config for the genesis, so a key changed meanwhile signed it); proven
-        # and every refusal checked BEFORE anything is saved (code L3 r6 codex 2/6, complement 5)
+        # git's sequencer frame (a stopped rebase leaves rebase-merge/, which only rebase writes and only --continue
+        # reads): an init that stopped left an `init_pending` record, written by init alone in the same save as its
+        # pin, and it resumes from THAT record's parameters, never from this call's arguments or the state's shape
+        # (code L3 r11 codex 1-4 + complement 1-3: a pin left by `join` was "resumed" as an init)
+        pending = self.state().get("init_pending")
+        if isinstance(pending, dict) and pending.get("genesis") and pending.get("genesis") == self.pinned_root:
+            if remote is not None and remote != (pending.get("remote") or ""):
+                raise TeamError(f"an init of genesis {pending['genesis'][:12]} is pending on this clone with remote "
+                                f"{pending.get('remote') or '(none)'}; run `levain team init` without --remote to "
+                                "finish it")
+            return self._finish_init(pending["genesis"], push=push, resumed=True)
+        # the key is resolved ONCE and that value proves, fingerprints, signs and is saved (code L3 r10 codex 1, r11
+        # codex 3 + complement 5: a git-config key was re-read later, so a changed config signed as a key tenure does
+        # not grant); proven and every refusal checked BEFORE anything is saved (code L3 r6 codex 2/6, complement 5)
         key = signing_key or self.signing_key
         self.prove_signing_key(key)
         remote = remote or self._default_remote()
         pinned = self.pinned_root
-        if pinned and not self.joined() and self._init_resumable(pinned, remote):
-            return self._finish_init(pinned, push=push, resumed=True)
         if self.legacy_only() and not replace_legacy:
             raise TeamError(LEGACY_MESSAGE)
         if self._local_branch_exists():
@@ -605,9 +614,9 @@ class GitLedger:
             ten.pending_keys[h] = [line.strip()]
         # join's frame (code L3 r4), not a roll-back (code L3 r9 codex 2: init's roll-back grew every round): every
         # refusal ran above; the genesis signs with the resolved key itself, so nothing is saved to make it; then the
-        # key, its fingerprint and the pin are persisted in ONE save, BEFORE the ref is created: a later stop (a crash,
-        # a refused create, a failed worktree or push) leaves the pin, and `levain team init` resumes from it whenever
-        # _init_resumable holds (code L3 r10 codex 2-4); nothing is ever rolled back.
+        # key, its fingerprint, the pin and the init_pending record are persisted in ONE save, BEFORE the ref is
+        # created: a later stop (a crash, a refused create, a failed worktree) leaves the record and `levain team init`
+        # resumes from it (code L3 r10 codex 2-4); nothing is ever rolled back.
         fp = S.fingerprint(own)
         commit = self._genesis_commit({T.TEAM_FILE: R.dump_team(team), T.TENURE_FILE: T.dump_tenure(ten)},
                                       f"levain team: init strict ledger for {team.project}", key=key)
@@ -616,40 +625,43 @@ class GitLedger:
         def persist(st: dict) -> None:
             st.update(device=device, remote=remote or "", branch=branch, pinned_root=commit, anchor=None, accepted={},
                       distrust=[])
-            if signing_key:
-                st["signing_key"] = signing_key
+            st["signing_key"] = key
             st["own_keys"] = list(dict.fromkeys([*(st.get("own_keys") or []), fp]))
+            st["init_pending"] = {"genesis": commit, "remote": remote or ""}
         self.save_state(_mutate=persist)
         return self._finish_init(commit, push=push, resumed=False)
 
-    def _init_resumable(self, pinned: str, remote: str | None) -> bool:
-        """A pinned clone whose ledger checkout never finished: the branch is this genesis's line, or is missing while
-        the genesis is a local root commit no remote ledger carries (an init stopped before its ref was created)."""
-        top = self.repo.toplevel
-        if self._local_branch_exists():
-            return git(["rev-list", "--max-parents=0", self.ref], top, check=False).stdout.split() == [pinned]
-        if git(["rev-list", "--parents", "-n", "1", pinned], top, check=False).stdout.split() != [pinned]:
-            return False
-        return not (remote and self._remote_ledgers(remote))
-
     def _finish_init(self, commit: str, *, push: bool, resumed: bool) -> str:
-        """Everything after the persist: create the ref, prove the genesis judges, attach the checkout, publish. A
-        failure keeps the pin and says what is still needed; running `init` again resumes here."""
-        branch, remote = self.branch, self.remote
+        """Everything after the persist. The LOCAL part (the ref is this genesis, it judges, the checkout is attached)
+        completes the init and clears its record; a stop there keeps the record and `init` resumes. Publishing is
+        sync's job: a refused push says `levain team sync` (code L3 r11 codex 2: the record, not joined(), decides)."""
+        branch, remote, top = self.branch, self.remote, self.repo.toplevel
         try:
-            if not self._local_branch_exists():
-                git(["update-ref", self.ref, commit, ""], self.repo.toplevel)
+            if self._local_branch_exists():
+                # equality, never existence (code L3 r11 complement 4): another writer's branch is not this init's line
+                roots = git(["rev-list", "--max-parents=0", self.ref], top, check=False).stdout.split()
+                if roots != [commit]:
+                    raise TeamError(f"branch {branch} exists here but is not this init's line (root "
+                                    f"{(roots or ['none'])[0][:12]}); remove it with `git branch -D {branch}` if none "
+                                    "of it was published")
+            else:
+                git(["update-ref", self.ref, commit, ""], top)
             self._dcache = None
             self.derivation()      # proves the genesis judges, before anything is pushed
             self._attach_worktree()
-            if remote and push:
-                self._sync(push=True)
         except Exception as exc:  # noqa: BLE001 - any ordinary failure after the persist is "incomplete" (r10)
             raise InitIncomplete(f"initialised and pinned {branch} (genesis {commit[:12]}) on this clone, still "
                                  f"needs: {exc}; run `levain team init` again to finish it") from exc
+        self.save_state(_mutate=lambda st: st.pop("init_pending", None)
+                        if (st.get("init_pending") or {}).get("genesis") == commit else None)
         how = (f"resumed: the init of genesis {commit[:12]} is finished (the team and keys given now were not used; "
                "change them with the team commands)") if resumed else ""
         if remote and push:
+            try:
+                self._sync(push=True)
+            except Exception as exc:  # noqa: BLE001 - initialised; only the publish is pending
+                raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but the push to "
+                                     f"{remote} failed ({exc}): run `levain team sync`") from exc
             done = f"strict ledger created and pushed to {remote}/{branch} (genesis {commit[:12]})"
         else:
             done = f"strict ledger created locally ({'no remote' if not remote else 'not pushed'}; genesis {commit[:12]})"
