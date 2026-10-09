@@ -2579,7 +2579,9 @@ if os.fork() == 0:
             try:
                 os.write(kfd, b"1")
                 break
-            except OSError:
+            except OSError as e:
+                if e.errno in (2, 19):   # ENOENT, ENODEV: the leaf is already gone
+                    break
                 time.sleep(0.2)
         os._exit(0)
     if held not in ready:
@@ -3593,7 +3595,9 @@ class ConfinementProvider(ABC):
             refreshed = refresh_socket_denies(policy)
         except Exception as exc:
             raise FloorRefreshError(str(exc)) from exc
-        _refuse_multiply_linked_jewels(refreshed)
+        # Against what this shell can reach: a hands view's jewels only (codex L3 r4). The shell still
+        # reports, and its caller keeps, the whole refreshed policy.
+        _refuse_multiply_linked_jewels(self._view_policy(refreshed, hands))
         # `hands` is passed only when set, so a provider written before it existed still works for
         # every operator-uid shell, and refuses a hands one. Decided from the signature, never from a
         # TypeError, which a hands-capable provider can raise for any other reason (S2 L1b LOW-5).
@@ -3617,6 +3621,11 @@ class ConfinementProvider(ABC):
             )
         shell.effective_policy = refreshed
         return shell
+
+    def _view_policy(self, policy: CrownJewelsPolicy, hands: HandsIdentity | None) -> CrownJewelsPolicy:
+        """The part of ``policy`` a shell of this provider, run as ``hands``, can reach: all of it, unless
+        the provider confines a hands shell to a narrower view."""
+        return policy
 
     @abstractmethod
     def _spawn_shell_impl(
@@ -4149,24 +4158,46 @@ def _stop_hands_group(hands: HandsIdentity, proc: subprocess.Popen[bytes]) -> bo
 def _run_hands_helper(argv: list[str], hands: HandsIdentity, data: bytes, timeout: float,
                       what: str = "the editor's file operation",
                       on_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
+                      cancelled: Callable[[], bool] | None = None,
                       ) -> subprocess.CompletedProcess[bytes]:
     """Run the helper in a new session (no controlling terminal) and, on a timeout or any error,
     kill its WHOLE group, not only sudo: ``subprocess.run`` kills just the child it started (S2 L3 r1,
-    codex + glm). ``on_start`` is given the process first; if it raises, the group is killed too."""
+    codex + glm). ``on_start`` is given the process first; if it raises, the group is killed too.
+    ``cancelled`` is asked every 0.2 s; once it says so the group is killed and OSError raised. Only
+    this thread ever signals or reaps the helper (L3 r3, r4: another thread signalling it could reach a
+    reused pid)."""
     from levain.launch import child_env
 
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             cwd="/", env=child_env(), start_new_session=True)
+    stopped = False
     try:
         if on_start is not None:
             on_start(proc)
-        out, err = proc.communicate(data, timeout=timeout)
+        if cancelled is None:
+            out, err = proc.communicate(data, timeout=timeout)
+        else:
+            deadline, sent = time.monotonic() + timeout, data
+            while True:
+                try:
+                    out, err = proc.communicate(sent, timeout=max(0.0, min(0.2, deadline - time.monotonic())))
+                    break
+                except subprocess.TimeoutExpired:
+                    sent = None   # retried without input: "Cannot send input after starting communication"
+                    if time.monotonic() >= deadline:
+                        raise
+                    if cancelled():
+                        stopped = True
+                        gone = _stop_hands_group(hands, proc)
+                        raise OSError(f"{what} as {hands.user} was cancelled"
+                                      + ("" if gone else f"; its process group {proc.pid} could not be stopped"))
     except subprocess.TimeoutExpired:
         gone = _stop_hands_group(hands, proc)
         raise OSError(f"{what} as {hands.user} timed out"
                       + ("" if gone else f"; its process group {proc.pid} could not be stopped")) from None
     except BaseException:
-        _stop_hands_group(hands, proc)
+        if not stopped:
+            _stop_hands_group(hands, proc)
         raise
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
@@ -6590,14 +6621,30 @@ def _in_hands_view(path: str | Path, hands: HandsIdentity) -> bool:
     return any(p == Path(t) or p.is_relative_to(t) for t in (*ro, *rw))
 
 
+#: The policy's jewel paths a hands launch narrows to its view: each names a host path the hands user
+#: would have to reach, so one outside the view is moot. `_HANDS_POLICY_KEPT` holds every other path
+#: field, each a SOURCE or a classification whose entry may feed something inside the view; a test
+#: fails while a path field is in neither, so a new one gets a decision.
+_HANDS_POLICY_NARROWED = ("deny_read_write", "deny_files", "deny_write_dirs", "deny_write_files", "deny_sockets",
+                          "socket_spellings", "own_memory_files", "sqlite_sidecars", "trust_spellings",
+                          "ssh_dir", "config_file")
+_HANDS_POLICY_KEPT = ("entity_dir", "workspace", "socket_sources", "ro_tool_dirs", "cred_dir_sources",
+                      "trusted_roots")
+
+
 def _hands_policy(policy: CrownJewelsPolicy, hands: HandsIdentity) -> CrownJewelsPolicy:
-    """The floor's policy with only the jewels a hands view contains: what a hands launch plans from,
-    rechecks and edits under. A jewel outside the view is unreachable by the hands user, so a refusal
-    over it refused for nothing (RUN 2026-10-09: the operator's ~/.levain/autonomic as a SQLite file
-    refused every hands launch)."""
-    return replace(policy,
-                   deny_read_write=tuple(p for p in policy.deny_read_write if _in_hands_view(p, hands)),
-                   deny_files=tuple(p for p in policy.deny_files if _in_hands_view(p, hands)))
+    """The floor's policy with only the jewels a hands view contains: what a hands launch checks, plans
+    from, rechecks and edits under. A jewel outside the view is unreachable by the hands user, so a
+    refusal over it refused for nothing (RUN 2026-10-09: a SQLite file, and a hardlinked file in the
+    operator's ~/.ssh, each refused every hands launch)."""
+    changes: dict[str, object] = {}
+    for name in _HANDS_POLICY_NARROWED:
+        v = getattr(policy, name)
+        if isinstance(v, tuple):
+            changes[name] = tuple(p for p in v if _in_hands_view(p, hands))
+        elif v is not None and not _in_hands_view(v, hands):
+            changes[name] = None
+    return replace(policy, **changes)
 
 
 def _hands_bwrap_argv(argv: list[str], hands: HandsIdentity) -> list[str]:
@@ -6799,12 +6846,18 @@ if mode == "out":
     def maker_gone(name):
         parts = name[len(".levain-relay-"):].split("-")
         if len(parts) != 3 or not parts[0].isdigit():
-            return True   # a name from before the maker was in it
+            return False   # no maker in the name: cannot tell, kept (L3 r4)
         try:
             with open("/proc/%s/stat" % parts[0]) as f:
                 return f.read().rsplit(")", 1)[1].split()[19] != parts[1]
         except FileNotFoundError:
-            return True
+            try:
+                os.kill(int(parts[0]), 0)   # hidepid hides it from /proc, not from kill(2)
+            except ProcessLookupError:
+                return True
+            except OSError:
+                pass
+            return False
         except (OSError, IndexError):
             return False   # cannot tell: kept
     def sweep(home):
@@ -7011,12 +7064,13 @@ def _hands_reach_text(hands: HandsIdentity, found: list[str]) -> str:
 
 
 def _hands_walk(hands: HandsIdentity,
-                on_start: Callable[[subprocess.Popen[bytes]], None] | None = None) -> list[str]:
+                on_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
+                cancelled: Callable[[], bool] | None = None) -> list[str]:
     """Every unix socket or FIFO in the read-only host trees of a hands view that the hands user may
     write (and every directory there it may search but not list). Asked of the kernel as the hands
     user inside the view with none of the floor's masks (they only hide; so this sees at least what
     bash will), by ``find -writable``, which is access(2): modes, ACLs and every ancestor's search bit.
-    OSError when the walk could not be done; ``on_start`` as for :func:`_run_hands_helper`."""
+    OSError when the walk could not be done; ``on_start`` and ``cancelled`` as for :func:`_run_hands_helper`."""
 
     ro, _ = _hands_view_trees(hands)
     if not ro:
@@ -7026,7 +7080,8 @@ def _hands_walk(hands: HandsIdentity,
             "-readable", ")", ")", "-o", "(", "-type", "d", "-executable", "!", "-readable", ")", ")", "-print0"]
     # The whole OR in one pair of parentheses: -print0 binds by -a, tighter than -o, so without it only
     # the last branch printed (RUN 2026-10-09: a 0777 socket under /opt walked as None).
-    r = _run_hands_helper(argv, hands, b"", _HANDS_WALK_TIMEOUT, "the walk", on_start=on_start)
+    r = _run_hands_helper(argv, hands, b"", _HANDS_WALK_TIMEOUT, "the walk", on_start=on_start,
+                          cancelled=cancelled)
     found = [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
     said = [x for x in r.stderr.decode("utf-8", "replace").splitlines() if x.strip()]
     # find exits 1 when a directory cannot be listed and walks the rest. Only that is let through, for
@@ -7113,7 +7168,8 @@ class _BwrapShell(SandboxedShell):
         self._relay: _HandsRelay | None = None   # a hands launch's host-side proxy relay, if any
         self._hands: HandsIdentity | None = None   # a hands launch's user, whose files are repaired
         self._command_since = 0.0
-        self._probed = False   # start()'s own command has run: it changes no file, so nothing to repair
+        self._walk_done = threading.Event()   # clear while a pre-command walk runs
+        self._walk_done.set()
 
     def start(self) -> "SandboxedShell":
         super().start()
@@ -7122,6 +7178,7 @@ class _BwrapShell(SandboxedShell):
 
     # Each command runs in a pid namespace of its own (``--unshare-pid --as-pid-1``), inside its leaf.
     _own_pid_namespace = True
+    _probed = False   # start()'s own command has run: it changes no file, so nothing to repair
 
     def _group_emptied(self, pgid: int, leader: _Leader, timeout: float) -> bool:
         """Empty once the command's driver (the leader) has exited and its leaf has no live process.
@@ -7210,11 +7267,14 @@ class _BwrapShell(SandboxedShell):
         # that does not empty keeps the claim; once this levain is gone, the next Linux spawn's
         # `sweep_dead_leaves` kills the leaf and the ledger sweep then drops the claim. Released in
         # `finally`, whatever the base teardown did.
-        # A walk cannot start once this is set (`_hold_walk`). One already running is left to its owner,
-        # the run thread, which alone reaps it: a second thread signalling it could reach a reused pid
-        # (L3 r3). It is the fixed read-only find, ended by its own timeout (_HANDS_WALK_TIMEOUT).
+        # A walk cannot start once this is set (`_refuse_once_closed`). One already running belongs to the
+        # run thread, which alone signals and reaps it: it sees this within 0.2 s, stops the walk's group
+        # and sets `_walk_done` (L3 r3: a second thread signalling it could reach a reused pid; r4: close()
+        # must not return with it alive).
         with self._lock:
             self._closed = True
+        if not self._walk_done.wait(5.0):
+            _log.warning("levain: the shell's pre-command walk did not stop within 5 s of close()")
         try:
             super().close()
         finally:
@@ -7368,13 +7428,17 @@ class _BwrapShell(SandboxedShell):
             # made since the last one (RUN: a root listener planted mid-shell was CONNECTED) refuses
             # this command. What is made DURING a command is not seen; that is the README's residue.
             # A walk that could not be done says nothing about the host: that command is refused and the
-            # shell stays (complement L3 r2). None starts once the shell is closed (codex L3 r2).
+            # shell stays (complement L3 r2). None starts once the shell is closed (codex L3 r2); one
+            # running when it closes is stopped by this thread, its owner, and close() waits for that.
+            self._walk_done.clear()
             try:
-                found = _hands_walk(hands, self._refuse_once_closed)
+                found = _hands_walk(hands, self._refuse_once_closed, lambda: self._closed)
             except OSError as exc:
                 raise ConfinementError(
                     f"levain could not walk, as {hands.user}, the host files its bash would see ({exc}) — "
                     "the command was not run (fail-closed).") from exc
+            finally:
+                self._walk_done.set()
             if found:
                 self.close()
                 raise ConfinementError(f"{_hands_reach_text(hands, found)} — the shell was closed and the "
@@ -7531,6 +7595,9 @@ class BwrapProvider(ConfinementProvider):
                    data: bytes = b"", *, timeout: float = 60.0) -> bytes:
         return _bwrap_hands_file(policy, hands, op, path, data, timeout)
 
+    def _view_policy(self, policy: CrownJewelsPolicy, hands: HandsIdentity | None) -> CrownJewelsPolicy:
+        return policy if hands is None else _hands_policy(policy, hands)
+
     def _spawn_shell_impl(
         self,
         policy: CrownJewelsPolicy,
@@ -7571,9 +7638,8 @@ class BwrapProvider(ConfinementProvider):
 
     def _spawn_bwrap(self, policy: CrownJewelsPolicy, env: dict[str, str] | None, default_timeout: float,
                      hands: HandsIdentity | None, relay: _HandsRelay | None) -> SandboxedShell:
-        if hands is not None:
-            # Planned, claimed, rechecked and edited under the view's jewels only.
-            policy = _hands_policy(policy, hands)
+        # Planned, claimed and rechecked under the view's jewels only (a hands launch).
+        policy = self._view_policy(policy, hands)
         # A crashed levain's leaves first, so the ledger sweep below finds their claims empty.
         sweep_dead_leaves()
         # ONE ledger transaction from the sweep to the claim (L1 r1): another session's release or sweep

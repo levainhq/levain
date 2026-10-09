@@ -846,7 +846,7 @@ def test_a_hands_shell_walks_again_before_every_command(monkeypatch):
     """RUN 2026-10-09 (R6-mid): a 0777 listener planted under /opt after the launch was CONNECTED by a
     later command of the same shell. The walk now runs before every command and refuses it."""
     shell, closed = _walking_shell(monkeypatch)
-    monkeypatch.setattr(confinement, "_hands_walk", lambda h, on_start=None: ["/opt/s2mid/sock"])
+    monkeypatch.setattr(confinement, "_hands_walk", lambda h, on_start=None, cancelled=None: ["/opt/s2mid/sock"])
     with pytest.raises(ConfinementError, match="/opt/s2mid/sock.*not run"):
         shell._before_command()
     assert closed == [True]
@@ -859,6 +859,8 @@ def _walking_shell(monkeypatch):
     shell._hands = _view_hands(monkeypatch)
     shell._lock = threading.Lock()
     shell._closed = False
+    shell._walk_done = threading.Event()
+    shell._walk_done.set()
     closed: list[bool] = []
     monkeypatch.setattr(confinement._BwrapShell, "close", lambda self: closed.append(True))
     monkeypatch.setattr(confinement._BwrapShell, "_recheck", lambda self: pytest.fail("ran past the walk"))
@@ -869,7 +871,7 @@ def test_a_walk_that_could_not_run_refuses_the_command_and_keeps_the_shell(monke
     """complement L3 r2: a timeout says nothing about the host, so only that command is refused."""
     shell, closed = _walking_shell(monkeypatch)
 
-    def failed(h, on_start=None):
+    def failed(h, on_start=None, cancelled=None):
         raise OSError("the walk as hands timed out")
     monkeypatch.setattr(confinement, "_hands_walk", failed)
     with pytest.raises(ConfinementError, match="timed out.*not run"):
@@ -979,6 +981,7 @@ def test_a_relay_removes_a_dead_levains_relay_directory_and_keeps_a_live_ones(tm
     pre = confinement._HANDS_RELAY_PREFIX
     me = f"{os.getpid()}-{confinement._proc_start_time(os.getpid())}"
     legacy, dead, live = tmp_path / f"{pre}0123abcd", tmp_path / f"{pre}{os.getpid()}-1-ab", tmp_path / f"{pre}{me}-cd"
+    # a name with no maker cannot be judged, so it is kept (L3 r4)
     for d in (legacy, dead, live):
         d.mkdir()
     (dead / "18080.sock").write_text("")
@@ -987,8 +990,8 @@ def test_a_relay_removes_a_dead_levains_relay_directory_and_keeps_a_live_ones(tm
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         assert relay.stdout.readline() == b"ready\n", relay.stderr.read()   # type: ignore[union-attr]
-        assert not legacy.exists() and not dead.exists()
-        assert live.exists() and new.exists()
+        assert not dead.exists()
+        assert legacy.exists() and live.exists() and new.exists()
     finally:
         relay.terminate()
         relay.wait(10)
@@ -996,3 +999,47 @@ def test_a_relay_removes_a_dead_levains_relay_directory_and_keeps_a_live_ones(tm
     while new.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
     assert not new.exists()
+
+
+def test_every_path_field_of_the_policy_is_narrowed_for_a_hands_view_or_kept_on_purpose():
+    """codex + glm L3 r4: the first narrowing left ssh_dir and the hardlink check out, and a hardlinked
+    file in the operator's ~/.ssh refused every hands launch (RUN 2026-10-09). A new path field fails here
+    until it is put in one list or the other."""
+    import dataclasses
+    import typing
+
+    hints = typing.get_type_hints(confinement.CrownJewelsPolicy)
+    paths = {f.name for f in dataclasses.fields(confinement.CrownJewelsPolicy) if "Path" in str(hints[f.name])}
+    assert paths == set(confinement._HANDS_POLICY_NARROWED) | set(confinement._HANDS_POLICY_KEPT)
+    assert not set(confinement._HANDS_POLICY_NARROWED) & set(confinement._HANDS_POLICY_KEPT)
+
+
+def test_a_hands_view_drops_the_operators_ssh_dir_and_keeps_jewels_inside_it(tmp_path, monkeypatch):
+    hands = _view_hands(monkeypatch)
+    inside = Path("/etc/levain-jewel")
+    policy = build_policy(_entity(tmp_path), workspace=hands.workspace)
+    policy = confinement.replace(policy, ssh_dir=tmp_path / ".ssh", deny_files=(*policy.deny_files, inside))
+    narrowed = confinement._hands_policy(policy, hands)
+    assert narrowed.ssh_dir is None
+    assert inside in narrowed.deny_files
+    assert all(confinement._in_hands_view(p, hands) for p in narrowed.deny_read_write)
+
+
+def test_a_cancelled_helper_is_stopped_by_its_own_thread_once(monkeypatch, tmp_path):
+    """L3 r3 + r4: close() must not signal the walk (a reused pid) nor return while it runs; the run
+    thread polls `cancelled` and stops its own helper."""
+    import time
+
+    stops: list[int] = []
+
+    def stop(h, proc):
+        stops.append(proc.pid)
+        proc.kill()
+        proc.wait()
+        return True
+    monkeypatch.setattr(confinement, "_stop_hands_group", stop)
+    began = time.monotonic()
+    with pytest.raises(OSError, match="cancelled"):
+        confinement._run_hands_helper(["/bin/sleep", "30"], _hands(tmp_path), b"", 60, "the walk",
+                                      cancelled=lambda: time.monotonic() - began > 0.3)
+    assert len(stops) == 1 and time.monotonic() - began < 5
