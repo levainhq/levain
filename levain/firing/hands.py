@@ -313,7 +313,7 @@ def egress_boundary_problem(hands_user: str, ports: tuple[int, ...] = (), *, net
             listener.close()
             listener = socket.socket()
             listener.bind(("127.0.0.1", 0))
-        else:
+        if listener.getsockname()[1] in ports:
             return "the probe found no loopback port the boundary refuses (are all ports allowed?)"
         listener.listen(4)
         listener.settimeout(3)
@@ -353,6 +353,24 @@ def egress_boundary_problem(hands_user: str, ports: tuple[int, ...] = (), *, net
         return f"the probe failed ({exc})"
     finally:
         listener.close()
+
+
+def egress_drift_problem(hands_user: str, hands_id: int, ports: tuple[int, ...]) -> str | None:
+    """Does the ruleset on disk (what boot and every reload load) say exactly what the record says?
+    The file is world-readable; the loaded table is not (listing needs root), and the probe tests only
+    a refused port, so a ruleset allowing MORE than the record (a part-way or concurrent repair) would
+    otherwise pass (L3 r2, codex)."""
+    import grp
+
+    try:
+        net_gid = grp.getgrnam(hands_net_group(hands_user)).gr_gid
+        on_disk = egress_rules_path(hands_user).read_text(encoding="utf-8")
+    except (KeyError, OSError) as exc:
+        return f"the boundary's ruleset or group cannot be read ({exc})"
+    if on_disk != egress_ruleset(hands_user, hands_id, ports, net_gid):
+        return (f"the ruleset in {egress_rules_path(hands_user)} is not the one the record describes (allowed ports "
+                f"{list(ports) or 'none'}): a repair stopped part way, or the file was edited")
+    return None
 
 
 def egress_steps(hands_user: str, hands_id: int, ports: tuple[int, ...], net_gid: int | None = None) -> list[Step]:
@@ -423,6 +441,31 @@ def net_group_problem(hands_user: str) -> str | None:
             return f"{db} cannot be read ({exc.strerror}), so a subordinate id range for {hands_user} cannot be ruled out"
         if any(ln.split(":", 1)[0] in owners for ln in text.splitlines()):
             return f"{hands_user} has a range in {db}, so its processes can take ids the boundary does not match"
+    return _subid_nss_problem(hands_user)
+
+
+def _subid_nss_problem(hands_user: str) -> str | None:
+    """subuid(5): ranges can come from an NSS provider instead of the files (``subid:`` in
+    nsswitch.conf). Then ask the provider through ``getsubids`` (uid and gid ranges); a provider that
+    cannot be asked fails closed (L3 r2, codex)."""
+    try:
+        conf = Path("/etc/nsswitch.conf").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        return f"/etc/nsswitch.conf cannot be read ({exc.strerror}), so a subordinate id provider cannot be ruled out"
+    providers = [ln.split(":", 1)[1].split() for ln in conf.splitlines()
+                 if ln.split("#", 1)[0].strip().startswith("subid:")]
+    if not providers or all(p in ("files",) for p in providers[-1]):
+        return None
+    getsubids = shutil.which("getsubids", path=SECURE_PATH)
+    if getsubids is None:
+        return (f"nsswitch.conf names a subordinate id provider ({' '.join(providers[-1])}) and getsubids is not "
+                f"installed, so a range for {hands_user} cannot be ruled out")
+    for flag in ((), ("-g",)):
+        r = subprocess.run([getsubids, *flag, hands_user], capture_output=True, text=True, env=child_env())
+        if r.returncode == 0 and r.stdout.strip():
+            return f"{hands_user} has a subordinate id range from {' '.join(providers[-1])}: {r.stdout.strip()}"
     return None
 
 
@@ -1407,6 +1450,25 @@ def _repair_linux(entity_dir: Path, cfg, operator: str, op: pwd.struct_passwd, p
     plan = Plan("linux", operator, hands, hands_id, entity_dir, cfg.hands_workspace, tuple(steps))
     print(f"Repairing the setup recorded in {entity_dir} (user {hands}): linger, and the network boundary "
           + (f"(loopback ports {', '.join(map(str, ports))} allowed)." if ports else "(no port allowed)."))
+    # One repair at a time, and none under a session or ws-git: the hands lock, exclusive, from the
+    # re-read of the record to the end of the plan (L3 r2, codex: two repairs could record B and load A).
+    lock_fd = None
+    if not dry_run:
+        try:
+            lock_fd = _undo_lock(entity_dir, op.pw_uid, op.pw_gid)
+        except (HandsSetupError, OSError) as exc:
+            print(f"setup-isolation: {exc}")
+            return 1
+        if lock_fd == -1:
+            print("setup-isolation: a session of this entity, or ws-git / ws-put / ws-adopt, or another repair is "
+                  "running; refusing to repair under it.")
+            return 1
+        from levain.firing.confinement import load_confinement_config
+
+        if load_confinement_config(entity_dir, bound_hands=False) != cfg:
+            os.close(lock_fd)
+            print("setup-isolation: the record changed while this repair started; run it again.")
+            return 1
     if ports != cfg.hands_egress_ports and not dry_run:
         # Recorded FIRST, as the state to reach: if a step below fails part way, the ruleset on disk may
         # already hold these ports, and a rerun (which reads the record) converges on them rather than
@@ -1414,7 +1476,11 @@ def _repair_linux(entity_dir: Path, cfg, operator: str, op: pwd.struct_passwd, p
         record_hands(entity_dir, {"hands_user": hands, "hands_uid": hands_id,
                                   "hands_workspace": str(cfg.hands_workspace), "hands_egress_ports": list(ports)},
                      owner_uid=op.pw_uid, owner_gid=op.pw_gid)
-    rc = run_plan(plan, dry_run=dry_run)
+    try:
+        rc = run_plan(plan, dry_run=dry_run)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
     if rc != 0:
         print("setup-isolation: the repair stopped part way; run it again (it converges on the recorded ports).")
     if rc != 0 or dry_run:
