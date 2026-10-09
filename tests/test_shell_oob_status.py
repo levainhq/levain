@@ -1302,7 +1302,9 @@ def test_only_the_initial_pid_namespace_makes_or_sweeps_leaves(tmp_path, monkeyp
 
     uid = os.getuid()
     base = tmp_path / C._user_manager_rel(uid) / C._LEVAIN_SLICE
-    gone = C._PID_MAX_LIMIT   # pids stay below pid_max, so none is ever this one
+    gone = 4000123   # in range; the kernel is stubbed to say no process holds it
+    monkeypatch.setattr(C, "_stat_fields", lambda pid: (_ for _ in ()).throw(FileNotFoundError(pid)))
+    monkeypatch.setattr(C.os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError(pid)))
     dead = f"levain-{C._INIT_PIDNS}-{gone}-1-{'a' * 12}-1.scope"
     # Never judged: another namespace's name, and a name that does not say its namespace (L3 r12).
     for other in (f"levain-4026532999-{gone}-1-{'c' * 12}-1.scope", f"levain-{gone}-1-{'d' * 12}-1.scope"):
@@ -1331,7 +1333,10 @@ def test_claim_recovery_judges_leaves_exactly_as_the_sweep_does(monkeypatch):
     monkeypatch.setattr(C, "_leaf_kill", lambda rel: killed.append(rel) or True)
     monkeypatch.setattr(C, "_leaf_gone", lambda rel, timeout: True)
     head = f"{C._user_manager_rel(os.getuid())}/{C._LEVAIN_SLICE}/"
-    gone = C._PID_MAX_LIMIT   # pids stay below pid_max, so none is ever this one
+    gone = 4000123   # in range; the kernel is stubbed to say no process holds it
+    real_kill = os.kill
+    monkeypatch.setattr(C.os, "kill", lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError(pid))
+                        if pid == gone else real_kill(pid, sig))
     dead = f"{gone}:1:{C._INIT_PIDNS}:x"
 
     def stat(pid):
@@ -1346,7 +1351,9 @@ def test_claim_recovery_judges_leaves_exactly_as_the_sweep_does(monkeypatch):
     assert C._claim_alive(f"{dead}:c{live}") and killed == []
     huge = f"{head}levain-{C._INIT_PIDNS}-{'9' * 5000}-1-{'d' * 12}-1.scope"
     assert C._claim_alive(f"{dead}:c{huge}") and killed == []
-    for bad in ("0", "9999999999"):   # L3 r17: kill(0) is our own group; a 10-digit pid overflows kill()
+    # L3 r17: kill(0) is our own group, a 10-digit pid overflows kill(); r18: PID_MAX_LIMIT is never a pid,
+    # and a zero-padded number is not a name levain writes.
+    for bad in ("0", "9999999999", str(C._PID_MAX_LIMIT), f"0{os.getpid()}"):
         odd = f"{head}levain-{C._INIT_PIDNS}-{bad}-1-{'e' * 12}-1.scope"
         assert C._claim_alive(f"{dead}:c{odd}") and killed == []
     ours = f"{head}levain-{C._INIT_PIDNS}-{gone}-1-{'b' * 12}-1.scope"

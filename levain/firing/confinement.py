@@ -5240,10 +5240,12 @@ def _leaf_rel(uid: int, unit: str) -> str:
 # since its leaves would outlive it with no sweep able to judge them (L3 r10, r11). The namespace stays
 # in the name so the sweep judges only names it can read, whatever made them; a name without it is
 # never judged (L3 r12).
-# Bounded fields: a tag is read back from the ledger, and an unbounded digit run would not convert (L3 r14).
-_LEAF_UNIT = re.compile(r"levain-([0-9]{1,20})-([0-9]{1,10})-([0-9]{1,20})-[0-9a-f]{12}-[0-9]{1,20}\.scope")
+# Bounded, canonical fields (no leading zero): a tag is read back from the ledger, an unbounded digit run
+# would not convert (L3 r14), and a padded number would not compare equal to /proc's (L3 r18).
+_N = r"(?:0|[1-9][0-9]{0,19})"
+_LEAF_UNIT = re.compile(rf"levain-({_N})-({_N})-({_N})-[0-9a-f]{{12}}-{_N}\.scope")
 _INIT_PIDNS = "4026531836"
-_PID_MAX_LIMIT = 4194304   # PID_MAX_LIMIT on 64-bit Linux (include/linux/threads.h)
+_PID_MAX_LIMIT = 4194304   # PID_MAX_LIMIT on 64-bit Linux (include/linux/threads.h); pids stay below it
 
 
 def _leaf_unit(token: str, n: int) -> str | None:
@@ -5267,7 +5269,7 @@ def _leaf_orphaned(rel: str, uid: int) -> bool:
     # any other way, or a stat line too short to read, is not knowing, and an unknown maker keeps its
     # leaf (L3 r15: an EMFILE here killed a live levain's command).
     pid = int(m.group(2))
-    if not 1 <= pid <= _PID_MAX_LIMIT:
+    if not 1 <= pid < _PID_MAX_LIMIT:
         return False   # no levain has that pid: not a name to judge (L3 r17: kill(0) is our own group)
     try:
         fields = _stat_fields(pid)
