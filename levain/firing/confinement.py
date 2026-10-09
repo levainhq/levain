@@ -5233,30 +5233,28 @@ def _leaf_rel(uid: int, unit: str) -> str:
     return f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/{unit}.scope"
 
 
-# A leaf's unit names the levain process that made it (pid namespace, pid and kernel start time), so a
-# sweep can tell a crashed levain's leaf from a live one's without any other record. A pid is only
-# meaningful inside its own namespace: a levain in another pid namespace sharing this uid's cgroupfs
-# makes leaves this sweep must leave alone (L3 r10).
-_LEAF_UNIT = re.compile(r"levain-(\d+)-(\d+)-(\d+)-[0-9a-f]{12}-\d+\.scope")
-# The name before the namespace was in it. The sweep never judges one (it cannot tell whose namespace
-# made it); the ledger claim that tagged it, which carries its namespace, still can.
-_LEGACY_LEAF_UNIT = re.compile(r"levain-(\d+)-(\d+)-[0-9a-f]{12}-\d+\.scope")
+# A leaf's unit names the levain process that made it (pid and kernel start time), so a sweep can tell a
+# crashed levain's leaf from a live one's without any other record.
+_LEAF_UNIT = re.compile(r"levain-(\d+)-(\d+)-[0-9a-f]{12}-\d+\.scope")
+# A pid names a process only inside its own pid namespace, so leaves are made, and swept, only from the
+# host's initial one (PROC_PID_INIT_INO, include/linux/proc_ns.h). A levain in a nested namespace is
+# refused by name: its leaves would outlive it with no sweep able to judge them (L3 r10, r11).
+_INIT_PIDNS = "4026531836"
 
 
 def _leaf_unit(token: str, n: int) -> str | None:
-    """The unit name of this levain's leaf number ``n``; None when /proc cannot say who this levain is."""
-    started, ns = _proc_start_time(os.getpid()), _pidns()
-    if started is None or ns == "-":
+    """The unit name of this levain's leaf number ``n``; None when this levain must not make one (not
+    in the initial pid namespace) or /proc cannot say who it is."""
+    started = _proc_start_time(os.getpid())
+    if started is None or _pidns() != _INIT_PIDNS:
         return None
-    return f"levain-{ns}-{os.getpid()}-{started}-{token}-{n}"
+    return f"levain-{os.getpid()}-{started}-{token}-{n}"
 
 
 def _is_levain_leaf(rel: str, uid: int) -> bool:
     """Whether ``rel`` names a leaf levain makes for ``uid`` and nothing else (a crash sweep kills it)."""
     head = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/"
-    name = rel[len(head):]
-    return rel.startswith(head) and (_LEAF_UNIT.fullmatch(name) is not None
-                                     or _LEGACY_LEAF_UNIT.fullmatch(name) is not None)
+    return rel.startswith(head) and _LEAF_UNIT.fullmatch(rel[len(head):]) is not None
 
 
 def sweep_dead_leaves() -> list[str]:
@@ -5269,13 +5267,14 @@ def sweep_dead_leaves() -> list[str]:
         names = os.listdir(base)
     except OSError:
         return []
-    ns = _pidns()
+    if _pidns() != _INIT_PIDNS:
+        return []   # the pids in leaf names are the initial namespace's; from here they name nothing
     left: list[str] = []
     killed: list[str] = []
     for name in names:
         m = _LEAF_UNIT.fullmatch(name)
-        if not m or m.group(1) != ns or _proc_start_time(int(m.group(2))) == m.group(3):
-            continue   # not a leaf, another pid namespace's (not ours to judge), or its levain is alive
+        if not m or _proc_start_time(int(m.group(1))) == m.group(2):
+            continue   # not a leaf, or its levain is alive
         rel = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/{name}"
         (killed if _leaf_kill(rel) else left).append(rel)
     # Every leaf is killed first, then all are awaited against ONE deadline: the sweep runs at every
@@ -5288,7 +5287,7 @@ def sweep_dead_leaves() -> list[str]:
 
 
 def _cgroup_problem(*, release: str | None = None, osrelease: str | None = None, mounts: str | None = None,
-                    container: bool | None = None, uid: int | None = None,
+                    container: bool | None = None, pidns: str | None = None, uid: int | None = None,
                     root: Path = _CGROUP_ROOT) -> tuple[str, str | None] | None:
     """Why a Linux command cannot get a cgroup leaf here, as (reason, remedy), or None. Each refusal is
     by name; there is no fallback that runs a command without its leaf. The inputs default to this
@@ -5307,6 +5306,9 @@ def _cgroup_problem(*, release: str | None = None, osrelease: str | None = None,
     if container:
         return ("this is a container, which levain's Linux floor does not support yet (cgroup "
                 "delegation into it is not measured)", "run levain on the host")
+    if (_pidns() if pidns is None else pidns) != _INIT_PIDNS:
+        return ("levain is running in a nested pid namespace, where a crashed levain's command scopes "
+                "could not be told from a live one's", "run levain in the host's pid namespace")
     m = re.match(r"(\d+)\.(\d+)", release if release is not None else os.uname().release)
     if not m or (int(m.group(1)), int(m.group(2))) < _CGROUP_KILL_KERNEL:
         return (f"Linux {release if release is not None else os.uname().release} has no cgroup.kill "
@@ -5353,7 +5355,7 @@ def _leaf_chain_problem() -> str | None:
     it said. Static checks cannot see an LSM, a seccomp profile or a user manager that refuses (L3 r9)."""
     unit = _leaf_unit(os.urandom(6).hex(), 0)
     if unit is None:
-        return "levain cannot read its own start time or pid namespace from /proc"
+        return "levain cannot read its own start time from /proc, or is not in the host's pid namespace"
     rel = _leaf_rel(os.getuid(), unit)
     argv = ["/usr/bin/env", f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}", SYSTEMD_RUN, "--user", "--scope",
             "--quiet", "--collect", f"--slice={_LEVAIN_SLICE}", f"--unit={unit}", "--",
@@ -6434,10 +6436,10 @@ class _BwrapShell(SandboxedShell):
         argv, pass_fds = super()._spawn_argv()
         unit = _leaf_unit(self._unit_token, self._units + 1)
         if unit is None:
-            # The unit name carries both, so a crash sweep can tell this levain's leaves from a live one's.
-            raise ConfinementError("levain cannot read its own start time or pid namespace from /proc — "
-                                   "refusing to run the command (fail-closed): a crash could not be told "
-                                   "from a live levain.")
+            # The unit name carries it, so a crash sweep can tell this levain's leaves from a live one's.
+            raise ConfinementError("levain cannot read its own start time from /proc, or is not in the "
+                                   "host's pid namespace — refusing to run the command (fail-closed): a "
+                                   "crash could not be told from a live levain.")
         self._units += 1
         leaf = _leaf_rel(os.getuid(), unit)
         # The claim names the leaf BEFORE anything is spawned in it: after a levain crash at any later

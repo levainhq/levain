@@ -276,7 +276,7 @@ def test_on_linux_any_other_procfs_counts_as_a_process_view(monkeypatch) -> None
 def test_a_host_that_cannot_give_bash_a_pid_namespace_is_named_and_refused(monkeypatch) -> None:
     monkeypatch.setattr(C.os.path, "isfile", lambda p: True if p == C.BWRAP else os.path.lexists(p))
     monkeypatch.setattr(C.os, "access", lambda p, m: True if p == C.BWRAP else os.access(p, m))
-    monkeypatch.setattr(C.BwrapProvider, "available", lambda self: False)
+    monkeypatch.setattr(C, "bwrap_available", lambda: False)   # what the diagnosis asks, once
     monkeypatch.setattr(C, "_bwrap_runs_without_a_pid_namespace", lambda: True)
     monkeypatch.setattr(C, "_cgroup_problem", lambda: None)
     d = C.diagnose_confinement("Linux")

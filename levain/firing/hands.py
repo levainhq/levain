@@ -1130,7 +1130,11 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
         return 0
 
     if cfg.hands_user is not None:
-        if host == "linux" and not dry_run:
+        if host == "linux" and dry_run:
+            print(f"setup-isolation: would run `loginctl enable-linger {operator}` for the setup recorded "
+                  f"in {entity_dir} (user {cfg.hands_user}).")
+            return 0
+        if host == "linux":
             # An install from before the cgroup frame has no linger, and "run setup again" is its
             # remedy: the one step it is missing runs here, idempotently, without an undo (L3 r9).
             try:
@@ -1144,9 +1148,10 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
                      else f"could not enable it ({said or 'no reason given'})."))
             if not ok:
                 return 1
-            # The repair was what this run was for: it succeeded, so it is not a refusal (L3 r10).
-            print(f"setup-isolation: {entity_dir} was already set up (user {cfg.hands_user}); "
-                  "linger is now enabled for it.")
+            # The repair was what this run was for: it succeeded, so it is not a refusal (L3 r10). This
+            # run checked nothing else of the recorded setup, so it claims nothing else (L3 r11).
+            print(f"setup-isolation: linger is now enabled for the setup recorded in {entity_dir} (user "
+                  f"{cfg.hands_user}); `levain doctor` checks the rest of it.")
             return 0
         print(f"setup-isolation: {entity_dir} is already set up (user {cfg.hands_user}). "
               "Run with --undo first to set it up again.")

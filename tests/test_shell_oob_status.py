@@ -1246,6 +1246,7 @@ _V2 = "cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate
 @pytest.mark.parametrize("host, said", [
     (dict(osrelease="5.15.153.1-microsoft-standard-WSL2"), "WSL2"),
     (dict(container=True), "container"),
+    (dict(pidns="4026532999"), "nested pid namespace"),
     (dict(mounts="cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n"), "nsdelegate"),
     (dict(release="5.10.0-28-amd64"), "5.14"),
     (dict(mounts="tmpfs /sys/fs/cgroup tmpfs ro 0 0\ncgroup2 /sys/fs/cgroup/unified cgroup2 rw 0 0\n"
@@ -1256,7 +1257,8 @@ def test_a_host_without_a_cgroup_leaf_is_refused_by_name(host, said):
     without its leaf."""
     from levain.firing import confinement as C
 
-    args = dict(release="6.8.0-124-generic", osrelease="6.8.0-124-generic", mounts=_V2, container=False)
+    args = dict(release="6.8.0-124-generic", osrelease="6.8.0-124-generic", mounts=_V2, container=False,
+                pidns=C._INIT_PIDNS)
     args.update(host)
     problem = C._cgroup_problem(**args)
     assert problem is not None and said in problem[0]
@@ -1290,26 +1292,25 @@ def test_linux_a_command_cannot_move_itself_out_of_its_leaf(tmp_path):
             # an assert above failed already and says why; do not mask it with this one
 
 
-def test_the_crash_sweep_leaves_another_pid_namespaces_leaves_alone(tmp_path, monkeypatch):
-    """L3 r10 consensus, RUN on argushub (1009-13_S2/r10_fix1_ns_sweep_run.txt): a pid is only meaningful
-    in its own namespace, and the sweep killed the live leaf of a levain in another one because its pid
-    was not a live process here. Only this namespace's dead levain's leaf may be killed."""
+def test_only_the_initial_pid_namespace_makes_or_sweeps_leaves(tmp_path, monkeypatch):
+    """L3 r10 consensus, RUN on argushub (1009-13_S2/r10_fix1_ns_sweep_run.txt): the sweep killed the live
+    leaf of a levain in another pid namespace, whose pid named nothing here. L3 r11: keeping such leaves
+    instead leaks them once that levain crashes. So a nested namespace neither names a leaf nor sweeps,
+    and from the initial one a dead levain's leaf is killed."""
     from levain.firing import confinement as C
 
-    uid, ns = os.getuid(), "4026531836"
+    uid = os.getuid()
     base = tmp_path / C._user_manager_rel(uid) / C._LEVAIN_SLICE
-    names = {
-        "own_dead": f"levain-{ns}-999999-1-{'a' * 12}-1.scope",
-        "foreign": f"levain-{int(ns) + 1}-999999-1-{'b' * 12}-1.scope",
-        "legacy": f"levain-999999-1-{'c' * 12}-1.scope",
-    }
-    for n in names.values():
-        (base / n).mkdir(parents=True)
+    dead = f"levain-999999-1-{'a' * 12}-1.scope"
+    (base / dead).mkdir(parents=True)
     killed: list[str] = []
     monkeypatch.setattr(C, "_CGROUP_ROOT", tmp_path)
-    monkeypatch.setattr(C, "_pidns", lambda: ns)
-    monkeypatch.setattr(C, "_proc_start_time", lambda pid: None)   # pid 999999 is not alive here
+    monkeypatch.setattr(C, "_proc_start_time", lambda pid: None if pid == 999999 else "7")
     monkeypatch.setattr(C, "_leaf_kill", lambda rel: killed.append(rel.rsplit("/", 1)[-1]) or True)
     monkeypatch.setattr(C, "_leaf_gone", lambda rel, timeout: True)
-    assert C.sweep_dead_leaves() == []
-    assert killed == [names["own_dead"]]
+    monkeypatch.setattr(C, "_pidns", lambda: "4026532999")
+    assert C._leaf_unit("b" * 12, 1) is None
+    assert C.sweep_dead_leaves() == [] and killed == []
+    monkeypatch.setattr(C, "_pidns", lambda: C._INIT_PIDNS)
+    assert C._leaf_unit("b" * 12, 1) == f"levain-{os.getpid()}-7-{'b' * 12}-1"
+    assert C.sweep_dead_leaves() == [] and killed == [dead]
