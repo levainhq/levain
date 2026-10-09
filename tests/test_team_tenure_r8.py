@@ -55,6 +55,7 @@ def test_i2_a_busy_op_is_reported_by_the_hook_fetch_and_never_stamped(two):
     """codex r7 3 (HIGH) + complement 3: `fetch_if_due` stamped the attempt, met a busy op and returned None, so the hook
     showed the old copy with no note and did not retry for a whole interval."""
     tmp, ana, ben = two
+    gl(ben).save_state(last_fetch_ok=0)     # the copy shown is stale (r8: a fresh copy stays quiet, test_j2)
     before = gl(ben).state().get("last_fetch_attempt")
     note = _hold_op(ben, lambda: gl(ben).fetch_if_due(0, timeout=5))
     assert note and "another levain team operation" in note, note
