@@ -888,6 +888,10 @@ def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
 
 
 PROJECT_MEMORY_HOME = ".anneal-projects"
+# The autonomic engine's store DIRECTORY (``levain.autonomic.db.default_store_dir``): its binding registry,
+# run journal, SQLite sidecars and effect leases, denied read and write as ONE subtree under the levain
+# home (``$LEVAIN_HOME``, else ``~/.levain``). The database's sidecars live inside it, so bash is not refused.
+AUTONOMIC_STORE_DIR = "autonomic"
 DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
 
 
@@ -1172,6 +1176,9 @@ def build_policy(
         read the operator's own memory;
       - sibling entities' ``<other>/.levain/`` stores (subtrees) — one entity can't read another's
         memory;
+      - the autonomic engine's store directory ``<levain home>/autonomic`` (``$LEVAIN_HOME``, else
+        ``~/.levain``; subtree, read and write) — the binding registry and run journal that decide
+        what fires, so an entity can neither read nor rewrite its own authority (:data:`AUTONOMIC_STORE_DIR`);
       - ⛔ ALL of ``~/.ssh`` (read+write-denied when ``ssh_mode="agent"``, except ``known_hosts``
         r+w and ``config`` r) — LOCATION-BASED, NOT NAME-BASED. See this module's docstring, which
         is the one home for this fact and carries its provenance (apparatus L2). This bullet used
@@ -1262,6 +1269,7 @@ def build_policy(
     home = Path.home()
 
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
+    subtrees.append((Path(os.environ.get("LEVAIN_HOME") or home / ".levain").expanduser() / AUTONOMIC_STORE_DIR).resolve())
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
     listed_dirs = _trust_listed_stores(home, ed, ws)

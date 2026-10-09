@@ -122,14 +122,14 @@ def test_build_policy_does_not_guess_cred_files(tmp_path: Path, monkeypatch) -> 
     """REGRESSION (L4-live 2026-07-11): a generic, operator-neutral module must NOT invent a cred
     path like ``~/.env.flow`` — that is FALSE SECURITY (it "protects" a path the secret isn't at
     while missing the real one). With no ``deny_files`` passed, no credential file is denied. The
-    only entries are the SQLite sidecar names of the universal stores (``~/.anneal-memory`` and
-    ``~/.anneal-projects``, absent here), which are derived, not guessed."""
+    only entries are the SQLite sidecar names of the universal stores (``~/.anneal-memory``,
+    ``~/.anneal-projects`` and ``~/.levain/autonomic``, absent here), which are derived, not guessed."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("ANNEAL_MEMORY_DERIVE_TRUST", raising=False)
     policy = build_policy(_entity(tmp_path))
     assert set(policy.deny_files) == set(policy.sqlite_sidecars)
     assert {p.name for p in policy.sqlite_sidecars} == {
-        f"{store}{suffix}" for store in (".anneal-memory", ".anneal-projects")
+        f"{store}{suffix}" for store in (".anneal-memory", ".anneal-projects", "autonomic")
         for suffix in ("-wal", "-shm", "-journal")}
 
 
