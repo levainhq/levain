@@ -241,6 +241,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -2481,31 +2482,34 @@ def _hands_env(hands: HandsIdentity) -> dict[str, str]:
             "TERM": "dumb", "USER": hands.user, "LOGNAME": hands.user}
 
 
-#: Linux: run first by every hands process, as the hands user, between sudo and what it starts
-#: (argv: levain's pid, then the command). Two things before it execs the command:
-#: 1. It joins a NEW, empty session keyring. The operator's session keyring otherwise crosses sudo (no
+#: Linux: run in front of every sandboxed command levain starts (argv: ``keyring`` or ``-``, levain's
+#: pid, then the command): by every hands process, as the hands user, between sudo and what it starts
+#: (``keyring``); by the operator floor's bwrap, as the operator (``-``). Before it execs the command:
+#: 1. With ``keyring`` it joins a NEW, empty session keyring. The operator's session keyring otherwise crosses sudo (no
 #:    pam_keyinit in Ubuntu's sudo stack) and bwrap (a user namespace does not detach it): RUN in a VM
 #:    2026-10-09, `keyctl print` inside a hands bash printed a key the operator had added to @s. The
 #:    keyctl syscall number is the architecture's; one not listed refuses.
 #: 2. It forks a watcher holding pidfds on levain and on itself (the command, once exec'd): when levain
 #:    exits first, the command's other children get SIGKILL (bwrap's: the namespace's pid 1), then the
-#:    command SIGTERM, then SIGKILL. bwrap's ``--die-with-parent`` binds to sudo
-#:    here, and sudo outlives levain: RUN 2026-10-09, levain SIGKILLed mid-command left the command's
-#:    bash, a ``setsid`` child and both relays running. A pidfd signal cannot reach a reused pid, and
+#:    command SIGTERM, then SIGKILL. RUN 2026-10-09 with levain SIGKILLed mid-command: as hands, bwrap's
+#:    ``--die-with-parent`` binds to sudo, which outlives levain, and the command's bash, a ``setsid``
+#:    child and both relays kept running; as the operator, bwrap died with levain but a ``setsid``
+#:    child and the command's own child of bash (the namespace's pid 1) kept running. A pidfd signal cannot reach a reused pid, and
 #:    levain must be an ancestor at the start, so a pid reused after levain died is refused.
 #: ``python3 -I -S`` (no site, no environment); every input is argv data.
-_HANDS_START = r"""import ctypes, os, select, signal, sys
+_HANDS_START = r"""import ctypes, os, select, signal, sys, time
 nr = {"x86_64": 250, "aarch64": 219, "riscv64": 219}.get(os.uname().machine)
-if nr is None:
+keyring = sys.argv[1] == "keyring"
+if keyring and nr is None:
     sys.stderr.write("levain: no keyctl syscall number known for %s; refusing to start with the "
                      "operator's session keyring\n" % os.uname().machine)
     os._exit(126)
 libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
-if libc.syscall(ctypes.c_long(nr), ctypes.c_long(1), ctypes.c_void_p(None)) < 0:
+if keyring and libc.syscall(ctypes.c_long(nr), ctypes.c_long(1), ctypes.c_void_p(None)) < 0:
     sys.stderr.write("levain: could not join a new session keyring: %s\n" % os.strerror(ctypes.get_errno()))
     os._exit(126)
-watch, argv, me = int(sys.argv[1]), sys.argv[2:], os.getpid()
+watch, argv, me = int(sys.argv[2]), sys.argv[3:], os.getpid()
 def parent(pid):
     with open("/proc/%d/stat" % pid) as f:
         return int(f.read().rsplit(")", 1)[1].split()[1])
@@ -2528,24 +2532,39 @@ if os.fork() == 0:
         mine = os.pidfd_open(me)
     except OSError:
         os._exit(0)
-    if select.select([held, mine], [], [])[0] == [held]:
-        # The command's other children first: for bwrap that is the namespace's pid 1, whose death ends
-        # the namespace. bwrap's own --die-with-parent did not reach it (RUN 2026-10-09: bash, pid 1,
-        # outlived a SIGTERMed bwrap). They cannot be reaped while the command lives, so no pid is reused.
-        for pid in os.listdir("/proc"):
-            if pid.isdigit() and int(pid) != os.getpid():
-                try:
-                    if parent(int(pid)) == me:
-                        os.kill(int(pid), signal.SIGKILL)
-                except OSError:
-                    pass
-        for sig, wait in ((signal.SIGTERM, 2), (signal.SIGKILL, None)):
-            try:
-                signal.pidfd_send_signal(mine, sig)
-            except OSError:
-                break
-            if wait and select.select([mine], [], [], wait)[0]:
-                break
+    # A pidfd on each child of the command, taken as it appears (bwrap's: the namespace's pid 1). On the
+    # operator floor bwrap's own --die-with-parent kills bwrap the moment levain dies, and its pid 1 is
+    # reparented at once (RUN 2026-10-09), so it must be held before then; a pidfd outlives reparenting.
+    # Looked for until the first is found, for 10 s at most: bwrap forks its one pid 1 at once, and the
+    # relays fork none.
+    kids, scan_until = {}, time.monotonic() + 10
+    while True:
+        wait = 0 if kids else scan_until - time.monotonic()
+        ready = select.select([held, mine], [], [], 0.05 if wait > 0 else None)[0]
+        if wait > 0:
+            for pid in os.listdir("/proc"):
+                if pid.isdigit() and int(pid) not in kids and int(pid) != os.getpid():
+                    try:
+                        if parent(int(pid)) == me:
+                            kids[int(pid)] = os.pidfd_open(int(pid))
+                    except OSError:
+                        pass
+        if held in ready:
+            break
+        if mine in ready:
+            os._exit(0)
+    for fd in kids.values():
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except OSError:
+            pass
+    for sig, wait in ((signal.SIGTERM, 2), (signal.SIGKILL, None)):
+        try:
+            signal.pidfd_send_signal(mine, sig)
+        except OSError:
+            break
+        if wait and select.select([mine], [], [], wait)[0]:
+            break
     os._exit(0)
 os.close(held)
 os.execv(argv[0], argv)
@@ -2560,8 +2579,13 @@ def hands_prefix(hands: HandsIdentity, *, system: str | None = None) -> list[str
     argv = [SUDO, "-n", "-u", hands.user, "/usr/bin/env", "-i",
             *(f"{k}={v}" for k, v in _hands_env(hands).items())]
     if (system or platform.system()) == "Linux":
-        argv += [HANDS_PYTHON, "-I", "-S", "-c", _HANDS_START, str(os.getpid())]
+        argv += _start_argv(HANDS_PYTHON, keyring=True)
     return argv
+
+
+def _start_argv(python: str, *, keyring: bool) -> list[str]:
+    """:data:`_HANDS_START` run by ``python``, watching this process; the command follows it."""
+    return [python, "-I", "-S", "-c", _HANDS_START, "keyring" if keyring else "-", str(os.getpid())]
 
 
 def _require_hands_python() -> None:
@@ -7387,6 +7411,10 @@ class BwrapProvider(ConfinementProvider):
             # sudo OUTSIDE bwrap, as on macOS; bash starts from the hands user's environment alone.
             argv = [*hands_prefix(hands), *argv]
             shell_env = _hands_env(hands)
+        else:
+            # The command ends when levain does (see _HANDS_START): bwrap's --die-with-parent alone left
+            # a setsid child and the namespace's pid 1 running.
+            argv = [*_start_argv(sys.executable, keyring=False), *argv]
         shell = _BwrapShell(
             # The per-command SQLite check, like the manifest, covers only jewels in the hands view.
             policy=policy if hands is None else replace(
