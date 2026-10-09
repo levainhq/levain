@@ -174,7 +174,7 @@
   // day (view.jar, counts from its store); a typical day sits at the dashed mark. A bubble
   // rises for each episode that arrived since the LAST render of the same day, so a bubble is
   // a true new episode, never decoration. status != "ok" -> an empty jar with its reason.
-  let jarLastToday = null;
+  let jarLastToday = null, jarLastDay = null;
   function renderJar(jar) {
     const j = document.getElementById("jar");
     if (!j) return;
@@ -199,7 +199,7 @@
     svg.appendChild(mk("line", { class: "jar-mark", x1: 4, x2: 22, y1: top + h / 2, y2: top + h / 2 }));
     svg.appendChild(mk("path", { class: "jar-glass", d: "M8 4 H18 V8 H21 V28 Q21 32 17 32 H9 Q5 32 5 28 V8 H8 Z" }));
     // bubbles: one per newly arrived episode (cap 5), only on a same-day rise
-    const grew = jar.today != null && jarLastToday != null && jar.today > jarLastToday;
+    const grew = jar.today != null && jarLastToday != null && jar.day === jarLastDay && jar.today > jarLastToday;
     if (grew && jar.status === "ok") {
       const n = Math.min(5, jar.today - jarLastToday);
       for (let i = 0; i < n; i++) {
@@ -210,6 +210,7 @@
       }
     }
     jarLastToday = jar.today == null ? null : jar.today;
+    jarLastDay = jar.day || null;
     j.appendChild(svg);
     j.appendChild(el("span", "jar-label", jar.status === "ok" ? jar.label : jar.label + " (empty)"));
   }

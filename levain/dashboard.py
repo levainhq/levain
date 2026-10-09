@@ -612,7 +612,9 @@ class Jar:
     store's first episode, so a young entity is judged on the days it has had). ``level``
     is 0..1 with a typical day at 0.5 (full at twice typical). ``status``: ``ok`` |
     ``no_store`` | ``no_history``; anything but ``ok`` is level 0 and the ``label`` says
-    why. Pure counts: nothing here reads an episode's content."""
+    why. Pure counts: nothing here reads an episode's content. Read in its own short
+    transaction, so it is not atomic with the other tiers of one view (a capture landing
+    between them can differ by one episode)."""
 
     status: str
     today: int | None
@@ -620,9 +622,21 @@ class Jar:
     history_days: int
     level: float
     label: str
+    day: str | None  # the host-local date ``today`` belongs to (a client resets its baseline on a new day)
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
+
+
+def _local_day(ts: Any) -> "date | None":
+    """The host-local calendar date of a stored UTC timestamp (None if unparseable)."""
+    try:
+        d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone().date()
+    except (ValueError, TypeError, OverflowError):
+        return None
 
 
 def _read_jar(episodic_db: Path | None, now: datetime) -> "Jar":
@@ -632,50 +646,53 @@ def _read_jar(episodic_db: Path | None, now: datetime) -> "Jar":
     import sqlite3
     from statistics import median
 
-    empty = Jar("no_store", None, None, 0, 0.0, "no store to read")
+    empty = Jar("no_store", None, None, 0, 0.0, "no store to read", None)
     if episodic_db is None:
         return empty
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    # Host-local days, resolved PER INSTANT (``astimezone()`` with no argument applies the
+    # host zone's DST rules to each timestamp; a fixed offset would mis-bucket across a shift).
+    today = now.astimezone().date()
+    window_start = today - timedelta(days=JAR_WINDOW_DAYS)
+    # Only the window is read (a long-lived store has millions of rows): a UTC lower bound a
+    # day wider than the local window, plus the store's first timestamp from the index.
+    lower = (datetime.combine(window_start, datetime.min.time()).astimezone(timezone.utc)
+             - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
     try:
         if not episodic_db.exists():
             return empty
-        con = sqlite3.connect(f"file:{episodic_db}?mode=ro", uri=True, timeout=2)
+        con = sqlite3.connect(f"{episodic_db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
         try:
-            rows = con.execute("SELECT timestamp FROM episodes").fetchall()
+            rows = con.execute("SELECT timestamp FROM episodes WHERE timestamp >= ?", (lower,)).fetchall()
+            first_row = con.execute("SELECT MIN(timestamp) FROM episodes").fetchone()
         finally:
             con.close()
     except (OSError, sqlite3.Error, ValueError):
         return empty
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    local_now = now.astimezone()
-    today = local_now.date()
     counts: dict[Any, int] = {}
     for (ts,) in rows:
-        try:
-            d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-            if d.tzinfo is None:
-                d = d.replace(tzinfo=timezone.utc)
-            day = d.astimezone(local_now.tzinfo).date()
-        except (ValueError, TypeError, OverflowError):
-            continue
-        counts[day] = counts.get(day, 0) + 1
+        day = _local_day(ts)
+        if day is not None:
+            counts[day] = counts.get(day, 0) + 1
+    store_first = _local_day(first_row[0]) if first_row else None
     n_today = counts.get(today, 0)
-    prior = [d for d in counts if d < today]
-    if not prior:
-        return Jar("no_history", n_today, None, 0, 0.0, f"{n_today} today \u00b7 no history yet")
-    first = max(min(prior), today - timedelta(days=JAR_WINDOW_DAYS))
+    day_iso = today.isoformat()
+    if store_first is None or store_first >= today:
+        return Jar("no_history", n_today, None, 0, 0.0, f"{n_today} today \u00b7 no history yet", day_iso)
+    first = max(store_first, window_start)
     span = (today - first).days  # full days strictly before today
     if span < JAR_MIN_HISTORY_DAYS:
         return Jar("no_history", n_today, None, span, 0.0,
-                   f"{n_today} today \u00b7 only {span} day(s) of history")
+                   f"{n_today} today \u00b7 only {span} day(s) of history", day_iso)
     daily = [counts.get(first + timedelta(days=i), 0) for i in range(span)]
     typical = float(median(daily))
     if typical <= 0:
         return Jar("no_history", n_today, None, span, 0.0,
-                   f"{n_today} today \u00b7 no typical day in the last {span} d")
+                   f"{n_today} today \u00b7 no typical day in the last {span} d", day_iso)
     level = min(n_today / (2 * typical), 1.0)
     return Jar("ok", n_today, typical, span, level,
-               f"{n_today} today \u00b7 typical {typical:g} (median of {span} d)")
+               f"{n_today} today \u00b7 typical {typical:g} (median of {span} d)", day_iso)
 
 
 # A state older than this is not shown or injected: a stale "how I am" presented as

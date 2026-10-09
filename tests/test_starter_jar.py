@@ -50,5 +50,32 @@ def test_level_is_todays_count_against_the_median_day_and_empty_without_data(tmp
     # reduced motion: the shipped CSS removes the bubbles and the level transition
     from pathlib import Path
     css = (Path(__file__).resolve().parents[1] / "levain/templates/web/dashboard.css").read_text()
-    block = css[css.index("prefers-reduced-motion: reduce) {\n    .jar"):]
-    assert ".jar-bubble { display: none" in block and ".jar-fill { transition: none" in block
+    import re
+    block = css[re.search(r"prefers-reduced-motion:\s*reduce\)\s*\{\s*\.jar", css).start():]
+    assert re.search(r"\.jar-bubble\s*\{\s*display:\s*none", block)
+    # the host zone's DST rules apply per instant: on the US fall-back day an episode at
+    # 00:30 EDT is still that day's, and a path with URI metacharacters still opens
+    import os, time
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = "America/New_York"; time.tzset()
+    try:
+        fall = datetime(2026, 11, 1, 15, 0, tzinfo=timezone.utc)  # 10:00 EST
+        tricky = tmp_path / "a?b#c%20d"; tricky.mkdir()
+        db = tricky / "memory.db"
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE episodes (id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, type TEXT, content TEXT)")
+        stamps = ["2026-11-01T04:30:00.000000Z"] + [f"2026-10-{d:02d}T16:00:00.000000Z" for d in (25, 26, 27, 28, 29, 30) for _ in range(2)]
+        for i, ts in enumerate(stamps):
+            con.execute("INSERT INTO episodes VALUES (?,?,?,?)", (f"d{i}", ts, "observation", "x"))
+        con.commit(); con.close()
+        j = _read_jar(db, fall)
+        assert (j.status, j.today, j.day) == ("ok", 1, "2026-11-01")  # 04:30Z is 00:30 EDT, TODAY
+        # only old rows plus a recent one: the window has a zero-median -> empty and labelled
+        far = tmp_path / "far.db"; _store(far, {2: 1, 100: 1})
+        assert _read_jar(far, NOW).status == "no_history"
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()

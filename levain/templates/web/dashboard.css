@@ -254,7 +254,8 @@
          letter-spacing: .05em; }
   .jar svg { width: 40px; height: 52px; overflow: visible; }
   .jar .jar-glass { fill: none; stroke: var(--operate); stroke-width: 1.4; }
-  .jar .jar-fill { fill: var(--operate); opacity: .55; transition: y .6s ease, height .6s ease; }
+  .jar[hidden] { display: none; }
+  .jar .jar-fill { fill: var(--operate); opacity: .55; }
   .jar.empty .jar-fill { opacity: 0; }
   .jar .jar-mark { stroke: var(--faint); stroke-width: 1; stroke-dasharray: 2 2; }
   .jar .jar-bubble { fill: var(--ink); opacity: 0; animation: jar-rise 2.4s ease-out forwards; }
@@ -264,7 +265,6 @@
     100% { transform: translateY(-14px); opacity: 0; }
   }
   @media (prefers-reduced-motion: reduce) {
-    .jar .jar-fill { transition: none; }
     .jar .jar-bubble { display: none; animation: none; }
   }
   .indicators { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
