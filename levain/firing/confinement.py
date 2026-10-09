@@ -249,7 +249,7 @@ import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Literal, NoReturn
+from typing import Any, Callable, Literal, NoReturn
 
 # The efferent gate's accepted settings, imported rather than restated: the config loader and the
 # gate must agree on the vocabulary by construction, not by two lists staying in sync. Both modules
@@ -3962,8 +3962,10 @@ esac
 _HANDS_FILE_OPS = ("read", "stat", "list", "write")
 
 
-def _hands_file_argv(profile_text: str, hands: HandsIdentity, op: str, path: str, ws_id: str) -> list[str]:
-    return [*hands_prefix(hands), SANDBOX_EXEC, "-p", profile_text,
+def _hands_file_argv(driver: list[str], hands: HandsIdentity, op: str, path: str, ws_id: str) -> list[str]:
+    """The helper as the hands user under ``driver``, the platform's sandbox argv (the Seatbelt driver
+    with its profile, or a hands launch's bwrap argv): the same program and arguments on both."""
+    return [*hands_prefix(hands), *driver,
             HANDS_ZSH, "-f", "-c", _HANDS_FILE_HELPER, "zsh", op, str(hands.workspace), path,
             str(_HANDS_READ_LIMIT), ws_id, str(_HANDS_LIST_MAX)]
 
@@ -4012,17 +4014,18 @@ def _run_hands_helper(argv: list[str], hands: HandsIdentity, data: bytes,
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
-def _seatbelt_hands_file(provider: "SeatbeltProvider", policy: CrownJewelsPolicy, hands: HandsIdentity,
-                         op: str, path: str, data: bytes, timeout: float) -> bytes:
+def _hands_file_op(hands: HandsIdentity, op: str, path: str, data: bytes, timeout: float,
+                   driver: Callable[[], list[str]]) -> bytes:
+    """One editor operation through the helper, on every platform: ``driver()`` gives the sandbox argv
+    the helper runs under (asked after the operation and the workspace are checked), and the helper's
+    exit status becomes the result or the exception :meth:`ConfinementProvider.hands_file` documents."""
     if op not in _HANDS_FILE_OPS:
         raise ValueError(f"unknown hands file operation {op!r}")
-    text = provider.render_profile(policy)
-    _refuse_kernel_mask_rules(text)
     try:
         ws_id = _workspace_id(hands)
     except FileNotFoundError:
         raise HandsFileRefused(f"the hands workspace {hands.workspace} is gone") from None
-    argv = _hands_file_argv(text, hands, op, path, ws_id)
+    argv = _hands_file_argv(driver(), hands, op, path, ws_id)
     # stdin is the content for a write and empty otherwise.
     r = _run_hands_helper(argv, hands, data if op == "write" else b"", timeout)
     said = r.stderr.decode("utf-8", "replace").strip()
@@ -4036,6 +4039,45 @@ def _seatbelt_hands_file(provider: "SeatbeltProvider", policy: CrownJewelsPolicy
         raise HandsFileRefused(said or f"{hands.user} may not {op} {path}")
     raise OSError(f"{hands.user} could not {op} {path} (status {r.returncode}): "
                   + (said.splitlines()[-1] if said else "no reason given"))
+
+
+def _seatbelt_hands_file(provider: "SeatbeltProvider", policy: CrownJewelsPolicy, hands: HandsIdentity,
+                         op: str, path: str, data: bytes, timeout: float) -> bytes:
+    def driver() -> list[str]:
+        text = provider.render_profile(policy)
+        _refuse_kernel_mask_rules(text)
+        return [SANDBOX_EXEC, "-p", text]
+
+    return _hands_file_op(hands, op, path, data, timeout, driver)
+
+
+def _bwrap_hands_file(policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, path: str, data: bytes,
+                      timeout: float) -> bytes:
+    """The editor on Linux: the same helper under the bwrap argv a hands shell runs under, from the
+    same planner and transform. The launch probes and the listener sweep are not run for it: the helper
+    is a fixed program that opens files and never a socket, and a bwrap that cannot build the
+    namespaces fails the operation (fail-closed)."""
+    if not os.access(HANDS_ZSH, os.X_OK):
+        raise ConfinementError(
+            f"{HANDS_ZSH} is missing: install zsh (the editor's hands use it) — refusing to use the "
+            "entity's files as you instead (fail-closed)."
+        )
+
+    def driver() -> list[str]:
+        argv, _ = _bwrap_plan(policy)
+        argv = _hands_bwrap_argv(argv, *_hands_hidden_roots(policy))
+        missing = _hands_argv_unmade(argv)
+        if missing is not None:
+            # A shell creates such a placeholder under its ledger claim and removes it once no shell
+            # needs it. The editor takes no claim, so it refuses rather than let bwrap create the
+            # path on the host and leave it behind.
+            raise ConfinementError(
+                f"the floor mounts over {missing}, which does not exist; only a running shell creates it "
+                "— refusing to use the entity's files (fail-closed). Run a command in the shell, then retry."
+            )
+        return argv
+
+    return _hands_file_op(hands, op, path, data, timeout, driver)
 
 
 def _default_shell_env() -> dict[str, str]:
@@ -6442,6 +6484,371 @@ def _hands_ns_problem(hands: HandsIdentity, timeout: float = 30.0) -> str | None
             "later is needed for --disable-userns")
 
 
+def _hands_argv_unmade(argv: list[str]) -> str | None:
+    """The first mount target of a hands bwrap ``argv`` that is not on the host, or None. bwrap would
+    create such a target itself, on the host, unless it lies in a tmpfs mounted earlier in the argv
+    (then it is made in that view only); a ``-try`` bind with no source is skipped by bwrap."""
+    views: list[Path] = []
+    i = 1
+    while i < len(argv):
+        op = argv[i]
+        n = _BWRAP_OP_ARITY.get(op, 0)
+        args = argv[i + 1:i + 1 + n]
+        i += 1 + n
+        if not n or op in ("--symlink", "--dir"):
+            continue
+        dst = Path(args[-1])
+        if op in ("--bind-try", "--ro-bind-try") and not os.path.lexists(args[0]):
+            continue
+        if not any(dst.is_relative_to(v) and dst != v for v in views) and not os.path.lexists(dst):
+            return str(dst)
+        if op == "--tmpfs":
+            views.append(dst)
+    return None
+
+
+# --- the proxy relays (criterion 1) ---------------------------------------------------------------
+# A hands launch's network namespace has no route to the host's loopback, where the entity's proxy
+# listens. Two relays carry exactly the recorded egress ports across, and add no authority: the host
+# side runs AS the hands user in the host's network namespace, so its TCP connects to 127.0.0.1:<port>
+# are the hands user's and the nftables table still decides which ports get out; the namespace side
+# runs inside each command's sandbox. They meet on pathname unix sockets in a fresh 0700 directory
+# under the hands user's own home, which no hidden root covers. ONE fixed program for both, run with
+# ``python3 -I -S`` (stdlib only, no site, no environment): every input is argv data, nothing is
+# evaluated, and it connects to nothing but 127.0.0.1:<port> or <dir>/<port>.sock.
+#   out <dir> <port>...   bind <dir>/<port>.sock (0600) for each port, relay each connection to
+#                         127.0.0.1:<port>; print "ready" once every socket listens; on SIGTERM remove
+#                         the sockets and the directory (levain, another user, cannot)
+#   in <dir> <port>... -- <argv>
+#                         listen on 127.0.0.1:<port> for each port, fork the relay to <dir>/<port>.sock,
+#                         then exec <argv> (the command's bash) in its own place: bash stays pid 1 of
+#                         the command's pid namespace and the relay, its child, dies with it. Every
+#                         socket listens before bash exists, so a connection is queued, never refused,
+#                         and the relay is in no job table of bash (``wait`` does not wait for it).
+HANDS_PYTHON = "/usr/bin/python3"
+_HANDS_RELAY_PREFIX = ".levain-relay-"
+_HANDS_RELAY_READY_TIMEOUT = 10.0
+_HANDS_RELAY = r"""import os, signal, socket, sys, threading, time
+def pump(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        for s in (a, b):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        return
+    try:
+        b.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+def pair(c, connect):
+    try:
+        t = connect()
+    except OSError:
+        c.close()
+        return
+    th = threading.Thread(target=pump, args=(c, t), daemon=True)
+    th.start()
+    pump(t, c)
+    th.join()
+    c.close()
+    t.close()
+def serve(ls, connect):
+    while True:
+        try:
+            c = ls.accept()[0]
+        except OSError:
+            time.sleep(0.05)
+            continue
+        threading.Thread(target=pair, args=(c, connect), daemon=True).start()
+def tcp(port):
+    return lambda: socket.create_connection(("127.0.0.1", port))
+def unix(path):
+    def connect():
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(path)
+        except OSError:
+            s.close()
+            raise
+        return s
+    return connect
+def ports(args):
+    for a in args:
+        if not (a.isascii() and a.isdigit() and 0 < int(a) < 65536):
+            raise ValueError("not a port: %r" % a)
+    return [int(a) for a in args]
+def run(listeners):
+    for s, connect in listeners:
+        threading.Thread(target=serve, args=(s, connect), daemon=True).start()
+    while True:
+        signal.pause()
+mode, d = sys.argv[1], sys.argv[2]
+if mode == "out":
+    made = []
+    mine = []
+    def tidy():
+        for p in made:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        if mine:
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+    def stop(*_):
+        tidy()
+        os._exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    os.umask(0o077)
+    try:
+        listeners = []
+        want = ports(sys.argv[3:])
+        os.mkdir(d, 0o700)
+        mine.append(d)
+        for port in want:
+            p = os.path.join(d, "%d.sock" % port)
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.bind(p)
+            made.append(p)
+            os.chmod(p, 0o600)
+            s.listen(64)
+            listeners.append((s, tcp(port)))
+    except Exception as e:
+        sys.stderr.write("levain relay: %s\n" % e)
+        sys.stderr.flush()
+        tidy()
+        os._exit(1)
+    sys.stdout.write("ready\n")
+    sys.stdout.flush()
+    n = os.open(os.devnull, os.O_RDWR)
+    os.dup2(n, 1)
+    os.dup2(n, 2)
+    run(listeners)
+elif mode == "in":
+    i = sys.argv.index("--")
+    try:
+        listeners = []
+        for port in ports(sys.argv[3:i]):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", port))
+            s.listen(64)
+            listeners.append((s, unix(os.path.join(d, "%d.sock" % port))))
+    except Exception as e:
+        sys.stderr.write("levain relay: cannot listen inside the sandbox: %s\n" % e)
+        sys.stderr.flush()
+        os._exit(126)
+    if os.fork() == 0:
+        n = os.open(os.devnull, os.O_RDWR)
+        for f in (0, 1, 2):
+            os.dup2(n, f)
+        run(listeners)
+    for s, _ in listeners:
+        s.close()
+    os.execv(sys.argv[i + 1], sys.argv[i + 1:])
+else:
+    sys.stderr.write("levain relay: unknown mode %r\n" % mode)
+    os._exit(2)
+"""
+
+
+def _hands_relay_dir(hands: HandsIdentity) -> str:
+    """A fresh directory name for one shell's relay sockets, under the hands user's home."""
+    return os.path.join(os.path.realpath(hands.home), _HANDS_RELAY_PREFIX + os.urandom(8).hex())
+
+
+def _hands_relay_in(hands: HandsIdentity, sockdir: str) -> list[str]:
+    """What goes in front of each command's bash in a hands launch with egress ports."""
+    return [HANDS_PYTHON, "-I", "-S", "-c", _HANDS_RELAY, "in", sockdir,
+            *(str(p) for p in hands.egress_ports), "--"]
+
+
+class _HandsRelay:
+    """The host side of one hands shell's relays: a process group led by sudo, the relay in it running
+    as the hands user. :meth:`stop` is idempotent."""
+
+    def __init__(self, hands: HandsIdentity, proc: subprocess.Popen[bytes], sockdir: str) -> None:
+        self.hands, self.proc, self.sockdir = hands, proc, sockdir
+        self._gone: bool | None = None
+
+    def stop(self) -> bool:
+        """SIGTERM as the hands user first, so the relay removes its sockets and directory; then the
+        whole group killed and sudo reaped. True once nothing of it is left."""
+        if self._gone is not None:
+            return self._gone
+        _hands_signal(self.hands, self.proc.pid, signal.SIGTERM)
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        self._gone = _stop_hands_group(self.hands, self.proc)
+        return self._gone
+
+
+def _start_hands_relay(policy: CrownJewelsPolicy, hands: HandsIdentity, sockdir: str) -> _HandsRelay:
+    """Start the host side of the relays and wait (bounded) for its ready line; refuse by name when it
+    does not come. Nothing of a refused start is left running."""
+    from levain.launch import child_env
+
+    ro, rw = _hands_hidden_roots(policy)
+    for root in (*ro, *rw):
+        if sockdir == root or sockdir.startswith(root.rstrip("/") + "/"):
+            raise ConfinementError(
+                f"the hands user's home {hands.home} is inside {root}, which bash run as it never sees, so "
+                "its proxy relay could not be reached — refusing to run bash as the entity's own user, or "
+                "as you instead (fail-closed)."
+            )
+    argv = [*hands_prefix(hands), HANDS_PYTHON, "-I", "-S", "-c", _HANDS_RELAY, "out", sockdir,
+            *(str(p) for p in hands.egress_ports)]
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            cwd="/", env=child_env(), start_new_session=True)
+    relay = _HandsRelay(hands, proc, sockdir)
+    try:
+        got = b""
+        deadline = time.monotonic() + _HANDS_RELAY_READY_TIMEOUT
+        fd = proc.stdout.fileno()   # type: ignore[union-attr]
+        while b"\n" not in got:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                break
+            chunk = os.read(fd, 64)
+            if not chunk:
+                break
+            got += chunk
+        if got == b"ready\n":
+            for f in (proc.stdout, proc.stderr):
+                f.close()   # type: ignore[union-attr]
+            proc.stdout = proc.stderr = None
+            return relay
+        said = ""
+        if proc.poll() is not None:
+            said = proc.stderr.read().decode("utf-8", "replace").strip()   # type: ignore[union-attr]
+        raise ConfinementError(
+            f"the proxy relay for the entity's egress ports {list(hands.egress_ports)}, run as {hands.user}, "
+            f"did not start ({said.splitlines()[-1] if said else f'no ready line within {_HANDS_RELAY_READY_TIMEOUT:g} s'})"
+            " — refusing to run bash as the entity's own user, or as you instead (fail-closed)."
+        )
+    except BaseException:
+        relay.stop()
+        raise
+
+
+# --- pathname listeners (criterion 2) -------------------------------------------------------------
+# A unix socket bound at a path outside the hidden roots (a daemon's socket in /var/lib, one bound in
+# another network namespace at a host path) stays reachable from inside the hands launch, through the
+# filesystem: a deputy the network namespace does not cut. Inside the new namespace /proc/net/unix
+# lists none of the host's sockets, so levain sweeps them from the host before any hands process
+# starts, and asks the kernel, as the hands user, which ones it may connect to (write permission on
+# the socket file and search on every ancestor: access(2), so modes and ACLs both count).
+_SO_ACCEPTCON = 0x00010000
+_SOCK_DGRAM = 0x0002
+_HANDS_WRITABLE = r'for p; do [ -w "$p" ] && printf "%s\0" "$p"; done; exit 0'
+_HANDS_WRITABLE_CHUNK = 2000
+_PROC = "/proc"
+
+
+def _unix_socket_paths(text: str) -> set[str]:
+    """The pathname sockets in a ``/proc/net/unix`` text that accept connections or datagrams. A line
+    of any other shape raises ValueError: an entry that cannot be read is not skipped."""
+    out: set[str] = set()
+    for line in text.split("\n")[1:]:
+        if not line:
+            continue
+        f = line.split(None, 7)
+        if len(f) < 7 or not f[0].endswith(":"):
+            raise ValueError(f"unreadable /proc/net/unix line {line!r}")
+        flags, kind = int(f[3], 16), int(f[4], 16)
+        if len(f) == 7 or f[7].startswith("@"):   # unnamed, or abstract (the network namespace cuts those)
+            continue
+        if not f[7].startswith("/"):
+            raise ValueError(f"unreadable /proc/net/unix line {line!r}")
+        if flags & _SO_ACCEPTCON or kind == _SOCK_DGRAM:
+            out.add(f[7])
+    return out
+
+
+def _proc_hidepid() -> str | None:
+    """The ``hidepid`` option /proc is mounted with here, when it hides other users' processes."""
+    for line in Path(_PROC, "self", "mountinfo").read_text().splitlines():
+        pre, _, post = line.partition(" - ")
+        fields = pre.split()
+        if len(fields) > 4 and fields[4] == "/proc":
+            opts = post.split()[2] if len(post.split()) > 2 else ""
+            for o in opts.split(","):
+                if o.startswith("hidepid=") and o.split("=", 1)[1] not in ("0", "off"):
+                    return o
+    return None
+
+
+def _hands_listener_problem(policy: CrownJewelsPolicy, hands: HandsIdentity) -> str | None:
+    """A pathname unix socket outside every hidden root that the hands user may connect to, named with
+    the remedy; None when there is none. Sockets in a relay directory under the hands user's own home
+    are its own shells' relays and are left out."""
+    from levain.launch import child_env
+
+    try:
+        hide = _proc_hidepid()
+        if hide is not None:
+            return (f"/proc is mounted with {hide}, so levain cannot list the unix sockets bound in other "
+                    "network namespaces before bash runs as the entity's own user; remount /proc without it")
+        paths = _unix_socket_paths(Path(_PROC, "net", "unix").read_text())
+        seen: set[str] = set()
+        for pid in os.listdir(_PROC):
+            if not pid.isdigit():
+                continue
+            try:
+                text = Path(_PROC, pid, "net", "unix").read_text()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue   # gone, or not ours to read
+            if text in seen:
+                continue
+            seen.add(text)
+            paths |= _unix_socket_paths(text)
+    except (OSError, ValueError) as exc:
+        return f"levain could not list the host's unix sockets ({exc})"
+    ro, rw = _hands_hidden_roots(policy)
+    roots = [r.rstrip("/") for r in (*ro, *rw)]
+    home = os.path.realpath(hands.home)
+    left: list[str] = []
+    for p in sorted(paths):
+        d = os.path.realpath(os.path.dirname(p))
+        q = os.path.join(d, os.path.basename(p))
+        if any(q == r or q.startswith(r + "/") for r in roots):
+            continue
+        if os.path.dirname(d) == home and os.path.basename(d).startswith(_HANDS_RELAY_PREFIX):
+            continue
+        left.append(p)
+    open_: list[str] = []
+    for i in range(0, len(left), _HANDS_WRITABLE_CHUNK):
+        chunk = left[i:i + _HANDS_WRITABLE_CHUNK]
+        argv = [*hands_prefix(hands), "/bin/sh", "-c", _HANDS_WRITABLE, "sh", *chunk]
+        try:
+            r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(),
+                               timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"levain could not check, as {hands.user}, which unix sockets it may reach ({exc})"
+        if r.returncode != 0:
+            said = r.stderr.decode("utf-8", "replace").strip()
+            return (f"levain could not check, as {hands.user}, which unix sockets it may reach "
+                    f"({said.splitlines()[-1] if said else f'status {r.returncode}'})")
+        open_ += [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
+    if not open_:
+        return None
+    more = f" and {len(open_) - 3} more" if len(open_) > 3 else ""
+    return (f"{hands.user} may connect to the unix socket{'s' if len(open_) > 1 else ''} "
+            f"{', '.join(open_[:3])}{more}, outside what bash run as it never sees: tighten its mode so the "
+            "entity's user cannot write it, or move it under /run")
+
+
 def _hands_launch_problem(hands: HandsIdentity) -> str | None:
     """What stops a Linux hands launch, checked before any of its processes starts (Phill's ruling (A):
     probe at every hands launch). None when nothing does."""
@@ -6513,6 +6920,7 @@ class _BwrapShell(SandboxedShell):
         self._named: dict[str, _Leader | None] = {}
         self._unit_token = os.urandom(6).hex()
         self._units = 0
+        self._relay: _HandsRelay | None = None   # a hands launch's host-side proxy relay, if any
 
     # Each command runs in a pid namespace of its own (``--unshare-pid --as-pid-1``), inside its leaf.
     _own_pid_namespace = True
@@ -6607,6 +7015,8 @@ class _BwrapShell(SandboxedShell):
         try:
             super().close()
         finally:
+            if self._relay is not None:
+                self._relay.stop()   # after the commands: nothing inside is left to use it
             claim, self._ledger_claim = self._ledger_claim, None
             _LIVE_BWRAP_SHELLS.discard(self)
             if claim is not None and not self.unemptied_groups and self._settled():
@@ -6777,7 +7187,7 @@ class BwrapProvider(ConfinementProvider):
         return bwrap_netns_available()
 
     def _prepare(self, policy: CrownJewelsPolicy, made: list[tuple[str, str]],
-                 hands: HandsIdentity | None = None):
+                 hands: HandsIdentity | None = None, relay_dir: str | None = None):
         """Plan the floor and put on the host what it needs, inside the caller's ledger transaction:
         ``(argv, create_first, mounted, unmounted, manifest)``. Every object it creates is appended to
         ``made`` as it goes, so a refusal part-way still hands the ledger everything made."""
@@ -6813,7 +7223,10 @@ class BwrapProvider(ConfinementProvider):
         # of their own, apart from the bwrap process levain waits on. Without it a `kill 0` inside the
         # sandbox reached bwrap too (a group signal crosses pid namespaces), so a command could stop or
         # kill the process that reports its status (S2 L2 M5).
-        argv = argv + ["--new-session", "--as-pid-1", "/bin/bash", "--noprofile", "--norc", "-p"]
+        # A hands launch with egress ports starts each command's bash through the namespace side of the
+        # proxy relays, which execs it (see `_HANDS_RELAY`): bash is still pid 1.
+        relay_in = _hands_relay_in(hands, relay_dir) if hands is not None and relay_dir is not None else []
+        argv = argv + ["--new-session", "--as-pid-1", *relay_in, "/bin/bash", "--noprofile", "--norc", "-p"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
         # Each one this process made is levain's, recorded in the placeholder ledger and removed once
@@ -6857,6 +7270,10 @@ class BwrapProvider(ConfinementProvider):
         mkdir = f"mkdir -m 700 {shlex.join(create_first)} && " if create_first else ""
         return mkdir + shlex.join(argv) + "\n"
 
+    def hands_file(self, policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, path: str,
+                   data: bytes = b"", *, timeout: float = 60.0) -> bytes:
+        return _bwrap_hands_file(policy, hands, op, path, data, timeout)
+
     def _spawn_shell_impl(
         self,
         policy: CrownJewelsPolicy,
@@ -6865,12 +7282,22 @@ class BwrapProvider(ConfinementProvider):
         default_timeout: float = 120.0,
         hands: HandsIdentity | None = None,
     ) -> SandboxedShell:
+        relay_dir: str | None = None
         if hands is not None:
+            if hands.egress_ports and not os.access(HANDS_PYTHON, os.X_OK):
+                raise ConfinementError(
+                    f"{HANDS_PYTHON} is missing: it relays the entity's proxy ports "
+                    f"{list(hands.egress_ports)} into its sandbox. Install python3, or set the entity up "
+                    "without --egress-port — refusing to run bash as the entity's own user, or as you "
+                    "instead (fail-closed)."
+                )
             _require_hands_sudo(hands)
-            problem = _hands_launch_problem(hands)
+            problem = _hands_launch_problem(hands) or _hands_listener_problem(policy, hands)
             if problem is not None:
                 raise ConfinementError(f"{problem} — refusing to run bash as the entity's own user, or as "
                                        "you instead (fail-closed).")
+            if hands.egress_ports:
+                relay_dir = _hands_relay_dir(hands)
         if not bwrap_available():
             d = diagnose_confinement("Linux")
             raise ConfinementError(
@@ -6881,6 +7308,18 @@ class BwrapProvider(ConfinementProvider):
                 "`bwrap` being installed and `kernel.unprivileged_userns_clone=1` can both be true on "
                 "a host where this still fails, which is why it is probed by running bwrap."
             )
+        # Started once per shell, after the sweep above (its sockets are not swept) and before the start
+        # probe; from the shell's construction on, the shell owns it and its close stops it.
+        relay = _start_hands_relay(policy, hands, relay_dir) if hands is not None and relay_dir else None
+        try:
+            return self._spawn_bwrap(policy, env, default_timeout, hands, relay)
+        except BaseException:
+            if relay is not None:
+                relay.stop()
+            raise
+
+    def _spawn_bwrap(self, policy: CrownJewelsPolicy, env: dict[str, str] | None, default_timeout: float,
+                     hands: HandsIdentity | None, relay: _HandsRelay | None) -> SandboxedShell:
         # A crashed levain's leaves first, so the ledger sweep below finds their claims empty.
         sweep_dead_leaves()
         # ONE ledger transaction from the sweep to the claim (L1 r1): another session's release or sweep
@@ -6898,7 +7337,8 @@ class BwrapProvider(ConfinementProvider):
                 )
             txn.sweep()
             try:
-                argv, create_first, mounted, unmounted, manifest = self._prepare(policy, made, hands)
+                argv, create_first, mounted, unmounted, manifest = self._prepare(
+                    policy, made, hands, relay.sockdir if relay is not None else None)
             finally:
                 # Recorded even on a refusal: unclaimed, it is removed as the transaction ends.
                 txn.record(made)
@@ -6934,6 +7374,7 @@ class BwrapProvider(ConfinementProvider):
         )
         shell._ledger_claim = claim
         shell._claim_base = claim
+        shell._relay = relay
         _LIVE_BWRAP_SHELLS.add(shell)
         try:
             # Each command, the start probe included, tags the claim with its process group.
