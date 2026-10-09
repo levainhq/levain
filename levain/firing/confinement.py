@@ -2481,13 +2481,20 @@ def _hands_env(hands: HandsIdentity) -> dict[str, str]:
             "TERM": "dumb", "USER": hands.user, "LOGNAME": hands.user}
 
 
-#: Linux: run first by every hands process, as the hands user, between sudo and what it starts. It
-#: joins a NEW, empty session keyring, then execs its argv. The operator's session keyring otherwise
-#: crosses sudo (no pam_keyinit in Ubuntu's sudo stack) and bwrap (a user namespace does not detach
-#: it): RUN in a VM 2026-10-09, `keyctl print` inside a hands bash printed a key the operator had
-#: added to @s. ``python3 -I -S`` (no site, no environment); the keyctl syscall number is the
-#: architecture's, and an architecture not listed refuses rather than run with the operator's keyring.
-_HANDS_KEYRING_JOIN = r"""import ctypes, os, sys
+#: Linux: run first by every hands process, as the hands user, between sudo and what it starts
+#: (argv: levain's pid, then the command). Two things before it execs the command:
+#: 1. It joins a NEW, empty session keyring. The operator's session keyring otherwise crosses sudo (no
+#:    pam_keyinit in Ubuntu's sudo stack) and bwrap (a user namespace does not detach it): RUN in a VM
+#:    2026-10-09, `keyctl print` inside a hands bash printed a key the operator had added to @s. The
+#:    keyctl syscall number is the architecture's; one not listed refuses.
+#: 2. It forks a watcher holding pidfds on levain and on itself (the command, once exec'd): when levain
+#:    exits first, the command's other children get SIGKILL (bwrap's: the namespace's pid 1), then the
+#:    command SIGTERM, then SIGKILL. bwrap's ``--die-with-parent`` binds to sudo
+#:    here, and sudo outlives levain: RUN 2026-10-09, levain SIGKILLed mid-command left the command's
+#:    bash, a ``setsid`` child and both relays running. A pidfd signal cannot reach a reused pid, and
+#:    levain must be an ancestor at the start, so a pid reused after levain died is refused.
+#: ``python3 -I -S`` (no site, no environment); every input is argv data.
+_HANDS_START = r"""import ctypes, os, select, signal, sys
 nr = {"x86_64": 250, "aarch64": 219, "riscv64": 219}.get(os.uname().machine)
 if nr is None:
     sys.stderr.write("levain: no keyctl syscall number known for %s; refusing to start with the "
@@ -2498,7 +2505,50 @@ libc.syscall.restype = ctypes.c_long
 if libc.syscall(ctypes.c_long(nr), ctypes.c_long(1), ctypes.c_void_p(None)) < 0:
     sys.stderr.write("levain: could not join a new session keyring: %s\n" % os.strerror(ctypes.get_errno()))
     os._exit(126)
-os.execv(sys.argv[1], sys.argv[1:])
+watch, argv, me = int(sys.argv[1]), sys.argv[2:], os.getpid()
+def parent(pid):
+    with open("/proc/%d/stat" % pid) as f:
+        return int(f.read().rsplit(")", 1)[1].split()[1])
+try:
+    held = os.pidfd_open(watch)
+    up = os.getppid()
+    while up not in (watch, 0, 1):
+        up = parent(up)
+except OSError as e:
+    sys.stderr.write("levain: cannot watch levain (pid %d): %s\n" % (watch, e))
+    os._exit(126)
+if up != watch:
+    sys.stderr.write("levain: levain (pid %d) is gone; not starting\n" % watch)
+    os._exit(126)
+if os.fork() == 0:
+    n = os.open(os.devnull, os.O_RDWR)
+    for f in (0, 1, 2):
+        os.dup2(n, f)
+    try:
+        mine = os.pidfd_open(me)
+    except OSError:
+        os._exit(0)
+    if select.select([held, mine], [], [])[0] == [held]:
+        # The command's other children first: for bwrap that is the namespace's pid 1, whose death ends
+        # the namespace. bwrap's own --die-with-parent did not reach it (RUN 2026-10-09: bash, pid 1,
+        # outlived a SIGTERMed bwrap). They cannot be reaped while the command lives, so no pid is reused.
+        for pid in os.listdir("/proc"):
+            if pid.isdigit() and int(pid) != os.getpid():
+                try:
+                    if parent(int(pid)) == me:
+                        os.kill(int(pid), signal.SIGKILL)
+                except OSError:
+                    pass
+        for sig, wait in ((signal.SIGTERM, 2), (signal.SIGKILL, None)):
+            try:
+                signal.pidfd_send_signal(mine, sig)
+            except OSError:
+                break
+            if wait and select.select([mine], [], [], wait)[0]:
+                break
+    os._exit(0)
+os.close(held)
+os.execv(argv[0], argv)
 """
 
 
@@ -2506,11 +2556,11 @@ def hands_prefix(hands: HandsIdentity, *, system: str | None = None) -> list[str
     """``sudo -n -u <hands> /usr/bin/env -i <env>``: what goes in front of the sandbox driver. sudo is
     OUTSIDE the sandbox: the shipped profile refuses to exec a setuid binary (measured in the M1 VM
     run), so the profile applies to the hands process, which is the point. ``-n``: never prompt.
-    On Linux the keyring join (:data:`_HANDS_KEYRING_JOIN`) follows ``env -i``."""
+    On Linux the start program (:data:`_HANDS_START`) follows ``env -i``, watching this process."""
     argv = [SUDO, "-n", "-u", hands.user, "/usr/bin/env", "-i",
             *(f"{k}={v}" for k, v in _hands_env(hands).items())]
     if (system or platform.system()) == "Linux":
-        argv += [HANDS_PYTHON, "-I", "-S", "-c", _HANDS_KEYRING_JOIN]
+        argv += [HANDS_PYTHON, "-I", "-S", "-c", _HANDS_START, str(os.getpid())]
     return argv
 
 
@@ -2520,7 +2570,7 @@ def _require_hands_python() -> None:
     if not os.access(HANDS_PYTHON, os.X_OK):
         raise ConfinementError(
             f"{HANDS_PYTHON} is missing: every process run as the entity's own user on Linux starts "
-            "through it, to leave your session keyring behind. Install python3 — refusing to run it as "
+            "through it, to leave your session keyring behind and to end with levain. Install python3 — refusing to run it as "
             "the entity's own user, or as you instead (fail-closed)."
         )
 
@@ -6555,7 +6605,8 @@ def _hands_argv_unmade(argv: list[str]) -> str | None:
 # evaluated, and it connects to nothing but 127.0.0.1:<port> or <dir>/<port>.sock.
 #   out <dir> <port>...   bind <dir>/<port>.sock (0600) for each port, relay each connection to
 #                         127.0.0.1:<port>; print "ready" once every socket listens; on SIGTERM remove
-#                         the sockets and the directory (levain, another user, cannot)
+#                         the sockets (through the directory's fd from mkdir, so a directory swapped
+#                         for a symlink meanwhile is not followed) and the directory (levain cannot)
 #   in <dir> <port>... -- <argv>
 #                         listen on 127.0.0.1:<port> for each port, fork the relay to <dir>/<port>.sock,
 #                         then exec <argv> (the command's bash) in its own place: bash stays pid 1 of
@@ -6631,9 +6682,9 @@ if mode == "out":
     made = []
     mine = []
     def tidy():
-        for p in made:
+        for name in made:
             try:
-                os.unlink(p)
+                os.unlink(name, dir_fd=mine[0])
             except OSError:
                 pass
         if mine:
@@ -6650,12 +6701,12 @@ if mode == "out":
         listeners = []
         want = ports(sys.argv[3:])
         os.mkdir(d, 0o700)
-        mine.append(d)
+        mine.append(os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
         for port in want:
             p = os.path.join(d, "%d.sock" % port)
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.bind(p)
-            made.append(p)
+            made.append("%d.sock" % port)
             os.chmod(p, 0o600)
             s.listen(64)
             listeners.append((s, tcp(port)))
@@ -6731,15 +6782,19 @@ class _HandsRelay:
         return self._gone
 
 
-def _start_hands_relay(policy: CrownJewelsPolicy, hands: HandsIdentity, sockdir: str) -> _HandsRelay:
+def _start_hands_relay(hands: HandsIdentity, sockdir: str) -> _HandsRelay:
     """Start the host side of the relays and wait (bounded) for its ready line; refuse by name when it
     does not come. Nothing of a refused start is left running."""
     from levain.launch import child_env
 
     argv = [*hands_prefix(hands), HANDS_PYTHON, "-I", "-S", "-c", _HANDS_RELAY, "out", sockdir,
             *(str(p) for p in hands.egress_ports)]
-    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            cwd="/", env=child_env(), start_new_session=True)
+    refuse = " — refusing to run bash as the entity's own user, or as you instead (fail-closed)."
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                cwd="/", env=child_env(), start_new_session=True)
+    except OSError as exc:
+        raise ConfinementError(f"the proxy relay could not be started as {hands.user} ({exc}){refuse}") from exc
     relay = _HandsRelay(hands, proc, sockdir)
     try:
         got = b""
@@ -6764,8 +6819,11 @@ def _start_hands_relay(policy: CrownJewelsPolicy, hands: HandsIdentity, sockdir:
         raise ConfinementError(
             f"the proxy relay for the entity's egress ports {list(hands.egress_ports)}, run as {hands.user}, "
             f"did not start ({said.splitlines()[-1] if said else f'no ready line within {_HANDS_RELAY_READY_TIMEOUT:g} s'})"
-            " — refusing to run bash as the entity's own user, or as you instead (fail-closed)."
+            + refuse
         )
+    except OSError as exc:
+        relay.stop()
+        raise ConfinementError(f"the proxy relay run as {hands.user} could not be read ({exc}){refuse}") from exc
     except BaseException:
         relay.stop()
         raise
@@ -7275,7 +7333,7 @@ class BwrapProvider(ConfinementProvider):
             )
         # Started once per shell, after the sweep above (its sockets are not swept) and before the start
         # probe; from the shell's construction on, the shell owns it and its close stops it.
-        relay = _start_hands_relay(policy, hands, relay_dir) if hands is not None and relay_dir else None
+        relay = _start_hands_relay(hands, relay_dir) if hands is not None and relay_dir else None
         try:
             return self._spawn_bwrap(policy, env, default_timeout, hands, relay)
         except BaseException:
