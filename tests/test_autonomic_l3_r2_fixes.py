@@ -156,10 +156,20 @@ def test_a_child_forked_while_the_compose_lock_is_held_can_still_compose():
     import levain.autonomic.risk as risk_mod
     if not hasattr(os, "fork"):
         pytest.skip("no fork on this platform")
-    with risk_mod._COMPOSE_LOCK:
-        pid = os.fork()
-        if pid == 0:                                                   # the child
-            ok = risk_mod._COMPOSE_LOCK.acquire(timeout=2)
-            os._exit(0 if ok else 1)
-    _, status = os.waitpid(pid, 0)
+    import warnings
+    pid = None
+    try:
+        with risk_mod._COMPOSE_LOCK:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)    # fork in a threaded process
+                pid = os.fork()
+            if pid == 0:                                               # the child never returns
+                code = 2
+                try:
+                    code = 0 if risk_mod._COMPOSE_LOCK.acquire(timeout=2) else 1
+                finally:
+                    os._exit(code)
+    finally:
+        if pid:
+            _, status = os.waitpid(pid, 0)
     assert os.waitstatus_to_exitcode(status) == 0
