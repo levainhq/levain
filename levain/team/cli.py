@@ -91,30 +91,36 @@ def cmd_init(args) -> int:
         print(gl.init(team, member_keys=keys, remote=args.remote, push=not args.no_push,
                       signing_key=args.signing_key, replace_legacy=args.replace_legacy, anneal_db=anneal_db))
     except InitIncomplete as exc:
-        incomplete = exc        # initialised, only the push is pending: the clone's setup below runs, then it fails
+        incomplete = exc        # initialised, the push not completed: the setup below runs only if it was published
     try:
-        if args.pack and incomplete is None:
-            written = P.seed(gl, Path(args.pack), push=not args.no_push)
-            print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
-        elif args.pack and not incomplete.seedable:
-            # lost, or the remote could not be read: a seed here could land on a ledger that is dropped for another,
-            # so only a ledger SEEN as ours or absent is seeded (code L3 r15 codex 2, r16 codex 1)
-            after = "the join" if incomplete.outcome == "lost" else "the sync"
-            incomplete = InitIncomplete(f"{incomplete}; the pack was NOT seeded: after {after}, run "
-                                        f"`levain team pack-sync {shlex.quote(args.pack)}`", outcome=incomplete.outcome)
-        elif args.pack:
-            # an init whose only stop was its push still seeds, locally, and the next sync publishes both; a seed that
-            # fails here is named in the pending message, never swallowed (code L3 r10/r11 codex 5)
-            try:
-                written = P.seed(gl, Path(args.pack), push=False)
+        if incomplete is None:
+            if args.pack:
+                written = P.seed(gl, Path(args.pack), push=not args.no_push)
                 print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
-            except (TeamError, E.EntryError, R.RolesError, ValueError, OSError) as exc:
-                incomplete = InitIncomplete(f"{incomplete}; the pack was NOT seeded ({exc}): after the sync, run "
-                                            f"`levain team pack-sync {shlex.quote(args.pack)}`",
-                                            outcome=incomplete.outcome)
-        # a lost ledger is dropped for the other one, and the join that adopts it installs (code L3 r16 complement)
-        if not args.no_install and not (incomplete is not None and incomplete.outcome == "lost"):
-            _install_all(repo)
+            if not args.no_install:
+                _install_all(repo)
+        elif not incomplete.confirmed:
+            # the remote was not seen to hold this ledger, so nothing is set up on it: it may yet be dropped for
+            # another (code L3 r15 codex 2, r16 codex 1, r17 codex 1 + 2); the join that adopts another installs
+            after = "the join" if incomplete.outcome == "lost" else "the sync"
+            todo = [f"`levain team pack-sync {shlex.quote(args.pack)}`"] if args.pack else []
+            if not args.no_install and incomplete.outcome != "lost":
+                todo.append("`levain team install`")
+            if todo:
+                incomplete = InitIncomplete(f"{incomplete}; the clone was NOT set up: after {after}, run "
+                                            + " and ".join(todo), outcome=incomplete.outcome)
+        else:
+            # published, only the bookkeeping sync is pending: the ledger is ours, so the setup runs, the seed locally
+            if args.pack:
+                try:
+                    written = P.seed(gl, Path(args.pack), push=False)
+                    print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
+                except (TeamError, E.EntryError, R.RolesError, ValueError, OSError) as exc:
+                    incomplete = InitIncomplete(f"{incomplete}; the pack was NOT seeded ({exc}): after the sync, run "
+                                                f"`levain team pack-sync {shlex.quote(args.pack)}`",
+                                                outcome=incomplete.outcome)
+            if not args.no_install:
+                _install_all(repo)
     except Exception as exc:
         if incomplete is not None:
             # both pending items are named: this CLI never shows a chained cause (code L3 r14 codex 3)

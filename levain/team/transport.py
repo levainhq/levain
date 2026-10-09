@@ -75,9 +75,10 @@ class InitIncomplete(TeamError):
         self.outcome = outcome
 
     @property
-    def seedable(self) -> bool:
-        """Only a ledger SEEN to be ours or absent on the remote takes local writes that the next sync publishes."""
-        return self.outcome in ("published", "pending")
+    def confirmed(self) -> bool:
+        """The remote was SEEN to hold this ledger: only then does the clone's setup (a pack seed, the hooks) run. A
+        branch seen absent can still be taken by another init before the next sync (code L3 r17 codex 1 + 2)."""
+        return self.outcome == "published"
 
 
 @dataclass(frozen=True)
@@ -744,7 +745,8 @@ class GitLedger:
         is not our genesis, on ANCESTRY in what was fetched (git settles a create-only race on the server and gives the
         client no outcome after a transport failure, so the client re-reads; https://git-scm.com/docs/git-push).
         Returns (outcome, what was seen); a read that fails is "unknown", never "pending" (code L3 r16 codex 1)."""
-        from .tenure import TEAM_FILE
+        from . import signing as S
+        from . import tenure as T
         ref = f"refs/heads/{branch}"
         seen = remote_tip(remote, ref, self.repo.toplevel)
         if isinstance(seen, RemoteUnreadable):
@@ -766,31 +768,43 @@ class GitLedger:
                 return "published", "holds this genesis and later entries"
             if anc.returncode != 1:
                 return "unknown", f"its branch could not be compared ({_tail(anc)})"
+            tip = git(["rev-parse", scratch], self.repo.toplevel, timeout=10).stdout.strip()
             roots = git(["rev-list", "--max-parents=0", scratch], self.repo.toplevel, check=False,
                         timeout=60).stdout.split()
-            ledger = len(roots) == 1 and git(["cat-file", "-e", f"{roots[0]}:{TEAM_FILE}"], self.repo.toplevel,
-                                             check=False, timeout=10).returncode == 0
+            # joinable only as join itself would judge it: a candidate pinned at its one root, derived (code L3 r17
+            # codex 3: a root that merely carries team.toml sent the person to delete theirs for a join that refuses)
+            why = "it has more than one root" if len(roots) != 1 else ""
+            if not why:
+                try:
+                    T.derive(self.repo.toplevel, tip, T.Clone(pinned_root=roots[0], anchor=None, accepted={},
+                                                              distrust=set()), S.SigCache(self.base / "sigcache.json"))
+                except Exception as exc:  # noqa: BLE001 - any failure to judge it means join would not take it as is
+                    why = f"it cannot be judged as a team ledger: {exc}"
         except TeamError as exc:
             return "unknown", f"its branch could not be fetched ({exc})"
         finally:
-            git(["update-ref", "-d", scratch], self.repo.toplevel, check=False, timeout=10)
+            # best effort: a leaked probe ref is overwritten by the next probe, and a raise here must never replace
+            # the outcome (code L3 r17 complement 1 + codex 4)
+            with contextlib.suppress(TeamError):
+                git(["update-ref", "-d", scratch], self.repo.toplevel, check=False, timeout=10)
         drop = f"drop this unpublished one: {self._init_cleanup(branch)}"
-        if ledger:
+        if not why:
             # RUN (r14): `join --root` alone refuses, the unpublished local branch having "diverged"
             return "lost", (f"received another team ledger first (genesis {roots[0][:12]}). To join that one instead, "
                             f"{drop}, then `levain team join --root {roots[0][:12]}`")
-        # not a ledger at all: join would refuse it, so no join is advised (code L3 r16 complement 2)
-        return "lost", (f"holds a history on {branch} that is not a team ledger. To keep using this remote, {drop}, "
-                        f"then settle what {ref} on {remote} should be before running `levain team init` again")
+        # join would refuse it as it stands, so no join is advised (code L3 r16 complement 2, r17 codex 3)
+        return "lost", (f"holds another history on {branch} (tip {tip[:12]}; {why}). Settle what {ref} on {remote} "
+                        f"should be before dropping anything; to start again on this remote afterwards, {drop}, and "
+                        "run `levain team init` again")
 
     def _reattach_advice(self, branch: str) -> str:
         """For a local-only pinned clone that is not joined (its checkout is missing or on another branch):
         _attach_worktree's own sequence, which first removes a checkout that exists on another branch (code L3 r16
         codex MED + complement 1: a bare `worktree add` fails whenever the checkout exists)."""
         top, q = shlex.quote(str(self.repo.toplevel)), shlex.quote
-        return (f"re-attach its checkout with `git -C {top} worktree remove --force --force {q(str(self.wt))}` (if it "
-                f"is listed), `git -C {top} worktree prune` and `git -C {top} worktree add --lock {q(str(self.wt))} "
-                f"{q(branch)}`")
+        return (f"re-attach its checkout (levain's private one: anything uncommitted in it is discarded) with "
+                f"`git -C {top} worktree remove --force --force {q(str(self.wt))}` (if it is listed), "
+                f"`git -C {top} worktree prune` and `git -C {top} worktree add --lock {q(str(self.wt))} {q(branch)}`")
 
     def _init_cleanup(self, branch: str) -> str:
         """Commands that run from any directory, quoted (code L3 r14 codex 5 + complement 2)."""
