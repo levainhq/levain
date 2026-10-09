@@ -44,7 +44,7 @@ import os
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -79,6 +79,7 @@ __all__ = [
     "Section",
     "Focus",
     "State",
+    "Jar",
     "SubstrateView",
     "build_substrate_view",
     "write_focus",
@@ -597,6 +598,118 @@ def _read_focus(context_json: Path | None, now: datetime) -> "Focus | None":
     )
 
 
+# The starter jar: how full today is against this entity's own typical day. Every number
+# is a count read from the entity's own episodic store; with no store or too little
+# history the jar is EMPTY and says why (never a faked level).
+JAR_WINDOW_DAYS = 14  # the "recent days" the typical day is the median of
+JAR_MIN_HISTORY_DAYS = 3  # fewer prior days than this -> no typical day exists
+
+
+@dataclass
+class Jar:
+    """Episodes captured today (host-local date) against the median daily count over the
+    last ``JAR_WINDOW_DAYS`` full days (idle days count as zero; the window starts at the
+    store's first episode, so a young entity is judged on the days it has had). ``level``
+    is 0..1 with a typical day at 0.5 (full at twice typical). ``status``: ``ok`` |
+    ``no_store`` | ``no_history``; anything but ``ok`` is level 0 and the ``label`` says
+    why. Pure counts: nothing here reads an episode's content. Read in its own short
+    transaction, so it is not atomic with the other tiers of one view (a capture landing
+    between them can differ by one episode)."""
+
+    status: str
+    today: int | None
+    typical: float | None
+    history_days: int
+    level: float
+    label: str
+    day: str | None  # the host-local date ``today`` belongs to (a client resets its baseline on a new day)
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.__dict__.copy()
+
+
+def _local_day(ts: Any) -> "date | None":
+    """The host-local calendar date of a stored UTC timestamp (None if unparseable)."""
+    try:
+        d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone().date()
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _read_jar(episodic_db: Path | None, now: datetime) -> "Jar":
+    """Count episodes per host-local day straight from the store (read-only, stdlib
+    sqlite3; independent of the anneal tiers). Fail-soft: any fault -> the ``no_store``
+    jar, never an exception."""
+    import sqlite3
+    from statistics import median
+
+    empty = Jar("no_store", None, None, 0, 0.0, "no store to read", None)
+    if episodic_db is None:
+        return empty
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    # Host-local days, resolved PER INSTANT (``astimezone()`` with no argument applies the
+    # host zone's DST rules to each timestamp; a fixed offset would mis-bucket across a shift).
+    # ONE statement = one snapshot: the window's rows plus a flag for whether the store holds
+    # anything OLDER than the window (a sentinel row, present even when the window is empty:
+    # a quiet old store is not a young one). Timestamps are the
+    # ISO-8601 UTC strings anneal writes; a row in any other shape is skipped, never misread.
+    try:
+        today = now.astimezone().date()
+        window_start = today - timedelta(days=JAR_WINDOW_DAYS)
+        lower = (datetime.combine(window_start, datetime.min.time()).astimezone(timezone.utc)
+                 - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        if not episodic_db.exists():
+            return empty
+        con = sqlite3.connect(f"{episodic_db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
+        try:
+            rows = con.execute(
+                "SELECT NULL, EXISTS(SELECT 1 FROM episodes WHERE timestamp < ? "
+                "AND timestamp GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*') "
+                "UNION ALL SELECT timestamp, 0 FROM episodes WHERE timestamp >= ?",
+                (lower, lower),
+            ).fetchall()
+        finally:
+            con.close()
+    except (OSError, RuntimeError, OverflowError, sqlite3.Error, ValueError):
+        try:
+            present = episodic_db.exists()
+        except (OSError, RuntimeError):
+            present = False
+        return Jar("no_store", None, None, 0, 0.0,
+                   "store unreadable" if present else "no store to read", None)
+    counts: dict[Any, int] = {}
+    older = False
+    for ts, has_older in rows:
+        older = older or bool(has_older)
+        if ts is None:  # the sentinel row carrying the older-than-window flag
+            continue
+        day = _local_day(ts)
+        if day is not None:
+            counts[day] = counts.get(day, 0) + 1
+    store_first = window_start if older else min(counts, default=None)
+    n_today = counts.get(today, 0)
+    day_iso = today.isoformat()
+    if store_first is None or store_first >= today:
+        return Jar("no_history", n_today, None, 0, 0.0, f"{n_today} today \u00b7 no history yet", day_iso)
+    first = max(store_first, window_start)
+    span = (today - first).days  # full days strictly before today
+    if span < JAR_MIN_HISTORY_DAYS:
+        return Jar("no_history", n_today, None, span, 0.0,
+                   f"{n_today} today \u00b7 only {span} day(s) of history", day_iso)
+    daily = [counts.get(first + timedelta(days=i), 0) for i in range(span)]
+    typical = float(median(daily))
+    if typical <= 0:
+        return Jar("no_history", n_today, None, span, 0.0,
+                   f"{n_today} today \u00b7 no typical day in the last {span} d", day_iso)
+    level = min(n_today / (2 * typical), 1.0)
+    return Jar("ok", n_today, typical, span, level,
+               f"{n_today} today \u00b7 typical {typical:g} (median of {span} d)", day_iso)
+
+
 # A state older than this is not shown or injected: a stale "how I am" presented as
 # current is worse than none. UNLIKE focus (which flags a stale one), state DROPS it.
 STATE_EXPIRES_AFTER_HOURS = 8
@@ -791,6 +904,7 @@ class SubstrateView:
     # the anneal memory stores — live-state, not consolidated cognition.
     focus: Focus | None = None
     state: State | None = None  # the optional freeform state line; same file, expires
+    jar: Jar | None = None  # today's episode count against the entity's own typical day
     errors: dict[str, str] = field(default_factory=dict)
 
     def layout(self) -> list[dict[str, Any]]:
@@ -917,6 +1031,7 @@ class SubstrateView:
             "recent_edits": self.recent_edits,
             "focus": self.focus.to_dict() if self.focus else None,
             "state": self.state.to_dict() if self.state else None,
+            "jar": self.jar.to_dict() if self.jar else None,
             "layout": self.layout(),
             "errors": self.errors,
         }
@@ -1375,6 +1490,7 @@ def build_substrate_view(
         _now = _now.replace(tzinfo=timezone.utc)
     view.focus = _read_focus(context_json, _now)
     view.state = _read_state(context_json, _now)
+    view.jar = _read_jar(paths.episodic_db, _now)
 
     # Data/IO fault classes we degrade on; programming bugs propagate (loud).
     # anneal wraps store faults in AnnealMemoryError, imported lazily so this
@@ -1708,6 +1824,8 @@ def render_text(view: SubstrateView) -> str:
         out.append(f"  focus: ⊙ {view.focus.text}{meta}")
     if view.state is not None and view.state.text:
         out.append(f"  state: {view.state.text} ({view.state.age_label})")
+    if view.jar is not None:
+        out.append(f"  jar: {view.jar.label}" + ("" if view.jar.status == "ok" else " (empty)"))
     out.append("")
 
     h = view.health
