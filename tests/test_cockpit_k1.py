@@ -48,8 +48,9 @@ def _install(tmp_path: Path) -> tuple[Path, SubstrateSource]:
     spores.add(type="task", text="handoff undated", disposition="handoff")
     spores.add(type="task", text="a long reference note " + "word " * 40 + "NEEDLEINBODY tail", disposition="note")
     (root / ".levain" / "memory.crystal.json").write_text(json.dumps(
-        {"crystals": [{"name": "a_pattern", "level": 2, "explanation": "It means a thing. More.",
-                       "permanence": "graduated", "activation_mode": "always", "tags": ["x"]}]}))
+        {"crystal": [{"name": "a_pattern", "status": "crystallized", "level": 2,
+                      "explanation": "It means a thing. More.", "permanence": "graduated",
+                      "activation_mode": "always", "tags": ["x"]}]}))
     (root / ".levain" / "edits.jsonl").write_text(
         "\n".join(json.dumps({"id": f"e{i}", "ts": f"2026-10-0{i}T00:00:00+00:00", "kind": "state",
                               "action": "edit", "source": "s"}) for i in range(1, 4)) + "\n")
@@ -278,9 +279,12 @@ class TestRefreshersAndTimeouts:
         got = ck.panel("h")
         assert got["status"] == "error" and "timed out" in got["error"]
         assert time.monotonic() - t0 < 1.5
-        again = ck.panel("h")  # no second thread is stacked on a hung call
-        assert again["status"] == "error" and "still running" in again["error"]
+        again = ck.panel("h")  # waits on the SAME read: no second thread is stacked on a hung call
+        assert again["status"] == "error" and "timed out" in again["error"]
+        assert sum(t.name == "cockpit-read" and t.is_alive() for t in threading.enumerate()) == 1
         release.set()
+        time.sleep(0.1)
+        assert ck.panel("h")["status"] == "empty"   # and it recovers when the source does
 
     def test_a_failed_refresh_is_error_at_once_carrying_the_last_good_read(self) -> None:
         state = {"fail": False}
@@ -632,3 +636,191 @@ class TestRev9EtagAndProse:
     def test_prose_values_carry_a_null_provenance(self, env) -> None:
         _r, _s, ck = env
         assert ck.panel("section:state")["value"]["provenance"] is None
+
+
+# --- L3 round 1 fixes: each test is built from a finding that was reproduced or read on disk -----
+
+
+class TestL3R1Fixes:
+    def test_concurrent_requests_do_not_turn_a_healthy_panel_into_an_error(self) -> None:
+        gate = threading.Event()
+
+        def slow(ctx):
+            gate.wait(2)
+            return Read(rows=())
+        ck = Cockpit()
+        ck.register(ProviderSpec(**{**_simple("s").__dict__, "read": slow, "timeout_s": 5}))
+        out: list[str] = []
+        ts = [threading.Thread(target=lambda: out.append(ck.panel("s")["status"])) for _ in range(4)]
+        for t in ts:
+            t.start()
+        time.sleep(0.2)
+        gate.set()
+        for t in ts:
+            t.join()
+        assert out == ["empty"] * 4
+
+    def test_a_hung_shared_view_costs_one_timeout_not_one_per_panel(self, tmp_path: Path, monkeypatch) -> None:
+        import levain.cockpit.providers as prov
+        _root, src = _install(tmp_path)
+        ck = build_default_cockpit(src)
+        ck.manifest(NONE_CRED)                    # discover the prose panels while the source is healthy
+        release = threading.Event()
+        real = src.build
+        monkeypatch.setattr(prov, "_view", lambda source, ctx: ctx.memo(
+            "view", lambda: (release.wait(30), real())[1]))
+        ck._entity_timeout_s = 0.3
+        for spec in ck._specs.values():
+            spec.timeout_s = 0.3
+        t0 = time.monotonic()
+        m = ck.manifest(NONE_CRED)
+        took = time.monotonic() - t0
+        release.set()
+        assert took < 3.0, took                    # ~25 panels x 0.3 s, if each paid its own
+        assert m["panels"]["tray"]["status"] == "error"
+        assert any(e["source"] == "entity" for e in m["errors"])
+
+    def test_a_cached_refresher_snapshot_ages_into_stale(self) -> None:
+        clock = {"t": datetime(2026, 10, 9, 12, tzinfo=timezone.utc)}
+        ck = Cockpit(clock=lambda: clock["t"])
+        ck.register(_simple(refresh_every_s=10, stale_after_s=1, rows=[RowIn("r", "t", {"at": "1"}, stored={"id": "r"})]))
+        ck.refresh("p")
+        assert ck.panel("p")["status"] == "ok"
+        clock["t"] += timedelta(seconds=5)
+        assert ck.panel("p")["status"] == "stale"
+
+    def test_the_manifest_etag_covers_entity_and_manifest_errors(self) -> None:
+        name = {"n": "A"}
+        ck = Cockpit(entity=lambda ctx: {"name": name["n"]})
+        ck.register(_simple())
+        e1 = ck.manifest(NONE_CRED)["etag"]
+        name["n"] = "B"
+        assert ck.manifest(NONE_CRED)["etag"] != e1
+
+    def test_prose_panels_are_discovered_late_and_a_discovery_fault_is_a_manifest_error(self, tmp_path: Path) -> None:
+        root, src = _install(tmp_path)
+        cont = root / ".levain" / "memory.continuity.md"
+        text = cont.read_text()
+        cont.write_bytes(b"\xff\xfe\x00 not utf8")
+        ck = build_default_cockpit(src)
+        m = ck.manifest(NONE_CRED)
+        assert any(e["source"].startswith("discovery") for e in m["errors"]), m["errors"]
+        assert not any(p.startswith("section:") for p in m["panels"])
+        cont.write_text(text)                       # the file heals: the panels appear, no restart
+        m2 = ck.manifest(NONE_CRED)
+        assert "section:state" in m2["panels"] and m2["errors"] == []
+
+    def test_read_one_runs_the_list_pipeline_so_group_and_band_agree(self, env) -> None:
+        _r, _s, ck = env
+        listed = {r["id"]: r for r in ck.panel("tray")["rows"]}
+        for rid, row in listed.items():
+            one = ck.read_one("tray", rid)
+            assert isinstance(one, Read)
+            assert (one.value["group"], one.value["band"], one.value["version"]) == (row["group"], row["band"], row["version"])
+
+    def test_a_spore_rescheduled_into_the_future_is_still_found_by_read_one(self, env) -> None:
+        root, _s, ck = env
+        path = root / ".levain" / "memory.spores.json"
+        data = json.loads(path.read_text())
+        for s in data["spores"]:
+            if s["text"] == "seed overdue":
+                s["next"] = "2999-01-01"
+        path.write_text(json.dumps(data))
+        assert "spore:spore-002" not in [r["id"] for r in ck.panel("tray")["rows"]]   # held out of the list
+        assert isinstance(ck.read_one("tray", "spore:spore-002"), Read)                # but a write finds it
+
+    def test_malformed_provider_output_is_a_fault_not_a_crash(self) -> None:
+        ck = Cockpit()
+        ck.register(ProviderSpec("m", "metric", "m", "gauge", lambda c: Read(value={"metrics": ["bad"]})))
+        ck.register(_simple("r", rows=["not a RowIn"]))
+        assert ck.panel("m")["status"] == "error" or ck.panel("m")["status"] in ("ok", "empty")
+        assert ck.panel("r")["status"] == "error"
+        assert ck.manifest(NONE_CRED)["panels"]["r"]["status"] == "error"
+
+    def test_a_refresher_survives_a_cycle_that_raises_outside_the_provider(self) -> None:
+        ck = Cockpit()
+        calls = {"n": 0}
+
+        def read(ctx):
+            calls["n"] += 1
+            return Read(rows=())
+        ck.register(ProviderSpec(**{**_simple().__dict__, "read": read, "refresh_every_s": 0.05, "stale_after_s": 0.1}))
+        ck.start()
+        orig = ck._process
+        flaky = {"n": 0}
+
+        def process(*a, **k):
+            flaky["n"] += 1
+            if flaky["n"] == 2:
+                raise AttributeError("boom")
+            return orig(*a, **k)
+        ck._process = process  # type: ignore[method-assign]
+        try:
+            time.sleep(0.5)
+            assert ck.refresher("p").thread.is_alive() and calls["n"] >= 4
+        finally:
+            ck.stop()
+
+    def test_a_slow_but_alive_refresh_is_not_reported_dead(self) -> None:
+        clock = {"t": datetime(2026, 10, 9, 12, tzinfo=timezone.utc)}
+        ck = Cockpit(clock=lambda: clock["t"])
+        ck.register(_simple(refresh_every_s=1, stale_after_s=2, timeout_s=10, rows=[RowIn("r", "t", {"at": "1"}, stored={"id": "r"})]))
+        ck.refresh("p")
+        clock["t"] += timedelta(seconds=2.5)
+        st = ck._state["p"]
+        st.refresh_started = clock["t"] - timedelta(seconds=1.5)    # a read 1.5 s into a 10 s timeout
+        assert "not reporting" not in (ck.panel("p")["error"] or "")
+        st.refresh_started = None
+        assert "not reporting" in ck.panel("p")["error"]
+
+    def test_stop_keeps_a_refresher_that_is_still_inside_a_read(self) -> None:
+        release = threading.Event()
+        ck = Cockpit()
+        ck.register(ProviderSpec(**{**_simple().__dict__, "read": lambda c: (release.wait(10), Read(rows=()))[1],
+                                    "refresh_every_s": 0.05, "stale_after_s": 0.1, "timeout_s": 0.1}))
+        ck.refresh("p")  # times out at 0.1 s; the read thread lingers
+        ck._refreshers["p"] = type("R", (), {"spec": ck._specs["p"], "halt": lambda self: None,
+                                              "thread": threading.Thread(target=release.wait, args=(5,), daemon=True)})()
+        ck._refreshers["p"].thread.start()
+        assert ck.stop() == ["p"] and "p" in ck._refreshers
+        release.set()
+
+    def test_a_row_with_a_wrongly_typed_facet_is_skipped_and_counted_not_a_blanked_panel(self) -> None:
+        ck = Cockpit()
+        rows = [RowIn("a", "a", {"tier": "hot"}, stored={"id": "a"}), RowIn("b", "b", {"tier": "scorching"}, stored={"id": "b"})]
+        ck.register(ProviderSpec(**{**_simple().__dict__, "read": lambda c: Read(rows=tuple(rows)),
+                                    "facets": frozenset({"tier"}), "order": "spore.keep"}))
+        got = ck.panel("p")
+        assert got["status"] == "partial" and [r["id"] for r in got["rows"]] == ["a"] and got["skipped"][0]["count"] == 1
+
+    def test_q_on_the_now_view_is_a_no_op_not_zero_rows(self, env) -> None:
+        _r, _s, ck = env
+        assert ck.panel(NOW_ID, q="anything")["rows"] == ck.panel(NOW_ID)["rows"]
+
+    def test_a_context_file_that_is_valid_json_of_the_wrong_shape_is_error(self, env) -> None:
+        root, _s, ck = env
+        (root / ".levain" / "context.json").write_text("[]")
+        assert ck.panel("focus")["status"] == "error"
+
+    def test_a_malformed_crystal_row_is_counted_not_hidden(self, env) -> None:
+        root, _s, ck = env
+        (root / ".levain" / "memory.crystal.json").write_text(json.dumps({"crystal": [
+            {"name": "ok", "status": "crystallized", "level": 1, "explanation": "x"},
+            {"name": "bad", "status": "crystallized", "level": "high", "explanation": "y"}]}))
+        got = ck.panel("crystals")
+        assert got["status"] == "partial" and got["skipped"][0]["count"] == 1
+
+    def test_the_etag_variant_cannot_be_forged_through_a_delimiter(self) -> None:
+        from levain.cockpit.routes import _etag_header
+        a = _etag_header("e", ["panel", "full", "a|b", None, "none"])
+        b = _etag_header("e", ["panel", "full", "a", "b|", "none"])
+        assert a != b and a.startswith('W/"')
+
+    def test_exactly_the_cap_is_not_reported_as_truncated(self, env, monkeypatch) -> None:
+        import levain.cockpit.providers as prov
+        monkeypatch.setattr(prov, "SPORE_CAP", 3)
+        _r, _s, ck = env
+        got = ck.panel("loops")   # one loop, cap 3
+        assert got["status"] == "ok" and got["skipped"] == []
+        monkeypatch.setattr(prov, "SPORE_CAP", 0)
+        assert ck.panel("loops")["skipped"]

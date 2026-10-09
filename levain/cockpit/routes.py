@@ -36,14 +36,21 @@ def credential_for(supplied: str, expected: str | None) -> dict[str, Any]:
     return {"class": "token" if ok else "none", "device_class": None}
 
 
-def _etag_header(etag: str, variant: str) -> str:
-    return '"' + hashlib.sha256(f"{etag}|{variant}".encode()).hexdigest()[:32] + '"'
+
+
+def _etag_header(etag: str, variant: list[Any]) -> str:
+    """A WEAK validator: the body also carries ``as_of`` / ``generated_at``, which the etag leaves
+    out on purpose, so two byte-distinct bodies are semantically equivalent, not identical. The
+    variant (profile, query, row, credential) is hashed as canonical JSON, never joined with a
+    delimiter a query string could contain."""
+    h = hashlib.sha256(json.dumps([etag, variant], separators=(",", ":")).encode()).hexdigest()[:32]
+    return f'W/"{h}"'
 
 
 def _matches(if_none_match: str | None, etag: str) -> bool:
     if not if_none_match:
         return False
-    return any(t.strip().lstrip("W/") == etag for t in if_none_match.split(","))
+    return any(t.strip().removeprefix("W/") == etag.removeprefix("W/") for t in if_none_match.split(","))
 
 
 def handle_get(
@@ -61,7 +68,7 @@ def handle_get(
     def jerr(status: int, error: str, message: str) -> tuple[int, bytes, list[tuple[str, str]]]:
         return status, json.dumps({"error": error, "message": message}).encode(), base_headers
 
-    def ok(payload: dict[str, Any], variant: str) -> tuple[int, bytes, list[tuple[str, str]]]:
+    def ok(payload: dict[str, Any], variant: list[Any]) -> tuple[int, bytes, list[tuple[str, str]]]:
         etag = _etag_header(payload["etag"], variant)
         hdrs = base_headers + [("ETag", etag)]
         if _matches(if_none_match, etag):
@@ -69,7 +76,7 @@ def handle_get(
         return 200, json.dumps(payload, separators=(",", ":")).encode("utf-8"), hdrs
 
     if path == MANIFEST_PATH:
-        return ok(cockpit.manifest(cred), f"manifest|{cred['class']}")
+        return ok(cockpit.manifest(cred), ["manifest", cred["class"]])
     panel_id = unquote(path[len(PANEL_PREFIX): -len(PANEL_SUFFIX)])
     profile = (qs.get("profile") or ["full"])[0]
     if profile not in PROFILES:
@@ -82,5 +89,5 @@ def handle_get(
         return jerr(404, "not_found", f"panel {panel_id!r} has no row {row!r}")
     if panel is None:
         return jerr(404, "not_found", f"no panel {panel_id!r}")
-    variant = f"{profile}|{q or ''}|{row or ''}|{cred['class']}"
+    variant = ["panel", profile, q, row, cred["class"]]
     return ok(panel, variant)

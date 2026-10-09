@@ -597,10 +597,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
             if self.cockpit is None:
                 from levain.cockpit.providers import build_default_cockpit
 
-                self.cockpit = build_default_cockpit(
+                built = build_default_cockpit(
                     self.levain_source,
                     job_store=self.job_runtime.store if self.job_runtime is not None else None)
-                self.cockpit.start()
+                built.start()
+                self.cockpit = built   # published only once started: a failed start retries next request
             return self.cockpit
 
     def server_close(self) -> None:

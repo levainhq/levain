@@ -87,16 +87,20 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
 }
 
 
+class FacetValueError(ValueError):
+    """A registered facet carrying a value of the wrong type: bad DATA in one row (a store holding a
+    tier outside the enum), not a provider bug. The engine skips and counts the row."""
+
+
 def validate_facets(facets: dict[str, Any]) -> None:
-    """Raise ``CockpitRegistrationError`` for an unregistered facet or an ill-typed value."""
+    """Raise ``CockpitRegistrationError`` for an unregistered facet (a provider bug) and
+    ``FacetValueError`` for an ill-typed value (bad data in that row)."""
     for name, value in facets.items():
         entry = FACETS.get(name)
         if entry is None:
             raise CockpitRegistrationError(f"unregistered facet {name!r}")
         if not entry[1](value):
-            raise CockpitRegistrationError(
-                f"facet {name!r} must be {entry[0]}, got {value!r}"
-            )
+            raise FacetValueError(f"facet {name!r} must be {entry[0]}, got {value!r}")
 
 
 # --- orderings ---------------------------------------------------------------------------
