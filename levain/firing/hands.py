@@ -355,21 +355,49 @@ def egress_boundary_problem(hands_user: str, ports: tuple[int, ...] = (), *, net
         listener.close()
 
 
+def _root_owned_text(path: Path) -> str:
+    """``path``'s text, read only if it and every directory above it are root's and nobody else can
+    write them: a matching file that the hands user or the operator could rewrite after the check
+    proves nothing about the next boot (L3 r3, codex). Raises ValueError naming what is wrong."""
+    import stat
+
+    for d in path.parents:
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise ValueError(f"{d} is not a root-owned directory only root can write")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, encoding="utf-8") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise ValueError(f"{path} is not a regular root-owned file only root can write")
+        return fh.read()
+
+
 def egress_drift_problem(hands_user: str, hands_id: int, ports: tuple[int, ...]) -> str | None:
-    """Does the ruleset on disk (what boot and every reload load) say exactly what the record says?
-    The file is world-readable; the loaded table is not (listing needs root), and the probe tests only
-    a refused port, so a ruleset allowing MORE than the record (a part-way or concurrent repair) would
-    otherwise pass (L3 r2, codex)."""
+    """Is what boot and every reload load exactly what the record says? The ruleset and the unit are
+    world-readable; the loaded table is not (listing needs root), and the probe tests only a refused
+    port, so a ruleset allowing MORE than the record (a part-way or concurrent repair) or a unit that no
+    longer loads it would otherwise pass (L3 r2, r3: codex)."""
     import grp
 
     try:
         net_gid = grp.getgrnam(hands_net_group(hands_user)).gr_gid
-        on_disk = egress_rules_path(hands_user).read_text(encoding="utf-8")
-    except (KeyError, OSError) as exc:
-        return f"the boundary's ruleset or group cannot be read ({exc})"
-    if on_disk != egress_ruleset(hands_user, hands_id, ports, net_gid):
+        rules = _root_owned_text(egress_rules_path(hands_user))
+        unit = _root_owned_text(egress_unit_path(hands_user))
+    except (KeyError, OSError, ValueError) as exc:
+        return f"the boundary's files or group cannot be trusted ({exc})"
+    if rules != egress_ruleset(hands_user, hands_id, ports, net_gid):
         return (f"the ruleset in {egress_rules_path(hands_user)} is not the one the record describes (allowed ports "
                 f"{list(ports) or 'none'}): a repair stopped part way, or the file was edited")
+    if unit != egress_unit_text(hands_user):
+        return f"{egress_unit_path(hands_user)} is not the unit setup wrote, so boot may not load the boundary"
+    try:
+        r = subprocess.run([_abs("systemctl"), "is-enabled", egress_unit_name(hands_user)], capture_output=True,
+                           text=True, timeout=20, env=child_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"systemd could not say whether the boundary loads at boot ({exc})"
+    if r.stdout.strip() != "enabled":
+        return f"{egress_unit_name(hands_user)} is {r.stdout.strip() or 'unknown'}, not enabled: boot would not load the boundary"
     return None
 
 
@@ -379,6 +407,8 @@ def egress_steps(hands_user: str, hands_id: int, ports: tuple[int, ...], net_gid
     unit even when it was already active, which is what loads a changed ruleset."""
     systemctl, unit = _abs("systemctl"), egress_unit_name(hands_user)
     return [
+        Step("make its directories root's and readable by all (doctor reads the ruleset as you)",
+             (_abs("install"), "-d", "-m", "755", "-o", "root", "-g", "root", str(_EGRESS_DIR.parent), str(_EGRESS_DIR))),
         Step("write the hands user's network boundary (nftables, checked with nft -c)",
              write=(egress_rules_path(hands_user), egress_ruleset(hands_user, hands_id, ports, net_gid), 0o644),
              validate=(_abs("nft"), "-c", "-f")),
@@ -454,8 +484,8 @@ def _subid_nss_problem(hands_user: str) -> str | None:
         return None
     except OSError as exc:
         return f"/etc/nsswitch.conf cannot be read ({exc.strerror}), so a subordinate id provider cannot be ruled out"
-    providers = [ln.split(":", 1)[1].split() for ln in conf.splitlines()
-                 if ln.split("#", 1)[0].strip().startswith("subid:")]
+    lines = (ln.split("#", 1)[0].strip() for ln in conf.splitlines())
+    providers = [ln.split(":", 1)[1].split() for ln in lines if ln.startswith("subid:")]
     if not providers or all(p in ("files",) for p in providers[-1]):
         return None
     getsubids = shutil.which("getsubids", path=SECURE_PATH)
@@ -463,8 +493,16 @@ def _subid_nss_problem(hands_user: str) -> str | None:
         return (f"nsswitch.conf names a subordinate id provider ({' '.join(providers[-1])}) and getsubids is not "
                 f"installed, so a range for {hands_user} cannot be ruled out")
     for flag in ((), ("-g",)):
-        r = subprocess.run([getsubids, *flag, hands_user], capture_output=True, text=True, env=child_env())
-        if r.returncode == 0 and r.stdout.strip():
+        try:
+            r = subprocess.run([getsubids, *flag, hands_user], capture_output=True, text=True, timeout=20,
+                               env=child_env())
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"getsubids could not answer for {hands_user} ({exc}), so a range cannot be ruled out"
+        # getsubids exits non-zero when the provider could not be asked; only a clean, empty answer is "none".
+        if r.returncode != 0:
+            return (f"getsubids {' '.join(flag)} {hands_user} failed ({(r.stderr or '').strip() or f'exit {r.returncode}'}), "
+                    "so a range cannot be ruled out")
+        if r.stdout.strip():
             return f"{hands_user} has a subordinate id range from {' '.join(providers[-1])}: {r.stdout.strip()}"
     return None
 
@@ -1463,20 +1501,29 @@ def _repair_linux(entity_dir: Path, cfg, operator: str, op: pwd.struct_passwd, p
             print("setup-isolation: a session of this entity, or ws-git / ws-put / ws-adopt, or another repair is "
                   "running; refusing to repair under it.")
             return 1
-        from levain.firing.confinement import load_confinement_config
-
-        if load_confinement_config(entity_dir, bound_hands=False) != cfg:
-            os.close(lock_fd)
-            print("setup-isolation: the record changed while this repair started; run it again.")
-            return 1
-    if ports != cfg.hands_egress_ports and not dry_run:
-        # Recorded FIRST, as the state to reach: if a step below fails part way, the ruleset on disk may
-        # already hold these ports, and a rerun (which reads the record) converges on them rather than
-        # silently reverting (L3 r1).
-        record_hands(entity_dir, {"hands_user": hands, "hands_uid": hands_id,
-                                  "hands_workspace": str(cfg.hands_workspace), "hands_egress_ports": list(ports)},
-                     owner_uid=op.pw_uid, owner_gid=op.pw_gid)
     try:
+        if lock_fd is not None:
+            from levain.firing.confinement import ConfinementError, load_confinement_config
+
+            try:
+                same = load_confinement_config(entity_dir, bound_hands=False) == cfg
+            except ConfinementError:
+                same = False
+            if not same:
+                print("setup-isolation: the record changed while this repair started; run it again.")
+                return 1
+            if ports != cfg.hands_egress_ports:
+                # Recorded FIRST, as the state to reach: if a step below fails part way, the ruleset on disk
+                # may already hold these ports, and a rerun (which reads the record) converges on them rather
+                # than silently reverting (L3 r1).
+                try:
+                    record_hands(entity_dir, {"hands_user": hands, "hands_uid": hands_id,
+                                              "hands_workspace": str(cfg.hands_workspace),
+                                              "hands_egress_ports": list(ports)},
+                                 owner_uid=op.pw_uid, owner_gid=op.pw_gid)
+                except (HandsSetupError, OSError, ValueError) as exc:
+                    print(f"setup-isolation: could not record the ports ({exc}); nothing was changed.")
+                    return 1
         rc = run_plan(plan, dry_run=dry_run)
     finally:
         if lock_fd is not None:
