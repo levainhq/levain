@@ -33,6 +33,7 @@ import subprocess
 import tempfile
 from dataclasses import replace
 
+from levain.cockpit.engine import Cockpit
 from levain.dashboard import CLASS_A, CLASS_B, CLASS_C, SubstrateSource, SubstrateView
 from levain.tui import (
     ZONES,
@@ -75,6 +76,7 @@ def main_loop(
     view: SubstrateView,
     *,
     read_only: bool = False,
+    cockpit: "Cockpit | None" = None,
 ) -> int:
     """Run the curses event loop under ``curses.wrapper`` (which guarantees the
     terminal is restored on any exit). The first view is built by the caller,
@@ -83,8 +85,52 @@ def main_loop(
     The write target is ``source.write_scope`` (the explicit governed write surface).
     ``read_only`` forces the inspect-only variant; a source with ``write_scope is None``
     is read-only too. Either way ``_active_verbs`` advertises + dispatches nothing and
-    ``_apply`` refuses (the un-bypassable chokepoint) — a pure inspection surface."""
+    ``_apply`` refuses (the un-bypassable chokepoint) — a pure inspection surface.
+
+    ``cockpit`` (R2) renders the shared cockpit MANIFEST instead of the substrate view: the
+    kernel's panels, order and groups, read-only (verbs are K2a/K2b)."""
+    if cockpit is not None:
+        return curses.wrapper(_manifest_loop, cockpit)
     return curses.wrapper(_loop, source, view, read_only)
+
+
+_MANIFEST_ATTRS = {
+    "head": lambda c: c.A_BOLD, "panel": lambda c: c.A_BOLD | c.A_UNDERLINE, "group": lambda c: c.A_BOLD,
+    "row": lambda c: c.A_NORMAL, "note": lambda c: c.A_DIM, "dim": lambda c: c.A_DIM,
+    "error": lambda c: c.A_REVERSE | c.A_BOLD, "stale": lambda c: c.A_STANDOUT, "partial": lambda c: c.A_STANDOUT,
+}
+
+
+def _manifest_loop(stdscr: "curses.window", cockpit: "Cockpit") -> int:
+    """The manifest viewer: j/k/arrows/PgUp/PgDn scroll, r re-reads, q quits. It repaints every
+    couple of seconds so a status change (a fault, staleness) shows without a keypress."""
+    from levain.cockpit.text import render_lines, snapshot
+
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.timeout(2000)
+    top = 0
+    while True:
+        h, w = stdscr.getmaxyx()
+        lines = render_lines(snapshot(cockpit), max(20, w - 1))
+        body = max(1, h - 2)
+        top = max(0, min(top, max(0, len(lines) - body)))
+        stdscr.erase()
+        for i, (style, text) in enumerate(lines[top:top + body]):
+            _safe_addstr(stdscr, i, 0, text, _MANIFEST_ATTRS.get(style, lambda c: c.A_NORMAL)(curses))
+        _safe_addstr(stdscr, h - 1, 0, "j/k scroll · PgUp/PgDn · r refresh · q quit  (read-only manifest view)"[: w - 1], curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (ord("q"), 27):
+            return 0
+        if ch in (ord("j"), curses.KEY_DOWN):
+            top += 1
+        elif ch in (ord("k"), curses.KEY_UP):
+            top -= 1
+        elif ch == curses.KEY_NPAGE:
+            top += body
+        elif ch == curses.KEY_PPAGE:
+            top -= body
 
 
 def _loop(
