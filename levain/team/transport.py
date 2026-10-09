@@ -61,12 +61,56 @@ class JoinIncomplete(TeamError):
 
 class InitIncomplete(TeamError):
     """`init` created, attached and pinned the ledger, but its push did not complete: the clone IS initialised and its
-    state stays; the command still does not report success. ``publishable`` False: another team's ledger holds the
-    remote branch, so this one is never published there (the message names the cleanup and `join --root`)."""
+    state stays; the command still does not report success. ``outcome`` is what the remote was SEEN to hold:
+    "published" (ours is there, only the bookkeeping is pending), "pending" (the branch is absent there: the next sync
+    publishes ours), "lost" (another history holds it: ours is never published there) or "unknown" (the remote could
+    not be read, which is never taken for absent: code L3 r16 codex 1)."""
 
-    def __init__(self, message: str, *, publishable: bool = True):
+    OUTCOMES = ("published", "pending", "lost", "unknown")
+
+    def __init__(self, message: str, *, outcome: str):
+        if outcome not in self.OUTCOMES:
+            raise ValueError(f"InitIncomplete outcome {outcome!r}")
         super().__init__(message)
-        self.publishable = publishable
+        self.outcome = outcome
+
+    @property
+    def seedable(self) -> bool:
+        """Only a ledger SEEN to be ours or absent on the remote takes local writes that the next sync publishes."""
+        return self.outcome in ("published", "pending")
+
+
+@dataclass(frozen=True)
+class RemoteAbsent:
+    """The remote answered, and it has no such branch."""
+
+
+@dataclass(frozen=True)
+class RemoteTip:
+    sha: str
+
+
+@dataclass(frozen=True)
+class RemoteUnreadable:
+    """The remote could not be asked; nothing is known about the branch (never read as absent)."""
+    why: str
+
+
+def remote_tip(remote: str, ref: str, cwd: Path) -> "RemoteAbsent | RemoteTip | RemoteUnreadable":
+    """One ref's advertised tip. `git ls-remote --exit-code` exits 2 for "no matching refs" and 0 for a talk that
+    matched; any other status, or a timeout, is a failure to ask (https://git-scm.com/docs/git-ls-remote)."""
+    try:
+        cp = git(["ls-remote", "--exit-code", remote, ref], cwd, check=False, timeout=60)
+    except TeamError as exc:
+        return RemoteUnreadable(str(exc))
+    if cp.returncode == 2:
+        return RemoteAbsent()
+    if cp.returncode != 0:
+        return RemoteUnreadable(_tail(cp))
+    # ls-remote matches a pattern by its tail, so only the row naming exactly this ref counts
+    rows = [r.split("\t") for r in cp.stdout.splitlines() if "\t" in r]
+    hit = [sha for sha, name in rows if name == ref]
+    return RemoteTip(hit[0]) if hit else RemoteAbsent()
 
 
 class TeamBusy(TeamError):
@@ -614,10 +658,8 @@ class GitLedger:
                 raise TeamError(f"branch {branch} already exists here and this clone is pinned to it: "
                                 + ("`levain team sync` publishes it" if self.joined() else
                                    "`levain team join` re-attaches its checkout" if self.remote else
-                                   # local-only: join needs a remote (r15 codex 4); this is _attach_worktree's own step
-                                   f"re-attach its checkout with `git -C {shlex.quote(str(self.repo.toplevel))} "
-                                   f"worktree prune` and `git -C {shlex.quote(str(self.repo.toplevel))} worktree add "
-                                   f"--lock {shlex.quote(str(self.wt))} {shlex.quote(branch)}`"))
+                                   # local-only: join needs a remote (r15 codex 4)
+                                   self._reattach_advice(branch)))
             raise TeamError(f"branch {branch} already exists here: use `levain team join`; if it is left from an init "
                             f"that stopped (nothing of it published), remove it first: {self._init_cleanup(branch)}")
         if remote and self._remote_ledgers(remote):
@@ -672,30 +714,83 @@ class GitLedger:
             except TeamError as exc:      # a timeout or no git: still a failed push, never a raw error (r15 cpl 1)
                 why = str(exc)
             if why:
-                # decided on the advertised TIP, never the branch name: a push that landed but reported a failure
-                # (a dropped connection) is ours (r15 codex 3 + complement 2)
-                try:
-                    row = git(["ls-remote", remote, f"refs/heads/{branch}"], self.repo.toplevel, timeout=60).stdout
-                    tip = row.split()[0] if row.split() else ""
-                except TeamError:
-                    tip = ""
-                if tip and tip != commit:
-                    # RUN (r14): `join --root` alone refuses, the unpublished local branch having "diverged"
-                    raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but {remote} "
-                                         "received another team ledger first, so this one cannot be published there. "
-                                         f"To join that one instead, drop this unpublished one: "
-                                         f"{self._init_cleanup(branch)}, then `levain team join --root <its genesis>` "
-                                         "(a bare `levain team join` lists it)", publishable=False)
-                if tip != commit:
+                outcome, said = self._publish_outcome(remote, branch, commit)
+                if outcome == "lost":
+                    raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but it cannot be "
+                                         f"published: {remote} {said}", outcome="lost")
+                if outcome == "unknown":
+                    # RUN (r17 residue R-D): after a lost race that sync refuses, so the drop and join are named here
                     raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but the push to "
-                                         f"{remote} failed ({why}): run `levain team sync`")
+                                         f"{remote} failed ({why}) and {said}, so whether it was published is not "
+                                         "known: run `levain team sync` once the remote answers. It publishes this "
+                                         "ledger, or refuses because another got there first; then drop "
+                                         f"this one: {self._init_cleanup(branch)}, and run `levain team join`",
+                                         outcome="unknown")
+                if outcome == "pending":
+                    raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but the push to "
+                                         f"{remote} failed ({why}): run `levain team sync`", outcome="pending")
+                # "published": the push landed (its report was lost), or a teammate has already built on it
             try:
                 self._sync(push=True)      # the clone's own bookkeeping of what it published
             except Exception as exc:  # noqa: BLE001 - published; only the bookkeeping is pending
                 raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) and pushed it to {remote}, but the "
-                                     f"follow-up sync failed ({exc}): run `levain team sync`") from exc
+                                     f"follow-up sync failed ({exc}): run `levain team sync`",
+                                     outcome="published") from exc
             return f"strict ledger created and pushed to {remote}/{branch} (genesis {commit[:12]})"
         return f"strict ledger created locally ({'no remote' if not remote else 'not pushed'}; genesis {commit[:12]})"
+
+    def _publish_outcome(self, remote: str, branch: str, commit: str) -> tuple[str, str]:
+        """After a push that reported failure, what the remote holds: decided on the advertised tip and, for a tip that
+        is not our genesis, on ANCESTRY in what was fetched (git settles a create-only race on the server and gives the
+        client no outcome after a transport failure, so the client re-reads; https://git-scm.com/docs/git-push).
+        Returns (outcome, what was seen); a read that fails is "unknown", never "pending" (code L3 r16 codex 1)."""
+        from .tenure import TEAM_FILE
+        ref = f"refs/heads/{branch}"
+        seen = remote_tip(remote, ref, self.repo.toplevel)
+        if isinstance(seen, RemoteUnreadable):
+            return "unknown", f"its branch could not be read ({seen.why})"
+        if isinstance(seen, RemoteAbsent):
+            return "pending", "has no such branch"
+        if seen.sha == commit:
+            return "published", "holds this genesis"
+        # a tip that is not ours may still DESCEND from ours: a teammate built on it after our push landed unreported
+        # (code L3 r16 codex MED + complement 2), so it is fetched and judged on ancestry, never on the sha alone
+        scratch = f"refs/levain-probe/{branch}"
+        try:
+            got = git(["fetch", "-q", "--no-tags", remote, f"+{ref}:{scratch}"], self.repo.toplevel, check=False,
+                      timeout=120)
+            if got.returncode != 0:
+                return "unknown", f"its branch could not be fetched ({_tail(got)})"
+            anc = git(["merge-base", "--is-ancestor", commit, scratch], self.repo.toplevel, check=False, timeout=60)
+            if anc.returncode == 0:
+                return "published", "holds this genesis and later entries"
+            if anc.returncode != 1:
+                return "unknown", f"its branch could not be compared ({_tail(anc)})"
+            roots = git(["rev-list", "--max-parents=0", scratch], self.repo.toplevel, check=False,
+                        timeout=60).stdout.split()
+            ledger = len(roots) == 1 and git(["cat-file", "-e", f"{roots[0]}:{TEAM_FILE}"], self.repo.toplevel,
+                                             check=False, timeout=10).returncode == 0
+        except TeamError as exc:
+            return "unknown", f"its branch could not be fetched ({exc})"
+        finally:
+            git(["update-ref", "-d", scratch], self.repo.toplevel, check=False, timeout=10)
+        drop = f"drop this unpublished one: {self._init_cleanup(branch)}"
+        if ledger:
+            # RUN (r14): `join --root` alone refuses, the unpublished local branch having "diverged"
+            return "lost", (f"received another team ledger first (genesis {roots[0][:12]}). To join that one instead, "
+                            f"{drop}, then `levain team join --root {roots[0][:12]}`")
+        # not a ledger at all: join would refuse it, so no join is advised (code L3 r16 complement 2)
+        return "lost", (f"holds a history on {branch} that is not a team ledger. To keep using this remote, {drop}, "
+                        f"then settle what {ref} on {remote} should be before running `levain team init` again")
+
+    def _reattach_advice(self, branch: str) -> str:
+        """For a local-only pinned clone that is not joined (its checkout is missing or on another branch):
+        _attach_worktree's own sequence, which first removes a checkout that exists on another branch (code L3 r16
+        codex MED + complement 1: a bare `worktree add` fails whenever the checkout exists)."""
+        top, q = shlex.quote(str(self.repo.toplevel)), shlex.quote
+        return (f"re-attach its checkout with `git -C {top} worktree remove --force --force {q(str(self.wt))}` (if it "
+                f"is listed), `git -C {top} worktree prune` and `git -C {top} worktree add --lock {q(str(self.wt))} "
+                f"{q(branch)}`")
 
     def _init_cleanup(self, branch: str) -> str:
         """Commands that run from any directory, quoted (code L3 r14 codex 5 + complement 2)."""
