@@ -170,6 +170,50 @@
     wireFocusEdit(fEl, focus);
   }
 
+  // The starter jar (masthead): rise level = today's episodes against the entity's own typical
+  // day (view.jar, counts from its store); a typical day sits at the dashed mark. A bubble
+  // rises for each episode that arrived since the LAST render of the same day, so a bubble is
+  // a true new episode, never decoration. status != "ok" -> an empty jar with its reason.
+  let jarLastToday = null;
+  function renderJar(jar) {
+    const j = document.getElementById("jar");
+    if (!j) return;
+    j.replaceChildren();
+    if (!jar) { j.hidden = true; return; }
+    j.hidden = false;
+    j.classList.toggle("empty", jar.status !== "ok");
+    const NS = "http://www.w3.org/2000/svg";
+    const mk = (tag, attrs) => {
+      const n = document.createElementNS(NS, tag);
+      for (const k of Object.keys(attrs)) n.setAttribute(k, attrs[k]);
+      return n;
+    };
+    const svg = mk("svg", { viewBox: "0 0 26 34", role: "img", "aria-label": "starter jar: " + jar.label });
+    const clip = mk("clipPath", { id: "jar-clip" });
+    clip.appendChild(mk("path", { d: "M5 8 H21 V28 Q21 32 17 32 H9 Q5 32 5 28 Z" }));
+    svg.appendChild(clip);
+    const top = 10, h = 22;  // the inside of the jar
+    const fillH = Math.max(0, Math.min(1, jar.level || 0)) * h;
+    svg.appendChild(mk("rect", { class: "jar-fill", "clip-path": "url(#jar-clip)", x: 5,
+      y: top + h - fillH, width: 16, height: fillH }));
+    svg.appendChild(mk("line", { class: "jar-mark", x1: 4, x2: 22, y1: top + h / 2, y2: top + h / 2 }));
+    svg.appendChild(mk("path", { class: "jar-glass", d: "M8 4 H18 V8 H21 V28 Q21 32 17 32 H9 Q5 32 5 28 V8 H8 Z" }));
+    // bubbles: one per newly arrived episode (cap 5), only on a same-day rise
+    const grew = jar.today != null && jarLastToday != null && jar.today > jarLastToday;
+    if (grew && jar.status === "ok") {
+      const n = Math.min(5, jar.today - jarLastToday);
+      for (let i = 0; i < n; i++) {
+        const b = mk("circle", { class: "jar-bubble", cx: 9 + i * 2.5, cy: top + h - fillH + 2, r: 1.4 });
+        b.style.animationDelay = (i * 0.25) + "s";
+        b.addEventListener("animationend", () => b.remove());
+        svg.appendChild(b);
+      }
+    }
+    jarLastToday = jar.today == null ? null : jar.today;
+    j.appendChild(svg);
+    j.appendChild(el("span", "jar-label", jar.status === "ok" ? jar.label : jar.label + " (empty)"));
+  }
+
   // The masthead state line: the optional freeform "how I am" line beside the focus.
   // `state` is view.state ({text:null} when unset OR expired: the server already dropped
   // an expired one, so nothing here re-derives age). Verbatim text via textContent, age
@@ -280,6 +324,7 @@
     // the operator can re-confirm (operator-reports-first — a nudge, not a verdict).
     renderFocus(view.focus);
     renderState(view.state);
+    renderJar(view.jar);
     // Drive the living-rings vital-signs from substrate health: write-path LIVE →
     // steady phosphor heartbeat; DARK → slow, dim-red. The background IS the pulse.
     // (view.scope stays a data-only seam — the UI surfaces it when team scope is

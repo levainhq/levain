@@ -248,6 +248,25 @@
     text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 46vw;
   }
   .entity::after { content: "▮"; color: var(--mind); margin-left: .25em; font-size: .8em; animation: blink 1.25s steps(1) infinite; }
+  /* The starter jar: a self-contained SVG. Level and bubbles are TRUE state (counts from the
+     entity's own store); an empty/unknown jar is drawn empty and labelled, never faked. */
+  .jar { display: flex; align-items: center; gap: 8px; color: var(--faint); font-size: 10.5px;
+         letter-spacing: .05em; }
+  .jar svg { width: 40px; height: 52px; overflow: visible; }
+  .jar .jar-glass { fill: none; stroke: var(--operate); stroke-width: 1.4; }
+  .jar .jar-fill { fill: var(--operate); opacity: .55; transition: y .6s ease, height .6s ease; }
+  .jar.empty .jar-fill { opacity: 0; }
+  .jar .jar-mark { stroke: var(--faint); stroke-width: 1; stroke-dasharray: 2 2; }
+  .jar .jar-bubble { fill: var(--ink); opacity: 0; animation: jar-rise 2.4s ease-out forwards; }
+  @keyframes jar-rise {
+    0% { transform: translateY(0); opacity: .0; }
+    15% { opacity: .75; }
+    100% { transform: translateY(-14px); opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .jar .jar-fill { transition: none; }
+    .jar .jar-bubble { display: none; animation: none; }
+  }
   .indicators { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: flex-end; }
   .stamp { color: var(--dim); font-size: 10px; letter-spacing: .04em; }
   button#refresh {
