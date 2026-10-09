@@ -193,7 +193,7 @@ class Cockpit:
         self._rowsets: dict[str, str] = {}
         self._discoverers: list[Callable[[ReadContext], list[ProviderSpec]]] = []
         self._entity_state = _State()
-        self._discovery_state = _State()
+        self._discovery_states: list[_State] = []
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
 
@@ -263,8 +263,8 @@ class Cockpit:
             self._state[spec.id].started = self._clock()
             self.refresh(spec.id)
             r = _Refresher(self, spec)
-            self._refreshers[spec.id] = r
             r.thread.start()
+            self._refreshers[spec.id] = r
 
     def stop(self) -> list[str]:
         """Halt every refresher and wait out any read it is inside (bounded by that provider's
@@ -274,6 +274,9 @@ class Cockpit:
             r.halt()
         stuck = []
         for pid, r in list(self._refreshers.items()):
+            if r.thread.ident is None:      # never started: nothing to join
+                del self._refreshers[pid]
+                continue
             r.thread.join(timeout=r.spec.timeout_s + 1)
             if r.thread.is_alive():
                 stuck.append(pid)
@@ -319,7 +322,16 @@ class Cockpit:
                     out = Fault(f"{type(exc).__name__}: {exc}")
                 fut.set_result(out)
 
-            threading.Thread(target=work, name="cockpit-read", daemon=True).start()
+            try:
+                threading.Thread(target=work, name="cockpit-read", daemon=True).start()
+            except BaseException as exc:  # noqa: BLE001 - thread exhaustion: fail THIS read, poison nothing
+                out = Fault(f"could not start a read: {type(exc).__name__}: {exc}")
+                fut.set_result(out)
+                if st is not None:
+                    with st.lock:
+                        if st.flight is fut:
+                            st.flight = None
+                return out
         try:
             res = fut.result(timeout=wait)
         except FutureTimeout:
@@ -614,6 +626,17 @@ class Cockpit:
             "empty": "Nothing needs you now.", "order": None, "groups": None, "search": None,
             "actions": [], "degraded": degraded,
         }
+        # the union of the source panels' declared groups (labels and order), counted over the now
+        # rows, so a renderer prints "Today" / "Overdue", not the raw ids the rows carry
+        union: dict[str, dict[str, Any]] = {}
+        for src in sources:
+            if src.order and ORDERINGS[src.order].groups:
+                for gid, title in ORDERINGS[src.order].groups:
+                    union.setdefault(gid, {"id": gid, "title": title, "count": 0})
+        for r in rows:
+            if r["group"] in union:
+                union[r["group"]]["count"] += 1
+        head["groups"] = list(union.values()) or None
         return head, rows
 
     def _entity(self, ctx: ReadContext) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -631,14 +654,12 @@ class Cockpit:
             raise TypeError(f"entity must return an object, got {type(got).__name__}")
         return Read(value=got)
 
-    def _discover_all(self, ctx: ReadContext) -> Result:
-        found: list[ProviderSpec] = []
-        for fn in self._discoverers:
-            got = fn(ctx)
-            if not isinstance(got, list) or not all(isinstance(x, ProviderSpec) for x in got):
-                raise TypeError("a discoverer returns a list of ProviderSpec")
-            found += got
-        return Read(value=found)
+    @staticmethod
+    def _discover_one(fn: Callable[[ReadContext], list[ProviderSpec]], ctx: ReadContext) -> Result:
+        got = fn(ctx)
+        if not isinstance(got, list) or not all(isinstance(x, ProviderSpec) for x in got):
+            raise TypeError("a discoverer returns a list of ProviderSpec")
+        return Read(value=got)
 
     def discover(self, fn: Callable[[ReadContext], list[ProviderSpec]]) -> None:
         """Register a discoverer: run when a manifest is built (or a panel nobody registered is
@@ -649,23 +670,29 @@ class Cockpit:
         self._discoverers.append(fn)
 
     def _ensure_discovered(self, ctx: ReadContext) -> list[dict[str, Any]]:
-        if not self._discoverers:
-            return []
-        res = self._bounded(self._entity_timeout_s, self._discovery_state, self._discover_all, ctx)
-        if isinstance(res, Fault):
-            return [{"source": "discovery", "message": res.message}]
+        """Each discoverer runs on its own bounded single-flight, so one that fails or hangs costs
+        only its own panels and one error entry."""
         errors: list[dict[str, Any]] = []
-        for spec in res.value:
-            with self._lock:
-                have = self._specs.get(spec.id)
-                if have is None:
-                    try:
-                        self._register_locked(spec)
-                    except CockpitRegistrationError as exc:
-                        errors.append({"source": f"discovery:{spec.id}", "message": str(exc)})
-                elif have.title != spec.title:
-                    errors.append({"source": f"discovery:{spec.id}",
-                                   "message": f"id collision: {spec.title!r} maps to the id of {have.title!r}"})
+        while len(self._discovery_states) < len(self._discoverers):
+            self._discovery_states.append(_State())
+        for i, fn in enumerate(self._discoverers):
+            res = self._bounded(self._entity_timeout_s, self._discovery_states[i], self._discover_one, fn, ctx)
+            if isinstance(res, Fault):
+                errors.append({"source": f"discovery:{i}", "message": res.message})
+                continue
+            for spec in res.value:
+                with self._lock:
+                    have = self._specs.get(spec.id)
+                    if have is None:
+                        try:
+                            if spec.refresh_every_s is not None:
+                                raise CockpitRegistrationError("a discovered panel cannot carry a refresher")
+                            self._register_locked(spec)
+                        except Exception as exc:  # noqa: BLE001 - a bad spec is an errors entry, never a 500
+                            errors.append({"source": f"discovery:{spec.id}", "message": str(exc)})
+                    elif have.title != spec.title:
+                        errors.append({"source": f"discovery:{spec.id}",
+                                       "message": f"id collision: {spec.title!r} maps to the id of {have.title!r}"})
         return errors
 
     @staticmethod
@@ -717,8 +744,6 @@ class Cockpit:
             self._ensure_discovered(ctx)      # a panel we do not know yet may be a heading added since
             specs_map = self._specs
         if panel_id == NOW_ID:
-            self._ensure_discovered(ctx)
-            specs_map = self._specs
             head, rows = self._now_head_and_rows(ctx, credential_class, specs_map)
             spec = None
             snap_rows: list[dict[str, Any]] | None = rows

@@ -838,10 +838,10 @@ class TestL3R2Fixes:
         ck.discover(lambda ctx: (release.wait(30), [])[1])
         ck._entity_timeout_s = 0.2
         errs = [ck.manifest(NONE_CRED)["errors"] for _ in range(1)]
-        assert errs[0] and errs[0][0]["source"] == "discovery"
+        assert errs[0] and errs[0][0]["source"] == "discovery:0"
         t0 = time.monotonic()
         for _ in range(5):
-            assert ck.manifest(NONE_CRED)["errors"][0]["source"] == "discovery"
+            assert ck.manifest(NONE_CRED)["errors"][0]["source"] == "discovery:0"
         assert time.monotonic() - t0 < 0.5      # five more requests, no wait, no new thread
         assert sum(t.name == "cockpit-read" and t.is_alive() for t in threading.enumerate()) == 1
         release.set()
@@ -868,7 +868,7 @@ class TestL3R2Fixes:
         ck = Cockpit(entity=lambda ctx: None)    # type: ignore[arg-type,return-value]
         ck.discover(lambda ctx: [object()])      # type: ignore[list-item,return-value]
         m = ck.manifest(NONE_CRED)
-        assert {e["source"] for e in m["errors"]} == {"entity", "discovery"}
+        assert {e["source"] for e in m["errors"]} == {"entity", "discovery:0"}
 
     def test_a_held_row_does_not_displace_a_visible_one_under_the_cap(self, tmp_path: Path, monkeypatch) -> None:
         import levain.cockpit.providers as prov
@@ -917,3 +917,65 @@ class TestL3R2Fixes:
             assert httpd.cockpit is None and all(not c._refreshers for c in started)
         finally:
             httpd.server_close()
+
+
+class TestL3R3Fixes:
+    def test_a_thread_that_cannot_start_fails_that_read_and_poisons_nothing(self, monkeypatch) -> None:
+        ck = Cockpit()
+        ck.register(_simple())
+        real = threading.Thread.start
+        state = {"fail": True}
+
+        def start(self):
+            if state["fail"] and self.name == "cockpit-read":
+                raise RuntimeError("can't start new thread")
+            return real(self)
+        monkeypatch.setattr(threading.Thread, "start", start)
+        assert ck.panel("p")["status"] == "error"
+        state["fail"] = False
+        assert ck.panel("p")["status"] == "empty"        # recovered at once, no restart
+
+    def test_one_failing_discoverer_does_not_hide_another_discoverers_panels(self) -> None:
+        ck = Cockpit()
+        ck.discover(lambda ctx: 1 / 0)                    # type: ignore[arg-type,return-value]
+        ck.discover(lambda ctx: [_simple("found")])
+        m = ck.manifest(NONE_CRED)
+        assert "found" in m["panels"] and [e["source"] for e in m["errors"]] == ["discovery:0"]
+
+    def test_a_discovered_panel_cannot_carry_a_refresher(self) -> None:
+        ck = Cockpit()
+        ck.discover(lambda ctx: [_simple("r", refresh_every_s=5, stale_after_s=5)])
+        m = ck.manifest(NONE_CRED)
+        assert "r" not in m["panels"] and "refresher" in m["errors"][0]["message"]
+
+    def test_a_crystal_store_removed_between_the_check_and_the_read_is_error_not_empty(self, env, monkeypatch) -> None:
+        root, _s, ck = env
+        from anneal_memory.crystal import CrystalStore
+        path = root / ".levain" / "memory.crystal.json"
+        real = CrystalStore.active
+
+        def active(self):
+            out = real(self)
+            path.unlink()
+            return out
+        assert ck.panel("crystals")["status"] == "ok"      # a clean read: the source has now been seen
+        monkeypatch.setattr(CrystalStore, "active", active)
+        assert ck.panel("crystals")["status"] == "error"   # it vanished mid-read: error, never healthy-empty
+
+    def test_a_non_dict_crystal_row_is_skipped_per_row(self, env) -> None:
+        root, _s, ck = env
+        (root / ".levain" / "memory.crystal.json").write_text(json.dumps({"crystal": [
+            {"name": "a", "status": "crystallized", "level": 1, "explanation": "x"}]}))
+        from anneal_memory.crystal import CrystalStore
+        assert ck.panel("crystals")["count"] == 1
+
+
+class TestNowGroups:
+    def test_the_now_head_carries_the_union_of_its_sources_groups_counted(self, env) -> None:
+        _r, _s, ck = env
+        now = ck.panel(NOW_ID)
+        assert [g["id"] for g in now["groups"]] == ["today", "overdue", "also"]
+        assert [g["title"] for g in now["groups"]][:2] == ["Today", "Overdue"]
+        by = {g["id"]: g["count"] for g in now["groups"]}
+        assert by == {"today": 1, "overdue": 1, "also": 0} and sum(by.values()) == now["count"]
+        assert ck.manifest(NONE_CRED)["panels"][NOW_ID]["groups"] == now["groups"]
