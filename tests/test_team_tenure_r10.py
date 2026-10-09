@@ -87,5 +87,5 @@ def test_k2_init_never_deletes_a_ref_it_did_not_create(tmp_path, keys, monkeypat
     assert ref, "init deleted a ledger ref another writer had created"
     assert not gl(a).pinned_root and "signing_key" not in gl(a).state(), gl(a).state()
     # no resume (r13: deleted, spore-813): a retry refuses and names the exact cleanup
-    with pytest.raises(TeamError, match="git branch -D"):
+    with pytest.raises(TeamError, match="branch -D levain-team-ledger"):
         gl(a).init(team_, signing_key=str(keys["ana"]), push=False)
