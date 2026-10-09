@@ -4215,7 +4215,7 @@ def _bwrap_hands_file(policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, 
     _require_hands_python()
 
     def driver() -> list[str]:
-        argv, _ = _bwrap_plan(policy)
+        argv, _ = _bwrap_plan(_hands_policy(policy, hands))
         argv = _hands_bwrap_argv(argv, hands)
         missing = _hands_argv_unmade(argv)
         if missing is not None:
@@ -6583,6 +6583,16 @@ def _in_hands_view(path: str | Path, hands: HandsIdentity) -> bool:
     return any(p == Path(t) or p.is_relative_to(t) for t in (*ro, *rw))
 
 
+def _hands_policy(policy: CrownJewelsPolicy, hands: HandsIdentity) -> CrownJewelsPolicy:
+    """The floor's policy with only the jewels a hands view contains: what a hands launch plans from,
+    rechecks and edits under. A jewel outside the view is unreachable by the hands user, so a refusal
+    over it refused for nothing (RUN 2026-10-09: the operator's ~/.levain/autonomic as a SQLite file
+    refused every hands launch)."""
+    return replace(policy,
+                   deny_read_write=tuple(p for p in policy.deny_read_write if _in_hands_view(p, hands)),
+                   deny_files=tuple(p for p in policy.deny_files if _in_hands_view(p, hands)))
+
+
 def _hands_bwrap_argv(argv: list[str], hands: HandsIdentity) -> list[str]:
     """The floor's bwrap ``argv`` (``_bwrap_plan``'s, without the command) turned into a hands launch's
     allowlisted view: the view's own mounts first, then every op of the floor's plan whose target lies
@@ -6779,9 +6789,46 @@ if mode == "out":
         os._exit(0)
     signal.signal(signal.SIGTERM, stop)
     os.umask(0o077)
+    def maker_gone(name):
+        parts = name[len(".levain-relay-"):].split("-")
+        if len(parts) != 3 or not parts[0].isdigit():
+            return True   # a name from before the maker was in it
+        try:
+            with open("/proc/%s/stat" % parts[0]) as f:
+                return f.read().rsplit(")", 1)[1].split()[19] != parts[1]
+        except FileNotFoundError:
+            return True
+        except (OSError, IndexError):
+            return False   # cannot tell: kept
+    def sweep(home):
+        # A relay killed outright (not by its SIGTERM) leaves its directory; only its maker's other
+        # shells may still use one whose maker lives.
+        for name in os.listdir(home):
+            if name.startswith(".levain-relay-") and name != os.path.basename(d) and maker_gone(name):
+                try:
+                    fd = os.open(os.path.join(home, name), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                except OSError:
+                    continue
+                try:
+                    for e in os.listdir(fd):
+                        if e.endswith(".sock"):
+                            try:
+                                os.unlink(e, dir_fd=fd)
+                            except OSError:
+                                pass
+                finally:
+                    os.close(fd)
+                try:
+                    os.rmdir(os.path.join(home, name))
+                except OSError:
+                    pass
     try:
         listeners = []
         want = ports(sys.argv[3:])
+        try:
+            sweep(os.path.dirname(d))
+        except OSError:
+            pass
         os.mkdir(d, 0o700)
         try:
             mine.append(os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
@@ -6836,8 +6883,15 @@ else:
 
 
 def _hands_relay_dir(hands: HandsIdentity) -> str:
-    """A fresh directory name for one shell's relay sockets, under the hands user's home."""
-    return os.path.join(os.path.realpath(hands.home), _HANDS_RELAY_PREFIX + os.urandom(8).hex())
+    """A fresh directory name for one shell's relay sockets, under the hands user's home. It names the
+    levain that made it (pid and kernel start time), so a later relay can tell a dead levain's directory,
+    left by a relay killed outright, from a live one's and remove it (see ``_HANDS_RELAY``)."""
+    started = _proc_start_time(os.getpid())
+    if started is None:
+        raise ConfinementError("levain cannot read its own start time from /proc — refusing to start the "
+                               "entity's proxy relay (fail-closed).")
+    return os.path.join(os.path.realpath(hands.home),
+                        f"{_HANDS_RELAY_PREFIX}{os.getpid()}-{started}-{os.urandom(8).hex()}")
 
 
 def _hands_relay_in(hands: HandsIdentity, sockdir: str) -> list[str]:
@@ -7053,6 +7107,12 @@ class _BwrapShell(SandboxedShell):
         self._hands: HandsIdentity | None = None   # a hands launch's user, whose files are repaired
         self._command_since = 0.0
         self._walk: subprocess.Popen[bytes] | None = None   # the per-command walk's helper, while it runs
+        self._probed = False   # start()'s own command has run: it changes no file, so nothing to repair
+
+    def start(self) -> "SandboxedShell":
+        super().start()
+        self._probed = True
+        return self
 
     # Each command runs in a pid namespace of its own (``--unshare-pid --as-pid-1``), inside its leaf.
     _own_pid_namespace = True
@@ -7256,7 +7316,7 @@ class _BwrapShell(SandboxedShell):
             rec = self._leaves.get(pgid)
         if rec is not None:
             _leaf_gone(rec[1], timeout=5.0)
-        if self._hands is not None:
+        if self._hands is not None and self._probed:
             self._repair_masks()
 
     @property
@@ -7395,8 +7455,8 @@ class BwrapProvider(ConfinementProvider):
         argv, create_first = _bwrap_plan(policy)
         mounted, unmounted = _mount_plan_paths(argv, policy)
         if hands is not None:
-            # The placeholders stay the operator floor's, computed above from its plan; what bwrap
-            # executes is the view, and the manifest is narrowed to it below.
+            # The policy was narrowed to the view's jewels before this plan (`_spawn_bwrap`); what bwrap
+            # executes is the view.
             argv = _hands_bwrap_argv(argv, hands)
         # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
         # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
@@ -7506,6 +7566,9 @@ class BwrapProvider(ConfinementProvider):
 
     def _spawn_bwrap(self, policy: CrownJewelsPolicy, env: dict[str, str] | None, default_timeout: float,
                      hands: HandsIdentity | None, relay: _HandsRelay | None) -> SandboxedShell:
+        if hands is not None:
+            # Planned, claimed, rechecked and edited under the view's jewels only.
+            policy = _hands_policy(policy, hands)
         # A crashed levain's leaves first, so the ledger sweep below finds their claims empty.
         sweep_dead_leaves()
         # ONE ledger transaction from the sweep to the claim (L1 r1): another session's release or sweep
@@ -7555,11 +7618,7 @@ class BwrapProvider(ConfinementProvider):
             # bwrap's --die-with-parent alone left a setsid child and the namespace's pid 1 running.
             argv = [*_start_argv(sys.executable, hands=False), *argv]
         shell = _BwrapShell(
-            # The per-command SQLite check, like the manifest, covers only jewels in the hands view.
-            policy=policy if hands is None else replace(
-                policy,
-                deny_read_write=tuple(p for p in policy.deny_read_write if _in_hands_view(p, hands)),
-                deny_files=tuple(p for p in policy.deny_files if _in_hands_view(p, hands))),
+            policy=policy,   # a hands launch's is already the view's (`_spawn_bwrap`)
             manifest=manifest,
             argv=argv,
             cwd=policy.workspace,

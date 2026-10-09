@@ -956,3 +956,32 @@ def test_the_relays_carry_a_connection_from_the_sandbox_side_to_the_hosts_loopba
                 p.wait()
         target.close()
         shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.mark.skipif(platform.system() != "Linux", reason="the relay reads /proc")
+def test_a_relay_removes_a_dead_levains_relay_directory_and_keeps_a_live_ones(tmp_path):
+    """RUN 2026-10-09 (R5): a relay SIGKILLed outright left its directory in the hands home, unswept. The
+    next relay removes every one whose maker (pid and start time in its name) is gone."""
+    import sys
+    import time
+
+    pre = confinement._HANDS_RELAY_PREFIX
+    me = f"{os.getpid()}-{confinement._proc_start_time(os.getpid())}"
+    legacy, dead, live = tmp_path / f"{pre}0123abcd", tmp_path / f"{pre}{os.getpid()}-1-ab", tmp_path / f"{pre}{me}-cd"
+    for d in (legacy, dead, live):
+        d.mkdir()
+    (dead / "18080.sock").write_text("")
+    new = tmp_path / f"{pre}{me}-ef"
+    relay = subprocess.Popen([sys.executable, "-I", "-S", "-c", confinement._HANDS_RELAY, "out", str(new)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        assert relay.stdout.readline() == b"ready\n", relay.stderr.read()   # type: ignore[union-attr]
+        assert not legacy.exists() and not dead.exists()
+        assert live.exists() and new.exists()
+    finally:
+        relay.terminate()
+        relay.wait(10)
+    deadline = time.monotonic() + 5
+    while new.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not new.exists()
