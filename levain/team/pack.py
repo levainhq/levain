@@ -55,16 +55,17 @@ def seed(gl: GitLedger, pack_dir: Path, *, push: bool = True) -> list[dict]:
     if not path.is_file():
         raise TeamError(f"{pack_dir} has no {R.JUDGMENT_FILE}")
     judgment = R.load_judgment(path)
-    team = gl.team()
-    handle = gl.handle(team)
-    if handle != team.owner:
-        raise TeamError(f"only the team owner ({team.owner}) seeds pack rules; you are {handle or 'not a member'}")
-    bad = [r.id for r in judgment.rules if not team.owner_ok(r.owner)]
-    if bad:
-        raise TeamError(f"rule owner(s) not allowed by team.toml (client_owners / members): {', '.join(bad)}")
     # One pack-sync at a time: two that plan from the same ledger would both supersede the same old rule.
-    # the op first, then the pack lock: the CLI order (code L3 r7 codex 1: seed took pack then op, a deadlock)
+    # the op first, then the pack lock: the CLI order (code L3 r7 codex 1: seed took pack then op, a deadlock); every
+    # check reads the team under the op (code L3 r8 codex 4 + complement 4)
     with gl.op(), gl.lock(name="pack", timeout=60):
+        team = gl.team()
+        handle = gl.handle(team)
+        if handle != team.owner:
+            raise TeamError(f"only the team owner ({team.owner}) seeds pack rules; you are {handle or 'not a member'}")
+        bad = [r.id for r in judgment.rules if not team.owner_ok(r.owner)]
+        if bad:
+            raise TeamError(f"rule owner(s) not allowed by team.toml (client_owners / members): {', '.join(bad)}")
         led = gl.ledger(team)
         todo = plan(judgment, led.pack_rules(judgment.pack), led.retired_by_others(judgment.pack))
         written = []

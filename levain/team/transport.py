@@ -45,25 +45,7 @@ _SCRUB_ENV = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_
               "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
               "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_NAMESPACE")
 _PUSH_RETRIES = 6
-_OP = threading.local()     # per thread: clone base -> depth of the `op` lock this thread holds
-_OP_FDS: set[int] = set()   # descriptors of op locks this process holds
-
-
-def _op_after_fork_in_child() -> None:
-    """A forked child holds no op: its inherited descriptors are closed (the parent's still holds the lock) and its
-    depth is cleared, so its next op opens a fresh lock and waits for the parent (code L3 r7 codex 2: a child inherited
-    the depth and ran whole operations as if it held the lock)."""
-    for fd in list(_OP_FDS):
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    _OP_FDS.clear()
-    _OP.held = {}
-
-
-if hasattr(os, "register_at_fork"):
-    os.register_at_fork(after_in_child=_op_after_fork_in_child)
+_OP = threading.local()     # per thread: (clone base, pid) -> depth of the `op` lock this thread holds
 WARNINGS: list[str] = []  # process-wide: things a person must hear that did not stop the operation
 
 
@@ -262,7 +244,10 @@ class GitLedger:
         leaves it pointing at the original repository, where every write would silently land. git relinks it."""
         if self._wt_is_ours():
             return
-        git(["worktree", "repair", str(self.wt)], self.repo.toplevel, check=False, timeout=30)
+        with self.op():      # a repair is a write: never beside a join that is moving the worktree (code L3 r8 codex 6)
+            if self._wt_is_ours():
+                return
+            git(["worktree", "repair", str(self.wt)], self.repo.toplevel, check=False, timeout=30)
         if not self._wt_is_ours():
             raise TeamError(f"the ledger worktree {self.wt} does not belong to this repository and "
                             "`git worktree repair` could not relink it; run `levain team join --new-device`")
@@ -277,8 +262,6 @@ class GitLedger:
         """
         self.base.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.base / name, os.O_RDWR | os.O_CREAT, 0o644)
-        if name == "op":
-            _OP_FDS.add(fd)
         try:
             mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
             deadline = time.monotonic() + timeout
@@ -292,11 +275,7 @@ class GitLedger:
                     time.sleep(0.05)
             yield
         finally:
-            # closing the descriptor releases the flock; an op descriptor a fork already closed in this child is not
-            # closed again (its number may have been reused)
-            if name != "op" or fd in _OP_FDS:
-                _OP_FDS.discard(fd)
-                os.close(fd)
+            os.close(fd)  # closing the descriptor releases the flock
 
     @contextlib.contextmanager
     def op(self, *, timeout: float = 150.0):
@@ -308,11 +287,16 @@ class GitLedger:
         (the hook's lock-free bookkeeping, session denials and fetch stamps, is not one).
 
         Reentrant in the thread that holds it (join -> sync -> re-land -> update_counted nest); any other thread or
-        process waits up to ``timeout`` and then gets TeamBusy. Order: op -> net -> worktree -> state."""
+        process waits up to ``timeout`` and then gets TeamBusy. Order: op -> net -> worktree -> state.
+
+        The depth is keyed by the process id too: a child forked while the op is held does not hold it (it opens a
+        fresh lock, which the description it inherited keeps busy, so it is refused, never run unguarded). Levain does
+        not fork under the op; r7's at-fork handler for that unrun path was DELETED (code L3 r8 codex 1+2: it was
+        already growing guards of its own)."""
         held = getattr(_OP, "held", None)
         if held is None:
             held = _OP.held = {}
-        key = os.path.realpath(self.base)
+        key = self._op_key()
         if held.get(key):
             held[key] += 1
             try:
@@ -327,9 +311,12 @@ class GitLedger:
                 finally:
                     held.pop(key, None)
 
+    def _op_key(self) -> tuple[str, int]:
+        return os.path.realpath(self.base), os.getpid()
+
     def _require_op(self) -> None:
         """Fails where a step that decides from state and then writes it runs outside the op (point of use)."""
-        if not getattr(_OP, "held", {}).get(os.path.realpath(self.base)):
+        if not getattr(_OP, "held", {}).get(self._op_key()):
             raise TeamError("internal: a ledger-changing step ran outside the team operation lock; nothing was changed")
 
     # ---- identity: an SSH signing key, never an email ---------------------------------------------------------
@@ -586,17 +573,21 @@ class GitLedger:
         prior = self.state().get("signing_key")
         if signing_key:
             self.save_state(signing_key=signing_key)
+        commit = ""
         try:
             commit = self._genesis_commit({T.TEAM_FILE: R.dump_team(team), T.TENURE_FILE: T.dump_tenure(ten)},
                                           f"levain team: init strict ledger for {team.project}")
+            git(["update-ref", self.ref, commit, ""], self.repo.toplevel)
+            self.save_state(device=self._new_device(), remote=remote or "", branch=self.branch, pinned_root=commit,
+                            anchor=None, accepted={}, distrust=[])
         except BaseException:
+            # nothing of a failed init stays: the key, and the branch it created (code L3 r8 complement 7)
+            if commit:
+                git(["update-ref", "-d", self.ref, commit], self.repo.toplevel, check=False)
             if signing_key:
                 self.save_state(_mutate=lambda st: st.pop("signing_key", None) if prior is None
                                 else st.__setitem__("signing_key", prior))
             raise
-        git(["update-ref", self.ref, commit, ""], self.repo.toplevel)
-        self.save_state(device=self._new_device(), remote=remote or "", branch=self.branch, pinned_root=commit,
-                        anchor=None, accepted={}, distrust=[])
         self._remember_own_key()
         self.derivation()      # proves the genesis judges, before anything is pushed
         self._attach_worktree()
@@ -929,13 +920,14 @@ class GitLedger:
         """
         # the whole append is one op, waited for up to its own lock_timeout (the hook's ack gives up in seconds and says
         # so): a pin moved between its validation and its commit filed it under another ledger (code L3 r7 codex 1)
+        deadline = time.monotonic() + lock_timeout     # one budget for both waits (code L3 r8 complement 1)
         with self.op(timeout=lock_timeout):
-            return self._append_in_op(entry, push=push, lock_timeout=lock_timeout)
+            return self._append_in_op(entry, push=push, deadline=deadline)
 
-    def _append_in_op(self, entry: dict, *, push: bool, lock_timeout: float) -> dict:
+    def _append_in_op(self, entry: dict, *, push: bool, deadline: float) -> dict:
         self.require_joined()
         self._require_own_key_in_force(entry["author"])
-        with self.lock(timeout=lock_timeout):
+        with self.lock(timeout=max(0.05, deadline - time.monotonic())):
             self._recover_dirty()
             self._dcache = None
             ledger = self.ledger()
@@ -1558,9 +1550,16 @@ class GitLedger:
             # complement 3: the hook showed the old copy with no note and did not retry for a whole interval)
             try:
                 with self.op(timeout=0.5):
+                    # decided again under the op: another caller may have just refreshed (code L3 r8 codex 5)
+                    if time.time() - float(self.state().get("last_fetch_attempt") or 0) < interval:
+                        return None
                     self.save_state(last_fetch_attempt=time.time())
                     self._sync_in_op(push=False, timeout=timeout, net_timeout=0.5, lock_timeout=3.0)
             except TeamBusy:
+                # reported only when the copy shown is itself older than the interval: an overlapping refresh by
+                # another caller stays quiet (code L3 r8 complement 2)
+                if time.time() - float(self.state().get("last_fetch_ok") or 0) < max(interval, 1.0):
+                    return None
                 return "another levain team operation on this clone is running"    # the hook adds the rest
             return None
         except TeamError as exc:
