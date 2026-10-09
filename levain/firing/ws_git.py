@@ -36,6 +36,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from levain.firing.hands import SECURE_PATH, WORKSPACE_ROOT, _abs
 from levain.launch import child_env
@@ -911,7 +912,16 @@ def wildcard_safe_directory(roots: tuple[Path, ...] = ()) -> list[str]:
     return hits
 
 
-def mask_repair_argv(hands: Hands, since: float | None = None) -> list[str]:
+class _HandsUser(Protocol):
+    """What the mask repair needs: ws-git's :class:`Hands` and confinement's HandsIdentity both have it."""
+
+    @property
+    def user(self) -> str: ...
+    @property
+    def workspace(self) -> Path: ...
+
+
+def mask_repair_argv(hands: _HandsUser, since: float | None = None) -> list[str]:
     """Linux: restore the ACL mask on files the hands user owns in its workspace (with ``since``, only
     those whose status changed from that time on). A file created with mode 0600 (an atomic write), or
     chmod 600, gets a mask of ---, which cancels the operator's named read entry (measured in CI, and

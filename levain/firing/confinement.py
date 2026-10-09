@@ -2543,12 +2543,12 @@ if os.fork() == 0:
     # A pidfd on each child of the command, taken as it appears (bwrap's: the namespace's pid 1). On the
     # operator floor bwrap's own --die-with-parent kills bwrap the moment levain dies, and its pid 1 is
     # reparented at once (RUN 2026-10-09), so it must be held before then; a pidfd outlives reparenting.
-    # Looked for until the first is found, for 10 s at most: bwrap forks its one pid 1 at once, and the
-    # relays fork none.
+    # Looked for until the first is found: every 50 ms for 10 s (bwrap forks its one pid 1 at once),
+    # then every 2 s (glm L3 r1: a slow host); the relays fork none.
     kids, scan_until = {}, time.monotonic() + 10
     ready = []
     while True:
-        if not kids and time.monotonic() < scan_until:
+        if not kids:
             for pid in os.listdir("/proc"):
                 if pid.isdigit() and int(pid) not in kids and int(pid) != os.getpid():
                     try:
@@ -2558,7 +2558,7 @@ if os.fork() == 0:
                         pass
         if held in ready or mine in ready:
             break
-        ready = select.select([held, mine], [], [], None if kids or time.monotonic() >= scan_until else 0.05)[0]
+        ready = select.select([held, mine], [], [], None if kids else 0.05 if time.monotonic() < scan_until else 2)[0]
     # A child still alive is killed either way: bwrap ends on its own only after its pid 1 has, so a
     # pid 1 that outlives it was orphaned. On the operator floor bwrap's --die-with-parent kills bwrap
     # before levain's pidfd turns readable, so the command's end is seen first (RUN 2026-10-09: 4 of 10).
@@ -6604,9 +6604,8 @@ def _hands_ns_problem(hands: HandsIdentity, timeout: float = 30.0) -> str | None
     it said. Ubuntu 23.10+ with ``kernel.apparmor_restrict_unprivileged_userns=1`` refuses it until the
     bwrap-userns-restrict profile is installed (RUN 2026-10-09)."""
 
-    argv = [*hands_prefix(hands), BWRAP, "--unshare-user", "--disable-userns", "--unshare-ipc", "--unshare-net",
-            "--unshare-pid", "--die-with-parent", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
-            "/bin/true"]
+    # The bare view the launch builds (glm L3 r1: a probe over `--bind / /` could pass where the view fails).
+    argv = [*hands_prefix(hands), *_hands_bwrap_argv([BWRAP], hands), "/bin/true"]
     try:
         r = _run_hands_helper(argv, hands, b"", timeout, "the namespace probe")
     except OSError as exc:
@@ -7233,9 +7232,12 @@ class _BwrapShell(SandboxedShell):
         command started. A failure is logged, not raised: the command already ran."""
         from levain.firing.ws_git import mask_repair_argv
 
-        argv = mask_repair_argv(self._hands, since=self._command_since - 2)   # type: ignore[arg-type]
+        hands = self._hands
+        if hands is None:
+            return
+        argv = mask_repair_argv(hands, since=self._command_since - 2)
         try:
-            r = _run_hands_helper(argv, self._hands, b"", 60, "restoring your read access")
+            r = _run_hands_helper(argv, hands, b"", 60, "restoring your read access")
             if r.returncode != 0:
                 _log.warning("restoring your read access to files the entity's command changed failed: %s",
                              r.stderr.decode("utf-8", "replace").strip()[-300:])
