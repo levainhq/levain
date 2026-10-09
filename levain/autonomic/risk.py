@@ -60,6 +60,11 @@ class UnknownAction(KeyError):
     model could reach by NAMING an action you never declared), never a silent low-risk default."""
 
 
+# register and freeze: a register lands in the copy a gate holds, or raises. Module-level, so a manifest
+# stays copyable and picklable.
+_COMPOSE_LOCK = threading.Lock()
+
+
 class ManifestFrozen(RuntimeError):
     """Raised by :meth:`ActionManifest.register` on a manifest a gate holds (desk ruling (a), 2026-10-09):
     a declaration changes by building a new manifest and a new gate, never by editing one in place."""
@@ -92,17 +97,24 @@ class ActionManifest:
     admission differed and the hold reopened at the new rung). A binding risk resolver that reads a
     catalog of its own is not frozen by the gate: within one admission the fence holds it to one read
     (the same e3e5010 run), and freezing it is the adapter's.
+
+    What the freeze is NOT (L3 r6-r7, spore-813): a defence against code running in the gate's own
+    process. Such code can reassign or edit any private attribute (``gate._manifest``, its ``_actions``),
+    as it can edit a ``frozen=True`` :class:`ActionRisk` with ``object.__setattr__`` (run 2026-10-09);
+    no Python-level guard bounds it, so none is added. The authority boundary is outside the process:
+    a person's approval is a signature the operator's uid cannot make (:mod:`levain.autonomic.confirm`).
+    The freeze makes the API honest: a change through :meth:`register` after a gate holds the manifest
+    raises instead of half-applying.
     """
 
     def __init__(self, actions: dict[str, ActionRisk] | None = None) -> None:
         self._actions: dict[str, ActionRisk] = dict(actions or {})
         self._frozen = False
-        self._lock = threading.Lock()   # register and freeze: a register lands in the copy or raises
 
     def register(self, name: str, risk: ActionRisk) -> None:
         """Declare (or re-declare) an action's risk while the manifest is being composed. Last-writer-wins.
         Raises :class:`ManifestFrozen` once a gate holds the manifest (:meth:`freeze`)."""
-        with self._lock:
+        with _COMPOSE_LOCK:
             if self._frozen:
                 raise ManifestFrozen(
                     f"cannot register {name!r}: a gate holds this manifest; build a new manifest and swap in "
@@ -112,7 +124,7 @@ class ActionManifest:
     def freeze(self) -> "ActionManifest":
         """End composition and return the frozen COPY a gate holds: every later :meth:`register` on this
         manifest raises, and nothing done to this object afterwards reaches the copy. Idempotent."""
-        with self._lock:
+        with _COMPOSE_LOCK:
             self._frozen = True
             copy = ActionManifest(self._actions)
         copy._frozen = True
