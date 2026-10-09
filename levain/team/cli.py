@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -100,13 +101,15 @@ def cmd_init(args) -> int:
                 written = P.seed(gl, Path(args.pack), push=False)
                 print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
             except (TeamError, E.EntryError, R.RolesError, ValueError, OSError) as exc:
-                incomplete = InitIncomplete(f"{incomplete}; the pack was NOT seeded ({exc}): run `levain team "
-                                            f"pack-sync {args.pack}`")
+                incomplete = InitIncomplete(f"{incomplete}; the pack was NOT seeded ({exc}): after the sync, run "
+                                            f"`levain team pack-sync {shlex.quote(args.pack)}`")
         if not args.no_install:
             _install_all(repo)
     except Exception as exc:
         if incomplete is not None:
-            raise incomplete from exc       # what is still pending is the message a person must read (as join)
+            # both pending items are named: this CLI never shows a chained cause (code L3 r14 codex 3)
+            raise InitIncomplete(f"{incomplete}; then the clone's setup failed ({exc}): fix it, then run "
+                                 "`levain team install`") from exc
         raise
     if incomplete is not None:
         raise incomplete

@@ -22,6 +22,7 @@ import os
 import random
 import re
 import secrets
+import shlex
 import stat
 import threading
 import subprocess
@@ -584,24 +585,33 @@ class GitLedger:
         # the key is resolved ONCE and that value proves, fingerprints, signs and is saved (code L3 r10 codex 1, r11
         # codex 3 + complement 5); proven and every refusal checked BEFORE anything is written (code L3 r6 codex 2/6)
         key = signing_key or self.signing_key
-        self.prove_signing_key(key)
+        if not key:
+            self.signing_pubkey()           # raises the how-to
         if not key.startswith("key::"):
-            # saved as an absolute path: a relative git-config path read from another cwd is another file (r12 cpl 6)
+            # normalised FIRST, then its public key line read ONCE: that line is proved, fingerprinted and granted
+            # (code L3 r14 codex 2: the file was read by the proof and again for the grant, so a swap between the two
+            # granted an unproved key), and saved absolute (r12 complement 6)
             key = str(Path(os.path.expanduser(key)).resolve())
+        own = self.signing_pubkey(key)
+        try:
+            S.prove_can_sign(key, own)
+            fp = S.fingerprint(own)
+        except S.SigningError as exc:
+            raise TeamError(f"the signing key {key} cannot be used: {exc}; nothing was changed") from None
         remote = remote or self._default_remote()
         if self.legacy_only() and not replace_legacy:
             raise TeamError(LEGACY_MESSAGE)
         branch = self.branch
         if self._local_branch_exists():
-            pinned = self.pinned_root
-            if pinned and self.joined():
-                raise TeamError(f"branch {branch} already exists here: use `levain team join` (to publish it: "
-                                "`levain team sync`)")
+            if self.pinned_root:
+                # a real ledger this clone trusts, never "left from an init": no delete advice (r14 complement 2)
+                raise TeamError(f"branch {branch} already exists here and this clone is pinned to it: "
+                                + ("`levain team sync` publishes it" if self.joined() else
+                                   "`levain team join` re-attaches its checkout"))
             raise TeamError(f"branch {branch} already exists here: use `levain team join`; if it is left from an init "
                             f"that stopped (nothing of it published), remove it first: {self._init_cleanup(branch)}")
         if remote and self._remote_ledgers(remote):
             raise TeamError(f"{remote} already has a team ledger: use `levain team join`")
-        own = self.signing_pubkey(key)
         ten = T.Tenure(keys={team.owner: [own]})
         for h, line in (member_keys or {}).items():
             if h not in team.members:
@@ -613,7 +623,6 @@ class GitLedger:
             except S.SigningError as exc:
                 raise TeamError(f"{h}'s key cannot be used: {exc}") from None
             ten.pending_keys[h] = [line.strip()]
-        fp = S.fingerprint(own)
         commit = self._genesis_commit({T.TEAM_FILE: R.dump_team(team), T.TENURE_FILE: T.dump_tenure(ten)},
                                       f"levain team: init strict ledger for {team.project}", key=key)
         # a create-only ref: if another writer made it first this fails and nothing of theirs is touched (r9 codex 2)
@@ -626,29 +635,53 @@ class GitLedger:
             except T.Unjudgeable as exc:
                 raise TeamError(f"the new genesis cannot be judged: {exc}") from None
             self._attach_worktree()
+            device = self._new_device()
+
+            def persist(st: dict) -> None:
+                st.update(device=device, remote=remote or "", branch=branch, pinned_root=commit, anchor=None,
+                          accepted={}, distrust=[], signing_key=key)
+                st["own_keys"] = list(dict.fromkeys([*(st.get("own_keys") or []), fp]))
+            # the save is the last step under the wrap (r14 codex 4 + complement 1): save_state's os.replace is its
+            # last write, so a raise from it means nothing was saved
+            self.save_state(_mutate=persist)
         except Exception as exc:  # noqa: BLE001 - reported with the exact cleanup, never rolled back
             raise TeamError(f"init stopped after creating branch {branch} (genesis {commit[:12]}); nothing was saved on "
                             f"this clone ({exc}). To start again: {self._init_cleanup(branch)}, then run "
                             "`levain team init` again") from exc
-        device = self._new_device()
-
-        def persist(st: dict) -> None:
-            st.update(device=device, remote=remote or "", branch=branch, pinned_root=commit, anchor=None, accepted={},
-                      distrust=[], signing_key=key)
-            st["own_keys"] = list(dict.fromkeys([*(st.get("own_keys") or []), fp]))
-        self.save_state(_mutate=persist)
         self._dcache = None
         if remote and push:
-            try:
-                self._sync(push=True)
-            except Exception as exc:  # noqa: BLE001 - initialised; only the publish is pending
+            # the genesis is published by a plain push, which the remote refuses when another team's ledger got there
+            # first (unrelated history is never a fast-forward); a sync would fetch theirs and rebase onto it, and a
+            # "run sync" would then never work (code L3 r14 codex 1 + complement 3)
+            cp = git(["push", "--porcelain", remote, f"{commit}:refs/heads/{branch}"], self.repo.toplevel,
+                     check=False, timeout=120)
+            if cp.returncode != 0:
+                try:
+                    taken = branch in self._remote_ledgers(remote)
+                except TeamError:
+                    taken = False
+                if taken:
+                    # RUN (r14): `join --root` alone refuses, the unpublished local branch having "diverged"
+                    raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but {remote} "
+                                         "received another team ledger first, so this one cannot be published there. "
+                                         f"To join that one instead, drop this unpublished one: "
+                                         f"{self._init_cleanup(branch)}, then `levain team join --root <its genesis>` "
+                                         "(a bare `levain team join` lists it)")
                 raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but the push to "
-                                     f"{remote} failed ({exc}): run `levain team sync`") from exc
+                                     f"{remote} failed ({_tail(cp)}): run `levain team sync`")
+            try:
+                self._sync(push=True)      # the clone's own bookkeeping of what it published
+            except Exception as exc:  # noqa: BLE001 - published; only the bookkeeping is pending
+                raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) and pushed it to {remote}, but the "
+                                     f"follow-up sync failed ({exc}): run `levain team sync`") from exc
             return f"strict ledger created and pushed to {remote}/{branch} (genesis {commit[:12]})"
         return f"strict ledger created locally ({'no remote' if not remote else 'not pushed'}; genesis {commit[:12]})"
 
     def _init_cleanup(self, branch: str) -> str:
-        return f"`git worktree remove --force --force {self.wt}` (if it exists) and `git branch -D {branch}`"
+        """Commands that run from any directory, quoted (code L3 r14 codex 5 + complement 2)."""
+        top, q = shlex.quote(str(self.repo.toplevel)), shlex.quote
+        return (f"`git -C {top} worktree remove --force --force {q(str(self.wt))}` (if it is listed), "
+                f"`git -C {top} worktree prune` and `git -C {top} branch -D {q(branch)}`")
 
     def join(self, *, remote: str | None = None, new_device: bool = False, root: str | None = None,
              signing_key: str | None = None, accept_merges: dict[str, int] | None = None) -> str:
