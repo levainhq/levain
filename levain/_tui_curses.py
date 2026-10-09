@@ -102,28 +102,44 @@ _MANIFEST_ATTRS = {
 
 
 def _manifest_loop(stdscr: "curses.window", cockpit: "Cockpit") -> int:
-    """The manifest viewer: j/k/arrows/PgUp/PgDn scroll, r re-reads, q quits. It repaints every
-    couple of seconds so a status change (a fault, staleness) shows without a keypress."""
-    from levain.cockpit.text import render_lines, snapshot
+    """The manifest viewer: j/k/arrows/PgUp/PgDn scroll, r re-reads now, q quits. It re-reads every
+    couple of seconds (a getch timeout) so a status change shows without a keypress; scrolling only
+    re-slices the lines already read. A read that raises keeps the last good lines under a banner."""
+    from levain.cockpit.text import render_lines, snapshot, visible
 
     curses.curs_set(0)
     stdscr.keypad(True)
     stdscr.timeout(2000)
     top = 0
+    lines: list[tuple[str, str]] = []
+    banner = ""
+    reread = True
     while True:
         h, w = stdscr.getmaxyx()
-        lines = render_lines(snapshot(cockpit), max(20, w - 1))
+        if reread:
+            try:
+                lines = render_lines(snapshot(cockpit), max(20, w - 1))
+                banner = ""
+            except Exception as exc:  # noqa: BLE001 - keep the last good screen, say the read failed
+                banner = visible(f"READ FAILED: {type(exc).__name__}: {exc}")
+            reread = False
         body = max(1, h - 2)
         top = max(0, min(top, max(0, len(lines) - body)))
         stdscr.erase()
         for i, (style, text) in enumerate(lines[top:top + body]):
             _safe_addstr(stdscr, i, 0, text, _MANIFEST_ATTRS.get(style, lambda c: c.A_NORMAL)(curses))
-        _safe_addstr(stdscr, h - 1, 0, "j/k scroll · PgUp/PgDn · r refresh · q quit  (read-only manifest view)"[: w - 1], curses.A_DIM)
+        foot = banner or "j/k scroll · PgUp/PgDn · r refresh · q quit  (read-only manifest view)"
+        _safe_addstr(stdscr, h - 1, 0, foot[: w - 1], curses.A_REVERSE if banner else curses.A_DIM)
         stdscr.refresh()
         ch = stdscr.getch()
         if ch in (ord("q"), 27):
             return 0
-        if ch in (ord("j"), curses.KEY_DOWN):
+        if ch in (-1, ord("r")):
+            reread = True
+        elif ch == curses.KEY_RESIZE:
+            curses.update_lines_cols()
+            reread = True
+        elif ch in (ord("j"), curses.KEY_DOWN):
             top += 1
         elif ch in (ord("k"), curses.KEY_UP):
             top -= 1

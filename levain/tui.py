@@ -823,8 +823,9 @@ def run_tui(path: Path, *, read_only: bool = False, manifest: bool = False) -> i
         from levain.cockpit.providers import build_default_cockpit
 
         cockpit = build_default_cockpit(source)
-        cockpit.start()
     try:
+        if cockpit is not None:
+            cockpit.start()
         return _tui_curses.main_loop(source, view, read_only=read_only, cockpit=cockpit)
     finally:
         if cockpit is not None:

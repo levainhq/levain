@@ -59,7 +59,41 @@ def _titles(lines: list[tuple[str, str]]) -> list[str]:
     return [t.strip() for s, t in lines if s == "row"]
 
 
+def _flip_cockpit() -> Cockpit:
+    """A source that reads fine for the manifest and fails for the next read of the panel."""
+    ck = Cockpit()
+    calls = {"n": 0}
+
+    def read(ctx):
+        calls["n"] += 1
+        return Read(rows=()) if calls["n"] == 1 else Fault("disk failed after the manifest")
+    ck.register(ProviderSpec("flip", "triage-list", "Flip", "gate", read, order="time.desc",
+                             facets=frozenset({"at"}), version_fields=("id",), stale_after_s=0.0))
+    return ck
+
+
+def _cached_head_then_error() -> dict[str, Any]:
+    """A snapshot whose manifest head is `ok` while the panel payload, read after it, is `error`."""
+    ck = _flip_cockpit()
+    manifest = ck.manifest({"class": "none", "device_class": None})
+    panel = ck.panel("flip")
+    snap = {"manifest": manifest, "panels": {"flip": panel}}
+    assert manifest["panels"]["flip"]["status"] != "error" and panel["status"] == "error"
+    return snap
+
+
 class TestTuiRenderer:
+    def test_spaces_are_not_escaped_and_format_characters_are(self) -> None:
+        assert visible("a b\u061cc\u206ad\u2028e") == "a b<U+061C>c<U+206A>d<U+2028>e"
+
+    def test_head_and_payload_disagreement_shows_the_payloads_error(self) -> None:
+        text = "\n".join(t for _, t in render_lines(_cached_head_then_error(), 100))
+        assert "disk failed after the manifest" in text
+
+    def test_a_bad_timestamp_is_still_sanitised(self) -> None:
+        from levain.cockpit.text import _age
+        assert _age("bad\u202e", datetime.now(timezone.utc)) == "bad<U+202E>"
+
     def test_non_natural_order_and_groups_are_shown_as_served(self) -> None:
         ck = _cockpit()
         served = [r["id"] for r in ck.panel("items")["rows"]]
@@ -112,6 +146,44 @@ process.stdout.write(JSON.stringify(out));
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 class TestWebRenderer:
+    def test_head_and_payload_disagreement_shows_the_payloads_error(self) -> None:
+        nodes = _node_render(_cached_head_then_error())
+        panel = [n for n in nodes if n["attrs"].get("data-panel") == "flip"][0]
+        assert panel["attrs"]["data-status"] == "error"
+        assert any("disk failed after the manifest" in n["text"] for n in nodes)
+
+    def test_prototype_named_groups_do_not_defeat_the_cut(self) -> None:
+        ck = Cockpit()
+        try:
+            register_ordering(Ordering(name="test.proto", key=lambda r, t: (r.id,), group=lambda r, t: "constructor",
+                                       groups=(("constructor", "Ctor"),)))
+        except Exception:  # noqa: BLE001
+            pass
+        rows = [RowIn(f"r-{i:02d}", f"t{i}", {"at": "2026-10-01T00:00:00+00:00"}, stored={"id": f"r-{i}"}) for i in range(20)]
+        ck.register(ProviderSpec("p", "triage-list", "P", "gate", lambda c: Read(rows=tuple(rows)),
+                                 order="test.proto", facets=frozenset({"at"}), version_fields=("id",)))
+        nodes = _node_render(snapshot(ck))
+        assert len([n for n in nodes if "data-row" in n["attrs"]]) == 12
+        assert [n["text"] for n in nodes if n["cls"] == "ck-more"] == ["+8 more (cut by this view)"]
+
+    def test_full_prose_renders_its_markdown_text_and_compact_feed_lines_get_an_open_button(self) -> None:
+        ck = Cockpit()
+        ck.register(ProviderSpec("pr", "prose", "Doc", "gauge",
+                                 lambda c: Read(value={"markdown": "the body text", "headline": "Head"})))
+        ck.register(ProviderSpec("ln", "line", "Feed", "feed",
+                                 lambda c: Read(value={"lines": [{"label": "a", "text": "b", "at": None, "source": None}]})))
+        full = _node_render(snapshot(ck))
+        assert any(n["text"] == "the body text" for n in full)
+        compact = _node_render(snapshot(ck, profile="compact"))
+        assert [n for n in compact if n["cls"] == "ck-open"], "a compact feed line must offer its content on open"
+
+    def test_format_characters_and_naive_timestamps(self) -> None:
+        out = subprocess.run(
+            [NODE, "-e", "const C=require(process.argv[1]);const n=Date.parse('2026-10-09T12:00:00Z');"
+             "process.stdout.write(C.visible('a b\\u061c\\u206a')+'|'+C.age('2026-10-09T11:00:00',n))",
+             str(WEB / "cockpit.js")], capture_output=True, text=True, check=True).stdout
+        assert out == "a b<U+061C><U+206A>|1h ago"
+
     def test_non_natural_order_and_groups_are_shown_as_served(self) -> None:
         ck = _cockpit()
         served = [r["id"] for r in ck.panel("items")["rows"]]
