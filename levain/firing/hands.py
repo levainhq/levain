@@ -366,7 +366,7 @@ def egress_drift_problem(hands_user: str, hands_id: int, ports: tuple[int, ...])
     The live check before a launch is the CALLER's: as of 2026-10-09 no entity code runs as the hands
     user on Linux (``hands_for`` gives None off Darwin), and S2-linux and the fleet member runner must call
     :func:`egress_boundary_problem` and :func:`net_group_problem` before starting a hands process and
-    refuse on a problem (carried, v2.0 must-ship; levain project_memory/1009-egress/DESIGN.md)."""
+    refuse on a problem (carried, v2.0 must-ship)."""
     import grp
 
     try:
