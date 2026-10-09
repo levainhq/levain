@@ -61,7 +61,12 @@ class JoinIncomplete(TeamError):
 
 class InitIncomplete(TeamError):
     """`init` created, attached and pinned the ledger, but its push did not complete: the clone IS initialised and its
-    state stays (`levain team sync` publishes it); the command still does not report success."""
+    state stays; the command still does not report success. ``publishable`` False: another team's ledger holds the
+    remote branch, so this one is never published there (the message names the cleanup and `join --root`)."""
+
+    def __init__(self, message: str, *, publishable: bool = True):
+        super().__init__(message)
+        self.publishable = publishable
 
 
 class TeamBusy(TeamError):
@@ -563,13 +568,14 @@ class GitLedger:
         return cp.stdout.strip()
 
     def init(self, team: R.Team, *, member_keys: dict[str, str] | None = None, remote: str | None = None,
-             push: bool = True, signing_key: str | None = None, replace_legacy: bool = False) -> str:
+             push: bool = True, signing_key: str | None = None, replace_legacy: bool = False,
+             anneal_db: str | None = None) -> str:
         with self.op():
             return self._init_in_op(team, member_keys=member_keys, remote=remote, push=push, signing_key=signing_key,
-                                    replace_legacy=replace_legacy)
+                                    replace_legacy=replace_legacy, anneal_db=anneal_db)
 
     def _init_in_op(self, team: R.Team, *, member_keys: dict[str, str] | None, remote: str | None, push: bool,
-                    signing_key: str | None, replace_legacy: bool) -> str:
+                    signing_key: str | None, replace_legacy: bool, anneal_db: str | None) -> str:
         """Create a STRICT ledger: a genesis carrying team.toml and tenure.toml, signed by the owner's key (this
         clone's), pinned here in the same operation. Members' keys are pending until each confirms from their own
         machine (`levain team join`). Returns a status line.
@@ -607,7 +613,11 @@ class GitLedger:
                 # a real ledger this clone trusts, never "left from an init": no delete advice (r14 complement 2)
                 raise TeamError(f"branch {branch} already exists here and this clone is pinned to it: "
                                 + ("`levain team sync` publishes it" if self.joined() else
-                                   "`levain team join` re-attaches its checkout"))
+                                   "`levain team join` re-attaches its checkout" if self.remote else
+                                   # local-only: join needs a remote (r15 codex 4); this is _attach_worktree's own step
+                                   f"re-attach its checkout with `git -C {shlex.quote(str(self.repo.toplevel))} "
+                                   f"worktree prune` and `git -C {shlex.quote(str(self.repo.toplevel))} worktree add "
+                                   f"--lock {shlex.quote(str(self.wt))} {shlex.quote(branch)}`"))
             raise TeamError(f"branch {branch} already exists here: use `levain team join`; if it is left from an init "
                             f"that stopped (nothing of it published), remove it first: {self._init_cleanup(branch)}")
         if remote and self._remote_ledgers(remote):
@@ -641,6 +651,8 @@ class GitLedger:
                 st.update(device=device, remote=remote or "", branch=branch, pinned_root=commit, anchor=None,
                           accepted={}, distrust=[], signing_key=key)
                 st["own_keys"] = list(dict.fromkeys([*(st.get("own_keys") or []), fp]))
+                if anneal_db:
+                    st["anneal_db"] = anneal_db     # in the one save: no later setup stage to retry (r15 codex 5)
             # the save is the last step under the wrap (r14 codex 4 + complement 1): save_state's os.replace is its
             # last write, so a raise from it means nothing was saved
             self.save_state(_mutate=persist)
@@ -653,22 +665,30 @@ class GitLedger:
             # the genesis is published by a plain push, which the remote refuses when another team's ledger got there
             # first (unrelated history is never a fast-forward); a sync would fetch theirs and rebase onto it, and a
             # "run sync" would then never work (code L3 r14 codex 1 + complement 3)
-            cp = git(["push", "--porcelain", remote, f"{commit}:refs/heads/{branch}"], self.repo.toplevel,
-                     check=False, timeout=120)
-            if cp.returncode != 0:
+            try:
+                cp = git(["push", "--porcelain", remote, f"{commit}:refs/heads/{branch}"], self.repo.toplevel,
+                         check=False, timeout=120)
+                why = "" if cp.returncode == 0 else _tail(cp)
+            except TeamError as exc:      # a timeout or no git: still a failed push, never a raw error (r15 cpl 1)
+                why = str(exc)
+            if why:
+                # decided on the advertised TIP, never the branch name: a push that landed but reported a failure
+                # (a dropped connection) is ours (r15 codex 3 + complement 2)
                 try:
-                    taken = branch in self._remote_ledgers(remote)
+                    row = git(["ls-remote", remote, f"refs/heads/{branch}"], self.repo.toplevel, timeout=60).stdout
+                    tip = row.split()[0] if row.split() else ""
                 except TeamError:
-                    taken = False
-                if taken:
+                    tip = ""
+                if tip and tip != commit:
                     # RUN (r14): `join --root` alone refuses, the unpublished local branch having "diverged"
                     raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but {remote} "
                                          "received another team ledger first, so this one cannot be published there. "
                                          f"To join that one instead, drop this unpublished one: "
                                          f"{self._init_cleanup(branch)}, then `levain team join --root <its genesis>` "
-                                         "(a bare `levain team join` lists it)")
-                raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but the push to "
-                                     f"{remote} failed ({_tail(cp)}): run `levain team sync`")
+                                         "(a bare `levain team join` lists it)", publishable=False)
+                if tip != commit:
+                    raise InitIncomplete(f"initialised {branch} (genesis {commit[:12]}) on this clone, but the push to "
+                                         f"{remote} failed ({why}): run `levain team sync`")
             try:
                 self._sync(push=True)      # the clone's own bookkeeping of what it published
             except Exception as exc:  # noqa: BLE001 - published; only the bookkeeping is pending

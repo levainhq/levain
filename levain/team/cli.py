@@ -85,15 +85,18 @@ def cmd_init(args) -> int:
         team = R.Team(project=args.project or repo.toplevel.name, owner=args.owner, members=members,
                       client_owners=_split(args.client_owner), mode=args.mode, fetch_interval=args.fetch_interval)
         print(gl.init(team, member_keys=keys, remote=args.remote, push=not args.no_push,
-                      signing_key=args.signing_key, replace_legacy=args.replace_legacy))
+                      signing_key=args.signing_key, replace_legacy=args.replace_legacy,
+                      anneal_db=str(Path(args.anneal_db).expanduser().resolve()) if args.anneal_db else None))
     except InitIncomplete as exc:
         incomplete = exc        # initialised, only the push is pending: the clone's setup below runs, then it fails
     try:
-        if args.anneal_db:
-            gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
         if args.pack and incomplete is None:
             written = P.seed(gl, Path(args.pack), push=not args.no_push)
             print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
+        elif args.pack and not incomplete.publishable:
+            # the race was lost: this ledger is dropped for the published one, so nothing is seeded here (r15 codex 2)
+            incomplete = InitIncomplete(f"{incomplete}; the pack was NOT seeded: after the join, run "
+                                        f"`levain team pack-sync {shlex.quote(args.pack)}`", publishable=False)
         elif args.pack:
             # an init whose only stop was its push still seeds, locally, and the next sync publishes both; a seed that
             # fails here is named in the pending message, never swallowed (code L3 r10/r11 codex 5)
@@ -109,7 +112,7 @@ def cmd_init(args) -> int:
         if incomplete is not None:
             # both pending items are named: this CLI never shows a chained cause (code L3 r14 codex 3)
             raise InitIncomplete(f"{incomplete}; then the clone's setup failed ({exc}): fix it, then run "
-                                 "`levain team install`") from exc
+                                 "`levain team install`", publishable=incomplete.publishable) from exc
         raise
     if incomplete is not None:
         raise incomplete
