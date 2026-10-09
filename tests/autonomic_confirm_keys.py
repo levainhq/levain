@@ -7,7 +7,9 @@ returns an unsigned approval, which is what a caller holding no challenge could 
 """
 from __future__ import annotations
 
+import atexit
 import functools
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -20,7 +22,10 @@ SIGNER = "operator"
 
 @functools.cache
 def _key() -> tuple[Path, Path]:
-    d = Path(tempfile.mkdtemp(prefix="levain-confirm-keys-"))
+    # under the home directory, not the system temp directory: an allowed-signers file is a trust anchor,
+    # and a world-writable ancestor (``/tmp`` on Linux) is refused (``confirm.trust_anchor_problem``)
+    d = Path(tempfile.mkdtemp(prefix=".levain-confirm-keys-", dir=Path.home()))
+    atexit.register(shutil.rmtree, d, True)
     key = d / "operator"
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", SIGNER, "-f", str(key)],
                    check=True, timeout=30, capture_output=True)

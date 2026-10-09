@@ -13,7 +13,7 @@ import textwrap
 
 import pytest
 
-from levain.autonomic.journal import EffectStatus, JournalCorruptError, RunJournal
+from levain.autonomic.journal import AUTHORIZED, EffectStatus, JournalCorruptError, RunJournal
 
 
 class Effect:
@@ -29,7 +29,9 @@ class Effect:
 
 
 # the risk fence an effect is admitted under, read back unchanged at admission
-FENCE = {"fence": "f", "fence_now": lambda conn: "f"}
+# an unchanged fence, and an admission check that finds every approval authority (the gate's real check,
+# ``EfferentGate._authorize_admission``, is exercised through the gate's own tests)
+FENCE = {"fence": "f", "fence_now": lambda conn: "f", "authorize": lambda hold, fence: AUTHORIZED}
 # what a verified resolve stores with a person's approval (these tests decide holds; the signature itself
 # is verified at admission, by the gate's check: tests/test_autonomic_l3_fixes.py)
 SIGNED = {"signer": "operator", "signature": "-----BEGIN SSH SIGNATURE-----", "challenge": "c", "fence": "f"}

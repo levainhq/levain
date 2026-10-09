@@ -46,12 +46,15 @@ from dataclasses import dataclass
 
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.binding import Binding, BindingStore, _scan_in
-from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN, challenge as confirm_challenge_bytes, verify_signature
+from levain.autonomic.confirm import (
+    DEFAULT_SSH_KEYGEN, UNAVAILABLE, VERIFIED, challenge as confirm_challenge_bytes, verify_signature,
+    verify_signature_status,
+)
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
 from levain.autonomic.journal import (
-    EffectOutcome, EffectStatus, JournalCorruptError, RunJournal, RunRef, effect_digest, hold_id_for,
-    needs_signature,
+    AUTHORIZED, UNSIGNED_DECIDER, EffectOutcome, EffectStatus, JournalCorruptError, RunJournal, RunRef,
+    decision_key, effect_digest, hold_id_for, needs_signature,
 )
 from levain.autonomic.kill import kill_trips
 from levain.autonomic.monitor import TrajectoryObserver, prediction_diverged
@@ -119,10 +122,12 @@ def _risk_fence(manifest_risk: ActionRisk | None, binding_risk: ActionRisk | Non
 @dataclass(frozen=True)
 class _Fence:
     """The fence an effect's rung was decided under (``value``) and how to read it again at admission, in
-    the admission's transaction (``read``)."""
+    the admission's transaction (``read``); for a resolve, the decision it fires under (``expect``, a
+    :func:`~levain.autonomic.journal.decision_key`), so the effect runs under no other."""
 
     value: str
     read: Callable[[sqlite3.Connection], str]
+    expect: tuple | None = None
 
 
 def _authority_from(a: dict[str, Any]) -> AuthorityScope:
@@ -271,7 +276,9 @@ class EfferentGate:
         confirm_signers: str | Path | None = None,
         ssh_keygen: str | Path | None = None,
     ) -> None:
-        self._manifest = manifest
+        # a copy: the manifest the gate classifies with does not change under it (a deployment that edits
+        # its declarations builds a new gate), so the risk an admission reads cannot move mid-admission
+        self._manifest = manifest.copy()
         # The signature verifier: an absolute path to ``ssh-keygen`` (``/usr/bin/ssh-keygen`` unless set
         # here), never found through PATH, and refused unless root-owned and writable by nobody else.
         self._ssh_keygen = Path(ssh_keygen) if ssh_keygen is not None else DEFAULT_SSH_KEYGEN
@@ -388,25 +395,53 @@ class EfferentGate:
                               allowed_signers=self._confirm_signers, ssh_keygen=self._ssh_keygen)
         return message if ok else None
 
-    def _verify_admitted_approval(self, hold: dict[str, Any], fence_now: str) -> bool:
-        """The journal's check at an effect's admission (the point of use): the person's approval stored
-        with ``hold`` verifies over the challenge rebuilt here for the CURRENT fence, at the rung the
-        decision recorded, in this store, for this hold. Never raises."""
+    def _authorize_admission(self, hold: dict[str, Any], fence_now: str) -> str:
+        """The journal's check at an effect's admission (the point of use, outside its write transaction):
+        is the approval recorded on ``hold`` authority NOW? The rung the effect needs is derived again from
+        the current risk inputs, and the decision must have met it. A person's approval must carry a
+        signature that verifies over the challenge rebuilt here for the CURRENT fence, at the rung the
+        decision recorded, in this store, for this hold. The silence default (``on-loop``) must still be one
+        the gate may give unattended. Returns :data:`~levain.autonomic.journal.AUTHORIZED`,
+        ``"unavailable:<why>"`` (the check cannot run now) or ``"bad:<why>"``. Never raises."""
         try:
             pending = PendingAction.from_dict(hold["pending"])
             if not pending.seal_matches() or pending.hold_id != hold["hold_id"]:
-                return False
+                return "bad:integrity"
+            sealed = self._posture_of(pending)
+            if sealed is None:
+                return "bad:corrupt_posture"
+            effective, why, fence = self._resolve_posture(pending, sealed, hold)
+            if effective is None:
+                return f"unavailable:{why}"
+            if fence is None or effective is Posture.REFUSE_ESCALATE:
+                return f"bad:{why or 'no_rung_may_approve'}"
             rung = hold.get("decided_posture")
-            if not isinstance(rung, str) or rung not in Posture.__members__ or self._journal is None:
-                return False
-            message = confirm_challenge_bytes(pending=pending, fence=fence_now, rung=rung,
+            if not isinstance(rung, str) or rung not in Posture.__members__:
+                return "bad:no_decided_rung"
+            decided = Posture[rung]
+            if hold.get("by") != UNSIGNED_DECIDER:
+                if not hold.get("signature") or not hold.get("signer") or not hold.get("challenge"):
+                    return "bad:unsigned_approval"
+                if hold.get("fence") != fence_now:
+                    return "bad:signed_under_another_fence"
+            if decided < effective:
+                return "bad:rung_rose"   # decided below the rung the effect needs now
+            if hold.get("by") == UNSIGNED_DECIDER:
+                return AUTHORIZED if self._unattended_approval_allowed(pending, effective) else \
+                    "bad:unattended_approval_not_allowed"
+            if self._journal is None:
+                return "unavailable:no_journal"
+            message = confirm_challenge_bytes(pending=pending, fence=fence_now, rung=decided.name,
                                               store_id=self._journal.store_id, hold_id=hold["hold_id"])
-            return verify_signature(message, signature=hold.get("signature"), signer=hold.get("signer"),
-                                    allowed_signers=self._confirm_signers, ssh_keygen=self._ssh_keygen)
-        except Exception as e:  # noqa: BLE001 — a check that cannot run verifies nothing
-            _log.warning("efferent gate: approval of %s not verified at admission (%s): %s",
+            status = verify_signature_status(message, signature=hold.get("signature"), signer=hold.get("signer"),
+                                             allowed_signers=self._confirm_signers, ssh_keygen=self._ssh_keygen)
+            if status == VERIFIED:
+                return AUTHORIZED
+            return "unavailable:verifier" if status == UNAVAILABLE else "bad:signature_not_verified"
+        except Exception as e:  # noqa: BLE001 — a check that cannot run grants nothing
+            _log.warning("efferent gate: approval of %s not checked at admission (%s): %s",
                          hold.get("hold_id"), type(e).__name__, e)
-            return False
+            return f"unavailable:{type(e).__name__}"
 
     def binding_effect_refusal(self) -> str | None:
         """Why no binding effect may start now, or ``None``: ``executor_not_confined`` while the executor
@@ -829,17 +864,11 @@ class EfferentGate:
             return self._refuse_open(why or "revalidate:registry_unreadable", binding_id)
         stop_reason = why or "revalidate:risk_floor_rose"
         signed_decision = hold.get("decided") is True and needs_signature(hold.get("by"))
-        if signed_decision:
-            # A person's approval that stands: it fires at the rung it was signed at, and the journal
-            # verifies its signature at admission over the challenge for the fence current then. A risk
-            # that changed since it was signed changes that fence, so the hold reopens there for a new
-            # signature; there is no separate rung check here to keep in step with it.
-            if fence is None:
-                return self._refuse_open(stop_reason, binding_id)   # nothing can be re-derived: no change
-            posture = self._decided_rung(hold, posture)
-        elif hold.get("decided") is True and effective > self._decided_rung(hold, posture):
-            # Approved at a lower rung by the silence default (no person, no signature to ask for again):
-            # the run ends instead, with a receipt. Only while the effect has not started,
+        if hold.get("decided") is True and (fence is None or (
+                not signed_decision and effective > self._decided_rung(hold, posture))):
+            # An approval no rung can carry any more (the risk cannot be re-derived for good: the binding is
+            # gone or unsealed), or one the silence default gave at a lower rung (no person, no signature to
+            # ask for again): the run ends instead, with a receipt. Only while the effect has not started,
             # checked in the cancel's own transaction: one that ran (or is running) is the journal's to
             # report, and the fire below reports it without running anything.
             try:
@@ -856,6 +885,11 @@ class EfferentGate:
                 )
             if started is None:
                 return deny(effective, stop_reason, by="on-loop")
+        elif signed_decision:
+            # A person's approval that stands fires at the rung it was signed at. The journal checks it at
+            # admission (``_authorize_admission``): the rung needed then, and the signature over the challenge
+            # for the fence current then; a change since it was signed reopens the hold for a new signature.
+            posture = self._decided_rung(hold, posture)
         elif effective is Posture.REFUSE_ESCALATE:
             return reject(posture, stop_reason)   # no rung may approve it: a decision, recorded
         else:
@@ -903,8 +937,7 @@ class EfferentGate:
         )
         assert fence is not None   # every path here re-derived the risk inputs
         chain = hold.get("chain")
-        armed = _Fence(fence, lambda conn: self._fence_now(conn, pending.action_name, binding_id,
-                                                           hold["effect_id"], chain, with_binding=True))
+        expect = decision_key(hold) if already_approved else None
         if not already_approved:
             # Everything that could stop this effect WITHOUT a decision is checked BEFORE the decision is
             # written, so "refused" never coexists with an approval in the journal: an unadmitted run
@@ -939,16 +972,24 @@ class EfferentGate:
                     return self._refuse_open("confirm:not_signed_by_an_enrolled_key", binding_id)
                 else:   # digest_mismatch: the bytes about to fire are not the ones the hold was opened on
                     return reject(posture, f"journal:{d.reason}")
+            expect = d.decision   # the effect runs under the decision written here, or not at all
+        armed = _Fence(fence, lambda conn: self._fence_now(conn, pending.action_name, binding_id,
+                                                           hold["effect_id"], chain, with_binding=True),
+                       expect=expect)
         fired = self._fire(
             request=request, created_at=created_at, posture=posture,
             verdict=verdict, by=by, actor_first_estimate=estimate, decided=True,
             fence=armed, executor=executor,
         )
-        if fired.held and fired.reason.startswith(f"journal:{EffectStatus.REOPENED.value}"):
-            # the approval did not verify at admission (unsigned, or signed under another fence): the hold
-            # is an open decision again, asking for a new signature. Not approved-not-yet-run.
+        reopened = self._journal.get_hold(hold_id) if fired.held else None
+        if reopened is not None and reopened.get("decided") is None:
+            # the hold is an open decision again (this admission refused the approval, or another resolver's
+            # did since this one read it): it asks for a new decision at the rung needed NOW, read again
+            # here. Not approved-not-yet-run.
+            rung_now, _, _ = self._resolve_posture(pending, self._posture_of(pending) or Posture.REFUSE_ESCALATE,
+                                                   reopened)   # None: the registry is unreadable now
             return GateOutcome(
-                posture=effective, fired=False, refused=False,
+                posture=rung_now or Posture.REFUSE_ESCALATE, fired=False, refused=False,
                 deferred=False, pending=True, pending_id=pending.pending_id, reason=fired.reason,
                 receipt_id=None, execution=None, binding_id=binding_id, hold_id=hold_id,
             )
@@ -1706,7 +1747,7 @@ class EfferentGate:
         result, so a replay can write a receipt that never landed.
 
         ``executor`` is the object the caller checked, and the one called: it is not read again. A person's
-        approval of the effect is verified by the journal at admission (:meth:`_verify_admitted_approval`)."""
+        approval of the effect is checked by the journal at admission (:meth:`_authorize_admission`)."""
         assert self._journal is not None and request.run is not None
         run = request.run
         bar = None
@@ -1736,7 +1777,7 @@ class EfferentGate:
             assert fence is not None
             out = self._journal.effect(run.run_id, run.effect_id, digest=self._digest_of(request),
                                        fence=fence.value, fence_now=fence.read, fn=call, needs_decision=decided,
-                                       verify_approval=self._verify_admitted_approval)
+                                       authorize=self._authorize_admission, expect=fence.expect)
         except Exception as e:  # noqa: BLE001 — the gate never raises
             if not called:
                 _log.error("efferent gate: run journal FAILED before the effect (%s): %s — nothing ran",

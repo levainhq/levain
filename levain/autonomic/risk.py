@@ -87,3 +87,7 @@ class ActionManifest:
 
     def __contains__(self, name: object) -> bool:
         return name in self._actions
+
+    def copy(self) -> "ActionManifest":
+        """A manifest with the same declarations, which later ``register`` calls on this one do not change."""
+        return ActionManifest(self._actions)

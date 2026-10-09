@@ -258,12 +258,12 @@ def test_an_ssh_keygen_the_user_owns_is_refused_even_for_a_real_signature(tmp_pa
 
 
 def test_a_group_or_world_writable_ssh_keygen_is_refused(monkeypatch):
-    real_stat = os.stat
+    real_stat = os.lstat
 
     def writable(path, *a, **k):
         st = real_stat(path, *a, **k)
         return os.stat_result((st.st_mode | stat.S_IWOTH,) + tuple(st)[1:4] + (0,) + tuple(st)[5:])
-    monkeypatch.setattr(confirm_mod.os, "stat", writable)
+    monkeypatch.setattr(confirm_mod.os, "lstat", writable)
     assert "writable" in (confirm_mod.ssh_keygen_problem(confirm_mod.DEFAULT_SSH_KEYGEN) or "")
 
 

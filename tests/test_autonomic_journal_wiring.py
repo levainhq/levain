@@ -193,6 +193,8 @@ def _child(work: Path, body: str, crash_after: str) -> int:
         from test_autonomic_journal_wiring import World
         import levain.autonomic.gate as _g
         _g._executor_is_confined = lambda executor: True   # TEST ONLY (tests/autonomic_test_only_confinement.py)
+        import os, levain.autonomic.confirm as _c
+        _c._SIGNERS_FILE_OWNERS = frozenset({{0, os.getuid()}})   # TEST ONLY (tests/conftest.py)
         w = World(Path({str(work)!r}))
     """) + textwrap.dedent(body)
     env = dict(os.environ, CRASH_AFTER_EFFECT=crash_after)
@@ -1146,6 +1148,8 @@ def test_many_processes_delivering_one_event_produce_one_effect(tmp_path):
         from test_autonomic_journal_wiring import World
         import levain.autonomic.gate as _g
         _g._executor_is_confined = lambda executor: True   # TEST ONLY (tests/autonomic_test_only_confinement.py)
+        import os, levain.autonomic.confirm as _c
+        _c._SIGNERS_FILE_OWNERS = frozenset({{0, os.getuid()}})   # TEST ONLY (tests/conftest.py)
         World(Path({str(tmp_path)!r})).dispatch('race')
     """)
     procs = [subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

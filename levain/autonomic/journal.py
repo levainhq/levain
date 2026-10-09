@@ -40,12 +40,11 @@ Six properties, each one a run that fails without it:
     read again from those inputs inside the admission's transaction. A classification changed in any way
     after the rung was decided stops the effect (STALE: the caller decides it again); inputs that cannot be
     read stop it too (UNCLASSIFIED), and nothing is recorded;
-  - **signed-at-the-point-of-use** — an effect that runs under a person's approval (any decider but
-    ``on-loop``, the silence default) is admitted only if the signature stored with the decision verifies,
-    at admission, over the challenge rebuilt for the CURRENT fence (the caller's ``verify_approval``). A
-    decision with no signature (one written before signatures were stored, or by anything but a verified
-    resolve), one signed under another fence, or one nothing can verify here, does not run: the hold
-    REOPENS (undecided, its signature cleared) for a new signed decision.
+  - **authorized-at-the-point-of-use** — an effect that runs under an approval (a person's, or the
+    silence default's ``on-loop``) is admitted only if the caller's ``authorize`` finds that decision
+    authority under the CURRENT fence. An approval refused there does not run: the hold REOPENS (undecided, its
+    signature cleared) for a new decision. One whose check cannot run is HELD, the approval intact. The
+    check runs outside the write transaction and counts only for the decision and fence it read.
 
 And one rule that is not a property but follows from "at most once": an effect whose intent was
 recorded and whose result was not (the process died mid-call, or the call raised) has an UNKNOWN
@@ -81,7 +80,7 @@ from levain.autonomic.db import AutonomicDB
 __all__ = [
     "EffectStatus", "EffectOutcome", "HoldResult", "RunJournal", "RunRef", "JournalCorruptError",
     "JournalConflictError", "UNSIGNED_DECIDER",
-    "run_id_for", "hold_id_for", "effect_digest", "needs_signature",
+    "run_id_for", "hold_id_for", "effect_digest", "needs_signature", "AUTHORIZED", "decision_key",
 ]
 
 _log = logging.getLogger(__name__)
@@ -124,7 +123,7 @@ class EffectOutcome:
     decided_by: str | None = None
     # HELD from ``hold`` only: True iff this call opened the hold (False: it was already open).
     new_hold: bool = False
-    # REOPENED / UNCLASSIFIED only: why.
+    # REOPENED / UNCLASSIFIED, and HELD by an admission's check: why.
     why: str | None = None
 
     @property
@@ -136,6 +135,9 @@ class EffectOutcome:
 class HoldResult:
     ok: bool
     reason: str
+    # an approval written by this call: its :func:`decision_key`, which the caller hands to ``effect`` as
+    # ``expect`` so the effect runs only under the decision it wrote
+    decision: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +203,22 @@ def needs_signature(by: str | None) -> bool:
     Every decider but :data:`UNSIGNED_DECIDER` is (``"human"``, and also an absent or unknown label: a
     decision that does not say it was the silence default is not treated as one)."""
     return by != UNSIGNED_DECIDER
+
+
+# What ``authorize`` returns for an approval that is authority at this admission. Anything else is
+# ``"unavailable:<why>"`` (the check could not run: the approval stands, the effect is held) or a refusal
+# (``"bad:<why>"``, or any other value: the hold reopens for a new decision).
+AUTHORIZED = "ok"
+# How many times an admission re-runs its check when the decision or the risk inputs changed between the
+# check (made outside the write transaction) and the admission; after that the effect is held.
+_ADMIT_TRIES = 3
+_RETRY = object()
+
+
+def decision_key(hold: dict[str, Any]) -> tuple:
+    """The decision recorded on ``hold``: two decisions with one key are the same decision (a person's
+    carries its own signature)."""
+    return tuple(hold.get(k) for k in ("by", "decided_posture", "signer", "signature", "challenge", "fence"))
 
 
 def hold_id_for(run_id: str, effect_id: str) -> str:
@@ -501,7 +519,8 @@ class RunJournal:
     def effect(self, run_id: str, effect_id: str, *, digest: str, fence: str,
                fence_now: Callable[[sqlite3.Connection], str], fn: Callable[[], Any],
                needs_decision: bool = False,
-               verify_approval: Callable[[dict[str, Any], str], bool] | None = None) -> EffectOutcome:
+               authorize: Callable[[dict[str, Any], str], str] | None = None,
+               expect: tuple | None = None) -> EffectOutcome:
         """Run one effect at most once.
 
         ``digest`` identifies exactly what the effect will do (the bytes a person approves). It is
@@ -513,33 +532,68 @@ class RunJournal:
         ``needs_decision`` is the gate's verdict for this effect: True means the effect runs only
         under an APPROVED hold of its own (one is opened if there is none). An effect with no
         approved hold of its own is HELD while any hold on its binding is open.
-        ``verify_approval(hold, fence_now)`` checks a person's approval of this effect's own hold at
-        admission: True only if the hold's stored signature verifies over the challenge rebuilt for the
-        current fence. An approval that needs a signature (:func:`needs_signature`) and does not verify
-        (or with no ``verify_approval`` to check it) is not run: the hold reopens (REOPENED)."""
+        ``authorize(hold, fence_now)`` decides whether the approval recorded on this effect's own hold is
+        authority NOW (whoever decided it, a person or the silence default): :data:`AUTHORIZED`, or
+        ``"unavailable:<why>"`` when the check cannot run (the approval stands and the effect is HELD), or
+        a refusal (the hold reopens: REOPENED). With no ``authorize`` every approval is refused. The check
+        runs OUTSIDE the write transaction (it may be slow: a signature verifier), and the admission
+        uses its answer only if the decision and the fence it read are unchanged in the transaction;
+        otherwise it checks again (:data:`_ADMIT_TRIES` times, then HELD).
+        ``expect`` (a :func:`decision_key`) is the decision the caller acted on: an approved hold now
+        carrying another decision is HELD, nothing run."""
         if not isinstance(fence, str) or not fence:
             raise TypeError("fence must be a non-empty string")
         hold_id = hold_id_for(run_id, effect_id)
-        taken: list[int] = []   # the lease, once taken: released here if the admission does not commit
-        try:
-            with self._write() as conn:
-                admitted = self._admit_in(conn, run_id, effect_id, hold_id, digest, needs_decision, taken,
-                                          fence, fence_now, verify_approval)
-        except BaseException:
-            for fd in taken:
-                self._drop_lease(run_id, effect_id, fd)
-            raise
-        if isinstance(admitted, EffectOutcome):
-            return admitted
-        return self._run_effect(run_id, effect_id, fn, admitted)
+        for _ in range(_ADMIT_TRIES):
+            checked = self._authorized(hold_id, fence_now, authorize)
+            taken: list[int] = []   # the lease, once taken: released here if the admission does not commit
+            try:
+                with self._write() as conn:
+                    admitted = self._admit_in(conn, run_id, effect_id, hold_id, digest, needs_decision, taken,
+                                              fence, fence_now, checked, expect)
+            except BaseException:
+                for fd in taken:
+                    self._drop_lease(run_id, effect_id, fd)
+                raise
+            if admitted is _RETRY:
+                continue
+            if isinstance(admitted, EffectOutcome):
+                return admitted
+            return self._run_effect(run_id, effect_id, fn, admitted)
+        return EffectOutcome(EffectStatus.HELD, hold_id=hold_id, why="admission_raced")
+
+    def _authorized(self, hold_id: str, fence_now: Callable[[sqlite3.Connection], str],
+                    authorize: Callable[[dict[str, Any], str], str] | None) -> tuple | None:
+        """``(decision_key, fence, verdict)`` for this effect's approved hold, checked outside any write
+        transaction, or ``None`` when there is no approved hold or its fence cannot be read now."""
+        with self._read() as conn:
+            row = self._hold_row(conn, hold_id)
+            own = self._hold_dict(row) if row is not None else None
+            if own is None or own["decided"] is not True:
+                return None
+            try:
+                live = fence_now(conn)
+            except Exception:  # noqa: BLE001 — the admission reads it again and reports it
+                return None
+        if authorize is None:
+            verdict = "bad:approval_not_verifiable_here"
+        else:
+            try:
+                verdict = authorize(own, live)
+            except Exception as e:  # noqa: BLE001 — a check that could not run grants nothing
+                verdict = f"unavailable:authorize_raised:{type(e).__name__}"
+            if not isinstance(verdict, str):
+                verdict = "bad:authorize_returned_no_verdict"
+        return decision_key(own), live, verdict
 
     def _admit_in(self, conn: sqlite3.Connection, run_id: str, effect_id: str, hold_id: str, digest: str,
                   needs_decision: bool, taken: list[int], fence: str,
                   fence_now: Callable[[sqlite3.Connection], str],
-                  verify_approval: Callable[[dict[str, Any], str], bool] | None) -> EffectOutcome | int:
+                  checked: tuple | None, expect: tuple | None) -> EffectOutcome | int | object:
         """The admission of an effect, in the caller's transaction: the barrier, the hold rules, and
         the intent (the lease is taken just before it and appended to ``taken``). Returns the outcome
-        that stops the effect, or the lease fd."""
+        that stops the effect, the lease fd, or :data:`_RETRY` when ``checked`` (:meth:`_authorized`) was
+        made for another decision or fence than the ones read here."""
         barrier = self._barrier(conn, run_id, effect_id, digest)
         if barrier is not None:
             return barrier
@@ -576,25 +630,20 @@ class RunJournal:
             _log.warning("run journal: risk fence of %s/%s unreadable (%s): %s", run_id, effect_id,
                          type(e).__name__, e)
             return EffectOutcome(EffectStatus.UNCLASSIFIED, why=f"fence_unreadable:{type(e).__name__}")
-        if approved and own is not None and needs_signature(own["by"]):
-            # a person's approval is authority here only if its signature verifies NOW, over the challenge
-            # for the current fence; anything else reopens the decision for a new signed one
-            why = None
-            if not own.get("signature") or not own.get("signer") or not own.get("challenge"):
-                why = "unsigned_approval"
-            elif verify_approval is None:
-                why = "approval_not_verifiable_here"
-            else:
-                try:
-                    verified = verify_approval(own, live) is True
-                except Exception:  # noqa: BLE001 — a check that could not run verifies nothing
-                    verified = False
-                if not verified:
-                    why = ("signed_under_another_fence" if own.get("fence") != live
-                           else "signature_not_verified")
-            if why is not None:
+        if approved and own is not None:
+            # the approval is authority only as checked for THIS decision under THIS fence (the check ran
+            # outside the transaction, see ``effect``); a change since then checks again
+            key = decision_key(own)
+            if expect is not None and key != expect:
+                return EffectOutcome(EffectStatus.HELD, hold_id=hold_id, why="decision_changed")
+            if checked is None or checked[0] != key or checked[1] != live:
+                return _RETRY
+            verdict = checked[2]
+            if verdict.startswith("unavailable:"):
+                return EffectOutcome(EffectStatus.HELD, hold_id=hold_id, why=verdict)
+            if verdict != AUTHORIZED:
                 self._reopen_in(conn, hold_id)
-                return EffectOutcome(EffectStatus.REOPENED, hold_id=hold_id, why=why)
+                return EffectOutcome(EffectStatus.REOPENED, hold_id=hold_id, why=verdict.removeprefix("bad:"))
         if live != fence:
             # the risk inputs changed after this effect's rung was decided: that rung is not the one they
             # give now, so nothing is admitted or recorded until it is decided again
@@ -673,7 +722,8 @@ class RunJournal:
             if not approve:
                 conn.execute("INSERT OR IGNORE INTO cancels (run_id, reason) VALUES (?, ?)",
                              (h["run_id"], "rejected"))
-            return HoldResult(True, "approved" if approve else "rejected")
+                return HoldResult(True, "rejected")
+            return HoldResult(True, "approved", decision=decision_key(self._hold_dict(self._hold_row(conn, hold_id))))
 
     def _holds(self, where: str, args: tuple = ()) -> list[dict[str, Any]]:
         with self._read() as conn:

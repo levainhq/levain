@@ -11,6 +11,17 @@ from tests.autonomic_test_only_confinement import test_only_confined_executor  #
 
 
 @pytest.fixture(autouse=True)
+def _test_uid_may_own_the_test_signers_file():
+    """TEST ONLY: the throwaway key the tests enrol (``tests/autonomic_confirm_keys.py``) is in a file this
+    process's uid owns, where a deployment's allowed-signers file must be root's
+    (``levain.autonomic.confirm._SIGNERS_FILE_OWNERS``; the verifier binary stays root's). A test of the root-only rule itself sets it back."""
+    import levain.autonomic.confirm as confirm
+    with pytest.MonkeyPatch.context() as own:   # its own, so a test's ``monkeypatch.undo()`` keeps it
+        own.setattr(confirm, "_SIGNERS_FILE_OWNERS", frozenset({0, os.getuid()}))
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_activation_env(monkeypatch):
     """`LEVAIN_SCOPE` and `CLAUDE_CONFIG_DIR` are AMBIENT INPUTS to doctor, so a
     test that does not clear them is graded by the reviewer's shell.

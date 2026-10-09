@@ -12,15 +12,15 @@ decision, a signature under another fence or at a lower rung) is not authority, 
 open. A "yes" that arrives over any channel is a request to be checked, not an answer.
 
 Verification is ``ssh-keygen -Y verify`` against the allowed-signers file, run from an absolute path
-(:data:`DEFAULT_SSH_KEYGEN` unless the gate is configured with another), never found through ``PATH``, and
-only if that binary is a regular file owned by root and writable by nobody else. Stdlib only.
+(:data:`DEFAULT_SSH_KEYGEN` unless the gate is configured with another), never found through ``PATH``. Both
+the binary and the allowed-signers file are trust anchors (:func:`trust_anchor_problem`): root-owned,
+writable by nobody else, in root-owned directories, so enrolling a key is an act of root. Stdlib only.
 
 What this module cannot check, and must be held elsewhere:
   - that an enrolled key lives in hardware the operator's uid cannot export (a Secure Enclave key): the
     file names public keys, and a software key in it verifies exactly as well;
-  - that the allowed-signers file itself cannot be written by the requester: it is the trust root. Kept
-    inside the autonomic store directory, the confinement floor denies it to an entity's hands; the
-    operator's own uid can still write it;
+  - who root lets enrol a key: the allowed-signers file is checked to be root's, never derived from a
+    signed record of enrolments (the authenticator ledger, when it lands, is to be that record);
   - that the device showing the content to sign cannot be written by the requester.
 """
 from __future__ import annotations
@@ -36,7 +36,8 @@ from pathlib import Path
 
 from levain.autonomic.pending import PendingAction
 
-__all__ = ["NAMESPACE", "DEFAULT_SSH_KEYGEN", "challenge", "ssh_keygen_problem", "verify_signature"]
+__all__ = ["NAMESPACE", "DEFAULT_SSH_KEYGEN", "challenge", "ssh_keygen_problem", "trust_anchor_problem",
+           "verify_signature", "verify_signature_status", "VERIFIED", "NOT_VERIFIED", "UNAVAILABLE"]
 
 NAMESPACE = "levain-confirm"
 CHALLENGE_FORMAT = "levain-confirm/2"
@@ -47,7 +48,14 @@ DEFAULT_SSH_KEYGEN = Path("/usr/bin/ssh-keygen")
 _VERIFY_ENV = {"LC_ALL": "C", "SSH_ASKPASS_REQUIRE": "never"}
 # st_mode bits (the values of stat.S_IFMT / S_IFREG / S_IWGRP / S_IWOTH, which are fixed by POSIX; the
 # package's standard-library allowlist does not include ``stat``)
-_S_IFMT, _S_IFREG, _S_IWGRP, _S_IWOTH = 0o170000, 0o100000, 0o000020, 0o000002
+_S_IFMT, _S_IFREG, _S_IFDIR, _S_IWGRP, _S_IWOTH = 0o170000, 0o100000, 0o040000, 0o000020, 0o000002
+# who may own a trust anchor and every directory above it: root alone
+_ROOT: frozenset[int] = frozenset({0})
+# who may own the allowed-signers file and its directories: root alone. (The tests' conftest adds the test
+# process's uid, for the throwaway key it enrols; no production code path changes it.)
+_SIGNERS_FILE_OWNERS: frozenset[int] = _ROOT
+# the three answers of :func:`verify_signature_status`
+VERIFIED, NOT_VERIFIED, UNAVAILABLE = "verified", "not_verified", "unavailable"
 _SIGNER = re.compile(r"[A-Za-z0-9._@+][A-Za-z0-9._@+-]{0,127}")
 _MAX_SIGNATURE = 16384
 _log = logging.getLogger(__name__)
@@ -69,51 +77,88 @@ def challenge(*, pending: PendingAction, fence: str | None, rung: str, store_id:
     return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def ssh_keygen_problem(path: Path | str) -> str | None:
-    """Why the binary at ``path`` may not verify a signature, or ``None``: it must be an absolute path to a
-    regular file owned by root and writable by neither its group nor anyone else."""
+def trust_anchor_problem(path: Path | str, *, what: str,
+                         owners: frozenset[int] = _ROOT) -> tuple[str | None, str | None]:
+    """``(why, None)`` if the file at ``path`` may not be trusted to verify a signature, else ``(None, the
+    resolved path)``, which is the path to use. A trust anchor (the verifier binary, the allowed-signers
+    file) must be an absolute path that resolves to a regular file owned by one of ``owners`` (root),
+    writable by neither its group nor anyone else, in directories that
+    are all the same, up to ``/``: the requester's uid can then neither edit it nor swap it between this
+    check and its use (the rule of sshd's StrictModes and sudo's sudoers, with root as the only owner)."""
     p = Path(path)
     if not p.is_absolute():
-        return f"ssh-keygen path {p} is not absolute"
+        return f"{what} path {p} is not absolute", None
+    real = os.path.realpath(p)
     try:
-        st = os.stat(p)
+        st = os.lstat(real)
     except OSError as e:
-        return f"ssh-keygen {p} cannot be read ({type(e).__name__})"
+        return f"{what} {p} cannot be read ({type(e).__name__})", None
     if st.st_mode & _S_IFMT != _S_IFREG:
-        return f"ssh-keygen {p} is not a regular file"
-    if st.st_uid != 0:
-        return f"ssh-keygen {p} is not owned by root (uid {st.st_uid})"
+        return f"{what} {p} is not a regular file", None
+    if st.st_uid not in owners:
+        return f"{what} {p} is not owned by root (uid {st.st_uid})", None
     if st.st_mode & (_S_IWGRP | _S_IWOTH):
-        return f"ssh-keygen {p} is group- or world-writable"
-    return None
+        return f"{what} {p} is group- or world-writable", None
+    parent = os.path.dirname(real)
+    while True:
+        try:
+            dst = os.lstat(parent)
+        except OSError as e:
+            return f"{what} directory {parent} cannot be read ({type(e).__name__})", None
+        if dst.st_mode & _S_IFMT != _S_IFDIR:
+            return f"{what} directory {parent} is not a directory", None
+        if dst.st_uid not in owners:
+            return f"{what} directory {parent} is not owned by root (uid {dst.st_uid})", None
+        if dst.st_mode & (_S_IWGRP | _S_IWOTH):
+            return f"{what} directory {parent} is group- or world-writable", None
+        if parent == os.path.dirname(parent):
+            return None, real
+        parent = os.path.dirname(parent)
+
+
+def ssh_keygen_problem(path: Path | str) -> str | None:
+    """Why the binary at ``path`` may not verify a signature, or ``None`` (:func:`trust_anchor_problem`)."""
+    return trust_anchor_problem(path, what="ssh-keygen")[0]
 
 
 def verify_signature(message: bytes, *, signature: str | None, signer: str | None,
                      allowed_signers: Path | None, timeout: float = 10.0,
                      ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> bool:
-    """True only if ``signature`` is a valid SSHSIG over ``message`` in :data:`NAMESPACE` by the key the
-    allowed-signers file names for ``signer``, as the ``ssh_keygen`` binary at that absolute path reports
-    it. Never raises: every failure, including one of this machine (a verifier that is missing or not
-    root-owned, no temporary file, a timeout, an unreadable file), is ``False``, because a check that could
-    not run grants nothing."""
+    """True only if :func:`verify_signature_status` is :data:`VERIFIED`."""
+    return verify_signature_status(message, signature=signature, signer=signer, allowed_signers=allowed_signers,
+                                   timeout=timeout, ssh_keygen=ssh_keygen) == VERIFIED
+
+
+def verify_signature_status(message: bytes, *, signature: str | None, signer: str | None,
+                            allowed_signers: Path | None, timeout: float = 10.0,
+                            ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> str:
+    """:data:`VERIFIED` only if ``signature`` is a valid SSHSIG over ``message`` in :data:`NAMESPACE` by the key
+    the allowed-signers file names for ``signer``, as the ``ssh_keygen`` binary reports it, both files being
+    trust anchors (:func:`trust_anchor_problem`). :data:`NOT_VERIFIED` when the check ran and refused (or
+    the signature or signer is malformed); :data:`UNAVAILABLE` when it could not run (no allowed-signers
+    file, a verifier or signers file that is not a trust anchor, no temporary file, a timeout). Never
+    raises; neither non-verdict grants anything."""
     try:
-        if allowed_signers is None or not isinstance(signature, str) or not isinstance(signer, str):
-            return False
+        if not isinstance(signature, str) or not isinstance(signer, str):
+            return NOT_VERIFIED
         if not _SIGNER.fullmatch(signer) or len(signature) > _MAX_SIGNATURE or _BEGIN not in signature:
-            return False
-        if not Path(allowed_signers).is_file():
-            return False
-        problem = ssh_keygen_problem(ssh_keygen)
+            return NOT_VERIFIED
+        if allowed_signers is None:
+            return UNAVAILABLE
+        problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
+        if problem is None:
+            problem, signers_file = trust_anchor_problem(allowed_signers, what="allowed-signers file",
+                                                         owners=_SIGNERS_FILE_OWNERS)
         if problem is not None:
             _log.error("confirm: refusing to verify a signature: %s", problem)
-            return False
+            return UNAVAILABLE
         sig_path: str | None = None
         try:
             fd, sig_path = tempfile.mkstemp(prefix="levain-confirm-", suffix=".sig")
             with os.fdopen(fd, "w", encoding="ascii") as fh:
                 fh.write(signature.strip() + "\n")
             cp = subprocess.run(
-                [str(ssh_keygen), "-Y", "verify", "-f", str(allowed_signers), "-I", signer, "-n", NAMESPACE,
+                [str(keygen), "-Y", "verify", "-f", str(signers_file), "-I", signer, "-n", NAMESPACE,
                  "-s", sig_path],
                 input=message, capture_output=True, timeout=timeout, env=dict(_VERIFY_ENV))
         finally:
@@ -123,10 +168,10 @@ def verify_signature(message: bytes, *, signature: str | None, signer: str | Non
                 except OSError:
                     pass
         if cp.returncode != 0:
-            return False
+            return NOT_VERIFIED
         good = f'Good "{NAMESPACE}" signature for {signer} with '
         out = (cp.stdout or b"").decode("utf-8", "replace") + "\n" + (cp.stderr or b"").decode("utf-8", "replace")
-        return any(line.strip().startswith(good) for line in out.splitlines())
+        return VERIFIED if any(line.strip().startswith(good) for line in out.splitlines()) else NOT_VERIFIED
     except Exception as e:  # noqa: BLE001 — a verifier that cannot run grants nothing, and never raises
         _log.warning("confirm: signature not verified (%s): %s", type(e).__name__, e)
-        return False
+        return UNAVAILABLE
