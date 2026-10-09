@@ -58,7 +58,9 @@ def test_hands_for_runs_as_the_hands_user_only_outside_the_repl_on_macos(tmp_pat
     assert got == HandsIdentity("nobody", _NOBODY.pw_uid, _NOBODY.pw_dir, ws)
     assert hands_for(cfg, "unattended", system="Darwin") == got
     assert hands_for(cfg, "interactive", system="Darwin") is None   # D4: a human reads each turn
-    assert hands_for(cfg, "headless", system="Linux") is None       # not built on Linux yet
+    assert hands_for(cfg, "headless", system="Linux") == got        # S2-linux: bwrap runs as it
+    assert hands_for(cfg, "interactive", system="Linux") is None
+    assert hands_for(cfg, "headless", system="FreeBSD") is None      # no hands launch there
     assert hands_for(_cfg(), "headless", system="Darwin") is None   # no setup
 
 
@@ -187,9 +189,96 @@ def test_a_timeout_whose_kill_did_not_land_is_not_reported_as_killed(tmp_path, m
         sh.close()
 
 
-def test_the_linux_provider_refuses_a_hands_spawn(tmp_path):
-    with pytest.raises(ConfinementError, match="not built for Linux"):
+# --- the Linux hands launch (S2-linux) ---------------------------------------------------------
+
+
+def test_hands_for_carries_the_recorded_egress_ports(tmp_path):
+    cfg = _cfg(hands_user="nobody", hands_uid=_NOBODY.pw_uid, hands_workspace=tmp_path,
+               hands_egress_ports=(18080,))
+    assert hands_for(cfg, "headless", system="Linux").egress_ports == (18080,)
+
+
+def test_the_linux_hands_launch_refuses_naming_the_problem_before_any_hands_process(tmp_path, monkeypatch):
+    """Ruling (A): probe at every hands launch. A refused probe stops the spawn before bwrap runs, and
+    the refusal says what the probe found (the egress table deleted, RUN in a VM 2026-10-09)."""
+    monkeypatch.setattr(confinement, "_require_hands_sudo", lambda hands: None)
+    monkeypatch.setattr(confinement, "_hands_launch_problem",
+                        lambda hands: "the entity's network boundary does not hold: the nftables rule is not loaded")
+    monkeypatch.setattr(confinement, "_bwrap_plan", lambda *a, **k: pytest.fail("planned past a refused probe"))
+    with pytest.raises(ConfinementError, match="the nftables rule is not loaded.*fail-closed"):
         BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)), hands=_hands(tmp_path))
+
+
+def test_the_launch_probe_asks_every_check_and_passes_only_when_all_hold(tmp_path, monkeypatch):
+    from levain.firing import hands as hands_mod
+
+    asked: list[str] = []
+    found = {"net": None, "egress": None, "ns": None}
+
+    def check(name):
+        def f(*a, **k):
+            asked.append(name)
+            return found[name]
+        return f
+
+    monkeypatch.setattr(hands_mod, "net_group_problem", check("net"))
+    monkeypatch.setattr(hands_mod, "egress_boundary_problem", check("egress"))
+    monkeypatch.setattr(confinement, "_hands_ns_problem", check("ns"))
+    monkeypatch.setattr(hands_mod, "hands_net_group", lambda user: "levain_net")
+    h = _hands(tmp_path)
+    assert confinement._hands_launch_problem(h) is None and asked == ["net", "egress", "ns"]
+    for name, said in (("net", "is a member of"), ("egress", "connected to a loopback port"), ("ns", "uid map")):
+        found = {"net": None, "egress": None, "ns": None, name: said}
+        assert said in confinement._hands_launch_problem(h)
+
+
+def _plan_like_the_vm(home: str, entity: str) -> list[str]:
+    """The shape of the floor's plan for an entity in the operator's home (RUN in a VM 2026-10-09)."""
+    return [confinement.BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--die-with-parent",
+            "--unshare-pid", "--unshare-cgroup", "--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup",
+            "--bind", "/home", "/home", "--tmpfs", home, "--ro-bind-try", f"{home}/.bashrc", f"{home}/.bashrc",
+            "--bind", f"{home}/.ssh", f"{home}/.ssh", "--bind", entity, entity, "--bind", "/run", "/run",
+            "--tmpfs", "/run/user/1000/systemd", "--ro-bind", "/dev/null", "/run/user/1000/bus",
+            "--remount-ro", "/run/user/1000/systemd", "--ro-bind", "/dev/null", f"{home}/.netrc",
+            "--remount-ro", home]
+
+
+def test_the_hands_argv_hides_the_operators_home_and_the_daemon_dirs_and_drops_what_is_under_them():
+    """J1 RUN: the floor's argv as the hands user stops at its first jewel under the operator's home
+    (no search permission). The hands argv mounts nothing beneath a hidden root, hides each root whole
+    after every other op, and builds new user (no nesting), pid and network namespaces."""
+    home, entity = "/home/admin", "/home/admin/ent"
+    out = confinement._hands_bwrap_argv(_plan_like_the_vm(home, entity), [home],
+                                        ["/run", "/tmp", "/var/tmp", "/dev/shm"])
+    roots = [Path(r) for r in (home, "/run", "/tmp", "/var/tmp", "/dev/shm")]
+    # every root is a tmpfs, after every op that is not a root mount
+    first_root = min(i for i in range(len(out) - 1) if out[i] == "--tmpfs" and Path(out[i + 1]) in roots)
+    for i in range(first_root, len(out)):
+        if out[i] in ("--bind", "--ro-bind", "--ro-bind-try", "--symlink", "--dir"):
+            pytest.fail(f"{out[i]} after the hidden roots")
+    # nothing beneath a hidden root survives, except the roots' own tmpfs/remount
+    for i in range(1, first_root):
+        tok = out[i]
+        if tok.startswith("/") and tok != "/" and any(Path(tok) == r or Path(tok).is_relative_to(r) for r in roots):
+            pytest.fail(f"{tok} is under a hidden root and still in the argv")
+    assert ["--remount-ro", home] == out[-2:]
+    for flag in ("--unshare-user", "--disable-userns", "--unshare-net", "--unshare-pid", "--unshare-cgroup"):
+        assert flag in out
+    assert ["--bind", "/", "/"] == out[out.index("--bind"):out.index("--bind") + 3]
+    assert ["--bind", "/home", "/home"] == out[out.index("/home") - 1:out.index("/home") + 2]
+
+
+def test_the_hands_argv_refuses_an_op_it_does_not_know():
+    with pytest.raises(ConfinementError, match="does not know how to place"):
+        confinement._hands_bwrap_argv([confinement.BWRAP, "--overlay-src", "/x"], ["/home/a"], [])
+
+
+def test_a_hands_workspace_inside_a_hidden_root_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(confinement.Path, "home", classmethod(lambda cls: tmp_path))
+    ent = _entity(tmp_path)
+    pol = build_policy(ent, workspace=tmp_path / "ws")
+    with pytest.raises(ConfinementError, match="never sees"):
+        confinement._hands_hidden_roots(pol)
 
 
 def test_a_provider_without_hands_support_refuses_rather_than_running_as_the_operator(tmp_path):
