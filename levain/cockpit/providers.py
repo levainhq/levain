@@ -17,11 +17,14 @@ from typing import Any, Callable
 from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext
 from levain.cockpit.registry import parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
-from levain.dashboard import FOCUS_STALE_AFTER_HOURS, SubstrateSource, SubstrateView
+from levain.dashboard import FOCUS_STALE_AFTER_HOURS, SubstrateSource, SubstrateView, _one_clause
 
 # The view caps each spore bucket at ``max_spores``. The cockpit asks for far more than any store
 # holds and DISCLOSES a cap that is still hit, so a panel never shows a prefix as the whole set.
 SPORE_CAP = 5000
+# The view's own per-bucket limit is raised out of the way so the cockpit's cap is applied AFTER the
+# hold filter: ranking and holds decide what is visible, then the cap truncates what is visible.
+VIEW_SPORE_LIMIT = 10_000_000
 EDITS_LIMIT = 20
 # An undated handoff stops leading after this many days untouched: it says "pick up here next
 # session", and a calendar that has refuted that must not keep it first (flow, 2026-08-27, where
@@ -36,7 +39,7 @@ SPORE_FACETS = frozenset({
 
 
 def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
-    return ctx.memo("view", lambda: source.build(max_spores=SPORE_CAP + 1, now=ctx.now))
+    return ctx.memo("view", lambda: source.build(max_spores=VIEW_SPORE_LIMIT, now=ctx.now))
 
 
 def _view_fault(view: SubstrateView, *keys: str) -> Fault | None:
@@ -81,8 +84,6 @@ def _spore_provider(
         if not path.exists():           # removed while the view was being built
             return Absent(f"no spore store at {path}")
         items = {"tray": view.tray, "loops": view.open_spores, "keep": view.keep}[bucket]
-        capped = len(items) > SPORE_CAP
-        items = items[:SPORE_CAP]
         filtered = 0
         rows = []
         for s in items:
@@ -90,6 +91,8 @@ def _spore_provider(
                 filtered += 1           # surface date not reached: held on purpose, not unreadable
                 continue
             rows.append(_spore_row(s, ctx.today))
+        capped = apply_hold and len(rows) > SPORE_CAP   # a lookup by id is never truncated
+        rows = rows[:SPORE_CAP] if apply_hold else rows
         skipped = ((1, f"capped at {SPORE_CAP}; at least this many more exist"),) if capped else ()
         return Read(rows=tuple(rows), filtered=((filtered, "surface date not reached"),) if filtered else (),
                     skipped=skipped)
@@ -188,30 +191,31 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         path = source.anneal.crystal_json
         if not path.exists():
             return Absent(f"no crystal store at {path}")
-        view = _view(source, ctx)
-        if "crystal_index" in view.errors:
-            return Fault(f"crystal_index: {view.errors['crystal_index']}")
-        if not path.exists():
-            return Absent(f"no crystal store at {path}")
         try:
             from anneal_memory.crystal import CrystalStore
 
-            raw = len(CrystalStore(path).active())
-        except Exception as exc:  # noqa: BLE001 - the view read it; a second read failing is a fault too
+            raw = CrystalStore(path).active()   # the ONE read this panel makes; the view's copy is not used
+        except Exception as exc:  # noqa: BLE001 - any store fault is a Fault, not an empty list
             return Fault(f"crystal store unreadable: {type(exc).__name__}: {exc}")
-        dropped = max(0, raw - len(view.crystal_index))   # the view skips a malformed row without a trace
-        rows = tuple(
-            RowIn(
-                id=f"crystal:{c.name}", title=c.name, body=c.one_clause,
-                facets={"crystal_level": c.level, "permanence": c.permanence,
-                        "last_activated_on": c.last_activated_on or None, "tags": list(c.tags)},
-                stored={"name": c.name, "level": c.level, "one_clause": c.one_clause,
-                        "permanence": c.permanence, "activation_mode": c.activation_mode,
-                        "last_activated_on": c.last_activated_on, "tags": list(c.tags)},
-            )
-            for c in view.crystal_index
-        )
-        return Read(rows=rows, skipped=((dropped, "malformed crystal row"),) if dropped else ())
+        rows, dropped = [], 0
+        for c in raw:
+            try:
+                name = str(c.get("name") or "(unnamed)")
+                level = int(c.get("level", 0) or 0)
+                tags = [str(t) for t in (c.get("tags") or [])]
+                clause = _one_clause(str(c.get("explanation", "")))
+                act = str(c.get("activation_mode", ""))
+                perm = str(c.get("permanence", ""))
+                last = str(c.get("last_activated_on", ""))
+            except (ValueError, TypeError):
+                dropped += 1
+                continue
+            rows.append(RowIn(
+                id=f"crystal:{name}", title=name, body=clause,
+                facets={"crystal_level": level, "permanence": perm, "last_activated_on": last or None, "tags": tags},
+                stored={"name": name, "level": level, "one_clause": clause, "permanence": perm,
+                        "activation_mode": act, "last_activated_on": last, "tags": tags}))
+        return Read(rows=tuple(rows), skipped=((dropped, "malformed crystal row"),) if dropped else ())
     return read
 
 

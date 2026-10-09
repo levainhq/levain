@@ -600,7 +600,11 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 built = build_default_cockpit(
                     self.levain_source,
                     job_store=self.job_runtime.store if self.job_runtime is not None else None)
-                built.start()
+                try:
+                    built.start()
+                except BaseException:
+                    built.stop()    # a half-started cockpit must not leave refreshers running
+                    raise
                 self.cockpit = built   # published only once started: a failed start retries next request
             return self.cockpit
 

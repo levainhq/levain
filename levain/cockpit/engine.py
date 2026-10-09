@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
@@ -152,6 +153,7 @@ class _State:
     failing_since: str | None = None
     last_completion: datetime | None = None
     flight: "Future | None" = None            # the read currently running, shared by concurrent callers
+    flight_started: float = 0.0               # monotonic start of that read
     refresh_started: datetime | None = None   # set while a refresher cycle is inside its read
     started: datetime | None = None
 
@@ -191,11 +193,19 @@ class Cockpit:
         self._rowsets: dict[str, str] = {}
         self._discoverers: list[Callable[[ReadContext], list[ProviderSpec]]] = []
         self._entity_state = _State()
+        self._discovery_state = _State()
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
 
     # --- registration ----------------------------------------------------------------
     def register(self, spec: ProviderSpec) -> None:
+        """Add a panel. The registry is copy-on-write: a registration builds NEW dicts and swaps
+        them in, and nothing ever mutates a dict a reader holds, so a request that took a snapshot
+        iterates a stable set with no lock and a concurrent discovery cannot corrupt it."""
+        with self._lock:
+            self._register_locked(spec)
+
+    def _register_locked(self, spec: ProviderSpec) -> None:
         sid = spec.id
         if not sid or sid in self._specs or sid == NOW_ID:
             raise CockpitRegistrationError(f"panel id {sid!r} is empty, reserved or already registered")
@@ -231,9 +241,14 @@ class Cockpit:
                 raise CockpitRegistrationError(
                     f"{sid}: row set {spec.rowset!r} already belongs to panel {owner!r} (one panel per row set)"
                 )
+        if spec.rowset is not None:
             self._rowsets[spec.rowset] = sid
-        self._specs[sid] = spec
-        self._state[sid] = _State()
+        states = dict(self._state)
+        states[sid] = _State()
+        self._state = states            # state first: a reader that sees the spec finds its state
+        specs = dict(self._specs)
+        specs[sid] = spec
+        self._specs = specs
 
     @property
     def panel_ids(self) -> list[str]:
@@ -279,12 +294,20 @@ class Cockpit:
 
     def _bounded(self, timeout_s: float, st: _State | None, fn: Callable[..., Any], *args: Any) -> Any:
         fut: Future
+        wait = timeout_s
         if st is not None:
             with st.lock:
                 if st.flight is not None and not st.flight.done():
-                    fut, mine = st.flight, False
+                    # Join a read only while it is still inside its own budget (the singleflight
+                    # pattern). One already past it is hung: fail at once, so a hung source costs
+                    # neither a thread per request nor a full timeout per request.
+                    age = time.monotonic() - st.flight_started
+                    if age >= timeout_s:
+                        return Fault("previous read still running past its timeout (source hung?)")
+                    fut, mine, wait = st.flight, False, timeout_s - age
                 else:
                     fut = st.flight = Future()
+                    st.flight_started = time.monotonic()
                     mine = True
         else:
             fut, mine = Future(), True
@@ -298,7 +321,7 @@ class Cockpit:
 
             threading.Thread(target=work, name="cockpit-read", daemon=True).start()
         try:
-            res = fut.result(timeout=timeout_s)
+            res = fut.result(timeout=wait)
         except FutureTimeout:
             for a in args:
                 if isinstance(a, ReadContext):
@@ -546,13 +569,14 @@ class Cockpit:
         }
 
     def _now_head_and_rows(
-        self, ctx: ReadContext, cred: str, snaps: dict[str, _Snap] | None = None
+        self, ctx: ReadContext, cred: str, specs_map: dict[str, ProviderSpec],
+        snaps: dict[str, _Snap] | None = None
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """The ``now`` view (design §3.2.4): the ``band == "now"`` rows of the gate panels, in panel
         rank order, each panel's rows in that panel's own order. No ordering, provider or actions of
         its own; every row keeps its source ``panel_id``. Its status is the worst of its sources'."""
         sources = sorted(
-            (s for s in self._specs.values() if s.priority == "gate" and s.kind == "triage-list"),
+            (s for s in specs_map.values() if s.priority == "gate" and s.kind == "triage-list"),
             key=lambda s: (0 if s.region == HEADER else 1 + [z for z, _ in ZONES].index(s.region), s.rank, s.id),
         )
         rows: list[dict[str, Any]] = []
@@ -602,37 +626,52 @@ class Cockpit:
         return {**base, **res.value}, []
 
     def _entity_call(self, ctx: ReadContext) -> Result:
-        return Read(value=self._entity_fn(ctx))  # type: ignore[misc]
+        got = self._entity_fn(ctx)  # type: ignore[misc]
+        if not isinstance(got, dict):
+            raise TypeError(f"entity must return an object, got {type(got).__name__}")
+        return Read(value=got)
 
-    @staticmethod
-    def _discover_call(fn: Callable[[ReadContext], list[ProviderSpec]], ctx: ReadContext) -> Result:
-        return Read(value=fn(ctx))
+    def _discover_all(self, ctx: ReadContext) -> Result:
+        found: list[ProviderSpec] = []
+        for fn in self._discoverers:
+            got = fn(ctx)
+            if not isinstance(got, list) or not all(isinstance(x, ProviderSpec) for x in got):
+                raise TypeError("a discoverer returns a list of ProviderSpec")
+            found += got
+        return Read(value=found)
 
     def discover(self, fn: Callable[[ReadContext], list[ProviderSpec]]) -> None:
-        """Register a discoverer: run at every manifest and panel read, it returns the panels the
-        substrate holds NOW (prose panels, one per heading). Ones not yet registered are added; one
-        that later vanishes keeps its provider, which then reads ``Absent`` and renders ``error``. A
-        discoverer that raises is a manifest ``errors`` entry, never silent absence."""
+        """Register a discoverer: run when a manifest is built (or a panel nobody registered is
+        asked for), it returns the panels the substrate holds NOW (prose panels, one per heading).
+        Ones not yet registered are added; one that later vanishes keeps its provider, which then
+        reads ``Absent`` and renders ``error``. A discoverer that raises is a manifest ``errors``
+        entry, never silent absence. All discoverers share ONE bounded single-flight read."""
         self._discoverers.append(fn)
 
     def _ensure_discovered(self, ctx: ReadContext) -> list[dict[str, Any]]:
+        if not self._discoverers:
+            return []
+        res = self._bounded(self._entity_timeout_s, self._discovery_state, self._discover_all, ctx)
+        if isinstance(res, Fault):
+            return [{"source": "discovery", "message": res.message}]
         errors: list[dict[str, Any]] = []
-        for i, fn in enumerate(self._discoverers):
-            res = self._bounded(self._entity_timeout_s, None, self._discover_call, fn, ctx)
-            if isinstance(res, Fault):
-                errors.append({"source": f"discovery:{i}", "message": res.message})
-                continue
-            for spec in res.value:
-                if spec.id not in self._specs:
+        for spec in res.value:
+            with self._lock:
+                have = self._specs.get(spec.id)
+                if have is None:
                     try:
-                        self.register(spec)
+                        self._register_locked(spec)
                     except CockpitRegistrationError as exc:
                         errors.append({"source": f"discovery:{spec.id}", "message": str(exc)})
+                elif have.title != spec.title:
+                    errors.append({"source": f"discovery:{spec.id}",
+                                   "message": f"id collision: {spec.title!r} maps to the id of {have.title!r}"})
         return errors
 
-    def _ordered_specs(self) -> list[ProviderSpec]:
+    @staticmethod
+    def _ordered_specs(specs_map: dict[str, ProviderSpec]) -> list[ProviderSpec]:
         zi = [z for z, _ in ZONES]
-        return sorted(self._specs.values(),
+        return sorted(specs_map.values(),
                       key=lambda s: (-1 if s.region == HEADER else zi.index(s.region), s.rank, s.id))
 
     def manifest(self, credential: dict[str, Any], *, install_class: str | None = None) -> dict[str, Any]:
@@ -642,12 +681,13 @@ class Cockpit:
         errors += entity_errors
         heads: dict[str, dict[str, Any]] = {}
         snaps: dict[str, _Snap] = {}
-        for spec in self._ordered_specs():
+        specs_map = self._specs      # one snapshot for the whole manifest
+        for spec in self._ordered_specs(specs_map):
             snaps[spec.id] = self._snap_for(spec, ctx)
             heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today)
-        now_head, _ = self._now_head_and_rows(ctx, credential["class"], snaps)
+        now_head, _ = self._now_head_and_rows(ctx, credential["class"], specs_map, snaps)
         heads[NOW_ID] = now_head
-        specs = self._ordered_specs()
+        specs = self._ordered_specs(specs_map)
         regions = {
             "header": [s.id for s in specs if s.region == HEADER],
             "zones": [
@@ -672,14 +712,19 @@ class Cockpit:
         ``compact``; ``q`` is the server-side search over row bodies; ``row`` returns one row in
         full."""
         ctx = ReadContext(self._clock())
-        self._ensure_discovered(ctx)
+        specs_map = self._specs
+        if panel_id != NOW_ID and panel_id not in specs_map:
+            self._ensure_discovered(ctx)      # a panel we do not know yet may be a heading added since
+            specs_map = self._specs
         if panel_id == NOW_ID:
-            head, rows = self._now_head_and_rows(ctx, credential_class)
+            self._ensure_discovered(ctx)
+            specs_map = self._specs
+            head, rows = self._now_head_and_rows(ctx, credential_class, specs_map)
             spec = None
             snap_rows: list[dict[str, Any]] | None = rows
             value = None
         else:
-            spec = self._specs.get(panel_id)
+            spec = specs_map.get(panel_id)
             if spec is None:
                 return None
             snap = self._snap_for(spec, ctx)

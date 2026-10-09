@@ -279,8 +279,10 @@ class TestRefreshersAndTimeouts:
         got = ck.panel("h")
         assert got["status"] == "error" and "timed out" in got["error"]
         assert time.monotonic() - t0 < 1.5
-        again = ck.panel("h")  # waits on the SAME read: no second thread is stacked on a hung call
-        assert again["status"] == "error" and "timed out" in again["error"]
+        t1 = time.monotonic()
+        again = ck.panel("h")  # past its budget the read is hung: fail AT ONCE, no thread stacked
+        assert again["status"] == "error" and "past its timeout" in again["error"]
+        assert time.monotonic() - t1 < 0.1
         assert sum(t.name == "cockpit-read" and t.is_alive() for t in threading.enumerate()) == 1
         release.set()
         time.sleep(0.1)
@@ -824,3 +826,94 @@ class TestL3R1Fixes:
         assert got["status"] == "ok" and got["skipped"] == []
         monkeypatch.setattr(prov, "SPORE_CAP", 0)
         assert ck.panel("loops")["skipped"]
+
+
+# --- L3 round 2 fixes -----------------------------------------------------------------------------
+
+
+class TestL3R2Fixes:
+    def test_discovery_is_single_flight_and_a_hung_discoverer_fails_fast_after_its_budget(self) -> None:
+        release = threading.Event()
+        ck = Cockpit()
+        ck.discover(lambda ctx: (release.wait(30), [])[1])
+        ck._entity_timeout_s = 0.2
+        errs = [ck.manifest(NONE_CRED)["errors"] for _ in range(1)]
+        assert errs[0] and errs[0][0]["source"] == "discovery"
+        t0 = time.monotonic()
+        for _ in range(5):
+            assert ck.manifest(NONE_CRED)["errors"][0]["source"] == "discovery"
+        assert time.monotonic() - t0 < 0.5      # five more requests, no wait, no new thread
+        assert sum(t.name == "cockpit-read" and t.is_alive() for t in threading.enumerate()) == 1
+        release.set()
+
+    def test_registration_is_copy_on_write_a_held_snapshot_never_changes(self) -> None:
+        ck = Cockpit()
+        ck.register(_simple("a"))
+        snap = ck._specs
+        ck.register(_simple("b"))
+        assert list(snap) == ["a"] and list(ck._specs) == ["a", "b"]
+
+    def test_concurrent_discovery_registers_each_panel_once_without_a_spurious_error(self, tmp_path: Path) -> None:
+        _root, src = _install(tmp_path)
+        ck = build_default_cockpit(src)
+        errs: list[Any] = []
+        ts = [threading.Thread(target=lambda: errs.append(ck.manifest(NONE_CRED)["errors"])) for _ in range(6)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert errs == [[]] * 6
+
+    def test_malformed_entity_and_discoverer_returns_are_manifest_errors_not_500s(self) -> None:
+        ck = Cockpit(entity=lambda ctx: None)    # type: ignore[arg-type,return-value]
+        ck.discover(lambda ctx: [object()])      # type: ignore[list-item,return-value]
+        m = ck.manifest(NONE_CRED)
+        assert {e["source"] for e in m["errors"]} == {"entity", "discovery"}
+
+    def test_a_held_row_does_not_displace_a_visible_one_under_the_cap(self, tmp_path: Path, monkeypatch) -> None:
+        import levain.cockpit.providers as prov
+        root, src = _install(tmp_path)
+        sp = SporeStore(root / ".levain" / "memory.spores.json")
+        for i in range(4):
+            sp.add(type="task", text=f"held {i}", disposition="seed", next="2999-01-01", tier="hot", salience=3)
+        monkeypatch.setattr(prov, "SPORE_CAP", 2)
+        got = build_default_cockpit(src).panel("tray")
+        assert got["filtered"][0]["count"] == 4 and got["count"] == 2    # the visible rows survive the cap
+
+    def test_read_one_is_not_truncated_by_the_cap(self, env, monkeypatch) -> None:
+        import levain.cockpit.providers as prov
+        _r, _s, ck = env
+        monkeypatch.setattr(prov, "SPORE_CAP", 1)
+        assert isinstance(ck.read_one("tray", "spore:spore-002"), Read)
+
+    def test_a_crystal_added_between_two_reads_cannot_fake_a_malformed_row(self, env) -> None:
+        root, _s, ck = env
+        (root / ".levain" / "memory.crystal.json").write_text(json.dumps({"crystal": [
+            {"name": "a", "status": "crystallized", "level": 1, "explanation": "x"},
+            {"name": "b", "status": "crystallized", "level": 2, "explanation": "y"}]}))
+        got = ck.panel("crystals")
+        assert got["status"] == "ok" and got["count"] == 2 and got["skipped"] == []
+
+    def test_if_none_match_star_matches(self, tmp_path: Path) -> None:
+        _root, src = _install(tmp_path)
+        with _serve(src) as (base, _h):
+            assert _http(f"{base}/cockpit/manifest.json", {"If-None-Match": "*"})[0] == 304
+
+    def test_a_failed_start_leaves_no_refresher_running(self, tmp_path: Path, monkeypatch) -> None:
+        import levain.cockpit.engine as eng
+        _root, src = _install(tmp_path)
+        started: list[Cockpit] = []
+        real = eng.Cockpit.start
+
+        def boom(self):
+            started.append(self)
+            real(self)
+            raise RuntimeError("start failed")
+        monkeypatch.setattr(eng.Cockpit, "start", boom)
+        httpd = make_server(src, host="127.0.0.1", port=0)
+        try:
+            with pytest.raises(RuntimeError):
+                httpd.get_cockpit()
+            assert httpd.cockpit is None and all(not c._refreshers for c in started)
+        finally:
+            httpd.server_close()
