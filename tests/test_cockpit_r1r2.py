@@ -85,6 +85,14 @@ def _cached_head_then_error() -> dict[str, Any]:
 class TestTuiRenderer:
     def test_spaces_are_not_escaped_and_format_characters_are(self) -> None:
         assert visible("a b\u061cc\u206ad\u2028e") == "a b<U+061C>c<U+206A>d<U+2028>e"
+        assert visible("x\ud800y") == "x<U+D800>y"
+
+    def test_prose_splits_only_on_newline_so_separators_stay_visible(self) -> None:
+        ck = Cockpit()
+        ck.register(ProviderSpec("pr", "prose", "Doc", "gauge",
+                                 lambda c: Read(value={"markdown": "safe\u2028ERROR: forged\nnext", "headline": "H"})))
+        rows = [t for s, t in render_lines(snapshot(ck), 100) if s == "row"]
+        assert rows[1].strip() == "safe<U+2028>ERROR: forged" and rows[2].strip() == "next"
 
     def test_head_and_payload_disagreement_shows_the_payloads_error(self) -> None:
         text = "\n".join(t for _, t in render_lines(_cached_head_then_error(), 100))
@@ -180,9 +188,9 @@ class TestWebRenderer:
     def test_format_characters_and_naive_timestamps(self) -> None:
         out = subprocess.run(
             [NODE, "-e", "const C=require(process.argv[1]);const n=Date.parse('2026-10-09T12:00:00Z');"
-             "process.stdout.write(C.visible('a b\\u061c\\u206a')+'|'+C.age('2026-10-09T11:00:00',n))",
+             "process.stdout.write(C.visible('a b\\u061c\\u206a\\ud800')+'|'+C.age('2026-10-09T11:00:00',n))",
              str(WEB / "cockpit.js")], capture_output=True, text=True, check=True).stdout
-        assert out == "a b<U+061C><U+206A>|1h ago"
+        assert out == "a b<U+061C><U+206A><U+D800>|1h ago"
 
     def test_non_natural_order_and_groups_are_shown_as_served(self) -> None:
         ck = _cockpit()
