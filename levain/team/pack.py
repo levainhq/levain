@@ -63,7 +63,8 @@ def seed(gl: GitLedger, pack_dir: Path, *, push: bool = True) -> list[dict]:
     if bad:
         raise TeamError(f"rule owner(s) not allowed by team.toml (client_owners / members): {', '.join(bad)}")
     # One pack-sync at a time: two that plan from the same ledger would both supersede the same old rule.
-    with gl.lock(name="pack", timeout=60):
+    # the op first, then the pack lock: the CLI order (code L3 r7 codex 1: seed took pack then op, a deadlock)
+    with gl.op(), gl.lock(name="pack", timeout=60):
         led = gl.ledger(team)
         todo = plan(judgment, led.pack_rules(judgment.pack), led.retired_by_others(judgment.pack))
         written = []
