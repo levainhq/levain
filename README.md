@@ -169,13 +169,13 @@ It runs against Ollama by default, through `--model`/`--base-url` — or any Ope
 
 On macOS, any program can read the command line and environment of every other program running as the same user. That includes tokens passed in an environment variable. No sandbox rule changes that: independent tests on current macOS found no rule that does, and our own test confirmed it. So an entity whose bash runs as you can read the secrets your other programs were started with.
 
-`sudo levain setup-isolation --path <entity>` closes that. It creates a dedicated user for the entity, and from then on, on macOS, headless chat turns, `--task` runs and scheduled seats execute bash as that user, and the file editor reads and writes as it, inside the entity's workspace only:
+`sudo levain setup-isolation --path <entity>` closes that. It creates a dedicated user for the entity, and from then on, on macOS and Linux, headless chat turns, `--task` runs and scheduled seats execute bash as that user, and the file editor reads and writes as it, inside the entity's workspace only:
 
 - the kernel refuses to give that user the environment of your processes;
 - files only you can read are out of its reach, and so is your home directory;
 - the sandbox floor still applies on top, unchanged.
 
-The interactive `levain run` REPL still runs bash as you, because you drive it and read each turn before the next. On Linux, setup creates the user and its workspace, and bash keeps running as you there for now; `levain run` and `levain doctor` say which one is in force.
+The interactive `levain run` REPL still runs bash as you, because you drive it and read each turn before the next. On Linux the entity's bash, run as that user, sees only an allowlisted view of the machine: `/usr`, `/etc` and `/opt` read-only, its own workspace and home, and fresh empty `/tmp`, `/var/tmp` and `/run`. Your home, `/srv`, `/mnt`, `/var/lib`, other disks and every daemon socket under `/run` are not there at all, and it shares no IPC objects or session keyring with you. That makes Linux stricter than macOS, where the entity's bash still sees the rest of the machine its user may read: on Linux, a tree outside that list is out of reach even when its permissions would let the entity's user read it. Each session first checks, as the entity's user, that no socket or FIFO in `/usr`, `/etc` or `/opt` is writable by it, and refuses to start, naming the file, if one is. It needs `python3` (and `zsh` for the file editor). `levain run` and `levain doctor` say which user bash runs as.
 
 **The workspace.** The entity works in a directory outside your home, `/Users/Shared/levain/<user>/workspace` on macOS or `/var/lib/levain/<user>/workspace` on Linux.
 
