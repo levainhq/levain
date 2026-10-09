@@ -273,8 +273,7 @@ def test_the_hands_argv_is_an_allowlisted_view_keeping_only_the_floors_ops_insid
 def test_on_linux_every_hands_process_starts_through_the_keyring_join(tmp_path):
     hands = _hands(tmp_path)
     linux = hands_prefix(hands, system="Linux")
-    assert linux[-7:] == [confinement.HANDS_PYTHON, "-I", "-S", "-c", confinement._HANDS_START, "keyring",
-                          str(os.getpid())]
+    assert linux[-6:] == [confinement.HANDS_PYTHON, "-I", "-S", "-c", confinement._HANDS_START, str(os.getpid())]
     assert confinement._HANDS_START not in hands_prefix(hands, system="Darwin")
 
 
@@ -291,7 +290,7 @@ def test_the_keyring_join_leaves_the_callers_session_keyring_behind():
     import sys
 
     own = subprocess.run([sys.executable, "-I", "-S", "-c", _SESSION_KEYRING_ID], capture_output=True, text=True)
-    joined = subprocess.run([sys.executable, "-I", "-S", "-c", confinement._HANDS_START, "keyring", str(os.getpid()),
+    joined = subprocess.run([sys.executable, "-I", "-S", "-c", confinement._HANDS_START, str(os.getpid()),
                              sys.executable, "-I", "-S", "-c", _SESSION_KEYRING_ID], capture_output=True, text=True)
     assert own.returncode == 0 and joined.returncode == 0, (own.stderr, joined.stderr)
     assert int(own.stdout) > 0 and int(joined.stdout) > 0
@@ -300,8 +299,7 @@ def test_the_keyring_join_leaves_the_callers_session_keyring_behind():
 
 @pytest.mark.skipif(platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"),
                     reason="the start program is Linux's")
-@pytest.mark.parametrize("mode", ["keyring", "-"])
-def test_a_sandboxed_command_ends_when_levain_is_killed(mode):
+def test_a_sandboxed_command_ends_when_levain_is_killed():
     """RUN 2026-10-09 (R5): levain SIGKILLed mid-command left the hands command's bash and a setsid child
     running, because --die-with-parent binds to sudo and sudo outlives levain. Here a stand-in levain
     starts a command through the start program and is SIGKILLed; the command must be gone soon after."""
@@ -311,8 +309,8 @@ def test_a_sandboxed_command_ends_when_levain_is_killed(mode):
     levain = subprocess.Popen(
         [sys.executable, "-I", "-S", "-c",
          "import os, subprocess, sys, time; p = subprocess.Popen([sys.executable, '-I', '-S', '-c', sys.argv[1], "
-         "sys.argv[2], str(os.getpid()), '/bin/sleep', '120']); print(p.pid, flush=True); time.sleep(120)",
-         confinement._HANDS_START, mode], stdout=subprocess.PIPE, text=True)
+         "str(os.getpid()), '/bin/sleep', '120']); print(p.pid, flush=True); time.sleep(120)",
+         confinement._HANDS_START], stdout=subprocess.PIPE, text=True)
     child = int(levain.stdout.readline())   # type: ignore[union-attr]
     time.sleep(0.5)
     assert Path(f"/proc/{child}").exists()
@@ -774,6 +772,21 @@ def test_the_walk_asks_as_the_hands_user_inside_its_view_and_refuses_what_it_may
     out.update(stderr=b"bwrap: Can't mount proc on /newroot/proc: Operation not permitted\n")
     said = confinement._hands_listener_problem(hands)
     assert said is not None and "could not walk" in said and "Can't mount proc" in said
+
+
+def test_a_hands_shell_walks_again_before_every_command(monkeypatch):
+    """RUN 2026-10-09 (R6-mid): a 0777 listener planted under /opt after the launch was CONNECTED by a
+    later command of the same shell. The walk now runs before every command and refuses it."""
+    shell = object.__new__(confinement._BwrapShell)
+    shell._hands = _view_hands(monkeypatch)
+    closed: list[bool] = []
+    monkeypatch.setattr(confinement._BwrapShell, "closed", property(lambda self: bool(closed)))
+    monkeypatch.setattr(confinement._BwrapShell, "close", lambda self: closed.append(True))
+    monkeypatch.setattr(confinement, "_hands_listener_problem", lambda h: "hands can reach /opt/s2mid/sock")
+    monkeypatch.setattr(confinement._BwrapShell, "_recheck", lambda self: pytest.fail("ran past the walk"))
+    with pytest.raises(ConfinementError, match="/opt/s2mid/sock.*not run"):
+        shell.run("true")
+    assert closed == [True]
 
 
 def test_the_linux_editor_refuses_by_name_without_zsh(tmp_path, monkeypatch):

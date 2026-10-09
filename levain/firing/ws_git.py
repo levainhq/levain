@@ -418,7 +418,7 @@ def _start() -> list[str]:
         return []
     from levain.firing.confinement import HANDS_PYTHON, _start_argv
 
-    return _start_argv(HANDS_PYTHON, keyring=True)
+    return _start_argv(HANDS_PYTHON)
 
 
 def _under_a_workspace_root(path: Path) -> bool:
