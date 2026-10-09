@@ -996,7 +996,7 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
             name, True,
             f"hands user {cfg.hands_user} is set up (workspace {cfg.hands_workspace}), but on this OS "
             "levain still runs the entity's bash as you",
-            hint="running bash as the entity's own user is built for macOS so far",
+            hint="running bash as the entity's own user is built for macOS and Linux",
             warn=True,
         ), *extra]
     return [CheckResult(
