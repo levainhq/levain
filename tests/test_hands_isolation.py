@@ -577,6 +577,39 @@ def test_doctor_says_who_bash_runs_as(tmp_path: Path, monkeypatch, system) -> No
     assert probes == [["sudo", "-n", "-u", rec["hands_user"], "/bin/test", "-w", rec["hands_workspace"]]]
 
 
+@pytest.mark.parametrize("missing", ["python3", "zsh"])
+def test_doctor_names_what_linux_hands_needs(tmp_path: Path, monkeypatch, missing) -> None:
+    """S2-linux: every Linux hands process starts through python3 (refused at launch without it) and the
+    file editor needs zsh; doctor names each rather than leave it to the first refusal."""
+    from levain import doctor
+    from levain.firing import confinement, ws_git
+
+    monkeypatch.setattr(confinement.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(hands, "host_os", lambda: "linux")
+    for f in ("net_group_problem", "egress_boundary_problem", "egress_drift_problem"):
+        monkeypatch.setattr(hands, f, lambda *a, **k: None)
+    monkeypatch.setattr(hands, "hands_net_group", lambda u: "levain-net")
+    gone = confinement.HANDS_PYTHON if missing == "python3" else confinement.HANDS_ZSH
+    real_access = os.access
+    monkeypatch.setattr(doctor.os, "access", lambda p, m, **k: False if p == gone else real_access(p, m, **k))
+    ed = _entity(tmp_path)
+    me = hands.pwd.getpwuid(os.getuid())
+    (ed / ".levain" / "confinement.json").write_text(json.dumps({**_record(ed), "hands_uid": me.pw_uid}))
+    monkeypatch.setattr(doctor, "_probe", lambda cmd: (True, ""))
+    monkeypatch.setattr(ws_git, "wildcard_safe_directory", lambda roots=(): [])
+    monkeypatch.setattr(ws_git, "foreign_entries", lambda h: [])
+    monkeypatch.setattr(ws_git, "bare_repository_explicit", lambda: True)
+    import pwd as _pwd
+    monkeypatch.setattr(_pwd, "getpwnam", lambda n: me)
+    rs = doctor._check_hands_isolation(ed)
+    hit = [r for r in rs if gone in r.detail]
+    assert len(hit) == 1
+    if missing == "python3":
+        assert not hit[0].ok and "install python3" in hit[0].hint
+    else:
+        assert hit[0].ok and hit[0].warn and "install zsh" in hit[0].hint
+
+
 def test_the_warn_badge_prints_its_hint(capsys) -> None:
     from levain import doctor
 
