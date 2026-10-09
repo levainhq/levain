@@ -273,8 +273,8 @@ def test_the_hands_argv_is_an_allowlisted_view_keeping_only_the_floors_ops_insid
 def test_on_linux_every_hands_process_starts_through_the_keyring_join(tmp_path):
     hands = _hands(tmp_path)
     linux = hands_prefix(hands, system="Linux")
-    assert linux[-5:] == [confinement.HANDS_PYTHON, "-I", "-S", "-c", confinement._HANDS_KEYRING_JOIN]
-    assert confinement._HANDS_KEYRING_JOIN not in hands_prefix(hands, system="Darwin")
+    assert linux[-6:] == [confinement.HANDS_PYTHON, "-I", "-S", "-c", confinement._HANDS_START, str(os.getpid())]
+    assert confinement._HANDS_START not in hands_prefix(hands, system="Darwin")
 
 
 _SESSION_KEYRING_ID = ("import ctypes, os; nr = {'x86_64': 250, 'aarch64': 219}[os.uname().machine]; "
@@ -290,11 +290,43 @@ def test_the_keyring_join_leaves_the_callers_session_keyring_behind():
     import sys
 
     own = subprocess.run([sys.executable, "-I", "-S", "-c", _SESSION_KEYRING_ID], capture_output=True, text=True)
-    joined = subprocess.run([sys.executable, "-I", "-S", "-c", confinement._HANDS_KEYRING_JOIN,
+    joined = subprocess.run([sys.executable, "-I", "-S", "-c", confinement._HANDS_START, str(os.getpid()),
                              sys.executable, "-I", "-S", "-c", _SESSION_KEYRING_ID], capture_output=True, text=True)
     assert own.returncode == 0 and joined.returncode == 0, (own.stderr, joined.stderr)
     assert int(own.stdout) > 0 and int(joined.stdout) > 0
     assert own.stdout != joined.stdout
+
+
+@pytest.mark.skipif(platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"),
+                    reason="the start program is Linux's")
+def test_a_hands_command_ends_when_levain_is_killed():
+    """RUN 2026-10-09 (R5): levain SIGKILLed mid-command left the hands command's bash and a setsid child
+    running, because --die-with-parent binds to sudo and sudo outlives levain. Here a stand-in levain
+    starts a command through the start program and is SIGKILLed; the command must be gone soon after."""
+    import sys
+    import time
+
+    levain = subprocess.Popen(
+        [sys.executable, "-I", "-S", "-c",
+         "import os, subprocess, sys, time; p = subprocess.Popen([sys.executable, '-I', '-S', '-c', sys.argv[1], "
+         "str(os.getpid()), '/bin/sleep', '120']); print(p.pid, flush=True); time.sleep(120)",
+         confinement._HANDS_START], stdout=subprocess.PIPE, text=True)
+    child = int(levain.stdout.readline())   # type: ignore[union-attr]
+    time.sleep(0.5)
+    assert Path(f"/proc/{child}").exists()
+    levain.kill()
+    levain.wait()
+
+    def gone() -> bool:
+        try:
+            return Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+        except FileNotFoundError:
+            return True
+
+    deadline = time.monotonic() + 10
+    while not gone() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert gone()
 
 
 def test_the_hands_argv_refuses_an_op_it_does_not_know(monkeypatch):
