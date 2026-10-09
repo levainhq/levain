@@ -7244,10 +7244,11 @@ class _BwrapShell(SandboxedShell):
         return True
 
     def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
-        with self._lock:
-            # A run() re-entered on the thread that holds a preflight (a signal handler, say) is refused
-            # as concurrent, and must not end the outer run's preflight (complement L3 r7).
-            outer = self._preflight_thread == threading.get_ident()
+        # A run() re-entered on the thread that holds a preflight (a signal handler, say) is refused as
+        # concurrent, and must not end the outer run's preflight (complement L3 r7). Read without `_lock`:
+        # a handler may interrupt this thread while it holds it (codex L3 r8); only this thread writes
+        # its own ident there.
+        outer = self._preflight_thread == threading.get_ident()
         try:
             return super().run(command, timeout=timeout)
         finally:
@@ -7311,16 +7312,21 @@ class _BwrapShell(SandboxedShell):
         drained = own or self._preflight_done.wait(_HANDS_WALK_TIMEOUT + 30)
         if not drained:
             _log.warning("levain: a command being prepared on the shell did not stop after close(); the "
-                         "shell's claim on the floor's files is kept until this levain exits")
+                         "shell keeps its claim on the floor's files: call close() again once it has")
         try:
             super().close()
         finally:
             if self._relay is not None:
                 self._relay.stop()   # after the commands: nothing inside is left to use it
-            claim, self._ledger_claim = self._ledger_claim, None
-            _LIVE_BWRAP_SHELLS.discard(self)
-            if claim is not None and drained and not self.unemptied_groups and self._settled():
-                _ledger_release(claim)
+            if drained:
+                claim, self._ledger_claim = self._ledger_claim, None
+                _LIVE_BWRAP_SHELLS.discard(self)
+                if claim is not None and not self.unemptied_groups and self._settled():
+                    _ledger_release(claim)
+            # Not drained: the shell keeps its claim and its registration, so a spawn the outstanding
+            # preflight still makes is retagged onto the claim and swept with the shell, and a later
+            # close() releases it (codex + glm + complement L3 r8: a detached claim left that leaf
+            # untagged; RUN on w24, the late spawn saw no claim).
 
     def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
         self._command_since = time.time()
