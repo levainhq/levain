@@ -3376,15 +3376,17 @@ class SandboxedShell:
             not_running = "shell is not running (call start() first, and not after close())"
             if self._closed:
                 raise ConfinementError(not_running)
-            # Before the started check, as the provider's checks ran before it when they lived in its own
-            # run(): an unstarted shell's floor is checked too (tests/test_jewel_recheck.py drives that).
-            self._before_command()
-            if not self._started:
-                raise ConfinementError(not_running)
             if "\0" in command:
                 raise ConfinementError(
                     "refusing a command that contains a NUL byte: bash cannot receive it whole."
                 )
+            # The provider's checks run before the started refusal, as they did in its own run(), so an
+            # unstarted shell's floor is checked too; whether it was started is read BEFORE them, so a
+            # start() finishing during a long check does not let this command in (codex L3 r6).
+            started = self._started
+            self._before_command()
+            if not started:
+                raise ConfinementError(not_running)
             self._prune_groups()
             late = self._late_output()
             r = self._execute(command, self._default_timeout if timeout is None else timeout)
@@ -7167,8 +7169,14 @@ class _BwrapShell(SandboxedShell):
         self._relay: _HandsRelay | None = None   # a hands launch's host-side proxy relay, if any
         self._hands: HandsIdentity | None = None   # a hands launch's user, whose files are repaired
         self._command_since = 0.0
-        self._walk_done = threading.Event()   # clear while a pre-command walk runs
-        self._walk_done.set()
+        # Clear from a run()'s admission (`_before_command`, under `_lock`, refused once closed) until its
+        # command's group is registered or the run is refused. close() waits for it, so it never settles
+        # or releases the claim while a spawn is being prepared (codex L3 r6, RUN on w22: the claim was
+        # released and a sandbox then spawned without one). Admission under the close lock, and close
+        # draining what was admitted, as concurrent.futures and net/http's Server.Shutdown do.
+        self._preflight_done = threading.Event()
+        self._preflight_done.set()
+        self._preflight_thread: int | None = None   # the run thread that holds it
 
     def start(self) -> "SandboxedShell":
         super().start()
@@ -7235,9 +7243,24 @@ class _BwrapShell(SandboxedShell):
                     del self._named[leaf]
         return True
 
+    def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
+        try:
+            return super().run(command, timeout=timeout)
+        finally:
+            self._end_preflight()   # a run refused before its spawn; a no-op once `_spawn` ended it
+
+    def _end_preflight(self) -> None:
+        """End the run thread's preflight (see `_preflight_done`); a no-op on any other thread, so a
+        second run() refused as concurrent, or start()'s own spawn, never ends another thread's."""
+        with self._lock:
+            if self._preflight_thread != threading.get_ident():
+                return
+            self._preflight_thread = None
+            self._preflight_done.set()
+
     def _spawn(self) -> tuple[_Leader, _Output, _Carry]:
         try:
-            return super()._spawn()
+            return super()._spawn()   # its group is registered, or killed as closed, before it returns
         except BaseException:
             # A spawn that failed before its driver was recorded (Popen raised, or the watch could not
             # be set up and the driver was killed): kill whatever reached its leaf, and stop tracking
@@ -7251,6 +7274,9 @@ class _BwrapShell(SandboxedShell):
                         if self._named.get(leaf, False) is None:
                             del self._named[leaf]
             raise
+        finally:
+            # After the failed spawn's leaf is dealt with: close() settles only what this left behind.
+            self._end_preflight()
 
     def _leader_made(self, leader: _Leader) -> None:
         with self._lock:
@@ -7266,15 +7292,17 @@ class _BwrapShell(SandboxedShell):
         # that does not empty keeps the claim; once this levain is gone, the next Linux spawn's
         # `sweep_dead_leaves` kills the leaf and the ledger sweep then drops the claim. Released in
         # `finally`, whatever the base teardown did.
-        # A walk cannot start once this is set (`_refuse_once_closed`). One already running belongs to the
-        # run thread, which alone signals and reaps it: it sees this within 0.2 s, stops the walk's group
-        # and sets `_walk_done` (L3 r3: a second thread signalling it could reach a reused pid; r4: close()
-        # must not return with it alive).
+        # No run() is admitted once this is set. One already admitted belongs to the run thread, which alone
+        # signals and reaps its walk (L3 r3: a second thread signalling it could reach a reused pid): the
+        # walk sees this within 0.2 s, and the run ends its preflight refused or with its group registered,
+        # which `_spawn` then kills. close() waits for that (L3 r4, r6), except on the run thread itself,
+        # which closes the shell when it refuses a command.
         with self._lock:
             self._closed = True
+            own = self._preflight_thread == threading.get_ident()
         # Longer than the walk's own bound plus its group stop, so close() does not return before it.
-        if not self._walk_done.wait(_HANDS_WALK_TIMEOUT + 30):
-            _log.warning("levain: the shell's pre-command walk did not stop after close()")
+        if not own and not self._preflight_done.wait(_HANDS_WALK_TIMEOUT + 30):
+            _log.warning("levain: a command being prepared on the shell did not stop after close()")
         try:
             super().close()
         finally:
@@ -7422,6 +7450,11 @@ class _BwrapShell(SandboxedShell):
                 )
 
     def _before_command(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise ConfinementError("the shell was closed; the command was not run")
+            self._preflight_done.clear()
+            self._preflight_thread = threading.get_ident()
         hands = self._hands
         if hands is not None:
             # The walk again before every command (Phill 2026-10-09, "yes to both"): a socket or FIFO
@@ -7430,18 +7463,12 @@ class _BwrapShell(SandboxedShell):
             # A walk that could not be done says nothing about the host: that command is refused and the
             # shell stays (complement L3 r2). None starts once the shell is closed (codex L3 r2); one
             # running when it closes is stopped by this thread, its owner, and close() waits for that.
-            with self._lock:
-                if self._closed:
-                    raise ConfinementError("the shell was closed; the command was not run")
-                self._walk_done.clear()
             try:
                 found = _hands_walk(hands, self._refuse_once_closed, lambda: self._closed)
             except OSError as exc:
                 raise ConfinementError(
                     f"levain could not walk, as {hands.user}, the host files its bash would see ({exc}) — "
                     "the command was not run (fail-closed).") from exc
-            finally:
-                self._walk_done.set()
             if found:
                 self.close()
                 raise ConfinementError(f"{_hands_reach_text(hands, found)} — the shell was closed and the "
@@ -7597,8 +7624,6 @@ class BwrapProvider(ConfinementProvider):
     def hands_file(self, policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, path: str,
                    data: bytes = b"", *, timeout: float = 60.0) -> bytes:
         return _bwrap_hands_file(policy, hands, op, path, data, timeout)
-
-
 
     def _spawn_shell_impl(
         self,

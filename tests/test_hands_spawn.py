@@ -859,8 +859,9 @@ def _walking_shell(monkeypatch):
     shell._hands = _view_hands(monkeypatch)
     shell._lock = threading.Lock()
     shell._closed = False
-    shell._walk_done = threading.Event()
-    shell._walk_done.set()
+    shell._preflight_done = threading.Event()
+    shell._preflight_done.set()
+    shell._preflight_thread = None
     closed: list[bool] = []
     monkeypatch.setattr(confinement._BwrapShell, "close", lambda self: closed.append(True))
     monkeypatch.setattr(confinement._BwrapShell, "_recheck", lambda self: pytest.fail("ran past the walk"))
@@ -1057,3 +1058,39 @@ def test_the_hardlink_rule_sees_the_whole_policy_for_a_hands_launch(tmp_path, mo
     with pytest.raises(ConfinementError, match="2 names"):
         BwrapProvider().spawn_shell(policy, hands=hands)
     assert seen == [policy]
+
+
+def test_close_waits_for_an_admitted_command_until_its_spawn_is_registered(monkeypatch):
+    """codex L3 r6, RUN on w22: close() from another thread returned, and released the claim, while a
+    run() past its walk had not yet spawned; that spawn then ran with no claim. close() now waits for an
+    admitted run's preflight, except on the run thread itself, and no run is admitted once it is closed."""
+    import threading
+
+    shell = object.__new__(confinement._BwrapShell)
+    shell._hands = None
+    shell._lock = threading.Lock()
+    shell._closed = False
+    shell._preflight_done = threading.Event()
+    shell._preflight_done.set()
+    shell._preflight_thread = None
+    shell._relay = None
+    shell._ledger_claim = None
+    monkeypatch.setattr(confinement._BwrapShell, "_recheck", lambda self: None)
+    torn_down: list[bool] = []
+    monkeypatch.setattr(confinement.SandboxedShell, "close", lambda self: torn_down.append(True))
+
+    shell._before_command()                        # this thread is admitted: its spawn is being prepared
+    closer = threading.Thread(target=shell.close)
+    closer.start()
+    closer.join(0.5)
+    assert closer.is_alive() and torn_down == []   # close() waits for the admitted run
+    shell._end_preflight()                         # the run's group is registered (or it was refused)
+    closer.join(5)
+    assert not closer.is_alive() and torn_down == [True]
+    with pytest.raises(ConfinementError, match="closed"):
+        shell._before_command()                    # nothing is admitted once closed
+
+    shell._closed = False
+    shell._before_command()
+    shell.close()                                  # the run thread closing its own shell does not wait
+    assert torn_down == [True, True]
