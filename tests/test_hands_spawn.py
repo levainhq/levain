@@ -168,6 +168,8 @@ def test_a_timeout_whose_kill_did_not_land_is_not_reported_as_killed(tmp_path, m
     run refuses, saying the group is still running."""
     from levain.firing.confinement import SandboxedShell
 
+    if platform.system() == "Linux":
+        pytest.skip("a base shell is refused on Linux (S2 L3 r5)")
     ws = tmp_path / "ws"
     ws.mkdir()
     sh = SandboxedShell(argv=["/bin/bash", "--noprofile", "--norc"], cwd=ws,
