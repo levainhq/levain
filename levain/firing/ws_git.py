@@ -28,6 +28,7 @@ import os
 import platform
 import pwd
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -156,23 +157,10 @@ def _config_lines(config: Path, *args: str) -> list[str]:
 
 
 #: The git verbs that reach a remote. On Linux ws-git runs them with the hands user's net group,
-#: the one gid its egress boundary lets out (D, Phill 2026-10-09); every other verb keeps the hands
-#: user's own group, so it has no network at all. A network verb not listed here is refused by the
-#: boundary, not let out.
+#: the one gid its egress boundary lets out (D, Phill 2026-10-09), only when the verb is the FIRST
+#: argument: anything before it (a global option) and the command keeps the hands user's own group,
+#: with no network at all. A network verb not listed here is refused by the boundary, not let out.
 NET_VERBS = frozenset({"push", "fetch", "pull", "ls-remote"})
-#: git's global options that take a value as the next argument.
-_GIT_OPTS_WITH_VALUE = frozenset({"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path"})
-
-
-def git_verb(args: list[str]) -> str | None:
-    """The git subcommand in ``args`` (the first word that is not a global option or its value)."""
-    it = iter(args)
-    for a in it:
-        if a in _GIT_OPTS_WITH_VALUE:
-            next(it, None)
-        elif not a.startswith("-"):
-            return a
-    return None
 
 
 def ws_git_argv(hands: Hands, gitdir: Path, args: list[str], *, system: str | None = None) -> list[str]:
@@ -183,8 +171,9 @@ def ws_git_argv(hands: Hands, gitdir: Path, args: list[str], *, system: str | No
     the hands user writes its own ~/.ssh/config, and a ProxyCommand there would run as it."""
     from levain.firing.hands import deploy_key_path, hands_net_group
 
-    ssh = f"core.sshCommand=/usr/bin/ssh -F /dev/null -i {deploy_key_path(hands.home)} -o IdentitiesOnly=yes"
-    net = ((system or platform.system()) == "Linux" and git_verb(args) in NET_VERBS)
+    ssh = ("core.sshCommand=/usr/bin/ssh -F /dev/null -i " + shlex.quote(str(deploy_key_path(hands.home)))
+           + " -o IdentitiesOnly=yes")
+    net = (system or platform.system()) == "Linux" and bool(args) and args[0] in NET_VERBS
     return _as_hands(
         hands, _real_git(), *_NEUTRALISE, "-c", ssh, f"--git-dir={gitdir}", f"--work-tree={gitdir.parent}",
         "-C", str(gitdir.parent), *args,

@@ -864,6 +864,7 @@ def test_linux_setup_refuses_by_name_without_nft(monkeypatch) -> None:
 
 def test_linux_setup_refuses_by_name_when_the_kernel_refuses_nftables(monkeypatch) -> None:
     monkeypatch.setattr(hands.shutil, "which", lambda name, path=None: f"/usr/sbin/{name}")
+    monkeypatch.setattr(hands.os.path, "isdir", lambda p: p == "/run/systemd/system")
     monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
         argv, 1, "", "Error: Operation not permitted (you must be root)\n"))
     problem = hands.egress_unavailable()

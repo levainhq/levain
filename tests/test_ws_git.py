@@ -910,8 +910,8 @@ def test_on_linux_only_network_verbs_get_the_net_group_and_ssh_reads_no_config(t
     monkeypatch.setattr(ws_git, "_real_git", lambda: "/usr/bin/git")
     h = _hands(tmp_path)
     gitdir = h.workspace / "r" / ".git"
-    for args, net in ((["push", "origin", "main"], True), (["-c", "x.y=z", "fetch"], True),
-                      (["status"], False), (["-C", "push", "log"], False)):
+    for args, net in ((["push", "origin", "main"], True), (["ls-remote"], True), (["-c", "x.y=z", "fetch"], False),
+                      (["status"], False), (["-C", "push", "log"], False), (["--super-prefix", "push", "status"], False)):
         argv = ws_git.ws_git_argv(h, gitdir, args, system="Linux")
         assert (("-g", f"{h.user}_net") == tuple(argv[4:6])) is net, args
     assert "-g" not in ws_git.ws_git_argv(h, gitdir, ["push"], system="Darwin")[:6]

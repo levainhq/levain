@@ -209,6 +209,11 @@ def egress_unit_text(hands_user: str) -> str:
         "DefaultDependencies=no",
         "Before=network-pre.target",
         "Wants=network-pre.target",
+        # nftables.service's own config starts with `flush ruleset` on Debian-family hosts: load after
+        # it, and run again whenever it is restarted, or a boot or a restart of it deletes this table.
+        "After=nftables.service local-fs.target",
+        "PartOf=nftables.service",
+        "Before=sysinit.target",
         "",
         "[Service]",
         "Type=oneshot",
@@ -216,7 +221,7 @@ def egress_unit_text(hands_user: str) -> str:
         f"ExecStart={_abs('nft')} -f {egress_rules_path(hands_user)}",
         "",
         "[Install]",
-        "WantedBy=sysinit.target",
+        "WantedBy=sysinit.target nftables.service",
         "",
     ])
 
@@ -228,6 +233,9 @@ def egress_unavailable() -> str | None:
         if shutil.which(tool, path=SECURE_PATH) is None:
             return (f"{package} is not installed (no `{tool}` on {SECURE_PATH}); the hands user's network "
                     f"boundary needs it. Install {package}, then run setup again")
+    if not os.path.isdir("/run/systemd/system"):
+        return ("systemd is not running as init here (no /run/systemd/system), so nothing would load the hands "
+                "user's network boundary at boot")
     try:
         r = subprocess.run([_abs("nft"), "list", "tables"], capture_output=True, text=True, timeout=30,
                            env=child_env())
@@ -247,12 +255,11 @@ def _egress_table_loaded(hands_user: str) -> tuple[bool, str]:
 
 
 def _egress_table_absent(hands_user: str) -> tuple[bool, str]:
-    nft = _abs("nft")
-    table = egress_table(hands_user)
-    if subprocess.run([nft, "list", "table", "inet", table], capture_output=True, env=child_env()).returncode != 0:
-        return True, ""
-    r = subprocess.run([nft, "delete", "table", "inet", table], capture_output=True, text=True, env=child_env())
-    return (r.returncode == 0, (r.stderr or r.stdout).strip())
+    r = subprocess.run([_abs("nft"), "delete", "table", "inet", egress_table(hands_user)],
+                       capture_output=True, text=True, env=child_env())
+    said = (r.stderr or r.stdout).strip()
+    # Only the kernel saying there is no such table is "already gone"; any other failure is a failure.
+    return (True, "") if r.returncode == 0 or "No such file or directory" in said else (False, said)
 
 
 _EGRESS_PROBE = (
@@ -267,15 +274,30 @@ _EGRESS_PROBE = (
 )
 
 
-def egress_boundary_problem(hands_user: str, ports: tuple[int, ...] = (), *, timeout: float = 15.0) -> str | None:
+_ECONNREFUSED = 111   # Linux; what a connect gets from `reject with tcp reset`
+
+
+def _probe_connect(hands_user: str, port: int, group: str | None, timeout: float) -> tuple[str, str]:
+    """(what the hands user's connect to 127.0.0.1:``port`` printed, stderr), run with ``group`` as its
+    gid when given."""
+    r = subprocess.run(["/usr/bin/sudo", "-n", "-u", hands_user, *(("-g", group) if group else ()), "/usr/bin/env", "-i",
+                        f"PATH={SECURE_PATH}", _abs("python3"), "-I", "-c", _EGRESS_PROBE, str(port)],
+                       capture_output=True, text=True, timeout=timeout, cwd="/", env=child_env())
+    return (r.stdout or "").strip(), (r.stderr or "").strip() or f"exit {r.returncode}"
+
+
+def egress_boundary_problem(hands_user: str, ports: tuple[int, ...] = (), *, net_group: str | None = None,
+                            timeout: float = 15.0) -> str | None:
     """Does the hands user's network boundary hold, asked of the kernel rather than the ruleset (which
     only root can list)? None when it holds, else what is wrong. Run by the operator, who may run
     commands as the hands user (the sudoers rule setup wrote).
 
     The operator listens on a loopback port the boundary does not allow, and the hands user tries to
-    connect to it. It holds when that connect fails, nothing from the hands user reached the listener,
-    AND the operator's own connect to the same listener then succeeds: without that last step a dead
-    listener would read as a boundary. A probe that cannot run is a problem, never a pass."""
+    connect to it. It holds when that connect is refused with ECONNREFUSED (the rule's reset; a timeout
+    or another error is some other mechanism and proves nothing), nothing from the hands user reached
+    the listener, AND the operator's own connect then lands (a dead listener must not read as a
+    boundary). With ``net_group``, the same connect made with that gid must land too: the boundary's
+    one way out works. A probe that cannot run is a problem, never a pass."""
     import socket
 
     listener = socket.socket()
@@ -286,34 +308,38 @@ def egress_boundary_problem(hands_user: str, ports: tuple[int, ...] = (), *, tim
             listener = socket.socket()
             listener.bind(("127.0.0.1", 0))
         listener.listen(4)
-        listener.setblocking(False)
+        listener.settimeout(3)
         port = listener.getsockname()[1]
+
+        def landed() -> bool:
+            try:
+                listener.accept()[0].close()
+                return True
+            except OSError:
+                return False
+
         try:
-            r = subprocess.run(["/usr/bin/sudo", "-n", "-u", hands_user, "/usr/bin/env", "-i", f"PATH={SECURE_PATH}",
-                                _abs("python3"), "-I", "-c", _EGRESS_PROBE, str(port)],
-                               capture_output=True, text=True, timeout=timeout, cwd="/", env=child_env())
+            said, err = _probe_connect(hands_user, port, None, timeout)
         except (OSError, subprocess.TimeoutExpired) as exc:
             return f"the probe could not run as {hands_user} ({exc})"
-        said = (r.stdout or "").strip()
-        reached = False
-        try:
-            listener.accept()[0].close()
-            reached = True
-        except BlockingIOError:
-            pass
-        if said == "connected" or reached:
+        listener.settimeout(0.2)
+        if said == "connected" or landed():
             return (f"{hands_user} connected to a loopback port its boundary does not allow: nothing confines "
                     "its network (the nftables rule is not loaded)")
-        if not said.startswith("refused"):
-            return f"the probe could not run as {hands_user} ({(r.stderr or said).strip() or f'exit {r.returncode}'})"
-        control = socket.create_connection(("127.0.0.1", port), timeout=3)
-        control.close()
-        try:
-            listener.setblocking(True)
-            listener.settimeout(3)
-            listener.accept()[0].close()
-        except OSError as exc:
-            return f"the probe's own listener did not answer ({exc}), so the refusal proves nothing"
+        if said != f"refused {_ECONNREFUSED}":
+            return f"the probe as {hands_user} did not get the boundary's refusal ({said or err})"
+        listener.settimeout(3)
+        socket.create_connection(("127.0.0.1", port), timeout=3).close()
+        if not landed():
+            return "the probe's own listener did not answer, so the refusal proves nothing"
+        if net_group is not None:
+            try:
+                said, err = _probe_connect(hands_user, port, net_group, timeout)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return f"the probe could not run as {hands_user} with {net_group} ({exc})"
+            if said != "connected" or not landed():
+                return (f"{hands_user} with the gid of {net_group} could not connect ({said or err}): network git "
+                        "(levain ws-git push/fetch) would be refused too")
         return None
     except OSError as exc:
         return f"the probe failed ({exc})"
@@ -357,8 +383,9 @@ def _net_group_retired_and_gone(hands_user: str) -> tuple[bool, str]:
 
 
 def net_group_problem(hands_user: str) -> str | None:
-    """Why the net group could let a process of the hands user out on its own, or None: the hands
-    user must not be a member of it (a member takes the gid with ``sg`` or ``newgrp``, no password)."""
+    """Why a process of the hands user could get past the boundary by taking another id, or None: the
+    hands user must not be a member of its net group (a member takes the gid with ``sg`` or ``newgrp``,
+    no password), nor have a subordinate id range."""
     import grp
 
     name = hands_net_group(hands_user)
@@ -373,6 +400,14 @@ def net_group_problem(hands_user: str) -> str | None:
             return f"{name} is {hands_user}'s primary group, so every one of its processes is let out"
     except KeyError:
         pass
+    # A subordinate id range lets a process map itself to other ids (newuidmap), and the rule matches
+    # the hands user's own uid: setup never gives one (useradd --system), so one here was added since.
+    for db in (Path("/etc/subuid"), Path("/etc/subgid")):
+        try:
+            if any(ln.split(":", 1)[0] == hands_user for ln in db.read_text(encoding="utf-8").splitlines()):
+                return f"{hands_user} has a range in {db}, so its processes can take ids the boundary does not match"
+        except OSError:
+            pass
     return None
 
 
