@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum
 
-__all__ = ["RiskClass", "ActionRisk", "ActionManifest", "UnknownAction"]
+__all__ = ["RiskClass", "ActionRisk", "ActionManifest", "ManifestFrozen", "UnknownAction"]
 
 
 class RiskClass(IntEnum):
@@ -59,6 +59,11 @@ class UnknownAction(KeyError):
     model could reach by NAMING an action you never declared), never a silent low-risk default."""
 
 
+class ManifestFrozen(RuntimeError):
+    """Raised by :meth:`ActionManifest.register` on a manifest a gate holds (desk ruling (a), 2026-10-09):
+    a declaration changes by building a new manifest and a new gate, never by editing one in place."""
+
+
 class ActionManifest:
     """A registry of ``action_name → ActionRisk``. Fail-closed by construction (§1.3): an
     unregistered action raises :class:`UnknownAction` — there is deliberately NO "default risk,"
@@ -68,15 +73,37 @@ class ActionManifest:
     The manifest is the governance artifact (Memory-Is-Governance at the action layer, §2.6): the
     operator governs the gradient by editing declarations here, the agent earns its way down it with
     evidence. Stdlib-only; the concrete per-deployment action set is the adapter's (fossil), this
-    schema is the yeast."""
+    schema is the yeast.
+
+    FROZEN PER GATE (desk ruling (a), 2026-10-09): an :class:`~levain.autonomic.gate.EfferentGate`
+    freezes the manifest it is built with, and :meth:`register` raises :class:`ManifestFrozen` from then
+    on. A change to the declarations, a TIGHTENING included, takes effect by building a new manifest and
+    swapping in a new gate built on it, ATOMICALLY with respect to admission: the holder replaces its one
+    reference to the gate, so an admission in flight on the old gate reads only the old manifest and every
+    later one only the new, never a mix of the two. The trust-tiering fold's change to a standing policy
+    MUST take effect through that same swap. A binding risk resolver that reads a manifest of its own
+    (an adapter's tool-risk manifest) freezes it too, and is swapped with the gate it serves."""
 
     def __init__(self, actions: dict[str, ActionRisk] | None = None) -> None:
         self._actions: dict[str, ActionRisk] = dict(actions or {})
+        self._frozen = False
 
     def register(self, name: str, risk: ActionRisk) -> None:
-        """Declare (or re-declare) an action's risk. Last-writer-wins — a deployment composes its
-        manifest by registering the actions it has consciously classed."""
+        """Declare (or re-declare) an action's risk while the manifest is being composed. Last-writer-wins.
+        Raises :class:`ManifestFrozen` once a gate holds the manifest (:meth:`freeze`)."""
+        if self._frozen:
+            raise ManifestFrozen(
+                f"cannot register {name!r}: a gate holds this manifest; build a new manifest and swap in a "
+                "new gate built on it")
         self._actions[name] = risk
+
+    def freeze(self) -> None:
+        """End composition: every later :meth:`register` raises. Idempotent. The gate calls it."""
+        self._frozen = True
+
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
 
     def risk_of(self, name: str) -> ActionRisk:
         """Return the declared risk, or raise :class:`UnknownAction` (fail-closed — §1.3)."""

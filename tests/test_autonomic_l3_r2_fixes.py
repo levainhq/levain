@@ -94,3 +94,18 @@ def test_an_allowed_signers_file_the_operator_owns_is_refused(tmp_path, monkeypa
     w.dispatch("a1")
     assert not w.resolve_open(approve=True).completed
     assert ("link1", "a1-1") not in w.outbox()
+
+
+def test_a_manifest_a_gate_holds_cannot_be_edited(tmp_path):
+    # desk ruling (a) 2026-10-09: frozen per gate; a change is a new gate on a new manifest
+    import pytest
+    from levain.autonomic import ActionManifest, ManifestFrozen
+    from tests.test_autonomic_journal_wiring import LOW
+    w = World(tmp_path)
+    m = w.gate._manifest
+    assert m.frozen
+    with pytest.raises(ManifestFrozen):
+        m.register("link1", LOW)
+    fresh = ActionManifest({"link0": LOW})
+    fresh.register("link1", HIGH)                                      # composing before a gate holds it
+    assert not fresh.frozen

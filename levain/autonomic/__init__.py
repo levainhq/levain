@@ -74,6 +74,14 @@ Architecture:
     effect's admission over the challenge for the CURRENT fence: an approval with no signature, or
     signed under another fence, does not run, and its hold reopens for a new signed decision.
 
+  The manifest is FROZEN per gate (desk ruling (a), 2026-10-09): the gate freezes the manifest it is
+  built with and ``register`` raises ``ManifestFrozen`` from then on. A change to the declarations, a
+  tightening included, takes effect by swapping in a NEW gate on a new manifest, atomically with respect
+  to admission (an admission in flight sees the old gate or the new, never a mix). The trust-tiering
+  fold's standing-policy change MUST use that swap. A test of the swap's atomicity is owed by that fold:
+  on e3e5010 a tightening registered mid-admission did not reproduce a mixed decision (the fence read
+  again at admission differed, so the gate re-checked and reopened the hold at the new rung).
+
 A lesson the fold carries for the surface that will put these decisions in front of a person:
   a perception layer that sees counts and not context asks about tuning, not decisions; LevainConnect's decision surface must not relearn it.
 """
@@ -165,7 +173,7 @@ from levain.autonomic.pending import PendingAction, PendingActionStore
 from levain.autonomic.policy import policy, risk_floor
 from levain.autonomic.posture import Posture
 from levain.autonomic.receipt import build_gate_face, build_gate_verdict
-from levain.autonomic.risk import ActionManifest, ActionRisk, RiskClass, UnknownAction
+from levain.autonomic.risk import ActionManifest, ActionRisk, ManifestFrozen, RiskClass, UnknownAction
 from levain.autonomic.store import GateReceiptStore, StoredGateReceipt
 from levain.autonomic.transport import ConfirmDecision, ConfirmProposal, ConfirmTransport
 from levain.autonomic.trust import (
@@ -182,6 +190,7 @@ __all__ = [
     "RiskClass",
     "ActionRisk",
     "ActionManifest",
+    "ManifestFrozen",
     "UnknownAction",
     # trust
     "SignalAuth",
