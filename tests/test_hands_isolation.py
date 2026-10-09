@@ -816,6 +816,7 @@ def test_linger_repair_on_an_existing_linux_install_succeeds(tmp_path: Path, mon
     monkeypatch.setattr(hands, "host_os", lambda: "linux")
     monkeypatch.setattr(hands, "egress_unavailable", lambda: None)
     monkeypatch.setattr(hands, "_group_exists", lambda n: False)
+    monkeypatch.setattr(hands, "_egress_dirs", lambda: (True, ""))
     monkeypatch.setattr(hands, "user_record_is_ours", lambda n, h: True)
     monkeypatch.setattr(hands, "used_ids", lambda h: set(range(901, 1000)))
     monkeypatch.setattr(hands, "retired_ids", lambda h: set())
