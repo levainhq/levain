@@ -5241,7 +5241,7 @@ def _leaf_rel(uid: int, unit: str) -> str:
 # in the name so the sweep judges only names it can read, whatever made them; a name without it is
 # never judged (L3 r12).
 # Bounded fields: a tag is read back from the ledger, and an unbounded digit run would not convert (L3 r14).
-_LEAF_UNIT = re.compile(r"levain-(\d{1,20})-(\d{1,10})-(\d{1,20})-[0-9a-f]{12}-\d{1,20}\.scope")
+_LEAF_UNIT = re.compile(r"levain-([0-9]{1,20})-([0-9]{1,10})-([0-9]{1,20})-[0-9a-f]{12}-[0-9]{1,20}\.scope")
 _INIT_PIDNS = "4026531836"
 
 
@@ -5262,7 +5262,19 @@ def _leaf_orphaned(rel: str, uid: int) -> bool:
     m = _LEAF_UNIT.fullmatch(rel[len(head):]) if rel.startswith(head) else None
     if m is None or m.group(1) != _INIT_PIDNS or _pidns() != _INIT_PIDNS:
         return False
-    return _proc_start_time(int(m.group(2))) != m.group(3)
+    # Gone means /proc says so: no such process, a zombie, or a later start time. A read that fails any
+    # other way, or a stat line too short to read, is not knowing, and an unknown maker keeps its leaf
+    # (L3 r15: an EMFILE here killed a live levain's command).
+    try:
+        data = Path(f"/proc/{int(m.group(2))}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    except OSError:
+        return False
+    fields = data.rsplit(")", 1)[-1].split()
+    if len(fields) < 20:
+        return False
+    return fields[0] in ("Z", "X", "x") or fields[19] != m.group(3)
 
 
 def sweep_dead_leaves() -> list[str]:

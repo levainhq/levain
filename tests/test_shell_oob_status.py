@@ -1309,7 +1309,7 @@ def test_only_the_initial_pid_namespace_makes_or_sweeps_leaves(tmp_path, monkeyp
     (base / dead).mkdir(parents=True)
     killed: list[str] = []
     monkeypatch.setattr(C, "_CGROUP_ROOT", tmp_path)
-    monkeypatch.setattr(C, "_proc_start_time", lambda pid: None if pid == 999999 else "7")
+    monkeypatch.setattr(C, "_proc_start_time", lambda pid: "7")
     monkeypatch.setattr(C, "_leaf_kill", lambda rel: killed.append(rel.rsplit("/", 1)[-1]) or True)
     monkeypatch.setattr(C, "_leaf_gone", lambda rel, timeout: True)
     monkeypatch.setattr(C, "_pidns", lambda: "4026532999")
@@ -1333,6 +1333,10 @@ def test_claim_recovery_judges_leaves_exactly_as_the_sweep_does(monkeypatch):
     gone = 2 ** 22 + 9   # a pid no process holds
     dead = f"{gone}:1:{C._INIT_PIDNS}:x"
     monkeypatch.setattr(C, "_proc_start_time", lambda pid: "77" if pid == os.getpid() else None)
+    real_read = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: (
+        f"{os.getpid()} (levain) S " + " ".join(["0"] * 18) + " 77 0" if str(self) == f"/proc/{os.getpid()}/stat"
+        else real_read(self, *a, **k)))
     foreign = f"{head}levain-4026532999-{gone}-1-{'a' * 12}-1.scope"
     assert C._claim_alive(f"{dead}:c{foreign}") and killed == []
     # L3 r14: a leaf whose own maker is alive is kept, whatever the claim's pid says.
