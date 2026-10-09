@@ -5262,19 +5262,31 @@ def _leaf_orphaned(rel: str, uid: int) -> bool:
     m = _LEAF_UNIT.fullmatch(rel[len(head):]) if rel.startswith(head) else None
     if m is None or m.group(1) != _INIT_PIDNS or _pidns() != _INIT_PIDNS:
         return False
-    # Gone means /proc says so: no such process, a zombie, or a later start time. A read that fails any
-    # other way, or a stat line too short to read, is not knowing, and an unknown maker keeps its leaf
-    # (L3 r15: an EMFILE here killed a live levain's command).
+    # Gone means the kernel says so: no such process, a zombie, or a later start time. A read that fails
+    # any other way, or a stat line too short to read, is not knowing, and an unknown maker keeps its
+    # leaf (L3 r15: an EMFILE here killed a live levain's command).
+    pid = int(m.group(2))
     try:
-        data = Path(f"/proc/{int(m.group(2))}/stat").read_text()
+        fields = _stat_fields(pid)
     except (FileNotFoundError, ProcessLookupError):
-        return True
+        try:
+            os.kill(pid, 0)   # a /proc that hides processes (hidepid) also says ENOENT (L3 r16)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            pass
+        return False
     except OSError:
         return False
-    fields = data.rsplit(")", 1)[-1].split()
     if len(fields) < 20:
         return False
-    return fields[0] in ("Z", "X", "x") or fields[19] != m.group(3)
+    return fields[0] in (b"Z", b"X", b"x") or fields[19] != m.group(3).encode()
+
+
+def _stat_fields(pid: int) -> list[bytes]:
+    """The fields of ``/proc/<pid>/stat`` after the command name, as bytes: a process sets its own
+    name, and one that does not decode must not stop a sweep (L3 r16)."""
+    return Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[-1].split()
 
 
 def sweep_dead_leaves() -> list[str]:

@@ -1302,14 +1302,15 @@ def test_only_the_initial_pid_namespace_makes_or_sweeps_leaves(tmp_path, monkeyp
 
     uid = os.getuid()
     base = tmp_path / C._user_manager_rel(uid) / C._LEVAIN_SLICE
-    dead = f"levain-{C._INIT_PIDNS}-999999-1-{'a' * 12}-1.scope"
+    gone = 2 ** 22 + 9   # above Linux's pid_max: no process holds it
+    dead = f"levain-{C._INIT_PIDNS}-{gone}-1-{'a' * 12}-1.scope"
     # Never judged: another namespace's name, and a name that does not say its namespace (L3 r12).
-    for other in (f"levain-4026532999-999999-1-{'c' * 12}-1.scope", f"levain-999999-1-{'d' * 12}-1.scope"):
+    for other in (f"levain-4026532999-{gone}-1-{'c' * 12}-1.scope", f"levain-{gone}-1-{'d' * 12}-1.scope"):
         (base / other).mkdir(parents=True)
     (base / dead).mkdir(parents=True)
     killed: list[str] = []
     monkeypatch.setattr(C, "_CGROUP_ROOT", tmp_path)
-    monkeypatch.setattr(C, "_proc_start_time", lambda pid: "7")
+    monkeypatch.setattr(C, "_proc_start_time", lambda pid: "7")   # this levain, naming its leaf
     monkeypatch.setattr(C, "_leaf_kill", lambda rel: killed.append(rel.rsplit("/", 1)[-1]) or True)
     monkeypatch.setattr(C, "_leaf_gone", lambda rel, timeout: True)
     monkeypatch.setattr(C, "_pidns", lambda: "4026532999")
@@ -1332,11 +1333,12 @@ def test_claim_recovery_judges_leaves_exactly_as_the_sweep_does(monkeypatch):
     head = f"{C._user_manager_rel(os.getuid())}/{C._LEVAIN_SLICE}/"
     gone = 2 ** 22 + 9   # a pid no process holds
     dead = f"{gone}:1:{C._INIT_PIDNS}:x"
-    monkeypatch.setattr(C, "_proc_start_time", lambda pid: "77" if pid == os.getpid() else None)
-    real_read = Path.read_text
-    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: (
-        f"{os.getpid()} (levain) S " + " ".join(["0"] * 18) + " 77 0" if str(self) == f"/proc/{os.getpid()}/stat"
-        else real_read(self, *a, **k)))
+
+    def stat(pid):
+        if pid != os.getpid():
+            raise FileNotFoundError(pid)
+        return [b"S"] + [b"0"] * 18 + [b"77", b"0"]   # field 22, the start time, is 77
+    monkeypatch.setattr(C, "_stat_fields", stat)
     foreign = f"{head}levain-4026532999-{gone}-1-{'a' * 12}-1.scope"
     assert C._claim_alive(f"{dead}:c{foreign}") and killed == []
     # L3 r14: a leaf whose own maker is alive is kept, whatever the claim's pid says.
