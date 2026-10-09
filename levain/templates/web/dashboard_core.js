@@ -727,7 +727,9 @@
     let lastGroup = null;
     for (const s of list) {
       // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order
-      if (s.group_title && s.group !== lastGroup) { p.appendChild(el("div", "grp-head", s.group_title)); lastGroup = s.group; }
+      const g = s.group || null;
+      if (s.group_title && g !== lastGroup) p.appendChild(el("div", "grp-head", s.group_title));
+      lastGroup = g;
       p.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
     }
     return p;
@@ -2542,7 +2544,8 @@
   document.addEventListener("keydown", (ev) => {
     if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
     const t = ev.target;
-    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    if (ev.defaultPrevented || modalKey) return;   // not behind an open overlay
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
     const idx = "1234".indexOf(ev.key);
     if (idx < 0 || ev.key.length !== 1) return;
     const tabs = document.querySelectorAll(".tab");
