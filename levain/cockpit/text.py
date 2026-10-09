@@ -30,7 +30,7 @@ def snapshot(cockpit: Cockpit, credential: dict[str, Any] | None = None, profile
     """The manifest plus every panel it lists, read once. A panel the kernel cannot produce is
     absent from ``panels`` and drawn as an error, never skipped."""
     cred = credential or LOCAL_CREDENTIAL
-    manifest = cockpit.manifest(cred)
+    manifest = cockpit.manifest(cred)   # a fault here propagates: the caller decides what the screen shows
     panels: dict[str, Any] = {}
     for pid in manifest["panels"]:
         try:
@@ -48,7 +48,7 @@ def visible(text: Any) -> str:
     out = []
     for ch in str(text):
         cat = unicodedata.category(ch)
-        if cat in ("Cc", "Cf") or ch in "  ":
+        if cat in ("Cc", "Cf", "Zl", "Zp"):
             out.append(f"<U+{ord(ch):04X}>")
         else:
             out.append(ch)
@@ -61,7 +61,7 @@ def _age(iso: str | None, now: datetime) -> str:
     try:
         dt = datetime.fromisoformat(iso)
     except ValueError:
-        return iso
+        return visible(iso)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     secs = max(0, int((now - dt).total_seconds()))
@@ -110,7 +110,9 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
         out.append((DIM, _fit(f"  {visible(head.get('empty') or 'Nothing here.')}", width)))
         return out
     kind = head["kind"]
-    if kind == "triage-list":
+    if panel.get("next") and not panel.get("rows") and not panel.get("value"):
+        out.append((DIM, _fit(f"  (summary only — open {visible(panel['next'])} for the content)", width)))
+    elif kind == "triage-list":
         out.extend(_rows(head, panel, width, top_n))
     elif kind == "line":
         for ln in (panel.get("value") or {}).get("lines", []):
@@ -133,6 +135,8 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
     elif kind == "prose":
         v = panel.get("value") or {}
         out.append((ROW, _fit(f"  {visible(v.get('headline') or '')}", width)))
+        for ln in str(v.get("markdown") or "").splitlines():
+            out.append((ROW, _fit(f"    {visible(ln)}", width)))
     return out
 
 
@@ -181,7 +185,11 @@ def render_lines(snap: dict[str, Any], width: int = 100, *, now: datetime | None
         if head is None:
             out.append((ERROR, f"{pid}: not in the manifest"))
             return
-        out.extend(_panel_lines(head, panels.get(pid), now, width, top_n))
+        # The panel payload is its own PanelHead plus rows/value, read in the same call: when it exists
+        # its status and error describe the rows below it. The manifest head was read earlier and may
+        # disagree (a source that failed in between), so it is only the fallback.
+        panel = panels.get(pid)
+        out.extend(_panel_lines(panel if panel is not None else head, panel, now, width, top_n))
 
     for pid in manifest["regions"].get("header", []):
         draw(pid)
