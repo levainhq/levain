@@ -4,6 +4,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
+### Added
+
+- **`levain.cockpit`: one manifest and one panel route, read side only.** `GET /cockpit/manifest.json` lists every panel (kind, priority, status, count, freshness, ETag) and `GET /cockpit/panel/<id>.json` serves one panel's rows or value, in a `full` or `compact` profile, with `?q=` to search row bodies and `?row=<id>` for one row in full. The kernel orders the rows once (a registered ordering with groups, so the Tray's TODAY / OVERDUE / ALSO bands are part of the order), computes status from a typed provider result (`Read`, `Absent` or `Fault`, so only a confirmed read of zero rows says `empty`), and a failed or silent refresher reads as `error`, not as a frozen `ok`. Both routes ride the dashboard's existing read gate; the responses are `Cache-Control: private` with `Vary` on the token header, so a shared cache never serves one caller's manifest to another. The built-in panels cover everything the dashboard shows. Nothing here writes: verbs and tiers are the next slice. `JobStore.list_recent` is new beside it, and `scripts/cockpit_payload_diff.py` diffs a saved or live payload against the design's field map.
+
 ## [0.7.1] — 2026-10-10
 
 Closes two of 0.7.0's known open issues (the Linux resolver deputy and concurrent codex installs) and fixes defects in the codex adapter and `ws-adopt`.

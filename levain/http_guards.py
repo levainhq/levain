@@ -103,15 +103,21 @@ class GuardedHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", _CSP)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        # Snapshots are per-request; never let a browser cache a stale one.
-        self.send_header("Cache-Control", "no-store")
+        # Snapshots are per-request; never let a browser cache a stale one. A route that serves a
+        # revalidatable, per-credential body (the cockpit's ETag'd reads) sets ``_cache_control``
+        # for that one response through ``_send(cache_control=...)``; nothing else does.
+        self.send_header("Cache-Control", getattr(self, "_cache_control", None) or "no-store")
         super().end_headers()
 
     def _send(
-        self, body: bytes, content_type: str, status: int = 200, *, head: bool = False
+        self, body: bytes, content_type: str, status: int = 200, *, head: bool = False,
+        headers: "list[tuple[str, str]] | None" = None, cache_control: str | None = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
+        for name, value in headers or ():
+            self.send_header(name, value)
+        self._cache_control = cache_control
         # Always the length the GET body WOULD be, so a HEAD reports correct framing without a body.
         self.send_header("Content-Length", str(len(body)))
         # When the connection is being closed (a refused write whose body was not read), say so,
@@ -119,6 +125,7 @@ class GuardedHandler(BaseHTTPRequestHandler):
         if self.close_connection:
             self.send_header("Connection", "close")
         self.end_headers()
+        self._cache_control = None
         if not head:
             self.wfile.write(body)
 
