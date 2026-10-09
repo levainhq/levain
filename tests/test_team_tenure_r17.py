@@ -1,5 +1,5 @@
-"""Code L3 round 16 on init's publish (9d28da7..e23e80a): each test is a RUN that failed on e23e80a (1009+15 residue
-R-D and the item-2/item-3 runs in levain project_memory/1009-6_REVIEWS/).
+"""Code L3 round 16 on init's publish (9d28da7..e23e80a): each test is a RUN that failed on e23e80a (a lost race with
+the origin unreachable, a descendant tip, a local-only checkout on another branch), built into a test.
 
 P1 a lost race whose tip probe FAILS is never read as absent, so --pack seeds nothing · P2 a tip that descends from
 our genesis is ours, never a lost race · P3 a local-only clone's re-attach advice works when the checkout is on
