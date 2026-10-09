@@ -24,7 +24,7 @@ from levain.dashboard import FOCUS_STALE_AFTER_HOURS, SubstrateSource, Substrate
 SPORE_CAP = 5000
 # The view's own per-bucket limit is raised out of the way so the cockpit's cap is applied AFTER the
 # hold filter: ranking and holds decide what is visible, then the cap truncates what is visible.
-VIEW_SPORE_LIMIT = 10_000_000
+VIEW_SPORE_LIMIT = 100_000
 EDITS_LIMIT = 20
 # An undated handoff stops leading after this many days untouched: it says "pick up here next
 # session", and a calendar that has refuted that must not keep it first (flow, 2026-08-27, where
@@ -91,9 +91,14 @@ def _spore_provider(
                 filtered += 1           # surface date not reached: held on purpose, not unreadable
                 continue
             rows.append(_spore_row(s, ctx.today))
-        capped = apply_hold and len(rows) > SPORE_CAP   # a lookup by id is never truncated
+        view_full = len(items) >= VIEW_SPORE_LIMIT
+        over = max(0, len(rows) - SPORE_CAP) if apply_hold else 0
         rows = rows[:SPORE_CAP] if apply_hold else rows
-        skipped = ((1, f"capped at {SPORE_CAP}; at least this many more exist"),) if capped else ()
+        skipped = ()
+        if over:
+            skipped = ((over, f"over the display cap of {SPORE_CAP}"),)
+        elif view_full:
+            skipped = ((1, f"the substrate view stopped at {VIEW_SPORE_LIMIT} rows; at least this many more exist"),)
         return Read(rows=tuple(rows), filtered=((filtered, "surface date not reached"),) if filtered else (),
                     skipped=skipped)
     return read
@@ -111,6 +116,8 @@ def _spore_read_one(source: SubstrateSource, bucket: str) -> Callable[[ReadConte
         for r in res.rows or ():
             if r.id == row_id:
                 return Read(rows=(r,))
+        if res.skipped:    # the scan was truncated: not finding the row proves nothing
+            return Fault(f"row {row_id!r} not found, but the scan was truncated")
         return Absent(f"row {row_id!r} is gone")
     return read_one
 
@@ -195,6 +202,8 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
             from anneal_memory.crystal import CrystalStore
 
             raw = CrystalStore(path).active()   # the ONE read this panel makes; the view's copy is not used
+            if not path.exists():           # anneal reads a vanished file as an empty store
+                return Absent(f"no crystal store at {path}")
         except Exception as exc:  # noqa: BLE001 - any store fault is a Fault, not an empty list
             return Fault(f"crystal store unreadable: {type(exc).__name__}: {exc}")
         rows, dropped = [], 0
@@ -207,7 +216,7 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
                 act = str(c.get("activation_mode", ""))
                 perm = str(c.get("permanence", ""))
                 last = str(c.get("last_activated_on", ""))
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 dropped += 1
                 continue
             rows.append(RowIn(
