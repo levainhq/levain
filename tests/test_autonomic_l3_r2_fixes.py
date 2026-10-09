@@ -147,3 +147,19 @@ def test_a_fence_that_moves_once_during_admission_checks_again_and_keeps_the_app
     out = w.gate.resolve(pid, yes, chain_owned=True)
     assert moved and len(inside) >= 2                                  # checked again after the move
     assert out.fired and ("link1", "r1-1") in w.outbox()
+
+
+def test_a_child_forked_while_the_compose_lock_is_held_can_still_compose():
+    # codex r8 1: a fork while the lock was held left the child a lock nobody could release
+    import os
+    import pytest
+    import levain.autonomic.risk as risk_mod
+    if not hasattr(os, "fork"):
+        pytest.skip("no fork on this platform")
+    with risk_mod._COMPOSE_LOCK:
+        pid = os.fork()
+        if pid == 0:                                                   # the child
+            ok = risk_mod._COMPOSE_LOCK.acquire(timeout=2)
+            os._exit(0 if ok else 1)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0

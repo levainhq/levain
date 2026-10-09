@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+import os
 import threading
 
 __all__ = ["RiskClass", "ActionRisk", "ActionManifest", "ManifestFrozen", "UnknownAction"]
@@ -61,8 +62,19 @@ class UnknownAction(KeyError):
 
 
 # register and freeze: a register lands in the copy a gate holds, or raises. Module-level, so a manifest
-# stays copyable and picklable.
+# carries no lock of its own. Only register against a gate's freeze is serialized; composing one manifest
+# (or copying it) from two threads at once is not supported. A forked child gets a fresh lock, as
+# ``logging`` does for its own: a lock held by a thread that does not exist in the child never releases.
 _COMPOSE_LOCK = threading.Lock()
+
+
+def _fresh_lock_in_child() -> None:
+    global _COMPOSE_LOCK
+    _COMPOSE_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):   # not on Windows
+    os.register_at_fork(after_in_child=_fresh_lock_in_child)
 
 
 class ManifestFrozen(RuntimeError):
