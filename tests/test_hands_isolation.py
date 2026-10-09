@@ -497,6 +497,7 @@ def test_setup_refuses_an_entity_already_set_up(tmp_path: Path, monkeypatch, cap
     (ed / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))
     monkeypatch.setattr(hands, "invoking_operator", lambda: os.environ.get("USER") or "root")
     monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: hands.pwd.getpwuid(os.getuid()))
+    monkeypatch.setattr(hands, "host_os", lambda: "darwin")   # on Linux this is the linger repair
     assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 1
     assert "already set up" in capsys.readouterr().out
 
