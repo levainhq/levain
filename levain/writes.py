@@ -133,8 +133,9 @@ MAX_SPORE_TEXT_BYTES = 8 * 1024
 # so a runaway request can't persist a novel-length focus (the server body cap is the
 # outer backstop). Measured AFTER whitespace-collapse, the shape `write_focus` stores.
 MAX_FOCUS_TEXT_LEN = 500
-# The freeform operator state line shares the focus bound (one line, same masthead row).
-MAX_OPERATOR_STATE_TEXT_LEN = MAX_FOCUS_TEXT_LEN
+# The freeform operator state line's bound is the kernel's (dashboard.STATE_MAX_TEXT_LEN), so
+# the governed edit, the CLI write and every reader agree.
+from levain.dashboard import STATE_MAX_TEXT_LEN as MAX_OPERATOR_STATE_TEXT_LEN  # noqa: E402
 # Provenance for a focus set: who authored it. A small allowlist — anything else (a
 # spoofed HTTP value) falls back to the honest default for the only HTTP caller ("web").
 _FOCUS_SOURCE_ALLOWLIST = frozenset({"web", "tui", "cli", "app"})

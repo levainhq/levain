@@ -735,9 +735,16 @@ def _paint(stdscr: "curses.window", model: TuiModel) -> TuiModel:
             tag = " ⊙ no focus set "
             f_attr = curses.A_DIM
         st = view.state
-        if st is not None and st.text:  # the state line follows the focus, with its age
-            tag += f"· {st.text} · {st.age_label.replace('set ', '')} "
-        _safe_addstr(stdscr, 2, 2, tag[: w - 4], f_attr)
+        avail = w - 4
+        if st is not None and st.text:
+            # State gets its own width budget (up to a third of the row) so a long focus
+            # can never clip it away entirely; each part truncates within its own share.
+            st_tag = f"· {st.text} · {st.age_label.replace('set ', '')} "
+            st_w = min(len(st_tag), max(avail // 3, 0))
+            _safe_addstr(stdscr, 2, 2, tag[: max(avail - st_w, 0)], f_attr)
+            _safe_addstr(stdscr, 2, 2 + min(len(tag), max(avail - st_w, 0)), st_tag[:st_w])
+        else:
+            _safe_addstr(stdscr, 2, 2, tag[:avail], f_attr)
 
     left_w = min(_LEFT_W, w // 3)
     body_top, body_bottom = 3, h - 3  # inclusive rows for the body

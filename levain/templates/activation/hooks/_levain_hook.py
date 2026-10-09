@@ -521,6 +521,8 @@ _FOCUS_STALE_AFTER_HOURS = 18  # mirror dashboard.FOCUS_STALE_AFTER_HOURS
 # mirror writes.MAX_FOCUS_TEXT_LEN so the reader enforces the same bound as the writer.
 _MAX_FOCUS_TEXT_LEN = 500  # mirror writes.MAX_FOCUS_TEXT_LEN
 _STATE_EXPIRES_AFTER_HOURS = 8  # mirror dashboard.STATE_EXPIRES_AFTER_HOURS
+_STATE_MAX_TEXT_LEN = 500  # mirror dashboard.STATE_MAX_TEXT_LEN
+_STATE_CLOCK_SKEW_SECONDS = 300  # mirror dashboard.STATE_CLOCK_SKEW_SECONDS
 
 
 def _humanize_focus_age(delta_seconds: float) -> str:
@@ -637,7 +639,7 @@ def state_notice() -> str | None:
         return None
     rt = data.get("state")
     text = " ".join(rt.split()) if isinstance(rt, str) and rt.split() else None
-    if text is None or len(text) > _MAX_FOCUS_TEXT_LEN:
+    if text is None or len(text) > _STATE_MAX_TEXT_LEN:
         return None
     set_at = data.get("state_set_at")
     if not isinstance(set_at, str) or not set_at.strip():
@@ -649,11 +651,13 @@ def state_notice() -> str | None:
         delta = (datetime.now(timezone.utc) - ts).total_seconds()
     except (ValueError, TypeError, OverflowError):
         return None
-    if delta < 0 or delta >= _STATE_EXPIRES_AFTER_HOURS * 3600:
+    if delta < -_STATE_CLOCK_SKEW_SECONDS or delta >= _STATE_EXPIRES_AFTER_HOURS * 3600:
         return None
+    delta = max(delta, 0.0)
     return (
         f'[state] The operator\'s own words for how they are right now '
-        f'({_humanize_focus_age(delta)}): "{text}". Their report, reflected back verbatim.'
+        f'({_humanize_focus_age(delta)}): {json.dumps(text, ensure_ascii=False)}. '
+        f'Their report, reflected back verbatim.'
     )
 
 

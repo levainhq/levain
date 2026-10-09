@@ -600,6 +600,12 @@ def _read_focus(context_json: Path | None, now: datetime) -> "Focus | None":
 # A state older than this is not shown or injected: a stale "how I am" presented as
 # current is worse than none. UNLIKE focus (which flags a stale one), state DROPS it.
 STATE_EXPIRES_AFTER_HOURS = 8
+# One bound, enforced at write (``write_state`` refuses) AND at read (an over-cap state
+# reads as unset), so no surface shows a line another surface cannot. Mirrored by the hooks.
+STATE_MAX_TEXT_LEN = 500
+# A stamp up to this far in the future is clock skew between writer and reader (a phone
+# app, another machine), not bad data: it reads as age 0, never as unset.
+STATE_CLOCK_SKEW_SECONDS = 300
 
 
 @dataclass
@@ -624,8 +630,9 @@ def _read_state(context_json: Path | None, now: datetime) -> "State | None":
     """Read ``{state, state_set_at, state_source}`` from the live-context file. Same
     ingress rules as ``_read_focus`` (None = no source at all; fail-soft to
     ``text=None`` on a missing/unreadable/malformed file; whitespace collapsed;
-    superset-tolerant) plus EXPIRY: a state whose age cannot be established, is in the
-    future, or is older than ``STATE_EXPIRES_AFTER_HOURS`` reads as unset."""
+    superset-tolerant) plus EXPIRY: a state whose age cannot be established, is further
+    in the future than ``STATE_CLOCK_SKEW_SECONDS``, is older than
+    ``STATE_EXPIRES_AFTER_HOURS``, or is over ``STATE_MAX_TEXT_LEN`` reads as unset."""
     if context_json is None:
         return None
     empty = State(text=None, set_at=None, source=None)
@@ -643,8 +650,8 @@ def _read_state(context_json: Path | None, now: datetime) -> "State | None":
     set_at = raw_at if isinstance(raw_at, str) and raw_at.strip() else None
     raw_src = data.get("state_source")
     source = raw_src if isinstance(raw_src, str) and raw_src.strip() else None
-    if not text or not set_at:
-        return empty  # no text, or no stamp: age unknowable → not shown
+    if not text or not set_at or len(text) > STATE_MAX_TEXT_LEN:
+        return empty  # no text, no stamp (age unknowable) or over the cap → not shown
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     try:
@@ -654,8 +661,9 @@ def _read_state(context_json: Path | None, now: datetime) -> "State | None":
         delta = (now - ts).total_seconds()
     except (ValueError, TypeError, OverflowError):
         return empty
-    if delta < 0 or delta >= STATE_EXPIRES_AFTER_HOURS * 3600:
+    if delta < -STATE_CLOCK_SKEW_SECONDS or delta >= STATE_EXPIRES_AFTER_HOURS * 3600:
         return empty
+    delta = max(delta, 0.0)
     return State(text=text, set_at=set_at, source=source, age_label=_humanize_focus_age(delta))
 
 
@@ -740,7 +748,10 @@ def write_state(context_json: Path, text: str, *, source: str = "cli") -> None:
     (pop all three keys) as ``write_focus``, whose CONCURRENCY note applies unchanged.
     The text is stored verbatim apart from whitespace collapse; nothing reads meaning
     into it."""
-    _write_context_line(context_json, "state", text, source=source)
+    collapsed = " ".join(text.split())
+    if len(collapsed) > STATE_MAX_TEXT_LEN:
+        raise ValueError(f"state exceeds {STATE_MAX_TEXT_LEN} chars")
+    _write_context_line(context_json, "state", collapsed, source=source)
 
 
 @dataclass
@@ -1832,6 +1843,8 @@ def render_summary(view: SubstrateView) -> str:
         else:
             meta = f" ({view.focus.age_label})"
         lines.append(f"Focus: {view.focus.text}{meta}")
+    if view.state is not None and view.state.text:  # fresh only: _read_state drops an expired one
+        lines.append(f"State: {view.state.text} ({view.state.age_label})")
 
     h = view.health
     if h is not None:
@@ -1965,7 +1978,11 @@ def run_state(
     if clear:
         text = ""
     if text is not None:
-        write_state(context_json, text, source=source)
+        try:
+            write_state(context_json, text, source=source)
+        except ValueError as exc:
+            print(f"state not set: {exc}", file=sys.stderr)
+            return 2
         print(f"state set: {' '.join(text.split())}" if text.strip() else "state cleared")
         return 0
     state = _read_state(context_json, datetime.now(timezone.utc))
