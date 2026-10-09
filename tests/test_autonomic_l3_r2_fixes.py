@@ -161,8 +161,8 @@ def test_a_child_forked_while_the_compose_lock_is_held_can_still_compose():
         pytest.skip("no fork on this platform")
     root = Path(__file__).resolve().parents[1]
     probe = (
-        "import os, sys, levain.autonomic.risk as r\n"
-        f"assert r.__file__.startswith({str(root)!r}), r.__file__\n"
+        "import os, pathlib, levain.autonomic.risk as r\n"
+        f"assert pathlib.Path(r.__file__).resolve().is_relative_to({str(root)!r}), r.__file__\n"
         "with r._COMPOSE_LOCK:\n"
         "    pid = os.fork()\n"
         "    if pid == 0:\n"

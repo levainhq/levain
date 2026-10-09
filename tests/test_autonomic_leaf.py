@@ -31,7 +31,8 @@ from pathlib import Path
 
 import levain.autonomic
 
-PKG = Path(levain.autonomic.__file__).parent
+ROOT = Path(__file__).resolve().parents[1]   # the checkout under test, from this file, never an import
+PKG = ROOT / "levain" / "autonomic"
 
 ALLOWED_STDLIB = frozenset({
     "__future__", "collections", "contextlib", "copy", "dataclasses", "datetime", "enum", "fcntl",
@@ -89,18 +90,18 @@ def test_every_module_imports_only_the_allowlist_and_itself():
 
 def test_importing_the_package_loads_nothing_outside_it():
     probe = (
-        "import json, pkgutil, sys\n"
+        "import json, pathlib, pkgutil, sys\n"
         "import levain\n"
         "before = set(sys.modules)\n"
         "import levain.autonomic as pkg\n"
+        f"assert pathlib.Path(pkg.__file__).resolve().is_relative_to({str(ROOT)!r}), pkg.__file__\n"
         "for m in pkgutil.walk_packages(pkg.__path__, 'levain.autonomic.'):\n"
         "    __import__(m.name)\n"
         "print(json.dumps(sorted(set(sys.modules) - before)))\n"
     )
-    root = PKG.parents[1]   # the checkout under test, never another installed levain (codex r11)
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(root), os.environ.get("PYTHONPATH")]))}
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(ROOT), os.environ.get("PYTHONPATH")]))}
     out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True,
-                         cwd=root, env=env)
+                         cwd=ROOT, env=env)   # codex r11-r12: the checkout under test, never another install
     loaded = json.loads(out.stdout)
     assert sum(n.startswith("levain.autonomic.") for n in loaded) > 1
     stray = [n for n in loaded
