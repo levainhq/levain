@@ -262,10 +262,39 @@ def test_the_hands_argv_hides_the_operators_home_and_the_daemon_dirs_and_drops_w
         if tok.startswith("/") and tok != "/" and any(Path(tok) == r or Path(tok).is_relative_to(r) for r in roots):
             pytest.fail(f"{tok} is under a hidden root and still in the argv")
     assert ["--remount-ro", home] == out[-2:]
-    for flag in ("--unshare-user", "--disable-userns", "--unshare-net", "--unshare-pid", "--unshare-cgroup"):
+    # --unshare-ipc: RUN 2026-10-09, a 0666 queue of another user was listed inside a hands bash without it.
+    for flag in ("--unshare-user", "--disable-userns", "--unshare-ipc", "--unshare-net", "--unshare-pid",
+                 "--unshare-cgroup"):
         assert flag in out
     assert ["--bind", "/", "/"] == out[out.index("--bind"):out.index("--bind") + 3]
     assert ["--bind", "/home", "/home"] == out[out.index("/home") - 1:out.index("/home") + 2]
+
+
+def test_on_linux_every_hands_process_starts_through_the_keyring_join(tmp_path):
+    hands = _hands(tmp_path)
+    linux = hands_prefix(hands, system="Linux")
+    assert linux[-5:] == [confinement.HANDS_PYTHON, "-I", "-S", "-c", confinement._HANDS_KEYRING_JOIN]
+    assert confinement._HANDS_KEYRING_JOIN not in hands_prefix(hands, system="Darwin")
+
+
+_SESSION_KEYRING_ID = ("import ctypes, os; nr = {'x86_64': 250, 'aarch64': 219}[os.uname().machine]; "
+                       "libc = ctypes.CDLL(None); libc.syscall.restype = ctypes.c_long; "
+                       "print(libc.syscall(ctypes.c_long(nr), ctypes.c_long(0), ctypes.c_long(-3), ctypes.c_long(0)))")
+
+
+@pytest.mark.skipif(platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"),
+                    reason="session keyrings are Linux's")
+def test_the_keyring_join_leaves_the_callers_session_keyring_behind():
+    """RUN 2026-10-09: without it, a hands bash read a key the operator added to @s (KEYCTL_GET_KEYRING_ID
+    of @s, created if absent, differs once the join has run)."""
+    import sys
+
+    own = subprocess.run([sys.executable, "-I", "-S", "-c", _SESSION_KEYRING_ID], capture_output=True, text=True)
+    joined = subprocess.run([sys.executable, "-I", "-S", "-c", confinement._HANDS_KEYRING_JOIN,
+                             sys.executable, "-I", "-S", "-c", _SESSION_KEYRING_ID], capture_output=True, text=True)
+    assert own.returncode == 0 and joined.returncode == 0, (own.stderr, joined.stderr)
+    assert int(own.stdout) > 0 and int(joined.stdout) > 0
+    assert own.stdout != joined.stdout
 
 
 def test_the_hands_argv_refuses_an_op_it_does_not_know():
@@ -746,14 +775,15 @@ def test_the_linux_editor_refuses_by_name_without_zsh(tmp_path, monkeypatch):
         BwrapProvider().hands_file(policy, hands, "read", str(hands.workspace / "a.txt"))
 
 
-def test_a_hands_launch_with_egress_ports_refuses_without_python3_before_any_hands_process(tmp_path, monkeypatch):
+def test_a_hands_launch_refuses_without_python3_before_any_hands_process(tmp_path, monkeypatch):
+    # python3 runs the keyring join in front of every Linux hands process, ports or none.
     real_access = os.access
     monkeypatch.setattr(confinement.os, "access",
                         lambda p, mode, **kw: False if p == confinement.HANDS_PYTHON else real_access(p, mode, **kw))
     monkeypatch.setattr(confinement, "_require_hands_sudo", lambda h: pytest.fail("a hands process ran first"))
-    h = _hands(tmp_path)
-    hands = HandsIdentity(h.user, h.uid, h.home, h.workspace, (18080,))
-    with pytest.raises(ConfinementError, match=r"/usr/bin/python3 is missing.*\[18080\].*fail-closed"):
+    hands = _hands(tmp_path)
+    assert not hands.egress_ports
+    with pytest.raises(ConfinementError, match=r"/usr/bin/python3 is missing.*session keyring.*fail-closed"):
         BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)), hands=hands)
 
 

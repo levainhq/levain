@@ -2482,12 +2482,48 @@ def _hands_env(hands: HandsIdentity) -> dict[str, str]:
             "TERM": "dumb", "USER": hands.user, "LOGNAME": hands.user}
 
 
-def hands_prefix(hands: HandsIdentity) -> list[str]:
+#: Linux: run first by every hands process, as the hands user, between sudo and what it starts. It
+#: joins a NEW, empty session keyring, then execs its argv. The operator's session keyring otherwise
+#: crosses sudo (no pam_keyinit in Ubuntu's sudo stack) and bwrap (a user namespace does not detach
+#: it): RUN in a VM 2026-10-09, `keyctl print` inside a hands bash printed a key the operator had
+#: added to @s. ``python3 -I -S`` (no site, no environment); the keyctl syscall number is the
+#: architecture's, and an architecture not listed refuses rather than run with the operator's keyring.
+_HANDS_KEYRING_JOIN = r"""import ctypes, os, sys
+nr = {"x86_64": 250, "aarch64": 219, "riscv64": 219}.get(os.uname().machine)
+if nr is None:
+    sys.stderr.write("levain: no keyctl syscall number known for %s; refusing to start with the "
+                     "operator's session keyring\n" % os.uname().machine)
+    os._exit(126)
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+if libc.syscall(ctypes.c_long(nr), ctypes.c_long(1), ctypes.c_void_p(None)) < 0:
+    sys.stderr.write("levain: could not join a new session keyring: %s\n" % os.strerror(ctypes.get_errno()))
+    os._exit(126)
+os.execv(sys.argv[1], sys.argv[1:])
+"""
+
+
+def hands_prefix(hands: HandsIdentity, *, system: str | None = None) -> list[str]:
     """``sudo -n -u <hands> /usr/bin/env -i <env>``: what goes in front of the sandbox driver. sudo is
     OUTSIDE the sandbox: the shipped profile refuses to exec a setuid binary (measured in the M1 VM
-    run), so the profile applies to the hands process, which is the point. ``-n``: never prompt."""
-    return [SUDO, "-n", "-u", hands.user, "/usr/bin/env", "-i",
+    run), so the profile applies to the hands process, which is the point. ``-n``: never prompt.
+    On Linux the keyring join (:data:`_HANDS_KEYRING_JOIN`) follows ``env -i``."""
+    argv = [SUDO, "-n", "-u", hands.user, "/usr/bin/env", "-i",
             *(f"{k}={v}" for k, v in _hands_env(hands).items())]
+    if (system or platform.system()) == "Linux":
+        argv += [HANDS_PYTHON, "-I", "-S", "-c", _HANDS_KEYRING_JOIN]
+    return argv
+
+
+def _require_hands_python() -> None:
+    """Linux: every hands process starts through ``python3`` (the keyring join); refuse by name
+    without it."""
+    if not os.access(HANDS_PYTHON, os.X_OK):
+        raise ConfinementError(
+            f"{HANDS_PYTHON} is missing: every process run as the entity's own user on Linux starts "
+            "through it, to leave your session keyring behind. Install python3 — refusing to run it as "
+            "the entity's own user, or as you instead (fail-closed)."
+        )
 
 
 def _require_hands_sudo(hands: HandsIdentity) -> None:
@@ -4062,6 +4098,7 @@ def _bwrap_hands_file(policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, 
             f"{HANDS_ZSH} is missing: install zsh (the editor's hands use it) — refusing to use the "
             "entity's files as you instead (fail-closed)."
         )
+    _require_hands_python()
 
     def driver() -> list[str]:
         argv, _ = _bwrap_plan(policy)
@@ -6438,7 +6475,10 @@ def _hands_bwrap_argv(argv: list[str], read_only: list[str], writable: list[str]
     if not argv or argv[0] != BWRAP:
         raise ConfinementError("internal: the hands launch was given a plan that is not bwrap's — refusing "
                                "(fail-closed).")
-    out = [argv[0], "--unshare-user", "--disable-userns"]
+    # --unshare-ipc: the host's SysV and POSIX message queues, shared memory and semaphores are
+    # otherwise the hands bash's too (RUN 2026-10-09: a 0666 queue of another user and a 0666 segment
+    # of root were listed inside a hands bash).
+    out = [argv[0], "--unshare-user", "--disable-userns", "--unshare-ipc"]
     i = 1
     while i < len(argv):
         op = argv[i]
@@ -6466,7 +6506,7 @@ def _hands_ns_problem(hands: HandsIdentity, timeout: float = 30.0) -> str | None
     bwrap-userns-restrict profile is installed (RUN 2026-10-09)."""
     from levain.launch import child_env
 
-    argv = [*hands_prefix(hands), BWRAP, "--unshare-user", "--disable-userns", "--unshare-net",
+    argv = [*hands_prefix(hands), BWRAP, "--unshare-user", "--disable-userns", "--unshare-ipc", "--unshare-net",
             "--unshare-pid", "--die-with-parent", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
             "/bin/true"]
     try:
@@ -7284,13 +7324,7 @@ class BwrapProvider(ConfinementProvider):
     ) -> SandboxedShell:
         relay_dir: str | None = None
         if hands is not None:
-            if hands.egress_ports and not os.access(HANDS_PYTHON, os.X_OK):
-                raise ConfinementError(
-                    f"{HANDS_PYTHON} is missing: it relays the entity's proxy ports "
-                    f"{list(hands.egress_ports)} into its sandbox. Install python3, or set the entity up "
-                    "without --egress-port — refusing to run bash as the entity's own user, or as you "
-                    "instead (fail-closed)."
-                )
+            _require_hands_python()
             _require_hands_sudo(hands)
             problem = _hands_launch_problem(hands) or _hands_listener_problem(policy, hands)
             if problem is not None:
