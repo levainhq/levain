@@ -507,6 +507,9 @@ _FOCUS_STALE_AFTER_HOURS = 18  # mirror dashboard.FOCUS_STALE_AFTER_HOURS
 # a focus the governed write seam would REJECT (over the cap) must not reach primacy —
 # mirror writes.MAX_FOCUS_TEXT_LEN so the reader enforces the same bound as the writer.
 _MAX_FOCUS_TEXT_LEN = 500  # mirror writes.MAX_FOCUS_TEXT_LEN
+_STATE_EXPIRES_AFTER_HOURS = 8  # mirror dashboard.STATE_EXPIRES_AFTER_HOURS
+_STATE_MAX_TEXT_LEN = 500  # mirror dashboard.STATE_MAX_TEXT_LEN
+_STATE_CLOCK_SKEW_SECONDS = 300  # mirror dashboard.STATE_CLOCK_SKEW_SECONDS
 
 
 def _humanize_focus_age(delta_seconds: float) -> str:
@@ -604,6 +607,44 @@ def focus_notice() -> str | None:
         f'[focus] The operator\'s last declared focus{age} — their own words for "what '
         f'I\'m on now": "{text}". It may be out of date: take it as a prompt to confirm '
         f'what they\'re on now, not a settled fact.'
+    )
+
+
+def state_notice() -> str | None:
+    """The operator's freeform state line ('how I am right now'), at primacy, VERBATIM
+    with its age: the READ half of dashboard._read_state (keys state / state_set_at in
+    .levain/context.json). Never parsed, scored or used to gate, soften or reduce scope:
+    the operator is the authority on their own state. EXPIRES: a state whose age cannot
+    be established, is in the future, or is older than _STATE_EXPIRES_AFTER_HOURS is
+    dropped (None), because a stale state is worse than none. Over-cap text is absent
+    too, as for focus. Fail-soft: any fault -> None."""
+    try:
+        data = json.loads((install_root() / ".levain" / "context.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    rt = data.get("state")
+    text = " ".join(rt.split()) if isinstance(rt, str) and rt.split() else None
+    if text is None or len(text) > _STATE_MAX_TEXT_LEN:
+        return None
+    set_at = data.get("state_set_at")
+    if not isinstance(set_at, str) or not set_at.strip():
+        return None
+    try:
+        ts = datetime.fromisoformat(set_at)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        delta = (datetime.now(timezone.utc) - ts).total_seconds()
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if delta < -_STATE_CLOCK_SKEW_SECONDS or delta >= _STATE_EXPIRES_AFTER_HOURS * 3600:
+        return None
+    delta = max(delta, 0.0)
+    return (
+        f'[state] The operator\'s own words for how they are right now '
+        f'({_humanize_focus_age(delta)}): {json.dumps(text, ensure_ascii=False)}. '
+        f'Their report, reflected back verbatim.'
     )
 
 

@@ -639,7 +639,9 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
     ``scope.install_root``; ``state`` (the neocortex ``State`` section, Class A, targets
     ``scope.anneal.continuity_md``); ``focus`` (the operator's live-context focus, Class A,
     targets ``scope.context_json`` — live-state, last-writer-wins, no lock/backup/undo,
-    distinct from the consolidated-cognition State edit); the Class-B verbs (``spore_touch`` /
+    distinct from the consolidated-cognition State edit); ``operator_state`` (the operator's
+    freeform expiring state line, beside focus in the same ``scope.context_json``; named
+    ``operator_state`` because ``state`` is the neocortex edit above); the Class-B verbs (``spore_touch`` /
     ``spore_descend`` / ``spore_ascend`` / ``episode_tombstone``, off ``scope.anneal``);
     the Slice-3b Tray operator-I/O kinds (``spore_seed`` capture / ``spore_set_disposition``
     re-route / ``spore_surface_at`` schedule, off ``scope.anneal`` — non-destructive);
@@ -656,6 +658,8 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
             return _apply_state_edit(scope, req, now)
         if kind == "focus":
             return _apply_focus_edit(scope, req, now)
+        if kind == "operator_state":
+            return _apply_operator_state_edit(scope, req, now)
         if kind == "entity_name":
             return _apply_entity_name(scope, req, now)
         if kind == "spore_touch":
@@ -1108,6 +1112,36 @@ def _apply_focus_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -
 
     write_focus(ctx, collapsed, source=source)
     return {"ok": True, "kind": "focus", "cleared": collapsed == ""}
+
+
+def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
+    """Set (or clear) the operator's freeform state line, the ``operator_state`` kind:
+    the twin of ``_apply_focus_edit`` (same file, lock, bound and provenance rules), so
+    the same notes apply. The text is stored verbatim apart from whitespace collapse and
+    is never interpreted. Refuses 422 ``no_state_target`` without a ``context_json``."""
+    ctx = scope.context_json
+    if ctx is None:
+        raise EditError(
+            "no_state_target", 422,
+            "this substrate has no writable operator-context (state); nothing to set",
+        )
+    text = req.get("text")
+    if text is None:
+        text = ""
+    if not isinstance(text, str):
+        raise EditError("bad_state", 400, "state 'text' must be a string")
+    collapsed = " ".join(text.split())
+    from levain.dashboard import STATE_MAX_TEXT_LEN
+    if len(collapsed) > STATE_MAX_TEXT_LEN:
+        raise EditError("state_too_long", 422, f"state exceeds {STATE_MAX_TEXT_LEN} chars")
+    raw_source = req.get("source")
+    source = raw_source if raw_source in _FOCUS_SOURCE_ALLOWLIST else "web"
+    # The bound is the kernel's (dashboard.STATE_MAX_TEXT_LEN), so the governed edit, the CLI
+    # write and every reader agree; imported lazily to avoid the writes↔dashboard cycle.
+    from levain.dashboard import write_state
+
+    write_state(ctx, collapsed, source=source)
+    return {"ok": True, "kind": "operator_state", "cleared": collapsed == ""}
 
 
 def _apply_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:

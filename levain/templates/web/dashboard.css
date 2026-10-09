@@ -267,6 +267,7 @@
                margin: 11px 2px 3px; font-size: 12.5px; letter-spacing: .02em; }
   .focusline::before { content: "⊙ focus"; align-self: center; color: var(--operate);
                font: 700 9px/1 var(--label); letter-spacing: .3em; text-transform: uppercase; }
+  #state.focusline::before { content: "◌ state"; }
   .focusline .ftext { color: var(--ink); overflow-wrap: anywhere; min-width: 0; }
   .focusline .fage  { color: var(--faint); font-size: 10.5px; letter-spacing: .05em; }
   .focusline.unset .ftext { color: var(--faint); font-style: italic; }

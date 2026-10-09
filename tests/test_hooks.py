@@ -310,6 +310,7 @@ _PORTED_FNS = (
     "config_entity_name", "origin_birth_name", "entity_name_notice",
     # live-focus reader surface — byte-identical across both copies
     "_humanize_focus_age", "_focus_freshness", "_read_focus_fields", "focus_notice",
+    "state_notice",
 )
 
 

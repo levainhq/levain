@@ -170,6 +170,38 @@
     wireFocusEdit(fEl, focus);
   }
 
+  // The masthead state line: the optional freeform "how I am" line beside the focus.
+  // `state` is view.state ({text:null} when unset OR expired: the server already dropped
+  // an expired one, so nothing here re-derives age). Verbatim text via textContent, age
+  // beside it, never interpreted. null/absent -> no live-context source -> hidden.
+  function renderState(state) {
+    const sEl = document.getElementById("state");
+    if (!sEl) return;
+    const openEditor = sEl.querySelector(".focus-editor");
+    if (openEditor && openEditor.dataset.saving !== "1") return;
+    sEl.replaceChildren();
+    sEl.classList.remove("unset", "stale");
+    if (!state) { sEl.hidden = true; return; }
+    sEl.hidden = false;
+    if (!state.text) {
+      sEl.classList.add("unset");
+      sEl.appendChild(el("span", "ftext", "no state set"));
+    } else {
+      sEl.appendChild(el("span", "ftext", state.text));
+      if (state.age_label) sEl.appendChild(el("span", "fage", state.age_label));
+    }
+    if (!commit) return;
+    const has = !!(state && state.text);
+    const btn = el("button", "focus-edit", has ? "edit" : "set");
+    btn.type = "button";
+    btn.title = has ? "edit your state" : "set your state";
+    btn.setAttribute("aria-label", has ? "edit state" : "set state");
+    btn.addEventListener("click", () => enterFocusEdit(sEl, state, btn, {
+      kind: "operator_state", placeholder: "how you are right now, in your words; blank to clear",
+    }));
+    sEl.appendChild(btn);
+  }
+
   // ---------------------------------------------------------------- render ----
   function render(view, opts) {
     // The surface injects its write transport here; a port that provides none (the
@@ -247,6 +279,7 @@
     // focus set" when present-but-empty; freshness-stamped, a stale focus flagged so
     // the operator can re-confirm (operator-reports-first — a nudge, not a verdict).
     renderFocus(view.focus);
+    renderState(view.state);
     // Drive the living-rings vital-signs from substrate health: write-path LIVE →
     // steady phosphor heartbeat; DARK → slow, dim-red. The background IS the pulse.
     // (view.scope stays a data-only seam — the UI surfaces it when team scope is
@@ -2170,12 +2203,13 @@
     fEl.appendChild(btn);
   }
 
-  function enterFocusEdit(fEl, focus, btn) {
+  function enterFocusEdit(fEl, focus, btn, opts) {
+    const kind = (opts && opts.kind) || "focus";
     const current = (focus && focus.text) || "";
     const editor = el("div", "focus-editor");
     const input = el("input", "focus-input");
     input.type = "text"; input.value = current; input.maxLength = 500;
-    input.placeholder = "what you're on now — blank to clear";
+    input.placeholder = (opts && opts.placeholder) || "what you're on now — blank to clear";
     const save = el("button", "edit-save", "save");
     const cancel = el("button", "edit-cancel", "cancel");
     save.type = "button"; cancel.type = "button";
@@ -2203,7 +2237,7 @@
       // sensor writer may have touched the file — an optimistic lock would false-409). A
       // blank value clears (the server reads an empty focus as unset). `source` is omitted
       // → the server stamps "web" (the honest HTTP default; a client shouldn't self-declare).
-      const res = await commit({ kind: "focus", text: input.value });
+      const res = await commit({ kind, text: input.value });
       if (res && res.ok) return;  // reloaded — the save render rebuilt #focus, removing this editor
       delete editor.dataset.saving;  // save FAILED: re-arm the guard so passive reloads defer again
       msg.className = "edit-msg err";
