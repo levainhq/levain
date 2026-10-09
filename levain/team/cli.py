@@ -106,7 +106,7 @@ def cmd_init(args) -> int:
             # (r19 complement 3); the join that adopts another installs, so install is named only for the sync path
             todo = ([f"`levain team pack-sync {shlex.quote(args.pack)}`"] if args.pack else []) + \
                 ([] if args.no_install else ["`levain team install`"])
-            if todo and incomplete.outcome != "lost":
+            if todo and incomplete.outcome in ("pending", "unknown"):
                 incomplete = InitIncomplete(f"{incomplete}; the clone was NOT set up: once a sync succeeds, run "
                                             + " and ".join(todo), outcome=incomplete.outcome)
             elif args.pack and incomplete.outcome == "lost":

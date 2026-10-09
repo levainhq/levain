@@ -783,8 +783,9 @@ class GitLedger:
             # + complement 2: an unaccepted merge derives "partial" without raising)
             why = "it has more than one root" if len(roots) != 1 else ""
             if not why:
-                # the try holds the temp dir too: its creation or cleanup failing is a failure to judge (r19 codex 2 +
-                # complement 1); a foreign ledger's verdicts stay out of this clone's cache (r18 complement 3)
+                # the try holds the temp dir too: failing to create it is a failure to judge (r19 codex 2 + complement
+                # 1); failing to delete it is not, the judgment being complete by then (r20 codex: so it is ignored); a
+                # foreign ledger's verdicts stay out of this clone's cache (r18 complement 3)
                 try:
                     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
                         d = T.derive(self.repo.toplevel, tip, T.Clone(pinned_root=roots[0], anchor=None, accepted={},
