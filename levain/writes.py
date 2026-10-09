@@ -133,9 +133,6 @@ MAX_SPORE_TEXT_BYTES = 8 * 1024
 # so a runaway request can't persist a novel-length focus (the server body cap is the
 # outer backstop). Measured AFTER whitespace-collapse, the shape `write_focus` stores.
 MAX_FOCUS_TEXT_LEN = 500
-# The freeform operator state line's bound is the kernel's (dashboard.STATE_MAX_TEXT_LEN), so
-# the governed edit, the CLI write and every reader agree.
-from levain.dashboard import STATE_MAX_TEXT_LEN as MAX_OPERATOR_STATE_TEXT_LEN  # noqa: E402
 # Provenance for a focus set: who authored it. A small allowlist — anything else (a
 # spoofed HTTP value) falls back to the honest default for the only HTTP caller ("web").
 _FOCUS_SOURCE_ALLOWLIST = frozenset({"web", "tui", "cli", "app"})
@@ -1134,11 +1131,14 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
     if not isinstance(text, str):
         raise EditError("bad_state", 400, "state 'text' must be a string")
     collapsed = " ".join(text.split())
-    if len(collapsed) > MAX_OPERATOR_STATE_TEXT_LEN:
-        raise EditError("state_too_long", 422, f"state exceeds {MAX_OPERATOR_STATE_TEXT_LEN} chars")
+    from levain.dashboard import STATE_MAX_TEXT_LEN
+    if len(collapsed) > STATE_MAX_TEXT_LEN:
+        raise EditError("state_too_long", 422, f"state exceeds {STATE_MAX_TEXT_LEN} chars")
     raw_source = req.get("source")
     source = raw_source if raw_source in _FOCUS_SOURCE_ALLOWLIST else "web"
-    from levain.dashboard import write_state  # lazy: avoid the writes↔dashboard import cycle
+    # The bound is the kernel's (dashboard.STATE_MAX_TEXT_LEN), so the governed edit, the CLI
+    # write and every reader agree; imported lazily to avoid the writes↔dashboard cycle.
+    from levain.dashboard import write_state
 
     write_state(ctx, collapsed, source=source)
     return {"ok": True, "kind": "operator_state", "cleared": collapsed == ""}

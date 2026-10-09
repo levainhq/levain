@@ -85,7 +85,7 @@ def test_hook_text_and_dashboard_agree(tmp_path, monkeypatch):
     assert hook._STATE_MAX_TEXT_LEN == 500 and hook._STATE_CLOCK_SKEW_SECONDS == 300
     assert '"sharp, go deep"' in note and "set 3h ago" in note
     assert "state: sharp, go deep (set 3h ago)" in rendered
-    assert "State: sharp, go deep (set 3h ago)" in render_summary(view)  # the model-visible MCP text
+    assert 'State: "sharp, go deep" (set 3h ago)' in render_summary(view)  # the model-visible MCP text
     # a state with a quote cannot break out of its delimiters
     p.write_text(json.dumps({"state": 'a" b', "state_set_at": stamp}))
     assert 'a\\" b' in hook.state_notice()

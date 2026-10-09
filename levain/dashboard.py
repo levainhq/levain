@@ -1844,7 +1844,9 @@ def render_summary(view: SubstrateView) -> str:
             meta = f" ({view.focus.age_label})"
         lines.append(f"Focus: {view.focus.text}{meta}")
     if view.state is not None and view.state.text:  # fresh only: _read_state drops an expired one
-        lines.append(f"State: {view.state.text} ({view.state.age_label})")
+        lines.append(  # quoted, like the hook: the operator's words, delimited
+            f"State: {json.dumps(view.state.text, ensure_ascii=False)} ({view.state.age_label})"
+        )
 
     h = view.health
     if h is not None:
