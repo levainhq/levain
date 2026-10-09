@@ -12,6 +12,7 @@
   const panels = {};   // id -> {etag, profile, payload}
   const opened = new Set();   // feed panels the reader opened: fetched full from then on
   let inflight = false;
+  let again = false;   // a click or poll that arrived mid-load re-runs once it settles
 
   function headers() {
     const h = {};
@@ -23,14 +24,25 @@
     if (q === "full" || q === "compact") return q;
     return window.matchMedia && window.matchMedia("(max-width: " + COMPACT_MAX_PX + "px)").matches ? "compact" : "full";
   }
+  let askedForToken = false;
   async function getJson(url) {
-    const r = await fetch(url, { headers: headers(), cache: "no-cache" });
+    let r = await fetch(url, { headers: headers(), cache: "no-cache" });
+    if (r.status === 403 && !askedForToken) {
+      // an off-box writable surface gates the reads on the device token (as the dashboard does): ask
+      // once, keep it in localStorage, retry. A loopback surface never reaches here.
+      askedForToken = true;
+      const tok = (window.prompt("Off-box token (shown on the serve --write startup line):") || "").trim();
+      if (tok) {
+        try { window.localStorage.setItem("levain_write_token", tok); } catch (_) { /* ignore */ }
+        r = await fetch(url, { headers: headers(), cache: "no-cache" });
+      }
+    }
     if (!r.ok) throw new Error(url + " → HTTP " + r.status);
     return r.json();
   }
 
   async function load() {
-    if (inflight) return;
+    if (inflight) { again = true; return; }
     inflight = true;
     try {
       const prof = profile();
@@ -54,7 +66,10 @@
       stampEl.textContent = "as of " + new Date().toLocaleTimeString();
     } catch (e) {
       stampEl.textContent = "cannot reach the cockpit: " + LevainCockpit.visible(e.message);
-    } finally { inflight = false; }
+    } finally {
+      inflight = false;
+      if (again) { again = false; load(); }
+    }
   }
 
   rootEl.addEventListener("click", async (ev) => {
