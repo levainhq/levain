@@ -1247,6 +1247,7 @@ _V2 = "cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime,nsdelegate
     (dict(osrelease="5.15.153.1-microsoft-standard-WSL2"), "WSL2"),
     (dict(container=True), "container"),
     (dict(pidns="4026532999"), "nested pid namespace"),
+    (dict(pidns="-"), "cannot read its pid namespace"),
     (dict(mounts="cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n"), "nsdelegate"),
     (dict(release="5.10.0-28-amd64"), "5.14"),
     (dict(mounts="tmpfs /sys/fs/cgroup tmpfs ro 0 0\ncgroup2 /sys/fs/cgroup/unified cgroup2 rw 0 0\n"
@@ -1301,7 +1302,10 @@ def test_only_the_initial_pid_namespace_makes_or_sweeps_leaves(tmp_path, monkeyp
 
     uid = os.getuid()
     base = tmp_path / C._user_manager_rel(uid) / C._LEVAIN_SLICE
-    dead = f"levain-999999-1-{'a' * 12}-1.scope"
+    dead = f"levain-{C._INIT_PIDNS}-999999-1-{'a' * 12}-1.scope"
+    # Never judged: another namespace's name, and a name that does not say its namespace (L3 r12).
+    for other in (f"levain-4026532999-999999-1-{'c' * 12}-1.scope", f"levain-999999-1-{'d' * 12}-1.scope"):
+        (base / other).mkdir(parents=True)
     (base / dead).mkdir(parents=True)
     killed: list[str] = []
     monkeypatch.setattr(C, "_CGROUP_ROOT", tmp_path)
@@ -1312,5 +1316,5 @@ def test_only_the_initial_pid_namespace_makes_or_sweeps_leaves(tmp_path, monkeyp
     assert C._leaf_unit("b" * 12, 1) is None
     assert C.sweep_dead_leaves() == [] and killed == []
     monkeypatch.setattr(C, "_pidns", lambda: C._INIT_PIDNS)
-    assert C._leaf_unit("b" * 12, 1) == f"levain-{os.getpid()}-7-{'b' * 12}-1"
+    assert C._leaf_unit("b" * 12, 1) == f"levain-{C._INIT_PIDNS}-{os.getpid()}-7-{'b' * 12}-1"
     assert C.sweep_dead_leaves() == [] and killed == [dead]
