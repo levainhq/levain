@@ -2433,7 +2433,7 @@ class HandsIdentity:
     home: str
     workspace: Path
     #: Linux: the loopback TCP ports the hands user's network boundary lets out (setup's
-    #: ``--egress-port``), which the launch probes and relays. Empty on macOS.
+    #: ``--egress-port``), which the launch probes and relays. Used on Linux only.
     egress_ports: tuple[int, ...] = ()
 
 
@@ -2443,9 +2443,8 @@ def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None)
 
     - No hands user set up: None.
     - The interactive REPL: None, by design (design §8 i, D4): a human reads every turn there.
-    - macOS or Linux, headless or unattended: the hands user. On Linux bwrap runs AS it and hides the
-      operator's home whole instead of masking jewels inside it, which it cannot enter
-      (:func:`_hands_bwrap_argv`). A setup whose account is gone raises (fail-closed): never a silent
+    - macOS or Linux, headless or unattended: the hands user. On Linux bwrap runs AS it in an
+      allowlisted view that leaves the operator's home out (:func:`_hands_bwrap_argv`). A setup whose account is gone raises (fail-closed): never a silent
       fall-back to the operator.
     - Any other OS: None."""
     if cfg.hands_user is None or cfg.hands_uid is None or cfg.hands_workspace is None:
@@ -6551,7 +6550,7 @@ def _hands_argv_unmade(argv: list[str]) -> str | None:
 # side runs AS the hands user in the host's network namespace, so its TCP connects to 127.0.0.1:<port>
 # are the hands user's and the nftables table still decides which ports get out; the namespace side
 # runs inside each command's sandbox. They meet on pathname unix sockets in a fresh 0700 directory
-# under the hands user's own home, which no hidden root covers. ONE fixed program for both, run with
+# under the hands user's own home, which the hands view binds read-write. ONE fixed program for both, run with
 # ``python3 -I -S`` (stdlib only, no site, no environment): every input is argv data, nothing is
 # evaluated, and it connects to nothing but 127.0.0.1:<port> or <dir>/<port>.sock.
 #   out <dir> <port>...   bind <dir>/<port>.sock (0600) for each port, relay each connection to
@@ -6773,12 +6772,9 @@ def _start_hands_relay(policy: CrownJewelsPolicy, hands: HandsIdentity, sockdir:
 
 
 # --- pathname listeners (criterion 2) -------------------------------------------------------------
-# A unix socket bound at a path outside the hidden roots (a daemon's socket in /var/lib, one bound in
-# another network namespace at a host path) stays reachable from inside the hands launch, through the
-# filesystem: a deputy the network namespace does not cut. Inside the new namespace /proc/net/unix
-# lists none of the host's sockets, so levain sweeps them from the host before any hands process
-# starts, and asks the kernel, as the hands user, which ones it may connect to (write permission on
-# the socket file and search on every ancestor: access(2), so modes and ACLs both count).
+# A unix socket or FIFO the hands user may write is a deputy the network namespace does not cut. The
+# view holds no host tree but /usr, /etc and /opt read-only (and the hands user's own), so those are
+# what is walked.
 #: The walk, as the hands user inside its own view: every socket and FIFO it may write in the view's
 #: read-only host trees. bash cannot reach any other host file, and the view's writable trees are the
 #: hands user's own.
