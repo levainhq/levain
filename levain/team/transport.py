@@ -23,6 +23,7 @@ import random
 import re
 import secrets
 import stat
+import threading
 import subprocess
 import tempfile
 import time
@@ -44,6 +45,7 @@ _SCRUB_ENV = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_
               "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
               "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_NAMESPACE")
 _PUSH_RETRIES = 6
+_OP = threading.local()     # per thread: clone base -> depth of the `op` lock this thread holds
 WARNINGS: list[str] = []  # process-wide: things a person must hear that did not stop the operation
 
 
@@ -272,6 +274,39 @@ class GitLedger:
         finally:
             os.close(fd)  # closing the descriptor releases the flock
 
+    @contextlib.contextmanager
+    def op(self, *, timeout: float = 150.0):
+        """ONE exclusive lock per clone, held for the WHOLE of every operation that changes the pin, the trust state or
+        the ledger (init, join, sync, the counted team changes, the clone's own trust acts). Git's frame: a command holds
+        index.lock for its whole run, never a lock per step. Code L3 r6 found the per-step construct failing at a new
+        site each round (a value read outside the lock that guards its writers: the re-land's decision, init's pin,
+        join's tail, its snapshot); inside one held op no other operation on this clone can interleave at all.
+
+        Reentrant in the thread that holds it (join -> sync -> re-land -> update_counted nest); any other thread or
+        process waits up to ``timeout`` and then gets TeamBusy. Order: op -> net -> worktree -> state."""
+        held = getattr(_OP, "held", None)
+        if held is None:
+            held = _OP.held = {}
+        key = os.path.realpath(self.base)
+        if held.get(key):
+            held[key] += 1
+            try:
+                yield
+            finally:
+                held[key] -= 1
+        else:
+            with self.lock(name="op", timeout=timeout):
+                held[key] = 1
+                try:
+                    yield
+                finally:
+                    held.pop(key, None)
+
+    def _require_op(self) -> None:
+        """Fails where a step that decides from state and then writes it runs outside the op (point of use)."""
+        if not getattr(_OP, "held", {}).get(os.path.realpath(self.base)):
+            raise TeamError("internal: a ledger-changing step ran outside the team operation lock; nothing was changed")
+
     # ---- identity: an SSH signing key, never an email ---------------------------------------------------------
 
     def email(self) -> str:
@@ -487,19 +522,21 @@ class GitLedger:
 
     def init(self, team: R.Team, *, member_keys: dict[str, str] | None = None, remote: str | None = None,
              push: bool = True, signing_key: str | None = None, replace_legacy: bool = False) -> str:
+        with self.op():
+            return self._init_in_op(team, member_keys=member_keys, remote=remote, push=push, signing_key=signing_key,
+                                    replace_legacy=replace_legacy)
+
+    def _init_in_op(self, team: R.Team, *, member_keys: dict[str, str] | None, remote: str | None, push: bool,
+                    signing_key: str | None, replace_legacy: bool) -> str:
         """Create a STRICT ledger: a genesis carrying team.toml and tenure.toml, signed by the owner's key (this
         clone's), pinned here in the same operation. Members' keys are pending until each confirms from their own
         machine (`levain team join`). Returns a status line."""
         from . import signing as S
         from . import tenure as T
         R.validate_team(team)
-        if signing_key:
-            self.save_state(signing_key=signing_key)
-        own = self.signing_pubkey()
-        try:
-            S.fingerprint(own)
-        except S.SigningError as exc:
-            raise TeamError(f"the signing key cannot be used: {exc}") from None
+        # the key is proven and every refusal checked BEFORE anything is saved (code L3 r6 codex 2/6, complement 5: a
+        # missing key's path, and a key given to an init that then refused, were persisted first)
+        self.prove_signing_key(signing_key)
         remote = remote or self._default_remote()
         if self.legacy_only() and not replace_legacy:
             raise TeamError(LEGACY_MESSAGE)
@@ -507,6 +544,9 @@ class GitLedger:
             raise TeamError(f"branch {self.branch} already exists here: use `levain team join`")
         if remote and self._remote_ledgers(remote):
             raise TeamError(f"{remote} already has a team ledger: use `levain team join`")
+        if signing_key:
+            self.save_state(signing_key=signing_key)
+        own = self.signing_pubkey()
         ten = T.Tenure(keys={team.owner: [own]})
         for h, line in (member_keys or {}).items():
             if h not in team.members:
@@ -533,6 +573,14 @@ class GitLedger:
 
     def join(self, *, remote: str | None = None, new_device: bool = False, root: str | None = None,
              signing_key: str | None = None, accept_merges: dict[str, int] | None = None) -> str:
+        # the WHOLE join, its post-pin reconcile and key confirm included, is one op (code L3 r6 complement 1-3, codex
+        # 3: the tail ran outside every lock with values captured before it, and the snapshot predated the wait)
+        with self.op():
+            return self._join_in_op(remote=remote, new_device=new_device, root=root, signing_key=signing_key,
+                                    accept_merges=accept_merges)
+
+    def _join_in_op(self, *, remote: str | None, new_device: bool, root: str | None, signing_key: str | None,
+                    accept_merges: dict[str, int] | None) -> str:
         """Pin this clone to a strict ledger on the remote (trust on first use: the genesis, its owner in force and
         her key fingerprints are printed for the person to check out of band), then confirm this clone's key."""
         remote = remote or self._default_remote()
@@ -1296,6 +1344,9 @@ class GitLedger:
     def _reland(self) -> None:
         """Re-apply stripped team ops to the counted state at the new tip: net per field, history-keyed."""
         from . import tenure as T
+        # it decides from the counted state and then applies: only inside the op, so no owner change lands between the
+        # decision and the commit (code L3 r6 codex 1)
+        self._require_op()
         # bound to the genesis they were made on (code L3 r3 codex 3, RUN: after `join --root` to a re-genesis that
         # left cy out, an old-ledger `member add cy` re-landed there); the others stay kept, never applied here
         root = self.pinned_root     # read ONCE (code L3 r5 codex 1)
@@ -1368,6 +1419,11 @@ class GitLedger:
 
     def _sync(self, *, push: bool, timeout: float = 120, net_timeout: float = 150,
               lock_timeout: float = 30.0) -> str:
+        """A sync is one op, waited for up to ``net_timeout`` (fetch_if_due passes its own short wait, then skips)."""
+        with self.op(timeout=net_timeout):
+            return self._sync_in_op(push=push, timeout=timeout, net_timeout=net_timeout, lock_timeout=lock_timeout)
+
+    def _sync_in_op(self, *, push: bool, timeout: float, net_timeout: float, lock_timeout: float) -> str:
         """Fetch, rebase, optionally push. Must be called WITHOUT the worktree lock held.
 
         Network I/O runs under a separate ``net`` lock, so a hook reading the worktree never waits on a
@@ -1587,6 +1643,10 @@ class GitLedger:
         return self.update_counted(lambda team, ten: change(team), message, push=push)
 
     def update_counted(self, change, message: str, *, push: bool = True, _check: bool = True) -> str:
+        with self.op():
+            return self._update_counted_in_op(change, message, push=push, _check=_check)
+
+    def _update_counted_in_op(self, change, message: str, *, push: bool = True, _check: bool = True) -> str:
         """Apply ``change(team, tenure)`` to the COUNTED state and commit it, signed, under the worktree lock.
 
         Written from the counted state, never the tip file (§3b): if the tip's team.toml/tenure.toml differ from it

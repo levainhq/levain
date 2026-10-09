@@ -550,7 +550,11 @@ def _guarded(func):
     def call(args) -> int:
         from .transport import WARNINGS
         try:
-            return func(args)
+            if getattr(args, "team_command", None) == "view":
+                return func(args)      # a long-running server: each write it makes takes the op itself
+            # every other team command is ONE operation on the clone, start to finish (code L3 r6: git's frame)
+            with GitLedger(_repo(args)).op():
+                return func(args)
         except (TeamError, E.EntryError, R.RolesError, ValueError, OSError) as exc:
             print(f"levain team: {exc}", file=sys.stderr)
             return 2
