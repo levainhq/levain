@@ -48,7 +48,7 @@ def visible(text: Any) -> str:
     out = []
     for ch in str(text):
         cat = unicodedata.category(ch)
-        if cat in ("Cc", "Cf", "Zl", "Zp"):
+        if cat in ("Cc", "Cf", "Cs", "Zl", "Zp"):
             out.append(f"<U+{ord(ch):04X}>")
         else:
             out.append(ch)
@@ -110,7 +110,7 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
         out.append((DIM, _fit(f"  {visible(head.get('empty') or 'Nothing here.')}", width)))
         return out
     kind = head["kind"]
-    if panel.get("next") and not panel.get("rows") and not panel.get("value"):
+    if panel.get("next") and panel.get("rows") is None and panel.get("value") is None:
         out.append((DIM, _fit(f"  (summary only — open {visible(panel['next'])} for the content)", width)))
     elif kind == "triage-list":
         out.extend(_rows(head, panel, width, top_n))
@@ -135,7 +135,7 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
     elif kind == "prose":
         v = panel.get("value") or {}
         out.append((ROW, _fit(f"  {visible(v.get('headline') or '')}", width)))
-        for ln in str(v.get("markdown") or "").splitlines():
+        for ln in str(v.get("markdown") or "").replace("\r\n", "\n").split("\n"):   # only \n breaks a line; every other separator stays visible
             out.append((ROW, _fit(f"    {visible(ln)}", width)))
     return out
 
