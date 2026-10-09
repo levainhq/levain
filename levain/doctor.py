@@ -946,10 +946,20 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
         return [CheckResult(name, False, f"network boundary: {problem}",
                             hint=f"sudo levain setup-isolation --path {shlex.quote(str(install))} (a repair run "
                                  "loads it again)")]
+    from levain.firing.confinement import HANDS_PYTHON, HANDS_ZSH
+
+    if host_os() == "linux" and not os.access(HANDS_PYTHON, os.X_OK):
+        return [CheckResult(name, False, f"{HANDS_PYTHON} is missing: every process run as {cfg.hands_user} "
+                            "starts through it, so bash and the file editor refuse",
+                            hint="install python3")]
     from levain.firing.hands import WORKSPACE_ROOT
     from levain.firing.ws_git import bare_repository_explicit, foreign_entries, wildcard_safe_directory
 
     extra: list[CheckResult] = []
+    if host_os() == "linux" and not os.access(HANDS_ZSH, os.X_OK):
+        extra.append(CheckResult("hands file editor", True,
+                                 f"{HANDS_ZSH} is missing: the file editor refuses as {cfg.hands_user}",
+                                 hint="install zsh", warn=True))
     wildcard = wildcard_safe_directory(tuple(WORKSPACE_ROOT.values()))
     if wildcard:
         extra.append(CheckResult(
