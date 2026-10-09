@@ -78,13 +78,20 @@ def _members(values: list[str] | None) -> tuple[dict[str, str], dict[str, str]]:
 def cmd_init(args) -> int:
     repo = _repo(args)
     gl = GitLedger(repo)
-    members, keys = _members(args.member)
-    team = R.Team(project=args.project or repo.toplevel.name, owner=args.owner, members=members,
-                  client_owners=_split(args.client_owner), mode=args.mode, fetch_interval=args.fetch_interval)
     incomplete = None
     try:
-        print(gl.init(team, member_keys=keys, remote=args.remote, push=not args.no_push, signing_key=args.signing_key,
-                      replace_legacy=args.replace_legacy))
+        if gl.pending_init():
+            # a stopped init resumes from its own record, before any argument is read (code L3 r12 codex 3)
+            print(gl.resume_init(remote=args.remote, push=not args.no_push))
+        else:
+            if not args.owner or not args.member:
+                # required for a NEW ledger only: finishing a stopped init reads none of them (code L3 r12 codex 3)
+                raise TeamError("levain team init needs --owner and at least one --member")
+            members, keys = _members(args.member)
+            team = R.Team(project=args.project or repo.toplevel.name, owner=args.owner, members=members,
+                          client_owners=_split(args.client_owner), mode=args.mode, fetch_interval=args.fetch_interval)
+            print(gl.init(team, member_keys=keys, remote=args.remote, push=not args.no_push,
+                          signing_key=args.signing_key, replace_legacy=args.replace_legacy))
     except InitIncomplete as exc:
         incomplete = exc        # initialised: the clone's own setup below still runs, then the command fails
     try:
@@ -93,7 +100,7 @@ def cmd_init(args) -> int:
         if args.pack and incomplete is None:
             written = P.seed(gl, Path(args.pack), push=not args.no_push)
             print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
-        elif args.pack and gl.joined():
+        elif args.pack and not gl.pending_init():      # the record, not joined(), says the local part is done (r12)
             # an init that stopped only at its push still seeds, locally, and the next sync publishes both; a seed
             # that fails here is named in the pending message, never swallowed (code L3 r11 codex 5)
             try:
@@ -463,8 +470,8 @@ def register(subparsers) -> None:
 
     p = add("init", cmd_init, "Create the team ledger in this repository (first engineer; becomes the remote branch).")
     p.add_argument("--project")
-    p.add_argument("--owner", required=True, help="handle of the canon owner (must be a --member)")
-    p.add_argument("--member", action="append", required=True, metavar="HANDLE=EMAIL[=PUBKEY]",
+    p.add_argument("--owner", help="handle of the canon owner (must be a --member)")
+    p.add_argument("--member", action="append", metavar="HANDLE=EMAIL[=PUBKEY]",
                    help="repeatable; PUBKEY (a .pub file or key line) is the member's signing key, pending until "
                         "their machine confirms it at join")
     p.add_argument("--signing-key", help="your ssh public key file (in ssh-agent, or without a passphrase)")

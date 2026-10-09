@@ -564,8 +564,33 @@ class GitLedger:
     def init(self, team: R.Team, *, member_keys: dict[str, str] | None = None, remote: str | None = None,
              push: bool = True, signing_key: str | None = None, replace_legacy: bool = False) -> str:
         with self.op():
+            if self.pending_init():
+                return self.resume_init(remote=remote, push=push)     # the retry's arguments are never validated
             return self._init_in_op(team, member_keys=member_keys, remote=remote, push=push, signing_key=signing_key,
                                     replace_legacy=replace_legacy)
+
+    def pending_init(self) -> dict | None:
+        """The record a stopped init left, when it still names this clone's pin and branch (else none). git's sequencer
+        frame: a stopped rebase leaves rebase-merge/, which only rebase writes and only --continue reads; this record
+        is written only by init, ended by init or by any move of the pin (join, repin), and a resume runs on ITS
+        parameters alone, never the retry's arguments or the state's shape (code L3 r11 codex 1-4, complement 1-3;
+        r12 codex 2-3: its branch and remote too, and before any argument is read)."""
+        rec = self.state().get("init_pending")
+        if not isinstance(rec, dict) or not all(isinstance(rec.get(k), str) for k in ("genesis", "branch", "remote")):
+            return None
+        if rec["genesis"] != self.pinned_root or rec["branch"] != self.branch:
+            return None
+        return rec
+
+    def resume_init(self, *, remote: str | None = None, push: bool = True) -> str:
+        with self.op():
+            rec = self.pending_init()
+            if rec is None:
+                raise TeamError("no stopped `levain team init` to finish on this clone")
+            if remote is not None and remote != rec["remote"]:
+                raise TeamError(f"an init of genesis {rec['genesis'][:12]} is pending on this clone with remote "
+                                f"{rec['remote'] or '(none)'}; run `levain team init` without --remote to finish it")
+            return self._finish_init(rec, push=push, resumed=True)
 
     def _init_in_op(self, team: R.Team, *, member_keys: dict[str, str] | None, remote: str | None, push: bool,
                     signing_key: str | None, replace_legacy: bool) -> str:
@@ -575,22 +600,14 @@ class GitLedger:
         from . import signing as S
         from . import tenure as T
         R.validate_team(team)
-        # git's sequencer frame (a stopped rebase leaves rebase-merge/, which only rebase writes and only --continue
-        # reads): an init that stopped left an `init_pending` record, written by init alone in the same save as its
-        # pin, and it resumes from THAT record's parameters, never from this call's arguments or the state's shape
-        # (code L3 r11 codex 1-4 + complement 1-3: a pin left by `join` was "resumed" as an init)
-        pending = self.state().get("init_pending")
-        if isinstance(pending, dict) and pending.get("genesis") and pending.get("genesis") == self.pinned_root:
-            if remote is not None and remote != (pending.get("remote") or ""):
-                raise TeamError(f"an init of genesis {pending['genesis'][:12]} is pending on this clone with remote "
-                                f"{pending.get('remote') or '(none)'}; run `levain team init` without --remote to "
-                                "finish it")
-            return self._finish_init(pending["genesis"], push=push, resumed=True)
         # the key is resolved ONCE and that value proves, fingerprints, signs and is saved (code L3 r10 codex 1, r11
         # codex 3 + complement 5: a git-config key was re-read later, so a changed config signed as a key tenure does
         # not grant); proven and every refusal checked BEFORE anything is saved (code L3 r6 codex 2/6, complement 5)
         key = signing_key or self.signing_key
         self.prove_signing_key(key)
+        if not key.startswith("key::"):
+            # saved as an absolute path: a relative git-config path read from another cwd is another file (r12 cpl 6)
+            key = str(Path(os.path.expanduser(key)).resolve())
         remote = remote or self._default_remote()
         pinned = self.pinned_root
         if self.legacy_only() and not replace_legacy:
@@ -621,39 +638,45 @@ class GitLedger:
         commit = self._genesis_commit({T.TEAM_FILE: R.dump_team(team), T.TENURE_FILE: T.dump_tenure(ten)},
                                       f"levain team: init strict ledger for {team.project}", key=key)
         branch, device = self.branch, self._new_device()
+        rec = {"genesis": commit, "branch": branch, "remote": remote or ""}
 
         def persist(st: dict) -> None:
             st.update(device=device, remote=remote or "", branch=branch, pinned_root=commit, anchor=None, accepted={},
                       distrust=[])
             st["signing_key"] = key
             st["own_keys"] = list(dict.fromkeys([*(st.get("own_keys") or []), fp]))
-            st["init_pending"] = {"genesis": commit, "remote": remote or ""}
+            st["init_pending"] = rec
         self.save_state(_mutate=persist)
-        return self._finish_init(commit, push=push, resumed=False)
+        return self._finish_init(rec, push=push, resumed=False)
 
-    def _finish_init(self, commit: str, *, push: bool, resumed: bool) -> str:
-        """Everything after the persist. The LOCAL part (the ref is this genesis, it judges, the checkout is attached)
-        completes the init and clears its record; a stop there keeps the record and `init` resumes. Publishing is
-        sync's job: a refused push says `levain team sync` (code L3 r11 codex 2: the record, not joined(), decides)."""
-        branch, remote, top = self.branch, self.remote, self.repo.toplevel
+    def _finish_init(self, rec: dict, *, push: bool, resumed: bool) -> str:
+        """Everything after the persist, on the RECORD's genesis, branch and remote. The LOCAL part (the branch tip IS
+        the genesis, it judges, the checkout is attached, the remote carries no other ledger) completes the init and
+        ends its record; a stop there keeps the record and `init` resumes. Publishing is sync's job: a refused push
+        says `levain team sync` (code L3 r11 codex 2)."""
+        commit, branch, remote, top = rec["genesis"], rec["branch"], rec["remote"], self.repo.toplevel
+        ref = f"refs/heads/{branch}"
         try:
-            if self._local_branch_exists():
-                # equality, never existence (code L3 r11 complement 4): another writer's branch is not this init's line
-                roots = git(["rev-list", "--max-parents=0", self.ref], top, check=False).stdout.split()
-                if roots != [commit]:
-                    raise TeamError(f"branch {branch} exists here but is not this init's line (root "
-                                    f"{(roots or ['none'])[0][:12]}); remove it with `git branch -D {branch}` if none "
-                                    "of it was published")
-            else:
-                git(["update-ref", self.ref, commit, ""], top)
+            tip = git(["rev-parse", "-q", "--verify", ref], top, check=False).stdout.strip()
+            if not tip:
+                git(["update-ref", ref, commit, ""], top)
+            elif tip != commit:
+                # the TIP, never existence or the root (r11 complement 4, r12 codex 1): nothing commits on the ledger
+                # before the record ends, so any other value is another writer's
+                raise TeamError(f"branch {branch} exists here at {tip[:12]}, not this init's genesis; remove it with "
+                                f"`git branch -D {branch}` if none of it was published")
             self._dcache = None
             self.derivation()      # proves the genesis judges, before anything is pushed
             self._attach_worktree()
+            if resumed and remote and push and self._remote_ledgers(remote):
+                # the fresh path refused a remote with a ledger; a resume checks it again (r12 complement 2)
+                raise TeamError(f"{remote} now has a team ledger, so this unpublished one cannot go there: "
+                                "`levain team join` (it ends this init)")
+            self.save_state(_mutate=lambda st: st.pop("init_pending", None)
+                            if (st.get("init_pending") or {}).get("genesis") == commit else None)
         except Exception as exc:  # noqa: BLE001 - any ordinary failure after the persist is "incomplete" (r10)
             raise InitIncomplete(f"initialised and pinned {branch} (genesis {commit[:12]}) on this clone, still "
                                  f"needs: {exc}; run `levain team init` again to finish it") from exc
-        self.save_state(_mutate=lambda st: st.pop("init_pending", None)
-                        if (st.get("init_pending") or {}).get("genesis") == commit else None)
         how = (f"resumed: the init of genesis {commit[:12]} is finished (the team and keys given now were not used; "
                "change them with the team commands)") if resumed else ""
         if remote and push:
@@ -817,6 +840,7 @@ class GitLedger:
                                     "during this join; nothing was changed by the join: run `levain team join` again")
                 st.update(branch=name, pinned_root=found[name], anchor=new_anchor, accepted=accepted, remote=remote,
                           device=device)
+                st.pop("init_pending", None)     # a move of the pin ends a stopped init (code L3 r12 complement 3-4)
                 if signing_key:
                     st["signing_key"] = signing_key
             self.save_state(_mutate=persist)

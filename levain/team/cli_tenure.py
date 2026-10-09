@@ -226,8 +226,9 @@ def cmd_repin(gl: GitLedger, args) -> int:
             raise TeamError("a genesis has no parents; that commit does")
         # a move of the pin: held under net, then the worktree lock, as `join` holds them (seat ruling, r5 lane item 1)
         with gl.lock(name="net", timeout=150.0), gl.lock():
-            gl.save_state(_mutate=lambda st: st.update(pinned_root=sha, anchor=None,
-                                                        repin_n=int(st.get("repin_n") or 0) + 1))
+            gl.save_state(_mutate=lambda st: (st.update(pinned_root=sha, anchor=None,
+                                                         repin_n=int(st.get("repin_n") or 0) + 1),
+                                               st.pop("init_pending", None)))     # a pin move ends a stopped init
         left = gl.other_genesis_items()
         if left:
             gl.warnings.append(left)
