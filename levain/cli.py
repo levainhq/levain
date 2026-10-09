@@ -1039,6 +1039,18 @@ def main(argv: list[str] | None = None) -> int:
         dest="dry_run",
         help="Print every step and change nothing (does not need sudo).",
     )
+    iso_p.add_argument(
+        "--egress-port",
+        action="append",
+        type=int,
+        dest="egress_ports",
+        metavar="PORT",
+        help=(
+            "Linux: a loopback TCP port the hands user may connect to (its model proxy); repeat for more. "
+            "Every other connection the hands user opens is refused (an nftables rule on its uid). "
+            "Omitted, a setup allows none and a repair run keeps what is recorded."
+        ),
+    )
     iso_p.set_defaults(func=_cmd_setup_isolation)
 
     wsg_p = subparsers.add_parser(
@@ -1956,7 +1968,9 @@ def _cmd_adopt_answers(args: argparse.Namespace) -> int:
 def _cmd_setup_isolation(args: argparse.Namespace) -> int:
     from levain.firing.hands import cmd_setup_isolation
 
-    return cmd_setup_isolation(args.path, undo=args.undo, dry_run=args.dry_run, reenable=args.reenable)
+    ports = tuple(args.egress_ports) if args.egress_ports is not None else None
+    return cmd_setup_isolation(args.path, undo=args.undo, dry_run=args.dry_run, reenable=args.reenable,
+                               egress_ports=ports)
 
 
 def _cmd_ws_git(args: argparse.Namespace) -> int:

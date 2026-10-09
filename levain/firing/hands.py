@@ -110,9 +110,285 @@ _CRON_DENY = {"darwin": (Path("/usr/lib/cron/cron.deny"), Path("/usr/lib/cron/at
 #: and read, and nothing that writes, creates or deletes.
 _DARWIN_OPERATOR_READ = "list,search,readattr,readextattr,readsecurity,read,file_inherit,directory_inherit"
 
+#: Linux egress boundary (P-1 (a), Phill 2026-10-08): where the per-user nftables ruleset and the
+#: systemd unit that loads it at boot live. Root-owned; only setup writes them, only undo removes them.
+_EGRESS_DIR = Path("/etc/levain/egress")
+_SYSTEMD_UNIT_DIR = Path("/etc/systemd/system")
+
 
 class HandsSetupError(RuntimeError):
     """setup-isolation cannot run here, or refused to act on something it did not create."""
+
+
+# --- the Linux egress boundary --------------------------------------------------------------------
+#
+# WHY. P2b (2026-10-08, levain project_memory P2_PROBE_2026-10-08/RESULT.md, property 3) ran claude
+# under its own sandbox and codex read-only as a hands user, both pointed at a rogue listener, and
+# both reached it: a harness vendor's sandbox confines the harness's TOOL children, never the harness
+# process. The boundary has to be the OS's, around the uid. On Linux that is an nftables output rule
+# matching the socket owner (`meta skuid`): every IP socket the hands user opens is refused except
+# loopback TCP to the recorded proxy ports. A Unix-socket proxy is outside netfilter and needs no
+# rule. nftables sees IP sockets only: a local daemon the hands user can ask to connect for it (a
+# resolver over D-Bus or varlink, say) is not covered by this rule.
+
+
+def egress_table(hands_user: str) -> str:
+    """The nftables table of ``hands_user``'s boundary, keyed by NAME (undo removes it without an id).
+    nft identifiers start with a letter, so the leading ``_levain_`` becomes ``levain_``."""
+    if not HANDS_USER_RE.match(hands_user):
+        raise HandsSetupError(f"refusing {hands_user!r}: not a Levain hands user name")
+    return "levain_" + hands_user[len("_levain_"):]
+
+
+def hands_net_group(hands_user: str) -> str:
+    """The group whose gid the boundary lets out (Linux, D: Phill 2026-10-09). Only network git that
+    ``levain ws-git`` starts runs with it: the hands user is never a member and the group has no
+    password, so no process of the hands user can take this gid by itself."""
+    egress_table(hands_user)   # validates the name
+    return hands_user + "_net"
+
+
+def egress_rules_path(hands_user: str) -> Path:
+    return _EGRESS_DIR / f"{egress_table(hands_user)}.nft"
+
+
+def egress_unit_name(hands_user: str) -> str:
+    return f"levain-egress-{egress_table(hands_user)[len('levain_'):].replace('_', '-')}.service"
+
+
+def egress_unit_path(hands_user: str) -> Path:
+    return _SYSTEMD_UNIT_DIR / egress_unit_name(hands_user)
+
+
+def check_egress_ports(ports: object) -> tuple[int, ...]:
+    """``ports`` as a sorted tuple of distinct TCP ports, or HandsSetupError."""
+    if not isinstance(ports, (list, tuple)) or any(
+            isinstance(p, bool) or not isinstance(p, int) or not 1 <= p <= 65535 for p in ports):
+        raise HandsSetupError(f"egress ports must be TCP port numbers (1-65535), got {ports!r}")
+    return tuple(sorted(set(ports)))
+
+
+def egress_ruleset(hands_user: str, hands_id: int, ports: tuple[int, ...], net_gid: int | None = None) -> str:
+    """The ruleset, loaded with ``nft -f`` as ONE transaction: the empty ``table`` line makes the
+    ``delete`` succeed when the table is absent, so a load replaces an older ruleset atomically and
+    there is no moment with no rule. Reject, not drop: a refused connect fails at once, by name."""
+    table = egress_table(hands_user)
+    ports = check_egress_ports(ports)
+    allow: list[str] = []
+    if ports:
+        dports = "{ " + ", ".join(str(p) for p in ports) + " }"
+        allow = [f"    meta skuid {hands_id} ip daddr 127.0.0.1 tcp dport {dports} accept",
+                 f"    meta skuid {hands_id} ip6 daddr ::1 tcp dport {dports} accept"]
+    if net_gid is not None:
+        # The one way out: a socket opened with the net group as its gid (network git ws-git starts).
+        allow.append(f"    meta skuid {hands_id} meta skgid {net_gid} accept")
+    return "\n".join([
+        "# Written by `levain setup-isolation`; removed by `levain setup-isolation --undo`.",
+        f"# The network boundary of the hands user {hands_user} (uid {hands_id}).",
+        f"table inet {table} {{}}",
+        f"delete table inet {table}",
+        f"table inet {table} {{",
+        "  chain output {",
+        "    type filter hook output priority filter; policy accept;",
+        *allow,
+        f"    meta skuid {hands_id} meta l4proto tcp reject with tcp reset",
+        f"    meta skuid {hands_id} reject with icmpx admin-prohibited",
+        "  }",
+        "}",
+        "",
+    ])
+
+
+def egress_unit_text(hands_user: str) -> str:
+    """Loads the ruleset at boot, before the network is configured. No ExecStop: stopping the unit
+    must not lift the boundary; only ``--undo`` removes the table."""
+    return "\n".join([
+        "# Written by `levain setup-isolation`; removed by `levain setup-isolation --undo`.",
+        "[Unit]",
+        f"Description=Levain network boundary for the hands user {hands_user}",
+        "DefaultDependencies=no",
+        "Before=network-pre.target",
+        "Wants=network-pre.target",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        "RemainAfterExit=yes",
+        f"ExecStart={_abs('nft')} -f {egress_rules_path(hands_user)}",
+        "",
+        "[Install]",
+        "WantedBy=sysinit.target",
+        "",
+    ])
+
+
+def egress_unavailable() -> str | None:
+    """Why this Linux host cannot carry the boundary, or None. Setup refuses by this name rather
+    than set up a hands user whose network nothing confines."""
+    for tool, package in (("nft", "nftables"), ("systemctl", "systemd")):
+        if shutil.which(tool, path=SECURE_PATH) is None:
+            return (f"{package} is not installed (no `{tool}` on {SECURE_PATH}); the hands user's network "
+                    f"boundary needs it. Install {package}, then run setup again")
+    try:
+        r = subprocess.run([_abs("nft"), "list", "tables"], capture_output=True, text=True, timeout=30,
+                           env=child_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"nftables could not be run ({exc}); the hands user's network boundary needs it"
+    if r.returncode != 0:
+        said = (r.stderr or r.stdout).strip() or f"exit {r.returncode}"
+        return f"the kernel refused nftables ({said}); the hands user's network boundary needs it"
+    return None
+
+
+def _egress_table_loaded(hands_user: str) -> tuple[bool, str]:
+    r = subprocess.run([_abs("nft"), "list", "table", "inet", egress_table(hands_user)],
+                       capture_output=True, text=True, env=child_env())
+    return (True, "") if r.returncode == 0 else (False, "the boundary's table is not loaded: "
+                                                 + ((r.stderr or r.stdout).strip() or f"exit {r.returncode}"))
+
+
+def _egress_table_absent(hands_user: str) -> tuple[bool, str]:
+    nft = _abs("nft")
+    table = egress_table(hands_user)
+    if subprocess.run([nft, "list", "table", "inet", table], capture_output=True, env=child_env()).returncode != 0:
+        return True, ""
+    r = subprocess.run([nft, "delete", "table", "inet", table], capture_output=True, text=True, env=child_env())
+    return (r.returncode == 0, (r.stderr or r.stdout).strip())
+
+
+_EGRESS_PROBE = (
+    "import socket, sys\n"
+    "s = socket.socket()\n"
+    "s.settimeout(3)\n"
+    "try:\n"
+    "    s.connect(('127.0.0.1', int(sys.argv[1])))\n"
+    "    print('connected')\n"
+    "except OSError as e:\n"
+    "    print('refused', e.errno)\n"
+)
+
+
+def egress_boundary_problem(hands_user: str, ports: tuple[int, ...] = (), *, timeout: float = 15.0) -> str | None:
+    """Does the hands user's network boundary hold, asked of the kernel rather than the ruleset (which
+    only root can list)? None when it holds, else what is wrong. Run by the operator, who may run
+    commands as the hands user (the sudoers rule setup wrote).
+
+    The operator listens on a loopback port the boundary does not allow, and the hands user tries to
+    connect to it. It holds when that connect fails, nothing from the hands user reached the listener,
+    AND the operator's own connect to the same listener then succeeds: without that last step a dead
+    listener would read as a boundary. A probe that cannot run is a problem, never a pass."""
+    import socket
+
+    listener = socket.socket()
+    try:
+        listener.bind(("127.0.0.1", 0))
+        while listener.getsockname()[1] in ports:   # never probe a port the boundary allows
+            listener.close()
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+        listener.listen(4)
+        listener.setblocking(False)
+        port = listener.getsockname()[1]
+        try:
+            r = subprocess.run(["/usr/bin/sudo", "-n", "-u", hands_user, "/usr/bin/env", "-i", f"PATH={SECURE_PATH}",
+                                _abs("python3"), "-I", "-c", _EGRESS_PROBE, str(port)],
+                               capture_output=True, text=True, timeout=timeout, cwd="/", env=child_env())
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"the probe could not run as {hands_user} ({exc})"
+        said = (r.stdout or "").strip()
+        reached = False
+        try:
+            listener.accept()[0].close()
+            reached = True
+        except BlockingIOError:
+            pass
+        if said == "connected" or reached:
+            return (f"{hands_user} connected to a loopback port its boundary does not allow: nothing confines "
+                    "its network (the nftables rule is not loaded)")
+        if not said.startswith("refused"):
+            return f"the probe could not run as {hands_user} ({(r.stderr or said).strip() or f'exit {r.returncode}'})"
+        control = socket.create_connection(("127.0.0.1", port), timeout=3)
+        control.close()
+        try:
+            listener.setblocking(True)
+            listener.settimeout(3)
+            listener.accept()[0].close()
+        except OSError as exc:
+            return f"the probe's own listener did not answer ({exc}), so the refusal proves nothing"
+        return None
+    except OSError as exc:
+        return f"the probe failed ({exc})"
+    finally:
+        listener.close()
+
+
+def egress_steps(hands_user: str, hands_id: int, ports: tuple[int, ...], net_gid: int | None = None) -> list[Step]:
+    """Install (or replace) the boundary: idempotent, so setup and a repair run use the same steps.
+    The ruleset is checked by the kernel (``nft -c``) before it is installed; ``restart`` re-runs the
+    unit even when it was already active, which is what loads a changed ruleset."""
+    systemctl, unit = _abs("systemctl"), egress_unit_name(hands_user)
+    return [
+        Step("write the hands user's network boundary (nftables, checked with nft -c)",
+             write=(egress_rules_path(hands_user), egress_ruleset(hands_user, hands_id, ports, net_gid), 0o644),
+             validate=(_abs("nft"), "-c", "-f")),
+        Step("load it at every boot, before the network (systemd unit)",
+             write=(egress_unit_path(hands_user), egress_unit_text(hands_user), 0o644)),
+        Step("tell systemd about the unit", (systemctl, "daemon-reload")),
+        Step("enable it", (systemctl, "enable", unit)),
+        Step("load the boundary now", (systemctl, "restart", unit)),
+        Step("check the boundary is loaded", call=lambda: _egress_table_loaded(hands_user)),
+    ]
+
+
+def _net_group_retired_and_gone(hands_user: str) -> tuple[bool, str]:
+    """Retire the net group's gid (never given out again: a rule left behind by a failed undo must
+    never let a later group out), then delete the group. Absent is done."""
+    import grp
+
+    name = hands_net_group(hands_user)
+    try:
+        gid = grp.getgrnam(name).gr_gid
+    except KeyError:
+        return True, ""
+    ok, why = _ensure_line(_RETIRED_IDS["linux"], str(gid), present=True, create=True)
+    if not ok:
+        return False, why
+    r = subprocess.run([_abs("groupdel"), name], capture_output=True, text=True, env=child_env())
+    return (r.returncode == 0, (r.stderr or r.stdout).strip())
+
+
+def net_group_problem(hands_user: str) -> str | None:
+    """Why the net group could let a process of the hands user out on its own, or None: the hands
+    user must not be a member of it (a member takes the gid with ``sg`` or ``newgrp``, no password)."""
+    import grp
+
+    name = hands_net_group(hands_user)
+    try:
+        g = grp.getgrnam(name)
+    except KeyError:
+        return f"the group {name} that network git runs with does not exist"
+    if hands_user in g.gr_mem:
+        return f"{hands_user} is a member of {name}, so any of its processes can take the gid the boundary lets out"
+    try:
+        if pwd.getpwnam(hands_user).pw_gid == g.gr_gid:
+            return f"{name} is {hands_user}'s primary group, so every one of its processes is let out"
+    except KeyError:
+        pass
+    return None
+
+
+def egress_undo_steps(hands_user: str) -> list[Step]:
+    """Remove the boundary. Run only after every hands process is stopped, so nothing of the hands
+    user runs with its network open."""
+    systemctl, unit, unit_path = _abs("systemctl"), egress_unit_name(hands_user), egress_unit_path(hands_user)
+    return [
+        Step("stop loading the network boundary at boot", (systemctl, "disable", unit),
+             skip_if=(_abs("test"), "!", "-e", str(unit_path))),
+        Step("remove its systemd unit", ("/bin/rm", "-f", str(unit_path))),
+        Step("tell systemd", (systemctl, "daemon-reload")),
+        Step("remove its ruleset file", ("/bin/rm", "-f", str(egress_rules_path(hands_user)))),
+        Step("remove the boundary's table", call=lambda: _egress_table_absent(hands_user)),
+        Step("retire and remove the group network git ran with", call=lambda: _net_group_retired_and_gone(hands_user)),
+    ]
 
 
 def hands_user_name(entity_dir: Path | str) -> str:
@@ -140,7 +416,7 @@ def sshd_dropin_path(hands_user: str) -> Path:
     return _SSHD_DROPIN_DIR / f"levain-{hands_user}.conf"
 
 
-def sudoers_text(operator: str, hands_user: str) -> str:
+def sudoers_text(operator: str, hands_user: str, net_group: str | None = None) -> str:
     return (
         f"# Written by `levain setup-isolation`; removed by `levain setup-isolation --undo`.\n"
         f"# {operator} may run commands as the Levain hands user {hands_user}, and nothing else.\n"
@@ -149,7 +425,10 @@ def sudoers_text(operator: str, hands_user: str) -> str:
         # levain hands bash a socket on stdin and reads its state back over it; I/O logging and a
         # pseudo-terminal would put sudo's own pipe or pty there instead (S2 L2b L3).
         f"Defaults>{hands_user} !log_input, !log_output, !use_pty\n"
-        f"{operator} ALL=({hands_user}) NOPASSWD: ALL\n"
+        # Linux: the runas group lets the operator's `levain ws-git` start network git with the net
+        # group's gid, the one gid the egress boundary lets out.
+        + (f"{operator} ALL=({hands_user} : {net_group}) NOPASSWD: ALL\n" if net_group
+           else f"{operator} ALL=({hands_user}) NOPASSWD: ALL\n")
     )
 
 
@@ -212,6 +491,8 @@ def plan_setup(
     git_identity: dict[str, str] | None = None,
     sshd_dropins: bool = False,
     deny_lists: tuple[Path, ...] = (),
+    egress_ports: tuple[int, ...] = (),
+    net_gid: int | None = None,
 ) -> Plan:
     """The setup, as data. ``sshd_dropins`` says whether sshd reads ``sshd_config.d``;
     ``deny_lists`` are the cron/at deny files that exist (only an existing list is extended: where
@@ -294,6 +575,13 @@ def plan_setup(
                  (_abs("loginctl"), "enable-linger", operator),
                  skip_if=(_abs("test"), "-e", f"/var/lib/systemd/linger/{operator}")),
         ]
+        # Before anything runs as the hands user (the key generation below), so nothing of it ever
+        # runs with its network open.
+        if net_gid is None:
+            raise HandsSetupError("a Linux setup needs a gid for the hands user's network group")
+        steps += [Step("create the group network git runs with (the hands user is not a member)",
+                       (_abs("groupadd"), "--system", "--gid", str(net_gid), hands_net_group(hands)))]
+        steps += egress_steps(hands, hands_id, egress_ports, net_gid)
     else:  # pragma: no cover - guarded by the caller
         raise HandsSetupError(f"unsupported host {host!r}")
 
@@ -313,7 +601,8 @@ def plan_setup(
         steps.append(Step(f"give the hands user your git {gkey}", (*as_hands, git, "config", "--global", gkey, value)))
     steps.append(Step(
         "allow you to run commands as the hands user, and nothing else (sudoers drop-in)",
-        write=(sudoers_path(hands), sudoers_text(operator, hands), 0o440),
+        write=(sudoers_path(hands), sudoers_text(operator, hands, hands_net_group(hands) if host == "linux" else None),
+               0o440),
         validate=(_abs("visudo"), "-cf"),
     ))
     if sshd_dropins:
@@ -415,6 +704,10 @@ def plan_undo(
             # that only the config names.
             steps.append(Step("stop every process of the hands user, and check they are gone",
                               call=lambda: _kill_all(hands_id)))
+    if host == "linux":
+        # After the processes are stopped: the boundary is lifted only once nothing of the hands user
+        # runs. Keyed by name, so it is removed even when the account and its id are gone.
+        steps += egress_undo_steps(hands_user)
     steps += [
         Step("give what the hands user owned your group (its owner stays its old id: never you, never root)",
              call=lambda: _to_operator_group(tree, hands_id, operator_gid)),
@@ -834,6 +1127,16 @@ def user_is_retired(hands_user: str, host: HostOS) -> bool:
     return r.returncode == 0 and RETIRED_MARKER[host] in r.stdout
 
 
+def _group_exists(name: str) -> bool:
+    import grp
+
+    try:
+        grp.getgrnam(name)
+    except KeyError:
+        return False
+    return True
+
+
 def _user_exists(name: str) -> bool:
     try:
         pwd.getpwnam(name)
@@ -917,7 +1220,7 @@ def _install_file(path: Path, content: str, mode: int, *, validate: tuple[str, .
 
 # --- the record -----------------------------------------------------------------------------------
 
-RECORD_KEYS = ("hands_user", "hands_uid", "hands_workspace")
+RECORD_KEYS = ("hands_user", "hands_uid", "hands_workspace", "hands_egress_ports")
 
 
 def record_hands(entity_dir: Path, values: dict | None, *, owner_uid: int, owner_gid: int) -> Path:
@@ -1006,8 +1309,67 @@ def _operator_path_under_home(operator: str) -> list[str]:
 # --- the command ----------------------------------------------------------------------------------
 
 
-def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable: bool = False) -> int:
-    """``levain setup-isolation [--undo] [--dry-run]``. Returns a process exit code."""
+def _repair_linux(entity_dir: Path, cfg, operator: str, op: pwd.struct_passwd, ports: tuple[int, ...], *,
+                  dry_run: bool) -> int:
+    """``setup-isolation`` on a Linux entity already set up: the steps an older install lacks run
+    here, idempotently, without an undo ("run setup again" is their remedy). Linger, from before the
+    cgroup frame (L3 r9); the network boundary, from before P-1 (a), or to change its ports."""
+    hands = cfg.hands_user
+    try:
+        hands_id = pwd.getpwnam(hands).pw_uid
+    except KeyError:
+        print(f"setup-isolation: the recorded hands user {hands} does not exist. Run with --undo, then again.")
+        return 1
+    if hands_id != cfg.hands_uid:
+        # From the directory service: root must not write a rule for an id the operator-writable config
+        # alone names.
+        print(f"setup-isolation: {hands} has id {hands_id}, but confinement.json records {cfg.hands_uid}; refusing.")
+        return 1
+    net = hands_net_group(hands)
+    steps = [Step(f"keep {operator}'s systemd user manager running without a login session (linger)",
+                  (_abs("loginctl"), "enable-linger", operator))]
+    if _group_exists(net):
+        import grp
+
+        net_gid = grp.getgrnam(net).gr_gid
+        if (problem := net_group_problem(hands)) is not None:
+            print(f"setup-isolation: refusing: {problem}.")
+            return 1
+    else:
+        # An install from before D has no net group: make one, with an id no Levain account has had.
+        try:
+            net_gid = choose_id("linux", used_ids("linux"), retired_ids("linux"))
+        except (HandsSetupError, subprocess.CalledProcessError) as exc:
+            print(f"setup-isolation: {exc}")
+            return 1
+        steps.append(Step("create the group network git runs with (the hands user is not a member)",
+                          (_abs("groupadd"), "--system", "--gid", str(net_gid), net)))
+    steps += egress_steps(hands, hands_id, ports, net_gid)
+    steps.append(Step("let you start network git as the hands user with that group (sudoers drop-in)",
+                      write=(sudoers_path(hands), sudoers_text(operator, hands, net), 0o440),
+                      validate=(_abs("visudo"), "-cf")))
+    plan = Plan("linux", operator, hands, hands_id, entity_dir, cfg.hands_workspace, tuple(steps))
+    print(f"Repairing the setup recorded in {entity_dir} (user {hands}): linger, and the network boundary "
+          + (f"(loopback ports {', '.join(map(str, ports))} allowed)." if ports else "(no port allowed)."))
+    rc = run_plan(plan, dry_run=dry_run)
+    if rc != 0 or dry_run:
+        return rc
+    if ports != cfg.hands_egress_ports:
+        record_hands(entity_dir, {"hands_user": hands, "hands_uid": hands_id,
+                                  "hands_workspace": str(cfg.hands_workspace), "hands_egress_ports": list(ports)},
+                     owner_uid=op.pw_uid, owner_gid=op.pw_gid)
+    # The repair was what this run was for: it succeeded, so it is not a refusal (L3 r10). This run
+    # checked nothing else of the recorded setup, so it claims nothing else (L3 r11).
+    print(f"setup-isolation: linger is on and the network boundary is loaded for {hands}; "
+          "`levain doctor` checks the rest of the setup.")
+    return 0
+
+
+def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable: bool = False,
+                        egress_ports: tuple[int, ...] | None = None) -> int:
+    """``levain setup-isolation [--undo] [--dry-run] [--egress-port N ...]``. Returns a process exit
+    code. ``egress_ports`` (Linux): the loopback TCP ports the hands user may connect to (the proxy
+    path); None keeps what is recorded."""
     from levain.firing.confinement import ConfinementError, load_confinement_config
     from levain.firing.isolation import IsolationError, guard_entity
 
@@ -1119,6 +1481,10 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
         leftovers = [what for what, there in (
             (f"the user {hands} as a live account (not retired)", hands_id is not None and not retired),
             (f"the sudoers rule {sudoers_path(hands)}", sudoers_path(hands).exists()),
+            (f"the network boundary unit {egress_unit_path(hands)}", host == "linux" and egress_unit_path(hands).exists()),
+            (f"the network boundary ruleset {egress_rules_path(hands)}",
+             host == "linux" and egress_rules_path(hands).exists()),
+            (f"the group {hands_net_group(hands)}", host == "linux" and _group_exists(hands_net_group(hands))),
         ) if there]
         if leftovers:
             print("setup-isolation: undo did not finish: " + "; ".join(leftovers) + " still present.")
@@ -1129,32 +1495,24 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
               "again later: sudo levain setup-isolation --reenable")
         return 0
 
+    try:
+        ports = check_egress_ports(egress_ports if egress_ports is not None else cfg.hands_egress_ports)
+    except HandsSetupError as exc:
+        print(f"setup-isolation: {exc}")
+        return 1
+    if host == "linux" and not dry_run:
+        unavailable = egress_unavailable()
+        if unavailable:
+            print(f"setup-isolation: refusing: {unavailable}.")
+            return 1
     if cfg.hands_user is not None:
-        if host == "linux" and dry_run:
-            print(f"setup-isolation: would run `loginctl enable-linger {operator}` for the setup recorded "
-                  f"in {entity_dir} (user {cfg.hands_user}).")
-            return 0
         if host == "linux":
-            # An install from before the cgroup frame has no linger, and "run setup again" is its
-            # remedy: the one step it is missing runs here, idempotently, without an undo (L3 r9).
-            try:
-                r = subprocess.run([_abs("loginctl"), "enable-linger", operator], capture_output=True,
-                                   text=True, timeout=30, env=child_env())
-                ok, said = r.returncode == 0, (r.stderr or "").strip()
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                ok, said = False, str(exc)
-            print(f"setup-isolation: linger for {operator}: "
-                  + ("on (each command's cgroup scope needs your systemd user manager running)." if ok
-                     else f"could not enable it ({said or 'no reason given'})."))
-            if not ok:
-                return 1
-            # The repair was what this run was for: it succeeded, so it is not a refusal (L3 r10). This
-            # run checked nothing else of the recorded setup, so it claims nothing else (L3 r11).
-            print(f"setup-isolation: linger is now enabled for the setup recorded in {entity_dir} (user "
-                  f"{cfg.hands_user}); `levain doctor` checks the rest of it.")
-            return 0
+            return _repair_linux(entity_dir, cfg, operator, op, ports, dry_run=dry_run)
         print(f"setup-isolation: {entity_dir} is already set up (user {cfg.hands_user}). "
               "Run with --undo first to set it up again.")
+        return 1
+    if egress_ports is not None and host != "linux":
+        print("setup-isolation: --egress-port is for Linux; on macOS the hands user has no network boundary yet.")
         return 1
     reenable_id: int | None = None
     if _user_exists(derived):
@@ -1190,9 +1548,11 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
         return 1
     try:
         hands_id = reenable_id if reenable_id is not None else choose_id(host, used_ids(host), retired_ids(host))
+        net_gid = (choose_id(host, used_ids(host) | {hands_id}, retired_ids(host)) if host == "linux" else None)
         plan = plan_setup(entity_dir, operator=operator, host=host, hands_id=hands_id, reenable=reenable_id is not None,
                           git_identity=operator_git_identity(operator),
-                          sshd_dropins=sshd_reads_dropins(), deny_lists=existing_deny_lists(host))
+                          sshd_dropins=sshd_reads_dropins(), deny_lists=existing_deny_lists(host),
+                          egress_ports=ports, net_gid=net_gid)
     except (HandsSetupError, subprocess.CalledProcessError) as exc:
         print(f"setup-isolation: {exc}")
         return 1
@@ -1206,7 +1566,8 @@ def cmd_setup_isolation(path: Path | str, *, undo: bool, dry_run: bool, reenable
     if dry_run:
         return 0
     record_hands(entity_dir, {"hands_user": plan.hands_user, "hands_uid": hands_id,
-                              "hands_workspace": str(plan.workspace)},
+                              "hands_workspace": str(plan.workspace),
+                              **({"hands_egress_ports": list(ports)} if host == "linux" else {})},
                  owner_uid=op.pw_uid, owner_gid=op.pw_gid)
     print(f"Done. The hands user {plan.hands_user} exists; its workspace is {plan.workspace}.")
     if not sshd_reads_dropins():

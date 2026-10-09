@@ -155,16 +155,42 @@ def _config_lines(config: Path, *args: str) -> list[str]:
     return [ln for ln in r.stdout.splitlines() if ln.strip()]
 
 
-def ws_git_argv(hands: Hands, gitdir: Path, args: list[str]) -> list[str]:
+#: The git verbs that reach a remote. On Linux ws-git runs them with the hands user's net group,
+#: the one gid its egress boundary lets out (D, Phill 2026-10-09); every other verb keeps the hands
+#: user's own group, so it has no network at all. A network verb not listed here is refused by the
+#: boundary, not let out.
+NET_VERBS = frozenset({"push", "fetch", "pull", "ls-remote"})
+#: git's global options that take a value as the next argument.
+_GIT_OPTS_WITH_VALUE = frozenset({"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path"})
+
+
+def git_verb(args: list[str]) -> str | None:
+    """The git subcommand in ``args`` (the first word that is not a global option or its value)."""
+    it = iter(args)
+    for a in it:
+        if a in _GIT_OPTS_WITH_VALUE:
+            next(it, None)
+        elif not a.startswith("-"):
+            return a
+    return None
+
+
+def ws_git_argv(hands: Hands, gitdir: Path, args: list[str], *, system: str | None = None) -> list[str]:
     """``git`` as the hands user, on exactly the git directory that was checked (``--git-dir`` and
     ``--work-tree``: no discovery, so git cannot fall through to another one), with no system or
     global config (the hands user writes its own ~/.gitconfig), the program-naming keys switched
-    off, and a clean environment."""
+    off, and a clean environment. ssh reads no config file and offers only the entity's deploy key:
+    the hands user writes its own ~/.ssh/config, and a ProxyCommand there would run as it."""
+    from levain.firing.hands import deploy_key_path, hands_net_group
+
+    ssh = f"core.sshCommand=/usr/bin/ssh -F /dev/null -i {deploy_key_path(hands.home)} -o IdentitiesOnly=yes"
+    net = ((system or platform.system()) == "Linux" and git_verb(args) in NET_VERBS)
     return _as_hands(
-        hands, _real_git(), *_NEUTRALISE, f"--git-dir={gitdir}", f"--work-tree={gitdir.parent}",
+        hands, _real_git(), *_NEUTRALISE, "-c", ssh, f"--git-dir={gitdir}", f"--work-tree={gitdir.parent}",
         "-C", str(gitdir.parent), *args,
         env=("GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0",
              "LANG=" + os.environ.get("LANG", "en_US.UTF-8")),
+        group=hands_net_group(hands.user) if net else None,
     )
 
 
@@ -384,10 +410,10 @@ def cmd_ws_git(entity_dir: Path | str, repo: Path | str, args: list[str]) -> int
         return 1
 
 
-def _as_hands(hands: Hands, *argv: str, env: tuple[str, ...] = ()) -> list[str]:
-    """``argv`` run as the hands user with a clean environment."""
-    return ["/usr/bin/sudo", "-n", "-u", hands.user, "/usr/bin/env", "-i", f"HOME={hands.home}",
-            f"PATH={SECURE_PATH}", *env, *argv]
+def _as_hands(hands: Hands, *argv: str, env: tuple[str, ...] = (), group: str | None = None) -> list[str]:
+    """``argv`` run as the hands user with a clean environment (and, with ``group``, that gid)."""
+    return ["/usr/bin/sudo", "-n", "-u", hands.user, *(("-g", group) if group else ()), "/usr/bin/env", "-i",
+            f"HOME={hands.home}", f"PATH={SECURE_PATH}", *env, *argv]
 
 
 def _under_a_workspace_root(path: Path) -> bool:

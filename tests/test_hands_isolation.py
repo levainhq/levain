@@ -39,6 +39,8 @@ def _entity(tmp_path: Path, name: str = "coyote") -> Path:
 
 def _setup(tmp_path: Path, host: str = "darwin", **kw):
     kw.setdefault("hands_id", 499 if host == "darwin" else 999)
+    if host == "linux":
+        kw.setdefault("net_gid", 998)
     return plan_setup(_entity(tmp_path), operator="alice", host=host, **kw)
 
 
@@ -165,8 +167,10 @@ def test_the_sudoers_step_is_validated_and_scoped_to_the_hands_user(tmp_path: Pa
     h = plan.hands_user
     # The I/O options pinned off (S2 L2b L3): a log_input pipe or a pty on stdin would replace the
     # socket levain reads the shell's state back over.
+    # Linux (D, Phill 2026-10-09): the runas group is the net group, the one gid the egress boundary lets out.
+    runas = f"{h} : {h}_net" if host == "linux" else h
     assert rules == [f"Defaults>{h} !requiretty", f"Defaults>{h} env_reset",
-                     f"Defaults>{h} !log_input, !log_output, !use_pty", f"alice ALL=({h}) NOPASSWD: ALL"]
+                     f"Defaults>{h} !log_input, !log_output, !use_pty", f"alice ALL=({runas}) NOPASSWD: ALL"]
 
 
 @pytest.mark.skipif(shutil.which("visudo") is None, reason="needs visudo")
@@ -174,9 +178,10 @@ def test_the_sudoers_text_parses(tmp_path: Path) -> None:
     import subprocess
 
     f = tmp_path / "rule"
-    f.write_text(sudoers_text("alice", "_levain_coyote_abcdef"))
-    r = subprocess.run(["visudo", "-cf", str(f)], capture_output=True, text=True)
-    assert r.returncode == 0, r.stdout + r.stderr
+    for net in (None, "_levain_coyote_abcdef_net"):
+        f.write_text(sudoers_text("alice", "_levain_coyote_abcdef", net))
+        r = subprocess.run(["visudo", "-cf", str(f)], capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout + r.stderr
 
 
 @pytest.mark.parametrize("bad", ["a,b", "a b", "a:b", "a\\b", "-x", "1abc", "x" * 40])
@@ -305,6 +310,8 @@ def _setup_dry(tmp_path: Path, monkeypatch, capsys, *, retired: bool, reenable: 
     monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: type("E", (), {"pw_uid": 450})() if n == hands_user_name(ed) else real(n))
     monkeypatch.setattr(hands, "shared_root_problem", lambda h: None)
     monkeypatch.setattr(hands, "operator_git_identity", lambda op: {})
+    monkeypatch.setattr(hands, "used_ids", lambda h: set())
+    monkeypatch.setattr(hands, "retired_ids", lambda h: set())
     rc = hands.cmd_setup_isolation(ed, undo=False, dry_run=True, reenable=reenable)
     return rc, capsys.readouterr().out
 
@@ -462,7 +469,8 @@ def test_hands_keys_are_appended_last_to_the_config_dataclass() -> None:
 
     from levain.firing.confinement import ConfinementConfig
 
-    assert [f.name for f in fields(ConfinementConfig)][-3:] == ["hands_user", "hands_uid", "hands_workspace"]
+    assert [f.name for f in fields(ConfinementConfig)][-4:] == ["hands_user", "hands_uid", "hands_workspace",
+                                                                "hands_egress_ports"]
 
 
 # --- preconditions ---------------------------------------------------------------------------------
@@ -802,11 +810,61 @@ def test_linger_repair_on_an_existing_linux_install_succeeds(tmp_path: Path, mon
     ed = _entity(tmp_path)
     (ed / ".levain" / "confinement.json").write_text(json.dumps(_record(ed)))
     monkeypatch.setattr(hands, "invoking_operator", lambda: os.environ.get("USER") or "root")
-    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: hands.pwd.getpwuid(os.getuid()))
+    me = hands.pwd.getpwuid(os.getuid())
+    monkeypatch.setattr(hands.pwd, "getpwnam", lambda n: me if n != hands_user_name(ed) else
+                        hands.pwd.struct_passwd((n, "*", 499, 499, "", "/nonexistent", "/bin/false")))
     monkeypatch.setattr(hands, "host_os", lambda: "linux")
+    monkeypatch.setattr(hands, "egress_unavailable", lambda: None)
+    monkeypatch.setattr(hands, "_group_exists", lambda n: False)
+    monkeypatch.setattr(hands, "used_ids", lambda h: set(range(901, 1000)))
+    monkeypatch.setattr(hands, "retired_ids", lambda h: set())
+    written: list[Path] = []
+    monkeypatch.setattr(hands, "_install_file", lambda path, *a, **kw: written.append(path) or (True, ""))
     ran: list[list[str]] = []
     monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: ran.append(argv)
                         or subprocess.CompletedProcess(argv, 0, "", ""))
     assert hands.cmd_setup_isolation(ed, undo=False, dry_run=False) == 0
     out = capsys.readouterr().out
-    assert any("enable-linger" in a for a in ran) and "linger is now enabled" in out and "--undo" not in out
+    assert any("enable-linger" in a for a in ran) and "linger is on" in out and "--undo" not in out
+    # P-1 (a): the repair also loads the network boundary (an install from before it has none).
+    h = hands_user_name(ed)
+    assert written == [hands.egress_rules_path(h), hands.egress_unit_path(h), hands.sudoers_path(h)]
+    assert any(list(a[-3:]) == ["--gid", "900", f"{h}_net"] for a in ran)   # pre-D install: the group is made
+    assert any(list(a[-2:]) == ["restart", hands.egress_unit_name(hands_user_name(ed))] for a in ran)
+
+
+# --- the Linux egress boundary (P-1 (a), Phill 2026-10-08) ------------------------------------------
+
+
+def test_linux_setup_loads_the_boundary_before_anything_runs_as_the_hands_user(tmp_path: Path) -> None:
+    plan = _setup(tmp_path, "linux", hands_id=999, egress_ports=(18080,))
+    whys = [s.why for s in plan.steps]
+    loaded = whys.index("check the boundary is loaded")
+    first_as_hands = next(i for i, s in enumerate(plan.steps) if s.argv[:3] == ("/usr/bin/sudo", "-u", plan.hands_user))
+    assert loaded < first_as_hands
+    ruleset = next(s.write[1] for s in plan.steps if s.write and s.write[0] == hands.egress_rules_path(plan.hands_user))
+    assert "meta skuid 999 ip daddr 127.0.0.1 tcp dport { 18080 } accept" in ruleset
+    assert ruleset.rstrip().splitlines()[-3].strip() == "meta skuid 999 reject with icmpx admin-prohibited"
+
+
+def test_linux_undo_lifts_the_boundary_only_after_the_hands_processes_are_stopped(tmp_path: Path) -> None:
+    ed = _entity(tmp_path)
+    plan = _undo(ed, "linux", hands_user=hands_user_name(ed), hands_id=999)
+    whys = [s.why for s in plan.steps]
+    assert whys.index("stop every process of the hands user, and check they are gone") < whys.index(
+        "remove the boundary's table")
+
+
+def test_linux_setup_refuses_by_name_without_nft(monkeypatch) -> None:
+    monkeypatch.setattr(hands.shutil, "which", lambda name, path=None: None if name == "nft" else f"/usr/bin/{name}")
+    assert hands.egress_unavailable() == (
+        "nftables is not installed (no `nft` on /usr/sbin:/usr/bin:/sbin:/bin); the hands user's network boundary "
+        "needs it. Install nftables, then run setup again")
+
+
+def test_linux_setup_refuses_by_name_when_the_kernel_refuses_nftables(monkeypatch) -> None:
+    monkeypatch.setattr(hands.shutil, "which", lambda name, path=None: f"/usr/sbin/{name}")
+    monkeypatch.setattr(hands.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 1, "", "Error: Operation not permitted (you must be root)\n"))
+    problem = hands.egress_unavailable()
+    assert problem is not None and problem.startswith("the kernel refused nftables (Error: Operation not permitted")

@@ -2093,6 +2093,7 @@ class ConfinementConfig:
     hands_user: str | None = None
     hands_uid: int | None = None
     hands_workspace: Path | None = None
+    hands_egress_ports: tuple[int, ...] = ()
     # M2: the dedicated unprivileged user `sudo levain setup-isolation` created for this entity's
     # bash, its numeric id, and the workspace it created for it outside the operator's home; removed
     # by its `--undo`. All three or none: absent means not set up. Appended last, per the rule above.
@@ -2254,6 +2255,19 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
                 f"({' or '.join(sorted(expected))}), got {hands_workspace_raw!r}.{redo}"
             )
         hands_workspace = Path(hands_workspace_raw)
+    # The loopback TCP ports the hands user's network boundary allows (Linux, P-1 (a)); setup writes
+    # them with the three above and reads them back on a repair run.
+    hands_egress_ports: tuple[int, ...] = ()
+    if "hands_egress_ports" in data:
+        from levain.firing.hands import HandsSetupError, check_egress_ports
+
+        if not present:
+            raise ConfinementError(f"{base}: hands_egress_ports belongs to a hands setup, and there is none — "
+                                   "fail-closed. Remove the key.")
+        try:
+            hands_egress_ports = check_egress_ports(data["hands_egress_ports"])
+        except HandsSetupError as exc:
+            raise ConfinementError(f"{base}: {exc} — fail-closed.") from None
 
     return ConfinementConfig(
         deny_files=_paths("deny_files"),
@@ -2266,6 +2280,7 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
         hands_user=hands_user,
         hands_uid=hands_uid,
         hands_workspace=hands_workspace,
+        hands_egress_ports=hands_egress_ports,
     )
 
 

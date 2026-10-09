@@ -935,6 +935,14 @@ def _check_hands_isolation(install: Path) -> list[CheckResult]:
     if not ok:
         return [CheckResult(name, False, f"{cfg.hands_user} cannot write its workspace "
                             f"{cfg.hands_workspace} ({out or 'refused'})", hint=redo)]
+    from levain.firing.hands import egress_boundary_problem, net_group_problem
+
+    if host_os() == "linux" and (problem := egress_boundary_problem(cfg.hands_user, cfg.hands_egress_ports)
+                                 or net_group_problem(cfg.hands_user)):
+        # A behaviour probe, not a ruleset read: listing nftables needs root (P-1 (a)).
+        return [CheckResult(name, False, f"network boundary: {problem}",
+                            hint=f"sudo levain setup-isolation --path {shlex.quote(str(install))} (a repair run "
+                                 "loads it again)")]
     from levain.firing.hands import WORKSPACE_ROOT
     from levain.firing.ws_git import bare_repository_explicit, foreign_entries, wildcard_safe_directory
 

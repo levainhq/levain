@@ -301,7 +301,7 @@ def _hands(tmp_path: Path, uid: int = ME) -> ws_git.Hands:
 
 def _no_sudo(monkeypatch) -> None:
     """Run the hands side as the current user: only the sudo prefix changes."""
-    monkeypatch.setattr(ws_git, "_as_hands", lambda h, *argv, env=(): [
+    monkeypatch.setattr(ws_git, "_as_hands", lambda h, *argv, env=(), group=None: [
         "/usr/bin/env", "-i", f"HOME={h.home}", f"PATH={ws_git.SECURE_PATH}", *env, *argv])
 
 
@@ -901,3 +901,19 @@ def test_a_failed_teardown_still_stops_the_hands_user_and_keeps_the_locks(tmp_pa
         ws_git.hold_hands_session(tmp_path)
     os.close(s.hands_lock_fd)
     os.close(s.hands_session_fd)
+
+
+def test_on_linux_only_network_verbs_get_the_net_group_and_ssh_reads_no_config(tmp_path: Path, monkeypatch) -> None:
+    """D (Phill 2026-10-09): the egress boundary lets out only the net group's gid, so only the verbs
+    that reach a remote get it, and ssh offers the deploy key with no ~/.ssh/config (the entity writes
+    that file; a ProxyCommand there would run with the net gid)."""
+    monkeypatch.setattr(ws_git, "_real_git", lambda: "/usr/bin/git")
+    h = _hands(tmp_path)
+    gitdir = h.workspace / "r" / ".git"
+    for args, net in ((["push", "origin", "main"], True), (["-c", "x.y=z", "fetch"], True),
+                      (["status"], False), (["-C", "push", "log"], False)):
+        argv = ws_git.ws_git_argv(h, gitdir, args, system="Linux")
+        assert (("-g", f"{h.user}_net") == tuple(argv[4:6])) is net, args
+    assert "-g" not in ws_git.ws_git_argv(h, gitdir, ["push"], system="Darwin")[:6]
+    argv = ws_git.ws_git_argv(h, gitdir, ["push"], system="Linux")
+    assert f"core.sshCommand=/usr/bin/ssh -F /dev/null -i {h.home}/.ssh/id_ed25519 -o IdentitiesOnly=yes" in argv
