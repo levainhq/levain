@@ -179,7 +179,7 @@
     const j = document.getElementById("jar");
     if (!j) return;
     j.replaceChildren();
-    if (!jar) { j.hidden = true; return; }
+    if (!jar) { j.hidden = true; jarLastToday = jarLastDay = null; return; }  // baseline resets while hidden
     j.hidden = false;
     j.classList.toggle("empty", jar.status !== "ok");
     const NS = "http://www.w3.org/2000/svg";

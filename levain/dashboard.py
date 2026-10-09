@@ -653,29 +653,35 @@ def _read_jar(episodic_db: Path | None, now: datetime) -> "Jar":
         now = now.replace(tzinfo=timezone.utc)
     # Host-local days, resolved PER INSTANT (``astimezone()`` with no argument applies the
     # host zone's DST rules to each timestamp; a fixed offset would mis-bucket across a shift).
-    today = now.astimezone().date()
-    window_start = today - timedelta(days=JAR_WINDOW_DAYS)
-    # Only the window is read (a long-lived store has millions of rows): a UTC lower bound a
-    # day wider than the local window, plus the store's first timestamp from the index.
-    lower = (datetime.combine(window_start, datetime.min.time()).astimezone(timezone.utc)
-             - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    # ONE statement = one snapshot: the window's rows, each tagged with whether the store holds
+    # anything OLDER than the window (a quiet old store is not a young one). Timestamps are the
+    # ISO-8601 UTC strings anneal writes; a row in any other shape is skipped, never misread.
     try:
+        today = now.astimezone().date()
+        window_start = today - timedelta(days=JAR_WINDOW_DAYS)
+        lower = (datetime.combine(window_start, datetime.min.time()).astimezone(timezone.utc)
+                 - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
         if not episodic_db.exists():
             return empty
         con = sqlite3.connect(f"{episodic_db.resolve().as_uri()}?mode=ro", uri=True, timeout=2)
         try:
-            rows = con.execute("SELECT timestamp FROM episodes WHERE timestamp >= ?", (lower,)).fetchall()
-            first_row = con.execute("SELECT MIN(timestamp) FROM episodes").fetchone()
+            rows = con.execute(
+                "SELECT timestamp, EXISTS(SELECT 1 FROM episodes WHERE timestamp < ? "
+                "AND timestamp GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*') "
+                "FROM episodes WHERE timestamp >= ?", (lower, lower),
+            ).fetchall()
         finally:
             con.close()
-    except (OSError, sqlite3.Error, ValueError):
+    except (OSError, RuntimeError, OverflowError, sqlite3.Error, ValueError):
         return empty
     counts: dict[Any, int] = {}
-    for (ts,) in rows:
+    older = False
+    for ts, has_older in rows:
+        older = older or bool(has_older)
         day = _local_day(ts)
         if day is not None:
             counts[day] = counts.get(day, 0) + 1
-    store_first = _local_day(first_row[0]) if first_row else None
+    store_first = window_start if older else min(counts, default=None)
     n_today = counts.get(today, 0)
     day_iso = today.isoformat()
     if store_first is None or store_first >= today:

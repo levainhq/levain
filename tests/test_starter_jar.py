@@ -55,7 +55,11 @@ def test_level_is_todays_count_against_the_median_day_and_empty_without_data(tmp
     assert re.search(r"\.jar-bubble\s*\{\s*display:\s*none", block)
     # the host zone's DST rules apply per instant: on the US fall-back day an episode at
     # 00:30 EDT is still that day's, and a path with URI metacharacters still opens
-    import os, time
+    import os
+    import time
+    import pytest
+    if not hasattr(time, "tzset"):
+        pytest.skip("no time.tzset on this platform; the DST section needs it")
     old = os.environ.get("TZ")
     os.environ["TZ"] = "America/New_York"; time.tzset()
     try:
@@ -79,3 +83,8 @@ def test_level_is_todays_count_against_the_median_day_and_empty_without_data(tmp
         else:
             os.environ["TZ"] = old
         time.tzset()
+    # a malformed timestamp row cannot hide real history, and an old-but-quiet store is judged
+    # on its zero days, not as a young one
+    odd = tmp_path / "odd.db"; _store(odd, {0: 2, 1: 4, 2: 4, 3: 4, 4: 4})
+    con = sqlite3.connect(odd); con.execute("INSERT INTO episodes VALUES ('bad','','x','x')"); con.commit(); con.close()
+    assert _read_jar(odd, NOW).status == "ok"
