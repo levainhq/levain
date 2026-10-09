@@ -763,6 +763,12 @@ def test_the_walk_asks_as_the_hands_user_inside_its_view_and_refuses_what_it_may
     f = argv.index(confinement._HANDS_FIND)
     assert argv[b:f] == [*confinement._hands_bwrap_argv([confinement.BWRAP], hands), "/usr/bin/env", "LC_ALL=C"]
     assert argv[f + 1:f + 4] == ["/usr", "/etc", "/opt"] and argv[-1] == "-print0"
+    # RUN 2026-10-09: without one pair around the whole OR, -print0 printed only its last branch.
+    assert argv[f + 4] == "(" and argv[-2] == ")"
+    depth = 0
+    for i, tok in enumerate(argv[f + 4:-1]):
+        depth += {"(": 1, ")": -1}.get(tok, 0)
+        assert depth > 0 or i == len(argv[f + 4:-1]) - 1
     # L2 r2 M1: a directory it may search but not list hides a reachable socket; a readable FIFO leaks.
     assert ["-type", "d", "-executable", "!", "-readable"] == argv[argv.index("d") - 1:argv.index("d") + 4]
     assert "-readable" in argv[argv.index("p"):argv.index("d")]

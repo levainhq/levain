@@ -6905,8 +6905,10 @@ def _hands_listener_problem(hands: HandsIdentity) -> str | None:
     if not ro:
         return None
     argv = [*hands_prefix(hands), *_hands_bwrap_argv([BWRAP], hands), "/usr/bin/env", "LC_ALL=C", _HANDS_FIND,
-            *ro, "(", "-type", "s", "-writable", ")", "-o", "(", "-type", "p", "(", "-writable", "-o", "-readable",
-            ")", ")", "-o", "(", "-type", "d", "-executable", "!", "-readable", ")", "-print0"]
+            *ro, "(", "(", "-type", "s", "-writable", ")", "-o", "(", "-type", "p", "(", "-writable", "-o",
+            "-readable", ")", ")", "-o", "(", "-type", "d", "-executable", "!", "-readable", ")", ")", "-print0"]
+    # The whole OR in one pair of parentheses: -print0 binds by -a, tighter than -o, so without it only
+    # the last branch printed (RUN 2026-10-09: a 0777 socket under /opt walked as None).
     try:
         r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(),
                            timeout=_HANDS_WALK_TIMEOUT)
