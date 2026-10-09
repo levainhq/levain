@@ -36,7 +36,7 @@ SPORE_FACETS = frozenset({
 
 
 def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
-    return ctx.memo("view", lambda: source.build(max_spores=SPORE_CAP, now=ctx.now))
+    return ctx.memo("view", lambda: source.build(max_spores=SPORE_CAP + 1, now=ctx.now))
 
 
 def _view_fault(view: SubstrateView, *keys: str) -> Fault | None:
@@ -67,7 +67,9 @@ def _spore_row(s: Any, today: date) -> RowIn:
     )
 
 
-def _spore_provider(source: SubstrateSource, bucket: str) -> Callable[[ReadContext], Result]:
+def _spore_provider(
+    source: SubstrateSource, bucket: str, *, apply_hold: bool = True
+) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
         path = source.anneal.spores_json
         if not path.exists():
@@ -79,14 +81,16 @@ def _spore_provider(source: SubstrateSource, bucket: str) -> Callable[[ReadConte
         if not path.exists():           # removed while the view was being built
             return Absent(f"no spore store at {path}")
         items = {"tray": view.tray, "loops": view.open_spores, "keep": view.keep}[bucket]
+        capped = len(items) > SPORE_CAP
+        items = items[:SPORE_CAP]
         filtered = 0
         rows = []
         for s in items:
-            if bucket == "tray" and (d := parse_date(s.next)) and d > ctx.today:
+            if apply_hold and bucket == "tray" and (d := parse_date(s.next)) and d > ctx.today:
                 filtered += 1           # surface date not reached: held on purpose, not unreadable
                 continue
             rows.append(_spore_row(s, ctx.today))
-        skipped = ((1, f"capped at {SPORE_CAP}; at least this many more exist"),) if len(items) >= SPORE_CAP else ()
+        skipped = ((1, f"capped at {SPORE_CAP}; at least this many more exist"),) if capped else ()
         return Read(rows=tuple(rows), filtered=((filtered, "surface date not reached"),) if filtered else (),
                     skipped=skipped)
     return read
@@ -96,7 +100,9 @@ def _spore_read_one(source: SubstrateSource, bucket: str) -> Callable[[ReadConte
     def read_one(ctx: ReadContext, row_id: str) -> Result:
         # a fresh read of the SOURCE (its own context, never the cycle's memoised view)
         fresh = ReadContext(ctx.now)
-        res = _spore_provider(source, bucket)(fresh)
+        # the row by its id, NOT through the list's visibility rules: a row rescheduled into the
+        # future since the render still exists, and a write must find it
+        res = _spore_provider(source, bucket, apply_hold=False)(fresh)
         if not isinstance(res, Read):
             return res
         for r in res.rows or ():
@@ -187,6 +193,13 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
             return Fault(f"crystal_index: {view.errors['crystal_index']}")
         if not path.exists():
             return Absent(f"no crystal store at {path}")
+        try:
+            from anneal_memory.crystal import CrystalStore
+
+            raw = len(CrystalStore(path).active())
+        except Exception as exc:  # noqa: BLE001 - the view read it; a second read failing is a fault too
+            return Fault(f"crystal store unreadable: {type(exc).__name__}: {exc}")
+        dropped = max(0, raw - len(view.crystal_index))   # the view skips a malformed row without a trace
         rows = tuple(
             RowIn(
                 id=f"crystal:{c.name}", title=c.name, body=c.one_clause,
@@ -198,7 +211,7 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
             )
             for c in view.crystal_index
         )
-        return Read(rows=rows)
+        return Read(rows=rows, skipped=((dropped, "malformed crystal row"),) if dropped else ())
     return read
 
 
@@ -265,9 +278,11 @@ def _context_state(source: SubstrateSource) -> tuple[Path | None, Fault | Absent
     if not cj.exists():
         return cj, Absent(f"no context file at {cj}")
     try:
-        json.loads(cj.read_text(encoding="utf-8"))
+        data = json.loads(cj.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return cj, Fault(f"context file unreadable: {type(exc).__name__}: {exc}")
+    if not isinstance(data, dict):
+        return cj, Fault(f"context file is a {type(data).__name__}, not an object")
     return cj, None
 
 
@@ -386,13 +401,30 @@ def build_default_cockpit(
         version_fields=("name", "level", "one_clause", "permanence", "activation_mode", "tags"),
         version_excluded=("last_activated_on",), search_fields=("title", "body"), empty="No crystals yet."))
     ck.register(ProviderSpec("wraps", "visual", "Projection history", "feed", _wraps(source), region="mind", rank=9))
-    # prose panels: one per neocortex heading and per seed/config doc present NOW; a heading that
-    # later vanishes reads Absent -> error, which is the point.
-    probe = source.build(max_spores=1)
-    for i, s in enumerate(probe.sections):
-        ck.register(ProviderSpec(f"section:{_slug(s.heading)}", "prose", s.heading, "feed",
-                                 _prose(source, "section", s.heading), region="mind", rank=20 + i))
-    for i, d in enumerate(probe.config_docs):
-        ck.register(ProviderSpec(f"config:{d.key}", "prose", d.title, "feed",
-                                 _prose(source, "config", d.key), region="identity", rank=i))
+    # prose panels: one per neocortex heading and per seed/config doc, DISCOVERED at every read so a
+    # heading added later appears and an unreadable file at first sight is a manifest error, not a
+    # permanent silent absence.
+    def discover(ctx: ReadContext) -> list[ProviderSpec]:
+        v = _view(source, ctx)
+        for key in ("sections", "config", "store"):
+            if key in v.errors and key != "store":
+                raise RuntimeError(f"{key}: {v.errors[key]}")
+        specs: list[ProviderSpec] = []
+        used: set[str] = set()
+        for i, s_ in enumerate(v.sections):
+            pid = f"section:{_slug(s_.heading)}"
+            while pid in used:
+                pid += "-2"
+            used.add(pid)
+            specs.append(ProviderSpec(pid, "prose", s_.heading, "feed",
+                                      _prose(source, "section", s_.heading), region="mind", rank=20 + i))
+        for i, d in enumerate(v.config_docs):
+            pid = f"config:{d.key}"
+            if pid not in used:
+                used.add(pid)
+                specs.append(ProviderSpec(pid, "prose", d.title, "feed",
+                                          _prose(source, "config", d.key), region="identity", rank=i))
+        return specs
+
+    ck.discover(discover)
     return ck

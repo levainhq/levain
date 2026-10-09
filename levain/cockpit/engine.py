@@ -11,6 +11,7 @@ import hashlib
 import json
 import threading
 from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
@@ -19,6 +20,7 @@ from levain.cockpit.registry import (
     FACETS,
     ORDERINGS,
     CockpitRegistrationError,
+    FacetValueError,
     apply_ordering,
     parse_date,
     validate_facets,
@@ -26,6 +28,7 @@ from levain.cockpit.registry import (
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 
 SCHEMA = "levain.cockpit/1"
+ENTITY_TIMEOUT_S = 10.0
 KINDS = ("triage-list", "line", "metric", "visual", "prose")
 PRIORITIES = ("gate", "gauge", "feed")
 ZONES = (("operate", "Operate"), ("mind", "Mind"), ("identity", "Identity"))
@@ -87,14 +90,27 @@ class ReadContext:
     """One read cycle: a fixed instant and a memo, so every built-in provider in a cycle sees one
     view of the substrate instead of building its own."""
 
-    def __init__(self, now: datetime) -> None:
+    def __init__(self, now: datetime, *, memo_timeout_s: float = 10.0) -> None:
         self.now = now
         self.today: date = now.astimezone().date()
         self._memo: dict[str, Future] = {}
+        self._dead: set[str] = set()
+        self._memo_timeout_s = memo_timeout_s
         self._lock = threading.Lock()
 
-    def memo(self, key: str, fn: Callable[[], Any]) -> Any:
+    def abandon(self) -> None:
+        """A bounded call that wraps this cycle's reads timed out: every shared read still running
+        is dead for the rest of the cycle, so the next reader fails at once."""
         with self._lock:
+            self._dead |= {k for k, f in self._memo.items() if not f.done()}
+
+    def memo(self, key: str, fn: Callable[[], Any]) -> Any:
+        """Run ``fn`` once per cycle and share its result. A waiter gives up after the memo
+        timeout, and once one has, the key is dead for the rest of the cycle: every later reader
+        fails at once instead of each paying its own timeout behind one hung read."""
+        with self._lock:
+            if key in self._dead:
+                raise TimeoutError(f"shared read {key!r} did not finish")
             fut = self._memo.get(key)
             mine = fut is None
             if mine:
@@ -104,7 +120,13 @@ class ReadContext:
                 fut.set_result(fn())
             except BaseException as exc:  # noqa: BLE001 - re-raised to every waiter
                 fut.set_exception(exc)
-        return fut.result()
+            return fut.result()
+        try:
+            return fut.result(timeout=self._memo_timeout_s)
+        except FutureTimeout:
+            with self._lock:
+                self._dead.add(key)
+            raise TimeoutError(f"shared read {key!r} did not finish in {self._memo_timeout_s:g}s") from None
 
 
 @dataclass
@@ -129,7 +151,8 @@ class _State:
     last_good_as_of: str | None = None
     failing_since: str | None = None
     last_completion: datetime | None = None
-    inflight: bool = False
+    flight: "Future | None" = None            # the read currently running, shared by concurrent callers
+    refresh_started: datetime | None = None   # set while a refresher cycle is inside its read
     started: datetime | None = None
 
 
@@ -142,7 +165,10 @@ class _Refresher:
     def _run(self) -> None:
         every = float(self.spec.refresh_every_s or 0)
         while not self.stop_event.wait(every):
-            self.cockpit.refresh(self.spec.id)
+            try:
+                self.cockpit.refresh(self.spec.id)
+            except Exception:  # noqa: BLE001 - the loop outlives one bad cycle; the panel reads error
+                continue
 
     def halt(self) -> None:
         """Stop looping without recording anything: to a reader this is a dead refresher, which
@@ -163,6 +189,9 @@ class Cockpit:
         self._state: dict[str, _State] = {}
         self._refreshers: dict[str, _Refresher] = {}
         self._rowsets: dict[str, str] = {}
+        self._discoverers: list[Callable[[ReadContext], list[ProviderSpec]]] = []
+        self._entity_state = _State()
+        self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
 
     # --- registration ----------------------------------------------------------------
@@ -222,44 +251,59 @@ class Cockpit:
             self._refreshers[spec.id] = r
             r.thread.start()
 
-    def stop(self) -> None:
+    def stop(self) -> list[str]:
+        """Halt every refresher and wait out any read it is inside (bounded by that provider's
+        timeout). A refresher still alive after that stays registered, so a later ``start()`` cannot
+        overlap it; the result says which."""
         for r in self._refreshers.values():
             r.halt()
-        for r in self._refreshers.values():
-            r.thread.join(timeout=2)
-        self._refreshers.clear()
+        stuck = []
+        for pid, r in list(self._refreshers.items()):
+            r.thread.join(timeout=r.spec.timeout_s + 1)
+            if r.thread.is_alive():
+                stuck.append(pid)
+            else:
+                del self._refreshers[pid]
+        return stuck
 
     def refresher(self, panel_id: str) -> _Refresher | None:
         return self._refreshers.get(panel_id)
 
     # --- reading ---------------------------------------------------------------------
     def _call(self, spec: ProviderSpec, st: _State | None, fn: Callable[..., Result], *args: Any) -> Result:
-        """Run a provider call with a timeout. A call still running from an earlier request is
-        not stacked on: it answers ``Fault`` at once, so a hung source costs one thread, not one
-        per request. Any exception, including a BaseException, is a Fault."""
+        """Run a provider call with a timeout, SINGLE-FLIGHT per panel: a request that arrives while
+        a read is running waits on that same read (up to the timeout) instead of starting another or
+        failing, so concurrent requests never turn a healthy panel into a false error, and a hung
+        source costs one thread, not one per request. Any exception is a Fault."""
+        return self._bounded(spec.timeout_s, st, fn, *args)
+
+    def _bounded(self, timeout_s: float, st: _State | None, fn: Callable[..., Any], *args: Any) -> Any:
+        fut: Future
         if st is not None:
             with st.lock:
-                if st.inflight:
-                    return Fault("previous read still running (source hung?)")
-                st.inflight = True
-        box: list[Result] = []
+                if st.flight is not None and not st.flight.done():
+                    fut, mine = st.flight, False
+                else:
+                    fut = st.flight = Future()
+                    mine = True
+        else:
+            fut, mine = Future(), True
+        if mine:
+            def work() -> None:
+                try:
+                    out: Any = fn(*args)
+                except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
+                    out = Fault(f"{type(exc).__name__}: {exc}")
+                fut.set_result(out)
 
-        def work() -> None:
-            try:
-                box.append(fn(*args))
-            except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
-                box.append(Fault(f"{type(exc).__name__}: {exc}"))
-            finally:
-                if st is not None:
-                    with st.lock:
-                        st.inflight = False
-
-        t = threading.Thread(target=work, name=f"cockpit-read-{spec.id}", daemon=True)
-        t.start()
-        t.join(spec.timeout_s)
-        if t.is_alive():
-            return Fault(f"timed out after {spec.timeout_s:g}s")
-        res = box[0]
+            threading.Thread(target=work, name="cockpit-read", daemon=True).start()
+        try:
+            res = fut.result(timeout=timeout_s)
+        except FutureTimeout:
+            for a in args:
+                if isinstance(a, ReadContext):
+                    a.abandon()
+            return Fault(f"timed out after {timeout_s:g}s")
         if not isinstance(res, (Read, Absent, Fault)):
             return Fault(f"provider returned {type(res).__name__}, not Read/Absent/Fault")
         return res
@@ -268,25 +312,39 @@ class Cockpit:
         """One refresh cycle for a refresher panel (the thread's body; also the test step)."""
         spec, st = self._specs[panel_id], self._state[panel_id]
         ctx = ReadContext(self._clock())
-        snap = self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
+        with st.lock:
+            st.refresh_started = ctx.now
+        try:
+            snap = self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
+        except Exception as exc:  # noqa: BLE001 - a refresh that cannot even be processed is an error read
+            snap = self._fault(spec, st, f"{type(exc).__name__}: {exc}", _iso(ctx.now))
         with st.lock:
             st.snap = snap
             st.last_completion = self._clock()
+            st.refresh_started = None
 
     def _snap_for(self, spec: ProviderSpec, ctx: ReadContext) -> _Snap:
         st = self._state[spec.id]
         if spec.refresh_every_s is None:
             return self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
         with st.lock:
-            snap, last, started = st.snap, st.last_completion, st.started
+            snap, last, started, running = st.snap, st.last_completion, st.started, st.refresh_started
         if snap is None:
             return _Snap("error", None, None, [], [], st.last_good_as_of, "no read yet (refresher not started)", spec.note)
         ref = last or started or ctx.now
-        if (ctx.now - ref) > timedelta(seconds=2 * spec.refresh_every_s):
+        # A cycle still inside its own read, within its timeout, is alive; only silence beyond that
+        # (or beyond twice the interval with nothing running) means the refresher is dead.
+        busy = running is not None and (ctx.now - running) <= timedelta(seconds=spec.timeout_s)
+        if not busy and (ctx.now - ref) > timedelta(seconds=2 * spec.refresh_every_s):
             return _Snap(
                 "error", None, None, [], [], st.last_good_as_of,
                 f"refresher not reporting since {_iso(ref)}", spec.note,
             )
+        # a cached snapshot ages: re-evaluate its freshness against THIS request's clock
+        if snap.status in ("ok", "empty", "partial") and snap.as_of and \
+                (ctx.now - _parse_iso(snap.as_of)) > timedelta(seconds=spec.stale_after_s):
+            return _Snap("stale", snap.rows, snap.value, snap.filtered, snap.skipped, snap.as_of,
+                         snap.error, snap.note, snap.stale_hint)
         return snap
 
     # --- result -> snapshot ----------------------------------------------------------
@@ -307,7 +365,7 @@ class Cockpit:
             return self._fault(spec, st, f"{why}: {res.reason}", now_iso)
         try:
             snap = self._read_snap(spec, res, ctx, now_iso)
-        except (CockpitRegistrationError, ValueError, TypeError, KeyError) as exc:
+        except Exception as exc:  # noqa: BLE001 - malformed provider output of ANY shape is a Fault, never a crash
             return self._fault(spec, st, f"provider output refused: {exc}", now_iso)
         st.ever_present = True
         st.last_good_as_of = snap.as_of
@@ -328,7 +386,9 @@ class Cockpit:
         if spec.kind == "triage-list":
             if res.rows is None:
                 raise ValueError("a triage-list Read carries rows")
-            rows = self._rows(spec, list(res.rows), ctx)
+            rows, refused = self._rows(spec, list(res.rows), ctx)
+            if refused:
+                skipped.append({"count": refused, "reason": "row refused: a facet value of the wrong type"})
             status = "partial" if skipped else ("empty" if not rows else "ok")
             value = None
         else:
@@ -367,14 +427,21 @@ class Cockpit:
                     raise ValueError(f"metric status {m.get('status')!r}")
         return v
 
-    def _rows(self, spec: ProviderSpec, rows_in: list[RowIn], ctx: ReadContext) -> list[dict[str, Any]]:
+    def _rows(self, spec: ProviderSpec, rows_in: list[RowIn], ctx: ReadContext) -> tuple[list[dict[str, Any]], int]:
+        """Validate, order, group and finish rows. A provider BUG (an undeclared or unregistered
+        facet, a stored field outside the version policy, a duplicate id) refuses the whole read; bad
+        DATA in one row (a facet value of the wrong type) skips that row and returns the count, so one
+        corrupt row makes the panel ``partial`` instead of blanking a gate panel."""
         seen: set[str] = set()
         allowed_stored = set(spec.version_fields) | set(spec.version_excluded)
+        good: list[RowIn] = []
+        refused = 0
         for r in rows_in:
+            if not isinstance(r, RowIn):
+                raise TypeError(f"a row must be a RowIn, got {type(r).__name__}")
             if r.id in seen:
                 raise ValueError(f"duplicate row id {r.id!r}")
             seen.add(r.id)
-            validate_facets(r.facets)
             undeclared = set(r.facets) - spec.facets
             if undeclared:
                 raise CockpitRegistrationError(f"facets {sorted(undeclared)} not declared by panel {spec.id!r}")
@@ -384,11 +451,16 @@ class Cockpit:
                     raise ValueError(
                         f"stored fields {sorted(stray)} are neither versioned nor named as excluded"
                     )
+            try:
+                validate_facets(r.facets)
+            except FacetValueError:
+                refused += 1
+                continue
+            good.append(r)
         o = ORDERINGS[spec.order]  # type: ignore[index]
-        out = []
-        for row, group in apply_ordering(spec.order, rows_in, ctx.today):  # type: ignore[arg-type]
-            out.append(self._row(spec, o, row, group, ctx.today))
-        return out
+        out = [self._row(spec, o, row, group, ctx.today)
+               for row, group in apply_ordering(spec.order, good, ctx.today)]  # type: ignore[arg-type]
+        return out, refused
 
     @staticmethod
     def row_version(spec: ProviderSpec, stored: dict[str, Any]) -> str:
@@ -473,7 +545,9 @@ class Cockpit:
             "actions": [],
         }
 
-    def _now_head_and_rows(self, ctx: ReadContext, cred: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    def _now_head_and_rows(
+        self, ctx: ReadContext, cred: str, snaps: dict[str, _Snap] | None = None
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         """The ``now`` view (design §3.2.4): the ``band == "now"`` rows of the gate panels, in panel
         rank order, each panel's rows in that panel's own order. No ordering, provider or actions of
         its own; every row keeps its source ``panel_id``. Its status is the worst of its sources'."""
@@ -486,8 +560,11 @@ class Cockpit:
         lines: list[str] = []
         worst = "ok"
         as_ofs: list[str] = []
+        snaps = snaps if snaps is not None else {}
         for s in sources:
-            snap = self._snap_for(s, ctx)
+            if s.id not in snaps:   # one read per source per cycle: the heads and this view agree
+                snaps[s.id] = self._snap_for(s, ctx)
+            snap = snaps[s.id]
             if snap.status in ("error", "stale"):
                 degraded.append(s.id)
                 lines.append(f"{s.id}: {snap.status}, last good {snap.as_of or 'never'}")
@@ -519,10 +596,39 @@ class Cockpit:
         base = {"name": None, "governance": None, "brand": {"wordmark": None, "model": None}}
         if self._entity_fn is None:
             return base, []
-        try:
-            return {**base, **self._entity_fn(ctx)}, []
-        except Exception as exc:  # noqa: BLE001 - an entity fault is a manifest error, not a 500
-            return base, [{"source": "entity", "message": f"{type(exc).__name__}: {exc}"}]
+        res = self._bounded(self._entity_timeout_s, self._entity_state, self._entity_call, ctx)
+        if isinstance(res, Fault):
+            return base, [{"source": "entity", "message": res.message}]
+        return {**base, **res.value}, []
+
+    def _entity_call(self, ctx: ReadContext) -> Result:
+        return Read(value=self._entity_fn(ctx))  # type: ignore[misc]
+
+    @staticmethod
+    def _discover_call(fn: Callable[[ReadContext], list[ProviderSpec]], ctx: ReadContext) -> Result:
+        return Read(value=fn(ctx))
+
+    def discover(self, fn: Callable[[ReadContext], list[ProviderSpec]]) -> None:
+        """Register a discoverer: run at every manifest and panel read, it returns the panels the
+        substrate holds NOW (prose panels, one per heading). Ones not yet registered are added; one
+        that later vanishes keeps its provider, which then reads ``Absent`` and renders ``error``. A
+        discoverer that raises is a manifest ``errors`` entry, never silent absence."""
+        self._discoverers.append(fn)
+
+    def _ensure_discovered(self, ctx: ReadContext) -> list[dict[str, Any]]:
+        errors: list[dict[str, Any]] = []
+        for i, fn in enumerate(self._discoverers):
+            res = self._bounded(self._entity_timeout_s, None, self._discover_call, fn, ctx)
+            if isinstance(res, Fault):
+                errors.append({"source": f"discovery:{i}", "message": res.message})
+                continue
+            for spec in res.value:
+                if spec.id not in self._specs:
+                    try:
+                        self.register(spec)
+                    except CockpitRegistrationError as exc:
+                        errors.append({"source": f"discovery:{spec.id}", "message": str(exc)})
+        return errors
 
     def _ordered_specs(self) -> list[ProviderSpec]:
         zi = [z for z, _ in ZONES]
@@ -531,13 +637,15 @@ class Cockpit:
 
     def manifest(self, credential: dict[str, Any], *, install_class: str | None = None) -> dict[str, Any]:
         ctx = ReadContext(self._clock())
-        entity, errors = self._entity(ctx)
+        errors = self._ensure_discovered(ctx)
+        entity, entity_errors = self._entity(ctx)
+        errors += entity_errors
         heads: dict[str, dict[str, Any]] = {}
         snaps: dict[str, _Snap] = {}
         for spec in self._ordered_specs():
             snaps[spec.id] = self._snap_for(spec, ctx)
             heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today)
-        now_head, _ = self._now_head_and_rows(ctx, credential["class"])
+        now_head, _ = self._now_head_and_rows(ctx, credential["class"], snaps)
         heads[NOW_ID] = now_head
         specs = self._ordered_specs()
         regions = {
@@ -550,7 +658,8 @@ class Cockpit:
         }
         order = [NOW_ID] + [s.id for s in specs]
         etag = _sha({"panels": [heads[i]["etag"] for i in order], "credential": credential,
-                     "install_class": install_class, "policy_revision": POLICY_REVISION})
+                     "install_class": install_class, "policy_revision": POLICY_REVISION,
+                     "entity": entity, "errors": errors})   # identity and manifest faults are content too
         return {
             "schema": SCHEMA, "entity": entity, "generated_at": _iso(ctx.now), "etag": etag,
             "credential": credential, "regions": regions,
@@ -563,6 +672,7 @@ class Cockpit:
         ``compact``; ``q`` is the server-side search over row bodies; ``row`` returns one row in
         full."""
         ctx = ReadContext(self._clock())
+        self._ensure_discovered(ctx)
         if panel_id == NOW_ID:
             head, rows = self._now_head_and_rows(ctx, credential_class)
             spec = None
@@ -588,8 +698,8 @@ class Cockpit:
                     raise RowNotFound(row)
                 return out
             matched = None
-            if q:
-                fields = spec.search_fields if spec else ()
+            if q and spec is not None:   # the now view declares no search
+                fields = spec.search_fields
                 needle = q.casefold()
                 keep = [r for r in rows_all if any(needle in _field_text(r, f).casefold() for f in fields)]
                 matched = len(keep)
@@ -627,12 +737,13 @@ class Cockpit:
         if not isinstance(res, Read):
             return res
         try:
-            rows = list(res.rows or ())
-            if len(rows) != 1:
-                return Fault(f"read_one returned {len(rows)} rows")
-            validate_facets(rows[0].facets)
-            return Read(value=self._row(spec, ORDERINGS[spec.order], rows[0], None, ctx.today))  # type: ignore[index]
-        except (CockpitRegistrationError, ValueError, TypeError) as exc:
+            if len(res.rows or ()) != 1:
+                return Fault(f"read_one returned {len(res.rows or ())} rows")
+            rows, refused = self._rows(spec, list(res.rows), ctx)   # type: ignore[arg-type]
+            if refused or len(rows) != 1:
+                return Fault("read_one row refused: a facet value of the wrong type")
+            return Read(value=rows[0])
+        except Exception as exc:  # noqa: BLE001
             return Fault(f"provider output refused: {exc}")
 
 
