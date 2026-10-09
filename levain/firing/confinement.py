@@ -2432,6 +2432,9 @@ class HandsIdentity:
     uid: int
     home: str
     workspace: Path
+    #: Linux: the loopback TCP ports the hands user's network boundary lets out (setup's
+    #: ``--egress-port``), which the launch probes and relays. Empty on macOS.
+    egress_ports: tuple[int, ...] = ()
 
 
 def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None) -> HandsIdentity | None:
@@ -2440,15 +2443,16 @@ def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None)
 
     - No hands user set up: None.
     - The interactive REPL: None, by design (design §8 i, D4): a human reads every turn there.
-    - Linux: None for now: bwrap run as the hands user cannot mount over a jewel under the
-      operator's home, which it cannot enter. The banner and doctor say bash runs as you.
-    - macOS, headless or unattended: the hands user. A setup whose account is gone raises
-      (fail-closed): never a silent fall-back to the operator."""
+    - macOS or Linux, headless or unattended: the hands user. On Linux bwrap runs AS it and hides the
+      operator's home whole instead of masking jewels inside it, which it cannot enter
+      (:func:`_hands_bwrap_argv`). A setup whose account is gone raises (fail-closed): never a silent
+      fall-back to the operator.
+    - Any other OS: None."""
     if cfg.hands_user is None or cfg.hands_uid is None or cfg.hands_workspace is None:
         return None
     if mode == "interactive":
         return None
-    if (system or platform.system()) != "Darwin":
+    if (system or platform.system()) not in ("Darwin", "Linux"):
         return None
     import pwd
 
@@ -2467,7 +2471,8 @@ def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None)
             f"the entity's hands user {cfg.hands_user} now has uid {entry.pw_uid}, not the uid "
             f"{cfg.hands_uid} setup recorded — refusing to run bash as it (fail-closed). {redo}"
         )
-    return HandsIdentity(cfg.hands_user, cfg.hands_uid, entry.pw_dir, cfg.hands_workspace)
+    return HandsIdentity(cfg.hands_user, cfg.hands_uid, entry.pw_dir, cfg.hands_workspace,
+                         tuple(cfg.hands_egress_ports))
 
 
 def _hands_env(hands: HandsIdentity) -> dict[str, str]:
@@ -6330,6 +6335,131 @@ class _Leader:
             self._pidfd = None
 
 
+# --- the Linux hands launch (S2-linux) ------------------------------------------------------------
+# bwrap runs AS the hands user. It cannot mount over a jewel inside the operator's home: a mount needs
+# search permission on its target's parent, and the hands user has none there (RUN in a VM 2026-10-09:
+# the floor's own argv as the hands user stops at its first jewel with "Permission denied"). It CAN
+# mount over the home itself, which needs search on /home only. So a hands launch hides the operator's
+# home and the entity's directory whole, read-only and empty, and drops every op of the floor's plan
+# beneath them. It also hides /run, /tmp, /var/tmp and /dev/shm whole (empty, writable): daemons the
+# hands user may reach (a resolver over D-Bus or varlink, nscd, avahi, snapd) listen under /run, and a
+# 0777 listener in each of the four was reached by the hands user without bwrap and refused with it.
+# The network namespace is always new (abstract unix sockets, the host's loopback), and the user
+# namespace is new with ``--disable-userns``, so no nested one can be made inside (ENOSPC).
+
+#: Hidden whole, empty and writable, for a hands launch. A symlink among them (``/var/run`` -> ``/run``)
+#: is covered by its target.
+_HANDS_SCRATCH = ("/run", "/var/run", "/tmp", "/var/tmp", "/dev/shm")
+#: Ops of the floor's plan and the number of arguments each takes. An op not named here is refused by
+#: the transform, so a new op in the plan cannot pass through it unexamined.
+_BWRAP_OP_ARITY = {
+    "--bind": 2, "--ro-bind": 2, "--bind-try": 2, "--ro-bind-try": 2, "--symlink": 2,
+    "--tmpfs": 1, "--remount-ro": 1, "--dir": 1, "--proc": 1, "--dev": 1,
+    "--die-with-parent": 0, "--unshare-pid": 0, "--unshare-cgroup": 0, "--unshare-net": 0,
+}
+
+
+def _hands_hidden_roots(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
+    """``(read_only, writable)``: what a hands launch hides whole. The workspace must be in neither,
+    or the launch refuses (the hands user's workspace is outside the operator's home by setup)."""
+    def real(p: Path) -> Path:
+        return Path(os.path.realpath(p))
+
+    ro: list[Path] = []
+    for p in (real(Path.home()), real(policy.entity_dir)):
+        if not any(p == q or p.is_relative_to(q) for q in ro):
+            ro = [q for q in ro if not q.is_relative_to(p)] + [p]
+    rw = [Path(p) for p in _HANDS_SCRATCH if os.path.isdir(p) and not os.path.islink(p)]
+    ws = real(policy.workspace)
+    for root in (*ro, *rw):
+        if ws == root or ws.is_relative_to(root):
+            raise ConfinementError(
+                f"the entity's workspace {ws} is inside {root}, which bash run as the entity's own user "
+                "never sees — refusing to start it (fail-closed). Set the entity up again: sudo levain "
+                "setup-isolation --undo, then sudo levain setup-isolation."
+            )
+    ro = [q for q in ro if not any(q == r or q.is_relative_to(r) for r in rw)]
+    return [str(q) for q in ro], [str(q) for q in rw]
+
+
+def _hands_bwrap_argv(argv: list[str], read_only: list[str], writable: list[str]) -> list[str]:
+    """The floor's bwrap ``argv`` (``_bwrap_plan``'s, without the command) turned into a hands
+    launch's: every op whose target is under a hidden root dropped, the roots mounted as empty tmpfs
+    AFTER every remaining op (a later mount covers an earlier one beneath it), read-only ones
+    remounted read-only, and the namespace flags a hands launch needs added. Pure."""
+    roots = [Path(r) for r in (*read_only, *writable)]
+
+    def hidden(target: str) -> bool:
+        t = Path(target)
+        return any(t == r or t.is_relative_to(r) for r in roots)
+
+    if not argv or argv[0] != BWRAP:
+        raise ConfinementError("internal: the hands launch was given a plan that is not bwrap's — refusing "
+                               "(fail-closed).")
+    out = [argv[0], "--unshare-user", "--disable-userns"]
+    i = 1
+    while i < len(argv):
+        op = argv[i]
+        n = _BWRAP_OP_ARITY.get(op)
+        if n is None or i + n >= len(argv):
+            raise ConfinementError(f"internal: the floor's plan has {op!r}, which the hands launch does not "
+                                   "know how to place — refusing (fail-closed).")
+        args = argv[i + 1:i + 1 + n]
+        # The target is an op's last argument; `--bind / /` and the other root pins are never hidden.
+        if not (n and args[-1] != "/" and hidden(args[-1])):
+            out += [op, *args]
+        i += 1 + n
+    if "--unshare-net" not in out:
+        out.append("--unshare-net")
+    for r in (*read_only, *writable):
+        out += ["--tmpfs", r]
+    for r in read_only:
+        out += ["--remount-ro", r]
+    return out
+
+
+def _hands_ns_problem(hands: HandsIdentity, timeout: float = 30.0) -> str | None:
+    """Can bwrap build a hands launch's namespaces AS the hands user here? None when it can, else what
+    it said. Ubuntu 23.10+ with ``kernel.apparmor_restrict_unprivileged_userns=1`` refuses it until the
+    bwrap-userns-restrict profile is installed (RUN 2026-10-09)."""
+    from levain.launch import child_env
+
+    argv = [*hands_prefix(hands), BWRAP, "--unshare-user", "--disable-userns", "--unshare-net",
+            "--unshare-pid", "--die-with-parent", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+            "/bin/true"]
+    try:
+        r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(),
+                           timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"bwrap could not be run as {hands.user} ({exc})"
+    if r.returncode == 0:
+        return None
+    said = r.stderr.decode("utf-8", "replace").strip().splitlines()
+    return (f"bwrap cannot build the sandbox's namespaces as {hands.user} ({said[-1] if said else 'no reason given'}). "
+            "On Ubuntu 23.10+ install the bwrap-userns-restrict AppArmor profile: sudo install -m 0644 "
+            "/usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/ && sudo apparmor_parser "
+            "-r /etc/apparmor.d/bwrap-userns-restrict (from the apparmor-profiles package); bubblewrap 0.8 or "
+            "later is needed for --disable-userns")
+
+
+def _hands_launch_problem(hands: HandsIdentity) -> str | None:
+    """What stops a Linux hands launch, checked before any of its processes starts (Phill's ruling (A):
+    probe at every hands launch). None when nothing does."""
+    from levain.firing.hands import HandsSetupError, egress_boundary_problem, hands_net_group, net_group_problem
+
+    try:
+        net_group = hands_net_group(hands.user)
+    except HandsSetupError as exc:
+        return str(exc)
+    problem = net_group_problem(hands.user)
+    if problem is not None:
+        return f"the entity's network boundary is open: {problem}"
+    problem = egress_boundary_problem(hands.user, hands.egress_ports, net_group=net_group)
+    if problem is not None:
+        return f"the entity's network boundary does not hold: {problem}"
+    return _hands_ns_problem(hands)
+
+
 class _BwrapShell(SandboxedShell):
     """A :class:`SandboxedShell` that checks, before every command, that the disk still matches the
     mounts it was started with (spore-1312, rec C, ruled by Phill 2026-10-03, widened by its L3).
@@ -6646,7 +6776,8 @@ class BwrapProvider(ConfinementProvider):
     def localhost_deny_ready(self) -> bool:
         return bwrap_netns_available()
 
-    def _prepare(self, policy: CrownJewelsPolicy, made: list[tuple[str, str]]):
+    def _prepare(self, policy: CrownJewelsPolicy, made: list[tuple[str, str]],
+                 hands: HandsIdentity | None = None):
         """Plan the floor and put on the host what it needs, inside the caller's ledger transaction:
         ``(argv, create_first, mounted, unmounted, manifest)``. Every object it creates is appended to
         ``made`` as it goes, so a refusal part-way still hands the ledger everything made."""
@@ -6666,6 +6797,10 @@ class BwrapProvider(ConfinementProvider):
         policy.workspace.mkdir(parents=True, exist_ok=True)
         argv, create_first = _bwrap_plan(policy)
         mounted, unmounted = _mount_plan_paths(argv, policy)
+        if hands is not None:
+            # The bookkeeping (placeholders, manifest, the per-command recheck) stays the operator
+            # floor's, computed above from its plan; only what bwrap executes changes.
+            argv = _hands_bwrap_argv(argv, *_hands_hidden_roots(policy))
         # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
         # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
         # `--as-pid-1`: bash itself is pid 1 of the namespace and the bwrap process levain waits on
@@ -6731,12 +6866,11 @@ class BwrapProvider(ConfinementProvider):
         hands: HandsIdentity | None = None,
     ) -> SandboxedShell:
         if hands is not None:
-            # Not built on Linux yet (see `hands_for`, which never asks for it here): refused rather
-            # than run as the operator.
-            raise ConfinementError(
-                "running bash as the entity's own user is not built for Linux yet — refusing to run it "
-                "as you instead (fail-closed)."
-            )
+            _require_hands_sudo(hands)
+            problem = _hands_launch_problem(hands)
+            if problem is not None:
+                raise ConfinementError(f"{problem} — refusing to run bash as the entity's own user, or as "
+                                       "you instead (fail-closed).")
         if not bwrap_available():
             d = diagnose_confinement("Linux")
             raise ConfinementError(
@@ -6764,7 +6898,7 @@ class BwrapProvider(ConfinementProvider):
                 )
             txn.sweep()
             try:
-                argv, create_first, mounted, unmounted, manifest = self._prepare(policy, made)
+                argv, create_first, mounted, unmounted, manifest = self._prepare(policy, made, hands)
             finally:
                 # Recorded even on a refusal: unclaimed, it is removed as the transaction ends.
                 txn.record(made)
@@ -6786,6 +6920,10 @@ class BwrapProvider(ConfinementProvider):
             k: v for k, v in (env if env is not None else _default_shell_env()).items()
             if k not in _STARTUP_EXEC_VARS and not k.startswith("BASH_FUNC_")
         }
+        if hands is not None:
+            # sudo OUTSIDE bwrap, as on macOS; bash starts from the hands user's environment alone.
+            argv = [*hands_prefix(hands), *argv]
+            shell_env = _hands_env(hands)
         shell = _BwrapShell(
             policy=policy,
             manifest=manifest,
