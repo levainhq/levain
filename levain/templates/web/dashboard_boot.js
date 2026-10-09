@@ -234,14 +234,20 @@
   const useManifest = new URLSearchParams(window.location.search).get("source") === "manifest";
 
   async function loadManifestView() {
-    const manifest = await authedReadJson("/cockpit/manifest.json");
+    const manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
     const ids = Object.keys(manifest.panels);
-    const panels = {};
+    const panels = Object.create(null);
     await Promise.all(ids.map(async (id) => {
-      try { panels[id] = await authedReadJson("/cockpit/panel/" + encodeURIComponent(id) + ".json?profile=full"); }
-      catch (_) { /* a panel that cannot be read is drawn as unavailable by the mapper, never as empty */ }
+      try {
+        const res = await fetch("/cockpit/panel/" + encodeURIComponent(id) + ".json?profile=full", { cache: "no-store", headers: readHeaders() });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        panels[id] = await res.json();
+      } catch (e) {
+        // keep the reason: the mapper draws this panel as unavailable with it, never as an empty one
+        panels[id] = { error: e && e.message ? e.message : String(e) };
+      }
     }));
-    return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: panels }, Date.now());
+    return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: panels });
   }
 
   async function load(opts) {
