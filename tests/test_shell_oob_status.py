@@ -1330,8 +1330,15 @@ def test_claim_recovery_judges_leaves_exactly_as_the_sweep_does(monkeypatch):
     monkeypatch.setattr(C, "_leaf_kill", lambda rel: killed.append(rel) or True)
     monkeypatch.setattr(C, "_leaf_gone", lambda rel, timeout: True)
     head = f"{C._user_manager_rel(os.getuid())}/{C._LEVAIN_SLICE}/"
-    dead = f"{2 ** 22 + 9}:1:{C._INIT_PIDNS}:x"   # a pid no process holds
-    foreign = f"{head}levain-4026532999-4242-77-{'a' * 12}-1.scope"
+    gone = 2 ** 22 + 9   # a pid no process holds
+    dead = f"{gone}:1:{C._INIT_PIDNS}:x"
+    monkeypatch.setattr(C, "_proc_start_time", lambda pid: "77" if pid == os.getpid() else None)
+    foreign = f"{head}levain-4026532999-{gone}-1-{'a' * 12}-1.scope"
     assert C._claim_alive(f"{dead}:c{foreign}") and killed == []
-    ours = f"{head}levain-{C._INIT_PIDNS}-4242-77-{'b' * 12}-1.scope"
+    # L3 r14: a leaf whose own maker is alive is kept, whatever the claim's pid says.
+    live = f"{head}levain-{C._INIT_PIDNS}-{os.getpid()}-77-{'c' * 12}-1.scope"
+    assert C._claim_alive(f"{dead}:c{live}") and killed == []
+    huge = f"{head}levain-{C._INIT_PIDNS}-{'9' * 5000}-1-{'d' * 12}-1.scope"
+    assert C._claim_alive(f"{dead}:c{huge}") and killed == []
+    ours = f"{head}levain-{C._INIT_PIDNS}-{gone}-1-{'b' * 12}-1.scope"
     assert not C._claim_alive(f"{dead}:c{ours}") and killed == [ours]

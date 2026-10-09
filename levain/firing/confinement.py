@@ -5240,7 +5240,8 @@ def _leaf_rel(uid: int, unit: str) -> str:
 # since its leaves would outlive it with no sweep able to judge them (L3 r10, r11). The namespace stays
 # in the name so the sweep judges only names it can read, whatever made them; a name without it is
 # never judged (L3 r12).
-_LEAF_UNIT = re.compile(r"levain-(\d+)-(\d+)-(\d+)-[0-9a-f]{12}-\d+\.scope")
+# Bounded fields: a tag is read back from the ledger, and an unbounded digit run would not convert (L3 r14).
+_LEAF_UNIT = re.compile(r"levain-(\d{1,20})-(\d{1,10})-(\d{1,20})-[0-9a-f]{12}-\d{1,20}\.scope")
 _INIT_PIDNS = "4026531836"
 
 
@@ -5253,16 +5254,15 @@ def _leaf_unit(token: str, n: int) -> str | None:
     return f"levain-{_INIT_PIDNS}-{os.getpid()}-{started}-{token}-{n}"
 
 
-def _judged_leaf(rel: str, uid: int) -> tuple[int, str] | None:
-    """The (pid, start time) of the levain that made leaf ``rel`` for ``uid``, when this process may
-    judge it: a levain leaf name from the initial pid namespace, read from that namespace. None means
-    never kill it. The crash sweep and the claim path both ask this, so they cannot disagree about
-    whose leaf is whose (L3 r13)."""
+def _leaf_orphaned(rel: str, uid: int) -> bool:
+    """Whether leaf ``rel`` of ``uid`` may be killed as a crashed levain's: a levain leaf name from the
+    initial pid namespace, read from that namespace, whose maker (its pid and start time) is gone. The
+    crash sweep and the claim path both ask only this, so they cannot disagree about a leaf (L3 r13, r14)."""
     head = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/"
     m = _LEAF_UNIT.fullmatch(rel[len(head):]) if rel.startswith(head) else None
     if m is None or m.group(1) != _INIT_PIDNS or _pidns() != _INIT_PIDNS:
-        return None
-    return int(m.group(2)), m.group(3)
+        return False
+    return _proc_start_time(int(m.group(2))) != m.group(3)
 
 
 def sweep_dead_leaves() -> list[str]:
@@ -5279,9 +5279,8 @@ def sweep_dead_leaves() -> list[str]:
     killed: list[str] = []
     for name in names:
         rel = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/{name}"
-        owner = _judged_leaf(rel, uid)
-        if owner is None or _proc_start_time(owner[0]) == owner[1]:
-            continue   # not ours to judge, or its levain is alive
+        if not _leaf_orphaned(rel, uid):
+            continue
         (killed if _leaf_kill(rel) else left).append(rel)
     # Every leaf is killed first, then all are awaited against ONE deadline: the sweep runs at every
     # CLI start, so a wait per leaf would add up (L3 r10).
@@ -5835,8 +5834,8 @@ def _claim_alive(claim: str) -> bool:
         # The leaf of the command it covers, tagged before that command was spawned: kill it, and keep
         # the claim while it is populated (the next sweep looks again; no wait under the ledger lock).
         rel = tag[1:]
-        if _judged_leaf(rel, os.getuid()) is None:
-            return True   # not a leaf this process may judge: kept
+        if not _leaf_orphaned(rel, os.getuid()):
+            return True   # not ours to judge, or its maker is alive: kept
         _leaf_kill(rel)
         return not _leaf_gone(rel, timeout=0.5)
     if tag.startswith("b"):
