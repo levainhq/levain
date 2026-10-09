@@ -1094,3 +1094,39 @@ def test_close_waits_for_an_admitted_command_until_its_spawn_is_registered(monke
     shell._before_command()
     shell.close()                                  # the run thread closing its own shell does not wait
     assert torn_down == [True, True]
+
+
+def test_a_close_whose_wait_times_out_keeps_the_claim(monkeypatch):
+    """codex + glm + complement L3 r7, RUN on w23: when close()'s wait timed out with a preflight still
+    outstanding (a check stuck on a hung mount), it released the claim, and the run then spawned without
+    one. The claim is now kept; once the preflight drains, a close() releases it as before."""
+    import threading
+
+    shell = object.__new__(confinement._BwrapShell)
+    shell._hands = None
+    shell._lock = threading.Lock()
+    shell._closed = False
+    shell._groups = {}
+    shell._preflight_done = threading.Event()
+    shell._preflight_done.set()
+    shell._preflight_thread = None
+    shell._relay = None
+    shell._ledger_claim = "the-claim"
+    monkeypatch.setattr(confinement._BwrapShell, "_recheck", lambda self: None)
+    monkeypatch.setattr(confinement._BwrapShell, "_settled", lambda self: True)
+    monkeypatch.setattr(confinement.SandboxedShell, "close", lambda self: None)
+    released: list[str] = []
+    monkeypatch.setattr(confinement, "_ledger_release", released.append)
+    real_wait = shell._preflight_done.wait
+    monkeypatch.setattr(shell._preflight_done, "wait", lambda timeout=None: real_wait(0.2))
+
+    shell._before_command()                        # admitted, and never ends its preflight here
+    closer = threading.Thread(target=shell.close)
+    closer.start()
+    closer.join(5)
+    assert not closer.is_alive() and released == []   # the wait timed out: the claim is kept
+
+    shell._end_preflight()
+    shell._ledger_claim = "the-claim"
+    shell.close()                                   # drained: released as before
+    assert released == ["the-claim"]
