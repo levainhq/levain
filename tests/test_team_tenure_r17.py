@@ -81,7 +81,9 @@ def test_p3_local_only_reattach_advice_works_with_the_checkout_on_another_branch
     the checkout exists on another branch, so following it left the clone broken."""
     repo = tmp_path / "solo"
     sh("git", "init", "-q", str(repo))
-    sh("git", "-c", "user.email=a@x", "-c", "user.name=a", "commit", "-q", "--allow-empty", "-m", "i", cwd=repo)
+    sh("git", "config", "user.email", "ana@ex.com", cwd=repo)
+    sh("git", "config", "user.name", "ana", cwd=repo)
+    sh("git", "commit", "-q", "--allow-empty", "-m", "i", cwd=repo)
     assert _init(repo, keys, "ana") == 0
     sh("git", "checkout", "-q", "-b", "elsewhere", cwd=gl(repo).wt)
     capsys.readouterr()
