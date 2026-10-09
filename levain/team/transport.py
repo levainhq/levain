@@ -46,6 +46,24 @@ _SCRUB_ENV = ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_
               "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_NAMESPACE")
 _PUSH_RETRIES = 6
 _OP = threading.local()     # per thread: clone base -> depth of the `op` lock this thread holds
+_OP_FDS: set[int] = set()   # descriptors of op locks this process holds
+
+
+def _op_after_fork_in_child() -> None:
+    """A forked child holds no op: its inherited descriptors are closed (the parent's still holds the lock) and its
+    depth is cleared, so its next op opens a fresh lock and waits for the parent (code L3 r7 codex 2: a child inherited
+    the depth and ran whole operations as if it held the lock)."""
+    for fd in list(_OP_FDS):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    _OP_FDS.clear()
+    _OP.held = {}
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_op_after_fork_in_child)
 WARNINGS: list[str] = []  # process-wide: things a person must hear that did not stop the operation
 
 
@@ -259,6 +277,8 @@ class GitLedger:
         """
         self.base.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.base / name, os.O_RDWR | os.O_CREAT, 0o644)
+        if name == "op":
+            _OP_FDS.add(fd)
         try:
             mode = (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB
             deadline = time.monotonic() + timeout
@@ -272,7 +292,11 @@ class GitLedger:
                     time.sleep(0.05)
             yield
         finally:
-            os.close(fd)  # closing the descriptor releases the flock
+            # closing the descriptor releases the flock; an op descriptor a fork already closed in this child is not
+            # closed again (its number may have been reused)
+            if name != "op" or fd in _OP_FDS:
+                _OP_FDS.discard(fd)
+                os.close(fd)
 
     @contextlib.contextmanager
     def op(self, *, timeout: float = 150.0):
@@ -280,7 +304,8 @@ class GitLedger:
         the ledger (init, join, sync, the counted team changes, the clone's own trust acts). Git's frame: a command holds
         index.lock for its whole run, never a lock per step. Code L3 r6 found the per-step construct failing at a new
         site each round (a value read outside the lock that guards its writers: the re-land's decision, init's pin,
-        join's tail, its snapshot); inside one held op no other operation on this clone can interleave at all.
+        join's tail, its snapshot); inside one held op no other LEDGER-CHANGING operation on this clone interleaves
+        (the hook's lock-free bookkeeping, session denials and fetch stamps, is not one).
 
         Reentrant in the thread that holds it (join -> sync -> re-land -> update_counted nest); any other thread or
         process waits up to ``timeout`` and then gets TeamBusy. Order: op -> net -> worktree -> state."""
@@ -544,9 +569,7 @@ class GitLedger:
             raise TeamError(f"branch {self.branch} already exists here: use `levain team join`")
         if remote and self._remote_ledgers(remote):
             raise TeamError(f"{remote} already has a team ledger: use `levain team join`")
-        if signing_key:
-            self.save_state(signing_key=signing_key)
-        own = self.signing_pubkey()
+        own = self.signing_pubkey(signing_key)
         ten = T.Tenure(keys={team.owner: [own]})
         for h, line in (member_keys or {}).items():
             if h not in team.members:
@@ -558,8 +581,19 @@ class GitLedger:
             except S.SigningError as exc:
                 raise TeamError(f"{h}'s key cannot be used: {exc}") from None
             ten.pending_keys[h] = [line.strip()]
-        commit = self._genesis_commit({T.TEAM_FILE: R.dump_team(team), T.TENURE_FILE: T.dump_tenure(ten)},
-                                      f"levain team: init strict ledger for {team.project}")
+        # saved only now that every refusal has run (code L3 r7 complement 1 + codex 4: a refused member key left the
+        # key saved), and put back if the genesis cannot be made (the genesis signs with the saved key)
+        prior = self.state().get("signing_key")
+        if signing_key:
+            self.save_state(signing_key=signing_key)
+        try:
+            commit = self._genesis_commit({T.TEAM_FILE: R.dump_team(team), T.TENURE_FILE: T.dump_tenure(ten)},
+                                          f"levain team: init strict ledger for {team.project}")
+        except BaseException:
+            if signing_key:
+                self.save_state(_mutate=lambda st: st.pop("signing_key", None) if prior is None
+                                else st.__setitem__("signing_key", prior))
+            raise
         git(["update-ref", self.ref, commit, ""], self.repo.toplevel)
         self.save_state(device=self._new_device(), remote=remote or "", branch=self.branch, pinned_root=commit,
                         anchor=None, accepted={}, distrust=[])
@@ -893,6 +927,12 @@ class GitLedger:
         A refusal (EntryError) writes nothing. A push failure leaves the entry committed locally and
         raises TeamError saying so; the next write or `levain team sync` pushes it.
         """
+        # the whole append is one op, waited for up to its own lock_timeout (the hook's ack gives up in seconds and says
+        # so): a pin moved between its validation and its commit filed it under another ledger (code L3 r7 codex 1)
+        with self.op(timeout=lock_timeout):
+            return self._append_in_op(entry, push=push, lock_timeout=lock_timeout)
+
+    def _append_in_op(self, entry: dict, *, push: bool, lock_timeout: float) -> dict:
         self.require_joined()
         self._require_own_key_in_force(entry["author"])
         with self.lock(timeout=lock_timeout):
@@ -944,10 +984,11 @@ class GitLedger:
         return sealed
 
     def sync(self, *, push: bool = True) -> str:
-        self.require_joined()
-        with self.lock():
-            self._recover_dirty()
-        return self._sync(push=push)
+        with self.op():      # the recovery too (code L3 r7 codex 1)
+            self.require_joined()
+            with self.lock():
+                self._recover_dirty()
+            return self._sync(push=push)
 
     def _fetch(self, remote: str, rref: str, timeout: float) -> bool:
         """Fetch the ledger branch. False when the remote has no ledger branch yet."""
@@ -1512,11 +1553,15 @@ class GitLedger:
             last = float(self.state().get("last_fetch_attempt") or 0)
             if time.time() - last < interval:
                 return None
-            self.save_state(last_fetch_attempt=time.time())
+            # the op first, the attempt stamped only once it is held: a busy op is NOT another sync (it may be any team
+            # command), so it is reported and retried next time, never recorded as an attempt (code L3 r7 codex 3 +
+            # complement 3: the hook showed the old copy with no note and did not retry for a whole interval)
             try:
-                self._sync(push=False, timeout=timeout, net_timeout=0.5, lock_timeout=3.0)
+                with self.op(timeout=0.5):
+                    self.save_state(last_fetch_attempt=time.time())
+                    self._sync_in_op(push=False, timeout=timeout, net_timeout=0.5, lock_timeout=3.0)
             except TeamBusy:
-                return None  # another process is syncing right now; it brings the same data
+                return "another levain team operation on this clone is running"    # the hook adds the rest
             return None
         except TeamError as exc:
             self.save_state(last_fetch_error=str(exc))
@@ -1623,6 +1668,10 @@ class GitLedger:
             return fh.read().decode("utf-8")
 
     def _write_file(self, name: str, text: str, message: str, push: bool) -> str:
+        with self.op():      # code L3 r7 codex 1: a canon rendered from one ledger committed into another
+            return self._write_file_in_op(name, text, message, push)
+
+    def _write_file_in_op(self, name: str, text: str, message: str, push: bool) -> str:
         self.require_joined()
         with self.lock():
             self._recover_dirty()

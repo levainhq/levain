@@ -546,12 +546,18 @@ def register(subparsers) -> None:
     p.add_argument("--no-push", action="store_true")
 
 
+# commands that change no ledger, pin or trust state run outside the op, so they never queue behind a slow sync (code
+# L3 r7 complement 2): `view` (a server; its writes take the op), `status`/`verify`/`doctor` (read), `install` (writes
+# .claude settings only)
+_OUTSIDE_OP = {"view", "status", "verify", "doctor", "install"}
+
+
 def _guarded(func):
     def call(args) -> int:
         from .transport import WARNINGS
         try:
-            if getattr(args, "team_command", None) == "view":
-                return func(args)      # a long-running server: each write it makes takes the op itself
+            if getattr(args, "team_command", None) in _OUTSIDE_OP:
+                return func(args)      # read-only, or a server whose writes take the op themselves
             # every other team command is ONE operation on the clone, start to finish (code L3 r6: git's frame)
             with GitLedger(_repo(args)).op():
                 return func(args)

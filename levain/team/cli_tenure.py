@@ -326,7 +326,10 @@ def cmd_regenesis(gl: GitLedger, args) -> int:
     # rejected parent is an ancestor of the merge, and a local-only ledger's newest line is no ancestor of the last team
     # change). A frozen derivation counts only through the commit its verdicts are frozen at.
     walk = d_old.walk
-    if d_old.judged != "full" and d_old.frozen_at in walk:
+    if d_old.judged != "full":
+        if d_old.frozen_at not in walk:     # never the whole walk of a frozen ledger (code L3 r7 complement 4)
+            raise TeamError("the ledger is frozen and this clone cannot say up to where it judged it; nothing was "
+                            "changed. Sync, or name a repair (`levain team repin --anchor <commit>`), then re-genesis")
         walk = walk[:walk.index(d_old.frozen_at) + 1]
     if old_tip not in walk:
         raise TeamError(f"--from {args.from_} is not on the ledger this clone is pinned to (genesis {old_root[:12]}) "
