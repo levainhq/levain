@@ -62,7 +62,7 @@ def test_k1_pack_seed_reads_the_pack_file_under_the_op(two, tmp_path, monkeypatc
 def test_k2_init_never_deletes_a_ref_it_did_not_create(tmp_path, keys, monkeypatch):
     """codex r9 2 (HIGH): when another writer created the ledger ref at the same genesis first, init's create failed and
     its roll-back (keyed on 'genesis computed', not 'ref created') deleted the other writer's ref. The roll-back is
-    deleted (join's frame): a failed create changes nothing."""
+    deleted (join's frame): a failed create deletes nothing, and the persisted pin lets `init` resume (r10)."""
     WARNINGS.clear()
     a = tmp_path / "a"
     a.mkdir()
@@ -83,6 +83,9 @@ def test_k2_init_never_deletes_a_ref_it_did_not_create(tmp_path, keys, monkeypat
     with pytest.raises(TeamError):
         gl(a).init(team_, signing_key=str(keys["ana"]), push=False)
     monkeypatch.setattr(Tr, "git", real)
-    assert sh("git", "rev-parse", "-q", "--verify", "refs/heads/" + Tr.BRANCH, cwd=a, check=False).strip(), \
-        "init deleted a ledger ref another writer had created"
-    assert not gl(a).pinned_root and "signing_key" not in gl(a).state(), gl(a).state()
+    ref = sh("git", "rev-parse", "-q", "--verify", "refs/heads/" + Tr.BRANCH, cwd=a, check=False).strip()
+    assert ref, "init deleted a ledger ref another writer had created"
+    # r10: the pin is persisted before the create, so the stop is resumable: `init` again finishes it
+    assert gl(a).pinned_root == ref, gl(a).state()
+    assert "resumed" in gl(a).init(team_, signing_key=str(keys["ana"]), push=False)
+    assert gl(a).joined() and gl(a).team().owner == "ana"
