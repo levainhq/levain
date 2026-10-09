@@ -2560,8 +2560,11 @@ if role == "operator":
     if len(unit) != 5 or unit[1] != str(watch) or not unit[4].endswith(".scope"):
         refuse("not in a cgroup leaf levain (pid %d) made (%s); refusing to run without one" % (watch, leaf))
     kill = "/sys/fs/cgroup" + leaf[len("0::"):] + "/cgroup.kill"
-    if not os.access(kill, os.W_OK):
-        refuse("cannot write %s, which ends the command with levain; refusing" % kill)
+    try:
+        # Opened now, so the write at the end needs no open that could fail then (codex L3 r3).
+        kfd = os.open(kill, os.O_WRONLY | os.O_CLOEXEC)
+    except OSError as e:
+        refuse("cannot open %s, which ends the command with levain (%s); refusing" % (kill, e))
 mine = os.pidfd_open(me)
 if os.fork() == 0:
     n = os.open(os.devnull, os.O_RDWR)
@@ -2571,11 +2574,13 @@ if os.fork() == 0:
     if role == "operator":
         # Either end: bwrap's --die-with-parent may kill bwrap before levain's pidfd turns readable (RUN
         # 2026-10-09: 4 of 10), and a command that ended on its own leaves nothing here but this watcher.
-        try:
-            with open(kill, "w") as f:
-                f.write("1")
-        except OSError:
-            pass
+        # Retried; if every write fails, the next levain's crash sweep kills a dead levain's leaves.
+        for _ in range(5):
+            try:
+                os.write(kfd, b"1")
+                break
+            except OSError:
+                time.sleep(0.2)
         os._exit(0)
     if held not in ready:
         os._exit(0)
@@ -2597,6 +2602,8 @@ if os.fork() == 0:
     os._exit(0)
 os.close(held)
 os.close(mine)
+if role == "operator":
+    os.close(kfd)
 os.execv(argv[0], argv)
 """
 _HANDS_START = _START_KEYRING + _START_WATCH
@@ -7106,7 +7113,6 @@ class _BwrapShell(SandboxedShell):
         self._relay: _HandsRelay | None = None   # a hands launch's host-side proxy relay, if any
         self._hands: HandsIdentity | None = None   # a hands launch's user, whose files are repaired
         self._command_since = 0.0
-        self._walk: subprocess.Popen[bytes] | None = None   # the per-command walk's helper, while it runs
         self._probed = False   # start()'s own command has run: it changes no file, so nothing to repair
 
     def start(self) -> "SandboxedShell":
@@ -7204,12 +7210,11 @@ class _BwrapShell(SandboxedShell):
         # that does not empty keeps the claim; once this levain is gone, the next Linux spawn's
         # `sweep_dead_leaves` kills the leaf and the ledger sweep then drops the claim. Released in
         # `finally`, whatever the base teardown did.
-        # A walk started before this read is stopped here; one starting after it sees the shell closed.
-        self._closed = True
+        # A walk cannot start once this is set (`_hold_walk`). One already running is left to its owner,
+        # the run thread, which alone reaps it: a second thread signalling it could reach a reused pid
+        # (L3 r3). It is the fixed read-only find, ended by its own timeout (_HANDS_WALK_TIMEOUT).
         with self._lock:
-            walk = self._walk
-        if walk is not None and self._hands is not None:
-            _stop_hands_group(self._hands, walk)
+            self._closed = True
         try:
             super().close()
         finally:
@@ -7311,10 +7316,14 @@ class _BwrapShell(SandboxedShell):
 
     def _after_command(self, pgid: int) -> None:
         # The command's bash was pid 1 of its namespace, so the kernel is killing everything left in
-        # it; wait for the leaf to empty, so the next command's leaf is the only one the claim names.
+        # it, but only once pid 1 has died: when bwrap alone died (an OOM kill, a root SIGKILL), pid 1
+        # and a setsid child outlived run()'s return (RUN 2026-10-09, codex L3 r3). Whatever is still in a
+        # finished command's leaf outlived it, so the leaf is killed; a leaf that does not empty is still
+        # named, and `_settled` refuses the next command over it.
         with self._lock:
             rec = self._leaves.get(pgid)
         if rec is not None:
+            _leaf_kill(rec[1])
             _leaf_gone(rec[1], timeout=5.0)
         if self._hands is not None and self._probed:
             self._repair_masks()
@@ -7359,16 +7368,13 @@ class _BwrapShell(SandboxedShell):
             # made since the last one (RUN: a root listener planted mid-shell was CONNECTED) refuses
             # this command. What is made DURING a command is not seen; that is the README's residue.
             # A walk that could not be done says nothing about the host: that command is refused and the
-            # shell stays (complement L3 r2). Its process is held where close() can stop it (codex L3 r2).
+            # shell stays (complement L3 r2). None starts once the shell is closed (codex L3 r2).
             try:
-                found = _hands_walk(hands, self._hold_walk)
+                found = _hands_walk(hands, self._refuse_once_closed)
             except OSError as exc:
                 raise ConfinementError(
                     f"levain could not walk, as {hands.user}, the host files its bash would see ({exc}) — "
                     "the command was not run (fail-closed).") from exc
-            finally:
-                with self._lock:
-                    self._walk = None
             if found:
                 self.close()
                 raise ConfinementError(f"{_hands_reach_text(hands, found)} — the shell was closed and the "
@@ -7384,11 +7390,10 @@ class _BwrapShell(SandboxedShell):
                 f"the shell was closed and the command was not run. {exc}"
             ) from exc
 
-    def _hold_walk(self, proc: subprocess.Popen[bytes]) -> None:
+    def _refuse_once_closed(self, proc: subprocess.Popen[bytes]) -> None:
         with self._lock:
             if self._closed:
                 raise ConfinementError("the shell was closed; the command was not run")
-            self._walk = proc
 
 
 class BwrapProvider(ConfinementProvider):

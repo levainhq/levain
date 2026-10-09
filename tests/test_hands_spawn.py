@@ -366,16 +366,29 @@ def test_the_operator_floor_kills_its_leaf_when_levain_dies():
     levain = subprocess.Popen([sys.executable, "-c", stand_in], stdout=subprocess.PIPE, text=True)
     leaf = Path("/sys/fs/cgroup") / levain.stdout.readline().strip()   # type: ignore[union-attr]
     procs = leaf / "cgroup.procs"
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and len(procs.read_text().split() if procs.exists() else []) < 3:
-        time.sleep(0.1)
-    assert len(procs.read_text().split()) >= 3, "the command and its setsid child never ran in the leaf"
-    levain.kill()
-    levain.wait()
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and procs.exists() and procs.read_text().split():
-        time.sleep(0.1)
-    assert not procs.exists() or not procs.read_text().split()
+
+    def members() -> list[str]:
+        try:
+            return procs.read_text().split()
+        except FileNotFoundError:
+            return []
+
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and len(members()) < 3:
+            time.sleep(0.1)
+        assert len(members()) >= 3, "the command and its setsid child never ran in the leaf"
+        levain.kill()
+        levain.wait()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and members():
+            time.sleep(0.1)
+        assert not members()
+    finally:
+        levain.kill()
+        levain.wait()
+        if members():   # what the test found must not outlive it (codex L3 r3)
+            (leaf / "cgroup.kill").write_text("1")
 
 
 def test_the_hands_argv_refuses_an_op_it_does_not_know(monkeypatch):
@@ -845,7 +858,6 @@ def _walking_shell(monkeypatch):
     shell = object.__new__(confinement._BwrapShell)
     shell._hands = _view_hands(monkeypatch)
     shell._lock = threading.Lock()
-    shell._walk = None
     shell._closed = False
     closed: list[bool] = []
     monkeypatch.setattr(confinement._BwrapShell, "close", lambda self: closed.append(True))
@@ -866,12 +878,11 @@ def test_a_walk_that_could_not_run_refuses_the_command_and_keeps_the_shell(monke
 
 
 def test_a_walk_does_not_start_once_the_shell_is_closed(monkeypatch):
-    """codex L3 r2: close() stops a walk it can see, and a walk starting after it refuses."""
+    """codex L3 r2: a walk starting after close() refuses (one already running ends by its own timeout)."""
     shell, _ = _walking_shell(monkeypatch)
     shell._closed = True
     with pytest.raises(ConfinementError, match="closed"):
-        shell._hold_walk(object())   # type: ignore[arg-type]
-    assert shell._walk is None
+        shell._refuse_once_closed(object())   # type: ignore[arg-type]
 
 
 def test_the_linux_editor_refuses_by_name_without_zsh(tmp_path, monkeypatch):
