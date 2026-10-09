@@ -508,6 +508,10 @@
      unread → operate left-rule) or the dim/inert read state. The body rides the shared
      .clause/.row machinery, so per-item expand + line-clamp are inherited, not re-invented. */
   .ext-note { color: var(--dim); font-size: 11px; margin: 2px 0 8px; }
+  .ext-note.stale { color: var(--operate); }
+  .grp-head { color: var(--faint); font: 700 10px/1.6 var(--label); letter-spacing: .12em; text-transform: uppercase;
+    margin: 10px 0 2px; padding-top: 6px; border-top: 1px solid var(--line, rgba(255,255,255,.08)); }
+  .grp-head:first-child { border-top: 0; margin-top: 0; }
   .row.ext-accent { border-left: 2px solid var(--operate); padding-left: 9px; }
   .row.ext-dim .clause { color: var(--dim); }
   .ext-meta { color: var(--faint); flex: 0 0 auto; font: 700 10px/1.6 var(--label);

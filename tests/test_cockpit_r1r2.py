@@ -1,4 +1,4 @@
-"""R1 (web renderer, read half) and R2 (TUI renderer) of the shared cockpit (design
+"""R1 (the dashboard drawn from the manifest, read half) and R2 (TUI renderer) of the shared cockpit (design
 ``cockpit_manifest_DESIGN_1009.md`` §9 rows R1/R2, §7). DONE cases discharged here, none needing a write:
 
 * an injected provider fault shows its error text (TUI lines, JS renderer);
@@ -25,6 +25,7 @@ from levain.cockpit.text import render_lines, snapshot, visible
 
 WEB = Path(__file__).resolve().parent.parent / "levain" / "templates" / "web"
 NODE = shutil.which("node")
+CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
 # A DELIBERATELY NON-NATURAL ordering: ids descending, two groups assigned by id parity. The natural
 # kernel orderings sort by due date / tier; a renderer that re-sorts would show that instead.
@@ -132,129 +133,106 @@ class TestTuiRenderer:
         assert manifest["regions"]["zones"][0]["panels"][0] == "now"
 
 
-def _node_render(snap: dict[str, Any]) -> list[dict[str, Any]]:
-    """Run cockpit.js's render against a fake DOM and return a flat description of what it drew."""
-    driver = r"""
-const C = require(process.argv[1]);
-class El { constructor(t){this.tag=t;this.className="";this.textContent="";this.children=[];this.attrs={};}
-  appendChild(c){this.children.push(c);return c;} replaceChildren(...c){this.children=c;}
-  setAttribute(k,v){this.attrs[k]=v;} }
-const doc = { createElement: (t) => new El(t) };
-const root = new El("main");
-const snap = JSON.parse(require("fs").readFileSync(0, "utf8"));
-C.render(doc, root, snap, { now: Date.parse("2026-10-09T12:00:00Z"), topN: 12 });
-const out = [];
-(function walk(e, d){ out.push({tag:e.tag, cls:e.className, text:e.textContent, attrs:e.attrs}); e.children.forEach(c=>walk(c,d+1)); })(root,0);
-process.stdout.write(JSON.stringify(out));
-"""
-    res = subprocess.run([NODE, "-e", driver, str(WEB / "cockpit.js")], input=json.dumps(snap), capture_output=True,
-                         text=True, check=True, timeout=30)
+def _tray_cockpit(*, fault: bool = False, stale: bool = False) -> Cockpit:
+    """The kernel's own `tray` id (so the dashboard's native Tray component takes it) over the
+    deliberately non-natural test ordering, plus optional fault / stale panels."""
+    ck = Cockpit(entity=lambda ctx: {"name": "test entity", "governance": "x", "brand": {"wordmark": "W", "model": "M"}})
+    rows = [RowIn(f"spore:spore-{i}", f"title {i}", {"at": f"2026-10-0{i}T00:00:00+00:00"}, stored={"id": f"spore-{i}"})
+            for i in range(1, 6)]
+    ck.register(ProviderSpec("tray", "triage-list", "Tray", "gate", lambda c: Read(rows=tuple(rows)),
+                             order="test.reversed", facets=frozenset({"at"}), version_fields=("id",)))
+    if fault:
+        ck.register(ProviderSpec("broken", "triage-list", "Broken", "gauge", lambda c: Fault("source exploded: disk on fire"),
+                                 order="time.desc", facets=frozenset({"at"}), version_fields=("id",), region="mind"))
+    if stale:
+        ck.register(ProviderSpec("old", "line", "Old", "gauge", lambda c: Read(value={"lines": [
+            {"label": "a", "text": "b", "at": None, "source": None}]}), refresh_every_s=10, stale_after_s=1, region="mind"))
+    return ck
+
+
+def _view(snap: dict[str, Any]) -> dict[str, Any]:
+    driver = (
+        "const V=require(process.argv[1]);const snap=JSON.parse(require('fs').readFileSync(0,'utf8'));"
+        "process.stdout.write(JSON.stringify(V.fromManifest(snap, Date.parse('2026-10-09T12:00:00Z'))))")
+    res = subprocess.run([NODE, "-e", driver, str(WEB / "cockpit_view.js")], input=json.dumps(snap),
+                         capture_output=True, text=True, check=True, timeout=30)
     return json.loads(res.stdout)
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
-class TestWebRenderer:
-    def test_head_and_payload_disagreement_shows_the_payloads_error(self) -> None:
-        nodes = _node_render(_cached_head_then_error())
-        panel = [n for n in nodes if n["attrs"].get("data-panel") == "flip"][0]
-        assert panel["attrs"]["data-status"] == "error"
-        assert any("disk failed after the manifest" in n["text"] for n in nodes)
+class TestManifestMapper:
+    """cockpit_view.js builds the dashboard's view from the manifest and re-orders nothing."""
 
-    def test_prototype_named_groups_do_not_defeat_the_cut(self) -> None:
-        ck = Cockpit()
-        try:
-            register_ordering(Ordering(name="test.proto", key=lambda r, t: (r.id,), group=lambda r, t: "constructor",
-                                       groups=(("constructor", "Ctor"),)))
-        except Exception:  # noqa: BLE001
-            pass
-        rows = [RowIn(f"r-{i:02d}", f"t{i}", {"at": "2026-10-01T00:00:00+00:00"}, stored={"id": f"r-{i}"}) for i in range(20)]
-        ck.register(ProviderSpec("p", "triage-list", "P", "gate", lambda c: Read(rows=tuple(rows)),
-                                 order="test.proto", facets=frozenset({"at"}), version_fields=("id",)))
-        nodes = _node_render(snapshot(ck))
-        assert len([n for n in nodes if "data-row" in n["attrs"]]) == 12
-        assert [n["text"] for n in nodes if n["cls"] == "ck-more"] == ["+8 more (cut by this view)"]
+    def test_non_natural_order_and_groups_reach_the_view_as_served(self) -> None:
+        ck = _tray_cockpit()
+        served = [r["id"] for r in ck.panel("tray")["rows"]]
+        assert served != sorted(served)
+        view = _view(snapshot(ck))
+        assert [f"spore:{s['id']}" for s in view["tray"]] == served
+        assert [s["group_title"] for s in view["tray"]] == ["Odd ids"] * 3 + ["Even ids"] * 2
+        assert [e["id"] for e in view["layout"]][:2] == ["now", "tray"]   # the kernel's panel order
 
-    def test_full_prose_renders_its_markdown_text_and_compact_feed_lines_get_an_open_button(self) -> None:
-        ck = Cockpit()
-        ck.register(ProviderSpec("pr", "prose", "Doc", "gauge",
-                                 lambda c: Read(value={"markdown": "the body text", "headline": "Head"})))
-        ck.register(ProviderSpec("ln", "line", "Feed", "feed",
-                                 lambda c: Read(value={"lines": [{"label": "a", "text": "b", "at": None, "source": None}]})))
-        full = _node_render(snapshot(ck))
-        assert any(n["text"] == "the body text" for n in full)
-        compact = _node_render(snapshot(ck, profile="compact"))
-        assert [n for n in compact if n["cls"] == "ck-open"], "a compact feed line must offer its content on open"
+    def test_a_provider_fault_becomes_an_unavailable_panel_never_an_empty_one(self) -> None:
+        view = _view(snapshot(_tray_cockpit(fault=True)))
+        broken = [e for e in view["layout"] if e["id"] == "broken"][0]
+        assert broken["kind"] == "external"
+        assert "disk on fire" in view["extra_panels"]["broken"]["error"]
 
-    def test_format_characters_and_naive_timestamps(self) -> None:
-        out = subprocess.run(
-            [NODE, "-e", "const C=require(process.argv[1]);const n=Date.parse('2026-10-09T12:00:00Z');"
-             "process.stdout.write(C.visible('a b\\u061c\\u206a\\ud800')+'|'+C.age('2026-10-09T11:00:00',n))",
-             str(WEB / "cockpit.js")], capture_output=True, text=True, check=True).stdout
-        assert out == "a b<U+061C><U+206A><U+D800>|1h ago"
-
-    def test_non_natural_order_and_groups_are_shown_as_served(self) -> None:
-        ck = _cockpit()
-        served = [r["id"] for r in ck.panel("items")["rows"]]
-        nodes = _node_render(snapshot(ck))
-        rows = [n["attrs"]["data-row"] for n in nodes if "data-row" in n["attrs"]]
-        assert rows == served
-        groups = [n["text"] for n in nodes if n["cls"] == "ck-group"]
-        assert groups == ["Odd ids (3)", "Even ids (2)"]
-
-    def test_a_provider_fault_shows_its_error_text(self) -> None:
-        nodes = _node_render(snapshot(_cockpit(fault=True)))
-        errs = [n["text"] for n in nodes if "ck-msg-error" in n["cls"]]
-        assert any("disk on fire" in t and "last good" in t for t in errs)
-        broken = [n for n in nodes if n["attrs"].get("data-panel") == "broken"][0]
-        assert broken["attrs"]["data-status"] == "error"
-
-    def test_top_n_cut_says_how_many_it_hid(self) -> None:
-        ck = Cockpit()
-        rows = [RowIn(f"r-{i}", f"t{i}", {"at": "2026-10-01T00:00:00+00:00"}, stored={"id": f"r-{i}"}) for i in range(30)]
-        ck.register(ProviderSpec("many", "triage-list", "Many", "gate", lambda c: Read(rows=tuple(rows)),
-                                 order="test.reversed", facets=frozenset({"at"}), version_fields=("id",)))
-        nodes = _node_render(snapshot(ck))
-        drawn = [n for n in nodes if "data-row" in n["attrs"]]
-        assert len(drawn) == 24   # 12 per group
-        mores = sorted(n["text"] for n in nodes if n["cls"] == "ck-more")
-        assert mores == ["+3 more (cut by this view)"] * 2
-
-    def test_control_characters_are_visible(self) -> None:
-        out = subprocess.run(
-            [NODE, "-e", "const C=require(process.argv[1]);process.stdout.write(C.visible('a\\u202eb\\x1b'))",
-             str(WEB / "cockpit.js")], capture_output=True, text=True, check=True).stdout
-        assert out == "a<U+202E>b<U+001B>"
+    def test_a_stale_panel_carries_a_banner(self) -> None:
+        from datetime import timedelta
+        clock = {"t": datetime(2026, 10, 9, 12, tzinfo=timezone.utc)}
+        ck = _tray_cockpit(stale=True)
+        ck._clock = lambda: clock["t"]
+        ck.refresh("old")
+        clock["t"] += timedelta(seconds=5)
+        view = _view(snapshot(ck))
+        entry = [e for e in view["layout"] if e["id"] == "old"][0]
+        assert any(b["text"].startswith("STALE") for b in entry["banner"])
 
 
-class TestServedPage:
-    def test_the_page_and_its_assets_are_served_and_draw_the_kernels_order(self, tmp_path: Path) -> None:
+def _dump_dom(url: str) -> str:
+    return subprocess.run([CHROME, "--headless=new", "--dump-dom", "--virtual-time-budget=8000", "--window-size=1440,1000", url],
+                          capture_output=True, text=True, timeout=60).stdout
+
+
+@pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
+class TestTheDashboardPageFromTheManifest:
+    """The real page in a real browser: `/?source=manifest` draws the kernel's order and its errors."""
+
+    def _serve(self, tmp_path: Path, ck: Cockpit):
         import threading
-        import urllib.request
 
-        from levain.dashboard import SubstrateSource
         from levain.web_server import make_server
         from tests.test_cockpit_k1 import _install
 
-        root, src = _install(tmp_path)
-        ck = _cockpit()
+        _root, src = _install(tmp_path)
         httpd = make_server(src, host="127.0.0.1", port=0, cockpit=ck)
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
+        return httpd, t
+
+    def test_reversed_order_groups_and_an_error_panel_are_drawn(self, tmp_path: Path) -> None:
+        import re
+
+        ck = _tray_cockpit(fault=True)
+        served = [r["id"].split(":")[1] for r in ck.panel("tray")["rows"]]
+        httpd, t = self._serve(tmp_path, ck)
         try:
-            base = f"http://127.0.0.1:{httpd.server_address[1]}"
-            def get(path: str):
-                with urllib.request.urlopen(base + path, timeout=5) as r:  # noqa: S310 - loopback
-                    return r.status, r.headers.get("Content-Type"), r.read().decode()
-            st, ct, html = get("/cockpit")
-            assert st == 200 and ct.startswith("text/html") and "/cockpit.js" in html and "<script>" not in html
-            for path, kind in (("/cockpit.js", "javascript"), ("/cockpit_boot.js", "javascript"), ("/cockpit.css", "css")):
-                st, ct, body = get(path)
-                assert st == 200 and kind in ct and body
-            st, _, m = get("/cockpit/manifest.json")
-            served = json.loads(get("/cockpit/panel/items.json")[2])
-            assert [r["id"] for r in served["rows"]] == [r["id"] for r in ck.panel("items")["rows"]]
-            assert json.loads(m)["panels"]["items"]["groups"][0]["id"] == "odd"
+            dom = _dump_dom(f"http://127.0.0.1:{httpd.server_address[1]}/?source=manifest")
         finally:
             httpd.shutdown()
             httpd.server_close()
             t.join(timeout=5)
+        assert re.findall(r'class="sid"[^>]*>(spore-\d)<', dom) == served
+        assert dom.index("Odd ids") < dom.index("Even ids")
+        assert "disk on fire" in dom and "unavailable" in dom
+
+    def test_the_default_page_still_reads_the_substrate(self, tmp_path: Path) -> None:
+        httpd, t = self._serve(tmp_path, _tray_cockpit())
+        try:
+            dom = _dump_dom(f"http://127.0.0.1:{httpd.server_address[1]}/")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            t.join(timeout=5)
+        assert "Open loops" in dom and "loop one" in dom

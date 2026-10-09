@@ -47,10 +47,14 @@
       head.appendChild(el("span", "chip chip-" + entry.edit_class, entry.edit_class));
     }
     if (entry.source) head.appendChild(el("span", "src", entry.source));
+    if (entry.fresh) head.appendChild(el("span", "src", entry.fresh));   // manifest source: when the kernel last read it
     // dense kinds get a ⤢ control in the header → a focused, full-screen re-render
     // (Slice 2). Only the long modules (CLAMP_KINDS) — health/graph stay natural-height.
     if (entry.kind && CLAMP_KINDS.has(entry.kind)) head.appendChild(buildExpandBtn(entry));
     p.appendChild(head);
+    // A manifest source's status lines (stale / partial / held back / the provider's note), drawn
+    // under the header so a degraded panel never reads as a healthy one.
+    for (const b of entry.banner || []) p.appendChild(el("div", "ext-note" + (b.tone === "stale" ? " stale" : ""), b.text));
     return p;
   };
   const kv = (parent, k, v) => {
@@ -270,7 +274,10 @@
       return;
     }
     const paths = view.paths || {};
-    if (storeEl) storeEl.textContent = paths.episodic_db || "(store path unknown)";
+    if (storeEl) {
+      storeEl.textContent = paths.episodic_db || "(store path unknown)";
+      storeEl.hidden = !!paths.omitted;   // a manifest source carries no store path: no line, not a false "unknown"
+    }
     if (entityEl) {
       const stem = (paths.episodic_db ? String(paths.episodic_db).split("/").pop() : "") || "substrate";
       // A rename editor open in the masthead (spore-280 — the pre-existing twin of the 247
@@ -495,8 +502,9 @@
     head.appendChild(vWrap);
     p.appendChild(head);
 
-    kv(p, "Hebbian links", `${fmt(h.total_links)} (avg ${num(h.avg_strength).toFixed(2)}, max ${num(h.max_strength).toFixed(2)})`);
-    kv(p, "density", `${num(h.density).toFixed(3)} · local ${num(h.local_density).toFixed(3)}`);
+    // a manifest source may not carry every figure: show only what was sent, never a made-up 0.00
+    kv(p, "Hebbian links", `${fmt(h.total_links)} (avg ${num(h.avg_strength).toFixed(2)}` + (h.max_strength != null ? `, max ${num(h.max_strength).toFixed(2)}` : "") + ")");
+    kv(p, "density", `${num(h.density).toFixed(3)}` + (h.local_density != null ? ` · local ${num(h.local_density).toFixed(3)}` : ""));
     kv(p, "graduations", `${fmt(h.graduations_validated_total)} validated / ${fmt(h.graduations_demoted_total)} demoted`);
     kv(p, "episodes", `${fmt(h.total_episodes)} (${fmt(h.episodes_since_wrap)} since wrap)`);
     const last = h.last_wrap_at ? datePart(h.last_wrap_at) : "never";
@@ -716,7 +724,12 @@
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (!list || list.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
-    for (const s of list) p.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
+    let lastGroup = null;
+    for (const s of list) {
+      // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order
+      if (s.group_title && s.group !== lastGroup) { p.appendChild(el("div", "grp-head", s.group_title)); lastGroup = s.group; }
+      p.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
+    }
     return p;
   }
 
@@ -2524,6 +2537,17 @@
   }
 
   wireTabs();
+
+  // Number keys switch the zone tab (1 All, 2 Identity, 3 Operate, 4 Mind) unless typing in a field.
+  document.addEventListener("keydown", (ev) => {
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    const t = ev.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+    const idx = "1234".indexOf(ev.key);
+    if (idx < 0 || ev.key.length !== 1) return;
+    const tabs = document.querySelectorAll(".tab");
+    if (tabs[idx]) tabs[idx].click();
+  });
 
   // Is the operator mid-edit/capture with text that an involuntary re-render would
   // discard? (spore-108) render() rebuilds the whole #board (+ modal) via
