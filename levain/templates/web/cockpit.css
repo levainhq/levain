@@ -1,0 +1,31 @@
+:root { color-scheme: light dark; --fg:#1d1f21; --bg:#fafaf8; --dim:#6b6f73; --line:#d9d9d4; --bad:#b3261e; --warn:#8a5a00; --accent:#0b5cad; }
+@media (prefers-color-scheme: dark) { :root { --fg:#e6e6e3; --bg:#16181a; --dim:#9a9fa4; --line:#33373a; --bad:#ff8a80; --warn:#f0b429; --accent:#7ab7ff; } }
+body { margin:0; font:15px/1.45 system-ui,-apple-system,sans-serif; color:var(--fg); background:var(--bg); }
+.ck-mast { display:flex; justify-content:space-between; align-items:baseline; padding:.75rem 1rem; border-bottom:1px solid var(--line); }
+.ck-brand { font-weight:600; letter-spacing:.02em; }
+.ck-stamp { color:var(--dim); font-size:.85rem; }
+main { max-width:60rem; margin:0 auto; padding:0 1rem 3rem; }
+.ck-header { padding:.5rem 0; border-bottom:1px solid var(--line); }
+.ck-zone > h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.1em; color:var(--dim); margin:1.5rem 0 .25rem; }
+.ck-panel { border:1px solid var(--line); border-radius:6px; padding:.5rem .75rem; margin:.6rem 0; }
+.ck-panel > h3 { font-size:1rem; margin:0 0 .25rem; display:flex; gap:.5rem; align-items:baseline; }
+.ck-status { font-size:.7rem; text-transform:uppercase; letter-spacing:.06em; border:1px solid currentColor; border-radius:3px; padding:0 .3rem; color:var(--dim); }
+.ck-status-error { color:var(--bad); font-weight:700; }
+.ck-status-stale, .ck-status-partial { color:var(--warn); font-weight:700; }
+.ck-msg { margin:.25rem 0; font-size:.9rem; }
+.ck-msg-error { color:var(--bad); border-left:3px solid var(--bad); padding-left:.5rem; }
+.ck-msg-stale, .ck-msg-partial { color:var(--warn); border-left:3px solid var(--warn); padding-left:.5rem; }
+.ck-msg-dim, .ck-note, .ck-empty { color:var(--dim); }
+.ck-group { font-size:.8rem; font-weight:600; margin:.6rem 0 .1rem; color:var(--dim); }
+.ck-rows { list-style:none; margin:0; padding:0; }
+.ck-row { padding:.2rem 0; border-top:1px solid var(--line); display:flex; gap:.5rem; flex-wrap:wrap; align-items:baseline; }
+.ck-row:first-child { border-top:0; }
+.ck-row.ck-accent .ck-title { color:var(--accent); font-weight:600; }
+.ck-row.ck-dimmed { color:var(--dim); }
+.ck-badge { font-size:.72rem; border:1px solid var(--line); border-radius:3px; padding:0 .3rem; color:var(--dim); }
+.ck-prov { font-size:.72rem; color:var(--dim); font-style:italic; }
+.ck-more { color:var(--dim); font-size:.8rem; }
+.ck-lines, .ck-metrics { list-style:none; margin:0; padding:0; }
+.ck-label { color:var(--dim); margin-right:.4rem; }
+.ck-metric-bad { color:var(--bad); } .ck-metric-warn { color:var(--warn); }
+.ck-compact .ck-body { display:none; }
