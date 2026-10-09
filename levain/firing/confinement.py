@@ -7257,8 +7257,8 @@ class BwrapProvider(ConfinementProvider):
         argv, create_first = _bwrap_plan(policy)
         mounted, unmounted = _mount_plan_paths(argv, policy)
         if hands is not None:
-            # The bookkeeping (placeholders, manifest, the per-command recheck) stays the operator
-            # floor's, computed above from its plan; only what bwrap executes changes.
+            # The placeholders stay the operator floor's, computed above from its plan; what bwrap
+            # executes is the view, and the manifest is narrowed to it below.
             argv = _hands_bwrap_argv(argv, hands)
         # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
         # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
