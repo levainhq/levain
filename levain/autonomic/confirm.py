@@ -99,10 +99,13 @@ def trust_anchor_problem(path: Path | str, *, what: str,
         return f"{what} {p} is not owned by root (uid {st.st_uid})", None
     if st.st_mode & (_S_IWGRP | _S_IWOTH):
         return f"{what} {p} is group- or world-writable", None
-    # the mode bits do not show an ACL: ask the kernel whether THIS uid may write (access(2) applies ACLs)
-    check_access = os.geteuid() not in owners
+    # the mode bits do not show an ACL: ask the kernel whether THIS uid may write (access(2) applies ACLs,
+    # and tests the REAL uid, so a process whose effective uid differs is refused rather than guessed about)
+    if os.getuid() != os.geteuid():
+        return f"{what} {p} cannot be checked: real uid {os.getuid()} is not effective uid {os.geteuid()}", None
+    check_access = os.getuid() not in owners
     if check_access and os.access(real, os.W_OK):
-        return f"{what} {p} is writable by uid {os.geteuid()}", None
+        return f"{what} {p} is writable by uid {os.getuid()}", None
     parent = os.path.dirname(real)
     while True:
         try:
@@ -116,7 +119,7 @@ def trust_anchor_problem(path: Path | str, *, what: str,
         if dst.st_mode & (_S_IWGRP | _S_IWOTH):
             return f"{what} directory {parent} is group- or world-writable", None
         if check_access and os.access(parent, os.W_OK):
-            return f"{what} directory {parent} is writable by uid {os.geteuid()}", None
+            return f"{what} directory {parent} is writable by uid {os.getuid()}", None
         if parent == os.path.dirname(parent):
             return None, real
         parent = os.path.dirname(parent)
@@ -156,7 +159,7 @@ def verify_signature_status(message: bytes, *, signature: str | None, signer: st
             problem, signers_file = trust_anchor_problem(allowed_signers, what="allowed-signers file",
                                                          owners=_SIGNERS_FILE_OWNERS)
         if problem is None and not os.access(signers_file, os.R_OK):
-            problem = f"allowed-signers file {allowed_signers} is not readable by uid {os.geteuid()}"
+            problem = f"allowed-signers file {allowed_signers} is not readable by uid {os.getuid()}"
         if problem is not None:
             _log.error("confirm: refusing to verify a signature: %s", problem)
             return UNAVAILABLE

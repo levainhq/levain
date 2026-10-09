@@ -80,7 +80,7 @@ from levain.autonomic.db import AutonomicDB
 __all__ = [
     "EffectStatus", "EffectOutcome", "HoldResult", "RunJournal", "RunRef", "JournalCorruptError",
     "JournalConflictError", "UNSIGNED_DECIDER",
-    "run_id_for", "hold_id_for", "effect_digest", "needs_signature", "AUTHORIZED", "decision_key",
+    "run_id_for", "hold_id_for", "effect_digest", "needs_signature", "AUTHORIZED", "RECHECK", "decision_key",
 ]
 
 _log = logging.getLogger(__name__)
@@ -209,6 +209,8 @@ def needs_signature(by: str | None) -> bool:
 # ``"unavailable:<why>"`` (the check could not run: the approval stands, the effect is held) or a refusal
 # (``"bad:<why>"``, or any other value: the hold reopens for a new decision).
 AUTHORIZED = "ok"
+# What ``authorize`` returns when the inputs it read moved under it: the admission checks again.
+RECHECK = "recheck"
 # How many times an admission re-runs its check when the decision or the risk inputs changed between the
 # check (made outside the write transaction) and the admission; after that the effect is held.
 _ADMIT_TRIES = 3
@@ -534,8 +536,9 @@ class RunJournal:
         approved hold of its own is HELD while any hold on its binding is open.
         ``authorize(hold, fence_now)`` decides whether the approval recorded on this effect's own hold is
         authority NOW (whoever decided it, a person or the silence default): :data:`AUTHORIZED`, or
-        ``"unavailable:<why>"`` when the check cannot run (the approval stands and the effect is HELD), or
-        a refusal (the hold reopens: REOPENED). With no ``authorize`` every approval is refused. The check
+        ``"unavailable:<why>"`` when the check cannot run (the approval stands and the effect is HELD),
+        :data:`RECHECK` when what it read moved (checked again), or a refusal (the hold reopens:
+        REOPENED). With no ``authorize`` every approval is refused. The check
         runs OUTSIDE the write transaction (it may be slow: a signature verifier), and the admission
         uses its answer only if the decision and the fence it read are unchanged in the transaction;
         otherwise it checks again (:data:`_ADMIT_TRIES` times, then HELD).
@@ -639,6 +642,8 @@ class RunJournal:
             if checked is None or checked[0] != key or checked[1] != live:
                 return _RETRY
             verdict = checked[2]
+            if verdict == RECHECK:
+                return _RETRY
             if verdict.startswith("unavailable:"):
                 return EffectOutcome(EffectStatus.HELD, hold_id=hold_id, why=verdict)
             if verdict != AUTHORIZED:

@@ -53,7 +53,7 @@ from levain.autonomic.confirm import (
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.gates import screen
 from levain.autonomic.journal import (
-    AUTHORIZED, UNSIGNED_DECIDER, EffectOutcome, EffectStatus, JournalCorruptError, RunJournal, RunRef,
+    AUTHORIZED, RECHECK, UNSIGNED_DECIDER, EffectOutcome, EffectStatus, JournalCorruptError, RunJournal, RunRef,
     decision_key, effect_digest, hold_id_for, needs_signature,
 )
 from levain.autonomic.kill import kill_trips
@@ -414,7 +414,7 @@ class EfferentGate:
             if fence is None or effective is Posture.REFUSE_ESCALATE:
                 return f"bad:{why or 'no_rung_may_approve'}"
             if fence != fence_now:
-                return "retry"   # the rung above was derived from other inputs than ``fence_now``: read again
+                return RECHECK   # the rung above was derived from other inputs than ``fence_now``: read again
             rung = hold.get("decided_posture")
             if not isinstance(rung, str) or rung not in Posture.__members__:
                 return "bad:no_decided_rung"
