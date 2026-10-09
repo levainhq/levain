@@ -280,8 +280,7 @@ class EfferentGate:
         # a tightening included, is a NEW gate on a new manifest. The swap that exists today is a new
         # process; the in-process handle the trust-tiering fold must build is described on
         # :class:`ActionManifest`.
-        manifest.freeze()
-        self._manifest = manifest
+        self._manifest = manifest.freeze()
         # The signature verifier: an absolute path to ``ssh-keygen`` (``/usr/bin/ssh-keygen`` unless set
         # here), never found through PATH, and refused unless root-owned and writable by nobody else.
         self._ssh_keygen = Path(ssh_keygen) if ssh_keygen is not None else DEFAULT_SSH_KEYGEN

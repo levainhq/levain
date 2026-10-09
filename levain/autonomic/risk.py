@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from types import MappingProxyType
+import threading
 
 __all__ = ["RiskClass", "ActionRisk", "ActionManifest", "ManifestFrozen", "UnknownAction"]
 
@@ -78,7 +78,8 @@ class ActionManifest:
 
     FROZEN PER GATE (desk ruling (a), 2026-10-09): an :class:`~levain.autonomic.gate.EfferentGate`
     freezes the manifest it is built with, and :meth:`register` raises :class:`ManifestFrozen` from then
-    on, so every admission a gate makes reads one manifest. A change to the declarations, a TIGHTENING
+    on; the gate holds its own frozen copy (:meth:`freeze`), so every admission it makes reads one
+    manifest whatever is later done to the caller's object. A change to the declarations, a TIGHTENING
     included, takes effect by building a new manifest and a new gate on it, never by editing one a gate
     holds. The only swap that exists is the process: a new process builds a new gate (flow's adapter
     built one per CLI command when this was written, 2026-10-09: ``grep -n 'build_gate()'
@@ -96,22 +97,26 @@ class ActionManifest:
     def __init__(self, actions: dict[str, ActionRisk] | None = None) -> None:
         self._actions: dict[str, ActionRisk] = dict(actions or {})
         self._frozen = False
+        self._lock = threading.Lock()   # register and freeze: a register lands in the copy or raises
 
     def register(self, name: str, risk: ActionRisk) -> None:
         """Declare (or re-declare) an action's risk while the manifest is being composed. Last-writer-wins.
         Raises :class:`ManifestFrozen` once a gate holds the manifest (:meth:`freeze`)."""
-        if self._frozen:
-            raise ManifestFrozen(
-                f"cannot register {name!r}: a gate holds this manifest; build a new manifest and swap in a "
-                "new gate built on it")
-        self._actions[name] = risk
+        with self._lock:
+            if self._frozen:
+                raise ManifestFrozen(
+                    f"cannot register {name!r}: a gate holds this manifest; build a new manifest and swap in "
+                    "a new gate built on it")
+            self._actions[name] = risk
 
-    def freeze(self) -> None:
-        """End composition: every later :meth:`register` raises. Idempotent. The gate calls it. The
-        declarations become a read-only view, so a write that does not go through :meth:`register` fails
-        too."""
-        self._frozen = True
-        self._actions = MappingProxyType(dict(self._actions))  # type: ignore[assignment]
+    def freeze(self) -> "ActionManifest":
+        """End composition and return the frozen COPY a gate holds: every later :meth:`register` on this
+        manifest raises, and nothing done to this object afterwards reaches the copy. Idempotent."""
+        with self._lock:
+            self._frozen = True
+            copy = ActionManifest(self._actions)
+        copy._frozen = True
+        return copy
 
     @property
     def frozen(self) -> bool:

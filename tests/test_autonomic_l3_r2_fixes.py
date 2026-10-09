@@ -106,8 +106,14 @@ def test_a_manifest_a_gate_holds_cannot_be_edited(tmp_path):
     assert m.frozen
     with pytest.raises(ManifestFrozen):
         m.register("link1", LOW)
-    with pytest.raises(TypeError):
-        m._actions["link1"] = LOW                                      # not through register either
+    # codex r6 1: the caller's object, edited by any means after, does not reach the gate's copy
+    from levain.autonomic import EfferentGate
+    held = ActionManifest({"link1": HIGH})
+    g = EfferentGate(manifest=held, store=w.receipts, executor=w.gate._executor)
+    with pytest.raises(ManifestFrozen):
+        held.register("link1", LOW)
+    held._actions = {"link1": LOW}
+    assert g._manifest.risk_of("link1") == HIGH
     fresh = ActionManifest({"link0": LOW})
     fresh.register("link1", HIGH)                                      # composing before a gate holds it
     assert not fresh.frozen
