@@ -273,7 +273,8 @@ def test_the_hands_argv_is_an_allowlisted_view_keeping_only_the_floors_ops_insid
 def test_on_linux_every_hands_process_starts_through_the_keyring_join(tmp_path):
     hands = _hands(tmp_path)
     linux = hands_prefix(hands, system="Linux")
-    assert linux[-6:] == [confinement.HANDS_PYTHON, "-I", "-S", "-c", confinement._HANDS_START, str(os.getpid())]
+    assert linux[-7:] == [confinement.HANDS_PYTHON, "-I", "-S", "-c", confinement._HANDS_START, "hands",
+                          str(os.getpid())]
     assert confinement._HANDS_START not in hands_prefix(hands, system="Darwin")
 
 
@@ -290,43 +291,91 @@ def test_the_keyring_join_leaves_the_callers_session_keyring_behind():
     import sys
 
     own = subprocess.run([sys.executable, "-I", "-S", "-c", _SESSION_KEYRING_ID], capture_output=True, text=True)
-    joined = subprocess.run([sys.executable, "-I", "-S", "-c", confinement._HANDS_START, str(os.getpid()),
+    join = confinement._START_KEYRING + "os.execv(sys.argv[1], sys.argv[1:])\n"
+    joined = subprocess.run([sys.executable, "-I", "-S", "-c", join,
                              sys.executable, "-I", "-S", "-c", _SESSION_KEYRING_ID], capture_output=True, text=True)
     assert own.returncode == 0 and joined.returncode == 0, (own.stderr, joined.stderr)
     assert int(own.stdout) > 0 and int(joined.stdout) > 0
     assert own.stdout != joined.stdout
 
 
-@pytest.mark.skipif(platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"),
-                    reason="the start program is Linux's")
-def test_a_sandboxed_command_ends_when_levain_is_killed():
-    """RUN 2026-10-09 (R5): levain SIGKILLed mid-command left the hands command's bash and a setsid child
-    running, because --die-with-parent binds to sudo and sudo outlives levain. Here a stand-in levain
-    starts a command through the start program and is SIGKILLed; the command must be gone soon after."""
+_LINUX_START = pytest.mark.skipif(platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"),
+                                  reason="the start program is Linux's")
+
+
+def _start(role: str, *command: str) -> subprocess.CompletedProcess[str]:
+    import sys
+
+    return subprocess.run([sys.executable, "-I", "-S", "-c", confinement._HANDS_START, role, str(os.getpid()),
+                           *command], capture_output=True, text=True, timeout=30)
+
+
+@_LINUX_START
+def test_a_hands_start_as_levains_own_uid_refuses_before_the_command():
+    """Its kill(-1) at levain's end would take every process of levain's user (L3 r2: the role was
+    once inferred from /proc/<levain>'s owner, which a non-dumpable levain changes on some kernels)."""
+    r = _start("hands", "/bin/echo", "ran")
+    assert r.returncode == 126 and "ran" not in r.stdout
+    assert "levain's user" in r.stderr
+
+
+@_LINUX_START
+def test_an_operator_start_outside_a_leaf_levain_made_refuses():
+    r = _start("operator", "/bin/echo", "ran")
+    assert r.returncode == 126 and "ran" not in r.stdout
+    assert "not in a cgroup leaf levain" in r.stderr
+
+
+@_LINUX_START
+def test_an_unknown_start_role_refuses():
+    r = _start("oper", "/bin/echo", "ran")
+    assert r.returncode == 126 and "unknown start role" in r.stderr
+
+
+def _user_scope_ok() -> bool:
+    if platform.system() != "Linux":
+        return False
+    env = {**os.environ, "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}"}
+    try:
+        return subprocess.run([confinement.SYSTEMD_RUN, "--user", "--scope", "--quiet", "--collect", "/bin/true"],
+                              env=env, capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def test_the_operator_floor_kills_its_leaf_when_levain_dies():
+    """RUN 2026-10-09 (R5, operator floor): levain SIGKILLed mid-command left the namespace's pid 1 and a
+    setsid child running. A stand-in levain makes a leaf the way levain names one, starts a command with
+    a setsid child through the start program in it, and is SIGKILLed: the leaf must empty."""
     import sys
     import time
 
-    levain = subprocess.Popen(
-        [sys.executable, "-I", "-S", "-c",
-         "import os, subprocess, sys, time; p = subprocess.Popen([sys.executable, '-I', '-S', '-c', sys.argv[1], "
-         "str(os.getpid()), '/bin/sleep', '120']); print(p.pid, flush=True); time.sleep(120)",
-         confinement._HANDS_START], stdout=subprocess.PIPE, text=True)
-    child = int(levain.stdout.readline())   # type: ignore[union-attr]
-    time.sleep(0.5)
-    assert Path(f"/proc/{child}").exists()
+    if not _user_scope_ok():
+        if os.environ.get("LEVAIN_REQUIRE_LINUX_LIVE") == "1":
+            pytest.fail("LEVAIN_REQUIRE_LINUX_LIVE=1 but systemd-run --user --scope does not work here")
+        pytest.skip("needs a systemd user manager (systemd-run --user --scope)")
+    stand_in = (
+        "import os, subprocess, sys, time\n"
+        "from levain.firing import confinement as c\n"
+        "unit = c._leaf_unit(os.urandom(6).hex(), 1)\n"
+        "print(c._leaf_rel(os.getuid(), unit), flush=True)\n"
+        "subprocess.Popen(['/usr/bin/env', 'XDG_RUNTIME_DIR=/run/user/%d' % os.getuid(), c.SYSTEMD_RUN, '--user',"
+        " '--scope', '--quiet', '--collect', '--slice=' + c._LEVAIN_SLICE, '--unit=' + unit, '--',"
+        " *c._start_argv(sys.executable, hands=False), '/bin/sh', '-c', 'setsid sleep 120 & exec sleep 120'])\n"
+        "time.sleep(120)\n")
+    levain = subprocess.Popen([sys.executable, "-c", stand_in], stdout=subprocess.PIPE, text=True)
+    leaf = Path("/sys/fs/cgroup") / levain.stdout.readline().strip()   # type: ignore[union-attr]
+    procs = leaf / "cgroup.procs"
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(procs.read_text().split() if procs.exists() else []) < 3:
+        time.sleep(0.1)
+    assert len(procs.read_text().split()) >= 3, "the command and its setsid child never ran in the leaf"
     levain.kill()
     levain.wait()
-
-    def gone() -> bool:
-        try:
-            return Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-        except FileNotFoundError:
-            return True
-
     deadline = time.monotonic() + 10
-    while not gone() and time.monotonic() < deadline:
+    while time.monotonic() < deadline and procs.exists() and procs.read_text().split():
         time.sleep(0.1)
-    assert gone()
+    assert not procs.exists() or not procs.read_text().split()
 
 
 def test_the_hands_argv_refuses_an_op_it_does_not_know(monkeypatch):
@@ -751,7 +800,7 @@ def test_the_walk_asks_as_the_hands_user_inside_its_view_and_refuses_what_it_may
     out: dict[str, object] = {"stdout": b"/etc/s2probe/sock\0", "stderr": b"", "rc": 0}
     seen: list[list[str]] = []
 
-    def as_hands(argv, h, data, timeout, what=""):
+    def as_hands(argv, h, data, timeout, what="", **kw):
         seen.append(argv)
         return subprocess.CompletedProcess(argv, out["rc"], out["stdout"], out["stderr"])
 
@@ -783,16 +832,46 @@ def test_the_walk_asks_as_the_hands_user_inside_its_view_and_refuses_what_it_may
 def test_a_hands_shell_walks_again_before_every_command(monkeypatch):
     """RUN 2026-10-09 (R6-mid): a 0777 listener planted under /opt after the launch was CONNECTED by a
     later command of the same shell. The walk now runs before every command and refuses it."""
+    shell, closed = _walking_shell(monkeypatch)
+    monkeypatch.setattr(confinement, "_hands_walk", lambda h, on_start=None: ["/opt/s2mid/sock"])
+    with pytest.raises(ConfinementError, match="/opt/s2mid/sock.*not run"):
+        shell._before_command()
+    assert closed == [True]
+
+
+def _walking_shell(monkeypatch):
+    import threading
+
     shell = object.__new__(confinement._BwrapShell)
     shell._hands = _view_hands(monkeypatch)
+    shell._lock = threading.Lock()
+    shell._walk = None
+    shell._closed = False
     closed: list[bool] = []
-    monkeypatch.setattr(confinement._BwrapShell, "closed", property(lambda self: bool(closed)))
     monkeypatch.setattr(confinement._BwrapShell, "close", lambda self: closed.append(True))
-    monkeypatch.setattr(confinement, "_hands_listener_problem", lambda h: "hands can reach /opt/s2mid/sock")
     monkeypatch.setattr(confinement._BwrapShell, "_recheck", lambda self: pytest.fail("ran past the walk"))
-    with pytest.raises(ConfinementError, match="/opt/s2mid/sock.*not run"):
-        shell.run("true")
-    assert closed == [True]
+    return shell, closed
+
+
+def test_a_walk_that_could_not_run_refuses_the_command_and_keeps_the_shell(monkeypatch):
+    """complement L3 r2: a timeout says nothing about the host, so only that command is refused."""
+    shell, closed = _walking_shell(monkeypatch)
+
+    def failed(h, on_start=None):
+        raise OSError("the walk as hands timed out")
+    monkeypatch.setattr(confinement, "_hands_walk", failed)
+    with pytest.raises(ConfinementError, match="timed out.*not run"):
+        shell._before_command()
+    assert closed == []
+
+
+def test_a_walk_does_not_start_once_the_shell_is_closed(monkeypatch):
+    """codex L3 r2: close() stops a walk it can see, and a walk starting after it refuses."""
+    shell, _ = _walking_shell(monkeypatch)
+    shell._closed = True
+    with pytest.raises(ConfinementError, match="closed"):
+        shell._hold_walk(object())   # type: ignore[arg-type]
+    assert shell._walk is None
 
 
 def test_the_linux_editor_refuses_by_name_without_zsh(tmp_path, monkeypatch):

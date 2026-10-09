@@ -94,6 +94,7 @@ jobs:
           pytest -q -rs tests/test_firing_confinement.py tests/test_jewel_recheck.py
           tests/test_nlink_floor.py tests/test_masks_last.py tests/test_floor_project_memory.py
           tests/test_floor_spellings.py tests/test_floor_cloud_creds.py tests/test_floor_process_view.py
+          tests/test_hands_spawn.py::test_the_operator_floor_kills_its_leaf_when_levain_dies
 
   isolation:
     # `levain setup-isolation` for real: create the hands user, check the uid gate, undo. Only on

@@ -2302,8 +2302,8 @@ class ShellResult:
     process it spawned; ``signal`` is set instead when a signal ended it. Under bwrap that process is
     bwrap, which waits on bash and exits with bash's status, a signal death of bash as 128 + its
     number, so that arrives in ``exit_code``; a signal levain sends (``interrupt()``) ends bwrap
-    itself, the start program's watcher then kills bash (``_HANDS_START``; bwrap's ``--die-with-parent``
-    did not, RUN 2026-10-09), and it arrives in ``signal``.
+    itself, and the command's leaf is killed with it, bash included (``_HANDS_START`` and
+    :meth:`_BwrapShell._signal`; bwrap's ``--die-with-parent`` alone did not, RUN 2026-10-09), and it arrives in ``signal``.
     ``timed_out`` is True when the
     command did not finish within the deadline and levain killed its process group (``exit_code`` and
     ``signal`` are then ``None``)."""
@@ -2483,23 +2483,27 @@ def _hands_env(hands: HandsIdentity) -> dict[str, str]:
             "TERM": "dumb", "USER": hands.user, "LOGNAME": hands.user}
 
 
-#: Linux: run in front of every sandboxed command levain starts (argv: levain's pid, then the command):
-#: by every hands process, as the hands user, between sudo and what it starts; by the operator floor's
-#: bwrap, as the operator. Before it execs the command:
-#: 1. It joins a NEW, empty session keyring (on the operator floor too, Phill 2026-10-09: "yes to both";
-#:    a session-keyring credential, a krb5 KEYRING ccache or a keyctl token, is not usable inside). The operator's session keyring otherwise crosses sudo (no
-#:    pam_keyinit in Ubuntu's sudo stack) and bwrap (a user namespace does not detach it): RUN in a VM
-#:    2026-10-09, `keyctl print` inside a hands bash printed a key the operator had added to @s. The
-#:    keyctl syscall number is the architecture's; one not listed refuses.
-#: 2. It forks a watcher holding pidfds on levain and on itself (the command, once exec'd): when levain
-#:    exits first, the command's other children get SIGKILL (bwrap's: the namespace's pid 1), then the
-#:    command SIGTERM, then SIGKILL; for a hands process, then every process of the hands user. RUN 2026-10-09 with levain SIGKILLed mid-command: as hands, bwrap's
-#:    ``--die-with-parent`` binds to sudo, which outlives levain, and the command's bash, a ``setsid``
-#:    child and both relays kept running; as the operator, bwrap died with levain but a ``setsid``
-#:    child and the command's own child of bash (the namespace's pid 1) kept running. A pidfd signal cannot reach a reused pid, and
-#:    levain must be an ancestor at the start, so a pid reused after levain died is refused.
+#: Linux: run in front of every sandboxed command levain starts (argv: its role, levain's pid, then the
+#: command): by every hands process, as the hands user, between sudo and what it starts (role ``hands``);
+#: by the operator floor's bwrap, as the operator, inside the command's cgroup leaf (role ``operator``).
+#: The role is passed, never inferred (L3 r2: a guess from ``/proc/<levain>``'s owner is a guess about
+#: procfs). Before it execs the command:
+#: 1. It joins a NEW, empty session keyring (:data:`_START_KEYRING`; on the operator floor too, Phill
+#:    2026-10-09: "yes to both").
+#: 2. It forks a watcher holding pidfds on levain and on itself (the command, once exec'd).
+#:    ``operator``: when either ends, the watcher writes ``cgroup.kill`` of its own leaf, which holds
+#:    only this command, so every process of it goes, one reparented by bwrap's death included, and the
+#:    watcher with them. The kernel's membership answers "what belongs to this command"; no scan.
+#:    ``hands``: the leaf is the operator's and the hands user cannot write it; when levain ends first,
+#:    the command gets SIGTERM, then SIGKILL, then, 3 s on, every process of the hands user. RUN
+#:    2026-10-09 with levain SIGKILLed mid-command: as hands, bwrap's ``--die-with-parent`` binds to sudo,
+#:    which outlives levain, and the command's bash, a ``setsid`` child and both relays kept running; as
+#:    the operator, bwrap died with levain but the namespace's pid 1 and a ``setsid`` child kept running.
+#: Refused before the command starts: levain not an ancestor (a pid reused after levain died), levain
+#: gone by the time its uid is read, a ``hands`` start as levain's own uid (its ``kill(-1)`` would end
+#: the operator's processes), an ``operator`` start as another uid, or outside a leaf this levain made.
 #: ``python3 -I -S`` (no site, no environment); every input is argv data.
-_HANDS_START = r"""import ctypes, os, select, signal, sys, time
+_START_KEYRING = r"""import ctypes, os, select, signal, sys, time
 nr = {"x86_64": 250, "aarch64": 219, "riscv64": 219}.get(os.uname().machine)
 if nr is None:
     sys.stderr.write("levain: no keyctl syscall number known for %s; refusing to start with the "
@@ -2510,11 +2514,21 @@ libc.syscall.restype = ctypes.c_long
 if libc.syscall(ctypes.c_long(nr), ctypes.c_long(1), ctypes.c_void_p(None)) < 0:
     sys.stderr.write("levain: could not join a new session keyring: %s\n" % os.strerror(ctypes.get_errno()))
     os._exit(126)
-if not hasattr(os, "pidfd_open"):
-    sys.stderr.write("levain: this python3 (%s) has no os.pidfd_open (3.9 or later and Linux 5.3 or later "
-                     "are needed) to end the command with levain; refusing\n" % sys.version.split()[0])
+"""
+# The keyring join: the operator's session keyring otherwise crosses sudo (no pam_keyinit in Ubuntu's
+# sudo stack) and bwrap (a user namespace does not detach it): RUN in a VM 2026-10-09, `keyctl print`
+# inside a hands bash printed a key the operator had added to @s. The keyctl syscall number is the
+# architecture's; one not listed refuses.
+
+_START_WATCH = r"""def refuse(why):
+    sys.stderr.write("levain: %s\n" % why)
     os._exit(126)
-watch, argv, me = int(sys.argv[1]), sys.argv[2:], os.getpid()
+if not hasattr(os, "pidfd_open"):
+    refuse("this python3 (%s) has no os.pidfd_open (3.9 or later and Linux 5.3 or later are needed) to "
+           "end the command with levain; refusing" % sys.version.split()[0])
+role, watch, argv, me = sys.argv[1], int(sys.argv[2]), sys.argv[3:], os.getpid()
+if role not in ("hands", "operator"):
+    refuse("unknown start role %r; refusing" % role)
 def parent(pid):
     with open("/proc/%d/stat" % pid) as f:
         return int(f.read().rsplit(")", 1)[1].split()[1])
@@ -2523,51 +2537,46 @@ try:
     up = os.getppid()
     while up not in (watch, 0, 1):
         up = parent(up)
+    if up == watch:
+        with open("/proc/%d/status" % watch) as f:
+            uid = [int(x.split()[1]) for x in f if x.startswith("Uid:")][0]
 except PermissionError as e:
-    sys.stderr.write("levain: cannot read %s: /proc hides other users' processes here (hidepid), so the "
-                     "command cannot be tied to levain; remount /proc without hidepid\n" % e.filename)
-    os._exit(126)
+    refuse("cannot read %s: /proc hides other users' processes here (hidepid), so the command cannot be "
+           "tied to levain; remount /proc without hidepid" % e.filename)
 except OSError as e:
-    sys.stderr.write("levain: cannot watch levain (pid %d): %s\n" % (watch, e))
-    os._exit(126)
-if up != watch:
-    sys.stderr.write("levain: levain (pid %d) is gone; not starting\n" % watch)
-    os._exit(126)
-# Run as another user than levain: a hands process. Its whole user is ended once levain is gone.
-other = os.getuid() != os.stat("/proc/%d" % watch).st_uid
+    refuse("cannot watch levain (pid %d): %s" % (watch, e))
+# The pidfd was taken before the reads: readable now means levain ended, so they may describe another.
+if up != watch or select.select([held], [], [], 0)[0]:
+    refuse("levain (pid %d) is gone; not starting" % watch)
+if role == "hands" and os.getuid() == uid:
+    refuse("a process meant for the entity's own user would run as levain's user (uid %d); refusing" % uid)
+if role == "operator":
+    if os.getuid() != uid:
+        refuse("the operator's sandbox would run as uid %d, not levain's (uid %d); refusing" % (os.getuid(), uid))
+    with open("/proc/self/cgroup") as f:
+        leaf = f.read().strip()
+    head = "0::/user.slice/user-%d.slice/user@%d.service/levain.slice/levain-" % (uid, uid)
+    unit = leaf[len(head):].split("-") if leaf.startswith(head) and "\n" not in leaf else []
+    if len(unit) != 5 or unit[1] != str(watch) or not unit[4].endswith(".scope"):
+        refuse("not in a cgroup leaf levain (pid %d) made (%s); refusing to run without one" % (watch, leaf))
+    kill = "/sys/fs/cgroup" + leaf[len("0::"):] + "/cgroup.kill"
+    if not os.access(kill, os.W_OK):
+        refuse("cannot write %s, which ends the command with levain; refusing" % kill)
 mine = os.pidfd_open(me)
 if os.fork() == 0:
     n = os.open(os.devnull, os.O_RDWR)
     for f in (0, 1, 2):
         os.dup2(n, f)
-    # A pidfd on each child of the command, taken as it appears (bwrap's: the namespace's pid 1). On the
-    # operator floor bwrap's own --die-with-parent kills bwrap the moment levain dies, and its pid 1 is
-    # reparented at once (RUN 2026-10-09), so it must be held before then; a pidfd outlives reparenting.
-    # Looked for until the first is found: every 50 ms for 10 s (bwrap forks its one pid 1 at once),
-    # then every 2 s (glm L3 r1: a slow host); the relays fork none.
-    kids, scan_until = {}, time.monotonic() + 10
-    ready = []
-    while True:
-        if not kids:
-            for pid in os.listdir("/proc"):
-                if pid.isdigit() and int(pid) not in kids and int(pid) != os.getpid():
-                    try:
-                        if parent(int(pid)) == me:
-                            kids[int(pid)] = os.pidfd_open(int(pid))
-                    except OSError:
-                        pass
-        if held in ready or mine in ready:
-            break
-        ready = select.select([held, mine], [], [], None if kids else 0.05 if time.monotonic() < scan_until else 2)[0]
-    # A child still alive is killed either way: bwrap ends on its own only after its pid 1 has, so a
-    # pid 1 that outlives it was orphaned. On the operator floor bwrap's --die-with-parent kills bwrap
-    # before levain's pidfd turns readable, so the command's end is seen first (RUN 2026-10-09: 4 of 10).
-    for fd in kids.values():
-        if not select.select([fd], [], [], 0)[0]:
-            try:
-                signal.pidfd_send_signal(fd, signal.SIGKILL)
-            except OSError:
-                pass
+    ready = select.select([held, mine], [], [])[0]
+    if role == "operator":
+        # Either end: bwrap's --die-with-parent may kill bwrap before levain's pidfd turns readable (RUN
+        # 2026-10-09: 4 of 10), and a command that ended on its own leaves nothing here but this watcher.
+        try:
+            with open(kill, "w") as f:
+                f.write("1")
+        except OSError:
+            pass
+        os._exit(0)
     if held not in ready:
         os._exit(0)
     for sig, wait in ((signal.SIGTERM, 2), (signal.SIGKILL, None)):
@@ -2577,37 +2586,38 @@ if os.fork() == 0:
             break
         if wait and select.select([mine], [], [], wait)[0]:
             break
-    if other:
-        # With levain gone its session is over, and only one session holds the hands user: everything
-        # of that user goes, grandchildren included (a git's ssh), once every watcher has had its own
-        # SIGTERM turn above (2 s), so a relay can still tidy its directory (codex L3 r1).
-        time.sleep(3)
-        try:
-            os.kill(-1, signal.SIGKILL)
-        except OSError:
-            pass
+    # With levain gone its session is over, and only one session holds the hands user: everything of
+    # that user goes, grandchildren and the namespace's pid 1 included, once every watcher has had its
+    # own SIGTERM turn above (2 s), so a relay can still tidy its directory (codex L3 r1).
+    time.sleep(3)
+    try:
+        os.kill(-1, signal.SIGKILL)
+    except OSError:
+        pass
     os._exit(0)
 os.close(held)
 os.close(mine)
 os.execv(argv[0], argv)
 """
+_HANDS_START = _START_KEYRING + _START_WATCH
 
 
 def hands_prefix(hands: HandsIdentity, *, system: str | None = None) -> list[str]:
     """``sudo -n -u <hands> /usr/bin/env -i <env>``: what goes in front of the sandbox driver. sudo is
     OUTSIDE the sandbox: the shipped profile refuses to exec a setuid binary (measured in the M1 VM
     run), so the profile applies to the hands process, which is the point. ``-n``: never prompt.
-    On Linux the start program (:data:`_HANDS_START`) follows ``env -i``, watching this process."""
+    On Linux the start program (:data:`_HANDS_START`, role ``hands``) follows ``env -i``."""
     argv = [SUDO, "-n", "-u", hands.user, "/usr/bin/env", "-i",
             *(f"{k}={v}" for k, v in _hands_env(hands).items())]
     if (system or platform.system()) == "Linux":
-        argv += _start_argv(HANDS_PYTHON)
+        argv += _start_argv(HANDS_PYTHON, hands=True)
     return argv
 
 
-def _start_argv(python: str) -> list[str]:
-    """:data:`_HANDS_START` run by ``python``, watching this process; the command follows it."""
-    return [python, "-I", "-S", "-c", _HANDS_START, str(os.getpid())]
+def _start_argv(python: str, *, hands: bool) -> list[str]:
+    """:data:`_HANDS_START` run by ``python`` in role ``hands`` or ``operator``, watching this process;
+    the command follows it."""
+    return [python, "-I", "-S", "-c", _HANDS_START, "hands" if hands else "operator", str(os.getpid())]
 
 
 def _require_hands_python() -> None:
@@ -3238,6 +3248,10 @@ class SandboxedShell:
             return False
         return _group_gone(pgid, timeout=timeout)
 
+    def _before_command(self) -> None:
+        """What a provider checks before each command, inside :meth:`run`'s single-caller lock and after
+        its closed check; raising refuses the command. Nothing by default."""
+
     def _prune_groups(self) -> None:
         """Reap the leader of each group that has emptied (:meth:`_group_emptied`), and forget the
         group. Only then may its number be reused, and it is no longer signalled."""
@@ -3358,6 +3372,7 @@ class SandboxedShell:
                 raise ConfinementError(
                     "refusing a command that contains a NUL byte: bash cannot receive it whole."
                 )
+            self._before_command()
             self._prune_groups()
             late = self._late_output()
             r = self._execute(command, self._default_timeout if timeout is None else timeout)
@@ -4125,15 +4140,19 @@ def _stop_hands_group(hands: HandsIdentity, proc: subprocess.Popen[bytes]) -> bo
 
 
 def _run_hands_helper(argv: list[str], hands: HandsIdentity, data: bytes, timeout: float,
-                      what: str = "the editor's file operation") -> subprocess.CompletedProcess[bytes]:
+                      what: str = "the editor's file operation",
+                      on_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
+                      ) -> subprocess.CompletedProcess[bytes]:
     """Run the helper in a new session (no controlling terminal) and, on a timeout or any error,
     kill its WHOLE group, not only sudo: ``subprocess.run`` kills just the child it started (S2 L3 r1,
-    codex + glm)."""
+    codex + glm). ``on_start`` is given the process first; if it raises, the group is killed too."""
     from levain.launch import child_env
 
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             cwd="/", env=child_env(), start_new_session=True)
     try:
+        if on_start is not None:
+            on_start(proc)
         out, err = proc.communicate(data, timeout=timeout)
     except subprocess.TimeoutExpired:
         gone = _stop_hands_group(hands, proc)
@@ -4762,7 +4781,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         "--proc", "/proc",
         "--dev", "/dev",
         # bwrap dies with the levain thread that started it. Its pid 1 does not follow it: the start
-        # program's watcher (``_HANDS_START``) ends that. Complements, never replaces,
+        # program's watcher (``_HANDS_START``) kills the command's leaf, which does. Complements, never replaces,
         # SandboxedShell.close()'s process-group and leaf teardown.
         "--die-with-parent",
         # A new PID namespace (lane P2 item 2c), so the ``--proc /proc`` above shows only the
@@ -4773,9 +4792,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # cannot see or signal host processes (``ps``, ``kill`` of a server started outside). bash is
         # that namespace's pid 1 (``--as-pid-1``, added in `spawn_shell`) and runs in a session of its
         # own (``--new-session``), so it is NOT in the process group ``_signal_group`` signals: a
-        # signal there reaches bwrap, and bash dies when bwrap does: the start program's watcher kills a
-        # pid 1 that outlives bwrap (``_HANDS_START``), which ``--die-with-parent`` above did not do
-        # (RUN 2026-10-09), and the command's cgroup leaf is killed after it.
+        # signal there reaches bwrap, and bash dies when bwrap does: the start program's watcher kills the
+        # command's leaf when bwrap ends (``_HANDS_START``), a pid 1 that outlived it included, which
+        # ``--die-with-parent`` above did not do (RUN 2026-10-09); levain's own kill is that leaf's too.
         # When bash, pid 1, exits, the kernel kills the rest of the namespace (pid_namespaces(7)).
         "--unshare-pid",
         # A cgroup namespace rooted at the command's own leaf: without it bash, which runs as the
@@ -6615,8 +6634,10 @@ def _hands_ns_problem(hands: HandsIdentity, timeout: float = 30.0) -> str | None
     said = r.stderr.decode("utf-8", "replace").strip().splitlines()
     if said and said[-1].startswith("levain: "):   # the start program refused, before bwrap ran
         return said[-1][len("levain: "):]
-    return (f"bwrap cannot build the sandbox's namespaces as {hands.user} ({said[-1] if said else 'no reason given'}). "
-            "On Ubuntu 23.10+ install the bwrap-userns-restrict AppArmor profile: sudo install -m 0644 "
+    # The probe builds the whole view, so a missing bind source fails here too: bwrap's own words lead
+    # (complement L3 r2), and the AppArmor remedy is offered for the namespace case only.
+    return (f"bwrap cannot start the hands view as {hands.user} ({said[-1] if said else 'no reason given'}). "
+            "If that is about namespaces or uid_map: on Ubuntu 23.10+ install the bwrap-userns-restrict AppArmor profile: sudo install -m 0644 "
             "/usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/ && sudo apparmor_parser "
             "-r /etc/apparmor.d/bwrap-userns-restrict (from the apparmor-profiles package); bubblewrap 0.8 or "
             "later is needed for --disable-userns")
@@ -6912,23 +6933,39 @@ _HANDS_WALK_TIMEOUT = 120.0
 
 
 def _hands_listener_problem(hands: HandsIdentity) -> str | None:
-    """A unix socket or FIFO in the read-only host trees of a hands view that the hands user may write,
-    named with the remedy; None when there is none. Asked of the kernel as the hands user inside the
-    view with none of the floor's masks (they only hide; so this sees at least what bash will), by
-    ``find -writable``, which is access(2): modes, ACLs and every ancestor's search bit."""
+    """What :func:`_hands_walk` found, named with the remedy, or why it could not walk; None when it
+    found nothing."""
+    try:
+        found = _hands_walk(hands)
+    except OSError as exc:
+        return f"levain could not walk, as {hands.user}, the host files its bash would see ({exc})"
+    return _hands_reach_text(hands, found) if found else None
+
+
+def _hands_reach_text(hands: HandsIdentity, found: list[str]) -> str:
+    more = f" and {len(found) - 3} more" if len(found) > 3 else ""
+    return (f"{hands.user} can reach {', '.join(found[:3])}{more}, which bash run as it sees (a socket it "
+            "may write, a FIFO it may read or write, or a directory it may search but not list, where such "
+            "a file could be): tighten the mode so the entity's user cannot")
+
+
+def _hands_walk(hands: HandsIdentity,
+                on_start: Callable[[subprocess.Popen[bytes]], None] | None = None) -> list[str]:
+    """Every unix socket or FIFO in the read-only host trees of a hands view that the hands user may
+    write (and every directory there it may search but not list). Asked of the kernel as the hands
+    user inside the view with none of the floor's masks (they only hide; so this sees at least what
+    bash will), by ``find -writable``, which is access(2): modes, ACLs and every ancestor's search bit.
+    OSError when the walk could not be done; ``on_start`` as for :func:`_run_hands_helper`."""
 
     ro, _ = _hands_view_trees(hands)
     if not ro:
-        return None
+        return []
     argv = [*hands_prefix(hands), *_hands_bwrap_argv([BWRAP], hands), "/usr/bin/env", "LC_ALL=C", _HANDS_FIND,
             *ro, "(", "(", "-type", "s", "-writable", ")", "-o", "(", "-type", "p", "(", "-writable", "-o",
             "-readable", ")", ")", "-o", "(", "-type", "d", "-executable", "!", "-readable", ")", ")", "-print0"]
     # The whole OR in one pair of parentheses: -print0 binds by -a, tighter than -o, so without it only
     # the last branch printed (RUN 2026-10-09: a 0777 socket under /opt walked as None).
-    try:
-        r = _run_hands_helper(argv, hands, b"", _HANDS_WALK_TIMEOUT, "the walk")
-    except OSError as exc:
-        return f"levain could not walk, as {hands.user}, the host files its bash would see ({exc})"
+    r = _run_hands_helper(argv, hands, b"", _HANDS_WALK_TIMEOUT, "the walk", on_start=on_start)
     found = [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
     said = [x for x in r.stderr.decode("utf-8", "replace").splitlines() if x.strip()]
     # find exits 1 when a directory cannot be listed and walks the rest. Only that is let through, for
@@ -6937,14 +6974,8 @@ def _hands_listener_problem(hands: HandsIdentity) -> str | None:
     # Anything else (bwrap or find failing to start) refuses.
     unlisted = [x for x in said if x.startswith(f"{_HANDS_FIND}: ") and x.endswith(": Permission denied")]
     if r.returncode != 0 and (not said or len(unlisted) != len(said)):
-        return (f"levain could not walk, as {hands.user}, the host files its bash would see "
-                f"({said[-1] if said else f'status {r.returncode}'})")
-    if not found:
-        return None
-    more = f" and {len(found) - 3} more" if len(found) > 3 else ""
-    return (f"{hands.user} can reach {', '.join(found[:3])}{more}, which bash run as it sees (a socket it "
-            "may write, a FIFO it may read or write, or a directory it may search but not list, where such "
-            "a file could be): tighten the mode so the entity's user cannot")
+        raise OSError(said[-1] if said else f"status {r.returncode}")
+    return found
 
 
 def _hands_launch_problem(hands: HandsIdentity) -> str | None:
@@ -7021,6 +7052,7 @@ class _BwrapShell(SandboxedShell):
         self._relay: _HandsRelay | None = None   # a hands launch's host-side proxy relay, if any
         self._hands: HandsIdentity | None = None   # a hands launch's user, whose files are repaired
         self._command_since = 0.0
+        self._walk: subprocess.Popen[bytes] | None = None   # the per-command walk's helper, while it runs
 
     # Each command runs in a pid namespace of its own (``--unshare-pid --as-pid-1``), inside its leaf.
     _own_pid_namespace = True
@@ -7112,6 +7144,12 @@ class _BwrapShell(SandboxedShell):
         # that does not empty keeps the claim; once this levain is gone, the next Linux spawn's
         # `sweep_dead_leaves` kills the leaf and the ledger sweep then drops the claim. Released in
         # `finally`, whatever the base teardown did.
+        # A walk started before this read is stopped here; one starting after it sees the shell closed.
+        self._closed = True
+        with self._lock:
+            walk = self._walk
+        if walk is not None and self._hands is not None:
+            _stop_hands_group(self._hands, walk)
         try:
             super().close()
         finally:
@@ -7254,18 +7292,27 @@ class _BwrapShell(SandboxedShell):
                     "the floor no longer covers what is on disk there."
                 )
 
-    def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
-        if self.closed:
-            return super().run(command, timeout=timeout)   # the base refusal names the real reason
-        if self._hands is not None:
+    def _before_command(self) -> None:
+        hands = self._hands
+        if hands is not None:
             # The walk again before every command (Phill 2026-10-09, "yes to both"): a socket or FIFO
             # made since the last one (RUN: a root listener planted mid-shell was CONNECTED) refuses
             # this command. What is made DURING a command is not seen; that is the README's residue.
-            problem = _hands_listener_problem(self._hands)
-            if problem is not None:
+            # A walk that could not be done says nothing about the host: that command is refused and the
+            # shell stays (complement L3 r2). Its process is held where close() can stop it (codex L3 r2).
+            try:
+                found = _hands_walk(hands, self._hold_walk)
+            except OSError as exc:
+                raise ConfinementError(
+                    f"levain could not walk, as {hands.user}, the host files its bash would see ({exc}) — "
+                    "the command was not run (fail-closed).") from exc
+            finally:
+                with self._lock:
+                    self._walk = None
+            if found:
                 self.close()
-                raise ConfinementError(f"{problem} — the shell was closed and the command was not run "
-                                       "(fail-closed).")
+                raise ConfinementError(f"{_hands_reach_text(hands, found)} — the shell was closed and the "
+                                       "command was not run (fail-closed).")
         try:
             self._recheck()
         except (OSError, RuntimeError) as exc:   # RuntimeError includes ConfinementError
@@ -7276,7 +7323,12 @@ class _BwrapShell(SandboxedShell):
                 f"a crown jewel changed since this shell started, or could not be re-checked, so "
                 f"the shell was closed and the command was not run. {exc}"
             ) from exc
-        return super().run(command, timeout=timeout)
+
+    def _hold_walk(self, proc: subprocess.Popen[bytes]) -> None:
+        with self._lock:
+            if self._closed:
+                raise ConfinementError("the shell was closed; the command was not run")
+            self._walk = proc
 
 
 class BwrapProvider(ConfinementProvider):
@@ -7499,9 +7551,9 @@ class BwrapProvider(ConfinementProvider):
             argv = [*hands_prefix(hands), *argv]
             shell_env = _hands_env(hands)
         else:
-            # The command ends when levain does (see _HANDS_START): bwrap's --die-with-parent alone left
-            # a setsid child and the namespace's pid 1 running.
-            argv = [*_start_argv(sys.executable), *argv]
+            # The command ends when levain does (see _HANDS_START, role operator: its leaf is killed):
+            # bwrap's --die-with-parent alone left a setsid child and the namespace's pid 1 running.
+            argv = [*_start_argv(sys.executable, hands=False), *argv]
         shell = _BwrapShell(
             # The per-command SQLite check, like the manifest, covers only jewels in the hands view.
             policy=policy if hands is None else replace(
