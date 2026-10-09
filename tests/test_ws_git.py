@@ -516,6 +516,9 @@ def test_the_mask_repair_runs_as_the_owner_on_its_own_files_only(tmp_path: Path)
     argv = ws_git.mask_repair_argv(h)
     assert argv[:4] == ["/usr/bin/sudo", "-n", "-u", h.user]
     assert argv[argv.index("-user") + 1] == h.user and "m::rX" in argv
+    # after a hands command: only what changed since it started (RUN 2026-10-09, chmod 600 hid a file)
+    since = ws_git.mask_repair_argv(h, since=1760000000.7)
+    assert since[since.index("-newerct") + 1] == "@1760000000"
 
 
 def _doctor_env(tmp_path: Path, monkeypatch):
