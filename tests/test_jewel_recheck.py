@@ -589,17 +589,12 @@ def test_a_retag_that_does_not_reach_the_disk_closes_the_shell(tmp_path, monkeyp
                 raise OSError(28, "No space left on device")
         return real_replace(src, dst)
 
-    class _P:
-        pid = 4242
-
     def start(self):
-        # r7: `_after_spawn` refuses a pid whose group this shell does not track, so register one.
-        self._groups[_P.pid] = object()   # type: ignore[assignment]
-        self._after_spawn(_P.pid)   # each command tags the claim with its bash, the probe first
+        self._spawn_argv()   # each command tags the claim with its leaf before it spawns, the probe first
         return self
 
     closed = []
-    monkeypatch.setattr(conf._BwrapShell, "_read_child_pid", lambda self: _P.pid)   # bwrap's --info-fd
+    monkeypatch.setattr(conf, "_cgroup_problem", lambda: None)
     monkeypatch.setattr(conf.os, "replace", second_commit_fails)
     monkeypatch.setattr(conf._BwrapShell, "start", start)
     monkeypatch.setattr(conf._BwrapShell, "close", lambda self: closed.append(1))

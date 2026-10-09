@@ -702,39 +702,6 @@ def test_the_start_refuses_a_shell_whose_state_channel_is_broken(tmp_path):
     sh.close()
 
 
-def test_bwrap_child_pid_is_read_without_waiting_for_eof_and_owned_by_the_reader(tmp_path, monkeypatch):
-    """S2 L1b (not checked on Linux) and L2b L7: the --info-fd read waited for EOF, which never comes
-    while another process holds the write end (each command would stall to the 20 s deadline), and
-    close() from another thread could close the fd under the read."""
-    import select as _select
-
-    from levain.firing import confinement as C
-
-    sh = object.__new__(C._BwrapShell)
-    import threading
-
-    sh._lock = threading.Lock()
-    rd, wr = os.pipe()
-    os.write(wr, b'{\n    "child-pid": 4242\n}\n')   # bwrap's whole object; `wr` stays open
-    sh._info_r = rd
-    real_select = _select.select
-    calls = []
-
-    def racing_select(r, w, x, t):
-        if not calls:
-            sh._close_info()   # a close() from another thread, mid-read
-        calls.append(1)
-        return real_select(r, w, x, t)
-
-    monkeypatch.setattr(C.select, "select", racing_select)
-    t0 = time.monotonic()
-    try:
-        assert sh._read_child_pid() == 4242
-        assert time.monotonic() - t0 < 5
-    finally:
-        os.close(wr)
-
-
 def test_a_close_during_a_spawn_runs_none_of_the_command(tmp_path):
     """S2 L3 r1 (codex HIGH): run() checked `_closed` without the lock and registered its group later,
     so a close() in between left a command running with nobody to kill it."""
@@ -1246,147 +1213,66 @@ def _bwrap_books(tmp_path):
     return C._BwrapShell(policy=None, manifest={}, argv=["/bin/true"], cwd=tmp_path, env={})  # type: ignore[arg-type]
 
 
-def test_a_bash_record_belongs_to_its_leader_not_to_a_reused_group_number(tmp_path, monkeypatch):
-    """r6 codex HIGH: a gone bash's record stayed under its group NUMBER, so a later bwrap that got
-    the same number after pid wraparound was judged empty by it, and reaped and forgotten while its
-    namespace could live. A record is now its leader's, and is deleted when that leader is reaped."""
+def test_a_leaf_belongs_to_its_leader_not_to_a_reused_group_number(tmp_path, monkeypatch):
+    """r6 codex HIGH, kept under the cgroup frame: a record stayed under its group NUMBER, so a later
+    leader that got the same number after pid wraparound was judged empty by it. A leaf is its
+    leader's, and is deleted when that leader is reaped."""
     from levain.firing import confinement as C
 
     sh = _bwrap_books(tmp_path)
-    monkeypatch.setattr(C, "_proc_start_time", lambda pid: "1")
-    monkeypatch.setattr(C, "_bash_gone", lambda pid, start, timeout: True)
-    sh._read_child_pid = lambda: 4242   # type: ignore[method-assign]
+    monkeypatch.setattr(C, "_leaf_gone", lambda rel, timeout: True)
     first, later = _ExitedLeader(), _ExitedLeader()
     sh._groups[777] = first   # type: ignore[attr-defined]
-    sh._after_spawn(777)   # type: ignore[attr-defined]
+    sh._leaves[777] = (first, "leaf-1")   # type: ignore[attr-defined]
     assert sh._group_emptied(777, first, 0.0) and sh._reap(777, first)   # type: ignore[attr-defined]
-    sh._groups[777] = later   # type: ignore[attr-defined]  # the number again, its bash not yet reported
+    assert 777 not in sh._leaves   # type: ignore[attr-defined]
+    sh._groups[777] = later   # type: ignore[attr-defined]  # the number again, no leaf recorded for it
     assert sh._group_emptied(777, later, 0.0) is False   # type: ignore[attr-defined]
 
 
-def test_a_bwrap_that_started_no_bash_is_reaped_and_an_unreported_one_keeps_the_claim(tmp_path, monkeypatch):
-    """r6 MED (codex + complement): when bwrap reported no bash, its exited leader was never reaped
-    and the claim never released. r7: a bwrap that exited without a pid is NOT known to have started
-    none (it may have cloned its namespace init), so it is unverified like one interrupted before it
-    answered: its leader is reapable, never empty, and the claim is kept."""
-    from levain.firing import confinement as C
-
+def test_a_spawn_whose_group_is_not_tracked_is_refused(tmp_path):
+    """r7 complement LOW, kept: the group is not this shell's (a close() reaped it): refuse."""
     sh = _bwrap_books(tmp_path)
-    failed = _ExitedLeader(status=1)
-    sh._groups[777] = failed   # type: ignore[attr-defined]
-    r, w = os.pipe()
-    os.close(w)                # bwrap exited, closing its --info-fd without writing a pid
-    sh._info_r = r   # type: ignore[attr-defined]
-    with pytest.raises(ConfinementError):
-        sh._after_spawn(777)   # type: ignore[attr-defined]
-    # r7: no longer "bwrap started none": a no-pid spawn is unverified, so reapable and never empty.
-    assert (not sh._group_emptied(777, failed, 0.0)   # type: ignore[attr-defined]
-            and sh._reapable(777, failed, 0.0) and sh._reap(777, failed))   # type: ignore[attr-defined]
-
-    sh2 = _bwrap_books(tmp_path)
-    cut = _ExitedLeader()
-    sh2._groups[778] = cut   # type: ignore[attr-defined]
-
-    def interrupted():
-        raise KeyboardInterrupt
-
-    sh2._read_child_pid = interrupted   # type: ignore[method-assign]
-    with pytest.raises(KeyboardInterrupt):
-        sh2._after_spawn(778)   # type: ignore[attr-defined]
-    released: list[str] = []
-    monkeypatch.setattr(C, "_ledger_release", released.append)
-    sh2._ledger_claim = "c"   # type: ignore[attr-defined]
-    sh2.close()
-    assert cut.reaped and sh2.unemptied_groups == () and released == []
-
-
-# --- S2 L3 r7 (codex, complement on 99424c4..285f402) ------------------------------------------
-
-
-class _LiveSignalLeader(_ExitedLeader):
-    """An exited bwrap leader whose group is still signalled (a cloned namespace init may live in it)."""
-
-    def hold_for_signal(self):
-        return True
-
-
-def _eof_info_pipe(sh):
-    r, w = os.pipe()
-    os.close(w)   # bwrap exited and closed its --info-fd without writing a pid
-    sh._info_r = r
-
-
-def test_r7_a_no_pid_spawn_is_killed_as_a_group_and_left_unverified(tmp_path):
-    """r7 codex MED: EOF on the info pipe proves no bash ran, not that no namespace init exists (bwrap
-    clones it before it writes child-pid and releases it after), and a blocked pid-ns init ignores
-    SIGTERM. Whatever the exit status, the group gets a SIGKILL and the leader goes to `_unverified`."""
-    sh = _bwrap_books(tmp_path)
-    lead = _LiveSignalLeader(status=1)   # exited by itself, EOF, and a still-live group member
-    sent: list[tuple[int, int]] = []
-    sh._signal = lambda pgid, sig: sent.append((pgid, sig)) or True   # type: ignore[method-assign]
-    sh._groups[777] = lead   # type: ignore[attr-defined]
-    _eof_info_pipe(sh)
-    with pytest.raises(ConfinementError, match="closed its info pipe"):
-        sh._after_spawn(777)   # type: ignore[attr-defined]
-    assert (777, signal.SIGKILL) in sent
-    assert [(g, ld) for g, ld in sh._unverified] == [(777, lead)]   # type: ignore[attr-defined]
-    assert (777 not in sh._bashes)   # type: ignore[attr-defined]
-
-
-def test_r7_an_unverified_shell_refuses_every_later_command_before_it_spawns(tmp_path, monkeypatch):
-    """r7 codex + complement MED: the next command must not retag the claim away from the unverified
-    namespace. `_spawn` refuses before any bwrap is started."""
-    from levain.firing import confinement as C
-
-    sh = C._BwrapShell(policy=None, manifest={}, argv=["/bin/true", "--as-pid-1"], cwd=tmp_path,  # type: ignore[arg-type]
-                       env={})
-    sh._unverified.append((777, _ExitedLeader()))   # type: ignore[attr-defined]
-
-    def no_spawn(*a, **k):
-        raise AssertionError("a bwrap was spawned on a poisoned shell")
-
-    monkeypatch.setattr(subprocess, "Popen", no_spawn)
-    with pytest.raises(ConfinementError, match="could not be verified gone"):
-        sh._spawn()   # type: ignore[attr-defined]
-    assert len(sh._unverified) == 1   # type: ignore[attr-defined]
-
-
-def test_r7_an_unverified_leader_is_reapable_but_never_reported_empty(tmp_path):
-    """r7 complement MED: `_group_emptied` called an unverified leader empty once it exited. It is
-    now reapable (`_reapable`) and not empty, so a SIGKILL gate still fires and a caller reading
-    'empty' never takes it for 'nothing of this command runs'."""
-    sh = _bwrap_books(tmp_path)
-    lead = _LiveSignalLeader()
-    sent: list[tuple[int, int]] = []
-    sh._signal = lambda pgid, sig: sent.append((pgid, sig)) or True   # type: ignore[method-assign]
-    sh._groups[777] = lead   # type: ignore[attr-defined]
-    sh._unverified.append((777, lead))   # type: ignore[attr-defined]
-    assert sh._group_emptied(777, lead, 0.0) is False   # type: ignore[attr-defined]
-    assert sh._reapable(777, lead, 0.0) is True   # type: ignore[attr-defined]
-    assert sh._kill_group(777, lead) is True   # type: ignore[attr-defined]  # reaped...
-    assert (777, signal.SIGKILL) in sent                # ...but only after a SIGKILL
-    assert lead.reaped and sh._unverified            # type: ignore[attr-defined]  # claim stays covered
-
-
-def test_r7_a_pid_with_no_leader_is_not_silently_dropped(tmp_path):
-    """r7 complement LOW: a pid was read but the group is not in `_groups`: refuse, do not fall through."""
-    sh = _bwrap_books(tmp_path)
-    sh._read_child_pid = lambda: 4242   # type: ignore[method-assign]
     with pytest.raises(ConfinementError, match="no longer"):
         sh._after_spawn(999)   # type: ignore[attr-defined]
 
 
-def test_r7_bashes_gone_does_not_resurrect_a_reaped_record(tmp_path, monkeypatch):
+# --- S2 cgroup v2 frame (Phill 2026-10-09: "yes sorry, that is correct: A'") -------------------
+
+
+_V2 = "cgroup2 /sys/fs/cgroup cgroup2 rw,nosuid,nodev,noexec,relatime 0 0\n"
+
+
+@pytest.mark.parametrize("host, said", [
+    (dict(osrelease="5.15.153.1-microsoft-standard-WSL2"), "WSL2"),
+    (dict(container=True), "container"),
+    (dict(release="5.10.0-28-amd64"), "5.14"),
+    (dict(mounts="tmpfs /sys/fs/cgroup tmpfs ro 0 0\ncgroup2 /sys/fs/cgroup/unified cgroup2 rw 0 0\n"
+                 "cgroup /sys/fs/cgroup/memory cgroup rw,memory 0 0\n"), "v1 or hybrid"),
+])
+def test_a_host_without_a_cgroup_leaf_is_refused_by_name(host, said):
+    """Each unsupported host is refused with its own name; none falls back to running a command
+    without its leaf."""
     from levain.firing import confinement as C
 
-    sh = _bwrap_books(tmp_path)
-    lead = _ExitedLeader()
-    sh._bashes[777] = (lead, (4243, "1"))   # type: ignore[attr-defined]
+    args = dict(release="6.8.0-124-generic", osrelease="6.8.0-124-generic", mounts=_V2, container=False)
+    args.update(host)
+    problem = C._cgroup_problem(**args)
+    assert problem is not None and said in problem[0]
 
-    def gone_and_reaped(pid, start, timeout):
-        del sh._bashes[777]   # type: ignore[attr-defined]  # _reap ran meanwhile
-        return True
 
-    monkeypatch.setattr(C, "_bash_gone", gone_and_reaped)
-    assert sh._bashes_gone(1.0) is True   # type: ignore[attr-defined]
-    assert 777 not in sh._bashes   # type: ignore[attr-defined]
+@pytest.mark.skipif(not (_SYSTEM == "Linux" and _LIVE), reason="a real cgroup v2 leaf, Linux only")
+def test_linux_a_command_cannot_move_itself_out_of_its_leaf(tmp_path):
+    """RUN on argushub 2026-10-09 (1009-13_S2/DESIGN.md P4): bash runs as the operator, and without a
+    cgroup namespace it moved itself into another cgroup the operator owns, out of the leaf levain kills.
+    The write must fail and the command must still be in its own leaf."""
+    uid = os.getuid()
+    target = Path(f"/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service/levain-escape-{os.getpid()}")
+    target.mkdir()
+    try:
+        with _shell(tmp_path) as sh:
+            r = sh.run(f"echo $$ > {target}/cgroup.procs && echo ESCAPED; cat /proc/self/cgroup", timeout=20)
+        assert "ESCAPED" not in r.output, r.output
+        assert not (target / "cgroup.procs").read_text().strip()
+    finally:
+        target.rmdir()

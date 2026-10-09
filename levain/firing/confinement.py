@@ -2417,9 +2417,8 @@ def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None)
 
     - No hands user set up: None.
     - The interactive REPL: None, by design (design §8 i, D4): a human reads every turn there.
-    - Linux: None for now. Two pieces are not built yet: sudo closes every fd above 2, which the
-      bwrap shell's ``--info-fd`` needs, and bwrap run as the hands user cannot mount over a jewel
-      under the operator's home, which it cannot enter. The banner and doctor say bash runs as you.
+    - Linux: None for now: bwrap run as the hands user cannot mount over a jewel under the
+      operator's home, which it cannot enter. The banner and doctor say bash runs as you.
     - macOS, headless or unattended: the hands user. A setup whose account is gone raises
       (fail-closed): never a silent fall-back to the operator."""
     if cfg.hands_user is None or cfg.hands_uid is None or cfg.hands_workspace is None:
@@ -2927,6 +2926,9 @@ class SandboxedShell:
         """The argv for one command's driver, and fds it inherits (closed here after the spawn)."""
         return [*self._argv, "-c", _RUNNER, "bash"], ()
 
+    def _leader_made(self, leader: _Leader) -> None:
+        """Hook: a command's driver process exists and is watched; nothing of it has run yet."""
+
     def _after_spawn(self, pgid: int) -> None:
         """Hook: a command's process group exists and its bash is waiting for its input (the bwrap
         shell records it in its claim). Raising here refuses the command before it can run."""
@@ -2935,7 +2937,7 @@ class SandboxedShell:
         """Hook: a command's bash has been reaped and its result is about to be returned."""
 
     def _spawn(self) -> tuple[_Leader, _Output, _Carry]:
-        # The argv first: it may raise (and the bwrap shell's makes the --info-fd pipe itself), and
+        # The argv first: it may raise (the bwrap shell refuses there, and records the claim), and
         # nothing below exists yet to leak (S2 L2b L6).
         argv, pass_fds = self._spawn_argv()
         made: list[int] = []
@@ -2977,6 +2979,7 @@ class SandboxedShell:
             )
             # Watched from here on, never reaped by Popen until its group is empty (see `_Leader`).
             leader = _Leader(proc)
+            self._leader_made(leader)
         except BaseException:
             os.close(rd)
             ours.close()
@@ -3027,7 +3030,7 @@ class SandboxedShell:
             delivered = self._signal_group(pgid, leader, signal.SIGKILL)
         leader.wait(5.0)
         # A SIGKILL that may not have landed leaves the group held, whatever it looks like (r5).
-        return (delivered and leader.exited and self._reapable(pgid, leader, 5.0)
+        return (delivered and leader.exited and self._group_emptied(pgid, leader, 5.0)
                 and self._reap(pgid, leader))
 
     def _signal_group(self, pgid: int, leader: _Leader, sig: int) -> bool:
@@ -3070,18 +3073,11 @@ class SandboxedShell:
         reap of a leader rests on. Here, macOS's: a process table read in one call
         (:func:`_group_gone`). Linux has no such call and /proc is read one entry at a time, which a
         member that keeps forking can evade (S2 L3 r3, r4, r5), so a Linux shell must run each command
-        in a pid namespace of its own and answer from that (:class:`_BwrapShell`); any other shell is
+        in a cgroup leaf of its own and answer from that (:class:`_BwrapShell`); any other shell is
         refused there at its spawn."""
         if platform.system() != "Darwin":
             return False
         return _group_gone(pgid, timeout=timeout)
-
-    def _reapable(self, pgid: int, leader: _Leader, timeout: float) -> bool:
-        """Whether ``leader`` may be reaped now: its group is empty, which is all that ever allows it
-        here. The bwrap shell also allows a leader whose sandbox is unverified (not empty, see
-        :meth:`_BwrapShell._group_emptied`). Every reap decision asks this; every "may something of
-        this command still run" decision asks :meth:`_group_emptied`."""
-        return self._group_emptied(pgid, leader, timeout)
 
     def _prune_groups(self) -> None:
         """Reap the leader of each group that has emptied (:meth:`_group_emptied`), and forget the
@@ -3090,7 +3086,7 @@ class SandboxedShell:
             groups = list(self._groups.items())
         # Decided outside the lock: `_group_emptied` may run pgrep (S2 L3 r3).
         for pgid, leader in groups:
-            if leader.reaped or (leader.wait(0) and self._reapable(pgid, leader, 0.0)):
+            if leader.reaped or (leader.wait(0) and self._group_emptied(pgid, leader, 0.0)):
                 self._reap(pgid, leader)
             elif leader.exited:
                 leader.release_watch()
@@ -3244,7 +3240,7 @@ class SandboxedShell:
         for pgid, leader in groups:
             leader.wait(5.0)
             emptied = leader.reaped or (pgid not in undelivered and leader.exited
-                                        and self._reapable(pgid, leader, 5.0))
+                                        and self._group_emptied(pgid, leader, 5.0))
             if not (emptied and self._reap(pgid, leader)):
                 # close() never raises; a group it could not empty is said, not hidden, and the
                 # session keeps the workspace lock while it lives (S2 L3 r2, codex HIGH).
@@ -4576,6 +4572,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # signal there reaches bwrap, and bash dies when bwrap does (``--die-with-parent`` above).
         # When bash, pid 1, exits, the kernel kills the rest of the namespace (pid_namespaces(7)).
         "--unshare-pid",
+        # A cgroup namespace rooted at the command's own leaf: without it bash, which runs as the
+        # operator, could move itself into any other cgroup the operator owns and out of the leaf levain
+        # kills (RUN on argushub 2026-10-09: ESCAPED without, refused with; 1009-13_S2/DESIGN.md P4).
+        "--unshare-cgroup",
     ]
     if policy.deny_localhost_outbound:
         # spore-755 on Linux (option B, see LINUX_LOCALHOST_REFUSAL's comment): a new, empty network
@@ -5202,6 +5202,155 @@ def _probe_env() -> dict[str, str]:
     return child_env()
 
 
+# --- one cgroup v2 leaf per command (S2, Phill 2026-10-09: "yes sorry, that is correct: A'") --------
+# Every process of a Linux command lives in ONE cgroup v2 leaf levain names before the command runs: a
+# transient scope of the operator's own systemd user manager (``systemd-run --user --scope``), which
+# systemd delegates to the operator. kill = write ``1`` to its ``cgroup.kill``; gone = its
+# ``cgroup.events`` says ``populated 0``, or the leaf is absent (the kernel refuses to remove a populated
+# cgroup, and systemd removes an empty scope). No pid is needed for either. Why a user scope and not a
+# unit setup installs: a process may be moved between cgroups only by a writer of the COMMON
+# ANCESTOR's ``cgroup.procs``, which for the operator's session and any delegated unit is root's (RUN on
+# argushub 2026-10-09, project_memory/1009-13_S2/DESIGN.md P1); the user manager does the move for us.
+SYSTEMD_RUN = "/usr/bin/systemd-run"
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+_LEVAIN_SLICE = "levain.slice"
+_CGROUP_KILL_KERNEL = (5, 14)   # cgroup.kill first shipped in 5.14
+_LINGER_REMEDY = ("run `sudo levain setup-isolation` (it enables linger for you, so your systemd user "
+                  "manager runs without a login session), or `sudo loginctl enable-linger $USER`")
+
+
+def _user_manager_rel(uid: int) -> str:
+    return f"user.slice/user-{uid}.slice/user@{uid}.service"
+
+
+def _leaf_rel(uid: int, unit: str) -> str:
+    """The leaf of transient scope ``unit``, relative to the cgroup root (layout RUN on systemd 255)."""
+    return f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/{unit}.scope"
+
+
+# A leaf's unit names the levain process that made it (pid and kernel start time), so a sweep can tell a
+# crashed levain's leaf from a live one's without any other record.
+_LEAF_UNIT = re.compile(r"levain-(\d+)-(\d+)-[0-9a-f]{12}-\d+\.scope")
+
+
+def _is_levain_leaf(rel: str, uid: int) -> bool:
+    """Whether ``rel`` names a leaf levain makes for ``uid`` and nothing else (a crash sweep kills it)."""
+    head = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/"
+    return rel.startswith(head) and _LEAF_UNIT.fullmatch(rel[len(head):]) is not None
+
+
+def sweep_dead_leaves() -> list[str]:
+    """Kill every leaf whose levain is gone (its pid absent, or now another process's), and return the
+    ones still populated afterwards. A crashed levain's sandbox can outlive it: bwrap's PDEATHSIG misses a
+    namespace init cloned before it is armed (bubblewrap #633, #700; reproduced by the S2 proving run)."""
+    uid = os.getuid()
+    base = _CGROUP_ROOT / _user_manager_rel(uid) / _LEVAIN_SLICE
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return []
+    left: list[str] = []
+    for name in names:
+        m = _LEAF_UNIT.fullmatch(name)
+        if not m or _proc_start_time(int(m.group(1))) == m.group(2):
+            continue   # not a leaf, or its levain is alive
+        rel = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/{name}"
+        _leaf_kill(rel)
+        if not _leaf_gone(rel, timeout=5.0):
+            left.append(rel)
+    return left
+
+
+def _cgroup_problem(*, release: str | None = None, osrelease: str | None = None, mounts: str | None = None,
+                    container: bool | None = None, uid: int | None = None,
+                    root: Path = _CGROUP_ROOT) -> tuple[str, str | None] | None:
+    """Why a Linux command cannot get a cgroup leaf here, as (reason, remedy), or None. Each refusal is
+    by name; there is no fallback that runs a command without its leaf. The inputs default to this
+    host's; they are parameters so each refusal is testable off Linux."""
+    if osrelease is None:
+        try:
+            osrelease = Path("/proc/sys/kernel/osrelease").read_text()
+        except OSError:
+            osrelease = ""
+    if "microsoft" in osrelease.lower() or "wsl" in osrelease.lower():
+        return ("this is WSL2, which levain's Linux floor does not support yet (its cgroup setup is "
+                "not measured)", "run levain on a Linux host")
+    if container is None:
+        container = any(os.path.exists(f) for f in ("/.dockerenv", "/run/.containerenv",
+                                                     "/run/systemd/container"))
+    if container:
+        return ("this is a container, which levain's Linux floor does not support yet (cgroup "
+                "delegation into it is not measured)", "run levain on the host")
+    m = re.match(r"(\d+)\.(\d+)", release if release is not None else os.uname().release)
+    if not m or (int(m.group(1)), int(m.group(2))) < _CGROUP_KILL_KERNEL:
+        return (f"Linux {release if release is not None else os.uname().release} has no cgroup.kill "
+                "(it needs 5.14 or later), which is how levain stops every process of a command",
+                "upgrade the kernel")
+    if mounts is None:
+        try:
+            mounts = Path("/proc/self/mounts").read_text()
+        except OSError:
+            mounts = ""
+    fields = [ln.split() for ln in mounts.splitlines()]
+    unified = any(len(f) > 2 and f[1] == str(root) and f[2] == "cgroup2" for f in fields)
+    legacy = any(len(f) > 2 and f[2] == "cgroup" for f in fields)
+    if not unified or legacy:
+        return (f"cgroups here are not the unified v2 hierarchy at {root} (v1 or hybrid), which "
+                "levain needs to account for every process of a command",
+                "boot with the unified cgroup hierarchy (`systemd.unified_cgroup_hierarchy=1`)")
+    if not (os.path.isfile(SYSTEMD_RUN) and os.access(SYSTEMD_RUN, os.X_OK)):
+        return (f"{SYSTEMD_RUN} is missing: levain puts each command in a systemd user scope",
+                "use a systemd host")
+    uid = os.getuid() if uid is None else uid
+    mgr = root / _user_manager_rel(uid)
+    try:
+        st = os.lstat(mgr)
+        ok = stat.S_ISDIR(st.st_mode) and st.st_uid == uid
+    except OSError:
+        ok = False
+    if not ok:
+        return (f"your systemd user manager is not running ({mgr} is absent or not yours)", _LINGER_REMEDY)
+    return None
+
+
+def _leaf_populated(rel: str) -> bool | None:
+    """True or False from the leaf's ``cgroup.events``; None when the leaf is absent (removed)."""
+    try:
+        text = (_CGROUP_ROOT / rel / "cgroup.events").read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ENODEV:   # removed while open
+            return None
+        return True   # cannot tell: not gone
+    for line in text.splitlines():
+        if line.startswith("populated "):
+            return line.split()[1] != "0"
+    return True
+
+
+def _leaf_kill(rel: str) -> bool:
+    """SIGKILL every process in the leaf and its descendants (``cgroup.kill``). True when written, or
+    the leaf is absent; False when the write failed."""
+    try:
+        (_CGROUP_ROOT / rel / "cgroup.kill").write_text("1")
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        return exc.errno == errno.ENODEV
+    return True
+
+
+def _leaf_gone(rel: str, *, timeout: float) -> bool:
+    """True once the leaf has no live process (polled up to ``timeout``)."""
+    deadline = time.monotonic() + timeout
+    while _leaf_populated(rel) is True:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
 def bwrap_available() -> bool:
     """True iff ``bwrap`` is present AND CAN ACTUALLY ESTABLISH A NAMESPACE ON THIS HOST RIGHT NOW.
 
@@ -5577,15 +5726,25 @@ def _claim_alive(claim: str) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        # levain is gone, but its sandbox may still be dying (bwrap's pid 1 goes down after a
-        # SIGKILLed levain only when PDEATHSIG reaches it): the running command's bash, recorded in
-        # the claim before the command ran, keeps the claim until it is gone (L3 r1, S2 L2 M5).
+        # levain is gone, but its sandbox may not be: bwrap's PDEATHSIG does not reach a namespace
+        # init cloned in the window before it is armed (bubblewrap #633, #700). The claim names the
+        # leaf of the command it covers (tagged before that command was spawned), so the sweep kills
+        # the leaf, and keeps the claim until it is empty.
+        if len(parts) >= 5 and parts[4].startswith("c"):
+            rel = parts[4][1:]
+            if not _is_levain_leaf(rel, os.getuid()):
+                return True   # not a leaf levain makes here: not ours to judge, so kept
+            _leaf_kill(rel)
+            return not _leaf_gone(rel, timeout=5.0)
+        # A claim tagged by the previous build names the command's bash: kept while that pid exists.
         if len(parts) >= 5 and parts[4].startswith("b"):
-            pid_s, _, start = parts[4][1:].partition("@")
             try:
-                return _bash_alive(int(pid_s), start or "-")
-            except ValueError:
+                os.kill(int(parts[4][1:].partition("@")[0]), 0)
+                return True
+            except (ValueError, ProcessLookupError):
                 return False
+            except PermissionError:
+                return True
         # A claim tagged by an earlier build names the command's process group.
         if len(parts) >= 5 and parts[4].startswith("g"):
             try:
@@ -5814,28 +5973,6 @@ def _close_live_shells() -> None:
             shell.close()
         except Exception:  # noqa: BLE001 — exit must go on
             pass
-
-
-def _bash_alive(pid: int, start: str) -> bool:
-    """Whether ``pid`` is still the process that started at ``start`` (Linux /proc) and has not yet
-    finished exiting. A zombie counts as gone: a pid 1 becomes one only after its namespace is empty."""
-    try:
-        data = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return False
-    fields = data.rsplit(")", 1)[-1].split()
-    if len(fields) < 20 or fields[0] in ("Z", "X", "x"):
-        return False
-    return start == "-" or fields[19] == start
-
-
-def _bash_gone(pid: int, start: str, *, timeout: float) -> bool:
-    deadline = time.monotonic() + timeout
-    while _bash_alive(pid, start):
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.05)
-    return True
 
 
 def _group_live(pgid: int) -> bool:
@@ -6081,222 +6218,161 @@ class _BwrapShell(SandboxedShell):
         self._manifest = dict(manifest)   # recorded before the start; never updated
         self._ledger_claim: str | None = None   # this shell's claim on the placeholder ledger
         self._claim_base: str | None = None     # the claim before a command's bash is added to it
-        self._info_r: int | None = None         # read end of the running command's --info-fd pipe
-        # Each command's bash by its process group: (its leader, (pid, kernel start time)), the second
-        # None once seen gone or when bwrap started none. Bound to the leader OBJECT, not its number,
-        # so a later group that reuses the number is never judged by an earlier one's record (S2 L3
-        # r6, codex HIGH); deleted when that leader is reaped. bash is pid 1 of its pid namespace, and pid 1 finishes exiting only once the namespace is empty
-        # ("the kernel terminates all of the processes in the namespace via a SIGKILL signal",
-        # pid_namespaces(7)), so "bash gone" means "namespace gone". With --new-session bash is NOT in
-        # the bwrap process's group, so the group alone cannot say that.
-        self._bashes: dict[int, tuple[_Leader, tuple[int, str] | None]] = {}
-        # Leaders whose bash levain never learned, though bwrap may have cloned a namespace init (an
-        # interrupt, a timeout, or a pipe closed without a pid): the leader may be reaped once it
-        # exits, but the shell's claim stays, since a namespace may still hold its mounts, and the
-        # shell refuses every later command (S2 L3 r6, r7). So at most one entry per shell.
-        self._unverified: list[tuple[int, _Leader]] = []
+        # Each command's cgroup leaf by its process group (see `_leaf_rel`), bound to the leader OBJECT
+        # so a later group that reuses the number is never judged by an earlier one's leaf; deleted
+        # when that leader is reaped. The leaf, not a pid, answers "may anything of it still run".
+        self._leaves: dict[int, tuple[_Leader, str]] = {}
+        self._pending_leaf: str | None = None   # named for the spawn in progress, before its leader exists
+        self._unit_token = os.urandom(6).hex()
+        self._units = 0
 
-    # Each command runs in a pid namespace of its own (``--unshare-pid --as-pid-1``).
+    # Each command runs in a pid namespace of its own (``--unshare-pid --as-pid-1``), inside its leaf.
     _own_pid_namespace = True
 
     def _group_emptied(self, pgid: int, leader: _Leader, timeout: float) -> bool:
-        """The command's group is empty once its bwrap process (the leader) has exited and its bash,
-        the namespace's pid 1, is gone (or bwrap started none): the kernel's answer, not a read of
-        /proc's listing. Only THIS leader's record counts. A leader whose bash is unverified is NEVER
-        empty (a namespace may live); it is only reapable (:meth:`_reapable`), and its namespace stays
-        on the claim (S2 L3 r7)."""
+        """Empty once the command's driver (the leader) has exited and its leaf has no live process.
+        Only THIS leader's leaf counts."""
         deadline = time.monotonic() + timeout
         if not leader.wait(timeout):
             return False
-        rec = self._bashes.get(pgid)
-        if rec is not None and rec[0] is leader:
-            return self._bashes_gone(max(0.0, deadline - time.monotonic()), only=pgid)
-        return False
+        rec = self._leaves.get(pgid)
+        if rec is None or rec[0] is not leader:
+            return False
+        return _leaf_gone(rec[1], timeout=max(0.0, deadline - time.monotonic()))
 
-    def _reapable(self, pgid: int, leader: _Leader, timeout: float) -> bool:
-        """Empty, or an exited leader whose sandbox is unverified: its number may go, its claim stays."""
-        if self._group_emptied(pgid, leader, timeout):
-            return True
-        return leader.exited and any(lead is leader for _, lead in self._unverified)
+    def _signal(self, pgid: int, sig: int) -> bool:   # type: ignore[override]
+        """Every signal levain sends a Linux command stops it: SIGKILL to the driver (levain's own
+        unreaped child, so the number is still it), then ``cgroup.kill`` on its leaf. The driver first:
+        until ``systemd-run`` has moved it into the leaf it is outside it, and dead it cannot exec the
+        sandbox afterwards. True when the leaf kill was written or the leaf is absent."""
+        rec = self._leaves.get(pgid)
+        leaf = rec[1] if rec is not None else self._pending_leaf
+        try:
+            os.kill(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return False
+        return leaf is None or _leaf_kill(leaf)
+
+    def _kill_group(self, pgid: int, leader: _Leader) -> bool:
+        """Kill the command (driver and leaf), wait for the leaf to empty, then reap the driver. False,
+        the group kept, when the kill was not written or the leaf did not empty in time."""
+        delivered = self._signal_group(pgid, leader, signal.SIGKILL)
+        leader.wait(5.0)
+        return (delivered and leader.exited and self._group_emptied(pgid, leader, 5.0)
+                and self._reap(pgid, leader))
 
     def _reap(self, pgid: int, leader: _Leader) -> bool:
         if not super()._reap(pgid, leader):
             return False
-        rec = self._bashes.get(pgid)
-        if rec is not None and rec[0] is leader:
-            del self._bashes[pgid]
+        with self._lock:
+            rec = self._leaves.get(pgid)
+            if rec is not None and rec[0] is leader:
+                del self._leaves[pgid]
         return True
 
+    def _leader_made(self, leader: _Leader) -> None:
+        with self._lock:
+            leaf, self._pending_leaf = self._pending_leaf, None
+            if leaf is not None:
+                self._leaves[leader.pid] = (leader, leaf)
+
     def close(self) -> None:
-        # The claim is released only once the sandbox's namespace is GONE, never while any process of
-        # it lives: a host-side unlink of a placeholder still mounted in a live namespace detaches that
-        # mount (Linux 3.18+, 8ed936b), and the shell could then plant the file (L1 + L2 r1). Each
-        # command's bash is pid 1 of its pid namespace (``--as-pid-1``), so that bash gone means that
-        # namespace empty. If one is not gone in time, the claim stays, and the sweep at the next spawn
-        # or at launch releases it once this levain is gone. Released in `finally`, whatever the base
-        # teardown did.
+        # The claim is released only once every leaf is EMPTY, never while any process of a sandbox
+        # lives: a host-side unlink of a placeholder still mounted in a live namespace detaches that
+        # mount (Linux 3.18+, 8ed936b), and the shell could then plant the file (L1 + L2 r1). A leaf
+        # that does not empty keeps the claim; once this levain is gone, the next Linux spawn's
+        # `sweep_dead_leaves` kills the leaf and the ledger sweep then drops the claim. Released in
+        # `finally`, whatever the base teardown did.
         try:
             super().close()
         finally:
-            self._close_info()
             claim, self._ledger_claim = self._ledger_claim, None
             _LIVE_BWRAP_SHELLS.discard(self)
-            if self._unverified:
-                _log.warning("levain: a sandbox of process group(s) %s may still exist (its bash was "
-                             "never reported); the shell's claim is kept",
-                             sorted({g for g, _ in self._unverified}))
-            if (claim is not None and not self.unemptied_groups and not self._unverified
-                    and self._bashes_gone(5.0)):
+            with self._lock:
+                leaves = [leaf for _, leaf in self._leaves.values()]
+            if claim is not None and not self.unemptied_groups and all(
+                    _leaf_gone(leaf, timeout=5.0) for leaf in leaves):
                 _ledger_release(claim)
 
-    def _close_info(self) -> None:
-        with self._lock:
-            fd, self._info_r = self._info_r, None
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-
     def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
-        # Before any bwrap is started: with an earlier sandbox unverified the claim must keep naming
-        # it, and a later command's retag would not (S2 L3 r7).
-        if self._unverified:
+        # One command at a time on the claim: it names one leaf, so an earlier one still populated
+        # refuses this command (a retag would stop the claim covering it).
+        with self._lock:
+            leaves = [leaf for _, leaf in self._leaves.values()]
+        if not all(_leaf_gone(leaf, timeout=5.0) for leaf in leaves):
             raise ConfinementError(
-                "an earlier command's sandbox could not be verified gone — refusing to run the command "
+                "an earlier command's sandbox could not be stopped — refusing to run the command "
                 "(fail-closed): the shell's claim must keep covering it, so close this shell."
             )
-        argv, _ = super()._spawn_argv()
-        self._close_info()
-        rd, wr = os.pipe()
-        self._info_r = rd
-        # bwrap writes {"child-pid": N} here once it has cloned bash (bubblewrap.c, opt_info_fd).
-        at = argv.index("--as-pid-1")
-        return argv[:at] + ["--info-fd", str(wr)] + argv[at:], (wr,)
-
-    def _read_child_pid(self) -> int | None:
-        # The pid bwrap reports for the command's bash; None when bwrap closed the pipe without one
-        # (EOF), and a refusal when the read ran out of time or had no pipe to read.
-        # This thread takes the read end, so close() from another thread can no longer close it
-        # under the read, and a reused fd number is never read from (S2 L2b L7). A close() meanwhile
-        # kills bwrap, whose exit ends the read with EOF.
-        with self._lock:
-            fd, self._info_r = self._info_r, None
-        data = b""
-        eof = False
-        deadline = time.monotonic() + _START_TIMEOUT
-        try:
-            while fd is not None and time.monotonic() < deadline:
-                ready, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
-                if not ready:
-                    break
-                chunk = os.read(fd, 4096)
-                if not chunk:
-                    eof = True
-                    break
-                data += chunk
-                # bwrap writes the whole object at once; stop there rather than wait for EOF, which
-                # comes only when every holder of the write end has closed it (S2 L1b).
-                if re.search(rb'"child-pid"\s*:\s*\d+\s*[,}]', data):
-                    break
-        finally:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-        m = re.search(rb'"child-pid"\s*:\s*(\d+)', data)
-        pid = int(m.group(1)) if m else 0
-        if pid <= 0 and eof:
-            return None
-        if pid <= 0:
-            raise ConfinementError(
-                "bwrap did not report the pid of the command's bash in time — refusing to run the "
-                "command (fail-closed)."
-            )
-        return pid
-
-    def _bashes_gone(self, timeout: float, *, only: int | None = None, but: int | None = None) -> bool:
-        """Whether every recorded bash (or the one of group ``only``; or all but group ``but``'s) is
-        gone, polled up to ``timeout``."""
-        deadline = time.monotonic() + timeout
-        gone = True
-        for pgid, (leader, b) in list(self._bashes.items()):
-            if b is None or pgid == but or (only is not None and pgid != only):
-                continue
-            if _bash_gone(*b, timeout=max(0.0, deadline - time.monotonic())):
-                # Only while the record is still this leader's: a `_reap` between the check and the
-                # write has deleted it, and it must not come back (S2 L3 r7).
-                if self._bashes.get(pgid, (None,))[0] is leader:
-                    self._bashes[pgid] = (leader, None)
-            else:
-                gone = False
-        return gone
+        problem = _cgroup_problem()
+        if problem is not None:
+            raise ConfinementError(f"{problem[0]} — refusing to run the command (fail-closed)."
+                                   + (f" To fix: {problem[1]}." if problem[1] else ""))
+        argv, pass_fds = super()._spawn_argv()
+        self._units += 1
+        unit = f"levain-{os.getpid()}-{_proc_start_time(os.getpid())}-{self._unit_token}-{self._units}"
+        leaf = _leaf_rel(os.getuid(), unit)
+        # The claim names the leaf BEFORE anything is spawned in it: after a levain crash at any later
+        # point the sweep finds the leaf, kills it, and keeps the claim until it is empty.
+        claim = self._ledger_claim
+        if claim is not None and self._claim_base is not None:
+            tagged = f"{self._claim_base}:c{leaf}"
+            with _LedgerTxn() as txn:
+                if txn.ok:
+                    txn.retag(claim, tagged)
+            if not txn.ok or txn.problem is not None:
+                raise ConfinementError(
+                    f"{txn.problem} — refusing to run the command (fail-closed): the shell's claim on "
+                    "the floor's files could not be recorded."
+                )
+            self._ledger_claim = tagged
+        self._pending_leaf = leaf
+        # systemd-run finds the user manager through XDG_RUNTIME_DIR; bash does not get it unless the
+        # caller gave it, so a second env drops it again after the move.
+        scope = [SYSTEMD_RUN, "--user", "--scope", "--quiet", "--collect", f"--slice={_LEVAIN_SLICE}",
+                 f"--unit={unit}", "--"]
+        if "XDG_RUNTIME_DIR" not in self._env:
+            scope = ["/usr/bin/env", f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}", *scope,
+                     "/usr/bin/env", "-u", "XDG_RUNTIME_DIR"]
+        return scope + argv, pass_fds
 
     def _after_spawn(self, pgid: int) -> None:
-        # bash is blocked reading its input, so nothing of the command has run yet. Learn its pid,
-        # then retag the claim to name it (see `_claim_alive`): after a levain crash the sweep keeps
-        # the claim until that bash, and so its namespace, is gone. One bash at a time: an earlier
-        # command's bash that is still not gone refuses this command, because the retag would stop
-        # the claim covering it.
+        # bash is blocked reading its input, so nothing of the command has run yet. Before it may run,
+        # its driver must be IN its leaf: systemd-run moves itself there and then execs bwrap, so
+        # everything the command ever starts is a descendant of a member.
         with self._lock:
-            leader = self._groups.get(pgid)
-        try:
-            pid = self._read_child_pid()
-        except BaseException:
-            # Interrupted or timed out before bwrap answered: it may have started a bash. The leader
-            # can be reaped once it exits; the namespace stays unverified, on the claim.
-            if leader is not None:
-                self._unverified.append((pgid, leader))
-            raise
-        if pid is None:
-            # bwrap closed its info pipe without a pid. That proves no bash was released, not that no
-            # namespace process exists: bwrap clones the namespace init BEFORE it writes child-pid and
-            # releases it only afterwards, and an init blocked there ignores SIGTERM. So whatever the
-            # exit status: SIGKILL the command's group (a namespace init always takes a SIGKILL from
-            # its parent namespace), leave the leader unverified, and refuse (S2 L3 r7).
-            if leader is not None:
-                self._signal_group(pgid, leader, signal.SIGKILL)
-                self._unverified.append((pgid, leader))
+            rec = self._leaves.get(pgid)
+        if rec is None:
             raise ConfinementError(
-                "bwrap closed its info pipe without reporting the pid of the command's bash — "
-                "refusing to run the command (fail-closed); this shell refuses further commands."
+                "the command's process group is no longer tracked by this shell — refusing to run the "
+                "command (fail-closed)."
             )
-        if leader is None:
-            # A pid was read but the group is no longer this shell's (a close() reaped it meanwhile):
-            # nothing records that bash, so the command does not run.
-            raise ConfinementError(
-                "bwrap reported the command's bash, but its process group is no longer tracked by "
-                "this shell — refusing to run the command (fail-closed)."
-            )
-        start = _proc_start_time(pid) or "-"
-        # Recorded first: it is how this group is known empty.
-        self._bashes[pgid] = (leader, (pid, start))
-        if not self._bashes_gone(5.0, but=pgid):
-            raise ConfinementError(
-                "an earlier command's sandbox is still exiting — refusing to run the command "
-                "(fail-closed): the shell's claim on the floor's files must cover it until it is gone."
-            )
-        claim = self._ledger_claim
-        if claim is None or self._claim_base is None:
-            return
-        tagged = f"{self._claim_base}:b{pid}@{start}"
-        with _LedgerTxn() as txn:
-            if txn.ok:
-                txn.retag(claim, tagged)
-        if not txn.ok or txn.problem is not None:
-            # Unwritten, the claim names only levain's pid (or an older bash): after a levain crash
-            # a sweep would drop it while this sandbox lives on its mounts (codex, L3 r3).
-            raise ConfinementError(
-                f"{txn.problem} — refusing to run the command (fail-closed): the shell's claim on "
-                "the floor's files could not be recorded."
-            )
-        self._ledger_claim = tagged
+        leader, leaf = rec
+        want = f"0::/{leaf}"
+        deadline = time.monotonic() + _START_TIMEOUT
+        while True:
+            try:
+                now = Path(f"/proc/{pgid}/cgroup").read_text().strip()
+            except OSError:
+                now = ""
+            if now == want:
+                return
+            if leader.exited or time.monotonic() >= deadline:
+                raise ConfinementError(
+                    "the command's sandbox did not start in its cgroup (systemd-run --user failed or "
+                    "stalled; `levain doctor` checks it) — refusing to run the command (fail-closed)."
+                )
+            time.sleep(0.01)
 
     def _after_command(self, pgid: int) -> None:
-        # The command's bash was pid 1 of its namespace, so the kernel is killing everything left
-        # in it; wait for that, so the next command's bash is the only one the claim needs to name.
-        self._bashes_gone(5.0, only=pgid)
+        # The command's bash was pid 1 of its namespace, so the kernel is killing everything left in
+        # it; wait for the leaf to empty, so the next command's leaf is the only one the claim names.
+        with self._lock:
+            rec = self._leaves.get(pgid)
+        if rec is not None:
+            _leaf_gone(rec[1], timeout=5.0)
 
     def _recheck(self) -> None:
         _refuse_plantable_sqlite_jewels(self._jewel_policy)
@@ -6361,7 +6437,7 @@ class BwrapProvider(ConfinementProvider):
     localhost_deny_removes_network = True
 
     def available(self) -> bool:
-        return bwrap_available()
+        return _cgroup_problem() is None and bwrap_available()
 
     def localhost_deny_ready(self) -> bool:
         return bwrap_netns_available()
@@ -6467,6 +6543,8 @@ class BwrapProvider(ConfinementProvider):
                 "`bwrap` being installed and `kernel.unprivileged_userns_clone=1` can both be true on "
                 "a host where this still fails, which is why it is probed by running bwrap."
             )
+        # A crashed levain's leaves first, so the ledger sweep below finds their claims empty.
+        sweep_dead_leaves()
         # ONE ledger transaction from the sweep to the claim (L1 r1): another session's release or sweep
         # cannot remove an object this plan relies on between the plan and the claim. The sweep runs
         # FIRST, so a crashed session's objects are either gone before the plan looks or claimed by it.
@@ -6699,6 +6777,9 @@ def diagnose_confinement(system: str | None = None) -> ConfinementDiagnosis:
             "install it (`sudo apt install bubblewrap`, `sudo dnf install bubblewrap`, "
             "`sudo pacman -S bubblewrap`)",
         )
+    problem = _cgroup_problem()
+    if problem is not None:
+        return ConfinementDiagnosis(False, "bwrap (Linux mount namespace)", problem[0], problem[1])
     if provider.available():
         return ConfinementDiagnosis(True, "bwrap (Linux mount namespace)",
                                     "Linux bwrap floor active", None)

@@ -340,16 +340,16 @@ def test_a_shell_releases_its_claim_only_once_its_pid_namespace_is_gone(home: Pa
             return False   # 4242 is not a group of this test's: send it nothing
     lead = _P()
     shell._groups = {4242: lead}
-    shell._bashes = {4242: (lead, (4243, "1"))}   # the command's bash, pid 1 of its namespace
-    monkeypatch.setattr(C, "_bash_gone", lambda pid, start, timeout: False)
+    shell._leaves = {4242: (lead, "leaf")}   # the command's cgroup leaf
+    monkeypatch.setattr(C, "_leaf_gone", lambda rel, timeout: False)
     shell.close()
-    assert f.exists(), "the namespace may still hold the mount: keep the claim"
+    assert f.exists(), "the leaf may still hold the mount: keep the claim"
     shell2 = C._BwrapShell(policy=None, manifest={}, argv=["/bin/true"], cwd=home, env={})  # type: ignore[arg-type]
     shell2._ledger_claim = f"{os.getpid()}:-:-:k"
     lead2 = _P()
     shell2._groups = {4242: lead2}
-    shell2._bashes = {4242: (lead2, (4243, "1"))}
-    monkeypatch.setattr(C, "_bash_gone", lambda pid, start, timeout: True)
+    shell2._leaves = {4242: (lead2, "leaf")}
+    monkeypatch.setattr(C, "_leaf_gone", lambda rel, timeout: True)
     shell2.close()
     assert not f.exists()
 

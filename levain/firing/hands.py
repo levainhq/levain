@@ -286,6 +286,13 @@ def plan_setup(
                  (_abs("setfacl"), "-m", f"u:{operator}:rX", str(ws))),
             Step("make new files in the workspace inherit it (default ACL)",
                  (_abs("setfacl"), "-d", "-m", f"u:{operator}:rX", str(ws))),
+            # Each Linux command runs in a cgroup leaf of its own, a transient scope of the operator's
+            # systemd user manager (confinement `_cgroup_problem`); linger keeps that manager running
+            # without a login session (cron, ssh without pam_systemd). --undo leaves it: it is the
+            # operator's own manager, and other services of theirs may rely on it.
+            Step(f"keep {operator}'s systemd user manager running without a login session (linger)",
+                 (_abs("loginctl"), "enable-linger", operator),
+                 skip_if=(_abs("test"), "-e", f"/var/lib/systemd/linger/{operator}")),
         ]
     else:  # pragma: no cover - guarded by the caller
         raise HandsSetupError(f"unsupported host {host!r}")

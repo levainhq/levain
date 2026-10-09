@@ -3188,6 +3188,7 @@ def test_diagnose_linux_apparmor_names_the_cause_and_the_official_profile(monkey
     do is map root into one (no capabilities in the stacked child profile), which is what a nested
     bwrap, rootless docker/podman, flatpak and browser sandboxes all need. The remedy text says the
     accurate thing, so this asserts the accurate thing."""
+    monkeypatch.setattr("levain.firing.confinement._cgroup_problem", lambda: None)
     monkeypatch.setattr("levain.firing.confinement.os.path.isfile", lambda p: True)
     monkeypatch.setattr("levain.firing.confinement.os.access", lambda p, m: True)
     monkeypatch.setattr("levain.firing.confinement.bwrap_available", lambda: False)
@@ -3203,6 +3204,7 @@ def test_diagnose_linux_apparmor_names_the_cause_and_the_official_profile(monkey
 def test_diagnose_linux_namespace_denied_without_apparmor_is_a_different_sentence(monkeypatch) -> None:
     """Not every namespace refusal is AppArmor (a container's seccomp does it too, which is how the
     Linux branches were exercised). A remedy naming the wrong cause is worse than a generic one."""
+    monkeypatch.setattr("levain.firing.confinement._cgroup_problem", lambda: None)
     monkeypatch.setattr("levain.firing.confinement.os.path.isfile", lambda p: True)
     monkeypatch.setattr("levain.firing.confinement.os.access", lambda p, m: True)
     monkeypatch.setattr("levain.firing.confinement.bwrap_available", lambda: False)
