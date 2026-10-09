@@ -2483,10 +2483,11 @@ def _hands_env(hands: HandsIdentity) -> dict[str, str]:
             "TERM": "dumb", "USER": hands.user, "LOGNAME": hands.user}
 
 
-#: Linux: run in front of every sandboxed command levain starts (argv: ``keyring`` or ``-``, levain's
-#: pid, then the command): by every hands process, as the hands user, between sudo and what it starts
-#: (``keyring``); by the operator floor's bwrap, as the operator (``-``). Before it execs the command:
-#: 1. With ``keyring`` it joins a NEW, empty session keyring. The operator's session keyring otherwise crosses sudo (no
+#: Linux: run in front of every sandboxed command levain starts (argv: levain's pid, then the command):
+#: by every hands process, as the hands user, between sudo and what it starts; by the operator floor's
+#: bwrap, as the operator. Before it execs the command:
+#: 1. It joins a NEW, empty session keyring (on the operator floor too, Phill 2026-10-09: "yes to both";
+#:    a session-keyring credential, a krb5 KEYRING ccache or a keyctl token, is not usable inside). The operator's session keyring otherwise crosses sudo (no
 #:    pam_keyinit in Ubuntu's sudo stack) and bwrap (a user namespace does not detach it): RUN in a VM
 #:    2026-10-09, `keyctl print` inside a hands bash printed a key the operator had added to @s. The
 #:    keyctl syscall number is the architecture's; one not listed refuses.
@@ -2500,21 +2501,20 @@ def _hands_env(hands: HandsIdentity) -> dict[str, str]:
 #: ``python3 -I -S`` (no site, no environment); every input is argv data.
 _HANDS_START = r"""import ctypes, os, select, signal, sys, time
 nr = {"x86_64": 250, "aarch64": 219, "riscv64": 219}.get(os.uname().machine)
-keyring = sys.argv[1] == "keyring"
-if keyring and nr is None:
+if nr is None:
     sys.stderr.write("levain: no keyctl syscall number known for %s; refusing to start with the "
                      "operator's session keyring\n" % os.uname().machine)
     os._exit(126)
 libc = ctypes.CDLL(None, use_errno=True)
 libc.syscall.restype = ctypes.c_long
-if keyring and libc.syscall(ctypes.c_long(nr), ctypes.c_long(1), ctypes.c_void_p(None)) < 0:
+if libc.syscall(ctypes.c_long(nr), ctypes.c_long(1), ctypes.c_void_p(None)) < 0:
     sys.stderr.write("levain: could not join a new session keyring: %s\n" % os.strerror(ctypes.get_errno()))
     os._exit(126)
 if not hasattr(os, "pidfd_open"):
     sys.stderr.write("levain: this python3 (%s) has no os.pidfd_open (3.9 or later and Linux 5.3 or later "
                      "are needed) to end the command with levain; refusing\n" % sys.version.split()[0])
     os._exit(126)
-watch, argv, me = int(sys.argv[2]), sys.argv[3:], os.getpid()
+watch, argv, me = int(sys.argv[1]), sys.argv[2:], os.getpid()
 def parent(pid):
     with open("/proc/%d/stat" % pid) as f:
         return int(f.read().rsplit(")", 1)[1].split()[1])
@@ -2590,13 +2590,13 @@ def hands_prefix(hands: HandsIdentity, *, system: str | None = None) -> list[str
     argv = [SUDO, "-n", "-u", hands.user, "/usr/bin/env", "-i",
             *(f"{k}={v}" for k, v in _hands_env(hands).items())]
     if (system or platform.system()) == "Linux":
-        argv += _start_argv(HANDS_PYTHON, keyring=True)
+        argv += _start_argv(HANDS_PYTHON)
     return argv
 
 
-def _start_argv(python: str, *, keyring: bool) -> list[str]:
+def _start_argv(python: str) -> list[str]:
     """:data:`_HANDS_START` run by ``python``, watching this process; the command follows it."""
-    return [python, "-I", "-S", "-c", _HANDS_START, "keyring" if keyring else "-", str(os.getpid())]
+    return [python, "-I", "-S", "-c", _HANDS_START, str(os.getpid())]
 
 
 def _require_hands_python() -> None:
@@ -7234,6 +7234,15 @@ class _BwrapShell(SandboxedShell):
     def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
         if self.closed:
             return super().run(command, timeout=timeout)   # the base refusal names the real reason
+        if self._hands is not None:
+            # The walk again before every command (Phill 2026-10-09, "yes to both"): a socket or FIFO
+            # made since the last one (RUN: a root listener planted mid-shell was CONNECTED) refuses
+            # this command. What is made DURING a command is not seen; that is the README's residue.
+            problem = _hands_listener_problem(self._hands)
+            if problem is not None:
+                self.close()
+                raise ConfinementError(f"{problem} — the shell was closed and the command was not run "
+                                       "(fail-closed).")
         try:
             self._recheck()
         except (OSError, RuntimeError) as exc:   # RuntimeError includes ConfinementError
@@ -7469,7 +7478,7 @@ class BwrapProvider(ConfinementProvider):
         else:
             # The command ends when levain does (see _HANDS_START): bwrap's --die-with-parent alone left
             # a setsid child and the namespace's pid 1 running.
-            argv = [*_start_argv(sys.executable, keyring=False), *argv]
+            argv = [*_start_argv(sys.executable), *argv]
         shell = _BwrapShell(
             # The per-command SQLite check, like the manifest, covers only jewels in the hands view.
             policy=policy if hands is None else replace(
