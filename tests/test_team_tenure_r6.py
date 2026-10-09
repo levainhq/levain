@@ -111,7 +111,8 @@ def test_g4_a_reland_never_erases_a_pending_op_added_meanwhile(two, monkeypatch)
         return out
     monkeypatch.setattr(GitLedger, "derivation", derivation)
     WARNINGS.clear()
-    gl(ben)._reland()
+    with gl(ben).op():
+        gl(ben)._reland()
     assert fired
     ops = gl(ben).state().get("pending_ops") or []
     assert late in ops, ops

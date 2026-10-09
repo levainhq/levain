@@ -322,13 +322,18 @@ def cmd_regenesis(gl: GitLedger, args) -> int:
     old_root = gl.pinned_root or ""
     # Judged on this clone's CURRENT derivation of its pinned ledger (frozen: its last full one), never on --from's
     d_old = gl.derivation()
-    judged = [r for r in (gl.state().get("anchor"), d_old.counted_head) if r]
-    if git(["merge-base", "--is-ancestor", old_root, old_tip], gl.repo.toplevel, check=False).returncode != 0 or \
-            not any(git(["merge-base", "--is-ancestor", old_tip, r], gl.repo.toplevel, check=False).returncode == 0
-                    for r in judged):
+    # a MEMBER of the walk this clone judged, never a git ancestor of some judged commit (code L3 r6 codex 4: a merge's
+    # rejected parent is an ancestor of the merge, and a local-only ledger's newest line is no ancestor of the last team
+    # change). A frozen derivation counts only through the commit its verdicts are frozen at.
+    walk = d_old.walk
+    if d_old.judged != "full" and d_old.frozen_at in walk:
+        walk = walk[:walk.index(d_old.frozen_at) + 1]
+    if old_tip not in walk:
         raise TeamError(f"--from {args.from_} is not on the ledger this clone is pinned to (genesis {old_root[:12]}) "
-                        "as this clone has judged it (an ancestor of its anchor or of its last counted team change); "
-                        "a re-genesis starts from the pinned ledger. To re-genesis another, join it first")
+                        "as this clone has judged it: it is not a commit of the history this clone followed and counted"
+                        + (" (the ledger is frozen; only history up to the frozen point counts)"
+                           if d_old.judged != "full" else "")
+                        + ". A re-genesis starts from the pinned ledger; to re-genesis another, join it first")
     members: dict[str, str] = {}
     keys: dict[str, str] = {}
     for v in args.member or []:
