@@ -4102,7 +4102,7 @@ def _bwrap_hands_file(policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, 
 
     def driver() -> list[str]:
         argv, _ = _bwrap_plan(policy)
-        argv = _hands_bwrap_argv(argv, *_hands_hidden_roots(policy))
+        argv = _hands_bwrap_argv(argv, hands)
         missing = _hands_argv_unmade(argv)
         if missing is not None:
             # A shell creates such a placeholder under its ledger claim and removes it once no shell
@@ -6415,20 +6415,25 @@ class _Leader:
 
 
 # --- the Linux hands launch (S2-linux) ------------------------------------------------------------
-# bwrap runs AS the hands user. It cannot mount over a jewel inside the operator's home: a mount needs
-# search permission on its target's parent, and the hands user has none there (RUN in a VM 2026-10-09:
-# the floor's own argv as the hands user stops at its first jewel with "Permission denied"). It CAN
-# mount over the home itself, which needs search on /home only. So a hands launch hides the operator's
-# home and the entity's directory whole, read-only and empty, and drops every op of the floor's plan
-# beneath them. It also hides /run, /tmp, /var/tmp and /dev/shm whole (empty, writable): daemons the
-# hands user may reach (a resolver over D-Bus or varlink, nscd, avahi, snapd) listen under /run, and a
-# 0777 listener in each of the four was reached by the hands user without bwrap and refused with it.
-# The network namespace is always new (abstract unix sockets, the host's loopback), and the user
-# namespace is new with ``--disable-userns``, so no nested one can be made inside (ENOSPC).
+# bwrap runs AS the hands user, in an ALLOWLISTED view (Phill's ruling (A), 2026-10-09): the sandbox
+# root is bwrap's own empty tmpfs, and only the trees bash needs are mounted into it. Read-only: /usr
+# (and the merged-/usr links /bin, /sbin, /lib*), /etc and /opt. Writable: the hands workspace and the
+# hands home. Fresh and empty: /tmp, /var/tmp, /run, and bwrap's own /dev and /proc. The host's root is
+# never bound, so the operator's home, the entity directory, /srv, /mnt, /media, /var/lib, daemon
+# sockets under /run and container volumes are not in the view at all: no list of what to hide and no
+# matching of socket names. Of the floor's plan, only ops whose target lies in a host tree of the view
+# are kept (a mask over a jewel in /etc, say); everything else it hides is already absent. The network
+# namespace is always new (abstract unix sockets, the host's loopback), the IPC namespace is new, and
+# the user namespace is new with ``--disable-userns``, so no nested one can be made inside (ENOSPC).
+# Linux hands is therefore stricter than macOS hands, which stays default-allow under Seatbelt.
 
-#: Hidden whole, empty and writable, for a hands launch. A symlink among them (``/var/run`` -> ``/run``)
-#: is covered by its target.
-_HANDS_SCRATCH = ("/run", "/var/run", "/tmp", "/var/tmp", "/dev/shm")
+#: Host trees in a hands view, read-only (absent ones are skipped).
+_HANDS_VIEW_RO = ("/usr", "/etc", "/opt")
+#: The merged-/usr links: a symlink here becomes the same symlink in the view, a real directory (an
+#: unmerged host) is bound read-only.
+_HANDS_VIEW_LINKS = ("/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
+#: Fresh, empty and writable in a hands view.
+_HANDS_VIEW_TMP = ("/tmp", "/var/tmp", "/run")
 #: Ops of the floor's plan and the number of arguments each takes. An op not named here is refused by
 #: the transform, so a new op in the plan cannot pass through it unexamined.
 _BWRAP_OP_ARITY = {
@@ -6438,47 +6443,47 @@ _BWRAP_OP_ARITY = {
 }
 
 
-def _hands_hidden_roots(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
-    """``(read_only, writable)``: what a hands launch hides whole. The workspace must be in neither,
-    or the launch refuses (the hands user's workspace is outside the operator's home by setup)."""
-    def real(p: Path) -> Path:
-        return Path(os.path.realpath(p))
-
-    ro: list[Path] = []
-    for p in (real(Path.home()), real(policy.entity_dir)):
-        if not any(p == q or p.is_relative_to(q) for q in ro):
-            ro = [q for q in ro if not q.is_relative_to(p)] + [p]
-    rw = [Path(p) for p in _HANDS_SCRATCH if os.path.isdir(p) and not os.path.islink(p)]
-    ws = real(policy.workspace)
-    for root in (*ro, *rw):
-        if ws == root or ws.is_relative_to(root):
-            raise ConfinementError(
-                f"the entity's workspace {ws} is inside {root}, which bash run as the entity's own user "
-                "never sees — refusing to start it (fail-closed). Set the entity up again: sudo levain "
-                "setup-isolation --undo, then sudo levain setup-isolation."
-            )
-    ro = [q for q in ro if not any(q == r or q.is_relative_to(r) for r in rw)]
-    return [str(q) for q in ro], [str(q) for q in rw]
+_HANDS_VIEW_FLAGS = ("--unshare-user", "--disable-userns", "--unshare-ipc", "--unshare-net", "--unshare-pid",
+                     "--unshare-cgroup", "--die-with-parent")
 
 
-def _hands_bwrap_argv(argv: list[str], read_only: list[str], writable: list[str]) -> list[str]:
-    """The floor's bwrap ``argv`` (``_bwrap_plan``'s, without the command) turned into a hands
-    launch's: every op whose target is under a hidden root dropped, the roots mounted as empty tmpfs
-    AFTER every remaining op (a later mount covers an earlier one beneath it), read-only ones
-    remounted read-only, and the namespace flags a hands launch needs added. Pure."""
-    roots = [Path(r) for r in (*read_only, *writable)]
+def _hands_view_trees(hands: HandsIdentity) -> tuple[list[str], list[str]]:
+    """``(read_only, writable)``: the host trees a hands view binds, read-only ones that exist here and
+    the hands workspace and home."""
+    ro = [t for t in _HANDS_VIEW_RO if os.path.isdir(t) and not os.path.islink(t)]
+    return ro, [str(hands.workspace), os.path.realpath(hands.home)]
 
-    def hidden(target: str) -> bool:
-        t = Path(target)
-        return any(t == r or t.is_relative_to(r) for r in roots)
 
+def _in_hands_view(path: str | Path, hands: HandsIdentity) -> bool:
+    """Whether ``path`` lies in a host tree of the hands view, so bash run as the hands user can see it."""
+    ro, rw = _hands_view_trees(hands)
+    p = Path(path)
+    return any(p == Path(t) or p.is_relative_to(t) for t in (*ro, *rw))
+
+
+def _hands_bwrap_argv(argv: list[str], hands: HandsIdentity) -> list[str]:
+    """The floor's bwrap ``argv`` (``_bwrap_plan``'s, without the command) turned into a hands launch's
+    allowlisted view: the view's own mounts first, then every op of the floor's plan whose target lies
+    in a host tree of the view, in the plan's order; every other op is dropped. Reads only the host's
+    link layout and which view trees exist."""
     if not argv or argv[0] != BWRAP:
         raise ConfinementError("internal: the hands launch was given a plan that is not bwrap's — refusing "
                                "(fail-closed).")
-    # --unshare-ipc: the host's SysV and POSIX message queues, shared memory and semaphores are
-    # otherwise the hands bash's too (RUN 2026-10-09: a 0666 queue of another user and a 0666 segment
-    # of root were listed inside a hands bash).
-    out = [argv[0], "--unshare-user", "--disable-userns", "--unshare-ipc"]
+    ro, rw = _hands_view_trees(hands)
+    trees = [Path(t) for t in (*ro, *rw)]
+    out = [argv[0], *_HANDS_VIEW_FLAGS]
+    for t in ro:
+        out += ["--ro-bind", t, t]
+    for link in _HANDS_VIEW_LINKS:
+        if os.path.islink(link):
+            out += ["--symlink", os.readlink(link), link]
+        elif os.path.isdir(link):
+            out += ["--ro-bind", link, link]
+    out += ["--proc", "/proc", "--dev", "/dev"]
+    for t in _HANDS_VIEW_TMP:
+        out += ["--tmpfs", t]
+    for t in rw:
+        out += ["--bind", t, t]
     i = 1
     while i < len(argv):
         op = argv[i]
@@ -6487,16 +6492,9 @@ def _hands_bwrap_argv(argv: list[str], read_only: list[str], writable: list[str]
             raise ConfinementError(f"internal: the floor's plan has {op!r}, which the hands launch does not "
                                    "know how to place — refusing (fail-closed).")
         args = argv[i + 1:i + 1 + n]
-        # The target is an op's last argument; `--bind / /` and the other root pins are never hidden.
-        if not (n and args[-1] != "/" and hidden(args[-1])):
-            out += [op, *args]
         i += 1 + n
-    if "--unshare-net" not in out:
-        out.append("--unshare-net")
-    for r in (*read_only, *writable):
-        out += ["--tmpfs", r]
-    for r in read_only:
-        out += ["--remount-ro", r]
+        if n and any(Path(args[-1]) == t or Path(args[-1]).is_relative_to(t) for t in trees):
+            out += [op, *args]
     return out
 
 
@@ -6739,14 +6737,6 @@ def _start_hands_relay(policy: CrownJewelsPolicy, hands: HandsIdentity, sockdir:
     does not come. Nothing of a refused start is left running."""
     from levain.launch import child_env
 
-    ro, rw = _hands_hidden_roots(policy)
-    for root in (*ro, *rw):
-        if sockdir == root or sockdir.startswith(root.rstrip("/") + "/"):
-            raise ConfinementError(
-                f"the hands user's home {hands.home} is inside {root}, which bash run as it never sees, so "
-                "its proxy relay could not be reached — refusing to run bash as the entity's own user, or "
-                "as you instead (fail-closed)."
-            )
     argv = [*hands_prefix(hands), HANDS_PYTHON, "-I", "-S", "-c", _HANDS_RELAY, "out", sockdir,
             *(str(p) for p in hands.egress_ports)]
     proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -6789,104 +6779,45 @@ def _start_hands_relay(policy: CrownJewelsPolicy, hands: HandsIdentity, sockdir:
 # lists none of the host's sockets, so levain sweeps them from the host before any hands process
 # starts, and asks the kernel, as the hands user, which ones it may connect to (write permission on
 # the socket file and search on every ancestor: access(2), so modes and ACLs both count).
-_SO_ACCEPTCON = 0x00010000
-_SOCK_DGRAM = 0x0002
-_HANDS_WRITABLE = r'for p; do [ -w "$p" ] && printf "%s\0" "$p"; done; exit 0'
-_HANDS_WRITABLE_CHUNK = 2000
-_PROC = "/proc"
+#: The walk, as the hands user inside its own view: every socket and FIFO it may write in the view's
+#: read-only host trees. bash cannot reach any other host file, and the view's writable trees are the
+#: hands user's own.
+_HANDS_FIND = "/usr/bin/find"
+_HANDS_WALK_TIMEOUT = 120.0
 
 
-def _unix_socket_paths(text: str) -> set[str]:
-    """The pathname sockets in a ``/proc/net/unix`` text that accept connections or datagrams. A line
-    of any other shape raises ValueError: an entry that cannot be read is not skipped."""
-    out: set[str] = set()
-    for line in text.split("\n")[1:]:
-        if not line:
-            continue
-        f = line.split(None, 7)
-        if len(f) < 7 or not f[0].endswith(":"):
-            raise ValueError(f"unreadable /proc/net/unix line {line!r}")
-        flags, kind = int(f[3], 16), int(f[4], 16)
-        if len(f) == 7 or f[7].startswith("@"):   # unnamed, or abstract (the network namespace cuts those)
-            continue
-        if not f[7].startswith("/"):
-            raise ValueError(f"unreadable /proc/net/unix line {line!r}")
-        if flags & _SO_ACCEPTCON or kind == _SOCK_DGRAM:
-            out.add(f[7])
-    return out
-
-
-def _proc_hidepid() -> str | None:
-    """The ``hidepid`` option /proc is mounted with here, when it hides other users' processes."""
-    for line in Path(_PROC, "self", "mountinfo").read_text().splitlines():
-        pre, _, post = line.partition(" - ")
-        fields = pre.split()
-        if len(fields) > 4 and fields[4] == "/proc":
-            opts = post.split()[2] if len(post.split()) > 2 else ""
-            for o in opts.split(","):
-                if o.startswith("hidepid=") and o.split("=", 1)[1] not in ("0", "off"):
-                    return o
-    return None
-
-
-def _hands_listener_problem(policy: CrownJewelsPolicy, hands: HandsIdentity) -> str | None:
-    """A pathname unix socket outside every hidden root that the hands user may connect to, named with
-    the remedy; None when there is none. Sockets in a relay directory under the hands user's own home
-    are its own shells' relays and are left out."""
+def _hands_listener_problem(hands: HandsIdentity) -> str | None:
+    """A unix socket or FIFO in the read-only host trees of a hands view that the hands user may write,
+    named with the remedy; None when there is none. Asked of the kernel as the hands user inside the
+    view with none of the floor's masks (they only hide; so this sees at least what bash will), by
+    ``find -writable``, which is access(2): modes, ACLs and every ancestor's search bit."""
     from levain.launch import child_env
 
-    try:
-        hide = _proc_hidepid()
-        if hide is not None:
-            return (f"/proc is mounted with {hide}, so levain cannot list the unix sockets bound in other "
-                    "network namespaces before bash runs as the entity's own user; remount /proc without it")
-        paths = _unix_socket_paths(Path(_PROC, "net", "unix").read_text())
-        seen: set[str] = set()
-        for pid in os.listdir(_PROC):
-            if not pid.isdigit():
-                continue
-            try:
-                text = Path(_PROC, pid, "net", "unix").read_text()
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
-                continue   # gone, or not ours to read
-            if text in seen:
-                continue
-            seen.add(text)
-            paths |= _unix_socket_paths(text)
-    except (OSError, ValueError) as exc:
-        return f"levain could not list the host's unix sockets ({exc})"
-    ro, rw = _hands_hidden_roots(policy)
-    roots = [r.rstrip("/") for r in (*ro, *rw)]
-    home = os.path.realpath(hands.home)
-    left: list[str] = []
-    for p in sorted(paths):
-        d = os.path.realpath(os.path.dirname(p))
-        q = os.path.join(d, os.path.basename(p))
-        if any(q == r or q.startswith(r + "/") for r in roots):
-            continue
-        if os.path.dirname(d) == home and os.path.basename(d).startswith(_HANDS_RELAY_PREFIX):
-            continue
-        left.append(p)
-    open_: list[str] = []
-    for i in range(0, len(left), _HANDS_WRITABLE_CHUNK):
-        chunk = left[i:i + _HANDS_WRITABLE_CHUNK]
-        argv = [*hands_prefix(hands), "/bin/sh", "-c", _HANDS_WRITABLE, "sh", *chunk]
-        try:
-            r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(),
-                               timeout=30)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return f"levain could not check, as {hands.user}, which unix sockets it may reach ({exc})"
-        if r.returncode != 0:
-            said = r.stderr.decode("utf-8", "replace").strip()
-            return (f"levain could not check, as {hands.user}, which unix sockets it may reach "
-                    f"({said.splitlines()[-1] if said else f'status {r.returncode}'})")
-        open_ += [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
-    if not open_:
+    ro, _ = _hands_view_trees(hands)
+    if not ro:
         return None
-    more = f" and {len(open_) - 3} more" if len(open_) > 3 else ""
-    return (f"{hands.user} may connect to the unix socket{'s' if len(open_) > 1 else ''} "
-            f"{', '.join(open_[:3])}{more}, outside what bash run as it never sees: tighten its mode so the "
-            "entity's user cannot write it, or move it under /run")
+    argv = [*hands_prefix(hands), *_hands_bwrap_argv([BWRAP], hands), _HANDS_FIND, *ro, "(", "-type", "s", "-o", "-type", "p", ")",
+            "-writable", "-print0"]
+    try:
+        r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(),
+                           timeout=_HANDS_WALK_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"levain could not walk, as {hands.user}, the host files its bash would see ({exc})"
+    found = [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
+    said = [x for x in r.stderr.decode("utf-8", "replace").splitlines() if x.strip()]
+    # find exits 1 when a directory cannot be listed and walks the rest. Only that is let through: a
+    # directory the hands user cannot list is one it cannot look up names in by listing, and anything
+    # else (bwrap or find failing to start) refuses.
+    unlisted = [x for x in said if x.startswith(f"{_HANDS_FIND}: ") and x.endswith(": Permission denied")]
+    if r.returncode != 0 and (not said or len(unlisted) != len(said)):
+        return (f"levain could not walk, as {hands.user}, the host files its bash would see "
+                f"({said[-1] if said else f'status {r.returncode}'})")
+    if not found:
+        return None
+    more = f" and {len(found) - 3} more" if len(found) > 3 else ""
+    return (f"{hands.user} may write to the socket or FIFO{'s' if len(found) > 1 else ''} "
+            f"{', '.join(found[:3])}{more}, which bash run as it sees: tighten its mode so the entity's "
+            "user cannot write it")
 
 
 def _hands_launch_problem(hands: HandsIdentity) -> str | None:
@@ -7250,7 +7181,7 @@ class BwrapProvider(ConfinementProvider):
         if hands is not None:
             # The bookkeeping (placeholders, manifest, the per-command recheck) stays the operator
             # floor's, computed above from its plan; only what bwrap executes changes.
-            argv = _hands_bwrap_argv(argv, *_hands_hidden_roots(policy))
+            argv = _hands_bwrap_argv(argv, hands)
         # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
         # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
         # `--as-pid-1`: bash itself is pid 1 of the namespace and the bwrap process levain waits on
@@ -7296,6 +7227,10 @@ class BwrapProvider(ConfinementProvider):
                 f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
                 "— refusing to grant bash hands (fail-closed). Try again."
             )
+        if hands is not None:
+            # Only what the hands view shows is watched: a jewel outside it (the operator editing
+            # ~/.ssh/config, say) is absent from bash's view and must not close the shell.
+            manifest = {q: v for q, v in manifest.items() if _in_hands_view(q, hands)}
         return argv, create_first, mounted, unmounted, manifest
 
     def render_profile(self, policy: CrownJewelsPolicy) -> str:
@@ -7326,7 +7261,7 @@ class BwrapProvider(ConfinementProvider):
         if hands is not None:
             _require_hands_python()
             _require_hands_sudo(hands)
-            problem = _hands_launch_problem(hands) or _hands_listener_problem(policy, hands)
+            problem = _hands_launch_problem(hands) or _hands_listener_problem(hands)
             if problem is not None:
                 raise ConfinementError(f"{problem} — refusing to run bash as the entity's own user, or as "
                                        "you instead (fail-closed).")
@@ -7399,7 +7334,11 @@ class BwrapProvider(ConfinementProvider):
             argv = [*hands_prefix(hands), *argv]
             shell_env = _hands_env(hands)
         shell = _BwrapShell(
-            policy=policy,
+            # The per-command SQLite check, like the manifest, covers only jewels in the hands view.
+            policy=policy if hands is None else replace(
+                policy,
+                deny_read_write=tuple(p for p in policy.deny_read_write if _in_hands_view(p, hands)),
+                deny_files=tuple(p for p in policy.deny_files if _in_hands_view(p, hands))),
             manifest=manifest,
             argv=argv,
             cwd=policy.workspace,

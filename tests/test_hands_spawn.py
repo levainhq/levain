@@ -243,31 +243,31 @@ def _plan_like_the_vm(home: str, entity: str) -> list[str]:
             "--remount-ro", home]
 
 
-def test_the_hands_argv_hides_the_operators_home_and_the_daemon_dirs_and_drops_what_is_under_them():
-    """J1 RUN: the floor's argv as the hands user stops at its first jewel under the operator's home
-    (no search permission). The hands argv mounts nothing beneath a hidden root, hides each root whole
-    after every other op, and builds new user (no nesting), pid and network namespaces."""
+def _view_hands(monkeypatch) -> HandsIdentity:
+    monkeypatch.setattr(confinement, "_hands_view_trees",
+                        lambda h: (["/usr", "/etc", "/opt"], [str(h.workspace), h.home]))
+    monkeypatch.setattr(confinement, "_HANDS_VIEW_LINKS", ())
+    return HandsIdentity("hands", 988, "/var/lib/levain-hands/hands", Path("/var/lib/levain/hands/workspace"))
+
+
+def test_the_hands_argv_is_an_allowlisted_view_keeping_only_the_floors_ops_inside_it(monkeypatch):
+    """J1 RUN: the floor's argv as the hands user stops at its first jewel under the operator's home.
+    Phill's ruling (A): the hands view never binds the host root; it mounts only the view's trees, and of
+    the floor's plan keeps an op only when its target lies in a host tree of the view."""
+    hands = _view_hands(monkeypatch)
     home, entity = "/home/admin", "/home/admin/ent"
-    out = confinement._hands_bwrap_argv(_plan_like_the_vm(home, entity), [home],
-                                        ["/run", "/tmp", "/var/tmp", "/dev/shm"])
-    roots = [Path(r) for r in (home, "/run", "/tmp", "/var/tmp", "/dev/shm")]
-    # every root is a tmpfs, after every op that is not a root mount
-    first_root = min(i for i in range(len(out) - 1) if out[i] == "--tmpfs" and Path(out[i + 1]) in roots)
-    for i in range(first_root, len(out)):
-        if out[i] in ("--bind", "--ro-bind", "--ro-bind-try", "--symlink", "--dir"):
-            pytest.fail(f"{out[i]} after the hidden roots")
-    # nothing beneath a hidden root survives, except the roots' own tmpfs/remount
-    for i in range(1, first_root):
-        tok = out[i]
-        if tok.startswith("/") and tok != "/" and any(Path(tok) == r or Path(tok).is_relative_to(r) for r in roots):
-            pytest.fail(f"{tok} is under a hidden root and still in the argv")
-    assert ["--remount-ro", home] == out[-2:]
-    # --unshare-ipc: RUN 2026-10-09, a 0666 queue of another user was listed inside a hands bash without it.
+    plan = [*_plan_like_the_vm(home, entity), "--ro-bind", "/dev/null", "/etc/levain-jewel",
+            "--tmpfs", "/var/lib/levain/hands/workspace/.levain-mask"]
+    out = confinement._hands_bwrap_argv(plan, hands)
+    view = [confinement.BWRAP, *confinement._HANDS_VIEW_FLAGS,
+            "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc", "--ro-bind", "/opt", "/opt",
+            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/var/tmp", "--tmpfs", "/run",
+            "--bind", str(hands.workspace), str(hands.workspace), "--bind", hands.home, hands.home]
+    assert out == [*view, "--ro-bind", "/dev/null", "/etc/levain-jewel",
+                   "--tmpfs", "/var/lib/levain/hands/workspace/.levain-mask"]
     for flag in ("--unshare-user", "--disable-userns", "--unshare-ipc", "--unshare-net", "--unshare-pid",
                  "--unshare-cgroup"):
         assert flag in out
-    assert ["--bind", "/", "/"] == out[out.index("--bind"):out.index("--bind") + 3]
-    assert ["--bind", "/home", "/home"] == out[out.index("/home") - 1:out.index("/home") + 2]
 
 
 def test_on_linux_every_hands_process_starts_through_the_keyring_join(tmp_path):
@@ -297,17 +297,9 @@ def test_the_keyring_join_leaves_the_callers_session_keyring_behind():
     assert own.stdout != joined.stdout
 
 
-def test_the_hands_argv_refuses_an_op_it_does_not_know():
+def test_the_hands_argv_refuses_an_op_it_does_not_know(monkeypatch):
     with pytest.raises(ConfinementError, match="does not know how to place"):
-        confinement._hands_bwrap_argv([confinement.BWRAP, "--overlay-src", "/x"], ["/home/a"], [])
-
-
-def test_a_hands_workspace_inside_a_hidden_root_is_refused(tmp_path, monkeypatch):
-    monkeypatch.setattr(confinement.Path, "home", classmethod(lambda cls: tmp_path))
-    ent = _entity(tmp_path)
-    pol = build_policy(ent, workspace=tmp_path / "ws")
-    with pytest.raises(ConfinementError, match="never sees"):
-        confinement._hands_hidden_roots(pol)
+        confinement._hands_bwrap_argv([confinement.BWRAP, "--overlay-src", "/x"], _view_hands(monkeypatch))
 
 
 def test_a_provider_without_hands_support_refuses_rather_than_running_as_the_operator(tmp_path):
@@ -718,50 +710,33 @@ def test_the_sweep_leaves_macos_per_user_agents_and_counts_only_the_entitys(monk
 # --- the Linux hands launch: listener sweep, editor, proxy relays ---------------------------------
 
 
-_UNIX_HEADER = "Num       RefCount Protocol Flags    Type St Inode Path\n"
-
-
-def _unix_line(path: str, flags: str = "00010000", kind: str = "0001") -> str:
-    return f"0000000000000000: 00000002 00000000 {flags} {kind} 01 4242 {path}\n".replace(" \n", "\n")
-
-
-def test_the_sweep_refuses_a_connectable_listener_outside_the_hidden_roots(tmp_path, monkeypatch):
-    """J5 RUN: a 0777 listener in /var/lib/s2probe was reached from inside the hands launch; J6: the
-    new network namespace lists none of the host's sockets, so the sweep reads the host's and every
-    readable pid's table (one bound in another namespace) and asks, as the hands user, which it may
-    reach. Hidden roots, the hands user's own relays, abstract and unnamed sockets, and a connected
-    (not listening) stream socket are never asked about."""
-    hands = _hands(tmp_path)
-    home = os.path.realpath(hands.home)
-    proc = tmp_path / "proc"
-    (proc / "self").mkdir(parents=True)
-    (proc / "self" / "mountinfo").write_text("22 1 0:5 / /proc rw,nosuid shared:13 - proc proc rw\n")
-    (proc / "net").mkdir()
-    (proc / "net" / "unix").write_text(
-        _UNIX_HEADER + _unix_line("/var/lib/s2probe/sock") + _unix_line("/run/user/1000/bus")
-        + _unix_line("@/tmp/.X11-unix/X0") + _unix_line("") + _unix_line("/var/lib/connected", flags="00000000")
-        + _unix_line(f"{home}/.levain-relay-0123/18080.sock"))
-    (proc / "4242" / "net").mkdir(parents=True)
-    (proc / "4242" / "net" / "unix").write_text(_UNIX_HEADER + _unix_line("/srv/other-ns.sock", kind="0002"))
-    monkeypatch.setattr(confinement, "_PROC", str(proc))
-    monkeypatch.setattr(confinement, "_hands_hidden_roots", lambda policy: ([str(Path.home())], ["/run", "/tmp"]))
-    asked: list[list[str]] = []
-    writable: set[str] = {"/var/lib/s2probe/sock"}
+def test_the_walk_asks_as_the_hands_user_inside_its_view_and_refuses_what_it_may_write(monkeypatch):
+    """J5 RUN: a 0777 listener in /var/lib/s2probe was reached from inside the default-allow hands launch.
+    Under the view /var/lib is absent; what is left to ask is the view's read-only host trees, as the
+    hands user, inside the view. find's exit 1 for a directory it cannot list passes; any other failure
+    refuses."""
+    hands = _view_hands(monkeypatch)
+    out: dict[str, object] = {"stdout": b"/etc/s2probe/sock\0", "stderr": b"", "rc": 0}
+    seen: list[list[str]] = []
 
     def as_hands(argv, **kw):
-        assert argv[:4] == [confinement.SUDO, "-n", "-u", "nobody"] and argv[argv.index("/bin/sh") + 3] == "sh"
-        paths = argv[argv.index("/bin/sh") + 4:]
-        asked.append(paths)
-        return subprocess.CompletedProcess(argv, 0, b"".join(p.encode() + b"\0" for p in paths if p in writable), b"")
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, out["rc"], out["stdout"], out["stderr"])
 
     monkeypatch.setattr(confinement.subprocess, "run", as_hands)
-    policy = build_policy(_entity(tmp_path), workspace=hands.workspace)
-    said = confinement._hands_listener_problem(policy, hands)
-    assert asked == [["/srv/other-ns.sock", "/var/lib/s2probe/sock"]]
-    assert said is not None and "/var/lib/s2probe/sock" in said and "/srv" not in said
-    assert "tighten its mode" in said and "move it under /run" in said
-    writable.clear()
-    assert confinement._hands_listener_problem(policy, hands) is None
+    said = confinement._hands_listener_problem(hands)
+    argv = seen[-1]
+    assert argv[:4] == [confinement.SUDO, "-n", "-u", "hands"]
+    b = argv.index(confinement.BWRAP)
+    f = argv.index(confinement._HANDS_FIND)
+    assert argv[b:f] == confinement._hands_bwrap_argv([confinement.BWRAP], hands)
+    assert argv[f + 1:f + 4] == ["/usr", "/etc", "/opt"] and argv[-2:] == ["-writable", "-print0"]
+    assert said is not None and "/etc/s2probe/sock" in said and "tighten its mode" in said
+    out.update(stdout=b"", rc=1, stderr=b"/usr/bin/find: '/etc/ssl/private': Permission denied\n")
+    assert confinement._hands_listener_problem(hands) is None
+    out.update(stderr=b"bwrap: Can't mount proc on /newroot/proc: Operation not permitted\n")
+    said = confinement._hands_listener_problem(hands)
+    assert said is not None and "could not walk" in said and "Can't mount proc" in said
 
 
 def test_the_linux_editor_refuses_by_name_without_zsh(tmp_path, monkeypatch):
