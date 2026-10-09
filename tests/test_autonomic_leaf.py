@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -96,7 +97,10 @@ def test_importing_the_package_loads_nothing_outside_it():
         "    __import__(m.name)\n"
         "print(json.dumps(sorted(set(sys.modules) - before)))\n"
     )
-    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    root = PKG.parents[1]   # the checkout under test, never another installed levain (codex r11)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(root), os.environ.get("PYTHONPATH")]))}
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True,
+                         cwd=root, env=env)
     loaded = json.loads(out.stdout)
     assert sum(n.startswith("levain.autonomic.") for n in loaded) > 1
     stray = [n for n in loaded

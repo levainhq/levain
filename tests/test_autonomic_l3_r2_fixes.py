@@ -159,8 +159,10 @@ def test_a_child_forked_while_the_compose_lock_is_held_can_still_compose():
     import pytest
     if not hasattr(os, "fork"):
         pytest.skip("no fork on this platform")
+    root = Path(__file__).resolve().parents[1]
     probe = (
-        "import os, levain.autonomic.risk as r\n"
+        "import os, sys, levain.autonomic.risk as r\n"
+        f"assert r.__file__.startswith({str(root)!r}), r.__file__\n"
         "with r._COMPOSE_LOCK:\n"
         "    pid = os.fork()\n"
         "    if pid == 0:\n"
@@ -172,5 +174,7 @@ def test_a_child_forked_while_the_compose_lock_is_held_can_still_compose():
         "_, status = os.waitpid(pid, 0)\n"
         "raise SystemExit(os.waitstatus_to_exitcode(status))\n"
     )
-    done = subprocess.run([sys.executable, "-c", probe], timeout=30, capture_output=True, text=True)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(root), os.environ.get("PYTHONPATH")]))}
+    done = subprocess.run([sys.executable, "-c", probe], timeout=30, capture_output=True, text=True,
+                          cwd=root, env=env)   # codex r11: the checkout under test, never another install
     assert done.returncode == 0, done.stderr
