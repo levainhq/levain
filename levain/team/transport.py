@@ -637,9 +637,10 @@ class GitLedger:
         anchor = (old.get("anchor") or None) if keep else None
         cand = T.Clone(pinned_root=found[name], anchor=anchor, accepted={k: int(v) for k, v in accepted.items()},
                        distrust=set(old.get("distrust") or []))
-        # the worktree lock (the one sync and every worktree writer take) is held from this validation through the
-        # worktree attach, so no sync or writer ever runs against a half-moved pin (code L3 r5 codex 1)
-        with self.lock():
+        # the net lock, then the worktree lock (sync's order), are held from this validation through the worktree
+        # attach: no sync or writer runs against a half-moved pin (code L3 r5 codex 1), and a sync reads the ledger it
+        # syncs only under net, so none keeps the pin it read before this move (seat ruling, r5 lane item 1)
+        with self.lock(name="net", timeout=150.0), self.lock():
             try:
                 d = T.derive(self.repo.toplevel, tip0, cand, S.SigCache(self.base / "sigcache.json"))
             except T.Unjudgeable as exc:
@@ -1139,8 +1140,7 @@ class GitLedger:
             if not gone and not foreign and \
                     git(["merge-base", "--is-ancestor", remote_tip, orig], self.wt, check=False).returncode == 0:
                 return     # own commits already on top of an unrewritten remote: nothing to replay
-            held = list(self.state().get("pending_ops") or [])
-            pending = list(held)
+            pending: list[dict] = []     # THIS call's new ops only: added to, and on failure removed from, the current list
             picks: list[str] = []
             for c in own:
                 touched = set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", c], self.wt).stdout.split())
@@ -1169,7 +1169,7 @@ class GitLedger:
                 for c in picks:
                     git(["update-ref", self._held_ref(root, c), c], self.wt)
                 picks = []
-            published = False
+            published = added = False
             try:
                 git(["checkout", "-q", "--detach", remote_tip], self.wt, timeout=timeout)
                 for c in picks:
@@ -1207,14 +1207,16 @@ class GitLedger:
                                     "if this clone's .git was copied from another, see `levain team join --new-device`")
                 new = git(["rev-parse", "HEAD"], self.wt).stdout.strip()
                 # the stripped ops are saved BEFORE the ref moves past their commits (code L3 r2 glm MED, complement
-                # LOW: a failure between the two lost them), and put back if the ref never moves
-                self.save_state(pending_ops=pending)
+                # LOW: a failure between the two lost them), and taken back out if the ref never moves
+                self._add_pending(pending)
+                added = True
                 git(["update-ref", "-m", "levain team: replay onto remote", self.ref, new, orig], self.wt)
                 published = True
                 git(["checkout", "-q", "-f", self.branch], self.wt, timeout=60)
             finally:
                 if not published:
-                    self.save_state(pending_ops=held)
+                    if added:
+                        self._drop_pending(pending)
                     try:
                         self._reattach()
                     except TeamError as exc:
@@ -1271,15 +1273,33 @@ class GitLedger:
     def _record_seen_sha(self, tip: str) -> None:
         git(["update-ref", f"refs/levain/seen/{self.branch}/{tip}", tip], self.repo.toplevel, check=False)
 
+    def _add_pending(self, added: list[dict]) -> None:
+        """Append ``added`` to the CURRENT pending ops, under the state lock (never a write of an earlier snapshot)."""
+        if added:
+            self.save_state(_mutate=lambda st: st.__setitem__("pending_ops", list(st.get("pending_ops") or []) + added))
+
+    def _drop_pending(self, consumed: list[dict]) -> None:
+        """Remove ``consumed``, one occurrence each, from the CURRENT pending ops under the state lock: an op another
+        operation queued meanwhile stays (seat ruling, r5 lane item 2: `_reland` wrote back its entry snapshot and
+        erased it; C's stale-write shape, code L3 r5)."""
+        if not consumed:
+            return
+
+        def drop(st: dict) -> None:
+            cur = list(st.get("pending_ops") or [])
+            for op in consumed:
+                if op in cur:
+                    cur.remove(op)
+            st["pending_ops"] = cur
+        self.save_state(_mutate=drop)
+
     def _reland(self) -> None:
         """Re-apply stripped team ops to the counted state at the new tip: net per field, history-keyed."""
         from . import tenure as T
         # bound to the genesis they were made on (code L3 r3 codex 3, RUN: after `join --root` to a re-genesis that
         # left cy out, an old-ledger `member add cy` re-landed there); the others stay kept, never applied here
         root = self.pinned_root     # read ONCE (code L3 r5 codex 1)
-        every = list(self.state().get("pending_ops") or [])
-        ops = [op for op in every if op.get("root") == root]
-        kept = [op for op in every if op.get("root") != root]
+        ops = [op for op in self.state().get("pending_ops") or [] if op.get("root") == root]
         if not ops:
             return
         try:
@@ -1310,7 +1330,7 @@ class GitLedger:
             elif f["old"] != f["new"]:
                 apply[k] = f["new"]
         if not apply:
-            self.save_state(pending_ops=kept)
+            self._drop_pending(ops)
             return
 
         def change(team: R.Team, ten) -> None:
@@ -1331,7 +1351,7 @@ class GitLedger:
             if "would not count" not in str(exc):
                 raise          # a signing failure keeps the ops for the next sync
             self.warnings.append(f"your offline team change(s) were NOT re-applied, none of them: {exc}")
-        self.save_state(pending_ops=kept)     # only after the re-land is committed or refused whole
+        self._drop_pending(ops)     # only after the re-land is committed or refused whole
         self._dcache = None
 
     def _reattach(self) -> None:
@@ -1353,12 +1373,17 @@ class GitLedger:
         Network I/O runs under a separate ``net`` lock, so a hook reading the worktree never waits on a
         slow remote: the worktree lock is held only for the local rebase and commits.
         """
-        remote = self.remote
-        if not remote:
+        if not self.remote:
             return "local only (no remote)"
-        rref = f"refs/remotes/{remote}/{self.branch}"
-        local = self.ref
         with self.lock(name="net", timeout=net_timeout):
+            # read only under net: every move of the pin (join, repin --root) holds net, so the ledger synced here is
+            # the one pinned for the whole sync (seat ruling on the r5 lane's stopped item 1: read before the lock, a
+            # `join --root` landing meanwhile synced the old ledger's remote into the new pin)
+            remote = self.remote
+            if not remote:
+                return "local only (no remote)"
+            rref = f"refs/remotes/{remote}/{self.branch}"
+            local = self.ref
             for attempt in range(_PUSH_RETRIES):
                 if not self._fetch(remote, rref, timeout):
                     published = bool(self.state().get("anchor")) or bool(git(

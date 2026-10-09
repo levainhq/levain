@@ -224,7 +224,10 @@ def cmd_repin(gl: GitLedger, args) -> int:
         sha = git(["rev-parse", "--verify", args.root + "^{commit}"], gl.repo.toplevel).stdout.strip()
         if git(["rev-list", "--parents", "-n", "1", sha], gl.repo.toplevel).stdout.split()[1:]:
             raise TeamError("a genesis has no parents; that commit does")
-        gl.save_state(pinned_root=sha, anchor=None, repin_n=int(gl.state().get("repin_n") or 0) + 1)
+        # a move of the pin: held under net, then the worktree lock, as `join` holds them (seat ruling, r5 lane item 1)
+        with gl.lock(name="net", timeout=150.0), gl.lock():
+            gl.save_state(_mutate=lambda st: st.update(pinned_root=sha, anchor=None,
+                                                        repin_n=int(st.get("repin_n") or 0) + 1))
         left = gl.other_genesis_items()
         if left:
             gl.warnings.append(left)
