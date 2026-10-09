@@ -432,6 +432,27 @@ class JobStore:
             return out
         return {"job_id": job_id, "status": "unknown"}
 
+    def list_recent(self, now: str, limit: int = 20) -> list[dict[str, Any]]:
+        """Recent jobs, newest first (the cockpit's job-list read). Fail-CLOSED like
+        :meth:`read_status`: a corrupt store raises :class:`JobStoreCorruptError`, and a
+        malformed record raises through ``JobRecord.from_dict``, never a silently short list.
+        A non-terminal record past its LEASE reads as ``failed`` ("interrupted"), the same
+        backstop the poll applies, without persisting. A MISSING file is ``[]``."""
+        records = self._read_strict()
+        out: list[dict[str, Any]] = []
+        for r in records:
+            try:
+                rec = JobRecord.from_dict(r)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise JobStoreCorruptError(f"malformed job record: {exc}") from exc
+            d = rec.to_dict()
+            if rec.status in _NON_TERMINAL and self._lease_expired(rec.created_at, now):
+                d["status"] = "failed"
+                d["error"] = rec.error or "interrupted"
+            out.append(d)
+        out.sort(key=lambda d: d["created_at"], reverse=True)
+        return out[:limit]
+
     def sweep(self, now: str) -> int:
         """Restart recovery: mark every non-terminal (``pending``/``running``) record ``failed``
         ("interrupted"). Run ONCE when the runtime is built — a fresh process has no live worker

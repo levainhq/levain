@@ -87,6 +87,11 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from levain.cockpit.engine import Cockpit
+from levain.cockpit.routes import CACHE_CONTROL as COCKPIT_CACHE_CONTROL
+from levain.cockpit.routes import VARY as COCKPIT_VARY
+from levain.cockpit.routes import handle_get as handle_cockpit_get
+from levain.cockpit.routes import is_cockpit_path
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.http_guards import GuardedHandler
@@ -272,6 +277,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/job.json",
     "/edit",
     "/action",
+    "/cockpit/manifest.json",
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 
 
@@ -582,6 +588,25 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # The chat host (K1 part 2): live entity conversations, driven by jobs. None unless the operator
     # passed `--chat`; then the /chat routes are served, and make_server keeps the bind loopback-only.
     chat_host: "ChatHost | None"
+    cockpit: "Cockpit | None" = None   # class defaults: server_close() runs even when the bind failed
+
+    _cockpit_lock = threading.Lock()
+
+    def get_cockpit(self) -> "Cockpit":
+        with self._cockpit_lock:
+            if self.cockpit is None:
+                from levain.cockpit.providers import build_default_cockpit
+
+                self.cockpit = build_default_cockpit(
+                    self.levain_source,
+                    job_store=self.job_runtime.store if self.job_runtime is not None else None)
+                self.cockpit.start()
+            return self.cockpit
+
+    def server_close(self) -> None:
+        if self.cockpit is not None:
+            self.cockpit.stop()
+        super().server_close()
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family instead of dumping a traceback.
@@ -639,6 +664,11 @@ class _Handler(GuardedHandler):
             supplied.encode("utf-8"), expected.encode("utf-8")
         )
 
+    def _cockpit(self) -> "Cockpit":
+        """The server's cockpit; the kernel's default over this substrate is built on first use
+        (a server nobody asks for a manifest never reads the substrate for one)."""
+        return self.server.get_cockpit()
+
     def _chat_token_valid(self) -> bool:
         """True iff the request carries this launch's chat token (constant-time compare). A server with
         no token, or an empty supplied one, fails closed."""
@@ -688,6 +718,29 @@ class _Handler(GuardedHandler):
                 status=403,
                 head=head,
             )
+            return
+
+        if is_cockpit_path(path):
+            # The shared cockpit's two read routes (levain.cockpit, design §3): they ride this same
+            # envelope, so the Host allowlist, cross-site refusal, the off-box token gate above and
+            # the concurrency gate all apply with no second path.
+            if not self.server.request_gate.acquire(blocking=False):
+                self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
+                return
+            try:
+                status, body, hdrs = handle_cockpit_get(
+                    self._cockpit(), self.path,
+                    token=self.headers.get(_WRITE_TOKEN_HEADER, ""),
+                    expected_token=self.server.write_token,
+                    if_none_match=self.headers.get("If-None-Match"),
+                )
+            except Exception as exc:  # noqa: BLE001 - never 500 with a dead connection
+                status, hdrs = 500, [("Vary", COCKPIT_VARY)]
+                body = json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8")
+            finally:
+                self.server.request_gate.release()
+            self._send(body, "application/json; charset=utf-8", status=status, head=head,
+                       headers=hdrs, cache_control=COCKPIT_CACHE_CONTROL)
             return
 
         if path == "/substrate.json":
@@ -1032,6 +1085,7 @@ def make_server(
     job_runtime: "JobRuntime | None" = None,
     chat_host: "ChatHost | None" = None,
     chat_token: str | None = None,
+    cockpit: "Cockpit | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1246,6 +1300,11 @@ def make_server(
     httpd.extra_verbs = extra_verbs
     httpd.job_runtime = job_runtime
     httpd.chat_host = chat_host
+    # The shared cockpit (levain.cockpit). A downstream passes its own (the kernel's providers plus
+    # its panels); None means the kernel's default over this substrate, built on first request.
+    # Its start() (refresher threads) is the caller's when it passes its own.
+    httpd.cockpit = cockpit
+    httpd._cockpit_lock = threading.Lock()
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
