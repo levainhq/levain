@@ -50,6 +50,8 @@ def _etag_header(etag: str, variant: list[Any]) -> str:
 def _matches(if_none_match: str | None, etag: str) -> bool:
     if not if_none_match:
         return False
+    if if_none_match.strip() == "*":
+        return True
     return any(t.strip().removeprefix("W/") == etag.removeprefix("W/") for t in if_none_match.split(","))
 
 
