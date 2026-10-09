@@ -2493,7 +2493,7 @@ def _hands_env(hands: HandsIdentity) -> dict[str, str]:
 #:    keyctl syscall number is the architecture's; one not listed refuses.
 #: 2. It forks a watcher holding pidfds on levain and on itself (the command, once exec'd): when levain
 #:    exits first, the command's other children get SIGKILL (bwrap's: the namespace's pid 1), then the
-#:    command SIGTERM, then SIGKILL. RUN 2026-10-09 with levain SIGKILLed mid-command: as hands, bwrap's
+#:    command SIGTERM, then SIGKILL; for a hands process, then every process of the hands user. RUN 2026-10-09 with levain SIGKILLed mid-command: as hands, bwrap's
 #:    ``--die-with-parent`` binds to sudo, which outlives levain, and the command's bash, a ``setsid``
 #:    child and both relays kept running; as the operator, bwrap died with levain but a ``setsid``
 #:    child and the command's own child of bash (the namespace's pid 1) kept running. A pidfd signal cannot reach a reused pid, and
@@ -2533,6 +2533,8 @@ except OSError as e:
 if up != watch:
     sys.stderr.write("levain: levain (pid %d) is gone; not starting\n" % watch)
     os._exit(126)
+# Run as another user than levain: a hands process. Its whole user is ended once levain is gone.
+other = os.getuid() != os.stat("/proc/%d" % watch).st_uid
 mine = os.pidfd_open(me)
 if os.fork() == 0:
     n = os.open(os.devnull, os.O_RDWR)
@@ -2575,6 +2577,15 @@ if os.fork() == 0:
             break
         if wait and select.select([mine], [], [], wait)[0]:
             break
+    if other:
+        # With levain gone its session is over, and only one session holds the hands user: everything
+        # of that user goes, grandchildren included (a git's ssh), once every watcher has had its own
+        # SIGTERM turn above (2 s), so a relay can still tidy its directory (codex L3 r1).
+        time.sleep(3)
+        try:
+            os.kill(-1, signal.SIGKILL)
+        except OSError:
+            pass
     os._exit(0)
 os.close(held)
 os.close(mine)
@@ -4113,8 +4124,8 @@ def _stop_hands_group(hands: HandsIdentity, proc: subprocess.Popen[bytes]) -> bo
     return _group_gone(proc.pid, timeout=5.0) and proc.poll() is not None
 
 
-def _run_hands_helper(argv: list[str], hands: HandsIdentity, data: bytes,
-                      timeout: float) -> subprocess.CompletedProcess[bytes]:
+def _run_hands_helper(argv: list[str], hands: HandsIdentity, data: bytes, timeout: float,
+                      what: str = "the editor's file operation") -> subprocess.CompletedProcess[bytes]:
     """Run the helper in a new session (no controlling terminal) and, on a timeout or any error,
     kill its WHOLE group, not only sudo: ``subprocess.run`` kills just the child it started (S2 L3 r1,
     codex + glm)."""
@@ -4126,7 +4137,7 @@ def _run_hands_helper(argv: list[str], hands: HandsIdentity, data: bytes,
         out, err = proc.communicate(data, timeout=timeout)
     except subprocess.TimeoutExpired:
         gone = _stop_hands_group(hands, proc)
-        raise OSError(f"the editor's file operation as {hands.user} timed out"
+        raise OSError(f"{what} as {hands.user} timed out"
                       + ("" if gone else f"; its process group {proc.pid} could not be stopped")) from None
     except BaseException:
         _stop_hands_group(hands, proc)
@@ -6592,15 +6603,13 @@ def _hands_ns_problem(hands: HandsIdentity, timeout: float = 30.0) -> str | None
     """Can bwrap build a hands launch's namespaces AS the hands user here? None when it can, else what
     it said. Ubuntu 23.10+ with ``kernel.apparmor_restrict_unprivileged_userns=1`` refuses it until the
     bwrap-userns-restrict profile is installed (RUN 2026-10-09)."""
-    from levain.launch import child_env
 
     argv = [*hands_prefix(hands), BWRAP, "--unshare-user", "--disable-userns", "--unshare-ipc", "--unshare-net",
             "--unshare-pid", "--die-with-parent", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
             "/bin/true"]
     try:
-        r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(),
-                           timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        r = _run_hands_helper(argv, hands, b"", timeout, "the namespace probe")
+    except OSError as exc:
         return f"bwrap could not be run as {hands.user} ({exc})"
     if r.returncode == 0:
         return None
@@ -6754,7 +6763,11 @@ if mode == "out":
         listeners = []
         want = ports(sys.argv[3:])
         os.mkdir(d, 0o700)
-        mine.append(os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+        try:
+            mine.append(os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+        except OSError:
+            os.rmdir(d)
+            raise
         for port in want:
             p = os.path.join(d, "%d.sock" % port)
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -6823,9 +6836,10 @@ class _HandsRelay:
 
     def stop(self) -> bool:
         """SIGTERM as the hands user first, so the relay removes its sockets and directory; then the
-        whole group killed and sudo reaped. True once nothing of it is left."""
-        if self._gone is not None:
-            return self._gone
+        whole group killed and sudo reaped. True once nothing of it is left; a stop that left something
+        is tried again by the next call (codex L3 r1)."""
+        if self._gone:
+            return True
         _hands_signal(self.hands, self.proc.pid, signal.SIGTERM)
         try:
             self.proc.wait(timeout=2)
@@ -6880,6 +6894,10 @@ def _start_hands_relay(hands: HandsIdentity, sockdir: str) -> _HandsRelay:
     except BaseException:
         relay.stop()
         raise
+    finally:
+        for f in (proc.stdout, proc.stderr):
+            if f is not None:
+                f.close()
 
 
 # --- pathname listeners (criterion 2) -------------------------------------------------------------
@@ -6899,7 +6917,6 @@ def _hands_listener_problem(hands: HandsIdentity) -> str | None:
     named with the remedy; None when there is none. Asked of the kernel as the hands user inside the
     view with none of the floor's masks (they only hide; so this sees at least what bash will), by
     ``find -writable``, which is access(2): modes, ACLs and every ancestor's search bit."""
-    from levain.launch import child_env
 
     ro, _ = _hands_view_trees(hands)
     if not ro:
@@ -6910,9 +6927,8 @@ def _hands_listener_problem(hands: HandsIdentity) -> str | None:
     # The whole OR in one pair of parentheses: -print0 binds by -a, tighter than -o, so without it only
     # the last branch printed (RUN 2026-10-09: a 0777 socket under /opt walked as None).
     try:
-        r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(),
-                           timeout=_HANDS_WALK_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        r = _run_hands_helper(argv, hands, b"", _HANDS_WALK_TIMEOUT, "the walk")
+    except OSError as exc:
         return f"levain could not walk, as {hands.user}, the host files its bash would see ({exc})"
     found = [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
     said = [x for x in r.stderr.decode("utf-8", "replace").splitlines() if x.strip()]
@@ -7206,21 +7222,24 @@ class _BwrapShell(SandboxedShell):
         if self._hands is not None:
             self._repair_masks()
 
+    @property
+    def hands_user(self) -> str | None:
+        # So teardown counts a hands shell's unemptied groups as that user's (codex L3 r1).
+        return self._hands.user if self._hands is not None else None
+
     def _repair_masks(self) -> None:
         """A hands command's chmod 600, or a file it created 0600, leaves an ACL mask of --- that hides
         the file from the operator (RUN in a VM 2026-10-09); restore it on what changed since the
         command started. A failure is logged, not raised: the command already ran."""
         from levain.firing.ws_git import mask_repair_argv
-        from levain.launch import child_env
 
         argv = mask_repair_argv(self._hands, since=self._command_since - 2)   # type: ignore[arg-type]
         try:
-            r = subprocess.run(argv, capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(),
-                               timeout=60)
+            r = _run_hands_helper(argv, self._hands, b"", 60, "restoring your read access")
             if r.returncode != 0:
                 _log.warning("restoring your read access to files the entity's command changed failed: %s",
                              r.stderr.decode("utf-8", "replace").strip()[-300:])
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except OSError as exc:
             _log.warning("restoring your read access to files the entity's command changed failed: %s", exc)
 
     def _recheck(self) -> None:

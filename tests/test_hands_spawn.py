@@ -279,7 +279,7 @@ def test_on_linux_every_hands_process_starts_through_the_keyring_join(tmp_path):
 
 _SESSION_KEYRING_ID = ("import ctypes, os; nr = {'x86_64': 250, 'aarch64': 219}[os.uname().machine]; "
                        "libc = ctypes.CDLL(None); libc.syscall.restype = ctypes.c_long; "
-                       "print(libc.syscall(ctypes.c_long(nr), ctypes.c_long(0), ctypes.c_long(-3), ctypes.c_long(0)))")
+                       "print(libc.syscall(ctypes.c_long(nr), ctypes.c_long(0), ctypes.c_long(-3), ctypes.c_long(1)))")
 
 
 @pytest.mark.skipif(platform.system() != "Linux" or platform.machine() not in ("x86_64", "aarch64"),
@@ -751,11 +751,11 @@ def test_the_walk_asks_as_the_hands_user_inside_its_view_and_refuses_what_it_may
     out: dict[str, object] = {"stdout": b"/etc/s2probe/sock\0", "stderr": b"", "rc": 0}
     seen: list[list[str]] = []
 
-    def as_hands(argv, **kw):
+    def as_hands(argv, h, data, timeout, what=""):
         seen.append(argv)
         return subprocess.CompletedProcess(argv, out["rc"], out["stdout"], out["stderr"])
 
-    monkeypatch.setattr(confinement.subprocess, "run", as_hands)
+    monkeypatch.setattr(confinement, "_run_hands_helper", as_hands)
     said = confinement._hands_listener_problem(hands)
     argv = seen[-1]
     assert argv[:4] == [confinement.SUDO, "-n", "-u", "hands"]
