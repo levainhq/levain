@@ -67,6 +67,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "last_seen": ("timestamp|null", _opt(_is_str)),
     "source": ("str", _is_str),
     "episode_type": ("str", _is_str),
+    "agent": ("str", _is_str),          # who wrote an episode: the entity itself or a federated feed
     "edit_kind": ("str", _is_str),
     "at": ("timestamp", _is_str),
     "repo": ("str", _is_str),
@@ -202,6 +203,12 @@ def _time_desc_key(row: RowIn, today: date) -> tuple:
     return (tuple(-ord(c) for c in at), row.id)
 
 
+def _age_key(row: RowIn, today: date) -> tuple:
+    # oldest first; a row with no known age goes last
+    v = row.facets.get("age_days")
+    return (0, -v, row.id) if _is_int(v) else (1, 0, row.id)
+
+
 def _decision_key(row: RowIn, today: date) -> tuple:
     d = parse_date(row.facets.get("due"))
     return (0 if d else 1, d.toordinal() if d else 0, row.id)
@@ -250,6 +257,7 @@ register_ordering(
 )
 register_ordering(Ordering("spore.loops", _loops_key), builtin=True)
 register_ordering(Ordering("spore.keep", _keep_key), builtin=True)
+register_ordering(Ordering("spore.age", _age_key), builtin=True)   # the Tray's "by age" view
 register_ordering(Ordering("time.desc", _time_desc_key), builtin=True)
 register_ordering(Ordering("decision.dated", _decision_key), builtin=True)
 register_ordering(Ordering("exposure.desc", _exposure_key), builtin=True)

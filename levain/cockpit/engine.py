@@ -32,6 +32,7 @@ import dataclasses
 import hashlib
 from collections import Counter
 import json
+import re
 import threading
 import time
 from concurrent.futures import Future
@@ -64,6 +65,8 @@ WRITE_READ_CAP = 32       # source reads made inside writes that may run at once
 WRITE_READ_CAP_PER_SOURCE = 4   # of those, reads of one source (a panel or a discoverer)
 POLICY_REVISION = 1  # hashed into the manifest etag; bumped when a tier or gesture policy changes
 NOW_ID = "now"
+# a triage-list view id: lower-case, and never "default" (the panel's own order is the default view)
+_VIEW_ID = re.compile(r"^(?!default$)[a-z0-9][a-z0-9_-]{0,31}$")
 VALUE_ABSENT = "absent"   # the value_version of a line/prose value with no stored record yet
 PROCESS_GRACE_S = 5.0     # how long a joiner waits for the owner to process a finished read
 _STATUS_RANK = {"ok": 0, "empty": 0, "partial": 1, "stale": 2, "error": 3}
@@ -120,6 +123,9 @@ class ProviderSpec:
     optional: bool = False
     timeout_s: float = 10.0
     order: str | None = None
+    # other server orders of the SAME rows, as ``(id, title, ordering)``: a triage-list's views. The
+    # panel sends each view's row order (``view_rows``) and a renderer switches by it, never sorting.
+    views: tuple[tuple[str, str, str], ...] = ()
     facets: frozenset[str] = frozenset()
     version_fields: tuple[str, ...] = ()      # ("*",) = every stored field is versioned
     version_excluded: tuple[str, ...] = ()    # stored fields named as NOT versioned (clock/derived)
@@ -352,8 +358,19 @@ class Cockpit:
                 raise CockpitRegistrationError(f"{sid}: a triage-list names a registered ordering, got {spec.order!r}")
             if not spec.version_fields:
                 raise CockpitRegistrationError(f"{sid}: a triage-list declares version_fields")
-        elif spec.order is not None:
-            raise CockpitRegistrationError(f"{sid}: only a triage-list has an ordering")
+            seen_views: set[str] = set()
+            for v in spec.views:
+                if not (isinstance(v, tuple) and len(v) == 3 and all(isinstance(x, str) for x in v)):
+                    raise CockpitRegistrationError(f"{sid}: a view is (id, title, ordering), got {v!r}")
+                vid, _title, vorder = v
+                if not _VIEW_ID.match(vid) or vid in seen_views:
+                    raise CockpitRegistrationError(f"{sid}: view id {vid!r} is malformed, reserved or repeated")
+                if vorder not in ORDERINGS or ORDERINGS[vorder].groups:
+                    # a grouped view would need its own groups and bands; none is wanted yet
+                    raise CockpitRegistrationError(f"{sid}: view {vid!r} names a registered ungrouped ordering")
+                seen_views.add(vid)
+        elif spec.order is not None or spec.views:
+            raise CockpitRegistrationError(f"{sid}: only a triage-list has an ordering or views")
         if spec.rowset is not None:
             owner = self._rowsets.get(spec.rowset)
             if owner is not None:
@@ -805,6 +822,7 @@ class Cockpit:
             "refresh_every_s": spec.refresh_every_s, "etag": self._etag_of(snap, groups, cred, today),
             "error": snap.error, "note": snap.note, "empty": spec.empty if snap.empty is None else snap.empty,
             "order": spec.order, "groups": groups,
+            "views": [{"id": i, "title": t, "order": o} for i, t, o in spec.views] or None,
             "search": ({"fields": list(spec.search_fields), "default_visible": spec.search_default_visible}
                        if spec.search_fields else None),
             "actions": (self._verb_view.panel_actions(spec.id, cred, today, snap.value_version)
@@ -1102,6 +1120,8 @@ class Cockpit:
                 out["rows"] = rows_all
             if matched is not None:
                 out["matched"] = matched
+            if spec is not None and spec.views and out["rows"] is not None:
+                out["view_rows"] = self._view_rows(spec, rows_all, ctx.today)
             if out["rows"] is not None and not out.get("rows_by_ref"):
                 out["rows"] = self._with_actions(out["rows"], panel_id, credential_class, ctx.today)
         else:
@@ -1114,6 +1134,13 @@ class Cockpit:
             else:
                 out["value"] = value
         return out
+
+    @staticmethod
+    def _view_rows(spec: ProviderSpec, rows: list[dict[str, Any]], today: date) -> dict[str, list[str]]:
+        """Each view's row ids in that view's order, over the rows this payload sends. The views'
+        orderings key on facets only, which every rendered row carries whole."""
+        ins = [RowIn(id=r["id"], title=r.get("title") or "", facets=r.get("facets") or {}) for r in rows]
+        return {vid: [row.id for row, _g in apply_ordering(vorder, ins, today)] for vid, _t, vorder in spec.views}
 
     def _with_actions(self, rows: list[dict[str, Any]], panel_id: str, cred: str, today: date) -> list[dict[str, Any]]:
         """Each row's actions, rendered for this credential (design §4.1: the row's own tier and

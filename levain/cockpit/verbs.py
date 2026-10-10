@@ -326,7 +326,10 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("episode_tombstone", "tombstone", "deletes an episode (memory's graduation evidence)", "row",
              floor="T2", tier_fn=_const("T2"), confirm_required=True, reversible=False,
              fire=_unbuilt_fire("episode_tombstone fires through the broker (K2b)"),
-             legacy_kind="episode_tombstone"),
+             legacy_kind="episode_tombstone",
+             # the entity's own episodes only: a federated feed's row (``feed:<name>:<id>``) is another
+             # writer's, and this store cannot tombstone it
+             applies_to=lambda r: str(r.get("id", "")).startswith("episode:")),
     VerbSpec("operator_state", "set state", "sets your freeform state line", "value",
              fields=("text",), floor="C1", tier_fn=_const("C1"), fire=_operator_state_fire,
              legacy_kind="operator_state"),

@@ -13,7 +13,7 @@ import os
 import re
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext, row_version_of
 from levain.cockpit.registry import parse_date
@@ -51,8 +51,15 @@ SPORE_VERSION_EXCLUDED = ("seen",)    # seen alone never stales a write (a touch
 SPORE_VERSION_FIELDS = tuple(f for f in SPORE_STORED if f not in SPORE_VERSION_EXCLUDED)
 SPORE_FACETS = frozenset({
     "disposition", "domain", "tier", "salience", "spore_type", "due", "overdue_days",
-    "handoff_expired", "last_seen",
+    "handoff_expired", "last_seen", "age_days",
 })
+# the Tray's second view (Phill 2026-10-10, "yes to all": "Tray by Age" is a view of the Tray box, not
+# a second box): the same rows, oldest first
+TRAY_VIEWS = (("age", "By age", "spore.age"),)
+EPISODE_FACETS = frozenset({"episode_type", "source", "at", "tags", "agent"})
+EPISODE_STORED = ("id", "timestamp", "type", "source", "content", "tags")
+# a federated episode feed's name: it is part of every row id the feed contributes
+FEED_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 
 def _store_label(db: Path) -> str:
@@ -94,6 +101,9 @@ def _spore_row(s: Any, today: date) -> RowIn:
     }
     if due:
         facets["overdue_days"] = max(0, (today - due).days)
+    created = parse_date(s.created)
+    if created and created <= today:
+        facets["age_days"] = (today - created).days
     return RowIn(id=f"spore:{s.id}", title=s.text, body=s.text, facets=facets, stored=spore_stored(s))
 
 
@@ -165,22 +175,80 @@ def _ts(v: Any) -> str:
     return str(v) if v is not None else ""
 
 
-def _episodes(source: SubstrateSource) -> Callable[[ReadContext], Result]:
+def _utc_at(v: Any) -> str:
+    """A feed's timestamp in anneal's own form (UTC, microseconds, ``Z``), so ``time.desc``, which
+    compares the strings, orders a feed's rows against the entity's. A timestamp with no zone, or one
+    that does not parse, is kept as given: there is nothing to convert it from."""
+    s = _ts(v)
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00") if s.endswith("Z") else s)
+    except ValueError:
+        return s
+    if d.tzinfo is None:
+        return s
+    return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _feed_rows(name: str, res: Result) -> tuple[list[RowIn], str | None, str | None]:
+    """One federated feed's rows, re-keyed under the feed (``feed:<name>:<id>``) so no feed row can be
+    taken for one of the entity's own episodes (the tombstone verb applies to ``episode:`` rows only).
+    Returns ``(rows, skipped reason, note)``: a feed that faults or breaks the episode row contract
+    contributes NO rows and is named, so the panel is ``partial``, never short and quiet."""
+    if isinstance(res, Absent):
+        return [], None, f"{name}: not configured: {res.reason}"
+    if isinstance(res, Fault):
+        return [], f"{name} unavailable: {res.message}", None
+    if not isinstance(res, Read) or res.rows is None:
+        return [], f"{name} unavailable: the feed returned no rows", None
+    out: list[RowIn] = []
+    for r in res.rows:
+        if not isinstance(r, RowIn):
+            return [], f"{name} unavailable: a row is a {type(r).__name__}, not a RowIn", None
+        extra = (set(r.facets) - EPISODE_FACETS) | (set(r.stored) - set(EPISODE_STORED))
+        if extra:
+            return [], f"{name} unavailable: fields {sorted(extra)} are not episode fields", None
+        facets = {**r.facets, "agent": r.facets.get("agent") or name}
+        if "at" in facets:
+            facets["at"] = _utc_at(facets["at"])
+        out.append(RowIn(id=f"feed:{name}:{r.id}", title=r.title, body=r.body, facets=facets,
+                         emphasis=r.emphasis, stored=dict(r.stored)))
+    return out, None, None
+
+
+def _episodes(source: SubstrateSource,
+              feeds: Sequence[tuple[str, Callable[[ReadContext], Result]]] = ()) -> Callable[[ReadContext], Result]:
+    """The entity's own episodes (``agent`` = the entity's name), then each federated feed's. A feed
+    is read inside this panel's read, so its time counts against the panel's timeout."""
     def read(ctx: ReadContext) -> Result:
         view = _view(source, ctx)
         bad = _view_fault(view, "episodes")
         if bad:
             return bad
-        rows = tuple(
+        own = view.entity_name or "entity"
+        rows = [
             RowIn(
                 id=f"episode:{e.id}", title=e.content, body=e.content,
-                facets={"episode_type": e.type, "source": e.source, "at": _ts(e.timestamp), "tags": list(e.tags)},
+                facets={"episode_type": e.type, "source": e.source, "at": _ts(e.timestamp),
+                        "tags": list(e.tags), "agent": own},
                 stored={"id": e.id, "timestamp": e.timestamp, "type": e.type, "source": e.source,
                         "content": e.content, "tags": list(e.tags)},
             )
             for e in view.episodes
-        )
-        return Read(rows=rows)
+        ]
+        skipped: list[tuple[int, str]] = []
+        notes: list[str] = []
+        for name, feed in feeds:
+            try:
+                res = feed(ctx)
+            except Exception as exc:   # noqa: BLE001 -- one feed's fault names that feed, never blanks the panel
+                res = Fault(f"{type(exc).__name__}: {exc}")
+            got, why, note = _feed_rows(name, res)
+            rows.extend(got)
+            if why:
+                skipped.append((1, why))
+            if note:
+                notes.append(note)
+        return Read(rows=tuple(rows), skipped=tuple(skipped), note="; ".join(notes) or None)
     return read
 
 
@@ -438,10 +506,20 @@ def _scan_read_one(read: Callable[[ReadContext], Result]) -> Callable[[ReadConte
 
 
 def build_default_cockpit(
-    source: SubstrateSource, *, job_store: Any = None, clock: Callable[[], datetime] | None = None
+    source: SubstrateSource, *, job_store: Any = None, clock: Callable[[], datetime] | None = None,
+    episode_feeds: Mapping[str, Callable[[ReadContext], Result]] | None = None,
 ) -> Cockpit:
     """The kernel's own cockpit over one substrate: every panel the dashboard already shows,
-    as the five kinds (design §6.2). A downstream registers its own providers on the result."""
+    as the five kinds (design §6.2). A downstream registers its own providers on the result.
+
+    ``episode_feeds`` federates other writers' episodes into the Episodes panel (a constellation's
+    agents): ``{name: read}``, where ``read(ctx)`` returns a ``Read`` of ``RowIn`` rows using only the
+    episode facets and stored fields. Each row is shown under ``feed:<name>:<id>`` with ``agent`` set
+    (the feed's name when the row names none); the entity's own rows carry the entity's name."""
+    feeds = tuple((episode_feeds or {}).items())
+    for name, fn in feeds:
+        if not isinstance(name, str) or not FEED_NAME.match(name) or not callable(fn):
+            raise ValueError(f"episode feed {name!r}: a name matching {FEED_NAME.pattern} and a callable")
 
     def entity(ctx: ReadContext) -> dict[str, Any]:
         v = _view(source, ctx)
@@ -461,21 +539,23 @@ def build_default_cockpit(
     ck.register(ProviderSpec("state", "line", "State", "gauge", _context_line(source),
                              region="header", rank=0, optional=True, empty="No state line.",
                              verbs=("operator_state",)))
-    for pid, title, bucket, prio, order, rank in (
-        ("tray", "Tray", "tray", "gate", "spore.tray", 0),
-        ("loops", "Open loops", "loops", "feed", "spore.loops", 1),
-        ("keep", "Keep", "keep", "feed", "spore.keep", 2),
+    # Open loops leads the operate zone, then the Tray (Phill 2026-10-10, "yes to all")
+    for pid, title, bucket, prio, order, rank, views in (
+        ("loops", "Open loops", "loops", "feed", "spore.loops", 0, ()),
+        ("tray", "Tray", "tray", "gate", "spore.tray", 1, TRAY_VIEWS),
+        ("keep", "Keep", "keep", "feed", "spore.keep", 2, ()),
     ):
         ck.register(ProviderSpec(
             pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank,
-            order=order, rowset=f"spore:{bucket}", read_one=_spore_read_one(source, bucket),
+            order=order, views=views, rowset=f"spore:{bucket}", read_one=_spore_read_one(source, bucket),
             empty="Nothing waiting.", verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
             **spore_common))
     ck.register(ProviderSpec(
-        "episodes", "triage-list", "Recent episodes", "feed", _episodes(source), region="operate", rank=3,
+        "episodes", "triage-list", "Recent episodes", "feed", _episodes(source, feeds), region="operate", rank=3,
+        # a write's read: the entity's own rows only (a feed row is never a tombstone target)
         read_one=_scan_read_one(_episodes(source)), verbs=("episode_tombstone",),
-        order="time.desc", rowset="episodes", facets=frozenset({"episode_type", "source", "at", "tags"}),
-        version_fields=("id", "timestamp", "type", "source", "content", "tags"),
+        order="time.desc", rowset="episodes", facets=EPISODE_FACETS,
+        version_fields=EPISODE_STORED,
         search_fields=("title", "body", "source"), edit_class=CLASS_B, empty="No recent episodes."))
     ck.register(ProviderSpec(
         "edits", "triage-list", "Recent edits", "feed", _edits(source), region="operate", rank=4,
