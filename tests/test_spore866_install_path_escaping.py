@@ -7,7 +7,7 @@ doctor and verify read hook commands with shlex, which kept a backslash sh drops
 filled twice. L3 r2: one unreadable command hid the rest from `_names_install`; a `{{` in the
 anneal path read as "not substituted" in the hook. L3 r3: an argument merely naming the install
 counted as ownership, and an unreadable hooks.json was called another install's (the message now
-says it cannot tell).
+says it cannot tell). L3 r6: ownership is the exact scripts levain's own render runs.
 MUTATION (run 2026-10-10): with levain/install.py reverted to the raw substitution, both cases
 fail with the reproduced errors (`Unescaped '\\' in a string`, `Invalid \\escape`)."""
 
@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+import levain.install as levain_install
 from levain.install import SeedEntry, _names_install, apply_init
 from levain.verify import _python_from_hooks_config
 from tests.test_install import _templates_root
@@ -67,16 +68,19 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
         hooks = json.loads((codex_home / "hooks.json").read_text(encoding="utf-8"))
         commands = [ev[0]["hooks"][0]["command"] for ev in hooks["hooks"].values()]
         script_dir = f"{install}/activation/hooks/"
-        assert _names_install((codex_home / "hooks.json").read_text(encoding="utf-8"), install)
+        generated = (codex_home / "hooks.json").read_text(encoding="utf-8")
+        assert _names_install(generated, generated)
         # An unreadable foreign command ahead of levain's does not hide it.
         mixed = json.loads((codex_home / "hooks.json").read_text(encoding="utf-8"))
         mixed["hooks"]["SessionStart"].insert(0, {"hooks": [{"command": "echo it's"}]})
-        assert _names_install(json.dumps(mixed), install)
-        assert not _names_install(json.dumps(mixed), install.with_name(install.name + "2"))
+        assert _names_install(json.dumps(mixed), generated)
+        codex_root = Path(levain_install.__file__).parent / "templates" / "adapters" / "codex"
+        other = levain_install._codex_hooks_json(codex_root, python, install.with_name(install.name + "2"))
+        assert other != generated and not _names_install(json.dumps(mixed), other)
         foreign = {"hooks": {"SessionStart": [{"hooks": [{"command":
                    "/py /other/activation/hooks/session_start.py --log " + shlex.quote(f"{install}/x.log")}]}]}}
-        assert not _names_install(json.dumps(foreign), install)   # a mention is not ownership
-        assert not _names_install("{not json", install)
+        assert not _names_install(json.dumps(foreign), generated)   # a mention is not ownership
+        assert not _names_install("{not json", generated)
         hooks_config = codex_home / "hooks.json"
     else:
         server = json.loads((install / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["anneal_memory"]

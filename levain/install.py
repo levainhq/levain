@@ -2055,12 +2055,20 @@ def refresh_adapter(
                 out.review.append(str(hooks))
                 lines.append(f"  {hooks}: could not be read ({e}), so whether it is "
                              f"current, or this install's, cannot be told.")
-            if here is not None and here != want and not _names_install(here, install):
-                lines.append(f"  note: {hooks} does not name this install as levain writes it "
-                             f"(another install's, or not readable as levain's hooks), so "
-                             f"`levain update` left it alone: rewriting it repoints every codex "
-                             f"session. To point codex at this install, re-run `levain init "
-                             f"--adapter codex` from it.")
+            unreadable = False
+            if here is not None and here != want:
+                try:
+                    json.loads(here)
+                except (ValueError, RecursionError):
+                    unreadable = True
+            if unreadable:
+                out.review.append(str(hooks))
+                lines.append(f"  {hooks} is not valid JSON, so codex cannot read its hooks; "
+                             f"`levain update` left it alone, since whose it was cannot be told.")
+            elif here is not None and here != want and not _names_install(here, want):
+                lines.append(f"  note: {hooks} does not run this install's hooks as levain "
+                             f"writes them (another install's, or edited), so `levain update` "
+                             f"left it alone: rewriting it repoints every codex session.")
             elif here is not None:
                 files = {**files, hooks: want}
         _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines,
@@ -2131,20 +2139,15 @@ def _read_or_none(path: Path) -> str | None:
         raise _Unreadable(str(e)) from None
 
 
-def _names_install(text: str, install: Path) -> bool:
-    """Whether codex's hooks.json provably names THIS install: some hook command, decoded as
-    the shell, doctor and verify read it, runs a script levain generates there, a ``.py``
-    directly in ``<install>/activation/hooks/`` (normalised and case-folded as the platform
-    does, so ``/x/inst`` never claims ``/x/inst2`` and ``..`` cannot climb out; an argument
-    that merely mentions the install does not count; L2 HIGH, L3 r2-r3). Anything else is
-    False, and the caller says it cannot tell whose the file is rather than naming an owner:
-    a three-way answer was defeated by a new shape of unreadable input each round (L3 r3-r5),
-    so it was deleted (spore-813)."""
-    hooks_dir = os.path.normcase(os.path.join(os.path.abspath(str(install)), "activation", "hooks"))
+def _hook_scripts(text: str) -> set[str]:
+    """The script each hook command in a hooks.json runs, decoded as the shell, doctor and
+    verify read it (``shlex``; its second token), normalised and case-folded as the platform
+    does. A command that cannot be read is skipped; a file that cannot be read has none."""
     try:
         data = json.loads(text)
     except (ValueError, RecursionError):
-        return False
+        return set()
+    out: set[str] = set()
     hooks = data.get("hooks") if isinstance(data, dict) else None
     for entries in (hooks.values() if isinstance(hooks, dict) else ()):
         for entry in entries if isinstance(entries, list) else ():
@@ -2157,13 +2160,20 @@ def _names_install(text: str, install: Path) -> bool:
                     tokens = shlex.split(cmd, posix=os.name != "nt")
                 except ValueError:
                     continue
-                if len(tokens) < 2:
-                    continue
-                script = tokens[1].strip('"') if os.name == "nt" else tokens[1]
-                script = os.path.normcase(os.path.normpath(script))
-                if os.path.dirname(script) == hooks_dir and script.endswith(".py"):
-                    return True
-    return False
+                if len(tokens) >= 2:
+                    script = tokens[1].strip('"') if os.name == "nt" else tokens[1]
+                    out.add(os.path.normcase(os.path.normpath(script)))
+    return out
+
+
+def _names_install(here: str, want: str) -> bool:
+    """Whether codex's hooks.json (``here``) runs one of the exact scripts levain's own render
+    of it for this install (``want``) runs: derived from the writer, so ``/x/inst`` never
+    claims ``/x/inst2``, ``..`` cannot climb out, an argument that merely mentions the
+    install does not count, and neither does some other ``.py`` in its hooks directory
+    (L2 HIGH; L3 r2-r6). A three-way answer here was defeated by a new shape of unreadable
+    input each round and was deleted (spore-813); the caller checks readability itself."""
+    return bool(_hook_scripts(here) & _hook_scripts(want))
 
 def _refresh_decision(
     here: bytes | None, want: bytes, last: str | None, *, levain_code: bool,
