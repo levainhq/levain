@@ -6,6 +6,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-10-10
+
+The cockpit's read side: one manifest, the dashboard drawn from it, and a server's own panels in it.
+
 ### Changed
 
 - **The state line now reaches a running session when it changes, and lasts 12 hours.** Claude Code and Codex sessions read it on the next prompt after a change, once per change, not only at session start. It expires after 12 hours (was 8), everywhere it is shown.
@@ -17,6 +21,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Added
 
 - **`levain.cockpit`: one manifest and one panel route, read side only.** `GET /cockpit/manifest.json` lists every panel (kind, priority, status, count, freshness, ETag) and `GET /cockpit/panel/<id>.json` serves one panel's rows or value, in a `full` or `compact` profile, with `?q=` to search row bodies and `?row=<id>` for one row in full. The kernel orders the rows once (a registered ordering with groups, so the Tray's TODAY / OVERDUE / ALSO bands are part of the order), computes status from a typed provider result (`Read`, `Absent` or `Fault`, so only a confirmed read of zero rows says `empty`), and a failed or silent refresher reads as `error`, not as a frozen `ok`. Both routes ride the dashboard's existing read gate; the responses are `Cache-Control: private` with `Vary` on the token header, so a shared cache never serves one caller's manifest to another. The built-in panels cover everything the dashboard shows. Nothing here writes: verbs and tiers are the next slice. `JobStore.list_recent` is new beside it, and `scripts/cockpit_payload_diff.py` diffs a saved or live payload against the design's field map.
+
+- **The web dashboard can draw itself from the cockpit manifest: open it as `/?source=manifest`.** The same components render the kernel's panels, in the kernel's order and bands, with each panel's status and freshness. That view is read-only: edits, and the actions a server registers, stay on the plain URL, which is unchanged and still the default.
+- **A server's own panels (`make_server(extra_panels=...)`) appear in the manifest view.** Each becomes a manifest panel in its zone, under the id `ext:<id>`: lines become a list that keeps the server's order and its `meta` text, markdown becomes a prose panel, and a panel's note, empty text and error are shown once. The server's callable runs once per refresh however many panels read it, and a call that does not answer within 8 s shows as not answering instead of holding the page.
 
 ## [0.7.1] — 2026-10-10
 
