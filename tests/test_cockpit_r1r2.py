@@ -240,8 +240,7 @@ class TestManifestMapperAdversarial:
     def test_a_malformed_state_line_is_an_error_never_no_state_set(self) -> None:
         # the operator's own words: a panel with the wrong shape must not render as "no state set"
         for bad in ("abc", {}, [{"label": "state", "text": 5, "at": "2026-10-09T12:00:00+00:00"}],
-                    [{"label": "state", "text": "x", "at": 7}], [{"label": "state", "text": "x", "at": "not-a-date"}],
-                    [{"label": "state", "text": "x", "at": "2099-01-01T00:00:00+00:00"}]):
+                    [{"label": "state", "text": "x", "at": 7}]):
             ck = _tray_cockpit()
             ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c: Read(value={"lines": [
                 {"label": "state", "text": "x", "at": "2026-10-09T12:00:00+00:00", "source": "s"}]}), region="header"))
@@ -258,10 +257,22 @@ class TestManifestMapperAdversarial:
         view = _view(snap)
         assert view["state"] is None and "malformed" in view["errors"]["state"]
 
-    def test_the_state_skew_grace_matches_the_kernel(self) -> None:
-        from levain.dashboard import STATE_CLOCK_SKEW_SECONDS
-        js = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "web" / "cockpit_view.js").read_text()
-        assert f"const STATE_SKEW_MS = {STATE_CLOCK_SKEW_SECONDS * 1000};" in js
+    def test_a_stamp_this_clock_cannot_place_shows_the_words_with_no_age(self) -> None:
+        # the kernel owns parsing and expiry; a browser clock or date grammar that disagrees must not hide the line
+        for at in ("2026-10-10T12:00:00,5+00:00", "2099-01-01T00:00:00+00:00"):
+            ck = _tray_cockpit()
+            ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c, a=at: Read(value={"lines": [
+                {"label": "state", "text": "here", "at": a, "source": "cli"}]}), region="header"))
+            view = _view(self._snap(ck))
+            assert view["state"]["text"] == "here" and view["state"]["age_label"] == "", at
+
+    def test_a_null_state_value_is_no_state(self) -> None:
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c: Read(value={"lines": []}), region="header"))
+        snap = self._snap(ck)
+        snap["panels"]["state"]["value"] = None
+        view = _view(snap)
+        assert view["state"] == {"text": None} and "state" not in view["errors"]
 
     def test_an_unreadable_wraps_panel_is_an_error_not_a_never(self) -> None:
         ck = _tray_cockpit()
