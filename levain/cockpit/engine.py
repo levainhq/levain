@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+from collections import Counter
 import json
 import threading
 import time
@@ -918,17 +919,17 @@ class Cockpit:
                 errors.append({"source": f"discovery:{i}", "message": res.message})
                 continue
             returned: set[str] = set()
-            ids = [s.id for s in res.value]
+            ids = Counter(s.id for s in res.value)
             for spec in res.value:
                 if not isinstance(spec.id, str):
                     errors.append({"source": f"discovery:{i}", "message": "a discovered panel id must be a string"})
                     continue
-                if ids.count(spec.id) > 1:
+                if ids[spec.id] > 1:
                     # one id returned twice in one answer: neither copy is believed (a write asks the
                     # same question, offer_spec, and refuses too)
                     if spec.id not in returned:
                         errors.append({"source": f"discovery:{spec.id}",
-                                       "message": f"discoverer {i} returned this id {ids.count(spec.id)} times"})
+                                       "message": f"discoverer {i} returned this id {ids[spec.id]} times"})
                     returned.add(spec.id)
                     with self._lock:
                         if self._discovered.get(spec.id) == i and self._specs[spec.id].verbs:

@@ -690,6 +690,9 @@ def _read_state(context_json: Path | None, now: datetime) -> "State | None":
             from levain.cockpit.engine import VALUE_ABSENT   # lazy: the cockpit imports this module
             return State(text=None, set_at=None, source=None, version=VALUE_ABSENT)
         data = json.loads(context_json.read_text(encoding="utf-8"))
+    except FileNotFoundError:     # removed after the exists() check: as a missing file
+        from levain.cockpit.engine import VALUE_ABSENT
+        return State(text=None, set_at=None, source=None, version=VALUE_ABSENT)
     except (OSError, ValueError):
         return empty
     return state_from_data(data, now)
@@ -779,8 +782,8 @@ def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
     symlinked context file and its target share one lock, and the atomic ``os.replace`` of the file
     never swaps the locked inode). ``write_state`` takes it, so every writer that sets the line
     through it is serialised (the test names them). Where ``flock`` does not exist, an unchecked write runs unlocked
-    (last writer wins, as before) and a ``required`` one is refused; the same holds when the lock
-    file cannot be created."""
+    (last writer wins, as before) and a ``required`` one is refused. Where it does exist, a lock
+    that cannot be taken (the lock file, ``flock`` itself) refuses every write with ``OSError``."""
     try:
         import fcntl
     except ImportError:
@@ -789,14 +792,10 @@ def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
         yield
         return
     lock = os.path.realpath(context_json) + ".lock"
-    try:
-        os.makedirs(os.path.dirname(lock), exist_ok=True)
-        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
-    except OSError:
-        if required:
-            raise
-        yield            # an unchecked write that cannot make its lock file writes as before it existed
-        return
+    # where flock exists every writer takes the lock or does not write: one unlocked write could land
+    # between a checked writer's compare and its write and be overwritten unseen
+    os.makedirs(os.path.dirname(lock), exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
@@ -1969,7 +1968,7 @@ def run_state(
     if text is not None:
         try:
             write_state(context_json, text, source=source)
-        except ValueError as exc:
+        except (ValueError, OSError) as exc:
             print(f"state not set: {exc}", file=sys.stderr)
             return 2
         print(f"state set: {' '.join(text.split())}" if text.strip() else "state cleared")

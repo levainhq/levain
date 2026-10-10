@@ -667,7 +667,8 @@ def _cockpit(tmp_path):
     from levain.web_server import make_server
     install = tmp_path / "install"
     (install / ".levain").mkdir(parents=True)
-    httpd = make_server(install, port=0)
+    from levain.dashboard import SubstrateSource
+    httpd = make_server(SubstrateSource.local(install), port=0)   # a read-only source, as `levain serve` builds
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 

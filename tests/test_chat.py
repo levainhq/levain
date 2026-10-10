@@ -1679,6 +1679,7 @@ def test_serve_chat_opens_and_prints_the_link_with_the_token_in_the_fragment_onl
     class _Httpd:
         server_address = ("127.0.0.1", 7462)
         chat_token = "tok_-AZ09"
+        write_token = None          # K2a: a stand-in server holding no write token
 
         def serve_forever(self):
             raise KeyboardInterrupt
@@ -1708,6 +1709,7 @@ def test_serve_without_chat_opens_the_plain_url(tmp_path, monkeypatch, capsys):
 
     class _Httpd:
         server_address = ("127.0.0.1", 7463)
+        write_token = None
 
         def serve_forever(self):
             raise KeyboardInterrupt

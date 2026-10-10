@@ -6,6 +6,21 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+The cockpit's write side, part one (K2a). It ships in one release with K2b (the broker), which these notes will gain.
+
+### Changed
+
+- **Every write to the web cockpit needs the write token, on loopback too.** `levain serve --write` prints a token for this server run and a link that carries it (`#write_token=...` in the fragment, which the browser never sends anywhere); the page takes the token from the link and keeps it. A write with no token, or the wrong one, is refused `403 credential_required` before its body is read. Measured on Linux: another local user (`nobody`) posting to a `levain serve --write` on the same machine got 403 on the cockpit write route, on every `/edit` kind and on `/action`. A server given its own tokens (`make_server(surface_tokens=...)`, one per surface) refuses to start if two surfaces share one, or if a token is not printable ASCII without spaces.
+- **Writes go through one route, `POST /cockpit/verb`, and `/edit` and `/action` are aliases of it.** The kernel decides each write's tier from the stored row, never from the caller: a C1 write (touch, snooze, a retier that does not park, a resolve, your state line) fires; a write that needs your signature or your laptop (T2, T3) is refused "needs the broker" until K2b. A panel offers only its own verbs, and a write names the row version or value version it was shown: a row changed since, or a value changed since, is refused `409 stale`. For a spore, that compare runs inside anneal's own write transaction, so a change that lands between the server's read and the write is refused too.
+- **`/edit` bodies now bind to what was rendered.** An `operator_state` edit carries `panel_version` (the page sends the `version` its state line came with; the first line of a new install sends `"absent"`); a `spore_descend` carries the `expect_disposition` it was rendered with; an `/edit` on a spore that no Tray, Open loops or Keep panel shows is refused 409.
+- **The state line has one lock.** `levain state`, the TUI and the web cockpit take one lock on the context file (on its real path, so a symlinked file and its target share it); the cockpit's version check runs under it. Where the lock cannot be taken (a filesystem without working locks), the state line is not written and the command says why. A writer outside levain does not take it.
+- **Requires anneal-memory 0.9.42 or later** (the spore compare uses `expected_version`).
+
+### Known limits
+
+- The TUI's spore writes are compared on the item's list (`expect_disposition`), not on its version.
+- Without `flock` (Windows), a version-bound write (the cockpit's state line and spore writes) is refused; an unchecked `levain state` writes as before.
+
 ## [0.7.2] — 2026-10-10
 
 The cockpit's read side: one manifest, the dashboard drawn from it, and a server's own panels in it.

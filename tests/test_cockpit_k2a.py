@@ -897,22 +897,30 @@ class TestL3Round2:
         assert fired == []
 
     @pytest.mark.skipif(sys.platform == "win32", reason="no flock")
-    def test_a_lock_file_that_cannot_be_made_fails_only_a_checked_write(self, rig: Rig, monkeypatch) -> None:
-        """complement #4 (r2): levain state and the TUI could newly fail on the lock file."""
+    @pytest.mark.parametrize("fail", ["open", "flock"])
+    def test_a_state_lock_that_cannot_be_taken_refuses_every_writer(self, rig: Rig, monkeypatch, fail: str) -> None:
+        """codex HIGH r3 (on 3dcbc89): r2's fallback let an unchecked writer that could not make the lock
+        file write unlocked, which could land between a checked writer's compare and its write. Where
+        flock exists, no writer writes unlocked (complement #4 r3: flock failing too)."""
+        import fcntl
         from levain import dashboard
         cj = rig.root / ".levain" / "context.json"
-        real_open = os.open
+        before = cj.read_text()
+        if fail == "open":
+            real_open = os.open
 
-        def no_lock(path, *a, **k):
-            if str(path).endswith(".lock"):
-                raise PermissionError(13, "denied", str(path))
-            return real_open(path, *a, **k)
-        monkeypatch.setattr(os, "open", no_lock)
-        dashboard.write_state(cj, "unchecked")                       # writes as before
-        assert json.loads(cj.read_text())["state"] == "unchecked"
+            def no_lock(path, *a, **k):
+                if str(path).endswith(".lock"):
+                    raise PermissionError(13, "denied", str(path))
+                return real_open(path, *a, **k)
+            monkeypatch.setattr(os, "open", no_lock)
+        else:
+            monkeypatch.setattr(fcntl, "flock", lambda fd, op: (_ for _ in ()).throw(OSError(37, "No locks available")))
+        with pytest.raises(OSError):
+            dashboard.write_state(cj, "unchecked")
         e = _refused("store_unavailable", rig.edit, {"kind": "operator_state", "text": "checked",
                                                      "panel_version": rig.ck.read_value_version("state").value})
-        assert e.http_status == 503 and json.loads(cj.read_text())["state"] == "unchecked"
+        assert e.http_status == 503 and cj.read_text() == before
 
 
 # --- S2: the spore write is compared, inside anneal's transaction, with the row the kernel read ----
@@ -984,6 +992,23 @@ class TestSporeCas:
         rig.store.update(rig.ids["loop"], text="moved on")
         e = _refused("stale", apply_edit, rig.src.write_scope, {**req, "spore_id": rig.ids["loop"]}, expected_version=v)
         assert e.http_status == 409 and rig.spore("loop")["text"] == "moved on"
+
+    def test_a_spore_resolved_after_render_is_409(self, rig: Rig) -> None:
+        """Liveness at write (design §4.4 as amended 10-10): resolved between render and read_one."""
+        r = rig.row("tray", "seed")
+        rig.store.descend(rig.ids["seed"], kind="dropped")
+        e = _refused("stale", rig.post, "spore_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
+        assert e.http_status == 409
+
+    @pytest.mark.parametrize("exc", [OverflowError("1e400"), KeyError("x"), AttributeError("x")])
+    def test_any_failure_to_version_a_stored_row_is_stale_not_a_500(self, rig: Rig, monkeypatch, exc) -> None:
+        """r3 consensus (complement #2, codex #3, glm): only ValueError/TypeError were caught."""
+        import levain.cockpit.providers as prov
+        r = rig.row("tray", "seed")
+        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(exc))
+        before = rig.spore("seed")
+        _refused("stale", rig.post, "spore_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
+        assert rig.spore("seed") == before
 
     def test_a_spore_the_kernel_cannot_version_is_refused_stale(self, rig: Rig, monkeypatch) -> None:
         import levain.cockpit.providers as prov

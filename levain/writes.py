@@ -1367,7 +1367,8 @@ class _VersionGuard:
     def version_of(self, spore: dict[str, Any]) -> str:
         try:
             self.found = self._version(spore)
-        except (ValueError, TypeError) as exc:   # a malformed stored row: it matches no version it rendered
+        except Exception as exc:  # noqa: BLE001 - a stored row the kernel cannot read matches no version it
+            # rendered; the import is resolved in __init__, so this is the row, never the environment
             self.found, self.error = "unversionable", f"{type(exc).__name__}: {exc}"
         return self.found
 
