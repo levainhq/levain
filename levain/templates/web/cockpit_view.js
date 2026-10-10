@@ -105,7 +105,9 @@
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
         const badges = (r.badges || []).map(badgeText).join(" · ");
         const prov = r.provenance ? r.provenance.label : "";
-        const meta = [r.panel_id ? r.panel_id : "", grp, badges, prov].filter(Boolean).join(" · ");
+        const legacy = (r.facets || {}).legacy_meta;   // an adapted extra panel's own meta line (design §6.2)
+        const meta = [typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grp, badges, prov]
+          .filter(Boolean).join(" · ");
         return { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
       });
       if (panel.degraded && panel.degraded.length) out.note = "not complete: " + (panel.error || panel.degraded.join(", "));
@@ -345,6 +347,11 @@
         view.layout.push(Object.assign(entry, { kind: "section", ref: sectionRef++, heading: titleOf(panel.title, titleOf(head.title, pid)) }));
       } else {
         view.extra_panels[pid] = externalOf(panel, panel, groupTitles);
+        // the external renderer draws the note itself, so the banner must not draw it a second time
+        if (entry.banner && panel.note) {
+          entry.banner = entry.banner.filter((b) => !(b.tone === "dim" && b.text === panel.note));
+          if (!entry.banner.length) delete entry.banner;
+        }
         view.layout.push(Object.assign(entry, { kind: "external" }));
       }
     };

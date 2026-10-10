@@ -88,6 +88,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.cockpit.engine import Cockpit
+from levain.cockpit.external import ExternalPanels, discoverer
 from levain.cockpit.routes import CACHE_CONTROL as COCKPIT_CACHE_CONTROL
 from levain.cockpit.routes import VARY as COCKPIT_VARY
 from levain.cockpit.routes import handle_get as handle_cockpit_get
@@ -578,6 +579,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # base product injects nothing. Generic by design (a `kind:"external"` panel of titled
     # lines) so the kernel stays domain-agnostic — the flow Bridge injects its inbox here.
     extra_panels: "Callable[[], list[dict]] | None"
+    external_panels: "ExternalPanels | None" = None   # the manifest's adapter over extra_panels, built with the cockpit
     # Downstream-registered governed ACTION verbs (the write-peer of extra_panels): a
     # name → ActionVerb registry the POST /action route dispatches to. Empty on the base
     # product. Present ONLY on a WRITABLE source (make_server enforces it), so the off-box
@@ -603,6 +605,10 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 built = build_default_cockpit(
                     self.levain_source,
                     job_store=self.job_runtime.store if self.job_runtime is not None else None)
+                if self.extra_panels is not None:
+                    # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
+                    self.external_panels = ExternalPanels(self.extra_panels)
+                    built.discover(discoverer(self.external_panels))
                 try:
                     built.start()
                 except BaseException:

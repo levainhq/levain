@@ -582,7 +582,8 @@ class Cockpit:
         stale = res.stale or (ctx.now - _parse_iso(as_of)) > timedelta(seconds=spec.stale_after_s)
         if stale and _STATUS_RANK["stale"] > _STATUS_RANK[status]:
             status = "stale"
-        return _Snap(status, rows, value, filtered, skipped, as_of, None, spec.note, res.stale)
+        return _Snap(status, rows, value, filtered, skipped, as_of, None,
+                     res.note if isinstance(res.note, str) else spec.note, res.stale)
 
     @staticmethod
     def _value_empty(kind: str, value: Any) -> bool:

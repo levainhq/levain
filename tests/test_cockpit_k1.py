@@ -167,6 +167,7 @@ class TestEveryBuiltInProviderFailsLoudly:
         (root / ".levain" / "edits.jsonl").unlink()
         got = _status(build_default_cockpit(src), "edits")
         assert got["note"].startswith("not configured:") and got["error"] is None
+        assert str(root) not in got["note"] and "first edit" in got["note"]   # no path on the wire, says why
 
     def test_a_source_present_at_a_previous_read_and_now_absent_is_error_never_not_configured(self, env) -> None:
         root, _src, ck = env

@@ -120,7 +120,7 @@ class Ordering:
     urgent: frozenset[str] = frozenset()
 
 
-KERNEL_PREFIXES = frozenset({"spore", "time", "decision", "exposure", "crystal"})
+KERNEL_PREFIXES = frozenset({"spore", "time", "decision", "exposure", "crystal", "legacy"})
 
 _TIER_ORDER = {"hot": 0, "warm": 1, "cold": 2, "parked": 3}
 _DISP_ORDER = {"handoff": 0, "seed": 1, "agenda": 2}
@@ -254,6 +254,9 @@ register_ordering(Ordering("time.desc", _time_desc_key), builtin=True)
 register_ordering(Ordering("decision.dated", _decision_key), builtin=True)
 register_ordering(Ordering("exposure.desc", _exposure_key), builtin=True)
 register_ordering(Ordering("crystal.level", _crystal_key), builtin=True)
+# rows a migrated source already ordered (an external panel, design §6.2): one constant key, and the stable
+# sort keeps the source's own order
+register_ordering(Ordering("legacy.source", lambda row, today: ()), builtin=True)
 
 
 def apply_ordering(name: str, rows: list[RowIn], today: date) -> list[tuple[RowIn, str | None]]:

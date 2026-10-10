@@ -272,6 +272,24 @@ class TestManifestMapperAdversarial:
         view = _view(snap)
         assert view["state"]["text"] == "here" and view["state"]["age_label"].startswith("set "), view
 
+    def test_an_adapted_extra_panel_draws_in_its_zone_with_its_meta_and_emphasis(self) -> None:
+        from levain.cockpit.external import ExternalPanels, discoverer
+        ck = _tray_cockpit()
+        ck.discover(discoverer(ExternalPanels(lambda: [
+            {"id": "inbox", "zone": "operate", "title": "Inbox (2 unread)", "note": "argushub",
+             "lines": [{"meta": "diogenes→cli", "text": "first", "accent": True}, {"meta": "", "text": "second"}]},
+            {"id": "brief", "zone": "mind", "title": "Brief", "markdown": "**b**"}])))
+        view = _view(self._snap(ck))
+        inbox = view["extra_panels"]["ext:inbox"]
+        assert [(ln["meta"], ln["text"], ln["accent"]) for ln in inbox["lines"]] == [
+            ("diogenes→cli", "first", True), ("", "second", False)]
+        assert inbox["note"] == "2 unread · argushub"
+        entry = [e for e in view["layout"] if e.get("id") == "ext:inbox"][0]
+        assert not any(b["text"] == inbox["note"] for b in entry.get("banner") or [])   # drawn once, not twice
+        assert view["extra_panels"]["ext:brief"]["markdown"] == "**b**"
+        zones = {e["id"]: e["zone"] for e in view["layout"] if e["kind"] == "external"}
+        assert zones["ext:inbox"] == "operate" and zones["ext:brief"] == "mind"
+
     def test_a_non_object_state_value_is_an_error(self) -> None:
         ck = _tray_cockpit()
         ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c: Read(value={"lines": []}), region="header"))

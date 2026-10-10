@@ -181,7 +181,9 @@ def _edits(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         if path is None:
             return Absent("no edit ledger is configured for this source")
         if not path.exists():
-            return Absent(f"no edit ledger at {path}")
+            # the ledger's one writer (levain.writes' audit append) creates it at the first edit; the path stays
+            # off the wire, as the store path does (entity.store_label)
+            return Absent("no edit recorded yet (the first edit creates the ledger)")
         try:
             lines = path.read_text(encoding="utf-8").splitlines()
         except (OSError, ValueError) as exc:
