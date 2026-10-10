@@ -1723,14 +1723,13 @@ def _claude_code_files(
     claude_md = _fill_seed_on_demand(claude_md, _on_demand_block(on_demand_seed))
 
     settings_text = (adapter_root / "settings.template.json").read_text(encoding="utf-8")
-    settings_text = settings_text.replace("{{PYTHON}}", python_path)
+    settings_text = settings_text.replace("{{PYTHON}}", _hook_arg_body(python_path))
 
     mcp_text = (adapter_root / "mcp.template.json").read_text(encoding="utf-8")
-    mcp_text = mcp_text.replace("{{INSTALL_DIR}}", str(install))
+    mcp_text = mcp_text.replace("{{INSTALL_DIR}}", _string_body(str(install)))
     # spore-751: the MCP server is `<levain's interpreter> -m anneal_memory`, so the anneal
-    # that serves memory is structurally the one levain imports. Escaped as a JSON string
-    # body because an interpreter path can carry `\` or `"`.
-    mcp_text = mcp_text.replace("{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1])
+    # that serves memory is structurally the one levain imports.
+    mcp_text = mcp_text.replace("{{PYTHON}}", _string_body(python_path))
     return {
         install / "CLAUDE.md": claude_md,
         install / ".claude" / "settings.json": settings_text,
@@ -1769,15 +1768,8 @@ def _install_codex(
     _write_codex_hooks(codex_home / "hooks.json",
                        _codex_hooks_json(adapter_root, python_path, install), emit)
 
-    mcp_fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
-    # spore-751: see _install_claude_code. With ensure_ascii=False the only escapes left are
-    # `\"`, `\\`, `\b \f \n \r \t` and `\u00XX` for control characters, all of which TOML
-    # basic strings accept. The ASCII form would emit surrogate pairs that TOML rejects.
-    mcp_fragment = mcp_fragment.replace(
-        "{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1]
-    )
-    mcp_fragment = mcp_fragment.replace("{{INSTALL_DIR}}", str(install))
-    _merge_codex_config(codex_home / "config.toml", mcp_fragment, emit=emit)
+    _merge_codex_config(codex_home / "config.toml",
+                        _codex_fragment(adapter_root, python_path, install), emit=emit)
 
     emit("  Codex adapter installed.")
 
@@ -2333,13 +2325,40 @@ def _atomic_write_bytes(target: Path, data: bytes, *, like: Path | None = None) 
         raise
 
 
+def _string_body(value: str) -> str:
+    """``value`` as the body of a JSON string, for a template slot that sits inside one.
+    spore-866: a raw path with a `\\`, `"` or newline broke the file around it (and could
+    inject keys). With ensure_ascii=False the only escapes are `\\"`, `\\\\`, `\\b \\f \\n
+    \\r \\t` and `\\u00XX`, all of which TOML basic strings accept too; the ASCII form
+    would emit surrogate pairs TOML rejects."""
+    return json.dumps(value, ensure_ascii=False)[1:-1]
+
+
+def _hook_arg_body(value: str) -> str:
+    """``value`` for a hook ``command`` template slot: one argument inside shell double
+    quotes, inside a JSON string. POSIX double quotes keep `\\`, `"`, `$` and a backquote
+    special, so each is backslashed first; Windows paths cannot hold `"`, and cmd does not
+    treat `\\` as an escape, so there only the JSON escaping applies."""
+    if os.name != "nt":
+        value = re.sub(r'([\\"$`])', r"\\\1", value)
+    return _string_body(value)
+
+
 CODEX_CONFIG_KEY = "codex-home/config.toml#anneal_memory"
 
 
 def _codex_fragment(adapter_root: Path, python_path: str, install: Path) -> str:
     fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
-    fragment = fragment.replace("{{PYTHON}}", json.dumps(python_path, ensure_ascii=False)[1:-1])
-    return fragment.replace("{{INSTALL_DIR}}", str(install))
+    fragment = fragment.replace("{{PYTHON}}", _string_body(python_path))
+    fragment = fragment.replace("{{INSTALL_DIR}}", _string_body(str(install)))
+    # The block goes into the machine-global config.toml, where a parse failure takes
+    # down every MCP server codex has, so it is parsed here before anything writes it.
+    try:
+        tomllib.loads(fragment)
+    except tomllib.TOMLDecodeError as e:
+        raise InitError(f"levain rendered a codex config block that does not parse ({e}); "
+                        f"nothing was written.") from e
+    return fragment
 
 
 def _codex_block_hash(fragment_or_config: str) -> str | None:
@@ -2760,8 +2779,8 @@ def _write_codex_hooks(hooks_target: Path, hooks_text: str,
 
 def _codex_hooks_json(adapter_root: Path, python_path: str, install: Path) -> str:
     hooks_text = (adapter_root / "hooks.json.template").read_text(encoding="utf-8")
-    hooks_text = hooks_text.replace("{{PYTHON}}", python_path)
-    return hooks_text.replace("{{INSTALL_DIR}}", str(install))
+    hooks_text = hooks_text.replace("{{PYTHON}}", _hook_arg_body(python_path))
+    return hooks_text.replace("{{INSTALL_DIR}}", _hook_arg_body(str(install)))
 
 
 def _install_openhands(install: Path, *, emit: Callable[[str], None] = print) -> None:
