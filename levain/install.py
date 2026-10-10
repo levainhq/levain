@@ -2851,7 +2851,7 @@ def _write_codex_hooks(hooks_target: Path, hooks_text: str,
     # leaves the old file in place (an unlink then a write left none, reproduced with ENOSPC),
     # and a symlink into a dotfiles repo is replaced, never written through.
     try:
-        mode = hooks_target.stat().st_mode & 0o777 if not hooks_target.is_symlink() else 0o644
+        mode = hooks_target.stat().st_mode & 0o777  # through a link: the target's mode
     except FileNotFoundError:
         mode = 0o644
     fd, tmp = tempfile.mkstemp(dir=hooks_target.parent, prefix=f".{hooks_target.name}.",
