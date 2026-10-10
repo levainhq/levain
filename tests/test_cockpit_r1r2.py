@@ -228,7 +228,7 @@ class TestManifestMapperAdversarial:
     def test_a_failed_header_fetch_is_an_error_and_an_extra_header_panel_is_drawn(self) -> None:
         ck = _tray_cockpit()
         ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c: Read(value={"lines": [
-            {"label": "state", "text": "x", "at": "2026-10-09T12:00:00+00:00", "source": "s"}]}), region="header"))
+            {"label": "state", "text": "x", "at": "2026-10-09T12:00:00.000Z", "source": "s"}]}), region="header"))
         ck.register(ProviderSpec("weather", "line", "Weather", "gauge", lambda c: Read(value={"lines": [
             {"label": "now", "text": "cloudy", "at": None, "source": None}]}), region="header", rank=5))
         snap = self._snap(ck)
@@ -239,15 +239,38 @@ class TestManifestMapperAdversarial:
 
     def test_a_malformed_state_line_is_an_error_never_no_state_set(self) -> None:
         # the operator's own words: a panel with the wrong shape must not render as "no state set"
-        for bad in ("abc", {}, [{"label": "state", "text": 5, "at": "2026-10-09T12:00:00+00:00"}],
-                    [{"label": "state", "text": "x", "at": 7}], [{"label": "state", "text": "x", "at": "not-a-date"}]):
+        for bad in ("abc", {}, [{"label": "state", "text": 5, "at": "2026-10-09T12:00:00.000Z"}],
+                    [{"label": "state", "text": "x", "at": 7}], [{"label": "state", "text": "x", "at": "not-a-date"}],
+                    # outside ECMA-262's Date Time String Format Date.parse is engine-specific: V8 reads "0" as a
+                    # year and rolls Feb 30 into March, so only a stamp that round-trips through toISOString passes
+                    *([{"label": "state", "text": "x", "at": a}] for a in (
+                        "0", "2026-02-30T00:00:00.000Z", "2026-10-09T12:00:00.789012+00:00", "2026-10-09T12:00:00+00:00"))):
             ck = _tray_cockpit()
             ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c: Read(value={"lines": [
-                {"label": "state", "text": "x", "at": "2026-10-09T12:00:00+00:00", "source": "s"}]}), region="header"))
+                {"label": "state", "text": "x", "at": "2026-10-09T12:00:00.000Z", "source": "s"}]}), region="header"))
             snap = self._snap(ck)
             snap["panels"]["state"]["value"]["lines"] = bad
             view = _view(snap)
             assert view["state"] is None and "malformed" in view["errors"]["state"], bad
+
+    def test_the_kernel_state_stamp_is_one_every_engine_must_parse(self, tmp_path: Path) -> None:
+        # a local-offset, microsecond stamp on disk leaves the kernel as toISOString's form and reaches the view
+        from datetime import timedelta
+
+        from levain.cockpit.providers import _context_line
+        from levain.dashboard import SubstrateSource
+        (tmp_path / ".levain").mkdir()
+        set_at = (datetime.now(timezone.utc) - timedelta(minutes=5)).astimezone(timezone(timedelta(hours=-4)))
+        (tmp_path / ".levain" / "context.json").write_text(json.dumps(
+            {"state": "here", "state_set_at": set_at.isoformat(timespec="microseconds"), "state_source": "cli"}))
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("state", "line", "State", "gauge", _context_line(SubstrateSource.local(tmp_path)),
+                                 region="header"))
+        snap = self._snap(ck)
+        at = snap["panels"]["state"]["value"]["lines"][0]["at"]
+        assert at == set_at.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        view = _view(snap)
+        assert view["state"]["text"] == "here" and view["state"]["age_label"].startswith("set "), view
 
     def test_a_non_object_state_value_is_an_error(self) -> None:
         ck = _tray_cockpit()
@@ -259,7 +282,7 @@ class TestManifestMapperAdversarial:
 
     def test_a_stamp_ahead_of_this_clock_shows_the_words_with_no_age(self) -> None:
         # the kernel owns expiry; a browser clock behind the server's must not hide the line
-        for at in ("2099-01-01T00:00:00+00:00",):
+        for at in ("2099-01-01T00:00:00.000Z",):
             ck = _tray_cockpit()
             ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c, a=at: Read(value={"lines": [
                 {"label": "state", "text": "here", "at": a, "source": "cli"}]}), region="header"))

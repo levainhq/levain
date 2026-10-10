@@ -220,14 +220,28 @@ def _run_closed_stdout(inst, script, payload):
     proc.stdout.close()
     proc.stdin.write(json.dumps(payload).encode())
     proc.stdin.close()
+    proc.stdin = proc.stdout = None     # both closed by hand; communicate() then drains stderr alone
     try:
-        proc.wait(timeout=60)           # bounded first: a hung hook fails the test instead of blocking a read
+        _out, err = proc.communicate(timeout=60)   # drains stderr while bounded: a hung hook fails, never blocks
     except subprocess.TimeoutExpired:
         proc.kill()
+        proc.communicate()
         raise
-    err = proc.stderr.read()
-    # exit 0 with no shutdown retry of the broken buffer ('Exception ignored ...' / exit 120)
-    assert proc.returncode == 0 and b"Exception ignored" not in err and b"BrokenPipe" not in err, (proc.returncode, err)
+    # silent exit 0: no 'Exception ignored on flushing sys.stdout' / exit 120 at shutdown
+    assert proc.returncode == 0 and err == b"", (proc.returncode, err)
+
+
+def test_a_hook_started_with_fd_1_closed_exits_silently(inst):
+    # os.open hands the closed fd 1 back, so the devnull repair must not close what it just put there
+    inst.set_state("first")
+    inst.start()
+    wrapper = ("import os,runpy,sys; os.close(1); sys.argv=[sys.argv[1]]; "
+               "runpy.run_path(sys.argv[0], run_name='__main__')")
+    proc = subprocess.run(
+        [sys.executable, "-c", wrapper, str(inst.hooks / "user_prompt_submit.py")],
+        input=json.dumps({"session_id": "s1", "prompt": "hi"}).encode(), capture_output=True, cwd=inst.root,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(inst.root)}, timeout=60)
+    assert proc.returncode == 0 and proc.stderr == b"", (proc.returncode, proc.stderr)
 
 
 def test_a_marker_is_not_advanced_when_the_prompt_output_was_not_delivered(inst):
