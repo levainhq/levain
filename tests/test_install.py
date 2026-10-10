@@ -3180,16 +3180,35 @@ def test_a_concurrent_init_force_is_refused_and_writes_nothing(tmp_path, capsys)
 
 def test_install_lock_proceeds_where_the_filesystem_cannot_lock(tmp_path, monkeypatch, capsys):
     # L2 MED: ENOTSUP (a filesystem with no flock at all) is not "busy"; refusing would
-    # block every init and update there forever.
+    # block every init and update there forever. And it is not "unguarded" either (L3 r2 desk
+    # finish bar, 2026-10-10): an exclusively created file holds the single writer there.
     import errno
+    import threading
+
+    from levain.install import InstallBusy
 
     def no_locks(_fd, _op):
         raise OSError(errno.ENOTSUP, "Operation not supported")
 
     monkeypatch.setattr(fcntl, "flock", no_locks)
+    held = tmp_path / ".levain" / "install.lock.held"
+    refused: list[str] = []
+
+    def second() -> None:  # another thread: a fresh holder, as another process would be
+        try:
+            with install_lock(tmp_path):
+                pass
+        except InstallBusy as e:
+            refused.append(e.message)
+
     with install_lock(tmp_path):
-        pass
-    assert "cannot lock" in capsys.readouterr().err
+        assert held.exists()
+        t = threading.Thread(target=second)
+        t.start()
+        t.join()
+    assert refused and str(held) in refused[0]
+    assert not held.exists()
+    assert "cannot flock" in capsys.readouterr().err
 
 
 def test_install_lock_names_an_unwritable_levain_dir(tmp_path):

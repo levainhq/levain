@@ -32,11 +32,13 @@ re-install. Found by complement at L3, in the same diff that made it stale.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fnmatch
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1317,17 +1319,58 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
 
 
 @contextmanager
+def _exclusive_file_lock(
+    path: Path, key: tuple[Path, int], *, what: str, busy: Callable[[], InstallLockError],
+) -> Iterator[None]:
+    """The single-writer lock where ``flock`` is unavailable: ``<lock>.held`` created with
+    ``O_CREAT | O_EXCL | O_NOFOLLOW`` (git's ``index.lock`` primitive, which needs nothing from
+    the filesystem but an atomic exclusive create), removed on release. A process killed while
+    holding it leaves the file, and the next run is refused naming it: stale is refused, never
+    guessed at, because a holder on another machine sharing the home cannot be seen from here."""
+    held = path.with_name(path.name + ".held")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        held.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(held, flags, 0o644)
+    except FileExistsError:
+        exc = busy()
+        exc.message += (f" (Held by {held}. If no levain process is running on any machine that "
+                        f"shares this directory, remove that file and re-run.)")
+        exc.args = (exc.message,)
+        raise exc from None
+    except OSError as e:
+        raise InstallLockError(
+            f"cannot create {what} {held} ({e.strerror or e}). Nothing was written; fix the "
+            f"permissions on {held.parent} and re-run.") from None
+    try:
+        with contextlib.suppress(OSError):
+            os.write(fd, f"{os.getpid()} {socket.gethostname()}\n".encode())
+    finally:
+        os.close(fd)
+    with _held_install_locks_guard:
+        _held_install_locks[key] = 1
+    try:
+        yield
+    finally:
+        with _held_install_locks_guard:
+            del _held_install_locks[key]
+        with contextlib.suppress(OSError):
+            held.unlink()
+
+
+@contextmanager
 def _single_writer_lock(
     path: Path, *, what: str, guards: str, busy: Callable[[], InstallLockError],
     precheck: Callable[[], None] | None = None,
 ) -> Iterator[None]:
     """An exclusive non-blocking ``flock`` on ``path``, reentrant per (path, thread); the
-    body of :func:`install_lock` and :func:`codex_home_lock`."""
+    body of :func:`install_lock` and :func:`codex_home_lock`. Where ``flock`` does not exist
+    (Windows) or the filesystem does not support it (an SMB or NFS home without lockd), the
+    lock is an exclusively created file beside it (:func:`_exclusive_file_lock`), never none."""
     try:
         import fcntl
     except ImportError:
-        yield
-        return
+        fcntl = None  # type: ignore[assignment]
     key = (path.resolve(), threading.get_ident())
     with _held_install_locks_guard:
         if key in _held_install_locks:
@@ -1342,10 +1385,13 @@ def _single_writer_lock(
             with _held_install_locks_guard:
                 _held_install_locks[key] -= 1
         return
-    import errno
-
     if precheck is not None:
         precheck()
+    if fcntl is None:
+        with _exclusive_file_lock(path, key, what=what, busy=busy):
+            yield
+        return
+    fd = -1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Never through a link: a lock file swapped for a symlink to a file levain later
@@ -1354,6 +1400,12 @@ def _single_writer_lock(
         if path.parent.name == ".levain":
             _ensure_gitignored(path.parent, path.name)
     except OSError as e:
+        if fd >= 0:
+            os.close(fd)
+        if e.errno == errno.ELOOP:
+            raise InstallLockError(
+                f"{what} {path} is a symlink, and levain never takes a lock through one. "
+                f"Nothing was written; remove the link and re-run.") from None
         raise InstallLockError(
             f"cannot open {what} {path} ({e.strerror or e}). Nothing was "
             f"written; fix the permissions on {path.parent} and re-run."
@@ -1376,20 +1428,16 @@ def _single_writer_lock(
                     f"re-run, and check the filesystem if it repeats."
                 ) from None
             if e.errno in unsupported:
-                # A filesystem without lock support (NFS without lockd, some SMB/FUSE
-                # homes) is not "another process": proceed unguarded, and say so.
-                print(f"  note: this filesystem cannot lock {path} ({e.strerror or e}); "
-                      f"continuing without the guard against {guards}.",
+                # A filesystem without flock (an SMB or NFS home without lockd) is not
+                # "another process", and running unguarded there was a stated hole: the
+                # exclusively created file holds the same single writer.
+                print(f"  note: this filesystem cannot flock {path} ({e.strerror or e}); "
+                      f"using an exclusive lock file instead, against {guards}.",
                       file=sys.stderr)
                 os.close(fd)
                 fd = -1
-                with _held_install_locks_guard:
-                    _held_install_locks[key] = 1
-                try:
+                with _exclusive_file_lock(path, key, what=what, busy=busy):
                     yield
-                finally:
-                    with _held_install_locks_guard:
-                        del _held_install_locks[key]
                 return
             raise busy() from None
         with _held_install_locks_guard:
@@ -2981,68 +3029,109 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
 
     The undo is a RENAME, never a rewrite (the lockfile / conffile frame, git's lockfile.c and
     dpkg's .dpkg-old): before the merge, the file config.toml resolves to (a symlink is written
-    through, so the link stays) is kept beside itself under a second name, a hard link where
-    the filesystem has them, else a copy; failing to keep it writes nothing. Putting it back
-    renames that original over the live name, which needs no free space and restores its
-    bytes, mode and owner as they were. It is put back only while the live file is still
-    exactly what the merge wrote: an edit made in between is kept, and named. A file that did
-    not exist goes away the same way. What this cannot cover: codex reading in the moment
-    between the two renames, and a crash (SIGKILL, power loss) in it."""
+    through, so the link stays) is kept beside itself under a second name
+    (:func:`_keep_original`); failing to keep it writes nothing. Putting it back renames that
+    original over the live name, which needs no free space. It is put back only while the live
+    name is still the very file the merge wrote (same link state, same inode, same bytes): an
+    edit made in between is kept, and the original is named. Messages are held until the end,
+    so a failing output channel cannot interrupt the undo. What this cannot cover: codex
+    reading in the moment between the two writes, and a crash (SIGKILL, power loss) in it."""
     config = codex_home / "config.toml"
     hooks = codex_home / "hooks.json"
     written = config.resolve()
-    kept: Path | None = None
-    if written.exists():
-        kept = written.with_name(f".{written.name}.levain-prior.{time.time_ns()}")
-        try:
-            try:
-                os.link(written, kept)
-            except OSError:
-                shutil.copy2(written, kept)
-        except OSError as e:
-            with contextlib.suppress(OSError):
-                kept.unlink()
-            raise InitError(f"could not keep a copy of {written} to put back if codex's "
-                            f"hooks.json then fails ({e}). Nothing was written.") from None
+    was_link = config.is_symlink()
+    notes: list[str] = []
+    kept = _keep_original(written)
+    ours: tuple[int, int, bytes] | None = None  # the file the merge wrote: (dev, inode, bytes)
+    leave_kept = False
     try:
-        _merge_codex_config(config, fragment, emit=emit)
         try:
-            ours: bytes | None = written.read_bytes()
-        except OSError:
-            ours = None
-        try:
-            _write_codex_hooks(hooks, hooks_text, emit)
+            _merge_codex_config(config, fragment, emit=notes.append)
+            ours = _file_identity(written)
+            _write_codex_hooks(hooks, hooks_text, notes.append)
         except BaseException:
             try:
                 landed = hooks.read_text(encoding="utf-8") == hooks_text
             except BaseException:
                 landed = False
             if not landed:
-                _put_codex_config_back(written, kept, ours, config, hooks, emit)
-                kept = None  # renamed back over the live name, or left and named
+                leave_kept = _put_codex_config_back(config, written, was_link, ours, kept, hooks,
+                                                    notes)
             raise
     finally:
-        if kept is not None:
+        if kept is not None and not leave_kept:
             with contextlib.suppress(OSError):
                 kept.unlink()
+        for n in notes:
+            emit(n)
 
 
-def _put_codex_config_back(written: Path, kept: Path | None, ours: bytes | None, config: Path,
-                           hooks: Path, emit: Callable[[str], None]) -> None:
-    """:func:`_write_codex_pair`'s undo, by rename: ``kept`` (the original, or None when there
-    was none) goes back over ``written`` only while ``written`` still holds ``ours``."""
+def _keep_original(written: Path) -> Path | None:
+    """Keep ``written`` (when it exists) under a second name beside it, for
+    :func:`_write_codex_pair`'s undo: a hard link, which keeps its mode, owner and inode, or
+    where the filesystem has none, a copy of its bytes and mode created exclusively (never
+    through a planted link). None when there is nothing to keep. Raises :class:`InitError`
+    before anything is written when it cannot be kept."""
+    if not written.exists():
+        return None
+    kept = written.with_name(f".{written.name}.levain-prior.{time.time_ns()}")
     try:
-        now: bytes | None = written.read_bytes()
-    except FileNotFoundError:
-        now = None
+        try:
+            os.link(written, kept)
+        except FileExistsError:
+            raise
+        except OSError:
+            fd = os.open(kept, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                         0o600)
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(written.read_bytes())
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                shutil.copymode(written, kept)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    kept.unlink()
+                raise
+    except OSError as e:
+        raise InitError(f"could not keep a copy of {written} to put back if codex's hooks.json "
+                        f"then fails ({e}). Nothing was written.") from None
+    return kept
+
+
+def _file_identity(path: Path) -> tuple[int, int, bytes] | None:
+    try:
+        st = os.stat(path)
+        return st.st_dev, st.st_ino, path.read_bytes()
     except OSError:
-        now = b"\0unreadable"
-    if ours is None or now != ours:
+        return None
+
+
+def _put_codex_config_back(config: Path, written: Path, was_link: bool,
+                           ours: tuple[int, int, bytes] | None, kept: Path | None, hooks: Path,
+                           notes: list[str]) -> bool:
+    """:func:`_write_codex_pair`'s undo. ``ours`` is the file the merge wrote, or None when the
+    merge was interrupted before that could be read (then the live file is taken as it). True
+    when the kept original must stay on disk (it is named in ``notes``)."""
+    try:
+        if kept is not None and os.path.samestat(os.stat(kept), os.stat(written)):
+            return False  # the merge never replaced it: nothing to undo, the copy goes
+    except OSError:
+        pass
+    if kept is None and not written.exists():
+        return False  # nothing was created
+    try:
+        still_ours = (config.is_symlink() == was_link and config.resolve() == written
+                      and written.is_file()
+                      and (ours is None or _file_identity(written) == ours))
+    except OSError:
+        still_ours = False
+    if not still_ours:
         where = f"; the original is kept at {kept}" if kept is not None else ""
-        emit(f"  ! {hooks} could not be written, and {config} changed after levain wrote it, "
-             f"so it was left as it is{where}. It may register this install's store: re-run "
-             f"`levain init --adapter codex` from the install codex should use.")
-        return
+        notes.append(f"  ! {hooks} could not be written, and {config} changed after levain wrote "
+                     f"it, so it was left as it is{where}. It may register this install's store: "
+                     f"re-run `levain init --adapter codex` from the install codex should use.")
+        return kept is not None
     try:
         if kept is None:
             written.unlink()
@@ -3050,12 +3139,13 @@ def _put_codex_config_back(written: Path, kept: Path | None, ours: bytes | None,
             os.replace(kept, written)
     except OSError as e:
         where = f" The original is kept at {kept}." if kept is not None else ""
-        emit(f"  ! {hooks} could not be written, AND {config} could not be put back ({e}): "
-             f"it now registers this install's store.{where} Re-run `levain init --adapter "
-             f"codex` from the install codex should use.")
-        return
-    emit(f"  ! {hooks} could not be written, so the change to {config} above was undone: it "
-         f"is back as it was (any backup listed above is a copy of it).")
+        notes.append(f"  ! {hooks} could not be written, AND {config} could not be put back "
+                     f"({e}): it now registers this install's store.{where} Re-run `levain init "
+                     f"--adapter codex` from the install codex should use.")
+        return kept is not None
+    notes.append(f"  ! {hooks} could not be written, so the change to {config} above was undone: "
+                 f"it is back as it was (any backup listed above is a copy of it).")
+    return False
 
 
 def _codex_hooks_json(adapter_root: Path, python_path: str, install: Path) -> str:

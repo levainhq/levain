@@ -4823,8 +4823,9 @@ def _dirmngr_sockets() -> list[Path]:
     network namespace, and it fetches (WKD, keyservers) and resolves names the client chooses."""
     found: list[Path] = []
     roots = [Path(r) / "gnupg" for r in _runtime_dirs()] + [Path.home() / ".gnupg"]
-    if os.environ.get("GNUPGHOME"):
-        roots.append(Path(os.environ["GNUPGHOME"]).expanduser())
+    gnupghome = Path(os.environ.get("GNUPGHOME") or "~/.gnupg").expanduser()
+    if gnupghome.is_absolute():  # a relative one names nothing stable
+        roots.append(gnupghome)
     for g in roots:
         try:
             if not g.is_dir():
@@ -4832,7 +4833,7 @@ def _dirmngr_sockets() -> list[Path]:
             found += [g / "S.dirmngr", *sorted(g.glob("d.*/S.dirmngr"))]
         except OSError:
             continue  # another user's runtime dir: out of the entity's reach too
-    return [f for f in found if _reachable(f) and f.exists()]
+    return list(dict.fromkeys(f for f in found if _reachable(f) and f.exists()))
 
 
 def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
