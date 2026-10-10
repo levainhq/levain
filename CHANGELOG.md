@@ -4,6 +4,23 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [0.7.1] — unreleased
+
+Closes two of 0.7.0's known open issues (the Linux resolver deputy and concurrent codex installs) and three codex-adapter defects.
+
+### Fixed
+
+- **On Linux, bash with no IP network can no longer look names up through the host's resolver.** Bash run as your own user (no `levain setup-isolation`) still saw the system D-Bus socket, and through it `systemd-resolved` resolved whatever name bash asked for, on the network. Wherever bash has no IP network (the default), the system D-Bus, `systemd-resolved`'s varlink, nscd and avahi directories are now hidden and snapd's sockets masked, as bash run as the entity's user already had them. Measured 2026-10-10 on an Ubuntu host with a packet capture on port 53: a fresh name asked through `resolvectl`, `varlinkctl` and `busctl` reached the wire on 0.7.0 and does not with this release. Cost, in that bash: no `systemctl` or `busctl` on the system bus, no `resolvectl`, no `snap`. A daemon whose directory does not exist when the shell starts is not hidden.
+- **Two `levain init --adapter codex` (or `levain update`) runs from different installs can no longer mix their writes to codex's shared configuration.** A lock on the codex home (`<CODEX_HOME>/levain.lock`) is now held across reading and writing both `config.toml` and `hooks.json`; the second run is refused before it writes anything and says so (re-run it once the first has finished). Reproduced on 0.7.0 through the CLI: 3 of 40 concurrent pairs left `config.toml` naming one install's store and `hooks.json` the other's hooks, both runs exiting 0; none with this release.
+- **If `init` cannot write codex's `hooks.json`, it puts `config.toml` back as it was.** Before, `config.toml` was left registering the new install's memory server with no hooks behind it.
+- **`init` no longer crashes when codex's `hooks.json` is a symlink to a file that does not exist.** It raised `FileNotFoundError` while taking the backup, after `config.toml` was already written. The broken link is now kept as the backup and a new `hooks.json` written.
+- **A staged copy under `.levain/pending/` is removed once its file is settled.** After you adopted a staged copy (or levain wrote the file), the copy stayed, and adopting it again later replaced the file with an older release's version, which the next `levain update` then left alone. `update` now removes the copy and says so.
+
+### Known open issues
+
+- **On Linux, a placeholder can outlive a levain that was killed.** Unchanged from 0.7.0.
+- **If levain cannot save its record of those placeholders as a session ends, the record can name files already removed.** Unchanged from 0.7.0.
+
 ## [0.7.0] — 2026-10-10
 
 The entity's own hands: on macOS and Linux, `levain setup-isolation` runs its bash as a separate user, each command in a fresh shell whose exit status comes from the operating system, and on Linux behind a network boundary of its own. Also the governed action engine (`levain.autonomic`, library only), the operator state line and the starter jar.
