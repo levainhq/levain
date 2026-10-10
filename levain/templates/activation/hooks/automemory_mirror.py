@@ -296,8 +296,9 @@ def _anneal(args: list[str], stdin: str | None = None) -> tuple[int, str, str] |
     re-run by a second entry point (that is how a duplicate would be written)."""
     db = str(hook.store_path())
     candidates = []
-    bin_path = getattr(hook, "_INSTALL_ANNEAL_BIN", "{{")
-    if "{{" not in bin_path:
+    unfilled = "{{" + "ANNEAL_MEMORY}}"   # split, so the install fill cannot reach it
+    bin_path = getattr(hook, "_INSTALL_ANNEAL_BIN", unfilled)
+    if bin_path != unfilled:
         candidates.append([bin_path, "--db", db, *args])
     candidates.append([sys.executable, "-P", "-m", "anneal_memory", "--db", db, *args])
     for cmd in candidates:

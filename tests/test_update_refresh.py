@@ -208,7 +208,8 @@ def test_codex_global_files_of_this_install_are_refreshed(make_install, tmp_path
     install = make_install("codex")
     hooks = tmp_path / "codex-home" / "hooks.json"
     current = hooks.read_text()
-    older = current.replace("activation", "activation-old")
+    older = current.replace('"timeout": 30', '"timeout": 31')   # still this install's shape
+    assert older != current
     hooks.write_text(older)
     receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
     data = json.loads(receipt.read_text())

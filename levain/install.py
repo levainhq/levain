@@ -1753,8 +1753,6 @@ def _install_codex(
     # (adapters/codex/activation, NOT templates/activation) first, then any pack
     # activation/ trees by order. base_activation passed explicitly for the
     # base-completeness check (a pack must not mask an empty base).
-    fragment = _codex_fragment(adapter_root, python_path, install)
-    _check_codex_config(_codex_home() / "config.toml", fragment)
     _copy_activation_tree(
         activation_roots,
         install / "activation",
@@ -1768,10 +1766,14 @@ def _install_codex(
     codex_home = _codex_home()
     codex_home.mkdir(parents=True, exist_ok=True)
 
+    # config.toml first: its parse refusal (`_require_toml`, judged inside the writer on the
+    # exact text written) then fires before either of codex's machine-global files changes.
+    # Holding the pair together against a concurrent writer or an I/O failure between them
+    # needs a CODEX_HOME-wide transaction: a stated open item, not a preflight (L3 r3).
+    _merge_codex_config(codex_home / "config.toml",
+                        _codex_fragment(adapter_root, python_path, install), emit=emit)
     _write_codex_hooks(codex_home / "hooks.json",
                        _codex_hooks_json(adapter_root, python_path, install), emit)
-
-    _merge_codex_config(codex_home / "config.toml", fragment, emit=emit)
 
     emit("  Codex adapter installed.")
 
@@ -2053,7 +2055,13 @@ def refresh_adapter(
                 out.review.append(str(hooks))
                 lines.append(f"  {hooks}: could not be read ({e}), so whether it is "
                              f"current, or this install's, cannot be told.")
-            if here is not None and here != want and not _names_install(here, install):
+            owner = _names_install(here, install) if here is not None and here != want else True
+            if owner is None:
+                out.review.append(str(hooks))
+                lines.append(f"  {hooks}: whose install it names cannot be told (not readable "
+                             f"as levain's hooks), so `levain update` left it alone. Re-run "
+                             f"`levain init --adapter codex` from the install it should name.")
+            elif not owner:
                 lines.append(f"  note: {hooks} belongs to another install, so `levain "
                              f"update` left it alone (rewriting it repoints every codex "
                              f"session).")
@@ -2127,20 +2135,24 @@ def _read_or_none(path: Path) -> str | None:
         raise _Unreadable(str(e)) from None
 
 
-def _names_install(text: str, install: Path) -> bool:
-    """Whether codex's hooks.json points INTO this install: an argument of some hook command,
-    decoded as the shell, doctor and verify read it and normalised, lies under ``<install>/``
-    (so ``/x/inst`` never claims ``/x/inst2``, L2 HIGH, and ``..`` cannot climb out, L3 r2). One
-    unreadable command is skipped, not fatal. A file that is not JSON, or not this shape, names
-    no install (fail closed): the old whole-text search could not see a path escaped for the
-    shell since spore-866, and matched the prefix anywhere in the file, not only in commands."""
-    root = os.path.normpath(str(install)) + os.sep
+def _names_install(text: str, install: Path) -> bool | None:
+    """Whether codex's hooks.json is THIS install's: True when some hook command, decoded as
+    the shell, doctor and verify read it, runs a script levain generates there, a ``.py``
+    directly in ``<install>/activation/hooks/`` (normalised and case-folded as the platform
+    does, so ``/x/inst`` never claims ``/x/inst2`` and ``..`` cannot climb out; an argument
+    that merely mentions the install does not count; L2 HIGH, L3 r2-r3). False when every
+    command reads and none is one. None when whose it is cannot be told (not JSON, not this
+    shape, or no command readable), which the caller reports instead of calling it foreign."""
+    hooks_dir = os.path.normcase(os.path.join(os.path.abspath(str(install)), "activation", "hooks"))
     try:
         data = json.loads(text)
     except (ValueError, RecursionError):
-        return False
+        return None
     hooks = data.get("hooks") if isinstance(data, dict) else None
-    for entries in (hooks.values() if isinstance(hooks, dict) else ()):
+    if not isinstance(hooks, dict):
+        return None
+    readable = False
+    for entries in hooks.values():
         for entry in entries if isinstance(entries, list) else ():
             inner = entry.get("hooks") if isinstance(entry, dict) else None
             for h in inner if isinstance(inner, list) else ():
@@ -2151,12 +2163,14 @@ def _names_install(text: str, install: Path) -> bool:
                     tokens = shlex.split(cmd, posix=os.name != "nt")
                 except ValueError:
                     continue
-                for t in tokens[1:]:
-                    t = os.path.normpath(t.strip('"') if os.name == "nt" else t)
-                    if t.startswith(root):
-                        return True
-    return False
-
+                readable = True
+                if len(tokens) < 2:
+                    continue
+                script = tokens[1].strip('"') if os.name == "nt" else tokens[1]
+                script = os.path.normcase(os.path.normpath(script))
+                if os.path.dirname(script) == hooks_dir and script.endswith(".py"):
+                    return True
+    return False if readable else None
 
 def _refresh_decision(
     here: bytes | None, want: bytes, last: str | None, *, levain_code: bool,
@@ -2392,7 +2406,12 @@ def _fill(template: str, slots: Mapping[str, str]) -> str:
     """Fill ``{{PYTHON}}`` / ``{{INSTALL_DIR}}`` in one pass over the template, so a value that
     itself contains a slot name is never filled again (codex L3 r1: an install path holding
     ``{{PYTHON}}`` became the interpreter path)."""
-    return _SLOT_RE.sub(lambda m: slots.get(m.group(1), m.group(0)), template)
+    def one(m: re.Match[str]) -> str:
+        if m.group(1) not in slots:
+            raise InitError(f"a levain template holds {{{{{m.group(1)}}}}}, which its renderer "
+                            f"does not fill.")
+        return slots[m.group(1)]
+    return _SLOT_RE.sub(one, template)
 
 
 CODEX_CONFIG_KEY = "codex-home/config.toml#anneal_memory"
@@ -2430,29 +2449,16 @@ def _require_toml(text: str, path: Path, before: str | None) -> str | None:
     """Refuse (``InitError``) when levain's change is what would stop codex's machine-global
     ``path`` parsing: a parse failure there takes down every MCP server codex has, not only
     levain's (spore-866). A file that did not parse BEFORE the change either (``before``) is not
-    levain's to judge, since codex's parser may accept what ``tomllib`` refuses: returns that
-    parse error, for the caller to report once the write has landed; otherwise None."""
+    levain's to judge, since codex's parser may accept what ``tomllib`` refuses: returns the
+    error it has AFTER the change, for the caller to report once the write has landed;
+    otherwise None."""
     err = _toml_error(text)
     if err is None:
         return None
-    prior = _toml_error(before) if before is not None else None
-    if prior is not None:
-        return prior
+    if before is not None and _toml_error(before) is not None:
+        return err
     raise InitError(f"{path} would not parse after levain's change ({err}), so it was left "
                     f"as it was.")
-
-
-def _check_codex_config(path: Path, fragment: str) -> None:
-    """``_merge_codex_config``'s parse judgement, run before init writes anything (L3 r2): a
-    refusal then leaves the install and codex's files as they were, not half-installed."""
-    try:
-        existing = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        _require_toml(fragment.rstrip() + "\n", path, None)
-        return
-    m = _CODEX_MCP_BLOCK_RE.search(fragment)
-    if m is not None:
-        _require_toml(_splice_codex_block(existing, m.group(0).rstrip() + "\n"), path, existing)
 
 
 def _codex_block_hash(fragment_or_config: str) -> str | None:
