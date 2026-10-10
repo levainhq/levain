@@ -17,13 +17,16 @@ any two bytecodes, so no placement of ``try`` makes a critical section fully int
 only general answer, deferring SIGINT through a process-wide handler, is the host's to install, not
 a library's). What the engine guarantees under ANY interrupt: two provider reads of one state never
 overlap, because a worker invokes the provider only after the owner's ``go``, which follows a clean
-thread start, and only the worker ends a flight whose provider started. What it does not: an
-interrupt that lands inside ``_single_flight``'s flight-publication section (from taking the flight
-under ``st.lock`` to entering the owner's ``try``) can leave that panel answering errors for the
-life of the Cockpit object. A caller that catches KeyboardInterrupt from a read and keeps the same
-Cockpit must rebuild it. [judged by 1010+13 levain-seat, 2026-10-10, against the callers on
-seat/1009-k1-cockpit-read and seat/1009-r1r2-render3: web reads run on server and refresher threads;
-the one main-thread reader, ``levain tui --manifest``, ends and stops the Cockpit on an interrupt.]"""
+thread start, and only the worker ends a flight whose provider started. A flight left behind by an
+interrupt in its owner's retirement is retired by the next caller. What it does not: an interrupt
+that lands inside ``_single_flight``'s flight-publication section (from taking the flight under
+``st.lock`` to entering the owner's ``try``) can leave that panel answering errors for the life of
+the Cockpit object. A caller that catches KeyboardInterrupt from a read and keeps the same Cockpit
+must rebuild it. [judged by 1010+13 levain-seat, 2026-10-10, against the callers on
+seat/1009-k1-cockpit-read and seat/1009-r1r2-render3: the web server's main thread runs only
+``serve_forever`` and closes the server on an interrupt, while its reads run on request and
+refresher threads; the one main-thread reader, ``levain tui --manifest``, ends and stops the
+Cockpit on an interrupt.]"""
 
 from __future__ import annotations
 
@@ -353,6 +356,11 @@ class Cockpit:
         committed_ok = False
         with st.lock:
             fl = st.pflight
+            if fl is not None and fl.committed and fl.raw.done():
+                # Retired, but left in place (an interrupt inside its owner's retirement): ``raw`` resolves
+                # only once the worker is done or the read was cancelled before ``go``, so no provider is
+                # running and this caller takes the next read.
+                fl = st.pflight = None
             if fl is None:
                 fl = st.pflight = _Flight(timeout_s)
                 if on_start:
