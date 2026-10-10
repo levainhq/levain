@@ -418,7 +418,7 @@ class Cockpit:
             except BaseException as exc:  # noqa: BLE001 - thread exhaustion fails THIS read and poisons nothing
                 _set_once(fl.raw, Fault(f"could not start a read: {type(exc).__name__}: {_safe_str(exc)}"))
             try:
-                res: Any = fl.raw.result(timeout=spec.timeout_s)
+                res: Any = fl.raw.result(timeout=max(0.0, fl.started + spec.timeout_s - time.monotonic()))   # the SAME flight deadline joiners use
             except FutureTimeout:
                 ctx.abandon()
                 res = Fault(f"timed out after {spec.timeout_s:g}s")
@@ -496,7 +496,7 @@ class Cockpit:
         try:
             snap = self._read_snap(spec, res, ctx, now_iso)
         except Exception as exc:  # noqa: BLE001 - malformed provider output of ANY shape is a Fault, never a crash
-            return self._fault(spec, st, f"provider output refused: {exc}", now_iso)
+            return self._fault(spec, st, f"provider output refused: {_safe_str(exc)}", now_iso)
         st.ever_present = True
         st.last_good_as_of = snap.as_of
         st.failing_since = None
@@ -965,13 +965,13 @@ class Cockpit:
                 return Fault("read_one row refused: a facet value of the wrong type")
             return Read(value=rows[0])
         except Exception as exc:  # noqa: BLE001
-            return Fault(f"provider output refused: {exc}")
+            return Fault(f"provider output refused: {_safe_str(exc)}")
 
 
 def _safe_str(exc: BaseException) -> str:
     try:
         return str(exc)
-    except Exception:  # noqa: BLE001 - an exception whose own text raises must not abort the caller
+    except BaseException:  # noqa: BLE001 - an exception whose own text raises must not abort the caller
         return "(unprintable exception)"
 
 
