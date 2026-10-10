@@ -64,7 +64,7 @@ EPISODE_FACETS = frozenset({"episode_type", "source", "at", "tags", "agent"})
 EPISODE_STORED = ("id", "timestamp", "type", "source", "content", "tags")
 # a federated episode feed's name: it is part of every row id the feed contributes
 FEED_EMPHASIS = ("none", "dim")      # what a feed row may ask for (a quiet agent's rows recede)
-FEED_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+FEED_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")      # matched whole (fullmatch)
 
 
 def _store_label(db: Path) -> str:
@@ -182,16 +182,15 @@ def _ts(v: Any) -> str:
 
 
 def _utc_at(v: Any) -> str:
-    """A feed's timestamp in anneal's own form (UTC, microseconds, ``Z``), so ``time.desc``, which
-    compares the strings, orders a feed's rows against the entity's. A timestamp with no zone, or one
-    that does not parse, is kept as given: there is nothing to convert it from."""
-    s = _ts(v)
+    """An episode timestamp in one form (UTC, microseconds, ``Z``), for the entity's rows and every
+    feed's alike, so ``time.desc`` and the cap's floor, which compare the strings, compare instants.
+    A timestamp with no zone, or one that does not parse, is unknown time: "" (it sorts last)."""
     try:
-        d = datetime.fromisoformat(s.replace("Z", "+00:00") if s.endswith("Z") else s)
+        d = datetime.fromisoformat(_ts(v))
     except ValueError:
-        return s
+        return ""
     if d.tzinfo is None:
-        return s
+        return ""
     return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
@@ -202,9 +201,21 @@ class _FeedRead:
     filtered: list[tuple[int, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     stale: bool = False
+    as_of: datetime | None = None
 
 
 def _feed_rows(name: str, res: Result) -> _FeedRead:
+    """``_feed_read`` with every failure of the feed's own output, of any shape, as that feed's
+    skipped entry: nothing a feed returns can take the entity's rows or another feed down with it."""
+    try:
+        return _feed_read(name, res)
+    except Exception as exc:  # noqa: BLE001 -- a malformed feed result of ANY shape is that feed's fault
+        out = _FeedRead()
+        out.skipped.append((1, f"{name} unavailable: {type(exc).__name__}: {exc}"))
+        return out
+
+
+def _feed_read(name: str, res: Result) -> _FeedRead:
     """One federated feed's rows, re-keyed under the feed (``feed:<name>:<id>``) so no feed row can be
     taken for one of the entity's own episodes (the tombstone verb applies to ``episode:`` rows only).
     A feed that faults or breaks the episode row contract contributes NO rows and is named in
@@ -239,13 +250,19 @@ def _feed_rows(name: str, res: Result) -> _FeedRead:
             facets["at"] = _utc_at(facets["at"])
         rows.append(RowIn(id=f"feed:{name}:{r.id}", title=r.title, body=r.body, facets=facets,
                           emphasis=r.emphasis if r.emphasis in FEED_EMPHASIS else "none",
-                          stored=dict(r.stored)))
-    out.rows = rows
-    out.skipped = [(n, f"{name}: {why}") for n, why in res.skipped]
-    out.filtered = [(n, f"{name}: {why}") for n, why in res.filtered]
+                          stored={k: list(v) if isinstance(v, list) else v for k, v in r.stored.items()}))
+    skipped = [(int(n), f"{name}: {why}") for n, why in res.skipped]
+    filtered = [(int(n), f"{name}: {why}") for n, why in res.filtered]
+    as_of = None
+    if res.as_of is not None:      # the feed's own confirmation time: old cached data must not read fresh
+        as_of = datetime.fromisoformat(res.as_of)
+        if as_of.tzinfo is None:
+            raise ValueError(f"as_of {res.as_of!r} has no zone")
+    out.rows, out.skipped, out.filtered = rows, skipped, filtered
     if isinstance(res.note, str) and res.note:
         out.notes.append(f"{name}: {res.note}")
     out.stale = bool(res.stale)
+    out.as_of = as_of
     return out
 
 
@@ -263,7 +280,7 @@ def _episodes(source: SubstrateSource,
         rows = [
             RowIn(
                 id=f"episode:{e.id}", title=e.content, body=e.content,
-                facets={"episode_type": e.type, "source": e.source, "at": _ts(e.timestamp),
+                facets={"episode_type": e.type, "source": e.source, "at": _utc_at(e.timestamp),
                         "tags": list(e.tags), "agent": own},
                 stored={"id": e.id, "timestamp": e.timestamp, "type": e.type, "source": e.source,
                         "content": e.content, "tags": list(e.tags)},
@@ -277,9 +294,11 @@ def _episodes(source: SubstrateSource,
         filtered: list[tuple[int, str]] = []
         notes: list[str] = [f"the entity's newest {EPISODE_LIMIT} episodes"] if capped and feeds else []
         stale = False
+        as_ofs: list[datetime] = []
         for name, feed in feeds:
             try:
-                res = feed(ctx)
+                # its own context: a feed over another source must not be handed this cycle's memoised view
+                res = feed(ReadContext(ctx.now, fresh=ctx.fresh))
             except Exception as exc:   # noqa: BLE001 -- one feed's fault names that feed, never blanks the panel
                 res = Fault(f"{type(exc).__name__}: {exc}")
             got = _feed_rows(name, res)
@@ -291,8 +310,12 @@ def _episodes(source: SubstrateSource,
             filtered += got.filtered
             notes += got.notes
             stale = stale or got.stale
+            if got.as_of is not None:
+                as_ofs.append(got.as_of)
+        # the panel is as fresh as its oldest confirmed source; the entity's own read is now
+        as_of = min(as_ofs).astimezone(timezone.utc).isoformat() if as_ofs and min(as_ofs) < ctx.now else None
         return Read(rows=tuple(rows), skipped=tuple(skipped), filtered=tuple(filtered),
-                    note="; ".join(notes) or None, stale=stale)
+                    note="; ".join(notes) or None, stale=stale, as_of=as_of)
     return read
 
 
@@ -562,7 +585,7 @@ def build_default_cockpit(
     (the feed's name when the row names none); the entity's own rows carry the entity's name."""
     feeds = tuple((episode_feeds or {}).items())
     for name, fn in feeds:
-        if not isinstance(name, str) or not FEED_NAME.match(name) or not callable(fn):
+        if not isinstance(name, str) or not FEED_NAME.fullmatch(name) or not callable(fn):
             raise ValueError(f"episode feed {name!r}: a name matching {FEED_NAME.pattern} and a callable")
 
     def entity(ctx: ReadContext) -> dict[str, Any]:

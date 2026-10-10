@@ -150,6 +150,7 @@ class TestViewRegistration:
         (("Bad Id", "t", "spore.age"),),
         (("", "t", "spore.age"),),
         (("default", "t", "spore.age"),),
+        (("age\n", "t", "spore.age"),),
         (("a", "t", "spore.age"), ("a", "u", "spore.age")),
         (("a", "t", "no.such.ordering"),),
         (("a", "t", "spore.tray"),),
@@ -211,13 +212,13 @@ class TestFederatedEpisodes:
         feeds = {"a": _feed(
             _ep("early", "2999-01-01T01:00:00+05:00"),    # 2998-12-31 20:00Z
             _ep("late", "2998-12-31T23:00:00+00:00"),     # later in true time, earlier as a string
-            _ep("naive", "2997-06-01T00:00:00"),          # no zone: kept as given
+            _ep("naive", "2997-06-01T00:00:00"),          # no zone: unknown time
         )}
         p = _episodes(src, feeds)
         rows = {r["id"]: r for r in p["rows"]}
         assert rows["feed:a:early"]["facets"]["at"] == "2998-12-31T20:00:00.000000Z"
         assert rows["feed:a:late"]["facets"]["at"] == "2998-12-31T23:00:00.000000Z"
-        assert rows["feed:a:naive"]["facets"]["at"] == "2997-06-01T00:00:00"
+        assert rows["feed:a:naive"]["facets"]["at"] == ""
         order = _ids(p)
         assert order.index("feed:a:late") < order.index("feed:a:early") < order.index("feed:a:naive")
 
@@ -254,7 +255,7 @@ class TestFederatedEpisodes:
         assert p["skipped"] == []
         assert any(i.startswith("episode:") for i in _ids(p))
 
-    @pytest.mark.parametrize("name", ["Bad", "", "-x", "a b", "x" * 33, "a/b"])
+    @pytest.mark.parametrize("name", ["Bad", "", "-x", "a b", "x" * 33, "a/b", "ana\n"])
     def test_a_bad_feed_name_is_refused_at_build(self, src: SubstrateSource, name: str) -> None:
         with pytest.raises(ValueError):
             build_default_cockpit(src, clock=_clock, episode_feeds={name: _feed()})
@@ -373,3 +374,51 @@ class TestL1L2Fixes:
             return ck.panel("p", credential_class="token")["etag"]
         assert mk() != mk(views=(("a", "By age", "time.desc"),))
         assert mk(views=(("a", "A", "time.desc"),)) != mk(views=(("a", "A", "time.desc"), ("b", "B", "legacy.source")))
+
+
+class TestL3Round6:
+    """r6 on 2432284..2a15049 (complement, codex, glm)."""
+
+    def test_a_malformed_feed_result_of_any_shape_skips_only_that_feed(self, src: SubstrateSource) -> None:
+        """complement #1 + codex #3 + glm #1: only feed(ctx) was inside the try; a RowIn with
+        facets=None, or a bad skipped entry, made the whole Episodes panel an error."""
+        bad_rows = lambda ctx: Read(rows=(RowIn(id="x", title="t", facets=None),))  # type: ignore[arg-type]
+        bad_skip = lambda ctx: Read(rows=(), skipped=(("many", "x", "y"),))  # type: ignore[arg-type]
+        bad_asof = lambda ctx: Read(rows=(), as_of="yesterday")
+        p = _episodes(src, {"a": bad_rows, "b": bad_skip, "c": bad_asof, "ok": _feed(_ep("k", "2026-10-10T00:00:00Z"))})
+        assert p["status"] == "partial"
+        reasons = " ".join(e["reason"] for e in p["skipped"])
+        assert all(f"{n} unavailable" in reasons for n in ("a", "b", "c"))
+        ids = _ids(p)
+        assert "feed:ok:k" in ids and any(i.startswith("episode:") for i in ids)
+
+    def test_each_feed_reads_its_own_context(self, src: SubstrateSource) -> None:
+        """codex HIGH r6: feeds got the panel's memoised context, so a feed over another source got
+        the entity's own view."""
+        seen: list[Any] = []
+
+        def feed(ctx: ReadContext) -> Read:
+            seen.append(ctx.memo("view", lambda: "the feed's own"))
+            return Read(rows=())
+        _episodes(src, {"a": feed})
+        assert seen == ["the feed's own"]
+
+    def test_unknown_time_sorts_last(self, src: SubstrateSource) -> None:
+        """codex #4: an unparseable at was kept and compared as a string, so "garbage" led the panel."""
+        p = _episodes(src, {"a": _feed(_ep("g", "garbage"), _ep("z", "2999-01-01T00:00:00Z"))})
+        ids = _ids(p)
+        assert ids[0] == "feed:a:z" and ids[-1] == "feed:a:g"
+        assert {r["id"]: r for r in p["rows"]}["feed:a:g"]["facets"]["at"] == ""
+
+    def test_old_feed_data_does_not_read_fresh(self, src: SubstrateSource) -> None:
+        """codex #2: a feed's own as_of was dropped, so cached data from long ago read as fresh."""
+        old = lambda ctx: Read(rows=(_ep("o", "2000-01-01T00:00:00Z"),), as_of="2000-01-01T00:00:00+00:00")
+        p = _episodes(src, {"a": old})
+        assert p["status"] == "stale"
+        assert p["as_of"].startswith("2000-01-01")
+
+    def test_version_of_on_an_unguarded_write_says_so(self) -> None:
+        """glm MED: version_of on a guard with no expected version died on a missing attribute."""
+        from levain.writes import _VersionGuard
+        with pytest.raises(RuntimeError, match="unguarded"):
+            _VersionGuard(None).version_of({})

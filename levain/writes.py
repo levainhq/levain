@@ -1369,6 +1369,8 @@ class _VersionGuard:
             self._refuse = SporeError
 
     def version_of(self, spore: dict[str, Any]) -> str:
+        if self.expected is None:
+            raise RuntimeError("version_of on an unguarded write: there is no version to compare")
         try:
             self.found = self._version(spore)
         except (MemoryError, RecursionError):

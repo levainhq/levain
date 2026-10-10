@@ -66,7 +66,7 @@ WRITE_READ_CAP_PER_SOURCE = 4   # of those, reads of one source (a panel or a di
 POLICY_REVISION = 1  # hashed into the manifest etag; bumped when a tier or gesture policy changes
 NOW_ID = "now"
 # a triage-list view id: lower-case, and never "default" (the panel's own order is the default view)
-_VIEW_ID = re.compile(r"^(?!default$)[a-z0-9][a-z0-9_-]{0,31}$")
+_VIEW_ID = re.compile(r"(?!default\Z)[a-z0-9][a-z0-9_-]{0,31}")     # matched whole (fullmatch)
 VALUE_ABSENT = "absent"   # the value_version of a line/prose value with no stored record yet
 PROCESS_GRACE_S = 5.0     # how long a joiner waits for the owner to process a finished read
 _STATUS_RANK = {"ok": 0, "empty": 0, "partial": 1, "stale": 2, "error": 3}
@@ -364,7 +364,7 @@ class Cockpit:
                 if not (isinstance(v, tuple) and len(v) == 3 and all(isinstance(x, str) for x in v)):
                     raise CockpitRegistrationError(f"{sid}: a view is (id, title, ordering), got {v!r}")
                 vid, _title, vorder = v
-                if not _VIEW_ID.match(vid) or vid in seen_views:
+                if not _VIEW_ID.fullmatch(vid) or vid in seen_views:
                     raise CockpitRegistrationError(f"{sid}: view id {vid!r} is malformed, reserved or repeated")
                 if vorder not in ORDERINGS or ORDERINGS[vorder].groups:
                     # a grouped view would need its own groups and bands; none is wanted yet
