@@ -4817,27 +4817,42 @@ _NETWORK_DEPUTY_SOCKETS = ("/run/snapd.socket", "/run/snapd-snap.socket")
 
 
 _PROC_NET_UNIX = "/proc/net/unix"
+_ON_LINUX = sys.platform.startswith("linux")
+# One row of /proc/net/unix: Num RefCount Protocol Flags Type St Inode [Path].
+_UNIX_ROW = re.compile(r"[0-9a-fA-F]+: [0-9a-fA-F]{8} [0-9a-fA-F]{8} [0-9a-fA-F]{8} "
+                       r"[0-9a-fA-F]{4} [0-9a-fA-F]{2} +[0-9]+(?: (.*))?")
 
 
 def _bound_unix_socket_paths() -> list[str]:
-    """Every filesystem path a unix socket is bound to on this host, as the kernel lists it in
-    ``/proc/net/unix`` (abstract names, ``@...``, have no path and are skipped). Linux only: bwrap
-    runs nowhere else, so elsewhere this is empty. Raises :class:`ConfinementError` when the list
-    cannot be read, because the offline floor cannot then know which sockets to hide."""
-    if not sys.platform.startswith("linux"):
+    """Every filesystem path a unix socket is bound to in levain's network namespace, as the kernel
+    lists it in ``/proc/net/unix`` (abstract names, ``@...``, have no path and are skipped). Linux
+    only: bwrap runs nowhere else, so elsewhere this is empty. Raises :class:`ConfinementError` when
+    the list cannot be read or a row does not have the kernel's shape (a bound path containing a
+    newline splits its row, and its socket would otherwise go unseen), because the offline floor
+    cannot then know which sockets to hide. Sockets of other network namespaces are not listed, and
+    no unprivileged process can list them."""
+    if not _ON_LINUX:
         return []
     try:
-        with open(_PROC_NET_UNIX, encoding="utf-8", errors="surrogateescape") as fh:
-            lines = fh.read().splitlines()[1:]  # the first line is the column header
+        with open(_PROC_NET_UNIX, encoding="utf-8", errors="surrogateescape", newline="\n") as fh:
+            lines = fh.read().split("\n")
     except OSError as e:
         raise ConfinementError(
             f"cannot read {_PROC_NET_UNIX} ({e.strerror or e}), so the floor cannot find the "
             "daemon sockets to hide from bash without network (fail-closed).") from None
+    if lines and lines[-1] == "":
+        lines.pop()
+    if not lines or not lines[0].startswith("Num "):
+        raise ConfinementError(f"{_PROC_NET_UNIX} has no header row (fail-closed).")
     out: list[str] = []
-    for line in lines:
-        parts = line.split(None, 7)  # Num RefCount Protocol Flags Type St Inode Path
-        if len(parts) == 8 and not parts[7].startswith("@"):
-            out.append(parts[7])
+    for line in lines[1:]:
+        m = _UNIX_ROW.fullmatch(line)
+        if m is None:
+            raise ConfinementError(
+                f"{_PROC_NET_UNIX} has a row the floor cannot read ({line[:80]!r}): a socket path "
+                "with a newline in it, say. Bash without network is refused (fail-closed).")
+        if m.group(1) and not m.group(1).startswith("@"):
+            out.append(m.group(1))
     return out
 
 
@@ -4846,7 +4861,8 @@ def _dirmngr_sockets() -> list[Path]:
     by the user's service manager (or left running by an earlier gpg), so a connect reaches it OUTSIDE
     bash's network namespace, and it fetches (WKD, keyservers) and resolves names the client chooses.
 
-    Two sources, unioned: every ``S.dirmngr`` the kernel lists as bound (:func:`_bound_unix_socket_paths`),
+    Two sources, unioned: every socket named ``S.dirmngr`` the kernel lists as bound in levain's network
+    namespace (:func:`_bound_unix_socket_paths`),
     which covers any GNUPGHOME, including one bash sets for itself later (codex L3 r6: guessing from
     levain's own GNUPGHOME missed that); and the default places (``<runtime>/gnupg``, its ``d.*``
     subdirectories, ``~/.gnupg``), so a socket file present at spawn with no listener is hidden as
@@ -4859,7 +4875,7 @@ def _dirmngr_sockets() -> list[Path]:
             raise ConfinementError(
                 f"a dirmngr socket is bound at the relative path {s!r}, which the floor cannot "
                 "place, so it cannot hide it from bash without network (fail-closed).")
-        found.append(Path(s))
+        found.append(_host_spelling(Path(s)))  # bound through a linked parent, masked where it lands
     roots = [Path(r) / "gnupg" for r in _runtime_dirs()]
     try:
         roots.append(Path.home() / ".gnupg")
@@ -4883,7 +4899,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
 
     Pure: no I/O EXCEPT ``Path.exists`` probes, which decide between the self-bind and the
     ``/dev/null`` form for a write-denied file, and a 16-byte header read of file-shaped jewels
-    (:func:`_refuse_plantable_sqlite_jewels`). Reads, never a mutation."""
+    (:func:`_refuse_plantable_sqlite_jewels`), and, for bash without network, the kernel's list of bound
+    unix sockets (:func:`_bound_unix_socket_paths`, which refuses when it cannot be read). Reads, never
+    a mutation."""
     _refuse_plantable_sqlite_jewels(policy)
     argv: list[str] = [
         BWRAP,

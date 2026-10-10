@@ -1323,7 +1323,7 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
     def unlockable(why: str) -> InstallLockError:
         return CodexHomeUnlockable(
             f"{lock} cannot be locked ({why}), so two codex installs writing {codex_home} at "
-            f"once could mix config.toml and hooks.json. Nothing was written. If no other "
+            f"once could mix config.toml and hooks.json. Nothing was written there. If no other "
             f"levain install writes this codex home at the same time, re-run with "
             f"{CODEX_HOME_UNLOCKED_ENV}=1.")
 
@@ -1332,7 +1332,7 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
         guards="a concurrent codex init/update from another install",
         busy=lambda: CodexHomeBusy(
             f"another levain process (an `init` or `update` of a codex install) is "
-            f"writing {codex_home} right now. This run installed nothing; re-run once "
+            f"writing {codex_home} right now. This run wrote nothing there; re-run once "
             f"that one has finished."),
         unlockable=None if os.environ.get(CODEX_HOME_UNLOCKED_ENV) == "1" else unlockable,
     ):
@@ -3128,7 +3128,7 @@ def _put_codex_config_back(config: Path, written: Path, was_link: bool,
     except FileNotFoundError:
         if kept is None:
             return False  # nothing was created
-        gone = True
+        gone = not os.path.lexists(config)  # a dangling link swapped in is not "removed"
     except OSError:
         pass
     try:

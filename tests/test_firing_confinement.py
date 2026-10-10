@@ -3514,8 +3514,10 @@ def test_offline_bash_masks_every_dirmngr_the_kernel_lists(tmp_path, monkeypatch
     elsewhere.mkdir(parents=True)
     (elsewhere / "S.dirmngr").touch()
     (elsewhere / "S.gpg-agent").touch()
+    linked = tmp_path / "linked-keyring"
+    linked.symlink_to(elsewhere)  # complement L3 r7: a bound path may go through a linked parent
     monkeypatch.setattr(_conf, "_bound_unix_socket_paths",
-                        lambda: [str(elsewhere / "S.dirmngr"), str(elsewhere / "S.gpg-agent")])
+                        lambda: [str(linked / "S.dirmngr"), str(elsewhere / "S.gpg-agent")])
     on = _bwrap_argv(build_policy(_entity(tmp_path, "on"), deny_localhost_outbound=True))
     dirmngr = str(elsewhere.resolve() / "S.dirmngr")
     assert any(on[k:k + 3] == ["--ro-bind", "/dev/null", dirmngr] for k in range(len(on)))
@@ -3526,7 +3528,7 @@ def test_offline_bash_is_refused_when_the_kernel_socket_list_cannot_be_read(
         tmp_path, monkeypatch) -> None:
     from levain.firing import confinement as _conf
 
-    monkeypatch.setattr(_conf.sys, "platform", "linux")
+    monkeypatch.setattr(_conf, "_ON_LINUX", True)
     monkeypatch.setattr(_conf, "_PROC_NET_UNIX", str(tmp_path / "absent"))
     with pytest.raises(_conf.ConfinementError, match="cannot read"):
         _conf._bound_unix_socket_paths()
@@ -3539,3 +3541,10 @@ def test_offline_bash_is_refused_when_the_kernel_socket_list_cannot_be_read(
         "0000000000000000: 00000002 00000000 00010000 0001 01  9624 /tmp/a b/S.dirmngr\n")
     monkeypatch.setattr(_conf, "_PROC_NET_UNIX", str(listing))
     assert _conf._bound_unix_socket_paths() == ["/run/user/1000/gnupg/S.dirmngr", "/tmp/a b/S.dirmngr"]
+    # a bound path with a newline splits its row: refused, never read as two rows
+    listing.write_text(listing.read_text().replace("/tmp/a b/", "/tmp/a\nb/"))
+    with pytest.raises(_conf.ConfinementError, match="cannot read"):
+        _conf._bound_unix_socket_paths()
+    listing.write_text("garbage\n")
+    with pytest.raises(_conf.ConfinementError, match="no header"):
+        _conf._bound_unix_socket_paths()
