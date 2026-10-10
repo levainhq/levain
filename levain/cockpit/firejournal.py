@@ -2,7 +2,7 @@
 design §0, §2, §3, §4.1.2, §5).
 
 A separate SQLite file in the broker's data root with its own schema and format marker, opened with
-the durability of :mod:`levain.durable_sqlite`. ``AutonomicDB`` is not reused: its schema would add
+the durability of :mod:`levain.autonomic.durable_sqlite`. ``AutonomicDB`` is not reused: its schema would add
 the autonomic tables, and both schemas name an ``effects`` table (§0.1).
 
 Every state transition is one method and one ``BEGIN IMMEDIATE`` transaction:
@@ -44,7 +44,7 @@ from levain.cockpit.consent import (
     record_sha256,
     utc_stamp,
 )
-from levain.durable_sqlite import open_durable, read_transaction, write_transaction
+from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 
 _OPERATION_ID = re.compile(r"cp[0-9a-f]{32}")
 

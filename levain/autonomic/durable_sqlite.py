@@ -1,4 +1,4 @@
-"""levain.durable_sqlite — the one way a levain store opens SQLite and runs a transaction.
+"""levain.autonomic.durable_sqlite — the one way a levain store opens SQLite and runs a transaction.
 
 One definition so every store carries the same durability (K2b design §0.1): WAL journaling,
 ``synchronous=FULL`` (every commit is on disk before it returns), ``fullfsync`` and

@@ -14,7 +14,7 @@ neither read nor write any of it, and a shell is not refused on its account (a d
 sidecars outside itself to plant). A store kept anywhere else is protected by naming its directory in
 the entity's ``deny_subtrees``.
 
-Durability: :mod:`levain.durable_sqlite` (every commit on disk before it returns; every write one
+Durability: :mod:`levain.autonomic.durable_sqlite` (every commit on disk before it returns; every write one
 ``BEGIN IMMEDIATE``, serialized by SQLite itself).
 
 The store carries a format marker; a database with another marker, or tables and no marker, is refused
@@ -33,8 +33,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
-from levain.durable_sqlite import open_durable, read_transaction, write_transaction
-from levain.durable_sqlite import rollback as _rollback
+from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
+from levain.autonomic.durable_sqlite import rollback as _rollback
 
 __all__ = ["AutonomicDB", "StoreFormatError", "STORE_FORMAT", "default_store_dir"]
 

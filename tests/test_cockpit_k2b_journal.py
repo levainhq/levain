@@ -167,7 +167,7 @@ def test_the_journal_runs_the_durable_pragmas(db):
 
 
 def test_an_old_sqlite_is_refused_at_open(tmp_path, monkeypatch):
-    monkeypatch.setattr("levain.durable_sqlite.sqlite3.sqlite_version", "3.34.1")
+    monkeypatch.setattr("levain.autonomic.durable_sqlite.sqlite3.sqlite_version", "3.34.1")
     with pytest.raises(RuntimeError, match="RETURNING"):
         CockpitDB(tmp_path).meta("format")
 
