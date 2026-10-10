@@ -120,16 +120,18 @@ class ExternalPanels:
         except BaseException as exc:  # noqa: BLE001 - every failure is a reading, reused like one
             call = _Call(None, _describe(exc), _now_iso())
         finally:
-            with self._lock:
-                if flight.timeout is None:
-                    flight.result = call      # the first transition; after a timeout the answer is dropped
-                self._parked.discard(flight)
-                # golang.org/x/sync/singleflight's rule: only the current (unforgotten) call may touch
-                # the shared state
-                if self._flight is flight:
-                    self._flight = None
-                    self._last = (self._clock(), call)
-            flight.done.set()
+            try:
+                with self._lock:
+                    if flight.timeout is None:
+                        flight.result = call      # the first transition; after a timeout the answer is dropped
+                    self._parked.discard(flight)
+                    # golang.org/x/sync/singleflight's rule: only the current (unforgotten) call may touch
+                    # the shared state
+                    if self._flight is flight:
+                        self._flight = None
+                        self._last = (self._clock(), call)
+            finally:
+                flight.done.set()                 # its readers return now even if the clock failed above
 
 
 def _describe(exc: BaseException) -> str:
