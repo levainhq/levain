@@ -112,6 +112,7 @@
     } else if (head.kind === "line") {
       out.lines = (v.lines || []).map((l) => ({ meta: l.label, text: l.text }));
     } else if (head.kind === "metric") {
+      need(Array.isArray(v.metrics || []) && (v.metrics || []).every(isObj), "metrics");
       out.lines = (v.metrics || []).map((m) => ({
         meta: m.label, text: m.value + (m.unit ? " " + m.unit : "") + (m.read ? " — " + m.read : ""),
         accent: m.status === "warn" || m.status === "bad", dim: m.status === "unknown" }));
@@ -123,22 +124,55 @@
     return out;
   }
 
-  // wraps = "unavailable" means the wraps panel was unreadable: last-wrap figures are then ABSENT, not "never"
-  // a number, or absent: the renderer's numeric conversions throw on a cleaned object, after fault isolation
-  const fin = (x) => (typeof x === "number" && Number.isFinite(x) ? x : undefined);
-  const str = (x) => (typeof x === "string" && x ? x : null);
-  // the masthead jar, rebuilt from typed fields only (null when the kernel sent none or a malformed one)
-  function jarOf(j) {
-    if (!j || typeof j !== "object" || Array.isArray(j)) return null;
-    const today = fin(j.today);
-    return { status: str(j.status) || "", label: str(j.label) || "", level: fin(j.level) || 0,
-             today: Number.isInteger(today) ? today : null, day: str(j.day) };
+  // PARSE, DON'T VALIDATE. Each panel kind has ONE shape check at this boundary. A payload that fails it
+  // throws inside its own mapping, and placeOnce() turns that into an unavailable panel while every other
+  // panel still renders. Nothing here repairs a bad field into a value that reads as data: a default such
+  // as 0 or "" is a reading the renderer would print as true.
+  const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
+  const isNum = (x) => typeof x === "number" && Number.isFinite(x);
+  function need(ok, what) { if (!ok) throw new Error("malformed " + what); }
+  // text where text belongs; absent (null/undefined) is allowed and stays absent
+  function textOrAbsent(x, what) { need(x === undefined || x === null || typeof x === "string", what); return x === null ? undefined : x; }
+  // a tag list: the legacy form is ONE comma-joined string, which is split; an array's elements are whole tags
+  function tagsOf(t) {
+    if (t === undefined || t === null) return [];
+    if (typeof t === "string") return t.split(",").map((s) => s.trim()).filter(Boolean);
+    need(Array.isArray(t) && t.every((s) => typeof s === "string"), "tags");
+    return t;
   }
 
+  // The entity record: a bad masthead string is omitted and named in view.errors.entity; the jar is all-or-null.
+  function entityOf(ent, errors) {
+    const bad = [];
+    const text = (x, what) => { if (x === undefined || x === null) return undefined;
+      if (typeof x === "string") return x; bad.push(what); return undefined; };
+    if (!isObj(ent)) { if (ent !== undefined && ent !== null) bad.push("entity"); ent = {}; }
+    const brand = isObj(ent.brand) ? ent.brand : (ent.brand === undefined || ent.brand === null ? {} : (bad.push("brand"), {}));
+    const out = { name: text(ent.name, "name"), governance: text(ent.governance, "governance"),
+                  wordmark: text(brand.wordmark, "brand.wordmark"), model: text(brand.model, "brand.model"),
+                  store: text(ent.store_label, "store_label"), jar: null };
+    const j = ent.jar;
+    if (j !== undefined && j !== null) {
+      const ok = isObj(j) && typeof j.status === "string" && typeof j.label === "string" && isNum(j.level)
+        && j.level >= 0 && j.level <= 1 && (j.today === undefined || j.today === null || Number.isInteger(j.today))
+        && (j.day === undefined || j.day === null || typeof j.day === "string");
+      if (ok) out.jar = { status: j.status, label: j.label, level: j.level, today: j.today == null ? null : j.today, day: j.day == null ? null : j.day };
+      else bad.push("jar");
+    }
+    if (bad.length) errors.entity = "malformed entity field(s) omitted: " + bad.join(", ");
+    return out;
+  }
+
+  // The figures health reads: each is a finite number, except the write-path flag.
+  const HEALTH_FIGURES = ["links", "avg strength", "max strength", "density", "local density", "episodes",
+    "episodes since wrap", "tombstones", "wraps", "graduations validated", "graduations demoted"];
   function healthOf(metrics, wraps) {
+    need(Array.isArray(metrics), "metrics");
     const m = new Map();
-    for (const x of metrics) m.set(x.label, x.value);
-    const n = (k) => fin(m.get(k));
+    for (const x of metrics) { need(isObj(x) && typeof x.label === "string", "metric"); m.set(x.label, x.value); }
+    for (const k of HEALTH_FIGURES) if (m.has(k)) need(isNum(m.get(k)), "metric " + k);
+    if (m.has("write path")) need(m.get("write path") === "live" || m.get("write path") === "dark", "metric write path");
+    const n = (k) => (m.has(k) ? m.get(k) : undefined);
     const last = Array.isArray(wraps) && wraps[0] ? wraps[0] : null;
     return {
       write_path_live: m.get("write path") === "live", total_links: n("links"), avg_strength: n("avg strength"),
@@ -151,14 +185,19 @@
     };
   }
 
-  function lineOf(panel, head, now, withSet) {
+  // wraps = "unavailable" means the wraps panel was unreadable: last-wrap figures are then ABSENT, not "never"
+  function checkWraps(data) {
+    need(Array.isArray(data), "wraps data");
+    for (const w of data) need(isObj(w) && typeof w.wrapped_at === "string" && (w.continuity_chars === null || isNum(w.continuity_chars)), "wraps row");
+  }
+
+  function lineOf(panel, head, now) {
     if (head.status === "error") return null;
     const l = ((panel.value || {}).lines || [])[0];
     if (!l) return { text: null };
     const t = parseIso(l.at);
     const known = !isNaN(t) && t <= now + 60000;   // an unparseable or future stamp is "age unknown", never "fresh"
     const out = { text: l.text, set_at: l.at, source: l.source, age_label: known ? ageLabel(l.at, now, "set ") : "" };
-    if (withSet) { out.stale = head.status === "stale"; out.freshness = known ? "fresh" : "unknown"; }
     return out;
   }
 
@@ -189,14 +228,15 @@
     }
     const P = new Map(Object.entries(snap.panels || {}));
     const heads = new Map(Object.entries(m.panels || {}));
-    const ent = m.entity || {};
+    const view_errors = Object.create(null);
+    const ent = entityOf(m.entity, view_errors);
     const view = {
       // the store line is the kernel's home-relative label, never an absolute path; no label, no line
-      paths: str(ent.store_label) ? { episodic_db: str(ent.store_label) } : { omitted: true }, scope: ent.governance, entity_name: ent.name,
-      brand_wordmark: (ent.brand || {}).wordmark, brand_model: (ent.brand || {}).model,
+      paths: ent.store ? { episodic_db: ent.store } : { omitted: true }, scope: ent.governance, entity_name: ent.name,
+      brand_wordmark: ent.wordmark, brand_model: ent.model,
       health: null, graph: null, crystal_index: [], open_spores: [], tray: [], keep: [], episodes: [],
-      sections: [], config_docs: [], wraps: [], recent_edits: [], focus: null, state: null, jar: jarOf(ent.jar),
-      layout: [], errors: Object.create(null), extra_panels: Object.create(null), writable: false, write_token_required: false,
+      sections: [], config_docs: [], wraps: [], recent_edits: [], state: null, jar: ent.jar,
+      layout: [], errors: view_errors, extra_panels: Object.create(null), writable: false, write_token_required: false,
     };
     for (const e of m.errors || []) view.errors[e.source || "manifest"] = e.message;
 
@@ -216,20 +256,25 @@
     };
 
     const wrapsFail = heads.has("wraps") ? failure("wraps") : null;
-    const wrapsData = !heads.has("wraps") ? [] : wrapsFail ? "unavailable" : (P.get("wraps").value || {}).data || [];
+    let wrapsData = !heads.has("wraps") ? [] : wrapsFail ? "unavailable" : (P.get("wraps").value || {}).data;
+    let wrapsShape = null;
+    if (!wrapsFail && heads.has("wraps")) {
+      try { checkWraps(wrapsData); } catch (e) { wrapsShape = e; wrapsData = "unavailable"; view.errors.wraps = e.message; }
+    }
     if (wrapsFail) view.errors.wraps = wrapsFail;
 
-    // header region: focus and state go under the masthead; any other header panel (a downstream's
-    // weather, say) is drawn as a panel first in Operate, never silently dropped
+    // header region: state goes under the masthead; any other header panel (a downstream's weather, say)
+    // is drawn as a panel first in Operate, never silently dropped. An older kernel's `focus` panel is
+    // retired data, not a fault: it is skipped.
     const headerExtra = [];
     for (const pid of (m.regions.header || [])) {
       const head = heads.get(pid);
       if (!head) { view.errors[pid] = "listed in the manifest header but has no head"; continue; }
       const bad = failure(pid);
-      if (pid === "focus" || pid === "state") {
+      if (pid === "focus") continue;
+      if (pid === "state") {
         if (bad) { view.errors[pid] = bad; continue; }
-        const line = lineOf(P.get(pid), P.get(pid), now, pid === "focus");
-        if (pid === "focus") view.focus = line; else view.state = line;
+        view.state = lineOf(P.get(pid), P.get(pid), now);
       } else headerExtra.push(pid);
     }
 
@@ -254,7 +299,7 @@
         view.layout.push(Object.assign(entry, { kind: kind }));
       } else if (pid === "episodes" && panel.kind === "triage-list") {
         view.episodes = rows.map((r) => ({ id: bare(r.id), timestamp: (r.facets || {}).at, type: (r.facets || {}).episode_type,
-          source: (r.facets || {}).source, tags: (r.facets || {}).tags || [], content: r.body || r.title }));
+          source: (r.facets || {}).source, tags: tagsOf((r.facets || {}).tags), content: r.body || r.title }));
         view.layout.push(Object.assign(entry, { kind: "episodes" }));
       } else if (pid === "edits" && panel.kind === "triage-list") {
         view.recent_edits = rows.map((r) => ({ id: bare(r.id), ts: (r.facets || {}).at, action: (r.facets || {}).edit_kind,
@@ -263,20 +308,19 @@
       } else if (pid === "crystals" && panel.kind === "triage-list") {
         view.crystal_index = rows.map((r) => {
           const f = r.facets || {};
-          // a list of tags; an element may still carry the older comma-joined form, so each is split
-          const tags = [].concat(f.tags || []).filter((s) => typeof s === "string")
-            .flatMap((s) => s.split(",")).map((s) => s.trim()).filter(Boolean).map(visible);
+          const tags = tagsOf(f.tags);
           return { name: bare(r.id), level: f.crystal_level, one_clause: r.body || r.title, permanence: f.permanence,
                    last_activated_on: f.last_activated_on, tags: tags };
         });
         view.layout.push(Object.assign(entry, { kind: "crystals" }));
       } else if (pid === "health" && panel.kind === "metric") {
-        view.health = healthOf((panel.value || {}).metrics || [], wrapsData);
+        view.health = healthOf((panel.value || {}).metrics, wrapsData);
         view.layout.push(Object.assign(entry, { kind: "health" }));
       } else if (pid === "graph" && panel.kind === "visual") {
         view.graph = (panel.value || {}).data || null;
         view.layout.push(Object.assign(entry, { kind: "graph" }));
       } else if (pid === "wraps" && panel.kind === "visual") {
+        if (wrapsShape) throw wrapsShape;
         view.wraps = Array.isArray(wrapsData) ? wrapsData : [];
         view.layout.push(Object.assign(entry, { kind: "wraps" }));
       } else if (panel.kind === "prose" && pid.indexOf("section:") === 0 && (panel.value || {}).markdown != null) {
