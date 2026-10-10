@@ -1927,13 +1927,15 @@ def test_offline_bash_cannot_reach_the_hosts_resolver_deputies(tmp_path, monkeyp
     from levain.firing import confinement as _conf
 
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
+    (tmp_path / "home" / ".gnupg").mkdir(parents=True)
+    (tmp_path / "home" / ".gnupg" / "S.dirmngr").touch()
+    (tmp_path / "home" / ".gnupg" / "S.gpg-agent").touch()
     run = tmp_path / "run"
     (run / "dbus").mkdir(parents=True)
     (run / "dbus" / "system_bus_socket").touch()
     (run / "snapd.socket").touch()
-    monkeypatch.setattr(_conf, "_RESOLVER_DEPUTY_DIRS", (str(run / "dbus"), str(run / "absent")))
-    monkeypatch.setattr(_conf, "_RESOLVER_DEPUTY_SOCKETS",
+    monkeypatch.setattr(_conf, "_NETWORK_DEPUTY_DIRS", (str(run / "dbus"), str(run / "absent")))
+    monkeypatch.setattr(_conf, "_NETWORK_DEPUTY_SOCKETS",
                         (str(run / "snapd.socket"), str(run / "snapd-snap.socket")))
     on = _bwrap_argv(build_policy(_entity(tmp_path, "on"), deny_localhost_outbound=True))
     off = _bwrap_argv(build_policy(_entity(tmp_path, "off"), deny_localhost_outbound=False))
@@ -1941,7 +1943,10 @@ def test_offline_bash_cannot_reach_the_hosts_resolver_deputies(tmp_path, monkeyp
     assert _tmpfs_then_ro(on, dbus)
     assert any(on[k:k + 3] == ["--ro-bind", "/dev/null", snapd] for k in range(len(on)))
     assert str(run / "absent") not in " ".join(on)  # a mount on an absent root dir aborts bwrap
-    assert dbus not in off and snapd not in off
+    dirmngr = str((tmp_path / "home" / ".gnupg").resolve() / "S.dirmngr")
+    assert any(on[k:k + 3] == ["--ro-bind", "/dev/null", dirmngr] for k in range(len(on)))
+    assert "S.gpg-agent" not in " ".join(on)  # signing through gpg-agent keeps working
+    assert dbus not in off and snapd not in off and dirmngr not in off
 
 
 def _tmpfs_then_ro(argv: list[str], d: str) -> bool:

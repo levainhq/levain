@@ -867,7 +867,7 @@ def test_a_refreshed_hooks_json_keeps_its_mode(make_install, tmp_path, through_l
 
 
 def test_codex_home_is_one_writer_across_installs(make_install, tmp_path, capsys):
-    # codex L3 r2 HIGH 2026-10-10, reproduced 2/20 pairs through the CLI: two installs'
+    # codex L3 r2 HIGH 2026-10-10, reproduced through the CLI on 0.7.0: two installs'
     # inits interleaved, leaving config.toml on one store and hooks.json on the other.
     import fcntl
 

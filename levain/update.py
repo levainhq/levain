@@ -34,7 +34,6 @@ pip step.
 
 from __future__ import annotations
 
-import contextlib
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -43,14 +42,7 @@ from typing import Callable
 
 from levain import manifest, reconcile
 from levain.launch import NETWORK, child_env
-from levain.install import (
-    InstallLockError,
-    _codex_home,
-    codex_home_lock,
-    effective_adapter,
-    install_lock,
-    refresh_adapter,
-)
+from levain.install import InstallLockError, install_lock, refresh_adapter
 from levain.manifest import AxisVerdict, CompatSet, InstalledSet
 
 Emit = Callable[[str], None]
@@ -75,11 +67,7 @@ def run_update(
         return _run_update(path, **kwargs)  # type: ignore[arg-type]
     install = Path(str(path)).expanduser().resolve()
     try:
-        with install_lock(install, create=False), contextlib.ExitStack() as codex_held:
-            if effective_adapter(install) == "codex":
-                # Before the first write, so a refusal means nothing was written; the
-                # adapter refresh takes it again (a nested no-op).
-                codex_held.enter_context(codex_home_lock(_codex_home()))
+        with install_lock(install, create=False):
             return _run_update(path, **kwargs)  # type: ignore[arg-type]
     except InstallLockError as e:
         emit(f"FAIL: {e.message}")

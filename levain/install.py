@@ -1302,8 +1302,8 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
     The per-install lock cannot cover them: two ``levain init --adapter codex`` runs from
     DIFFERENT installs hold different install locks, and interleaved between the two
     writes they left config.toml registering one install's store and hooks.json firing
-    the other's hooks, both exiting 0 (codex L3 r2 2026-10-10; reproduced 2/20 pairs
-    through the CLI). Taken after the install lock, never before, so two levain processes
+    the other's hooks, both exiting 0 (codex L3 r2 2026-10-10; reproduced through the CLI
+    on 0.7.0). Taken after the install lock, never before, so two levain processes
     cannot wait on each other. Same semantics as :func:`install_lock`."""
     with _single_writer_lock(
         codex_home / CODEX_HOME_LOCK_NAME, what="the CODEX_HOME lock",
@@ -2048,7 +2048,13 @@ def refresh_adapter(
         if adapter == "codex" and apply:
             # Across the read of hooks.json/config.toml and both writes: another install's
             # init between them would otherwise be overwritten from a stale read.
-            codex_held.enter_context(codex_home_lock(_codex_home()))
+            try:
+                codex_held.enter_context(codex_home_lock(_codex_home()))
+            except CodexHomeBusy as e:
+                out.review.append("adapter")
+                emit(f"\n• adapter files NOT refreshed: {e.message} Re-run `levain update`; "
+                     f"nothing else of the adapter was changed.")
+                return out
         try:
             roster = compose_roster([templates_root, *pack_dirs])
             adapter_root = templates_root / "adapters" / adapter
@@ -2966,29 +2972,42 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
     """Write codex's two machine-global files as one unit, under :func:`codex_home_lock`
     held by the caller. Both texts are rendered before either file is touched. config.toml
     goes first, so its parse refusal (``_require_toml``, judged on the exact text written)
-    fires before anything changes; if hooks.json then fails, config.toml is put back to its
-    prior bytes (removed if it did not exist), so an I/O failure between the two cannot leave
-    codex registering this install's store while firing another install's hooks."""
+    fires before anything changes; if hooks.json then does not hold the new text, config.toml
+    is put back to its prior bytes, so an I/O failure between the two cannot leave codex
+    registering this install's store while firing another install's hooks.
+
+    The rollback acts on the file config.toml RESOLVES to, which is the file the merge wrote
+    (a symlink, dangling or not, is written through): the link stays, and its target goes
+    back to its prior bytes, or away if it did not exist. Whether hooks.json was written is
+    read from hooks.json itself, so a failure (an interrupt, say) after its rename does not
+    undo config.toml under the new hooks."""
     config = codex_home / "config.toml"
+    hooks = codex_home / "hooks.json"
+    written = config.resolve()
     try:
-        prior: bytes | None = config.read_bytes()
+        prior: bytes | None = written.read_bytes()
     except FileNotFoundError:
         prior = None
     _merge_codex_config(config, fragment, emit=emit)
     try:
-        _write_codex_hooks(codex_home / "hooks.json", hooks_text, emit)
+        _write_codex_hooks(hooks, hooks_text, emit)
     except BaseException:
         try:
-            if prior is None:
-                config.unlink(missing_ok=True)
-            else:
-                _atomic_write_bytes(config, prior)
-            emit(f"  ! {codex_home / 'hooks.json'} could not be written, so {config} was "
-                 f"put back as it was.")
-        except OSError as e:
-            emit(f"  ! {codex_home / 'hooks.json'} could not be written, AND {config} could "
-                 f"not be put back ({e}): it now registers this install's store. Re-run "
-                 f"`levain init --adapter codex` from the install codex should use.")
+            landed = hooks.read_text(encoding="utf-8") == hooks_text
+        except (OSError, ValueError):
+            landed = False
+        if not landed:
+            try:
+                if prior is None:
+                    written.unlink(missing_ok=True)
+                else:
+                    _atomic_write_bytes(written, prior)
+                emit(f"  ! {hooks} could not be written, so the change to {config} above was "
+                     f"undone: it is back as it was (any backup listed above is a copy of it).")
+            except OSError as e:
+                emit(f"  ! {hooks} could not be written, AND {config} could not be put back "
+                     f"({e}): it now registers this install's store. Re-run `levain init "
+                     f"--adapter codex` from the install codex should use.")
         raise
 
 

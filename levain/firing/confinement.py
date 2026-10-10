@@ -4805,13 +4805,32 @@ def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         ) from exc
 
 
-#: Step (7b) of :func:`_bwrap_plan_impl`: directories of root daemons that resolve or fetch a name
-#: on the network for whoever connects (the system D-Bus, which carries systemd-resolved and avahi;
-#: resolved's varlink; nscd; avahi's own socket), hidden whole; and the deputy sockets that sit in
-#: the shared /run itself (snapd), masked. The list R1 measured as deputies (levain
+#: Step (7b) of :func:`_bwrap_plan_impl`: directories of daemons that resolve or fetch a name on
+#: the network for whoever connects (the system D-Bus, which carries systemd-resolved and avahi;
+#: resolved's varlink; nscd; avahi's own socket; tailscaled's LocalAPI, a deputy where the host made
+#: this user its operator [traced, not run]), hidden whole; and the deputy sockets that sit in the
+#: shared /run itself (snapd), masked. R1 measured the resolver rows (levain
 #: project_memory/1009-s2-linux/R1_RESULT.md); the abstract-socket row is closed by --unshare-net.
-_RESOLVER_DEPUTY_DIRS = ("/run/dbus", "/run/systemd/resolve", "/run/nscd", "/run/avahi-daemon")
-_RESOLVER_DEPUTY_SOCKETS = ("/run/snapd.socket", "/run/snapd-snap.socket")
+_NETWORK_DEPUTY_DIRS = ("/run/dbus", "/run/systemd/resolve", "/run/nscd", "/run/avahi-daemon",
+                        "/run/tailscale")
+_NETWORK_DEPUTY_SOCKETS = ("/run/snapd.socket", "/run/snapd-snap.socket")
+
+
+def _dirmngr_sockets() -> list[Path]:
+    """The operator's gnupg dirmngr sockets the offline bash could reach: ``<runtime>/gnupg/S.dirmngr``,
+    the same under a non-default GNUPGHOME's ``d.*`` subdirectory, and the ``~/.gnupg`` fallback.
+    dirmngr is socket-activated by the user's service manager, so a connect starts it OUTSIDE bash's
+    network namespace, and it fetches (WKD, keyservers) and resolves names the client chooses."""
+    found: list[Path] = []
+    roots = [Path(r) / "gnupg" for r in _runtime_dirs()] + [Path.home() / ".gnupg"]
+    for g in roots:
+        try:
+            if not g.is_dir():
+                continue
+            found += [g / "S.dirmngr", *sorted(g.glob("d.*/S.dirmngr"))]
+        except OSError:
+            continue  # another user's runtime dir: out of the entity's reach too
+    return [f for f in found if _reachable(f) and f.exists()]
 
 
 def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
@@ -5328,26 +5347,31 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if _reachable(bus) and bus.exists():
             masks.append(str(bus))
 
-    # (7b) THE HOST'S NAME-RESOLVER DEPUTIES, WHENEVER BASH HAS NO IP NETWORK. ``--unshare-net``
+    # (7b) THE HOST'S NETWORK DEPUTIES, WHENEVER BASH HAS NO IP NETWORK. ``--unshare-net``
     # removes bash's own sockets from the network, but a root daemon reached over a unix socket
     # resolves (and so sends on the wire) whatever name bash hands it, and the name can carry data
     # out. MEASURED 2026-10-10 on argushub (Ubuntu, systemd-resolved) with the 0.7.0 wheel: in the
     # operator-floor bash, `resolvectl query` of a fresh name over the system bus answered "Data
-    # from: network". The hands view never sees them (its /run is empty; R1, 2026-10-09: D-Bus,
-    # varlink, avahi, snapd and nscd closed). So each such daemon's own directory gets a read-only
-    # tmpfs (the form that holds across a daemon restart, step (6)), and a socket that sits directly
-    # in the shared /run gets the file mask. Cost: in offline bash, `systemctl` and `busctl` on the
-    # system bus, `resolvectl`, `snap` and the nscd cache are gone. A daemon whose directory is
-    # absent at spawn is not hidden, the residual step (6) states for its own dirs.
+    # from: network". The same day, the operator's own gnupg dirmngr resolved a name bash handed it
+    # in a WKD request (63 packets carrying it on port 53, 0.7.1.dev0 before this mask). The hands
+    # view never sees them (its /run is empty and its uid is not the operator's; R1, 2026-10-09:
+    # D-Bus, varlink, avahi, snapd and nscd closed). So each such daemon's own directory gets a
+    # read-only tmpfs (the form that holds across a daemon restart while the directory persists,
+    # step (6)), and a socket in a directory shared with other sockets gets the file mask (gpg-agent
+    # beside dirmngr keeps working). Cost: in offline bash, `systemctl` and `busctl` on the system
+    # bus, `resolvectl`, `snap`, `tailscale` and gpg's network commands are gone, and
+    # /etc/resolv.conf may point at nothing. A daemon whose socket or directory is absent at spawn,
+    # or that recreates its socket, is not hidden from then on: the residual step (6) states.
     if policy.deny_localhost_outbound:
-        for d in _RESOLVER_DEPUTY_DIRS:
+        masks += [str(f) for f in _dirmngr_sockets()]
+        for d in _NETWORK_DEPUTY_DIRS:
             real = Path(d).resolve()
             if not _reachable(real) or not real.is_dir() or real in hidden_dirs:
                 continue
             argv += ["--tmpfs", str(real)]
             remount_ro.append(str(real))
             hidden_dirs.append(real)
-        for f in _RESOLVER_DEPUTY_SOCKETS:
+        for f in _NETWORK_DEPUTY_SOCKETS:
             real = Path(f).resolve()
             if _reachable(real) and real.exists():
                 masks.append(str(real))
@@ -5848,7 +5872,8 @@ NETNS_REFUSAL = (
 #: twice; the ControlMaster class is spore-1005).
 OFFLINE_RESIDUAL = (
     "bash keeps only its own isolated loopback. NOT blocked: a unix socket at a file path the floor "
-    "does not deny (an ssh ControlMaster or a proxy socket in /tmp, X11), which can reach "
+    "does not deny (an ssh ControlMaster or a proxy socket in /tmp, X11, a daemon that fetches "
+    "on request other than the ones the floor hides), which can reach "
     "this host's services and so bypass the block (spore-1005); and inside a VM, AF_VSOCK to the "
     "hypervisor"
 )
