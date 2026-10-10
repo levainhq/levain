@@ -1119,7 +1119,7 @@ def test_a_close_whose_wait_times_out_keeps_the_claim(monkeypatch):
     monkeypatch.setattr(confinement._BwrapShell, "_settled", lambda self: True)
     monkeypatch.setattr(confinement.SandboxedShell, "close", lambda self: None)
     released: list[str] = []
-    monkeypatch.setattr(confinement, "_ledger_release", released.append)
+    monkeypatch.setattr(confinement, "_ledger_release", lambda c: released.append(c) or [])
     real_wait = shell._preflight_done.wait
     monkeypatch.setattr(shell._preflight_done, "wait", lambda timeout=None: real_wait(0.2))
 
@@ -1154,7 +1154,7 @@ def test_a_close_that_cannot_settle_keeps_the_claim_for_the_next_close(monkeypat
     monkeypatch.setattr(confinement._BwrapShell, "_settled", lambda self: settled[0])
     monkeypatch.setattr(confinement.SandboxedShell, "close", lambda self: None)
     released: list[str] = []
-    monkeypatch.setattr(confinement, "_ledger_release", released.append)
+    monkeypatch.setattr(confinement, "_ledger_release", lambda c: released.append(c) or [])
     confinement._LIVE_BWRAP_SHELLS.add(shell)
     try:
         shell.close()
@@ -1184,7 +1184,9 @@ def test_a_run_re_entered_on_the_run_thread_is_refused_without_touching_the_shel
 
     def handler_on_the_run_thread():
         shell._run_lock.acquire()   # the interrupted run ...
-        shell._lock.acquire()       # ... inside its admission
+        shell._lock.acquire()       # ... inside its admission, its preflight already this thread's
+        shell._preflight_thread = threading.get_ident()
+        shell._preflight_done.clear()
         try:
             shell.run("echo from-the-handler")
         except ConfinementError as exc:
@@ -1194,3 +1196,42 @@ def test_a_run_re_entered_on_the_run_thread_is_refused_without_touching_the_shel
     t.join(3)
     assert not t.is_alive(), "a re-entered run() hung"
     assert result and "single-caller" in result[0]
+    # The refused re-entry left the outer run's preflight alone (complement L3 r10).
+    assert shell._preflight_thread == t.ident and not shell._preflight_done.is_set()
+
+
+def test_a_release_the_ledger_did_not_take_keeps_the_claim_for_the_next_close(monkeypatch):
+    """codex L3 r10, RUN on w26 (the ledger unreadable at close()): the claim was taken off the shell
+    though the ledger never dropped it, so no later close() could. A claim leaves the shell, and the shell
+    the exit hook's set, only on a confirmed release."""
+    import threading
+
+    shell = object.__new__(confinement._BwrapShell)
+    shell._lock = threading.Lock()
+    shell._closed = False
+    shell._groups = {}
+    shell._preflight_done = threading.Event()
+    shell._preflight_done.set()
+    shell._preflight_thread = None
+    shell._relay = None
+    shell._ledger_claim = "the-claim"
+    monkeypatch.setattr(confinement._BwrapShell, "_settled", lambda self: True)
+    monkeypatch.setattr(confinement.SandboxedShell, "close", lambda self: None)
+    ledger_ok = [False]
+    tried: list[str] = []
+
+    def release(c):
+        tried.append(c)
+        return [] if ledger_ok[0] else None
+    monkeypatch.setattr(confinement, "_ledger_release", release)
+    confinement._LIVE_BWRAP_SHELLS.add(shell)
+    try:
+        shell.close()
+        assert tried == ["the-claim"] and shell._ledger_claim == "the-claim"
+        assert shell in confinement._LIVE_BWRAP_SHELLS
+        ledger_ok[0] = True
+        confinement._close_live_shells()             # levain's exit
+        assert tried == ["the-claim", "the-claim"] and shell._ledger_claim is None
+        assert shell not in confinement._LIVE_BWRAP_SHELLS
+    finally:
+        confinement._LIVE_BWRAP_SHELLS.discard(shell)

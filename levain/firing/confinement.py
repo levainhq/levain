@@ -246,7 +246,6 @@ import tempfile
 import threading
 import time
 import unicodedata
-import weakref
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -6315,12 +6314,14 @@ def _ledger_enter(created: list[tuple[str, str]], mounted: set[str], claim: str)
             txn.claim(mounted, claim)
 
 
-def _ledger_release(claim: str) -> list[str]:
-    """Drop ``claim`` and remove what no session holds any more. Called only once the claiming
-    shell's namespace is gone (:meth:`_BwrapShell.close`)."""
+def _ledger_release(claim: str) -> list[str] | None:
+    """Drop ``claim`` and remove what no session holds any more; the paths removed, or None when the
+    ledger could not be used and the claim was NOT dropped (the caller keeps it, to try again). Called
+    only once the claiming shell's namespace is gone (:meth:`_BwrapShell.close`)."""
     with _LedgerTxn() as txn:
-        if txn.ok:
-            txn.drop(claim)
+        if not txn.ok:
+            return None
+        txn.drop(claim)
     return txn.removed
 
 
@@ -6361,7 +6362,10 @@ def live_floor_placeholders() -> list[Path]:
             and any(isinstance(c, str) and _claim_alive(c) for c in e.get("claims", []))]
 
 
-_LIVE_BWRAP_SHELLS: "weakref.WeakSet[_BwrapShell]" = weakref.WeakSet()
+# Every Linux shell until its claim is confirmed released (`_BwrapShell.close`). Held strongly: a shell its
+# caller dropped with its claim unreleased is still closed, and the claim released, at exit (codex L3 r10,
+# RUN on w26: from a WeakSet it was collected and its claim outlived levain).
+_LIVE_BWRAP_SHELLS: "set[_BwrapShell]" = set()
 
 
 @atexit.register
@@ -7324,11 +7328,23 @@ class _BwrapShell(SandboxedShell):
             # it keeps both: a spawn the preflight still makes is retagged onto the claim, and a later
             # close(), or the exit hook's, releases it (L3 r8, RUN on w24: a claim taken off the shell left
             # the late spawn's leaf untagged; codex L3 r9: the same after a group that did not empty).
-            if drained and not self.unemptied_groups and self._settled():
-                claim, self._ledger_claim = self._ledger_claim, None
-                _LIVE_BWRAP_SHELLS.discard(self)
-                if claim is not None:
-                    _ledger_release(claim)
+            # With no claim there is nothing to settle for (complement L3 r10: up to 5 s per leaf, and an
+            # OSError out of a close() that never raises); a settle that errs is not settled.
+            try:
+                settled = self._ledger_claim is None or self._settled()
+            except OSError:
+                settled = False
+            # A claim belongs to this shell until its release is CONFIRMED: a ledger that could not be
+            # written leaves it here for the next close() or the exit hook's (codex L3 r10, RUN on w26:
+            # dropped from the shell first, it stayed in the ledger with nothing left to release it).
+            if drained and not self.unemptied_groups and settled:
+                claim = self._ledger_claim
+                if claim is None or _ledger_release(claim) is not None:
+                    self._ledger_claim = None
+                    _LIVE_BWRAP_SHELLS.discard(self)
+                else:
+                    _log.warning("levain: the placeholder ledger could not be written; the shell keeps its "
+                                 "claim, and a later close() or levain's exit releases it")
 
     def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
         self._command_since = time.time()
