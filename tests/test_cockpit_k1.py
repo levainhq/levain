@@ -1383,3 +1383,35 @@ class TestOneFlightOrdersByConstruction:
         assert ck.panel("p")["status"] == "error"
         assert time.monotonic() - t0 < 0.2   # no fresh grace for a late arrival
         t.join()
+
+    def test_a_slow_thread_start_consumes_the_read_budget_so_owner_and_joiner_agree(self, monkeypatch) -> None:
+        ck = Cockpit()
+
+        def read(ctx):
+            time.sleep(0.15)
+            return Read(rows=())
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=read, order="time.desc",
+                                 facets=frozenset({"at"}), version_fields=("id",), timeout_s=0.2))
+        real_start = threading.Thread.start
+
+        def slow_start(self):
+            if self.name == "cockpit-read":
+                time.sleep(0.35)
+            return real_start(self)
+        monkeypatch.setattr(threading.Thread, "start", slow_start)
+        assert ck.panel("p")["status"] == "error"        # the budget ran out before the read could finish: no late healthy commit
+        assert ck.freshness()["p"]["status"] == "error"
+
+    def test_a_hostile_exception_in_output_processing_is_an_error_snapshot(self) -> None:
+        class Hostile(Exception):
+            def __str__(self):
+                raise KeyboardInterrupt()
+
+        class Rows:
+            def __iter__(self):
+                raise Hostile()
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed",
+                                 read=lambda c: Read(rows=Rows()), order="time.desc",
+                                 facets=frozenset({"at"}), version_fields=("id",)))
+        assert ck.panel("p")["status"] == "error"
