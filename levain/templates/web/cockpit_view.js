@@ -154,7 +154,17 @@
   // `snap.panels` maps a panel id to its payload, or to {error} when its fetch failed.
   function fromManifest(raw, opts) {
     const elapsed = Math.max(0, (opts && opts.elapsedMs) || 0);   // time since the manifest was fetched, measured by the caller
-    const snap = clean(raw);
+    // The manifest and each panel are cleaned apart: a hostile key inside ONE panel's payload (two keys that
+    // clean to one) rejects that panel alone; a collision in the manifest or between two panel ids is
+    // refused whole, since the references between them cannot then be told apart.
+    const snap = { manifest: clean(raw.manifest), panels: Object.create(null) };
+    for (const key of Object.keys(raw.panels || {})) {
+      const k = visible(key);
+      if (Object.prototype.hasOwnProperty.call(snap.panels, k)) throw new Error("two panel ids collide once cleaned: " + k);
+      let v;
+      try { v = clean(raw.panels[key]); } catch (e) { v = { error: "payload rejected: " + (e && e.message ? e.message : e) }; }
+      Object.defineProperty(snap.panels, k, { value: v, enumerable: true, writable: true, configurable: true });
+    }
     const m = snap.manifest;
     const gen = parseIso(m.generated_at);
     let now = isNaN(gen) ? Date.now() : gen;   // the server's clock, so a skewed browser cannot misreport ages
@@ -218,7 +228,7 @@
       if (bad) { unavailable(pid, zoneId, bad); return; }
       const panel = P.get(pid);
       const groupTitles = new Map();
-      for (const g of panel.groups || head.groups || []) groupTitles.set(g.id, g.title);
+      for (const g of panel.groups || head.groups || []) groupTitles.set(g.id, titleOf(g.title, String(g.id)));
       const entry = { zone: zoneId, edit_class: "", title: titleOf(panel.title, titleOf(head.title, pid)), id: pid };
       const banner = bannerOf(panel, panel, now);
       if (banner) entry.banner = banner;
