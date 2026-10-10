@@ -105,9 +105,11 @@ def test_focus_is_gone_from_the_hooks_the_cli_and_the_write_seam(tmp_path, monke
     from levain import cli
     from levain.writes import EditError, WriteScope, apply_edit
 
-    assert not hasattr(hook, "focus_notice")
+    # the helper keeps a silent focus_notice() for one release: a session_start.py that `levain update` left
+    # pending still calls it, and must not lose its other sections
+    assert hook.focus_notice() is None
     for hooks_dir in (HOOKS, HOOKS.parents[1] / "adapters" / "codex" / "activation" / "hooks"):
-        for name in ("_levain_hook.py", "session_start.py"):
+        for name in ("session_start.py", "user_prompt_submit.py"):
             assert "focus" not in (hooks_dir / name).read_text(encoding="utf-8").lower(), (hooks_dir, name)
 
     with pytest.raises(SystemExit) as ei:
