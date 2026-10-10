@@ -110,14 +110,17 @@
       });
       if (panel.degraded && panel.degraded.length) out.note = "not complete: " + (panel.error || panel.degraded.join(", "));
     } else if (head.kind === "line") {
-      out.lines = (v.lines || []).map((l) => ({ meta: l.label, text: l.text }));
+      out.lines = labelled(v.lines, "lines").map((l) => ({ meta: l.label, text: l.text }));
     } else if (head.kind === "metric") {
-      need(Array.isArray(v.metrics || []) && (v.metrics || []).every(isObj), "metrics");
-      out.lines = (v.metrics || []).map((m) => ({
+      const ms = v.metrics === undefined ? [] : v.metrics;
+      need(Array.isArray(ms) && ms.every((m) => isObj(m) && typeof m.label === "string"
+        && (typeof m.value === "string" || isNum(m.value)) && (m.unit == null || typeof m.unit === "string")
+        && (m.read == null || typeof m.read === "string")), "metrics");
+      out.lines = ms.map((m) => ({
         meta: m.label, text: m.value + (m.unit ? " " + m.unit : "") + (m.read ? " — " + m.read : ""),
         accent: m.status === "warn" || m.status === "bad", dim: m.status === "unknown" }));
     } else if (head.kind === "visual") {
-      out.lines = (v.text || []).map((l) => ({ meta: l.label, text: l.text }));
+      out.lines = labelled(v.text, "text").map((l) => ({ meta: l.label, text: l.text }));
     } else if (head.kind === "prose") {
       out.markdown = v.markdown || "";
     }
@@ -133,6 +136,12 @@
   function need(ok, what) { if (!ok) throw new Error("malformed " + what); }
   // text where text belongs; absent (null/undefined) is allowed and stays absent
   function textOrAbsent(x, what) { need(x === undefined || x === null || typeof x === "string", what); return x === null ? undefined : x; }
+  // a line list (line and visual kinds): absent is empty; each line is an object whose text is a string
+  function labelled(x, what) {
+    if (x === undefined || x === null) return [];
+    need(Array.isArray(x) && x.every((l) => isObj(l) && typeof l.text === "string" && (l.label == null || typeof l.label === "string")), what);
+    return x;
+  }
   // a tag list: the legacy form is ONE comma-joined string, which is split; an array's elements are whole tags
   function tagsOf(t) {
     if (t === undefined || t === null) return [];
@@ -170,9 +179,10 @@
     need(Array.isArray(metrics), "metrics");
     const m = new Map();
     for (const x of metrics) { need(isObj(x) && typeof x.label === "string", "metric"); m.set(x.label, x.value); }
-    for (const k of HEALTH_FIGURES) if (m.has(k)) need(isNum(m.get(k)), "metric " + k);
-    if (m.has("write path")) need(m.get("write path") === "live" || m.get("write path") === "dark", "metric write path");
-    const n = (k) => (m.has(k) ? m.get(k) : undefined);
+    // every figure is required: the kernel always sends each one, and an absent figure would print as 0
+    for (const k of HEALTH_FIGURES) need(m.has(k) && isNum(m.get(k)), "metric " + k);
+    need(m.get("write path") === "live" || m.get("write path") === "dark", "metric write path");
+    const n = (k) => m.get(k);
     const last = Array.isArray(wraps) && wraps[0] ? wraps[0] : null;
     return {
       write_path_live: m.get("write path") === "live", total_links: n("links"), avg_strength: n("avg strength"),
