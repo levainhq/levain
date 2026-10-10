@@ -4884,7 +4884,7 @@ def _dirmngr_sockets() -> list[Path]:
                 "place, so it cannot hide it from bash without network (fail-closed).")
         try:
             found.append(_host_spelling(Path(s)))  # bound through a linked parent: masked where it lands
-        except (OSError, RuntimeError) as e:
+        except (OSError, RuntimeError, ValueError) as e:
             raise ConfinementError(
                 f"cannot resolve the dirmngr socket path {s!r} ({e}), so the floor cannot hide it "
                 "from bash without network (fail-closed).") from None
