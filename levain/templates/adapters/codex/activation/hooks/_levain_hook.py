@@ -648,7 +648,7 @@ def focus_notice() -> None:
     return None
 
 
-def state_line_if_changed(session_id: str) -> tuple[str | None, str | None]:
+def state_line_pending(session_id: str) -> tuple[str | None, str | None]:
     """The per-prompt state line as (line, pending_signature): the line is shown only when
     it differs from what this session last saw. Unknown marker (never seeded, or pruned)
     shows a live line: a repeat is harmless, a swallowed change is not. A line that went
@@ -1052,4 +1052,11 @@ def emit(additional_context: str, event_name: str) -> bool:
         sys.stdout.flush()
         return True
     except (OSError, ValueError):
+        # Point fd 1 at devnull so interpreter shutdown cannot retry flushing the broken
+        # buffer (it would print 'Exception ignored' and exit 120). Python's documented
+        # SIGPIPE recipe.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
         return False

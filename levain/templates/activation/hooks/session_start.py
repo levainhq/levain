@@ -190,7 +190,7 @@ def main() -> int:
 
         delivered = True
         if sections:
-            delivered = hook.emit("\n\n".join(sections), "SessionStart") is not False
+            delivered = hook.emit("\n\n".join(sections), "SessionStart") is True
         if delivered and pending_sig is not None and isinstance(session_id, str) and session_id:
             hook.state_seen_record(session_id, pending_sig)
     except Exception:

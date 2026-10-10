@@ -203,7 +203,7 @@ def test_a_fault_in_the_state_section_drops_only_it(inst):
     inst.set_state("a line")
     inst.start()
     with (inst.hooks / "_levain_hook.py").open("a", encoding="utf-8") as f:
-        f.write("\n\ndef state_line_if_changed(session_id):\n    raise RuntimeError('boom')\n"
+        f.write("\n\ndef state_line_pending(session_id):\n    raise RuntimeError('boom')\n"
                 "\n\ndef state_line():\n    raise RuntimeError('boom')\n")
     inst.set_state("changed")
     out = inst.prompt()
@@ -215,12 +215,15 @@ def _run_closed_stdout(inst, script, payload):
     # The harness closed the pipe: emit() cannot deliver, whatever else the hook did.
     proc = subprocess.Popen(
         [sys.executable, str(inst.hooks / script)], stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=inst.root,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=inst.root,
         env={"PATH": "/usr/bin:/bin", "HOME": str(inst.root)})
     proc.stdout.close()
     proc.stdin.write(json.dumps(payload).encode())
     proc.stdin.close()
+    err = proc.stderr.read()
     proc.wait(timeout=60)
+    # silent exit 0: no 'Exception ignored on flushing sys.stdout' / exit 120 at shutdown
+    assert proc.returncode == 0 and err == b"", (proc.returncode, err)
 
 
 def test_a_marker_is_not_advanced_when_the_prompt_output_was_not_delivered(inst):
