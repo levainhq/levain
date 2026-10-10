@@ -42,6 +42,7 @@ class _Flight:
         self.done = threading.Event()
         self.result: _Call | None = None
         self.deadline = deadline       # on the instance's clock: a flight is abandoned once past it
+        self.timeout: _Call | None = None   # its own timeout reading, set once when it is abandoned
 
 
 class ExternalPanels:
@@ -50,7 +51,8 @@ class ExternalPanels:
     A flight carries its own deadline (``wait_s`` from its start), so every reader of one burst waits on the
     same instant. Past it the flight is abandoned: a timeout is recorded and reused like any other reading,
     so the burst's later readers return at once, and the next reuse window starts a fresh flight; the
-    abandoned flight's late answer reaches only readers already waiting on it, never the reuse. A callable
+    abandoned flight's late answer reaches only readers already waiting on it, never the reuse, so a callable
+    that always answers later than ``wait_s`` is shown as not answering, never as late data. A callable
     that hangs therefore parks its thread; at most ``max_parked`` such threads live at once, and while that
     many are parked no new flight starts (the timeout reading stands)."""
 
@@ -100,12 +102,13 @@ class ExternalPanels:
         return call
 
     def _abandon_locked(self, flight: _Flight, now: float) -> _Call:
-        if self._flight is flight:
-            self._flight = None
-            self._parked.add(flight)
-            return self._record_locked(
-                _Call(None, f"the external panels did not answer within {self._wait_s:g} s", _now_iso()), now)
-        return self._last[1] if self._last is not None else _Call(None, "the external panels failed", _now_iso())
+        if flight.timeout is None:
+            flight.timeout = _Call(None, f"the external panels did not answer within {self._wait_s:g} s", _now_iso())
+            if self._flight is flight:
+                self._flight = None
+                self._parked.add(flight)
+                self._record_locked(flight.timeout, now)
+        return flight.timeout     # every reader of an abandoned flight gets that flight's own reading
 
     def _run(self, flight: _Flight) -> None:
         call = _Call(None, "the external panels call ended without an answer", _now_iso())
@@ -250,7 +253,7 @@ def _reader(ext: ExternalPanels, pid: str, prose: bool) -> Callable[[ReadContext
             note = _note(_title(p, pid, None)[1], _str(p.get("note")))
             return Read(value={"markdown": p["markdown"]}, as_of=call.as_of, note=note, empty=_empty(p))
         lines = p.get("lines")
-        if lines is not None and not isinstance(lines, (list, tuple)):   # absent or None is no lines, as before
+        if lines is not None and not isinstance(lines, (list, tuple)):   # absent or None is no lines, as the legacy renderer reads it
             return Fault("the external panel's lines are not a list")
         rows, bad = _rows(p)
         note = _note(_title(p, pid, len(rows))[1], _str(p.get("note")))
