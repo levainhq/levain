@@ -38,7 +38,6 @@ import json
 import os
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -1319,58 +1318,17 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
 
 
 @contextmanager
-def _exclusive_file_lock(
-    path: Path, key: tuple[Path, int], *, what: str, busy: Callable[[], InstallLockError],
-) -> Iterator[None]:
-    """The single-writer lock where ``flock`` is unavailable: ``<lock>.held`` created with
-    ``O_CREAT | O_EXCL | O_NOFOLLOW`` (git's ``index.lock`` primitive, which needs nothing from
-    the filesystem but an atomic exclusive create), removed on release. A process killed while
-    holding it leaves the file, and the next run is refused naming it: stale is refused, never
-    guessed at, because a holder on another machine sharing the home cannot be seen from here."""
-    held = path.with_name(path.name + ".held")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        held.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(held, flags, 0o644)
-    except FileExistsError:
-        exc = busy()
-        exc.message += (f" (Held by {held}. If no levain process is running on any machine that "
-                        f"shares this directory, remove that file and re-run.)")
-        exc.args = (exc.message,)
-        raise exc from None
-    except OSError as e:
-        raise InstallLockError(
-            f"cannot create {what} {held} ({e.strerror or e}). Nothing was written; fix the "
-            f"permissions on {held.parent} and re-run.") from None
-    try:
-        with contextlib.suppress(OSError):
-            os.write(fd, f"{os.getpid()} {socket.gethostname()}\n".encode())
-    finally:
-        os.close(fd)
-    with _held_install_locks_guard:
-        _held_install_locks[key] = 1
-    try:
-        yield
-    finally:
-        with _held_install_locks_guard:
-            del _held_install_locks[key]
-        with contextlib.suppress(OSError):
-            held.unlink()
-
-
-@contextmanager
 def _single_writer_lock(
     path: Path, *, what: str, guards: str, busy: Callable[[], InstallLockError],
     precheck: Callable[[], None] | None = None,
 ) -> Iterator[None]:
     """An exclusive non-blocking ``flock`` on ``path``, reentrant per (path, thread); the
-    body of :func:`install_lock` and :func:`codex_home_lock`. Where ``flock`` does not exist
-    (Windows) or the filesystem does not support it (an SMB or NFS home without lockd), the
-    lock is an exclusively created file beside it (:func:`_exclusive_file_lock`), never none."""
+    body of :func:`install_lock` and :func:`codex_home_lock`."""
     try:
         import fcntl
     except ImportError:
-        fcntl = None  # type: ignore[assignment]
+        yield
+        return
     key = (path.resolve(), threading.get_ident())
     with _held_install_locks_guard:
         if key in _held_install_locks:
@@ -1387,10 +1345,6 @@ def _single_writer_lock(
         return
     if precheck is not None:
         precheck()
-    if fcntl is None:
-        with _exclusive_file_lock(path, key, what=what, busy=busy):
-            yield
-        return
     fd = -1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1428,16 +1382,20 @@ def _single_writer_lock(
                     f"re-run, and check the filesystem if it repeats."
                 ) from None
             if e.errno in unsupported:
-                # A filesystem without flock (an SMB or NFS home without lockd) is not
-                # "another process", and running unguarded there was a stated hole: the
-                # exclusively created file holds the same single writer.
-                print(f"  note: this filesystem cannot flock {path} ({e.strerror or e}); "
-                      f"using an exclusive lock file instead, against {guards}.",
+                # A filesystem without lock support (NFS without lockd, some SMB/FUSE
+                # homes) is not "another process": proceed unguarded, and say so.
+                print(f"  note: this filesystem cannot lock {path} ({e.strerror or e}); "
+                      f"continuing without the guard against {guards}.",
                       file=sys.stderr)
                 os.close(fd)
                 fd = -1
-                with _exclusive_file_lock(path, key, what=what, busy=busy):
+                with _held_install_locks_guard:
+                    _held_install_locks[key] = 1
+                try:
                     yield
+                finally:
+                    with _held_install_locks_guard:
+                        del _held_install_locks[key]
                 return
             raise busy() from None
         with _held_install_locks_guard:
@@ -3055,6 +3013,7 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
             except BaseException:
                 landed = False
             if not landed:
+                leave_kept = kept is not None  # owned by the undo until it proves otherwise
                 leave_kept = _put_codex_config_back(config, written, was_link, ours, kept, hooks,
                                                     notes)
             raise
@@ -3063,7 +3022,10 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
             with contextlib.suppress(OSError):
                 kept.unlink()
         for n in notes:
-            emit(n)
+            try:
+                emit(n)
+            except Exception:  # a broken output channel must not mask the real error
+                print(n, file=sys.stderr)
 
 
 def _keep_original(written: Path) -> Path | None:
@@ -3120,11 +3082,18 @@ def _put_codex_config_back(config: Path, written: Path, was_link: bool,
         pass
     if kept is None and not written.exists():
         return False  # nothing was created
+    if ours is None and kept is not None:
+        # Which file is live cannot be proved (the merge was interrupted before it could be
+        # read, or the read failed). Unchanged bytes mean nothing to undo; anything else is
+        # left as it is and the original named, never overwritten on a guess.
+        with contextlib.suppress(OSError):
+            if written.read_bytes() == kept.read_bytes():
+                return False
     try:
-        still_ours = (config.is_symlink() == was_link and config.resolve() == written
-                      and written.is_file()
-                      and (ours is None or _file_identity(written) == ours))
-    except OSError:
+        still_ours = (ours is not None and config.is_symlink() == was_link
+                      and config.resolve() == written and written.is_file()
+                      and _file_identity(written) == ours)
+    except (OSError, RuntimeError):
         still_ours = False
     if not still_ours:
         where = f"; the original is kept at {kept}" if kept is not None else ""

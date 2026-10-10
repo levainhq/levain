@@ -4824,8 +4824,10 @@ def _dirmngr_sockets() -> list[Path]:
     found: list[Path] = []
     roots = [Path(r) / "gnupg" for r in _runtime_dirs()] + [Path.home() / ".gnupg"]
     gnupghome = Path(os.environ.get("GNUPGHOME") or "~/.gnupg").expanduser()
-    if gnupghome.is_absolute():  # a relative one names nothing stable
+    if gnupghome.is_absolute():
         roots.append(gnupghome)
+    else:  # gpg resolves a relative one against its cwd; both bases are checked
+        roots += [Path.cwd() / gnupghome, Path.home() / gnupghome]
     for g in roots:
         try:
             if not g.is_dir():
