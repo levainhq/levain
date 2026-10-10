@@ -1506,3 +1506,68 @@ class TestOneFlightOrdersByConstruction:
             ck.panel("p")
         assert ck._state["p"].pflight is None                  # not stranded
         assert ck.panel("p")["status"] == "empty"              # and the next read works
+
+
+class TestR18:
+    """L3 r18's three findings, each reproduced on 8087360 before the fix."""
+
+    def test_an_interrupt_after_the_read_thread_launched_never_overlaps_two_provider_reads(self, monkeypatch) -> None:
+        gate, mu = threading.Event(), threading.Lock()
+        live, peak, calls = [0], [0], [0]
+
+        def read(ctx):
+            with mu:
+                calls[0] += 1
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+            gate.wait(2)
+            with mu:
+                live[0] -= 1
+            return Read(rows=())
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=read, order="time.desc",
+                                 facets=frozenset({"at"}), version_fields=("id",), timeout_s=1.0))
+        real = threading.Thread.start
+        first = [True]
+
+        def start(self):                      # the finding's wrapper: the OS thread is running, then the interrupt
+            real(self)
+            if self.name == "cockpit-read" and first[0]:
+                first[0] = False
+                raise KeyboardInterrupt()
+        monkeypatch.setattr(threading.Thread, "start", start)
+        with pytest.raises(KeyboardInterrupt):
+            ck.panel("p")
+        time.sleep(0.1)                       # give a launched worker every chance to reach the provider
+        t = threading.Thread(target=ck.panel, args=("p",))
+        t.start()
+        time.sleep(0.2)
+        gate.set()
+        t.join(3)
+        assert peak[0] == 1 and calls[0] == 1  # the interrupted flight never invoked the provider
+
+    def test_provider_made_fault_and_absent_from_bounded_reads_carry_plain_text(self) -> None:
+        mode = ["fault"]
+
+        def one(ctx, rid):
+            return Fault(ValueError("db down")) if mode[0] == "fault" else Absent(KeyError("gone"))  # type: ignore[arg-type]
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=lambda c: Read(rows=()),
+                                 order="time.desc", facets=frozenset({"at"}), version_fields=("id",), read_one=one))
+        f = ck.read_one("p", "x")
+        assert isinstance(f, Fault) and type(f.message) is str and "db down" in f.message
+        mode[0] = "absent"
+        a = ck.read_one("p", "x")
+        assert isinstance(a, Absent) and type(a.reason) is str and "gone" in a.reason
+        json.dumps({"m": f.message, "r": a.reason})
+
+    def test_a_second_commit_failure_is_an_error_snapshot_not_a_raw_exception(self, monkeypatch) -> None:
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=lambda c: Read(rows=()),
+                                 order="time.desc", facets=frozenset({"at"}), version_fields=("id",)))
+
+        def boom(*a, **k):
+            raise RuntimeError("book failed")
+        monkeypatch.setattr(ck, "_book", boom)
+        assert ck.panel("p")["status"] == "error"
+        assert ck._state["p"].pflight is None

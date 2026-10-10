@@ -179,6 +179,8 @@ class _Flight:
         self.started = time.monotonic()
         self.finished: float | None = None   # when the read thread produced ``raw``
         self.committed = False
+        self.go = threading.Event()      # the owner's word that the read may invoke the provider
+        self.cancelled = False           # set before ``go`` when the owner left without launching cleanly
 
 
 class _Refresher:
@@ -321,8 +323,10 @@ class Cockpit:
         on_timeout: Callable[[], None] | None = None, on_end: Callable[[], None] | None = None,
     ) -> Any:
         """THE ONLY place a provider is invoked (panel reads, entity, discovery, read_one). It owns
-        thread start, the once-only resolution of every future, exception text (``_safe_str``) and the
-        deadline, so none of that is copied per call site.
+        thread start, the once-only resolution of every future, exception text (``_safe_str``), the plain
+        text of a provider-made Fault/Absent and the deadline, so none of that is copied per call site.
+        The worker invokes the provider only after the owner sets ``go``; an owner that leaves before a
+        clean start cancels the flight, so a launched worker can never overlap the next one.
 
         One read runs at a time per state. The caller that finds none OWNS it: ``produce()`` runs in a
         worker thread (provider code and everything derived from provider output lives there, so a hung
@@ -353,7 +357,15 @@ class Cockpit:
         def work() -> None:
             out: Any = Fault("the read ended without a result")
             try:
-                out = produce()
+                fl.go.wait()
+                if fl.cancelled:
+                    out = Fault("the read was cancelled before it started")
+                else:
+                    out = produce()
+                    if isinstance(out, Fault):            # engine-owned plain text: nothing provider-made reaches the owner
+                        out = Fault(_safe_str(out.message))
+                    elif isinstance(out, Absent):
+                        out = Absent(_safe_str(out.reason))
             except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
                 out = Fault(f"{type(exc).__name__}: {_safe_str(exc)}")
             finally:                      # raw ALWAYS reaches a terminal state, even for a hostile exception
@@ -373,7 +385,10 @@ class Cockpit:
         try:
             try:
                 threading.Thread(target=work, name="cockpit-read", daemon=True).start()
+                fl.go.set()
             except BaseException as exc:  # noqa: BLE001 - a failed start fails THIS read and poisons nothing
+                fl.cancelled = True        # a thread that did launch before the failure exits without the provider
+                fl.go.set()
                 fl.finished = time.monotonic()
                 _set_once(fl.raw, Fault(f"could not start a read: {type(exc).__name__}: {_safe_str(exc)}"))
                 if not isinstance(exc, Exception):
@@ -389,10 +404,16 @@ class Cockpit:
             try:
                 result = commit(raw)
             except Exception as exc:  # noqa: BLE001 - an outcome that cannot be committed is an error outcome
-                result = commit(Fault(f"{type(exc).__name__}: {_safe_str(exc)}"))
+                try:
+                    result = commit(Fault(f"{type(exc).__name__}: {_safe_str(exc)}"))
+                except Exception as exc2:  # noqa: BLE001 - nothing committed; the caller still gets an error answer
+                    result = refused(f"the read could not be committed: {type(exc2).__name__}: {_safe_str(exc2)}")
             committed_ok = True
             return result
         finally:
+            if not fl.go.is_set():         # left between a clean start and ``go`` (an interrupt): the worker must not read
+                fl.cancelled = True
+                fl.go.set()
             with st.lock:
                 fl.committed = True
                 if on_end:
@@ -484,10 +505,8 @@ class Cockpit:
         """Provider output -> a snapshot, or the Fault/Absent it already is. Runs in the read worker:
         everything that touches provider-controlled data (rows, values) happens here, under the
         flight's deadline, never on the owner."""
-        if isinstance(res, Fault):
-            return Fault(_safe_str(res.message))      # engine-owned plain text: nothing provider-made reaches the owner
-        if isinstance(res, Absent):
-            return Absent(_safe_str(res.reason))
+        if isinstance(res, (Fault, Absent)):
+            return res                                # its text is rebuilt in ``_single_flight``'s worker
         if not isinstance(res, Read):
             return Fault(f"provider returned {type(res).__name__}, not Read/Absent/Fault")
         try:
@@ -987,7 +1006,7 @@ class Cockpit:
         return self._bounded(spec.timeout_s, None, once, ctx)
 
 
-def _safe_str(exc: BaseException) -> str:
+def _safe_str(exc: object) -> str:
     try:
         return str(exc)
     except BaseException:  # noqa: BLE001 - an exception whose own text raises must not abort the caller
