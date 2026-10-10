@@ -10,7 +10,20 @@ trusted not to be adversarial. The flight deadline bounds provider hangs and wor
 of their output; output objects are NOT deep-materialised, so a provider that returns a hostile
 object (a container subclass whose methods block, a hostile ``__hash__``) is outside the model. If
 any later slice lets an UNTRUSTED party register a provider (a team server, a plugin), this
-assumption becomes a must-close for that slice."""
+assumption becomes a must-close for that slice.
+
+INTERRUPT CONTRACT (K1 L3 r20). Python delivers KeyboardInterrupt only to the main thread, between
+any two bytecodes, so no placement of ``try`` makes a critical section fully interrupt-safe (the
+only general answer, deferring SIGINT through a process-wide handler, is the host's to install, not
+a library's). What the engine guarantees under ANY interrupt: two provider reads of one state never
+overlap, because a worker invokes the provider only after the owner's ``go``, which follows a clean
+thread start, and only the worker ends a flight whose provider started. What it does not: an
+interrupt that lands inside ``_single_flight``'s flight-publication section (from taking the flight
+under ``st.lock`` to entering the owner's ``try``) can leave that panel answering errors for the
+life of the Cockpit object. A caller that catches KeyboardInterrupt from a read and keeps the same
+Cockpit must rebuild it. [judged by 1010+13 levain-seat, 2026-10-10, against the callers on
+seat/1009-k1-cockpit-read and seat/1009-r1r2-render3: web reads run on server and refresher threads;
+the one main-thread reader, ``levain tui --manifest``, ends and stops the Cockpit on an interrupt.]"""
 
 from __future__ import annotations
 
