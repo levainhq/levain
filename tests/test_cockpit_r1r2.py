@@ -336,7 +336,7 @@ class TestManifestMapperBoundary:
         assert health_view(None)["wrap_history_unavailable"] is False
         assert health_view("fault")["wrap_history_unavailable"] is True
 
-    def test_one_malformed_panel_degrades_alone_and_colliding_cleaned_keys_stay_distinct(self) -> None:
+    def test_one_malformed_panel_degrades_alone_and_a_colliding_cleaned_key_is_refused(self) -> None:
         ck = _tray_cockpit()
         ck.register(ProviderSpec("m", "metric", "M", "gauge", lambda c: Read(value={"metrics": [
             {"label": "x", "value": 1, "unit": None, "status": "ok", "read": None}]})))
@@ -345,11 +345,12 @@ class TestManifestMapperBoundary:
         view = _view(snap)
         assert "could not be mapped" in view["extra_panels"]["m"]["error"]
         assert [e["id"] for e in view["layout"]].count("tray") == 1          # the rest of the cockpit still renders
-        out = subprocess.run([NODE, "-e", "const C=require(process.argv[1]);"
-                              "const o=C.clean(JSON.parse('{\"ops\\\\u202ey\":1,\"ops<U+202E>y\":2}'));"
-                              "process.stdout.write(Object.keys(o).join('|') + ':' + o[Object.keys(o)[0]])", str(WEB / "cockpit_view.js")],
-                             capture_output=True, text=True, check=True).stdout
-        assert out == "ops<U+202E>y:1"          # a collision keeps the first key and its value; no renamed twin the references miss
+        js = ("const C=require(process.argv[1]);let r=[];"
+              "for (const j of ['{\"ops\\\\u202ey\":1,\"ops<U+202E>y\":2}', '{\"ops<U+202E>y\":2,\"ops\\\\u202ey\":1}'])"
+              "{try{C.clean(JSON.parse(j));r.push('kept')}catch(e){r.push('refused')}}"
+              "process.stdout.write(r.join(','))")
+        out = subprocess.run([NODE, "-e", js, str(WEB / "cockpit_view.js")], capture_output=True, text=True, check=True).stdout
+        assert out == "refused,refused"        # a collision is refused whole, in any key order, never resolved by a guess
 
     def test_a_non_string_panel_title_falls_back_to_the_head_title(self) -> None:
         ck = _tray_cockpit()
@@ -460,4 +461,5 @@ console.log("OK");
         body = core[core.index("function renderSporeProjection"):core.index("function renderSpores(")]
         assert "mountSporeFilter(p, list" in body and "entry.kind" in body
         assert "const sporeQueries = Object.create(null)" in core            # a kind named "constructor" is data
-        assert "try { node = renderPanel(entry, view); }" in core            # a panel that cannot be drawn degrades alone
+        assert "try { return renderPanel(entry, view, opts); }" in core      # a panel that cannot be drawn degrades alone
+        assert core.count("renderPanelSafe(") >= 3                          # the board AND the modal draw through it
