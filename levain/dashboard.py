@@ -43,6 +43,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -639,6 +640,7 @@ STATE_MAX_TEXT_LEN = 500
 # app, another machine), not bad data: it reads as age 0, never as unset.
 STATE_CLOCK_SKEW_SECONDS = 300
 STATE_KEYS = ("state", "state_set_at", "state_source")   # the stored record a state write binds to
+STATE_LOCK_WAIT_S = 5.0   # how long a state write waits for another writer's lock before refusing
 
 
 @dataclass
@@ -797,7 +799,16 @@ def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
     os.makedirs(os.path.dirname(lock), exist_ok=True)
     fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        # a bounded wait, then refuse (SQLite's busy_timeout shape): a stopped holder never hangs a writer
+        deadline = time.monotonic() + STATE_LOCK_WAIT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise OSError(f"the state file is locked by another writer ({lock}); try again") from None
+                time.sleep(0.05)
         yield
     finally:
         os.close(fd)    # closing the descriptor releases the flock

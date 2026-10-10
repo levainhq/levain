@@ -1023,3 +1023,42 @@ class TestSporeCas:
         e = _refused("bad_request", apply_edit, rig.src.write_scope, {"kind": "operator_state", "text": "x"},
                      expected_version="0" * 16)
         assert e.http_status == 400
+
+
+class TestL3Round4:
+    def test_no_caller_value_matches_an_unversionable_row(self, rig: Rig, monkeypatch) -> None:
+        """codex HIGH r4 (on e35cdee): the failure marker was the string "unversionable", so a caller
+        passing that exact expected_version made an unreadable row compare equal and the write land."""
+        import levain.cockpit.providers as prov
+        from levain.writes import apply_edit
+        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
+        before = rig.spore("seed")
+        for v in ("unversionable", "x"):
+            _refused("stale", apply_edit, rig.src.write_scope, {"kind": "spore_touch", "spore_id": rig.ids["seed"]},
+                     expected_version=v)
+        assert rig.spore("seed") == before
+
+    def test_a_discovered_id_that_is_not_a_string_is_an_errors_entry_not_a_crash(self, tmp_path: Path) -> None:
+        """complement + codex + glm r4: the Counter hashed ids before the string check."""
+        r = Rig(tmp_path)
+        r.ck.discover(lambda ctx: [ProviderSpec([], "line", "x", "feed", lambda ctx: Read(value={"lines": []}))])  # type: ignore[arg-type]
+        m = r.ck.manifest(CRED)
+        assert any("must be a string" in e["message"] for e in m["errors"])
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no flock")
+    def test_a_held_state_lock_refuses_after_a_bounded_wait(self, rig: Rig, monkeypatch) -> None:
+        """complement #2 r4: flock(LOCK_EX) waited forever behind a stopped holder."""
+        import fcntl
+        import time as _time
+        from levain import dashboard
+        monkeypatch.setattr(dashboard, "STATE_LOCK_WAIT_S", 0.2)
+        cj = rig.root / ".levain" / "context.json"
+        fd = os.open(os.path.realpath(cj) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            t0 = _time.monotonic()
+            with pytest.raises(OSError, match="locked by another writer"):
+                dashboard.write_state(cj, "blocked")
+            assert _time.monotonic() - t0 < 2
+        finally:
+            os.close(fd)

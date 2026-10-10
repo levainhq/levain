@@ -919,7 +919,7 @@ class Cockpit:
                 errors.append({"source": f"discovery:{i}", "message": res.message})
                 continue
             returned: set[str] = set()
-            ids = Counter(s.id for s in res.value)
+            ids = Counter(s.id for s in res.value if isinstance(s.id, str))   # a bad id is an errors entry below
             for spec in res.value:
                 if not isinstance(spec.id, str):
                     errors.append({"source": f"discovery:{i}", "message": "a discovered panel id must be a string"})

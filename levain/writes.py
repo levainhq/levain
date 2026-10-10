@@ -1367,9 +1367,13 @@ class _VersionGuard:
     def version_of(self, spore: dict[str, Any]) -> str:
         try:
             self.found = self._version(spore)
+        except (MemoryError, RecursionError):
+            raise
         except Exception as exc:  # noqa: BLE001 - a stored row the kernel cannot read matches no version it
-            # rendered; the import is resolved in __init__, so this is the row, never the environment
-            self.found, self.error = "unversionable", f"{type(exc).__name__}: {exc}"
+            # rendered; the import is resolved in __init__, so this is the row, never the environment.
+            # "" can never equal an expected version (anneal refuses an empty one), so no caller value
+            # can make an unreadable row compare equal
+            self.found, self.error = "", f"{type(exc).__name__}: {exc}"
         return self.found
 
 
