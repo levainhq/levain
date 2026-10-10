@@ -202,16 +202,17 @@
   function lineOf(panel, head, now) {
     if (head.status === "error") return null;
     // the state line is the operator's own words: a malformed panel must never read as "no state set"
-    // The kernel drops an expired line and sends the stamp in one canonical UTC form, so a stamp that does
-    // not parse is malformed. Time is not judged here beyond that: a stamp ahead of this clock (a browser
-    // clock behind the server's) shows its words with the age unknown, never hidden.
+    // The kernel drops an expired line and sends the stamp as toISOString would, so a stamp that does not
+    // round-trip through Date is malformed (outside that format Date.parse is engine-specific). Time is not
+    // judged here beyond that: a stamp ahead of this clock (a browser clock behind the server's) shows its
+    // words with the age unknown, never hidden.
     if (panel.value === null) return { text: null };    // the kernel's empty or compact read
     need(isObj(panel.value), "state value");
     const l = labelled(panel.value.lines, "state lines")[0];
     if (!l) return { text: null };
     need(typeof l.at === "string" && (l.source == null || typeof l.source === "string"), "state line");
-    const t = parseIso(l.at);
-    need(!isNaN(t), "state line stamp");
+    const t = Date.parse(l.at);
+    need(!isNaN(t) && new Date(t).toISOString() === l.at, "state line stamp");
     const known = t <= now + 60000;   // a minute of slack before an age is called unknown rather than "just now"
     return { text: l.text, set_at: l.at, source: l.source, age_label: known ? ageLabel(l.at, now, "set ") : "" };
   }

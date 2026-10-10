@@ -343,10 +343,12 @@ def _context_line(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         item = view.state
         if item is None or not item.text:
             return Read(value={"lines": []})
-        # an expired or age-unknown line is already dropped by the reader, so what arrives is fresh; the
-        # stamp goes out in one canonical UTC form, so a client never meets a variant only Python parses
+        # an expired or age-unknown line is already dropped by the reader, so what arrives is fresh. The stamp
+        # goes out in ECMA-262's Date Time String Format (what toISOString emits), the one form every JS engine
+        # must parse; any other string is implementation-defined, so the client checks the round trip.
         ts = datetime.fromisoformat(item.set_at)
-        at = (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).isoformat()
+        at = (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+        at = at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
         return Read(value={"lines": [{"label": "state", "text": item.text, "at": at, "source": item.source}]})
     return read
 

@@ -1065,10 +1065,10 @@ def emit(additional_context: str, event_name: str) -> bool:
         # buffer (it would print 'Exception ignored' and exit 120). Python's documented
         # SIGPIPE recipe.
         try:
+            target = sys.stdout.fileno()
             fd = os.open(os.devnull, os.O_WRONLY)
-            try:
-                os.dup2(fd, sys.stdout.fileno())
-            finally:
+            if fd != target:    # a closed fd 1 is handed back by open itself, and closing it then re-breaks stdout
+                os.dup2(fd, target)
                 os.close(fd)
         except Exception:
             pass
