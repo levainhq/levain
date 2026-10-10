@@ -507,8 +507,13 @@
     kv(p, "density", `${num(h.density).toFixed(3)}` + (h.local_density != null ? ` · local ${num(h.local_density).toFixed(3)}` : ""));
     kv(p, "graduations", `${fmt(h.graduations_validated_total)} validated / ${fmt(h.graduations_demoted_total)} demoted`);
     kv(p, "episodes", `${fmt(h.total_episodes)} (${fmt(h.episodes_since_wrap)} since wrap)`);
-    const last = h.last_wrap_at ? datePart(h.last_wrap_at) : "never";
-    kv(p, "continuity", `${h.continuity_chars != null ? fmt(h.continuity_chars) + " chars" : "not yet created"} · ${fmt(h.total_wraps)} wraps · last ${last}`);
+    if (h.wrap_history_unavailable) {
+      // the wraps panel could not be read: say so, never "never" (a manifest source)
+      kv(p, "continuity", `${fmt(h.total_wraps)} wraps · history unavailable`);
+    } else {
+      const last = h.last_wrap_at ? datePart(h.last_wrap_at) : "never";
+      kv(p, "continuity", `${h.continuity_chars != null ? fmt(h.continuity_chars) + " chars" : "not yet created"} · ${fmt(h.total_wraps)} wraps · last ${last}`);
+    }
     if (h.tombstones) kv(p, "tombstones", fmt(h.tombstones));
     if (h.wrap_in_progress) p.appendChild(el("p", "note", "⚠ wrap in progress — snapshot may be momentarily inconsistent"));
     return p;
