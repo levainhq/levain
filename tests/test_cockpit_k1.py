@@ -1511,8 +1511,11 @@ class TestOneFlightOrdersByConstruction:
 class TestR18:
     """L3 r18's three findings, each reproduced on 8087360 before the fix."""
 
-    def test_an_interrupt_after_the_read_thread_launched_never_overlaps_two_provider_reads(self, monkeypatch) -> None:
-        gate, mu = threading.Event(), threading.Lock()
+    @pytest.mark.parametrize("where", ["start", "go"])
+    def test_an_interrupt_after_the_read_thread_launched_never_overlaps_two_provider_reads(
+            self, monkeypatch, where: str) -> None:
+        from levain.cockpit import engine
+        gate, entered, mu = threading.Event(), threading.Event(), threading.Lock()
         live, peak, calls = [0], [0], [0]
 
         def read(ctx):
@@ -1520,6 +1523,7 @@ class TestR18:
                 calls[0] += 1
                 live[0] += 1
                 peak[0] = max(peak[0], live[0])
+            entered.set()
             gate.wait(2)
             with mu:
                 live[0] -= 1
@@ -1527,24 +1531,42 @@ class TestR18:
         ck = Cockpit()
         ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=read, order="time.desc",
                                  facets=frozenset({"at"}), version_fields=("id",), timeout_s=1.0))
-        real = threading.Thread.start
         first = [True]
+        if where == "start":                  # r18: the OS thread is running, then the interrupt
+            real = threading.Thread.start
 
-        def start(self):                      # the finding's wrapper: the OS thread is running, then the interrupt
-            real(self)
-            if self.name == "cockpit-read" and first[0]:
-                first[0] = False
-                raise KeyboardInterrupt()
-        monkeypatch.setattr(threading.Thread, "start", start)
+            def start(self):
+                real(self)
+                if self.name == "cockpit-read" and first[0]:
+                    first[0] = False
+                    raise KeyboardInterrupt()
+            monkeypatch.setattr(threading.Thread, "start", start)
+        else:                                 # r19: the go is given, the worker is in the provider, then the interrupt
+            class Go(threading.Event):
+                def set(self):
+                    super().set()
+                    if first[0]:
+                        first[0] = False
+                        entered.wait(2)
+                        raise KeyboardInterrupt()
+
+            class Flight(engine._Flight):
+                def __init__(self, timeout_s):
+                    super().__init__(timeout_s)
+                    self.go = Go()
+            monkeypatch.setattr(engine, "_Flight", Flight)
         with pytest.raises(KeyboardInterrupt):
             ck.panel("p")
-        time.sleep(0.1)                       # give a launched worker every chance to reach the provider
         t = threading.Thread(target=ck.panel, args=("p",))
         t.start()
         time.sleep(0.2)
         gate.set()
         t.join(3)
-        assert peak[0] == 1 and calls[0] == 1  # the interrupted flight never invoked the provider
+        until = time.monotonic() + 3
+        while ck._state["p"].pflight is not None and time.monotonic() < until:
+            time.sleep(0.01)
+        assert ck.panel("p")["status"] == "empty"   # the panel recovers once the one read in flight ends
+        assert peak[0] == 1                          # never two provider reads at once
 
     def test_provider_made_fault_and_absent_from_bounded_reads_carry_plain_text(self) -> None:
         mode = ["fault"]
