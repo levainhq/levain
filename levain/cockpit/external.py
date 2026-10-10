@@ -43,7 +43,6 @@ class _Flight:
         self.result: _Call | None = None
         self.deadline = deadline       # on the instance's clock: a flight is abandoned once past it
         self.timeout: _Call | None = None   # its own timeout reading, set once when it is abandoned
-        self.answered: tuple[float, _Call] | None = None   # (when, answer): the worker's, before it takes the lock
 
 
 class ExternalPanels:
@@ -52,10 +51,11 @@ class ExternalPanels:
     A flight carries its own deadline (``wait_s`` from its start), so every reader of one burst waits on the
     same instant. Past it the flight is abandoned: a timeout is recorded and reused like any other reading,
     so the burst's later readers return at once, and the next reuse window starts a fresh flight. A flight
-    has one verdict for all its readers: an answer at or after its deadline is its timeout, never late data
-    in a reader or the reuse, so a callable that always answers later than ``wait_s`` is shown as not
-    answering. A callable that hangs therefore parks its thread; at most ``max_parked`` such threads live at
-    once, and while that many are parked no new flight starts (the timeout reading stands)."""
+    has one verdict for all its readers and the reuse: its FIRST transition under the lock, either the
+    worker's answer or a reader's timeout once that reader's deadline wait ran out; the second is dropped
+    (java.util.concurrent.FutureTask's rule: set() and cancel() race on one CAS from NEW, no clock). A
+    callable that hangs therefore parks its thread; at most ``max_parked`` such threads live at once, and while that
+    many are parked no new flight starts (the timeout reading stands)."""
 
     def __init__(self, fn: Callable[[], Any], *, reuse_s: float = 5.0, wait_s: float = 8.0,
                  max_parked: int = 2, clock: Callable[[], float] = time.monotonic) -> None:
@@ -92,11 +92,7 @@ class ExternalPanels:
                 self._flight = flight
                 self.calls += 1
         flight.done.wait(max(0.0, flight.deadline - self._clock()))
-        with self._lock:          # one verdict per flight: its timeout once it has one, else its answer
-            if flight.timeout is not None:
-                return flight.timeout
-            if flight.result is not None:
-                return flight.result
+        with self._lock:
             return self._abandon_locked(flight, self._clock())
 
     def _record_locked(self, call: _Call, now: float) -> _Call:
@@ -104,9 +100,8 @@ class ExternalPanels:
         return call
 
     def _abandon_locked(self, flight: _Flight, now: float) -> _Call:
-        answered = flight.answered
-        if flight.timeout is None and answered is not None and answered[0] < flight.deadline:
-            return answered[1]    # it answered on time and its publication is waiting on the lock
+        if flight.result is not None:
+            return flight.result      # the answer was the first transition
         if flight.timeout is None:
             flight.timeout = _Call(None, f"the external panels did not answer within {self._wait_s:g} s", _now_iso())
             if self._flight is flight:
@@ -125,21 +120,15 @@ class ExternalPanels:
         except BaseException as exc:  # noqa: BLE001 - every failure is a reading, reused like one
             call = _Call(None, _describe(exc), _now_iso())
         finally:
-            try:
-                now = self._clock()    # when the call answered, not when its answer got the lock
-            except BaseException:  # noqa: BLE001 - a clock that fails cannot vouch for the answer
-                now = flight.deadline
-            flight.answered = (now, call)   # visible to a reader that takes the lock first
             with self._lock:
-                if flight.timeout is None and now >= flight.deadline:
-                    self._abandon_locked(flight, now)   # an answer after the deadline is a timeout, for all readers
-                flight.result = call
+                if flight.timeout is None:
+                    flight.result = call      # the first transition; after a timeout the answer is dropped
                 self._parked.discard(flight)
                 # golang.org/x/sync/singleflight's rule: only the current (unforgotten) call may touch
-                # the shared state; an abandoned one's readers already hold its timeout
+                # the shared state
                 if self._flight is flight:
                     self._flight = None
-                    self._last = (now, call)
+                    self._last = (self._clock(), call)
             flight.done.set()
 
 

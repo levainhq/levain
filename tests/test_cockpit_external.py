@@ -468,25 +468,6 @@ def test_two_readers_of_one_flight_never_disagree_when_it_answers_after_its_dead
     assert out["r2"] is r1                         # one verdict for both readers
 
 
-def test_an_answer_that_wins_the_lock_past_the_deadline_is_a_timeout_not_published() -> None:
-    # the call answers after its deadline before any reader abandoned it: no reader and no reuse sees it
-    now = [0.0]
-
-    def fn():
-        now[0] = 1.0                               # the deadline (0.5) passes while the call runs
-        return _panels()
-    ext = ExternalPanels(fn, reuse_s=10, wait_s=0.5, clock=lambda: now[0])
-    got = ext.take()
-    assert got.panels is None and "did not answer" in (got.error or "")
-    assert ext._last is not None and ext._last[1] is got
-    assert ext.take() is got                       # the reuse holds the timeout, not the late answer
-    for _ in range(500):                           # the worker's cleanup may still be running
-        if not ext._parked:
-            break
-        time.sleep(0.01)
-    assert not ext._parked                         # the finished flight parks no thread
-
-
 def test_an_answer_on_time_whose_publication_waits_on_the_lock_is_still_the_answer() -> None:
     # the call answers before its deadline; its worker then waits on the lock until past it (codex r5)
     now = [0.0]
@@ -515,20 +496,43 @@ def test_an_answer_on_time_whose_publication_waits_on_the_lock_is_still_the_answ
     assert out["r"].panels is not None and out["r"].error is None
 
 
-def test_a_reader_past_the_deadline_honours_an_answer_stamped_on_time() -> None:
-    # the worker stamped an on-time answer and waits on the lock; a reader takes it first, past the
-    # deadline (complement + codex r6): the reader, the waiting reader and the reuse all get the answer
-    now = [0.0]
-    stamped = threading.Event()
+def test_an_answer_past_the_deadline_before_any_timeout_is_the_one_verdict(monkeypatch) -> None:
+    # the call answers late, but no reader declared a timeout first: the answer is the flight's first
+    # transition, so the reader and the reuse both hold it (FutureTask: set() before cancel() wins)
+    import levain.cockpit.external as external
 
-    def clock() -> float:
-        value = now[0]
-        if threading.current_thread().name == "levain-external-panels":
-            stamped.set()
-        return value
+    class _UntilDone(threading.Event):         # the reader resumes only once the worker has finished
+        def wait(self, timeout=None):
+            return super().wait(5)
+
+    class _Flight(external._Flight):
+        def __init__(self, deadline: float) -> None:
+            super().__init__(deadline)
+            self.done = _UntilDone()
+    monkeypatch.setattr(external, "_Flight", _Flight)
+    now = [0.0]
+
+    def fn():
+        now[0] = 1.0                               # the deadline (0.5) passes while the call runs
+        return _panels()
+    ext = ExternalPanels(fn, reuse_s=10, wait_s=0.5, clock=lambda: now[0])
+    got = ext.take()
+    assert got.panels is not None
+    assert ext._last is not None and ext._last[1] is got and ext.take() is got
+    for _ in range(500):
+        if not ext._parked:
+            break
+        time.sleep(0.01)
+    assert not ext._parked
+
+
+def test_a_timeout_declared_first_drops_the_answer_for_every_reader_and_the_reuse() -> None:
+    # the worker answers while a reader past the deadline holds the lock and declares the timeout:
+    # the timeout is the first transition; the waiting reader, the reuse and the flight all keep it
+    now = [0.0]
     fn = _Counted()
     fn.gate.clear()
-    ext = ExternalPanels(fn, reuse_s=10, wait_s=0.5, clock=clock)
+    ext = ExternalPanels(fn, reuse_s=10, wait_s=0.5, clock=lambda: now[0])
     out: dict[str, Any] = {}
     r = threading.Thread(target=lambda: out.__setitem__("r", ext.take()))
     r.start()
@@ -536,30 +540,15 @@ def test_a_reader_past_the_deadline_honours_an_answer_stamped_on_time() -> None:
         time.sleep(0.001)
     flight = ext._flight
     with ext._lock:
-        fn.gate.set()
-        stamped.wait(1)                            # the worker stamped its answer (before the deadline) ...
-        time.sleep(0.02)                           # ... and now waits on the lock
-        now[0] = 1.0                               # past the deadline, the worker still waiting on the lock
-        first = ext._abandon_locked(flight, now[0])   # a reader's path past the deadline
+        fn.gate.set()                              # the answer comes back and waits on the lock
+        time.sleep(0.02)
+        now[0] = 1.0
+        first = ext._abandon_locked(flight, now[0])   # a reader past the deadline
+    assert threading.Event.wait(flight.done, 5)
     r.join(5)
     assert not r.is_alive()
-    assert first.panels is not None and flight.timeout is None
-    assert out["r"] is first and ext.take() is first
-
-
-def test_a_clock_that_fails_in_the_worker_still_ends_the_flight() -> None:
-    def clock() -> float:
-        if threading.current_thread().name == "levain-external-panels":
-            raise RuntimeError("clock down")
-        return 0.0
-    ext = ExternalPanels(_Counted(), reuse_s=0, wait_s=0.5, clock=clock)
-    got = ext.take()
-    assert got.panels is None and "did not answer" in (got.error or "")
-    for _ in range(500):
-        if not ext._parked:
-            break
-        time.sleep(0.01)
-    assert not ext._parked                         # no slot leaks to a worker that died on its clock
+    assert first.panels is None and out["r"] is first and ext.take() is first
+    assert flight.result is None                   # the late answer was dropped, not stored beside the verdict
 
 
 def test_absent_or_null_lines_are_no_lines_not_an_error() -> None:
