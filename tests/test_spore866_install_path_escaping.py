@@ -1,11 +1,13 @@
 """spore-866, reproduced 2026-10-10 with a real `levain init`: an install path holding `\\`
 or `"` exited 0 and wrote a codex config.toml, a codex hooks.json and a claude-code
-.mcp.json that no longer parsed (the raw path was substituted into string literals).
+.mcp.json that no longer parsed (the raw path was substituted into string literals); L1 found
+the same in every hook .py's `_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"`, and L2 DEL in TOML.
 MUTATION (run 2026-10-10): with levain/install.py reverted to the raw substitution, both cases
 fail with the reproduced errors (`Unescaped '\\' in a string`, `Invalid \\escape`)."""
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -36,14 +38,15 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
     monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _Result())
     codex_home = tmp_path / "codex_home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    install = tmp_path / 'we\\g<1>i"rd $X`a'
+    install = tmp_path / 'we\\g<1>i"rd $X`a\x7f'
     install.mkdir()
     python = '/opt/py"th\\on $V/bin/python3'
+    anneal = 'C:\\Users\\an"neal\\Scripts\\anneal-memory.exe'
     with _templates_root() as templates_root:
         specs = [parse_template(templates_root / "seed" / n) for n in ("world.md", "origin.md")]
         answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
         apply_init(
-            install, adapter, answers, templates_root, python, "anneal-memory", specs,
+            install, adapter, answers, templates_root, python, anneal, specs,
             [SeedEntry(n, templates_root / "seed" / n, "verbatim")
              for n in ("partnership.md", "memory.md", "spore_instructions.md",
                        "continuity.md", "README.md")],
@@ -62,6 +65,17 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
         commands = [h["command"] for ev in settings["hooks"].values() for m in ev for h in m["hooks"]]
         script_dir = None
     assert server["command"] == python
+    hooks_py = sorted((install / "activation" / "hooks").glob("*.py"))
+    assert hooks_py
+    seen = 0
+    for f in hooks_py:
+        tree = ast.parse(f.read_text(encoding="utf-8"))   # every hook still compiles
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and any(
+                    getattr(t, "id", None) == "_INSTALL_ANNEAL_BIN" for t in node.targets):
+                assert node.value.value == anneal
+                seen += 1
+    assert seen
     assert server["args"][server["args"].index("--db") + 1] == store
     assert commands
     for cmd in commands:

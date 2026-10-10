@@ -1925,7 +1925,8 @@ def _expected_activation(
         data = src.read_bytes()
         if anneal_path is not None and rel.startswith("hooks/") and rel.endswith(".py"):
             try:
-                data = data.decode("utf-8").replace("{{ANNEAL_MEMORY}}", anneal_path).encode("utf-8")
+                data = data.decode("utf-8").replace(
+                    "{{ANNEAL_MEMORY}}", _string_body(anneal_path)).encode("utf-8")
             except UnicodeDecodeError:
                 pass
         out[rel] = (data, src)
@@ -2326,12 +2327,19 @@ def _atomic_write_bytes(target: Path, data: bytes, *, like: Path | None = None) 
 
 
 def _string_body(value: str) -> str:
-    """``value`` as the body of a JSON string, for a template slot that sits inside one.
+    """``value`` as the body of a double-quoted string literal, for a template slot that sits
+    inside one: JSON, a TOML basic string or a Python ``"..."`` (the hooks' anneal path).
     spore-866: a raw path with a `\\`, `"` or newline broke the file around it (and could
-    inject keys). With ensure_ascii=False the only escapes are `\\"`, `\\\\`, `\\b \\f \\n
-    \\r \\t` and `\\u00XX`, all of which TOML basic strings accept too; the ASCII form
-    would emit surrogate pairs TOML rejects."""
-    return json.dumps(value, ensure_ascii=False)[1:-1]
+    inject keys or code). JSON's escapes with ensure_ascii=False, plus DEL as ``\\u007f``
+    (TOML forbids it raw), are valid in all three; the ASCII form would emit surrogate pairs
+    TOML rejects. A lone surrogate (a path whose bytes are not UTF-8) cannot be written to a
+    UTF-8 file at all, so it is refused by name rather than crashing the write."""
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise InitError(f"{value!r} is not valid UTF-8, so levain cannot write it into a "
+                        f"config file; use a path whose name is UTF-8.") from None
+    return json.dumps(value, ensure_ascii=False)[1:-1].replace("\x7f", "\\u007f")
 
 
 def _hook_arg_body(value: str) -> str:
@@ -2350,15 +2358,17 @@ CODEX_CONFIG_KEY = "codex-home/config.toml#anneal_memory"
 def _codex_fragment(adapter_root: Path, python_path: str, install: Path) -> str:
     fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
     fragment = fragment.replace("{{PYTHON}}", _string_body(python_path))
-    fragment = fragment.replace("{{INSTALL_DIR}}", _string_body(str(install)))
-    # The block goes into the machine-global config.toml, where a parse failure takes
-    # down every MCP server codex has, so it is parsed here before anything writes it.
+    return fragment.replace("{{INSTALL_DIR}}", _string_body(str(install)))
+
+
+def _require_toml(text: str, path: Path) -> None:
+    """Refuse to write ``text`` to codex's machine-global ``path`` unless it parses: a parse
+    failure there takes down every MCP server codex has, not only levain's (spore-866)."""
     try:
-        tomllib.loads(fragment)
+        tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
-        raise InitError(f"levain rendered a codex config block that does not parse ({e}); "
-                        f"nothing was written.") from e
-    return fragment
+        raise InitError(f"{path} would not parse after levain's change ({e}), so it was left "
+                        f"as it was.") from e
 
 
 def _codex_block_hash(fragment_or_config: str) -> str | None:
@@ -3273,7 +3283,10 @@ def _copy_activation_tree(
             # install missing an activation file.
             shutil.copy2(source, target)
         if anneal_path is not None:
-            _substitute_hook_placeholders(new_tree / "hooks", {"{{ANNEAL_MEMORY}}": anneal_path})
+            # The slot is a Python "..." literal (`_INSTALL_ANNEAL_BIN`), so the value is escaped
+            # for one, the same way `_expected_activation` renders it (spore-866).
+            _substitute_hook_placeholders(new_tree / "hooks",
+                                          {"{{ANNEAL_MEMORY}}": _string_body(anneal_path)})
 
         # This run's receipt, from the staged bytes and the winning source of each.
         receipt: dict[str, dict[str, str]] = {
@@ -3666,6 +3679,7 @@ def _merge_codex_config(
     problem it is guarding.
     """
     if not path.is_file():
+        _require_toml(fragment, path)
         path.write_text(fragment.rstrip() + "\n", encoding="utf-8")
         return
 
@@ -3796,6 +3810,7 @@ def _merge_codex_config(
         if not existing.endswith("\n\n"):
             existing += "\n"
         existing += new_block
+    _require_toml(existing, path)
 
     # ATOMIC, and announced only AFTER it lands. A partial `write_text` can truncate
     # the operator's whole global codex config, and announcing "now points at X"

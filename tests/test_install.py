@@ -25,6 +25,7 @@ from levain.install import (
     _clear_checkpoint,
     _compose_activation_layers,
     _codex_block_store,
+    _string_body,
     _copy_activation_tree,
     _merge_codex_config,
     _same_contents,
@@ -2292,20 +2293,18 @@ def test_a_store_path_with_a_backslash_is_inserted_LITERALLY(tmp_path: Path):
     been read as a group reference and mangled the file (or raised `error: invalid
     group reference`). The replacement is now a lambda, so it is inserted verbatim.
 
-    ⚠ ASSERTED BY SUBSTRING, NOT BY PARSING, AND THAT IS THE POINT. An earlier version
-    of this test round-tripped the path through `_codex_block_store` and failed — for
-    a reason that is NOT this bug: `args = ["...\\g<1>..."]` is INVALID TOML (an
-    unescaped backslash in a basic string), so levain writes a config codex cannot
-    parse for ANY backslash-containing install path. Pre-existing, latent, out of
-    scope here, and routed — but the test asserting a round-trip was itself claiming
-    a behaviour the product does not have."""
+    The block holds the path escaped for a TOML basic string, as levain renders it since
+    spore-866 (a raw backslash there was invalid TOML; `_merge_codex_config` now refuses to
+    write a config that does not parse). The escaped text must survive `re.sub` verbatim and
+    parse back to the path."""
     path = tmp_path / "config.toml"
     path.write_text(_codex_cfg("/home/op/old.db"), encoding="utf-8")
     weird = "/home/op/we\\g<1>ird/memory.db"
-    _merge_codex_config(path, _codex_cfg(weird), emit=lambda _m: None)
+    _merge_codex_config(path, _codex_cfg(_string_body(weird)), emit=lambda _m: None)
     written = path.read_text(encoding="utf-8")
-    assert weird in written, "the store path must be inserted literally, not expanded"
+    assert _string_body(weird) in written, "the store path must be inserted literally, not expanded"
     assert "old.db" not in written
+    assert _codex_block_store(written) == weird
 
 
 def test_an_UNPARSEABLE_codex_block_is_backed_up_and_announced_before_replacement(tmp_path: Path):
