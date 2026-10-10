@@ -1854,6 +1854,11 @@ class TestOperatorStateEdit:
         apply_edit(_scope(install), {"kind": "operator_state", "text": "x", "source": "evil"})
         assert json.loads(self._ctx(install).read_text())["state_source"] == "web"
 
+    def test_a_non_string_source_falls_back_to_web(self, install: Path) -> None:
+        for odd in ([], {}, 3):                     # an unhashable source must not 500 the edit
+            apply_edit(_scope(install), {"kind": "operator_state", "text": "x", "source": odd})
+            assert json.loads(self._ctx(install).read_text())["state_source"] == "web"
+
     def test_blank_text_clears(self, install: Path) -> None:
         apply_edit(_scope(install), {"kind": "operator_state", "text": "something"})
         res = apply_edit(_scope(install), {"kind": "operator_state", "text": "   "})
