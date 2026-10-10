@@ -199,19 +199,20 @@
     for (const w of data) need(isObj(w) && typeof w.wrapped_at === "string" && (w.continuity_chars === null || isNum(w.continuity_chars)), "wraps row");
   }
 
-  const STATE_SKEW_MS = 300000;   // the kernel's STATE_CLOCK_SKEW_SECONDS; a test holds the two equal
   function lineOf(panel, head, now) {
     if (head.status === "error") return null;
     // the state line is the operator's own words: a malformed panel must never read as "no state set"
-    // Expiry is the kernel's (it drops a line past its age rule before sending); here the stamp must parse and
-    // sit no further ahead than the kernel's own clock-skew grace, or the panel is malformed.
+    // The kernel parses the stamp and drops an expired line before sending, so time is not judged here:
+    // the shape must hold (a malformed panel never reads as "no state set"), and an age this clock cannot
+    // compute is shown as unknown, never by hiding the operator's words.
+    if (panel.value === null || panel.value === undefined) return { text: null };
     need(isObj(panel.value), "state value");
     const l = labelled(panel.value.lines, "state lines")[0];
     if (!l) return { text: null };
     need(typeof l.at === "string" && (l.source == null || typeof l.source === "string"), "state line");
     const t = parseIso(l.at);
-    need(!isNaN(t) && t <= now + STATE_SKEW_MS, "state line stamp");
-    return { text: l.text, set_at: l.at, source: l.source, age_label: ageLabel(l.at, now, "set ") };
+    const known = !isNaN(t) && t <= now + 60000;   // an unparseable or future stamp is "age unknown", never "fresh"
+    return { text: l.text, set_at: l.at, source: l.source, age_label: known ? ageLabel(l.at, now, "set ") : "" };
   }
 
   // snap = {manifest, panels}; returns the SubstrateView-shaped object dashboard_core.js renders.
