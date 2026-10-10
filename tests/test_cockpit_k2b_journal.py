@@ -290,7 +290,6 @@ def test_decide_after_expiry_is_expired(db):
     ("", "SHA256:nobody", "T2", "key not enrolled"),
     ("", FP_WEAK, "T2", "key class presence does not cover T2"),
     ("", FP_PHONE, "T3", "key class display-phone does not cover T3"),
-    ("UPDATE meta SET value = '1' WHERE key = 'policy_rev'", FP_PHONE, "T2", "policy changed"),
 ])
 def test_decide_refuses_on_authority_and_policy(db, setup, fp, tier, reason):
     pid, raw = issue(db, tier=tier)
@@ -299,6 +298,16 @@ def test_decide_refuses_on_authority_and_policy(db, setup, fp, tier, reason):
             conn.execute(setup)
     out = _decide(db, pid, raw, fp=fp)
     assert (out.state, out.reason) == ("REFUSED", reason)
+    assert db.load(pid).effects == ()
+
+
+def test_a_policy_change_after_issue_is_stale_not_refused(db):
+    # seat ruling R1: a policy change is a re-sign (§9)
+    pid, raw = issue(db)
+    with db.write() as conn:
+        conn.execute("UPDATE meta SET value = '1' WHERE key = 'policy_rev'")
+    out = _decide(db, pid, raw)
+    assert (out.state, out.reason) == ("STALE", "policy changed")
     assert db.load(pid).effects == ()
 
 
@@ -313,7 +322,9 @@ def test_decide_compares_the_recompute_byte_for_byte(db):
     assert (_decide(db, pid, moved).state, db.outcome(pid).reason) == ("STALE", "changed")
     pid2, raw2 = issue(db, key="k2")
     _, raised = make_record(pid=pid2, tier="T3")
-    assert _decide(db, pid2, raised).reason == "tier"
+    # seat ruling R2: every expect equal, tier differs -> the normaliser's
+    out2 = _decide(db, pid2, raised)
+    assert (out2.state, out2.reason) == ("REFUSED", "normaliser")
     pid3, raw3 = issue(db, key="k3")
     _, renorm = make_record(pid=pid3, params={"text": "NEW 0"})
     out = _decide(db, pid3, renorm)

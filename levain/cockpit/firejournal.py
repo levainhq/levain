@@ -578,7 +578,8 @@ class CockpitDB:
             fence = record.get("fence")
             rev = _int_meta(operation_id, _meta(conn, "policy_rev"), "policy_rev")
             if not isinstance(fence, dict) or fence.get("policy_rev") != rev:
-                return terminal("REFUSED", "policy changed")
+                # seat ruling R1: a policy change is a re-sign, never an authority refusal (§9)
+                return terminal("STALE", "policy changed")
             if recomputed is None:
                 if decision_kind == "ALLOWED":
                     return DecideOutcome(operation_id, "WAITING", "source unavailable",
@@ -751,7 +752,89 @@ class CockpitDB:
                 return Outcome(operation_id, "CANCELLED", "cancelled", None)
             return _outcome(row)
 
+    # -- cockpit.db's own objects as effects (§3.5, §4.1.4, §13) -------------------------------
+    #
+    # Each is one transaction under the store's own lock (SQLite's write lock), in §4.1.1's order:
+    # the postcondition already holds -> "already"; the precondition holds -> mutate -> "applied";
+    # else "precondition_lost".
+
+    def ensure_token(self, name: str) -> int:
+        """The token's current generation, creating it at 1 when the journal has never seen it."""
+        if not isinstance(name, str) or not name or ":" in name:
+            raise ValueError(f"token name {name!r} is empty or holds ':'")
+        with self.write() as conn:
+            conn.execute("INSERT OR IGNORE INTO tokens (name, generation) VALUES (?, 1)", (name,))
+            (gen,) = conn.execute("SELECT generation FROM tokens WHERE name = ?", (name,)).fetchone()
+        return int(gen)
+
+    def rotate_token(self, name: str, *, expect_generation: int, new_generation: int, by: str,
+                     now: datetime) -> str:
+        """Token rotation as ONE transaction (§13): ``generation`` moves to the ABSOLUTE
+        ``new_generation`` only from ``expect_generation``, and every WAITING pending of the old
+        generation is cancelled in the same transaction."""
+        if new_generation != expect_generation + 1:
+            raise ValueError("a rotation moves the generation by exactly one")
+        stamp = utc_stamp(now)
+        with self.write() as conn:
+            conn.execute(_EXPIRE_SQL, (stamp,))
+            row = conn.execute("SELECT generation FROM tokens WHERE name = ?", (name,)).fetchone()
+            if row is not None and row[0] == new_generation:
+                return "already"
+            if row is None or row[0] != expect_generation:
+                return "precondition_lost"
+            conn.execute("UPDATE tokens SET generation = ? WHERE name = ? AND generation = ?",
+                         (new_generation, name, expect_generation))
+            conn.execute("UPDATE pendings SET state = 'CANCELLED', reason = 'token rotated', "
+                         "cancelled_by = ?, terminal_at = ? WHERE principal = ? AND state = 'WAITING'",
+                         (by, stamp, f"token:{name}:{expect_generation}"))
+        return "applied"
+
+    def cancel_as_effect(self, target_id: str, *, by: str, now: datetime) -> str:
+        """The cross-principal cancel's single effect on ``pend:<id>`` (§3.5): ``state`` WAITING ->
+        CANCELLED, recording the cancelling operation."""
+        stamp = utc_stamp(now)
+        with self.write() as conn:
+            conn.execute(_EXPIRE_SQL, (stamp,))
+            row = conn.execute("SELECT state FROM pendings WHERE pending_id = ?", (target_id,)).fetchone()
+            if row is not None and row[0] == "CANCELLED":
+                return "already"
+            if row is None or row[0] != "WAITING":
+                return "precondition_lost"
+            conn.execute("UPDATE pendings SET state = 'CANCELLED', reason = 'cancelled', "
+                         "cancelled_by = ?, terminal_at = ? WHERE pending_id = ? AND state = 'WAITING'",
+                         (by, stamp, target_id))
+        return "applied"
+
+    def signer_keys(self) -> list[tuple[str, str]]:
+        """``(principal, public_key)`` of every unrevoked key: the one source a signers file is
+        generated from (§6.5, invariant 8)."""
+        with self.read() as conn:
+            rows = conn.execute("SELECT principal, public_key FROM keys WHERE revoked_at IS NULL "
+                                "ORDER BY principal").fetchall()
+        return [(r[0], r[1]) for r in rows]
+
+    def key_fingerprint(self, principal: str) -> str | None:
+        with self.read() as conn:
+            row = conn.execute("SELECT fingerprint FROM keys WHERE principal = ?", (principal,)).fetchone()
+        return None if row is None else row[0]
+
+    def set_install_class(self, install_class: str) -> str:
+        """The install class this journal was started under (§6); a journal never changes class
+        here (a reported->governed move is the root helper's, with a new epoch). Returns the stored
+        class, which the caller compares."""
+        with self.write() as conn:
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('install_class', ?)",
+                         (install_class,))
+            return str(_meta(conn, "install_class"))
+
     # -- readers -------------------------------------------------------------------------------
+
+    def decided_ops(self) -> list[str]:
+        """Every ``DECIDED`` op, oldest decision first: start recovery's input (§4.2)."""
+        with self.read() as conn:
+            rows = conn.execute("SELECT pending_id FROM pendings WHERE state = 'DECIDED' "
+                                "ORDER BY decided_at, rowid").fetchall()
+        return [r[0] for r in rows]
 
     def load(self, operation_id: str) -> OpView:
         with self.read() as conn:
@@ -903,17 +986,16 @@ def _key_problem(conn: sqlite3.Connection, fingerprint: str | None,
 
 
 def _classify_difference(stored: dict[str, Any], recomputed: bytes) -> tuple[str, str]:
-    """Why a fresh recompute differs from the signed record (§3.2.2): an effect's precondition moved
-    is ``STALE``; a tier raised is ``REFUSED`` (authority); anything else the normaliser produced
-    differently is ``REFUSED`` (normaliser)."""
+    """Why a fresh recompute differs from the signed record (§3.2.2, seat ruling R2): an effect count
+    or any effect's ``expect`` moved is ``STALE "changed"`` (the state moved; re-sign); with every
+    ``expect`` equal, any other difference, a raised tier included, is the normaliser's and is
+    ``REFUSED "normaliser"``."""
     try:
         fresh = json.loads(recomputed.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         return "REFUSED", "normaliser"
     if not isinstance(fresh, dict):
         return "REFUSED", "normaliser"
-    if fresh.get("tier") != stored.get("tier"):
-        return "REFUSED", "tier"
     old_fx, new_fx = stored.get("effects"), fresh.get("effects")
     if not isinstance(new_fx, list) or len(new_fx) != len(old_fx or []):
         return "STALE", "changed"
