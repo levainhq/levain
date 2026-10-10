@@ -6,7 +6,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [0.7.1] — unreleased
 
-Closes two of 0.7.0's known open issues (the Linux resolver deputy and concurrent codex installs) and three codex-adapter defects.
+Closes two of 0.7.0's known open issues (the Linux resolver deputy and concurrent codex installs) and fixes defects in the codex adapter and `ws-adopt`.
 
 ### Fixed
 
@@ -15,9 +15,11 @@ Closes two of 0.7.0's known open issues (the Linux resolver deputy and concurren
 - **If `init` cannot write codex's `hooks.json`, it puts `config.toml` back as it was.** Before, `config.toml` was left registering the new install's memory server with no hooks behind it (reproduced on 0.7.0). The original is kept under a second name before anything is written and renamed back, so the undo needs no free space and keeps its mode (and, where the filesystem has hard links, its owner); a symlinked `config.toml` stays a link. If `config.toml` was edited after levain wrote it, the edit is kept and the original's name is printed. A crash in that moment, codex reading `config.toml` between the two writes, or an edit saved in the instant between levain's check and its put-back, is not covered.
 - **`init` no longer crashes when codex's `hooks.json` is a symlink to a file that does not exist.** It raised `FileNotFoundError` while taking the backup, after `config.toml` was already written. The broken link is now kept as the backup and a new `hooks.json` written.
 - **A staged copy under `.levain/pending/` is removed once its file is settled.** After you adopted a staged copy (or levain wrote the file), the copy stayed, and adopting it again later replaced the file with an older release's version, which the next `levain update` then left alone. `update` now removes the copy and says so.
+- **`ws-adopt` fails closed when git cannot read the source repository's config in full.**
 
 ### Known open issues
 
+- **On Linux, bash without network can still reach your own gnupg dirmngr if it deliberately renames one of your directories.** Bash runs as you, so it can rename the directory holding a running dirmngr's socket in one session and reach that socket from its next; dirmngr then fetches for it. The root-owned resolver daemons are not affected. This closes before Levain 2.0.
 - **On Linux, a placeholder can outlive a levain that was killed.** Unchanged from 0.7.0.
 - **If levain cannot save its record of those placeholders as a session ends, the record can name files already removed.** Unchanged from 0.7.0.
 
