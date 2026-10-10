@@ -1557,6 +1557,13 @@ class TestR18:
             monkeypatch.setattr(engine, "_Flight", Flight)
         with pytest.raises(KeyboardInterrupt):
             ck.panel("p")
+        if where == "start":                  # the interrupted flight ends without ever reaching the provider
+            until = time.monotonic() + 3
+            while ck._state["p"].pflight is not None and time.monotonic() < until:
+                time.sleep(0.01)
+            assert ck._state["p"].pflight is None and calls[0] == 0 and not entered.is_set()
+        else:                                 # the go was given: that one read runs, and is the only one
+            assert calls[0] == 1
         t = threading.Thread(target=ck.panel, args=("p",))
         t.start()
         time.sleep(0.2)
@@ -1567,6 +1574,7 @@ class TestR18:
             time.sleep(0.01)
         assert ck.panel("p")["status"] == "empty"   # the panel recovers once the one read in flight ends
         assert peak[0] == 1                          # never two provider reads at once
+        assert calls[0] == 2                 # start: t's read + the last; go: the go read (t was refused) + the last
 
     def test_provider_made_fault_and_absent_from_bounded_reads_carry_plain_text(self) -> None:
         mode = ["fault"]
