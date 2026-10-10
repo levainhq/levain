@@ -45,6 +45,15 @@ SPORE_FACETS = frozenset({
 })
 
 
+def _store_label(db: Path) -> str:
+    """The store's display label for the masthead: ``~/…`` under the home directory, else the file
+    name. The absolute path (which carries the account name) never goes on the wire (design §6.2)."""
+    try:
+        return "~/" + db.expanduser().resolve().relative_to(Path.home().resolve()).as_posix()
+    except ValueError:
+        return db.name
+
+
 def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
     return ctx.memo("view", lambda: source.build(max_spores=VIEW_SPORE_LIMIT, now=ctx.now))
 
@@ -388,12 +397,12 @@ def build_default_cockpit(
 
     def entity(ctx: ReadContext) -> dict[str, Any]:
         v = _view(source, ctx)
-        # ``jar`` (today's episode count against the entity's own typical day) and the store path
-        # are the masthead's: the same two the dashboard's /substrate.json carries.
+        # ``jar`` (today's episode count against the entity's own typical day) and ``store_label``
+        # (the store's home-relative display path, never the absolute one) are the masthead's.
         return {"name": v.entity_name, "governance": v.scope,
                 "brand": {"wordmark": v.brand_wordmark, "model": v.brand_model},
                 "jar": v.jar.to_dict() if v.jar else None,
-                "paths": {"episodic_db": str(source.anneal.episodic_db)}}
+                "store_label": _store_label(source.anneal.episodic_db)}
 
     ck = Cockpit(entity=entity, clock=clock)
     spore_common = dict(
