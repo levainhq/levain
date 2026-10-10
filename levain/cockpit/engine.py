@@ -937,9 +937,11 @@ class Cockpit:
                 errors.append({"source": f"discovery:{i}", "message": res.message})
                 continue
             returned: set[str] = set()
-            ids = Counter(s.id for s in res.value if isinstance(s.id, str))   # a bad id is an errors entry below
+            # exactly str: a str subclass can carry its own __hash__/__eq__ (None, or one that hangs)
+            # and nothing a discoverer returns is hashed or compared outside its bounded worker
+            ids = Counter(s.id for s in res.value if type(s.id) is str)   # a bad id is an errors entry below
             for spec in res.value:
-                if not isinstance(spec.id, str):
+                if type(spec.id) is not str:
                     errors.append({"source": f"discovery:{i}", "message": "a discovered panel id must be a string"})
                     continue
                 if ids[spec.id] > 1:

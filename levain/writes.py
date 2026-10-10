@@ -646,6 +646,8 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
     kind = req.get("kind")
     # a spore kind's row version, compared by anneal inside its write transaction (the cockpit
     # passes the Row.version it read); None keeps a caller's write unguarded, as before
+    if expected_version is not None and (type(expected_version) is not str or not expected_version):
+        raise EditError("bad_request", 400, "expected_version must be a non-empty string")
     guard = _VersionGuard(expected_version)
     if expected_version is not None and not str(kind).startswith("spore_"):
         raise EditError("bad_request", 400, f"expected_version binds a spore write, not {kind!r}")
@@ -1361,8 +1363,10 @@ class _VersionGuard:
         if expected is not None:
             # resolved before any store lock is taken, so the callback anneal runs under its lock
             # imports nothing
+            from anneal_memory.spores import SporeError
             from levain.cockpit.providers import spore_row_version   # lazy: the cockpit imports this module
             self._version = spore_row_version
+            self._refuse = SporeError
 
     def version_of(self, spore: dict[str, Any]) -> str:
         try:
@@ -1371,9 +1375,10 @@ class _VersionGuard:
             raise
         except Exception as exc:  # noqa: BLE001 - a stored row the kernel cannot read matches no version it
             # rendered; the import is resolved in __init__, so this is the row, never the environment.
-            # "" can never equal an expected version (anneal refuses an empty one), so no caller value
-            # can make an unreadable row compare equal
-            self.found, self.error = "", f"{type(exc).__name__}: {exc}"
+            # It RAISES: there is no return value a caller's expected_version could equal, and anneal
+            # saves nothing when its transaction body raises.
+            self.error = f"{type(exc).__name__}: {exc}"
+            raise self._refuse(f"the stored spore could not be versioned ({self.error})") from exc
         return self.found
 
 

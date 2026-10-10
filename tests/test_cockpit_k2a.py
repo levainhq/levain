@@ -1040,6 +1040,45 @@ class TestL3Round4:
                      expected_version=v)
         assert rig.spore("seed") == before
 
+
+class TestL3Round5:
+    def test_an_empty_or_non_string_expected_version_is_400_before_any_read(self, rig: Rig, monkeypatch) -> None:
+        """glm HIGH + complement #1 r5 (on 2432284): the r4 marker "" was safe only because anneal refuses
+        an empty expected_version. The marker is deleted (the guard raises) and levain refuses it itself."""
+        import levain.cockpit.providers as prov
+        from levain.writes import apply_edit
+        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
+        before = rig.spore("seed")
+        for v in ("", 0, b"x"):
+            e = _refused("bad_request", apply_edit, rig.src.write_scope,
+                         {"kind": "spore_touch", "spore_id": rig.ids["seed"]}, expected_version=v)
+            assert e.http_status == 400
+        assert rig.spore("seed") == before
+
+    def test_an_unversionable_row_is_stale_through_every_guarded_verb(self, rig: Rig, monkeypatch) -> None:
+        """The guard raises inside anneal's transaction, so each guarded spore verb refuses 409 and saves
+        nothing, whatever expected_version the caller sent."""
+        import levain.cockpit.providers as prov
+        from levain.writes import apply_edit
+        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
+        before = rig.spore("seed")
+        for req in ({"kind": "spore_touch"}, {"kind": "spore_surface_at", "surface_at": "2030-01-01"},
+                    {"kind": "spore_update", "text": "y"}):
+            e = _refused("stale", apply_edit, rig.src.write_scope, {**req, "spore_id": rig.ids["seed"]},
+                         expected_version="0" * 16)
+            assert "could not be versioned" in str(e)
+        assert rig.spore("seed") == before
+
+    def test_a_str_subclass_id_is_an_errors_entry_and_never_hashed(self, tmp_path: Path) -> None:
+        """codex MED r5: a str subclass with __hash__ = None passed isinstance and crashed the Counter."""
+        class Unhashable(str):
+            __hash__ = None  # type: ignore[assignment]
+        r = Rig(tmp_path)
+        r.ck.discover(lambda ctx: [ProviderSpec(Unhashable("ext:a"), "line", "x", "feed",  # type: ignore[arg-type]
+                                                lambda ctx: Read(value={"lines": []}))])
+        m = r.ck.manifest(CRED)
+        assert any("must be a string" in e["message"] for e in m["errors"])
+
     def test_a_discovered_id_that_is_not_a_string_is_an_errors_entry_not_a_crash(self, tmp_path: Path) -> None:
         """complement + codex + glm r4: the Counter hashed ids before the string check."""
         r = Rig(tmp_path)
