@@ -31,6 +31,7 @@ re-install. Found by complement at L3, in the same diff that made it stale.
 
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import json
 import os
@@ -2844,12 +2845,34 @@ def _write_codex_hooks(hooks_target: Path, hooks_text: str,
         # `shutil.copy2` preserves perms/mtime AND is atomic-from-the-reader's-side;
         # `read_text`+`write_text` had a tiny window where Ctrl+C lost the original.
         shutil.copy2(hooks_target, bak)
-        # Unlink first (in case it's a symlink into a dotfiles repo) so we don't
-        # silently modify the symlink's target.
-        hooks_target.unlink()
         emit(f"  ! Existing {hooks_target} backed up to {bak}")
         emit("    (Codex is one-install-per-machine at v1 — this install now owns it.)")
-    hooks_target.write_text(hooks_text, encoding="utf-8")
+    # Written beside it, fsynced, then renamed over the PATH: a failed or interrupted write
+    # leaves the old file in place (an unlink then a write left none, reproduced with ENOSPC),
+    # and a symlink into a dotfiles repo is replaced, never written through.
+    try:
+        mode = hooks_target.stat().st_mode & 0o777 if not hooks_target.is_symlink() else 0o644
+    except FileNotFoundError:
+        mode = 0o644
+    fd, tmp = tempfile.mkstemp(dir=hooks_target.parent, prefix=f".{hooks_target.name}.",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(hooks_text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, hooks_target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    with contextlib.suppress(OSError):  # the rename itself, durable where the OS allows it
+        dfd = os.open(hooks_target.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
 
 def _codex_hooks_json(adapter_root: Path, python_path: str, install: Path) -> str:

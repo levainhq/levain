@@ -771,3 +771,28 @@ def test_ack_is_skipped_on_a_run_that_refreshes_the_carrier(tmp_path, capsys, mo
     assert carrier.read_text() == current
     assert _migrate_state(install).migrate_acked == before.migrate_acked
     assert "--ack SKIPPED" in out and "refreshed" in out
+
+
+def test_an_interrupted_codex_hooks_write_leaves_the_old_file(tmp_path, monkeypatch):
+    # Reproduced 2026-10-10 on a4b2bef: ENOSPC during the write left NO hooks.json (it was
+    # unlinked first), only its backup. Now it is written beside it and renamed over it.
+    import errno
+    import os
+
+    from levain.install import _write_codex_hooks
+
+    hooks = tmp_path / "hooks.json"
+    hooks.write_text('{"old": true}\n')
+
+    def full(*_a):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", full)
+    with pytest.raises(OSError):
+        _write_codex_hooks(hooks, '{"new": true}\n', lambda _s: None)
+    assert hooks.read_text() == '{"old": true}\n'
+    assert sorted(p.name.split(".bak.")[0] for p in tmp_path.iterdir()) == ["hooks.json",
+                                                                           "hooks.json"]
+    monkeypatch.undo()
+    _write_codex_hooks(hooks, '{"new": true}\n', lambda _s: None)
+    assert hooks.read_text() == '{"new": true}\n'
