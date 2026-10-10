@@ -379,3 +379,39 @@ def test_a_per_read_empty_sentence_survives_the_snapshot_going_stale() -> None:
     st.last_completion = now
     got = ck.panel("r")
     assert got["status"] == "stale" and got["empty"] == "live sentence", got
+
+
+# --- L3 r2: the singleflight rule (an abandoned call answers only its own waiters) -----------------
+
+def test_an_abandoned_answer_never_reaches_the_reuse_while_a_newer_flight_runs() -> None:
+    release_a, release_b = threading.Event(), threading.Event()
+    n = {"c": 0}
+
+    def fn():
+        n["c"] += 1
+        me = n["c"]
+        (release_a if me == 1 else release_b).wait(10)
+        return [{"id": "old" if me == 1 else "new", "title": "T", "lines": []}]
+    now = [0.0]
+    ext = ExternalPanels(fn, reuse_s=5, wait_s=0.2, clock=lambda: now[0])
+    ext.take()                                     # A abandoned
+    now[0] = 10.0
+    out: list[Any] = []
+    t = threading.Thread(target=lambda: out.append(ext.take()))
+    t.start()                                      # B starts and is still running
+    time.sleep(0.05)
+    release_a.set()                                # A answers late
+    time.sleep(0.1)
+    assert ext._last is None or ext._last[1].panels is None   # A published nothing
+    release_b.set()
+    t.join(5)
+    assert [p["id"] for p in out[0].panels] == ["new"]
+
+
+def test_absent_or_null_lines_are_no_lines_not_an_error() -> None:
+    fn = _Counted([{"id": "a", "title": "A", "empty": "none here."},
+                   {"id": "b", "title": "B", "lines": None, "empty": "none here."}])
+    ck, _ = _cockpit(fn)
+    snap = snapshot(ck)
+    assert [snap["panels"][p]["status"] for p in ("ext:a", "ext:b")] == ["empty", "empty"]
+    assert snap["panels"]["ext:a"]["empty"] == "none here."

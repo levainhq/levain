@@ -38,11 +38,10 @@ class _Call:
 
 
 class _Flight:
-    def __init__(self, deadline: float, gen: int) -> None:
+    def __init__(self, deadline: float) -> None:
         self.done = threading.Event()
         self.result: _Call | None = None
         self.deadline = deadline       # on the instance's clock: a flight is abandoned once past it
-        self.gen = gen                 # start order: a late answer never replaces a newer flight's
 
 
 class ExternalPanels:
@@ -50,7 +49,8 @@ class ExternalPanels:
 
     A flight carries its own deadline (``wait_s`` from its start), so every reader of one burst waits on the
     same instant. Past it the flight is abandoned: a timeout is recorded and reused like any other reading,
-    so the burst's later readers return at once, and the next reuse window starts a fresh flight. A callable
+    so the burst's later readers return at once, and the next reuse window starts a fresh flight; the
+    abandoned flight's late answer reaches only readers already waiting on it, never the reuse. A callable
     that hangs therefore parks its thread; at most ``max_parked`` such threads live at once, and while that
     many are parked no new flight starts (the timeout reading stands)."""
 
@@ -65,7 +65,6 @@ class ExternalPanels:
         self._flight: _Flight | None = None
         self._parked: set[_Flight] = set()
         self._last: tuple[float, _Call] | None = None
-        self._published = 0      # the newest flight generation whose answer is in _last
         self.calls = 0           # how many times the callable ran (the burst measurement reads it)
 
     def take(self) -> _Call:
@@ -80,7 +79,7 @@ class ExternalPanels:
                 if len(self._parked) >= self._max_parked:
                     return self._record_locked(_Call(None, f"{len(self._parked)} earlier calls of the external "
                                                      "panels have not returned; not starting another", _now_iso()), now)
-                flight = _Flight(now + self._wait_s, self.calls + 1)
+                flight = _Flight(now + self._wait_s)
                 try:
                     threading.Thread(target=self._run, args=(flight,), name="levain-external-panels",
                                      daemon=True).start()
@@ -121,18 +120,18 @@ class ExternalPanels:
             with self._lock:
                 flight.result = call
                 self._parked.discard(flight)
-                if flight.gen > self._published:   # a late answer is a reading only if nothing newer landed
-                    self._published = flight.gen
-                    self._last = (self._clock(), call)
+                # golang.org/x/sync/singleflight's rule: an abandoned (forgotten) call answers only the
+                # readers already waiting on it, and only the current call may touch the shared state
                 if self._flight is flight:
                     self._flight = None
+                    self._last = (self._clock(), call)
             flight.done.set()
 
 
 def _describe(exc: BaseException) -> str:
     try:
         return f"{type(exc).__name__}: {exc}"
-    except Exception:  # noqa: BLE001 - an exception whose text itself raises still names its type
+    except BaseException:  # noqa: BLE001 - an exception whose text itself raises still names its type
         return type(exc).__name__
 
 
@@ -202,7 +201,7 @@ def _is_prose(p: dict[str, Any]) -> bool:
 
 def _n_lines(p: dict[str, Any]) -> int:
     lines = p.get("lines")
-    return len(lines) if isinstance(lines, list) else 0
+    return len(lines) if isinstance(lines, (list, tuple)) else 0
 
 
 def _empty(p: dict[str, Any]) -> str:
@@ -217,7 +216,7 @@ def _rows(p: dict[str, Any]) -> tuple[tuple[RowIn, ...], int]:
     rows: list[RowIn] = []
     bad = 0
     lines = p.get("lines")
-    for i, ln in enumerate(lines if isinstance(lines, list) else []):
+    for i, ln in enumerate(lines if isinstance(lines, (list, tuple)) else []):
         if not isinstance(ln, dict) or not isinstance(ln.get("text"), str):
             bad += 1
             continue
@@ -250,7 +249,8 @@ def _reader(ext: ExternalPanels, pid: str, prose: bool) -> Callable[[ReadContext
         if prose:
             note = _note(_title(p, pid, None)[1], _str(p.get("note")))
             return Read(value={"markdown": p["markdown"]}, as_of=call.as_of, note=note, empty=_empty(p))
-        if not isinstance(p.get("lines"), list):
+        lines = p.get("lines")
+        if lines is not None and not isinstance(lines, (list, tuple)):   # absent or None is no lines, as before
             return Fault("the external panel's lines are not a list")
         rows, bad = _rows(p)
         note = _note(_title(p, pid, len(rows))[1], _str(p.get("note")))
