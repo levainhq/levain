@@ -345,8 +345,10 @@ def _context_line(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         cj, problem = _context_state(source)
         if problem is not None:
             return problem
-        # the stored record, read BEFORE the view: a write landing between the two makes the version
-        # older than the display, so a write bound to it is refused, never let through
+        # the stored record, read before the view is built: on a fresh context (every write-time read)
+        # a write landing between the two makes the version older than the display, so a write bound
+        # to it is refused. A render that reuses a memoised view may pair a newer version with an
+        # older line; a write bound to that is re-checked against the source at write time.
         try:
             raw = json.loads(cj.read_text(encoding="utf-8")) if cj is not None else {}
         except (OSError, ValueError) as exc:

@@ -50,6 +50,20 @@
   const WRITE_TOKEN_KEY = "levain_write_token";
   let writeTokenRequired = false;
 
+  // K2a: `levain serve` opens the page with the write token in the URL FRAGMENT (never sent to the server).
+  // Take it, keep it, and strip it from the address bar, leaving any chat_token for the chat panel.
+  (function takeFragmentWriteToken() {
+    try {
+      const params = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+      const tok = params.get("write_token");
+      if (tok === null) return;
+      params.delete("write_token");
+      const rest = params.toString();
+      history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
+      if (/^[A-Za-z0-9_-]+$/.test(tok)) window.localStorage.setItem(WRITE_TOKEN_KEY, tok);
+    } catch (_) { /* no history or storage: the prompt still works */ }
+  })();
+
   // The device-held off-box token from localStorage ("" if none / private mode).
   function storedToken() {
     try { return window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { return ""; }

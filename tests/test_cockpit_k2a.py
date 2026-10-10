@@ -17,7 +17,8 @@ import pytest
 from anneal_memory.spores import SporeStore
 
 from levain.cockpit import verbs as verbs_mod
-from levain.cockpit.engine import NOW_ID
+from levain.cockpit.engine import NOW_ID, ProviderSpec
+from levain.cockpit.results import Absent, Read
 from levain.cockpit.providers import build_default_cockpit
 from levain.cockpit.verbs import VerbRegistry, VerbSpec, VerbView, dispatch
 from levain.dashboard import SubstrateSource
@@ -178,7 +179,8 @@ class TestCredentialAndTiers:
                 for tok in (None, TOKEN):
                     st, body = _post(f"{base}/edit", b, tok)
                     assert st in (403, 409), (name, tok, st, body)
-                    assert body["error"] in ("credential_required", "needs_broker", "needs_intent"), (name, body)
+                    # an undo naming no real edit is refused as gone before its tier (it inherits one)
+                    assert body["error"] in ("credential_required", "needs_broker", "needs_intent", "stale"), (name, body)
                     if tok is None:
                         assert body["error"] == "credential_required"
         assert (_root / ".levain" / "memory.spores.json").read_text() == before
@@ -236,10 +238,14 @@ class TestCredentialAndTiers:
                         tier_fn=lambda *a: "C1", idempotent=True,
                         fire=lambda scope, p, target, confirm: fired.append(p) or {"summary": "noted"})
         r = Rig(tmp_path, extra={"note_it": spec})
-        req = {"verb": "note_it", "params": {"text": "hi"}, "idempotency_key": "k1"}
+        r.ck.register(ProviderSpec("ext:notes", "line", "Notes", "feed", lambda ctx: Read(value={"lines": []}),
+                                   verbs=("note_it",)))
+        req = {"verb": "note_it", "panel_id": "ext:notes", "params": {"text": "hi"}, "idempotency_key": "k1"}
         for _ in range(2):
             dispatch(registry=r.reg, cockpit=r.ck, scope=r.src.write_scope, req=dict(req), credential=CRED,
-                     install_class=INSTALL_CLASS, route="action")
+                     install_class=INSTALL_CLASS, route="cockpit")
+        _refused("unknown_verb", dispatch, registry=r.reg, cockpit=r.ck, scope=r.src.write_scope,
+                 req=dict(req, verb="note_it"), credential=CRED, install_class=INSTALL_CLASS, route="action")
         assert fired == [{"text": "hi"}]
         ledger = (r.root / ".levain" / "edits.jsonl").read_text()
         assert '"action": "note_it"' in ledger and '"outcome": "ok"' in ledger
@@ -315,7 +321,9 @@ class TestBinding:
             pytest.fail("anneal's touch kept an elapsed next; the desk's premise no longer holds, re-read it")
 
     @pytest.mark.xfail(strict=True, reason="needs anneal SporeStore expected_version under _transaction "
-                       "(slice P, anneal seat/1010-31-spore-cas), released and installed: K2a S2")
+                       "(slice P, anneal seat/1010-31-spore-cas), released and installed: K2a S2. In this window "
+                       "the tier is computed on a row the kernel does not hold, so a seat holding a row between "
+                       "read_one and the write lets a pull-forward fire at C1 (L2 M2, run): K2a must not ship open")
     def test_a_text_edit_between_read_one_and_the_handler_is_409(self, rig: Rig, monkeypatch) -> None:
         """'a text edit landing between read_one and the handler → 409'"""
         r = rig.row("tray", "seed")      # rendered before the race is armed
@@ -484,3 +492,88 @@ class TestRenderedActions:
 #   verb; the kernel holds the allowlist for any downstream VerbSpec (test_actions.py), flow holds the rest.
 # - 'a grep of flow, flowConnect and levain for /edit and /action callers ...': S3.
 # - 'a text edit landing between read_one and the handler → 409': xfail above until anneal's CAS is installed.
+
+
+# --- L1/L2 round 1 findings, each held by a test that failed on fc9c83e ---------------------------
+
+
+class TestRound1:
+    def test_edit_on_a_row_the_view_drops_is_refused_not_tiered_as_no_row(self, rig: Rig) -> None:
+        """L2 H1: a held row the view drops (a bad salience) was tiered C1 as 'no row' while the
+        legacy handler still pulled its date forward."""
+        sid = rig.store.add(type="task", text="drift", disposition="seed",
+                            next=(TODAY + timedelta(days=5)).isoformat(), today=TODAY)["id"]
+        p = rig.root / ".levain" / "memory.spores.json"
+        data = json.loads(p.read_text())
+        for sp in data["spores"]:
+            if sp["id"] == sid:
+                sp["salience"] = "x"
+        p.write_text(json.dumps(data))
+        before = p.read_text()
+        e = _refused("stale", rig.edit, {"kind": "spore_surface_at", "spore_id": sid, "surface_at": TODAY.isoformat()})
+        assert e.http_status == 409
+        assert p.read_text() == before
+
+    def test_the_edit_alias_supplies_the_cas_key_itself(self, rig: Rig, monkeypatch) -> None:
+        """L2 L2: a legacy descend without expect_disposition fired with no CAS; the kernel now
+        supplies the key from the row it read."""
+        import levain.cockpit.verbs as v
+        seen: list[dict] = []
+        real = v.apply_edit
+        monkeypatch.setattr(v, "apply_edit", lambda scope, req: seen.append(req) or real(scope, req))
+        rig.edit({"kind": "spore_descend", "spore_id": rig.ids["loop"], "spore_kind": "dropped", "confirm": True})
+        assert seen and seen[0]["expect_disposition"] == "loop"   # the row's own, normalised by the handler
+
+    def test_operator_state_source_comes_from_the_credential(self, rig: Rig) -> None:
+        """L2 M3: a browser-token write could label its line 'cli'."""
+        v = rig.ck.read_value_version("state").value
+        _refused("field_not_allowed", rig.post, "operator_state", "state", None, {"text": "x", "source": "cli"},
+                 panel_version=v)
+        rig.edit({"kind": "operator_state", "text": "via edit", "source": "cli"})
+        stored = json.loads((rig.root / ".levain" / "context.json").read_text())
+        assert (stored["state"], stored["state_source"]) == ("via edit", "web")
+
+    def test_the_first_state_write_binds_to_absent(self, rig: Rig) -> None:
+        """L1 M4: with no context file the line could never be written on /cockpit/verb."""
+        (rig.root / ".levain" / "context.json").unlink()
+        _refused("stale", rig.post, "operator_state", "state", None, {"text": "x"}, panel_version="0" * 16)
+        assert rig.post("operator_state", "state", None, {"text": "first"}, panel_version=verbs_mod.VALUE_ABSENT)["ok"]
+        _refused("stale", rig.post, "operator_state", "state", None, {"text": "again"},
+                 panel_version=verbs_mod.VALUE_ABSENT)
+
+    def test_spore_update_refuses_fields_its_handler_cannot_write(self, rig: Rig) -> None:
+        """L1 M3 / L2 L1: next and domain were allowlisted and silently dropped."""
+        for f, val in (("next", "2030-01-01"), ("domain", "x")):
+            _refused("field_not_allowed", rig.post, "spore_update", "loops", "loop", {"tier": "warm", f: val})
+
+    def test_an_external_panel_cannot_offer_a_kernel_verb(self, tmp_path: Path) -> None:
+        """L1 #12 / L2 L3."""
+        r = Rig(tmp_path)
+        r.ck.register(ProviderSpec("ext:sneaky", "line", "S", "feed", lambda ctx: Read(value={"lines": []}),
+                                   verbs=("operator_state",)))
+        _refused("not_offered", r.post, "operator_state", "ext:sneaky", None, {"text": "x"},
+                 panel_version=verbs_mod.VALUE_ABSENT)
+
+    def test_a_row_bound_downstream_verbspec_is_refused_at_registration(self) -> None:
+        """L1 H1 / L2 M1: /action fired a row-bound downstream VerbSpec with row=None."""
+        spec = VerbSpec("ds_row", "x", "x", "row", tier_fn=lambda p, row, *_: "T2" if row else "C1",
+                        fire=lambda *a: {})
+        with pytest.raises(ValueError, match="binding must be 'panel'"):
+            VerbRegistry({"ds_row": spec})
+
+    def test_an_idempotency_key_on_a_non_idempotent_verb_is_refused(self, rig: Rig) -> None:
+        """L1 #9: it was accepted and silently ignored."""
+        _refused("bad_request", rig.post, "spore_touch", "tray", "seed", {}, idempotency_key="k")
+
+    def test_hung_write_reads_are_bounded_and_finished_ones_do_not_count(self, rig: Rig, monkeypatch) -> None:
+        """L1 M5: write-time reads no longer join an older flight; the bound is on reads still running."""
+        import levain.cockpit.engine as eng
+        for _ in range(eng.WRITE_READ_CAP + 5):      # finished reads never fill the cap
+            assert rig.tier("spore_touch", "tray", "seed") == "C1"
+        gate = threading.Event()
+        spec = rig.ck.spec("tray")
+        monkeypatch.setattr(spec, "read_one", lambda ctx, rid: (gate.wait(5), Absent("x"))[1])
+        monkeypatch.setattr(spec, "timeout_s", 0.05)
+        outs = [rig.ck.read_one("tray", "spore:x") for _ in range(eng.WRITE_READ_CAP + 1)]
+        gate.set()
+        assert "still running" in outs[-1].message

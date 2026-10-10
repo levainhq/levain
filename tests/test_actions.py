@@ -83,7 +83,12 @@ def _c1_spec(name: str, fire, *, confirm_required: bool = False, label: str = "C
 
 @contextmanager
 def _serving_verbs(source: SubstrateSource, verbs: dict):
-    httpd = make_server(source, host="127.0.0.1", port=0, extra_verbs=verbs, write_token=_TOK)
+    # each verb offered by one external panel (ext:p_<verb>): a downstream VerbSpec fires only on
+    # /cockpit/verb, bound to the panel that offers it (K2a)
+    panels = [{"id": f"p_{n}", "title": n, "lines": [],
+               "action": {"verb": n, "fields": [{"name": "text", "kind": "text"}]}} for n in verbs]
+    httpd = make_server(source, host="127.0.0.1", port=0, extra_verbs=verbs, write_token=_TOK,
+                        extra_panels=lambda: panels)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -445,8 +450,8 @@ class TestActionRoute:
         assert recent_edits(src.write_scope.ledger_root) == []
 
     def test_c1_downstream_verb_fires_over_the_route(self, tmp_path: Path) -> None:
-        # a downstream VerbSpec whose tier_fn answers C1 DOES fire over /action with the token, and
-        # receives (scope, params, target, confirm).
+        # a downstream VerbSpec whose tier_fn answers C1 fires over /cockpit/verb (on the panel that
+        # offers it) with the token, and receives (scope, params, target, confirm); /action refuses it.
         got: list = []
 
         def fire(scope, params, target, confirm):
@@ -455,9 +460,11 @@ class TestActionRoute:
 
         src = _writable_source(tmp_path)
         with _serving_verbs(src, {"c1_test": _c1_spec("c1_test", fire)}) as (base, _httpd):
-            status, body = _post(base + "/action",
-                                 {"verb": "c1_test", "params": {"text": "hi"}, "confirm": True})
-        assert status == 200 and body["ok"] is True
+            status, body = _post(base + "/cockpit/verb", {"verb": "c1_test", "panel_id": "ext:p_c1_test",
+                                                           "params": {"text": "hi"}, "confirm": True})
+            st2, body2 = _post(base + "/action", {"verb": "c1_test", "params": {"text": "hi"}, "confirm": True})
+        assert status == 200 and body["ok"] is True, body
+        assert (st2, body2["error"]) == (404, "unknown_verb")
         assert len(got) == 1 and got[0][1] == {"text": "hi"} and got[0][3] is True
         assert got[0][0] is src.write_scope
 
@@ -466,7 +473,8 @@ class TestActionRoute:
         with _serving_verbs(_writable_source(tmp_path),
                             {"c1_test": _c1_spec("c1_test", lambda *a: got.append(a) or {"ok": True})}
                             ) as (base, _httpd):
-            status, body = _post(base + "/action", {"verb": "c1_test", "params": {"other": 1}})
+            status, body = _post(base + "/cockpit/verb",
+                                 {"verb": "c1_test", "panel_id": "ext:p_c1_test", "params": {"other": 1}})
         assert status == 400 and body["error"] == "field_not_allowed"
         assert got == []
 
@@ -475,11 +483,11 @@ class TestActionRoute:
         ran: list = []
         spec = _c1_spec("c1_test", lambda *a: ran.append(a) or {"ok": True}, confirm_required=True)
         with _serving_verbs(_writable_source(tmp_path), {"c1_test": spec}) as (base, _httpd):
-            status, body = _post(base + "/action", {"verb": "c1_test", "params": {"text": "x"}})
+            req = {"verb": "c1_test", "panel_id": "ext:p_c1_test", "params": {"text": "x"}}
+            status, body = _post(base + "/cockpit/verb", req)
             assert status == 409 and body["error"] == "confirm_required"
             assert ran == []                              # NO execution without confirm
-            status, _body = _post(base + "/action",
-                                  {"verb": "c1_test", "params": {"text": "x"}, "confirm": True})
+            status, _body = _post(base + "/cockpit/verb", dict(req, confirm=True))
         assert status == 200 and len(ran) == 1
 
     def test_action_without_a_credential_is_403_before_anything_runs(self, tmp_path: Path) -> None:

@@ -59,6 +59,8 @@ HEADER = "header"
 VISUALS = ("sky", "constellation", "cognition-graph", "wrap-history")
 TITLE_MAX = 160
 SOON_DAYS = 3
+WRITE_READ_CAP = 32       # source reads made inside writes that may run at once (design §4.4)
+WRITE_READ_GRACE_S = 0.5  # an added write read counts as live this long before its flight exists
 POLICY_REVISION = 1  # hashed into the manifest etag; bumped when a tier or gesture policy changes
 NOW_ID = "now"
 PROCESS_GRACE_S = 5.0     # how long a joiner waits for the owner to process a finished read
@@ -240,9 +242,8 @@ class Cockpit:
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
         self._verb_view: Any = None      # levain.cockpit.verbs.VerbView, attached by the server (K2a)
-        # one flight per (panel, row) for source reads made inside a write, so concurrent writes on
-        # one row share a read and a hung source cannot grow a thread per request
-        self._one_states: dict[tuple[str, str], _State] = {}
+        # source reads made inside a write still running (a hung source keeps its flight here)
+        self._one_live: list[list[Any]] = []
 
     def attach_verbs(self, view: Any) -> None:
         """Attach the verb registry's view: row and panel actions, the manifest ``verbs`` map, and
@@ -1064,7 +1065,7 @@ class Cockpit:
                 return Read(value=rows[0])
             except Exception as exc:  # noqa: BLE001
                 return Fault(f"provider output refused: {_safe_str(exc)}")
-        return self._bounded_keyed((panel_id, row_id), spec.timeout_s, once, ctx)
+        return self._bounded_fresh(spec.timeout_s, once, ctx)
 
     def read_value_version(self, panel_id: str) -> Result:
         """Read a line or prose panel's value from the SOURCE (never the refresher snapshot) and
@@ -1082,17 +1083,27 @@ class Cockpit:
                 return Read(value=self._value(spec, res.value, res.version_of)["value_version"])
             except Exception as exc:  # noqa: BLE001
                 return Fault(f"provider output refused: {_safe_str(exc)}")
-        return self._bounded_keyed(("\x00value", panel_id), spec.timeout_s, once, ctx)
+        return self._bounded_fresh(spec.timeout_s, once, ctx)
 
-    def _bounded_keyed(self, key: tuple[str, str], timeout_s: float, fn: Callable[..., Any], *args: Any) -> Any:
+    def _bounded_fresh(self, timeout_s: float, fn: Callable[..., Any], *args: Any) -> Any:
+        """A source read made inside a write. It never joins a flight another request started: a
+        flight that began before this write's own read could hand it a version older than the source.
+        The bound is on reads still running (a hung source's threads), not on requests."""
+        st = _State()
+        entry = [st, time.monotonic(), False]     # state, added at, returned
         with self._lock:
-            st = self._one_states.setdefault(key, _State())
+            now = time.monotonic()
+            # live: a flight still running (a hung source), or one added but not yet started; a read
+            # that returned and whose worker ended is dropped at once
+            self._one_live = [e for e in self._one_live
+                              if e[0].pflight is not None or (not e[2] and now - e[1] < WRITE_READ_GRACE_S)]
+            if len(self._one_live) >= WRITE_READ_CAP:
+                return Fault(f"{WRITE_READ_CAP} source reads are still running (a hung source?); refused")
+            self._one_live.append(entry)
         try:
             return self._bounded(timeout_s, st, fn, *args)
         finally:
-            with self._lock, st.lock:
-                if st.pflight is None and self._one_states.get(key) is st:
-                    del self._one_states[key]   # a hung flight keeps its entry; the next read of the key removes it
+            entry[2] = True
 
 
 def _safe_str(exc: object) -> str:

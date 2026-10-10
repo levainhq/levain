@@ -611,6 +611,27 @@ def recent_edits(ledger_root: Path, limit: int = 20) -> list[dict[str, Any]]:
 # The public entry — apply_edit, routed by kind.
 # ---------------------------------------------------------------------------
 
+@contextmanager
+def context_lock(scope: WriteScope) -> Iterator[None]:
+    """An exclusive lock on the operator's live-context file, held across a cockpit write's version
+    compare and its write (design §4.4: the check and the write are one step under the source's
+    lock). A sidecar ``<context>.lock`` file, so the atomic ``os.replace`` of the context file
+    never swaps the locked inode. Only writers that take it are serialised by it."""
+    import fcntl
+
+    path = scope.context_json
+    if path is None:
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)    # closing the descriptor releases the flock
+
+
 def _require_install_root(scope: WriteScope, kind_label: str) -> Path:
     """A ``config`` / ``entity_name`` edit targets the install's seed/config surface —
     which only exists when the scope has an ``install_root``. A non-install substrate

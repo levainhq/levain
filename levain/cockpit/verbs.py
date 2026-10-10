@@ -2,8 +2,10 @@
 ``projects/levain/reference/cockpit_manifest_DESIGN_1009.md`` §4.1, §4.2, §4.4, §5.1, §5.2, §9 K2a).
 
 Every cockpit write is a ``VerbSpec``. ``POST /cockpit/verb``, ``POST /edit`` and ``POST /action`` all
-end in :func:`dispatch`, so the legacy routes are aliases of the registry, never a bypass (§4.3). The
-order inside ``dispatch`` is the contract:
+end in :func:`dispatch`, so the legacy routes are aliases of the registry, never a bypass (§4.3). A
+legacy ``/edit`` body is translated onto the steps below (its row found by id on the same panels) and
+fires through the same ``VerbSpec.fire``; ``/action`` serves only a downstream ``ActionVerb``, which
+has no tier function and is therefore T2. The steps of ``/cockpit/verb``:
 
 1. the verb is registered and routed ``cockpit`` (a ``broker`` head is refused here, §4.1);
 2. the panel named in the request offers it (else 404, so a retired panel takes its verb with it);
@@ -11,12 +13,12 @@ order inside ``dispatch`` is the contract:
 4. the target is read from the SOURCE through the provider's ``read_one`` (or the panel value is read
    fresh) and its version compared with the one the caller rendered (409 on a mismatch, §4.4);
 5. the tier is computed by the kernel from the verb, its params and the stored target, never taken
-   from the caller; a ``dry_run`` returns it here and fires nothing;
+   from the caller; a ``dry_run`` returns it here and fires nothing (so it skips 6-8 and confirm);
 6. params that raise the tier above the row's rendered tier without an ``intent`` are refused
    "needs intent" (§4.1);
 7. a T2 or T3 never fires from this handler: until K2b's broker exists they are refused
    "needs the broker" (§4.3);
-8. only a C1 reaches its handler.
+8. the verb's ``confirm`` is checked, and only a C1 reaches its handler.
 
 Provenance: no row carries a label before K2b's fire journal exists, so every ``tier_fn`` receives
 ``"unverified"`` (§9 K2a). The standing policy that may raise a tier is a T3 store that does not
@@ -32,9 +34,10 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
+from levain.cockpit.external import ID_PREFIX as EXTERNAL_PREFIX
 from levain.cockpit.registry import parse_date
 from levain.cockpit.results import Absent, Fault, Read
-from levain.writes import ActionVerb, EditError, apply_action, apply_edit
+from levain.writes import ActionVerb, EditError, apply_action, apply_edit, context_lock
 
 if TYPE_CHECKING:
     from levain.cockpit.engine import Cockpit
@@ -44,6 +47,7 @@ if TYPE_CHECKING:
 Tier = Literal["C1", "T2", "T3"]
 TIERS: tuple[Tier, ...] = ("C1", "T2", "T3")
 UNVERIFIED = "unverified"
+VALUE_ABSENT = "absent"     # the panel_version a write sends for a value with no stored record yet
 
 # The verbs that are never cockpit verbs: a harness pending is answered on the broker's
 # remote-control path (§4.6). Registering one as a cockpit verb is refused.
@@ -94,8 +98,10 @@ class VerbSpec:
       param (the floor the "needs intent" rule compares against); defaults to ``floor``.
     - ``escalates(row, provenance, today)``: typed predicates a renderer evaluates on its compose
       fields to show the tier a param will raise to (``RowAction.escalates``).
-    - ``fire(scope, params, target, ctx)``: the C1 write. Kernel verbs build their legacy request
-      here, supplying the CAS key from the stored row, so a client never chooses it."""
+    - ``fire(scope, params, target, confirm)``: the C1 write. ``target`` carries the row read at the
+      source (``row``), the surface's ``source`` label, and for a value write a ``check`` to re-run
+      under the source's lock. Kernel verbs build their legacy request here, supplying the CAS key
+      from the stored row, so a client never chooses it."""
 
     name: str
     label: str
@@ -205,19 +211,21 @@ def _update_tier(params: dict[str, Any], row: dict[str, Any] | None, prov: str, 
 
 
 def _update_escalates(row: dict[str, Any] | None, prov: str, today: date) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = [{"param": "text", "op": "present", "tier": "T2"},
-                                 {"param": "domain", "op": "present", "tier": "T2"}]
+    out: list[dict[str, Any]] = [{"param": "text", "op": "present", "tier": "T2"}]
     if prov != "verified":
         out.append({"param": "type", "op": "present", "tier": "T2"})
         if _facet(row, "tier") == "parked":
             out.append({"param": "tier", "op": "not_eq", "value": "parked", "tier": "T2"})
         else:
             out.append({"param": "tier", "op": "eq", "value": "parked", "tier": "T2"})
-    return out + _date_escalates(row, prov, today, "next")
+    return out
 
 
 def _const(t: Tier) -> Callable[..., Tier]:
-    return lambda *_a: t
+    def tier(*_a: Any) -> Tier:
+        return t
+    tier._const = True  # type: ignore[attr-defined]
+    return tier
 
 
 # The tier of an ``undo`` is the tier of the edit it reverses (§4.1). Only these kinds keep a backup
@@ -255,9 +263,20 @@ def _spore_fire(kind: str) -> Callable[..., dict[str, Any]]:
     return fire
 
 
+# the surface a credential names, recorded as the line's source (never a caller-chosen label)
+_SURFACE_SOURCE = {"browser": "web", "flowconnect": "app"}
+
+
 def _operator_state_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any],
                          confirm: bool) -> dict[str, Any]:
-    return apply_edit(scope, {"kind": "operator_state", **params})
+    """The version compare and the write in one step under the context file's lock (§4.4). A writer
+    that does not take this lock (flow's own state CLI) is outside it: routed to M1."""
+    with context_lock(scope):
+        check = target.get("check")
+        if check is not None:
+            check()
+        return apply_edit(scope, {"kind": "operator_state", "text": params.get("text"),
+                                  "source": target.get("source", "web")})
 
 
 def _unbuilt_fire(why: str) -> Callable[..., dict[str, Any]]:
@@ -284,8 +303,10 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              row_tier=_const("C1"),
              escalates=lambda row, prov, today: _date_escalates(row, prov, today, "surface_at"),
              fire=_spore_fire("spore_surface_at"), legacy_kind="spore_surface_at", applies_to=_SPORE_ROW),
-    VerbSpec("spore_update", "edit", "changes the item's text, domain, tier, type or date", "row",
-             fields=("text", "domain", "tier", "type", "next"), floor="C1", tier_fn=_update_tier,
+    VerbSpec("spore_update", "edit", "changes the item's text, tier or type", "row",
+             # design §4.2 also allowlists domain and next; levain's handler has no write for either, and a
+             # field the handler drops must be refused, never reported ok
+             fields=("text", "tier", "type"), floor="C1", tier_fn=_update_tier,
              row_tier=_const("C1"), escalates=_update_escalates,
              fire=_spore_fire("spore_update"), legacy_kind="spore_update", applies_to=_SPORE_ROW),
     VerbSpec("spore_set_disposition", "move", "moves the item to another list (Tray, Keep, loops)", "row",
@@ -304,7 +325,7 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              fire=_unbuilt_fire("episode_tombstone fires through the broker (K2b)"),
              legacy_kind="episode_tombstone"),
     VerbSpec("operator_state", "set state", "sets your freeform state line", "value",
-             fields=("text", "source"), floor="C1", tier_fn=_const("C1"), fire=_operator_state_fire,
+             fields=("text",), floor="C1", tier_fn=_const("C1"), fire=_operator_state_fire,
              legacy_kind="operator_state"),
     VerbSpec("section_edit", "edit", "rewrites the neocortex State section", "value",
              fields=("new_body",), floor="T2", tier_fn=_const("T2"),
@@ -324,7 +345,6 @@ LEGACY_KINDS: dict[str, str] = {v.legacy_kind: v.name for v in KERNEL_VERBS if v
 
 # The legacy ``/edit`` keys that are not params: the target, the CAS keys the kernel now supplies
 # itself, and the confirm flag. Everything else in a legacy body is a param and meets the allowlist.
-_LEGACY_TARGET = {"spore_id", "episode_id", "edit_id"}
 _LEGACY_BINDING = {"expect_disposition", "expected_body", "expected", "source", "heading"}
 
 
@@ -356,6 +376,10 @@ class VerbRegistry:
                 raise ValueError(f"verb registered as {name!r} names itself {spec.name!r}")
             if spec.fire is None:
                 raise ValueError(f"downstream verb {name!r} has no fire handler")
+            if spec.binding != "panel":
+                # the kernel reads and versions only its own providers' rows and values; a downstream
+                # verb binds to its panel (bounded, not a per-case read path)
+                raise ValueError(f"downstream verb {name!r}: binding must be 'panel', not {spec.binding!r}")
             self._add(spec)
             self._downstream_names.add(name)
             return
@@ -388,7 +412,11 @@ def offered(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, *, discov
     spec = cockpit.spec(panel_id, discover=discover)
     if spec is None:
         return []
-    return [v for n in spec.verbs if (v := registry.get(n)) is not None]
+    # a downstream panel's feed names its own verb; it may offer only a downstream verb, never a kernel
+    # one (a kernel verb binds to the kernel's own rows and values)
+    external = panel_id.startswith(EXTERNAL_PREFIX)
+    return [v for n in spec.verbs if (v := registry.get(n)) is not None
+            and (not external or registry.is_downstream(n))]
 
 
 def row_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, row: dict[str, Any],
@@ -460,9 +488,9 @@ def _check_value_version(cockpit: "Cockpit", panel_id: str, supplied: Any) -> No
     res = cockpit.read_value_version(panel_id)
     if isinstance(res, Fault):
         raise _refuse("source_unavailable", 503, f"could not read {panel_id!r} from its source: {res.message}")
-    if isinstance(res, Absent):
-        raise _refuse("stale", 409, f"panel {panel_id!r} has no stored value")
-    if res.value != supplied:
+    # a value that is not stored yet binds to VALUE_ABSENT, so the first write has something to name
+    current = VALUE_ABSENT if isinstance(res, Absent) else res.value
+    if current != supplied:
         raise _refuse("stale", 409, f"panel {panel_id!r} changed since it was rendered")
 
 
@@ -480,33 +508,14 @@ def dispatch(
     today = cockpit.today()
 
     if route == "edit":
-        kind = req.get("kind")
-        name = LEGACY_KINDS.get(kind) if isinstance(kind, str) else None
-        if name is None:
-            raise _refuse("bad_kind", 400, f"unknown edit kind {kind!r}")
-        verb = registry.get(name)
-        assert verb is not None
-        params = {k: v for k, v in req.items()
-                  if k not in ("kind", "confirm") and k not in _LEGACY_TARGET and k not in _LEGACY_BINDING}
-        target_row = _legacy_row(cockpit, verb, req)
-        bad = sorted(set(params) - set(verb.fields or ()))
-        if bad:
-            raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
-        tier = verb.tier(params, target_row, UNVERIFIED, today)
-        floor = verb.rendered_tier(target_row, UNVERIFIED, today)
-        # A legacy body carries no intent: a reported install sends "reported" for a write that
-        # escalates nothing and refuses an escalating one; a governed one sends "sign" (§9 Order).
-        if tier != floor and TIERS.index(tier) > TIERS.index(floor):
-            raise _refuse("needs_intent", 409,
-                          f"these params raise {verb.name!r} to {tier}; a legacy /edit body carries no intent")
-        _refuse_unless_c1(verb, tier, credential, install_class)
-        _require_confirm(verb, req)
-        return apply_edit(scope, req)
+        return _legacy_edit(registry, cockpit, scope, req, credential, install_class, today)
 
     if route == "action":
         name = req.get("verb")
-        verb = registry.get(name) if isinstance(name, str) and registry.is_downstream(name) else None
+        verb = registry.get(name) if isinstance(name, str) and registry.action_verb(name) is not None else None
         if verb is None:
+            # a downstream VerbSpec is a cockpit verb: it is offered by a panel and bound to what that
+            # panel rendered, which a legacy /action body cannot name, so it fires on /cockpit/verb only
             raise _refuse("unknown_verb", 404, f"no such action verb: {name!r}")
         params = req.get("params", {})
         if not isinstance(params, dict):
@@ -549,6 +558,8 @@ def dispatch(
             raise _refuse("stale", 409, f"row {row['id']!r} changed since it was rendered")
     elif verb.binding == "value":
         _check_value_version(cockpit, panel_id, req.get("panel_version"))
+    if "idempotency_key" in req and not verb.idempotent:
+        raise _refuse("bad_request", 400, f"{verb.name!r} is not idempotent; it takes no idempotency_key")
 
     tier = verb.tier(params, row, UNVERIFIED, today)
     floor = verb.rendered_tier(row, UNVERIFIED, today)
@@ -565,7 +576,11 @@ def dispatch(
         return _fire_downstream(registry, verb, scope, params, req, job_runtime)
     if verb.fire is None:
         raise _refuse("not_built", 501, f"{verb.name!r} has no handler")
-    target = {"panel_id": panel_id, "row_id": req.get("row_id"), "row": row}
+    target: dict[str, Any] = {"panel_id": panel_id, "row_id": req.get("row_id"), "row": row,
+                              "source": _SURFACE_SOURCE.get(str(credential.get("name")), "web")}
+    if verb.binding == "value":
+        supplied = req.get("panel_version")
+        target["check"] = lambda: _check_value_version(cockpit, panel_id, supplied)
     return verb.fire(scope, params, target, req.get("confirm") is True)
 
 
@@ -604,31 +619,75 @@ def _require_confirm(verb: VerbSpec, req: dict[str, Any]) -> None:
         raise _refuse("confirm_required", 409, f"{verb.name!r} requires confirm:true")
 
 
-def _legacy_row(cockpit: "Cockpit", verb: VerbSpec, req: dict[str, Any]) -> dict[str, Any] | None:
-    """The stored target of a legacy ``/edit`` body, read from the source, so its tier is the same
-    function of the stored row as on ``/cockpit/verb``. A spore is looked up on every spore panel
-    (read_one ignores a panel's visibility rules); an edit row on the edits panel."""
-    if verb.binding != "row":
-        return None
-    if "spore_id" in req:
-        rid, panels = f"spore:{req.get('spore_id')}", ("tray", "loops", "keep")
-    elif "edit_id" in req:
-        rid, panels = f"edit:{req.get('edit_id')}", ("edits",)
-    else:
-        return None
-    faults = []
+_ROW_KEYS = {"spore_id": ("spore:", ("tray", "loops", "keep")), "edit_id": ("edit:", ("edits",)),
+             "episode_id": ("episode:", ("episodes",))}
+
+
+def _legacy_target(cockpit: "Cockpit", verb: VerbSpec, req: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """The stored target of a legacy ``/edit`` body, read from the source on the same panels
+    ``/cockpit/verb`` reads, so the tier and the CAS key come from one row read. A row that is not
+    found is refused (409), never tiered as "no row"; a row that more than one panel or store entry
+    answers for with different content is refused too."""
+    key = next((k for k in _ROW_KEYS if k in req), None)
+    if key is None:
+        raise _refuse("bad_request", 400, f"{verb.name!r} names a row: one of {sorted(_ROW_KEYS)} is required")
+    prefix, panels = _ROW_KEYS[key]
+    rid = f"{prefix}{req.get(key)}"
+    found: list[tuple[str, dict[str, Any]]] = []
     for pid in panels:
         if cockpit.spec(pid) is None:
             continue
         res = cockpit.read_one(pid, rid)
         if isinstance(res, Read):
-            return res.value
-        if isinstance(res, Fault):
-            faults.append(res.message)
-    if faults:
-        # an unreadable store must not read as "no row": the tier would be computed against nothing
-        raise _refuse("source_unavailable", 503, f"could not read {rid!r} from its source: {faults[0]}")
-    return None
+            found.append((pid, res.value))
+        elif isinstance(res, Fault):
+            raise _refuse("source_unavailable", 503, f"could not read {rid!r} from its source: {res.message}")
+    if not found:
+        raise _refuse("stale", 409, f"row {rid!r} is gone or not readable")
+    if len({r["version"] for _p, r in found}) != 1:
+        raise _refuse("stale", 409, f"row {rid!r} reads differently on {[p for p, _r in found]}")
+    return found[0]
+
+
+def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope", req: dict[str, Any],
+                 credential: dict[str, Any], install_class: str, today: date) -> dict[str, Any]:
+    """``POST /edit``: the legacy body translated onto the cockpit path. One row read, one tier, the
+    kernel's CAS key and the verb's own ``fire``; ``apply_edit`` never receives the client's body."""
+    kind = req.get("kind")
+    name = LEGACY_KINDS.get(kind) if isinstance(kind, str) else None
+    if name is None:
+        raise _refuse("bad_kind", 400, f"unknown edit kind {kind!r}")
+    verb = registry.get(name)
+    assert verb is not None
+    params = {k: v for k, v in req.items()
+              if k not in ("kind", "confirm") and k not in _ROW_KEYS and k not in _LEGACY_BINDING}
+    bad = sorted(set(params) - set(verb.fields or ()))
+    if bad:
+        raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
+    if verb.tier_fn is None or _is_const(verb):
+        # a verb whose tier does not depend on the row: refuse a T2/T3 before reading anything
+        _refuse_unless_c1(verb, verb.tier(params, None, UNVERIFIED, today), credential, install_class)
+    panel_id, row = (None, None)
+    if verb.binding == "row":
+        panel_id, row = _legacy_target(cockpit, verb, req)
+    tier = verb.tier(params, row, UNVERIFIED, today)
+    floor = verb.rendered_tier(row, UNVERIFIED, today)
+    # A legacy body carries no intent: a reported install sends "reported" for a write that escalates
+    # nothing and refuses an escalating one; a governed one sends "sign" (§9 Order).
+    if TIERS.index(tier) > TIERS.index(floor):
+        raise _refuse("needs_intent", 409,
+                      f"these params raise {verb.name!r} to {tier}; a legacy /edit body carries no intent")
+    _refuse_unless_c1(verb, tier, credential, install_class)
+    _require_confirm(verb, req)
+    if verb.fire is None:
+        raise _refuse("not_built", 501, f"{verb.name!r} has no handler")
+    target = {"panel_id": panel_id, "row_id": row["id"] if row else None, "row": row,
+              "source": _SURFACE_SOURCE.get(str(credential.get("name")), "web")}
+    return verb.fire(scope, params, target, req.get("confirm") is True)
+
+
+def _is_const(verb: VerbSpec) -> bool:
+    return getattr(verb.tier_fn, "_const", False)
 
 
 class VerbView:

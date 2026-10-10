@@ -1210,7 +1210,7 @@ def make_server(
         # bind-then-brick. The per-request gate already treats "" as no-token (`not expected` →
         # 403), so without this an off-box writable bind with write_token="" would pass here and
         # then 403 every write — a silently bricked surface instead of a clean refusal [L2 LOW].
-        if source.write_scope is not None and not write_token:
+        if source.write_scope is not None and not (write_token or surface_tokens):
             raise ValueError(
                 f"refusing to bind {host!r}: a WRITABLE substrate may bind a non-loopback "
                 "(private-mesh / Tailscale) address ONLY with a write_token — the off-box "
@@ -1342,7 +1342,7 @@ def make_server(
     verb_registry = VerbRegistry(extra_verbs)
     # One write token per surface, required on every bind (design §4.3). ``write_token`` is the
     # ``browser`` surface's for callers that pass one token. A writable source given none gets a
-    # per-launch ``browser`` token, printed by ``levain serve`` in the unlocked link.
+    # per-launch ``browser`` token; ``run_web_server`` prints it and puts it in the unlocked link.
     tokens = {str(k): str(v) for k, v in (surface_tokens or {}).items()}
     for name, tok in tokens.items():
         if not name or not tok:
@@ -1558,9 +1558,16 @@ def run_web_server(
         # The link carries the token in the URL FRAGMENT, which a browser keeps to itself: it is never sent to a
         # server, so it reaches no access log and no Referer. The panel reads it and strips it from the address bar.
         unlocked = f"{url}#chat_token={httpd.chat_token}"
-        print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
     else:
         unlocked = url
+    if httpd.write_token:
+        # K2a: every write carries the browser surface's token, loopback included. Same fragment
+        # discipline as the chat token: never sent to the server, taken and stripped by the page.
+        print(f"  write token (send as {_WRITE_TOKEN_HEADER}; valid until this server stops): "
+              f"{httpd.write_token}", flush=True)
+        unlocked += ("&" if "#" in unlocked else "#") + f"write_token={httpd.write_token}"
+    if unlocked != url:
+        print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
 
     if open_browser:
         # The listening socket is already bound (ThreadingHTTPServer binds in
