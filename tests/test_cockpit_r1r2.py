@@ -358,7 +358,8 @@ class TestManifestMapperBoundary:
         raw = json.dumps(snapshot(ck)).replace('"metrics": []', '"metrics": [], "ops\\u202ey": 1, "ops<U+202E>y": 2')
         assert '"ops<U+202E>y": 2' in raw           # the replacement happened
         view = _view(json.loads(raw))
-        assert "payload rejected" in view["extra_panels"]["m"]["error"] or "payload rejected" in json.dumps(view["errors"])
+        assert "payload rejected" in view["extra_panels"]["m"]["error"]   # that panel, and only that panel
+        assert "payload rejected" not in json.dumps(view["extra_panels"].get("tray", {}))
         assert [e["id"] for e in view["layout"]].count("tray") == 1      # the rest of the cockpit still renders
 
     def test_a_non_string_panel_title_falls_back_to_the_head_title(self) -> None:
