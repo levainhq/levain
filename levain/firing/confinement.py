@@ -4866,7 +4866,14 @@ def _dirmngr_sockets() -> list[Path]:
     which covers any GNUPGHOME, including one bash sets for itself later (codex L3 r6: guessing from
     levain's own GNUPGHOME missed that); and the default places (``<runtime>/gnupg``, its ``d.*``
     subdirectories, ``~/.gnupg``), so a socket file present at spawn with no listener is hidden as
-    before. A dirmngr first bound after spawn is not hidden: the residual the call site states."""
+    before. A dirmngr first bound after spawn is not hidden: the residual the call site states.
+
+    These are masks BY PATH, and the operator-floor bash runs as the operator, so it can rename any of
+    the operator's directories: one session moves the directory holding a live dirmngr socket, and the
+    next reaches it at its new name, where neither source finds it (REPRODUCED 2026-10-10 on argushub,
+    63 packets on port 53 carrying a fresh name).
+    No path mask closes that; the frame for the v2.0 must-close is Landlock's RESOLVE_UNIX (inode rules,
+    kernel 7.1+) with an allowlisted runtime-dir view on older kernels."""
     found: list[Path] = []
     for s in _bound_unix_socket_paths():
         if Path(s).name != "S.dirmngr":
@@ -4875,7 +4882,12 @@ def _dirmngr_sockets() -> list[Path]:
             raise ConfinementError(
                 f"a dirmngr socket is bound at the relative path {s!r}, which the floor cannot "
                 "place, so it cannot hide it from bash without network (fail-closed).")
-        found.append(_host_spelling(Path(s)))  # bound through a linked parent, masked where it lands
+        try:
+            found.append(_host_spelling(Path(s)))  # bound through a linked parent: masked where it lands
+        except (OSError, RuntimeError) as e:
+            raise ConfinementError(
+                f"cannot resolve the dirmngr socket path {s!r} ({e}), so the floor cannot hide it "
+                "from bash without network (fail-closed).") from None
     roots = [Path(r) / "gnupg" for r in _runtime_dirs()]
     try:
         roots.append(Path.home() / ".gnupg")

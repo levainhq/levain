@@ -3024,7 +3024,9 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
     edit made in between, or a file levain cannot confirm as its own, is kept, and the original
     is named. Messages are held until the end,
     so a failing output channel cannot interrupt the undo. What this cannot cover: codex
-    reading in the moment between the two writes, and a crash (SIGKILL, power loss) in it."""
+    reading in the moment between the two writes, a crash (SIGKILL, power loss) in it, and an
+    edit saved between the identity check and the rename that puts the original back (codex
+    L3 r8; no portable no-clobber exchange closes it)."""
     config = codex_home / "config.toml"
     hooks = codex_home / "hooks.json"
     written = config.resolve()
@@ -3128,7 +3130,9 @@ def _put_codex_config_back(config: Path, written: Path, was_link: bool,
     except FileNotFoundError:
         if kept is None:
             return False  # nothing was created
-        gone = not os.path.lexists(config)  # a dangling link swapped in is not "removed"
+        # removed: the name is absent, or it is still the same link and its target is gone; a
+        # dangling link swapped in is not "removed"
+        gone = same_name or not os.path.lexists(config)
     except OSError:
         pass
     try:
