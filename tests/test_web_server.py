@@ -55,11 +55,26 @@ def _store_with_data(tmp_path: Path) -> SubstrateSource:
     return SubstrateSource(anneal=AnnealPaths.from_db(db))
 
 
+# K2a: every POST to /edit, /action and /cockpit/verb on a WRITABLE source carries this surface
+# credential on EVERY bind, loopback included. ``_serving`` hands it to a writable source and ``_post``
+# attaches it by default; a test about the missing/wrong credential passes ``token=None`` / its own.
+_TOK = "test-surface-token"
+_TOK_HEADER = "X-Levain-Write-Token"
+
+
+def _set_token(httpd, token: str | None) -> None:
+    """Re-key a RUNNING server's browser surface token (the off-box tests flip the bind class after
+    start, so they re-key after start too). ``write_token`` and ``surface_tokens`` move together."""
+    httpd.write_token = token
+    httpd.surface_tokens = {"browser": token} if token else {}
+
+
 @contextmanager
 def _serving(source: SubstrateSource):
     """Bring up a real server on an ephemeral loopback port, yield its base URL,
     and tear it down cleanly — the live integration harness for the route tests."""
-    httpd = make_server(source, host="127.0.0.1", port=0)
+    httpd = make_server(source, host="127.0.0.1", port=0,
+                        write_token=_TOK if source.write_scope is not None else None)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     host, port = httpd.server_address[0], httpd.server_address[1]
@@ -1053,9 +1068,12 @@ def _make_full_install(tmp_path: Path) -> SubstrateSource:
     return SubstrateSource.local(root)
 
 
-def _post(url: str, payload, *, headers: dict | None = None, content_type: str = "application/json"):
+def _post(url: str, payload, *, headers: dict | None = None, content_type: str = "application/json",
+          token: str | None = _TOK):
     data = json.dumps(payload).encode("utf-8")
     h = {} if content_type is None else {"Content-Type": content_type}
+    if token is not None:
+        h[_TOK_HEADER] = token
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, data=data, method="POST", headers=h)
@@ -1067,35 +1085,44 @@ def _post(url: str, payload, *, headers: dict | None = None, content_type: str =
 
 
 class TestWriteBoundary:
-    def test_world_section_edit_happy_path(self, tmp_path: Path) -> None:
+    def test_world_section_edit_is_refused_needs_broker(self, tmp_path: Path) -> None:
+        # K2a: a config edit is T3, so /edit refuses it "needs_broker" even WITH a valid credential,
+        # and the file is untouched. The handler's own happy path is covered by test_writes.py
+        # (apply_edit direct); over HTTP it fires again once K2b's broker exists.
         src = _make_full_install(tmp_path)
+        before = (src.install_root / "seed" / "world.md").read_text(encoding="utf-8")
         with _serving(src) as (base, _httpd):
             status, body = _post(base + "/edit", {
                 "kind": "config", "source": "seed/world.md", "heading": "Identity",
                 "expected_body": "Avery. 39. Riverton.", "new_body": "Topological mind.",
             })
-        assert status == 200 and body["ok"] is True
-        out = (src.install_root / "seed" / "world.md").read_text(encoding="utf-8")
-        assert "Topological mind." in out
-        assert "Direct, profanity welcome." in out  # sibling preserved
+        assert status == 403 and body["error"] == "needs_broker"
+        assert (src.install_root / "seed" / "world.md").read_text(encoding="utf-8") == before
+        from levain.writes import recent_edits
+        assert recent_edits(src.install_root / ".levain") == []     # no audit record: nothing fired
 
-    def test_entity_name_edit(self, tmp_path: Path) -> None:
+    def test_entity_name_edit_is_refused_needs_broker(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
+        cfg = src.install_root / ".levain" / "config.json"
+        before = cfg.read_bytes() if cfg.exists() else None
         with _serving(src) as (base, _httpd):
             status, body = _post(base + "/edit", {"kind": "entity_name", "value": "Sol"})
-        assert status == 200
-        cfg = json.loads((src.install_root / ".levain" / "config.json").read_text("utf-8"))
-        assert cfg["entity_name"] == "Sol"
+        assert status == 403 and body["error"] == "needs_broker"
+        assert (cfg.read_bytes() if cfg.exists() else None) == before     # nothing written
+        from levain.writes import recent_edits
+        assert recent_edits(src.install_root / ".levain") == []     # no audit record: nothing fired
 
-    def test_state_section_edit_end_to_end(self, tmp_path: Path) -> None:
-        # Slice 2b: the neocortex State section edits through the same governed route;
-        # the felt layer is preserved, and a non-State section is refused 403.
+    def test_state_section_edit_is_refused_needs_broker(self, tmp_path: Path) -> None:
+        # K2a: the neocortex State section (section_edit) is T2 -> "needs_broker" over /edit, whatever
+        # the heading, and the felt layer and State alike are untouched. The State-only / felt-layer
+        # `not_editable` rule is covered by test_writes.py (apply_edit direct).
         src = _make_full_install(tmp_path)
         cont = src.install_root / ".levain" / "memory.continuity.md"
         cont.write_text(
             "# Memory\n\n## State\n\nFocus: A.\n\n## Patterns\n\nfelt layer.\n",
             encoding="utf-8",
         )
+        before = cont.read_text(encoding="utf-8")
         with _serving(src) as (base, _httpd):
             ok_status, ok_body = _post(base + "/edit", {
                 "kind": "state", "heading": "State",
@@ -1105,10 +1132,11 @@ class TestWriteBoundary:
                 "kind": "state", "heading": "Patterns",
                 "expected_body": "felt layer.", "new_body": "hacked",
             })
-        assert ok_status == 200 and ok_body["ok"] is True
-        out = cont.read_text(encoding="utf-8")
-        assert "Focus: B." in out and "felt layer." in out  # State changed, felt kept
-        assert bad_status == 403 and bad_body["error"] == "not_editable"
+        assert ok_status == 403 and ok_body["error"] == "needs_broker"
+        assert bad_status == 403 and bad_body["error"] in ("needs_broker", "not_editable")
+        assert cont.read_text(encoding="utf-8") == before
+        from levain.writes import recent_edits
+        assert recent_edits(src.install_root / ".levain") == []     # no audit record: nothing fired
 
     def test_cross_site_refused(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
@@ -1124,47 +1152,64 @@ class TestWriteBoundary:
     def test_same_site_refused(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, _httpd):
-            status, _ = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
+            status, _ = _post(base + "/edit", {"kind": "operator_state", "text": "x"},
                               headers={"Sec-Fetch-Site": "same-site"})
         assert status == 403
 
     def test_same_origin_allowed(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, _httpd):
-            status, _ = _post(base + "/edit", {"kind": "entity_name", "value": "Ok"},
+            status, _ = _post(base + "/edit", {"kind": "operator_state", "text": "ok"},
                               headers={"Sec-Fetch-Site": "same-origin"})
         assert status == 200
 
     def test_wrong_content_type_415(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, _httpd):
-            status, body = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
+            status, body = _post(base + "/edit", {"kind": "operator_state", "text": "x"},
                                  content_type="text/plain")
         assert status == 415 and body["error"] == "unsupported_media_type"
 
-    def test_class_c_origin_refused(self, tmp_path: Path) -> None:
+    def test_credential_is_checked_before_content_type_and_body(self, tmp_path: Path) -> None:
+        # K2a: no token -> 403 credential_required, ahead of the 415 and before the body is read.
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, body = _post(base + "/edit", {"kind": "operator_state", "text": "x"},
+                                 content_type="text/plain", token=None)
+        assert status == 403 and body["error"] == "credential_required"
+        assert not (src.install_root / ".levain" / "context.json").exists()
+
+    def test_class_c_origin_edit_is_refused_over_http(self, tmp_path: Path) -> None:
+        # a config edit of a Class-C file (origin.md) never lands over HTTP: T3 -> needs_broker
+        # (the handler's own not_editable refusal is covered by test_writes.py).
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, _httpd):
             status, body = _post(base + "/edit", {
                 "kind": "config", "source": "seed/origin.md", "heading": None,
                 "expected_body": _W_ORIGIN, "new_body": "hacked",
             })
-        assert status == 403 and body["error"] == "not_editable"
+        assert status == 403 and body["error"] in ("needs_broker", "not_editable")
         assert (src.install_root / "seed" / "origin.md").read_text("utf-8") == _W_ORIGIN
 
-    def test_stale_409(self, tmp_path: Path) -> None:
+    def test_stale_config_edit_is_refused_needs_broker(self, tmp_path: Path) -> None:
+        # the stale-CAS 409 for a config edit is covered by test_writes.py; over HTTP the T3
+        # edit is refused before the handler, and the file is untouched.
         src = _make_full_install(tmp_path)
+        before = (src.install_root / "seed" / "world.md").read_text(encoding="utf-8")
         with _serving(src) as (base, _httpd):
             status, body = _post(base + "/edit", {
                 "kind": "config", "source": "seed/world.md", "heading": "Identity",
                 "expected_body": "WRONG", "new_body": "x",
             })
-        assert status == 409 and body["error"] == "stale"
+        assert status == 403 and body["error"] == "needs_broker"
+        assert (src.install_root / "seed" / "world.md").read_text(encoding="utf-8") == before
+        from levain.writes import recent_edits
+        assert recent_edits(src.install_root / ".levain") == []     # no audit record: nothing fired
 
     def test_bad_host_refused(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, _httpd):
-            status, _ = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
+            status, _ = _post(base + "/edit", {"kind": "operator_state", "text": "x"},
                               headers={"Host": "evil.com"})
         assert status == 403
 
@@ -1180,7 +1225,7 @@ class TestWriteBoundary:
             data = b"{not json"
             req = urllib.request.Request(
                 base + "/edit", data=data, method="POST",
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", _TOK_HEADER: _TOK},
             )
             try:
                 with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310
@@ -1195,11 +1240,9 @@ class TestWriteBoundary:
         src = _make_full_install(tmp_path)
         big = "z" * (_MAX_POST_BYTES + 1024)
         with _serving(src) as (base, _httpd):
-            status, body = _post(base + "/edit", {
-                "kind": "config", "source": "seed/world.md", "heading": "Identity",
-                "expected_body": "Avery. 39. Riverton.", "new_body": big,
-            })
+            status, body = _post(base + "/edit", {"kind": "operator_state", "text": big})
         assert status == 413
+        assert not (src.install_root / ".levain" / "context.json").exists()
 
     def test_get_to_edit_is_404(self, tmp_path: Path) -> None:
         # /edit is POST-only; a GET falls through the read allowlist to 404.
@@ -1260,7 +1303,7 @@ class TestClassBRoute:
         assert s1 == 409 and b1["error"] == "confirm_required"
         assert s2 == 200 and b2["ok"] is True
 
-    def test_spore_touch_and_episode_tombstone(self, tmp_path: Path) -> None:
+    def test_spore_touch_fires_and_episode_tombstone_is_refused_needs_broker(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         sid, eid = _seed_anneal(src)
         with _serving(src) as (base, _httpd):
@@ -1269,7 +1312,12 @@ class TestClassBRoute:
                 "kind": "episode_tombstone", "episode_id": eid, "confirm": True,
             })
         assert st == 200 and bt["action"] == "touch"
-        assert se == 200 and be["action"] == "tombstone"
+        # K2a: an episode tombstone is T2 -> needs_broker over HTTP (even confirmed); the episode
+        # stays. (The tombstone handler itself is covered by test_writes.py.)
+        assert se == 403 and be["error"] == "needs_broker"
+        from anneal_memory import Store
+        with Store(str(src.install_root / ".levain" / "memory.db")) as store:
+            assert store.status().tombstone_count == 0
 
 
 class TestRecallJson:
@@ -1546,7 +1594,8 @@ class TestExtraRoutes:
 class TestOffBoxWriteToken:
     """A WRITABLE source MAY bind off-loopback ONLY with a ``write_token`` (the off-box
     governance factor that replaces loopback-is-auth); POST /edit then requires the
-    ``X-Levain-Write-Token`` header (constant-time compared); loopback stays token-free.
+    ``X-Levain-Write-Token`` header (constant-time compared). K2a: the WRITE credential is now
+    required on EVERY bind, loopback included; the off-box READ gate is unchanged.
 
     The off-loopback BIND itself can't be exercised in a test (no real mesh interface →
     OSError on the unroutable TEST-NET addr), so the bind-LOGIC is asserted via the
@@ -1591,17 +1640,31 @@ class TestOffBoxWriteToken:
         with pytest.raises(ValueError, match="install-bearing"):
             make_server(install_writable, host="192.0.2.1", port=0, write_token="s3cret")
 
-    def test_loopback_writable_is_token_free(self, tmp_path: Path) -> None:
-        # The localhost-sovereign path is UNCHANGED: a loopback writable bind needs no token,
-        # write_token_required is False, and a tokenless write is NOT the token-403.
-        with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
+    def test_loopback_writable_needs_a_credential(self, tmp_path: Path) -> None:
+        # K2a (design §4.3): a loopback writable bind NO LONGER trusts the address. A write with no
+        # token is 403 credential_required and writes nothing; with the launch's token a C1 write
+        # lands. Reads on loopback stay token-free; the substrate signal write_token_required now says "attach it".
+        from anneal_memory.spores import SporeStore
+        src = self._writable_noinstall(tmp_path)          # plants the open spore in tmp_path
+        store = SporeStore(tmp_path / "memory.spores.json")
+        sid = str(store.list_open()[0]["id"])
+        from levain.writes import recent_edits
+        ledger = tmp_path / "ledger"
+        assert recent_edits(ledger) == []
+        with _serving(src) as (base, httpd):
             assert httpd.is_loopback_bind is True
-            assert httpd.write_token is None
+            tok = httpd.surface_tokens["browser"]      # a writable source always has a browser token
+            assert tok and httpd.write_token == tok
             v = json.loads(_get(base + "/substrate.json")[2])
             assert v["writable"] is True
-            assert v["write_token_required"] is False
-            _st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"})
-            assert resp.get("message") != "missing or invalid write token"
+            assert v["write_token_required"] is True    # K2a: the signal now means "attach the credential"
+            for bad in (None, "wrong"):
+                st, resp = _post(base + "/edit", {"kind": "spore_touch", "spore_id": sid}, token=bad)
+                assert st == 403 and resp["error"] == "credential_required"
+            assert recent_edits(ledger) == []                           # nothing written
+            st, resp = _post(base + "/edit", {"kind": "spore_touch", "spore_id": sid}, token=tok)
+            assert st == 200 and resp["action"] == "touch"            # with the token a C1 write lands
+            assert [r["kind"] for r in recent_edits(ledger)] == ["spore_touch"]
 
     def test_offbox_substrate_json_requires_token(self, tmp_path: Path) -> None:
         # spore-220: an off-box WRITABLE bind gates the substrate-bearing READS too — the exact
@@ -1610,7 +1673,7 @@ class TestOffBoxWriteToken:
         # frontend keeps attaching it). The predicate + compare mirror do_POST via the shared helpers.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            httpd.write_token = "s3cret"
+            _set_token(httpd, "s3cret")
             assert _get_h(base + "/substrate.json")[0] == 403
             assert _get_h(base + "/substrate.json", headers={"X-Levain-Write-Token": "wrong"})[0] == 403
             st, body = _get_h(base + "/substrate.json", headers={"X-Levain-Write-Token": "s3cret"})
@@ -1622,7 +1685,7 @@ class TestOffBoxWriteToken:
         # HEAD → 403 (no substrate framing leaked); WITH the token it reaches the route → 200.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            httpd.write_token = "s3cret"
+            _set_token(httpd, "s3cret")
             assert _get_h(base + "/substrate.json", method="HEAD")[0] == 403
             assert _get_h(base + "/substrate.json", method="HEAD",
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
@@ -1631,7 +1694,7 @@ class TestOffBoxWriteToken:
         # spore-220: /recall.json (episode keyword search = substrate content) is gated identically.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            httpd.write_token = "s3cret"
+            _set_token(httpd, "s3cret")
             assert _get_h(base + "/recall.json?keyword=x")[0] == 403
             assert _get_h(base + "/recall.json?keyword=x",
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
@@ -1642,7 +1705,7 @@ class TestOffBoxWriteToken:
         # (no runtime → 'unknown', still 200).
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            httpd.write_token = "s3cret"
+            _set_token(httpd, "s3cret")
             assert _get_h(base + "/job.json?id=x")[0] == 403
             assert _get_h(base + "/job.json?id=x",
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
@@ -1652,7 +1715,7 @@ class TestOffBoxWriteToken:
         # bootstrap and THEN supply the token on the data fetches. It carries NO substrate data.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            httpd.write_token = "s3cret"
+            _set_token(httpd, "s3cret")
             for path in ("/", "/dashboard.css", "/dashboard_core.js", "/dashboard_boot.js"):
                 assert _get_h(base + path)[0] == 200, path
 
@@ -1662,7 +1725,7 @@ class TestOffBoxWriteToken:
         # treating it as a hard read failure.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            httpd.write_token = "s3cret"
+            _set_token(httpd, "s3cret")
             st, body = _get_h(base + "/substrate.json")
             assert st == 403
             assert json.loads(body)["message"] == "missing or invalid write token"
@@ -1690,7 +1753,7 @@ class TestOffBoxWriteToken:
             extra_json={"/fleet.json": lambda: b'{"fleet":[]}'},
         ) as (base, httpd):
             httpd.is_loopback_bind = False
-            httpd.write_token = "s3cret"
+            _set_token(httpd, "s3cret")
             assert _get_h(base + "/fleet.json")[0] == 403
             assert _get_h(base + "/fleet.json",
                           headers={"X-Levain-Write-Token": "s3cret"})[0] == 200
@@ -1698,18 +1761,16 @@ class TestOffBoxWriteToken:
 
     def test_offbox_write_requires_correct_token(self, tmp_path: Path) -> None:
         # The enforcement: off-box, POST /edit demands X-Levain-Write-Token == the server's
-        # token. Missing or wrong → 403 token error; correct → clears the gate (reaches the
-        # write layer, where no-install yields some OTHER error, never the token message).
+        # token. Missing or wrong -> 403 credential_required; correct -> clears the gate (reaches the
+        # verb layer, where this no-install source yields some OTHER outcome, never the token message).
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            httpd.write_token = "s3cret"
-            st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"})
+            _set_token(httpd, "s3cret")
+            st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"}, token=None)
             assert st == 403 and resp["message"] == "missing or invalid write token"
-            st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
-                             headers={"X-Levain-Write-Token": "wrong"})
+            st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"}, token="wrong")
             assert st == 403 and resp["message"] == "missing or invalid write token"
-            _st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
-                              headers={"X-Levain-Write-Token": "s3cret"})
+            _st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"}, token="s3cret")
             assert resp.get("message") != "missing or invalid write token"
 
     def test_offbox_with_no_server_token_fails_closed(self, tmp_path: Path) -> None:
@@ -1717,9 +1778,9 @@ class TestOffBoxWriteToken:
         # to BIND that, but do_POST must not TRUST that) refuses every write, fail-closed.
         with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
             httpd.is_loopback_bind = False
-            httpd.write_token = None
+            _set_token(httpd, None)
             st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"},
-                             headers={"X-Levain-Write-Token": "anything"})
+                             token="anything")
             assert st == 403 and resp["message"] == "missing or invalid write token"
 
     def test_readonly_offbox_post_is_422_not_token_403(self, tmp_path: Path) -> None:
@@ -1765,26 +1826,80 @@ class TestOffBoxWriteToken:
         with pytest.raises(ValueError, match="operator-private"):
             ws.make_server(install, host="127.0.0.1", port=0)
 
-    def test_loopback_bind_ignores_passed_token(self, tmp_path: Path) -> None:
-        # L1 LOW-2: exercise the REAL make_server computation — a 127.0.0.1 bind yields
-        # is_loopback_bind True even with a write_token passed, and do_POST IGNORES the token
-        # (the localhost-sovereign token-free path). (The other tests force the attr; this one
-        # proves make_server derives it from the actual bound address.)
+    def test_loopback_bind_enforces_the_passed_token(self, tmp_path: Path) -> None:
+        # K2a: the REAL make_server computation — a 127.0.0.1 bind is is_loopback_bind True, reads stay
+        # token-free (the substrate signal now says write_token_required: attach the credential), and do_POST now ENFORCES the passed token
+        # (the old rule ignored it on loopback). Wrong/missing -> 403 credential_required.
         httpd = make_server(self._writable_noinstall(tmp_path), host="127.0.0.1", port=0,
-                            write_token="ignored-on-loopback")
+                            write_token="loopback-token")
         assert httpd.is_loopback_bind is True
-        assert httpd.write_token == "ignored-on-loopback"
+        assert httpd.write_token == "loopback-token"
+        assert httpd.surface_tokens == {"browser": "loopback-token"}
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         try:
             base = f"http://{httpd.server_address[0]}:{httpd.server_address[1]}"
-            assert json.loads(_get(base + "/substrate.json")[2])["write_token_required"] is False
-            _st, resp = _post(base + "/edit", {"kind": "entity_name", "value": "x"})
-            assert resp.get("message") != "missing or invalid write token"
+            assert json.loads(_get(base + "/substrate.json")[2])["write_token_required"] is True
+            # reads stay token-free on loopback (only the off-box READ gate keys on the bind)
+            for tok in (None, "ignored-on-loopback"):
+                st, resp = _post(base + "/edit", {"kind": "operator_state", "text": "x"}, token=tok)
+                assert st == 403 and resp["error"] == "credential_required"
+            _st, resp = _post(base + "/edit", {"kind": "operator_state", "text": "x"},
+                              token="loopback-token")
+            assert resp.get("error") != "credential_required"
         finally:
             httpd.shutdown()
             httpd.server_close()
             thread.join(timeout=5)
+
+
+class TestSurfaceTokens:
+    """K2a (design §4.3): one write token per SURFACE. Each surface's token alone authorises a C1
+    write; a value that is no surface's is refused; two surfaces may not share a token."""
+
+    def test_each_surface_token_alone_lets_a_c1_write_land(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        httpd = make_server(src, host="127.0.0.1", port=0,
+                            surface_tokens={"browser": "tok-A", "flowconnect": "tok-B"})
+        assert httpd.surface_tokens == {"browser": "tok-A", "flowconnect": "tok-B"}
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base = f"http://{httpd.server_address[0]}:{httpd.server_address[1]}"
+            ctx = src.install_root / ".levain" / "context.json"
+            for tok, text in (("tok-A", "from A"), ("tok-B", "from B")):
+                st, resp = _post(base + "/edit", {"kind": "operator_state", "text": text}, token=tok)
+                assert st == 200 and resp["ok"] is True, (tok, resp)
+                assert json.loads(ctx.read_text())["state"] == text
+            before = ctx.read_text()
+            for bad in ("tok-C", "tok-", "tok-A ", None):
+                st, resp = _post(base + "/edit", {"kind": "operator_state", "text": "x"}, token=bad)
+                assert st == 403 and resp["error"] == "credential_required", bad
+            assert ctx.read_text() == before             # the refused writes wrote nothing
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+
+    def test_two_surfaces_sharing_a_token_are_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="share one token"):
+            make_server(_make_full_install(tmp_path), host="127.0.0.1", port=0,
+                        surface_tokens={"browser": "same", "flowconnect": "same"})
+
+    def test_write_token_and_a_disagreeing_browser_token_are_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="disagree"):
+            make_server(_make_full_install(tmp_path), host="127.0.0.1", port=0,
+                        write_token="one", surface_tokens={"browser": "two"})
+
+    def test_a_writable_source_given_no_token_gets_a_random_browser_token(self, tmp_path: Path) -> None:
+        a = make_server(_make_full_install(tmp_path / "a"), host="127.0.0.1", port=0)
+        b = make_server(_make_full_install(tmp_path / "b"), host="127.0.0.1", port=0)
+        try:
+            assert a.surface_tokens["browser"] and a.write_token == a.surface_tokens["browser"]
+            assert a.surface_tokens["browser"] != b.surface_tokens["browser"]
+        finally:
+            a.server_close()
+            b.server_close()
 
 
 class TestStateEditRoute:
@@ -1899,7 +2014,8 @@ class TestOversizeWithALyingContentLength:
         try:
             s.sendall(
                 f"POST /edit HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
-                f"Content-Type: application/json\r\nContent-Length: {declared}\r\n\r\n".encode()
+                f"Content-Type: application/json\r\n{_TOK_HEADER}: {_TOK}\r\n"
+                f"Content-Length: {declared}\r\n\r\n".encode()
                 + actually_send
             )
             chunks = []

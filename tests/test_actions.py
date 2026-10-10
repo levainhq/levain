@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from levain.cockpit.verbs import VerbSpec
 from levain.dashboard import SubstrateSource
 from levain.web_server import make_server
 from levain.writes import ActionVerb, EditError, WriteScope, apply_action, recent_edits
@@ -66,9 +67,23 @@ def _noinstall_writable_source(tmp_path: Path) -> SubstrateSource:
     return SubstrateSource(anneal=anneal, write_scope=scope)
 
 
+# K2a: every POST to /action on a writable source carries a surface credential on EVERY bind, and an
+# ActionVerb with no tier function is T2, which this build refuses "needs_broker" over HTTP (the broker
+# is K2b). A downstream verb that may fire over HTTP registers a VerbSpec whose tier_fn answers "C1".
+_TOK = "test-surface-token"
+_TOK_HEADER = "X-Levain-Write-Token"
+
+
+def _c1_spec(name: str, fire, *, confirm_required: bool = False, label: str = "C1 test verb") -> VerbSpec:
+    """A downstream verb the kernel will fire over /action: tier_fn -> C1, panel-bound, one param."""
+    return VerbSpec(name, label, label, "panel", fields=("text",), floor="C1",
+                    tier_fn=lambda params, row, provenance, today: "C1",
+                    confirm_required=confirm_required, fire=fire)
+
+
 @contextmanager
 def _serving_verbs(source: SubstrateSource, verbs: dict):
-    httpd = make_server(source, host="127.0.0.1", port=0, extra_verbs=verbs)
+    httpd = make_server(source, host="127.0.0.1", port=0, extra_verbs=verbs, write_token=_TOK)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
@@ -79,9 +94,11 @@ def _serving_verbs(source: SubstrateSource, verbs: dict):
         thread.join(timeout=5)
 
 
-def _post(url: str, payload, *, headers: dict | None = None):
+def _post(url: str, payload, *, headers: dict | None = None, token: str | None = _TOK):
     data = json.dumps(payload).encode("utf-8")
     h = {"Content-Type": "application/json"}
+    if token is not None:
+        h[_TOK_HEADER] = token
     if headers:
         h.update(headers)
     req = urllib.request.Request(url, data=data, method="POST", headers=h)
@@ -412,50 +429,107 @@ class TestActionRegistration:
 
 
 class TestActionRoute:
-    def test_happy_path(self, tmp_path: Path) -> None:
+    def test_plain_action_verb_is_refused_needs_broker_and_never_runs(self, tmp_path: Path) -> None:
+        # K2a: an ActionVerb with no tier function is T2 -> 403 needs_broker over /action even with a
+        # valid credential and confirm:true. The handler NEVER ran and nothing was audited. (The
+        # handler's own happy path is covered by TestApplyAction above, apply_action direct.)
         sent: list = []
         verbs = {"send_test": ActionVerb(
             handler=lambda p: sent.append(p) or {"ok": True, "summary": "did it"}, label="Send")}
-        with _serving_verbs(_writable_source(tmp_path), verbs) as (base, _httpd):
+        src = _writable_source(tmp_path)
+        with _serving_verbs(src, verbs) as (base, _httpd):
             status, body = _post(base + "/action",
                                  {"verb": "send_test", "params": {"x": 1}, "confirm": True})
-        assert status == 200 and body["ok"] is True and body["verb"] == "send_test"
-        assert sent == [{"x": 1}]                         # the handler actually ran with the params
+        assert status == 403 and body["error"] == "needs_broker"
+        assert sent == []                                 # the handler never ran
+        assert recent_edits(src.write_scope.ledger_root) == []
 
-    def test_confirm_required_409(self, tmp_path: Path) -> None:
+    def test_c1_downstream_verb_fires_over_the_route(self, tmp_path: Path) -> None:
+        # a downstream VerbSpec whose tier_fn answers C1 DOES fire over /action with the token, and
+        # receives (scope, params, target, confirm).
+        got: list = []
+
+        def fire(scope, params, target, confirm):
+            got.append((scope, params, target, confirm))
+            return {"ok": True, "summary": "fired"}
+
+        src = _writable_source(tmp_path)
+        with _serving_verbs(src, {"c1_test": _c1_spec("c1_test", fire)}) as (base, _httpd):
+            status, body = _post(base + "/action",
+                                 {"verb": "c1_test", "params": {"text": "hi"}, "confirm": True})
+        assert status == 200 and body["ok"] is True
+        assert len(got) == 1 and got[0][1] == {"text": "hi"} and got[0][3] is True
+        assert got[0][0] is src.write_scope
+
+    def test_c1_downstream_verb_rejects_a_field_outside_its_allowlist(self, tmp_path: Path) -> None:
+        got: list = []
+        with _serving_verbs(_writable_source(tmp_path),
+                            {"c1_test": _c1_spec("c1_test", lambda *a: got.append(a) or {"ok": True})}
+                            ) as (base, _httpd):
+            status, body = _post(base + "/action", {"verb": "c1_test", "params": {"other": 1}})
+        assert status == 400 and body["error"] == "field_not_allowed"
+        assert got == []
+
+    def test_c1_downstream_confirm_required_409(self, tmp_path: Path) -> None:
+        # the confirm gate still holds for a C1 downstream verb: no confirm -> 409, handler never ran.
         ran: list = []
-        verbs = {"send_test": ActionVerb(handler=lambda p: ran.append(1) or {"ok": True})}  # confirm default
-        with _serving_verbs(_writable_source(tmp_path), verbs) as (base, _httpd):
-            status, body = _post(base + "/action", {"verb": "send_test", "params": {}})
-        assert status == 409 and body["error"] == "confirm_required"
-        assert ran == []                                  # NO execution without confirm
+        spec = _c1_spec("c1_test", lambda *a: ran.append(a) or {"ok": True}, confirm_required=True)
+        with _serving_verbs(_writable_source(tmp_path), {"c1_test": spec}) as (base, _httpd):
+            status, body = _post(base + "/action", {"verb": "c1_test", "params": {"text": "x"}})
+            assert status == 409 and body["error"] == "confirm_required"
+            assert ran == []                              # NO execution without confirm
+            status, _body = _post(base + "/action",
+                                  {"verb": "c1_test", "params": {"text": "x"}, "confirm": True})
+        assert status == 200 and len(ran) == 1
 
-    def test_idempotent_replay_over_the_live_route(self, tmp_path: Path) -> None:
-        # the full HTTP round-trip: an irreversible verb POSTed twice with the SAME idempotency_key
-        # (a tailnet/proxy retry) fires ONCE; the replay returns the original response, replayed:true.
+    def test_action_without_a_credential_is_403_before_anything_runs(self, tmp_path: Path) -> None:
+        ran: list = []
+        spec = _c1_spec("c1_test", lambda *a: ran.append(a) or {"ok": True})
+        with _serving_verbs(_writable_source(tmp_path), {"c1_test": spec}) as (base, _httpd):
+            for tok in (None, "wrong"):
+                status, body = _post(base + "/action", {"verb": "c1_test", "params": {}}, token=tok)
+                assert status == 403 and body["error"] == "credential_required"
+        assert ran == []
+
+    def test_idempotent_action_verb_is_refused_needs_broker_over_the_live_route(self, tmp_path: Path) -> None:
+        # K2a: the idempotency envelope (same key twice fires once, replayed:true) lives in apply_action
+        # and stays covered by TestApplyAction. Over the live route a plain irreversible ActionVerb is T2:
+        # BOTH posts are refused needs_broker, the handler never runs, and no ledger record is written.
         fired: list = []
         verbs = {"send_relay": ActionVerb(
-            handler=lambda p: fired.append(p) or {"ok": True, "summary": "relay → chip"},
+            handler=lambda p: fired.append(p) or {"ok": True, "summary": "relay -> chip"},
             confirm_required=True, idempotent=True, label="Send to relay")}
         body1 = {"verb": "send_relay", "params": {"message": "hi"}, "confirm": True,
                  "idempotency_key": "retry-key-1"}
-        with _serving_verbs(_writable_source(tmp_path), verbs) as (base, _httpd):
+        src = _writable_source(tmp_path)
+        with _serving_verbs(src, verbs) as (base, _httpd):
             s1, b1 = _post(base + "/action", body1)
-            s2, b2 = _post(base + "/action", dict(body1))     # the retry — identical body
-        assert s1 == 200 and "replayed" not in b1
-        assert s2 == 200 and b2["replayed"] is True and b2["id"] == b1["id"]
-        assert len(fired) == 1                                # the irreversible action fired ONCE
+            s2, b2 = _post(base + "/action", dict(body1))
+        assert s1 == 403 and b1["error"] == "needs_broker"
+        assert s2 == 403 and b2["error"] == "needs_broker" and "replayed" not in b2
+        assert fired == []
+        assert recent_edits(src.write_scope.ledger_root) == []
 
-    def test_idempotent_missing_key_400_over_the_route(self, tmp_path: Path) -> None:
-        verbs = {"send_relay": ActionVerb(handler=lambda p: {"ok": True},
+    def test_idempotent_missing_key_is_refused_needs_broker_over_the_route(self, tmp_path: Path) -> None:
+        # the missing-key 400 is apply_action's (covered above, direct); over the route the T2 tier
+        # refuses first, so the claim here is only that the handler cannot run keyless.
+        ran: list = []
+        verbs = {"send_relay": ActionVerb(handler=lambda p: ran.append(p) or {"ok": True},
                                           confirm_required=False, idempotent=True)}
         with _serving_verbs(_writable_source(tmp_path), verbs) as (base, _httpd):
             status, body = _post(base + "/action", {"verb": "send_relay", "params": {}})
-        assert status == 400 and body["error"] == "bad_request"
+        assert status == 403 and body["error"] == "needs_broker"
+        assert ran == []
 
     def test_unknown_verb_404(self, tmp_path: Path) -> None:
         with _serving_verbs(_writable_source(tmp_path), {}) as (base, _httpd):
             status, body = _post(base + "/action", {"verb": "ghost", "confirm": True})
+        assert status == 404 and body["error"] == "unknown_verb"
+
+    def test_a_kernel_verb_is_not_an_action_alias(self, tmp_path: Path) -> None:
+        # /action reaches DOWNSTREAM verbs only; a kernel verb name is 404 unknown_verb, not a bypass.
+        with _serving_verbs(_writable_source(tmp_path), {}) as (base, _httpd):
+            status, body = _post(base + "/action", {"verb": "spore_touch", "params": {}})
         assert status == 404 and body["error"] == "unknown_verb"
 
     def test_action_shares_the_edit_auth_gate_cross_origin_refused(self, tmp_path: Path) -> None:
@@ -566,18 +640,37 @@ class TestApplyActionJobPath:
 
 
 class TestJobPollRoute:
-    def test_live_propose_poll_done(self, tmp_path: Path) -> None:
-        # end-to-end over the REAL server: a job verb auto-creates the runtime; propose via
-        # POST /action, poll via GET /job.json until done.
-        verbs = {"consult": ActionVerb(handler=lambda p: {"text": "synthesis", "summary": "s"},
+    def test_live_propose_is_refused_needs_broker_and_no_job_is_created(self, tmp_path: Path) -> None:
+        # K2a: a job ActionVerb is T2, so POST /action refuses to propose it (needs_broker) and no job
+        # is queued. The propose semantics stay covered by TestApplyActionJobPath (apply_action direct).
+        ran: list = []
+        verbs = {"consult": ActionVerb(handler=lambda p: ran.append(p) or {"text": "synthesis"},
                                        idempotent=True, job=True, confirm_required=True,
                                        label="Consult")}
-        with _serving_verbs(_writable_source(tmp_path), verbs) as (base, _httpd):
+        src = _writable_source(tmp_path)
+        with _serving_verbs(src, verbs) as (base, _httpd):
             status, body = _post(base + "/action",
                                  {"verb": "consult", "params": {"q": "x"}, "confirm": True,
                                   "idempotency_key": "k1"})
-            assert status == 200 and body["status"] == "pending"
-            jid = body["job_id"]
+        assert status == 403 and body["error"] == "needs_broker"
+        assert ran == []
+        assert recent_edits(src.write_scope.ledger_root) == []
+
+    def test_live_poll_route_serves_a_job_to_done(self, tmp_path: Path) -> None:
+        # the GET /job.json poll route, end to end over the REAL server: the job is proposed through
+        # apply_action against the server's own runtime (as the broker will in K2b), then polled over
+        # HTTP until done.
+        verbs = {"consult": ActionVerb(handler=lambda p: {"text": "synthesis", "summary": "s"},
+                                       idempotent=True, job=True, confirm_required=True,
+                                       label="Consult")}
+        src = _writable_source(tmp_path)
+        with _serving_verbs(src, verbs) as (base, httpd):
+            assert httpd.job_runtime is not None          # a job verb auto-creates the runtime
+            r = apply_action(src.write_scope, verbs,
+                             {"verb": "consult", "params": {"q": "x"}, "confirm": True,
+                              "idempotency_key": "k1"}, job_runtime=httpd.job_runtime)
+            assert r["status"] == "pending"
+            jid = r["job_id"]
             # poll until terminal
             for _ in range(150):
                 st, pb = _get(base + "/job.json?id=" + jid)
