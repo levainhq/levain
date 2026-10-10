@@ -2,7 +2,8 @@
 ``projects/levain/reference/cockpit_manifest_DESIGN_1009.md`` §3, §6, §9 K1).
 
 One manifest and one panel route, served by the kernel under the existing read gate. Writes,
-verbs and tiers are K2a/K2b and are not here."""
+verbs and tiers are K2a/K2b and are not here. Embedding it (the provider trust assumption and the
+interrupt contract): ``docs/cockpit-engine.md``."""
 
 from levain.cockpit.engine import (
     HEADER,
