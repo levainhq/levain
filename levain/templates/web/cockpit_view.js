@@ -38,7 +38,11 @@
       // null-prototype with own data properties: a wire key such as "__proto__" is data, never the prototype.
       // Keys are cleaned like values, so an id and the references to it still agree after cleaning.
       const o = Object.create(null);
-      for (const k of Object.keys(x)) Object.defineProperty(o, visible(k), { value: clean(x[k]), enumerable: true, writable: true, configurable: true });
+      for (const k of Object.keys(x)) {
+        let key = visible(k);
+        while (Object.prototype.hasOwnProperty.call(o, key)) key += "~";   // two raw keys that clean to one stay two, never overwritten
+        Object.defineProperty(o, key, { value: clean(x[k]), enumerable: true, writable: true, configurable: true });
+      }
       return o;
     }
     return x;
@@ -143,17 +147,18 @@
 
   // snap = {manifest, panels}; returns the SubstrateView-shaped object dashboard_core.js renders.
   // `snap.panels` maps a panel id to its payload, or to {error} when its fetch failed.
-  function fromManifest(raw) {
+  function fromManifest(raw, opts) {
+    const elapsed = Math.max(0, (opts && opts.elapsedMs) || 0);   // time since the manifest was fetched, measured by the caller
     const snap = clean(raw);
     const m = snap.manifest;
     const gen = parseIso(m.generated_at);
     let now = isNaN(gen) ? Date.now() : gen;   // the server's clock, so a skewed browser cannot misreport ages
     const genAt = now;
     for (const p of Object.values(snap.panels || {})) {
-      // panels are fetched after the manifest, so a few minutes may have passed; a stamp further ahead
-      // than that is a bad stamp, and it must not move every other panel's clock
+      // panels are fetched after the manifest, so the measured fetch time (plus a minute of skew) may have
+      // passed; a stamp further ahead than that is a bad stamp, and it must not move every other panel's clock
       const t = parseIso(p && p.as_of);
-      if (!isNaN(t) && t > now && t <= genAt + 300000) now = t;
+      if (!isNaN(t) && t > now && t <= genAt + elapsed + 60000) now = t;
     }
     const P = new Map(Object.entries(snap.panels || {}));
     const heads = new Map(Object.entries(m.panels || {}));
@@ -255,7 +260,16 @@
     };
 
     const placed = new Set();
-    const placeOnce = (pid, zoneId) => { if (!placed.has(pid)) { placed.add(pid); place(pid, zoneId); } };
+    const placeOnce = (pid, zoneId) => {
+      if (placed.has(pid)) return;
+      placed.add(pid);
+      const mark = view.layout.length;
+      try { place(pid, zoneId); } catch (e) {
+        // one malformed panel must not blank the cockpit: it becomes an unavailable panel with the reason
+        view.layout.length = mark;
+        unavailable(pid, zoneId, "could not be mapped (" + (e && e.message ? e.message : e) + ")");
+      }
+    };
     for (const pid of headerExtra) placeOnce(pid, "operate");
     for (const zone of (m.regions.zones || [])) for (const pid of (zone.panels || [])) placeOnce(pid, zone.id);
     return view;
