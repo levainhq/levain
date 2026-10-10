@@ -1262,3 +1262,25 @@ class TestR9Bookkeeping:
         monkeypatch.setattr(Cockpit, "_read_snap", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         assert ck.panel("p")["status"] == "error"
         assert ck.freshness()["p"]["status"] == "error"
+
+    def test_ordering_is_by_read_start_not_by_the_providers_data_time(self) -> None:
+        ck, spec, st = self._setup()
+        old = datetime(2026, 10, 9, 9, 0, tzinfo=timezone.utc).isoformat()
+        ck._process(spec, st, Read(rows=(), as_of=old), self._ctx(10))        # newer read, data time 09:00
+        ck._process(spec, st, Fault("older"), self._ctx(5))                   # older read faults last
+        assert st.failing_since is None and st.last_good_as_of == old
+        ck._process(spec, st, Fault("newer"), self._ctx(20))
+        ck._process(spec, st, Read(rows=()), self._ctx(20))                   # same start: the failure stays
+        assert st.failing_since.startswith("2026-10-09T12:20")
+
+    def test_a_future_data_time_does_not_suppress_a_real_failure(self) -> None:
+        ck, spec, st = self._setup()
+        future = datetime(2030, 1, 1, tzinfo=timezone.utc).isoformat()
+        ck._process(spec, st, Read(rows=(), as_of=future), self._ctx(10))
+        ck._process(spec, st, Fault("real"), self._ctx(11))
+        assert st.failing_since.startswith("2026-10-09T12:11")
+
+    def test_a_store_label_never_raises_or_leaks_on_a_broken_home(self, monkeypatch) -> None:
+        from levain.cockpit import providers
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: (_ for _ in ()).throw(RuntimeError("/Users/x/secret"))))
+        assert providers._store_label(Path("/Users/x/.anneal-memory/memory.db")) == "memory.db"

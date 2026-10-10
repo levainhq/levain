@@ -151,7 +151,8 @@ class _State:
     mu: threading.Lock = field(default_factory=threading.Lock)   # guards the fields _process writes
     snap: _Snap | None = None
     ever_present: bool = False
-    last_good_as_of: str | None = None
+    last_good_as_of: str | None = None       # the newest-STARTED good read's data time (display)
+    last_good_started: str | None = None     # when that read started: the clock the bookkeeping orders on
     failing_since: str | None = None
     last_completion: datetime | None = None
     flight: "Future | None" = None            # the read currently running, shared by concurrent callers
@@ -360,7 +361,8 @@ class Cockpit:
         try:
             snap = self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
         except Exception as exc:  # noqa: BLE001 - a refresh that cannot even be processed is an error read
-            snap = self._fault(spec, st, f"{type(exc).__name__}: {exc}", _iso(ctx.now))
+            with st.mu:
+                snap = self._fault(spec, st, f"{type(exc).__name__}: {exc}", _iso(ctx.now))
         with st.lock:
             st.snap = snap
             st.last_completion = self._clock()
@@ -419,19 +421,20 @@ class Cockpit:
             snap = self._read_snap(spec, res, ctx, now_iso)
         except Exception as exc:  # noqa: BLE001 - malformed provider output of ANY shape is a Fault, never a crash
             return self._fault(spec, st, f"provider output refused: {exc}", now_iso)
-        # Reads can finish out of start order, so the bookkeeping only moves along the clock: the
-        # last good read never goes back, and a success older than the current failure's start
-        # does not clear it.
+        # Reads can finish out of start order, so the bookkeeping orders on READ START (never on the
+        # provider's data time): the newest-started success owns last_good, and a success clears a
+        # failure only if it STARTED after the failure did (a tie keeps the failure).
         st.ever_present = True
-        if not st.last_good_as_of or _iso_ge(snap.as_of, st.last_good_as_of):
-            st.last_good_as_of = snap.as_of
-        if st.failing_since is None or _iso_ge(now_iso, st.failing_since):
+        if not st.last_good_started or _iso_ge(now_iso, st.last_good_started):
+            st.last_good_started, st.last_good_as_of = now_iso, snap.as_of
+        if st.failing_since is None or (_iso_ge(now_iso, st.failing_since) and now_iso != st.failing_since):
             st.failing_since = None
         return snap
 
     def _fault(self, spec: ProviderSpec, st: _State, message: str, now_iso: str) -> _Snap:
-        # a fault older than the last good read is stale news: it does not (re)start a failure
-        if st.failing_since is None and not (st.last_good_as_of and not _iso_ge(now_iso, st.last_good_as_of)):
+        # a fault that started before the newest good read is stale news: it does not (re)start a
+        # failure (a tie goes to the fault)
+        if st.failing_since is None and (not st.last_good_started or _iso_ge(now_iso, st.last_good_started)):
             st.failing_since = now_iso
         detail = f"{message}"
         if st.failing_since:

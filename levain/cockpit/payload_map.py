@@ -47,7 +47,7 @@ _add(B, "map", "tray filtered: [{count, reason}]", True, "tray.held")
 S = "substrate"
 _add(S, "map", "manifest entity", True, "entity_name", "brand_wordmark", "brand_model")
 _add(S, "map", "manifest entity.store_label: a home-relative display label for the masthead's store line, never the "
-     "absolute path (Phill 10-09 20:54, option c; honours §6.2)", False, "paths.episodic_db")
+     "absolute path (Phill 10-09 20:54, option c; honours §6.2). The pattern is the DASHBOARD payload's source key.", False, "paths.episodic_db")
 _add(S, "drop", "install-private paths", True, "paths.continuity_md", "paths.crystal_json", "paths.spores_json", "scope")
 _add(S, "map", "regions.zones[].panels + PanelHead", True,
      "layout[].kind", "layout[].id", "layout[].zone", "layout[].title")
