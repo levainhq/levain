@@ -37,11 +37,12 @@
     if (x && typeof x === "object") {
       // null-prototype with own data properties: a wire key such as "__proto__" is data, never the prototype.
       // Keys are cleaned like values, so an id and the references to it still agree after cleaning.
-      // Two raw keys that clean to one: the first wins (a rename would break the references to it).
+      // Two raw keys that clean to one cannot both be kept and no choice between them is stable (the
+      // payload map's order is fetch-completion order), so the snapshot is refused whole.
       const o = Object.create(null);
       for (const k of Object.keys(x)) {
         let key = visible(k);
-        if (Object.prototype.hasOwnProperty.call(o, key)) continue;
+        if (Object.prototype.hasOwnProperty.call(o, key)) throw new Error("two wire keys collide once cleaned: " + key);
         Object.defineProperty(o, key, { value: clean(x[k]), enumerable: true, writable: true, configurable: true });
       }
       return o;
@@ -267,10 +268,12 @@
     const placeOnce = (pid, zoneId) => {
       if (placed.has(pid)) return;
       placed.add(pid);
-      const mark = view.layout.length;
+      const mark = view.layout.length, nSections = view.sections.length, refMark = sectionRef;
       try { place(pid, zoneId); } catch (e) {
         // one malformed panel must not blank the cockpit: it becomes an unavailable panel with the reason
         view.layout.length = mark;
+        view.sections.length = nSections;
+        sectionRef = refMark;
         delete view.extra_panels[pid];
         unavailable(pid, zoneId, "could not be mapped (" + (e && e.message ? e.message : e) + ")");
       }
