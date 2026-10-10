@@ -204,7 +204,7 @@ def test_codex_global_files_of_another_install_are_left_alone(make_install, tmp_
     # hooks.json is not what levain wrote for THIS install, and this levain renders the same
     # as it did: kept as it is. Had the package moved, _refresh_decision would stage it.
     assert not r.review and (hooks.read_text(), config.read_text()) == before
-    assert "another store" in out and "not what levain last wrote for this install" in out
+    assert "another store" in out
 
 
 def test_codex_global_files_of_this_install_are_refreshed(make_install, tmp_path):
@@ -273,7 +273,7 @@ def test_codex_hooks_not_recorded_for_this_install_are_staged(
     assert staged.read_text() == current
     assert not list(hooks.parent.glob("hooks.json.bak.*"))
     r, out = _refresh(install)                        # once, then quiet
-    assert hooks.read_text() == text and not r.review
+    assert hooks.read_text() == text and not r.review and "hooks.json" not in out
     hooks.write_text(staged.read_text())              # the operator accepts levain's version
     r, out = _refresh(install)
     assert not r.review and not r.refreshed

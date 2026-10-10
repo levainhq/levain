@@ -2055,17 +2055,16 @@ def refresh_adapter(
                 out.review.append(str(hooks))
                 lines.append(f"  {hooks}: could not be read ({e}), so whether it is "
                              f"current, or this install's, cannot be told.")
-            unreadable = False
             if here is not None and here != want:
                 try:
                     json.loads(here)
                 except (ValueError, RecursionError):
-                    unreadable = True
-            if unreadable:
-                out.review.append(str(hooks))
-                lines.append(f"  {hooks} is not valid JSON, so codex cannot read its hooks; "
-                             f"`levain update` left it alone, since whose it was cannot be told.")
-            elif here is not None:
+                    # A note, never a gate: the receipt below still decides, so levain's own
+                    # unreadable write (an install path holding `"` or `\` before 0.7.0) is
+                    # replaced, and anyone else's is staged.
+                    lines.append(f"  note: {hooks} is not valid JSON, so codex cannot read its "
+                                 f"hooks.")
+            if here is not None:
                 # The adapter receipt alone decides (_refresh_decision): replaced only while
                 # its bytes are what levain last wrote for THIS install; anything else,
                 # another install's file, an edit, or a file from before the receipt, is
@@ -2616,12 +2615,6 @@ def _refresh_adapter_files(
             action = "write_backup"
             released_copy = True
         if action == "keep":
-            if key.startswith("codex-home/"):
-                # Machine-global: a copy levain did not last write for THIS install may be
-                # another install's, so codex is not running this install's hooks.
-                lines.append(f"  note: {target} is not what levain last wrote for this install "
-                             f"(edited, or another install's), so `levain update` left it alone; "
-                             f"`levain doctor` says whether codex runs this install's hooks.")
             continue
         if action == "current":
             new_receipt[key] = _sha256_text(want_text)
