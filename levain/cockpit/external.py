@@ -55,7 +55,8 @@ class ExternalPanels:
     worker's answer or a reader's timeout once that reader's deadline wait ran out; the second is dropped
     (java.util.concurrent.FutureTask's rule: set() and cancel() race on one CAS from NEW, no clock). A
     callable that hangs therefore parks its thread; at most ``max_parked`` such threads live at once, and while that
-    many are parked no new flight starts (the timeout reading stands)."""
+    many are parked no new flight starts (the timeout reading stands). ``clock`` is a monotonic clock that
+    does not raise (``time.monotonic``; tests inject a fake); a raising clock is outside this contract."""
 
     def __init__(self, fn: Callable[[], Any], *, reuse_s: float = 5.0, wait_s: float = 8.0,
                  max_parked: int = 2, clock: Callable[[], float] = time.monotonic) -> None:
@@ -120,18 +121,16 @@ class ExternalPanels:
         except BaseException as exc:  # noqa: BLE001 - every failure is a reading, reused like one
             call = _Call(None, _describe(exc), _now_iso())
         finally:
-            try:
-                with self._lock:
-                    if flight.timeout is None:
-                        flight.result = call      # the first transition; after a timeout the answer is dropped
-                    self._parked.discard(flight)
-                    # golang.org/x/sync/singleflight's rule: only the current (unforgotten) call may touch
-                    # the shared state
-                    if self._flight is flight:
-                        self._flight = None
-                        self._last = (self._clock(), call)
-            finally:
-                flight.done.set()                 # its readers return now even if the clock failed above
+            with self._lock:
+                if flight.timeout is None:
+                    flight.result = call      # the first transition; after a timeout the answer is dropped
+                self._parked.discard(flight)
+                # golang.org/x/sync/singleflight's rule: only the current (unforgotten) call may touch
+                # the shared state
+                if self._flight is flight:
+                    self._flight = None
+                    self._last = (self._clock(), call)
+            flight.done.set()
 
 
 def _describe(exc: BaseException) -> str:

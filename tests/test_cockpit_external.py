@@ -8,8 +8,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from levain.cockpit import Cockpit, ProviderSpec, Read, RowIn
 from levain.cockpit.external import ExternalPanels, discoverer
 from levain.cockpit.text import snapshot
@@ -504,7 +502,7 @@ def test_an_answer_past_the_deadline_before_any_timeout_is_the_one_verdict(monke
     got = ext.take()
     assert got.panels is not None
     assert ext._last is not None and ext._last[1] is got and ext.take() is got
-    _until(lambda: not ext._parked, "the worker's cleanup")
+    assert ext._flight is None and not ext._parked   # the worker published and nothing was parked
 
 
 def test_a_timeout_declared_first_drops_the_answer_for_every_reader_and_the_reuse() -> None:
@@ -519,8 +517,8 @@ def test_a_timeout_declared_first_drops_the_answer_for_every_reader_and_the_reus
     r.start()
     _until(lambda: ext._flight is not None, "the flight to start")
     flight = ext._flight
-    with ext._lock:
-        fn.gate.set()                              # the answer comes back and waits on the lock
+    with ext._lock:                                # held throughout: the reader's timeout is the first
+        fn.gate.set()                              # transition wherever the worker is (returned or not)
         time.sleep(0.02)
         now[0] = 1.0
         first = ext._abandon_locked(flight, now[0])   # a reader past the deadline
@@ -529,22 +527,6 @@ def test_a_timeout_declared_first_drops_the_answer_for_every_reader_and_the_reus
     assert not r.is_alive()
     assert first.panels is None and out["r"] is first and ext.take() is first
     assert flight.result is None                   # the late answer was dropped, not stored beside the verdict
-
-
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")   # the clock raises in the worker
-def test_a_clock_that_fails_while_the_worker_publishes_still_releases_its_readers() -> None:
-    def clock() -> float:
-        if threading.current_thread().name == "levain-external-panels":
-            raise RuntimeError("clock down")
-        return 0.0
-    ext = ExternalPanels(_Counted(), reuse_s=0, wait_s=2.0, clock=clock)
-    t0 = time.monotonic()
-    got = ext.take()
-    assert got.panels is not None                  # the answer was the first transition
-    assert time.monotonic() - t0 < 1.0             # released at once, not at the 2 s deadline
-    for t in threading.enumerate():                # its exception lands in this test, not the next
-        if t.name == "levain-external-panels":
-            t.join(5)
 
 
 def test_absent_or_null_lines_are_no_lines_not_an_error() -> None:
