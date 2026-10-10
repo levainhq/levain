@@ -237,9 +237,18 @@
     const manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
     const ids = Object.keys(manifest.panels);
     const panels = Object.create(null);
+    // One shared re-auth for the batch: if the token rotated after the manifest read, every panel 403s
+    // together, so the first one prompts (or drops the dead token) and the rest wait on that same answer.
+    let reauth = null;
+    const fetchPanel = (url) => fetch(url, { cache: "no-store", headers: readHeaders() });
     await Promise.all(ids.map(async (id) => {
+      const url = "/cockpit/panel/" + encodeURIComponent(id) + ".json?profile=full";
       try {
-        const res = await fetch("/cockpit/panel/" + encodeURIComponent(id) + ".json?profile=full", { cache: "no-store", headers: readHeaders() });
+        let res = await fetchPanel(url);
+        if (res.status === 403 && await isTokenReject(res.clone())) {
+          reauth = reauth || Promise.resolve().then(() => { if (promptForToken()) return true; dropToken(); return false; });
+          if (await reauth) res = await fetchPanel(url);
+        }
         if (!res.ok) throw new Error("HTTP " + res.status);
         panels[id] = await res.json();
       } catch (e) {

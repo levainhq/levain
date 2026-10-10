@@ -260,6 +260,46 @@ class TestManifestMapperAdversarial:
         assert _view(self._snap(ck))["focus"]["freshness"] == "unknown"
 
 
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+class TestManifestMapperBoundary:
+    """L3 r2 on the redo: ONE sanitising boundary, and the state/dup cases."""
+
+    def test_every_wire_string_is_cleaned_in_one_place_and_legitimate_text_survives(self) -> None:
+        ck = Cockpit()
+        rows = [RowIn("episode:e1", "title", {"at": "2026-10-01T00:00:00+00:00", "episode_type": "obs", "source": "s\u202ex",
+                                              "tags": ["t\u202ey"]}, body="a\r\nb\u200d\u200cc\t\u0007", stored={"id": "e1"})]
+        ck.register(ProviderSpec("episodes", "triage-list", "Episodes", "feed", lambda c: Read(rows=tuple(rows)),
+                                 order="time.desc", facets=frozenset({"at", "episode_type", "source", "tags"}), version_fields=("id",)))
+        ep = _view(snapshot(ck))["episodes"][0]
+        assert ep["source"] == "s<U+202E>x" and ep["tags"] == ["t<U+202E>y"]      # a field the old per-field guards missed
+        assert ep["content"] == "a\nb\u200d\u200cc\t<U+0007>"                      # CRLF normalised, ZWJ/ZWNJ/tab kept, BEL shown
+
+    def test_a_downstream_metric_alert_is_drawn_once(self) -> None:
+        ck = Cockpit()
+        ck.register(ProviderSpec("m", "metric", "M", "gauge", lambda c: Read(value={"metrics": [
+            {"label": "x", "value": 1, "unit": None, "status": "ok", "read": None}], "alerts": [{"message": "danger", "severity": "bad"}]})))
+        view = _view(snapshot(ck))
+        entry = [e for e in view["layout"] if e["id"] == "m"][0]
+        shown = [b["text"] for b in entry["banner"]] + [ln["text"] for ln in view["extra_panels"]["m"]["lines"]]
+        assert shown.count("! danger") + shown.count("danger") == 1
+
+    def test_unreadable_wraps_marks_the_health_history_unavailable(self) -> None:
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": [
+            {"label": "wraps", "value": 4, "unit": None, "status": "ok", "read": None}]})))
+        ck.register(ProviderSpec("wraps", "visual", "W", "feed", lambda c: Fault("nope")))
+        assert _view(snapshot(ck))["health"]["wrap_history_unavailable"] is True
+
+    def test_a_panel_listed_twice_is_placed_once_and_a_non_string_stamp_does_not_blank_the_view(self) -> None:
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("weather", "line", "Weather", "gauge", lambda c: Read(value={"lines": [
+            {"label": "now", "text": "cloudy", "at": 12345, "source": None}]}), region="header"))
+        snap = snapshot(ck)
+        snap["manifest"]["regions"]["zones"][0]["panels"].append("weather")
+        view = _view(snap)
+        assert [e["id"] for e in view["layout"]].count("weather") == 1
+
+
 def _dump_dom(url: str) -> str:
     return subprocess.run([CHROME, "--headless=new", "--dump-dom", "--virtual-time-budget=8000", "--window-size=1440,1000", url],
                           capture_output=True, text=True, timeout=60).stdout
