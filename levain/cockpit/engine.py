@@ -157,6 +157,7 @@ class _State:
     flight_started: float = 0.0               # monotonic start of that read
     refresh_started: datetime | None = None   # set while a refresher cycle is inside its read
     started: datetime | None = None
+    fresh: tuple[datetime, str | None, str] | None = None   # (read at, as_of, status) of the last read served
 
 
 class _Refresher:
@@ -198,6 +199,7 @@ class Cockpit:
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
+        self._now_fresh: tuple[str | None, str] | None = None   # (as_of, status) of the last `now` head built
 
     # --- registration ----------------------------------------------------------------
     def register(self, spec: ProviderSpec) -> None:
@@ -367,8 +369,9 @@ class Cockpit:
         st = self._state[spec.id]
         if spec.refresh_every_s is None:
             snap = self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
-            with st.lock:
-                st.snap = snap       # what the freshness route reports; it never reads a source itself
+            with st.lock:        # what the freshness route reports; it never reads a source itself
+                if st.fresh is None or ctx.now >= st.fresh[0]:
+                    st.fresh = (ctx.now, snap.as_of, snap.status)
             return snap
         with st.lock:
             snap, last, started, running = st.snap, st.last_completion, st.started, st.refresh_started
@@ -647,6 +650,7 @@ class Cockpit:
                 union[r["group"]]["count"] += 1
         head["groups"] = list(union.values()) or None
         head["etag"] = self._etag_of(snap, head["groups"], cred, ctx.today)   # groups are content
+        self._now_fresh = (head["as_of"], head["status"])    # the one computation freshness reports
         return head, rows
 
     def _entity(self, ctx: ReadContext) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -750,30 +754,31 @@ class Cockpit:
     def freshness(self) -> dict[str, dict[str, Any]]:
         """``{panel_id: {as_of, status}}`` for every registered panel, ``now`` included (design §3.4).
         A client that got a 304 on a panel reads the panel's current age here. It is metadata only:
-        it runs NO provider. A refresher panel reports its cached snapshot (with the liveness and
-        aging rules); an on-demand panel reports its last served read, and ``status: "unread"`` with
-        ``as_of: null`` before it has been read once. No rows, no etag, never 304."""
+        it runs NO provider and computes no status of its own. A refresher panel reports its cached
+        snapshot (liveness and aging rules applied); an on-demand panel reports its last served read,
+        aged against ``stale_after_s``; ``now`` reports the head the last manifest or ``now`` read
+        built. Anything not yet read is ``status: "unread"`` with ``as_of: null``. Panels found by
+        discovery appear after the first manifest read. No rows, no etag, never 304."""
         ctx = ReadContext(self._clock())
+        unread = {"as_of": None, "status": "unread"}
         out: dict[str, dict[str, Any]] = {}
-        gate: list[tuple[str, str | None]] = []
         for spec in self._ordered_specs(self._specs):
             if spec.refresh_every_s is not None:
                 snap = self._snap_for(spec, ctx)
-            else:
-                with self._state[spec.id].lock:
-                    snap = self._state[spec.id].snap
-            out[spec.id] = {"as_of": snap.as_of, "status": snap.status} if snap else {"as_of": None, "status": "unread"}
-            if spec.priority == "gate" and spec.kind == "triage-list":
-                gate.append((out[spec.id]["status"], out[spec.id]["as_of"]))
-        worst = "ok"
-        for status, _a in gate:
-            if status == "unread":
-                worst = "unread"
-                break
-            if _STATUS_RANK[status] > _STATUS_RANK[worst]:
-                worst = status
-        as_ofs = [a for _s, a in gate if a]
-        return {NOW_ID: {"as_of": min(as_ofs) if as_ofs and worst != "unread" else None, "status": worst}, **out}
+                out[spec.id] = {"as_of": snap.as_of, "status": snap.status}
+                continue
+            with self._state[spec.id].lock:
+                fresh = self._state[spec.id].fresh
+            if fresh is None:
+                out[spec.id] = dict(unread)
+                continue
+            _at, as_of, status = fresh
+            if status in ("ok", "empty", "partial") and as_of and \
+                    (ctx.now - _parse_iso(as_of)) > timedelta(seconds=spec.stale_after_s):
+                status = "stale"
+            out[spec.id] = {"as_of": as_of, "status": status}
+        now = self._now_fresh
+        return {NOW_ID: {"as_of": now[0], "status": now[1]} if now else dict(unread), **out}
 
     def panel(self, panel_id: str, *, profile: str = "full", q: str | None = None,
               row: str | None = None, credential_class: str = "none") -> dict[str, Any] | None:

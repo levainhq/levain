@@ -1147,3 +1147,24 @@ class TestL3R4CodexFixes:
         today = ck._clock().astimezone().date()
         assert ck._etag_of(snap, None, "none", today) != ck._etag_of(snap, now["groups"], "none", today)
         assert now["etag"] == ck._etag_of(snap, now["groups"], "none", today)
+
+
+class TestL3R6Freshness:
+    def test_freshness_now_is_the_head_the_manifest_built_never_its_own_roll_up(self, env) -> None:
+        _r, _s, ck = env
+        assert ck.freshness()[NOW_ID] == {"as_of": None, "status": "unread"}
+        head = ck.manifest(NONE_CRED)["panels"][NOW_ID]
+        assert ck.freshness()[NOW_ID] == {"as_of": head["as_of"], "status": head["status"]}
+        (_r / ".levain" / "memory.spores.json").unlink()          # a gate source fails: error, not masked
+        head = ck.manifest(NONE_CRED)["panels"][NOW_ID]
+        assert ck.freshness()[NOW_ID]["status"] == head["status"] == "error"
+
+    def test_an_on_demand_panels_freshness_ages_against_its_stale_after(self, tmp_path: Path) -> None:
+        _root, src = _install(tmp_path)
+        t = [datetime(2026, 10, 9, tzinfo=timezone.utc)]
+        ck = Cockpit(clock=lambda: t[0])
+        ck.register(_simple("p", stale_after_s=60))
+        ck.panel("p")
+        assert ck.freshness()["p"]["status"] == "empty"
+        t[0] += timedelta(hours=1)
+        assert ck.freshness()["p"]["status"] == "stale"
