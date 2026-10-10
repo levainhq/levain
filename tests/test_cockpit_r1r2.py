@@ -159,6 +159,15 @@ def _view(snap: dict[str, Any]) -> dict[str, Any]:
     return json.loads(res.stdout)
 
 
+
+def _full_metrics(**figures: Any) -> list[dict[str, Any]]:
+    """A complete health reading, as the kernel always sends one: every figure plus the write-path flag."""
+    names = ("links", "avg strength", "max strength", "density", "local density", "episodes", "episodes since wrap",
+             "tombstones", "wraps", "graduations validated", "graduations demoted")
+    vals = {k: 1 for k in names} | figures
+    return [{"label": "write path", "value": "live", "unit": None, "status": "ok", "read": None}] + [
+        {"label": k, "value": vals[k], "unit": None, "status": "ok", "read": None} for k in names]
+
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
 class TestManifestMapper:
     """cockpit_view.js builds the dashboard's view from the manifest and re-orders nothing."""
@@ -230,8 +239,7 @@ class TestManifestMapperAdversarial:
 
     def test_an_unreadable_wraps_panel_is_an_error_not_a_never(self) -> None:
         ck = _tray_cockpit()
-        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": [
-            {"label": "wraps", "value": 4, "unit": None, "status": "ok", "read": None}], "alerts": [
+        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": _full_metrics(wraps=4), "alerts": [
             {"message": "wrap in progress", "severity": "warn"}]})))
         ck.register(ProviderSpec("wraps", "visual", "Projection history", "feed", lambda c: Fault("wraps unreadable")))
         view = _view(self._snap(ck))
@@ -245,9 +253,7 @@ class TestManifestMapperAdversarial:
         # renderer's conversions after the board is cleared (reproduced in node: +o, Math.min(o), String(o))
         ck = Cockpit(entity=lambda ctx: {"name": "e", "governance": "x", "brand": {}, "store_label": "~/s.db",
                                          "jar": {"status": "ok", "label": "3 today", "level": 0.5, "today": 3, "day": "d"}})
-        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": [
-            {"label": "max strength", "value": 1.3, "unit": None, "status": "ok", "read": None},
-            {"label": "local density", "value": 0.02, "unit": None, "status": "ok", "read": None}]})))
+        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": _full_metrics(**{"max strength": 1.3, "local density": 0.02})})))
         ck.register(ProviderSpec("crystals", "triage-list", "Crystals", "feed", lambda c: Read(rows=(
             RowIn("crystal:c1", "c1", {"at": "2026-10-01T00:00:00+00:00", "tags": ["a"]}, stored={"id": "c1"}),)),
             order="time.desc", facets=frozenset({"at", "tags"}), version_fields=("id",), region="mind"))
@@ -303,8 +309,7 @@ class TestManifestMapperBoundary:
 
     def test_unreadable_wraps_marks_the_health_history_unavailable(self) -> None:
         ck = _tray_cockpit()
-        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": [
-            {"label": "wraps", "value": 4, "unit": None, "status": "ok", "read": None}]})))
+        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": _full_metrics(wraps=4)})))
         ck.register(ProviderSpec("wraps", "visual", "W", "feed", lambda c: Fault("nope")))
         assert _view(snapshot(ck))["health"]["wrap_history_unavailable"] is True
 
@@ -345,8 +350,7 @@ class TestManifestMapperBoundary:
     def test_wraps_state_is_tri_state_missing_is_not_unavailable_but_errored_is(self) -> None:
         def health_view(with_wraps: str | None) -> dict[str, Any]:
             ck = _tray_cockpit()
-            ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": [
-                {"label": "wraps", "value": 4, "unit": None, "status": "ok", "read": None}]})))
+            ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": _full_metrics(wraps=4)})))
             if with_wraps == "fault":
                 ck.register(ProviderSpec("wraps", "visual", "W", "feed", lambda c: Fault("x")))
             return _view(snapshot(ck))["health"]
@@ -428,6 +432,31 @@ class TestManifestMapperParses:
             view = _view(snap)
             assert view["health"] is None
             self._degraded(view, "health")
+
+    FIGURES = ("links", "avg strength", "max strength", "density", "local density", "episodes", "episodes since wrap",
+               "tombstones", "wraps", "graduations validated", "graduations demoted")
+
+    def _full_health(self) -> list[dict[str, Any]]:
+        return [self._metric("write path", "live")] + [self._metric(k, 1) for k in self.FIGURES]
+
+    def test_a_complete_health_reading_renders(self) -> None:
+        view = _view(snapshot(self._health(self._full_health())))
+        assert view["health"]["density"] == 1 and view["health"]["write_path_live"] is True
+
+    def test_an_absent_health_figure_degrades_the_panel_not_a_printed_zero(self) -> None:
+        for drop in ("density", "write path"):
+            view = _view(snapshot(self._health([m for m in self._full_health() if m["label"] != drop])))
+            assert view["health"] is None, drop
+            self._degraded(view, "health")
+
+    def test_a_downstream_line_or_metric_panel_with_a_bad_shape_degrades_alone(self) -> None:
+        for kind, value in (("line", {"lines": [{"label": "a", "text": {"x": 1}}]}), ("line", {"lines": "a"}),
+                            ("visual", {"text": [3]}), ("metric", {"metrics": [{"label": "m", "value": {"x": 1}}]})):
+            ck = _tray_cockpit()
+            ck.register(ProviderSpec("ext", kind, "Ext", "gauge", lambda c: Read(value={"lines": [], "text": [], "metrics": [], "visual": "sky"})))
+            snap = snapshot(ck)
+            snap["panels"]["ext"]["value"] = value
+            self._degraded(_view(snap), "ext")
 
     def test_a_malformed_jar_is_null_with_an_entity_error(self) -> None:
         jar = {"status": "ok", "label": "3 today", "level": 0.5, "today": 3, "day": "d"}
