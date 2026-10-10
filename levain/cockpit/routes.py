@@ -23,6 +23,9 @@ TOKEN_HEADER = "X-Levain-Write-Token"
 CACHE_CONTROL = "private, no-cache"
 VARY = TOKEN_HEADER
 PROFILES = ("full", "compact")
+# Hashed into every validator: bumped when a wire projection changes (rev 2: compact `now` rows are
+# refs, panel heads carry edit_class), so a client holding an older body revalidates to a 200.
+REPRESENTATION = 2
 
 
 def is_cockpit_path(path: str) -> bool:
@@ -44,7 +47,7 @@ def _etag_header(etag: str, variant: list[Any]) -> str:
     out on purpose, so two byte-distinct bodies are semantically equivalent, not identical. The
     variant (profile, query, row, credential) is hashed as canonical JSON, never joined with a
     delimiter a query string could contain."""
-    h = hashlib.sha256(json.dumps([etag, variant], separators=(",", ":")).encode()).hexdigest()[:32]
+    h = hashlib.sha256(json.dumps([REPRESENTATION, etag, variant], separators=(",", ":")).encode()).hexdigest()[:32]
     return f'W/"{h}"'
 
 
