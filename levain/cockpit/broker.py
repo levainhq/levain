@@ -17,8 +17,8 @@ waited for (up to the drain deadline), and only then is the lock released; a set
 store call keeps the lock held until process exit.
 
 The settlers are §4.2's: start recovery, the request that decided the op (once, right after its
-commit point), and the re-drive thread. Reads only wake the thread. One settler per op:
-an in-process mutex per ``operation_id``, which the thread skips while held.
+commit point), and the re-drive thread. A read of an applying op wakes the thread and never settles.
+One settler per op: an in-process mutex per ``operation_id``, which the thread skips while held.
 
 ``_kp(name)`` is a kill point (§7): a no-op unless the constructor's ``kill_at`` argument names it,
 then ``os._exit(137)``. The environment is never read for it.
@@ -30,6 +30,7 @@ import enum
 import fcntl
 import logging
 import os
+import sqlite3
 import tempfile
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -65,6 +66,7 @@ from levain.cockpit.effects import (
     _stored_authority,
     canonical_effect,
     create_origin_key,
+    plan_units,
     registration_refusals,
     resolve_effect,
     settle,
@@ -80,7 +82,7 @@ from levain.cockpit.firejournal import (
     new_pending_id,
 )
 from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
-from levain.cockpit.results import Fault
+from levain.cockpit.results import Absent, Fault
 
 __all__ = ["Broker", "BrokerError", "COCKPIT_STORE", "INTERNAL_VERBS", "LOCK_NAME", "Lifecycle",
            "PENDING_TTL", "STANDBY_FAULT", "label_class"]
@@ -105,12 +107,20 @@ class Lifecycle(str, enum.Enum):
 
 
 class BrokerError(Exception):
-    """A refusal the HTTP layer returns as ``{error: code, message}`` with ``status``."""
+    """A refusal the HTTP layer returns as ``{error: code, message, **extra}`` with ``status``."""
 
-    def __init__(self, code: str, status: int, message: str) -> None:
+    def __init__(self, code: str, status: int, message: str,
+                 extra: Mapping[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.status = status
+        self.extra = dict(extra or {})
+
+
+def _transient(exc: BaseException) -> bool:
+    """SQLite's busy/locked: another process holds the journal's write lock for now."""
+    return isinstance(exc, sqlite3.OperationalError) and any(
+        w in str(exc).lower() for w in ("locked", "busy"))
 
 
 def label_class(decision_kind: str | None, install_class: str | None) -> str:
@@ -197,12 +207,14 @@ class Broker:
     """The cockpit broker over ``data_root``. ``stores`` maps a store name to its ``EffectStore``;
     ``install_class`` is the ``--install-class`` declaration (``None`` = none given); ``store_paths``
     are the registered store paths the local-FS check covers; ``tier_of(verb, params, target)``
-    recomputes a registry verb's tier from a fresh read for the decision (§3.2.1), ``None`` meaning
-    the read faulted. ``kill_at`` names one kill point (§7)."""
+    recomputes a registry verb's tier from a fresh read for the decision (§3.2.1): ``Absent`` when
+    the target is gone, ``None`` or a ``Fault`` when the read faulted. ``kill_at`` names one kill
+    point (§7)."""
 
     def __init__(self, data_root: Path | str, *, stores: Mapping[str, EffectStore],
                  install_class: str | None, store_paths: Sequence[Path | str] = (),
-                 tier_of: Callable[[str, Mapping[str, Any], Mapping[str, Any]], str | None] | None = None,
+                 tier_of: Callable[[str, Mapping[str, Any], Mapping[str, Any]], str | Absent | Fault | None]
+                 | None = None,
                  clock: Callable[[], datetime] | None = None, kill_at: str | None = None,
                  lock_wait: float = 10.0, lock_retry: float = 5.0, lock_poll: float = 0.25,
                  drain_timeout: float = 5.0, min_wait: float = 0.2, max_wait: float = 5.0,
@@ -235,7 +247,7 @@ class Broker:
         self.disabled_reason: str | None = None
         self._generation = 0
         self._inflight = 0
-        self._op_locks: dict[str, threading.Lock] = {}
+        self._op_locks: dict[str, list[Any]] = {}       # pid -> [mutex, users], pruned at zero users
         self._lock_fd: int | None = None
         self.db: CockpitDB | None = None
         self._thread: threading.Thread | None = None
@@ -295,18 +307,20 @@ class Broker:
         return time.monotonic()
 
     def _attempt(self) -> bool:
-        """The start sequence, in order (§4.2). True when ACTIVE; False leaves STANDBY (lock held
-        elsewhere) or INSTALL_DISABLED."""
+        """The start sequence, in order (§4.2). True when ACTIVE. False leaves STANDBY (the lock is
+        held elsewhere, or the journal was busy: the healer retries), INSTALL_DISABLED (anything
+        else, with its reason), or the state a stop that arrived meanwhile set. Every failure after
+        the lock is taken closes the lock's fd before returning."""
         problem = network_fs_problem([self.data_root, *self.store_paths])
         if problem is not None:
             self._disable(problem)
             return False
         try:
             self.data_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(self.data_root / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
         except OSError as exc:
             self._disable(f"data root {self.data_root}: {exc}")
             return False
-        fd = os.open(self.data_root / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -323,23 +337,41 @@ class Broker:
             self._state = Lifecycle.ACTIVATING
             # recovery below is a settler, so a stop during it drains like any other
             self._inflight += 1
+        failure: Exception | None = None
         try:
-            try:
-                db = CockpitDB(self.data_root)
-                stored = db.set_install_class(self.install_class or "")
-                if stored != self.install_class:
-                    raise CockpitFormatError(f"journal was started as {stored!r}, not {self.install_class!r}")
-            except (CockpitFormatError, OSError) as exc:
-                self._release_after_disable(str(exc))
-                return False
-            self.db = db
+            db = CockpitDB(self.data_root)
+            stored = db.set_install_class(self.install_class or "")
+            if stored != self.install_class:
+                raise CockpitFormatError(f"journal was started as {stored!r}, not {self.install_class!r}")
             now = self._clock()
             db.expire_due(now)
-            self._recover(now)
+            self.db = db
+            self._recover(now, db)
+        except Exception as exc:  # noqa: BLE001 - each failure is classified below, the fd closed
+            failure = exc
         finally:
             with self._mu:
                 self._inflight -= 1
                 self._drained.notify_all()
+                fd_to_close = None
+                if failure is not None:
+                    # the attempt took the fd, so the attempt closes it, whether or not a stop is
+                    # waiting: a stop finds no fd and no settler, and releases nothing twice
+                    fd_to_close, self._lock_fd, self.db = self._lock_fd, None, None
+                    waiting = self._state in (Lifecycle.ACTIVATING, Lifecycle.DRAINING)
+                    if waiting and not _transient(failure):
+                        self._state = Lifecycle.INSTALL_DISABLED
+                        self.disabled_reason = f"cockpit journal: {type(failure).__name__}: {failure}"
+                    elif self._state is Lifecycle.ACTIVATING:
+                        self._state = Lifecycle.STANDBY
+            if fd_to_close is not None:
+                os.close(fd_to_close)
+        if failure is not None:
+            if _transient(failure):
+                _log.warning("cockpit broker: journal busy at start, retrying: %s", failure)
+            else:
+                _log.warning("cockpit broker disabled: %s", self.disabled_reason)
+            return False
         with self._mu:
             if self._state is not Lifecycle.ACTIVATING:
                 return False          # a stop arrived during recovery; it owns the lock now
@@ -347,15 +379,6 @@ class Broker:
             self._thread = threading.Thread(target=self._redrive, name="cockpit-broker-redrive", daemon=True)
             self._thread.start()
         return True
-
-    def _release_after_disable(self, reason: str) -> None:
-        with self._mu:
-            fd, self._lock_fd = self._lock_fd, None
-            self._state = Lifecycle.INSTALL_DISABLED
-            self.disabled_reason = reason
-        if fd is not None:
-            os.close(fd)
-        _log.warning("cockpit broker disabled: %s", reason)
 
     def stop(self) -> Lifecycle:
         """DRAINING, then CLOSED (§4.2): admission closes, admitted settlers are waited for up to the
@@ -376,6 +399,9 @@ class Broker:
                     break
                 self._drained.wait(left)
             drained = self._inflight == 0
+            if self._state is Lifecycle.INSTALL_DISABLED:
+                # the start attempt this stop waited on failed and disabled the broker; it closes its fd
+                return self._state
             self._state = Lifecycle.CLOSED
             fd = self._lock_fd if drained else None
             if drained:
@@ -385,7 +411,7 @@ class Broker:
             thread.join(timeout=self._drain_timeout)
         if fd is not None:
             os.close(fd)
-        else:
+        if not drained:
             _log.warning("cockpit broker: a settler outlived the drain; the lock is held until exit")
         return Lifecycle.CLOSED
 
@@ -476,7 +502,10 @@ class Broker:
                                   f"idempotency key {idempotency_key!r} is bound to another request")
             if rec.get("intent") == "reported" and view.state == "WAITING":
                 return None
-            return self.result(db, pid, replay=True)
+            out = self.result(db, pid, replay=True)
+        if out["state"] == "applying":
+            self.wake()
+        return out
 
     # -- building a verb's effects (§3.1.1) -------------------------------------------------------
 
@@ -611,7 +640,9 @@ class Broker:
                                idempotency_key=idempotency_key or ("auto:" + pid), now=now,
                                harness=harness, cap_exempt=intent == "reported")
             except PendingCapExceeded as exc:
-                raise BrokerError("pending_cap", 429, str(exc)) from exc
+                raise BrokerError("pending_cap", 429, str(exc), {"occupying": [
+                    {"idempotency_key": o.idempotency_key, "verb": o.verb, "issued_at": o.issued_at}
+                    for o in exc.occupying]}) from exc
             except IdempotencyConflict as exc:
                 raise BrokerError("idempotency_conflict", 409, str(exc)) from exc
             self._kp("issued")
@@ -620,10 +651,6 @@ class Broker:
                 # when that request died after ``issued``
                 return self._decide(db, res.pending_id, "ALLOWED_REPORTED", None, None)
             return self.result(db, res.pending_id, replay=res.replay)
-
-    def fire_reported(self, **kw: Any) -> dict[str, Any]:
-        """``issue`` with ``intent: "reported"``: a T2 on a surface token in a reported install."""
-        return self.issue(intent="reported", **kw)
 
     def _reported_refusal(self, tier: str, credential: Mapping[str, Any], harness: str) -> str | None:
         if self.install_class != REPORTED:
@@ -687,15 +714,16 @@ class Broker:
         except TransientApplyFault:
             return None, []
         except _Unbuildable:
-            # the object moved so far the effect no longer builds: every expect differs, so the
-            # decision ends STALE "changed" through the one comparison (§3.2.2)
-            fx = [dict(e, expect={"unbuildable": True}) for e in rec["effects"]]
-            moved = dict(rec, effects=fx)
-            return encode(moved), [None] * len(fx)
+            # the object moved so far the effect no longer builds
+            return self._moved(rec)
         tier = rec.get("tier")
         if self.tier_of is not None and rec["verb"] not in INTERNAL_VERBS:
+            # a tier that moves with the date between issue and decide differs from the record here,
+            # so the op ends and the write is issued and signed again (a known edge, left as is)
             tier = self.tier_of(rec["verb"], rec.get("params") or {}, rec.get("target") or {})
-            if tier is None:
+            if isinstance(tier, Absent):
+                return self._moved(rec)
+            if tier is None or isinstance(tier, Fault):
                 return None, []
         elif rec["verb"] == "pending_cancel":
             tier = self._target_tier(db, rec.get("target") or {}) or tier
@@ -703,6 +731,13 @@ class Broker:
                            params=rec.get("params") or {}, tier=str(tier), fence=rec["fence"],
                            issued_at=rec["issued_at"], expires_at=rec["expires_at"])
         return raw, built.pre_images
+
+    @staticmethod
+    def _moved(rec: Mapping[str, Any]) -> tuple[bytes, list[Any]]:
+        """A record whose every ``expect`` differs from the stored one, so the decision ends STALE
+        "changed" through the one comparison (§3.2.2)."""
+        fx = [dict(e, expect={"unbuildable": True}) for e in rec["effects"]]
+        return encode(dict(rec, effects=fx)), [None] * len(fx)
 
     @staticmethod
     def _target_tier(db: CockpitDB, target: Mapping[str, Any]) -> str | None:
@@ -724,8 +759,11 @@ class Broker:
         if out.decided:
             self._bump()
             self._kp("decided")
-            # the deciding request is one of the three settlers: its own op, once (§4.2)
-            self._settle_pass(db, pid, now=self._now(), mode="own")
+            # the deciding request is one of the three settlers: its own op, once (§4.2). Past the
+            # commit point a failure here is the re-drive's to finish, never this request's error;
+            # the thread is woken to take the op's new due time.
+            if not self._settle_one(db, pid, now=self._now(), mode="own"):
+                self._bump()
         elif kind == "ALLOWED" and out.state == "WAITING":
             raise BrokerError("source_unavailable", 503, "a source read faulted; the signature is unspent")
         return self.result(db, pid)
@@ -771,15 +809,6 @@ class Broker:
             self.wake()
         return out
 
-    def field_label(self, resource_key: str, field: str, value: Any) -> str | Fault:
-        """The label class of a field's current value (§5), from the latest matching label row."""
-        try:
-            with self._admitted() as db:
-                row = db.label_for(resource_key, field, value_sha256(value))
-        except BrokerError as exc:
-            return Fault(str(exc))
-        return "unverified" if row is None else label_class(row.decision_kind, self.install_class)
-
     def result(self, db: CockpitDB, pid: str, *, replay: bool = False) -> dict[str, Any]:
         view = self._load(db, pid)
         state = "applying" if view.state == "DECIDED" else view.state
@@ -814,18 +843,43 @@ class Broker:
         assert db is not None
         ops = db.decided_ops()
         for pid in ops:
-            try:
-                self._settle_pass(db, pid, now=now, mode="start")
-            except JournalCorruptError:
-                _log.exception("cockpit broker: op %s is corrupt; failing it closed", pid)
+            self._settle_one(db, pid, now=now, mode="start")
         return len(ops)
 
-    def _op_lock(self, pid: str) -> threading.Lock:
+    def _settle_one(self, db: CockpitDB, pid: str, *, now: datetime, mode: str) -> bool:
+        """One op's pass, its failure kept to that op; False when it failed. A corrupt op is marked
+        in the journal and leaves the due set; any other failure leaves it DECIDED for the next
+        pass."""
+        try:
+            self._settle_pass(db, pid, now=now, mode=mode)
+            return True
+        except JournalCorruptError as exc:
+            _log.error("cockpit broker: op %s is corrupt; it is set aside, unsettled: %s", pid, exc)
+            try:
+                db.mark_corrupt(pid, str(exc), now)
+            except Exception:  # noqa: BLE001 - unmarked, it is tried again on the next pass
+                _log.exception("cockpit broker: op %s could not be marked corrupt", pid)
+        except Exception:  # noqa: BLE001 - the op stays DECIDED; the next pass tries it again
+            _log.exception("cockpit broker: settling op %s failed", pid)
+        return False
+
+    @contextlib.contextmanager
+    def _op_mutex(self, pid: str) -> Iterator[bool]:
+        """The op's in-process mutex, taken without blocking; yields whether it was taken. The entry
+        is dropped when its last user leaves, so the map holds only ops being settled."""
         with self._mu:
-            lock = self._op_locks.get(pid)
-            if lock is None:
-                lock = self._op_locks[pid] = threading.Lock()
-            return lock
+            entry = self._op_locks.setdefault(pid, [threading.Lock(), 0])
+            entry[1] += 1
+        taken = entry[0].acquire(blocking=False)
+        try:
+            yield taken
+        finally:
+            if taken:
+                entry[0].release()
+            with self._mu:
+                entry[1] -= 1
+                if entry[1] == 0:
+                    del self._op_locks[pid]
 
     def _stores_for(self, db: CockpitDB, principal: str, now: datetime) -> dict[str, Any]:
         return {**self.stores, COCKPIT_STORE: _CockpitObjects(db, by=principal, now=now)}
@@ -835,72 +889,47 @@ class Broker:
         deciding request's, every unit; "start" and "thread": only units due, a never-faulted unit
         due at once at start and ``decided_at`` + 5 s for the thread), then FINISH once none is
         planned. The op's mutex is held for the pass; a held mutex skips it."""
-        lock = self._op_lock(pid)
-        if not lock.acquire(blocking=False):
+        with self._op_mutex(pid) as taken:
+            if taken:
+                self._settle_locked(db, pid, now=now, mode=mode)
+
+    def _settle_locked(self, db: CockpitDB, pid: str, *, now: datetime, mode: str) -> None:
+        view = db.load(pid)
+        if view.state != "DECIDED":
             return
         try:
-            view = db.load(pid)
-            if view.state != "DECIDED":
-                return
-            try:
-                effects = [Effect.from_record(e) for e in view.record["effects"]]
-            except ValueError as exc:
-                raise JournalCorruptError(f"cockpit op {pid}: {exc}") from exc
-            stores = self._stores_for(db, view.principal, now)
-            rows = {r.idx: r for r in view.effects}
-            for u, unit in enumerate(self._units(effects, stores)):
-                members = [rows[i] for i in unit.indices]
-                if all(m.status != "PLANNED" for m in members):
-                    continue
-                if mode != "own" and self._not_due(view, members[0], now, at_start=mode == "start"):
-                    continue
-                if unit.store not in stores:
-                    db.record_unit(pid, [UnitResult(i, "UNAPPLIED", "store gone") for i in unit.indices], now)
-                    rows = {r.idx: r for r in db.load(pid).effects}
-                    continue
-                prior = {i: EffectState(EffectStatus(r.status), r.native_id) for i, r in rows.items()}
-                try:
-                    res = settle(unit, stores[unit.store], prior)
-                except TransientApplyFault as fault:
-                    db.record_fault(pid, unit.indices, f"{fault.fault_class}: {fault.message}", now)
-                    self._bump()
-                    rows = {r.idx: r for r in db.load(pid).effects}
-                    continue
-                if res.status is EffectStatus.PLANNED:
-                    continue          # waits on a still-planned unit it refers to (§4.1.2)
-                self._kp(f"applied:{u}")
-                db.record_unit(pid, self._unit_results(unit, res, prior), now)
-                self._kp(f"journaled:{u}")
+            effects = [Effect.from_record(e) for e in view.record["effects"]]
+        except ValueError as exc:
+            raise JournalCorruptError(f"cockpit op {pid}: {exc}") from exc
+        stores = self._stores_for(db, view.principal, now)
+        rows = {r.idx: r for r in view.effects}
+        for u, unit in enumerate(plan_units(effects, stores)):
+            members = [rows[i] for i in unit.indices]
+            if all(m.status != "PLANNED" for m in members):
+                continue
+            if mode != "own" and self._not_due(view, members[0], now, at_start=mode == "start"):
+                continue
+            if unit.store not in stores:
+                db.record_unit(pid, [UnitResult(i, "UNAPPLIED", "store gone") for i in unit.indices], now)
                 rows = {r.idx: r for r in db.load(pid).effects}
-            if all(r.status != "PLANNED" for r in rows.values()):
-                db.finish(pid, now)
-                self._kp("finished")
-        finally:
-            lock.release()
-
-    @staticmethod
-    def _units(effects: Sequence[Effect], stores: Mapping[str, Any]) -> list[ApplyUnit]:
-        # §4.0: each maximal run of one store's effects, grouped by that store; an effect on a store
-        # no longer registered is its own unit, recorded "store gone"
-        out: list[ApplyUnit] = []
-        run: list[tuple[int, Effect]] = []
-
-        def flush() -> None:
-            if not run:
-                return
-            store = stores.get(run[0][1].store)
-            if store is None:
-                out.extend(ApplyUnit(e.store, (i,), (e,)) for i, e in run)
-            else:
-                out.extend(store.units(list(run)))
-            run.clear()
-
-        for i, e in enumerate(effects):
-            if run and run[-1][1].store != e.store:
-                flush()
-            run.append((i, e))
-        flush()
-        return out
+                continue
+            prior = {i: EffectState(EffectStatus(r.status), r.native_id) for i, r in rows.items()}
+            try:
+                res = settle(unit, stores[unit.store], prior)
+            except TransientApplyFault as fault:
+                db.record_fault(pid, unit.indices, f"{fault.fault_class}: {fault.message}", now)
+                self._bump()
+                rows = {r.idx: r for r in db.load(pid).effects}
+                continue
+            if res.status is EffectStatus.PLANNED:
+                continue          # waits on a still-planned unit it refers to (§4.1.2)
+            self._kp(f"applied:{u}")
+            db.record_unit(pid, self._unit_results(unit, res, prior), now)
+            self._kp(f"journaled:{u}")
+            rows = {r.idx: r for r in db.load(pid).effects}
+        if all(r.status != "PLANNED" for r in rows.values()):
+            db.finish(pid, now)
+            self._kp("finished")
 
     @staticmethod
     def _not_due(view: Any, row: Any, now: datetime, *, at_start: bool) -> bool:
@@ -936,10 +965,7 @@ class Broker:
                 with self._admitted() as db:
                     now = self._now()
                     for pid in db.due_ops(now):
-                        try:
-                            self._settle_pass(db, pid, now=now, mode="thread")
-                        except JournalCorruptError:
-                            _log.exception("cockpit broker: op %s is corrupt; failing it closed", pid)
+                        self._settle_one(db, pid, now=now, mode="thread")
                     due = db.earliest_due()
             except BrokerError:
                 return

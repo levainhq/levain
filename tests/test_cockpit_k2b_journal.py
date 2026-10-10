@@ -172,9 +172,11 @@ def test_an_old_sqlite_is_refused_at_open(tmp_path, monkeypatch):
         CockpitDB(tmp_path).meta("format")
 
 
-def test_policy_rev_reads_and_bumps(db):
+def test_policy_rev_reads(db):
     assert db.policy_rev() == 0
-    assert db.bump_policy_rev() == 1 and db.policy_rev() == 1
+    with db.write() as conn:
+        conn.execute("UPDATE meta SET value = '1' WHERE key = 'policy_rev'")
+    assert db.policy_rev() == 1
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -185,8 +187,7 @@ def test_expire_due_is_text_ordered_and_inclusive(db):
     b, _ = issue(db, key="b", ttl=timedelta(seconds=10, microseconds=1))
     c, _ = issue(db, key="c", ttl=timedelta(days=40))       # crosses a month boundary in text
     edge = T0 + timedelta(seconds=10)
-    assert not db.has_due(edge - timedelta(microseconds=1))
-    assert db.has_due(edge)
+    assert db.expire_due(edge - timedelta(microseconds=1)) == 0
     assert db.expire_due(edge) == 1
     assert db.outcome(a).state == "EXPIRED" and db.outcome(b).state == "WAITING"
     assert db.expire_due(T0 + timedelta(days=39, hours=23)) == 1

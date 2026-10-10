@@ -74,13 +74,16 @@ def write_transaction(connect: Callable[[], sqlite3.Connection]) -> Iterator[sql
 
 @contextmanager
 def read_transaction(connect: Callable[[], sqlite3.Connection]) -> Iterator[sqlite3.Connection]:
-    """A consistent read snapshot on a fresh connection."""
+    """A consistent read snapshot on a fresh connection, ended by COMMIT, or by a rollback when the
+    block raised (so the block's error is the one that propagates)."""
     conn = connect()
     try:
         conn.execute("BEGIN")
         try:
             yield conn
-        finally:
-            conn.execute("COMMIT")
+        except BaseException:
+            rollback(conn)
+            raise
+        conn.execute("COMMIT")
     finally:
         conn.close()

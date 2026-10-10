@@ -269,17 +269,25 @@ def registration_refusals(store: Any, canonical: Mapping[str, Callable[..., Any]
 
 def plan_units(effects: Sequence[Effect], stores: Mapping[str, EffectStore]) -> list[ApplyUnit]:
     """The record's effects grouped into apply units in record order: each maximal run of effects on
-    one store is handed to that store's grouping (§4.0). An effect on an unregistered store raises
-    ``KeyError``."""
+    one store is handed to that store's grouping (§4.0). An effect on a store no longer registered
+    is its own unit, which the settler records ``store gone``."""
     out: list[ApplyUnit] = []
     run: list[tuple[int, Effect]] = []
+
+    def flush() -> None:
+        store = stores.get(run[0][1].store)
+        if store is None:
+            out.extend(ApplyUnit(e.store, (i,), (e,)) for i, e in run)
+        else:
+            out.extend(store.units(list(run)))
+
     for i, e in enumerate(effects):
         if run and run[-1][1].store != e.store:
-            out.extend(stores[run[0][1].store].units(run))
+            flush()
             run = []
         run.append((i, e))
     if run:
-        out.extend(stores[run[0][1].store].units(run))
+        flush()
     return out
 
 
@@ -479,9 +487,9 @@ class SporeEffectStore:
             raise PermanentApplyRefusal(f"a spore unit is one spore effect (got {len(unit.effects)} on {unit.store!r})")
         effect = unit.effects[0]
         spore_apply = self.spore_apply(effect)
-        # anneal loads a missing file as an empty store (and a create would make one), so the
-        # definite absence is checked here, before its lock
-        if not self.path.parent.is_dir() or not self.path.exists():
+        # anneal loads a missing file as an empty store, so only a create may meet one (anneal
+        # makes the file); for any other effect a missing file is a definite absence
+        if not effect.is_create and (not self.path.parent.is_dir() or not self.path.exists()):
             raise StoreGone(f"{self.path} is absent")
         try:
             res = self._store.apply(spore_apply)

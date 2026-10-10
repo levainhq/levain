@@ -23,7 +23,8 @@ from anneal_memory.spores import SporeStore
 
 from levain.autonomic.confirm import NOT_VERIFIED, UNAVAILABLE, VERIFIED, verify_cockpit_signature
 from levain.cockpit import install
-from levain.cockpit.broker import STANDBY_FAULT, Broker, BrokerError, Lifecycle
+from levain.cockpit.broker import STANDBY_FAULT, Broker, BrokerError, Lifecycle, label_class
+from levain.cockpit.consent import value_sha256
 from levain.cockpit.effects import SporeEffectStore, TransientApplyFault
 from levain.cockpit.results import Fault
 
@@ -110,6 +111,13 @@ def _wait(pred: Any, timeout: float) -> bool:
     return pred()
 
 
+def _label(b: Broker, resource_key: str, field: str, value: Any) -> str:
+    """The label class of a field's current value (§5), read from the journal's label rows."""
+    assert b.db is not None
+    row = b.db.label_for(resource_key, field, value_sha256(value))
+    return "unverified" if row is None else label_class(row.decision_kind, b.install_class)
+
+
 def _state(b: Broker, pid: str) -> str:
     return _rows(b, "SELECT state FROM pendings WHERE pending_id = ?", pid)[0][0]
 
@@ -156,13 +164,13 @@ def test_a_t2_on_the_token_fires_allowed_reported_and_reads_claims_cockpit_token
     assert (out["state"], out["decision_kind"], out["label"]) == ("COMMITTED", "ALLOWED_REPORTED",
                                                                   "claims cockpit token")
     assert _disposition(spores, "k.seed") == "note"
-    assert broker.field_label("spore:k.seed", "disposition", "note") == "claims cockpit token"
+    assert _label(broker, "spore:k.seed", "disposition", "note") == "claims cockpit token"
     # the fire is journalled: no fire without a pending (a handler fired directly fails this line)
     assert _rows(broker, "SELECT verb, intent, state FROM pendings") == [
         ("spore_set_disposition", "reported", "COMMITTED")]
     # a later value written outside the broker is unlabelled
     SporeStore(spores).update(SporeStore(spores).get_by_origin_key("k.seed")["id"], disposition="seed")
-    assert broker.field_label("spore:k.seed", "disposition", "seed") == "unverified"
+    assert _label(broker, "spore:k.seed", "disposition", "seed") == "unverified"
 
 
 def test_a_seed_created_on_the_token_is_journalled_with_its_native_id(broker, spores):
@@ -174,7 +182,7 @@ def test_a_seed_created_on_the_token_is_journalled_with_its_native_id(broker, sp
     row = SporeStore(spores).get_by_origin_key(key)
     assert row is not None and row["text"] == "captured"
     assert _rows(broker, "SELECT native_id, status FROM effects") == [(row["id"], "APPLIED")]
-    assert broker.field_label(f"spore:{key}", "text", "captured") == "claims cockpit token"
+    assert _label(broker, f"spore:{key}", "text", "captured") == "claims cockpit token"
 
 
 # --- DONE: sign returns a pending that fires only on a valid signature; a bad one spends nothing ------

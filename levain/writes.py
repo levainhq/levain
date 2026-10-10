@@ -228,10 +228,12 @@ class EditError(Exception):
     """A write was refused. ``http_status`` is the code the server maps it to;
     ``code`` is a stable machine token the frontend can branch on."""
 
-    def __init__(self, code: str, http_status: int, message: str) -> None:
+    def __init__(self, code: str, http_status: int, message: str,
+                 extra: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.http_status = http_status
+        self.extra = dict(extra or {})   # receipt fields beside error + message
 
 
 @dataclass(frozen=True)

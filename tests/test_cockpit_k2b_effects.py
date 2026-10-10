@@ -276,13 +276,16 @@ def test_corrupt_store_is_transient_then_applies_after_repair(path):
     assert _row(path, "k.loop")["text"] == "survives"
 
 
-def test_missing_store_is_store_gone(path):
+def test_missing_store_is_store_gone_for_all_but_a_create(path):
     es = SporeEffectStore(path)
-    eff = _effect(es, "spore_seed", {"text": "x"}, None)
+    eff = _effect(es, "spore_update", {"text": "x"}, "k.loop")
     path.unlink()
     r = _settle(es, eff)
     assert (r.status, r.reason) == (EffectStatus.UNAPPLIED, "store gone")
     assert not path.exists()
+    # anneal makes the file for a create
+    seed = _effect(es, "spore_seed", {"text": "x"}, None)
+    assert _settle(es, seed).status is EffectStatus.APPLIED and path.exists()
 
 
 class _Boom(SporeEffectStore):

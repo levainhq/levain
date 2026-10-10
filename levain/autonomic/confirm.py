@@ -213,8 +213,9 @@ def verify_cockpit_signature(message: bytes, signature: str | None, signers_file
     ``-Y verify`` as that principal must succeed, and its output must hold exactly one anchored
     ``Good "levain-cockpit" signature for <principal> with <type> key SHA256:...`` line, whose
     fingerprint is returned for the caller to look up (class, revocation). ``owners`` is who may own
-    the signers file and its directories (root for a governed install; the caller states
-    ``{0, its uid}`` for a reported one). The binary stays a root trust anchor. Never raises."""
+    the signers file and its directories: the caller states it, and until the governed start check
+    (K2b-3) exists the broker passes the reported set ``{0, its uid}`` for every install. The
+    binary stays a root trust anchor. Never raises."""
     try:
         if not isinstance(signature, str) or len(signature) > _MAX_SIGNATURE or _BEGIN not in signature:
             return CockpitVerdict(NOT_VERIFIED)

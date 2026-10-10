@@ -132,8 +132,8 @@ def _pending_route(route: str) -> "tuple[str, str] | None":
 
 def _is_write_route(route: str) -> bool:
     return route in _WRITE_ROUTES or _pending_route(route) is not None
-# Until K2b's governed start check exists every install is reported (design §4.6): no install here can
-# show that its stores sit beyond the operator uid's reach.
+# The class the cockpit manifest renders gestures under (design §4.6). A dispatch decides under the
+# broker's own class instead (``_Handler._install_class``).
 INSTALL_CLASS = "reported"
 
 __all__ = [
@@ -1040,6 +1040,12 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8",
                    status=status, head=head)
 
+    def _install_class(self) -> str:
+        """The install class a dispatch decides gestures under: the broker's own, which is set only
+        when its install check passed; with none, no gesture is the reported one."""
+        broker = self.server.broker
+        return (broker.install_class if broker is not None else None) or "none"
+
     def _pending_post(self, pending_id: str, action: str, req: Any) -> dict[str, Any]:
         """``POST /cockpit/pending/<id>/signature`` (K2b §3.2: a signature over the stored bytes) and
         ``.../cancel`` (§3.5: C1 on your own pending, a pending of its tier on another's)."""
@@ -1061,7 +1067,7 @@ class _Handler(GuardedHandler):
             return broker.cancel(pending_id, credential=credential, intent=req.get("intent"),
                                  idempotency_key=req.get("idempotency_key"))
         except BrokerError as exc:
-            raise EditError(exc.code, exc.status, str(exc)) from exc
+            raise EditError(exc.code, exc.status, str(exc), exc.extra) from exc
 
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
         """The POST routes — the governed writes ``/edit`` + ``/action``, and the ``/chat`` operations
@@ -1165,11 +1171,11 @@ class _Handler(GuardedHandler):
                     # one dispatch for the cockpit route and both legacy aliases (design §4.3)
                     result = dispatch_verb(
                         registry=self.server.verb_registry, cockpit=self._cockpit(), scope=scope, req=req,
-                        credential=self._credential(), install_class=INSTALL_CLASS,
+                        credential=self._credential(), install_class=self._install_class(),
                         route={"/edit": "edit", "/action": "action"}.get(route, "cockpit"),
                         job_runtime=self.server.job_runtime, broker=self.server.broker)
             except EditError as exc:
-                self._send_json({"error": exc.code, "message": str(exc)}, exc.http_status)
+                self._send_json({**exc.extra, "error": exc.code, "message": str(exc)}, exc.http_status)
             except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
                 self._send_json({"error": "internal", "message": type(exc).__name__}, 500)
         finally:

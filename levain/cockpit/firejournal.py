@@ -117,7 +117,9 @@ _SCHEMA = (
 # §3.1: the one SQL definition of expiry; every caller runs this statement and no other
 _EXPIRE_SQL = ("UPDATE pendings SET state = 'EXPIRED', reason = 'expired', terminal_at = expires_at "
                "WHERE state = 'WAITING' AND expires_at <= ?")
-_HAS_DUE_SQL = "SELECT 1 FROM pendings WHERE state = 'WAITING' AND expires_at <= ? LIMIT 1"
+# an op the settler found corrupt is marked in ``meta`` (``corrupt:<id>``) and leaves the due set; its
+# rows are left as they are, as evidence
+_NOT_CORRUPT = "NOT EXISTS (SELECT 1 FROM meta WHERE key = 'corrupt:' || p.pending_id)"
 
 
 class CockpitFormatError(RuntimeError):
@@ -132,8 +134,21 @@ class IdempotencyConflict(ValueError):
     """The idempotency key is already bound to a request with other params (§2: a 409)."""
 
 
+@dataclass(frozen=True)
+class Occupant:
+    """A WAITING pending counted against a principal's cap."""
+    pending_id: str
+    idempotency_key: str
+    verb: str
+    issued_at: str
+
+
 class PendingCapExceeded(RuntimeError):
-    """The principal already holds its cap of WAITING pendings (§3.1)."""
+    """The principal already holds its cap of WAITING pendings (§3.1); ``occupying`` names them."""
+
+    def __init__(self, message: str, occupying: Sequence[Occupant] = ()) -> None:
+        super().__init__(message)
+        self.occupying = tuple(occupying)
 
 
 def new_pending_id() -> str:
@@ -460,23 +475,12 @@ class CockpitDB:
         """The policy revision a record's fence names and a render caches on (§2 meta)."""
         return _int_meta("-", self.meta("policy_rev"), "policy_rev")
 
-    def bump_policy_rev(self) -> int:
-        with self.write() as conn:
-            rev = _int_meta("-", _meta(conn, "policy_rev"), "policy_rev") + 1
-            conn.execute("UPDATE meta SET value = ? WHERE key = 'policy_rev'", (str(rev),))
-        return rev
-
     def token_generation(self, name: str) -> int | None:
         with self.read() as conn:
             row = conn.execute("SELECT generation FROM tokens WHERE name = ?", (name,)).fetchone()
         return None if row is None else int(row[0])
 
     # -- expiry (§3.1) -------------------------------------------------------------------------
-
-    def has_due(self, now: datetime) -> bool:
-        """The read-only probe a listing runs before it opens a write transaction (§3.1)."""
-        with self.read() as conn:
-            return conn.execute(_HAS_DUE_SQL, (utc_stamp(now),)).fetchone() is not None
 
     def expire_due(self, now: datetime) -> int:
         """Mark every WAITING pending whose ``expires_at`` has come ``EXPIRED``; the count."""
@@ -514,12 +518,14 @@ class CockpitDB:
                 return IssueResult(pending_id=prior["pending_id"], record=prior["record"],
                                    replay=True, outcome=_outcome(prior))
             if not cap_exempt:
-                (waiting,) = conn.execute(
-                    "SELECT COUNT(*) FROM pendings WHERE principal = ? AND state = 'WAITING'",
-                    (principal,)).fetchone()
-                if waiting >= PENDING_CAP:
+                held = conn.execute(
+                    "SELECT pending_id, idempotency_key, verb, issued_at FROM pendings "
+                    "WHERE principal = ? AND state = 'WAITING' ORDER BY issued_at, rowid",
+                    (principal,)).fetchall()
+                if len(held) >= PENDING_CAP:
                     raise PendingCapExceeded(
-                        f"{principal} holds {waiting} waiting pendings (cap {PENDING_CAP})")
+                        f"{principal} holds {len(held)} waiting pendings (cap {PENDING_CAP})",
+                        [Occupant(*r) for r in held])
             conn.execute(
                 "INSERT INTO pendings (pending_id, harness, principal, principal_base, "
                 "idempotency_key, verb, tier, intent, record, record_sha256, issued_at, expires_at, "
@@ -837,11 +843,18 @@ class CockpitDB:
         return None if row is None else row[0]
 
     def decided_ops(self) -> list[str]:
-        """Every ``DECIDED`` op, oldest decision first: start recovery's input (§4.2)."""
+        """Every ``DECIDED`` op not marked corrupt, oldest decision first: start recovery's input
+        (§4.2)."""
         with self.read() as conn:
-            rows = conn.execute("SELECT pending_id FROM pendings WHERE state = 'DECIDED' "
-                                "ORDER BY decided_at, rowid").fetchall()
+            rows = conn.execute("SELECT pending_id FROM pendings p WHERE state = 'DECIDED' AND "
+                                f"{_NOT_CORRUPT} ORDER BY decided_at, rowid").fetchall()
         return [r[0] for r in rows]
+
+    def mark_corrupt(self, operation_id: str, why: str, now: datetime) -> None:
+        """Set a corrupt op aside: it leaves the due set and start recovery, and stays DECIDED."""
+        with self.write() as conn:
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
+                         (f"corrupt:{operation_id}", f"{utc_stamp(now)} {why}"))
 
     def load(self, operation_id: str) -> OpView:
         with self.read() as conn:
@@ -854,30 +867,30 @@ class CockpitDB:
             return _outcome(row)
 
     def earliest_due(self) -> datetime | None:
-        """The earliest time a ``PLANNED`` unit of a ``DECIDED`` op is due:
-        ``MIN(COALESCE(next_attempt_at, decided_at + 5 s))``, computed here so a NULL never hides a
-        unit (§4.2)."""
-        with self.read() as conn:
-            rows = conn.execute(
-                "SELECT e.operation_id, e.next_attempt_at, p.decided_at FROM effects e "
-                "JOIN pendings p ON p.pending_id = e.operation_id "
-                "WHERE p.state = 'DECIDED' AND e.status = 'PLANNED'").fetchall()
-        due = [_due(r) for r in rows]
+        """The earliest time a ``DECIDED`` op is due: a ``PLANNED`` unit at
+        ``COALESCE(next_attempt_at, decided_at + 5 s)``, computed here so a NULL never hides a unit
+        (§4.2), and an op with no planned unit left (its finish is owed) at once."""
+        due = [d for _, d in self._due_rows()]
         return min(due) if due else None
 
     def due_ops(self, now: datetime) -> list[str]:
-        """``DECIDED`` ops with a ``PLANNED`` unit due at ``now``, oldest decision first."""
+        """``DECIDED`` ops with a ``PLANNED`` unit due at ``now`` or a finish owed, oldest decision
+        first."""
+        out: list[str] = []
+        for op, due in self._due_rows():
+            if op not in out and due <= now:
+                out.append(op)
+        return out
+
+    def _due_rows(self) -> list[tuple[str, datetime]]:
         with self.read() as conn:
             rows = conn.execute(
-                "SELECT e.operation_id, e.next_attempt_at, p.decided_at FROM effects e "
-                "JOIN pendings p ON p.pending_id = e.operation_id "
-                "WHERE p.state = 'DECIDED' AND e.status = 'PLANNED' "
+                "SELECT p.pending_id AS operation_id, e.next_attempt_at, p.decided_at, "
+                "e.operation_id IS NULL AS finish_owed FROM pendings p "
+                "LEFT JOIN effects e ON e.operation_id = p.pending_id AND e.status = 'PLANNED' "
+                f"WHERE p.state = 'DECIDED' AND {_NOT_CORRUPT} "
                 "ORDER BY p.decided_at, p.rowid").fetchall()
-        out: list[str] = []
-        for r in rows:
-            if r["operation_id"] not in out and _due(r) <= now:
-                out.append(r["operation_id"])
-        return out
+        return [(r["operation_id"], _finish_due(r) if r["finish_owed"] else _due(r)) for r in rows]
 
     def label_for(self, resource_key: str, field: str, value_sha256: str) -> LabelRow | None:
         """The label that describes a field's current value (§5): in the current epoch, the row whose
@@ -959,6 +972,14 @@ def _due(row: sqlite3.Row) -> datetime:
         return parse_stamp(row["decided_at"]) + FIRST_RETRY_DELAY
     except ConsentError as exc:
         raise _corrupt(op, "a due time does not parse") from exc
+
+
+def _finish_due(row: sqlite3.Row) -> datetime:
+    """An op whose units are all recorded owes its finish since its decision: already due."""
+    try:
+        return parse_stamp(row["decided_at"])
+    except ConsentError as exc:
+        raise _corrupt(row["operation_id"], "a due time does not parse") from exc
 
 
 def _credential_problem(conn: sqlite3.Connection, principal: str) -> str | None:

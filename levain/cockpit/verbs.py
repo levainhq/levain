@@ -673,7 +673,7 @@ def _broker_replay(broker: "Broker | None", verb: VerbSpec, params: dict[str, An
         return broker.replay(verb=verb.name, params=params, intent=intent, credential=credential,
                              idempotency_key=key)
     except BrokerError as exc:
-        raise _refuse(exc.code, exc.status, str(exc)) from exc
+        raise EditError(exc.code, exc.status, str(exc), exc.extra) from exc
 
 
 def _to_broker(verb: VerbSpec, tier: Tier, credential: dict[str, Any], install_class: str,
@@ -698,20 +698,22 @@ def _to_broker(verb: VerbSpec, tier: Tier, credential: dict[str, Any], install_c
         return broker.issue(verb=verb.name, params=params, target=target, tier=tier, credential=credential,
                             intent=intent, idempotency_key=idempotency_key)
     except BrokerError as exc:
-        raise _refuse(exc.code, exc.status, str(exc)) from exc
+        raise EditError(exc.code, exc.status, str(exc), exc.extra) from exc
 
 
 def retier(registry: "VerbRegistry", cockpit: "Cockpit", verb_name: str, params: dict[str, Any],
-           target: dict[str, Any]) -> Tier | None:
+           target: dict[str, Any]) -> Tier | Absent | None:
     """The kernel's tier for a pending's verb against its target read fresh (K2b §3.2.1), the
-    broker's ``tier_of``. ``None`` when the read faulted or the row is gone (the decision then
-    leaves a signed pending unspent, and refuses a reported one)."""
+    broker's ``tier_of``. ``Absent`` when the row is gone (the decision ends STALE); ``None`` when
+    the read faulted (the decision leaves a signed pending unspent, and refuses a reported one)."""
     verb = registry.get(verb_name)
     if verb is None:
         return None
     row = None
     if target.get("kind") == "row":
         res = cockpit.read_one(str(target.get("panel_id")), str(target.get("row_id")))
+        if isinstance(res, Absent):
+            return res
         if not isinstance(res, Read):
             return None
         row = res.value
