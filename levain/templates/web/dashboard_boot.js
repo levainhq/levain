@@ -233,8 +233,9 @@
   // Bridge panels. The flip is this one constant.
   const useManifest = new URLSearchParams(window.location.search).get("source") === "manifest";
 
-  async function loadManifestView() {
+  async function loadManifestView(passive) {
     const manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
+    const fetchedAt = Date.now();
     const ids = Object.keys(manifest.panels);
     const panels = Object.create(null);
     // One shared re-auth for the batch: if the token rotated after the manifest read, every panel 403s
@@ -246,11 +247,18 @@
       try {
         let res = await fetchPanel(url);
         if (res.status === 403 && await isTokenReject(res.clone())) {
-          reauth = reauth || Promise.resolve().then(() => { if (promptForToken()) return true; dropToken(); return false; });
+          // a passive refresh never steals focus with a prompt over an open editor (as the legacy path does)
+          reauth = reauth || Promise.resolve().then(() => {
+            if (passive && editInProgress()) return false;
+            if (promptForToken()) return true;
+            dropToken();
+            return false;
+          });
           if (await reauth) {
+            const usedToken = storedToken();
             res = await fetchPanel(url);
             // the replacement token was rejected too: drop it so the next refresh asks again
-            if (res.status === 403 && await isTokenReject(res.clone())) dropToken();
+            if (res.status === 403 && await isTokenReject(res.clone()) && storedToken() === usedToken) dropToken();   // not a newer token another tab stored
           }
         }
         if (!res.ok) throw new Error("HTTP " + res.status);
@@ -260,7 +268,7 @@
         panels[id] = { error: e && e.message ? e.message : String(e) };
       }
     }));
-    return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: panels });
+    return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: panels }, { elapsedMs: Date.now() - fetchedAt });
   }
 
   async function load(opts) {
@@ -283,7 +291,7 @@
     if (btn) btn.disabled = true;
     try {
       if (useManifest) {
-        const mview = await loadManifestView();
+        const mview = await loadManifestView(passive);
         if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
         window.LevainDashboard.render(mview, { recall });
         status("read " + new Date().toLocaleTimeString());

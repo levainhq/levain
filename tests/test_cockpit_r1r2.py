@@ -304,6 +304,7 @@ class TestManifestMapperBoundary:
         snap = json.loads(json.dumps(snapshot(ck)))
         snap["panels"]["tray"]["value"] = {"alerts": {}}
         raw = json.dumps(snap).replace('"value": {"alerts": {}}', '"value": {"__proto__": {"alerts": {}}, "metrics": []}')
+        assert '"__proto__"' in raw                  # the replacement happened (a vacuous test would pass without it)
         view = _view(json.loads(raw))        # json.loads keeps "__proto__" as an own key, as a browser's JSON.parse does
         assert [e["id"] for e in view["layout"]].count("tray") == 1
 
@@ -323,7 +324,32 @@ class TestManifestMapperBoundary:
         snap["panels"]["now"]["error"] = None
         view = _view(snap)
         assert view["extra_panels"]["now"]["note"] == "not complete: tray"
-        assert not view["health"] or view["health"].get("wrap_history_unavailable") in (None, False)
+
+    def test_wraps_state_is_tri_state_missing_is_not_unavailable_but_errored_is(self) -> None:
+        def health_view(with_wraps: str | None) -> dict[str, Any]:
+            ck = _tray_cockpit()
+            ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": [
+                {"label": "wraps", "value": 4, "unit": None, "status": "ok", "read": None}]})))
+            if with_wraps == "fault":
+                ck.register(ProviderSpec("wraps", "visual", "W", "feed", lambda c: Fault("x")))
+            return _view(snapshot(ck))["health"]
+        assert health_view(None)["wrap_history_unavailable"] is False
+        assert health_view("fault")["wrap_history_unavailable"] is True
+
+    def test_one_malformed_panel_degrades_alone_and_colliding_cleaned_keys_stay_distinct(self) -> None:
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("m", "metric", "M", "gauge", lambda c: Read(value={"metrics": [
+            {"label": "x", "value": 1, "unit": None, "status": "ok", "read": None}]})))
+        snap = snapshot(ck)
+        snap["panels"]["m"]["value"]["metrics"][0]["value"] = {"a": 1}      # an object where a scalar belongs
+        view = _view(snap)
+        assert "could not be mapped" in view["extra_panels"]["m"]["error"]
+        assert [e["id"] for e in view["layout"]].count("tray") == 1          # the rest of the cockpit still renders
+        out = subprocess.run([NODE, "-e", "const C=require(process.argv[1]);"
+                              "const o=C.clean(JSON.parse('{\"ops\\\\u202ey\":1,\"ops<U+202E>y\":2}'));"
+                              "process.stdout.write(String(Object.keys(o).length))", str(WEB / "cockpit_view.js")],
+                             capture_output=True, text=True, check=True).stdout
+        assert out == "2"                                                    # distinct raw keys stay distinct after cleaning
 
 
 def _dump_dom(url: str) -> str:
