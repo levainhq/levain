@@ -347,9 +347,17 @@ class TestManifestMapperBoundary:
         assert [e["id"] for e in view["layout"]].count("tray") == 1          # the rest of the cockpit still renders
         out = subprocess.run([NODE, "-e", "const C=require(process.argv[1]);"
                               "const o=C.clean(JSON.parse('{\"ops\\\\u202ey\":1,\"ops<U+202E>y\":2}'));"
-                              "process.stdout.write(String(Object.keys(o).length))", str(WEB / "cockpit_view.js")],
+                              "process.stdout.write(Object.keys(o).join('|') + ':' + o[Object.keys(o)[0]])", str(WEB / "cockpit_view.js")],
                              capture_output=True, text=True, check=True).stdout
-        assert out == "2"                                                    # distinct raw keys stay distinct after cleaning
+        assert out == "ops<U+202E>y:1"          # a collision keeps the first key and its value; no renamed twin the references miss
+
+    def test_a_non_string_panel_title_falls_back_to_the_head_title(self) -> None:
+        ck = _tray_cockpit()
+        snap = snapshot(ck)
+        snap["panels"]["tray"]["title"] = {"a": 1}
+        view = _view(snap)
+        titles = [e["title"] for e in view["layout"] if e["id"] == "tray"]
+        assert len(titles) == 1 and isinstance(titles[0], str) and titles[0]   # the head's title, not the object
 
 
 def _dump_dom(url: str) -> str:
@@ -451,3 +459,5 @@ console.log("OK");
         core = (WEB / "dashboard_core.js").read_text(encoding="utf-8")
         body = core[core.index("function renderSporeProjection"):core.index("function renderSpores(")]
         assert "mountSporeFilter(p, list" in body and "entry.kind" in body
+        assert "const sporeQueries = Object.create(null)" in core            # a kind named "constructor" is data
+        assert "try { node = renderPanel(entry, view); }" in core            # a panel that cannot be drawn degrades alone
