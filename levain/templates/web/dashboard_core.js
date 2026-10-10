@@ -132,49 +132,6 @@
   // rows land. null = don't restore (cleared on a fresh user search → resets to top).
   let modalRestoreScroll = null;
 
-  // The masthead focus line. `focus` is the view.focus payload (or null/undefined).
-  //   null/absent        → no live-context source → hide the line entirely.
-  //   {text: null}       → a source exists but no focus is set → "no focus set".
-  //   {text, age_label}  → the focus + its freshness; a stale focus dims + nudges.
-  // textContent throughout (the operator authored the string, but the cockpit never
-  // routes operator text through innerHTML — consistent with the rest of the app).
-  function renderFocus(focus) {
-    const fEl = document.getElementById("focus");
-    if (!fEl) return;
-    // Skip a rebuild while an edit is OPEN, so a background/passive render (a job poll)
-    // can't nuke the half-typed focus — EXCEPT the authoritative SAVE render (marked
-    // data-saving="1" by doSave), which MUST rebuild to replace the editor with the just-
-    // committed focus. Without that exception the guard fires on the save reload too and
-    // the editor strands frozen on "saving…" forever (codex/complement/nemotron L3, all
-    // three; deterministic). Passive reloads ALSO defer at the load() level via
-    // hasUnsavedEdit(".focus-editor") — this guard is the belt to that suspenders.
-    const openEditor = fEl.querySelector(".focus-editor");
-    if (openEditor && openEditor.dataset.saving !== "1") return;
-    fEl.replaceChildren();
-    fEl.classList.remove("unset", "stale");
-    if (!focus) { fEl.hidden = true; return; }  // no live-context source → no line, no affordance
-    fEl.hidden = false;
-    if (!focus.text) {
-      fEl.classList.add("unset");
-      fEl.appendChild(el("span", "ftext", "no focus set"));
-    } else {
-      fEl.appendChild(el("span", "ftext", focus.text));
-      if (focus.freshness === "unknown") {
-        // age can't be established (missing/unparseable/future stamp) — say so, dimmed;
-        // unknown ≠ fresh, so it must NOT render like a current focus.
-        fEl.appendChild(el("span", "fage", "· age unknown"));
-        fEl.classList.add("stale");
-      } else if (focus.age_label) {
-        fEl.appendChild(el("span", "fage",
-          focus.age_label + (focus.stale ? " · still live?" : "")));
-        if (focus.stale) fEl.classList.add("stale");
-      }
-    }
-    // Class-A inline edit affordance (commit-gated) — set/edit "what I'm on now" IN the
-    // cockpit, not only via `levain focus` / the app. A read-only port shows none (NO THEATER).
-    wireFocusEdit(fEl, focus);
-  }
-
   // The starter jar (masthead): rise level = today's episodes against the entity's own typical
   // day (view.jar, counts from its store); a typical day sits at the dashed mark. A bubble
   // rises for each episode that arrived since the LAST render of the same day, so a bubble is
@@ -220,17 +177,17 @@
     j.appendChild(el("span", "jar-label", jar.status === "ok" ? jar.label : jar.label + " (empty)"));
   }
 
-  // The masthead state line: the optional freeform "how I am" line beside the focus.
+  // The masthead state line: the optional freeform "what's going on" line.
   // `state` is view.state ({text:null} when unset OR expired: the server already dropped
   // an expired one, so nothing here re-derives age). Verbatim text via textContent, age
   // beside it, never interpreted. null/absent -> no live-context source -> hidden.
   function renderState(state) {
     const sEl = document.getElementById("state");
     if (!sEl) return;
-    const openEditor = sEl.querySelector(".focus-editor");
+    const openEditor = sEl.querySelector(".state-editor");
     if (openEditor && openEditor.dataset.saving !== "1") return;
     sEl.replaceChildren();
-    sEl.classList.remove("unset", "stale");
+    sEl.classList.remove("unset");
     if (!state) { sEl.hidden = true; return; }
     sEl.hidden = false;
     if (!state.text) {
@@ -242,12 +199,12 @@
     }
     if (!commit) return;
     const has = !!(state && state.text);
-    const btn = el("button", "focus-edit", has ? "edit" : "set");
+    const btn = el("button", "state-edit", has ? "edit" : "set");
     btn.type = "button";
     btn.title = has ? "edit your state" : "set your state";
     btn.setAttribute("aria-label", has ? "edit state" : "set state");
-    btn.addEventListener("click", () => enterFocusEdit(sEl, state, btn, {
-      kind: "operator_state", placeholder: "how you are right now, in your words; blank to clear",
+    btn.addEventListener("click", () => enterStateEdit(sEl, state, btn, {
+      kind: "operator_state", placeholder: "what's going on, in your words; blank to clear",
     }));
     sEl.appendChild(btn);
   }
@@ -282,10 +239,10 @@
     if (entityEl) {
       const stem = (paths.episodic_db ? String(paths.episodic_db).split("/").pop() : "") || "substrate";
       // A rename editor open in the masthead (spore-280 — the pre-existing twin of the 247
-      // focus stranding). Unlike renderFocus (which replaceChildren-rebuilds #focus and so
+      // state-line stranding). Unlike renderState (which replaceChildren-rebuilds #state and so
       // tears its editor down for free), the entity name toggles #entity's display + hangs a
       // sibling .name-editor on .unit — so the teardown must be EXPLICIT here or a successful
-      // rename strands the editor frozen with #entity hidden behind it. Mirrors renderFocus's
+      // rename strands the editor frozen with #entity hidden behind it. Mirrors renderState's
       // data-saving exception: a passive render that slipped past the hasUnsavedEdit gate must
       // NOT tear a still-being-typed editor down (that drops the half-typed name) — skip the
       // rebuild and leave it intact. The authoritative SAVE render marks the editor
@@ -326,12 +283,9 @@
       const md = document.querySelector(".brand .model");
       if (md) md.textContent = view.brand_model;
     }
-    // The operator's live focus — their OWN declared "what I'm on", reflected back
-    // (pure-echo: no machine interpretation, so no "does this match?" loop-close
-    // needed — it IS their read). Hidden when there's no live-context source; "no
-    // focus set" when present-but-empty; freshness-stamped, a stale focus flagged so
-    // the operator can re-confirm (operator-reports-first — a nudge, not a verdict).
-    renderFocus(view.focus);
+    // The operator's state line: their OWN words, reflected back verbatim (no machine
+    // interpretation). Hidden when there is no live-context source; "no state set"
+    // when present-but-empty; an expired line arrives already dropped by the server.
     renderState(view.state);
     renderJar(view.jar);
     // Drive the living-rings vital-signs from substrate health: write-path LIVE →
@@ -2283,7 +2237,7 @@
       msg.className = "edit-msg busy"; msg.textContent = "saving…";
       // Mark the editor "saving" so the SUCCESS reload's render() tears it down + restores the
       // entity line to the committed name, instead of the (passive-defer) guard leaving it
-      // stranded frozen on "saving…" (spore-280 — the twin of the 247 focus stranding). A
+      // stranded frozen on "saving…" (spore-280 — the twin of the 247 state-line stranding). A
       // passive reload defers via hasUnsavedEdit(".name-editor"); only this save's passive:false
       // reload rebuilds #entity.
       editor.dataset.saving = "1";
@@ -2305,29 +2259,18 @@
     });
   }
 
-  // The masthead focus line's Class-A inline edit (commit-gated). The operator sets
-  // "what I'm on now" IN the cockpit — a SECOND set-path alongside `levain focus` / the
-  // companion app (last-writer-wins). Mirrors wireEntityName: a small control swaps the
-  // line for an input; save → POST /edit {kind:"focus"}; a blank value CLEARS it. A
+  // The masthead state line's Class-A inline edit (commit-gated). The operator sets
+  // "what's going on" IN the cockpit, a second set-path alongside `levain state`
+  // (last-writer-wins). Mirrors wireEntityName: a small control swaps the line for an
+  // input; save -> POST /edit {kind:"operator_state"}; a blank value CLEARS it. A
   // read-only port (no commit) shows no affordance.
-  function wireFocusEdit(fEl, focus) {
-    if (!commit) return;
-    const has = !!(focus && focus.text);
-    const btn = el("button", "focus-edit", has ? "edit" : "set");
-    btn.type = "button";
-    btn.title = has ? "edit your focus" : "set your focus";
-    btn.setAttribute("aria-label", has ? "edit focus" : "set focus");
-    btn.addEventListener("click", () => enterFocusEdit(fEl, focus, btn));
-    fEl.appendChild(btn);
-  }
-
-  function enterFocusEdit(fEl, focus, btn, opts) {
-    const kind = (opts && opts.kind) || "focus";
-    const current = (focus && focus.text) || "";
-    const editor = el("div", "focus-editor");
-    const input = el("input", "focus-input");
+  function enterStateEdit(fEl, state, btn, opts) {
+    const kind = (opts && opts.kind) || "operator_state";
+    const current = (state && state.text) || "";
+    const editor = el("div", "state-editor");
+    const input = el("input", "state-input");
     input.type = "text"; input.value = current; input.maxLength = 500;
-    input.placeholder = (opts && opts.placeholder) || "what you're on now — blank to clear";
+    input.placeholder = (opts && opts.placeholder) || "what's going on, in your words; blank to clear";
     const save = el("button", "edit-save", "save");
     const cancel = el("button", "edit-cancel", "cancel");
     save.type = "button"; cancel.type = "button";
@@ -2346,17 +2289,17 @@
     const doSave = async () => {
       save.disabled = true; cancel.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "saving…";
-      // Mark the editor "saving" so the SUCCESS reload's renderFocus rebuilds PAST the
-      // in-progress guard (replacing this editor with the committed focus) instead of
+      // Mark the editor "saving" so the SUCCESS reload's renderState rebuilds PAST the
+      // in-progress guard (replacing this editor with the committed line) instead of
       // bailing and stranding it frozen on "saving…" (the L1 + codex/complement/nemotron
       // L3 HIGH, reproduced end-to-end).
       editor.dataset.saving = "1";
-      // No `expected`/optimistic lock: focus is live-state, last-writer-wins (a foreign
+      // No `expected`/optimistic lock: the state line is live-state, last-writer-wins (a foreign
       // sensor writer may have touched the file — an optimistic lock would false-409). A
-      // blank value clears (the server reads an empty focus as unset). `source` is omitted
+      // blank value clears (the server reads an empty line as unset). `source` is omitted
       // → the server stamps "web" (the honest HTTP default; a client shouldn't self-declare).
       const res = await commit({ kind, text: input.value });
-      if (res && res.ok) return;  // reloaded — the save render rebuilt #focus, removing this editor
+      if (res && res.ok) return;  // reloaded — the save render rebuilt #state, removing this editor
       delete editor.dataset.saving;  // save FAILED: re-arm the guard so passive reloads defer again
       msg.className = "edit-msg err";
       msg.textContent = (res && (res.message || res.error)) || "save failed";
@@ -2629,7 +2572,7 @@
   //   (the masthead rename `.name-editor` USED to be excluded here — it survives a board
   //   rebuild since it lives outside `#board` — but render() now TEARS a data-saving editor
   //   down to close the rename, so a passive reload firing mid-save could strip it early and
-  //   flash the OLD name; it is gated below with `.focus-editor`, spore-280.)
+  //   flash the OLD name; it is gated below with `.state-editor`, spore-280.)
   // Fails SAFE: a missing `data-orig` reads as dirty → defers a harmless passive re-read
   // rather than risking data loss (the boot shim's editInProgress fails closed the same way).
   function hasUnsavedEdit() {
@@ -2637,11 +2580,11 @@
     // discard the polling box + its pending result mid-consult (the job keeps running server-side,
     // but the operator loses the handle). Defer the rebuild until the poll terminates.
     if (_activeJobs.size > 0) return true;
-    // An open masthead focus editor is unsaved work — a passive reload must defer (not
-    // rebuild #focus out from under the half-typed input). The authoritative SAVE reload
+    // An open masthead state editor is unsaved work — a passive reload must defer (not
+    // rebuild #state out from under the half-typed input). The authoritative SAVE reload
     // is passive:false, so it is NOT gated here and still refreshes (see load() in the boot
-    // layer + the renderFocus data-saving exception).
-    if (document.querySelector(".focus-editor")) return true;
+    // layer + the renderState data-saving exception).
+    if (document.querySelector(".state-editor")) return true;
     // An open masthead RENAME editor is unsaved work too, and for the same reason render()
     // now tears a saving one down: a passive reload must defer or it could strip the editor
     // mid-save and flash the old name (or drop the half-typed one). The authoritative SAVE

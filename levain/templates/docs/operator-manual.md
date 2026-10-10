@@ -67,19 +67,19 @@ Three things follow, and they're the whole discipline:
 
 The rule underneath: work freely, wrap at the end.
 
-## 5. Dropping things in — the Tray, the Keep, and focus
+## 5. Dropping things in — the Tray, the Keep, and your state line
 
 Three ways to hand something to your partner outside the flow of conversation:
 
 - **The Tray** is where you offload things you don't want to lose — a stray thought, a "deal with this later," a prompt to pick up next session. You don't file it; you drop it and the partner sorts it into wherever it belongs — a task, a question, a thread to revisit. The point is that you never categorize anything.
 - **The Keep** is durable reference — the command you always forget, a standing note, context that stays true. It persists until you remove it, and the partner hands the right note back the moment it's relevant.
-- **`focus`** is the one-line "what I'm on right now" that travels across sessions. Set it — `levain focus "shipping the Q3 audit"` — and every session opens knowing your current thread. Clear it when you move on.
+- **The state line** is one freeform line, in your own words, of what's going on right now — "shipping the Q3 audit", "wiped, keep it light". Set it with `levain state "shipping the Q3 audit"` (or from the cockpit); every session opens with it, and the cockpit shows it under the masthead. It's never parsed, scored or used to limit what your partner does. It disappears on its own after 12 hours, so a stale line never passes for current; `levain state` shows it, `levain state --clear` removes it.
 
 You don't need a command for the Tray or the Keep: you just tell the partner in the conversation. "Hold this for later" drops something in the Tray; "keep this handy" puts it in the Keep; it sorts and files from there. (If you'd rather manage them directly — reorder, edit, clear — the `serve --write` cockpit in §9 lets you.)
 
 The Tray is the thing that lets you stay in flow. Mid-task, a thought lands that has nothing to do with what you're on — a different thread to circle back to, a config to check later, an idea worth keeping. The old habit is to either chase it and lose your thread, or trust yourself to remember and don't. You offload it in one line, almost mid-sentence, and it's gone from your head but not lost. After a week of it, the background hum of "don't forget to…" quiets down, because the system is holding the loose threads instead of your attention.
 
-The Keep replaces the scattered-notes problem — the command you look up every time, the standing fact you re-explain. Put it in the Keep once and the partner surfaces it exactly when it's relevant, instead of you digging through old messages. And `focus` has the biggest payoff for its size: set your current thread once, and you stop spending the first two minutes of each session re-establishing where you are.
+The Keep replaces the scattered-notes problem — the command you look up every time, the standing fact you re-explain. Put it in the Keep once and the partner surfaces it exactly when it's relevant, instead of you digging through old messages. And the state line has the biggest payoff for its size: say where you are once, and you stop spending the first two minutes of each session re-establishing it.
 
 ## 6. Thinking modes — shifting how the partner thinks
 
