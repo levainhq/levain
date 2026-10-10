@@ -570,7 +570,10 @@ def apply_init(
     fresh inits could both pass it and the second would overwrite the first's seeds with
     no authorization and no backup (codex L3 on 19811f7, reproduced). Raises
     :class:`InstallTargetTaken` before writing anything."""
-    with install_lock(install):
+    with install_lock(install), (
+            codex_home_lock(_codex_home()) if chosen == "codex" else contextlib.nullcontext()):
+        # The CODEX_HOME lock is taken here, before the first write, so a refusal still
+        # means nothing was written; _install_codex takes it again (a nested no-op).
         if require_empty and not _is_safe_install_target_locked(install):
             raise InstallTargetTaken(
                 f"{install} is no longer empty: something was written there while this "
@@ -1265,12 +1268,67 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
     refresh. A second ``flock`` on a fresh fd would refuse even its own process,
     because a BSD ``flock`` belongs to the open file, not the process. Without
     ``fcntl`` (Windows) there is no lock and this yields unguarded."""
+    path = install.joinpath(*INSTALL_LOCK_REL)
+
+    def precheck() -> None:
+        if not create and not path.parent.is_dir():
+            # `update` / `adopt-answers` on a path that is not an install must not leave a
+            # .levain/ behind, which would make a later `init` there refuse a non-empty dir.
+            raise InstallLockError(
+                f"{install} is not a levain install (no .levain/ directory).")
+
+    with _single_writer_lock(
+        path, precheck=precheck, what="the install lock", guards="a concurrent init/update",
+        busy=lambda: InstallBusy(
+            f"another levain process (an `init` or `update`) is writing {install} "
+            f"right now. This run installed nothing; re-run once that one has finished."),
+    ):
+        yield
+
+
+class CodexHomeBusy(InstallLockError):
+    """Another levain process is writing CODEX_HOME's config.toml / hooks.json right now;
+    nothing was written."""
+
+
+CODEX_HOME_LOCK_NAME = "levain.lock"
+
+
+@contextmanager
+def codex_home_lock(codex_home: Path) -> Iterator[None]:
+    """Hold the CODEX_HOME-wide single-writer lock (``<CODEX_HOME>/levain.lock``) across
+    reading and writing codex's two machine-global files, config.toml and hooks.json.
+
+    The per-install lock cannot cover them: two ``levain init --adapter codex`` runs from
+    DIFFERENT installs hold different install locks, and interleaved between the two
+    writes they left config.toml registering one install's store and hooks.json firing
+    the other's hooks, both exiting 0 (codex L3 r2 2026-10-10; reproduced 2/20 pairs
+    through the CLI). Taken after the install lock, never before, so two levain processes
+    cannot wait on each other. Same semantics as :func:`install_lock`."""
+    with _single_writer_lock(
+        codex_home / CODEX_HOME_LOCK_NAME, what="the CODEX_HOME lock",
+        guards="a concurrent codex init/update from another install",
+        busy=lambda: CodexHomeBusy(
+            f"another levain process (an `init` or `update` of a codex install) is "
+            f"writing {codex_home} right now. This run installed nothing; re-run once "
+            f"that one has finished."),
+    ):
+        yield
+
+
+@contextmanager
+def _single_writer_lock(
+    path: Path, *, what: str, guards: str, busy: Callable[[], InstallLockError],
+    precheck: Callable[[], None] | None = None,
+) -> Iterator[None]:
+    """An exclusive non-blocking ``flock`` on ``path``, reentrant per (path, thread); the
+    body of :func:`install_lock` and :func:`codex_home_lock`."""
     try:
         import fcntl
     except ImportError:
         yield
         return
-    key = (install.resolve(), threading.get_ident())
+    key = (path.resolve(), threading.get_ident())
     with _held_install_locks_guard:
         if key in _held_install_locks:
             _held_install_locks[key] += 1
@@ -1286,18 +1344,16 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
         return
     import errno
 
-    path = install.joinpath(*INSTALL_LOCK_REL)
-    if not create and not path.parent.is_dir():
-        # `update` / `adopt-answers` on a path that is not an install must not leave a
-        # .levain/ behind, which would make a later `init` there refuse a non-empty dir.
-        raise InstallLockError(f"{install} is not a levain install (no .levain/ directory).")
+    if precheck is not None:
+        precheck()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-        _ensure_gitignored(path.parent, path.name)
+        if path.parent.name == ".levain":
+            _ensure_gitignored(path.parent, path.name)
     except OSError as e:
         raise InstallLockError(
-            f"cannot open the install lock {path} ({e.strerror or e}). Nothing was "
+            f"cannot open {what} {path} ({e.strerror or e}). Nothing was "
             f"written; fix the permissions on {path.parent} and re-run."
         ) from None
     # ENOLCK is NOT here: it also means a full lock table or lockd down, both transient,
@@ -1321,7 +1377,7 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
                 # A filesystem without lock support (NFS without lockd, some SMB/FUSE
                 # homes) is not "another process": proceed unguarded, and say so.
                 print(f"  note: this filesystem cannot lock {path} ({e.strerror or e}); "
-                      f"continuing without the guard against a concurrent init/update.",
+                      f"continuing without the guard against {guards}.",
                       file=sys.stderr)
                 os.close(fd)
                 fd = -1
@@ -1333,10 +1389,7 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
                     with _held_install_locks_guard:
                         del _held_install_locks[key]
                 return
-            raise InstallBusy(
-                f"another levain process (an `init` or `update`) is writing {install} "
-                f"right now. This run installed nothing; re-run once that one has finished."
-            ) from None
+            raise busy() from None
         with _held_install_locks_guard:
             _held_install_locks[key] = 1
         try:
@@ -1765,15 +1818,9 @@ def _install_codex(
 
     codex_home = _codex_home()
     codex_home.mkdir(parents=True, exist_ok=True)
-
-    # config.toml first: its parse refusal (`_require_toml`, judged inside the writer on the
-    # exact text written) then fires before either of codex's machine-global files changes.
-    # Holding the pair together against a concurrent writer or an I/O failure between them
-    # needs a CODEX_HOME-wide transaction: a stated open item, not a preflight (L3 r3).
-    _merge_codex_config(codex_home / "config.toml",
-                        _codex_fragment(adapter_root, python_path, install), emit=emit)
-    _write_codex_hooks(codex_home / "hooks.json",
-                       _codex_hooks_json(adapter_root, python_path, install), emit)
+    with codex_home_lock(codex_home):
+        _write_codex_pair(codex_home, _codex_fragment(adapter_root, python_path, install),
+                          _codex_hooks_json(adapter_root, python_path, install), emit)
 
     emit("  Codex adapter installed.")
 
@@ -1997,7 +2044,11 @@ def refresh_adapter(
     python_path = sys.executable
     anneal_path = manifest.resolve_anneal_bin()
     lines: list[str] = []
-    with _templates_root() as templates_root:
+    with contextlib.ExitStack() as codex_held, _templates_root() as templates_root:
+        if adapter == "codex" and apply:
+            # Across the read of hooks.json/config.toml and both writes: another install's
+            # init between them would otherwise be overwritten from a stale read.
+            codex_held.enter_context(codex_home_lock(_codex_home()))
         try:
             roster = compose_roster([templates_root, *pack_dirs])
             adapter_root = templates_root / "adapters" / adapter
@@ -2180,6 +2231,23 @@ def _put_pending(install: Path, key: str, data: bytes) -> Path:
     return target
 
 
+def _drop_pending(install: Path, key: str, lines: list[str]) -> None:
+    """Remove ``key``'s staged copy once the file is settled (current, or written by levain).
+    A copy left behind is an older release's render: adopting it later downgrades the file,
+    and the next update calls the downgrade ``keep``, because the record already holds the
+    newer hash (reproduced through `levain update` 2026-10-10)."""
+    target = install.joinpath(*PENDING_REL, *key.split("/"))
+    try:
+        target.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        lines.append(f"  note: could not remove the stale staged copy {target} ({e}); it is "
+                     f"an older version, so do not copy it over the file.")
+        return
+    lines.append(f"  {key}: its staged copy under .levain/pending/ is settled and removed.")
+
+
 def _pack_held_activation(recorded: Sequence) -> set[str]:
     """Activation paths (relative to ``activation/``) that a recorded pack has added,
     changed or removed since it was recorded. The pack reconcile surfaces these for review
@@ -2222,6 +2290,9 @@ def _refresh_activation(
     receipt, status = read_activation_receipt(install)
     if status == "ok" and all(disk(rel) == want for rel, (want, _src) in expected.items()) \
             and set(receipt or {}) <= set(expected):
+        if apply:
+            for rel in sorted(expected):
+                _drop_pending(install, f"activation/{rel}", lines)
         return
     if status in ("corrupt", "empty"):
         out.review.append("activation/")
@@ -2260,11 +2331,13 @@ def _refresh_activation(
                  "source": _sha256_stream(src)}
         if action == "keep":
             continue
+        key = f"activation/{rel}"
         if action == "current":
             if rel not in record:
                 new_receipt[rel] = entry  # a pre-receipt install gains its record
+            if apply:
+                _drop_pending(install, key, lines)
             continue
-        key = f"activation/{rel}"
         if action == "pending":
             out.review.append(key)
             if apply:
@@ -2295,6 +2368,7 @@ def _refresh_activation(
             target.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(target, want, like=src)
             new_receipt[rel] = entry
+            _drop_pending(install, key, lines)
         except OSError as e:
             out.refreshed.pop()
             out.review.append(key)
@@ -2467,6 +2541,8 @@ def _refresh_codex_config(
         return
     old_text, new_text = old_block.group(0).rstrip() + "\n", new_block.group(0).rstrip() + "\n"
     if old_text == new_text:
+        if apply:
+            _drop_pending(install, "codex-home/config.toml.anneal_memory", lines)
         return
     old_store = _codex_block_store(old_text)
     if old_store != _codex_block_store(new_text):
@@ -2502,6 +2578,7 @@ def _refresh_codex_config(
         try:
             _merge_codex_config(config, fragment, emit=lines.append)
             _record_adapter_key(install, CODEX_CONFIG_KEY, _sha256_text(new_text))
+            _drop_pending(install, "codex-home/config.toml.anneal_memory", lines)
         except (OSError, InitError) as e:
             out.refreshed.pop()
             out.review.append(CODEX_CONFIG_KEY)
@@ -2619,6 +2696,8 @@ def _refresh_adapter_files(
             continue
         if action == "current":
             new_receipt[key] = _sha256_text(want_text)
+            if apply:
+                _drop_pending(install, key, lines)
             continue
         if action == "pending":
             out.review.append(key)
@@ -2672,6 +2751,7 @@ def _refresh_adapter_files(
                 target.parent.mkdir(parents=True, exist_ok=True)
                 _atomic_write_text(target, want_text)
             new_receipt[key] = _sha256_text(want_text)
+            _drop_pending(install, key, lines)
         except OSError as e:
             out.refreshed.pop()
             out.review.append(key)
@@ -2844,7 +2924,10 @@ def _write_codex_hooks(hooks_target: Path, hooks_text: str,
         bak = _timestamped_backup_path(hooks_target)
         # `shutil.copy2` preserves perms/mtime AND is atomic-from-the-reader's-side;
         # `read_text`+`write_text` had a tiny window where Ctrl+C lost the original.
-        shutil.copy2(hooks_target, bak)
+        # A link that resolves is backed up by its target's bytes; a dangling one has no
+        # bytes, so the link itself is kept (following it raised FileNotFoundError before
+        # the write, glm L3 r3 2026-10-10, reproduced through `levain init`).
+        shutil.copy2(hooks_target, bak, follow_symlinks=hooks_target.exists())
         emit(f"  ! Existing {hooks_target} backed up to {bak}")
         emit("    (Codex is one-install-per-machine at v1 — this install now owns it.)")
     # Written beside it, fsynced, then renamed over the PATH: a failed or interrupted write
@@ -2876,6 +2959,37 @@ def _write_codex_hooks(hooks_target: Path, hooks_text: str,
             os.fsync(dfd)
         finally:
             os.close(dfd)
+
+
+def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
+                     emit: Callable[[str], None]) -> None:
+    """Write codex's two machine-global files as one unit, under :func:`codex_home_lock`
+    held by the caller. Both texts are rendered before either file is touched. config.toml
+    goes first, so its parse refusal (``_require_toml``, judged on the exact text written)
+    fires before anything changes; if hooks.json then fails, config.toml is put back to its
+    prior bytes (removed if it did not exist), so an I/O failure between the two cannot leave
+    codex registering this install's store while firing another install's hooks."""
+    config = codex_home / "config.toml"
+    try:
+        prior: bytes | None = config.read_bytes()
+    except FileNotFoundError:
+        prior = None
+    _merge_codex_config(config, fragment, emit=emit)
+    try:
+        _write_codex_hooks(codex_home / "hooks.json", hooks_text, emit)
+    except BaseException:
+        try:
+            if prior is None:
+                config.unlink(missing_ok=True)
+            else:
+                _atomic_write_bytes(config, prior)
+            emit(f"  ! {codex_home / 'hooks.json'} could not be written, so {config} was "
+                 f"put back as it was.")
+        except OSError as e:
+            emit(f"  ! {codex_home / 'hooks.json'} could not be written, AND {config} could "
+                 f"not be put back ({e}): it now registers this install's store. Re-run "
+                 f"`levain init --adapter codex` from the install codex should use.")
+        raise
 
 
 def _codex_hooks_json(adapter_root: Path, python_path: str, install: Path) -> str:

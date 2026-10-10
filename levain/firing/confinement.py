@@ -4805,6 +4805,15 @@ def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         ) from exc
 
 
+#: Step (7b) of :func:`_bwrap_plan_impl`: directories of root daemons that resolve or fetch a name
+#: on the network for whoever connects (the system D-Bus, which carries systemd-resolved and avahi;
+#: resolved's varlink; nscd; avahi's own socket), hidden whole; and the deputy sockets that sit in
+#: the shared /run itself (snapd), masked. The list R1 measured as deputies (levain
+#: project_memory/1009-s2-linux/R1_RESULT.md); the abstract-socket row is closed by --unshare-net.
+_RESOLVER_DEPUTY_DIRS = ("/run/dbus", "/run/systemd/resolve", "/run/nscd", "/run/avahi-daemon")
+_RESOLVER_DEPUTY_SOCKETS = ("/run/snapd.socket", "/run/snapd-snap.socket")
+
+
 def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     """THE single source of the bwrap invocation, as ``(argv, dirs_to_create_first)``. :meth:`BwrapProvider.render_profile` renders this
     list as text and :meth:`BwrapProvider.spawn_shell` executes it — deliberately ONE computation
@@ -5319,6 +5328,30 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if _reachable(bus) and bus.exists():
             masks.append(str(bus))
 
+    # (7b) THE HOST'S NAME-RESOLVER DEPUTIES, WHENEVER BASH HAS NO IP NETWORK. ``--unshare-net``
+    # removes bash's own sockets from the network, but a root daemon reached over a unix socket
+    # resolves (and so sends on the wire) whatever name bash hands it, and the name can carry data
+    # out. MEASURED 2026-10-10 on argushub (Ubuntu, systemd-resolved) with the 0.7.0 wheel: in the
+    # operator-floor bash, `resolvectl query` of a fresh name over the system bus answered "Data
+    # from: network". The hands view never sees them (its /run is empty; R1, 2026-10-09: D-Bus,
+    # varlink, avahi, snapd and nscd closed). So each such daemon's own directory gets a read-only
+    # tmpfs (the form that holds across a daemon restart, step (6)), and a socket that sits directly
+    # in the shared /run gets the file mask. Cost: in offline bash, `systemctl` and `busctl` on the
+    # system bus, `resolvectl`, `snap` and the nscd cache are gone. A daemon whose directory is
+    # absent at spawn is not hidden, the residual step (6) states for its own dirs.
+    if policy.deny_localhost_outbound:
+        for d in _RESOLVER_DEPUTY_DIRS:
+            real = Path(d).resolve()
+            if not _reachable(real) or not real.is_dir() or real in hidden_dirs:
+                continue
+            argv += ["--tmpfs", str(real)]
+            remount_ro.append(str(real))
+            hidden_dirs.append(real)
+        for f in _RESOLVER_DEPUTY_SOCKETS:
+            real = Path(f).resolve()
+            if _reachable(real) and real.exists():
+                masks.append(str(real))
+
     # (8) ANY OTHER procfs MOUNT. ``--bind / /`` is recursive, so a procfs mounted elsewhere on the
     # host (a container runtime's, a chroot's) would still show the host's processes after
     # ``--unshare-pid``. Each is hidden by a read-only tmpfs. Read from this process's own
@@ -5815,7 +5848,7 @@ NETNS_REFUSAL = (
 #: twice; the ControlMaster class is spore-1005).
 OFFLINE_RESIDUAL = (
     "bash keeps only its own isolated loopback. NOT blocked: a unix socket at a file path the floor "
-    "does not deny (an ssh ControlMaster or a proxy socket in /tmp, D-Bus, X11), which can reach "
+    "does not deny (an ssh ControlMaster or a proxy socket in /tmp, X11), which can reach "
     "this host's services and so bypass the block (spore-1005); and inside a VM, AF_VSOCK to the "
     "hypervisor"
 )

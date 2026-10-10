@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import shlex
 from pathlib import Path
 
@@ -805,3 +807,88 @@ def test_an_interrupted_codex_hooks_write_leaves_the_old_file(tmp_path, monkeypa
     finally:
         os.umask(old_umask)
     assert fresh.stat().st_mode & 0o077 == 0
+
+
+def test_init_over_a_dangling_hooks_json_symlink_writes_the_file(make_install, tmp_path):
+    # glm L3 r3 HIGH 2026-10-10, reproduced through `levain init`: the backup followed the
+    # missing link and raised FileNotFoundError after config.toml was already written.
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    hooks = codex_home / "hooks.json"
+    hooks.symlink_to(tmp_path / "nowhere" / "hooks.json")
+    install = make_install("codex")  # asserts init exits 0
+    assert hooks.is_file() and not hooks.is_symlink()
+    assert str(install) in hooks.read_text()
+    (bak,) = codex_home.glob("hooks.json.bak.*")
+    assert bak.is_symlink() and os.readlink(bak) == str(tmp_path / "nowhere" / "hooks.json")
+
+
+def test_an_adopted_staged_copy_is_removed(make_install, tmp_path):
+    # Reproduced 2026-10-10 through `levain update`: the pending copy outlived its adoption,
+    # so copying it over later downgraded the file and the next update called that "keep".
+    install = make_install("codex")
+    hooks = tmp_path / "codex-home" / "hooks.json"
+    current = hooks.read_text()
+    hooks.write_text(current.replace('"timeout": 30', '"timeout": 45'))  # an operator edit
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
+    data = json.loads(receipt.read_text())
+    data["files"]["codex-home/hooks.json"] = _sha(b"an older release's render")
+    receipt.write_text(json.dumps(data))
+    staged = install / ".levain" / "pending" / "codex-home" / "hooks.json"
+    r, _out = _refresh(install)
+    assert staged.read_text() == current and r.review
+    hooks.write_text(staged.read_text())  # the operator adopts it
+    r, out = _refresh(install)
+    assert not r.review and not staged.exists() and "settled and removed" in out
+
+
+@pytest.mark.parametrize("through_link", [False, True])
+def test_a_refreshed_hooks_json_keeps_its_mode(make_install, tmp_path, through_link):
+    # complement L3 r3 LOW: deleting the fchmod branch left the suite green.
+    install = make_install("codex")
+    hooks = tmp_path / "codex-home" / "hooks.json"
+    current = hooks.read_text()
+    older = current.replace('"timeout": 30', '"timeout": 31')
+    real = hooks
+    if through_link:
+        real = tmp_path / "dotfiles" / "hooks.json"
+        real.parent.mkdir()
+        hooks.unlink()
+        hooks.symlink_to(real)
+    real.write_text(older)
+    real.chmod(0o640)
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
+    data = json.loads(receipt.read_text())
+    data["files"]["codex-home/hooks.json"] = _sha(older.encode())
+    receipt.write_text(json.dumps(data))
+    r, _out = _refresh(install)
+    assert str(hooks) in r.refreshed and hooks.read_text() == current
+    assert stat.S_IMODE(hooks.stat().st_mode) == 0o640
+
+
+def test_codex_home_is_one_writer_across_installs(make_install, tmp_path, capsys):
+    # codex L3 r2 HIGH 2026-10-10, reproduced 2/20 pairs through the CLI: two installs'
+    # inits interleaved, leaving config.toml on one store and hooks.json on the other.
+    import fcntl
+
+    from levain.install import CODEX_HOME_LOCK_NAME
+    from levain.update import run_update
+    from tests.test_init_answers import _filled
+
+    first = make_install("codex", name="first")
+    codex_home = tmp_path / "codex-home"
+    before = {p.name: p.read_bytes() for p in codex_home.iterdir() if p.is_file()}
+    af = tmp_path / "second-answers.json"
+    af.write_text(json.dumps(_filled(capsys)), encoding="utf-8")
+    fd = os.open(codex_home / CODEX_HOME_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # another install's init, mid-write
+    lines: list[str] = []
+    try:
+        assert run_init(tmp_path / "second", "codex", force=False, answers_file=af) == 1
+        assert run_update(first, no_pip=True, emit=lines.append) == 1
+    finally:
+        os.close(fd)
+    assert "writing " + str(codex_home) in capsys.readouterr().out
+    assert any(str(codex_home) in ln for ln in lines)
+    assert {p.name: p.read_bytes() for p in codex_home.iterdir() if p.is_file()} == before
+    assert not (tmp_path / "second" / "seed").exists()

@@ -1919,6 +1919,31 @@ def test_bwrap_enforces_the_localhost_deny_by_removing_the_network(tmp_path, mon
     assert "--unshare-net" in on and "--unshare-net" not in off
 
 
+def test_offline_bash_cannot_reach_the_hosts_resolver_deputies(tmp_path, monkeypatch) -> None:
+    """MEASURED 2026-10-10 on argushub with 0.7.0: in the operator-floor (offline) bash, `resolvectl
+    query` of a fresh name over the system D-Bus was answered from the network. Each resolver
+    daemon's directory gets a read-only tmpfs and a deputy socket in the shared /run a mask; a
+    networked bash (the operator's opt-out) can resolve directly, so nothing is hidden there."""
+    from levain.firing import confinement as _conf
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    run = tmp_path / "run"
+    (run / "dbus").mkdir(parents=True)
+    (run / "dbus" / "system_bus_socket").touch()
+    (run / "snapd.socket").touch()
+    monkeypatch.setattr(_conf, "_RESOLVER_DEPUTY_DIRS", (str(run / "dbus"), str(run / "absent")))
+    monkeypatch.setattr(_conf, "_RESOLVER_DEPUTY_SOCKETS",
+                        (str(run / "snapd.socket"), str(run / "snapd-snap.socket")))
+    on = _bwrap_argv(build_policy(_entity(tmp_path, "on"), deny_localhost_outbound=True))
+    off = _bwrap_argv(build_policy(_entity(tmp_path, "off"), deny_localhost_outbound=False))
+    dbus, snapd = str((run / "dbus").resolve()), str((run / "snapd.socket").resolve())
+    assert _tmpfs_then_ro(on, dbus)
+    assert any(on[k:k + 3] == ["--ro-bind", "/dev/null", snapd] for k in range(len(on)))
+    assert str(run / "absent") not in " ".join(on)  # a mount on an absent root dir aborts bwrap
+    assert dbus not in off and snapd not in off
+
+
 def _tmpfs_then_ro(argv: list[str], d: str) -> bool:
     """A read-only tmpfs over ``d``: mounted, then remounted read-only LATER (remounts are deferred to
     the end of the argv so mountpoints inside the tmpfs can still be created)."""
