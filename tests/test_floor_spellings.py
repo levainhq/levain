@@ -180,6 +180,21 @@ def test_a_placeholder_is_removed_when_its_only_session_releases_it(home: Path) 
     assert C.live_floor_placeholders() == []
 
 
+def test_a_release_whose_commit_fails_is_not_confirmed(home: Path) -> None:
+    """L3 r11, RUN on w27: the ledger read but its commit failed (its .tmp path a directory), and the
+    release still counted as confirmed, so the shell let go of a claim the ledger still held."""
+    f = home / ".netrc"
+    C._prepare_mountpoints({str(f): "file"})
+    C._ledger_enter([(str(f), "file")], {str(f)}, "1:a")
+    tmp = C._ledger_dir() / (C._LEDGER_NAME + ".tmp")
+    tmp.mkdir()
+    assert C._ledger_release("1:a") is None
+    assert [str(p) for p in C.live_floor_placeholders()] == [str(f)]
+    tmp.rmdir()
+    assert C._ledger_release("1:a") is not None
+    assert C.live_floor_placeholders() == []
+
+
 def test_a_placeholder_another_session_claims_survives_the_first_close(home: Path) -> None:
     f = home / ".netrc"
     C._prepare_mountpoints({str(f): "file"})
