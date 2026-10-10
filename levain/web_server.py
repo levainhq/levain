@@ -277,7 +277,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/job.json",
     "/edit",
     "/action",
-    "/cockpit/manifest.json",
+    "/cockpit/manifest.json", "/cockpit/freshness.json",
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 
 

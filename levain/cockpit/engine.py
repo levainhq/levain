@@ -227,6 +227,8 @@ class Cockpit:
                     f"{sid}: stale_after_s ({spec.stale_after_s}) must be <= 2 x refresh_every_s "
                     f"({spec.refresh_every_s})"
                 )
+        if spec.edit_class not in ("", "A", "B", "C"):
+            raise CockpitRegistrationError(f"{sid}: edit_class must be '', 'A', 'B' or 'C', got {spec.edit_class!r}")
         for f in spec.facets:
             if f not in FACETS:
                 raise CockpitRegistrationError(f"{sid}: unregistered facet {f!r}")
@@ -260,6 +262,8 @@ class Cockpit:
     def start(self) -> None:
         """Take the first read of every refresher panel, then start its refresher thread."""
         with self._life:
+            for pid in [p for p, r in self._refreshers.items() if not r.thread.is_alive()]:
+                del self._refreshers[pid]    # a halted refresher that has since died is restartable
             for spec in list(self._specs.values()):
                 if spec.refresh_every_s is None or spec.id in self._refreshers:
                     continue
@@ -362,7 +366,10 @@ class Cockpit:
     def _snap_for(self, spec: ProviderSpec, ctx: ReadContext) -> _Snap:
         st = self._state[spec.id]
         if spec.refresh_every_s is None:
-            return self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
+            snap = self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
+            with st.lock:
+                st.snap = snap       # what the freshness route reports; it never reads a source itself
+            return snap
         with st.lock:
             snap, last, started, running = st.snap, st.last_completion, st.started, st.refresh_started
         if snap is None:
@@ -741,21 +748,32 @@ class Cockpit:
         }
 
     def freshness(self) -> dict[str, dict[str, Any]]:
-        """``{panel_id: {as_of, status}}`` for every panel, ``now`` included (design §3.4). A client
-        that got a 304 on a panel reads the panel's current age here. It carries no rows and no
-        etag, and the route never answers it 304."""
+        """``{panel_id: {as_of, status}}`` for every registered panel, ``now`` included (design §3.4).
+        A client that got a 304 on a panel reads the panel's current age here. It is metadata only:
+        it runs NO provider. A refresher panel reports its cached snapshot (with the liveness and
+        aging rules); an on-demand panel reports its last served read, and ``status: "unread"`` with
+        ``as_of: null`` before it has been read once. No rows, no etag, never 304."""
         ctx = ReadContext(self._clock())
-        self._ensure_discovered(ctx)
-        specs_map = self._specs
-        snaps: dict[str, _Snap] = {}
         out: dict[str, dict[str, Any]] = {}
-        for spec in self._ordered_specs(specs_map):
-            snaps[spec.id] = self._snap_for(spec, ctx)
-        now_head, _ = self._now_head_and_rows(ctx, "none", specs_map, snaps)
-        out[NOW_ID] = {"as_of": now_head["as_of"], "status": now_head["status"]}
-        for spec in self._ordered_specs(specs_map):
-            out[spec.id] = {"as_of": snaps[spec.id].as_of, "status": snaps[spec.id].status}
-        return out
+        gate: list[tuple[str, str | None]] = []
+        for spec in self._ordered_specs(self._specs):
+            if spec.refresh_every_s is not None:
+                snap = self._snap_for(spec, ctx)
+            else:
+                with self._state[spec.id].lock:
+                    snap = self._state[spec.id].snap
+            out[spec.id] = {"as_of": snap.as_of, "status": snap.status} if snap else {"as_of": None, "status": "unread"}
+            if spec.priority == "gate" and spec.kind == "triage-list":
+                gate.append((out[spec.id]["status"], out[spec.id]["as_of"]))
+        worst = "ok"
+        for status, _a in gate:
+            if status == "unread":
+                worst = "unread"
+                break
+            if _STATUS_RANK[status] > _STATUS_RANK[worst]:
+                worst = status
+        as_ofs = [a for _s, a in gate if a]
+        return {NOW_ID: {"as_of": min(as_ofs) if as_ofs and worst != "unread" else None, "status": worst}, **out}
 
     def panel(self, panel_id: str, *, profile: str = "full", q: str | None = None,
               row: str | None = None, credential_class: str = "none") -> dict[str, Any] | None:

@@ -1006,8 +1006,8 @@ class TestSession2Freshness:
 
     def test_freshness_names_every_panel_with_as_of_and_status_only(self, env) -> None:
         _r, _s, ck = env
+        man = ck.manifest(NONE_CRED)          # reading the panels is what gives freshness something to report
         fr = ck.freshness()
-        man = ck.manifest(NONE_CRED)
         assert set(fr) == set(man["panels"])
         assert all(set(v) == {"as_of", "status"} for v in fr.values())
         assert fr["tray"]["status"] == man["panels"]["tray"]["status"]
@@ -1015,7 +1015,34 @@ class TestSession2Freshness:
     def test_freshness_reads_error_for_a_failing_panel(self, env) -> None:
         root, _s, ck = env
         (root / ".levain" / "memory.spores.json").unlink()
+        ck.manifest(NONE_CRED)
         assert ck.freshness()["tray"]["status"] == "error"
+
+    def test_freshness_runs_no_provider_and_reads_unread_before_a_first_read(self, tmp_path: Path) -> None:
+        _root, src = _install(tmp_path)
+        ck = build_default_cockpit(src)
+        calls = []
+
+        def counting(ctx):
+            calls.append(1)
+            return Read(rows=())
+        ck.register(_simple("probe", read=counting) if False else ProviderSpec(
+            id="probe", kind="triage-list", title="p", priority="gate", read=counting, order="time.desc",
+            facets=frozenset({"at"}), version_fields=("id",)))
+        fr = ck.freshness()
+        assert calls == [] and fr["probe"] == {"as_of": None, "status": "unread"}
+        assert fr[NOW_ID]["status"] == "unread"
+        ck.panel("probe")
+        assert calls == [1] and ck.freshness()["probe"]["status"] == "empty"
+        assert len(calls) == 1
+
+    def test_registration_refuses_a_bad_edit_class_and_a_downstream_freshness_route(self, tmp_path: Path) -> None:
+        _root, src = _install(tmp_path)
+        ck = Cockpit()
+        with pytest.raises(CockpitRegistrationError, match="edit_class"):
+            ck.register(_simple("x", edit_class="A "))
+        with pytest.raises(ValueError, match="collides"):
+            make_server(src, host="127.0.0.1", port=0, extra_json={"/cockpit/freshness.json": lambda: b"{}"})
 
 
 class TestSession2Gaps:
