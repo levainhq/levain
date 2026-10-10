@@ -415,20 +415,72 @@ def test_an_abandoned_answer_never_reaches_the_reuse_while_a_newer_flight_runs()
 
 
 def test_every_reader_of_an_abandoned_flight_gets_that_flights_own_timeout() -> None:
-    release_a = threading.Event()
     fn = _Counted()
     fn.gate.clear()
     now = [0.0]
     ext = ExternalPanels(fn, reuse_s=0, wait_s=0.2, clock=lambda: now[0])
     ext.take()                                     # A abandoned by its first reader
-    (flight_a,) = tuple(ext._parked)
+    with ext._lock:
+        (flight_a,) = tuple(ext._parked)
     fn.gate.set()                                  # a newer flight B can now answer
-    b = ext.take()
-    assert b.panels is not None
+    assert ext.take().panels is not None
     with ext._lock:                                # a second reader of A resumes after B published
         late = ext._abandon_locked(flight_a, now[0])
     assert late is flight_a.timeout and late.panels is None
-    release_a.set()
+
+
+def test_two_readers_of_one_flight_never_disagree_when_it_answers_after_its_deadline(monkeypatch) -> None:
+    # reader 2 waits on the flight; reader 1 arrives past the deadline and gets its timeout; the call then
+    # answers late and reader 2 resumes afterwards: both must hold the flight's one verdict, the timeout
+    import levain.cockpit.external as external
+    r2_waiting, release_r2 = threading.Event(), threading.Event()
+
+    class _HeldDone(threading.Event):         # only this flight's reader-2 is held; no global patch
+        def wait(self, timeout=None):
+            if threading.current_thread().name == "reader-2":
+                r2_waiting.set()
+                release_r2.wait(5)
+            return super().wait(timeout)
+
+    class _Flight(external._Flight):
+        def __init__(self, deadline: float) -> None:
+            super().__init__(deadline)
+            self.done = _HeldDone()
+    monkeypatch.setattr(external, "_Flight", _Flight)
+    fn = _Counted()
+    fn.gate.clear()
+    now = [0.0]
+    ext = ExternalPanels(fn, reuse_s=0, wait_s=0.5, clock=lambda: now[0])
+    out: dict[str, Any] = {}
+    r2 = threading.Thread(target=lambda: out.__setitem__("r2", ext.take()), name="reader-2")
+    r2.start()
+    assert r2_waiting.wait(5)
+    now[0] = 1.0                                   # past the flight's deadline
+    r1 = ext.take()                                # reader 1: the flight's timeout
+    assert r1.panels is None
+    with ext._lock:
+        (flight,) = tuple(ext._parked)
+    fn.gate.set()                                  # the late answer lands
+    assert threading.Event.wait(flight.done, 5)
+    release_r2.set()
+    r2.join(5)
+    assert not r2.is_alive()
+    assert out["r2"] is r1                         # one verdict for both readers
+
+
+def test_an_answer_that_wins_the_lock_past_the_deadline_is_a_timeout_not_published() -> None:
+    # the call answers after its deadline before any reader abandoned it: no reader and no reuse sees it
+    now = [0.0]
+
+    def fn():
+        now[0] = 1.0                               # the deadline (0.5) passes while the call runs
+        return _panels()
+    ext = ExternalPanels(fn, reuse_s=10, wait_s=0.5, clock=lambda: now[0])
+    got = ext.take()
+    assert got.panels is None and "did not answer" in (got.error or "")
+    assert ext._last is not None and ext._last[1] is got
+    assert ext.take() is got                       # the reuse holds the timeout, not the late answer
+    assert not ext._parked                         # the finished flight parks no thread
 
 
 def test_absent_or_null_lines_are_no_lines_not_an_error() -> None:
