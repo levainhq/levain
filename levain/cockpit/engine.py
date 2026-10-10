@@ -165,7 +165,8 @@ class _Flight:
     wait for ``out`` and receive that same outcome. At most one is in flight per state, so commits
     happen in start order by construction. One deadline, ``started + timeout``, governs everyone."""
 
-    def __init__(self) -> None:
+    def __init__(self, timeout_s: float) -> None:
+        self.timeout_s = timeout_s       # the budget THIS flight was started with: owner, joiners and messages use it
         self.raw: Future = Future()      # the provider's (normalised) outcome, set by the read thread
         self.out: Future = Future()      # what the owner committed, set once the owner is done
         self.started = time.monotonic()
@@ -327,20 +328,20 @@ class Cockpit:
         with st.lock:
             fl = st.pflight
             if fl is None:
-                fl = st.pflight = _Flight()
+                fl = st.pflight = _Flight(timeout_s)
                 if on_start:
                     on_start()
                 owner = True
             elif not fl.committed:
                 owner = False
-                wait = max(0.0, fl.started + timeout_s + PROCESS_GRACE_S - time.monotonic())
+                wait = max(0.0, fl.started + fl.timeout_s + PROCESS_GRACE_S - time.monotonic())
             else:
                 return refused("previous read still running past its timeout (source hung?)")
         if not owner:
             try:
                 return fl.out.result(timeout=wait)
             except FutureTimeout:
-                return refused(f"timed out waiting on the read in flight ({timeout_s:g}s budget)")
+                return refused(f"timed out waiting on the read in flight ({fl.timeout_s:g}s budget)")
 
         def work() -> None:
             out: Any = Fault("the read ended without a result")
@@ -357,13 +358,15 @@ class Cockpit:
 
         result: Any = None
         committed_ok = False
-        deadline = fl.started + timeout_s
+        deadline = fl.started + fl.timeout_s
         try:
             try:
                 threading.Thread(target=work, name="cockpit-read", daemon=True).start()
-            except Exception as exc:  # noqa: BLE001 - thread exhaustion fails THIS read and poisons nothing
+            except BaseException as exc:  # noqa: BLE001 - a failed start fails THIS read and poisons nothing
                 fl.finished = time.monotonic()
                 _set_once(fl.raw, Fault(f"could not start a read: {type(exc).__name__}: {_safe_str(exc)}"))
+                if not isinstance(exc, Exception):
+                    raise                  # an interrupt is not swallowed; the finally below still ends the flight
             try:
                 raw: Any = fl.raw.result(timeout=max(0.0, deadline - time.monotonic()))
                 if fl.finished is not None and fl.finished > deadline:
@@ -371,7 +374,7 @@ class Cockpit:
             except FutureTimeout:
                 if on_timeout:
                     on_timeout()
-                raw = Fault(f"timed out after {timeout_s:g}s")
+                raw = Fault(f"timed out after {fl.timeout_s:g}s")
             try:
                 result = commit(raw)
             except Exception as exc:  # noqa: BLE001 - an outcome that cannot be committed is an error outcome
@@ -470,8 +473,10 @@ class Cockpit:
         """Provider output -> a snapshot, or the Fault/Absent it already is. Runs in the read worker:
         everything that touches provider-controlled data (rows, values) happens here, under the
         flight's deadline, never on the owner."""
-        if isinstance(res, (Fault, Absent)):
-            return res
+        if isinstance(res, Fault):
+            return Fault(_safe_str(res.message))      # engine-owned plain text: nothing provider-made reaches the owner
+        if isinstance(res, Absent):
+            return Absent(_safe_str(res.reason))
         if not isinstance(res, Read):
             return Fault(f"provider returned {type(res).__name__}, not Read/Absent/Fault")
         try:
@@ -955,7 +960,7 @@ class Cockpit:
             return Fault(f"panel {panel_id!r} offers no read_one")
         ctx = ReadContext(self._clock())
 
-        def once() -> Result:
+        def once(ctx: ReadContext) -> Result:
             res = spec.read_one(ctx, row_id)       # type: ignore[misc]
             if not isinstance(res, Read):
                 return res
@@ -968,7 +973,7 @@ class Cockpit:
                 return Read(value=rows[0])
             except Exception as exc:  # noqa: BLE001
                 return Fault(f"provider output refused: {_safe_str(exc)}")
-        return self._bounded(spec.timeout_s, None, once)
+        return self._bounded(spec.timeout_s, None, once, ctx)
 
 
 def _safe_str(exc: BaseException) -> str:

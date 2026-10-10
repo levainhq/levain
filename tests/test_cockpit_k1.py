@@ -1476,3 +1476,33 @@ class TestOneFlightOrdersByConstruction:
                                  order="time.desc", facets=frozenset({"at"}), version_fields=("id",),
                                  read_one=lambda c, rid: Read(rows=Rows())))
         assert isinstance(ck.read_one("p", "x"), Fault)
+
+    def test_a_providers_non_string_fault_text_becomes_plain_text_in_the_worker(self) -> None:
+        class Blocky:
+            def __str__(self):
+                return "plain " + "text"
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed",
+                                 read=lambda c: Fault(Blocky()), order="time.desc",   # type: ignore[arg-type]
+                                 facets=frozenset({"at"}), version_fields=("id",)))
+        p = ck.panel("p")
+        assert p["status"] == "error" and isinstance(p["error"], str) and "plain text" in p["error"]
+
+    def test_an_interrupt_during_thread_start_ends_the_flight(self, monkeypatch) -> None:
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=lambda c: Read(rows=()),
+                                 order="time.desc", facets=frozenset({"at"}), version_fields=("id",)))
+        real = threading.Thread.start
+        calls = [0]
+
+        def start(self):
+            if self.name == "cockpit-read":
+                calls[0] += 1
+                if calls[0] == 1:
+                    raise KeyboardInterrupt()
+            return real(self)
+        monkeypatch.setattr(threading.Thread, "start", start)
+        with pytest.raises(KeyboardInterrupt):
+            ck.panel("p")
+        assert ck._state["p"].pflight is None                  # not stranded
+        assert ck.panel("p")["status"] == "empty"              # and the next read works
