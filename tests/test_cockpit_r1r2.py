@@ -299,6 +299,32 @@ class TestManifestMapperBoundary:
         view = _view(snap)
         assert [e["id"] for e in view["layout"]].count("weather") == 1
 
+    def test_wire_keys_named_like_prototype_members_are_data(self) -> None:
+        ck = _tray_cockpit()
+        snap = json.loads(json.dumps(snapshot(ck)))
+        snap["panels"]["tray"]["value"] = {"alerts": {}}
+        raw = json.dumps(snap).replace('"value": {"alerts": {}}', '"value": {"__proto__": {"alerts": {}}, "metrics": []}')
+        view = _view(json.loads(raw))        # json.loads keeps "__proto__" as an own key, as a browser's JSON.parse does
+        assert [e["id"] for e in view["layout"]].count("tray") == 1
+
+    def test_a_far_future_panel_stamp_does_not_move_every_other_ages(self) -> None:
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("focus", "line", "Focus", "gauge", lambda c: Read(value={"lines": [
+            {"label": "focus", "text": "x", "at": "2099-01-01T00:00:00+00:00", "source": "s"}]}), region="header"))
+        snap = snapshot(ck)
+        snap["panels"]["tray"]["as_of"] = "2100-01-01T00:00:00+00:00"
+        view = _view(snap)
+        assert view["focus"]["freshness"] == "unknown"
+
+    def test_a_degraded_now_view_names_its_source_and_a_missing_wraps_panel_is_not_unavailable(self) -> None:
+        ck = _tray_cockpit()
+        snap = snapshot(ck)
+        snap["panels"]["now"]["degraded"] = ["tray"]
+        snap["panels"]["now"]["error"] = None
+        view = _view(snap)
+        assert view["extra_panels"]["now"]["note"] == "not complete: tray"
+        assert not view["health"] or view["health"].get("wrap_history_unavailable") in (None, False)
+
 
 def _dump_dom(url: str) -> str:
     return subprocess.run([CHROME, "--headless=new", "--dump-dom", "--virtual-time-budget=8000", "--window-size=1440,1000", url],

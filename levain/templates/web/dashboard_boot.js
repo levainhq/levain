@@ -247,7 +247,11 @@
         let res = await fetchPanel(url);
         if (res.status === 403 && await isTokenReject(res.clone())) {
           reauth = reauth || Promise.resolve().then(() => { if (promptForToken()) return true; dropToken(); return false; });
-          if (await reauth) res = await fetchPanel(url);
+          if (await reauth) {
+            res = await fetchPanel(url);
+            // the replacement token was rejected too: drop it so the next refresh asks again
+            if (res.status === 403 && await isTokenReject(res.clone())) dropToken();
+          }
         }
         if (!res.ok) throw new Error("HTTP " + res.status);
         panels[id] = await res.json();
