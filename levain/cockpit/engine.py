@@ -336,6 +336,8 @@ class Cockpit:
         grace. A caller that arrives after the owner timed out while the source thread is still hung
         fails fast through ``refused`` and commits nothing. A result that finished after the deadline
         counts as a timeout, so an owner and its joiners can never disagree about the same read."""
+        result: Any = None
+        committed_ok = False
         with st.lock:
             fl = st.pflight
             if fl is None:
@@ -354,45 +356,44 @@ class Cockpit:
             except FutureTimeout:
                 return refused(f"timed out waiting on the read in flight ({fl.timeout_s:g}s budget)")
 
-        def work() -> None:
-            out: Any = Fault("the read ended without a result")
-            try:
-                fl.go.wait()
-                if fl.cancelled:
-                    out = Fault("the read was cancelled before it started")
-                else:
-                    out = produce()
-                    if isinstance(out, Fault):            # engine-owned plain text: nothing provider-made reaches the owner
-                        out = Fault(_safe_str(out.message))
-                    elif isinstance(out, Absent):
-                        out = Absent(_safe_str(out.reason))
-            except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
-                out = Fault(f"{type(exc).__name__}: {_safe_str(exc)}")
-            finally:                      # raw ALWAYS reaches a terminal state, even for a hostile exception
-                # RACE (accepted): ``finished`` is stamped just before ``raw`` resolves, so a read that
-                # finished in time can lose the deadline race by microseconds and be reported as a
-                # timeout. The error only ever goes in the safe direction: a late result is never
-                # reported healthy.
-                fl.finished = time.monotonic()
-                _set_once(fl.raw, out)
-                with st.lock:
-                    if fl.committed and st.pflight is fl:
-                        st.pflight = None    # the owner already committed and left a hung thread behind
+        try:                               # the owner's flight ends in the finally below from here on
+            def work() -> None:
+                out: Any = Fault("the read ended without a result")
+                try:
+                    fl.go.wait()
+                    if fl.cancelled:
+                        out = Fault("the read was cancelled before it started")
+                    else:
+                        out = produce()
+                        if isinstance(out, Fault):            # engine-owned plain text: nothing provider-made reaches the owner
+                            out = Fault(_safe_str(out.message))
+                        elif isinstance(out, Absent):
+                            out = Absent(_safe_str(out.reason))
+                except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
+                    out = Fault(f"{type(exc).__name__}: {_safe_str(exc)}")
+                finally:                      # raw ALWAYS reaches a terminal state, even for a hostile exception
+                    # RACE (accepted): ``finished`` is stamped just before ``raw`` resolves, so a read that
+                    # finished in time can lose the deadline race by microseconds and be reported as a
+                    # timeout. The error only ever goes in the safe direction: a late result is never
+                    # reported healthy.
+                    fl.finished = time.monotonic()
+                    _set_once(fl.raw, out)
+                    with st.lock:
+                        if fl.committed and st.pflight is fl:
+                            st.pflight = None    # the owner already committed and left a hung thread behind
 
-        result: Any = None
-        committed_ok = False
-        deadline = fl.started + fl.timeout_s
-        try:
+            deadline = fl.started + fl.timeout_s
             try:
                 threading.Thread(target=work, name="cockpit-read", daemon=True).start()
-                fl.go.set()
             except BaseException as exc:  # noqa: BLE001 - a failed start fails THIS read and poisons nothing
                 fl.cancelled = True        # a thread that did launch before the failure exits without the provider
-                fl.go.set()
                 fl.finished = time.monotonic()
                 _set_once(fl.raw, Fault(f"could not start a read: {type(exc).__name__}: {_safe_str(exc)}"))
+                fl.go.set()
                 if not isinstance(exc, Exception):
                     raise                  # an interrupt is not swallowed; the finally below still ends the flight
+            else:                          # only a clean start lets the worker read; an interrupt from here on is a hung read
+                fl.go.set()
             try:
                 raw: Any = fl.raw.result(timeout=max(0.0, deadline - time.monotonic()))
                 if fl.finished is not None and fl.finished > deadline:
@@ -411,8 +412,9 @@ class Cockpit:
             committed_ok = True
             return result
         finally:
-            if not fl.go.is_set():         # left between a clean start and ``go`` (an interrupt): the worker must not read
+            if not fl.go.is_set():         # left before ``go`` (an interrupt): no provider runs, so the flight can end here
                 fl.cancelled = True
+                _set_once(fl.raw, Fault("the read was cancelled before it started"))
                 fl.go.set()
             with st.lock:
                 fl.committed = True
