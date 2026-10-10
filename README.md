@@ -272,12 +272,12 @@ levain serve --path ./ada --chat ./ada            # the cockpit on ada's memory,
 
 **`levain tui`** is the terminal-native peer of `serve`: read and steer without a browser or a port. `--read-only` drops to a pure inspection view.
 
-**`levain focus`** sets the one line your sessions read to orient: *what you're working on right now*. It travels across sessions like the rest of your memory.
+**`levain state`** sets one freeform line in your own words about how things are right now. Every session reads it at start and again when it changes, and the cockpit shows it verbatim with its age. It is never parsed or scored, and it expires after 12 hours.
 
 ```
-levain focus "shipping the v2 onboarding flow"   # set it
-levain focus                                       # show it + how fresh it is
-levain focus --clear                               # unset it
+levain state "wiped, keep it light"   # set it
+levain state                           # show it + how old it is
+levain state --clear                   # remove it
 ```
 
 Two of those write targets are your own inbox into the partnership. Dump anything mid-stream (a thought, a handoff, something to pick up next time) and it surfaces at the start of your next session, then resolves. Keep durable reference you want your partner to recall when it's relevant. You dump freely; the kit sorts.

@@ -6,6 +6,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+
+- **The state line now reaches a running session when it changes, and lasts 12 hours.** Claude Code and Codex sessions read it on the next prompt after a change, once per change, not only at session start. It expires after 12 hours (was 8), everywhere it is shown.
+
+### Removed
+
+- **`levain focus` and the focus line are gone.** The state line replaces them: `levain state "..."` sets it, `levain state --clear` removes it. A web or API write of kind `focus` is refused as an unknown kind, the TUI has no `f` key, and the cockpit draws no focus line. A session-start hook from an older release that `levain update` left pending still runs; it shows no focus line.
+
 ### Added
 
 - **`levain.cockpit`: one manifest and one panel route, read side only.** `GET /cockpit/manifest.json` lists every panel (kind, priority, status, count, freshness, ETag) and `GET /cockpit/panel/<id>.json` serves one panel's rows or value, in a `full` or `compact` profile, with `?q=` to search row bodies and `?row=<id>` for one row in full. The kernel orders the rows once (a registered ordering with groups, so the Tray's TODAY / OVERDUE / ALSO bands are part of the order), computes status from a typed provider result (`Read`, `Absent` or `Fault`, so only a confirmed read of zero rows says `empty`), and a failed or silent refresher reads as `error`, not as a frozen `ok`. Both routes ride the dashboard's existing read gate; the responses are `Cache-Control: private` with `Vary` on the token header, so a shared cache never serves one caller's manifest to another. The built-in panels cover everything the dashboard shows. Nothing here writes: verbs and tiers are the next slice. `JobStore.list_recent` is new beside it, and `scripts/cockpit_payload_diff.py` diffs a saved or live payload against the design's field map.
