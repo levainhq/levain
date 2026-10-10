@@ -1354,3 +1354,32 @@ class TestOneFlightOrdersByConstruction:
         [t.start() for t in ts]
         [t.join() for t in ts]
         assert out == ["empty"] * 3
+
+    def test_a_provider_exception_whose_text_raises_still_ends_the_flight(self) -> None:
+        class Hostile(Exception):
+            def __str__(self):
+                raise RuntimeError("no text for you")
+
+        def read(ctx):
+            raise Hostile()
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=read, order="time.desc",
+                                 facets=frozenset({"at"}), version_fields=("id",), timeout_s=2))
+        assert ck.panel("p")["status"] == "error"
+        time.sleep(0.1)
+        assert ck._state["p"].pflight is None and ck.panel("p")["status"] == "error"   # not "still running", not stuck
+
+    def test_a_late_joiner_is_bound_by_one_absolute_deadline(self, monkeypatch) -> None:
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=lambda c: Read(rows=()),
+                                 order="time.desc", facets=frozenset({"at"}), version_fields=("id",), timeout_s=0.2))
+        monkeypatch.setattr("levain.cockpit.engine.PROCESS_GRACE_S", 0.3)
+        real = Cockpit._process
+        monkeypatch.setattr(Cockpit, "_process", lambda self, *a, **k: (time.sleep(3), real(self, *a, **k))[1])
+        t = threading.Thread(target=lambda: ck.panel("p"))
+        t.start()
+        time.sleep(0.8)                      # past timeout + grace; the owner is still processing
+        t0 = time.monotonic()
+        assert ck.panel("p")["status"] == "error"
+        assert time.monotonic() - t0 < 0.2   # no fresh grace for a late arrival
+        t.join()

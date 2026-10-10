@@ -389,7 +389,7 @@ class Cockpit:
             elif not fl.committed:
                 # the read's remaining budget PLUS the owner's processing grace: a joiner must not
                 # report a failure for a read the owner is about to publish as healthy
-                owner, wait = False, max(0.0, spec.timeout_s - (time.monotonic() - fl.started)) + PROCESS_GRACE_S
+                owner, wait = False, max(0.0, spec.timeout_s + PROCESS_GRACE_S - (time.monotonic() - fl.started))   # ONE absolute deadline
             else:
                 return self._plain_error(spec, st, "previous read still running past its timeout (source hung?)")
         if not owner:
@@ -399,21 +399,24 @@ class Cockpit:
                 return self._plain_error(spec, st, f"timed out waiting on the read in flight ({spec.timeout_s:g}s budget)")
 
         def work() -> None:
+            out: Any = Fault("the read ended without a result")
             try:
-                out: Any = spec.read(ctx)
+                out = spec.read(ctx)
             except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
-                out = Fault(f"{type(exc).__name__}: {exc}")
-            fl.raw.set_result(out)
-            with st.lock:
-                if fl.committed and st.pflight is fl:
-                    st.pflight = None        # the owner already committed and left a hung thread behind
+                out = Fault(f"{type(exc).__name__}: {_safe_str(exc)}")
+            finally:                      # raw ALWAYS reaches a terminal state, even for a hostile exception
+                _set_once(fl.raw, out)
+                with st.lock:
+                    if fl.committed and st.pflight is fl:
+                        st.pflight = None    # the owner already committed and left a hung thread behind
 
-        try:
-            threading.Thread(target=work, name="cockpit-read", daemon=True).start()
-        except BaseException as exc:  # noqa: BLE001 - thread exhaustion fails THIS read and poisons nothing
-            fl.raw.set_result(Fault(f"could not start a read: {type(exc).__name__}: {exc}"))
         snap: _Snap | None = None
+        committed_ok = False
         try:
+            try:
+                threading.Thread(target=work, name="cockpit-read", daemon=True).start()
+            except BaseException as exc:  # noqa: BLE001 - thread exhaustion fails THIS read and poisons nothing
+                _set_once(fl.raw, Fault(f"could not start a read: {type(exc).__name__}: {_safe_str(exc)}"))
             try:
                 res: Any = fl.raw.result(timeout=spec.timeout_s)
             except FutureTimeout:
@@ -425,7 +428,7 @@ class Cockpit:
                 snap = self._process(spec, st, res, ctx)
             except Exception as exc:  # noqa: BLE001 - a read that cannot be processed is an error read
                 with st.mu:
-                    snap = self._fault(spec, st, f"{type(exc).__name__}: {exc}", _iso(ctx.now))
+                    snap = self._fault(spec, st, f"{type(exc).__name__}: {_safe_str(exc)}", _iso(ctx.now))
             try:
                 done_at: datetime | None = self._clock()      # before the lock: a failing clock cannot strand the flight
             except Exception:  # noqa: BLE001
@@ -435,6 +438,7 @@ class Cockpit:
                 st.last_completion = done_at or ctx.now
                 st.refresh_started = None
                 st.fresh = (snap.as_of, snap.status)
+            committed_ok = True
             return snap
         finally:
             # whatever happened above, the flight ends: it is marked committed, cleared if its source
@@ -444,7 +448,10 @@ class Cockpit:
                 st.refresh_started = None
                 if fl.raw.done() and st.pflight is fl:
                     st.pflight = None
-            fl.snap.set_result(snap or self._plain_error(spec, st, "the read could not be committed"))
+            # joiners get the snapshot only if it was fully committed; otherwise an error, never a
+            # healthy answer that the panel's own state does not hold
+            _set_once(fl.snap, snap if (snap is not None and committed_ok)
+                      else self._plain_error(spec, st, "the read could not be committed"))
 
     def _snap_for(self, spec: ProviderSpec, ctx: ReadContext) -> _Snap:
         st = self._state[spec.id]
@@ -959,6 +966,21 @@ class Cockpit:
             return Read(value=rows[0])
         except Exception as exc:  # noqa: BLE001
             return Fault(f"provider output refused: {exc}")
+
+
+def _safe_str(exc: BaseException) -> str:
+    try:
+        return str(exc)
+    except Exception:  # noqa: BLE001 - an exception whose own text raises must not abort the caller
+        return "(unprintable exception)"
+
+
+def _set_once(fut: Future, value: Any) -> None:
+    """Resolve a future exactly once; a second resolution is a no-op, never an error."""
+    try:
+        fut.set_result(value)
+    except Exception:  # noqa: BLE001 - InvalidStateError: already resolved
+        pass
 
 
 def _parse_iso(s: str) -> datetime:
