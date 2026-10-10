@@ -63,6 +63,7 @@ WRITE_READ_CAP = 32       # source reads made inside writes that may run at once
 WRITE_READ_GRACE_S = 0.5  # an added write read counts as live this long before its flight exists
 POLICY_REVISION = 1  # hashed into the manifest etag; bumped when a tier or gesture policy changes
 NOW_ID = "now"
+VALUE_ABSENT = "absent"   # the value_version of a line/prose value with no stored record yet
 PROCESS_GRACE_S = 5.0     # how long a joiner waits for the owner to process a finished read
 _STATUS_RANK = {"ok": 0, "empty": 0, "partial": 1, "stale": 2, "error": 3}
 
@@ -73,6 +74,13 @@ def _canon(obj: Any) -> bytes:
 
 def _sha(obj: Any) -> str:
     return hashlib.sha256(_canon(obj)).hexdigest()
+
+
+def value_version_of(stored: Any) -> str:
+    """The version a value write binds to (§4.4), from the stored record a provider read
+    (``Read.version_of``). The ONE computation: a renderer outside the manifest that offers a
+    value write (the legacy dashboard's state line) takes its version from here too."""
+    return _sha({"stored": stored})[:16]
 
 
 def _iso(dt: datetime) -> str:
@@ -169,6 +177,7 @@ class _Snap:
     note: str
     stale_hint: bool = False
     empty: str | None = None
+    value_version: str | None = None    # a line/prose value's write version; VALUE_ABSENT if no record
 
 
 @dataclass
@@ -238,6 +247,7 @@ class Cockpit:
         self._discoverers: list[Callable[[ReadContext], list[ProviderSpec]]] = []
         self._entity_state = _State()
         self._discovery_states: list[_State] = []
+        self._discovered: frozenset[str] = frozenset()   # panel ids a discoverer registered
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
@@ -257,6 +267,34 @@ class Cockpit:
         if discover and panel_id not in self._specs and panel_id != NOW_ID:
             self._ensure_discovered(ReadContext(self._clock()))
         return self._specs.get(panel_id)
+
+    def offer_spec(self, panel_id: str) -> "ProviderSpec | Fault | None":
+        """The registration a WRITE checks its verb against. A panel registered in code is its
+        registration. A DISCOVERED panel's verbs are what its source offers now, so every
+        discoverer is run again here on a fresh read that never joins an earlier flight, and the
+        write is bound to that answer: the panel's spec with the verbs just discovered, ``None``
+        when no discoverer returns the panel any more, ``Fault`` when a discoverer failed and none
+        returned it (fail closed: an unconfirmed offer is no offer). A source with its own answer
+        cache (``ExternalPanels``' reuse window) is as fresh as that cache."""
+        spec = self.spec(panel_id, discover=True)
+        if spec is None or panel_id not in self._discovered:
+            return spec
+        ctx = ReadContext(self._clock())
+        with self._lock:
+            discoverers = list(self._discoverers)
+        fault: Fault | None = None
+        for fn in discoverers:
+            res = self._bounded_fresh(self._entity_timeout_s, self._discover_one, fn, ctx)
+            if isinstance(res, Fault):
+                fault = res
+                continue
+            for got in res.value:
+                if got.id != panel_id:
+                    continue
+                if got.title != spec.title:
+                    return Fault(f"id collision: {got.title!r} maps to the id of {spec.title!r}")
+                return dataclasses.replace(spec, verbs=tuple(got.verbs))
+        return fault
 
     def today(self) -> date:
         return ReadContext(self._clock()).today
@@ -568,11 +606,13 @@ class Cockpit:
                 st.failing_since = None
                 return out
             if isinstance(out, Absent):
+                # a value with no stored record binds its first write to VALUE_ABSENT (§4.4)
+                vv = VALUE_ABSENT if spec.kind in ("line", "prose") else None
                 if spec.optional and not st.ever_present:
                     return _Snap("ok", [] if listy else None, None, [], [], now_iso, None,
-                                 f"not configured: {out.reason}")
+                                 f"not configured: {out.reason}", value_version=vv)
                 why = "source disappeared" if st.ever_present else "source absent"
-                return self._fault(spec, st, f"{why}: {out.reason}", now_iso)
+                return dataclasses.replace(self._fault(spec, st, f"{why}: {out.reason}", now_iso), value_version=vv)
             message = out.message if isinstance(out, Fault) else f"unexpected outcome {type(out).__name__}"
             return self._fault(spec, st, message, now_iso)
 
@@ -610,7 +650,8 @@ class Cockpit:
             status = "stale"
         return _Snap(status, rows, value, filtered, skipped, as_of, None,
                      res.note if isinstance(res.note, str) else spec.note, res.stale,
-                     res.empty if isinstance(res.empty, str) else None)
+                     res.empty if isinstance(res.empty, str) else None,
+                     value["value_version"] if spec.kind in ("line", "prose") else None)
 
     @staticmethod
     def _value_empty(kind: str, value: Any) -> bool:
@@ -630,7 +671,7 @@ class Cockpit:
             # the version a value write binds to (§4.4): a hash of the stored value as read, never of
             # provenance (a render-time label) or of itself
             stored = {k: x for k, x in v.items() if k not in ("provenance", "value_version")}
-            v = {**v, "value_version": _sha(stored if version_of is None else {"stored": version_of})[:16]}
+            v = {**v, "value_version": _sha(stored)[:16] if version_of is None else value_version_of(version_of)}
         if spec.kind == "visual":
             if v["visual"] not in VISUALS:
                 raise ValueError(f"unknown visual {v['visual']!r}")
@@ -758,7 +799,8 @@ class Cockpit:
             "order": spec.order, "groups": groups,
             "search": ({"fields": list(spec.search_fields), "default_visible": spec.search_default_visible}
                        if spec.search_fields else None),
-            "actions": (self._verb_view.panel_actions(spec.id, cred, today) if self._verb_view is not None else []),
+            "actions": (self._verb_view.panel_actions(spec.id, cred, today, snap.value_version)
+                        if self._verb_view is not None else []),
             "edit_class": spec.edit_class or None,
         }
 
@@ -847,8 +889,9 @@ class Cockpit:
     def discover(self, fn: Callable[[ReadContext], list[ProviderSpec]]) -> None:
         """Register a discoverer: run when a manifest is built (or a panel nobody registered is
         asked for), it returns the panels the substrate holds NOW (prose panels, one per heading).
-        Ones not yet registered are added; one that later vanishes keeps its provider, which then
-        reads ``Absent`` and renders ``error``. A discoverer that raises is a manifest ``errors``
+        Ones not yet registered are added, and one already discovered takes the verbs its source
+        offers now (a write re-checks them fresh, ``offer_spec``); one that later vanishes keeps its
+        provider, which then reads ``Absent`` and renders ``error``, and offers nothing to a write. A discoverer that raises is a manifest ``errors``
         entry, never silent absence. All discoverers share ONE bounded single-flight read."""
         with self._lock:
             self._discoverers.append(fn)
@@ -878,11 +921,18 @@ class Cockpit:
                             if spec.refresh_every_s is not None:
                                 raise CockpitRegistrationError("a discovered panel cannot carry a refresher")
                             self._register_locked(spec)
+                            self._discovered = self._discovered | {spec.id}
                         except Exception as exc:  # noqa: BLE001 - a bad spec is an errors entry, never a 500
                             errors.append({"source": f"discovery:{spec.id}", "message": _safe_str(exc)})
                     elif have.title != spec.title:
                         errors.append({"source": f"discovery:{spec.id}",
                                        "message": f"id collision: {spec.title!r} maps to the id of {have.title!r}"})
+                    elif spec.id in self._discovered and tuple(have.verbs) != tuple(spec.verbs):
+                        # what a discovered panel offers is its source's answer, read per pass
+                        # (copy-on-write, like a registration)
+                        specs = dict(self._specs)
+                        specs[spec.id] = dataclasses.replace(have, verbs=tuple(spec.verbs))
+                        self._specs = specs
         return errors
 
     @staticmethod

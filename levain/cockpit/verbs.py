@@ -9,6 +9,7 @@ has no tier function and is therefore T2. The steps of ``/cockpit/verb``:
 
 1. the verb is registered and routed ``cockpit`` (a ``broker`` head is refused here, §4.1);
 2. the panel named in the request offers it (else 404, so a retired panel takes its verb with it);
+   a discovered panel's offer is re-read from its source for the write (``Cockpit.offer_spec``);
 3. every param is in the verb's allowlist (§4.2: a field outside it is refused, never ignored);
 4. the target is read from the SOURCE through the provider's ``read_one`` (or the panel value is read
    fresh) and its version compared with the one the caller rendered (409 on a mismatch, §4.4);
@@ -34,10 +35,12 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
+from levain.cockpit.engine import VALUE_ABSENT
 from levain.cockpit.external import ID_PREFIX as EXTERNAL_PREFIX
 from levain.cockpit.registry import parse_date
 from levain.cockpit.results import Absent, Fault, Read
-from levain.writes import ActionVerb, EditError, apply_action, apply_edit, context_lock
+from levain.writes import (ActionVerb, EditError, _normalize_expect_disposition, apply_action, apply_edit,
+                           context_lock)
 
 if TYPE_CHECKING:
     from levain.cockpit.engine import Cockpit
@@ -47,7 +50,6 @@ if TYPE_CHECKING:
 Tier = Literal["C1", "T2", "T3"]
 TIERS: tuple[Tier, ...] = ("C1", "T2", "T3")
 UNVERIFIED = "unverified"
-VALUE_ABSENT = "absent"     # the panel_version a write sends for a value with no stored record yet
 
 # The verbs that are never cockpit verbs: a harness pending is answered on the broker's
 # remote-control path (§4.6). Registering one as a cockpit verb is refused.
@@ -345,7 +347,7 @@ LEGACY_KINDS: dict[str, str] = {v.legacy_kind: v.name for v in KERNEL_VERBS if v
 
 # The legacy ``/edit`` keys that are not params: the target, the CAS keys the kernel now supplies
 # itself, and the confirm flag. Everything else in a legacy body is a param and meets the allowlist.
-_LEGACY_BINDING = {"expect_disposition", "expected_body", "expected", "source", "heading"}
+_LEGACY_BINDING = {"expect_disposition", "expected_body", "expected", "source", "heading", "panel_version"}
 
 
 class VerbRegistry:
@@ -408,8 +410,17 @@ class VerbRegistry:
 # --- what a panel offers ------------------------------------------------------------------------
 
 
-def offered(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, *, discover: bool = False) -> list[VerbSpec]:
-    spec = cockpit.spec(panel_id, discover=discover)
+def offered(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, *, fresh: bool = False) -> list[VerbSpec]:
+    """The verbs a panel offers. ``fresh`` (a write): a discovered panel's offer is re-read from its
+    source, and a source that cannot confirm it refuses the write (503), never falls back to the
+    rendered offer."""
+    if fresh:
+        got = cockpit.offer_spec(panel_id)
+        if isinstance(got, Fault):
+            raise _refuse("source_unavailable", 503, f"could not confirm what {panel_id!r} offers: {got.message}")
+        spec = got
+    else:
+        spec = cockpit.spec(panel_id)
     if spec is None:
         return []
     # a downstream panel's feed names its own verb; it may offer only a downstream verb, never a kernel
@@ -433,31 +444,34 @@ def row_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, row: 
 
 
 def panel_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str,
-                  credential_class: str, install_class: str, today: date) -> list[dict[str, Any]]:
+                  credential_class: str, install_class: str, today: date,
+                  value_version: str | None = None) -> list[dict[str, Any]]:
+    """A value write's target names the version of the value it was rendered with (§4.4), so a
+    renderer sends back what it showed; with no readable value there is none to name."""
     out = []
     for v in offered(registry, cockpit, panel_id):
         if v.binding == "row":
             continue
         t = v.rendered_tier(None, UNVERIFIED, today)
+        target: dict[str, Any] = {"panel_id": panel_id}
+        if v.binding == "value":
+            target["panel_version"] = value_version
         out.append({"verb": v.name, "tier": t, "gesture": gesture_for(t, credential_class, install_class),
-                    "escalates": [], "target": {"panel_id": panel_id}})
+                    "escalates": [], "target": target})
     return out
 
 
 def verbs_map(registry: VerbRegistry, cockpit: "Cockpit", credential_class: str,
               install_class: str) -> dict[str, dict[str, Any]]:
-    """The manifest's ``verbs`` map (§4.1): only verbs some panel offers, cockpit and broker sources."""
+    """The manifest's ``verbs`` map (§4.1): only verbs some panel offers, by the same rule a write
+    checks (``offered``). A broker head never comes from a panel's declared verbs: it is the
+    broker's to publish (K2b), so a feed naming one adds nothing here."""
     out: dict[str, dict[str, Any]] = {}
     for pid in cockpit.panel_ids:
-        spec = cockpit.spec(pid)
-        for n in (spec.verbs if spec else ()):
-            if n in BROKER_HEADS:
-                out[n] = dict(BROKER_HEADS[n])
-                continue
-            v = registry.get(n)
-            if v is not None and n not in out:
+        for v in offered(registry, cockpit, pid):
+            if v.name not in out:
                 tier = v.head("")["tier"]
-                out[n] = v.head(gesture_for(tier, credential_class, install_class))
+                out[v.name] = v.head(gesture_for(tier, credential_class, install_class))
     return out
 
 
@@ -538,7 +552,7 @@ def dispatch(
     if verb is None:
         raise _refuse("unknown_verb", 404, f"no such verb: {name!r}")
     panel_id = req.get("panel_id")
-    if not isinstance(panel_id, str) or verb not in offered(registry, cockpit, panel_id, discover=True):
+    if not isinstance(panel_id, str) or verb not in offered(registry, cockpit, panel_id, fresh=True):
         raise _refuse("not_offered", 404, f"panel {panel_id!r} does not offer {verb.name!r}")
     params = req.get("params", {})
     if not isinstance(params, dict):
@@ -546,6 +560,8 @@ def dispatch(
     bad = sorted(set(params) - set(verb.fields)) if verb.fields is not None else []
     if bad:
         raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
+    if "dry_run" in req and not isinstance(req["dry_run"], bool):
+        raise _refuse("bad_request", 400, "'dry_run' must be true or false")
     intent = req.get("intent")
     if intent is not None and intent not in _INTENTS:
         raise _refuse("bad_request", 400, f"'intent' must be one of {list(_INTENTS)}")
@@ -573,7 +589,7 @@ def dispatch(
     _refuse_unless_c1(verb, tier, credential, install_class)
     _require_confirm(verb, req)
     if registry.is_downstream(verb.name):
-        return _fire_downstream(registry, verb, scope, params, req, job_runtime)
+        return _fire_downstream(registry, verb, scope, params, req, job_runtime, panel_id)
     if verb.fire is None:
         raise _refuse("not_built", 501, f"{verb.name!r} has no handler")
     target: dict[str, Any] = {"panel_id": panel_id, "row_id": req.get("row_id"), "row": row,
@@ -585,7 +601,8 @@ def dispatch(
 
 
 def _fire_downstream(registry: VerbRegistry, verb: VerbSpec, scope: "WriteScope", params: dict[str, Any],
-                     req: dict[str, Any], job_runtime: "JobRuntime | None") -> dict[str, Any]:
+                     req: dict[str, Any], job_runtime: "JobRuntime | None",
+                     panel_id: str | None = None) -> dict[str, Any]:
     """A downstream ``ActionVerb`` keeps ``apply_action``'s confirm, idempotency, job and audit
     envelope; a downstream ``VerbSpec`` fires its own handler."""
     av = registry.action_verb(verb.name)
@@ -601,7 +618,9 @@ def _fire_downstream(registry: VerbRegistry, verb: VerbSpec, scope: "WriteScope"
     body: dict[str, Any] = {"verb": verb.name, "params": params, "confirm": req.get("confirm") is True}
     if "idempotency_key" in req:
         body["idempotency_key"] = req["idempotency_key"]
-    return apply_action(scope, {verb.name: av}, body, job_runtime=job_runtime)
+    # a cockpit fire is bound to its panel, so the panel is part of what an idempotency key names
+    return apply_action(scope, {verb.name: av}, body, job_runtime=job_runtime,
+                        bind=None if panel_id is None else {"panel_id": panel_id})
 
 
 def _refuse_unless_c1(verb: VerbSpec, tier: Tier, credential: dict[str, Any], install_class: str) -> None:
@@ -649,10 +668,19 @@ def _legacy_target(cockpit: "Cockpit", verb: VerbSpec, req: dict[str, Any]) -> t
     return found[0]
 
 
+# The panel a legacy value write binds to. A value verb not named here is refused on /edit.
+_LEGACY_VALUE_PANEL = {"operator_state": "state"}
+# Legacy verbs that act on what the client rendered and cannot be undone: the body must name the
+# disposition it rendered, so a confirm given on an old render never lands on a row that changed list.
+_LEGACY_NEEDS_SNAPSHOT = frozenset({"spore_descend"})
+
+
 def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope", req: dict[str, Any],
                  credential: dict[str, Any], install_class: str, today: date) -> dict[str, Any]:
     """``POST /edit``: the legacy body translated onto the cockpit path. One row read, one tier, the
-    kernel's CAS key and the verb's own ``fire``; ``apply_edit`` never receives the client's body."""
+    kernel's CAS key and the verb's own ``fire``; ``apply_edit`` never receives the client's body.
+    What the client rendered still binds: a body's ``expect_disposition`` must match the row as read
+    (409), and a value write names its ``panel_version`` (§4.4: an alias is never a bypass)."""
     kind = req.get("kind")
     name = LEGACY_KINDS.get(kind) if isinstance(kind, str) else None
     if name is None:
@@ -670,6 +698,17 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
     panel_id, row = (None, None)
     if verb.binding == "row":
         panel_id, row = _legacy_target(cockpit, verb, req)
+        if verb.name in _LEGACY_NEEDS_SNAPSHOT and "expect_disposition" not in req:
+            raise _refuse("bad_request", 400, f"{verb.name!r} on /edit names the disposition it rendered "
+                          "('expect_disposition')")
+        if "expect_disposition" in req and (_normalize_expect_disposition(req["expect_disposition"])
+                                            != _normalize_expect_disposition(_facet(row, "disposition"))):
+            raise _refuse("stale", 409, f"row {row['id']!r} moved to another list since it was rendered")
+    elif verb.binding == "value":
+        panel_id = _LEGACY_VALUE_PANEL.get(verb.name)
+        if panel_id is None:
+            raise _refuse("not_offered", 404, f"{verb.name!r} is not a /edit value write")
+        _check_value_version(cockpit, panel_id, req.get("panel_version"))
     tier = verb.tier(params, row, UNVERIFIED, today)
     floor = verb.rendered_tier(row, UNVERIFIED, today)
     # A legacy body carries no intent: a reported install sends "reported" for a write that escalates
@@ -681,8 +720,12 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
     _require_confirm(verb, req)
     if verb.fire is None:
         raise _refuse("not_built", 501, f"{verb.name!r} has no handler")
-    target = {"panel_id": panel_id, "row_id": row["id"] if row else None, "row": row,
-              "source": _SURFACE_SOURCE.get(str(credential.get("name")), "web")}
+    target: dict[str, Any] = {"panel_id": panel_id, "row_id": row["id"] if row else None, "row": row,
+                              "source": _SURFACE_SOURCE.get(str(credential.get("name")), "web")}
+    if verb.binding == "value":
+        supplied, vpanel = req.get("panel_version"), panel_id
+        assert vpanel is not None
+        target["check"] = lambda: _check_value_version(cockpit, vpanel, supplied)
     return verb.fire(scope, params, target, req.get("confirm") is True)
 
 
@@ -705,8 +748,9 @@ class VerbView:
     def row_actions(self, panel_id: str, row: dict[str, Any], cred: str, today: date) -> list[dict[str, Any]]:
         return row_actions(self.registry, self.cockpit, panel_id, row, cred, self.install_class, today)
 
-    def panel_actions(self, panel_id: str, cred: str, today: date) -> list[dict[str, Any]]:
-        return panel_actions(self.registry, self.cockpit, panel_id, cred, self.install_class, today)
+    def panel_actions(self, panel_id: str, cred: str, today: date,
+                      value_version: str | None = None) -> list[dict[str, Any]]:
+        return panel_actions(self.registry, self.cockpit, panel_id, cred, self.install_class, today, value_version)
 
     def verbs_map(self, cred: str) -> dict[str, dict[str, Any]]:
         return verbs_map(self.registry, self.cockpit, cred, self.install_class)

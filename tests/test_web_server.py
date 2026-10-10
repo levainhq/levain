@@ -111,6 +111,13 @@ def _get_h(url: str, *, headers: dict | None = None, method: str = "GET"):
 
 # --- the data endpoint: shape parity with the SubstrateView ----------------
 
+def _state_pv(src) -> str:
+    """The panel_version a state write names (K2a): the stored record's version, or 'absent'."""
+    from levain.dashboard import state_version
+    ctx = src.install_root / ".levain" / "context.json"
+    return state_version(json.loads(ctx.read_text())) if ctx.exists() else "absent"
+
+
 class TestSubstrateJson:
     def test_build_substrate_json_shape(self, tmp_path: Path) -> None:
         data = json.loads(build_substrate_json(_store_with_data(tmp_path)))
@@ -1159,7 +1166,8 @@ class TestWriteBoundary:
     def test_same_origin_allowed(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, _httpd):
-            status, _ = _post(base + "/edit", {"kind": "operator_state", "text": "ok"},
+            status, _ = _post(base + "/edit", {"kind": "operator_state", "text": "ok",
+                                               "panel_version": _state_pv(src)},
                               headers={"Sec-Fetch-Site": "same-origin"})
         assert status == 200
 
@@ -1295,10 +1303,11 @@ class TestClassBRoute:
         sid, _eid = _seed_anneal(src)
         with _serving(src) as (base, _httpd):
             s1, b1 = _post(base + "/edit", {
-                "kind": "spore_descend", "spore_id": sid, "spore_kind": "done",
+                "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "expect_disposition": None,
             })
             s2, b2 = _post(base + "/edit", {
                 "kind": "spore_descend", "spore_id": sid, "spore_kind": "done", "confirm": True,
+                "expect_disposition": None,     # K2a: a legacy descend names the list it rendered
             })
         assert s1 == 409 and b1["error"] == "confirm_required"
         assert s2 == 200 and b2["ok"] is True
@@ -1868,7 +1877,8 @@ class TestSurfaceTokens:
             base = f"http://{httpd.server_address[0]}:{httpd.server_address[1]}"
             ctx = src.install_root / ".levain" / "context.json"
             for tok, text in (("tok-A", "from A"), ("tok-B", "from B")):
-                st, resp = _post(base + "/edit", {"kind": "operator_state", "text": text}, token=tok)
+                st, resp = _post(base + "/edit", {"kind": "operator_state", "text": text,
+                                                  "panel_version": _state_pv(src)}, token=tok)
                 assert st == 200 and resp["ok"] is True, (tok, resp)
                 assert json.loads(ctx.read_text())["state"] == text
             before = ctx.read_text()
@@ -1911,7 +1921,8 @@ class TestStateEditRoute:
     def test_state_edit_happy_path(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, _httpd):
-            status, body = _post(base + "/edit", {"kind": "operator_state", "text": "shipping 247"})
+            status, body = _post(base + "/edit", {"kind": "operator_state", "text": "shipping 247",
+                                                  "panel_version": _state_pv(src)})
         assert status == 200 and body["ok"] is True and body["cleared"] is False
         ctx = json.loads((tmp_path / "install" / ".levain" / "context.json").read_text())
         assert ctx["state"] == "shipping 247"
@@ -1920,8 +1931,9 @@ class TestStateEditRoute:
     def test_state_edit_clear_over_post(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, _httpd):
-            _post(base + "/edit", {"kind": "operator_state", "text": "temp"})
-            status, body = _post(base + "/edit", {"kind": "operator_state", "text": ""})
+            _post(base + "/edit", {"kind": "operator_state", "text": "temp", "panel_version": _state_pv(src)})
+            status, body = _post(base + "/edit", {"kind": "operator_state", "text": "",
+                                                  "panel_version": _state_pv(src)})
         assert status == 200 and body["cleared"] is True
 
     def test_state_edit_read_only_refused(self, tmp_path: Path) -> None:

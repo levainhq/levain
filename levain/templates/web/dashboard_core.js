@@ -2261,7 +2261,7 @@
 
   // The masthead state line's Class-A inline edit (commit-gated). The operator sets
   // "what's going on" IN the cockpit, a second set-path alongside `levain state`
-  // (last-writer-wins). Mirrors wireEntityName: a small control swaps the line for an
+  // (version-bound: see doSave). Mirrors wireEntityName: a small control swaps the line for an
   // input; save -> POST /edit {kind:"operator_state"}; a blank value CLEARS it. A
   // read-only port (no commit) shows no affordance.
   function enterStateEdit(fEl, state, btn, opts) {
@@ -2294,11 +2294,12 @@
       // bailing and stranding it frozen on "saving…" (the L1 + codex/complement/nemotron
       // L3 HIGH, reproduced end-to-end).
       editor.dataset.saving = "1";
-      // No `expected`/optimistic lock: the state line is live-state, last-writer-wins (a foreign
-      // sensor writer may have touched the file — an optimistic lock would false-409). A
-      // blank value clears (the server reads an empty line as unset). `source` is omitted
-      // → the server stamps "web" (the honest HTTP default; a client shouldn't self-declare).
-      const res = await commit({ kind, text: input.value });
+      // The write names the version of the line it was rendered with (state.version, a hash of
+      // the stored state keys only, so a sensor writing other keys of the file does not
+      // stale it); a line changed since render is refused 409 and its message shows. A blank
+      // value clears (the server reads an empty line as unset). `source` is omitted → the
+      // server stamps it from the credential (a client never self-declares).
+      const res = await commit({ kind, text: input.value, panel_version: state && state.version });
       if (res && res.ok) return;  // reloaded — the save render rebuilt #state, removing this editor
       delete editor.dataset.saving;  // save FAILED: re-arm the guard so passive reloads defer again
       msg.className = "edit-msg err";

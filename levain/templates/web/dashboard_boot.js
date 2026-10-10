@@ -60,7 +60,9 @@
       params.delete("write_token");
       const rest = params.toString();
       history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
-      if (/^[A-Za-z0-9_-]+$/.test(tok)) window.localStorage.setItem(WRITE_TOKEN_KEY, tok);
+      // a token is printable ASCII without spaces (it travels in a request header)
+      if (/^[\x21-\x7e]+$/.test(tok)) window.localStorage.setItem(WRITE_TOKEN_KEY, tok);
+      else console.warn("levain: the write token in the link is not a header-safe string; not stored");
     } catch (_) { /* no history or storage: the prompt still works */ }
   })();
 

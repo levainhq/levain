@@ -76,6 +76,8 @@ from __future__ import annotations
 
 import dataclasses
 import hmac
+import re
+import urllib.parse
 import secrets
 import ipaddress
 import json
@@ -159,6 +161,7 @@ _MAX_INFLIGHT = 8
 # it is the factor that replaces loopback when the write surface leaves the machine.
 # Loopback binds stay token-free (the check below is skipped for a loopback-bound server).
 _WRITE_TOKEN_HEADER = "X-Levain-Write-Token"
+_HEADER_SAFE_TOKEN = re.compile(r"[\x21-\x7e]+")   # printable ASCII, no spaces: it travels in a header
 
 # The CHAT factor (spore-1310, rec B, ruled by Phill 2026-10-03). The no-token rule above rests on
 # "anything that can reach loopback can already edit the files". That holds for /edit and fails for
@@ -1344,15 +1347,19 @@ def make_server(
     # ``browser`` surface's for callers that pass one token. A writable source given none gets a
     # per-launch ``browser`` token; ``run_web_server`` prints it and puts it in the unlocked link.
     tokens = {str(k): str(v) for k, v in (surface_tokens or {}).items()}
-    for name, tok in tokens.items():
-        if not name or not tok:
-            raise ValueError(f"refusing surface token {name!r}: name and token must be non-empty")
-    if len(set(tokens.values())) != len(tokens):
-        raise ValueError("refusing surface tokens: two surfaces share one token")
     if write_token:
         if tokens.get("browser", write_token) != write_token:
             raise ValueError("write_token and surface_tokens['browser'] disagree")
         tokens["browser"] = write_token
+    # checked on the merged set, so write_token cannot equal another surface's token
+    for name, tok in tokens.items():
+        if not name or not tok:
+            raise ValueError(f"refusing surface token {name!r}: name and token must be non-empty")
+        if not _HEADER_SAFE_TOKEN.fullmatch(tok):
+            # a token travels in a request header and the page stores what this rule admits
+            raise ValueError(f"refusing surface token {name!r}: printable ASCII without spaces only")
+    if len(set(tokens.values())) != len(tokens):
+        raise ValueError("refusing surface tokens: two surfaces share one token")
     if source.write_scope is not None and not tokens:
         tokens["browser"] = secrets.token_urlsafe(32)
 
@@ -1565,7 +1572,7 @@ def run_web_server(
         # discipline as the chat token: never sent to the server, taken and stripped by the page.
         print(f"  write token (send as {_WRITE_TOKEN_HEADER}; valid until this server stops): "
               f"{httpd.write_token}", flush=True)
-        unlocked += ("&" if "#" in unlocked else "#") + f"write_token={httpd.write_token}"
+        unlocked += ("&" if "#" in unlocked else "#") + "write_token=" + urllib.parse.quote(httpd.write_token, safe="")
     if unlocked != url:
         print(f"  open the cockpit, unlocked: {unlocked}", flush=True)
 

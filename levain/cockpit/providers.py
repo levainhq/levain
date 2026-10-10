@@ -22,9 +22,11 @@ from levain.dashboard import (
     CLASS_A,
     CLASS_B,
     CLASS_C,
+    STATE_KEYS,
     SubstrateSource,
     SubstrateView,
     _one_clause,
+    state_from_data,
 )
 
 # The view caps each spore bucket at ``max_spores``. The cockpit asks for far more than any store
@@ -325,42 +327,38 @@ def _wraps(source: SubstrateSource) -> Callable[[ReadContext], Result]:
     return read
 
 
-def _context_state(source: SubstrateSource) -> tuple[Path | None, Fault | Absent | None]:
+def _context_state(source: SubstrateSource) -> tuple[dict[str, Any] | None, Fault | Absent | None]:
+    """The live-context file, parsed ONCE: ``(data, None)`` or ``(None, problem)``."""
     cj = source.context_json
     if cj is None:
         return None, Absent("no live-context source is configured")
     if not cj.exists():
-        return cj, Absent(f"no context file at {cj}")
+        return None, Absent(f"no context file at {cj}")
     try:
         data = json.loads(cj.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        return cj, Fault(f"context file unreadable: {type(exc).__name__}: {exc}")
+        return None, Fault(f"context file unreadable: {type(exc).__name__}: {exc}")
     if not isinstance(data, dict):
-        return cj, Fault(f"context file is a {type(data).__name__}, not an object")
-    return cj, None
+        return None, Fault(f"context file is a {type(data).__name__}, not an object")
+    return data, None
 
 
 def _context_line(source: SubstrateSource) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
-        cj, problem = _context_state(source)
+        # the line shown and the record its version hashes come from ONE read of the file, so a
+        # write bound to this version is bound to the content it displayed (§4.4)
+        data, problem = _context_state(source)
         if problem is not None:
             return problem
-        # the stored record, read before the view is built: on a fresh context (every write-time read)
-        # a write landing between the two makes the version older than the display, so a write bound
-        # to it is refused. A render that reuses a memoised view may pair a newer version with an
-        # older line; a write bound to that is re-checked against the source at write time.
-        try:
-            raw = json.loads(cj.read_text(encoding="utf-8")) if cj is not None else {}
-        except (OSError, ValueError) as exc:
-            return Fault(f"context file unreadable: {type(exc).__name__}: {exc}")
-        stored = {k: raw.get(k) for k in ("state", "state_set_at", "state_source")} if isinstance(raw, dict) else None
-        view = _view(source, ctx)
-        item = view.state
-        if item is None or not item.text:
+        assert data is not None
+        stored = {k: data.get(k) for k in STATE_KEYS}
+        item = state_from_data(data, ctx.now)
+        if not item.text:
             return Read(value={"lines": []}, version_of=stored)
         # an expired or age-unknown line is already dropped by the reader, so what arrives is fresh. The stamp
         # goes out in ECMA-262's Date Time String Format (what toISOString emits), the one form every JS engine
         # must parse; any other string is implementation-defined, so the client checks the round trip.
+        assert item.set_at is not None
         ts = datetime.fromisoformat(item.set_at)
         at = (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
         at = at.isoformat(timespec="milliseconds").replace("+00:00", "Z")

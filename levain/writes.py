@@ -746,13 +746,16 @@ def _best_effort_action_audit(ledger_root: Path, record: dict[str, Any]) -> None
 
 def apply_action(scope: WriteScope, registry: dict[str, "ActionVerb"],
                  req: dict[str, Any], *, now: str | None = None,
-                 job_runtime: "JobRuntime | None" = None) -> dict[str, Any]:
+                 job_runtime: "JobRuntime | None" = None,
+                 bind: dict[str, Any] | None = None) -> dict[str, Any]:
     """Dispatch ONE governed operator action described by ``req`` against a registered verb.
     The kernel GOVERNS (validate → confirm-gate → execute → audit-receipt); the verb's
     ``handler`` does the domain work. Returns a result dict; raises ``EditError`` (HTTP-
     mapped, so the server's existing ``except EditError`` handles it) on refusal or failure.
 
     ``req``: ``{"verb": str, "params": dict?, "confirm": bool?, "idempotency_key": str?}``.
+    ``bind``: what the request targets beyond its params (a cockpit verb's ``panel_id``); it is part
+    of the idempotency fingerprint, so one key sent to two targets is a reused key, not a replay.
     Unknown verb → 404; a ``confirm_required`` verb without ``confirm: true`` → 409 (NO execution,
     NO audit — nothing happened); a handler that raises → the attempt is AUDITED (outcome "error")
     then surfaced as 502 (the receipt binds to what actually happened — NO-THEATER; a rendered
@@ -801,7 +804,7 @@ def apply_action(scope: WriteScope, registry: dict[str, "ActionVerb"],
     idem_store: "IdempotencyStore | None" = None
     idem_key: str | None = None
     if spec.idempotent:
-        replay, idem_store, idem_key = _idempotency_claim(scope, verb, spec, params, req, now_iso)
+        replay, idem_store, idem_key = _idempotency_claim(scope, verb, spec, params, req, now_iso, bind)
         if replay is not None:
             return replay
 
@@ -962,7 +965,7 @@ def _dispatch_job(
 
 def _idempotency_claim(
     scope: WriteScope, verb: str, spec: "ActionVerb", params: dict[str, Any],
-    req: dict[str, Any], now_iso: str,
+    req: dict[str, Any], now_iso: str, bind: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, "IdempotencyStore | None", str | None]:
     """Run the at-most-once gate for an idempotent verb. Returns ``(replay_response, store, key)``:
     a non-None ``replay_response`` ⇒ RETURN it immediately (a deduped retry — no re-fire);
@@ -983,7 +986,7 @@ def _idempotency_claim(
                         f"'idempotency_key' exceeds {MAX_IDEMPOTENCY_KEY_LEN} characters")
     store = IdempotencyStore(scope.ledger_root / "idempotency.json")
     try:
-        fingerprint = request_fingerprint(verb, params)
+        fingerprint = request_fingerprint(verb, params if bind is None else {"params": params, "bind": bind})
     except ValueError as exc:
         # params that can't be canonically fingerprinted (non-string dict key / non-finite float —
         # L3 codex LOW). Unreachable via HTTP (JSON keys are strings); a clean 400 for the API path.

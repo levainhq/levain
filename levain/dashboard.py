@@ -604,6 +604,7 @@ STATE_MAX_TEXT_LEN = 500
 # A stamp up to this far in the future is clock skew between writer and reader (a phone
 # app, another machine), not bad data: it reads as age 0, never as unset.
 STATE_CLOCK_SKEW_SECONDS = 300
+STATE_KEYS = ("state", "state_set_at", "state_source")   # the stored record a state write binds to
 
 
 @dataclass
@@ -618,9 +619,20 @@ class State:
     set_at: str | None
     source: str | None
     age_label: str = ""  # "set 2h ago"; "" when text is None
+    version: str | None = None  # the stored record's write version (``state_version``); None if unreadable
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
+
+
+def state_version(data: Any) -> str | None:
+    """The version a state write binds to: the cockpit's value version of the stored record (the
+    three ``STATE_KEYS`` as stored, other keys ignored), so the legacy page and the manifest name
+    the same version. None for a file that is not a JSON object."""
+    if not isinstance(data, dict):
+        return None
+    from levain.cockpit.engine import value_version_of   # lazy: the cockpit imports this module
+    return value_version_of({k: data.get(k) for k in STATE_KEYS})
 
 
 def _read_state(context_json: Path | None, now: datetime) -> "State | None":
@@ -638,6 +650,13 @@ def _read_state(context_json: Path | None, now: datetime) -> "State | None":
         data = json.loads(context_json.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return empty
+    return state_from_data(data, now)
+
+
+def state_from_data(data: Any, now: datetime) -> State:
+    """The state line from a parsed context file (``_read_state``'s rules); a caller that holds the
+    record it versions builds the line from that same read."""
+    empty = State(text=None, set_at=None, source=None, version=state_version(data))
     if not isinstance(data, dict):
         return empty
     raw_text = data.get("state")
@@ -660,7 +679,7 @@ def _read_state(context_json: Path | None, now: datetime) -> "State | None":
     if delta < -STATE_CLOCK_SKEW_SECONDS or delta >= STATE_EXPIRES_AFTER_HOURS * 3600:
         return empty
     delta = max(delta, 0.0)
-    return State(text=text, set_at=set_at, source=source, age_label=_humanize_age(delta))
+    return State(text=text, set_at=set_at, source=source, age_label=_humanize_age(delta), version=empty.version)
 
 
 def _write_context_line(context_json: Path, key: str, text: str, *, source: str) -> None:

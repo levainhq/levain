@@ -521,7 +521,8 @@ class TestRound1:
         seen: list[dict] = []
         real = v.apply_edit
         monkeypatch.setattr(v, "apply_edit", lambda scope, req: seen.append(req) or real(scope, req))
-        rig.edit({"kind": "spore_descend", "spore_id": rig.ids["loop"], "spore_kind": "dropped", "confirm": True})
+        rig.edit({"kind": "spore_descend", "spore_id": rig.ids["loop"], "spore_kind": "dropped", "confirm": True,
+                  "expect_disposition": None})        # the rendered snapshot, compared normalised (loop = null)
         assert seen and seen[0]["expect_disposition"] == "loop"   # the row's own, normalised by the handler
 
     def test_operator_state_source_comes_from_the_credential(self, rig: Rig) -> None:
@@ -529,7 +530,8 @@ class TestRound1:
         v = rig.ck.read_value_version("state").value
         _refused("field_not_allowed", rig.post, "operator_state", "state", None, {"text": "x", "source": "cli"},
                  panel_version=v)
-        rig.edit({"kind": "operator_state", "text": "via edit", "source": "cli"})
+        rig.edit({"kind": "operator_state", "text": "via edit", "source": "cli",
+                  "panel_version": rig.ck.read_value_version("state").value})
         stored = json.loads((rig.root / ".levain" / "context.json").read_text())
         assert (stored["state"], stored["state_source"]) == ("via edit", "web")
 
@@ -577,3 +579,139 @@ class TestRound1:
         outs = [rig.ck.read_one("tray", "spore:x") for _ in range(eng.WRITE_READ_CAP + 1)]
         gate.set()
         assert "still running" in outs[-1].message
+
+
+# --- L3 r1 findings (codex + complement), each held by a test that failed on 346b715 ---------------
+
+
+def _note_spec(fired: list[dict]) -> VerbSpec:
+    return VerbSpec("note_it", "note", "records a note", "panel", fields=("text",), floor="C1",
+                    tier_fn=lambda *a: "C1", idempotent=True,
+                    fire=lambda scope, p, target, confirm: fired.append({**p, "panel": target["panel_id"]})
+                    or {"summary": "noted"})
+
+
+def _discovered_rig(tmp_path: Path, fired: list[dict]) -> tuple[Rig, dict[str, Any]]:
+    """A rig with discovered downstream panels whose offers the test changes between reads."""
+    r = Rig(tmp_path, extra={"note_it": _note_spec(fired)})
+    feed: dict[str, Any] = {"panels": {"ext:a": ("note_it",), "ext:b": ("note_it",)}, "raise": None}
+
+    def discover(ctx):
+        if feed["raise"]:
+            raise RuntimeError(feed["raise"])
+        return [ProviderSpec(pid, "line", pid, "feed", lambda ctx: Read(value={"lines": []}), verbs=v)
+                for pid, v in feed["panels"].items()]
+    r.ck.discover(discover)
+    r.ck.manifest(CRED)      # the first read registers them
+    return r, feed
+
+
+class TestL3Round1:
+    def test_a_discovered_panel_that_stops_offering_a_verb_refuses_it(self, tmp_path: Path) -> None:
+        """codex #2: an already-registered discovered panel kept its first offer for every write."""
+        fired: list[dict] = []
+        r, feed = _discovered_rig(tmp_path, fired)
+        r.post("note_it", "ext:a", None, {"text": "one"}, idempotency_key="k1")
+        feed["panels"]["ext:a"] = ()
+        e = _refused("not_offered", r.post, "note_it", "ext:a", None, {"text": "two"}, idempotency_key="k2")
+        assert e.http_status == 404
+        assert [f["text"] for f in fired] == ["one"]
+        assert r.ck.manifest(CRED)["panels"]["ext:a"]["actions"] == []   # the render follows the source too
+
+    def test_a_write_to_a_discovered_panel_fails_closed_when_discovery_fails(self, tmp_path: Path) -> None:
+        """codex #2, the bound: an offer discovery cannot confirm is no offer."""
+        fired: list[dict] = []
+        r, feed = _discovered_rig(tmp_path, fired)
+        feed["raise"] = "feed down"
+        e = _refused("source_unavailable", r.post, "note_it", "ext:a", None, {"text": "x"}, idempotency_key="k")
+        assert e.http_status == 503 and fired == []
+
+    def test_one_idempotency_key_on_two_panels_is_a_reused_key_not_a_replay(self, tmp_path: Path) -> None:
+        """codex #7: the fingerprint omitted panel_id, so the second panel's write was a false replay."""
+        fired: list[dict] = []
+        r, _feed = _discovered_rig(tmp_path, fired)
+        r.post("note_it", "ext:a", None, {"text": "same"}, idempotency_key="k")
+        e = _refused("idempotency_key_reuse", r.post, "note_it", "ext:b", None, {"text": "same"},
+                     idempotency_key="k")
+        assert e.http_status == 422 and fired == [{"text": "same", "panel": "ext:a"}]
+
+    def test_a_legacy_descend_rendered_on_another_list_is_409(self, rig: Rig) -> None:
+        """codex #3: /edit dropped the body's expect_disposition and bound to a fresh read, so a
+        'remove note' confirmed on an old render descended a now-live loop."""
+        before = rig.spore("loop")
+        e = _refused("stale", rig.edit, {"kind": "spore_descend", "spore_id": rig.ids["loop"],
+                                         "spore_kind": "composted", "confirm": True, "expect_disposition": "note"})
+        assert e.http_status == 409 and rig.spore("loop") == before
+        _refused("bad_request", rig.edit, {"kind": "spore_descend", "spore_id": rig.ids["loop"],
+                                           "spore_kind": "dropped", "confirm": True})
+        assert rig.spore("loop") == before
+        assert rig.edit({"kind": "spore_descend", "spore_id": rig.ids["loop"], "spore_kind": "dropped",
+                         "confirm": True, "expect_disposition": "loop"})["ok"]
+
+    def test_the_state_line_and_its_version_come_from_one_read(self, rig: Rig) -> None:
+        """codex #4 / complement #3: the line came from a memoised view, the version from a later raw
+        read, so a write could bind to content no one saw."""
+        from levain.cockpit.engine import ReadContext, value_version_of
+        from levain.cockpit.providers import _view
+        ctx = ReadContext(rig.clock())
+        _view(rig.src, ctx)                       # memoise the view with the old line
+        cj = rig.root / ".levain" / "context.json"
+        new = {"state": "changed", "state_set_at": rig.clock().isoformat(), "state_source": "cli"}
+        cj.write_text(json.dumps(new))
+        res = rig.ck.spec("state").read(ctx)
+        assert res.value["lines"][0]["text"] == "changed"
+        assert value_version_of(res.version_of) == value_version_of(new)
+
+    def test_edit_operator_state_binds_the_version_it_rendered(self, rig: Rig) -> None:
+        """codex #5 / complement #2: /edit operator_state had no version bind (last writer wins)."""
+        from levain.dashboard import _read_state
+        cj = rig.root / ".levain" / "context.json"
+        _refused("bad_request", rig.edit, {"kind": "operator_state", "text": "x"})
+        legacy_v = _read_state(cj, rig.clock()).version
+        assert legacy_v == rig.ck.read_value_version("state").value      # one version, both renderers
+        assert rig.edit({"kind": "operator_state", "text": "x", "panel_version": legacy_v})["ok"]
+        _refused("stale", rig.edit, {"kind": "operator_state", "text": "y", "panel_version": legacy_v})
+        assert json.loads(cj.read_text())["state"] == "x"
+
+    def test_a_value_panel_action_names_the_version_it_was_rendered_with(self, rig: Rig) -> None:
+        """codex #6: the value action's target carried no panel_version."""
+        p = rig.ck.panel("state", credential_class="token")
+        act = next(a for a in p["actions"] if a["verb"] == "operator_state")
+        assert act["target"]["panel_version"] == p["value"]["value_version"]
+        (rig.root / ".levain" / "context.json").unlink()
+        p = rig.ck.panel("state", credential_class="token")
+        act = next(a for a in p["actions"] if a["verb"] == "operator_state")
+        assert act["target"]["panel_version"] == verbs_mod.VALUE_ABSENT
+
+    def test_a_non_bool_dry_run_is_refused_not_a_live_write(self, rig: Rig) -> None:
+        """codex #8: dry_run "true" fell through to a live write."""
+        before = rig.spore("seed")
+        e = _refused("bad_request", rig.post, "spore_touch", "tray", "seed", dry_run="true")
+        assert e.http_status == 400 and rig.spore("seed") == before
+
+    def test_the_verbs_map_is_what_panels_offer_and_never_a_feed_named_broker_head(self, tmp_path: Path) -> None:
+        """codex #9 / complement #5: the map read raw spec.verbs, so a feed could publish a broker head
+        or a kernel verb its panel may not offer."""
+        r = Rig(tmp_path)
+        r.ck.register(ProviderSpec("ext:x", "line", "X", "feed", lambda ctx: Read(value={"lines": []}),
+                                   verbs=("harness_approve", "entity_name")))
+        vm = r.ck.manifest(CRED)["verbs"]
+        assert "harness_approve" not in vm and "entity_name" not in vm
+
+    def test_write_token_cannot_equal_another_surfaces_token(self, tmp_path: Path) -> None:
+        """complement #4: uniqueness was checked before write_token merged into 'browser'."""
+        _root, src, _ids = _install(tmp_path)
+        with pytest.raises(ValueError, match="share one token"):
+            make_server(src, host="127.0.0.1", port=0, write_token="T", surface_tokens={"flowconnect": "T"})
+
+    def test_a_token_the_page_cannot_store_is_refused_at_bind(self, tmp_path: Path) -> None:
+        """complement #8: a token outside the page's stored set was stripped from the link and dropped
+        silently. The server now admits only what the page stores, and both rules are the same set."""
+        import re as _re
+        from levain import web_server as ws
+        _root, src, _ids = _install(tmp_path)
+        with pytest.raises(ValueError, match="printable ASCII"):
+            make_server(src, host="127.0.0.1", port=0, write_token="has space")
+        boot = (Path(ws.__file__).parent / "templates" / "web" / "dashboard_boot.js").read_text()
+        m = _re.search(r"if \(/\^(\[[^\]]+\])\+\$/\.test\(tok\)\)", boot)
+        assert m and m.group(1) == ws._HEADER_SAFE_TOKEN.pattern[:-1]
