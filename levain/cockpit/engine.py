@@ -370,7 +370,11 @@ class Cockpit:
         st = self._state[spec.id]
         if spec.refresh_every_s is None:
             gen = next(self._gen)        # allocated BEFORE the read, so it orders reads by start
-            snap = self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
+            try:
+                snap = self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
+            except Exception as exc:  # noqa: BLE001 - as the refresher: a read that cannot be processed is an error read
+                with st.mu:
+                    snap = self._fault(spec, st, f"{type(exc).__name__}: {exc}", _iso(ctx.now))
             with st.lock:        # what the freshness route reports; it never reads a source itself
                 if st.fresh is None or gen >= st.fresh[0]:
                     st.fresh = (gen, snap.as_of, snap.status)
@@ -415,16 +419,26 @@ class Cockpit:
             snap = self._read_snap(spec, res, ctx, now_iso)
         except Exception as exc:  # noqa: BLE001 - malformed provider output of ANY shape is a Fault, never a crash
             return self._fault(spec, st, f"provider output refused: {exc}", now_iso)
+        # Reads can finish out of start order, so the bookkeeping only moves along the clock: the
+        # last good read never goes back, and a success older than the current failure's start
+        # does not clear it.
         st.ever_present = True
-        st.last_good_as_of = snap.as_of
-        st.failing_since = None
+        if not st.last_good_as_of or _iso_ge(snap.as_of, st.last_good_as_of):
+            st.last_good_as_of = snap.as_of
+        if st.failing_since is None or _iso_ge(now_iso, st.failing_since):
+            st.failing_since = None
         return snap
 
     def _fault(self, spec: ProviderSpec, st: _State, message: str, now_iso: str) -> _Snap:
-        if st.failing_since is None:
+        # a fault older than the last good read is stale news: it does not (re)start a failure
+        if st.failing_since is None and not (st.last_good_as_of and not _iso_ge(now_iso, st.last_good_as_of)):
             st.failing_since = now_iso
-        detail = f"{message} (failing since {st.failing_since}"
-        detail += f", last good {st.last_good_as_of})" if st.last_good_as_of else ")"
+        detail = f"{message}"
+        if st.failing_since:
+            detail += f" (failing since {st.failing_since}"
+            detail += f", last good {st.last_good_as_of})" if st.last_good_as_of else ")"
+        elif st.last_good_as_of:
+            detail += f" (last good {st.last_good_as_of})"
         return _Snap("error", None, None, [], [], st.last_good_as_of, detail, spec.note)
 
     def _read_snap(self, spec: ProviderSpec, res: Read, ctx: ReadContext, now_iso: str) -> _Snap:
@@ -754,7 +768,10 @@ class Cockpit:
 
     def freshness(self) -> dict[str, dict[str, Any]]:
         """``{panel_id: {as_of, status}}`` for every registered panel, ``now`` included (design §3.4).
-        A client that got a 304 on a panel reads the panel's current age here. It is metadata only:
+        A client that got a 304 on a panel reads the panel's current age here. SEMANTICS: a panel's entry
+        is the outcome of its most recently STARTED read; a newer failure is newer information about the
+        source, so ``error`` is the right answer even if an older read succeeded. A client that sees
+        ``error`` or ``unread`` re-fetches the panel. It is metadata only:
         it runs NO provider and computes no status of its own. A refresher panel reports its cached
         snapshot (liveness and aging rules applied); an on-demand panel reports its last served read,
         aged against ``stale_after_s``; ``now`` is rolled up from the gate triage-lists' entries in
@@ -877,6 +894,14 @@ class Cockpit:
             return Read(value=rows[0])
         except Exception as exc:  # noqa: BLE001
             return Fault(f"provider output refused: {exc}")
+
+
+def _iso_ge(a: str, b: str) -> bool:
+    """``a`` is at or after ``b``; an unparseable stamp never orders (it compares as not-later)."""
+    try:
+        return _parse_iso(a) >= _parse_iso(b)
+    except (ValueError, TypeError):
+        return False
 
 
 def _parse_iso(s: str) -> datetime:

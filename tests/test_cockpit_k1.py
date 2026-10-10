@@ -1053,7 +1053,9 @@ class TestSession2Gaps:
         _r, src, ck = env
         ent = ck.manifest(NONE_CRED)["entity"]
         assert set(ent["jar"]) == {"status", "today", "typical", "history_days", "level", "label", "day"}
-        assert ent["paths"] == {"episodic_db": str(src.anneal.episodic_db)}
+        assert "paths" not in ent and str(Path.home()) not in json.dumps(ent)       # never the absolute path
+        assert ent["store_label"] == src.anneal.episodic_db.name or ent["store_label"].startswith("~/")
+        assert ent["store_label"].endswith(src.anneal.episodic_db.name)
 
     def test_health_carries_max_strength_and_local_density(self, env) -> None:
         _r, _s, ck = env
@@ -1214,3 +1216,49 @@ class TestL3R8Fixes:
             return out
         ck._ordered_specs = racing           # type: ignore[method-assign]
         assert "tray" in ck.freshness()
+
+
+class TestStoreLabel:
+    def test_label_is_home_relative_or_the_bare_name(self, tmp_path: Path) -> None:
+        from levain.cockpit.providers import _store_label
+        assert _store_label(Path.home() / ".anneal-memory" / "memory.db") == "~/.anneal-memory/memory.db"
+        assert _store_label(Path("/nonexistent-root/elsewhere/x.db")) == "x.db"
+
+
+class TestR9Bookkeeping:
+    """An older-started read that finishes last must not regress the monotonic bookkeeping."""
+
+    def _setup(self):
+        ck = Cockpit()
+        spec = _simple("p")
+        ck.register(spec)
+        return ck, spec, ck._state["p"]
+
+    def _ctx(self, minute: int):
+        from levain.cockpit.engine import ReadContext
+        return ReadContext(datetime(2026, 10, 9, 12, minute, tzinfo=timezone.utc))
+
+    def test_an_older_success_finishing_last_does_not_regress_last_good(self) -> None:
+        ck, spec, st = self._setup()
+        ck._process(spec, st, Read(rows=()), self._ctx(10))      # newer read, finished first
+        ck._process(spec, st, Read(rows=()), self._ctx(5))       # older read, finished last
+        assert st.last_good_as_of.startswith("2026-10-09T12:10")
+
+    def test_an_older_fault_finishing_last_does_not_restore_failing_since(self) -> None:
+        ck, spec, st = self._setup()
+        ck._process(spec, st, Read(rows=()), self._ctx(10))
+        snap = ck._process(spec, st, Fault("old"), self._ctx(5))
+        assert st.failing_since is None and "failing since" not in snap.error
+
+    def test_an_older_success_finishing_last_does_not_clear_a_newer_failure(self) -> None:
+        ck, spec, st = self._setup()
+        ck._process(spec, st, Fault("new"), self._ctx(10))
+        ck._process(spec, st, Read(rows=()), self._ctx(5))
+        assert st.failing_since.startswith("2026-10-09T12:10")
+
+    def test_a_raising_fault_path_in_snap_for_is_an_error_read_and_freshness_follows(self, monkeypatch) -> None:
+        ck, spec, st = self._setup()
+        ck.panel("p")
+        monkeypatch.setattr(Cockpit, "_read_snap", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        assert ck.panel("p")["status"] == "error"
+        assert ck.freshness()["p"]["status"] == "error"

@@ -15,6 +15,10 @@ import urllib.parse
 import urllib.request
 
 TARGET = 40_000
+# Phill ruled 2026-10-09 20:54 ("agree with all recs"): the compact profile of flow's live store is
+# ACCEPTED at its measured 43.7 kB. The 40 kB target stays the design's aim; omitting null row keys
+# (~3.5 kB) moved to K2. The exit code fails above this budget.
+BUDGET = 43_700
 
 
 def get(url: str, token: str | None) -> bytes:
@@ -38,8 +42,9 @@ def main(argv: list[str]) -> int:
     for name, n in sorted(sizes.items(), key=lambda kv: -kv[1])[:10]:
         print(f"{name:28s} {n:8d} B")
     print(f"TOTAL compact (manifest + {len(sizes) - 1} panels): {total} B = {total / 1000:.1f} kB; "
-          f"target {TARGET // 1000} kB -> {'over' if total > TARGET else 'under'} by {abs(total - TARGET)} B")
-    return 0
+          f"target {TARGET // 1000} kB -> {'over' if total > TARGET else 'under'} by {abs(total - TARGET)} B; "
+          f"ruled budget {BUDGET} B -> {'OVER' if total > BUDGET else 'within'}")
+    return 1 if total > BUDGET else 0
 
 
 if __name__ == "__main__":
