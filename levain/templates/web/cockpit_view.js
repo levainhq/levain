@@ -20,16 +20,30 @@
     overdue_days: (v) => v + "d overdue", age_days: (v) => v + "d old", due: (v) => "due " + v,
   };
 
-  // Control, format, surrogate and separator characters shown as <U+XXXX>, as the terminal renderer
-  // does, so a kernel-sent title cannot reorder or hide what the reader sees. A newline is structure,
-  // not content, and is kept (markdown bodies need it).
+  // ONE sanitising boundary. Every string in the manifest and the panels goes through clean() once, on
+  // entry, so no per-field guard can miss a field. It shows as <U+XXXX> the characters that can move or
+  // hide neighbouring text: control characters (a tab and newlines are structure and stay), the bidi
+  // controls and marks, the invisible format characters, a byte-order mark, lone surrogates and the line
+  // and paragraph separators. The zero-width joiner and non-joiner stay: emoji sequences and Persian or
+  // Indic text need them.
+  const HOSTILE = /[\p{Cc}\p{Cs}\p{Zl}\p{Zp}\u061c\u200b\u200e\u200f\u202a-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb\u{e0000}-\u{e007f}]/gu;
   function visible(v) {
-    return String(v === null || v === undefined ? "" : v).replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu,
-      (ch) => (ch === "\n" ? ch : "<U+" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + ">"));
+    return String(v === null || v === undefined ? "" : v).replace(/\r\n/g, "\n").replace(HOSTILE,
+      (ch) => (ch === "\n" || ch === "\t" ? ch : "<U+" + ch.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + ">"));
+  }
+  function clean(x) {
+    if (typeof x === "string") return visible(x);
+    if (Array.isArray(x)) return x.map(clean);
+    if (x && typeof x === "object") {
+      const o = {};
+      for (const k of Object.keys(x)) o[k] = clean(x[k]);
+      return o;
+    }
+    return x;
   }
 
   function parseIso(iso) {
-    if (!iso) return NaN;
+    if (typeof iso !== "string" || !iso) return NaN;
     return Date.parse(iso.indexOf("T") < 0 || /(Z|[+-]\d\d:?\d\d)$/i.test(iso) ? iso : iso + "Z");
   }
 
@@ -54,9 +68,9 @@
     const f = row.facets || {};
     return {
       id: bare(row.id), type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
-      disposition: f.disposition, text: visible(row.body || row.title), next: f.due || null,
+      disposition: f.disposition, text: row.body || row.title, next: f.due || null,
       descend_kinds: [], ascend_kinds: [],
-      group_title: row.group ? (groupTitles.get(row.group) || visible(row.group)) : null, group: row.group || null,
+      group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
     };
   }
 
@@ -64,37 +78,36 @@
   function bannerOf(head, panel, now) {
     const out = [];
     if (head.status === "stale") out.push({ tone: "stale", text: "STALE: last read " + (ageLabel(head.as_of, now, "") || "unknown") });
-    if (head.status === "partial") for (const s of head.skipped || []) out.push({ tone: "stale", text: "PARTIAL: " + s.count + " unreadable — " + visible(s.reason) });
-    for (const f of head.filtered || []) out.push({ tone: "dim", text: f.count + " held back — " + visible(f.reason) });
-    if (head.note) out.push({ tone: "dim", text: visible(head.note) });
+    if (head.status === "partial") for (const s of head.skipped || []) out.push({ tone: "stale", text: "PARTIAL: " + s.count + " unreadable — " + s.reason });
+    for (const f of head.filtered || []) out.push({ tone: "dim", text: f.count + " held back — " + f.reason });
+    if (head.note) out.push({ tone: "dim", text: head.note });
     // a Metric's alerts (e.g. a wrap in progress) are part of its reading, never dropped
-    for (const a of ((panel.value || {}).alerts || [])) out.push({ tone: "stale", text: "! " + visible(a.message) });
+    for (const a of ((panel.value || {}).alerts || [])) out.push({ tone: "stale", text: "! " + a.message });
     return out.length ? out : null;
   }
 
   function externalOf(head, panel, groupTitles) {
     const v = panel.value || {};
-    const out = { note: visible(head.note || ""), empty: visible(head.empty || "nothing here") };
+    const out = { note: head.note || "", empty: head.empty || "nothing here" };
     if (head.kind === "triage-list") {
       out.lines = (panel.rows || []).map((r) => {
-        const grp = r.group ? (groupTitles.get(r.group) || visible(r.group)) : "";
+        const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
         const badges = (r.badges || []).map(badgeText).join(" · ");
-        const prov = r.provenance ? visible(r.provenance.label) : "";
-        const meta = [r.panel_id ? visible(r.panel_id) : "", grp, badges, prov].filter(Boolean).join(" · ");
-        return { meta: meta, text: visible(r.body || r.title), accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
+        const prov = r.provenance ? r.provenance.label : "";
+        const meta = [r.panel_id ? r.panel_id : "", grp, badges, prov].filter(Boolean).join(" · ");
+        return { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
       });
-      if (panel.degraded && panel.degraded.length) out.note = "not complete: " + visible(panel.error || panel.degraded.join(", "));
+      if (panel.degraded && panel.degraded.length) out.note = "not complete: " + panel.error || panel.degraded.join(", ");
     } else if (head.kind === "line") {
-      out.lines = (v.lines || []).map((l) => ({ meta: visible(l.label), text: visible(l.text) }));
+      out.lines = (v.lines || []).map((l) => ({ meta: l.label, text: l.text }));
     } else if (head.kind === "metric") {
       out.lines = (v.metrics || []).map((m) => ({
-        meta: visible(m.label), text: visible(m.value + (m.unit ? " " + m.unit : "") + (m.read ? " — " + m.read : "")),
+        meta: m.label, text: m.value + (m.unit ? " " + m.unit : "") + (m.read ? " — " + m.read : ""),
         accent: m.status === "warn" || m.status === "bad", dim: m.status === "unknown" }));
-      for (const a of v.alerts || []) out.lines.push({ meta: "!", text: visible(a.message), accent: true });
     } else if (head.kind === "visual") {
-      out.lines = (v.text || []).map((l) => ({ meta: visible(l.label), text: visible(l.text) }));
+      out.lines = (v.text || []).map((l) => ({ meta: l.label, text: l.text }));
     } else if (head.kind === "prose") {
-      out.markdown = visible(v.markdown || "");
+      out.markdown = v.markdown || "";
     }
     return out;
   }
@@ -111,6 +124,7 @@
       graduations_validated_total: m.get("graduations validated"), graduations_demoted_total: m.get("graduations demoted"),
       // not in the manifest (a K1 gap, routed): max_strength, local_density. The core omits what is absent.
       last_wrap_at: last ? last.wrapped_at : null, continuity_chars: last ? last.continuity_chars : null,
+      wrap_history_unavailable: wraps === null,
     };
   }
 
@@ -120,40 +134,46 @@
     if (!l) return { text: null };
     const t = parseIso(l.at);
     const known = !isNaN(t) && t <= now + 60000;   // an unparseable or future stamp is "age unknown", never "fresh"
-    const out = { text: visible(l.text), set_at: l.at, source: l.source, age_label: known ? ageLabel(l.at, now, "set ") : "" };
+    const out = { text: l.text, set_at: l.at, source: l.source, age_label: known ? ageLabel(l.at, now, "set ") : "" };
     if (withSet) { out.stale = head.status === "stale"; out.freshness = known ? "fresh" : "unknown"; }
     return out;
   }
 
   // snap = {manifest, panels}; returns the SubstrateView-shaped object dashboard_core.js renders.
   // `snap.panels` maps a panel id to its payload, or to {error} when its fetch failed.
-  function fromManifest(snap) {
+  function fromManifest(raw) {
+    const snap = clean(raw);
     const m = snap.manifest;
     const gen = parseIso(m.generated_at);
-    const now = isNaN(gen) ? Date.now() : gen;   // the server's clock, so a skewed browser cannot misreport ages
+    let now = isNaN(gen) ? Date.now() : gen;   // the server's clock, so a skewed browser cannot misreport ages
+    for (const p of Object.values(snap.panels || {})) {   // panels are fetched after the manifest: never older than what they report
+      const t = parseIso(p && p.as_of);
+      if (!isNaN(t) && t > now) now = t;
+    }
     const P = new Map(Object.entries(snap.panels || {}));
     const heads = new Map(Object.entries(m.panels || {}));
     const ent = m.entity || {};
     const view = {
-      paths: { omitted: true }, scope: ent.governance, entity_name: visible(ent.name),
-      brand_wordmark: visible((ent.brand || {}).wordmark), brand_model: visible((ent.brand || {}).model),
+      paths: { omitted: true }, scope: ent.governance, entity_name: ent.name,
+      brand_wordmark: (ent.brand || {}).wordmark, brand_model: (ent.brand || {}).model,
       health: null, graph: null, crystal_index: [], open_spores: [], tray: [], keep: [], episodes: [],
       sections: [], config_docs: [], wraps: [], recent_edits: [], focus: null, state: null, jar: null,
       layout: [], errors: Object.create(null), extra_panels: Object.create(null), writable: false, write_token_required: false,
     };
-    for (const e of m.errors || []) view.errors[e.source || "manifest"] = visible(e.message);
+    for (const e of m.errors || []) view.errors[e.source || "manifest"] = e.message;
 
     // a panel is unreadable when its payload is missing, a fetch failure, or the kernel said `error`
     const failure = (pid) => {
       const p = P.get(pid), h = heads.get(pid);
-      if (p && p.error !== undefined && p.status === undefined) return visible(p.error);      // our own fetch failure record
+      if (p && p.error !== undefined && p.status === undefined) return p.error;      // our own fetch failure record
       if (!p) return "no payload";
-      if (p.status === "error") return visible(p.error || "unavailable");
+      if (p.status === "error") return p.error || "unavailable";
       return null;
     };
     const unavailable = (pid, zone, why) => {
-      const h = heads.get(pid) || {};
-      view.layout.push({ kind: "external", zone: zone, edit_class: "", title: visible(h.title || pid), id: pid });
+      const pl = P.get(pid);
+      const h = pl && pl.status === "error" ? pl : (heads.get(pid) || {});   // a real error payload's own last-good time wins
+      view.layout.push({ kind: "external", zone: zone, edit_class: "", title: h.title || pid, id: pid });
       view.extra_panels[pid] = { error: why + " — last good " + (h.as_of ? ageLabel(h.as_of, now, "") : "never") };
     };
 
@@ -183,8 +203,8 @@
       if (bad) { unavailable(pid, zoneId, bad); return; }
       const panel = P.get(pid);
       const groupTitles = new Map();
-      for (const g of panel.groups || head.groups || []) groupTitles.set(g.id, visible(g.title));
-      const entry = { zone: zoneId, edit_class: "", title: visible(panel.title || head.title), id: pid };
+      for (const g of panel.groups || head.groups || []) groupTitles.set(g.id, g.title);
+      const entry = { zone: zoneId, edit_class: "", title: panel.title || head.title, id: pid };
       const banner = bannerOf(panel, panel, now);
       if (banner) entry.banner = banner;
       if (panel.as_of) entry.fresh = ageLabel(panel.as_of, now, "read ");
@@ -195,19 +215,19 @@
         view[lists[pid]] = rows.map((r) => sporeOf(r, groupTitles));
         view.layout.push(Object.assign(entry, { kind: kind }));
       } else if (pid === "episodes" && panel.kind === "triage-list") {
-        view.episodes = rows.map((r) => ({ id: bare(r.id), timestamp: (r.facets || {}).at, type: visible((r.facets || {}).episode_type),
-          source: (r.facets || {}).source, tags: (r.facets || {}).tags || [], content: visible(r.body || r.title) }));
+        view.episodes = rows.map((r) => ({ id: bare(r.id), timestamp: (r.facets || {}).at, type: (r.facets || {}).episode_type,
+          source: (r.facets || {}).source, tags: (r.facets || {}).tags || [], content: r.body || r.title }));
         view.layout.push(Object.assign(entry, { kind: "episodes" }));
       } else if (pid === "edits" && panel.kind === "triage-list") {
         view.recent_edits = rows.map((r) => ({ id: bare(r.id), ts: (r.facets || {}).at, action: (r.facets || {}).edit_kind,
-          source: visible(r.title), undoable: (r.facets || {}).undoable }));
+          source: r.title, undoable: (r.facets || {}).undoable }));
         view.layout.push(Object.assign(entry, { kind: "edits" }));
       } else if (pid === "crystals" && panel.kind === "triage-list") {
         view.crystal_index = rows.map((r) => {
           const f = r.facets || {};
           // the kernel sends a tag list as one comma-joined string in a one-element list (a K1 quirk, routed)
           const tags = [].concat(f.tags || []).join(",").split(",").map((s) => s.trim()).filter(Boolean).map(visible);
-          return { name: visible(bare(r.id)), level: f.crystal_level, one_clause: visible(r.body || r.title), permanence: f.permanence,
+          return { name: bare(r.id), level: f.crystal_level, one_clause: r.body || r.title, permanence: f.permanence,
                    last_activated_on: f.last_activated_on, tags: tags };
         });
         view.layout.push(Object.assign(entry, { kind: "crystals" }));
@@ -221,20 +241,22 @@
         view.wraps = wrapsData || [];
         view.layout.push(Object.assign(entry, { kind: "wraps" }));
       } else if (panel.kind === "prose" && pid.indexOf("section:") === 0 && (panel.value || {}).markdown != null) {
-        view.sections.push({ heading: visible(panel.title || head.title), body: visible(panel.value.markdown) });
-        view.layout.push(Object.assign(entry, { kind: "section", ref: sectionRef++, heading: visible(panel.title || head.title) }));
+        view.sections.push({ heading: panel.title || head.title, body: panel.value.markdown });
+        view.layout.push(Object.assign(entry, { kind: "section", ref: sectionRef++, heading: panel.title || head.title }));
       } else {
         view.extra_panels[pid] = externalOf(panel, panel, groupTitles);
         view.layout.push(Object.assign(entry, { kind: "external" }));
       }
     };
 
-    for (const pid of headerExtra) place(pid, "operate");
-    for (const zone of (m.regions.zones || [])) for (const pid of (zone.panels || [])) place(pid, zone.id);
+    const placed = new Set();
+    const placeOnce = (pid, zoneId) => { if (!placed.has(pid)) { placed.add(pid); place(pid, zoneId); } };
+    for (const pid of headerExtra) placeOnce(pid, "operate");
+    for (const zone of (m.regions.zones || [])) for (const pid of (zone.panels || [])) placeOnce(pid, zone.id);
     return view;
   }
 
-  const api = { fromManifest, ageLabel, badgeText, visible };
+  const api = { fromManifest, ageLabel, badgeText, visible, clean };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.LevainCockpitView = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);
