@@ -35,7 +35,6 @@ import fnmatch
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -1970,10 +1969,11 @@ def refresh_adapter(
     would load a seed the reconcile held back. An
     activation file a drifted pack changed is never refreshed here: the pack reconcile owns
     it and lists it for review.
-    Codex's machine-global hooks.json is handled only when it already names this
-    install, and config.toml only when it already registers this install's store;
-    otherwise they are named and left alone, because replacing them repoints every
-    codex session on the machine."""
+    Codex's machine-global hooks.json is replaced only while its bytes are what levain last
+    recorded writing for this install (the adapter receipt); any other copy, a legacy
+    install's included, is staged for review. config.toml is handled only when it already
+    registers this install's store. Otherwise they are left alone, because replacing them
+    repoints every codex session on the machine."""
     from levain import manifest
 
     install = install.resolve()  # every path compare below is against resolved paths
@@ -2009,8 +2009,6 @@ def refresh_adapter(
             variants = {t.name: x for t, x in _adapter_local_files(
                 adapter, install, adapter_root, _VARIABLE, import_entries(roster),
                 on_demand_entries(roster)).items()}
-            if adapter == "codex":
-                variants["hooks.json"] = _codex_hooks_json(adapter_root, _VARIABLE, install)
             # `expected` is composed from the LIVE pack sources, so a path a pack changed since
             # it was recorded would be installed in the same run the pack reconcile lists it for
             # review (codex L3 on 19811f7, reproduced: pack hook v1 -> v2, update exit 1,
@@ -2065,11 +2063,13 @@ def refresh_adapter(
                 out.review.append(str(hooks))
                 lines.append(f"  {hooks} is not valid JSON, so codex cannot read its hooks; "
                              f"`levain update` left it alone, since whose it was cannot be told.")
-            elif here is not None and here != want and not _names_install(here, want):
-                lines.append(f"  note: {hooks} does not run this install's hooks as levain "
-                             f"writes them (another install's, or edited), so `levain update` "
-                             f"left it alone: rewriting it repoints every codex session.")
             elif here is not None:
+                # The adapter receipt alone decides (_refresh_decision): replaced only while
+                # its bytes are what levain last wrote for THIS install; anything else,
+                # another install's file, an edit, or a file from before the receipt, is
+                # staged under .levain/pending/ and never overwritten. Ownership is not
+                # inferred from the file's text (spore-866 L3 r1-r7; Phill 2026-10-10 "go
+                # with B"), the way dpkg treats a conffile.
                 files = {**files, hooks: want}
         _refresh_adapter_files(install, files, apply=apply, out=out, lines=lines,
                                variants=variants)
@@ -2138,42 +2138,6 @@ def _read_or_none(path: Path) -> str | None:
     except (OSError, ValueError) as e:
         raise _Unreadable(str(e)) from None
 
-
-def _hook_scripts(text: str) -> set[str]:
-    """The script each hook command in a hooks.json runs, decoded as the shell, doctor and
-    verify read it (``shlex``; its second token), normalised and case-folded as the platform
-    does. A command that cannot be read is skipped; a file that cannot be read has none."""
-    try:
-        data = json.loads(text)
-    except (ValueError, RecursionError):
-        return set()
-    out: set[str] = set()
-    hooks = data.get("hooks") if isinstance(data, dict) else None
-    for entries in (hooks.values() if isinstance(hooks, dict) else ()):
-        for entry in entries if isinstance(entries, list) else ():
-            inner = entry.get("hooks") if isinstance(entry, dict) else None
-            for h in inner if isinstance(inner, list) else ():
-                cmd = h.get("command") if isinstance(h, dict) else None
-                if not isinstance(cmd, str):
-                    continue
-                try:
-                    tokens = shlex.split(cmd, posix=os.name != "nt")
-                except ValueError:
-                    continue
-                if len(tokens) >= 2:
-                    script = tokens[1].strip('"') if os.name == "nt" else tokens[1]
-                    out.add(os.path.normcase(os.path.normpath(script)))
-    return out
-
-
-def _names_install(here: str, want: str) -> bool:
-    """Whether codex's hooks.json (``here``) runs one of the exact scripts levain's own render
-    of it for this install (``want``) runs: derived from the writer, so ``/x/inst`` never
-    claims ``/x/inst2``, ``..`` cannot climb out, an argument that merely mentions the
-    install does not count, and neither does some other ``.py`` in its hooks directory
-    (L2 HIGH; L3 r2-r6). A three-way answer here was defeated by a new shape of unreadable
-    input each round and was deleted (spore-813); the caller checks readability itself."""
-    return bool(_hook_scripts(here) & _hook_scripts(want))
 
 def _refresh_decision(
     here: bytes | None, want: bytes, last: str | None, *, levain_code: bool,

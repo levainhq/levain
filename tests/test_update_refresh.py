@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -200,8 +201,10 @@ def test_codex_global_files_of_another_install_are_left_alone(make_install, tmp_
     before = hooks.read_text(), config.read_text()
     assert str(other) in before[0]
     r, out = _refresh(install)
+    # hooks.json is not what levain wrote for THIS install, and this levain renders the same
+    # as it did: kept as it is (the package-moved case is staged; see the test below).
     assert not r.review and (hooks.read_text(), config.read_text()) == before
-    assert "does not run this install's hooks" in out and "another store" in out
+    assert "another store" in out
 
 
 def test_codex_global_files_of_this_install_are_refreshed(make_install, tmp_path):
@@ -219,6 +222,63 @@ def test_codex_global_files_of_this_install_are_refreshed(make_install, tmp_path
     r, _out = _refresh(install)
     assert str(hooks) in r.refreshed and hooks.read_text() == current
     assert list(hooks.parent.glob("hooks.json.bak.*"))
+
+
+def _codex_r7_shape(shape: str, current: str, tmp_path: Path) -> str:
+    """hooks.json texts the deleted text predicate (spore-866 L3 r7) accepted as this
+    install's, and a legacy install's own render from another interpreter."""
+    data = json.loads(current)
+    cmd = data["hooks"]["SessionStart"][0]["hooks"][0]
+    script = shlex.split(cmd["command"])[1]
+    if shape == "nan_constant":        # a JSON constant json.loads accepts
+        cmd["timeout"] = float("nan")
+    elif shape == "echo_exact_script":  # the exact generated command, run by something else
+        cmd["command"] = "/bin/echo " + cmd["command"]
+    elif shape == "symlink_dotdot":    # normpath collapses `link/..`; the kernel follows link
+        (tmp_path / "far" / "away").mkdir(parents=True)
+        (tmp_path / "link").symlink_to(tmp_path / "far" / "away")
+        rel = Path(script).relative_to(tmp_path)
+        cmd["command"] = cmd["command"].replace(script, f"{tmp_path}/link/../{rel}")
+    else:                              # "legacy": levain's render, another interpreter
+        cmd["command"] = cmd["command"].replace(shlex.split(cmd["command"])[0],
+                                                "/usr/old/bin/python3", 1)
+    return json.dumps(data, indent=2)
+
+
+@pytest.mark.parametrize("shape", ["nan_constant", "echo_exact_script", "symlink_dotdot",
+                                   "legacy"])
+def test_codex_hooks_not_recorded_for_this_install_are_staged(
+        make_install, tmp_path, monkeypatch, shape):
+    # Phill 2026-10-10, "go with B": the adapter receipt alone decides. With no record of
+    # levain writing hooks.json (every 0.6.9 install), any bytes go to pending, untouched.
+    # MUTATION (2026-10-10): on 3d6152a's install.py the echo, symlink and legacy cases
+    # were overwritten.
+    import levain.install as inst_mod
+
+    install = make_install("codex")
+    hooks = tmp_path / "codex-home" / "hooks.json"
+    current = hooks.read_text()
+    text = _codex_r7_shape(shape, current, tmp_path)
+    assert text != current
+    hooks.write_text(text)
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
+    data = json.loads(receipt.read_text())
+    del data["files"]["codex-home/hooks.json"]
+    receipt.write_text(json.dumps(data))
+    r, out = _refresh(install)
+    assert hooks.read_text() == text and "codex-home/hooks.json" in r.review
+    staged = install.joinpath(".levain", "pending", "codex-home", "hooks.json")
+    assert staged.read_text() == current
+    assert not list(hooks.parent.glob("hooks.json.bak.*"))
+    r, out = _refresh(install)                        # once, then quiet
+    assert hooks.read_text() == text and not r.review
+    hooks.write_text(staged.read_text())              # the operator accepts levain's version
+    r, out = _refresh(install)
+    assert not r.review and not r.refreshed
+    moved = current + "\n"                           # the next release refreshes it
+    monkeypatch.setattr(inst_mod, "_codex_hooks_json", lambda *a: moved)
+    r, out = _refresh(install)
+    assert str(hooks) in r.refreshed and hooks.read_text() == moved
 
 
 def test_an_openhands_entity_has_nothing_to_refresh(make_install):
