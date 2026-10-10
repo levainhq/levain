@@ -356,14 +356,7 @@
         board.appendChild(sep);
         lastZone = entry.zone;
       }
-      let node;
-      try { node = renderPanel(entry, view); } catch (e) {
-        // one panel whose data a renderer cannot draw is an unavailable panel, never a blank board
-        node = el("div", "panel");
-        node.dataset.zone = entry.zone || "";
-        node.appendChild(el("div", "phead", typeof entry.id === "string" ? entry.id : "panel"));
-        node.appendChild(el("p", "err", "unavailable — could not be drawn (" + (e && e.message ? e.message : "bad data") + ")"));
-      }
+      const node = renderPanelSafe(entry, view);
       if (node) {
         if (CLAMP_KINDS.has(entry.kind)) node.setAttribute("data-clamp", "");
         board.appendChild(node);
@@ -476,6 +469,18 @@
   // Dispatch a single manifest entry to its renderer. Singleton kinds read their
   // data from the matching view field; indexed kinds (config/section) use `ref`.
   // `opts` (modal context) is forwarded to the kinds that vary in the focus modal.
+  // One panel whose data a renderer cannot draw is an unavailable panel, never a blank board or a
+  // stale modal: the board and the focus modal both draw through this.
+  function renderPanelSafe(entry, view, opts) {
+    try { return renderPanel(entry, view, opts); } catch (e) {
+      const node = el("div", "panel");
+      node.dataset.zone = entry.zone || "";
+      node.appendChild(el("div", "phead", typeof entry.id === "string" ? entry.id : "panel"));
+      node.appendChild(el("p", "err", "unavailable — could not be drawn (" + (e && e.message ? e.message : "bad data") + ")"));
+      return node;
+    }
+  }
+
   function renderPanel(entry, view, opts) {
     switch (entry.kind) {
       case "health": return renderHealth(entry, view);
@@ -2428,7 +2433,7 @@
   // body, so editing works in-place exactly as the grid does. NOT clamped — the
   // .modal-body is the scroll container, so the content reads at full height.
   function modalContent(entry, view) {
-    const p = renderPanel(entry, view, { modal: true });
+    const p = renderPanelSafe(entry, view, { modal: true });
     if (!p) return null;
     const host = el("div", "modal-panel");
     const phead = p.querySelector(".phead");
