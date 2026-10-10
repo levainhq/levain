@@ -240,7 +240,7 @@ class TestManifestMapperAdversarial:
     def test_a_malformed_state_line_is_an_error_never_no_state_set(self) -> None:
         # the operator's own words: a panel with the wrong shape must not render as "no state set"
         for bad in ("abc", {}, [{"label": "state", "text": 5, "at": "2026-10-09T12:00:00+00:00"}],
-                    [{"label": "state", "text": "x", "at": 7}]):
+                    [{"label": "state", "text": "x", "at": 7}], [{"label": "state", "text": "x", "at": "not-a-date"}]):
             ck = _tray_cockpit()
             ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c: Read(value={"lines": [
                 {"label": "state", "text": "x", "at": "2026-10-09T12:00:00+00:00", "source": "s"}]}), region="header"))
@@ -257,9 +257,9 @@ class TestManifestMapperAdversarial:
         view = _view(snap)
         assert view["state"] is None and "malformed" in view["errors"]["state"]
 
-    def test_a_stamp_this_clock_cannot_place_shows_the_words_with_no_age(self) -> None:
-        # the kernel owns parsing and expiry; a browser clock or date grammar that disagrees must not hide the line
-        for at in ("2026-10-10T12:00:00,5+00:00", "2099-01-01T00:00:00+00:00"):
+    def test_a_stamp_ahead_of_this_clock_shows_the_words_with_no_age(self) -> None:
+        # the kernel owns expiry; a browser clock behind the server's must not hide the line
+        for at in ("2099-01-01T00:00:00+00:00",):
             ck = _tray_cockpit()
             ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c, a=at: Read(value={"lines": [
                 {"label": "state", "text": "here", "at": a, "source": "cli"}]}), region="header"))
@@ -273,6 +273,9 @@ class TestManifestMapperAdversarial:
         snap["panels"]["state"]["value"] = None
         view = _view(snap)
         assert view["state"] == {"text": None} and "state" not in view["errors"]
+        del snap["panels"]["state"]["value"]                 # a missing value is malformed, not "no state"
+        view = _view(snap)
+        assert view["state"] is None and "malformed" in view["errors"]["state"]
 
     def test_an_unreadable_wraps_panel_is_an_error_not_a_never(self) -> None:
         ck = _tray_cockpit()

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -343,9 +343,11 @@ def _context_line(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         item = view.state
         if item is None or not item.text:
             return Read(value={"lines": []})
-        # an expired or age-unknown line is already dropped by the reader, so what arrives is fresh
-        return Read(value={"lines": [{"label": "state", "text": item.text, "at": item.set_at,
-                                      "source": item.source}]})
+        # an expired or age-unknown line is already dropped by the reader, so what arrives is fresh; the
+        # stamp goes out in one canonical UTC form, so a client never meets a variant only Python parses
+        ts = datetime.fromisoformat(item.set_at)
+        at = (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).isoformat()
+        return Read(value={"lines": [{"label": "state", "text": item.text, "at": at, "source": item.source}]})
     return read
 
 
