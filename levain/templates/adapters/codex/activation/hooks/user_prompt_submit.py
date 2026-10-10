@@ -127,14 +127,16 @@ def main() -> int:
         # The operator's state line, CHANGE-ONLY per session: session_start showed it and
         # seeded the marker, so this speaks only when it changed or went away. Its own try:
         # a fault here drops only this section. No session id -> silent (never an invented one).
+        # The signature is recorded only after emit() succeeded.
+        session_id = payload.get("session_id")
+        pending_sig = None
         try:
-            session_id = payload.get("session_id")
             if isinstance(session_id, str) and session_id:
-                changed = hook.state_line_if_changed(session_id)
+                changed, pending_sig = hook.state_line_if_changed(session_id)
                 if changed:
                     sections.append(changed)
         except Exception:
-            pass
+            pending_sig = None
 
         # Event-based spore germination — open loops whose content collides with
         # this prompt surface on their own (the intelligent prospective surface;
@@ -178,8 +180,11 @@ def main() -> int:
                     f"partnership compounds across sessions."
                 )
 
+        delivered = True
         if sections:
-            hook.emit("\n\n".join(sections), "UserPromptSubmit")
+            delivered = hook.emit("\n\n".join(sections), "UserPromptSubmit") is not False
+        if delivered and pending_sig is not None:
+            hook.state_seen_record(session_id, pending_sig)
     except Exception:
         # Structural fail-open: no error escapes a harness entry point.
         pass

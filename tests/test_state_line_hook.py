@@ -209,3 +209,51 @@ def test_a_fault_in_the_state_section_drops_only_it(inst):
     out = inst.prompt()
     assert "RECENCY-DIRECTIVE" in out and _state_lines(out) == []
     assert "[session orientation]" in inst.start(sid="other")
+
+
+def _run_closed_stdout(inst, script, payload):
+    # The harness closed the pipe: emit() cannot deliver, whatever else the hook did.
+    proc = subprocess.Popen(
+        [sys.executable, str(inst.hooks / script)], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=inst.root,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(inst.root)})
+    proc.stdout.close()
+    proc.stdin.write(json.dumps(payload).encode())
+    proc.stdin.close()
+    proc.wait(timeout=60)
+
+
+def test_a_marker_is_not_advanced_when_the_prompt_output_was_not_delivered(inst):
+    inst.set_state("first")
+    inst.start()
+    before = [m.read_text() for m in inst.markers()]
+    inst.set_state("second")
+    _run_closed_stdout(inst, "user_prompt_submit.py", {"session_id": "s1", "prompt": "hi"})
+    assert [m.read_text() for m in inst.markers()] == before
+    assert "second" in "\n".join(_state_lines(inst.prompt()))  # the change is still owed
+
+
+def test_a_marker_is_not_seeded_when_the_start_output_was_not_delivered(inst):
+    inst.set_state("first")
+    _run_closed_stdout(inst, "session_start.py", {"session_id": "s1", "source": "startup"})
+    assert inst.markers() == []
+    assert "first" in "\n".join(_state_lines(inst.prompt()))
+
+
+def test_a_later_section_raising_keeps_the_state_line_and_the_marker(inst):
+    inst.set_state("a line")
+    with (inst.hooks / "_levain_hook.py").open("a", encoding="utf-8") as f:
+        f.write("\n\ndef pack_drift():\n    raise RuntimeError('boom')\n")
+    out = inst.start()
+    assert "a line" in out
+    assert inst.prompt().count("a line") == 0 and len(inst.markers()) == 1
+
+
+def test_an_old_session_start_calling_focus_notice_loses_nothing(inst):
+    inst.set_state("a line")
+    p = inst.hooks / "session_start.py"
+    p.write_text(p.read_text(encoding="utf-8").replace(
+        "        sections: list[str] = []\n",
+        "        sections: list[str] = []\n        hook.focus_notice()\n", 1), encoding="utf-8")
+    out = inst.start()
+    assert "[session orientation]" in out and "a line" in out

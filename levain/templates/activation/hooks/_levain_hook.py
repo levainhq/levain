@@ -655,18 +655,26 @@ def state_seen_record(session_id: str, signature: str) -> None:
         pass
 
 
-def state_line_if_changed(session_id: str) -> str | None:
-    """The per-prompt state line: emitted only when it differs from what this session last
-    saw. Unknown marker (never seeded, or pruned) shows a live line: a repeat is harmless, a
-    swallowed change is not. A line that went away says so once. The marker is recorded
-    AFTER the decision, so a failed write can repeat a line but never lose one. Unreadable
-    context emits and records nothing. Fail-soft: any fault -> None."""
+def focus_notice() -> None:
+    """One-release shim: an older session_start.py left pending by `levain update` still
+    calls it, and the AttributeError would drop the whole SessionStart context."""
+    return None
+
+
+def state_line_if_changed(session_id: str) -> tuple[str | None, str | None]:
+    """The per-prompt state line as (line, pending_signature): the line is shown only when
+    it differs from what this session last saw. Unknown marker (never seeded, or pruned)
+    shows a live line: a repeat is harmless, a swallowed change is not. A line that went
+    away says so once. NON-MUTATING: the caller records the pending signature with
+    state_seen_record() only AFTER the output was delivered, so a failed hook can repeat a
+    line but never lose one. pending is None when there is nothing to record. Unreadable
+    context yields (None, None). Fail-soft: any fault -> (None, None)."""
     try:
         if not session_id:
-            return None
+            return None, None
         result = state_line()
         if result is None:
-            return None
+            return None, None
         sig, line = result
         path = _state_seen_path(session_id)
         prior = _state_seen_read(path)
@@ -675,12 +683,11 @@ def state_line_if_changed(session_id: str) -> str | None:
                 os.utime(path)  # recency = last prompt, so an active session is never pruned
             except OSError:
                 pass
-            return None
+            return None, None
         out = line if sig else (_STATE_CLEARED_LINE if prior else None)
-        state_seen_record(session_id, sig)
-        return out
+        return out, sig
     except Exception:
-        return None
+        return None, None
 
 
 def _is_migrate_check(data: object) -> bool:
@@ -1031,7 +1038,7 @@ def read_stdin() -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def emit(additional_context: str, event_name: str) -> None:
+def emit(additional_context: str, event_name: str) -> bool:
     """Write hook output in Claude Code's hook-JSON format. additionalContext
     is injected into the model's context at the hook's position; event_name is
     the hook event ("SessionStart" / "UserPromptSubmit"), emitted as
@@ -1041,7 +1048,7 @@ def emit(additional_context: str, event_name: str) -> None:
     THIS IS THE PRIMARY HARNESS-COUPLED SEAM — a non-Claude-Code adapter swaps
     this function. The stdout writes are guarded: if the harness has already
     closed the pipe (a killed-session race), emit() degrades to silence rather
-    than raising."""
+    than raising. Returns True only when the output was written and flushed."""
     try:
         payload = {
             "hookSpecificOutput": {
@@ -1051,5 +1058,7 @@ def emit(additional_context: str, event_name: str) -> None:
         }
         sys.stdout.write(json.dumps(payload))
         sys.stdout.write("\n")
+        sys.stdout.flush()
+        return True
     except (OSError, ValueError):
-        pass
+        return False
