@@ -35,6 +35,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1723,13 +1724,13 @@ def _claude_code_files(
     claude_md = _fill_seed_on_demand(claude_md, _on_demand_block(on_demand_seed))
 
     settings_text = (adapter_root / "settings.template.json").read_text(encoding="utf-8")
-    settings_text = settings_text.replace("{{PYTHON}}", _hook_arg_body(python_path))
+    settings_text = _fill(settings_text, {"PYTHON": _hook_arg_body(python_path)})
 
     mcp_text = (adapter_root / "mcp.template.json").read_text(encoding="utf-8")
-    mcp_text = mcp_text.replace("{{INSTALL_DIR}}", _string_body(str(install)))
     # spore-751: the MCP server is `<levain's interpreter> -m anneal_memory`, so the anneal
     # that serves memory is structurally the one levain imports.
-    mcp_text = mcp_text.replace("{{PYTHON}}", _string_body(python_path))
+    mcp_text = _fill(mcp_text, {"INSTALL_DIR": _string_body(str(install)),
+                                "PYTHON": _string_body(python_path)})
     return {
         install / "CLAUDE.md": claude_md,
         install / ".claude" / "settings.json": settings_text,
@@ -1765,11 +1766,12 @@ def _install_codex(
     codex_home = _codex_home()
     codex_home.mkdir(parents=True, exist_ok=True)
 
-    _write_codex_hooks(codex_home / "hooks.json",
-                       _codex_hooks_json(adapter_root, python_path, install), emit)
-
+    # config.toml first: it is the write that can refuse (`_require_toml`), and a refusal must
+    # leave hooks.json pointing where it did, not at a half-installed entity (L3 r1).
     _merge_codex_config(codex_home / "config.toml",
                         _codex_fragment(adapter_root, python_path, install), emit=emit)
+    _write_codex_hooks(codex_home / "hooks.json",
+                       _codex_hooks_json(adapter_root, python_path, install), emit)
 
     emit("  Codex adapter installed.")
 
@@ -1926,7 +1928,7 @@ def _expected_activation(
         if anneal_path is not None and rel.startswith("hooks/") and rel.endswith(".py"):
             try:
                 data = data.decode("utf-8").replace(
-                    "{{ANNEAL_MEMORY}}", _string_body(anneal_path)).encode("utf-8")
+                    "{{ANNEAL_MEMORY}}", _py_literal_body(anneal_path)).encode("utf-8")
             except UnicodeDecodeError:
                 pass
         out[rel] = (data, src)
@@ -2130,6 +2132,21 @@ def _names_install(text: str, install: Path) -> bool:
     separator, so ``/x/inst`` never claims ``/x/inst2`` (L2 HIGH, reproduced). Checked
     raw and JSON-escaped, since hooks.json escapes a backslash or quote in the path."""
     prefix = str(install) + os.sep
+    # Decoded first, as the shell, doctor and verify read it: since spore-866 a path with `$`,
+    # a backquote, `\\` or `"` is escaped in the command text, so no text search finds it (L3 r1).
+    try:
+        data = json.loads(text)
+        hooks = data.get("hooks") if isinstance(data, dict) else None
+        for entries in (hooks.values() if isinstance(hooks, dict) else ()):
+            for entry in entries if isinstance(entries, list) else ():
+                inner = entry.get("hooks") if isinstance(entry, dict) else None
+                for h in inner if isinstance(inner, list) else ():
+                    cmd = h.get("command") if isinstance(h, dict) else None
+                    if isinstance(cmd, str) and any(
+                            t.startswith(prefix) for t in shlex.split(cmd)[1:]):
+                        return True
+    except ValueError:   # JSONDecodeError, or shlex's unbalanced quotes
+        pass
     # Bounded on the LEFT too: "/var/x/e/" is a substring of "/private/var/x/e/".
     return any(re.search(r"(?<![\w/.~-])" + re.escape(p), text)
                for p in (prefix, json.dumps(prefix, ensure_ascii=False)[1:-1]))
@@ -2344,12 +2361,32 @@ def _string_body(value: str) -> str:
 
 def _hook_arg_body(value: str) -> str:
     """``value`` for a hook ``command`` template slot: one argument inside shell double
-    quotes, inside a JSON string. POSIX double quotes keep `\\`, `"`, `$` and a backquote
-    special, so each is backslashed first; Windows paths cannot hold `"`, and cmd does not
-    treat `\\` as an escape, so there only the JSON escaping applies."""
+    quotes, inside a JSON string. `\\` and `"` are backslashed; `$` and a backquote leave the
+    double quotes for a single-quoted segment (``"'$'"``), because inside double quotes
+    ``shlex.split`` (doctor's and verify's reader) keeps a backslash before them that sh drops
+    (L3 r1, run). Windows paths cannot hold `"`, and cmd does not treat `\\` as an escape, so
+    there only the JSON escaping applies."""
     if os.name != "nt":
-        value = re.sub(r'([\\"$`])', r"\\\1", value)
+        value = re.sub(r'([\\"])', r"\\\1", value)
+        value = re.sub(r"([$`])", "\"'\\1'\"", value)
     return _string_body(value)
+
+
+def _py_literal_body(value: str) -> str:
+    """``value`` as the body of a Python string literal in either quote style, for the hooks'
+    ``{{ANNEAL_MEMORY}}`` (base hooks use ``"..."``, a pack hook may use ``'...'``; codex L3
+    r1). `_string_body`'s escapes are all valid Python; `'` is added for the single-quoted form."""
+    return _string_body(value).replace("'", "\\'")
+
+
+_SLOT_RE = re.compile(r"\{\{(PYTHON|INSTALL_DIR)\}\}")
+
+
+def _fill(template: str, slots: Mapping[str, str]) -> str:
+    """Fill ``{{PYTHON}}`` / ``{{INSTALL_DIR}}`` in one pass over the template, so a value that
+    itself contains a slot name is never filled again (codex L3 r1: an install path holding
+    ``{{PYTHON}}`` became the interpreter path)."""
+    return _SLOT_RE.sub(lambda m: slots[m.group(1)], template)
 
 
 CODEX_CONFIG_KEY = "codex-home/config.toml#anneal_memory"
@@ -2357,18 +2394,49 @@ CODEX_CONFIG_KEY = "codex-home/config.toml#anneal_memory"
 
 def _codex_fragment(adapter_root: Path, python_path: str, install: Path) -> str:
     fragment = (adapter_root / "mcp.template.toml").read_text(encoding="utf-8")
-    fragment = fragment.replace("{{PYTHON}}", _string_body(python_path))
-    return fragment.replace("{{INSTALL_DIR}}", _string_body(str(install)))
+    return _fill(fragment, {"PYTHON": _string_body(python_path),
+                            "INSTALL_DIR": _string_body(str(install))})
 
 
-def _require_toml(text: str, path: Path) -> None:
-    """Refuse to write ``text`` to codex's machine-global ``path`` unless it parses: a parse
-    failure there takes down every MCP server codex has, not only levain's (spore-866)."""
+def _splice_codex_block(existing: str, new_block: str) -> str:
+    """``existing`` with its ``[mcp_servers.anneal_memory]`` block replaced by ``new_block``,
+    or ``new_block`` appended after a blank line when there is none."""
+    if _CODEX_MCP_BLOCK_RE.search(existing):
+        # `new_block` is data, not a template: a literal replacement, so a store path
+        # containing a backslash cannot be read as a group reference and corrupt the file.
+        return _CODEX_MCP_BLOCK_RE.sub(lambda _m: new_block, existing, count=1)
+    if not existing.endswith("\n"):
+        existing += "\n"
+    if not existing.endswith("\n\n"):
+        existing += "\n"
+    return existing + new_block
+
+
+def _toml_error(text: str) -> str | None:
     try:
         tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
-        raise InitError(f"{path} would not parse after levain's change ({e}), so it was left "
-                        f"as it was.") from e
+        return str(e)
+    return None
+
+
+def _require_toml(text: str, path: Path, before: str | None,
+                  emit: Callable[[str], None]) -> None:
+    """Refuse to write ``text`` to codex's machine-global ``path`` when levain's change is what
+    would stop it parsing (a parse failure there takes down every MCP server codex has, not
+    only levain's; spore-866). A file that did not parse BEFORE the change (``before``) is not
+    levain's to judge, since codex's parser may accept what ``tomllib`` refuses: the write goes
+    ahead, as it always did, and says so."""
+    err = _toml_error(text)
+    if err is None:
+        return
+    prior = _toml_error(before) if before is not None else None
+    if before is not None and prior is not None:
+        emit(f"  ! {path} did not parse as TOML before levain changed it ({prior}); levain's "
+             f"block was written into it anyway. Check it with codex.")
+        return
+    raise InitError(f"{path} would not parse after levain's change ({err}), so it was left "
+                    f"as it was.")
 
 
 def _codex_block_hash(fragment_or_config: str) -> str | None:
@@ -2789,8 +2857,8 @@ def _write_codex_hooks(hooks_target: Path, hooks_text: str,
 
 def _codex_hooks_json(adapter_root: Path, python_path: str, install: Path) -> str:
     hooks_text = (adapter_root / "hooks.json.template").read_text(encoding="utf-8")
-    hooks_text = hooks_text.replace("{{PYTHON}}", _hook_arg_body(python_path))
-    return hooks_text.replace("{{INSTALL_DIR}}", _hook_arg_body(str(install)))
+    return _fill(hooks_text, {"PYTHON": _hook_arg_body(python_path),
+                              "INSTALL_DIR": _hook_arg_body(str(install))})
 
 
 def _install_openhands(install: Path, *, emit: Callable[[str], None] = print) -> None:
@@ -3283,10 +3351,9 @@ def _copy_activation_tree(
             # install missing an activation file.
             shutil.copy2(source, target)
         if anneal_path is not None:
-            # The slot is a Python "..." literal (`_INSTALL_ANNEAL_BIN`), so the value is escaped
-            # for one, the same way `_expected_activation` renders it (spore-866).
-            _substitute_hook_placeholders(new_tree / "hooks",
-                                          {"{{ANNEAL_MEMORY}}": _string_body(anneal_path)})
+            # The slot sits in a Python string literal, so the value is escaped for one, the same
+            # way `_expected_activation` renders it (spore-866).
+            _substitute_hook_placeholders(new_tree / "hooks", {"{{ANNEAL_MEMORY}}": _py_literal_body(anneal_path)})
 
         # This run's receipt, from the staged bytes and the winning source of each.
         receipt: dict[str, dict[str, str]] = {
@@ -3679,8 +3746,9 @@ def _merge_codex_config(
     problem it is guarding.
     """
     if not path.is_file():
-        _require_toml(fragment, path)
-        path.write_text(fragment.rstrip() + "\n", encoding="utf-8")
+        text = fragment.rstrip() + "\n"
+        _require_toml(text, path, None, emit)
+        path.write_text(text, encoding="utf-8")
         return
 
     existing = path.read_text(encoding="utf-8")
@@ -3689,6 +3757,9 @@ def _merge_codex_config(
         return
 
     new_block = new_block_match.group(0).rstrip() + "\n"
+    # Judged before any backup or write, on exactly the text that will be written (L3 r1).
+    merged = _splice_codex_block(existing, new_block)
+    _require_toml(merged, path, existing, emit)
 
     repoint: tuple[str, str, Path] | None = None
     unknown_prior: Path | None = None
@@ -3801,16 +3872,7 @@ def _merge_codex_config(
                 relaunched_bak = bak
             else:
                 reformatted_bak = bak
-        # `new_block` is data, not a template: a literal replacement, so a store path
-        # containing a backslash cannot be read as a group reference and corrupt the file.
-        existing = _CODEX_MCP_BLOCK_RE.sub(lambda _m: new_block, existing, count=1)
-    else:
-        if not existing.endswith("\n"):
-            existing += "\n"
-        if not existing.endswith("\n\n"):
-            existing += "\n"
-        existing += new_block
-    _require_toml(existing, path)
+    existing = merged
 
     # ATOMIC, and announced only AFTER it lands. A partial `write_text` can truncate
     # the operator's whole global codex config, and announcing "now points at X"

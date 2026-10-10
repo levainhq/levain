@@ -1,7 +1,10 @@
 """spore-866, reproduced 2026-10-10 with a real `levain init`: an install path holding `\\`
 or `"` exited 0 and wrote a codex config.toml, a codex hooks.json and a claude-code
 .mcp.json that no longer parsed (the raw path was substituted into string literals); L1 found
-the same in every hook .py's `_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"`, and L2 DEL in TOML.
+the same in every hook .py's `_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"`, and L2 DEL in TOML. L3 r1:
+doctor and verify read hook commands with shlex, which kept a backslash sh drops; `update`'s
+`_names_install` searched the text and missed the escaped path; a value holding a slot name was
+filled twice.
 MUTATION (run 2026-10-10): with levain/install.py reverted to the raw substitution, both cases
 fail with the reproduced errors (`Unescaped '\\' in a string`, `Invalid \\escape`)."""
 
@@ -9,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import json
+import shlex
 import os
 import subprocess
 import tomllib
@@ -16,7 +20,8 @@ from pathlib import Path
 
 import pytest
 
-from levain.install import SeedEntry, apply_init
+from levain.install import SeedEntry, _names_install, apply_init
+from levain.verify import _python_from_hooks_config
 from tests.test_install import _templates_root
 
 # apply_init's subprocess.run is stubbed below, and that stub is the module-global function.
@@ -38,10 +43,10 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
     monkeypatch.setattr("levain.install.subprocess.run", lambda cmd, **k: _Result())
     codex_home = tmp_path / "codex_home"
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
-    install = tmp_path / 'we\\g<1>i"rd $X`a\x7f'
+    install = tmp_path / 'we\\g<1>i"rd $X`a\x7f{{PYTHON}}'
     install.mkdir()
     python = '/opt/py"th\\on $V/bin/python3'
-    anneal = 'C:\\Users\\an"neal\\Scripts\\anneal-memory.exe'
+    anneal = "C:\\Users\\O'Br\"ien\\Scripts\\anneal-memory.exe"
     with _templates_root() as templates_root:
         specs = [parse_template(templates_root / "seed" / n) for n in ("world.md", "origin.md")]
         answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
@@ -59,11 +64,14 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
         hooks = json.loads((codex_home / "hooks.json").read_text(encoding="utf-8"))
         commands = [ev[0]["hooks"][0]["command"] for ev in hooks["hooks"].values()]
         script_dir = f"{install}/activation/hooks/"
+        assert _names_install((codex_home / "hooks.json").read_text(encoding="utf-8"), install)
+        hooks_config = codex_home / "hooks.json"
     else:
         server = json.loads((install / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["anneal_memory"]
         settings = json.loads((install / ".claude" / "settings.json").read_text(encoding="utf-8"))
         commands = [h["command"] for ev in settings["hooks"].values() for m in ev for h in m["hooks"]]
         script_dir = None
+        hooks_config = install / ".claude" / "settings.json"
     assert server["command"] == python
     hooks_py = sorted((install / "activation" / "hooks").glob("*.py"))
     assert hooks_py
@@ -88,3 +96,7 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
         assert argv[0] == python
         if script_dir is not None:
             assert argv[1].startswith(script_dir) and argv[1].endswith(".py")
+        # doctor's and verify's reader agrees (they substitute the harness's own variable too)
+        tokens = [t.replace("${CLAUDE_PROJECT_DIR}", "/proj") for t in shlex.split(cmd)]
+        assert tokens[:len(argv)] == argv
+    assert _python_from_hooks_config(hooks_config, install) == python
