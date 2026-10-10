@@ -39,8 +39,9 @@ SPORE_CAP = 5000
 # hold filter: ranking and holds decide what is visible, then the cap truncates what is visible.
 VIEW_SPORE_LIMIT = 100_000
 EDITS_LIMIT = 20
-# the entity's own episodes the view reads (newest first); a feed row older than the oldest of them is
-# left out while the cap is hit, so the merged panel is one coherent newest window
+# the entity's own episodes the view reads (newest first). Feed rows are not cut to that window: a busy
+# entity's newest few minutes would otherwise hide every other agent (measured on flow, 10-10); the
+# panel's note names the window instead, and the agent filter shows each agent's own run
 EPISODE_LIMIT = 50
 # An undated handoff stops leading after this many days untouched: it says "pick up here next
 # session", and a calendar that has refuted that must not keep it first (flow, 2026-08-27, where
@@ -183,7 +184,7 @@ def _ts(v: Any) -> str:
 
 def _utc_at(v: Any) -> str:
     """An episode timestamp in one form (UTC, microseconds, ``Z``), for the entity's rows and every
-    feed's alike, so ``time.desc`` and the cap's floor, which compare the strings, compare instants.
+    feed's alike, so ``time.desc``, which compares the strings, compares instants.
     A timestamp with no zone, or one that does not parse, is unknown time: "" (it sorts last)."""
     try:
         d = datetime.fromisoformat(_ts(v))
@@ -287,9 +288,6 @@ def _episodes(source: SubstrateSource,
             )
             for e in view.episodes
         ]
-        # the oldest own timestamp, when the cap cut older own rows off: feed rows before it would sit in
-        # a gap where the entity's own rows are missing
-        floor = min((r.facets["at"] for r in rows if r.facets["at"]), default="") if capped else ""
         skipped: list[tuple[int, str]] = []
         filtered: list[tuple[int, str]] = []
         notes: list[str] = [f"the entity's newest {EPISODE_LIMIT} episodes"] if capped and feeds else []
@@ -302,10 +300,7 @@ def _episodes(source: SubstrateSource,
             except Exception as exc:   # noqa: BLE001 -- one feed's fault names that feed, never blanks the panel
                 res = Fault(f"{type(exc).__name__}: {exc}")
             got = _feed_rows(name, res)
-            older = {r.id for r in got.rows if floor and r.facets.get("at") and r.facets["at"] < floor}
-            rows.extend(r for r in got.rows if r.id not in older)
-            if older:
-                filtered.append((len(older), f"{name}: older than the entity's newest {EPISODE_LIMIT}"))
+            rows.extend(got.rows)
             skipped += got.skipped
             filtered += got.filtered
             notes += got.notes

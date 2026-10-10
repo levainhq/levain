@@ -347,7 +347,9 @@ class TestL1L2Fixes:
         assert order[-1] == "feed:f:u"
         assert order.index("feed:f:old") < order.index("feed:f:u")
 
-    def test_a_capped_own_window_filters_older_feed_rows_and_says_so(self, tmp_path: Path, monkeypatch) -> None:
+    def test_a_capped_own_window_keeps_every_feed_row_and_names_the_window(self, tmp_path: Path, monkeypatch) -> None:
+        """Glass run on flow, 10-10: a busy entity's newest episodes span minutes, so cutting feed rows
+        to that window hid every other agent. Feed rows stay; the note names the entity's window."""
         import levain.cockpit.providers as prov
         from anneal_memory import Store
         root, src, _ids_ = _install(tmp_path)
@@ -357,8 +359,8 @@ class TestL1L2Fixes:
         monkeypatch.setattr(prov, "EPISODE_LIMIT", 3)
         p = _episodes(src, {"f": _feed(_ep("old", "2000-01-01T00:00:00Z"), _ep("new", "2999-01-01T00:00:00Z"))})
         ids = _ids(p)
-        assert "feed:f:new" in ids and "feed:f:old" not in ids
-        assert {"count": 1, "reason": "f: older than the entity's newest 3"} in p["filtered"]
+        assert "feed:f:new" in ids and "feed:f:old" in ids
+        assert not p["filtered"]
         assert "the entity's newest 3 episodes" in p["note"]
 
     def test_under_the_cap_nothing_is_filtered(self, src: SubstrateSource) -> None:
