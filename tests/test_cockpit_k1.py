@@ -1415,3 +1415,18 @@ class TestOneFlightOrdersByConstruction:
                                  read=lambda c: Read(rows=Rows()), order="time.desc",
                                  facets=frozenset({"at"}), version_fields=("id",)))
         assert ck.panel("p")["status"] == "error"
+
+    def test_entity_and_discovery_reads_survive_a_hostile_exception_text(self) -> None:
+        class Hostile(Exception):
+            def __str__(self):
+                raise RuntimeError("no")
+
+        def entity(ctx):
+            raise Hostile()
+        ck = Cockpit(entity=entity)
+        ck._entity_timeout_s = 1.0
+        m = ck.manifest(NONE_CRED)
+        assert any(e["source"] == "entity" for e in m["errors"])
+        time.sleep(0.1)
+        assert any(e["source"] == "entity" for e in ck.manifest(NONE_CRED)["errors"])   # not "still running" forever
+        assert not any("still running" in e["message"] for e in m["errors"])

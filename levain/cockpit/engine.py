@@ -336,17 +336,19 @@ class Cockpit:
             fut, mine = Future(), True
         if mine:
             def work() -> None:
+                out: Any = Fault("the read ended without a result")
                 try:
-                    out: Any = fn(*args)
+                    out = fn(*args)
                 except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
-                    out = Fault(f"{type(exc).__name__}: {exc}")
-                fut.set_result(out)
+                    out = Fault(f"{type(exc).__name__}: {_safe_str(exc)}")
+                finally:                  # the future ALWAYS resolves: a flight can never be left unresolved
+                    _set_once(fut, out)
 
             try:
                 threading.Thread(target=work, name="cockpit-read", daemon=True).start()
             except BaseException as exc:  # noqa: BLE001 - thread exhaustion: fail THIS read, poison nothing
-                out = Fault(f"could not start a read: {type(exc).__name__}: {exc}")
-                fut.set_result(out)
+                out = Fault(f"could not start a read: {type(exc).__name__}: {_safe_str(exc)}")
+                _set_once(fut, out)
                 if st is not None:
                     with st.lock:
                         if st.flight is fut:
@@ -414,6 +416,7 @@ class Cockpit:
         committed_ok = False
         try:
             try:
+                fl.started = time.monotonic()      # the budget starts when the read does, not at flight creation
                 threading.Thread(target=work, name="cockpit-read", daemon=True).start()
             except BaseException as exc:  # noqa: BLE001 - thread exhaustion fails THIS read and poisons nothing
                 _set_once(fl.raw, Fault(f"could not start a read: {type(exc).__name__}: {_safe_str(exc)}"))
@@ -794,7 +797,7 @@ class Cockpit:
                                 raise CockpitRegistrationError("a discovered panel cannot carry a refresher")
                             self._register_locked(spec)
                         except Exception as exc:  # noqa: BLE001 - a bad spec is an errors entry, never a 500
-                            errors.append({"source": f"discovery:{spec.id}", "message": str(exc)})
+                            errors.append({"source": f"discovery:{spec.id}", "message": _safe_str(exc)})
                     elif have.title != spec.title:
                         errors.append({"source": f"discovery:{spec.id}",
                                        "message": f"id collision: {spec.title!r} maps to the id of {have.title!r}"})
