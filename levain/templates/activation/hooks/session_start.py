@@ -105,9 +105,27 @@ def main() -> int:
             sections.append(identity)
 
         # 2c. The operator's freeform state line (verbatim, with age, dropped past 12 h).
-        state = hook.state_notice()
-        if state:
-            sections.append(state)
+        #     Seeds the per-session "seen" marker with what it showed (also when nothing was
+        #     live, and on every `source`, compact included), so the per-prompt hook speaks
+        #     only on a change. Its own try: a fault here drops only this section.
+        try:
+            session_id = payload.get("session_id")
+            line = hook.state_line()
+            if line is not None:
+                if line[1]:
+                    sections.append(line[1])
+                if isinstance(session_id, str) and session_id:
+                    hook.state_seen_record(session_id, line[0])
+        except AttributeError:
+            # A pack's older helper without state_line: the plain reader still shows the line.
+            try:
+                legacy = hook.state_notice()
+                if legacy:
+                    sections.append(legacy)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
         # 3. Layer D — start-catch. Fires only on a genuinely fresh session;
         #    on `resume`/`compact` the unwrapped count reflects ongoing work.
