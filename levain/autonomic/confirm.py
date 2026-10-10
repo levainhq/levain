@@ -32,14 +32,18 @@ import os
 import re
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from levain.autonomic.pending import PendingAction
 
-__all__ = ["NAMESPACE", "DEFAULT_SSH_KEYGEN", "challenge", "ssh_keygen_problem", "trust_anchor_problem",
-           "verify_signature", "verify_signature_status", "VERIFIED", "NOT_VERIFIED", "UNAVAILABLE"]
+__all__ = ["NAMESPACE", "COCKPIT_NAMESPACE", "DEFAULT_SSH_KEYGEN", "CockpitVerdict", "challenge",
+           "ssh_keygen_problem", "trust_anchor_problem", "verify_cockpit_signature", "verify_signature",
+           "verify_signature_status", "VERIFIED", "NOT_VERIFIED", "UNAVAILABLE"]
 
 NAMESPACE = "levain-confirm"
+# the cockpit broker's namespace (K2b design §6.5): a signature in one namespace never verifies in the other
+COCKPIT_NAMESPACE = "levain-cockpit"
 CHALLENGE_FORMAT = "levain-confirm/2"
 # the verifier: an absolute path, never a PATH lookup (a binary planted earlier on PATH could print the
 # "Good signature" line for any signer). Overridable only by an explicit gate argument.
@@ -186,3 +190,78 @@ def verify_signature_status(message: bytes, *, signature: str | None, signer: st
     except Exception as e:  # noqa: BLE001 — a verifier that cannot run grants nothing, and never raises
         _log.warning("confirm: signature not verified (%s): %s", type(e).__name__, e)
         return UNAVAILABLE
+
+
+@dataclass(frozen=True)
+class CockpitVerdict:
+    """:func:`verify_cockpit_signature`'s answer. ``principal`` and ``fingerprint`` are set only when
+    ``status`` is :data:`VERIFIED`: they are read from the verifier's output, never from a request."""
+    status: str
+    principal: str | None = None
+    fingerprint: str | None = None
+
+
+_GOOD_COCKPIT = re.compile(r'Good "' + re.escape(COCKPIT_NAMESPACE)
+                           + r'" signature for (\S+) with (\S+) key (SHA256:[A-Za-z0-9+/]{43})')
+
+
+def verify_cockpit_signature(message: bytes, signature: str | None, signers_file: Path | str, *,
+                             owners: frozenset[int] = _ROOT, timeout: float = 10.0,
+                             ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> CockpitVerdict:
+    """Who signed ``message`` in :data:`COCKPIT_NAMESPACE`, named by the signature itself (K2b design
+    §6.5): ``ssh-keygen -Y find-principals`` must print exactly one principal of ``signers_file``,
+    ``-Y verify`` as that principal must succeed, and its output must hold exactly one anchored
+    ``Good "levain-cockpit" signature for <principal> with <type> key SHA256:...`` line, whose
+    fingerprint is returned for the caller to look up (class, revocation). ``owners`` is who may own
+    the signers file and its directories (root for a governed install; the caller states
+    ``{0, its uid}`` for a reported one). The binary stays a root trust anchor. Never raises."""
+    try:
+        if not isinstance(signature, str) or len(signature) > _MAX_SIGNATURE or _BEGIN not in signature:
+            return CockpitVerdict(NOT_VERIFIED)
+        if not isinstance(message, bytes):
+            return CockpitVerdict(NOT_VERIFIED)
+        problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
+        if problem is None:
+            problem, real_signers = trust_anchor_problem(signers_file, what="allowed-signers file",
+                                                         owners=owners)
+        if problem is None and not os.access(real_signers, os.R_OK):
+            problem = f"allowed-signers file {signers_file} is not readable by uid {os.getuid()}"
+        if problem is not None:
+            _log.error("confirm: refusing to verify a cockpit signature: %s", problem)
+            return CockpitVerdict(UNAVAILABLE)
+        sig_path: str | None = None
+        try:
+            fd, sig_path = tempfile.mkstemp(prefix="levain-cockpit-", suffix=".sig")
+            with os.fdopen(fd, "w", encoding="ascii") as fh:
+                fh.write(signature.strip() + "\n")
+            found = subprocess.run(
+                [str(keygen), "-Y", "find-principals", "-f", str(real_signers), "-s", sig_path],
+                capture_output=True, timeout=timeout, env=dict(_VERIFY_ENV))
+            if found.returncode != 0:
+                return CockpitVerdict(NOT_VERIFIED)
+            names = [ln.strip() for ln in (found.stdout or b"").decode("utf-8", "replace").splitlines()
+                     if ln.strip()]
+            # the signature's key can match several lines; anything but one principal names nobody
+            if len(names) != 1 or not _SIGNER.fullmatch(names[0]):
+                return CockpitVerdict(NOT_VERIFIED)
+            principal = names[0]
+            cp = subprocess.run(
+                [str(keygen), "-Y", "verify", "-f", str(real_signers), "-I", principal,
+                 "-n", COCKPIT_NAMESPACE, "-s", sig_path],
+                input=message, capture_output=True, timeout=timeout, env=dict(_VERIFY_ENV))
+        finally:
+            if sig_path is not None:
+                try:
+                    os.unlink(sig_path)
+                except OSError:
+                    pass
+        if cp.returncode != 0:
+            return CockpitVerdict(NOT_VERIFIED)
+        out = (cp.stdout or b"").decode("utf-8", "replace") + "\n" + (cp.stderr or b"").decode("utf-8", "replace")
+        good = [m for m in (_GOOD_COCKPIT.fullmatch(ln.strip()) for ln in out.splitlines()) if m]
+        if len(good) != 1 or good[0].group(1) != principal:
+            return CockpitVerdict(NOT_VERIFIED)
+        return CockpitVerdict(VERIFIED, principal, good[0].group(3))
+    except Exception as e:  # noqa: BLE001 — a verifier that cannot run grants nothing, and never raises
+        _log.warning("confirm: cockpit signature not verified (%s): %s", type(e).__name__, e)
+        return CockpitVerdict(UNAVAILABLE)
