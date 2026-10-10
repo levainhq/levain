@@ -2993,7 +2993,8 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
     (:func:`_keep_original`); failing to keep it writes nothing. Putting it back renames that
     original over the live name, which needs no free space. It is put back only while the live
     name is still the very file the merge wrote (same link state, same inode, same bytes): an
-    edit made in between is kept, and the original is named. Messages are held until the end,
+    edit made in between, or a file levain cannot confirm as its own, is kept, and the original
+    is named. Messages are held until the end,
     so a failing output channel cannot interrupt the undo. What this cannot cover: codex
     reading in the moment between the two writes, and a crash (SIGKILL, power loss) in it."""
     config = codex_home / "config.toml"
@@ -3001,6 +3002,11 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
     written = config.resolve()
     was_link = config.is_symlink()
     notes: list[str] = []
+    try:
+        st0 = os.stat(written)
+        before: tuple[int, int] | None = (st0.st_dev, st0.st_ino)  # the original live file
+    except OSError:
+        before = None
     kept = _keep_original(written)
     ours: tuple[int, int, bytes] | None = None  # the file the merge wrote: (dev, inode, bytes)
     leave_kept = False
@@ -3017,10 +3023,12 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
             if not landed:
                 leave_kept = kept is not None  # owned by the undo until it proves otherwise
                 try:
-                    leave_kept = _put_codex_config_back(config, written, was_link, ours, kept,
-                                                        hooks, notes)
-                except BaseException:
-                    pass  # the original stays on disk; the hooks failure is what is raised
+                    leave_kept = _put_codex_config_back(config, written, was_link, before, ours,
+                                                        kept, hooks, notes)
+                except Exception as e:  # the original stays on disk, named; hooks' error raises
+                    where = f"; the original is kept at {kept}" if kept is not None else ""
+                    notes.append(f"  ! {hooks} could not be written, and putting {config} back "
+                                 f"failed ({e}){where}. It may register this install's store.")
             raise
     finally:
         if kept is not None and not leave_kept:
@@ -3075,29 +3083,20 @@ def _file_identity(path: Path) -> tuple[int, int, bytes] | None:
 
 
 def _put_codex_config_back(config: Path, written: Path, was_link: bool,
-                           ours: tuple[int, int, bytes] | None, kept: Path | None, hooks: Path,
-                           notes: list[str]) -> bool:
-    """:func:`_write_codex_pair`'s undo. ``ours`` is the file the merge wrote, or None when the
-    merge was interrupted before that could be read (then the live file is taken as it). True
-    when the kept original must stay on disk (it is named in ``notes``)."""
+                           before: tuple[int, int] | None, ours: tuple[int, int, bytes] | None,
+                           kept: Path | None, hooks: Path, notes: list[str]) -> bool:
+    """:func:`_write_codex_pair`'s undo. ``before`` is the original live file's (dev, inode),
+    ``ours`` the file the merge wrote (None when it could not be read). True when the kept
+    original must stay on disk (it is named in ``notes``)."""
     try:
-        if kept is not None and os.path.samestat(os.stat(kept), os.stat(written)):
-            return False  # the merge never replaced it: nothing to undo, the copy goes
+        st = os.stat(written)
+        if before is not None and (st.st_dev, st.st_ino) == before:
+            return False  # the original is still the live file: nothing to undo
+    except FileNotFoundError:
+        if kept is None:
+            return False  # nothing was created
     except OSError:
         pass
-    if kept is None and not written.exists():
-        return False  # nothing was created
-    if ours is None and kept is not None:
-        # Which file is live cannot be proved (the merge was interrupted before it could be
-        # read, or the read failed). Bytes equal to the original lose nothing by renaming the
-        # original back, which restores its inode; anything else is left as it is and the
-        # original named, never overwritten on a guess.
-        try:
-            if written.read_bytes() == kept.read_bytes():
-                os.replace(kept, written)
-                return False
-        except OSError:
-            pass
     try:
         still_ours = (ours is not None and config.is_symlink() == was_link
                       and config.resolve() == written and written.is_file()
@@ -3106,8 +3105,8 @@ def _put_codex_config_back(config: Path, written: Path, was_link: bool,
         still_ours = False
     if not still_ours:
         where = f"; the original is kept at {kept}" if kept is not None else ""
-        notes.append(f"  ! {hooks} could not be written, and {config} could not be confirmed as "
-                     f"the file levain wrote, so it was left as it is{where}. It may register this install's store: "
+        notes.append(f"  ! {hooks} could not be written, and {config} could not be confirmed "
+                     f"as the file levain wrote, so it was left as it is{where}. It may register this install's store: "
                      f"re-run `levain init --adapter codex` from the install codex should use.")
         return kept is not None
     try:

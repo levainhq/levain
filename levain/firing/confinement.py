@@ -4816,23 +4816,30 @@ _NETWORK_DEPUTY_DIRS = ("/run/dbus", "/run/systemd/resolve", "/run/nscd", "/run/
 _NETWORK_DEPUTY_SOCKETS = ("/run/snapd.socket", "/run/snapd-snap.socket")
 
 
-def _dirmngr_sockets(workspace: Path | None = None) -> list[Path]:
+def _dirmngr_sockets() -> list[Path]:
     """The operator's gnupg dirmngr sockets the offline bash could reach: ``<runtime>/gnupg/S.dirmngr``,
     the same under a non-default GNUPGHOME's ``d.*`` subdirectory, and the ``~/.gnupg`` fallback.
     dirmngr is socket-activated by the user's service manager, so a connect starts it OUTSIDE bash's
     network namespace, and it fetches (WKD, keyservers) and resolves names the client chooses."""
     found: list[Path] = []
-    roots = [Path(r) / "gnupg" for r in _runtime_dirs()] + [Path.home() / ".gnupg"]
-    gnupghome = Path(os.environ.get("GNUPGHOME") or "~/.gnupg").expanduser()
-    if gnupghome.is_absolute():
-        roots.append(gnupghome)
-    else:  # gpg resolves a relative one against its cwd: levain's, bash's start, and home
-        bases = [Path.home(), workspace] if workspace is not None else [Path.home()]
-        try:
-            bases.append(Path.cwd())
-        except OSError:
-            pass  # a deleted cwd names nothing
-        roots += [b / gnupghome for b in bases]
+    try:
+        home: Path | None = Path.home()
+    except RuntimeError:
+        home = None  # no home directory for this user: nothing there to hide
+    roots = [Path(r) / "gnupg" for r in _runtime_dirs()]
+    if home is not None:
+        roots.append(home / ".gnupg")
+    gnupghome = os.environ.get("GNUPGHOME")
+    if gnupghome:
+        g = Path(gnupghome).expanduser() if home is not None else Path(gnupghome)
+        if not g.is_absolute():
+            # gpg resolves it against whatever directory gpg runs in, and bash can `cd`
+            # anywhere: no finite set of paths covers it (codex L3 r4+r5). Refused, not guessed.
+            raise ConfinementError(
+                f"GNUPGHOME is the relative path {gnupghome!r}, which gpg resolves against "
+                "whatever directory it runs in, so the floor cannot hide that home's dirmngr from "
+                "bash without network. Set GNUPGHOME to an absolute path, or unset it (fail-closed).")
+        roots.append(g)
     for g in roots:
         try:
             if not g.is_dir():
@@ -5373,7 +5380,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # /etc/resolv.conf may point at nothing. A daemon whose socket or directory is absent at spawn,
     # or that recreates its socket, is not hidden from then on: the residual step (6) states.
     if policy.deny_localhost_outbound:
-        masks += [str(f) for f in _dirmngr_sockets(policy.workspace)]
+        masks += [str(f) for f in _dirmngr_sockets()]
         for d in _NETWORK_DEPUTY_DIRS:
             real = Path(d).resolve()
             if not _reachable(real) or not real.is_dir() or real in hidden_dirs:
