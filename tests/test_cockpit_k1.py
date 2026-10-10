@@ -1221,6 +1221,7 @@ class TestStoreLabel:
     def test_label_is_home_relative_or_the_bare_name(self, tmp_path: Path) -> None:
         from levain.cockpit.providers import _store_label
         assert _store_label(Path.home() / ".anneal-memory" / "memory.db") == "~/.anneal-memory/memory.db"
+        assert _store_label(Path.home()) == "~/"
         assert _store_label(Path("/nonexistent-root/elsewhere/x.db")) == "x.db"
         assert _store_label(Path.home() / ".." / "outside-secret" / "x.db") == "x.db"      # no sibling-account leak
 
@@ -1322,3 +1323,34 @@ class TestOneFlightOrdersByConstruction:
         st = ck._state["p"]
         assert st.pflight is None and ck.freshness()["p"]["status"] == "error"   # the late OK committed nothing
         assert ck.panel("p")["status"] == "empty"                                 # a new read recovers
+
+    def test_an_exception_escaping_the_owner_does_not_wedge_the_panel(self) -> None:
+        n = [0]
+
+        def clock():
+            n[0] += 1
+            if n[0] == 2:              # the owner's completion stamp: ReadContext took the first call
+                raise OSError("clock failed")
+            return datetime.now(timezone.utc)
+        ck = Cockpit(clock=clock)
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=lambda c: Read(rows=()),
+                                 order="time.desc", facets=frozenset({"at"}), version_fields=("id",)))
+        assert ck.panel("p")["status"] == "empty"       # a failing completion clock does not fail the read
+        assert ck._state["p"].pflight is None
+        assert ck.panel("p")["status"] == "empty"       # and the panel is not stuck behind a dead flight
+
+    def test_a_joiner_waits_out_the_owners_processing_instead_of_reporting_a_false_timeout(self, monkeypatch) -> None:
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=lambda c: Read(rows=()),
+                                 order="time.desc", facets=frozenset({"at"}), version_fields=("id",), timeout_s=0.3))
+        real = Cockpit._process
+
+        def slow(self, *a, **k):
+            time.sleep(0.8)            # processing outlasts the read budget
+            return real(self, *a, **k)
+        monkeypatch.setattr(Cockpit, "_process", slow)
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(ck.panel("p")["status"])) for _ in range(3)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        assert out == ["empty"] * 3

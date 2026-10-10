@@ -52,7 +52,9 @@ def _store_label(db: Path) -> str:
     try:
         home = os.path.normpath(os.path.expanduser("~"))
         rel = os.path.relpath(os.path.normpath(os.path.abspath(db.expanduser())), home)
-        if rel == "." or rel == ".." or rel.startswith(".." + os.sep):
+        if rel == ".":
+            return "~/"
+        if rel == ".." or rel.startswith(".." + os.sep):
             return db.name
         return "~/" + Path(rel).as_posix()
     except (ValueError, RuntimeError, OSError):
