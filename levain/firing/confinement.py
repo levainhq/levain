@@ -6319,10 +6319,12 @@ def _ledger_release(claim: str) -> list[str] | None:
     ledger could not be used and the claim was NOT dropped (the caller keeps it, to try again). Called
     only once the claiming shell's namespace is gone (:meth:`_BwrapShell.close`)."""
     with _LedgerTxn() as txn:
-        if not txn.ok:
-            return None
-        txn.drop(claim)
-    return txn.removed
+        if txn.ok:
+            txn.drop(claim)
+    # Confirmed only once the ledger was read AND its commit written: a commit that failed leaves `ok` set
+    # and only records `problem` (L3 r11, RUN on w27: a .tmp that could not be written counted as
+    # released, and the claim stayed in the ledger with nothing left to release it).
+    return txn.removed if txn.ok and txn.problem is None else None
 
 
 def sweep_floor_placeholders() -> list[str]:
