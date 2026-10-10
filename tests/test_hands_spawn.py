@@ -1155,16 +1155,13 @@ def test_a_close_that_cannot_settle_keeps_the_claim_for_the_next_close(monkeypat
     monkeypatch.setattr(confinement.SandboxedShell, "close", lambda self: None)
     released: list[str] = []
     monkeypatch.setattr(confinement, "_ledger_release", lambda c: released.append(c) or [])
-    confinement._LIVE_BWRAP_SHELLS.add(shell)
-    try:
-        shell.close()
-        assert released == [] and shell._ledger_claim == "the-claim" and shell in confinement._LIVE_BWRAP_SHELLS
-        settled[0] = True
-        shell.close()
-        assert released == ["the-claim"] and shell._ledger_claim is None
-        assert shell not in confinement._LIVE_BWRAP_SHELLS
-    finally:
-        confinement._LIVE_BWRAP_SHELLS.discard(shell)
+    live = {shell}                                  # this test's registry: no other test's shells
+    monkeypatch.setattr(confinement, "_LIVE_BWRAP_SHELLS", live)
+    shell.close()
+    assert released == [] and shell._ledger_claim == "the-claim" and shell in live
+    settled[0] = True
+    shell.close()
+    assert released == ["the-claim"] and shell._ledger_claim is None and shell not in live
 
 
 def test_a_run_re_entered_on_the_run_thread_is_refused_without_touching_the_shells_lock():
@@ -1224,14 +1221,10 @@ def test_a_release_the_ledger_did_not_take_keeps_the_claim_for_the_next_close(mo
         tried.append(c)
         return [] if ledger_ok[0] else None
     monkeypatch.setattr(confinement, "_ledger_release", release)
-    confinement._LIVE_BWRAP_SHELLS.add(shell)
-    try:
-        shell.close()
-        assert tried == ["the-claim"] and shell._ledger_claim == "the-claim"
-        assert shell in confinement._LIVE_BWRAP_SHELLS
-        ledger_ok[0] = True
-        confinement._close_live_shells()             # levain's exit
-        assert tried == ["the-claim", "the-claim"] and shell._ledger_claim is None
-        assert shell not in confinement._LIVE_BWRAP_SHELLS
-    finally:
-        confinement._LIVE_BWRAP_SHELLS.discard(shell)
+    live = {shell}                                  # this test's registry: no other test's shells
+    monkeypatch.setattr(confinement, "_LIVE_BWRAP_SHELLS", live)
+    shell.close()
+    assert tried == ["the-claim"] and shell._ledger_claim == "the-claim" and shell in live
+    ledger_ok[0] = True
+    confinement._close_live_shells()                # levain's exit
+    assert tried == ["the-claim", "the-claim"] and shell._ledger_claim is None and shell not in live
