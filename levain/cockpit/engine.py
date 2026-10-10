@@ -199,7 +199,6 @@ class Cockpit:
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
-        self._now_fresh: tuple[str | None, str] | None = None   # (as_of, status) of the last `now` head built
 
     # --- registration ----------------------------------------------------------------
     def register(self, spec: ProviderSpec) -> None:
@@ -370,8 +369,7 @@ class Cockpit:
         if spec.refresh_every_s is None:
             snap = self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
             with st.lock:        # what the freshness route reports; it never reads a source itself
-                if st.fresh is None or ctx.now >= st.fresh[0]:
-                    st.fresh = (ctx.now, snap.as_of, snap.status)
+                st.fresh = (ctx.now, snap.as_of, snap.status)
             return snap
         with st.lock:
             snap, last, started, running = st.snap, st.last_completion, st.started, st.refresh_started
@@ -650,7 +648,6 @@ class Cockpit:
                 union[r["group"]]["count"] += 1
         head["groups"] = list(union.values()) or None
         head["etag"] = self._etag_of(snap, head["groups"], cred, ctx.today)   # groups are content
-        self._now_fresh = (head["as_of"], head["status"])    # the one computation freshness reports
         return head, rows
 
     def _entity(self, ctx: ReadContext) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -756,9 +753,11 @@ class Cockpit:
         A client that got a 304 on a panel reads the panel's current age here. It is metadata only:
         it runs NO provider and computes no status of its own. A refresher panel reports its cached
         snapshot (liveness and aging rules applied); an on-demand panel reports its last served read,
-        aged against ``stale_after_s``; ``now`` reports the head the last manifest or ``now`` read
-        built. Anything not yet read is ``status: "unread"`` with ``as_of: null``. Panels found by
-        discovery appear after the first manifest read. No rows, no etag, never 304."""
+        aged against ``stale_after_s``; ``now`` is rolled up from the gate triage-lists' entries in
+        this same call (error over unread over stale over partial over ok, oldest ``as_of``), so it
+        is as current as its sources; it has no ``empty`` (that needs rows) and reports ``ok``. Anything not
+        yet read is ``status: "unread"`` with ``as_of: null``. Panels found by discovery appear
+        after the first manifest read. No rows, no etag, never 304."""
         ctx = ReadContext(self._clock())
         unread = {"as_of": None, "status": "unread"}
         out: dict[str, dict[str, Any]] = {}
@@ -777,8 +776,11 @@ class Cockpit:
                     (ctx.now - _parse_iso(as_of)) > timedelta(seconds=spec.stale_after_s):
                 status = "stale"
             out[spec.id] = {"as_of": as_of, "status": status}
-        now = self._now_fresh
-        return {NOW_ID: {"as_of": now[0], "status": now[1]} if now else dict(unread), **out}
+        gate = [out[s.id] for s in self._specs.values() if s.priority == "gate" and s.kind == "triage-list"]
+        order = ("error", "unread", "stale", "partial")
+        status = next((o for o in order if any(g["status"] == o for g in gate)), "ok")
+        as_ofs = [g["as_of"] for g in gate if g["as_of"]]
+        return {NOW_ID: {"as_of": min(as_ofs) if as_ofs and status != "unread" else None, "status": status}, **out}
 
     def panel(self, panel_id: str, *, profile: str = "full", q: str | None = None,
               row: str | None = None, credential_class: str = "none") -> dict[str, Any] | None:
