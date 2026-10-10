@@ -202,9 +202,9 @@ def test_codex_global_files_of_another_install_are_left_alone(make_install, tmp_
     assert str(other) in before[0]
     r, out = _refresh(install)
     # hooks.json is not what levain wrote for THIS install, and this levain renders the same
-    # as it did: kept as it is (the package-moved case is staged; see the test below).
+    # as it did: kept as it is. Had the package moved, _refresh_decision would stage it.
     assert not r.review and (hooks.read_text(), config.read_text()) == before
-    assert "another store" in out
+    assert "another store" in out and "not what levain last wrote for this install" in out
 
 
 def test_codex_global_files_of_this_install_are_refreshed(make_install, tmp_path):
@@ -225,8 +225,10 @@ def test_codex_global_files_of_this_install_are_refreshed(make_install, tmp_path
 
 
 def _codex_r7_shape(shape: str, current: str, tmp_path: Path) -> str:
-    """hooks.json texts the deleted text predicate (spore-866 L3 r7) accepted as this
-    install's, and a legacy install's own render from another interpreter."""
+    """hooks.json texts from spore-866 L3 r7's findings against the deleted text predicate,
+    and a legacy install's own render from another interpreter. On 3d6152a the echo,
+    symlink and legacy texts were overwritten; nan_constant was already refused there and
+    stays as a regression pin."""
     data = json.loads(current)
     cmd = data["hooks"]["SessionStart"][0]["hooks"][0]
     script = shlex.split(cmd["command"])[1]
@@ -250,9 +252,9 @@ def _codex_r7_shape(shape: str, current: str, tmp_path: Path) -> str:
 def test_codex_hooks_not_recorded_for_this_install_are_staged(
         make_install, tmp_path, monkeypatch, shape):
     # Phill 2026-10-10, "go with B": the adapter receipt alone decides. With no record of
-    # levain writing hooks.json (every 0.6.9 install), any bytes go to pending, untouched.
-    # MUTATION (2026-10-10): on 3d6152a's install.py the echo, symlink and legacy cases
-    # were overwritten.
+    # levain writing hooks.json (an install from before 0.5.0, or a lost receipt), any bytes
+    # go to pending, untouched. MUTATION (2026-10-10): on 3d6152a's install.py the echo,
+    # symlink and legacy cases were overwritten.
     import levain.install as inst_mod
 
     install = make_install("codex")

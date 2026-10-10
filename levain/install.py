@@ -1781,8 +1781,10 @@ ADAPTER_RECEIPT_REL = (".levain", "adapter-receipt.json")
 
 
 def _read_adapter_receipt(install: Path) -> dict[str, str] | None:
-    """``{relpath: sha256 of the bytes levain last wrote}`` for the install-local adapter
-    files (the carrier, ``.claude/settings.json``, ``.mcp.json``), or None when there is
+    """``{key: sha256}`` of the bytes levain last wrote, or last staged under
+    ``.levain/pending/`` (adopting a staged copy is accepting it), for the adapter files:
+    the carrier, settings, MCP and base seeds by install-relative path, codex's machine-global
+    files as ``codex-home/<name>``, and the codex config block. None when there is
     no usable record (an install from before it existed, or a damaged file). Separate
     from the activation receipt on purpose: that one describes the activation tree only,
     and doctor validates every entry in it against that tree."""
@@ -2614,6 +2616,12 @@ def _refresh_adapter_files(
             action = "write_backup"
             released_copy = True
         if action == "keep":
+            if key.startswith("codex-home/"):
+                # Machine-global: a copy levain did not last write for THIS install may be
+                # another install's, so codex is not running this install's hooks.
+                lines.append(f"  note: {target} is not what levain last wrote for this install "
+                             f"(edited, or another install's), so `levain update` left it alone; "
+                             f"`levain doctor` says whether codex runs this install's hooks.")
             continue
         if action == "current":
             new_receipt[key] = _sha256_text(want_text)
@@ -2629,6 +2637,13 @@ def _refresh_adapter_files(
                     continue
             else:
                 where = install.joinpath(*PENDING_REL, *key.split("/"))
+            if key.startswith("codex-home/"):
+                lines.append(f"  {target}: kept as it is (edited, another install's, or levain "
+                             f"has no record of writing it for this install), and this levain "
+                             f"renders it differently, now at {where}. Copying that over it "
+                             f"points every codex session on this machine at this install. "
+                             f"Listed once: the next update is quiet about it.")
+                continue
             lines.append(f"  {key}: yours is kept (edited, or levain has no record of "
                          f"writing it), and this levain renders it differently, now at "
                          f"{where}. Merge it in, or copy it over yours if you never edited "
