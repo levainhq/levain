@@ -85,6 +85,7 @@ class ProviderSpec:
     note: str = ""
     empty: str = ""
     rowset: str | None = None
+    edit_class: str = ""              # the dashboard's A/B/C edit class chip; "" = none (read-side label only)
 
 
 class ReadContext:
@@ -196,6 +197,7 @@ class Cockpit:
         self._discovery_states: list[_State] = []
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
+        self._life = threading.Lock()    # start() and stop() never run at once
 
     # --- registration ----------------------------------------------------------------
     def register(self, spec: ProviderSpec) -> None:
@@ -241,13 +243,13 @@ class Cockpit:
                 raise CockpitRegistrationError(
                     f"{sid}: row set {spec.rowset!r} already belongs to panel {owner!r} (one panel per row set)"
                 )
-        if spec.rowset is not None:
-            self._rowsets[spec.rowset] = sid
         states = dict(self._state)
         states[sid] = _State()
-        self._state = states            # state first: a reader that sees the spec finds its state
         specs = dict(self._specs)
         specs[sid] = spec
+        if spec.rowset is not None:      # claimed last: a failure above leaves nothing half-registered
+            self._rowsets[spec.rowset] = sid
+        self._state = states            # state first: a reader that sees the spec finds its state
         self._specs = specs
 
     @property
@@ -257,32 +259,31 @@ class Cockpit:
     # --- lifecycle -------------------------------------------------------------------
     def start(self) -> None:
         """Take the first read of every refresher panel, then start its refresher thread."""
-        for spec in self._specs.values():
-            if spec.refresh_every_s is None or spec.id in self._refreshers:
-                continue
-            self._state[spec.id].started = self._clock()
-            self.refresh(spec.id)
-            r = _Refresher(self, spec)
-            r.thread.start()
-            self._refreshers[spec.id] = r
+        with self._life:
+            for spec in list(self._specs.values()):
+                if spec.refresh_every_s is None or spec.id in self._refreshers:
+                    continue
+                self._state[spec.id].started = self._clock()
+                self.refresh(spec.id)
+                r = _Refresher(self, spec)
+                r.thread.start()
+                self._refreshers[spec.id] = r
 
     def stop(self) -> list[str]:
         """Halt every refresher and wait out any read it is inside (bounded by that provider's
         timeout). A refresher still alive after that stays registered, so a later ``start()`` cannot
         overlap it; the result says which."""
-        for r in self._refreshers.values():
-            r.halt()
-        stuck = []
-        for pid, r in list(self._refreshers.items()):
-            if r.thread.ident is None:      # never started: nothing to join
-                del self._refreshers[pid]
-                continue
-            r.thread.join(timeout=r.spec.timeout_s + 1)
-            if r.thread.is_alive():
-                stuck.append(pid)
-            else:
-                del self._refreshers[pid]
-        return stuck
+        with self._life:
+            for r in list(self._refreshers.values()):
+                r.halt()
+            stuck = []
+            for pid, r in list(self._refreshers.items()):
+                r.thread.join(timeout=r.spec.timeout_s + 1)
+                if r.thread.is_alive():
+                    stuck.append(pid)
+                else:
+                    del self._refreshers[pid]
+            return stuck
 
     def refresher(self, panel_id: str) -> _Refresher | None:
         return self._refreshers.get(panel_id)
@@ -338,7 +339,7 @@ class Cockpit:
             for a in args:
                 if isinstance(a, ReadContext):
                     a.abandon()
-            return Fault(f"timed out after {timeout_s:g}s")
+            return Fault(f"timed out after {wait:g}s")
         if not isinstance(res, (Read, Absent, Fault)):
             return Fault(f"provider returned {type(res).__name__}, not Read/Absent/Fault")
         return res
@@ -578,6 +579,7 @@ class Cockpit:
             "search": ({"fields": list(spec.search_fields), "default_visible": spec.search_default_visible}
                        if spec.search_fields else None),
             "actions": [],
+            "edit_class": spec.edit_class or None,
         }
 
     def _now_head_and_rows(
@@ -624,7 +626,7 @@ class Cockpit:
             "filtered": [], "skipped": [], "as_of": snap.as_of, "stale_after_s": 0, "refresh_every_s": None,
             "etag": self._etag_of(snap, None, cred, ctx.today), "error": err, "note": snap.note,
             "empty": "Nothing needs you now.", "order": None, "groups": None, "search": None,
-            "actions": [], "degraded": degraded,
+            "actions": [], "degraded": degraded, "edit_class": None,
         }
         # the union of the source panels' declared groups (labels and order), counted over the now
         # rows, so a renderer prints "Today" / "Overdue", not the raw ids the rows carry
@@ -667,16 +669,20 @@ class Cockpit:
         Ones not yet registered are added; one that later vanishes keeps its provider, which then
         reads ``Absent`` and renders ``error``. A discoverer that raises is a manifest ``errors``
         entry, never silent absence. All discoverers share ONE bounded single-flight read."""
-        self._discoverers.append(fn)
+        with self._lock:
+            self._discoverers.append(fn)
 
     def _ensure_discovered(self, ctx: ReadContext) -> list[dict[str, Any]]:
         """Each discoverer runs on its own bounded single-flight, so one that fails or hangs costs
         only its own panels and one error entry."""
         errors: list[dict[str, Any]] = []
-        while len(self._discovery_states) < len(self._discoverers):
-            self._discovery_states.append(_State())
-        for i, fn in enumerate(self._discoverers):
-            res = self._bounded(self._entity_timeout_s, self._discovery_states[i], self._discover_one, fn, ctx)
+        with self._lock:     # one snapshot of the discoverers and their states for this pass
+            discoverers = list(self._discoverers)
+            while len(self._discovery_states) < len(discoverers):
+                self._discovery_states.append(_State())
+            dstates = list(self._discovery_states)
+        for i, fn in enumerate(discoverers):
+            res = self._bounded(self._entity_timeout_s, dstates[i], self._discover_one, fn, ctx)
             if isinstance(res, Fault):
                 errors.append({"source": f"discovery:{i}", "message": res.message})
                 continue
@@ -733,6 +739,23 @@ class Cockpit:
             "panels": {i: heads[i] for i in order}, "verbs": {}, "errors": errors,
         }
 
+    def freshness(self) -> dict[str, dict[str, Any]]:
+        """``{panel_id: {as_of, status}}`` for every panel, ``now`` included (design §3.4). A client
+        that got a 304 on a panel reads the panel's current age here. It carries no rows and no
+        etag, and the route never answers it 304."""
+        ctx = ReadContext(self._clock())
+        self._ensure_discovered(ctx)
+        specs_map = self._specs
+        snaps: dict[str, _Snap] = {}
+        out: dict[str, dict[str, Any]] = {}
+        for spec in self._ordered_specs(specs_map):
+            snaps[spec.id] = self._snap_for(spec, ctx)
+        now_head, _ = self._now_head_and_rows(ctx, "none", specs_map, snaps)
+        out[NOW_ID] = {"as_of": now_head["as_of"], "status": now_head["status"]}
+        for spec in self._ordered_specs(specs_map):
+            out[spec.id] = {"as_of": snaps[spec.id].as_of, "status": snaps[spec.id].status}
+        return out
+
     def panel(self, panel_id: str, *, profile: str = "full", q: str | None = None,
               row: str | None = None, credential_class: str = "none") -> dict[str, Any] | None:
         """The ``Panel`` payload, or None for an unknown panel id. ``profile`` is ``full`` or
@@ -774,7 +797,14 @@ class Cockpit:
                 keep = [r for r in rows_all if any(needle in _field_text(r, f).casefold() for f in fields)]
                 matched = len(keep)
                 rows_all = keep
-            if profile == "compact":
+            if profile == "compact" and panel_id == NOW_ID:
+                # The now view repeats rows its source gate panels already send whole in this same
+                # profile, so it sends each one's identity and placement and nothing else; the
+                # renderer joins on (panel_id, id) to the source panel's rows.
+                out["rows"] = [{**{k: r[k] for k in ("id", "panel_id", "version", "group")}, "body": None}
+                               for r in rows_all]
+                out["rows_by_ref"] = True
+            elif profile == "compact":
                 if q or head["priority"] == "gate":
                     out["rows"] = [{**r, "body": None} for r in rows_all]
                 else:

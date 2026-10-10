@@ -979,3 +979,112 @@ class TestNowGroups:
         by = {g["id"]: g["count"] for g in now["groups"]}
         assert by == {"today": 1, "overdue": 1, "also": 0} and sum(by.values()) == now["count"]
         assert ck.manifest(NONE_CRED)["panels"][NOW_ID]["groups"] == now["groups"]
+
+
+class TestSession2Freshness:
+    """K1 DONE (rev 12): after a 304 on a panel, ``GET /cockpit/freshness.json`` (never answered 304)
+    returns that panel's newer ``as_of``."""
+
+    def test_freshness_after_a_304_carries_the_newer_as_of_and_is_never_304(self, tmp_path: Path) -> None:
+        _root, src = _install(tmp_path)
+        ck = build_default_cockpit(src)
+        ck.register(_simple("slow", refresh_every_s=0.1, stale_after_s=0.2,
+                            rows=[RowIn("r", "t", {"at": "1"}, stored={"id": "r"})]))
+        ck.start()
+        try:
+            with _serve(src, cockpit=ck) as (base, _h):
+                st, hdr, _b = _http(f"{base}/cockpit/panel/slow.json")
+                f0 = json.loads(_http(f"{base}/cockpit/freshness.json")[2])["slow"]["as_of"]
+                time.sleep(0.45)
+                assert _http(f"{base}/cockpit/panel/slow.json", {"If-None-Match": hdr["ETag"]})[0] == 304
+                st2, h2, body = _http(f"{base}/cockpit/freshness.json", {"If-None-Match": hdr["ETag"]})
+                assert st2 == 200 and "ETag" not in h2
+                assert json.loads(body)["slow"]["as_of"] > f0
+                assert _http(f"{base}/cockpit/freshness.json", {"If-None-Match": "*"})[0] == 200
+        finally:
+            ck.stop()
+
+    def test_freshness_names_every_panel_with_as_of_and_status_only(self, env) -> None:
+        _r, _s, ck = env
+        fr = ck.freshness()
+        man = ck.manifest(NONE_CRED)
+        assert set(fr) == set(man["panels"])
+        assert all(set(v) == {"as_of", "status"} for v in fr.values())
+        assert fr["tray"]["status"] == man["panels"]["tray"]["status"]
+
+    def test_freshness_reads_error_for_a_failing_panel(self, env) -> None:
+        root, _s, ck = env
+        (root / ".levain" / "memory.spores.json").unlink()
+        assert ck.freshness()["tray"]["status"] == "error"
+
+
+class TestSession2Gaps:
+    """The build-found gaps (1009+48): masthead jar, store path, health max/local density, a real tag
+    list, an edit class per panel."""
+
+    def test_entity_carries_the_jar_and_the_store_path(self, env) -> None:
+        _r, src, ck = env
+        ent = ck.manifest(NONE_CRED)["entity"]
+        assert set(ent["jar"]) == {"status", "today", "typical", "history_days", "level", "label", "day"}
+        assert ent["paths"] == {"episodic_db": str(src.anneal.episodic_db)}
+
+    def test_health_carries_max_strength_and_local_density(self, env) -> None:
+        _r, _s, ck = env
+        labels = [m["label"] for m in ck.panel("health")["value"]["metrics"]]
+        assert "max strength" in labels and "local density" in labels
+
+    def test_crystal_tags_are_a_real_list(self, env) -> None:
+        root, _s, ck = env
+        (root / ".levain" / "memory.crystal.json").write_text(json.dumps({"crystal": [
+            {"name": "a", "status": "crystallized", "level": 1, "explanation": "x",
+             "tags": ["operator,ergonomics", " review ", "operator", ""]},
+            {"name": "b", "status": "crystallized", "level": 1, "explanation": "x", "tags": []}]}))
+        by = {r["id"]: r for r in ck.panel("crystals")["rows"]}
+        assert by["crystal:a"]["facets"]["tags"] == ["operator", "ergonomics", "review"]
+        assert by["crystal:b"]["facets"]["tags"] == []
+
+    def test_every_panel_head_carries_its_edit_class(self, env) -> None:
+        _r, _s, ck = env
+        heads = ck.manifest(NONE_CRED)["panels"]
+        assert {k: v["edit_class"] for k, v in heads.items() if not k.startswith(("section:", "config:"))} == {
+            "now": None, "focus": None, "state": None, "tray": "B", "loops": "B", "keep": "B",
+            "episodes": "B", "edits": None, "jobs": None, "health": "C", "graph": "C",
+            "crystals": "C", "wraps": "C"}
+        sections = {k: v["edit_class"] for k, v in heads.items() if k.startswith(("section:", "config:"))}
+        assert sections and all(c in ("A", "B", "C") for c in sections.values())
+
+
+class TestSession2CompactNow:
+    def test_compact_now_rows_are_refs_that_join_to_the_source_panels_compact_rows(self, env) -> None:
+        _r, _s, ck = env
+        now = ck.panel(NOW_ID, profile="compact")
+        full = ck.panel(NOW_ID)
+        assert now["rows_by_ref"] is True and "rows_by_ref" not in full
+        assert [(r["panel_id"], r["id"]) for r in now["rows"]] == [(r["panel_id"], r["id"]) for r in full["rows"]]
+        assert all(set(r) == {"id", "panel_id", "version", "group", "body"} and r["body"] is None for r in now["rows"])
+        tray = {r["id"]: r for r in ck.panel("tray", profile="compact")["rows"]}
+        for r in now["rows"]:
+            assert tray[r["id"]]["version"] == r["version"] and tray[r["id"]]["group"] == r["group"]
+        assert now["count"] == full["count"]
+
+
+class TestL3R4Fixes:
+    def test_an_infinite_crystal_level_drops_that_row_not_the_panel(self, env) -> None:
+        root, _s, ck = env
+        (root / ".levain" / "memory.crystal.json").write_text(
+            '{"crystal": [{"name": "bad", "status": "crystallized", "level": 1e999, "explanation": "x"},'
+            ' {"name": "good", "status": "crystallized", "level": 1, "explanation": "x"}]}')
+        p = ck.panel("crystals")
+        assert p["status"] == "partial" and [r["id"] for r in p["rows"]] == ["crystal:good"]
+
+    def test_concurrent_starts_make_one_refresher_per_panel(self, tmp_path: Path) -> None:
+        _root, src = _install(tmp_path)
+        ck = build_default_cockpit(src)
+        ck.register(_simple("slow", refresh_every_s=0.2, stale_after_s=0.4, rows=[RowIn("r", "t", {"at": "1"}, stored={"id": "r"})]))
+        ts = [threading.Thread(target=ck.start) for _ in range(4)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        try:
+            assert sum(1 for t in threading.enumerate() if t.name == "cockpit-refresh-slow") == 1
+        finally:
+            assert ck.stop() == []

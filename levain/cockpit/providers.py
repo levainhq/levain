@@ -17,7 +17,14 @@ from typing import Any, Callable
 from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext
 from levain.cockpit.registry import parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
-from levain.dashboard import FOCUS_STALE_AFTER_HOURS, SubstrateSource, SubstrateView, _one_clause
+from levain.dashboard import (
+    CLASS_B,
+    CLASS_C,
+    FOCUS_STALE_AFTER_HOURS,
+    SubstrateSource,
+    SubstrateView,
+    _one_clause,
+)
 
 # The view caps each spore bucket at ``max_spores``. The cockpit asks for far more than any store
 # holds and DISCLOSES a cap that is still hit, so a panel never shows a prefix as the whole set.
@@ -96,9 +103,9 @@ def _spore_provider(
         rows = rows[:SPORE_CAP] if apply_hold else rows
         skipped = ()
         if over:
-            skipped = ((over, f"over the display cap of {SPORE_CAP}"),)
-        elif view_full:
-            skipped = ((1, f"the substrate view stopped at {VIEW_SPORE_LIMIT} rows; at least this many more exist"),)
+            skipped += ((over, f"over the display cap of {SPORE_CAP}"),)
+        if view_full:
+            skipped += ((1, f"the substrate view stopped at {VIEW_SPORE_LIMIT} rows; at least this many more exist"),)
         return Read(rows=tuple(rows), filtered=((filtered, "surface date not reached"),) if filtered else (),
                     skipped=skipped)
     return read
@@ -193,6 +200,18 @@ def _edits(source: SubstrateSource) -> Callable[[ReadContext], Result]:
     return read
 
 
+def _tag_list(raw: Any) -> list[str]:
+    """A crystal's tags as a real list. The store holds them as one comma-joined string inside a
+    one-element list (``["operator,ergonomics"]``), so every element is split on commas, trimmed,
+    emptied of blanks and de-duplicated in first-seen order."""
+    seen: dict[str, None] = {}
+    for t in raw or []:
+        for part in str(t).split(","):
+            if part.strip():
+                seen.setdefault(part.strip(), None)
+    return list(seen)
+
+
 def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
         path = source.anneal.crystal_json
@@ -211,12 +230,12 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
             try:
                 name = str(c.get("name") or "(unnamed)")
                 level = int(c.get("level", 0) or 0)
-                tags = [str(t) for t in (c.get("tags") or [])]
+                tags = _tag_list(c.get("tags"))
                 clause = _one_clause(str(c.get("explanation", "")))
                 act = str(c.get("activation_mode", ""))
                 perm = str(c.get("permanence", ""))
                 last = str(c.get("last_activated_on", ""))
-            except (ValueError, TypeError, AttributeError):
+            except (ValueError, TypeError, AttributeError, OverflowError):
                 dropped += 1
                 continue
             rows.append(RowIn(
@@ -242,7 +261,8 @@ def _health(source: SubstrateSource) -> Callable[[ReadContext], Result]:
              "unit": None, "status": "ok" if h.write_path_live else "bad", "read": None},
         ]
         for label, value in (
-            ("links", h.total_links), ("avg strength", h.avg_strength), ("density", h.density),
+            ("links", h.total_links), ("avg strength", h.avg_strength), ("max strength", h.max_strength),
+            ("density", h.density), ("local density", h.local_density),
             ("episodes", h.total_episodes), ("episodes since wrap", h.episodes_since_wrap),
             ("tombstones", h.tombstones), ("wraps", h.total_wraps),
             ("graduations validated", h.graduations_validated_total),
@@ -368,14 +388,18 @@ def build_default_cockpit(
 
     def entity(ctx: ReadContext) -> dict[str, Any]:
         v = _view(source, ctx)
+        # ``jar`` (today's episode count against the entity's own typical day) and the store path
+        # are the masthead's: the same two the dashboard's /substrate.json carries.
         return {"name": v.entity_name, "governance": v.scope,
-                "brand": {"wordmark": v.brand_wordmark, "model": v.brand_model}}
+                "brand": {"wordmark": v.brand_wordmark, "model": v.brand_model},
+                "jar": v.jar.to_dict() if v.jar else None,
+                "paths": {"episodic_db": str(source.anneal.episodic_db)}}
 
     ck = Cockpit(entity=entity, clock=clock)
     spore_common = dict(
         facets=SPORE_FACETS,
         version_fields=tuple(f for f in SPORE_STORED if f != "seen"), version_excluded=("seen",),
-        search_fields=("title", "body", "domain"),
+        search_fields=("title", "body", "domain"), edit_class=CLASS_B,
     )
     ck.register(ProviderSpec("focus", "line", "Focus", "gauge", _context_line(source, "focus"),
                              region="header", rank=0, optional=True,
@@ -395,7 +419,7 @@ def build_default_cockpit(
         "episodes", "triage-list", "Recent episodes", "feed", _episodes(source), region="operate", rank=3,
         order="time.desc", rowset="episodes", facets=frozenset({"episode_type", "source", "at", "tags"}),
         version_fields=("id", "timestamp", "type", "source", "content", "tags"),
-        search_fields=("title", "body", "source"), empty="No recent episodes."))
+        search_fields=("title", "body", "source"), edit_class=CLASS_B, empty="No recent episodes."))
     ck.register(ProviderSpec(
         "edits", "triage-list", "Recent edits", "feed", _edits(source), region="operate", rank=4,
         optional=True, order="time.desc", rowset="edits",
@@ -405,15 +429,19 @@ def build_default_cockpit(
             "jobs", "triage-list", "Recent jobs", "feed", _jobs(job_store), region="operate", rank=5,
             optional=True, order="time.desc", rowset="jobs",
             facets=frozenset({"job_status", "verb", "at"}), version_fields=("*",), empty="No jobs yet."))
-    ck.register(ProviderSpec("health", "metric", "Health", "gauge", _health(source), region="mind", rank=0))
-    ck.register(ProviderSpec("graph", "visual", "Cognition trace", "feed", _graph(source), region="mind", rank=1))
+    ck.register(ProviderSpec("health", "metric", "Health", "gauge", _health(source), region="mind", rank=0,
+                             edit_class=CLASS_C))
+    ck.register(ProviderSpec("graph", "visual", "Cognition trace", "feed", _graph(source), region="mind", rank=1,
+                             edit_class=CLASS_C))
     ck.register(ProviderSpec(
         "crystals", "triage-list", "Crystallized patterns", "feed", _crystals(source), region="mind", rank=2,
         optional=True, order="crystal.level", rowset="crystals",
         facets=frozenset({"crystal_level", "permanence", "last_activated_on", "tags"}),
         version_fields=("name", "level", "one_clause", "permanence", "activation_mode", "tags"),
-        version_excluded=("last_activated_on",), search_fields=("title", "body"), empty="No crystals yet."))
-    ck.register(ProviderSpec("wraps", "visual", "Projection history", "feed", _wraps(source), region="mind", rank=9))
+        version_excluded=("last_activated_on",), search_fields=("title", "body"), edit_class=CLASS_C,
+        empty="No crystals yet."))
+    ck.register(ProviderSpec("wraps", "visual", "Projection history", "feed", _wraps(source), region="mind", rank=9,
+                             edit_class=CLASS_C))
     # prose panels: one per neocortex heading and per seed/config doc, DISCOVERED at every read so a
     # heading added later appears and an unreadable file at first sight is a manifest error, not a
     # permanent silent absence.
@@ -430,13 +458,15 @@ def build_default_cockpit(
                 pid += "-2"
             used.add(pid)
             specs.append(ProviderSpec(pid, "prose", s_.heading, "feed",
-                                      _prose(source, "section", s_.heading), region="mind", rank=20 + i))
+                                      _prose(source, "section", s_.heading), region="mind", rank=20 + i,
+                                      edit_class=s_.edit_class))
         for i, d in enumerate(v.config_docs):
             pid = f"config:{d.key}"
             if pid not in used:
                 used.add(pid)
                 specs.append(ProviderSpec(pid, "prose", d.title, "feed",
-                                          _prose(source, "config", d.key), region="identity", rank=i))
+                                          _prose(source, "config", d.key), region="identity", rank=i,
+                                          edit_class=d.edit_class))
         return specs
 
     ck.discover(discover)

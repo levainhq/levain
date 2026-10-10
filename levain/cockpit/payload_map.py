@@ -46,7 +46,9 @@ _add(B, "map", "tray filtered: [{count, reason}]", True, "tray.held")
 # --- 6.2 Bridge /substrate.json ---------------------------------------------------------------------
 S = "substrate"
 _add(S, "map", "manifest entity", True, "entity_name", "brand_wordmark", "brand_model")
-_add(S, "drop", "install-private paths", True, "paths.**", "scope")
+_add(S, "map", "manifest entity.paths.episodic_db: the masthead's store path, a K1 session-2 amendment to "
+     "§6.2 (the other three paths stay install-private)", False, "paths.episodic_db")
+_add(S, "drop", "install-private paths", True, "paths.continuity_md", "paths.crystal_json", "paths.spores_json", "scope")
 _add(S, "map", "regions.zones[].panels + PanelHead", True,
      "layout[].kind", "layout[].id", "layout[].zone", "layout[].title")
 _add(S, "map", "Row.id / title / body / facets (open_spores, tray, keep rows)", True,
@@ -101,8 +103,10 @@ _add(S, "map", "prose panel", True, "extra_panels.*.markdown")
 _add(S, "map", "PanelAction + VerbHead.fields", True, "extra_panels.*.action.**")
 _add(S, "map", "placement of each extra panel in the layout", False, "extra_panels")
 # The Bridge's current installed levain predates these; they are on levain main (SubstrateView).
-_add(S, "unmapped", "SubstrateView.state / .jar exist on levain main and §6 does not map them", False,
-     "state.**", "jar.**")
+_add(S, "map", "manifest entity.jar (the masthead starter jar), a K1 session-2 amendment to §6.2", False, "jar.**")
+_add(S, "map", "line state in header (the panel `state` exists, like focus); §6.2 does not spell this out, "
+     "a K1 session-2 amendment", False, "state.text", "state.set_at", "state.source")
+_add(S, "drop", "the renderer formats age (as for focus.age_label)", False, "state.age_label")
 
 # --- 6.3 /header.json, /sky.json, /fleet.json ------------------------------------------------------
 H = "header"
