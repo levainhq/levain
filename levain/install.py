@@ -1327,6 +1327,8 @@ def _single_writer_lock(
     try:
         import fcntl
     except ImportError:
+        if precheck is not None:
+            precheck()  # a path that is not an install is refused here too, lock or none
         yield
         return
     key = (path.resolve(), threading.get_ident())
@@ -3014,8 +3016,11 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
                 landed = False
             if not landed:
                 leave_kept = kept is not None  # owned by the undo until it proves otherwise
-                leave_kept = _put_codex_config_back(config, written, was_link, ours, kept, hooks,
-                                                    notes)
+                try:
+                    leave_kept = _put_codex_config_back(config, written, was_link, ours, kept,
+                                                        hooks, notes)
+                except BaseException:
+                    pass  # the original stays on disk; the hooks failure is what is raised
             raise
     finally:
         if kept is not None and not leave_kept:
@@ -3084,11 +3089,15 @@ def _put_codex_config_back(config: Path, written: Path, was_link: bool,
         return False  # nothing was created
     if ours is None and kept is not None:
         # Which file is live cannot be proved (the merge was interrupted before it could be
-        # read, or the read failed). Unchanged bytes mean nothing to undo; anything else is
-        # left as it is and the original named, never overwritten on a guess.
-        with contextlib.suppress(OSError):
+        # read, or the read failed). Bytes equal to the original lose nothing by renaming the
+        # original back, which restores its inode; anything else is left as it is and the
+        # original named, never overwritten on a guess.
+        try:
             if written.read_bytes() == kept.read_bytes():
+                os.replace(kept, written)
                 return False
+        except OSError:
+            pass
     try:
         still_ours = (ours is not None and config.is_symlink() == was_link
                       and config.resolve() == written and written.is_file()
@@ -3097,8 +3106,8 @@ def _put_codex_config_back(config: Path, written: Path, was_link: bool,
         still_ours = False
     if not still_ours:
         where = f"; the original is kept at {kept}" if kept is not None else ""
-        notes.append(f"  ! {hooks} could not be written, and {config} changed after levain wrote "
-                     f"it, so it was left as it is{where}. It may register this install's store: "
+        notes.append(f"  ! {hooks} could not be written, and {config} could not be confirmed as "
+                     f"the file levain wrote, so it was left as it is{where}. It may register this install's store: "
                      f"re-run `levain init --adapter codex` from the install codex should use.")
         return kept is not None
     try:

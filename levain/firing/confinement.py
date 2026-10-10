@@ -4816,7 +4816,7 @@ _NETWORK_DEPUTY_DIRS = ("/run/dbus", "/run/systemd/resolve", "/run/nscd", "/run/
 _NETWORK_DEPUTY_SOCKETS = ("/run/snapd.socket", "/run/snapd-snap.socket")
 
 
-def _dirmngr_sockets() -> list[Path]:
+def _dirmngr_sockets(workspace: Path | None = None) -> list[Path]:
     """The operator's gnupg dirmngr sockets the offline bash could reach: ``<runtime>/gnupg/S.dirmngr``,
     the same under a non-default GNUPGHOME's ``d.*`` subdirectory, and the ``~/.gnupg`` fallback.
     dirmngr is socket-activated by the user's service manager, so a connect starts it OUTSIDE bash's
@@ -4826,8 +4826,13 @@ def _dirmngr_sockets() -> list[Path]:
     gnupghome = Path(os.environ.get("GNUPGHOME") or "~/.gnupg").expanduser()
     if gnupghome.is_absolute():
         roots.append(gnupghome)
-    else:  # gpg resolves a relative one against its cwd; both bases are checked
-        roots += [Path.cwd() / gnupghome, Path.home() / gnupghome]
+    else:  # gpg resolves a relative one against its cwd: levain's, bash's start, and home
+        bases = [Path.home(), workspace] if workspace is not None else [Path.home()]
+        try:
+            bases.append(Path.cwd())
+        except OSError:
+            pass  # a deleted cwd names nothing
+        roots += [b / gnupghome for b in bases]
     for g in roots:
         try:
             if not g.is_dir():
@@ -5368,7 +5373,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # /etc/resolv.conf may point at nothing. A daemon whose socket or directory is absent at spawn,
     # or that recreates its socket, is not hidden from then on: the residual step (6) states.
     if policy.deny_localhost_outbound:
-        masks += [str(f) for f in _dirmngr_sockets()]
+        masks += [str(f) for f in _dirmngr_sockets(policy.workspace)]
         for d in _NETWORK_DEPUTY_DIRS:
             real = Path(d).resolve()
             if not _reachable(real) or not real.is_dir() or real in hidden_dirs:
