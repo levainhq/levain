@@ -43,6 +43,7 @@ class _Flight:
         self.result: _Call | None = None
         self.deadline = deadline       # on the instance's clock: a flight is abandoned once past it
         self.timeout: _Call | None = None   # its own timeout reading, set once when it is abandoned
+        self.answered: tuple[float, _Call] | None = None   # (when, answer): the worker's, before it takes the lock
 
 
 class ExternalPanels:
@@ -103,6 +104,9 @@ class ExternalPanels:
         return call
 
     def _abandon_locked(self, flight: _Flight, now: float) -> _Call:
+        answered = flight.answered
+        if flight.timeout is None and answered is not None and answered[0] < flight.deadline:
+            return answered[1]    # it answered on time and its publication is waiting on the lock
         if flight.timeout is None:
             flight.timeout = _Call(None, f"the external panels did not answer within {self._wait_s:g} s", _now_iso())
             if self._flight is flight:
@@ -121,7 +125,11 @@ class ExternalPanels:
         except BaseException as exc:  # noqa: BLE001 - every failure is a reading, reused like one
             call = _Call(None, _describe(exc), _now_iso())
         finally:
-            now = self._clock()        # when the call answered, not when its answer got the lock
+            try:
+                now = self._clock()    # when the call answered, not when its answer got the lock
+            except BaseException:  # noqa: BLE001 - a clock that fails cannot vouch for the answer
+                now = flight.deadline
+            flight.answered = (now, call)   # visible to a reader that takes the lock first
             with self._lock:
                 if flight.timeout is None and now >= flight.deadline:
                     self._abandon_locked(flight, now)   # an answer after the deadline is a timeout, for all readers
