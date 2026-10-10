@@ -19,6 +19,7 @@ from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext
 from levain.cockpit.registry import parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 from levain.dashboard import (
+    CLASS_A,
     CLASS_B,
     CLASS_C,
     SubstrateSource,
@@ -38,6 +39,9 @@ EDITS_LIMIT = 20
 # one led the queue for 26 days). A dated handoff never expires.
 HANDOFF_FRESH_DAYS = 7
 
+# the verbs a spore panel offers (design §4.2); anneal still refuses a verb the spore's type forbids
+SPORE_ROW_VERBS = ("spore_touch", "spore_descend", "spore_surface_at", "spore_update",
+                   "spore_set_disposition", "spore_ascend")
 SPORE_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen")
 SPORE_FACETS = frozenset({
     "disposition", "domain", "tier", "salience", "spore_type", "due", "overdue_days",
@@ -398,6 +402,22 @@ def _slug(heading: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-") or "section"
 
 
+def _scan_read_one(read: Callable[[ReadContext], Result]) -> Callable[[ReadContext, str], Result]:
+    """``read_one`` for a provider whose source is read whole: a FRESH read (never the memoised
+    view of a render) and the row found by id."""
+    def read_one(ctx: ReadContext, row_id: str) -> Result:
+        res = read(ReadContext(ctx.now))
+        if not isinstance(res, Read):
+            return res
+        for r in res.rows or ():
+            if r.id == row_id:
+                return Read(rows=(r,))
+        if res.skipped:
+            return Fault(f"row {row_id!r} not found, but the read skipped rows")
+        return Absent(f"row {row_id!r} is gone")
+    return read_one
+
+
 def build_default_cockpit(
     source: SubstrateSource, *, job_store: Any = None, clock: Callable[[], datetime] | None = None
 ) -> Cockpit:
@@ -420,7 +440,8 @@ def build_default_cockpit(
         search_fields=("title", "body", "domain"), edit_class=CLASS_B,
     )
     ck.register(ProviderSpec("state", "line", "State", "gauge", _context_line(source),
-                             region="header", rank=0, optional=True, empty="No state line."))
+                             region="header", rank=0, optional=True, empty="No state line.",
+                             verbs=("operator_state",)))
     for pid, title, bucket, prio, order, rank in (
         ("tray", "Tray", "tray", "gate", "spore.tray", 0),
         ("loops", "Open loops", "loops", "feed", "spore.loops", 1),
@@ -429,14 +450,17 @@ def build_default_cockpit(
         ck.register(ProviderSpec(
             pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank,
             order=order, rowset=f"spore:{bucket}", read_one=_spore_read_one(source, bucket),
-            empty="Nothing waiting.", **spore_common))
+            empty="Nothing waiting.", verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
+            **spore_common))
     ck.register(ProviderSpec(
         "episodes", "triage-list", "Recent episodes", "feed", _episodes(source), region="operate", rank=3,
+        read_one=_scan_read_one(_episodes(source)), verbs=("episode_tombstone",),
         order="time.desc", rowset="episodes", facets=frozenset({"episode_type", "source", "at", "tags"}),
         version_fields=("id", "timestamp", "type", "source", "content", "tags"),
         search_fields=("title", "body", "source"), edit_class=CLASS_B, empty="No recent episodes."))
     ck.register(ProviderSpec(
         "edits", "triage-list", "Recent edits", "feed", _edits(source), region="operate", rank=4,
+        read_one=_scan_read_one(_edits(source)), verbs=("undo",),
         optional=True, order="time.desc", rowset="edits",
         facets=frozenset({"edit_kind", "at", "undoable"}), version_fields=("*",), empty="No edits yet."))
     if job_store is not None:
@@ -474,14 +498,16 @@ def build_default_cockpit(
             used.add(pid)
             specs.append(ProviderSpec(pid, "prose", s_.heading, "feed",
                                       _prose(source, "section", s_.heading), region="mind", rank=20 + i,
-                                      edit_class=s_.edit_class))
+                                      edit_class=s_.edit_class,
+                                      verbs=("section_edit",) if s_.edit_class == CLASS_A else ()))
         for i, d in enumerate(v.config_docs):
             pid = f"config:{d.key}"
             if pid not in used:
                 used.add(pid)
                 specs.append(ProviderSpec(pid, "prose", d.title, "feed",
                                           _prose(source, "config", d.key), region="identity", rank=i,
-                                          edit_class=d.edit_class))
+                                          edit_class=d.edit_class,
+                                          verbs=("config",) if d.edit_class == CLASS_A else ()))
         return specs
 
     ck.discover(discover)

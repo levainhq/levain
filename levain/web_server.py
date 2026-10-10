@@ -93,6 +93,8 @@ from levain.cockpit.routes import CACHE_CONTROL as COCKPIT_CACHE_CONTROL
 from levain.cockpit.routes import VARY as COCKPIT_VARY
 from levain.cockpit.routes import handle_get as handle_cockpit_get
 from levain.cockpit.routes import is_cockpit_path
+from levain.cockpit.verbs import VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb
+
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
 from levain.http_guards import GuardedHandler
@@ -102,9 +104,15 @@ from levain.writes import (
     MAX_BODY_BYTES,
     ActionVerb,
     EditError,
-    apply_action,
-    apply_edit,
 )
+
+# The one write route of the shared cockpit (design §4.1). ``/edit`` and ``/action`` are its aliases:
+# all three end in ``levain.cockpit.verbs.dispatch``.
+_COCKPIT_VERB_PATH = "/cockpit/verb"
+_WRITE_ROUTES = ("/edit", "/action", _COCKPIT_VERB_PATH)
+# Until K2b's governed start check exists every install is reported (design §4.6): no install here can
+# show that its stores sit beyond the operator uid's reach.
+INSTALL_CLASS = "reported"
 
 __all__ = [
     "DEFAULT_HOST",
@@ -281,7 +289,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/job.json",
     "/edit",
     "/action",
-    "/cockpit/manifest.json", "/cockpit/freshness.json",
+    "/cockpit/manifest.json", "/cockpit/freshness.json", _COCKPIT_VERB_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 
 
@@ -567,6 +575,10 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # read-only server (then the token check is skipped — the localhost path stays token-free).
     is_loopback_bind: bool
     write_token: str | None
+    # K2a (design §4.3, §9): one write token per surface (``browser``, ``flowconnect``), required on
+    # EVERY bind for every write, since 127.0.0.1 is reachable by every local uid. Name -> token.
+    surface_tokens: dict[str, str]
+    verb_registry: VerbRegistry
     # Downstream-registered READ-ONLY routes (the FleetView extension point). Both
     # default to empty so the base product carries nothing extra. extra_assets are
     # cached static bytes (ungated, like levain_assets); extra_json are per-request
@@ -605,6 +617,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 built = build_default_cockpit(
                     self.levain_source,
                     job_store=self.job_runtime.store if self.job_runtime is not None else None)
+                built.attach_verbs(VerbView(self.verb_registry, built, INSTALL_CLASS))
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
@@ -665,6 +678,23 @@ class _Handler(GuardedHandler):
             and self.server.levain_source.write_scope is not None
         )
 
+    def _credential(self) -> dict[str, Any]:
+        """The credential THIS request carries, verified here and never claimed (design §5.1): a
+        surface token, compared in constant time against every surface's token (no early exit, so
+        timing does not say which surface matched), or nothing. Device keys arrive with slice G."""
+        supplied = self.headers.get(_WRITE_TOKEN_HEADER, "").encode("utf-8")
+        name = None
+        for n, tok in sorted(self.server.surface_tokens.items()):
+            if tok and hmac.compare_digest(supplied, tok.encode("utf-8")) and name is None:
+                name = n
+        if name is None:
+            return {"class": "none", "device_class": None}
+        return {"class": "token", "name": name, "device_class": None}
+
+    def _writes_need_credential(self) -> bool:
+        """K2a: a writable surface needs a credential on every write, on every bind."""
+        return self.server.levain_source.write_scope is not None
+
     def _off_box_token_valid(self) -> bool:
         """True iff the request carries the correct off-box token (constant-time compare against the
         token ``make_server`` was given). The SINGLE compare shared by the read gate (``_route``) and
@@ -672,11 +702,7 @@ class _Handler(GuardedHandler):
         (``structural_invariants_beat_discipline``). Only meaningful when ``_write_token_required()``
         — the callers check that first; a missing server token (``write_token=None``) or an empty
         supplied token fails CLOSED (``bool(expected)`` gates before the compare)."""
-        expected = self.server.write_token or ""
-        supplied = self.headers.get(_WRITE_TOKEN_HEADER, "")
-        return bool(expected) and hmac.compare_digest(
-            supplied.encode("utf-8"), expected.encode("utf-8")
-        )
+        return self._credential()["class"] == "token"
 
     def _cockpit(self) -> "Cockpit":
         """The server's cockpit; the kernel's default over this substrate is built on first use
@@ -743,9 +769,7 @@ class _Handler(GuardedHandler):
                 return
             try:
                 status, body, hdrs = handle_cockpit_get(
-                    self._cockpit(), self.path,
-                    token=self.headers.get(_WRITE_TOKEN_HEADER, ""),
-                    expected_token=self.server.write_token,
+                    self._cockpit(), self.path, credential=self._credential(),
                     if_none_match=self.headers.get("If-None-Match"),
                 )
             except Exception as exc:  # noqa: BLE001 - never 500 with a dead connection
@@ -767,7 +791,7 @@ class _Handler(GuardedHandler):
             try:
                 body = build_substrate_json(
                     self.server.levain_source, self.server.extra_panels,
-                    write_token_required=self._write_token_required(),
+                    write_token_required=self._write_token_required() or self._writes_need_credential(),
                     extra_verbs=self.server.extra_verbs)
             except Exception as exc:  # noqa: BLE001 — never 500 on a runtime fault
                 # build_substrate_view already degrades data/IO faults into the
@@ -780,7 +804,7 @@ class _Handler(GuardedHandler):
                 body = json.dumps({
                     "paths": {},
                     "writable": self.server.levain_source.write_scope is not None,
-                    "write_token_required": self._write_token_required(),
+                    "write_token_required": self._write_token_required() or self._writes_need_credential(),
                     "errors": {"server": f"{type(exc).__name__}: {exc}"},
                 }).encode("utf-8")
             finally:
@@ -1007,7 +1031,13 @@ class _Handler(GuardedHandler):
         # depth). A loopback bind skips this — the localhost-sovereign token-free path is unchanged.
         # The predicate requires write_scope (writability): a READ-ONLY off-box surface has no write
         # path, so it falls through to the 422 'read_only' refusal below, NOT a token-403 [codex L3].
-        if self._write_token_required() and not self._off_box_token_valid():
+        route = self.path.split("?", 1)[0]
+        if route in _WRITE_ROUTES and self._writes_need_credential() and not self._off_box_token_valid():
+            # K2a (design §4.3): every write carries a credential on every bind, loopback included;
+            # refused before a byte of the body is read
+            return self._reject(403, "credential_required", "missing or invalid write token")
+        if (self._write_token_required() and route not in _WRITE_ROUTES
+                and not self._off_box_token_valid()):
             return self._reject(403, "forbidden", "missing or invalid write token")
         # CSRF layer 2: require application/json (a cross-origin page cannot send it
         # without a CORS preflight this server never answers).
@@ -1018,9 +1048,8 @@ class _Handler(GuardedHandler):
         # /action carries no second, weaker auth path. The off-box token check keys on
         # write_scope, and action verbs REQUIRE a write_scope (make_server enforces it), so
         # the spore-129 governance already covers /action with no change here.
-        route = self.path.split("?", 1)[0]
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
-        if route not in ("/edit", "/action") and not is_chat:
+        if route not in _WRITE_ROUTES and not is_chat:
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -1071,11 +1100,12 @@ class _Handler(GuardedHandler):
                 )
                 return
             try:
-                if route == "/edit":
-                    result = apply_edit(scope, req)
-                else:  # /action — governed channel-verb dispatch (the write-peer of extra_panels)
-                    result = apply_action(scope, self.server.extra_verbs, req,
-                                          job_runtime=self.server.job_runtime)
+                # one dispatch for the cockpit route and both legacy aliases (design §4.3)
+                result = dispatch_verb(
+                    registry=self.server.verb_registry, cockpit=self._cockpit(), scope=scope, req=req,
+                    credential=self._credential(), install_class=INSTALL_CLASS,
+                    route={"/edit": "edit", "/action": "action"}.get(route, "cockpit"),
+                    job_runtime=self.server.job_runtime)
             except EditError as exc:
                 self._send_json({"error": exc.code, "message": str(exc)}, exc.http_status)
             except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -1098,6 +1128,7 @@ def make_server(
     write_token: str | None = None,
     job_runtime: "JobRuntime | None" = None,
     chat_host: "ChatHost | None" = None,
+    surface_tokens: "Mapping[str, str] | None" = None,
     chat_token: str | None = None,
     cockpit: "Cockpit | None" = None,
 ) -> _LevainHTTPServer:
@@ -1274,6 +1305,8 @@ def make_server(
         for name, spec in extra_verbs.items():
             if not isinstance(name, str) or not name:
                 raise ValueError(f"refusing action verb {name!r}: name must be a non-empty string.")
+            if isinstance(spec, VerbSpec):
+                continue    # a downstream cockpit verb carrying its own tier_fn; the registry validates it
             if not isinstance(spec, ActionVerb):
                 raise ValueError(
                     f"refusing action verb {name!r}: value must be an ActionVerb "
@@ -1304,6 +1337,25 @@ def make_server(
     if job_runtime is not None:
         job_runtime.store.sweep(datetime.now(timezone.utc).isoformat())
 
+    # The verb registry (K2a, design §4.1): the kernel's verbs plus the downstream's. A name that
+    # collides with a kernel verb, or a broker head (``harness_approve``), is refused here, pre-bind.
+    verb_registry = VerbRegistry(extra_verbs)
+    # One write token per surface, required on every bind (design §4.3). ``write_token`` is the
+    # ``browser`` surface's for callers that pass one token. A writable source given none gets a
+    # per-launch ``browser`` token, printed by ``levain serve`` in the unlocked link.
+    tokens = {str(k): str(v) for k, v in (surface_tokens or {}).items()}
+    for name, tok in tokens.items():
+        if not name or not tok:
+            raise ValueError(f"refusing surface token {name!r}: name and token must be non-empty")
+    if len(set(tokens.values())) != len(tokens):
+        raise ValueError("refusing surface tokens: two surfaces share one token")
+    if write_token:
+        if tokens.get("browser", write_token) != write_token:
+            raise ValueError("write_token and surface_tokens['browser'] disagree")
+        tokens["browser"] = write_token
+    if source.write_scope is not None and not tokens:
+        tokens["browser"] = secrets.token_urlsafe(32)
+
     assets = {fn: load_web_asset(fn).encode("utf-8") for fn, _ in _ASSETS.values()}
     httpd = _LevainHTTPServer((host, port), _Handler)
     httpd.levain_source = source
@@ -1318,6 +1370,9 @@ def make_server(
     # its panels); None means the kernel's default over this substrate, built on first request.
     # Its start() (refresher threads) is the caller's when it passes its own.
     httpd.cockpit = cockpit
+    httpd.verb_registry = verb_registry
+    if cockpit is not None:
+        cockpit.attach_verbs(VerbView(verb_registry, cockpit, INSTALL_CLASS))
     httpd._cockpit_lock = threading.Lock()
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
@@ -1327,7 +1382,8 @@ def make_server(
     # unchanged); an off-loopback writable bind enforces ``write_token`` (the bind-refusal
     # above already guaranteed a writable off-loopback source was given one).
     httpd.is_loopback_bind = _is_loopback_host(str(httpd.server_address[0]))
-    httpd.write_token = write_token
+    httpd.write_token = tokens.get("browser")
+    httpd.surface_tokens = tokens
     # GENERAL post-bind reality check (codex L3): the pre-bind refusal rejects a wildcard/PUBLIC
     # *requested* host, but the ACTUAL bound address can still be wildcard/public via a resolver
     # surprise (a hosts-file/DNS mapping of a loopback-CLASSIFIED name to such an address) — for

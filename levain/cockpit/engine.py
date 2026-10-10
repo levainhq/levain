@@ -109,6 +109,7 @@ class ProviderSpec:
     empty: str = ""
     rowset: str | None = None
     edit_class: str = ""              # the dashboard's A/B/C edit class chip; "" = none (read-side label only)
+    verbs: tuple[str, ...] = ()       # the verbs this panel offers (K2a, design §4.1): only these may target it
 
 
 class ReadContext:
@@ -238,6 +239,25 @@ class Cockpit:
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
+        self._verb_view: Any = None      # levain.cockpit.verbs.VerbView, attached by the server (K2a)
+        # one flight per (panel, row) for source reads made inside a write, so concurrent writes on
+        # one row share a read and a hung source cannot grow a thread per request
+        self._one_states: dict[tuple[str, str], _State] = {}
+
+    def attach_verbs(self, view: Any) -> None:
+        """Attach the verb registry's view: row and panel actions, the manifest ``verbs`` map, and
+        the revision (install class + policy) hashed into every etag, since a gesture can change with
+        rows unchanged (design §9 K2a)."""
+        self._verb_view = view
+
+    def spec(self, panel_id: str) -> "ProviderSpec | None":
+        return self._specs.get(panel_id)
+
+    def today(self) -> date:
+        return ReadContext(self._clock()).today
+
+    def _verb_rev(self) -> Any:
+        return self._verb_view.revision() if self._verb_view is not None else None
 
     # --- registration ----------------------------------------------------------------
     def register(self, spec: ProviderSpec) -> None:
@@ -601,6 +621,11 @@ class Cockpit:
             raise ValueError(f"{spec.kind} value lacks {need!r}")
         if spec.kind == "prose":
             v = {**v, "provenance": v.get("provenance")}   # Prose.provenance (rev 9, §3.2.2); null until K2b
+        if spec.kind in ("line", "prose"):
+            # the version a value write binds to (§4.4): a hash of the stored value as read, never of
+            # provenance (a render-time label) or of itself
+            stored = {k: x for k, x in v.items() if k not in ("provenance", "value_version")}
+            v = {**v, "value_version": _sha(stored)[:16]}
         if spec.kind == "visual":
             if v["visual"] not in VISUALS:
                 raise ValueError(f"unknown visual {v['visual']!r}")
@@ -700,7 +725,8 @@ class Cockpit:
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
         return _sha({"status": snap.status, "rows": snap.rows, "value": snap.value,
                      "filtered": snap.filtered, "skipped": snap.skipped, "error": snap.error,
-                     "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat()})
+                     "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat(),
+                     "verbs": self._verb_rev()})
 
     def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date) -> dict[str, Any]:
         listy = spec.kind == "triage-list"
@@ -727,7 +753,7 @@ class Cockpit:
             "order": spec.order, "groups": groups,
             "search": ({"fields": list(spec.search_fields), "default_visible": spec.search_default_visible}
                        if spec.search_fields else None),
-            "actions": [],
+            "actions": (self._verb_view.panel_actions(spec.id, cred, today) if self._verb_view is not None else []),
             "edit_class": spec.edit_class or None,
         }
 
@@ -883,13 +909,15 @@ class Cockpit:
             ],
         }
         order = [NOW_ID] + [s.id for s in specs]
-        etag = _sha({"panels": [heads[i]["etag"] for i in order], "credential": credential,
+        etag = _sha({"panels": [heads[i]["etag"] for i in order], "credential": credential, "verbs": self._verb_rev(),
                      "install_class": install_class, "policy_revision": POLICY_REVISION,
                      "entity": entity, "errors": errors})   # identity and manifest faults are content too
         return {
             "schema": SCHEMA, "entity": entity, "generated_at": _iso(ctx.now), "etag": etag,
             "credential": credential, "regions": regions,
-            "panels": {i: heads[i] for i in order}, "verbs": {}, "errors": errors,
+            "panels": {i: heads[i] for i in order},
+            "verbs": self._verb_view.verbs_map(credential["class"]) if self._verb_view is not None else {},
+            "errors": errors,
         }
 
     def freshness(self) -> dict[str, dict[str, Any]]:
@@ -961,7 +989,7 @@ class Cockpit:
             rows_all = snap_rows or []
             if row is not None:
                 hit = [r for r in rows_all if r["id"] == row]
-                out["rows"] = hit
+                out["rows"] = self._with_actions(hit, panel_id, credential_class, ctx.today)
                 if not hit:
                     raise RowNotFound(row)
                 return out
@@ -989,6 +1017,8 @@ class Cockpit:
                 out["rows"] = rows_all
             if matched is not None:
                 out["matched"] = matched
+            if out["rows"] is not None and not out.get("rows_by_ref"):
+                out["rows"] = self._with_actions(out["rows"], panel_id, credential_class, ctx.today)
         else:
             if profile == "compact":
                 out["value"] = _compact_value(head["kind"], value)
@@ -999,6 +1029,14 @@ class Cockpit:
             else:
                 out["value"] = value
         return out
+
+    def _with_actions(self, rows: list[dict[str, Any]], panel_id: str, cred: str, today: date) -> list[dict[str, Any]]:
+        """Each row's actions, rendered for this credential (design §4.1: the row's own tier and
+        gesture plus the param values that escalate it). A now-view row takes its source panel's."""
+        if self._verb_view is None:
+            return rows
+        return [{**r, "actions": self._verb_view.row_actions(r.get("panel_id") or panel_id, r, cred, today)}
+                for r in rows]
 
     def read_one(self, panel_id: str, row_id: str) -> Result:
         """Read ONE row from the SOURCE through the provider's ``read_one``, never from a refresher
@@ -1022,7 +1060,35 @@ class Cockpit:
                 return Read(value=rows[0])
             except Exception as exc:  # noqa: BLE001
                 return Fault(f"provider output refused: {_safe_str(exc)}")
-        return self._bounded(spec.timeout_s, None, once, ctx)
+        return self._bounded_keyed((panel_id, row_id), spec.timeout_s, once, ctx)
+
+    def read_value_version(self, panel_id: str) -> Result:
+        """Read a line or prose panel's value from the SOURCE (never the refresher snapshot) and
+        return its ``value_version`` in ``Read.value`` (design §4.4)."""
+        spec = self._specs.get(panel_id)
+        if spec is None or spec.kind not in ("line", "prose"):
+            return Fault(f"panel {panel_id!r} has no stored value")
+        ctx = ReadContext(self._clock())
+
+        def once(ctx: ReadContext) -> Result:
+            res = spec.read(ctx)
+            if not isinstance(res, Read):
+                return res
+            try:
+                return Read(value=self._value(spec, res.value)["value_version"])
+            except Exception as exc:  # noqa: BLE001
+                return Fault(f"provider output refused: {_safe_str(exc)}")
+        return self._bounded_keyed(("\x00value", panel_id), spec.timeout_s, once, ctx)
+
+    def _bounded_keyed(self, key: tuple[str, str], timeout_s: float, fn: Callable[..., Any], *args: Any) -> Any:
+        with self._lock:
+            st = self._one_states.setdefault(key, _State())
+        try:
+            return self._bounded(timeout_s, st, fn, *args)
+        finally:
+            with self._lock, st.lock:
+                if st.pflight is None and self._one_states.get(key) is st:
+                    del self._one_states[key]   # a hung flight keeps its entry until its worker ends
 
 
 def _safe_str(exc: object) -> str:

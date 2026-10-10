@@ -3,7 +3,7 @@
 A downstream (flow's Bridge) hands ``make_server`` a zero-arg callable returning legacy external-panel
 dicts. Here each one becomes a manifest panel: ``lines`` -> a triage-list whose rows carry the legacy
 ``meta`` as the ``legacy_meta`` facet, ``markdown`` -> a prose panel, ``note``/``empty``/``error`` -> the
-panel head. The ``action`` half waits for K2a: the manifest source is read-only.
+panel head. A panel's ``action`` verb is the one verb it offers (``ProviderSpec.verbs``, K2a).
 
 The callable may do network reads (flow's inbox is HTTP to argushub), so it is called ONCE per refresh,
 not once per panel: concurrent callers join the running call, and a finished call is reused for
@@ -274,16 +274,19 @@ def discoverer(ext: ExternalPanels) -> Callable[[ReadContext], list[ProviderSpec
             raise RuntimeError(call.error or "the external panels failed")
         specs: list[ProviderSpec] = []
         for i, (pid, p) in enumerate(_usable(call.panels)):
+            act = p.get("action")
+            # the verb a panel's compose box fires is the one verb it offers (K2a, design §4.1)
+            offers = (act["verb"],) if isinstance(act, dict) and isinstance(act.get("verb"), str) and act["verb"] else ()
             zone = p.get("zone")
             region = zone if isinstance(zone, str) and zone in _ZONE_IDS else "operate"
             name = _title(p, pid, _n_lines(p))[0]
             if _is_prose(p):
                 specs.append(ProviderSpec(ID_PREFIX + pid, "prose", name, "feed", _reader(ext, pid, True),
-                                          region=region, rank=RANK_BASE + i, empty=_empty(p)))
+                                          region=region, rank=RANK_BASE + i, empty=_empty(p), verbs=offers))
             else:
                 specs.append(ProviderSpec(ID_PREFIX + pid, "triage-list", name, "feed", _reader(ext, pid, False),
                                           order="legacy.source", facets=frozenset({"legacy_meta"}),
                                           version_fields=("*",), region=region, rank=RANK_BASE + i,
-                                          empty=_empty(p)))
+                                          empty=_empty(p), verbs=offers))
         return specs
     return discover

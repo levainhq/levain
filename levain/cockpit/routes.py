@@ -33,9 +33,8 @@ def is_cockpit_path(path: str) -> bool:
 
 
 def credential_for(supplied: str, expected: str | None) -> dict[str, Any]:
-    """The credential class THIS request carries, verified here and never claimed by the caller.
-    K1 knows two: a valid write token, or nothing. Device credentials arrive with remote slice G
-    (K3); until then ``device_class`` is null."""
+    """The credential class for one expected token (tests and single-token callers). The server
+    verifies against every surface's token itself and passes the result to ``handle_get``."""
     ok = bool(expected) and hmac.compare_digest(supplied.encode("utf-8"), (expected or "").encode("utf-8"))
     return {"class": "token" if ok else "none", "device_class": None}
 
@@ -60,15 +59,15 @@ def _matches(if_none_match: str | None, etag: str) -> bool:
 
 
 def handle_get(
-    cockpit: Cockpit, raw_path: str, *, token: str, expected_token: str | None,
-    if_none_match: str | None,
+    cockpit: Cockpit, raw_path: str, *, if_none_match: str | None, credential: dict[str, Any] | None = None,
+    token: str = "", expected_token: str | None = None,
 ) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Return ``(status, body, extra headers)`` for a cockpit GET. Never raises on a provider
     fault: a panel's fault is carried in that panel's own ``status``/``error``."""
     parts = urlsplit(raw_path)
     path = parts.path
     qs = parse_qs(parts.query)
-    cred = credential_for(token, expected_token)
+    cred = credential if credential is not None else credential_for(token, expected_token)
     base_headers = [("Vary", VARY)]
 
     def jerr(status: int, error: str, message: str) -> tuple[int, bytes, list[tuple[str, str]]]:
