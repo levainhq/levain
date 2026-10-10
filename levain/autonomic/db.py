@@ -14,9 +14,8 @@ neither read nor write any of it, and a shell is not refused on its account (a d
 sidecars outside itself to plant). A store kept anywhere else is protected by naming its directory in
 the entity's ``deny_subtrees``.
 
-Durability: WAL journaling, ``synchronous=FULL`` (every commit is on disk before it returns), and
-``fullfsync`` (macOS flushes the drive's cache too; a no-op elsewhere). Every write runs inside
-``BEGIN IMMEDIATE``, so writers are serialized by SQLite itself; ``busy_timeout`` waits for the lock.
+Durability: :mod:`levain.durable_sqlite` (every commit on disk before it returns; every write one
+``BEGIN IMMEDIATE``, serialized by SQLite itself).
 
 The store carries a format marker; a database with another marker, or tables and no marker, is refused
 rather than read or taken over, and a store that disappears under a running object is refused rather
@@ -33,6 +32,9 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+
+from levain.durable_sqlite import open_durable, read_transaction, write_transaction
+from levain.durable_sqlite import rollback as _rollback
 
 __all__ = ["AutonomicDB", "StoreFormatError", "STORE_FORMAT", "default_store_dir"]
 
@@ -72,15 +74,6 @@ _ADDED_COLUMNS = (
 )
 
 
-def _rollback(conn: sqlite3.Connection) -> None:
-    """Roll back, never masking the error that caused it (a failed rollback is also a rolled-back
-    transaction once the connection closes)."""
-    try:
-        conn.execute("ROLLBACK")
-    except sqlite3.Error:
-        pass
-
-
 class StoreFormatError(RuntimeError):
     """The database is not a store of this format (another marker, or not a store at all)."""
 
@@ -112,13 +105,8 @@ class AutonomicDB:
         elif not self.directory.exists():
             # another opener may create it between the two calls
             self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)   # the umask can only narrow it
-        conn = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
+        conn = open_durable(self.path)
         try:
-            conn.execute("PRAGMA busy_timeout = 30000")
-            conn.execute("PRAGMA journal_mode = WAL")       # sidecars -wal/-shm stay in the directory
-            conn.execute("PRAGMA synchronous = FULL")
-            conn.execute("PRAGMA fullfsync = ON")
-            conn.execute("PRAGMA checkpoint_fullfsync = ON")
             if not self._ready:
                 self._ensure_schema(conn)
                 self._ready = True
@@ -160,30 +148,14 @@ class AutonomicDB:
     def write(self) -> Iterator[sqlite3.Connection]:
         """One write transaction (``BEGIN IMMEDIATE``): committed when the block exits, rolled back if it
         raises. Writers are serialized by SQLite; a reader always sees a committed state."""
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                yield conn
-            except BaseException:
-                _rollback(conn)
-                raise
-            conn.execute("COMMIT")
-        finally:
-            conn.close()
+        with write_transaction(self._connect) as conn:
+            yield conn
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
         """A consistent read snapshot."""
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN")
-            try:
-                yield conn
-            finally:
-                conn.execute("COMMIT")
-        finally:
-            conn.close()
+        with read_transaction(self._connect) as conn:
+            yield conn
 
     def meta(self, key: str) -> str | None:
         with self.read() as conn:
