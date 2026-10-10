@@ -49,9 +49,9 @@ def _store_label(db: Path) -> str:
     """The store's display label for the masthead: ``~/…`` under the home directory, else the file
     name. The absolute path (which carries the account name) never goes on the wire (design §6.2)."""
     try:
-        return "~/" + db.expanduser().resolve().relative_to(Path.home().resolve()).as_posix()
-    except ValueError:
-        return db.name
+        return "~/" + db.expanduser().absolute().relative_to(Path.home().absolute()).as_posix()
+    except (ValueError, RuntimeError, OSError):
+        return db.name       # no filesystem resolution, and no exception text, can reach the wire
 
 
 def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
