@@ -3,7 +3,14 @@
 Providers return typed results; this module turns them into the manifest and panel payloads:
 status, freshness, ETag, ordering and groups, row versions, bands, badges, profiles, search, the
 ``now`` view, background refreshers with liveness, and per-call timeouts. It writes nothing and
-enforces no authority: K1 is the read half, served under the existing read gate (routes.py)."""
+enforces no authority: K1 is the read half, served under the existing read gate (routes.py).
+
+TRUST ASSUMPTION (ruled for K1, 10-09): providers are operator-registered, in-process code and are
+trusted not to be adversarial. The flight deadline bounds provider hangs and worker-side derivation
+of their output; output objects are NOT deep-materialised, so a provider that returns a hostile
+object (a container subclass whose methods block, a hostile ``__hash__``) is outside the model. If
+any later slice lets an UNTRUSTED party register a provider (a team server, a plugin), this
+assumption becomes a must-close for that slice."""
 
 from __future__ import annotations
 
@@ -350,6 +357,10 @@ class Cockpit:
             except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
                 out = Fault(f"{type(exc).__name__}: {_safe_str(exc)}")
             finally:                      # raw ALWAYS reaches a terminal state, even for a hostile exception
+                # RACE (accepted): ``finished`` is stamped just before ``raw`` resolves, so a read that
+                # finished in time can lose the deadline race by microseconds and be reported as a
+                # timeout. The error only ever goes in the safe direction: a late result is never
+                # reported healthy.
                 fl.finished = time.monotonic()
                 _set_once(fl.raw, out)
                 with st.lock:
