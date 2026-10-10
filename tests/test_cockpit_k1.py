@@ -1511,7 +1511,7 @@ class TestOneFlightOrdersByConstruction:
 class TestR18:
     """L3 r18's three findings, each reproduced on 8087360 before the fix."""
 
-    @pytest.mark.parametrize("where", ["start", "go"])
+    @pytest.mark.parametrize("where", ["start", "go", "retire"])
     def test_an_interrupt_after_the_read_thread_launched_never_overlaps_two_provider_reads(
             self, monkeypatch, where: str) -> None:
         from levain.cockpit import engine
@@ -1541,7 +1541,7 @@ class TestR18:
                     first[0] = False
                     raise KeyboardInterrupt()
             monkeypatch.setattr(threading.Thread, "start", start)
-        else:                                 # r19: the go is given, the worker is in the provider, then the interrupt
+        elif where == "go":                   # r19: the go is given, the worker is in the provider, then the interrupt
             class Go(threading.Event):
                 def set(self):
                     super().set()
@@ -1555,6 +1555,21 @@ class TestR18:
                     super().__init__(timeout_s)
                     self.go = Go()
             monkeypatch.setattr(engine, "_Flight", Flight)
+        else:                                 # r21: the read finished, then the interrupt lands in the owner's retirement
+            gate.set()
+
+            class Flight(engine._Flight):
+                @property
+                def committed(self):
+                    return self.__dict__.get("_c", False)
+
+                @committed.setter
+                def committed(self, v):
+                    self.__dict__["_c"] = v
+                    if v and first[0]:
+                        first[0] = False
+                        raise KeyboardInterrupt()
+            monkeypatch.setattr(engine, "_Flight", Flight)
         with pytest.raises(KeyboardInterrupt):
             ck.panel("p")
         if where == "start":                  # the interrupted flight ends without ever reaching the provider
@@ -1562,11 +1577,16 @@ class TestR18:
             while ck._state["p"].pflight is not None and time.monotonic() < until:
                 time.sleep(0.01)
             assert ck._state["p"].pflight is None and calls[0] == 0 and not entered.is_set()
-        else:                                 # the go was given: that one read runs, and is the only one
+        else:                                 # one read ran, and it is the only one so far
             assert calls[0] == 1
-        t = threading.Thread(target=ck.panel, args=("p",))
+        got: list[Any] = []
+        t = threading.Thread(target=lambda: got.append(ck.panel("p")["status"]))
         t.start()
-        time.sleep(0.2)
+        if where == "start":
+            assert entered.wait(2)            # t's read is in the provider before the gate opens
+        elif where == "go":
+            t.join(2)                         # t is refused while the go read is still in the provider
+            assert got == ["error"]
         gate.set()
         t.join(3)
         until = time.monotonic() + 3
@@ -1574,7 +1594,9 @@ class TestR18:
             time.sleep(0.01)
         assert ck.panel("p")["status"] == "empty"   # the panel recovers once the one read in flight ends
         assert peak[0] == 1                          # never two provider reads at once
-        assert calls[0] == 2                 # start: t's read + the last; go: the go read (t was refused) + the last
+        if where != "go":
+            assert got == ["empty"]                  # start: t read normally; retire: t retired the left-behind flight
+        assert calls[0] == (3 if where == "retire" else 2)
 
     def test_provider_made_fault_and_absent_from_bounded_reads_carry_plain_text(self) -> None:
         mode = ["fault"]
