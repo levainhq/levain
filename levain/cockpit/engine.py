@@ -148,29 +148,28 @@ class _Snap:
 @dataclass
 class _State:
     lock: threading.Lock = field(default_factory=threading.Lock)
-    mu: threading.Lock = field(default_factory=threading.Lock)   # guards the fields _process writes
+    mu: threading.Lock = field(default_factory=threading.Lock)   # guards the fields _book writes
     snap: _Snap | None = None
     ever_present: bool = False
     last_good_as_of: str | None = None
     failing_since: str | None = None
     last_completion: datetime | None = None
-    pflight: "_Flight | None" = None          # the panel read in flight: ONE owner commits it, joiners share its snapshot
-    flight: "Future | None" = None            # _bounded's flight (entity, discovery): no bookkeeping
-    flight_started: float = 0.0               # monotonic start of that read
+    pflight: "_Flight | None" = None          # the read in flight: ONE owner commits it, joiners share its result
     refresh_started: datetime | None = None   # set while a refresher cycle is inside its read
     started: datetime | None = None
     fresh: tuple[str | None, str] | None = None   # (as_of, status) of the last read committed (on-demand panels)
 
 
 class _Flight:
-    """One panel read. The OWNER (the caller that started it) alone processes the result and commits
-    every per-panel field; joiners wait for ``snap`` and receive that same snapshot. At most one is
-    in flight per panel, so commits happen in start order by construction."""
+    """One provider read. The OWNER (the caller that started it) alone commits the outcome; joiners
+    wait for ``out`` and receive that same outcome. At most one is in flight per state, so commits
+    happen in start order by construction. One deadline, ``started + timeout``, governs everyone."""
 
     def __init__(self) -> None:
-        self.raw: Future = Future()      # the provider's result (set by the read thread)
-        self.snap: Future = Future()     # the processed snapshot (set by the owner after it commits)
+        self.raw: Future = Future()      # the provider's (normalised) outcome, set by the read thread
+        self.out: Future = Future()      # what the owner committed, set once the owner is done
         self.started = time.monotonic()
+        self.finished: float | None = None   # when the read thread produced ``raw``
         self.committed = False
 
 
@@ -308,62 +307,101 @@ class Cockpit:
         return self._refreshers.get(panel_id)
 
     # --- reading ---------------------------------------------------------------------
-    def _call(self, spec: ProviderSpec, st: _State | None, fn: Callable[..., Result], *args: Any) -> Result:
-        """Run a provider call with a timeout, SINGLE-FLIGHT per panel: a request that arrives while
-        a read is running waits on that same read (up to the timeout) instead of starting another or
-        failing, so concurrent requests never turn a healthy panel into a false error, and a hung
-        source costs one thread, not one per request. Any exception is a Fault."""
-        return self._bounded(spec.timeout_s, st, fn, *args)
+    def _single_flight(
+        self, st: _State, timeout_s: float, produce: Callable[[], Any], commit: Callable[[Any], Any],
+        refused: Callable[[str], Any], *, on_start: Callable[[], None] | None = None,
+        on_timeout: Callable[[], None] | None = None, on_end: Callable[[], None] | None = None,
+    ) -> Any:
+        """THE ONLY place a provider is invoked (panel reads, entity, discovery, read_one). It owns
+        thread start, the once-only resolution of every future, exception text (``_safe_str``) and the
+        deadline, so none of that is copied per call site.
 
-    def _bounded(self, timeout_s: float, st: _State | None, fn: Callable[..., Any], *args: Any) -> Any:
-        fut: Future
-        wait = timeout_s
-        if st is not None:
-            with st.lock:
-                if st.flight is not None and not st.flight.done():
-                    # Join a read only while it is still inside its own budget (the singleflight
-                    # pattern). One already past it is hung: fail at once, so a hung source costs
-                    # neither a thread per request nor a full timeout per request.
-                    age = time.monotonic() - st.flight_started
-                    if age >= timeout_s:
-                        return Fault("previous read still running past its timeout (source hung?)")
-                    fut, mine, wait = st.flight, False, timeout_s - age
-                else:
-                    fut = st.flight = Future()
-                    st.flight_started = time.monotonic()
-                    mine = True
-        else:
-            fut, mine = Future(), True
-        if mine:
-            def work() -> None:
-                out: Any = Fault("the read ended without a result")
-                try:
-                    out = fn(*args)
-                except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
-                    out = Fault(f"{type(exc).__name__}: {_safe_str(exc)}")
-                finally:                  # the future ALWAYS resolves: a flight can never be left unresolved
-                    _set_once(fut, out)
+        One read runs at a time per state. The caller that finds none OWNS it: ``produce()`` runs in a
+        worker thread (provider code and everything derived from provider output lives there, so a hung
+        or hostile provider cannot hold the owner), the owner waits until ``started + timeout_s``,
+        then ``commit(outcome)`` (the owner's own code) records it and its return value is what every
+        joiner receives. A joiner waits on that result until the same deadline plus a processing
+        grace. A caller that arrives after the owner timed out while the source thread is still hung
+        fails fast through ``refused`` and commits nothing. A result that finished after the deadline
+        counts as a timeout, so an owner and its joiners can never disagree about the same read."""
+        with st.lock:
+            fl = st.pflight
+            if fl is None:
+                fl = st.pflight = _Flight()
+                if on_start:
+                    on_start()
+                owner = True
+            elif not fl.committed:
+                owner = False
+                wait = max(0.0, fl.started + timeout_s + PROCESS_GRACE_S - time.monotonic())
+            else:
+                return refused("previous read still running past its timeout (source hung?)")
+        if not owner:
+            try:
+                return fl.out.result(timeout=wait)
+            except FutureTimeout:
+                return refused(f"timed out waiting on the read in flight ({timeout_s:g}s budget)")
 
+        def work() -> None:
+            out: Any = Fault("the read ended without a result")
+            try:
+                out = produce()
+            except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
+                out = Fault(f"{type(exc).__name__}: {_safe_str(exc)}")
+            finally:                      # raw ALWAYS reaches a terminal state, even for a hostile exception
+                fl.finished = time.monotonic()
+                _set_once(fl.raw, out)
+                with st.lock:
+                    if fl.committed and st.pflight is fl:
+                        st.pflight = None    # the owner already committed and left a hung thread behind
+
+        result: Any = None
+        committed_ok = False
+        deadline = fl.started + timeout_s
+        try:
             try:
                 threading.Thread(target=work, name="cockpit-read", daemon=True).start()
-            except BaseException as exc:  # noqa: BLE001 - thread exhaustion: fail THIS read, poison nothing
-                out = Fault(f"could not start a read: {type(exc).__name__}: {_safe_str(exc)}")
-                _set_once(fut, out)
-                if st is not None:
-                    with st.lock:
-                        if st.flight is fut:
-                            st.flight = None
-                return out
-        try:
-            res = fut.result(timeout=wait)
-        except FutureTimeout:
+            except Exception as exc:  # noqa: BLE001 - thread exhaustion fails THIS read and poisons nothing
+                fl.finished = time.monotonic()
+                _set_once(fl.raw, Fault(f"could not start a read: {type(exc).__name__}: {_safe_str(exc)}"))
+            try:
+                raw: Any = fl.raw.result(timeout=max(0.0, deadline - time.monotonic()))
+                if fl.finished is not None and fl.finished > deadline:
+                    raise FutureTimeout()
+            except FutureTimeout:
+                if on_timeout:
+                    on_timeout()
+                raw = Fault(f"timed out after {timeout_s:g}s")
+            try:
+                result = commit(raw)
+            except Exception as exc:  # noqa: BLE001 - an outcome that cannot be committed is an error outcome
+                result = commit(Fault(f"{type(exc).__name__}: {_safe_str(exc)}"))
+            committed_ok = True
+            return result
+        finally:
+            with st.lock:
+                fl.committed = True
+                if on_end:
+                    on_end()
+                if fl.raw.done() and st.pflight is fl:
+                    st.pflight = None
+            # joiners get the outcome only if it was fully committed; otherwise an error
+            _set_once(fl.out, result if committed_ok else refused("the read could not be committed"))
+
+    def _bounded(self, timeout_s: float, st: _State | None, fn: Callable[..., Any], *args: Any) -> Any:
+        """A provider call that is not a panel read (entity, discovery, read_one): one flight on its own
+        state (a throwaway when it has none), the outcome handed back as-is."""
+        def produce() -> Any:
+            out = fn(*args)
+            if not isinstance(out, (Read, Absent, Fault)):
+                return Fault(f"provider returned {type(out).__name__}, not Read/Absent/Fault")
+            return out
+
+        def abandon() -> None:
             for a in args:
                 if isinstance(a, ReadContext):
                     a.abandon()
-            return Fault(f"timed out after {wait:g}s")
-        if not isinstance(res, (Read, Absent, Fault)):
-            return Fault(f"provider returned {type(res).__name__}, not Read/Absent/Fault")
-        return res
+        return self._single_flight(st or _State(), timeout_s, produce, lambda raw: raw, Fault, on_timeout=abandon)
 
     def refresh(self, panel_id: str) -> None:
         """One refresh cycle for a refresher panel (the thread's body; also the test step). It goes
@@ -376,62 +414,14 @@ class Cockpit:
         return _Snap("error", None, None, [], [], st.last_good_as_of, message, spec.note)
 
     def _read_panel(self, spec: ProviderSpec, st: _State, ctx: ReadContext) -> _Snap:
-        """Read a panel's source ONCE at a time (design §3.4). The caller that finds no read in flight
-        owns it: it waits (bounded by the provider's timeout), processes the result, commits ``snap``,
-        ``last_completion`` and ``fresh`` and the failure bookkeeping, then releases the joiners.
-        A caller that arrives during a read joins it and gets the owner's snapshot; one that arrives
-        after the owner timed out while the source thread is still hung fails fast without
-        committing. Reads therefore commit in start order, with no clock or counter ordering them."""
-        with st.lock:
-            fl = st.pflight
-            if fl is None:
-                fl = st.pflight = _Flight()
-                st.refresh_started = ctx.now
-                owner = True
-            elif not fl.committed:
-                # the read's remaining budget PLUS the owner's processing grace: a joiner must not
-                # report a failure for a read the owner is about to publish as healthy
-                owner, wait = False, max(0.0, spec.timeout_s + PROCESS_GRACE_S - (time.monotonic() - fl.started))   # ONE absolute deadline
-            else:
-                return self._plain_error(spec, st, "previous read still running past its timeout (source hung?)")
-        if not owner:
-            try:
-                return fl.snap.result(timeout=wait)
-            except FutureTimeout:
-                return self._plain_error(spec, st, f"timed out waiting on the read in flight ({spec.timeout_s:g}s budget)")
+        """Read a panel's source through the one flight (design §3.4). ``produce`` runs the provider and
+        turns its output into a snapshot (or a Fault) in the worker; ``commit`` is the owner's
+        bookkeeping and publication of ``snap``, ``last_completion`` and ``fresh``."""
+        def produce() -> Any:
+            return self._normalize(spec, ctx, spec.read(ctx))
 
-        def work() -> None:
-            out: Any = Fault("the read ended without a result")
-            try:
-                out = spec.read(ctx)
-            except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
-                out = Fault(f"{type(exc).__name__}: {_safe_str(exc)}")
-            finally:                      # raw ALWAYS reaches a terminal state, even for a hostile exception
-                _set_once(fl.raw, out)
-                with st.lock:
-                    if fl.committed and st.pflight is fl:
-                        st.pflight = None    # the owner already committed and left a hung thread behind
-
-        snap: _Snap | None = None
-        committed_ok = False
-        try:
-            try:
-                fl.started = time.monotonic()      # the budget starts when the read does, not at flight creation
-                threading.Thread(target=work, name="cockpit-read", daemon=True).start()
-            except BaseException as exc:  # noqa: BLE001 - thread exhaustion fails THIS read and poisons nothing
-                _set_once(fl.raw, Fault(f"could not start a read: {type(exc).__name__}: {_safe_str(exc)}"))
-            try:
-                res: Any = fl.raw.result(timeout=max(0.0, fl.started + spec.timeout_s - time.monotonic()))   # the SAME flight deadline joiners use
-            except FutureTimeout:
-                ctx.abandon()
-                res = Fault(f"timed out after {spec.timeout_s:g}s")
-            if not isinstance(res, (Read, Absent, Fault)):
-                res = Fault(f"provider returned {type(res).__name__}, not Read/Absent/Fault")
-            try:
-                snap = self._process(spec, st, res, ctx)
-            except Exception as exc:  # noqa: BLE001 - a read that cannot be processed is an error read
-                with st.mu:
-                    snap = self._fault(spec, st, f"{type(exc).__name__}: {_safe_str(exc)}", _iso(ctx.now))
+        def commit(raw: Any) -> _Snap:
+            snap = self._book(spec, st, raw, ctx)
             try:
                 done_at: datetime | None = self._clock()      # before the lock: a failing clock cannot strand the flight
             except Exception:  # noqa: BLE001
@@ -439,22 +429,17 @@ class Cockpit:
             with st.lock:
                 st.snap = snap
                 st.last_completion = done_at or ctx.now
-                st.refresh_started = None
                 st.fresh = (snap.as_of, snap.status)
-            committed_ok = True
             return snap
-        finally:
-            # whatever happened above, the flight ends: it is marked committed, cleared if its source
-            # thread is done, and its joiners are released with the owner's snapshot or an error
-            with st.lock:
-                fl.committed = True
-                st.refresh_started = None
-                if fl.raw.done() and st.pflight is fl:
-                    st.pflight = None
-            # joiners get the snapshot only if it was fully committed; otherwise an error, never a
-            # healthy answer that the panel's own state does not hold
-            _set_once(fl.snap, snap if (snap is not None and committed_ok)
-                      else self._plain_error(spec, st, "the read could not be committed"))
+
+        def start() -> None:
+            st.refresh_started = ctx.now
+
+        def end() -> None:
+            st.refresh_started = None
+        return self._single_flight(
+            st, spec.timeout_s, produce, commit, lambda m: self._plain_error(spec, st, m),
+            on_start=start, on_timeout=ctx.abandon, on_end=end)
 
     def _snap_for(self, spec: ProviderSpec, ctx: ReadContext) -> _Snap:
         st = self._state[spec.id]
@@ -481,29 +466,38 @@ class Cockpit:
         return snap
 
     # --- result -> snapshot ----------------------------------------------------------
-    def _process(self, spec: ProviderSpec, st: _State, res: Result, ctx: ReadContext) -> _Snap:
-        with st.mu:
-            return self._process_locked(spec, st, res, ctx)
-
-    def _process_locked(self, spec: ProviderSpec, st: _State, res: Result, ctx: ReadContext) -> _Snap:
-        now_iso = _iso(ctx.now)
-        listy = spec.kind == "triage-list"
-        if isinstance(res, Fault):
-            return self._fault(spec, st, res.message, now_iso)
-        if isinstance(res, Absent):
-            if spec.optional and not st.ever_present:
-                return _Snap("ok", [] if listy else None, None, [], [], now_iso, None,
-                             f"not configured: {res.reason}")
-            why = "source disappeared" if st.ever_present else "source absent"
-            return self._fault(spec, st, f"{why}: {res.reason}", now_iso)
+    def _normalize(self, spec: ProviderSpec, ctx: ReadContext, res: Any) -> Any:
+        """Provider output -> a snapshot, or the Fault/Absent it already is. Runs in the read worker:
+        everything that touches provider-controlled data (rows, values) happens here, under the
+        flight's deadline, never on the owner."""
+        if isinstance(res, (Fault, Absent)):
+            return res
+        if not isinstance(res, Read):
+            return Fault(f"provider returned {type(res).__name__}, not Read/Absent/Fault")
         try:
-            snap = self._read_snap(spec, res, ctx, now_iso)
+            return self._read_snap(spec, res, ctx, _iso(ctx.now))
         except Exception as exc:  # noqa: BLE001 - malformed provider output of ANY shape is a Fault, never a crash
-            return self._fault(spec, st, f"provider output refused: {_safe_str(exc)}", now_iso)
-        st.ever_present = True
-        st.last_good_as_of = snap.as_of
-        st.failing_since = None
-        return snap
+            return Fault(f"provider output refused: {_safe_str(exc)}")
+
+    def _book(self, spec: ProviderSpec, st: _State, out: Any, ctx: ReadContext) -> _Snap:
+        """The owner's bookkeeping for one outcome: failure start, last good, presence. It reads only
+        our own types, so it cannot be held by a provider."""
+        with st.mu:
+            now_iso = _iso(ctx.now)
+            listy = spec.kind == "triage-list"
+            if isinstance(out, _Snap):
+                st.ever_present = True
+                st.last_good_as_of = out.as_of
+                st.failing_since = None
+                return out
+            if isinstance(out, Absent):
+                if spec.optional and not st.ever_present:
+                    return _Snap("ok", [] if listy else None, None, [], [], now_iso, None,
+                                 f"not configured: {out.reason}")
+                why = "source disappeared" if st.ever_present else "source absent"
+                return self._fault(spec, st, f"{why}: {out.reason}", now_iso)
+            message = out.message if isinstance(out, Fault) else f"unexpected outcome {type(out).__name__}"
+            return self._fault(spec, st, message, now_iso)
 
     def _fault(self, spec: ProviderSpec, st: _State, message: str, now_iso: str) -> _Snap:
         if st.failing_since is None:
@@ -789,6 +783,9 @@ class Cockpit:
                 errors.append({"source": f"discovery:{i}", "message": res.message})
                 continue
             for spec in res.value:
+                if not isinstance(spec.id, str):
+                    errors.append({"source": f"discovery:{i}", "message": "a discovered panel id must be a string"})
+                    continue
                 with self._lock:
                     have = self._specs.get(spec.id)
                     if have is None:
@@ -957,18 +954,21 @@ class Cockpit:
         if spec is None or spec.read_one is None:
             return Fault(f"panel {panel_id!r} offers no read_one")
         ctx = ReadContext(self._clock())
-        res = self._call(spec, None, spec.read_one, ctx, row_id)
-        if not isinstance(res, Read):
-            return res
-        try:
-            if len(res.rows or ()) != 1:
-                return Fault(f"read_one returned {len(res.rows or ())} rows")
-            rows, refused = self._rows(spec, list(res.rows), ctx)   # type: ignore[arg-type]
-            if refused or len(rows) != 1:
-                return Fault("read_one row refused: a facet value of the wrong type")
-            return Read(value=rows[0])
-        except Exception as exc:  # noqa: BLE001
-            return Fault(f"provider output refused: {_safe_str(exc)}")
+
+        def once() -> Result:
+            res = spec.read_one(ctx, row_id)       # type: ignore[misc]
+            if not isinstance(res, Read):
+                return res
+            try:
+                if len(res.rows or ()) != 1:
+                    return Fault(f"read_one returned {len(res.rows or ())} rows")
+                rows, refused = self._rows(spec, list(res.rows), ctx)   # type: ignore[arg-type]
+                if refused or len(rows) != 1:
+                    return Fault("read_one row refused: a facet value of the wrong type")
+                return Read(value=rows[0])
+            except Exception as exc:  # noqa: BLE001
+                return Fault(f"provider output refused: {_safe_str(exc)}")
+        return self._bounded(spec.timeout_s, None, once)
 
 
 def _safe_str(exc: BaseException) -> str:

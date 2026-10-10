@@ -748,7 +748,7 @@ class TestL3R1Fixes:
             return Read(rows=())
         ck.register(ProviderSpec(**{**_simple().__dict__, "read": read, "refresh_every_s": 0.05, "stale_after_s": 0.1}))
         ck.start()
-        orig = ck._process
+        orig = ck._book
         flaky = {"n": 0}
 
         def process(*a, **k):
@@ -756,7 +756,7 @@ class TestL3R1Fixes:
             if flaky["n"] == 2:
                 raise AttributeError("boom")
             return orig(*a, **k)
-        ck._process = process  # type: ignore[method-assign]
+        ck._book = process  # type: ignore[method-assign]
         try:
             time.sleep(0.5)
             assert ck.refresher("p").thread.is_alive() and calls["n"] >= 4
@@ -1343,12 +1343,12 @@ class TestOneFlightOrdersByConstruction:
         ck = Cockpit()
         ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=lambda c: Read(rows=()),
                                  order="time.desc", facets=frozenset({"at"}), version_fields=("id",), timeout_s=0.3))
-        real = Cockpit._process
+        real = Cockpit._book
 
         def slow(self, *a, **k):
             time.sleep(0.8)            # processing outlasts the read budget
             return real(self, *a, **k)
-        monkeypatch.setattr(Cockpit, "_process", slow)
+        monkeypatch.setattr(Cockpit, "_book", slow)
         out = []
         ts = [threading.Thread(target=lambda: out.append(ck.panel("p")["status"])) for _ in range(3)]
         [t.start() for t in ts]
@@ -1374,8 +1374,8 @@ class TestOneFlightOrdersByConstruction:
         ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=lambda c: Read(rows=()),
                                  order="time.desc", facets=frozenset({"at"}), version_fields=("id",), timeout_s=0.2))
         monkeypatch.setattr("levain.cockpit.engine.PROCESS_GRACE_S", 0.3)
-        real = Cockpit._process
-        monkeypatch.setattr(Cockpit, "_process", lambda self, *a, **k: (time.sleep(3), real(self, *a, **k))[1])
+        real = Cockpit._book
+        monkeypatch.setattr(Cockpit, "_book", lambda self, *a, **k: (time.sleep(3), real(self, *a, **k))[1])
         t = threading.Thread(target=lambda: ck.panel("p"))
         t.start()
         time.sleep(0.8)                      # past timeout + grace; the owner is still processing
@@ -1430,3 +1430,49 @@ class TestOneFlightOrdersByConstruction:
         time.sleep(0.1)
         assert any(e["source"] == "entity" for e in ck.manifest(NONE_CRED)["errors"])   # not "still running" forever
         assert not any("still running" in e["message"] for e in m["errors"])
+
+    def test_a_provider_output_that_hangs_while_processed_cannot_wedge_the_panel(self) -> None:
+        release = threading.Event()
+
+        class Rows:
+            def __iter__(self):
+                release.wait(5)
+                return iter(())
+        mode = ["hang"]
+
+        def read(ctx):
+            return Read(rows=Rows()) if mode[0] == "hang" else Read(rows=())
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=read, order="time.desc",
+                                 facets=frozenset({"at"}), version_fields=("id",), timeout_s=0.3))
+        t0 = time.monotonic()
+        assert ck.panel("p")["status"] == "error"
+        assert time.monotonic() - t0 < 1.5                      # bounded by the flight deadline, not by the provider
+        assert ck.panel("p")["status"] == "error"               # source thread still stuck: fails fast
+        mode[0] = "ok"
+        release.set()
+        time.sleep(0.3)
+        assert ck._state["p"].pflight is None and ck.panel("p")["status"] == "empty"
+
+    def test_a_discovered_panel_with_a_non_string_id_is_an_error_entry_not_a_500(self) -> None:
+        class BadId:
+            def __str__(self):
+                raise RuntimeError("no")
+
+            def __format__(self, spec):
+                raise RuntimeError("no")
+        ck = Cockpit()
+        ck.discover(lambda ctx: [ProviderSpec(id=BadId(), kind="line", title="x", priority="feed",   # type: ignore[arg-type]
+                                              read=lambda c: Read(value={"lines": []}))])
+        m = ck.manifest(NONE_CRED)
+        assert any(e["source"] == "discovery:0" for e in m["errors"])
+
+    def test_read_one_normalises_provider_rows_inside_the_flight(self) -> None:
+        class Rows:
+            def __iter__(self):
+                raise RuntimeError("boom")
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=lambda c: Read(rows=()),
+                                 order="time.desc", facets=frozenset({"at"}), version_fields=("id",),
+                                 read_one=lambda c, rid: Read(rows=Rows())))
+        assert isinstance(ck.read_one("p", "x"), Fault)
