@@ -4816,30 +4816,55 @@ _NETWORK_DEPUTY_DIRS = ("/run/dbus", "/run/systemd/resolve", "/run/nscd", "/run/
 _NETWORK_DEPUTY_SOCKETS = ("/run/snapd.socket", "/run/snapd-snap.socket")
 
 
-def _dirmngr_sockets() -> list[Path]:
-    """The operator's gnupg dirmngr sockets the offline bash could reach: ``<runtime>/gnupg/S.dirmngr``,
-    the same under a non-default GNUPGHOME's ``d.*`` subdirectory, and the ``~/.gnupg`` fallback.
-    dirmngr is socket-activated by the user's service manager, so a connect starts it OUTSIDE bash's
-    network namespace, and it fetches (WKD, keyservers) and resolves names the client chooses."""
-    found: list[Path] = []
+_PROC_NET_UNIX = "/proc/net/unix"
+
+
+def _bound_unix_socket_paths() -> list[str]:
+    """Every filesystem path a unix socket is bound to on this host, as the kernel lists it in
+    ``/proc/net/unix`` (abstract names, ``@...``, have no path and are skipped). Linux only: bwrap
+    runs nowhere else, so elsewhere this is empty. Raises :class:`ConfinementError` when the list
+    cannot be read, because the offline floor cannot then know which sockets to hide."""
+    if not sys.platform.startswith("linux"):
+        return []
     try:
-        home: Path | None = Path.home()
-    except RuntimeError:
-        home = None  # no home directory for this user: nothing there to hide
-    roots = [Path(r) / "gnupg" for r in _runtime_dirs()]
-    if home is not None:
-        roots.append(home / ".gnupg")
-    gnupghome = os.environ.get("GNUPGHOME")
-    if gnupghome:
-        g = Path(gnupghome).expanduser() if home is not None else Path(gnupghome)
-        if not g.is_absolute():
-            # gpg resolves it against whatever directory gpg runs in, and bash can `cd`
-            # anywhere: no finite set of paths covers it (codex L3 r4+r5). Refused, not guessed.
+        with open(_PROC_NET_UNIX, encoding="utf-8", errors="surrogateescape") as fh:
+            lines = fh.read().splitlines()[1:]  # the first line is the column header
+    except OSError as e:
+        raise ConfinementError(
+            f"cannot read {_PROC_NET_UNIX} ({e.strerror or e}), so the floor cannot find the "
+            "daemon sockets to hide from bash without network (fail-closed).") from None
+    out: list[str] = []
+    for line in lines:
+        parts = line.split(None, 7)  # Num RefCount Protocol Flags Type St Inode Path
+        if len(parts) == 8 and not parts[7].startswith("@"):
+            out.append(parts[7])
+    return out
+
+
+def _dirmngr_sockets() -> list[Path]:
+    """The operator's gnupg dirmngr sockets the offline bash could reach. dirmngr is socket-activated
+    by the user's service manager (or left running by an earlier gpg), so a connect reaches it OUTSIDE
+    bash's network namespace, and it fetches (WKD, keyservers) and resolves names the client chooses.
+
+    Two sources, unioned: every ``S.dirmngr`` the kernel lists as bound (:func:`_bound_unix_socket_paths`),
+    which covers any GNUPGHOME, including one bash sets for itself later (codex L3 r6: guessing from
+    levain's own GNUPGHOME missed that); and the default places (``<runtime>/gnupg``, its ``d.*``
+    subdirectories, ``~/.gnupg``), so a socket file present at spawn with no listener is hidden as
+    before. A dirmngr first bound after spawn is not hidden: the residual the call site states."""
+    found: list[Path] = []
+    for s in _bound_unix_socket_paths():
+        if Path(s).name != "S.dirmngr":
+            continue
+        if not s.startswith("/"):
             raise ConfinementError(
-                f"GNUPGHOME is the relative path {gnupghome!r}, which gpg resolves against "
-                "whatever directory it runs in, so the floor cannot hide that home's dirmngr from "
-                "bash without network. Set GNUPGHOME to an absolute path, or unset it (fail-closed).")
-        roots.append(g)
+                f"a dirmngr socket is bound at the relative path {s!r}, which the floor cannot "
+                "place, so it cannot hide it from bash without network (fail-closed).")
+        found.append(Path(s))
+    roots = [Path(r) / "gnupg" for r in _runtime_dirs()]
+    try:
+        roots.append(Path.home() / ".gnupg")
+    except RuntimeError:
+        pass  # no home directory for this user: nothing there to hide
     for g in roots:
         try:
             if not g.is_dir():

@@ -892,3 +892,107 @@ def test_codex_home_is_one_writer_across_installs(make_install, tmp_path, capsys
     assert any(str(codex_home) in ln for ln in lines)
     assert {p.name: p.read_bytes() for p in codex_home.iterdir() if p.is_file()} == before
     assert not (tmp_path / "second" / "seed").exists()
+
+
+@pytest.mark.parametrize("override", [None, "true", "1"])
+def test_codex_home_fails_closed_where_it_cannot_be_locked(
+        make_install, tmp_path, capsys, monkeypatch, override):
+    # Phill 2026-10-10, option B: where flock answers "not supported" (some SMB/NFS homes),
+    # codex init and update refuse before writing, unless LEVAIN_CODEX_HOME_UNLOCKED is
+    # exactly "1". Before this, both ran unguarded with a stderr note.
+    import errno
+    import fcntl
+
+    from levain.install import CODEX_HOME_UNLOCKED_ENV
+    from levain.update import run_update
+    from tests.test_init_answers import _filled
+
+    first = make_install("codex", name="first")
+    codex_home = tmp_path / "codex-home"
+    before = {p.name: p.read_bytes() for p in codex_home.iterdir() if p.is_file()}
+    af = tmp_path / "second-answers.json"
+    af.write_text(json.dumps(_filled(capsys)), encoding="utf-8")
+    if override is None:
+        monkeypatch.delenv(CODEX_HOME_UNLOCKED_ENV, raising=False)
+    else:
+        monkeypatch.setenv(CODEX_HOME_UNLOCKED_ENV, override)
+
+    def no_locks(_fd, _op):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(fcntl, "flock", no_locks)
+    lines: list[str] = []
+    init_rc = run_init(tmp_path / "second", "codex", force=False, answers_file=af)
+    update_rc = run_update(first, no_pip=True, emit=lines.append)
+    out = capsys.readouterr()
+    if override == "1":
+        assert init_rc == 0
+        assert (tmp_path / "second" / "seed").exists()
+        assert "cannot lock" in out.err
+        return
+    assert (init_rc, update_rc) == (1, 1)
+    assert f"{CODEX_HOME_UNLOCKED_ENV}=1" in out.out
+    assert any(f"{CODEX_HOME_UNLOCKED_ENV}=1" in ln and "NOT refreshed" in ln for ln in lines)
+    assert {p.name: p.read_bytes() for p in codex_home.iterdir() if p.is_file()} == before
+    assert not (tmp_path / "second" / "seed").exists()
+
+
+def test_codex_home_lock_fails_closed_without_fcntl(tmp_path, monkeypatch):
+    # Windows has no fcntl: same refusal, same override.
+    from levain.install import CODEX_HOME_UNLOCKED_ENV, CodexHomeUnlockable, codex_home_lock
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "fcntl", None)  # `import fcntl` raises ImportError
+    monkeypatch.delenv(CODEX_HOME_UNLOCKED_ENV, raising=False)
+    with pytest.raises(CodexHomeUnlockable, match="no flock"):
+        with codex_home_lock(tmp_path):
+            pass
+    monkeypatch.setenv(CODEX_HOME_UNLOCKED_ENV, "1")
+    with codex_home_lock(tmp_path):
+        pass
+
+
+def _pair_failing_hooks(tmp_path, monkeypatch, meddle):
+    """Run _write_codex_pair on a codex home holding a config.toml, with the hooks.json write
+    replaced by ``meddle(config, kept)`` and then a failure. Returns (config, notes)."""
+    from levain import install as _inst
+
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    config = home / "config.toml"
+    config.write_text('[mcp_servers.anneal_memory]\ncommand = "old"\nargs = ["--db", "/old"]\n')
+
+    def failing_hooks(_hooks, _text, _emit):
+        kept = next(home.glob(".config.toml.levain-prior.*"))
+        meddle(config, kept)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(_inst, "_write_codex_hooks", failing_hooks)
+    notes: list[str] = []
+    fragment = '[mcp_servers.anneal_memory]\ncommand = "new"\nargs = ["--db", "/new"]\n'
+    with pytest.raises(OSError, match="disk full"):
+        _inst._write_codex_pair(home, fragment, "{}", notes.append)
+    return config, notes
+
+
+def test_codex_pair_undo_never_deletes_the_original_a_link_now_leads_to(tmp_path, monkeypatch):
+    # codex L3 r6 MED: config.toml swapped for a link to the kept original between the merge and
+    # the undo; the undo read the original's inode through the link, called it "nothing to undo"
+    # and deleted the kept file, leaving config.toml dangling.
+    def link_to_kept(config, kept):
+        config.unlink()
+        config.symlink_to(kept)
+
+    config, notes = _pair_failing_hooks(tmp_path, monkeypatch, link_to_kept)
+    assert config.resolve().is_file() and "/old" in config.read_text()
+    assert any("could not be confirmed" in n for n in notes)
+
+
+def test_codex_pair_undo_names_a_config_removed_meanwhile(tmp_path, monkeypatch):
+    # glm L3 r6 MED: a config.toml removed while levain ran was reported as "left as it is".
+    config, notes = _pair_failing_hooks(tmp_path, monkeypatch, lambda c, _k: c.unlink())
+    assert not config.exists()
+    kept = list(config.parent.glob(".config.toml.levain-prior.*"))
+    assert len(kept) == 1 and "/old" in kept[0].read_text()
+    assert any("was removed by something else" in n and str(kept[0]) in n for n in notes)

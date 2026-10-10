@@ -3500,3 +3500,42 @@ def test_cred_floor_label_names_the_keychain_on_macos_only() -> None:
 
     assert cred_floor_label("Darwin").endswith("· the Keychain")
     assert "Keychain" not in cred_floor_label("Linux")
+
+
+def test_offline_bash_masks_every_dirmngr_the_kernel_lists(tmp_path, monkeypatch) -> None:
+    """codex L3 r6 HIGH: a host dirmngr already listening under a GNUPGHOME levain never saw (bash can
+    `export GNUPGHOME=...` itself) was left reachable. The kernel's bound-socket list is the source."""
+    from levain.firing import confinement as _conf
+
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    elsewhere = tmp_path / "srv" / "keyring"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "S.dirmngr").touch()
+    (elsewhere / "S.gpg-agent").touch()
+    monkeypatch.setattr(_conf, "_bound_unix_socket_paths",
+                        lambda: [str(elsewhere / "S.dirmngr"), str(elsewhere / "S.gpg-agent")])
+    on = _bwrap_argv(build_policy(_entity(tmp_path, "on"), deny_localhost_outbound=True))
+    dirmngr = str(elsewhere.resolve() / "S.dirmngr")
+    assert any(on[k:k + 3] == ["--ro-bind", "/dev/null", dirmngr] for k in range(len(on)))
+    assert "S.gpg-agent" not in " ".join(on)
+
+
+def test_offline_bash_is_refused_when_the_kernel_socket_list_cannot_be_read(
+        tmp_path, monkeypatch) -> None:
+    from levain.firing import confinement as _conf
+
+    monkeypatch.setattr(_conf.sys, "platform", "linux")
+    monkeypatch.setattr(_conf, "_PROC_NET_UNIX", str(tmp_path / "absent"))
+    with pytest.raises(_conf.ConfinementError, match="cannot read"):
+        _conf._bound_unix_socket_paths()
+    listing = tmp_path / "unix"
+    listing.write_text(
+        "Num       RefCount Protocol Flags    Type St Inode Path\n"
+        "0000000000000000: 00000002 00000000 00010000 0001 01  9621 /run/user/1000/gnupg/S.dirmngr\n"
+        "0000000000000000: 00000002 00000000 00010000 0001 01  9622 @abstract\n"
+        "0000000000000000: 00000003 00000000 00000000 0001 03  9623\n"
+        "0000000000000000: 00000002 00000000 00010000 0001 01  9624 /tmp/a b/S.dirmngr\n")
+    monkeypatch.setattr(_conf, "_PROC_NET_UNIX", str(listing))
+    assert _conf._bound_unix_socket_paths() == ["/run/user/1000/gnupg/S.dirmngr", "/tmp/a b/S.dirmngr"]

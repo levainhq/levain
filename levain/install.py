@@ -1292,7 +1292,16 @@ class CodexHomeBusy(InstallLockError):
     nothing was written."""
 
 
+class CodexHomeUnlockable(InstallLockError):
+    """CODEX_HOME cannot be locked here (no ``flock`` on the platform, or the filesystem
+    answers "not supported") and :data:`CODEX_HOME_UNLOCKED_ENV` is not ``1``; nothing was
+    written."""
+
+
 CODEX_HOME_LOCK_NAME = "levain.lock"
+# The named override for a CODEX_HOME that cannot be locked (Phill 2026-10-10, option B:
+# fail closed there, with a named override). Exactly "1" opts in; any other value refuses.
+CODEX_HOME_UNLOCKED_ENV = "LEVAIN_CODEX_HOME_UNLOCKED"
 
 
 @contextmanager
@@ -1305,14 +1314,27 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
     writes they left config.toml registering one install's store and hooks.json firing
     the other's hooks, both exiting 0 (codex L3 r2 2026-10-10; reproduced through the CLI
     on 0.7.0). Taken after the install lock, never before, so two levain processes
-    cannot wait on each other. Same semantics as :func:`install_lock`."""
+    cannot wait on each other. Same semantics as :func:`install_lock`, except where no lock
+    can be taken: there it raises :class:`CodexHomeUnlockable` (fail closed) unless
+    ``LEVAIN_CODEX_HOME_UNLOCKED=1`` is set, the operator's statement that no other install
+    writes this codex home at the same time."""
+    lock = codex_home / CODEX_HOME_LOCK_NAME
+
+    def unlockable(why: str) -> InstallLockError:
+        return CodexHomeUnlockable(
+            f"{lock} cannot be locked ({why}), so two codex installs writing {codex_home} at "
+            f"once could mix config.toml and hooks.json. Nothing was written. If no other "
+            f"levain install writes this codex home at the same time, re-run with "
+            f"{CODEX_HOME_UNLOCKED_ENV}=1.")
+
     with _single_writer_lock(
-        codex_home / CODEX_HOME_LOCK_NAME, what="the CODEX_HOME lock",
+        lock, what="the CODEX_HOME lock",
         guards="a concurrent codex init/update from another install",
         busy=lambda: CodexHomeBusy(
             f"another levain process (an `init` or `update` of a codex install) is "
             f"writing {codex_home} right now. This run installed nothing; re-run once "
             f"that one has finished."),
+        unlockable=None if os.environ.get(CODEX_HOME_UNLOCKED_ENV) == "1" else unlockable,
     ):
         yield
 
@@ -1321,14 +1343,18 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
 def _single_writer_lock(
     path: Path, *, what: str, guards: str, busy: Callable[[], InstallLockError],
     precheck: Callable[[], None] | None = None,
+    unlockable: Callable[[str], InstallLockError] | None = None,
 ) -> Iterator[None]:
     """An exclusive non-blocking ``flock`` on ``path``, reentrant per (path, thread); the
-    body of :func:`install_lock` and :func:`codex_home_lock`."""
+    body of :func:`install_lock` and :func:`codex_home_lock`. Where no lock can be taken,
+    ``unlockable`` (when given) builds the refusal to raise instead of running unguarded."""
     try:
         import fcntl
     except ImportError:
         if precheck is not None:
             precheck()  # a path that is not an install is refused here too, lock or none
+        if unlockable is not None:
+            raise unlockable("this platform has no flock") from None
         yield
         return
     key = (path.resolve(), threading.get_ident())
@@ -1384,6 +1410,8 @@ def _single_writer_lock(
                     f"re-run, and check the filesystem if it repeats."
                 ) from None
             if e.errno in unsupported:
+                if unlockable is not None:
+                    raise unlockable(f"the filesystem answers {e.strerror or e}") from None
                 # A filesystem without lock support (NFS without lockd, some SMB/FUSE
                 # homes) is not "another process": proceed unguarded, and say so.
                 print(f"  note: this filesystem cannot lock {path} ({e.strerror or e}); "
@@ -2060,7 +2088,7 @@ def refresh_adapter(
             # init between them would otherwise be overwritten from a stale read.
             try:
                 codex_held.enter_context(codex_home_lock(_codex_home()))
-            except CodexHomeBusy as e:
+            except (CodexHomeBusy, CodexHomeUnlockable) as e:
                 out.review.append("adapter")
                 emit(f"\n• adapter files NOT refreshed, none of them (activation, carrier and "
                      f"codex's files alike): {e.message} Re-run `levain update`.")
@@ -3088,26 +3116,34 @@ def _put_codex_config_back(config: Path, written: Path, was_link: bool,
     """:func:`_write_codex_pair`'s undo. ``before`` is the original live file's (dev, inode),
     ``ours`` the file the merge wrote (None when it could not be read). True when the kept
     original must stay on disk (it is named in ``notes``)."""
+    try:  # the name still leads where it led: a link swapped in since (one to `kept`, say) does not
+        same_name = config.is_symlink() == was_link and config.resolve() == written
+    except (OSError, RuntimeError):
+        same_name = False
+    gone = False
     try:
         st = os.stat(written)
-        if before is not None and (st.st_dev, st.st_ino) == before:
+        if same_name and before is not None and (st.st_dev, st.st_ino) == before:
             return False  # the original is still the live file: nothing to undo
     except FileNotFoundError:
         if kept is None:
             return False  # nothing was created
+        gone = True
     except OSError:
         pass
     try:
-        still_ours = (ours is not None and config.is_symlink() == was_link
-                      and config.resolve() == written and written.is_file()
+        still_ours = (ours is not None and same_name and written.is_file()
                       and _file_identity(written) == ours)
     except (OSError, RuntimeError):
         still_ours = False
     if not still_ours:
         where = f"; the original is kept at {kept}" if kept is not None else ""
-        notes.append(f"  ! {hooks} could not be written, and {config} could not be confirmed "
-                     f"as the file levain wrote, so it was left as it is{where}. It may register this install's store: "
-                     f"re-run `levain init --adapter codex` from the install codex should use.")
+        state = ("was removed by something else while levain ran, so it was not put back"
+                 if gone else
+                 "could not be confirmed as the file levain wrote, so it was left as it is")
+        risk = "" if gone else " It may register this install's store:"
+        notes.append(f"  ! {hooks} could not be written, and {config} {state}{where}.{risk} "
+                     f"Re-run `levain init --adapter codex` from the install codex should use.")
         return kept is not None
     try:
         if kept is None:
@@ -4018,7 +4054,9 @@ def _merge_codex_config(
     if not path.is_file():
         text = fragment.rstrip() + "\n"
         _require_toml(text, path, None)
-        path.write_text(text, encoding="utf-8")
+        # Atomic like the replace path below: a torn write must not leave a partial
+        # config.toml that the undo cannot confirm as ours (complement L3 r6).
+        _atomic_write_text(path, text)
         return
 
     existing = path.read_text(encoding="utf-8")
