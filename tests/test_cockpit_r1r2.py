@@ -398,3 +398,56 @@ class TestTheDashboardPageFromTheManifest:
             httpd.server_close()
             t.join(timeout=5)
         assert "Open loops" in dom and "loop one" in dom
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+class TestTrayKeepFilter:
+    """Tray and Keep carry the filter bar Open Loops has (text or spore-id, client-side, persisted)."""
+
+    DRIVER = r"""
+const fs = require("fs");
+const text = fs.readFileSync(process.argv[2], "utf8");
+const a = text.indexOf("FILTER-EXTRACT-START"), b = text.indexOf("FILTER-EXTRACT-END");
+const block = text.slice(text.lastIndexOf("\n", a) + 1, text.lastIndexOf("\n", b) + 1);
+function mk(t) { return { tagName: t, className: "", children: [], attrs: {}, listeners: {}, value: "", _text: "",
+  set textContent(v) { this._text = String(v); this.children = []; }, get textContent() { return this._text; },
+  appendChild(c) { this.children.push(c); c.parent = this; return c; }, append(...cs) { cs.forEach((c) => this.appendChild(c)); },
+  replaceChildren(...cs) { this.children = []; cs.forEach((c) => this.appendChild(c)); },
+  setAttribute(k, v) { this.attrs[k] = String(v); }, addEventListener(e, f) { this.listeners[e] = f; },
+  closest() { return null; } }; }
+const el = (t, c, x) => { const n = mk(t); if (c) n.className = c; if (x != null) n.textContent = x; return n; };
+const sporeQueries = {};
+const f = new Function("el", "sporeQueries", "measureOverflow", "measureClauses", block + "\nreturn mountSporeFilter;");
+const rowsOf = (panel) => panel.children[1].children.filter((c) => c.className === "row").length;
+const ROWS = [1, 2, 3, 4, 5].map((i) => ({ id: "spore-" + i, text: i === 4 ? "Kettle bell" : "item " + i }));
+for (const kind of ["tray", "keep"]) {
+  const mount = f(el, sporeQueries, () => {}, () => {});
+  const p = mk("div");
+  mount(p, ROWS, "items", kind, (rows, results) => rows.forEach((s) => results.appendChild(el("div", "row", s.id))));
+  const input = p.children[0].children[0];
+  const type = (v) => { input.value = v; input.listeners.input(); };
+  const fail = (m) => { console.error("FAIL " + kind + ": " + m); process.exit(1); };
+  if (rowsOf(p) !== 5) fail("initial rows " + rowsOf(p));
+  type("spore-2"); if (rowsOf(p) !== 1) fail("id filter gave " + rowsOf(p));
+  type("KETTLE"); if (rowsOf(p) !== 1) fail("text filter gave " + rowsOf(p));
+  type("nomatch"); if (rowsOf(p) !== 0 || !p.children[1].children[0].textContent.includes("nomatch")) fail("empty state");
+  type(""); if (rowsOf(p) !== 5) fail("clearing did not restore, got " + rowsOf(p));
+  type("spore-3");                                     // persists into the next render of the same kind
+  const p2 = mk("div"); mount(p2, ROWS, "items", kind, (rows, results) => rows.forEach((s) => results.appendChild(el("div", "row", s.id))));
+  if (rowsOf(p2) !== 1) fail("query not persisted across a re-render");
+  sporeQueries[kind] = "";
+}
+console.log("OK");
+"""
+
+    def test_filtering_narrows_rows_and_clearing_restores_them_on_tray_and_keep(self, tmp_path: Path) -> None:
+        drv = tmp_path / "filter_check.js"
+        drv.write_text(self.DRIVER, encoding="utf-8")
+        r = subprocess.run([NODE, str(drv), str(WEB / "dashboard_core.js")], capture_output=True, text=True, timeout=20)
+        assert r.returncode == 0, r.stderr
+        assert "OK" in r.stdout
+
+    def test_tray_and_keep_projections_mount_the_filter_by_panel_kind(self) -> None:
+        core = (WEB / "dashboard_core.js").read_text(encoding="utf-8")
+        body = core[core.index("function renderSporeProjection"):core.index("function renderSpores(")]
+        assert "mountSporeFilter(p, list" in body and "entry.kind" in body
