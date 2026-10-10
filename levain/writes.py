@@ -1083,7 +1083,7 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
     if len(collapsed) > STATE_MAX_TEXT_LEN:
         raise EditError("state_too_long", 422, f"state exceeds {STATE_MAX_TEXT_LEN} chars")
     raw_source = req.get("source")
-    source = raw_source if raw_source in _CONTEXT_SOURCE_ALLOWLIST else "web"
+    source = raw_source if isinstance(raw_source, str) and raw_source in _CONTEXT_SOURCE_ALLOWLIST else "web"
     # The bound is the kernel's (dashboard.STATE_MAX_TEXT_LEN), so the governed edit, the CLI
     # write and every reader agree; imported lazily to avoid the writes↔dashboard cycle.
     from levain.dashboard import write_state
