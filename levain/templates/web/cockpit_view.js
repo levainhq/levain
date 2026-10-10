@@ -130,10 +130,10 @@
     const last = Array.isArray(wraps) && wraps[0] ? wraps[0] : null;
     return {
       write_path_live: m.get("write path") === "live", total_links: m.get("links"), avg_strength: m.get("avg strength"),
-      density: m.get("density"), total_episodes: m.get("episodes"), episodes_since_wrap: m.get("episodes since wrap"),
+      max_strength: m.get("max strength"), density: m.get("density"), local_density: m.get("local density"),
+      total_episodes: m.get("episodes"), episodes_since_wrap: m.get("episodes since wrap"),
       tombstones: m.get("tombstones"), total_wraps: m.get("wraps"),
       graduations_validated_total: m.get("graduations validated"), graduations_demoted_total: m.get("graduations demoted"),
-      // not in the manifest (a K1 gap, routed): max_strength, local_density. The core omits what is absent.
       last_wrap_at: last ? last.wrapped_at : null, continuity_chars: last ? last.continuity_chars : null,
       wrap_history_unavailable: wraps === "unavailable",
     };
@@ -179,10 +179,11 @@
     const heads = new Map(Object.entries(m.panels || {}));
     const ent = m.entity || {};
     const view = {
-      paths: { omitted: true }, scope: ent.governance, entity_name: ent.name,
+      // the store line is the kernel's home-relative label, never an absolute path; no label, no line
+      paths: ent.store_label ? { episodic_db: ent.store_label } : { omitted: true }, scope: ent.governance, entity_name: ent.name,
       brand_wordmark: (ent.brand || {}).wordmark, brand_model: (ent.brand || {}).model,
       health: null, graph: null, crystal_index: [], open_spores: [], tray: [], keep: [], episodes: [],
-      sections: [], config_docs: [], wraps: [], recent_edits: [], focus: null, state: null, jar: null,
+      sections: [], config_docs: [], wraps: [], recent_edits: [], focus: null, state: null, jar: ent.jar || null,
       layout: [], errors: Object.create(null), extra_panels: Object.create(null), writable: false, write_token_required: false,
     };
     for (const e of m.errors || []) view.errors[e.source || "manifest"] = e.message;
@@ -250,8 +251,7 @@
       } else if (pid === "crystals" && panel.kind === "triage-list") {
         view.crystal_index = rows.map((r) => {
           const f = r.facets || {};
-          // the kernel sends a tag list as one comma-joined string in a one-element list (a K1 quirk, routed)
-          const tags = [].concat(f.tags || []).join(",").split(",").map((s) => s.trim()).filter(Boolean).map(visible);
+          const tags = [].concat(f.tags || []).map((s) => String(s).trim()).filter(Boolean).map(visible);
           return { name: bare(r.id), level: f.crystal_level, one_clause: r.body || r.title, permanence: f.permanence,
                    last_activated_on: f.last_activated_on, tags: tags };
         });
