@@ -1787,33 +1787,41 @@ class TestOffBoxWriteToken:
             thread.join(timeout=5)
 
 
-class TestFocusEditRoute:
-    """The Class-A `focus` edit over POST /edit — it rides the SAME auth gate as every
-    other edit kind (no focus-specific auth path), so this locks the happy path + the
-    read-only refusal; the token/host/CSRF gates are the kind-agnostic /edit tests."""
+class TestStateEditRoute:
+    """The Class-A `operator_state` edit over POST /edit: it rides the SAME auth gate as
+    every other edit kind (no state-specific auth path), so this locks the happy path + the
+    read-only refusal; the token/host/CSRF gates are the kind-agnostic /edit tests. The
+    retired `focus` kind is refused by the generic unknown-kind path."""
 
-    def test_focus_edit_happy_path(self, tmp_path: Path) -> None:
+    def test_state_edit_happy_path(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, _httpd):
-            status, body = _post(base + "/edit", {"kind": "focus", "text": "shipping 247"})
+            status, body = _post(base + "/edit", {"kind": "operator_state", "text": "shipping 247"})
         assert status == 200 and body["ok"] is True and body["cleared"] is False
         ctx = json.loads((tmp_path / "install" / ".levain" / "context.json").read_text())
-        assert ctx["focus"] == "shipping 247"
-        assert ctx["focus_source"] == "web"  # server-stamped default, not client-supplied
+        assert ctx["state"] == "shipping 247"
+        assert ctx["state_source"] == "web"  # server-stamped default, not client-supplied
 
-    def test_focus_edit_clear_over_post(self, tmp_path: Path) -> None:
+    def test_state_edit_clear_over_post(self, tmp_path: Path) -> None:
         src = _make_full_install(tmp_path)
         with _serving(src) as (base, _httpd):
-            _post(base + "/edit", {"kind": "focus", "text": "temp"})
-            status, body = _post(base + "/edit", {"kind": "focus", "text": ""})
+            _post(base + "/edit", {"kind": "operator_state", "text": "temp"})
+            status, body = _post(base + "/edit", {"kind": "operator_state", "text": ""})
         assert status == 200 and body["cleared"] is True
 
-    def test_focus_edit_read_only_refused(self, tmp_path: Path) -> None:
-        # a read-only cockpit (no write_scope) 422s the focus edit exactly like any edit
+    def test_state_edit_read_only_refused(self, tmp_path: Path) -> None:
+        # a read-only cockpit (no write_scope) 422s the state edit exactly like any edit
         ro = _store_with_data(tmp_path)  # write_scope defaults to None
         with _serving(ro) as (base, _httpd):
-            status, resp = _post(base + "/edit", {"kind": "focus", "text": "x"})
+            status, resp = _post(base + "/edit", {"kind": "operator_state", "text": "x"})
         assert status == 422 and resp["error"] == "read_only"
+
+    def test_focus_kind_is_refused_over_post(self, tmp_path: Path) -> None:
+        src = _make_full_install(tmp_path)
+        with _serving(src) as (base, _httpd):
+            status, resp = _post(base + "/edit", {"kind": "focus", "text": "x"})
+        assert status == 400 and resp["error"] == "bad_kind"
+        assert not (tmp_path / "install" / ".levain" / "context.json").exists()
 
 
 class TestContentLengthGuardMatchesWhatIntAccepts:

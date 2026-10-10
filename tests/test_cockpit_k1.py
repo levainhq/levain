@@ -55,7 +55,6 @@ def _install(tmp_path: Path) -> tuple[Path, SubstrateSource]:
         "\n".join(json.dumps({"id": f"e{i}", "ts": f"2026-10-0{i}T00:00:00+00:00", "kind": "state",
                               "action": "edit", "source": "s"}) for i in range(1, 4)) + "\n")
     (root / ".levain" / "context.json").write_text(json.dumps({
-        "focus": "ship K1", "focus_set_at": datetime.now(timezone.utc).isoformat(), "focus_source": "cli",
         "state": "ok", "state_set_at": datetime.now(timezone.utc).isoformat(), "state_source": "cli"}))
     return root, SubstrateSource.local(root)
 
@@ -111,7 +110,6 @@ def _cases(root: Path):
         out.append((pid, "db", _rm(db), _garble(db)))
     out.append(("crystals", "crystal", _rm(crystal), _garble(crystal)))
     out.append(("edits", "edits", _rm(edits), _dirify(edits)))
-    out.append(("focus", "ctx", _rm(ctxj), _garble(ctxj)))
     out.append(("state", "ctx", _rm(ctxj), _garble(ctxj)))
     out.append(("jobs", "jobs", _rm(jobs), _garble(jobs)))
     out.append(("section:state", "cont", _rm(cont), _garble(cont)))
@@ -190,7 +188,7 @@ class TestWhyProvidersCheckTheirOwnSources:
         for name in ("memory.spores.json", "memory.crystal.json", "context.json"):
             (root / ".levain" / name).unlink()
         view = src.build()
-        assert view.tray == [] and view.crystal_index == [] and (view.focus is None or view.focus.text is None)
+        assert view.tray == [] and view.crystal_index == [] and (view.state is None or view.state.text is None)
         assert not ({"open_spores", "crystal_index"} & set(view.errors))
 
     def test_recent_edits_swallows_a_directory_in_place_of_the_ledger(self, tmp_path: Path) -> None:
@@ -802,7 +800,7 @@ class TestL3R1Fixes:
     def test_a_context_file_that_is_valid_json_of_the_wrong_shape_is_error(self, env) -> None:
         root, _s, ck = env
         (root / ".levain" / "context.json").write_text("[]")
-        assert ck.panel("focus")["status"] == "error"
+        assert ck.panel("state")["status"] == "error"
 
     def test_a_malformed_crystal_row_is_counted_not_hidden(self, env) -> None:
         root, _s, ck = env
@@ -1076,7 +1074,7 @@ class TestSession2Gaps:
         _r, _s, ck = env
         heads = ck.manifest(NONE_CRED)["panels"]
         assert {k: v["edit_class"] for k, v in heads.items() if not k.startswith(("section:", "config:"))} == {
-            "now": None, "focus": None, "state": None, "tray": "B", "loops": "B", "keep": "B",
+            "now": None, "state": None, "tray": "B", "loops": "B", "keep": "B",
             "episodes": "B", "edits": None, "jobs": None, "health": "C", "graph": "C",
             "crystals": "C", "wraps": "C"}
         sections = {k: v["edit_class"] for k, v in heads.items() if k.startswith(("section:", "config:"))}

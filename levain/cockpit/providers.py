@@ -21,7 +21,6 @@ from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 from levain.dashboard import (
     CLASS_B,
     CLASS_C,
-    FOCUS_STALE_AFTER_HOURS,
     SubstrateSource,
     SubstrateView,
     _one_clause,
@@ -335,21 +334,18 @@ def _context_state(source: SubstrateSource) -> tuple[Path | None, Fault | Absent
     return cj, None
 
 
-def _context_line(source: SubstrateSource, label: str) -> Callable[[ReadContext], Result]:
+def _context_line(source: SubstrateSource) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
         _cj, problem = _context_state(source)
         if problem is not None:
             return problem
         view = _view(source, ctx)
-        item = view.focus if label == "focus" else view.state
+        item = view.state
         if item is None or not item.text:
             return Read(value={"lines": []})
-        stale = False
-        if label == "focus":
-            # an unknown age is never rendered as current (unknown != fresh)
-            stale = bool(item.stale) or item.freshness != "fresh"
-        return Read(value={"lines": [{"label": label, "text": item.text, "at": item.set_at,
-                                      "source": item.source}]}, stale=stale)
+        # an expired or age-unknown line is already dropped by the reader, so what arrives is fresh
+        return Read(value={"lines": [{"label": "state", "text": item.text, "at": item.set_at,
+                                      "source": item.source}]})
     return read
 
 
@@ -417,11 +413,8 @@ def build_default_cockpit(
         version_fields=tuple(f for f in SPORE_STORED if f != "seen"), version_excluded=("seen",),
         search_fields=("title", "body", "domain"), edit_class=CLASS_B,
     )
-    ck.register(ProviderSpec("focus", "line", "Focus", "gauge", _context_line(source, "focus"),
-                             region="header", rank=0, optional=True,
-                             stale_after_s=FOCUS_STALE_AFTER_HOURS * 3600, empty="No focus set."))
-    ck.register(ProviderSpec("state", "line", "State", "gauge", _context_line(source, "state"),
-                             region="header", rank=1, optional=True, empty="No state line."))
+    ck.register(ProviderSpec("state", "line", "State", "gauge", _context_line(source),
+                             region="header", rank=0, optional=True, empty="No state line."))
     for pid, title, bucket, prio, order, rank in (
         ("tray", "Tray", "tray", "gate", "spore.tray", 0),
         ("loops", "Open loops", "loops", "feed", "spore.loops", 1),

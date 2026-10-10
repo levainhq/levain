@@ -129,13 +129,9 @@ MAX_IDEMPOTENCY_KEY_LEN = 200
 # paragraph. Bound the captured text so a runaway request can't persist an arbitrarily
 # large spore (the server caps the request body too — this is the data-layer backstop).
 MAX_SPORE_TEXT_BYTES = 8 * 1024
-# A focus is a single-line "what I'm on now", rendered on the cockpit masthead — bound it
-# so a runaway request can't persist a novel-length focus (the server body cap is the
-# outer backstop). Measured AFTER whitespace-collapse, the shape `write_focus` stores.
-MAX_FOCUS_TEXT_LEN = 500
-# Provenance for a focus set: who authored it. A small allowlist — anything else (a
+# Provenance for an operator-context (state line) set: who authored it. A small allowlist — anything else (a
 # spoofed HTTP value) falls back to the honest default for the only HTTP caller ("web").
-_FOCUS_SOURCE_ALLOWLIST = frozenset({"web", "tui", "cli", "app"})
+_CONTEXT_SOURCE_ALLOWLIST = frozenset({"web", "tui", "cli", "app"})
 # Strict YYYY-MM-DD shape — anchored \d so a space-padded "2026-06- 1" (which len==10 +
 # datetime.strptime would wrongly accept) is rejected; a real-date check follows.
 _ISO_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
@@ -182,18 +178,18 @@ class WriteScope:
       non-install substrate) → those kinds are refused; State + the Class-B verbs do
       not need it.
     - ``context_json`` — OPTIONAL. The operator's live-context contract
-      (``{focus, focus_set_at, focus_source}``) — the WRITE-peer of the read path's
+      (``{state, state_set_at, state_source}``) — the WRITE-peer of the read path's
       ``SubstrateSource.context_json`` (the same path, mirrored read/write like
-      ``anneal`` is). Locates the target for the Class-A ``focus`` edit (operator
-      live-state, last-writer-wins — no lock/backup/undo, distinct from the
+      ``anneal`` is). Locates the target for the Class-A ``operator_state`` edit
+      (operator live-state, last-writer-wins — no backup/undo, distinct from the
       consolidated-cognition State edit). ``None`` (a substrate with no live-context
-      file, or a read-only source) → the ``focus`` kind is refused. TRUSTED (never
+      file, or a read-only source) → the ``operator_state`` kind is refused. TRUSTED (never
       request-supplied). NB in flow's N-of-1 case this points at the sensor-written
-      SUPERSET (``state/context_state.json``), a foreign-multi-writer file — so the focus
+      SUPERSET (``state/context_state.json``), a foreign-multi-writer file — so the state
       write is a lost-update race with the sensor drains (``os.replace`` prevents a torn
-      read, but a concurrent whole-object writer can revert a just-set focus, which —
+      read, but a concurrent whole-object writer can revert a just-set line, which —
       unlike a resampled sensor key — does NOT self-heal). Accepted low-stakes; the full
-      rationale + the proper-fix pointer live in ``dashboard.write_focus``'s CONCURRENCY note.
+      rationale lives in ``dashboard.write_state``'s docstring.
 
     ``from_install_root`` reproduces the pre-WriteScope BEHAVIOR (store paths by the
     ``.levain/memory.db`` convention, ledger physical location at ``.levain/``, undo
@@ -637,11 +633,9 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
     Kinds: ``config`` (a world.md section or a whole posture/recency file) +
     ``entity_name`` (the .levain/config.json name) — Class-A seed/config, require a
     ``scope.install_root``; ``state`` (the neocortex ``State`` section, Class A, targets
-    ``scope.anneal.continuity_md``); ``focus`` (the operator's live-context focus, Class A,
-    targets ``scope.context_json`` — live-state, last-writer-wins, no lock/backup/undo,
-    distinct from the consolidated-cognition State edit); ``operator_state`` (the operator's
-    freeform expiring state line, beside focus in the same ``scope.context_json``; named
-    ``operator_state`` because ``state`` is the neocortex edit above); the Class-B verbs (``spore_touch`` /
+    ``scope.anneal.continuity_md``); ``operator_state`` (the operator's freeform expiring
+    state line, Class A, targets ``scope.context_json`` — live-state, last-writer-wins, no
+    backup/undo; named ``operator_state`` because ``state`` is the neocortex edit above); the Class-B verbs (``spore_touch`` /
     ``spore_descend`` / ``spore_ascend`` / ``episode_tombstone``, off ``scope.anneal``);
     the Slice-3b Tray operator-I/O kinds (``spore_seed`` capture / ``spore_set_disposition``
     re-route / ``spore_surface_at`` schedule, off ``scope.anneal`` — non-destructive);
@@ -656,8 +650,6 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
             return _apply_config_edit(scope, req, now)
         if kind == "state":
             return _apply_state_edit(scope, req, now)
-        if kind == "focus":
-            return _apply_focus_edit(scope, req, now)
         if kind == "operator_state":
             return _apply_operator_state_edit(scope, req, now)
         if kind == "entity_name":
@@ -1070,54 +1062,10 @@ def _apply_config_edit(scope: WriteScope, req: dict[str, Any], now: str | None) 
     )
 
 
-def _apply_focus_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
-    """Set (or clear) the operator's live focus — the Class-A ``focus`` edit kind.
-
-    Distinct from the ``state`` edit (consolidated-cognition, the consolidate's
-    single-writer territory, lock + backup + undo): focus is OPERATOR LIVE-STATE
-    (last-writer-wins, no deference-risk, no machine interpretation — the cleanest
-    Class-A input), so it needs NEITHER the continuity lock NOR a backup/undo. The set
-    IS the record (``write_focus`` stamps ``focus_set_at`` + ``focus_source``); a blank
-    ``text`` (or an omitted one) CLEARS it (``dashboard._read_focus`` reads an empty
-    focus as unset). Runs under the shared ``_WRITE_LOCK`` (serializes cockpit
-    focus-writes against each other + sibling edits); ``write_focus`` is merge-preserving
-    + atomic, so a FOREIGN sensor writer of the same superset file is handled by that
-    file's established last-writer-wins contract, not serialized here.
-
-    Refuses 422 ``no_focus_target`` when the scope carries no ``context_json`` — a
-    read-only source, or a substrate with no live-context file, has no writable focus.
-    (``now`` is unused — ``write_focus`` self-stamps a tz-aware time, as the CLI does.)"""
-    ctx = scope.context_json
-    if ctx is None:
-        raise EditError(
-            "no_focus_target", 422,
-            "this substrate has no writable operator-context (focus); nothing to set",
-        )
-    text = req.get("text")
-    if text is None:
-        text = ""  # an omitted 'text' is an explicit clear (blank reads back as unset)
-    if not isinstance(text, str):
-        raise EditError("bad_focus", 400, "focus 'text' must be a string")
-    # Cap the whitespace-collapsed length — the exact shape `write_focus` will store
-    # (it collapses internal whitespace on write; measure the same thing).
-    collapsed = " ".join(text.split())
-    if len(collapsed) > MAX_FOCUS_TEXT_LEN:
-        raise EditError("focus_too_long", 422, f"focus exceeds {MAX_FOCUS_TEXT_LEN} chars")
-    # Provenance: the TUI passes source="tui"; the web is the only HTTP caller, so a
-    # spoofed non-allowlisted source over HTTP falls back to the honest "web" (harmless —
-    # it's the operator's own self-report either way).
-    raw_source = req.get("source")
-    source = raw_source if raw_source in _FOCUS_SOURCE_ALLOWLIST else "web"
-    from levain.dashboard import write_focus  # lazy: avoid the writes↔dashboard import cycle
-
-    write_focus(ctx, collapsed, source=source)
-    return {"ok": True, "kind": "focus", "cleared": collapsed == ""}
-
-
 def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
     """Set (or clear) the operator's freeform state line, the ``operator_state`` kind:
-    the twin of ``_apply_focus_edit`` (same file, lock, bound and provenance rules), so
-    the same notes apply. The text is stored verbatim apart from whitespace collapse and
+    live-state in ``scope.context_json`` (last-writer-wins, no continuity lock or backup),
+    bounded by ``dashboard.STATE_MAX_TEXT_LEN`` with an allowlisted provenance tag. The text is stored verbatim apart from whitespace collapse and
     is never interpreted. Refuses 422 ``no_state_target`` without a ``context_json``."""
     ctx = scope.context_json
     if ctx is None:
@@ -1135,7 +1083,7 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
     if len(collapsed) > STATE_MAX_TEXT_LEN:
         raise EditError("state_too_long", 422, f"state exceeds {STATE_MAX_TEXT_LEN} chars")
     raw_source = req.get("source")
-    source = raw_source if raw_source in _FOCUS_SOURCE_ALLOWLIST else "web"
+    source = raw_source if raw_source in _CONTEXT_SOURCE_ALLOWLIST else "web"
     # The bound is the kernel's (dashboard.STATE_MAX_TEXT_LEN), so the governed edit, the CLI
     # write and every reader agree; imported lazily to avoid the writes↔dashboard cycle.
     from levain.dashboard import write_state

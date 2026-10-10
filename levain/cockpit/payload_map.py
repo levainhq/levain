@@ -88,9 +88,6 @@ _add(S, "drop", "edit_class becomes the verb's tier on VerbHead (K2a); ref is a 
      "by the panel/row ids; source and heading are the section_edit / config write address, carried by "
      "those verbs' fields. §6.2 maps only layout[].kind/id/zone/title: this is a gap the diff found", False,
      "layout[].edit_class", "layout[].ref", "layout[].source", "layout[].heading")
-_add(S, "map", "line focus in header", True, "focus.text", "focus.set_at", "focus.source", "focus.stale",
-     "focus.freshness")
-_add(S, "drop", "the renderer formats age", True, "focus.age_label")
 _add(S, "map", "manifest errors", True, "errors", "errors.*")
 _add(S, "map", "manifest credential + each VerbHead.gesture", True, "writable", "write_token_required")
 _add(S, "map", "manifest verbs", True, "action_verbs.**")
@@ -104,14 +101,14 @@ _add(S, "map", "PanelAction + VerbHead.fields", True, "extra_panels.*.action.**"
 _add(S, "map", "placement of each extra panel in the layout", False, "extra_panels")
 # The Bridge's current installed levain predates these; they are on levain main (SubstrateView).
 _add(S, "map", "manifest entity.jar (the masthead starter jar), a K1 session-2 amendment to §6.2", False, "jar.**")
-_add(S, "map", "line state in header (the panel `state` exists, like focus); §6.2 does not spell this out, "
+_add(S, "map", "line state in header (the panel `state`); §6.2 does not spell this out, "
      "a K1 session-2 amendment", False, "state.text", "state.set_at", "state.source")
-_add(S, "drop", "the renderer formats age (as for focus.age_label)", False, "state.age_label")
+_add(S, "drop", "the renderer formats age", False, "state.age_label")
 
 # --- 6.3 /header.json, /sky.json, /fleet.json ------------------------------------------------------
 H = "header"
-_add(H, "map", "lines focus, state in header (from the source keys, not the display text)", True,
-     "focus", "state")
+_add(H, "map", "line state in header (from the source keys, not the display text)", True,
+     "state")
 _add(H, "map", "metric weather (stale or error with that message)", True, "weather", "error")
 
 K = "sky"
