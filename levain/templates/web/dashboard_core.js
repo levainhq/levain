@@ -759,7 +759,10 @@
         const ids = viewOf() ? view.tray_view_rows[viewOf()] : null;
         if (!Array.isArray(ids)) return all;
         const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
-        return ids.filter((id) => byId.has(id)).map((id) => byId.get(id));
+        // a row the view did not name still shows, after the named ones
+        const named = new Set(ids);
+        return ids.filter((id) => byId.has(id)).map((id) => byId.get(id))
+          .concat(all.filter((s) => !named.has(s.id)).map((s) => byId.get(s.id)));
       },
     } : undefined;
     mountSporeFilter(p, list, "items", entry.kind, (rows, results) => {
@@ -859,7 +862,7 @@
   // affordance (the tombstone), which works on search rows too: `commit` is the
   // module-level closure, available to dynamically-added rows.
   function episodeRow(e, verbs, showAgent) {
-    const row = el("div", "row");
+    const row = el("div", "row" + (e.emphasis === "dim" ? " ext-dim" : ""));
     if (showAgent && e.agent) row.appendChild(el("span", "tier", `[${e.agent}]`));
     if (e.type) row.appendChild(el("span", "etype", e.type));
     appendClause(row, e.content);  // FULL content + per-item expand (no truncation)
@@ -917,14 +920,22 @@
     const agents = [];
     for (const e of list) if (e.agent && !agents.includes(e.agent)) agents.push(e.agent);
     const multi = agents.length > 1;
-    if (!agents.includes(episodeAgent)) episodeAgent = "";
+    // the choice outlives a refresh in which that agent is absent: it shows as All, and applies again on return
+    const agentNow = () => (agents.includes(episodeAgent) ? episodeAgent : "");
+    let agentSel = null;
+    const syncAgent = () => {
+      if (!agentSel) return;
+      const searching = !!input.value.trim();
+      agentSel.disabled = searching;
+      agentSel.title = searching ? "the agent filter applies to the recent list, not to keyword search results" : "";
+    };
     const renderRows = (rows) => {
       results.replaceChildren();
       for (const e of rows) results.appendChild(episodeRow(e, verbs, multi));
     };
     const showRecent = () => {
       status.textContent = "";
-      const shown = episodeAgent ? list.filter((e) => e.agent === episodeAgent) : list;
+      const shown = agentNow() ? list.filter((e) => e.agent === agentNow()) : list;
       if (list.length === 0) results.replaceChildren(el("p", "empty", "no episodes yet"));
       else renderRows(shown);
       reMeasure();
@@ -934,9 +945,10 @@
       sel.setAttribute("aria-label", "filter episodes by agent");
       sel.appendChild(Object.assign(el("option", null, "All agents"), { value: "" }));
       for (const a of agents) sel.appendChild(Object.assign(el("option", null, a), { value: a }));
-      sel.value = episodeAgent;
+      sel.value = agentNow();
       // a keyword search shows the store's own matches; the filter applies to the recent list
       sel.addEventListener("change", () => { episodeAgent = sel.value; if (!input.value.trim()) showRecent(); });
+      agentSel = sel;
       bar.appendChild(sel);
     }
 
@@ -993,9 +1005,9 @@
     // Emptying the box (backspace or the native search-clear ×) restores recent at once.
     // Any edit invalidates an in-flight search (seq++), so a late response never renders
     // under a changed box (codex L3); emptying also restores the recent list.
-    input.addEventListener("input", () => { seq++; capture(); if (!input.value.trim()) showRecent(); });
+    input.addEventListener("input", () => { seq++; capture(); syncAgent(); if (!input.value.trim()) showRecent(); });
 
-    if (modal && modalEpisodeQuery) { input.value = modalEpisodeQuery; search(modalEpisodeQuery); }
+    if (modal && modalEpisodeQuery) { input.value = modalEpisodeQuery; syncAgent(); search(modalEpisodeQuery); }
     else showRecent();
     return p;
   }

@@ -172,6 +172,7 @@ def _ep(rid: str, at: str, *, agent: str | None = None, content: str = "c", **ov
         facets["agent"] = agent
     return RowIn(
         id=rid, title=content, body=content, facets={**facets, **over.pop("facets", {})},
+        emphasis=over.pop("emphasis", "none"),
         stored=over.pop("stored", {"id": rid, "timestamp": at, "type": "observation", "source": "s",
                                    "content": content, "tags": []}))
 
@@ -283,3 +284,92 @@ class TestTombstoneAppliesToOwnRowsOnly:
         own_id = next(r["id"] for r in p["rows"] if r["id"].startswith("episode:"))
         assert isinstance(ck.read_one("episodes", own_id), Read)
         assert isinstance(ck.read_one("episodes", "feed:f:x"), Absent)
+
+
+class TestL1L2Fixes:
+    def test_a_raising_view_ordering_is_the_panels_fault_not_a_crash(self) -> None:
+        from levain.cockpit.registry import Ordering, register_ordering
+
+        def boom(row: RowIn, today: date) -> tuple:
+            raise RuntimeError("key blew up")
+
+        register_ordering(Ordering("zz.boom", boom))
+        try:
+            ck = Cockpit(clock=_clock)
+            ck.register(_simple("p", views=(("b", "Boom", "zz.boom"),),
+                                read=lambda ctx: Read(rows=(RowIn(id="r1", title="t", facets={"at": "2026-01-01"}),
+                                                            RowIn(id="r2", title="u", facets={"at": "2026-01-02"})))))
+            p = ck.panel("p", credential_class="token")
+            assert p["status"] == "error" and p["error"]
+            assert p["rows"] is None
+        finally:
+            ORDERINGS.pop("zz.boom", None)
+
+    def test_view_rows_come_from_the_snapshot_and_cover_the_sent_rows(self, rig) -> None:
+        _src, ids, ck = rig
+        p = _tray(ck, q="days old")
+        assert set(p["view_rows"]["age"]) == set(_ids(p))
+
+    def test_a_feed_repeating_a_row_id_is_skipped_and_the_rest_stays(self, src: SubstrateSource) -> None:
+        p = _episodes(src, {"dup": _feed(_ep("a", "2999-01-01T00:00:00Z"), _ep("a", "2999-01-02T00:00:00Z")),
+                            "good": _feed(_ep("g", "2999-01-03T00:00:00Z"))})
+        assert p["status"] == "partial" and p["error"] is None
+        assert any("dup" in s["reason"] and "repeats" in s["reason"] for s in p["skipped"])
+        ids = _ids(p)
+        assert "feed:good:g" in ids and not any(i.startswith("feed:dup:") for i in ids)
+        assert any(i.startswith("episode:") for i in ids)
+
+    def test_feed_emphasis_is_none_or_dim_only(self, src: SubstrateSource) -> None:
+        p = _episodes(src, {"f": _feed(_ep("w", "2999-01-01T00:00:00Z", emphasis="weird"),
+                                       _ep("d", "2999-01-02T00:00:00Z", emphasis="dim"))})
+        rows = {r["id"]: r for r in p["rows"]}
+        assert rows["feed:f:w"]["emphasis"] == "none"
+        assert rows["feed:f:d"]["emphasis"] == "dim"
+
+    def test_a_feeds_own_signals_reach_the_panel_named_by_the_feed(self, src: SubstrateSource) -> None:
+        row = _ep("x", "2999-01-01T00:00:00Z")
+        stale = _episodes(src, {"s": lambda ctx: Read(rows=(row,), stale=True)})
+        assert stale["status"] == "stale"
+        noted = _episodes(src, {"n": lambda ctx: Read(rows=(row,), note="digest old")})
+        assert "n: digest old" in noted["note"]
+        skipped = _episodes(src, {"k": lambda ctx: Read(rows=(row,), skipped=((2, "x"),))})
+        assert {"count": 2, "reason": "k: x"} in skipped["skipped"]
+        filtered = _episodes(src, {"f": lambda ctx: Read(rows=(row,), filtered=((3, "y"),))})
+        assert {"count": 3, "reason": "f: y"} in filtered["filtered"]
+
+    def test_time_desc_puts_a_row_with_no_timestamp_last(self, src: SubstrateSource) -> None:
+        undated = RowIn(id="u", title="u", body="u", facets={"episode_type": "observation", "source": "s", "tags": []},
+                        stored={"id": "u", "timestamp": "", "type": "observation", "source": "s",
+                                "content": "u", "tags": []})
+        p = _episodes(src, {"f": _feed(undated, _ep("old", "2000-01-01T00:00:00Z"))})
+        order = _ids(p)
+        assert order[-1] == "feed:f:u"
+        assert order.index("feed:f:old") < order.index("feed:f:u")
+
+    def test_a_capped_own_window_filters_older_feed_rows_and_says_so(self, tmp_path: Path, monkeypatch) -> None:
+        import levain.cockpit.providers as prov
+        from anneal_memory import Store
+        root, src, _ids_ = _install(tmp_path)
+        with Store(root / ".levain" / "memory.db") as store:
+            for i in range(3):
+                store.record(f"own {i}", "observation")
+        monkeypatch.setattr(prov, "EPISODE_LIMIT", 3)
+        p = _episodes(src, {"f": _feed(_ep("old", "2000-01-01T00:00:00Z"), _ep("new", "2999-01-01T00:00:00Z"))})
+        ids = _ids(p)
+        assert "feed:f:new" in ids and "feed:f:old" not in ids
+        assert {"count": 1, "reason": "f: older than the entity's newest 3"} in p["filtered"]
+        assert "the entity's newest 3 episodes" in p["note"]
+
+    def test_under_the_cap_nothing_is_filtered(self, src: SubstrateSource) -> None:
+        p = _episodes(src, {"f": _feed(_ep("old", "2000-01-01T00:00:00Z"))})
+        assert "feed:f:old" in _ids(p)
+        assert not p["filtered"] and "newest" not in (p["note"] or "")
+
+    def test_views_enter_the_etag(self) -> None:
+        def mk(**kw: Any) -> str:
+            ck = Cockpit(clock=_clock)
+            ck.register(_simple("p", read=lambda ctx: Read(rows=(RowIn(id="r", title="t", facets={"at": "2026-01-01"}),)),
+                                **kw))
+            return ck.panel("p", credential_class="token")["etag"]
+        assert mk() != mk(views=(("a", "By age", "time.desc"),))
+        assert mk(views=(("a", "A", "time.desc"),)) != mk(views=(("a", "A", "time.desc"), ("b", "B", "legacy.source")))

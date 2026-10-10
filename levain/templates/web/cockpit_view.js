@@ -337,7 +337,8 @@
       } else if (pid === "episodes" && panel.kind === "triage-list") {
         view.episodes = rows.map((r) => ({ id: bare(r.id), timestamp: (r.facets || {}).at, type: (r.facets || {}).episode_type,
           source: (r.facets || {}).source, agent: titleOf((r.facets || {}).agent, ""),
-          actions: Array.isArray(r.actions) ? r.actions : undefined, tags: tagsOf((r.facets || {}).tags), content: r.body || r.title }));
+          actions: Array.isArray(r.actions) ? r.actions : undefined, tags: tagsOf((r.facets || {}).tags), content: r.body || r.title,
+          emphasis: r.emphasis }));
         view.layout.push(Object.assign(entry, { kind: "episodes" }));
       } else if (pid === "edits" && panel.kind === "triage-list") {
         view.recent_edits = rows.map((r) => ({ id: bare(r.id), ts: (r.facets || {}).at, action: (r.facets || {}).edit_kind,

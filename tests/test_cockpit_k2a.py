@@ -1069,6 +1069,24 @@ class TestL3Round5:
             assert "could not be versioned" in str(e)
         assert rig.spore("seed") == before
 
+    def test_the_guard_raises_on_an_unreadable_row_and_records_why(self, rig: Rig, monkeypatch) -> None:
+        """complement #1 r5: version_of returned "" for a row it could not version. It raises SporeError
+        (anneal saves nothing when the transaction body raises) and found stays unset."""
+        import levain.cockpit.providers as prov
+        from anneal_memory.spores import SporeError
+        from levain.writes import _VersionGuard
+        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(OverflowError("inf")))
+        guard = _VersionGuard("x" * 16)
+        with pytest.raises(SporeError, match="could not be versioned"):
+            guard.version_of(rig.spore("seed"))
+        assert guard.found is None and guard.error and "OverflowError" in guard.error
+        before = rig.spore("seed")
+        guard = _VersionGuard("x" * 16)
+        with pytest.raises(SporeError):
+            rig.store.touch(rig.ids["seed"], expected_version="x" * 16, version_of=guard.version_of)
+        assert guard.found is None and guard.error
+        assert rig.spore("seed") == before
+
     def test_a_str_subclass_id_is_an_errors_entry_and_never_hashed(self, tmp_path: Path) -> None:
         """codex MED r5: a str subclass with __hash__ = None passed isinstance and crashed the Counter."""
         class Unhashable(str):
