@@ -240,6 +240,32 @@ class TestManifestMapperAdversarial:
         h = [e for e in view["layout"] if e["id"] == "health"][0]
         assert any("wrap in progress" in b["text"] for b in h["banner"])   # an alert is never dropped
 
+    def test_the_new_masthead_and_health_fields_reach_the_renderer_typed_or_not_at_all(self) -> None:
+        # render4 L3 (codex MED x2): a cleaned object where a string or number belongs throws in the
+        # renderer's conversions after the board is cleared (reproduced in node: +o, Math.min(o), String(o))
+        ck = Cockpit(entity=lambda ctx: {"name": "e", "governance": "x", "brand": {}, "store_label": "~/s.db",
+                                         "jar": {"status": "ok", "label": "3 today", "level": 0.5, "today": 3, "day": "d"}})
+        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": [
+            {"label": "max strength", "value": 1.3, "unit": None, "status": "ok", "read": None},
+            {"label": "local density", "value": 0.02, "unit": None, "status": "ok", "read": None}]})))
+        ck.register(ProviderSpec("crystals", "triage-list", "Crystals", "feed", lambda c: Read(rows=(
+            RowIn("crystal:c1", "c1", {"at": "2026-10-01T00:00:00+00:00", "tags": ["a"]}, stored={"id": "c1"}),)),
+            order="time.desc", facets=frozenset({"at", "tags"}), version_fields=("id",), region="mind"))
+        good = _view(snapshot(ck))
+        assert good["paths"] == {"episodic_db": "~/s.db"} and good["jar"]["level"] == 0.5
+        assert good["health"]["max_strength"] == 1.3 and good["health"]["local_density"] == 0.02
+        snap = snapshot(ck)
+        snap["manifest"]["entity"]["store_label"] = {"bad": True}
+        snap["manifest"]["entity"]["jar"]["level"] = {"bad": True}
+        for x in snap["panels"]["health"]["value"]["metrics"]:
+            x["value"] = {}
+        snap["panels"]["crystals"]["rows"][0]["facets"]["tags"] = ["operator,ergonomics", {"x": 1}, 3]
+        bad = _view(snap)
+        assert bad["paths"] == {"omitted": True}                       # no store line, never "[object Object]"
+        assert bad["jar"]["level"] == 0 and isinstance(bad["jar"]["label"], str)
+        assert "max_strength" not in bad["health"] and "local_density" not in bad["health"]
+        assert bad["crystal_index"][0]["tags"] == ["operator", "ergonomics"]   # the older joined form still splits
+
     def test_now_rows_keep_their_full_text_group_titles_and_hostile_characters_are_visible(self) -> None:
         ck = Cockpit()
         long = "x" * 200 + "\u202eEND"
