@@ -126,6 +126,10 @@
   // focus modal. Empty = show all. Matches spore text OR spore-id.
   let openLoopsQuery = "";
   const sporeQueries = Object.create(null);  // Tray / Keep filter queries, keyed by panel kind
+  // The Tray's chosen view ("" = the kernel's own order, else a view id) and the Episodes agent filter
+  // ("" = all). Both are display choices that survive a refresh re-render in the same page.
+  let trayView = "";
+  let episodeAgent = "";
   // The scroll position to re-apply after a modal refresh-rebuild. For the episode
   // panel the result list arrives async (a /recall.json fetch), so buildModal's
   // synchronous restore clamps to 0 — the episode renderer re-applies this once its
@@ -681,6 +685,7 @@
     if (badge) row.appendChild(el("span", "tier", `[${badge}]`));
     appendClause(row, s.text);  // FULL text + per-item expand (no truncation, no edit data-loss)
     if (s.next) row.appendChild(el("span", "muted", "→ " + s.next));
+    if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
     if (verbs && s.id) row.appendChild(buildSporeVerbs(s, panelKind));
     return row;
   }
@@ -689,7 +694,9 @@
   // loaded list, text (case-insensitive substring) OR spore-id. The query persists per panel
   // kind in `sporeQueries`, so a verb that rebuilds the board leaves you in your filter.
   // FILTER-EXTRACT-START (a node test lifts this block)
-  function mountSporeFilter(p, all, noun, kind, drawRows) {
+  // opts (optional): controls(bar, redraw) adds in-panel controls to the bar; pick(list) returns the
+  // rows to filter (a view's own order), re-read on every redraw.
+  function mountSporeFilter(p, all, noun, kind, drawRows, opts) {
     const bar = el("div", "ep-search");
     const input = el("input", "ep-search-input");
     input.type = "search";
@@ -702,10 +709,11 @@
     p.appendChild(results);
     const render = (raw) => {
       const q = raw.trim().toLowerCase();
+      const base = opts && opts.pick ? opts.pick(all) : all;
       const rows = q
-        ? all.filter((s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
+        ? base.filter((s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
                             String(s.id || "").toLowerCase().includes(q))
-        : all;
+        : base;
       results.replaceChildren();
       if (rows.length === 0) results.appendChild(el("p", "empty", "no " + noun + " match “" + raw.trim() + "”"));
       else drawRows(rows, results);
@@ -714,6 +722,7 @@
       measureClauses(results);
     };
     input.addEventListener("input", () => { sporeQueries[kind] = input.value; render(input.value); });
+    if (opts && opts.controls) opts.controls(bar, () => render(input.value));
     if (sporeQueries[kind]) input.value = sporeQueries[kind];
     render(input.value);
   }
@@ -733,16 +742,37 @@
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (!list || list.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
+    // the Tray's views: the kernel names each ordering and sends the row ids in it; this only picks one
+    const views = entry.kind === "tray" && Array.isArray(view.tray_views) && view.tray_view_rows ? view.tray_views : [];
+    const viewOf = () => (views.some((v) => v.id === trayView) ? trayView : "");
+    const opts = views.length ? {
+      controls: (bar, redraw) => {
+        const sel = el("select", "tray-dump-type");
+        sel.setAttribute("aria-label", "Tray order");
+        sel.appendChild(Object.assign(el("option", null, "Tray order"), { value: "" }));
+        for (const v of views) sel.appendChild(Object.assign(el("option", null, v.title), { value: v.id }));
+        sel.value = viewOf();
+        sel.addEventListener("change", () => { trayView = sel.value; redraw(); });
+        bar.appendChild(sel);
+      },
+      pick: (all) => {
+        const ids = viewOf() ? view.tray_view_rows[viewOf()] : null;
+        if (!Array.isArray(ids)) return all;
+        const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
+        return ids.filter((id) => byId.has(id)).map((id) => byId.get(id));
+      },
+    } : undefined;
     mountSporeFilter(p, list, "items", entry.kind, (rows, results) => {
       let lastGroup = null;
       for (const s of rows) {
-        // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order
+        // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order;
+        // a chosen view is ungrouped
         const g = s.group || null;
-        if (s.group_title && g !== lastGroup) results.appendChild(el("div", "grp-head", s.group_title));
+        if (s.group_title && g !== lastGroup && !viewOf()) results.appendChild(el("div", "grp-head", s.group_title));
         lastGroup = g;
         results.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
       }
-    });
+    }, opts);
     return p;
   }
 
@@ -828,15 +858,18 @@
   // hits (spore-107), so they render identically. `verbs` carries the panel's verb
   // affordance (the tombstone), which works on search rows too: `commit` is the
   // module-level closure, available to dynamically-added rows.
-  function episodeRow(e, verbs) {
+  function episodeRow(e, verbs, showAgent) {
     const row = el("div", "row");
+    if (showAgent && e.agent) row.appendChild(el("span", "tier", `[${e.agent}]`));
     if (e.type) row.appendChild(el("span", "etype", e.type));
     appendClause(row, e.content);  // FULL content + per-item expand (no truncation)
     if (Array.isArray(e.tags) && e.tags.length) {
       row.appendChild(el("span", "tags", "#" + e.tags.slice(0, 5).join(" #")));
     }
     row.appendChild(el("span", "muted", datePart(e.timestamp)));
-    if (verbs && e.id) row.appendChild(buildEpisodeVerbs(e));
+    // a row that lists its actions offers only those; a row without the field (the legacy path) keeps the panel's
+    const offers = !Array.isArray(e.actions) || e.actions.some((a) => a && a.verb === "episode_tombstone");
+    if (verbs && e.id && offers) row.appendChild(buildEpisodeVerbs(e));
     return row;
   }
 
@@ -881,16 +914,31 @@
         if (sc) { sc.scrollTop = modalRestoreScroll; modalRestoreScroll = null; }
       }
     };
+    const agents = [];
+    for (const e of list) if (e.agent && !agents.includes(e.agent)) agents.push(e.agent);
+    const multi = agents.length > 1;
+    if (!agents.includes(episodeAgent)) episodeAgent = "";
     const renderRows = (rows) => {
       results.replaceChildren();
-      for (const e of rows) results.appendChild(episodeRow(e, verbs));
+      for (const e of rows) results.appendChild(episodeRow(e, verbs, multi));
     };
     const showRecent = () => {
       status.textContent = "";
+      const shown = episodeAgent ? list.filter((e) => e.agent === episodeAgent) : list;
       if (list.length === 0) results.replaceChildren(el("p", "empty", "no episodes yet"));
-      else renderRows(list);
+      else renderRows(shown);
       reMeasure();
     };
+    if (multi) {
+      const sel = el("select", "tray-dump-type");
+      sel.setAttribute("aria-label", "filter episodes by agent");
+      sel.appendChild(Object.assign(el("option", null, "All agents"), { value: "" }));
+      for (const a of agents) sel.appendChild(Object.assign(el("option", null, a), { value: a }));
+      sel.value = episodeAgent;
+      // a keyword search shows the store's own matches; the filter applies to the recent list
+      sel.addEventListener("change", () => { episodeAgent = sel.value; if (!input.value.trim()) showRecent(); });
+      bar.appendChild(sel);
+    }
 
     // Latest-query-wins: a slow earlier response must not clobber a newer one.
     let seq = 0;

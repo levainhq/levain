@@ -75,10 +75,16 @@
   // "spore:spore-12" -> "spore-12": the source-scoped row id back to the id the components show
   function bare(id) { const i = String(id).indexOf(":"); return i < 0 ? String(id) : String(id).slice(i + 1); }
 
+  // a row's age as its kernel badge words it ("12d old"), else empty
+  function ageOf(row) {
+    for (const b of row.badges || []) if (b && b.kind === "age_days") return badgeText(b);
+    return "";
+  }
+
   function sporeOf(row, groupTitles) {
     const f = row.facets || {};
     return {
-      id: bare(row.id), type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
+      id: bare(row.id), age: ageOf(row), type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
       disposition: f.disposition, text: row.body || row.title, next: f.due || null,
       descend_kinds: [], ascend_kinds: [],
       group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
@@ -318,10 +324,20 @@
       const lists = { tray: "tray", loops: "open_spores", keep: "keep" };
       if ((pid === "tray" || pid === "loops" || pid === "keep") && panel.kind === "triage-list") {
         view[lists[pid]] = rows.map((r) => sporeOf(r, groupTitles));
+        if (pid === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
+          // the kernel's named orderings and the row ids in each; the renderer picks one, never sorts
+          const named = head.views.filter((v) => isObj(v) && typeof v.id === "string" && Array.isArray(panel.view_rows[v.id]));
+          if (named.length) {
+            view.tray_views = named.map((v) => ({ id: v.id, title: titleOf(v.title, v.id) }));
+            view.tray_view_rows = Object.create(null);
+            for (const v of named) view.tray_view_rows[v.id] = panel.view_rows[v.id].map(bare);
+          }
+        }
         view.layout.push(Object.assign(entry, { kind: kind }));
       } else if (pid === "episodes" && panel.kind === "triage-list") {
         view.episodes = rows.map((r) => ({ id: bare(r.id), timestamp: (r.facets || {}).at, type: (r.facets || {}).episode_type,
-          source: (r.facets || {}).source, tags: tagsOf((r.facets || {}).tags), content: r.body || r.title }));
+          source: (r.facets || {}).source, agent: titleOf((r.facets || {}).agent, ""),
+          actions: Array.isArray(r.actions) ? r.actions : undefined, tags: tagsOf((r.facets || {}).tags), content: r.body || r.title }));
         view.layout.push(Object.assign(entry, { kind: "episodes" }));
       } else if (pid === "edits" && panel.kind === "triage-list") {
         view.recent_edits = rows.map((r) => ({ id: bare(r.id), ts: (r.facets || {}).at, action: (r.facets || {}).edit_kind,
