@@ -37,16 +37,20 @@
     if (x && typeof x === "object") {
       // null-prototype with own data properties: a wire key such as "__proto__" is data, never the prototype.
       // Keys are cleaned like values, so an id and the references to it still agree after cleaning.
+      // Two raw keys that clean to one: the first wins (a rename would break the references to it).
       const o = Object.create(null);
       for (const k of Object.keys(x)) {
         let key = visible(k);
-        while (Object.prototype.hasOwnProperty.call(o, key)) key += "~";   // two raw keys that clean to one stay two, never overwritten
+        if (Object.prototype.hasOwnProperty.call(o, key)) continue;
         Object.defineProperty(o, key, { value: clean(x[k]), enumerable: true, writable: true, configurable: true });
       }
       return o;
     }
     return x;
   }
+
+  // a title is text: an object or number where one belongs falls back rather than reaching a renderer
+  function titleOf(v, fallback) { return typeof v === "string" && v ? v : fallback; }
 
   function parseIso(iso) {
     if (typeof iso !== "string" || !iso) return NaN;
@@ -183,7 +187,7 @@
     const unavailable = (pid, zone, why) => {
       const pl = P.get(pid);
       const h = pl && pl.status === "error" ? pl : (heads.get(pid) || {});   // a real error payload's own last-good time wins
-      view.layout.push({ kind: "external", zone: zone, edit_class: "", title: h.title || pid, id: pid });
+      view.layout.push({ kind: "external", zone: zone, edit_class: "", title: titleOf(h.title, pid), id: pid });
       view.extra_panels[pid] = { error: why + " — last good " + (h.as_of ? ageLabel(h.as_of, now, "") : "never") };
     };
 
@@ -214,7 +218,7 @@
       const panel = P.get(pid);
       const groupTitles = new Map();
       for (const g of panel.groups || head.groups || []) groupTitles.set(g.id, g.title);
-      const entry = { zone: zoneId, edit_class: "", title: panel.title || head.title, id: pid };
+      const entry = { zone: zoneId, edit_class: "", title: titleOf(panel.title, titleOf(head.title, pid)), id: pid };
       const banner = bannerOf(panel, panel, now);
       if (banner) entry.banner = banner;
       if (panel.as_of) entry.fresh = ageLabel(panel.as_of, now, "read ");
@@ -251,8 +255,8 @@
         view.wraps = Array.isArray(wrapsData) ? wrapsData : [];
         view.layout.push(Object.assign(entry, { kind: "wraps" }));
       } else if (panel.kind === "prose" && pid.indexOf("section:") === 0 && (panel.value || {}).markdown != null) {
-        view.sections.push({ heading: panel.title || head.title, body: panel.value.markdown });
-        view.layout.push(Object.assign(entry, { kind: "section", ref: sectionRef++, heading: panel.title || head.title }));
+        view.sections.push({ heading: titleOf(panel.title, titleOf(head.title, pid)), body: panel.value.markdown });
+        view.layout.push(Object.assign(entry, { kind: "section", ref: sectionRef++, heading: titleOf(panel.title, titleOf(head.title, pid)) }));
       } else {
         view.extra_panels[pid] = externalOf(panel, panel, groupTitles);
         view.layout.push(Object.assign(entry, { kind: "external" }));
@@ -267,6 +271,7 @@
       try { place(pid, zoneId); } catch (e) {
         // one malformed panel must not blank the cockpit: it becomes an unavailable panel with the reason
         view.layout.length = mark;
+        delete view.extra_panels[pid];
         unavailable(pid, zoneId, "could not be mapped (" + (e && e.message ? e.message : e) + ")");
       }
     };

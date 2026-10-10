@@ -125,7 +125,7 @@
   // re-renders (a verb fires → the board rebuilds → you stay in your filter) and into the
   // focus modal. Empty = show all. Matches spore text OR spore-id.
   let openLoopsQuery = "";
-  const sporeQueries = {};  // Tray / Keep filter queries, keyed by panel kind
+  const sporeQueries = Object.create(null);  // Tray / Keep filter queries, keyed by panel kind
   // The scroll position to re-apply after a modal refresh-rebuild. For the episode
   // panel the result list arrives async (a /recall.json fetch), so buildModal's
   // synchronous restore clamps to 0 — the episode renderer re-applies this once its
@@ -356,7 +356,14 @@
         board.appendChild(sep);
         lastZone = entry.zone;
       }
-      const node = renderPanel(entry, view);
+      let node;
+      try { node = renderPanel(entry, view); } catch (e) {
+        // one panel whose data a renderer cannot draw is an unavailable panel, never a blank board
+        node = el("div", "panel");
+        node.dataset.zone = entry.zone || "";
+        node.appendChild(el("div", "phead", typeof entry.id === "string" ? entry.id : "panel"));
+        node.appendChild(el("p", "err", "unavailable — could not be drawn (" + (e && e.message ? e.message : "bad data") + ")"));
+      }
       if (node) {
         if (CLAMP_KINDS.has(entry.kind)) node.setAttribute("data-clamp", "");
         board.appendChild(node);
@@ -735,7 +742,7 @@
     const render = (raw) => {
       const q = raw.trim().toLowerCase();
       const rows = q
-        ? all.filter((s) => (s.text || "").toLowerCase().includes(q) ||
+        ? all.filter((s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
                             String(s.id || "").toLowerCase().includes(q))
         : all;
       results.replaceChildren();
