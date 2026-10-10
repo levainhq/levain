@@ -15,6 +15,9 @@ The cockpit's write side, part one (K2a). It ships in one release with K2b (the 
 - **`/edit` bodies now bind to what was rendered.** An `operator_state` edit carries `panel_version` (the page sends the `version` its state line came with; the first line of a new install sends `"absent"`); a `spore_descend` carries the `expect_disposition` it was rendered with; an `/edit` on a spore that no Tray, Open loops or Keep panel shows is refused 409.
 - **The state line has one lock.** `levain state`, the TUI and the web cockpit take one lock on the context file (on its real path, so a symlinked file and its target share it); the cockpit's version check runs under it. Where the lock cannot be taken (a filesystem without working locks), the state line is not written and the command says why. A writer outside levain does not take it.
 - **Requires anneal-memory 0.9.42 or later** (the spore compare uses `expected_version`).
+- **Open loops comes before the Tray**, and the Tray has a **By age** view: the same box, the same rows, oldest first, with each item's age. The page switches between the Tray's order and By age without re-sorting anything itself: the server sends both orders.
+- **The Episodes panel can show other agents' episodes.** An embedding server passes `episode_feeds={name: read}` to `build_default_cockpit`; each feed's rows appear with their agent, and the page gets an agent filter. A feed that fails, or sends rows that are not episodes, is named on the panel and shows nothing, and the entity's own episodes stay. Only the entity's own episodes can be tombstoned. Once the entity's own recent episodes reach the panel's limit, older feed rows are left out and counted, so the list never has a gap on one side.
+- **The neocortex section panels offer no edit for now.** Editing a section returns with anneal's section writer.
 
 ### Known limits
 
