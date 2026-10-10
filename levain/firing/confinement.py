@@ -3394,7 +3394,14 @@ class SandboxedShell:
                 r = replace(r, output=late + r.output)
             return r
         finally:
-            self._run_lock.release()
+            try:
+                self._run_ended()
+            finally:
+                self._run_lock.release()
+
+    def _run_ended(self) -> None:
+        """Hook: :meth:`run` is returning or raising, still holding its single-caller lock, so nothing it
+        does here can be raced by another run(). Nothing by default."""
 
     def interrupt(self) -> None:
         """Best-effort SIGINT to the running command's process GROUP (Ctrl-C it and its children).
@@ -7243,21 +7250,15 @@ class _BwrapShell(SandboxedShell):
                     del self._named[leaf]
         return True
 
-    def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
-        # A run() re-entered on the thread that holds a preflight (a signal handler, say) is refused as
-        # concurrent, and must not end the outer run's preflight (complement L3 r7). Read without `_lock`:
-        # a handler may interrupt this thread while it holds it (codex L3 r8); only this thread writes
-        # its own ident there.
-        outer = self._preflight_thread == threading.get_ident()
-        try:
-            return super().run(command, timeout=timeout)
-        finally:
-            if not outer:
-                self._end_preflight()   # a run refused before its spawn; a no-op once `_spawn` ended it
+    def _run_ended(self) -> None:
+        # A run refused before its spawn; a no-op once `_spawn` ended it. Inside run()'s single-caller lock,
+        # so a run() re-entered on this thread (a signal handler, say) is refused by that lock before it
+        # touches the preflight (L3 r7-r9: a guard for it here deadlocked on `_lock`, reproduced).
+        self._end_preflight()
 
     def _end_preflight(self) -> None:
-        """End the run thread's preflight (see `_preflight_done`); a no-op on any other thread, so a
-        second run() refused as concurrent, or start()'s own spawn, never ends another thread's."""
+        """End the run thread's preflight (see `_preflight_done`); a no-op on any other thread, so
+        start()'s own spawn never ends a run's."""
         with self._lock:
             if self._preflight_thread != threading.get_ident():
                 return
@@ -7318,15 +7319,16 @@ class _BwrapShell(SandboxedShell):
         finally:
             if self._relay is not None:
                 self._relay.stop()   # after the commands: nothing inside is left to use it
-            if drained:
+            # The shell lets go of its claim, and of its registration, only when it releases the claim.
+            # Until then (a preflight still outstanding, a group that did not empty, a leaf not settled)
+            # it keeps both: a spawn the preflight still makes is retagged onto the claim, and a later
+            # close(), or the exit hook's, releases it (L3 r8, RUN on w24: a claim taken off the shell left
+            # the late spawn's leaf untagged; codex L3 r9: the same after a group that did not empty).
+            if drained and not self.unemptied_groups and self._settled():
                 claim, self._ledger_claim = self._ledger_claim, None
                 _LIVE_BWRAP_SHELLS.discard(self)
-                if claim is not None and not self.unemptied_groups and self._settled():
+                if claim is not None:
                     _ledger_release(claim)
-            # Not drained: the shell keeps its claim and its registration, so a spawn the outstanding
-            # preflight still makes is retagged onto the claim and swept with the shell, and a later
-            # close() releases it (codex + glm + complement L3 r8: a detached claim left that leaf
-            # untagged; RUN on w24, the late spawn saw no claim).
 
     def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
         self._command_since = time.time()

@@ -1075,7 +1075,9 @@ def test_close_waits_for_an_admitted_command_until_its_spawn_is_registered(monke
     shell._preflight_thread = None
     shell._relay = None
     shell._ledger_claim = None
+    shell._groups = {}
     monkeypatch.setattr(confinement._BwrapShell, "_recheck", lambda self: None)
+    monkeypatch.setattr(confinement._BwrapShell, "_settled", lambda self: True)
     torn_down: list[bool] = []
     monkeypatch.setattr(confinement.SandboxedShell, "close", lambda self: torn_down.append(True))
 
@@ -1131,3 +1133,64 @@ def test_a_close_whose_wait_times_out_keeps_the_claim(monkeypatch):
     shell._end_preflight()
     shell.close()                                   # drained: the next close() releases it
     assert released == ["the-claim"] and shell._ledger_claim is None
+
+
+def test_a_close_that_cannot_settle_keeps_the_claim_for_the_next_close(monkeypatch):
+    """codex L3 r9: a close() whose groups did not empty, or whose leaf was not settled, took the claim off
+    the shell, so the close() that later emptied it could not release it. The shell lets go of its claim
+    and registration only when it releases the claim."""
+    import threading
+
+    shell = object.__new__(confinement._BwrapShell)
+    shell._lock = threading.Lock()
+    shell._closed = False
+    shell._groups = {}
+    shell._preflight_done = threading.Event()
+    shell._preflight_done.set()
+    shell._preflight_thread = None
+    shell._relay = None
+    shell._ledger_claim = "the-claim"
+    settled = [False]
+    monkeypatch.setattr(confinement._BwrapShell, "_settled", lambda self: settled[0])
+    monkeypatch.setattr(confinement.SandboxedShell, "close", lambda self: None)
+    released: list[str] = []
+    monkeypatch.setattr(confinement, "_ledger_release", released.append)
+    confinement._LIVE_BWRAP_SHELLS.add(shell)
+    try:
+        shell.close()
+        assert released == [] and shell._ledger_claim == "the-claim" and shell in confinement._LIVE_BWRAP_SHELLS
+        settled[0] = True
+        shell.close()
+        assert released == ["the-claim"] and shell._ledger_claim is None
+        assert shell not in confinement._LIVE_BWRAP_SHELLS
+    finally:
+        confinement._LIVE_BWRAP_SHELLS.discard(shell)
+
+
+def test_a_run_re_entered_on_the_run_thread_is_refused_without_touching_the_shells_lock():
+    """codex + complement L3 r9, reproduced on 6cd2e7a: a signal handler that re-entered run() while the
+    interrupted run held `_lock` hung on it. The run lock refuses it first, and the preflight is ended
+    inside that lock, so nothing else is taken."""
+    import threading
+
+    shell = object.__new__(confinement._BwrapShell)
+    shell._lock = threading.Lock()
+    shell._run_lock = threading.Lock()
+    shell._closed = False
+    shell._preflight_done = threading.Event()
+    shell._preflight_done.set()
+    shell._preflight_thread = None
+    result: list[str] = []
+
+    def handler_on_the_run_thread():
+        shell._run_lock.acquire()   # the interrupted run ...
+        shell._lock.acquire()       # ... inside its admission
+        try:
+            shell.run("echo from-the-handler")
+        except ConfinementError as exc:
+            result.append(str(exc))
+    t = threading.Thread(target=handler_on_the_run_thread, daemon=True)
+    t.start()
+    t.join(3)
+    assert not t.is_alive(), "a re-entered run() hung"
+    assert result and "single-caller" in result[0]
