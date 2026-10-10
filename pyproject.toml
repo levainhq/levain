@@ -104,6 +104,9 @@ dependencies = [
     # older anneal does not accept, and cancels every wrap by that token.
     # `>=0.9.41` (2026-10-10): 0.9.40/0.9.41 stop a pruned or deleted team entry coming back on the next
     # `team-import`; 0.9.41 is what 0.7.0 was tested against, and KNOWN_GOOD_ANNEAL moves with this floor.
+    # `>=0.9.42` (2026-10-10): an API gate. Every cockpit spore write passes `expected_version=` and
+    # `version_of=` to SporeStore's update/touch/descend/ascend (first in 0.9.42), which an older anneal
+    # does not accept. KNOWN_GOOD_ANNEAL moves with this floor.
     # `>=0.9.39` (2026-10-04): 0.9.38 added FRAMED `team-import` and carried a library-only regression (an endless
     # blank-line iterable looped in `import_ledger`); 0.9.39 fixes it, and KNOWN_GOOD_ANNEAL and this floor are one number.
     # `>=0.9.38` (2026-10-04): `team-import` reads FRAMED input (contract v2: one root and one author per ledger file),
@@ -123,7 +126,7 @@ dependencies = [
     # wrap's bound token). No migration-manifest entry and no schema changed in 0.9.30 or 0.9.31;
     # their API additions (`prepare_wrap(wrap_token=)` above, `Store.wrap_status_snapshot`,
     # `Store.keyword_candidates`) are additive and the seed does not depend on them.
-    "anneal-memory>=0.9.41,<0.10",
+    "anneal-memory>=0.9.42,<0.10",
     # The reply classifier (levain.firing.agent_reply.unreadable_tool_call) reads Markdown code regions with a
     # CommonMark parser rather than a hand-written one: four review rounds on a hand reader each found its next edge
     # (Phill 2026-10-05, "Let's do A"). Floor 4.0: 3.0.0 took 23 s on a reply of 5,000 reference definitions,
