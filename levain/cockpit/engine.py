@@ -39,6 +39,7 @@ TITLE_MAX = 160
 SOON_DAYS = 3
 POLICY_REVISION = 1  # hashed into the manifest etag; bumped when a tier or gesture policy changes
 NOW_ID = "now"
+PROCESS_GRACE_S = 5.0     # how long a joiner waits for the owner to process a finished read
 _STATUS_RANK = {"ok": 0, "empty": 0, "partial": 1, "stale": 2, "error": 3}
 
 
@@ -386,14 +387,16 @@ class Cockpit:
                 st.refresh_started = ctx.now
                 owner = True
             elif not fl.committed:
-                owner, wait = False, max(0.0, spec.timeout_s - (time.monotonic() - fl.started))
+                # the read's remaining budget PLUS the owner's processing grace: a joiner must not
+                # report a failure for a read the owner is about to publish as healthy
+                owner, wait = False, max(0.0, spec.timeout_s - (time.monotonic() - fl.started)) + PROCESS_GRACE_S
             else:
                 return self._plain_error(spec, st, "previous read still running past its timeout (source hung?)")
         if not owner:
             try:
                 return fl.snap.result(timeout=wait)
             except FutureTimeout:
-                return self._plain_error(spec, st, f"timed out after {wait:g}s")
+                return self._plain_error(spec, st, f"timed out waiting on the read in flight ({spec.timeout_s:g}s budget)")
 
         def work() -> None:
             try:
@@ -409,28 +412,39 @@ class Cockpit:
             threading.Thread(target=work, name="cockpit-read", daemon=True).start()
         except BaseException as exc:  # noqa: BLE001 - thread exhaustion fails THIS read and poisons nothing
             fl.raw.set_result(Fault(f"could not start a read: {type(exc).__name__}: {exc}"))
+        snap: _Snap | None = None
         try:
-            res: Any = fl.raw.result(timeout=spec.timeout_s)
-        except FutureTimeout:
-            ctx.abandon()
-            res = Fault(f"timed out after {spec.timeout_s:g}s")
-        if not isinstance(res, (Read, Absent, Fault)):
-            res = Fault(f"provider returned {type(res).__name__}, not Read/Absent/Fault")
-        try:
-            snap = self._process(spec, st, res, ctx)
-        except Exception as exc:  # noqa: BLE001 - a read that cannot be processed is an error read
-            with st.mu:
-                snap = self._fault(spec, st, f"{type(exc).__name__}: {exc}", _iso(ctx.now))
-        with st.lock:
-            st.snap = snap
-            st.last_completion = self._clock()
-            st.refresh_started = None
-            st.fresh = (snap.as_of, snap.status)
-            fl.committed = True
-            if fl.raw.done() and st.pflight is fl:
-                st.pflight = None
-        fl.snap.set_result(snap)
-        return snap
+            try:
+                res: Any = fl.raw.result(timeout=spec.timeout_s)
+            except FutureTimeout:
+                ctx.abandon()
+                res = Fault(f"timed out after {spec.timeout_s:g}s")
+            if not isinstance(res, (Read, Absent, Fault)):
+                res = Fault(f"provider returned {type(res).__name__}, not Read/Absent/Fault")
+            try:
+                snap = self._process(spec, st, res, ctx)
+            except Exception as exc:  # noqa: BLE001 - a read that cannot be processed is an error read
+                with st.mu:
+                    snap = self._fault(spec, st, f"{type(exc).__name__}: {exc}", _iso(ctx.now))
+            try:
+                done_at: datetime | None = self._clock()      # before the lock: a failing clock cannot strand the flight
+            except Exception:  # noqa: BLE001
+                done_at = None
+            with st.lock:
+                st.snap = snap
+                st.last_completion = done_at or ctx.now
+                st.refresh_started = None
+                st.fresh = (snap.as_of, snap.status)
+            return snap
+        finally:
+            # whatever happened above, the flight ends: it is marked committed, cleared if its source
+            # thread is done, and its joiners are released with the owner's snapshot or an error
+            with st.lock:
+                fl.committed = True
+                st.refresh_started = None
+                if fl.raw.done() and st.pflight is fl:
+                    st.pflight = None
+            fl.snap.set_result(snap or self._plain_error(spec, st, "the read could not be committed"))
 
     def _snap_for(self, spec: ProviderSpec, ctx: ReadContext) -> _Snap:
         st = self._state[spec.id]
@@ -820,8 +834,8 @@ class Cockpit:
     def freshness(self) -> dict[str, dict[str, Any]]:
         """``{panel_id: {as_of, status}}`` for every registered panel, ``now`` included (design §3.4).
         A client that got a 304 on a panel reads the panel's current age here. SEMANTICS: a panel's entry
-        is the outcome of its most recently STARTED read; a newer failure is newer information about the
-        source, so ``error`` is the right answer even if an older read succeeded. A client that sees
+        is its last COMMITTED read; reads of one panel run one at a time and commit in start order, so
+        a failure after a success reads ``error``. A client that sees
         ``error`` or ``unread`` re-fetches the panel. It is metadata only:
         it runs NO provider and computes no status of its own. A refresher panel reports its cached
         snapshot (liveness and aging rules applied); an on-demand panel reports its last served read,
