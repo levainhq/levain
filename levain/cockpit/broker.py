@@ -1,0 +1,955 @@
+"""levain.cockpit.broker: the one process-wide owner of ``cockpit.db`` that turns a T2/T3 cockpit
+write into a consented, journalled fire (K2b design §3, §4.2, §4.3, §6).
+
+A T2/T3 write never fires from the POST handler: it is ISSUED as a pending holding the JCS consent
+record (§3.1), DECIDED in one transaction, the commit point (§3.2), then APPLIED unit by unit
+through each store's ``EffectStore`` (§3.3) and FINISHED (§3.4). ``intent: "sign"`` returns the
+pending for a signature (``submit``); ``intent: "reported"`` decides in the issuing request, only in
+a reported install, only T2, only on a surface token.
+
+**One broker per data root, as one lifecycle state** (§4.2): ``STANDBY -> ACTIVATING -> ACTIVE ->
+DRAINING -> CLOSED``, plus ``INSTALL_DISABLED`` (never healed). The start sequence, run by the
+first start and by every heal: local-FS check -> exclusive non-blocking ``flock`` on
+``<data_root>/cockpit.lock`` -> open ``cockpit.db`` -> install checks -> ``expire_due`` -> recovery ->
+the re-drive thread -> write routes open. In STANDBY no ``cockpit.db`` is opened and every
+broker-backed read is a typed ``Fault``. Stop drains: write admission closes, admitted settlers are
+waited for (up to the drain deadline), and only then is the lock released; a settler still inside a
+store call keeps the lock held until process exit.
+
+The settlers are §4.2's: start recovery, the request that decided the op (once, right after its
+commit point), and the re-drive thread. Reads only wake the thread. One settler per op:
+an in-process mutex per ``operation_id``, which the thread skips while held.
+
+``_kp(name)`` is a kill point (§7): a no-op unless the constructor's ``kill_at`` argument names it,
+then ``os._exit(137)``. The environment is never read for it.
+"""
+from __future__ import annotations
+
+import contextlib
+import enum
+import fcntl
+import logging
+import os
+import tempfile
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from levain.autonomic.confirm import (
+    COCKPIT_NAMESPACE,
+    DEFAULT_SSH_KEYGEN,
+    UNAVAILABLE,
+    VERIFIED,
+    verify_cockpit_signature,
+)
+from levain.autonomic.journal import JournalCorruptError
+from levain.cockpit.consent import ConsentError, build_record, encode, utc_stamp, value_sha256
+from levain.cockpit.effects import (
+    SPORE_AUTHORITY_FIELDS,
+    SPORE_CANONICAL,
+    SPORES,
+    ApplyOutcome,
+    ApplyUnit,
+    Effect,
+    EffectState,
+    EffectStatus,
+    EffectStore,
+    MemberApply,
+    PermanentApplyRefusal,
+    Snapshot,
+    TransientApplyFault,
+    UnitApplyResult,
+    _stored_authority,
+    canonical_effect,
+    create_origin_key,
+    registration_refusals,
+    resolve_effect,
+    settle,
+    spore_resource_key,
+)
+from levain.cockpit.firejournal import (
+    CockpitDB,
+    CockpitFormatError,
+    IdempotencyConflict,
+    PendingCapExceeded,
+    UnitResult,
+    UnknownPending,
+    new_pending_id,
+)
+from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
+from levain.cockpit.results import Fault
+
+__all__ = ["Broker", "BrokerError", "COCKPIT_STORE", "INTERNAL_VERBS", "LOCK_NAME", "Lifecycle",
+           "PENDING_TTL", "STANDBY_FAULT", "label_class"]
+
+_log = logging.getLogger(__name__)
+
+LOCK_NAME = "cockpit.lock"
+PENDING_TTL = timedelta(minutes=15)      # an unsigned cockpit pending's life (flow design §4.3)
+COCKPIT_STORE = "cockpit"                # cockpit.db's own objects as a store (§4.1.4)
+STANDBY_FAULT = "write-disabled: another broker holds this data root"
+INTERNAL_VERBS = ("pending_cancel", "token_rotate")
+_TIERS = ("C1", "T2", "T3")
+
+
+class Lifecycle(str, enum.Enum):
+    STANDBY = "STANDBY"
+    ACTIVATING = "ACTIVATING"
+    ACTIVE = "ACTIVE"
+    DRAINING = "DRAINING"
+    CLOSED = "CLOSED"
+    INSTALL_DISABLED = "INSTALL_DISABLED"
+
+
+class BrokerError(Exception):
+    """A refusal the HTTP layer returns as ``{error: code, message}`` with ``status``."""
+
+    def __init__(self, code: str, status: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
+def label_class(decision_kind: str | None, install_class: str | None) -> str:
+    """A fire's label class (§5) before revocation: ALLOWED_REPORTED -> ``claims cockpit token``;
+    ALLOWED in a reported install -> ``signed · reported``; ALLOWED governed -> ``verified``."""
+    if decision_kind == "ALLOWED_REPORTED":
+        return "claims cockpit token"
+    if decision_kind == "ALLOWED":
+        return "signed · reported" if install_class == REPORTED else "verified"
+    return "unverified"
+
+
+# --- cockpit.db's own objects as an EffectStore (§3.5, §4.1.4, §13) ---------------------------------
+
+class _CockpitObjects:
+    """``pend:<id>`` (a pending's ``state``) and ``token:<name>`` (its ``generation``), applied to
+    ``cockpit.db`` by its own transactions. ``by`` is the deciding op's principal, recorded as the
+    canceller. No label: these fields are not provenance-bearing."""
+
+    name = COCKPIT_STORE
+    version_fields = ("state", "generation")
+    authority_fields = ("state", "generation")
+    store_assigned_fields: tuple[str, ...] = ()
+
+    def __init__(self, db: CockpitDB, *, by: str, now: datetime) -> None:
+        self.db, self.by, self.now = db, by, now
+
+    def snapshot(self, resource_key: str) -> Snapshot:
+        kind, _, ident = resource_key.partition(":")
+        try:
+            if kind == "pend":
+                row = {"state": self.db.outcome(ident).state}
+            elif kind == "token":
+                gen = self.db.token_generation(ident)
+                row = None if gen is None else {"generation": gen}
+            else:
+                raise PermanentApplyRefusal(f"{resource_key!r} is not a cockpit object")
+        except UnknownPending:
+            row = None
+        except (OSError, CockpitFormatError, JournalCorruptError) as exc:
+            raise TransientApplyFault.of(exc) from exc
+        return Snapshot(row, None)
+
+    def units(self, effects: Sequence[tuple[int, Effect]]) -> list[ApplyUnit]:
+        return [ApplyUnit(COCKPIT_STORE, (i,), (e,)) for i, e in effects]
+
+    def label_fields(self, effect: Effect, stored: Mapping[str, Any] | None) -> tuple[str, ...]:
+        return ()
+
+    def apply_unit(self, unit: ApplyUnit) -> UnitApplyResult:
+        if len(unit.effects) != 1:
+            raise PermanentApplyRefusal("a cockpit unit is one effect")
+        eff = unit.effects[0]
+        kind, _, ident = eff.resource_key.partition(":")
+        want = dict(eff.expect).get("fields")
+        if kind == "pend" and want == {"state": "WAITING"} and dict(eff.changes) == {"state": "CANCELLED"}:
+            res = self.db.cancel_as_effect(ident, by=self.by, now=self.now)
+        elif kind == "token" and isinstance(want, dict) and set(want) == {"generation"} \
+                and set(eff.changes) == {"generation"}:
+            res = self.db.rotate_token(ident, expect_generation=want["generation"],
+                                       new_generation=eff.changes["generation"], by=self.by,
+                                       now=self.now)
+        else:
+            raise PermanentApplyRefusal(f"no cockpit write for {eff.resource_key!r}")
+        outcome = {"already": ApplyOutcome.ALREADY, "applied": ApplyOutcome.APPLIED,
+                   "precondition_lost": ApplyOutcome.PRECONDITION_LOST}[res]
+        return UnitApplyResult(outcome, (MemberApply(None, dict(eff.changes)),))
+
+
+@dataclass(frozen=True)
+class _Built:
+    target: dict[str, Any]
+    effects: list[Effect]
+    pre_images: list[Any]
+
+
+class _Unbuildable(Exception):
+    """The verb's effect cannot be built from the object as it now stands (it moved since issue)."""
+
+
+# --- the broker -------------------------------------------------------------------------------------
+
+class Broker:
+    """The cockpit broker over ``data_root``. ``stores`` maps a store name to its ``EffectStore``;
+    ``install_class`` is the ``--install-class`` declaration (``None`` = none given); ``store_paths``
+    are the registered store paths the local-FS check covers; ``tier_of(verb, params, target)``
+    recomputes a registry verb's tier from a fresh read for the decision (§3.2.1), ``None`` meaning
+    the read faulted. ``kill_at`` names one kill point (§7)."""
+
+    def __init__(self, data_root: Path | str, *, stores: Mapping[str, EffectStore],
+                 install_class: str | None, store_paths: Sequence[Path | str] = (),
+                 tier_of: Callable[[str, Mapping[str, Any], Mapping[str, Any]], str | None] | None = None,
+                 clock: Callable[[], datetime] | None = None, kill_at: str | None = None,
+                 lock_wait: float = 10.0, lock_retry: float = 5.0, lock_poll: float = 0.25,
+                 drain_timeout: float = 5.0, min_wait: float = 0.2, max_wait: float = 5.0,
+                 ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                 marker_directory: Path | None = None) -> None:
+        for name, store in stores.items():
+            canonical = SPORE_CANONICAL if name == SPORES else None
+            refusals = registration_refusals(store, canonical)
+            if refusals or name == COCKPIT_STORE:
+                raise ValueError(f"store {name!r} refused at registration: {refusals or ['reserved name']}")
+        self.data_root = Path(data_root)
+        self.stores = dict(stores)
+        self.declared = install_class
+        self.install_class: str | None = None
+        self.store_paths = tuple(Path(p) for p in store_paths)
+        self.tier_of = tier_of
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._kill_at = kill_at
+        self._lock_wait, self._lock_retry, self._lock_poll = lock_wait, lock_retry, lock_poll
+        self._drain_timeout = drain_timeout
+        self._min_wait, self._max_wait = min_wait, max_wait
+        self.ssh_keygen = ssh_keygen
+        self._marker_directory = marker_directory
+
+        self._mu = threading.Lock()
+        self._wake = threading.Condition(self._mu)      # the re-drive thread's one condition (§4.2)
+        self._drained = threading.Condition(self._mu)
+        self._state = Lifecycle.STANDBY
+        self._started = False
+        self.disabled_reason: str | None = None
+        self._generation = 0
+        self._inflight = 0
+        self._op_locks: dict[str, threading.Lock] = {}
+        self._lock_fd: int | None = None
+        self.db: CockpitDB | None = None
+        self._thread: threading.Thread | None = None
+        self._healer: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    # -- lifecycle -------------------------------------------------------------------------------
+
+    @property
+    def state(self) -> Lifecycle:
+        with self._mu:
+            return self._state
+
+    @property
+    def enabled(self) -> bool:
+        return self.state is Lifecycle.ACTIVE
+
+    def start(self) -> Lifecycle:
+        """Run the start sequence once now; on a held lock stay STANDBY and heal in the background:
+        retried every ``lock_poll`` for ``lock_wait`` seconds, then every ``lock_retry`` (§4.2)."""
+        with self._mu:
+            if self._started:
+                return self._state
+            self._started = True
+        decision = decide_install(self.declared, self.data_root, marker_directory=self._marker_directory)
+        if decision.install_class is None:
+            return self._disable(decision.reason or "install check")
+        self.install_class = decision.install_class
+        if self._attempt():
+            return self.state
+        if self.state is Lifecycle.STANDBY:
+            self._healer = threading.Thread(target=self._heal, name="cockpit-broker-heal", daemon=True)
+            self._healer.start()
+        return self.state
+
+    def _disable(self, reason: str) -> Lifecycle:
+        with self._mu:
+            self._state = Lifecycle.INSTALL_DISABLED
+            self.disabled_reason = reason
+        _log.warning("cockpit broker disabled: %s", reason)
+        return Lifecycle.INSTALL_DISABLED
+
+    def _heal(self) -> None:
+        begun = self._clock_monotonic()
+        while not self._stop.is_set():
+            fast = self._clock_monotonic() - begun < self._lock_wait
+            if self._stop.wait(self._lock_poll if fast else self._lock_retry):
+                return
+            if self.state is not Lifecycle.STANDBY:
+                return
+            if self._attempt():
+                return
+
+    @staticmethod
+    def _clock_monotonic() -> float:
+        import time
+        return time.monotonic()
+
+    def _attempt(self) -> bool:
+        """The start sequence, in order (§4.2). True when ACTIVE; False leaves STANDBY (lock held
+        elsewhere) or INSTALL_DISABLED."""
+        problem = network_fs_problem([self.data_root, *self.store_paths])
+        if problem is not None:
+            self._disable(problem)
+            return False
+        try:
+            self.data_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as exc:
+            self._disable(f"data root {self.data_root}: {exc}")
+            return False
+        fd = os.open(self.data_root / LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        except BaseException:
+            os.close(fd)
+            raise
+        with self._mu:
+            if self._stop.is_set():
+                os.close(fd)
+                return False
+            self._lock_fd = fd
+            self._state = Lifecycle.ACTIVATING
+            # recovery below is a settler, so a stop during it drains like any other
+            self._inflight += 1
+        try:
+            try:
+                db = CockpitDB(self.data_root)
+                stored = db.set_install_class(self.install_class or "")
+                if stored != self.install_class:
+                    raise CockpitFormatError(f"journal was started as {stored!r}, not {self.install_class!r}")
+            except (CockpitFormatError, OSError) as exc:
+                self._release_after_disable(str(exc))
+                return False
+            self.db = db
+            now = self._clock()
+            db.expire_due(now)
+            self._recover(now)
+        finally:
+            with self._mu:
+                self._inflight -= 1
+                self._drained.notify_all()
+        with self._mu:
+            if self._state is not Lifecycle.ACTIVATING:
+                return False          # a stop arrived during recovery; it owns the lock now
+            self._state = Lifecycle.ACTIVE
+            self._thread = threading.Thread(target=self._redrive, name="cockpit-broker-redrive", daemon=True)
+            self._thread.start()
+        return True
+
+    def _release_after_disable(self, reason: str) -> None:
+        with self._mu:
+            fd, self._lock_fd = self._lock_fd, None
+            self._state = Lifecycle.INSTALL_DISABLED
+            self.disabled_reason = reason
+        if fd is not None:
+            os.close(fd)
+        _log.warning("cockpit broker disabled: %s", reason)
+
+    def stop(self) -> Lifecycle:
+        """DRAINING, then CLOSED (§4.2): admission closes, admitted settlers are waited for up to the
+        drain deadline, then the lock is released. A settler still running keeps it until exit."""
+        self._stop.set()
+        with self._mu:
+            if self._state in (Lifecycle.CLOSED, Lifecycle.INSTALL_DISABLED):
+                return self._state
+            if self._state is Lifecycle.STANDBY:
+                self._state = Lifecycle.CLOSED
+                return self._state
+            self._state = Lifecycle.DRAINING
+            self._wake.notify_all()
+            deadline = self._clock_monotonic() + self._drain_timeout
+            while self._inflight > 0:
+                left = deadline - self._clock_monotonic()
+                if left <= 0:
+                    break
+                self._drained.wait(left)
+            drained = self._inflight == 0
+            self._state = Lifecycle.CLOSED
+            fd = self._lock_fd if drained else None
+            if drained:
+                self._lock_fd = None
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=self._drain_timeout)
+        if fd is not None:
+            os.close(fd)
+        else:
+            _log.warning("cockpit broker: a settler outlived the drain; the lock is held until exit")
+        return Lifecycle.CLOSED
+
+    # -- admission, wakes, kill points -----------------------------------------------------------
+
+    def _unavailable(self) -> BrokerError:
+        state = self._state
+        if state is Lifecycle.INSTALL_DISABLED:
+            return BrokerError("install_disabled", 403, f"write-disabled: {self.disabled_reason}")
+        if state is Lifecycle.STANDBY:
+            return BrokerError("standby", 503, STANDBY_FAULT)
+        return BrokerError("broker_unavailable", 503, f"write-disabled: the broker is {state.value}")
+
+    @contextlib.contextmanager
+    def _admitted(self) -> Iterator[CockpitDB]:
+        with self._mu:
+            if self._state is not Lifecycle.ACTIVE or self.db is None:
+                raise self._unavailable()
+            self._inflight += 1
+            db = self.db
+        try:
+            yield db
+        finally:
+            with self._mu:
+                self._inflight -= 1
+                self._drained.notify_all()
+
+    def _bump(self) -> None:
+        """A commit created DECIDED work or moved a ``next_attempt_at``: a new deadline (§4.2)."""
+        with self._mu:
+            self._generation += 1
+            self._wake.notify_all()
+
+    def wake(self) -> None:
+        """What a read of a DECIDED op does: wake the thread, which still honours due times."""
+        with self._mu:
+            self._wake.notify_all()
+
+    def _kp(self, name: str) -> None:
+        if self._kill_at is not None and self._kill_at == name:
+            os._exit(137)
+
+    def _now(self) -> datetime:
+        return self._clock()
+
+    # -- principals ------------------------------------------------------------------------------
+
+    def principal_of(self, db: CockpitDB, credential: Mapping[str, Any]) -> str:
+        cls = credential.get("class")
+        if cls == "token":
+            name = credential.get("name")
+            if not isinstance(name, str) or not name:
+                raise BrokerError("credential_required", 403, "a token credential names its surface")
+            return f"token:{name}:{db.ensure_token(name)}"
+        if cls == "device":
+            fp = credential.get("fingerprint")
+            if not isinstance(fp, str) or not fp:
+                raise BrokerError("credential_required", 403, "a device credential names its key")
+            return f"device:{fp}"
+        raise BrokerError("credential_required", 403, "a write needs a credential")
+
+    @staticmethod
+    def principal_base_of(credential: Mapping[str, Any]) -> str | None:
+        if credential.get("class") == "token" and isinstance(credential.get("name"), str):
+            return f"token:{credential['name']}"
+        if credential.get("class") == "device" and isinstance(credential.get("fingerprint"), str):
+            return f"device:{credential['fingerprint']}"
+        return None
+
+    def replay(self, *, verb: str, params: Mapping[str, Any], intent: str | None,
+               credential: Mapping[str, Any], idempotency_key: str) -> dict[str, Any] | None:
+        """A replayed POST's recorded pending and outcome, found by its idempotency key BEFORE the
+        target is read again (the fire it made has moved the target's version), or None when the key
+        is new. The same key with other params is a 409 (§2). A reported pending still WAITING is left
+        to ``issue``, which decides it."""
+        base = self.principal_base_of(credential)
+        if base is None:
+            return None
+        with self._admitted() as db:
+            pid = db.find_idempotent(base, idempotency_key)
+            if pid is None:
+                return None
+            view = self._load(db, pid)
+            rec = view.record
+            asked = encode({"verb": verb, "intent": intent or "sign", "params": dict(params)})
+            if asked != encode({"verb": rec.get("verb"), "intent": rec.get("intent"), "params": rec.get("params")}):
+                raise BrokerError("idempotency_conflict", 409,
+                                  f"idempotency key {idempotency_key!r} is bound to another request")
+            if rec.get("intent") == "reported" and view.state == "WAITING":
+                return None
+            return self.result(db, pid, replay=True)
+
+    # -- building a verb's effects (§3.1.1) -------------------------------------------------------
+
+    def _build(self, db: CockpitDB, verb: str, params: Mapping[str, Any], target: Mapping[str, Any],
+               pid: str, *, at_issue: bool) -> _Built:
+        """The verb's effects from a lock-free snapshot. ``BrokerError`` for a refusal,
+        ``TransientApplyFault`` for a read that faulted, ``_Unbuildable`` (at decide) for an object
+        that moved so far the effect no longer builds."""
+        try:
+            if verb in SPORE_CANONICAL:
+                return self._build_spore(verb, params, target, pid, at_issue=at_issue)
+            if verb == "pending_cancel":
+                return self._build_cancel(db, target)
+            if verb == "token_rotate":
+                return self._build_rotate(db, params, target)
+        except (ValueError, ConsentError) as exc:
+            if not at_issue:
+                raise _Unbuildable(str(exc)) from exc
+            raise BrokerError("refused", 409, str(exc)) from exc
+        raise BrokerError("not_built", 501, f"{verb!r} has no EffectStore adapter; it cannot fire "
+                                            "through the broker")
+
+    def _spores(self) -> Any:
+        store = self.stores.get(SPORES)
+        if store is None:
+            raise BrokerError("not_built", 501, "no spore store is registered with the broker")
+        return store
+
+    def _build_spore(self, verb: str, params: Mapping[str, Any], target: Mapping[str, Any], pid: str,
+                     *, at_issue: bool) -> _Built:
+        es = self._spores()
+        if verb == "spore_seed":
+            ok = create_origin_key(pid, 0)
+            snap = es.snapshot(spore_resource_key(ok))
+            eff = canonical_effect(verb, params, snap.row, origin_key=ok, version_of=es.version_of)
+            return _Built({"kind": "create", "panel_id": target.get("panel_id")}, [eff], [None])
+        if at_issue:
+            ok = self._origin_key_of_row(es, target)
+        else:
+            ok = target.get("origin_key")
+        snap = es.snapshot(spore_resource_key(ok))
+        if at_issue and target.get("row_version") is not None and snap.version != target["row_version"]:
+            raise BrokerError("stale", 409, f"row {target.get('row_id')!r} changed since it was rendered")
+        eff = canonical_effect(verb, params, snap.row, version_of=es.version_of)
+        pre = None if snap.row is None else {f: _stored_authority(snap.row, f) for f in SPORE_AUTHORITY_FIELDS}
+        return _Built({"kind": "row", "panel_id": target.get("panel_id"), "row_id": target.get("row_id"),
+                       "origin_key": ok}, [eff], [pre])
+
+    @staticmethod
+    def _origin_key_of_row(es: Any, target: Mapping[str, Any]) -> str:
+        """The spore's ``origin_key``, read by its id. A row read with none is REFUSED: no label
+        resource can name it, and none is invented (§2)."""
+        from anneal_memory.spores import SporeError, SporeStore
+
+        row_id = str(target.get("row_id") or "")
+        if not row_id.startswith("spore:"):
+            raise BrokerError("bad_target", 400, f"{row_id!r} is not a spore row")
+        try:
+            row = SporeStore(es.path).get(row_id[len("spore:"):])
+        except (SporeError, OSError, ValueError) as exc:
+            raise TransientApplyFault.of(exc) from exc
+        if row is None:
+            raise BrokerError("stale", 409, f"row {row_id!r} is gone")
+        ok = row.get("origin_key")
+        if not isinstance(ok, str) or not ok:
+            raise BrokerError("refused", 409, f"row {row_id!r} has no origin_key: no label resource yet")
+        return ok
+
+    def _build_cancel(self, db: CockpitDB, target: Mapping[str, Any]) -> _Built:
+        tid = target.get("pending_id")
+        if not isinstance(tid, str):
+            raise ValueError("a pending_cancel names its pending")
+        try:
+            state = db.outcome(tid).state
+        except UnknownPending as exc:
+            raise ValueError(f"no pending {tid!r}") from exc
+        if state != "WAITING":
+            raise ValueError(f"pending {tid} is {state}, not WAITING")
+        eff = Effect(f"pend:{tid}", COCKPIT_STORE, {"fields": {"state": "WAITING"}},
+                     {"state": "CANCELLED"})
+        return _Built({"kind": "pending", "pending_id": tid}, [eff], [{"state": state}])
+
+    def _build_rotate(self, db: CockpitDB, params: Mapping[str, Any], target: Mapping[str, Any]) -> _Built:
+        name = target.get("name")
+        if not isinstance(name, str) or params.get("token") != name:
+            raise ValueError("a token_rotate names its token in the target and params alike")
+        gen = db.token_generation(name)
+        if gen is None:
+            raise ValueError(f"no token {name!r}")
+        eff = Effect(f"token:{name}", COCKPIT_STORE, {"fields": {"generation": gen}},
+                     {"generation": gen + 1})
+        return _Built({"kind": "token", "name": name}, [eff], [{"generation": gen}])
+
+    def _record(self, *, pid: str, verb: str, intent: str, built: _Built, params: Mapping[str, Any],
+                tier: str, fence: Mapping[str, Any], issued_at: str, expires_at: str) -> bytes:
+        return encode(build_record(
+            operation_id=pid, verb=verb, intent=intent,  # type: ignore[arg-type]
+            target=built.target, params=dict(params), effects=[e.to_record() for e in built.effects],
+            tier=tier, fence=fence, issued_at=issued_at, expires_at=expires_at))
+
+    # -- ISSUE (§3.1) ------------------------------------------------------------------------------
+
+    def issue(self, *, verb: str, params: Mapping[str, Any], target: Mapping[str, Any], tier: str,
+              credential: Mapping[str, Any], intent: str | None = None,
+              idempotency_key: str | None = None, harness: str = "cockpit") -> dict[str, Any]:
+        """Record a WAITING pending for this write; ``intent`` absent is ``sign``. A ``reported``
+        intent decides in this request (§3.1.3)."""
+        intent = "sign" if intent is None else intent
+        if intent not in ("sign", "reported"):
+            raise BrokerError("bad_request", 400, f"'intent' must be sign or reported, not {intent!r}")
+        if tier not in ("T2", "T3"):
+            raise BrokerError("bad_request", 400, f"the broker takes T2/T3 writes, not {tier!r}")
+        if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key):
+            raise BrokerError("bad_request", 400, "'idempotency_key' must be a non-empty string")
+        with self._admitted() as db:
+            if intent == "reported":
+                why = self._reported_refusal(tier, credential, harness)
+                if why is not None:
+                    raise BrokerError("refused", 403, why)
+            principal = self.principal_of(db, credential)
+            pid = new_pending_id()
+            try:
+                built = self._build(db, verb, params, target, pid, at_issue=True)
+            except TransientApplyFault as exc:
+                raise BrokerError("source_unavailable", 503, f"could not read the target: {exc}") from exc
+            now = self._now()
+            raw = self._record(pid=pid, verb=verb, intent=intent, built=built, params=params, tier=tier,
+                               fence={"policy_rev": db.policy_rev()}, issued_at=utc_stamp(now),
+                               expires_at=utc_stamp(now + PENDING_TTL))
+            try:
+                res = db.issue(record_bytes=raw, principal=principal,
+                               idempotency_key=idempotency_key or ("auto:" + pid), now=now,
+                               harness=harness, cap_exempt=intent == "reported")
+            except PendingCapExceeded as exc:
+                raise BrokerError("pending_cap", 429, str(exc)) from exc
+            except IdempotencyConflict as exc:
+                raise BrokerError("idempotency_conflict", 409, str(exc)) from exc
+            self._kp("issued")
+            if intent == "reported" and res.outcome.state == "WAITING":
+                # a reported pending is decided by the request that issued it, or by its replay
+                # when that request died after ``issued``
+                return self._decide(db, res.pending_id, "ALLOWED_REPORTED", None, None)
+            return self.result(db, res.pending_id, replay=res.replay)
+
+    def fire_reported(self, **kw: Any) -> dict[str, Any]:
+        """``issue`` with ``intent: "reported"``: a T2 on a surface token in a reported install."""
+        return self.issue(intent="reported", **kw)
+
+    def _reported_refusal(self, tier: str, credential: Mapping[str, Any], harness: str) -> str | None:
+        if self.install_class != REPORTED:
+            return "a reported fire needs a reported install"
+        if harness != "cockpit":
+            return "ALLOWED-REPORTED is the cockpit harness's only"
+        if credential.get("class") != "token":
+            return "a reported fire rides a surface token; a device signs"
+        if tier != "T2":
+            return f"a {tier} on the token alone is refused: it needs a laptop-presence signature"
+        return None
+
+    # -- DECIDE (§3.2) ----------------------------------------------------------------------------
+
+    def submit(self, pending_id: str, signature: Any) -> dict[str, Any]:
+        """A signature over a ``sign`` pending's STORED bytes. A signature that does not verify is a
+        4xx and spends nothing: the pending stays WAITING (§3.2.1)."""
+        with self._admitted() as db:
+            db.expire_due(self._now())
+            view = self._load(db, pending_id)
+            if view.state != "WAITING":
+                return self.result(db, pending_id, replay=True)
+            if view.record.get("intent") != "sign":
+                raise BrokerError("refused", 409, "a reported pending takes no signature")
+            if not isinstance(signature, str) or not signature:
+                raise BrokerError("bad_request", 400, "'signature' is required")
+            fp = self._verify(db, view.record_bytes, signature)
+            return self._decide(db, pending_id, "ALLOWED", fp, signature)
+
+    def _verify(self, db: CockpitDB, message: bytes, signature: str) -> str:
+        """The verified signer's fingerprint (§6.5), against a signers file generated from ``keys``
+        for this verification into a fresh ``mkstemp`` file in the data root."""
+        keys = db.signer_keys()
+        fd, path = tempfile.mkstemp(prefix=".signers-", dir=self.data_root)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                for principal, public_key in keys:
+                    fh.write(f'{principal} namespaces="{COCKPIT_NAMESPACE}" {public_key}\n')
+            verdict = verify_cockpit_signature(message, signature, path,
+                                               owners=frozenset({0, os.getuid()}),
+                                               ssh_keygen=self.ssh_keygen)
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+        if verdict.status == UNAVAILABLE:
+            raise BrokerError("verifier_unavailable", 503, "the signature could not be checked")
+        if verdict.status != VERIFIED or verdict.principal is None:
+            raise BrokerError("bad_signature", 400, "the signature does not verify over this pending")
+        if db.key_fingerprint(verdict.principal) != verdict.fingerprint:
+            raise BrokerError("bad_signature", 400, "the signing key is not the enrolled key")
+        assert verdict.fingerprint is not None
+        return verdict.fingerprint
+
+    def _recompute(self, db: CockpitDB, view: Any) -> tuple[bytes | None, list[Any]]:
+        """§3.2.1: every effect's object read again, tier and canonical effects recomputed, the
+        record rebuilt with the stored fence and times. ``(None, [])`` when a read faulted."""
+        rec = view.record
+        try:
+            built = self._build(db, rec["verb"], rec.get("params") or {}, rec.get("target") or {},
+                                view.pending_id, at_issue=False)
+        except TransientApplyFault:
+            return None, []
+        except _Unbuildable:
+            # the object moved so far the effect no longer builds: every expect differs, so the
+            # decision ends STALE "changed" through the one comparison (§3.2.2)
+            fx = [dict(e, expect={"unbuildable": True}) for e in rec["effects"]]
+            moved = dict(rec, effects=fx)
+            return encode(moved), [None] * len(fx)
+        tier = rec.get("tier")
+        if self.tier_of is not None and rec["verb"] not in INTERNAL_VERBS:
+            tier = self.tier_of(rec["verb"], rec.get("params") or {}, rec.get("target") or {})
+            if tier is None:
+                return None, []
+        elif rec["verb"] == "pending_cancel":
+            tier = self._target_tier(db, rec.get("target") or {}) or tier
+        raw = self._record(pid=view.pending_id, verb=rec["verb"], intent=rec["intent"], built=built,
+                           params=rec.get("params") or {}, tier=str(tier), fence=rec["fence"],
+                           issued_at=rec["issued_at"], expires_at=rec["expires_at"])
+        return raw, built.pre_images
+
+    @staticmethod
+    def _target_tier(db: CockpitDB, target: Mapping[str, Any]) -> str | None:
+        try:
+            return str(db.load(str(target.get("pending_id"))).record.get("tier"))
+        except (UnknownPending, JournalCorruptError):
+            return None
+
+    def _decide(self, db: CockpitDB, pid: str, kind: str, signer_fp: str | None,
+                signature: str | None) -> dict[str, Any]:
+        view = self._load(db, pid)
+        if view.state != "WAITING":
+            return self.result(db, pid, replay=True)
+        recomputed, pre_images = self._recompute(db, view)
+        self._kp("verified")
+        out = db.decide(operation_id=pid, decision_kind=kind, recomputed=recomputed,  # type: ignore[arg-type]
+                        now=self._now(), signer_fp=signer_fp, signature=signature,
+                        pre_images=pre_images if recomputed is not None else [])
+        if out.decided:
+            self._bump()
+            self._kp("decided")
+            # the deciding request is one of the three settlers: its own op, once (§4.2)
+            self._settle_pass(db, pid, now=self._now(), mode="own")
+        elif kind == "ALLOWED" and out.state == "WAITING":
+            raise BrokerError("source_unavailable", 503, "a source read faulted; the signature is unspent")
+        return self.result(db, pid)
+
+    # -- CANCEL (§3.5) and rotation (§13) ---------------------------------------------------------
+
+    def cancel(self, pending_id: str, *, credential: Mapping[str, Any], intent: str | None = None,
+               idempotency_key: str | None = None) -> dict[str, Any]:
+        """C1 on the canceller's own pending; on another principal's, a pending of that pending's
+        tier whose one effect cancels it (§3.5)."""
+        with self._admitted() as db:
+            principal = self.principal_of(db, credential)
+            view = self._load(db, pending_id)
+            base = principal.rpartition(":")[0] if principal.startswith("token:") else principal
+            if view.principal_base == base:
+                out = db.cancel(pending_id, principal, self._now())
+                if out.state != "CANCELLED":
+                    raise BrokerError("refused", 409, f"pending {pending_id} is {out.state}; "
+                                                      "only a WAITING pending is cancelled")
+                return self.result(db, pending_id)
+            tier = str(view.record.get("tier"))
+        return self.issue(verb="pending_cancel", params={}, target={"kind": "pending", "pending_id": pending_id},
+                          tier=tier, credential=credential, intent=intent, idempotency_key=idempotency_key)
+
+    def rotate_token(self, name: str, *, credential: Mapping[str, Any], intent: str | None = None,
+                     idempotency_key: str | None = None) -> dict[str, Any]:
+        """Rotation is a T3 act on ``tokens`` (§13): its one effect moves the generation to the
+        absolute g+1 and cancels the old generation's WAITING pendings in one transaction."""
+        return self.issue(verb="token_rotate", params={"token": name}, target={"kind": "token", "name": name},
+                          tier="T3", credential=credential, intent=intent, idempotency_key=idempotency_key)
+
+    # -- reads ------------------------------------------------------------------------------------
+
+    def outcome(self, pending_id: str) -> dict[str, Any] | Fault:
+        """A broker-backed read: a typed ``Fault`` unless ACTIVE (§4.2). A DECIDED op only wakes the
+        thread; a read never settles."""
+        try:
+            with self._admitted() as db:
+                out = self.result(db, pending_id)
+        except BrokerError as exc:
+            return Fault(str(exc))
+        if out["state"] == "applying":
+            self.wake()
+        return out
+
+    def field_label(self, resource_key: str, field: str, value: Any) -> str | Fault:
+        """The label class of a field's current value (§5), from the latest matching label row."""
+        try:
+            with self._admitted() as db:
+                row = db.label_for(resource_key, field, value_sha256(value))
+        except BrokerError as exc:
+            return Fault(str(exc))
+        return "unverified" if row is None else label_class(row.decision_kind, self.install_class)
+
+    def result(self, db: CockpitDB, pid: str, *, replay: bool = False) -> dict[str, Any]:
+        view = self._load(db, pid)
+        state = "applying" if view.state == "DECIDED" else view.state
+        out: dict[str, Any] = {"ok": True, "pending_id": pid, "state": state, "reason": view.reason,
+                               "verb": view.record.get("verb"), "tier": view.record.get("tier"),
+                               "intent": view.record.get("intent"), "decision_kind": view.decision_kind,
+                               "replay": replay}
+        if view.decision_kind is not None:
+            out["label"] = label_class(view.decision_kind, self.install_class)
+        if view.state == "WAITING":
+            out["record"] = view.record_bytes.decode("utf-8")
+            out["expires_at"] = view.record.get("expires_at")
+        return out
+
+    @staticmethod
+    def _load(db: CockpitDB, pid: str) -> Any:
+        try:
+            return db.load(pid)
+        except UnknownPending as exc:
+            raise BrokerError("not_found", 404, f"no pending {pid!r}") from exc
+
+    # -- APPLY + FINISH: the settle pass (§3.3, §3.4, §4.2) ----------------------------------------
+
+    def recover(self) -> int:
+        """Start recovery, on demand (§4.2, §7): every DECIDED op's due units, a never-faulted unit
+        due now. Returns the number of ops passed over."""
+        with self._admitted() as db:
+            return self._recover(self._now(), db)
+
+    def _recover(self, now: datetime, db: CockpitDB | None = None) -> int:
+        db = db or self.db
+        assert db is not None
+        ops = db.decided_ops()
+        for pid in ops:
+            try:
+                self._settle_pass(db, pid, now=now, mode="start")
+            except JournalCorruptError:
+                _log.exception("cockpit broker: op %s is corrupt; failing it closed", pid)
+        return len(ops)
+
+    def _op_lock(self, pid: str) -> threading.Lock:
+        with self._mu:
+            lock = self._op_locks.get(pid)
+            if lock is None:
+                lock = self._op_locks[pid] = threading.Lock()
+            return lock
+
+    def _stores_for(self, db: CockpitDB, principal: str, now: datetime) -> dict[str, Any]:
+        return {**self.stores, COCKPIT_STORE: _CockpitObjects(db, by=principal, now=now)}
+
+    def _settle_pass(self, db: CockpitDB, pid: str, *, now: datetime, mode: str) -> None:
+        """One pass over an op: every PLANNED unit in order through ``settle`` (``mode`` "own": the
+        deciding request's, every unit; "start" and "thread": only units due, a never-faulted unit
+        due at once at start and ``decided_at`` + 5 s for the thread), then FINISH once none is
+        planned. The op's mutex is held for the pass; a held mutex skips it."""
+        lock = self._op_lock(pid)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            view = db.load(pid)
+            if view.state != "DECIDED":
+                return
+            try:
+                effects = [Effect.from_record(e) for e in view.record["effects"]]
+            except ValueError as exc:
+                raise JournalCorruptError(f"cockpit op {pid}: {exc}") from exc
+            stores = self._stores_for(db, view.principal, now)
+            rows = {r.idx: r for r in view.effects}
+            for u, unit in enumerate(self._units(effects, stores)):
+                members = [rows[i] for i in unit.indices]
+                if all(m.status != "PLANNED" for m in members):
+                    continue
+                if mode != "own" and self._not_due(view, members[0], now, at_start=mode == "start"):
+                    continue
+                if unit.store not in stores:
+                    db.record_unit(pid, [UnitResult(i, "UNAPPLIED", "store gone") for i in unit.indices], now)
+                    rows = {r.idx: r for r in db.load(pid).effects}
+                    continue
+                prior = {i: EffectState(EffectStatus(r.status), r.native_id) for i, r in rows.items()}
+                try:
+                    res = settle(unit, stores[unit.store], prior)
+                except TransientApplyFault as fault:
+                    db.record_fault(pid, unit.indices, f"{fault.fault_class}: {fault.message}", now)
+                    self._bump()
+                    rows = {r.idx: r for r in db.load(pid).effects}
+                    continue
+                if res.status is EffectStatus.PLANNED:
+                    continue          # waits on a still-planned unit it refers to (§4.1.2)
+                self._kp(f"applied:{u}")
+                db.record_unit(pid, self._unit_results(unit, res, prior), now)
+                self._kp(f"journaled:{u}")
+                rows = {r.idx: r for r in db.load(pid).effects}
+            if all(r.status != "PLANNED" for r in rows.values()):
+                db.finish(pid, now)
+                self._kp("finished")
+        finally:
+            lock.release()
+
+    @staticmethod
+    def _units(effects: Sequence[Effect], stores: Mapping[str, Any]) -> list[ApplyUnit]:
+        # §4.0: each maximal run of one store's effects, grouped by that store; an effect on a store
+        # no longer registered is its own unit, recorded "store gone"
+        out: list[ApplyUnit] = []
+        run: list[tuple[int, Effect]] = []
+
+        def flush() -> None:
+            if not run:
+                return
+            store = stores.get(run[0][1].store)
+            if store is None:
+                out.extend(ApplyUnit(e.store, (i,), (e,)) for i, e in run)
+            else:
+                out.extend(store.units(list(run)))
+            run.clear()
+
+        for i, e in enumerate(effects):
+            if run and run[-1][1].store != e.store:
+                flush()
+            run.append((i, e))
+        flush()
+        return out
+
+    @staticmethod
+    def _not_due(view: Any, row: Any, now: datetime, *, at_start: bool) -> bool:
+        if row.next_attempt_at is None and at_start:
+            return False
+        due = view.due_at(row)
+        return due is not None and due > now
+
+    @staticmethod
+    def _unit_results(unit: ApplyUnit, res: Any, prior: Mapping[int, EffectState]) -> list[UnitResult]:
+        if res.status is EffectStatus.UNAPPLIED:
+            return [UnitResult(i, "UNAPPLIED", res.reason or "refused") for i in unit.indices]
+        out = []
+        by_idx = {m.idx: m for m in res.members}
+        for i, eff in zip(unit.indices, unit.effects):
+            m = by_idx[i]
+            resolved = resolve_effect(eff, i, prior)
+            proj = resolved.projection or {}
+            labels = [(f, value_sha256(proj[f])) for f in m.label_fields if f in proj]
+            out.append(UnitResult(i, "APPLIED", None, m.native_id, labels))
+        return out
+
+    # -- the re-drive thread (§4.2) ---------------------------------------------------------------
+
+    def _redrive(self) -> None:
+        while True:
+            with self._mu:
+                if self._state is not Lifecycle.ACTIVE:
+                    return
+                seen = self._generation
+            due: datetime | None = None
+            try:
+                with self._admitted() as db:
+                    now = self._now()
+                    for pid in db.due_ops(now):
+                        try:
+                            self._settle_pass(db, pid, now=now, mode="thread")
+                        except JournalCorruptError:
+                            _log.exception("cockpit broker: op %s is corrupt; failing it closed", pid)
+                    due = db.earliest_due()
+            except BrokerError:
+                return
+            except Exception:  # noqa: BLE001 - the thread outlives one bad pass; the backstop is 5 s
+                _log.exception("cockpit broker: re-drive pass failed")
+            now = self._now()
+            wait = self._max_wait if due is None else (due - now).total_seconds()
+            wait = min(max(wait, self._min_wait), self._max_wait)
+            with self._mu:
+                if self._state is not Lifecycle.ACTIVE:
+                    return
+                if self._generation == seen:
+                    self._wake.wait(wait)

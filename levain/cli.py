@@ -660,6 +660,18 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     web_p.add_argument(
+        "--install-class",
+        choices=["reported"],
+        default=None,
+        dest="install_class",
+        help=(
+            "Declare this install's class for the cockpit broker (T2/T3 writes). `reported` is "
+            "the only class declared here: a write fired on the surface token is labelled "
+            "'claims cockpit token', and signatures read 'signed · reported'. With no declaration "
+            "and no governed marker, T2/T3 writes answer 'run the installer'."
+        ),
+    )
+    web_p.add_argument(
         "--chat",
         action="append",
         type=Path,
@@ -1489,6 +1501,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         api_key=args.api_key,
         max_iterations=args.max_iterations,
         turn_seconds=args.turn_seconds,
+        install_class=args.install_class,
     )
 
 

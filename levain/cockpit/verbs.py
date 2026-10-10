@@ -43,6 +43,7 @@ from levain.writes import (ActionVerb, EditError, _apply_operator_state_edit, _n
                            apply_action, apply_edit)
 
 if TYPE_CHECKING:
+    from levain.cockpit.broker import Broker
     from levain.cockpit.engine import Cockpit
     from levain.jobs import JobRuntime
     from levain.writes import WriteScope
@@ -519,7 +520,7 @@ def _check_value_version(cockpit: "Cockpit", panel_id: str, supplied: Any) -> No
 def dispatch(
     *, registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | None", req: Any,
     credential: dict[str, Any], install_class: str, route: Literal["cockpit", "edit", "action"],
-    job_runtime: "JobRuntime | None" = None,
+    job_runtime: "JobRuntime | None" = None, broker: "Broker | None" = None,
 ) -> dict[str, Any]:
     if credential.get("class") not in ("token", "device"):
         raise _refuse("credential_required", 403, "a write needs a credential (the write token)")
@@ -530,7 +531,7 @@ def dispatch(
     today = cockpit.today()
 
     if route == "edit":
-        return _legacy_edit(registry, cockpit, scope, req, credential, install_class, today)
+        return _legacy_edit(registry, cockpit, scope, req, credential, install_class, today, broker)
 
     if route == "action":
         name = req.get("verb")
@@ -574,6 +575,9 @@ def dispatch(
     if intent is not None and intent not in _INTENTS:
         raise _refuse("bad_request", 400, f"'intent' must be one of {list(_INTENTS)}")
 
+    replayed = _broker_replay(broker, verb, params, intent, credential, req.get("idempotency_key"))
+    if replayed is not None:
+        return replayed
     row = _read_target(cockpit, verb, panel_id, req.get("row_id"))
     if row is not None:
         if verb.applies_to is not None and not verb.applies_to(row):
@@ -582,11 +586,12 @@ def dispatch(
             raise _refuse("stale", 409, f"row {row['id']!r} changed since it was rendered")
     elif verb.binding == "value":
         _check_value_version(cockpit, panel_id, req.get("panel_version"))
-    if "idempotency_key" in req and not verb.idempotent:
-        raise _refuse("bad_request", 400, f"{verb.name!r} is not idempotent; it takes no idempotency_key")
 
     tier = verb.tier(params, row, UNVERIFIED, today)
     floor = verb.rendered_tier(row, UNVERIFIED, today)
+    # a broker pending's replay is keyed by it (K2b §2), so a T2/T3 takes one on any verb
+    if "idempotency_key" in req and not verb.idempotent and tier == "C1":
+        raise _refuse("bad_request", 400, f"{verb.name!r} is not idempotent; it takes no idempotency_key")
     gesture = gesture_for(tier, credential["class"], install_class)
     if req.get("dry_run") is True:
         return {"ok": True, "dry_run": True, "verb": verb.name, "tier": tier, "rendered_tier": floor,
@@ -594,7 +599,10 @@ def dispatch(
     if TIERS.index(tier) > TIERS.index(floor) and intent is None:
         raise _refuse("needs_intent", 409, f"these params raise {verb.name!r} from {floor} to {tier}; "
                       "send 'intent' to proceed")
-    _refuse_unless_c1(verb, tier, credential, install_class)
+    if tier != "C1":
+        _require_confirm(verb, req)
+        return _to_broker(verb, tier, credential, install_class, broker, params=params, row=row,
+                          panel_id=panel_id, intent=intent, idempotency_key=req.get("idempotency_key"))
     _require_confirm(verb, req)
     if registry.is_downstream(verb.name):
         return _fire_downstream(registry, verb, scope, params, req, job_runtime, panel_id)
@@ -631,14 +639,83 @@ def _fire_downstream(registry: VerbRegistry, verb: VerbSpec, scope: "WriteScope"
                         bind=None if panel_id is None else {"panel_id": panel_id})
 
 
-def _refuse_unless_c1(verb: VerbSpec, tier: Tier, credential: dict[str, Any], install_class: str) -> None:
-    """§4.3: T2 and T3 never fire from the POST handler. Until K2b's broker exists, refuse them."""
+def _refuse_unless_c1(verb: VerbSpec, tier: Tier, credential: dict[str, Any], install_class: str,
+                      broker: "Broker | None" = None) -> None:
+    """§4.3: T2 and T3 never fire from the POST handler; with no write-enabled broker they are
+    refused, naming why."""
     if tier == "C1":
         return
     gesture = gesture_for(tier, credential["class"], install_class)
+    if broker is None:
+        why = "which this build does not have"
+    else:
+        from levain.cockpit.broker import Lifecycle
+
+        state = broker.state
+        if state is Lifecycle.STANDBY:
+            raise _refuse("standby", 503, f"{verb.name!r} fires only through the broker, and another "
+                                          "broker holds this data root (write-disabled)")
+        why = (f"which is disabled here: {broker.disabled_reason}" if state is Lifecycle.INSTALL_DISABLED
+               else f"which is {state.value}")
     raise _refuse("needs_broker", 403,
-                  f"{verb.name!r} is {tier} here (gesture {gesture}); it fires only through the broker, "
-                  "which this build does not have")
+                  f"{verb.name!r} is {tier} here (gesture {gesture}); it fires only through the broker, {why}")
+
+
+def _broker_replay(broker: "Broker | None", verb: VerbSpec, params: dict[str, Any], intent: str | None,
+                   credential: dict[str, Any], key: Any) -> dict[str, Any] | None:
+    """K2b §2: a replayed POST returns its recorded pending and outcome. It is looked up before the
+    target's version is compared, because the fire it made moved that version."""
+    if broker is None or not broker.enabled or not isinstance(key, str) or not key:
+        return None
+    from levain.cockpit.broker import BrokerError
+
+    try:
+        return broker.replay(verb=verb.name, params=params, intent=intent, credential=credential,
+                             idempotency_key=key)
+    except BrokerError as exc:
+        raise _refuse(exc.code, exc.status, str(exc)) from exc
+
+
+def _to_broker(verb: VerbSpec, tier: Tier, credential: dict[str, Any], install_class: str,
+               broker: "Broker | None", *, params: dict[str, Any], row: dict[str, Any] | None,
+               panel_id: str | None, intent: str | None, idempotency_key: Any) -> dict[str, Any]:
+    """§4.3, K2b §3.1: a T2/T3 becomes a broker pending. ``intent`` absent is ``sign``; ``reported``
+    fires in this request in a reported install (T2 on a token only, the broker's check)."""
+    if broker is None or not broker.enabled:
+        _refuse_unless_c1(verb, tier, credential, install_class, broker)
+    assert broker is not None
+    from levain.cockpit.broker import BrokerError
+
+    if verb.binding == "row":
+        assert row is not None
+        target: dict[str, Any] = {"kind": "row", "panel_id": panel_id, "row_id": row["id"],
+                                  "row_version": row["version"]}
+    elif verb.binding == "create":
+        target = {"kind": "create", "panel_id": panel_id}
+    else:
+        target = {"kind": verb.binding, "panel_id": panel_id}
+    try:
+        return broker.issue(verb=verb.name, params=params, target=target, tier=tier, credential=credential,
+                            intent=intent, idempotency_key=idempotency_key)
+    except BrokerError as exc:
+        raise _refuse(exc.code, exc.status, str(exc)) from exc
+
+
+def retier(registry: "VerbRegistry", cockpit: "Cockpit", verb_name: str, params: dict[str, Any],
+           target: dict[str, Any]) -> Tier | None:
+    """The kernel's tier for a pending's verb against its target read fresh (K2b §3.2.1), the
+    broker's ``tier_of``. ``None`` when the read faulted or the row is gone (the decision then
+    leaves a signed pending unspent, and refuses a reported one)."""
+    verb = registry.get(verb_name)
+    if verb is None:
+        return None
+    row = None
+    if target.get("kind") == "row":
+        res = cockpit.read_one(str(target.get("panel_id")), str(target.get("row_id")))
+        if not isinstance(res, Read):
+            return None
+        row = res.value
+    return verb.tier(dict(params), row, UNVERIFIED, cockpit.today())
 
 
 def _require_confirm(verb: VerbSpec, req: dict[str, Any]) -> None:
@@ -684,7 +761,8 @@ _LEGACY_NEEDS_SNAPSHOT = frozenset({"spore_descend"})
 
 
 def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope", req: dict[str, Any],
-                 credential: dict[str, Any], install_class: str, today: date) -> dict[str, Any]:
+                 credential: dict[str, Any], install_class: str, today: date,
+                 broker: "Broker | None" = None) -> dict[str, Any]:
     """``POST /edit``: the legacy body translated onto the cockpit path. One row read, one tier, the
     kernel's CAS key and the verb's own ``fire``; ``apply_edit`` never receives the client's body.
     What the client rendered still binds: a body's ``expect_disposition`` must match the row as read
@@ -700,9 +778,9 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
     bad = sorted(set(params) - set(verb.fields or ()))
     if bad:
         raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
-    if verb.tier_fn is None or _is_const(verb):
+    if (verb.tier_fn is None or _is_const(verb)) and (broker is None or not broker.enabled):
         # a verb whose tier does not depend on the row: refuse a T2/T3 before reading anything
-        _refuse_unless_c1(verb, verb.tier(params, None, UNVERIFIED, today), credential, install_class)
+        _refuse_unless_c1(verb, verb.tier(params, None, UNVERIFIED, today), credential, install_class, broker)
     panel_id, row = (None, None)
     if verb.binding == "row":
         panel_id, row = _legacy_target(cockpit, verb, req)
@@ -724,7 +802,15 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
     if TIERS.index(tier) > TIERS.index(floor):
         raise _refuse("needs_intent", 409,
                       f"these params raise {verb.name!r} to {tier}; a legacy /edit body carries no intent")
-    _refuse_unless_c1(verb, tier, credential, install_class)
+    if tier != "C1":
+        _require_confirm(verb, req)
+        from levain.cockpit.install import REPORTED
+
+        # §9 Order: a legacy body carries no intent; a reported install sends "reported", a governed
+        # one "sign"
+        legacy_intent = "reported" if broker is not None and broker.install_class == REPORTED else "sign"
+        return _to_broker(verb, tier, credential, install_class, broker, params=params, row=row,
+                          panel_id=panel_id, intent=legacy_intent, idempotency_key=None)
     _require_confirm(verb, req)
     if verb.fire is None:
         raise _refuse("not_built", 501, f"{verb.name!r} has no handler")

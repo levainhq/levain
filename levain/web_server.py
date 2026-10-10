@@ -89,13 +89,15 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from levain.cockpit.broker import Broker, BrokerError
+from levain.cockpit.effects import SPORES, SporeEffectStore
 from levain.cockpit.engine import Cockpit
 from levain.cockpit.external import ExternalPanels, discoverer
 from levain.cockpit.routes import CACHE_CONTROL as COCKPIT_CACHE_CONTROL
 from levain.cockpit.routes import VARY as COCKPIT_VARY
 from levain.cockpit.routes import handle_get as handle_cockpit_get
 from levain.cockpit.routes import is_cockpit_path
-from levain.cockpit.verbs import VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb
+from levain.cockpit.verbs import VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb, retier
 
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
 from levain.dashboard import SubstrateSource, _resolve_source, recall_episode_rows
@@ -112,6 +114,24 @@ from levain.writes import (
 # all three end in ``levain.cockpit.verbs.dispatch``.
 _COCKPIT_VERB_PATH = "/cockpit/verb"
 _WRITE_ROUTES = ("/edit", "/action", _COCKPIT_VERB_PATH)
+# The broker's pending routes (K2b design §1, §3.2, §3.5): POST /cockpit/pending/<id>/signature and
+# POST /cockpit/pending/<id>/cancel. They ride the same write gate as _WRITE_ROUTES.
+_PENDING_PREFIX = "/cockpit/pending/"
+_PENDING_ACTIONS = ("signature", "cancel")
+
+
+def _pending_route(route: str) -> "tuple[str, str] | None":
+    """``(pending_id, action)`` for a broker pending route, else None."""
+    if not route.startswith(_PENDING_PREFIX):
+        return None
+    pid, sep, action = route[len(_PENDING_PREFIX):].partition("/")
+    if not sep or not pid or "/" in action or action not in _PENDING_ACTIONS:
+        return None
+    return pid, action
+
+
+def _is_write_route(route: str) -> bool:
+    return route in _WRITE_ROUTES or _pending_route(route) is not None
 # Until K2b's governed start check exists every install is reported (design §4.6): no install here can
 # show that its stores sit beyond the operator uid's reach.
 INSTALL_CLASS = "reported"
@@ -609,6 +629,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # passed `--chat`; then the /chat routes are served, and make_server keeps the bind loopback-only.
     chat_host: "ChatHost | None"
     cockpit: "Cockpit | None" = None   # class defaults: server_close() runs even when the bind failed
+    # The cockpit broker (K2b): None on a read-only source; else started with the cockpit and drained
+    # by server_close. It is write-disabled unless the install class is declared (design §6).
+    broker: "Broker | None" = None
 
     _cockpit_lock = threading.Lock()
 
@@ -631,9 +654,18 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                     built.stop()    # a half-started cockpit must not leave refreshers running
                     raise
                 self.cockpit = built   # published only once started: a failed start retries next request
-            return self.cockpit
+            cockpit = self.cockpit
+        if self.broker is not None:
+            # started with the cockpit, outside the cockpit's lock: its start recovery is a settler
+            # and may wait on a store lock (K2b §4.2, §9); a second call returns at once
+            self.broker.start()
+        return cockpit
 
     def server_close(self) -> None:
+        # K2b §4.2: the broker drains first (write admission closes; an admitted settler is waited
+        # for before its lock is released), then the cockpit's refreshers stop
+        if self.broker is not None:
+            self.broker.stop()
         if self.cockpit is not None:
             self.cockpit.stop()
         super().server_close()
@@ -1008,6 +1040,29 @@ class _Handler(GuardedHandler):
         self._send(json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8",
                    status=status, head=head)
 
+    def _pending_post(self, pending_id: str, action: str, req: Any) -> dict[str, Any]:
+        """``POST /cockpit/pending/<id>/signature`` (K2b §3.2: a signature over the stored bytes) and
+        ``.../cancel`` (§3.5: C1 on your own pending, a pending of its tier on another's)."""
+        if not isinstance(req, dict):
+            raise EditError("bad_request", 400, "request must be a JSON object")
+        unknown = sorted(set(req) - _PENDING_KEYS[action])
+        if unknown:
+            raise EditError("bad_request", 400, f"unknown request keys {unknown}")
+        credential = self._credential()
+        if credential.get("class") not in ("token", "device"):
+            raise EditError("credential_required", 403, "a write needs a credential (the write token)")
+        self._cockpit()      # the broker starts with the cockpit
+        broker = self.server.broker
+        if broker is None:
+            raise EditError("needs_broker", 403, "this server has no cockpit broker")
+        try:
+            if action == "signature":
+                return broker.submit(pending_id, req.get("signature"))
+            return broker.cancel(pending_id, credential=credential, intent=req.get("intent"),
+                                 idempotency_key=req.get("idempotency_key"))
+        except BrokerError as exc:
+            raise EditError(exc.code, exc.status, str(exc)) from exc
+
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
         """The POST routes — the governed writes ``/edit`` + ``/action``, and the ``/chat`` operations
         when a chat host is attached — behind one auth boundary. They fork only at dispatch, AFTER the
@@ -1035,11 +1090,11 @@ class _Handler(GuardedHandler):
         # The predicate requires write_scope (writability): a READ-ONLY off-box surface has no write
         # path, so it falls through to the 422 'read_only' refusal below, NOT a token-403 [codex L3].
         route = self.path.split("?", 1)[0]
-        if route in _WRITE_ROUTES and self._writes_need_credential() and not self._off_box_token_valid():
+        if _is_write_route(route) and self._writes_need_credential() and not self._off_box_token_valid():
             # K2a (design §4.3): every write carries a credential on every bind, loopback included;
             # refused before a byte of the body is read
             return self._reject(403, "credential_required", "missing or invalid write token")
-        if (self._write_token_required() and route not in _WRITE_ROUTES
+        if (self._write_token_required() and not _is_write_route(route)
                 and not self._off_box_token_valid()):
             return self._reject(403, "forbidden", "missing or invalid write token")
         # CSRF layer 2: require application/json (a cross-origin page cannot send it
@@ -1052,7 +1107,7 @@ class _Handler(GuardedHandler):
         # write_scope, and action verbs REQUIRE a write_scope (make_server enforces it), so
         # the spore-129 governance already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
-        if route not in _WRITE_ROUTES and not is_chat:
+        if not _is_write_route(route) and not is_chat:
             return self._reject(404, "not_found", "no such route")
         if is_chat and not self._chat_token_valid():   # before a byte of the body is read
             return self._reject(403, "chat_token", (
@@ -1103,12 +1158,16 @@ class _Handler(GuardedHandler):
                 )
                 return
             try:
-                # one dispatch for the cockpit route and both legacy aliases (design §4.3)
-                result = dispatch_verb(
-                    registry=self.server.verb_registry, cockpit=self._cockpit(), scope=scope, req=req,
-                    credential=self._credential(), install_class=INSTALL_CLASS,
-                    route={"/edit": "edit", "/action": "action"}.get(route, "cockpit"),
-                    job_runtime=self.server.job_runtime)
+                pending = _pending_route(route)
+                if pending is not None:
+                    result = self._pending_post(pending[0], pending[1], req)
+                else:
+                    # one dispatch for the cockpit route and both legacy aliases (design §4.3)
+                    result = dispatch_verb(
+                        registry=self.server.verb_registry, cockpit=self._cockpit(), scope=scope, req=req,
+                        credential=self._credential(), install_class=INSTALL_CLASS,
+                        route={"/edit": "edit", "/action": "action"}.get(route, "cockpit"),
+                        job_runtime=self.server.job_runtime, broker=self.server.broker)
             except EditError as exc:
                 self._send_json({"error": exc.code, "message": str(exc)}, exc.http_status)
             except Exception as exc:  # noqa: BLE001 — never leak a traceback to the client
@@ -1117,6 +1176,24 @@ class _Handler(GuardedHandler):
             self.server.request_gate.release()
         if result is not None:
             self._send_json(result, 200)
+
+
+_PENDING_KEYS = {"signature": frozenset({"signature"}),
+                 "cancel": frozenset({"intent", "idempotency_key"})}
+
+
+def _build_broker(source: SubstrateSource, install_class: str | None,
+                  httpd: "_LevainHTTPServer") -> "Broker | None":
+    """The cockpit broker over a writable source (K2b §4.2, §6): its data root is
+    ``<ledger_root>/cockpit``, its one store the source's spores, its tier recompute the kernel's."""
+    scope = source.write_scope
+    if scope is None:
+        return None
+    spores = scope.anneal.spores_json
+    return Broker(scope.ledger_root / "cockpit", stores={SPORES: SporeEffectStore(spores)},
+                  install_class=install_class, store_paths=[spores],
+                  tier_of=lambda verb, params, target: retier(
+                      httpd.verb_registry, httpd.get_cockpit(), verb, dict(params), dict(target)))
 
 
 def make_server(
@@ -1134,6 +1211,7 @@ def make_server(
     surface_tokens: "Mapping[str, str] | None" = None,
     chat_token: str | None = None,
     cockpit: "Cockpit | None" = None,
+    install_class: str | None = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1381,6 +1459,9 @@ def make_server(
     if cockpit is not None:
         cockpit.attach_verbs(VerbView(verb_registry, cockpit, INSTALL_CLASS))
     httpd._cockpit_lock = threading.Lock()
+    # K2b §6: `--install-class reported` is the only way to reported; no flag (and no governed
+    # marker) leaves the broker write-disabled, answering "run the installer"
+    httpd.broker = _build_broker(source, install_class, httpd)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
@@ -1476,6 +1557,7 @@ def run_web_server(
     api_key: str | None = None,
     max_iterations: int | None = None,
     turn_seconds: float | None = None,
+    install_class: str | None = None,
 ) -> int:
     """``levain serve`` entry point — serve the substrate dashboard on localhost.
 
@@ -1530,7 +1612,7 @@ def run_web_server(
             return 1
 
     try:
-        httpd = make_server(source, host=host, port=port, chat_host=chat_host)
+        httpd = make_server(source, host=host, port=port, chat_host=chat_host, install_class=install_class)
     except ValueError as exc:  # bind refused — wildcard/public, an install-bearing/writable source off-loopback, or --chat off-loopback
         print(str(exc), file=sys.stderr)
         return 1

@@ -829,6 +829,13 @@ class CockpitDB:
 
     # -- readers -------------------------------------------------------------------------------
 
+    def find_idempotent(self, principal_base: str, idempotency_key: str) -> str | None:
+        """The pending an earlier request with this key made, if any (§2)."""
+        with self.read() as conn:
+            row = conn.execute("SELECT pending_id FROM pendings WHERE principal_base = ? AND "
+                               "idempotency_key = ?", (principal_base, idempotency_key)).fetchone()
+        return None if row is None else row[0]
+
     def decided_ops(self) -> list[str]:
         """Every ``DECIDED`` op, oldest decision first: start recovery's input (§4.2)."""
         with self.read() as conn:
