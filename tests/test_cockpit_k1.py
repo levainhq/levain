@@ -1150,14 +1150,18 @@ class TestL3R4CodexFixes:
 
 
 class TestL3R6Freshness:
-    def test_freshness_now_is_the_head_the_manifest_built_never_its_own_roll_up(self, env) -> None:
-        _r, _s, ck = env
+    def test_freshness_now_rolls_up_its_sources_in_the_same_call_and_ages_with_them(self, env) -> None:
+        root, _s, ck = env
         assert ck.freshness()[NOW_ID] == {"as_of": None, "status": "unread"}
         head = ck.manifest(NONE_CRED)["panels"][NOW_ID]
-        assert ck.freshness()[NOW_ID] == {"as_of": head["as_of"], "status": head["status"]}
-        (_r / ".levain" / "memory.spores.json").unlink()          # a gate source fails: error, not masked
-        head = ck.manifest(NONE_CRED)["panels"][NOW_ID]
-        assert ck.freshness()[NOW_ID]["status"] == head["status"] == "error"
+        assert ck.freshness()[NOW_ID] == {"as_of": head["as_of"], "status": "ok"}
+        (root / ".levain" / "memory.spores.json").unlink()          # a gate source fails: error, not masked
+        ck.manifest(NONE_CRED)
+        assert ck.freshness()[NOW_ID]["status"] == "error"
+        ck.register(ProviderSpec(id="late", kind="triage-list", title="l", priority="gate",
+                                 read=lambda c: Read(rows=()), order="time.desc",
+                                 facets=frozenset({"at"}), version_fields=("id",)))
+        assert ck.freshness()[NOW_ID]["status"] == "error"          # an unread source does not hide a known error
 
     def test_an_on_demand_panels_freshness_ages_against_its_stale_after(self, tmp_path: Path) -> None:
         _root, src = _install(tmp_path)
