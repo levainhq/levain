@@ -1172,3 +1172,45 @@ class TestL3R6Freshness:
         assert ck.freshness()["p"]["status"] == "empty"
         t[0] += timedelta(hours=1)
         assert ck.freshness()["p"]["status"] == "stale"
+
+
+class TestL3R8Fixes:
+    def test_an_older_started_slow_read_never_overwrites_a_newer_ones_freshness(self, tmp_path: Path) -> None:
+        _root, src = _install(tmp_path)
+        ck = Cockpit()
+        gate, calls = threading.Event(), []
+
+        def read(ctx):
+            n = len(calls)
+            calls.append(n)
+            if n == 0:
+                gate.wait(5)
+                return Fault("slow first read failed")
+            return Read(rows=())
+        spec = ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=read,
+                            order="time.desc", facets=frozenset({"at"}), version_fields=("id",), timeout_s=10)
+        ck.register(spec)
+        t = threading.Thread(target=lambda: ck.panel("p"))
+        t.start()
+        time.sleep(0.2)
+        # the first read is still running; a second request would join its flight, so release it first
+        gate.set()
+        t.join()
+        assert ck.freshness()["p"]["status"] == "error"
+        ck.panel("p")
+        assert ck.freshness()["p"]["status"] == "empty"
+        assert ck._state["p"].fresh[0] == 2          # generations ordered by start
+
+    def test_freshness_survives_a_panel_registered_mid_call(self, env) -> None:
+        _r, _s, ck = env
+        ck.manifest(NONE_CRED)
+        orig = ck._ordered_specs
+
+        def racing(specs_map):
+            out = orig(specs_map)
+            ck.register(ProviderSpec(id="raced", kind="triage-list", title="r", priority="gate",
+                                     read=lambda c: Read(rows=()), order="time.desc",
+                                     facets=frozenset({"at"}), version_fields=("id",)))
+            return out
+        ck._ordered_specs = racing           # type: ignore[method-assign]
+        assert "tray" in ck.freshness()

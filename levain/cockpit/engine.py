@@ -8,6 +8,7 @@ enforces no authority: K1 is the read half, served under the existing read gate 
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import threading
 import time
@@ -157,7 +158,7 @@ class _State:
     flight_started: float = 0.0               # monotonic start of that read
     refresh_started: datetime | None = None   # set while a refresher cycle is inside its read
     started: datetime | None = None
-    fresh: tuple[datetime, str | None, str] | None = None   # (read at, as_of, status) of the last read served
+    fresh: tuple[int, str | None, str] | None = None   # (read generation, as_of, status) of the newest-started read served
 
 
 class _Refresher:
@@ -199,6 +200,7 @@ class Cockpit:
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
+        self._gen = itertools.count(1)   # read generations: an older-started read never overwrites a newer one's freshness
 
     # --- registration ----------------------------------------------------------------
     def register(self, spec: ProviderSpec) -> None:
@@ -367,9 +369,11 @@ class Cockpit:
     def _snap_for(self, spec: ProviderSpec, ctx: ReadContext) -> _Snap:
         st = self._state[spec.id]
         if spec.refresh_every_s is None:
+            gen = next(self._gen)        # allocated BEFORE the read, so it orders reads by start
             snap = self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
             with st.lock:        # what the freshness route reports; it never reads a source itself
-                st.fresh = (ctx.now, snap.as_of, snap.status)
+                if st.fresh is None or gen >= st.fresh[0]:
+                    st.fresh = (gen, snap.as_of, snap.status)
             return snap
         with st.lock:
             snap, last, started, running = st.snap, st.last_completion, st.started, st.refresh_started
@@ -755,13 +759,15 @@ class Cockpit:
         snapshot (liveness and aging rules applied); an on-demand panel reports its last served read,
         aged against ``stale_after_s``; ``now`` is rolled up from the gate triage-lists' entries in
         this same call (error over unread over stale over partial over ok, oldest ``as_of``), so it
-        is as current as its sources; it has no ``empty`` (that needs rows) and reports ``ok``. Anything not
-        yet read is ``status: "unread"`` with ``as_of: null``. Panels found by discovery appear
+        is as current as its sources; it has no ``empty`` (that needs rows) and reports ``ok``. A refresher
+        panel that was never started reads ``error``, as in its head; an on-demand panel not yet served is
+        ``status: "unread"`` with ``as_of: null``. Panels found by discovery appear
         after the first manifest read. No rows, no etag, never 304."""
         ctx = ReadContext(self._clock())
         unread = {"as_of": None, "status": "unread"}
         out: dict[str, dict[str, Any]] = {}
-        for spec in self._ordered_specs(self._specs):
+        specs_map = self._specs          # ONE registry snapshot for the whole call
+        for spec in self._ordered_specs(specs_map):
             if spec.refresh_every_s is not None:
                 snap = self._snap_for(spec, ctx)
                 out[spec.id] = {"as_of": snap.as_of, "status": snap.status}
@@ -776,7 +782,7 @@ class Cockpit:
                     (ctx.now - _parse_iso(as_of)) > timedelta(seconds=spec.stale_after_s):
                 status = "stale"
             out[spec.id] = {"as_of": as_of, "status": status}
-        gate = [out[s.id] for s in self._specs.values() if s.priority == "gate" and s.kind == "triage-list"]
+        gate = [out[s.id] for s in specs_map.values() if s.priority == "gate" and s.kind == "triage-list"]
         order = ("error", "unread", "stale", "partial")
         status = next((o for o in order if any(g["status"] == o for g in gate)), "ok")
         as_ofs = [g["as_of"] for g in gate if g["as_of"]]
