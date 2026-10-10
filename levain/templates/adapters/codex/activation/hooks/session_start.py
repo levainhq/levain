@@ -97,7 +97,7 @@ def main() -> int:
         if identity:
             sections.append(identity)
 
-        # 2c. The operator's freeform state line (verbatim, with age, dropped past 12 h).
+        # 2c. The operator's freeform state line (verbatim, with age, dropped once older than _STATE_EXPIRES_AFTER_HOURS).
         #     Seeds the per-session "seen" marker with what it showed (also when nothing was
         #     live, and on every `source`, compact included), so the per-prompt hook speaks
         #     only on a change. Its own try: a fault here drops only this section.
