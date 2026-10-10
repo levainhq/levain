@@ -4,6 +4,7 @@ live-context file (it replaced the separate `focus` field). Budget: contract rea
 from __future__ import annotations
 
 import json
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -109,6 +110,10 @@ def test_focus_is_gone_from_the_hooks_the_cli_and_the_write_seam(tmp_path, monke
     # pending still calls it, and must not lose its other sections
     assert hook.focus_notice() is None
     for hooks_dir in (HOOKS, HOOKS.parents[1] / "adapters" / "codex" / "activation" / "hooks"):
+        # the helper's only "focus" is the focus_notice shim (def block + its comment/docstring)
+        helper = (hooks_dir / "_levain_hook.py").read_text(encoding="utf-8")
+        stripped = re.sub(r"def focus_notice\(\).*?return None\n", "", helper, flags=re.S)
+        assert "focus" not in stripped.lower(), hooks_dir
         for name in ("session_start.py", "user_prompt_submit.py"):
             assert "focus" not in (hooks_dir / name).read_text(encoding="utf-8").lower(), (hooks_dir, name)
 

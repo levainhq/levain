@@ -106,8 +106,8 @@ def main() -> int:
         session_id = payload.get("session_id")
         pending_sig = None
         try:
-            if isinstance(session_id, str) and session_id:
-                changed, pending_sig = hook.state_line_if_changed(session_id)
+            if isinstance(session_id, str) and session_id and hasattr(hook, "state_line_pending"):
+                changed, pending_sig = hook.state_line_pending(session_id)
                 if changed:
                     sections.append(changed)
         except Exception:
@@ -155,7 +155,7 @@ def main() -> int:
 
         delivered = True
         if sections:
-            delivered = hook.emit("\n\n".join(sections), "UserPromptSubmit") is not False
+            delivered = hook.emit("\n\n".join(sections), "UserPromptSubmit") is True
         if delivered and pending_sig is not None:
             hook.state_seen_record(session_id, pending_sig)
     except Exception:
