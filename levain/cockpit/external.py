@@ -53,9 +53,8 @@ class ExternalPanels:
     so the burst's later readers return at once, and the next reuse window starts a fresh flight. A flight
     has one verdict for all its readers: an answer at or after its deadline is its timeout, never late data
     in a reader or the reuse, so a callable that always answers later than ``wait_s`` is shown as not
-    answering. A callable
-    that hangs therefore parks its thread; at most ``max_parked`` such threads live at once, and while that
-    many are parked no new flight starts (the timeout reading stands)."""
+    answering. A callable that hangs therefore parks its thread; at most ``max_parked`` such threads live at
+    once, and while that many are parked no new flight starts (the timeout reading stands)."""
 
     def __init__(self, fn: Callable[[], Any], *, reuse_s: float = 5.0, wait_s: float = 8.0,
                  max_parked: int = 2, clock: Callable[[], float] = time.monotonic) -> None:
@@ -122,8 +121,8 @@ class ExternalPanels:
         except BaseException as exc:  # noqa: BLE001 - every failure is a reading, reused like one
             call = _Call(None, _describe(exc), _now_iso())
         finally:
+            now = self._clock()        # when the call answered, not when its answer got the lock
             with self._lock:
-                now = self._clock()
                 if flight.timeout is None and now >= flight.deadline:
                     self._abandon_locked(flight, now)   # an answer after the deadline is a timeout, for all readers
                 flight.result = call

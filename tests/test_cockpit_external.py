@@ -480,7 +480,38 @@ def test_an_answer_that_wins_the_lock_past_the_deadline_is_a_timeout_not_publish
     assert got.panels is None and "did not answer" in (got.error or "")
     assert ext._last is not None and ext._last[1] is got
     assert ext.take() is got                       # the reuse holds the timeout, not the late answer
+    for _ in range(500):                           # the worker's cleanup may still be running
+        if not ext._parked:
+            break
+        time.sleep(0.01)
     assert not ext._parked                         # the finished flight parks no thread
+
+
+def test_an_answer_on_time_whose_publication_waits_on_the_lock_is_still_the_answer() -> None:
+    # the call answers before its deadline; its worker then waits on the lock until past it (codex r5)
+    now = [0.0]
+    stamped = threading.Event()
+
+    def clock() -> float:
+        if threading.current_thread().name == "levain-external-panels":
+            stamped.set()
+        return now[0]
+    fn = _Counted()
+    fn.gate.clear()
+    ext = ExternalPanels(fn, reuse_s=0, wait_s=0.5, clock=clock)
+    out: dict[str, Any] = {}
+    r = threading.Thread(target=lambda: out.__setitem__("r", ext.take()))
+    r.start()
+    while not fn.n:
+        time.sleep(0.001)
+    with ext._lock:                                # hold the lock across the deadline
+        fn.gate.set()
+        stamped.wait(1)                            # the worker reads the clock (before the deadline) ...
+        time.sleep(0.02)                           # ... and then waits on the lock
+        now[0] = 1.0
+    r.join(5)
+    assert not r.is_alive()
+    assert out["r"].panels is not None and out["r"].error is None
 
 
 def test_absent_or_null_lines_are_no_lines_not_an_error() -> None:
