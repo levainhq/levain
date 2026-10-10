@@ -1753,6 +1753,8 @@ def _install_codex(
     # (adapters/codex/activation, NOT templates/activation) first, then any pack
     # activation/ trees by order. base_activation passed explicitly for the
     # base-completeness check (a pack must not mask an empty base).
+    fragment = _codex_fragment(adapter_root, python_path, install)
+    _check_codex_config(_codex_home() / "config.toml", fragment)
     _copy_activation_tree(
         activation_roots,
         install / "activation",
@@ -1766,12 +1768,10 @@ def _install_codex(
     codex_home = _codex_home()
     codex_home.mkdir(parents=True, exist_ok=True)
 
-    # config.toml first: it is the write that can refuse (`_require_toml`), and a refusal must
-    # leave hooks.json pointing where it did, not at a half-installed entity (L3 r1).
-    _merge_codex_config(codex_home / "config.toml",
-                        _codex_fragment(adapter_root, python_path, install), emit=emit)
     _write_codex_hooks(codex_home / "hooks.json",
                        _codex_hooks_json(adapter_root, python_path, install), emit)
+
+    _merge_codex_config(codex_home / "config.toml", fragment, emit=emit)
 
     emit("  Codex adapter installed.")
 
@@ -2128,28 +2128,34 @@ def _read_or_none(path: Path) -> str | None:
 
 
 def _names_install(text: str, install: Path) -> bool:
-    """Whether codex's hooks.json points INTO this install: its path followed by a
-    separator, so ``/x/inst`` never claims ``/x/inst2`` (L2 HIGH, reproduced). Checked
-    raw and JSON-escaped, since hooks.json escapes a backslash or quote in the path."""
-    prefix = str(install) + os.sep
-    # Decoded first, as the shell, doctor and verify read it: since spore-866 a path with `$`,
-    # a backquote, `\\` or `"` is escaped in the command text, so no text search finds it (L3 r1).
+    """Whether codex's hooks.json points INTO this install: an argument of some hook command,
+    decoded as the shell, doctor and verify read it and normalised, lies under ``<install>/``
+    (so ``/x/inst`` never claims ``/x/inst2``, L2 HIGH, and ``..`` cannot climb out, L3 r2). One
+    unreadable command is skipped, not fatal. A file that is not JSON, or not this shape, names
+    no install (fail closed): the old whole-text search could not see a path escaped for the
+    shell since spore-866, and matched the prefix anywhere in the file, not only in commands."""
+    root = os.path.normpath(str(install)) + os.sep
     try:
         data = json.loads(text)
-        hooks = data.get("hooks") if isinstance(data, dict) else None
-        for entries in (hooks.values() if isinstance(hooks, dict) else ()):
-            for entry in entries if isinstance(entries, list) else ():
-                inner = entry.get("hooks") if isinstance(entry, dict) else None
-                for h in inner if isinstance(inner, list) else ():
-                    cmd = h.get("command") if isinstance(h, dict) else None
-                    if isinstance(cmd, str) and any(
-                            t.startswith(prefix) for t in shlex.split(cmd)[1:]):
+    except (ValueError, RecursionError):
+        return False
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    for entries in (hooks.values() if isinstance(hooks, dict) else ()):
+        for entry in entries if isinstance(entries, list) else ():
+            inner = entry.get("hooks") if isinstance(entry, dict) else None
+            for h in inner if isinstance(inner, list) else ():
+                cmd = h.get("command") if isinstance(h, dict) else None
+                if not isinstance(cmd, str):
+                    continue
+                try:
+                    tokens = shlex.split(cmd, posix=os.name != "nt")
+                except ValueError:
+                    continue
+                for t in tokens[1:]:
+                    t = os.path.normpath(t.strip('"') if os.name == "nt" else t)
+                    if t.startswith(root):
                         return True
-    except ValueError:   # JSONDecodeError, or shlex's unbalanced quotes
-        pass
-    # Bounded on the LEFT too: "/var/x/e/" is a substring of "/private/var/x/e/".
-    return any(re.search(r"(?<![\w/.~-])" + re.escape(p), text)
-               for p in (prefix, json.dumps(prefix, ensure_ascii=False)[1:-1]))
+    return False
 
 
 def _refresh_decision(
@@ -2386,7 +2392,7 @@ def _fill(template: str, slots: Mapping[str, str]) -> str:
     """Fill ``{{PYTHON}}`` / ``{{INSTALL_DIR}}`` in one pass over the template, so a value that
     itself contains a slot name is never filled again (codex L3 r1: an install path holding
     ``{{PYTHON}}`` became the interpreter path)."""
-    return _SLOT_RE.sub(lambda m: slots[m.group(1)], template)
+    return _SLOT_RE.sub(lambda m: slots.get(m.group(1), m.group(0)), template)
 
 
 CODEX_CONFIG_KEY = "codex-home/config.toml#anneal_memory"
@@ -2420,23 +2426,33 @@ def _toml_error(text: str) -> str | None:
     return None
 
 
-def _require_toml(text: str, path: Path, before: str | None,
-                  emit: Callable[[str], None]) -> None:
-    """Refuse to write ``text`` to codex's machine-global ``path`` when levain's change is what
-    would stop it parsing (a parse failure there takes down every MCP server codex has, not
-    only levain's; spore-866). A file that did not parse BEFORE the change (``before``) is not
-    levain's to judge, since codex's parser may accept what ``tomllib`` refuses: the write goes
-    ahead, as it always did, and says so."""
+def _require_toml(text: str, path: Path, before: str | None) -> str | None:
+    """Refuse (``InitError``) when levain's change is what would stop codex's machine-global
+    ``path`` parsing: a parse failure there takes down every MCP server codex has, not only
+    levain's (spore-866). A file that did not parse BEFORE the change either (``before``) is not
+    levain's to judge, since codex's parser may accept what ``tomllib`` refuses: returns that
+    parse error, for the caller to report once the write has landed; otherwise None."""
     err = _toml_error(text)
     if err is None:
-        return
+        return None
     prior = _toml_error(before) if before is not None else None
-    if before is not None and prior is not None:
-        emit(f"  ! {path} did not parse as TOML before levain changed it ({prior}); levain's "
-             f"block was written into it anyway. Check it with codex.")
-        return
+    if prior is not None:
+        return prior
     raise InitError(f"{path} would not parse after levain's change ({err}), so it was left "
                     f"as it was.")
+
+
+def _check_codex_config(path: Path, fragment: str) -> None:
+    """``_merge_codex_config``'s parse judgement, run before init writes anything (L3 r2): a
+    refusal then leaves the install and codex's files as they were, not half-installed."""
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        _require_toml(fragment.rstrip() + "\n", path, None)
+        return
+    m = _CODEX_MCP_BLOCK_RE.search(fragment)
+    if m is not None:
+        _require_toml(_splice_codex_block(existing, m.group(0).rstrip() + "\n"), path, existing)
 
 
 def _codex_block_hash(fragment_or_config: str) -> str | None:
@@ -3747,7 +3763,7 @@ def _merge_codex_config(
     """
     if not path.is_file():
         text = fragment.rstrip() + "\n"
-        _require_toml(text, path, None, emit)
+        _require_toml(text, path, None)
         path.write_text(text, encoding="utf-8")
         return
 
@@ -3759,7 +3775,7 @@ def _merge_codex_config(
     new_block = new_block_match.group(0).rstrip() + "\n"
     # Judged before any backup or write, on exactly the text that will be written (L3 r1).
     merged = _splice_codex_block(existing, new_block)
-    _require_toml(merged, path, existing, emit)
+    prior_unparsed = _require_toml(merged, path, existing)
 
     repoint: tuple[str, str, Path] | None = None
     unknown_prior: Path | None = None
@@ -3965,6 +3981,9 @@ def _merge_codex_config(
                if (customized or relaunched_bak or reformatted_bak) is not None else ".")
         ) from e
 
+    if prior_unparsed is not None:
+        emit(f"  ! {path} did not parse as TOML before levain changed it, and still does not "
+             f"({prior_unparsed}). levain's block is in it; check the file with codex.")
     if unknown_prior is not None:
         emit(f"  ! Codex's GLOBAL anneal_memory block was replaced in {path}.")
         emit("    Its previous store could not be read, so it was not a shape levain")

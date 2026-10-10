@@ -241,7 +241,7 @@ def _anneal_json(
     error, or a wrong-shape result all return None."""
     db = str(store_path())
     candidates = []
-    if "{{" not in _INSTALL_ANNEAL_BIN:
+    if _INSTALL_ANNEAL_BIN != "{{" + "ANNEAL_MEMORY}}":   # split, so the install fill cannot reach it
         candidates.append([_INSTALL_ANNEAL_BIN, "--db", db, *sub_args])
     candidates.append([sys.executable, "-P", "-m", "anneal_memory", "--db", db, *sub_args])
     for cmd in candidates:

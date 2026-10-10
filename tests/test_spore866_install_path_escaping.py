@@ -4,7 +4,8 @@ or `"` exited 0 and wrote a codex config.toml, a codex hooks.json and a claude-c
 the same in every hook .py's `_INSTALL_ANNEAL_BIN = "{{ANNEAL_MEMORY}}"`, and L2 DEL in TOML. L3 r1:
 doctor and verify read hook commands with shlex, which kept a backslash sh drops; `update`'s
 `_names_install` searched the text and missed the escaped path; a value holding a slot name was
-filled twice.
+filled twice. L3 r2: one unreadable command hid the rest from `_names_install`; a `{{` in the
+anneal path read as "not substituted" in the hook.
 MUTATION (run 2026-10-10): with levain/install.py reverted to the raw substitution, both cases
 fail with the reproduced errors (`Unescaped '\\' in a string`, `Invalid \\escape`)."""
 
@@ -12,8 +13,8 @@ from __future__ import annotations
 
 import ast
 import json
-import shlex
 import os
+import shlex
 import subprocess
 import tomllib
 from pathlib import Path
@@ -46,7 +47,7 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
     install = tmp_path / 'we\\g<1>i"rd $X`a\x7f{{PYTHON}}'
     install.mkdir()
     python = '/opt/py"th\\on $V/bin/python3'
-    anneal = "C:\\Users\\O'Br\"ien\\Scripts\\anneal-memory.exe"
+    anneal = "C:\\Users\\O'Br\"ien{{x}}\\Scripts\\anneal-memory.exe"
     with _templates_root() as templates_root:
         specs = [parse_template(templates_root / "seed" / n) for n in ("world.md", "origin.md")]
         answers = {f.slot: f"VAL_{f.slot}" for f in build_field_plan(specs)}
@@ -65,6 +66,11 @@ def test_an_install_path_with_shell_and_string_metacharacters_renders_parseable_
         commands = [ev[0]["hooks"][0]["command"] for ev in hooks["hooks"].values()]
         script_dir = f"{install}/activation/hooks/"
         assert _names_install((codex_home / "hooks.json").read_text(encoding="utf-8"), install)
+        # An unreadable foreign command ahead of levain's does not hide it.
+        mixed = json.loads((codex_home / "hooks.json").read_text(encoding="utf-8"))
+        mixed["hooks"]["SessionStart"].insert(0, {"hooks": [{"command": "echo it's"}]})
+        assert _names_install(json.dumps(mixed), install)
+        assert not _names_install(json.dumps(mixed), install.with_name(install.name + "2"))
         hooks_config = codex_home / "hooks.json"
     else:
         server = json.loads((install / ".mcp.json").read_text(encoding="utf-8"))["mcpServers"]["anneal_memory"]
