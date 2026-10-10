@@ -4,7 +4,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
-## [0.7.1] — unreleased
+## [0.7.1] — 2026-10-10
 
 Closes two of 0.7.0's known open issues (the Linux resolver deputy and concurrent codex installs) and fixes defects in the codex adapter and `ws-adopt`.
 
