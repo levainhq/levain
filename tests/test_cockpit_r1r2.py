@@ -218,14 +218,14 @@ class TestManifestMapperAdversarial:
 
     def test_a_failed_header_fetch_is_an_error_and_an_extra_header_panel_is_drawn(self) -> None:
         ck = _tray_cockpit()
-        ck.register(ProviderSpec("focus", "line", "Focus", "gauge", lambda c: Read(value={"lines": [
-            {"label": "focus", "text": "x", "at": "2026-10-09T12:00:00+00:00", "source": "s"}]}), region="header"))
+        ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c: Read(value={"lines": [
+            {"label": "state", "text": "x", "at": "2026-10-09T12:00:00+00:00", "source": "s"}]}), region="header"))
         ck.register(ProviderSpec("weather", "line", "Weather", "gauge", lambda c: Read(value={"lines": [
             {"label": "now", "text": "cloudy", "at": None, "source": None}]}), region="header", rank=5))
         snap = self._snap(ck)
-        snap["panels"]["focus"] = {"error": "HTTP 500"}
+        snap["panels"]["state"] = {"error": "HTTP 500"}
         view = _view(snap)
-        assert view["focus"] is None and "HTTP 500" in view["errors"]["focus"]
+        assert view["state"] is None and "HTTP 500" in view["errors"]["state"]
         assert view["extra_panels"]["weather"]["lines"][0]["text"] == "cloudy"
 
     def test_an_unreadable_wraps_panel_is_an_error_not_a_never(self) -> None:
@@ -259,12 +259,10 @@ class TestManifestMapperAdversarial:
         snap["manifest"]["entity"]["jar"]["level"] = {"bad": True}
         for x in snap["panels"]["health"]["value"]["metrics"]:
             x["value"] = {}
-        snap["panels"]["crystals"]["rows"][0]["facets"]["tags"] = ["operator,ergonomics", {"x": 1}, 3]
         bad = _view(snap)
         assert bad["paths"] == {"omitted": True}                       # no store line, never "[object Object]"
-        assert bad["jar"]["level"] == 0 and isinstance(bad["jar"]["label"], str)
-        assert "max_strength" not in bad["health"] and "local_density" not in bad["health"]
-        assert bad["crystal_index"][0]["tags"] == ["operator", "ergonomics"]   # the older joined form still splits
+        assert bad["jar"] is None and "jar" in bad["errors"]["entity"]      # never a healthy jar at level 0
+        assert bad["health"] is None                                   # a malformed metric degrades the panel, no fake figure
 
     def test_now_rows_keep_their_full_text_group_titles_and_hostile_characters_are_visible(self) -> None:
         ck = Cockpit()
@@ -278,12 +276,6 @@ class TestManifestMapperAdversarial:
         now = view["extra_panels"]["now"]["lines"][0]
         assert now["text"].endswith("<U+202E>END") and len(now["text"]) > 160   # full body, sanitised
         assert "Overdue" in now["meta"]                                         # the kernel's band title, not "overdue"
-
-    def test_an_unparseable_focus_stamp_is_age_unknown_not_fresh(self) -> None:
-        ck = _tray_cockpit()
-        ck.register(ProviderSpec("focus", "line", "Focus", "gauge", lambda c: Read(value={"lines": [
-            {"label": "focus", "text": "x", "at": "not-a-date", "source": "s"}]}), region="header"))
-        assert _view(self._snap(ck))["focus"]["freshness"] == "unknown"
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -334,14 +326,13 @@ class TestManifestMapperBoundary:
         view = _view(json.loads(raw))        # json.loads keeps "__proto__" as an own key, as a browser's JSON.parse does
         assert [e["id"] for e in view["layout"]].count("tray") == 1
 
-    def test_a_far_future_panel_stamp_does_not_move_every_other_ages(self) -> None:
+    def test_an_older_kernels_focus_header_panel_is_skipped_without_a_fault(self) -> None:
         ck = _tray_cockpit()
         ck.register(ProviderSpec("focus", "line", "Focus", "gauge", lambda c: Read(value={"lines": [
-            {"label": "focus", "text": "x", "at": "2099-01-01T00:00:00+00:00", "source": "s"}]}), region="header"))
-        snap = snapshot(ck)
-        snap["panels"]["tray"]["as_of"] = "2100-01-01T00:00:00+00:00"
-        view = _view(snap)
-        assert view["focus"]["freshness"] == "unknown"
+            {"label": "focus", "text": "x", "at": "2026-10-09T12:00:00+00:00", "source": "s"}]}), region="header"))
+        view = _view(self._snap(ck))
+        assert "focus" not in view and "focus" not in view["errors"]
+        assert "focus" not in [e["id"] for e in view["layout"]]
 
     def test_a_degraded_now_view_names_its_source_and_a_missing_wraps_panel_is_not_unavailable(self) -> None:
         ck = _tray_cockpit()
@@ -395,6 +386,88 @@ class TestManifestMapperBoundary:
         view = _view(snap)
         titles = [e["title"] for e in view["layout"] if e["id"] == "tray"]
         assert len(titles) == 1 and isinstance(titles[0], str) and titles[0]   # the head's title, not the object
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+class TestManifestMapperParses:
+    """Parse, don't validate: a payload either has the shape its panel kind needs or the panel degrades.
+    No malformed field is replaced by a default that reads as data."""
+
+    @staticmethod
+    def _health(metrics: list[dict[str, Any]]) -> Cockpit:
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": metrics})))
+        return ck
+
+    @staticmethod
+    def _metric(label: str, value: Any) -> dict[str, Any]:
+        return {"label": label, "value": value, "unit": None, "status": "ok", "read": None}
+
+    def _degraded(self, view: dict[str, Any], pid: str) -> None:
+        assert "could not be mapped" in view["extra_panels"][pid]["error"]
+        assert [e["id"] for e in view["layout"]].count("tray") == 1      # the others still render
+
+    def test_a_malformed_health_metric_degrades_the_health_panel_not_a_zero(self) -> None:
+        snap = snapshot(self._health([self._metric("density", 0.1), self._metric("links", 4)]))
+        snap["panels"]["health"]["value"]["metrics"][0]["value"] = {"bad": True}
+        view = _view(snap)
+        assert view["health"] is None
+        self._degraded(view, "health")
+
+    def test_a_stringified_health_metric_degrades_the_panel_not_a_silent_drop(self) -> None:
+        snap = snapshot(self._health([self._metric("links", 4)]))
+        snap["panels"]["health"]["value"]["metrics"][0]["value"] = "4"
+        view = _view(snap)
+        assert view["health"] is None
+        self._degraded(view, "health")
+
+    def test_non_array_or_non_object_metrics_degrade_the_health_panel(self) -> None:
+        for bad in ({"a": 1}, "x", [3]):
+            snap = snapshot(self._health([self._metric("links", 4)]))
+            snap["panels"]["health"]["value"]["metrics"] = bad
+            view = _view(snap)
+            assert view["health"] is None
+            self._degraded(view, "health")
+
+    def test_a_malformed_jar_is_null_with_an_entity_error(self) -> None:
+        jar = {"status": "ok", "label": "3 today", "level": 0.5, "today": 3, "day": "d"}
+        for field, bad in (("level", {"bad": True}), ("level", 1.5), ("level", None), ("label", 7)):
+            ck = Cockpit(entity=lambda ctx: {"name": "e", "governance": "x", "brand": {}, "jar": dict(jar)})
+            snap = snapshot(ck)
+            snap["manifest"]["entity"]["jar"][field] = bad
+            view = _view(snap)
+            assert view["jar"] is None and "jar" in view["errors"]["entity"], (field, bad)
+
+    def test_a_malformed_masthead_string_is_omitted_with_an_entity_error(self) -> None:
+        ck = Cockpit(entity=lambda ctx: {"name": "e", "governance": "x", "brand": {"wordmark": "W", "model": "M"}})
+        snap = snapshot(ck)
+        ent = snap["manifest"]["entity"]
+        ent["name"], ent["governance"] = {"a": 1}, 5
+        ent["brand"] = {"wordmark": ["w"], "model": "M"}
+        view = _view(snap)
+        assert view.get("entity_name") is None and view.get("scope") is None and view.get("brand_wordmark") is None
+        assert view["brand_model"] == "M" and view["errors"]["entity"]
+
+    def test_legacy_string_tags_split_and_array_tags_are_whole(self) -> None:
+        ck = Cockpit()
+        ck.register(ProviderSpec("crystals", "triage-list", "Crystals", "feed", lambda c: Read(rows=(
+            RowIn("crystal:c1", "c1", {"at": "2026-10-01T00:00:00+00:00", "tags": ["a"]}, stored={"id": "c1"}),
+            RowIn("crystal:c2", "c2", {"at": "2026-10-01T00:00:00+00:00", "tags": ["x,y", "z"]}, stored={"id": "c2"}))),
+            order="time.desc", facets=frozenset({"at", "tags"}), version_fields=("id",), region="mind"))
+        snap = snapshot(ck)
+        snap["panels"]["crystals"]["rows"][0]["facets"]["tags"] = "a, b"      # the legacy single-string form
+        tags = {c["name"]: c["tags"] for c in _view(snap)["crystal_index"]}
+        assert tags == {"c1": ["a", "b"], "c2": ["x,y", "z"]}
+
+    def test_a_wraps_row_with_a_non_string_stamp_degrades_the_wraps_panel(self) -> None:
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("wraps", "visual", "W", "feed", lambda c: Read(value={"visual": "wrap-history", "data": [
+            {"wrapped_at": "2026-10-01T00:00:00+00:00", "continuity_chars": 10}], "text": []})))
+        snap = snapshot(ck)
+        snap["panels"]["wraps"]["value"]["data"][0]["wrapped_at"] = {"bad": True}
+        view = _view(snap)
+        self._degraded(view, "wraps")
+        assert view["wraps"] == [] and view["errors"]["wraps"]
 
 
 def _dump_dom(url: str) -> str:
