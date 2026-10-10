@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from levain.cockpit.engine import Cockpit, RowNotFound
 
 MANIFEST_PATH = "/cockpit/manifest.json"
+FRESHNESS_PATH = "/cockpit/freshness.json"
 PANEL_PREFIX = "/cockpit/panel/"
 PANEL_SUFFIX = ".json"
 TOKEN_HEADER = "X-Levain-Write-Token"
@@ -25,7 +26,7 @@ PROFILES = ("full", "compact")
 
 
 def is_cockpit_path(path: str) -> bool:
-    return path == MANIFEST_PATH or (path.startswith(PANEL_PREFIX) and path.endswith(PANEL_SUFFIX))
+    return path in (MANIFEST_PATH, FRESHNESS_PATH) or (path.startswith(PANEL_PREFIX) and path.endswith(PANEL_SUFFIX))
 
 
 def credential_for(supplied: str, expected: str | None) -> dict[str, Any]:
@@ -77,6 +78,10 @@ def handle_get(
             return 304, b"", hdrs
         return 200, json.dumps(payload, separators=(",", ":")).encode("utf-8"), hdrs
 
+    if path == FRESHNESS_PATH:
+        # small and NEVER answered 304: no validator is offered, and If-None-Match is ignored, so a
+        # client that revalidated a panel always reads that panel's current age here.
+        return 200, json.dumps(cockpit.freshness(), separators=(",", ":")).encode("utf-8"), base_headers
     if path == MANIFEST_PATH:
         return ok(cockpit.manifest(cred), ["manifest", cred["class"]])
     panel_id = unquote(path[len(PANEL_PREFIX): -len(PANEL_SUFFIX)])
