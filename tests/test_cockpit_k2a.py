@@ -295,8 +295,10 @@ class TestBinding:
         assert rig.post("operator_state", "state", None, {"text": "x"}, panel_version=state_v)["ok"]
         _refused("stale", rig.post, "operator_state", "state", None, {"text": "y"}, panel_version=state_v)
         # discovered panels, named before any read discovered them: the write path discovers them itself
-        for pid, verb in (("section:state", "section_edit"), ("config:posture", "config")):
-            _refused("stale", rig.post, verb, pid, None, {"new_body": "x"}, panel_version="0" * 16)
+        _refused("stale", rig.post, "config", "config:posture", None, {"new_body": "x"}, panel_version="0" * 16)
+        # section_edit is not offered until anneal's section writer ships (Phill ruled (i), 2026-10-10)
+        _refused("not_offered", rig.post, "section_edit", "section:state", None, {"new_body": "x"},
+                 panel_version="0" * 16)
 
     def test_touch_session_open_and_midnight_leave_the_version_alone(self, rig: Rig) -> None:
         """'a spore_touch, a session-open and a clock moved past midnight between render and write →

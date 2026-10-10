@@ -597,8 +597,9 @@ def build_default_cockpit(
             used.add(pid)
             specs.append(ProviderSpec(pid, "prose", s_.heading, "feed",
                                       _prose(source, "section", s_.heading), region="mind", rank=20 + i,
-                                      edit_class=s_.edit_class,
-                                      verbs=("section_edit",) if s_.edit_class == CLASS_A else ()))
+                                      # no section_edit offered until anneal's section writer
+                                      # (Store.replace_section) ships: Phill ruled (i), 2026-10-10
+                                      edit_class=s_.edit_class))
         for i, d in enumerate(v.config_docs):
             pid = f"config:{d.key}"
             if pid not in used:
