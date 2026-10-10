@@ -8,7 +8,6 @@ enforces no authority: K1 is the read half, served under the existing read gate 
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import threading
 import time
@@ -151,15 +150,27 @@ class _State:
     mu: threading.Lock = field(default_factory=threading.Lock)   # guards the fields _process writes
     snap: _Snap | None = None
     ever_present: bool = False
-    last_good_as_of: str | None = None       # the newest-STARTED good read's data time (display)
-    last_good_started: str | None = None     # when that read started: the clock the bookkeeping orders on
+    last_good_as_of: str | None = None
     failing_since: str | None = None
     last_completion: datetime | None = None
-    flight: "Future | None" = None            # the read currently running, shared by concurrent callers
+    pflight: "_Flight | None" = None          # the panel read in flight: ONE owner commits it, joiners share its snapshot
+    flight: "Future | None" = None            # _bounded's flight (entity, discovery): no bookkeeping
     flight_started: float = 0.0               # monotonic start of that read
     refresh_started: datetime | None = None   # set while a refresher cycle is inside its read
     started: datetime | None = None
-    fresh: tuple[int, str | None, str] | None = None   # (read generation, as_of, status) of the newest-started read served
+    fresh: tuple[str | None, str] | None = None   # (as_of, status) of the last read committed (on-demand panels)
+
+
+class _Flight:
+    """One panel read. The OWNER (the caller that started it) alone processes the result and commits
+    every per-panel field; joiners wait for ``snap`` and receive that same snapshot. At most one is
+    in flight per panel, so commits happen in start order by construction."""
+
+    def __init__(self) -> None:
+        self.raw: Future = Future()      # the provider's result (set by the read thread)
+        self.snap: Future = Future()     # the processed snapshot (set by the owner after it commits)
+        self.started = time.monotonic()
+        self.committed = False
 
 
 class _Refresher:
@@ -201,7 +212,6 @@ class Cockpit:
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
-        self._gen = itertools.count(1)   # read generations: an older-started read never overwrites a newer one's freshness
 
     # --- registration ----------------------------------------------------------------
     def register(self, spec: ProviderSpec) -> None:
@@ -353,34 +363,79 @@ class Cockpit:
         return res
 
     def refresh(self, panel_id: str) -> None:
-        """One refresh cycle for a refresher panel (the thread's body; also the test step)."""
+        """One refresh cycle for a refresher panel (the thread's body; also the test step). It goes
+        through the same one-flight read as a request: if a read is already running it joins it."""
         spec, st = self._specs[panel_id], self._state[panel_id]
-        ctx = ReadContext(self._clock())
+        self._read_panel(spec, st, ReadContext(self._clock()))
+
+    def _plain_error(self, spec: ProviderSpec, st: _State, message: str) -> _Snap:
+        """An error answer for a caller that does not own the read: it commits nothing."""
+        return _Snap("error", None, None, [], [], st.last_good_as_of, message, spec.note)
+
+    def _read_panel(self, spec: ProviderSpec, st: _State, ctx: ReadContext) -> _Snap:
+        """Read a panel's source ONCE at a time (design §3.4). The caller that finds no read in flight
+        owns it: it waits (bounded by the provider's timeout), processes the result, commits ``snap``,
+        ``last_completion`` and ``fresh`` and the failure bookkeeping, then releases the joiners.
+        A caller that arrives during a read joins it and gets the owner's snapshot; one that arrives
+        after the owner timed out while the source thread is still hung fails fast without
+        committing. Reads therefore commit in start order, with no clock or counter ordering them."""
         with st.lock:
-            st.refresh_started = ctx.now
+            fl = st.pflight
+            if fl is None:
+                fl = st.pflight = _Flight()
+                st.refresh_started = ctx.now
+                owner = True
+            elif not fl.committed:
+                owner, wait = False, max(0.0, spec.timeout_s - (time.monotonic() - fl.started))
+            else:
+                return self._plain_error(spec, st, "previous read still running past its timeout (source hung?)")
+        if not owner:
+            try:
+                return fl.snap.result(timeout=wait)
+            except FutureTimeout:
+                return self._plain_error(spec, st, f"timed out after {wait:g}s")
+
+        def work() -> None:
+            try:
+                out: Any = spec.read(ctx)
+            except BaseException as exc:  # noqa: BLE001 - an escaping exception IS a Fault
+                out = Fault(f"{type(exc).__name__}: {exc}")
+            fl.raw.set_result(out)
+            with st.lock:
+                if fl.committed and st.pflight is fl:
+                    st.pflight = None        # the owner already committed and left a hung thread behind
+
         try:
-            snap = self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
-        except Exception as exc:  # noqa: BLE001 - a refresh that cannot even be processed is an error read
+            threading.Thread(target=work, name="cockpit-read", daemon=True).start()
+        except BaseException as exc:  # noqa: BLE001 - thread exhaustion fails THIS read and poisons nothing
+            fl.raw.set_result(Fault(f"could not start a read: {type(exc).__name__}: {exc}"))
+        try:
+            res: Any = fl.raw.result(timeout=spec.timeout_s)
+        except FutureTimeout:
+            ctx.abandon()
+            res = Fault(f"timed out after {spec.timeout_s:g}s")
+        if not isinstance(res, (Read, Absent, Fault)):
+            res = Fault(f"provider returned {type(res).__name__}, not Read/Absent/Fault")
+        try:
+            snap = self._process(spec, st, res, ctx)
+        except Exception as exc:  # noqa: BLE001 - a read that cannot be processed is an error read
             with st.mu:
                 snap = self._fault(spec, st, f"{type(exc).__name__}: {exc}", _iso(ctx.now))
         with st.lock:
             st.snap = snap
             st.last_completion = self._clock()
             st.refresh_started = None
+            st.fresh = (snap.as_of, snap.status)
+            fl.committed = True
+            if fl.raw.done() and st.pflight is fl:
+                st.pflight = None
+        fl.snap.set_result(snap)
+        return snap
 
     def _snap_for(self, spec: ProviderSpec, ctx: ReadContext) -> _Snap:
         st = self._state[spec.id]
         if spec.refresh_every_s is None:
-            gen = next(self._gen)        # allocated BEFORE the read, so it orders reads by start
-            try:
-                snap = self._process(spec, st, self._call(spec, st, spec.read, ctx), ctx)
-            except Exception as exc:  # noqa: BLE001 - as the refresher: a read that cannot be processed is an error read
-                with st.mu:
-                    snap = self._fault(spec, st, f"{type(exc).__name__}: {exc}", _iso(ctx.now))
-            with st.lock:        # what the freshness route reports; it never reads a source itself
-                if st.fresh is None or gen >= st.fresh[0]:
-                    st.fresh = (gen, snap.as_of, snap.status)
-            return snap
+            return self._read_panel(spec, st, ctx)
         with st.lock:
             snap, last, started, running = st.snap, st.last_completion, st.started, st.refresh_started
         if snap is None:
@@ -421,20 +476,13 @@ class Cockpit:
             snap = self._read_snap(spec, res, ctx, now_iso)
         except Exception as exc:  # noqa: BLE001 - malformed provider output of ANY shape is a Fault, never a crash
             return self._fault(spec, st, f"provider output refused: {exc}", now_iso)
-        # Reads can finish out of start order, so the bookkeeping orders on READ START (never on the
-        # provider's data time): the newest-started success owns last_good, and a success clears a
-        # failure only if it STARTED after the failure did (a tie keeps the failure).
         st.ever_present = True
-        if not st.last_good_started or _iso_ge(now_iso, st.last_good_started):
-            st.last_good_started, st.last_good_as_of = now_iso, snap.as_of
-        if st.failing_since is None or (_iso_ge(now_iso, st.failing_since) and now_iso != st.failing_since):
-            st.failing_since = None
+        st.last_good_as_of = snap.as_of
+        st.failing_since = None
         return snap
 
     def _fault(self, spec: ProviderSpec, st: _State, message: str, now_iso: str) -> _Snap:
-        # a fault that started before the newest good read is stale news: it does not (re)start a
-        # failure (a tie goes to the fault)
-        if st.failing_since is None and (not st.last_good_started or _iso_ge(now_iso, st.last_good_started)):
+        if st.failing_since is None:
             st.failing_since = now_iso
         detail = f"{message}"
         if st.failing_since:
@@ -797,7 +845,7 @@ class Cockpit:
             if fresh is None:
                 out[spec.id] = dict(unread)
                 continue
-            _at, as_of, status = fresh
+            as_of, status = fresh
             if status in ("ok", "empty", "partial") and as_of and \
                     (ctx.now - _parse_iso(as_of)) > timedelta(seconds=spec.stale_after_s):
                 status = "stale"
@@ -897,14 +945,6 @@ class Cockpit:
             return Read(value=rows[0])
         except Exception as exc:  # noqa: BLE001
             return Fault(f"provider output refused: {exc}")
-
-
-def _iso_ge(a: str, b: str) -> bool:
-    """``a`` is at or after ``b``; an unparseable stamp never orders (it compares as not-later)."""
-    try:
-        return _parse_iso(a) >= _parse_iso(b)
-    except (ValueError, TypeError):
-        return False
 
 
 def _parse_iso(s: str) -> datetime:

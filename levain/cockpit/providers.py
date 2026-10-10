@@ -9,6 +9,7 @@ edit ledger is read directly because ``recent_edits`` swallows every fault."""
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -49,7 +50,11 @@ def _store_label(db: Path) -> str:
     """The store's display label for the masthead: ``~/…`` under the home directory, else the file
     name. The absolute path (which carries the account name) never goes on the wire (design §6.2)."""
     try:
-        return "~/" + db.expanduser().absolute().relative_to(Path.home().absolute()).as_posix()
+        home = os.path.normpath(os.path.expanduser("~"))
+        rel = os.path.relpath(os.path.normpath(os.path.abspath(db.expanduser())), home)
+        if rel == "." or rel == ".." or rel.startswith(".." + os.sep):
+            return db.name
+        return "~/" + Path(rel).as_posix()
     except (ValueError, RuntimeError, OSError):
         return db.name       # no filesystem resolution, and no exception text, can reach the wire
 
