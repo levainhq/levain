@@ -124,16 +124,28 @@
   }
 
   // wraps = "unavailable" means the wraps panel was unreadable: last-wrap figures are then ABSENT, not "never"
+  // a number, or absent: the renderer's numeric conversions throw on a cleaned object, after fault isolation
+  const fin = (x) => (typeof x === "number" && Number.isFinite(x) ? x : undefined);
+  const str = (x) => (typeof x === "string" && x ? x : null);
+  // the masthead jar, rebuilt from typed fields only (null when the kernel sent none or a malformed one)
+  function jarOf(j) {
+    if (!j || typeof j !== "object" || Array.isArray(j)) return null;
+    const today = fin(j.today);
+    return { status: str(j.status) || "", label: str(j.label) || "", level: fin(j.level) || 0,
+             today: Number.isInteger(today) ? today : null, day: str(j.day) };
+  }
+
   function healthOf(metrics, wraps) {
     const m = new Map();
     for (const x of metrics) m.set(x.label, x.value);
+    const n = (k) => fin(m.get(k));
     const last = Array.isArray(wraps) && wraps[0] ? wraps[0] : null;
     return {
-      write_path_live: m.get("write path") === "live", total_links: m.get("links"), avg_strength: m.get("avg strength"),
-      max_strength: m.get("max strength"), density: m.get("density"), local_density: m.get("local density"),
-      total_episodes: m.get("episodes"), episodes_since_wrap: m.get("episodes since wrap"),
-      tombstones: m.get("tombstones"), total_wraps: m.get("wraps"),
-      graduations_validated_total: m.get("graduations validated"), graduations_demoted_total: m.get("graduations demoted"),
+      write_path_live: m.get("write path") === "live", total_links: n("links"), avg_strength: n("avg strength"),
+      max_strength: n("max strength"), density: n("density"), local_density: n("local density"),
+      total_episodes: n("episodes"), episodes_since_wrap: n("episodes since wrap"),
+      tombstones: n("tombstones"), total_wraps: n("wraps"),
+      graduations_validated_total: n("graduations validated"), graduations_demoted_total: n("graduations demoted"),
       last_wrap_at: last ? last.wrapped_at : null, continuity_chars: last ? last.continuity_chars : null,
       wrap_history_unavailable: wraps === "unavailable",
     };
@@ -180,10 +192,10 @@
     const ent = m.entity || {};
     const view = {
       // the store line is the kernel's home-relative label, never an absolute path; no label, no line
-      paths: ent.store_label ? { episodic_db: ent.store_label } : { omitted: true }, scope: ent.governance, entity_name: ent.name,
+      paths: str(ent.store_label) ? { episodic_db: str(ent.store_label) } : { omitted: true }, scope: ent.governance, entity_name: ent.name,
       brand_wordmark: (ent.brand || {}).wordmark, brand_model: (ent.brand || {}).model,
       health: null, graph: null, crystal_index: [], open_spores: [], tray: [], keep: [], episodes: [],
-      sections: [], config_docs: [], wraps: [], recent_edits: [], focus: null, state: null, jar: ent.jar || null,
+      sections: [], config_docs: [], wraps: [], recent_edits: [], focus: null, state: null, jar: jarOf(ent.jar),
       layout: [], errors: Object.create(null), extra_panels: Object.create(null), writable: false, write_token_required: false,
     };
     for (const e of m.errors || []) view.errors[e.source || "manifest"] = e.message;
@@ -251,7 +263,9 @@
       } else if (pid === "crystals" && panel.kind === "triage-list") {
         view.crystal_index = rows.map((r) => {
           const f = r.facets || {};
-          const tags = [].concat(f.tags || []).map((s) => String(s).trim()).filter(Boolean).map(visible);
+          // a list of tags; an element may still carry the older comma-joined form, so each is split
+          const tags = [].concat(f.tags || []).filter((s) => typeof s === "string")
+            .flatMap((s) => s.split(",")).map((s) => s.trim()).filter(Boolean).map(visible);
           return { name: bare(r.id), level: f.crystal_level, one_clause: r.body || r.title, permanence: f.permanence,
                    last_activated_on: f.last_activated_on, tags: tags };
         });
