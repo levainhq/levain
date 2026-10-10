@@ -121,3 +121,9 @@ def test_focus_is_gone_from_the_hooks_the_cli_and_the_write_seam(tmp_path, monke
         apply_edit(scope, {"kind": "focus", "text": "x"})
     assert ee.value.code == "bad_kind" and ee.value.http_status == 400
     assert json.loads(p.read_text())["focus"] == "legacy"  # refused, not applied
+
+
+def test_the_operator_manual_states_the_expiry_the_code_uses() -> None:
+    from levain.dashboard import STATE_EXPIRES_AFTER_HOURS
+    manual = (Path(__file__).resolve().parent.parent / "levain" / "templates" / "docs" / "operator-manual.md").read_text()
+    assert f"after {STATE_EXPIRES_AFTER_HOURS} hours" in manual
