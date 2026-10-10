@@ -4823,6 +4823,8 @@ def _dirmngr_sockets() -> list[Path]:
     network namespace, and it fetches (WKD, keyservers) and resolves names the client chooses."""
     found: list[Path] = []
     roots = [Path(r) / "gnupg" for r in _runtime_dirs()] + [Path.home() / ".gnupg"]
+    if os.environ.get("GNUPGHOME"):
+        roots.append(Path(os.environ["GNUPGHOME"]).expanduser())
     for g in roots:
         try:
             if not g.is_dir():

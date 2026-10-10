@@ -1348,7 +1348,9 @@ def _single_writer_lock(
         precheck()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        # Never through a link: a lock file swapped for a symlink to a file levain later
+        # replaces would hand a second process a different inode, and so a second lock.
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
         if path.parent.name == ".levain":
             _ensure_gitignored(path.parent, path.name)
     except OSError as e:
@@ -2052,8 +2054,8 @@ def refresh_adapter(
                 codex_held.enter_context(codex_home_lock(_codex_home()))
             except CodexHomeBusy as e:
                 out.review.append("adapter")
-                emit(f"\n• adapter files NOT refreshed: {e.message} Re-run `levain update`; "
-                     f"nothing else of the adapter was changed.")
+                emit(f"\n• adapter files NOT refreshed, none of them (activation, carrier and "
+                     f"codex's files alike): {e.message} Re-run `levain update`.")
                 return out
         try:
             roster = compose_roster([templates_root, *pack_dirs])
@@ -2237,7 +2239,7 @@ def _put_pending(install: Path, key: str, data: bytes) -> Path:
     return target
 
 
-def _drop_pending(install: Path, key: str, lines: list[str]) -> None:
+def _drop_pending(install: Path, key: str, lines: list[str], review: list[str]) -> None:
     """Remove ``key``'s staged copy once the file is settled (current, or written by levain).
     A copy left behind is an older release's render: adopting it later downgrades the file,
     and the next update calls the downgrade ``keep``, because the record already holds the
@@ -2248,8 +2250,9 @@ def _drop_pending(install: Path, key: str, lines: list[str]) -> None:
     except FileNotFoundError:
         return
     except OSError as e:
-        lines.append(f"  note: could not remove the stale staged copy {target} ({e}); it is "
-                     f"an older version, so do not copy it over the file.")
+        review.append(key)  # not settled until it is gone: update stays nonzero
+        lines.append(f"  {key}: could not remove its stale staged copy {target} ({e}); it is "
+                     f"an older version, so do not copy it over the file. Remove it yourself.")
         return
     lines.append(f"  {key}: its staged copy under .levain/pending/ is settled and removed.")
 
@@ -2298,7 +2301,7 @@ def _refresh_activation(
             and set(receipt or {}) <= set(expected):
         if apply:
             for rel in sorted(expected):
-                _drop_pending(install, f"activation/{rel}", lines)
+                _drop_pending(install, f"activation/{rel}", lines, out.review)
         return
     if status in ("corrupt", "empty"):
         out.review.append("activation/")
@@ -2342,7 +2345,7 @@ def _refresh_activation(
             if rel not in record:
                 new_receipt[rel] = entry  # a pre-receipt install gains its record
             if apply:
-                _drop_pending(install, key, lines)
+                _drop_pending(install, key, lines, out.review)
             continue
         if action == "pending":
             out.review.append(key)
@@ -2374,7 +2377,7 @@ def _refresh_activation(
             target.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write_bytes(target, want, like=src)
             new_receipt[rel] = entry
-            _drop_pending(install, key, lines)
+            _drop_pending(install, key, lines, out.review)
         except OSError as e:
             out.refreshed.pop()
             out.review.append(key)
@@ -2548,7 +2551,7 @@ def _refresh_codex_config(
     old_text, new_text = old_block.group(0).rstrip() + "\n", new_block.group(0).rstrip() + "\n"
     if old_text == new_text:
         if apply:
-            _drop_pending(install, "codex-home/config.toml.anneal_memory", lines)
+            _drop_pending(install, "codex-home/config.toml.anneal_memory", lines, out.review)
         return
     old_store = _codex_block_store(old_text)
     if old_store != _codex_block_store(new_text):
@@ -2584,7 +2587,7 @@ def _refresh_codex_config(
         try:
             _merge_codex_config(config, fragment, emit=lines.append)
             _record_adapter_key(install, CODEX_CONFIG_KEY, _sha256_text(new_text))
-            _drop_pending(install, "codex-home/config.toml.anneal_memory", lines)
+            _drop_pending(install, "codex-home/config.toml.anneal_memory", lines, out.review)
         except (OSError, InitError) as e:
             out.refreshed.pop()
             out.review.append(CODEX_CONFIG_KEY)
@@ -2703,7 +2706,7 @@ def _refresh_adapter_files(
         if action == "current":
             new_receipt[key] = _sha256_text(want_text)
             if apply:
-                _drop_pending(install, key, lines)
+                _drop_pending(install, key, lines, out.review)
             continue
         if action == "pending":
             out.review.append(key)
@@ -2757,7 +2760,7 @@ def _refresh_adapter_files(
                 target.parent.mkdir(parents=True, exist_ok=True)
                 _atomic_write_text(target, want_text)
             new_receipt[key] = _sha256_text(want_text)
-            _drop_pending(install, key, lines)
+            _drop_pending(install, key, lines, out.review)
         except OSError as e:
             out.refreshed.pop()
             out.review.append(key)
@@ -2972,43 +2975,87 @@ def _write_codex_pair(codex_home: Path, fragment: str, hooks_text: str,
     """Write codex's two machine-global files as one unit, under :func:`codex_home_lock`
     held by the caller. Both texts are rendered before either file is touched. config.toml
     goes first, so its parse refusal (``_require_toml``, judged on the exact text written)
-    fires before anything changes; if hooks.json then does not hold the new text, config.toml
-    is put back to its prior bytes, so an I/O failure between the two cannot leave codex
-    registering this install's store while firing another install's hooks.
+    fires before anything changes. If hooks.json then does not hold the new text, config.toml
+    is put back, so an I/O failure between the two cannot leave codex registering this
+    install's store while firing another install's hooks.
 
-    The rollback acts on the file config.toml RESOLVES to, which is the file the merge wrote
-    (a symlink, dangling or not, is written through): the link stays, and its target goes
-    back to its prior bytes, or away if it did not exist. Whether hooks.json was written is
-    read from hooks.json itself, so a failure (an interrupt, say) after its rename does not
-    undo config.toml under the new hooks."""
+    The undo is a RENAME, never a rewrite (the lockfile / conffile frame, git's lockfile.c and
+    dpkg's .dpkg-old): before the merge, the file config.toml resolves to (a symlink is written
+    through, so the link stays) is kept beside itself under a second name, a hard link where
+    the filesystem has them, else a copy; failing to keep it writes nothing. Putting it back
+    renames that original over the live name, which needs no free space and restores its
+    bytes, mode and owner as they were. It is put back only while the live file is still
+    exactly what the merge wrote: an edit made in between is kept, and named. A file that did
+    not exist goes away the same way. What this cannot cover: codex reading in the moment
+    between the two renames, and a crash (SIGKILL, power loss) in it."""
     config = codex_home / "config.toml"
     hooks = codex_home / "hooks.json"
     written = config.resolve()
-    try:
-        prior: bytes | None = written.read_bytes()
-    except FileNotFoundError:
-        prior = None
-    _merge_codex_config(config, fragment, emit=emit)
-    try:
-        _write_codex_hooks(hooks, hooks_text, emit)
-    except BaseException:
+    kept: Path | None = None
+    if written.exists():
+        kept = written.with_name(f".{written.name}.levain-prior.{time.time_ns()}")
         try:
-            landed = hooks.read_text(encoding="utf-8") == hooks_text
-        except (OSError, ValueError):
-            landed = False
-        if not landed:
             try:
-                if prior is None:
-                    written.unlink(missing_ok=True)
-                else:
-                    _atomic_write_bytes(written, prior)
-                emit(f"  ! {hooks} could not be written, so the change to {config} above was "
-                     f"undone: it is back as it was (any backup listed above is a copy of it).")
-            except OSError as e:
-                emit(f"  ! {hooks} could not be written, AND {config} could not be put back "
-                     f"({e}): it now registers this install's store. Re-run `levain init "
-                     f"--adapter codex` from the install codex should use.")
-        raise
+                os.link(written, kept)
+            except OSError:
+                shutil.copy2(written, kept)
+        except OSError as e:
+            with contextlib.suppress(OSError):
+                kept.unlink()
+            raise InitError(f"could not keep a copy of {written} to put back if codex's "
+                            f"hooks.json then fails ({e}). Nothing was written.") from None
+    try:
+        _merge_codex_config(config, fragment, emit=emit)
+        try:
+            ours: bytes | None = written.read_bytes()
+        except OSError:
+            ours = None
+        try:
+            _write_codex_hooks(hooks, hooks_text, emit)
+        except BaseException:
+            try:
+                landed = hooks.read_text(encoding="utf-8") == hooks_text
+            except BaseException:
+                landed = False
+            if not landed:
+                _put_codex_config_back(written, kept, ours, config, hooks, emit)
+                kept = None  # renamed back over the live name, or left and named
+            raise
+    finally:
+        if kept is not None:
+            with contextlib.suppress(OSError):
+                kept.unlink()
+
+
+def _put_codex_config_back(written: Path, kept: Path | None, ours: bytes | None, config: Path,
+                           hooks: Path, emit: Callable[[str], None]) -> None:
+    """:func:`_write_codex_pair`'s undo, by rename: ``kept`` (the original, or None when there
+    was none) goes back over ``written`` only while ``written`` still holds ``ours``."""
+    try:
+        now: bytes | None = written.read_bytes()
+    except FileNotFoundError:
+        now = None
+    except OSError:
+        now = b"\0unreadable"
+    if ours is None or now != ours:
+        where = f"; the original is kept at {kept}" if kept is not None else ""
+        emit(f"  ! {hooks} could not be written, and {config} changed after levain wrote it, "
+             f"so it was left as it is{where}. It may register this install's store: re-run "
+             f"`levain init --adapter codex` from the install codex should use.")
+        return
+    try:
+        if kept is None:
+            written.unlink()
+        else:
+            os.replace(kept, written)
+    except OSError as e:
+        where = f" The original is kept at {kept}." if kept is not None else ""
+        emit(f"  ! {hooks} could not be written, AND {config} could not be put back ({e}): "
+             f"it now registers this install's store.{where} Re-run `levain init --adapter "
+             f"codex` from the install codex should use.")
+        return
+    emit(f"  ! {hooks} could not be written, so the change to {config} above was undone: it "
+         f"is back as it was (any backup listed above is a copy of it).")
 
 
 def _codex_hooks_json(adapter_root: Path, python_path: str, install: Path) -> str:
