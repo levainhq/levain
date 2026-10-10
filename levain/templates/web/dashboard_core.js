@@ -125,6 +125,7 @@
   // re-renders (a verb fires → the board rebuilds → you stay in your filter) and into the
   // focus modal. Empty = show all. Matches spore text OR spore-id.
   let openLoopsQuery = "";
+  const sporeQueries = {};  // Tray / Keep filter queries, keyed by panel kind
   // The scroll position to re-apply after a modal refresh-rebuild. For the episode
   // panel the result list arrives async (a /recall.json fetch), so buildModal's
   // synchronous restore clamps to 0 — the episode renderer re-applies this once its
@@ -716,6 +717,41 @@
     return row;
   }
 
+  // The filter bar the spore panels share (Open Loops / Tray / Keep): CLIENT-side over the
+  // loaded list, text (case-insensitive substring) OR spore-id. The query persists per panel
+  // kind in `sporeQueries`, so a verb that rebuilds the board leaves you in your filter.
+  // FILTER-EXTRACT-START (a node test lifts this block)
+  function mountSporeFilter(p, all, noun, kind, drawRows) {
+    const bar = el("div", "ep-search");
+    const input = el("input", "ep-search-input");
+    input.type = "search";
+    input.placeholder = "filter " + noun + " by text or spore-id…";
+    input.setAttribute("aria-label", "filter " + kind + " by text or spore id");
+    const status = el("span", "ep-search-status", "");
+    bar.append(input, status);
+    p.appendChild(bar);
+    const results = el("div", "sp-results");
+    p.appendChild(results);
+    const render = (raw) => {
+      const q = raw.trim().toLowerCase();
+      const rows = q
+        ? all.filter((s) => (s.text || "").toLowerCase().includes(q) ||
+                            String(s.id || "").toLowerCase().includes(q))
+        : all;
+      results.replaceChildren();
+      if (rows.length === 0) results.appendChild(el("p", "empty", "no " + noun + " match “" + raw.trim() + "”"));
+      else drawRows(rows, results);
+      status.textContent = q ? (rows.length + (rows.length === 1 ? " match" : " matches") + " · ⌫ to clear") : "";
+      const b = results.closest(".pbody"); if (b) measureOverflow(b);
+      measureClauses(results);
+    };
+    input.addEventListener("input", () => { sporeQueries[kind] = input.value; render(input.value); });
+    if (sporeQueries[kind]) input.value = sporeQueries[kind];
+    render(input.value);
+  }
+
+  // FILTER-EXTRACT-END
+
   // The three spore projections share one renderer — same read/verb contract, different
   // source list + badge axis + empty copy. All three read their fault from the single
   // `open_spores` error key (the dashboard does ONE spore read that fills all three).
@@ -729,14 +765,16 @@
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (!list || list.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
-    let lastGroup = null;
-    for (const s of list) {
-      // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order
-      const g = s.group || null;
-      if (s.group_title && g !== lastGroup) p.appendChild(el("div", "grp-head", s.group_title));
-      lastGroup = g;
-      p.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
-    }
+    mountSporeFilter(p, list, "items", entry.kind, (rows, results) => {
+      let lastGroup = null;
+      for (const s of rows) {
+        // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order
+        const g = s.group || null;
+        if (s.group_title && g !== lastGroup) results.appendChild(el("div", "grp-head", s.group_title));
+        lastGroup = g;
+        results.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
+      }
+    });
     return p;
   }
 
