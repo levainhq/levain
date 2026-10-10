@@ -322,10 +322,6 @@ class TestBinding:
         else:
             pytest.fail("anneal's touch kept an elapsed next; the desk's premise no longer holds, re-read it")
 
-    @pytest.mark.xfail(strict=True, reason="needs anneal SporeStore expected_version under _transaction "
-                       "(slice P, anneal seat/1010-31-spore-cas), released and installed: K2a S2. In this window "
-                       "the tier is computed on a row the kernel does not hold, so a seat holding a row between "
-                       "read_one and the write lets a pull-forward fire at C1 (L2 M2, run): K2a must not ship open")
     def test_a_text_edit_between_read_one_and_the_handler_is_409(self, rig: Rig, monkeypatch) -> None:
         """'a text edit landing between read_one and the handler → 409'"""
         r = rig.row("tray", "seed")      # rendered before the race is armed
@@ -493,7 +489,6 @@ class TestRenderedActions:
 #   'a cockpit consult's outbound prompt carries no situational-context block': consult is flow's
 #   verb; the kernel holds the allowlist for any downstream VerbSpec (test_actions.py), flow holds the rest.
 # - 'a grep of flow, flowConnect and levain for /edit and /action callers ...': S3.
-# - 'a text edit landing between read_one and the handler → 409': xfail above until anneal's CAS is installed.
 
 
 # --- L1/L2 round 1 findings, each held by a test that failed on fc9c83e ---------------------------
@@ -522,10 +517,12 @@ class TestRound1:
         import levain.cockpit.verbs as v
         seen: list[dict] = []
         real = v.apply_edit
-        monkeypatch.setattr(v, "apply_edit", lambda scope, req: seen.append(req) or real(scope, req))
+        monkeypatch.setattr(v, "apply_edit", lambda scope, req, **kw: seen.append({**req, **kw}) or real(scope, req, **kw))
+        rig_row_version = rig.row("loops", "loop")["version"]
         rig.edit({"kind": "spore_descend", "spore_id": rig.ids["loop"], "spore_kind": "dropped", "confirm": True,
                   "expect_disposition": None})        # the rendered snapshot, compared normalised (loop = null)
         assert seen and seen[0]["expect_disposition"] == "loop"   # the row's own, normalised by the handler
+        assert seen[0]["expected_version"] == rig_row_version          # and its version (S2)
 
     def test_operator_state_source_comes_from_the_credential(self, rig: Rig) -> None:
         """L2 M3: a browser-token write could label its line 'cli'."""
@@ -916,3 +913,50 @@ class TestL3Round2:
         e = _refused("store_unavailable", rig.edit, {"kind": "operator_state", "text": "checked",
                                                      "panel_version": rig.ck.read_value_version("state").value})
         assert e.http_status == 503 and json.loads(cj.read_text())["state"] == "unchecked"
+
+
+# --- S2: the spore write is compared, inside anneal's transaction, with the row the kernel read ----
+
+
+class TestSporeCas:
+    @pytest.mark.parametrize("verb,panel,key,params,env", [
+        ("spore_touch", "tray", "seed", {}, {}),
+        ("spore_surface_at", "loops", "loop", {"surface_at": "2030-01-01"}, {}),
+        ("spore_update", "loops", "loop", {"tier": "warm"}, {}),
+        ("spore_descend", "loops", "loop", {"spore_kind": "dropped"}, {"confirm": True}),
+    ])
+    def test_a_write_landing_between_read_one_and_the_fire_is_409_on_every_c1_spore_verb(
+            self, rig: Rig, monkeypatch, verb: str, panel: str, key: str, params: dict, env: dict) -> None:
+        r = rig.row(panel, key)
+        real = rig.ck.read_one
+
+        def read_then_race(panel_id: str, row_id: str):
+            res = real(panel_id, row_id)
+            rig.store.update(rig.ids[key], text="landed in the window")
+            return res
+        monkeypatch.setattr(rig.ck, "read_one", read_then_race)
+        e = _refused("stale", rig.post, verb, panel, None, params, row_id=r["id"], row_version=r["version"], **env)
+        assert e.http_status == 409
+        after = rig.spore(key)
+        assert after is not None and after["text"] == "landed in the window" and after.get("status") != "resolved"
+
+    def test_the_version_anneal_compares_is_the_version_the_panel_rendered(self, rig: Rig) -> None:
+        from levain.cockpit.providers import spore_row_version
+        for panel, key in (("tray", "seed"), ("tray", "held"), ("loops", "loop"), ("keep", "parked"), ("keep", "note")):
+            if (row := rig.ck.read_one(panel, f"spore:{rig.ids[key]}")).__class__.__name__ != "Read":
+                continue
+            assert spore_row_version(rig.spore(key)) == row.value["version"], (panel, key)
+
+    def test_a_spore_the_kernel_cannot_version_is_refused_stale(self, rig: Rig, monkeypatch) -> None:
+        import levain.cockpit.providers as prov
+        r = rig.row("tray", "seed")
+        monkeypatch.setattr(prov, "open_spore_from", lambda raw: (_ for _ in ()).throw(ValueError("bad row")))
+        before = rig.spore("seed")
+        _refused("stale", rig.post, "spore_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
+        assert rig.spore("seed") == before
+
+    def test_expected_version_binds_only_a_spore_write(self, rig: Rig) -> None:
+        from levain.writes import apply_edit
+        e = _refused("bad_request", apply_edit, rig.src.write_scope, {"kind": "operator_state", "text": "x"},
+                     expected_version="0" * 16)
+        assert e.http_status == 400

@@ -83,6 +83,16 @@ def value_version_of(stored: Any) -> str:
     return _sha({"stored": stored})[:16]
 
 
+def row_version_of(stored: dict[str, Any], fields: tuple[str, ...], excluded: tuple[str, ...] = ()) -> str:
+    """A row's version (§4.4) over its stored record: the ONE computation, used for every rendered
+    row and by a store that recomputes it inside its own write (a spore's ``version_of``)."""
+    if "*" in fields:
+        payload = {k: v for k, v in stored.items() if k not in excluded}
+    else:
+        payload = {k: stored.get(k) for k in fields}
+    return _sha(payload)[:16]
+
+
 def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
@@ -721,11 +731,7 @@ class Cockpit:
 
     @staticmethod
     def row_version(spec: ProviderSpec, stored: dict[str, Any]) -> str:
-        if "*" in spec.version_fields:
-            payload = {k: v for k, v in stored.items() if k not in spec.version_excluded}
-        else:
-            payload = {k: stored.get(k) for k in spec.version_fields}
-        return _sha(payload)[:16]
+        return row_version_of(stored, spec.version_fields, spec.version_excluded)
 
     def _row(self, spec: ProviderSpec, o: Any, row: RowIn, group: str | None, today: date) -> dict[str, Any]:
         f = row.facets

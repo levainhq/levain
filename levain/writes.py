@@ -625,7 +625,8 @@ def _require_install_root(scope: WriteScope, kind_label: str) -> Path:
     return scope.install_root
 
 
-def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None) -> dict[str, Any]:
+def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None,
+               expected_version: str | None = None) -> dict[str, Any]:
     """Apply one governed edit described by ``req`` (an untrusted JSON dict) against
     ``scope`` (the explicit write surface). Returns a result dict on success; raises
     ``EditError`` (carrying an HTTP status) on refusal.
@@ -643,6 +644,11 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
     if not isinstance(req, dict):
         raise EditError("bad_request", 400, "request must be a JSON object")
     kind = req.get("kind")
+    # a spore kind's row version, compared by anneal inside its write transaction (the cockpit
+    # passes the Row.version it read); None keeps a caller's write unguarded, as before
+    guard = _VersionGuard(expected_version)
+    if expected_version is not None and not str(kind).startswith("spore_"):
+        raise EditError("bad_request", 400, f"expected_version binds a spore write, not {kind!r}")
     # Serialize the entire mutation (read→check→backup→audit→write) across the
     # server's request threads — this is what makes single-writer true (L1 HIGH).
     with _WRITE_LOCK:
@@ -655,19 +661,21 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
         if kind == "entity_name":
             return _apply_entity_name(scope, req, now)
         if kind == "spore_touch":
-            return _apply_spore_verb(scope, req, now, "touch")
+            return _apply_spore_verb(scope, req, now, "touch", guard)
         if kind == "spore_descend":
-            return _apply_spore_verb(scope, req, now, "descend")
+            return _apply_spore_verb(scope, req, now, "descend", guard)
         if kind == "spore_ascend":
-            return _apply_spore_verb(scope, req, now, "ascend")
+            return _apply_spore_verb(scope, req, now, "ascend", guard)
         if kind == "spore_seed":
+            if expected_version is not None:
+                raise EditError("bad_request", 400, "a new spore has no version to bind")
             return _apply_spore_seed(scope, req, now)
         if kind == "spore_set_disposition":
-            return _apply_spore_set_disposition(scope, req, now)
+            return _apply_spore_set_disposition(scope, req, now, guard)
         if kind == "spore_surface_at":
-            return _apply_spore_surface_at(scope, req, now)
+            return _apply_spore_surface_at(scope, req, now, guard)
         if kind == "spore_update":
-            return _apply_spore_update(scope, req, now)
+            return _apply_spore_update(scope, req, now, guard)
         if kind == "episode_tombstone":
             return _apply_episode_tombstone(scope, req, now)
         if kind == "undo":
@@ -1340,9 +1348,40 @@ def _normalize_expect_disposition(value: Any) -> str | None:
     return value
 
 
+class _VersionGuard:
+    """A spore write bound to the row version the caller read (design §4.4). anneal recomputes the
+    version inside its write transaction with ``version_of`` (the cockpit's own row version,
+    ``cockpit.providers.spore_row_version``) and refuses on a mismatch; ``found`` records what it
+    computed, so the refusal is reported as the stale write it is (409), never a generic failure."""
+
+    def __init__(self, expected: str | None) -> None:
+        self.expected = expected
+        self.found: str | None = None
+
+    def version_of(self, spore: dict[str, Any]) -> str:
+        from levain.cockpit.providers import spore_row_version   # lazy: the cockpit imports this module
+        try:
+            self.found = spore_row_version(spore)
+        except Exception:  # noqa: BLE001 - a spore the cockpit cannot version matches no version it rendered
+            self.found = "unversionable"
+        return self.found
+
+
+def _guard_kwargs(guard: "_VersionGuard | None") -> dict[str, Any]:
+    if guard is None or guard.expected is None:
+        return {}
+    return {"expected_version": guard.expected, "version_of": guard.version_of}
+
+
+def _spore_refusal(guard: "_VersionGuard | None", exc: Exception) -> EditError:
+    if guard is not None and guard.expected is not None and guard.found not in (None, guard.expected):
+        return EditError("stale", 409, "the item changed since it was read; re-read it and retry")
+    return EditError("verb_failed", 422, str(exc))
+
+
 def _apply_spore_verb(
     scope: WriteScope, req: dict[str, Any], now: str | None,
-    verb: Literal["touch", "descend", "ascend"],
+    verb: Literal["touch", "descend", "ascend"], guard: "_VersionGuard | None" = None,
 ) -> dict[str, Any]:
     """A Class-B spore lifecycle verb: ``touch`` (engage — non-destructive),
     ``descend`` (compost downward) or ``ascend`` (transmute upward). The two
@@ -1414,7 +1453,7 @@ def _apply_spore_verb(
         ascend_expect = cast("str | None", current.get("disposition")) if current is not None else None
     try:
         if verb == "touch":
-            store.touch(spore_id)
+            store.touch(spore_id, **_guard_kwargs(guard))
         elif verb == "descend":
             assert spore_kind is not None  # set in the descend validation branch above
             # CAS the operator's render-time SNAPSHOT disposition (the resolve FACE — Keep
@@ -1426,16 +1465,17 @@ def _apply_spore_verb(
             descend_kwargs: dict[str, Any] = {"kind": spore_kind}
             if descend_has_snapshot:
                 descend_kwargs["expect_disposition"] = descend_expect
-            store.descend(spore_id, **descend_kwargs)
+            store.descend(spore_id, **descend_kwargs, **_guard_kwargs(guard))
         else:  # ascend
             assert spore_kind is not None and ref is not None  # set in the ascend branch
             # expect_disposition = the (non-note) value we just read → fail-closed if a
             # concurrent writer flipped it to a note (or anything else) before this resolve.
-            store.ascend(spore_id, kind=spore_kind, ref=ref, expect_disposition=ascend_expect)
+            store.ascend(spore_id, kind=spore_kind, ref=ref, expect_disposition=ascend_expect,
+                         **_guard_kwargs(guard))
     except ValueError as exc:  # bad kind for the spore's type (anneal arg validation)
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / already resolved / store drift
-        raise EditError("verb_failed", 422, str(exc)) from exc
+        raise _spore_refusal(guard, exc) from exc
     except OSError as exc:  # raw IO from SporeStore._transaction (ENOLCK on a lock-less
         # FS, permission, fsync/replace) — not wrapped by anneal; map to a clean
         # retryable 503 instead of leaking a generic internal 500 [codex L3 MED].
@@ -1536,7 +1576,7 @@ def _apply_spore_seed(
 
 
 def _apply_spore_set_disposition(
-    scope: WriteScope, req: dict[str, Any], now: str | None
+    scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
     """Re-route an OPEN spore across the operator-I/O classes (the AI's triage verb, AND the
     Keep-note promote). ``disposition`` ∈ loop / seed / handoff / agenda / note: ``loop``
@@ -1665,11 +1705,11 @@ def _apply_spore_set_disposition(
         # re-reads and the confirm decision is re-made on fresh state. The disposition + the
         # optional surface_at land in ONE store.update (one transaction, one CAS) — the promote
         # and its schedule never half-apply.
-        store.update(spore_id, **update_kwargs)
+        store.update(spore_id, **update_kwargs, **_guard_kwargs(guard))
     except ValueError as exc:  # anneal arg validation
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / already resolved / store drift / CAS mismatch
-        raise EditError("verb_failed", 422, str(exc)) from exc
+        raise _spore_refusal(guard, exc) from exc
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
 
@@ -1708,7 +1748,7 @@ def _validate_surface_at(value: Any) -> str | None:
 
 
 def _apply_spore_surface_at(
-    scope: WriteScope, req: dict[str, Any], now: str | None
+    scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
     """Schedule WHEN a spore re-surfaces — the operator-input twin of a spore's ``next:``
     alarm: author now, time the surfacing for a future session-open. ``surface_at`` is
@@ -1728,11 +1768,11 @@ def _apply_spore_surface_at(
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
     store = SporeStore(paths.spores_json)
     try:
-        store.update(spore_id, next=surface_at or None)  # anneal re-validates the date
+        store.update(spore_id, next=surface_at or None, **_guard_kwargs(guard))  # anneal re-validates the date
     except ValueError as exc:
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:
-        raise EditError("verb_failed", 422, str(exc)) from exc
+        raise _spore_refusal(guard, exc) from exc
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
 
@@ -1745,7 +1785,7 @@ def _apply_spore_surface_at(
 
 
 def _apply_spore_update(
-    scope: WriteScope, req: dict[str, Any], now: str | None
+    scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
     """A governed metadata edit of an OPEN spore — the operator's forming-workbench levers:
     edit ``text`` (refine in place), reclassify ``type`` (ONLY while forming — a Tray item;
@@ -1843,11 +1883,11 @@ def _apply_spore_update(
     elif has_tier and client_snapshot_present:
         kwargs["expect_disposition"] = client_snapshot
     try:
-        store.update(spore_id, **kwargs)
+        store.update(spore_id, **kwargs, **_guard_kwargs(guard))
     except ValueError as exc:  # anneal arg validation
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / resolved / drift / CAS mismatch
-        raise EditError("verb_failed", 422, str(exc)) from exc
+        raise _spore_refusal(guard, exc) from exc
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
 

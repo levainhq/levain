@@ -13,9 +13,9 @@ import os
 import re
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
-from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext
+from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext, row_version_of
 from levain.cockpit.registry import parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 from levain.dashboard import (
@@ -24,7 +24,9 @@ from levain.dashboard import (
     CLASS_C,
     SubstrateSource,
     SubstrateView,
+    OpenSpore,
     _one_clause,
+    open_spore_from,
     state_from_data,
     state_record,
 )
@@ -45,6 +47,8 @@ HANDOFF_FRESH_DAYS = 7
 SPORE_ROW_VERBS = ("spore_touch", "spore_descend", "spore_surface_at", "spore_update",
                    "spore_set_disposition", "spore_ascend")
 SPORE_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen")
+SPORE_VERSION_EXCLUDED = ("seen",)    # a touch moves seen, never the version
+SPORE_VERSION_FIELDS = tuple(f for f in SPORE_STORED if f not in SPORE_VERSION_EXCLUDED)
 SPORE_FACETS = frozenset({
     "disposition", "domain", "tier", "salience", "spore_type", "due", "overdue_days",
     "handoff_expired", "last_seen",
@@ -90,12 +94,19 @@ def _spore_row(s: Any, today: date) -> RowIn:
     }
     if due:
         facets["overdue_days"] = max(0, (today - due).days)
-    return RowIn(
-        id=f"spore:{s.id}", title=s.text, body=s.text, facets=facets,
-        stored={"id": s.id, "text": s.text, "disposition": s.disposition, "tier": s.tier,
-                "type": s.type, "domain": s.domain, "next": s.next, "pointer": s.pointer,
-                "salience": s.salience, "seen": s.seen},
-    )
+    return RowIn(id=f"spore:{s.id}", title=s.text, body=s.text, facets=facets, stored=spore_stored(s))
+
+
+def spore_stored(s: OpenSpore) -> dict[str, Any]:
+    """A spore row's stored record: what its version covers (``SPORE_VERSION_FIELDS``)."""
+    return {f: getattr(s, f) for f in SPORE_STORED}
+
+
+def spore_row_version(raw: Mapping[str, Any]) -> str:
+    """The ``version`` the spore panels render for this stored spore, from anneal's raw dict. A
+    spore write passes it to anneal as ``version_of``, so the compare runs inside anneal's write
+    transaction against exactly what the operator was shown (§4.4)."""
+    return row_version_of(spore_stored(open_spore_from(raw)), SPORE_VERSION_FIELDS, SPORE_VERSION_EXCLUDED)
 
 
 def _spore_provider(
@@ -444,7 +455,7 @@ def build_default_cockpit(
     ck = Cockpit(entity=entity, clock=clock)
     spore_common = dict(
         facets=SPORE_FACETS,
-        version_fields=tuple(f for f in SPORE_STORED if f != "seen"), version_excluded=("seen",),
+        version_fields=SPORE_VERSION_FIELDS, version_excluded=SPORE_VERSION_EXCLUDED,
         search_fields=("title", "body", "domain"), edit_class=CLASS_B,
     )
     ck.register(ProviderSpec("state", "line", "State", "gauge", _context_line(source),

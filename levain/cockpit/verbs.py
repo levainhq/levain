@@ -255,13 +255,16 @@ def _spore_id(target: dict[str, Any]) -> str:
 
 def _spore_fire(kind: str) -> Callable[..., dict[str, Any]]:
     def fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any], confirm: bool) -> dict[str, Any]:
-        # The CAS key comes from the row as read from the source, never from the client (§4.4:
-        # "the cockpit always sends the key").
+        # The CAS keys come from the row as read from the source, never from the client (§4.4:
+        # "the cockpit always sends the key"): its disposition, and its version, which anneal
+        # recomputes inside its write transaction, so the row the tier was computed on is the row
+        # the write lands on (a write between read_one and here is refused 409).
+        row = target["row"]
         req = {"kind": kind, **params, "spore_id": _spore_id(target),
-               "expect_disposition": _facet(target.get("row"), "disposition")}
+               "expect_disposition": _facet(row, "disposition")}
         if confirm:
             req["confirm"] = True
-        return apply_edit(scope, req)
+        return apply_edit(scope, req, expected_version=row["version"])
     return fire
 
 

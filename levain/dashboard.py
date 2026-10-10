@@ -47,7 +47,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping
 
 from levain.spores import (
     BUCKET_KEEP,
@@ -368,6 +368,39 @@ class OpenSpore:
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
+
+
+def open_spore_from(s: Mapping[str, Any]) -> "OpenSpore":
+    """One stored spore (anneal's dict) as the view's ``OpenSpore``. The cockpit's spore rows and
+    the version a spore write is compared against (``cockpit.providers.spore_row_version``) are
+    both built through here. Raises ``ValueError``/``TypeError`` on a malformed row."""
+    from anneal_memory.spores import ASCEND_BY_TYPE, DESCEND_BY_TYPE   # lazy, as the view's own read
+
+    stype = str(s.get("type", ""))
+    return OpenSpore(
+        id=str(s.get("id", "")),
+        type=stype,
+        tier=str(s.get("tier", "")),
+        salience=int(s.get("salience", 0) or 0),
+        domain=str(s.get("domain", "")),
+        # FULL (raw) text over the wire — NOT truncated. A 200-char
+        # cap here lost the tail with no way to see it, and the 3b
+        # text-edit seeded the editor from this value → save wrote the
+        # truncation back (silent data loss). The surface clamps the row
+        # for density + offers a per-item expand; canonical stays whole.
+        text=str(s.get("text", "")),
+        seen=str(s.get("seen", "")),
+        # str-coerce next like its siblings: the TUI runs _oneline(next)
+        # which would crash on a non-str next from a corrupted store
+        # [codex L3 LOW]. None stays None (it's optional).
+        next=(str(nx) if (nx := s.get("next")) is not None else None),
+        pointer=s.get("pointer"),
+        # str-coerce for parity (a corrupted store could carry a non-str
+        # disposition); disposition_of itself stays the pure twin of flow's.
+        disposition=str(disposition_of(s)),
+        descend_kinds=sorted(DESCEND_BY_TYPE.get(stype, frozenset())),
+        ascend_kinds=sorted(ASCEND_BY_TYPE.get(stype, frozenset())),
+    )
 
 
 @dataclass
@@ -1584,11 +1617,7 @@ def build_substrate_view(
     #     list here would make each bucket's cap arbitrary). Defensive per-row: one
     #     malformed row skipped, the tier survives.
     try:
-        from anneal_memory.spores import (
-            ASCEND_BY_TYPE,
-            DESCEND_BY_TYPE,
-            SporeStore,
-        )
+        from anneal_memory.spores import SporeStore
 
         if paths.spores_json.exists():
             # bucket name → its destination list; the BUCKET_LOOP default is open_spores
@@ -1609,33 +1638,7 @@ def build_substrate_view(
                     target = bucket_target.get(bucket_of(s), view.open_spores)
                     if len(target) >= max_spores:
                         continue  # this bucket is full — keep scanning for the others
-                    stype = str(s.get("type", ""))
-                    target.append(
-                        OpenSpore(
-                            id=str(s.get("id", "")),
-                            type=stype,
-                            tier=str(s.get("tier", "")),
-                            salience=int(s.get("salience", 0) or 0),
-                            domain=str(s.get("domain", "")),
-                            # FULL (raw) text over the wire — NOT truncated. A 200-char
-                            # cap here lost the tail with no way to see it, and the 3b
-                            # text-edit seeded the editor from this value → save wrote the
-                            # truncation back (silent data loss). The surface clamps the row
-                            # for density + offers a per-item expand; canonical stays whole.
-                            text=str(s.get("text", "")),
-                            seen=str(s.get("seen", "")),
-                            # str-coerce next like its siblings: the TUI runs _oneline(next)
-                            # which would crash on a non-str next from a corrupted store
-                            # [codex L3 LOW]. None stays None (it's optional).
-                            next=(str(nx) if (nx := s.get("next")) is not None else None),
-                            pointer=s.get("pointer"),
-                            # str-coerce for parity (a corrupted store could carry a non-str
-                            # disposition); disposition_of itself stays the pure twin of flow's.
-                            disposition=str(disposition_of(s)),
-                            descend_kinds=sorted(DESCEND_BY_TYPE.get(stype, frozenset())),
-                            ascend_kinds=sorted(ASCEND_BY_TYPE.get(stype, frozenset())),
-                        )
-                    )
+                    target.append(open_spore_from(s))
                 except (ValueError, TypeError):
                     continue  # one malformed row skipped; the tier survives
     except store_faults as exc:
