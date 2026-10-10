@@ -1040,6 +1040,8 @@ def emit(additional_context: str, event_name: str) -> bool:
     the harness has already closed the pipe (a killed-session race), emit()
     degrades to silence rather than raising. Returns True only when the output was
     written and flushed."""
+    if sys.stdout is None:    # fd 1 was closed before the interpreter started: there is nowhere to write
+        return False
     try:
         payload = {
             "hookSpecificOutput": {

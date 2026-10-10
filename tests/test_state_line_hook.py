@@ -244,6 +244,15 @@ def test_a_hook_started_with_fd_1_closed_exits_silently(inst):
     assert proc.returncode == 0 and proc.stderr == b"", (proc.returncode, proc.stderr)
 
 
+def test_emit_with_fd_1_closed_before_the_interpreter_starts_returns_false(inst):
+    # CPython sets sys.stdout to None then; emit() keeps its bool contract instead of raising
+    probe = f"import sys; sys.path.insert(0, {str(inst.hooks)!r}); import _levain_hook as h; " \
+            "sys.stderr.write(repr(h.emit('x', 'UserPromptSubmit')))"
+    proc = subprocess.run(["/bin/sh", "-c", 'exec "$0" -c "$1" 1>&-', sys.executable, probe],
+                          capture_output=True, timeout=60, env={"PATH": "/usr/bin:/bin", "HOME": str(inst.root)})
+    assert proc.returncode == 0 and proc.stderr == b"False", (proc.returncode, proc.stderr)
+
+
 def test_a_marker_is_not_advanced_when_the_prompt_output_was_not_delivered(inst):
     inst.set_state("first")
     inst.start()
