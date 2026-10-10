@@ -1092,7 +1092,7 @@ class Cockpit:
         finally:
             with self._lock, st.lock:
                 if st.pflight is None and self._one_states.get(key) is st:
-                    del self._one_states[key]   # a hung flight keeps its entry until its worker ends
+                    del self._one_states[key]   # a hung flight keeps its entry; the next read of the key removes it
 
 
 def _safe_str(exc: object) -> str:

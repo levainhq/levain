@@ -222,7 +222,7 @@ def _const(t: Tier) -> Callable[..., Tier]:
 
 # The tier of an ``undo`` is the tier of the edit it reverses (§4.1). Only these kinds keep a backup
 # the plane can restore (``writes._apply_undo``); anything else is T3, the fail-closed answer.
-_UNDO_TIER: dict[str, Tier] = {"config": "T3", "entity_name": "T3", "state": "T2", "operator_state": "C1"}
+_UNDO_TIER: dict[str, Tier] = {"config": "T3", "entity_name": "T3", "state": "T2"}
 
 
 def _undo_row_tier(row: dict[str, Any] | None, prov: str, today: date) -> Tier:
@@ -574,15 +574,19 @@ def _fire_downstream(registry: VerbRegistry, verb: VerbSpec, scope: "WriteScope"
     """A downstream ``ActionVerb`` keeps ``apply_action``'s confirm, idempotency, job and audit
     envelope; a downstream ``VerbSpec`` fires its own handler."""
     av = registry.action_verb(verb.name)
-    if av is not None:
-        body: dict[str, Any] = {"verb": verb.name, "params": params, "confirm": req.get("confirm") is True}
-        if "idempotency_key" in req:
-            body["idempotency_key"] = req["idempotency_key"]
-        return apply_action(scope, {verb.name: av}, body, job_runtime=job_runtime)
-    _require_confirm(verb, req)
-    assert verb.fire is not None
-    return verb.fire(scope, params, {"panel_id": req.get("panel_id"), "row_id": None, "row": None},
-                     req.get("confirm") is True)
+    if av is None:
+        # a downstream VerbSpec rides the same envelope as an ActionVerb (confirm, idempotency, job,
+        # the audit receipt), so a C1 downstream fire is recorded and replay-guarded like any action
+        fire, target, confirmed = verb.fire, {"panel_id": req.get("panel_id"), "row_id": None, "row": None}, \
+            req.get("confirm") is True
+        assert fire is not None
+        av = ActionVerb(handler=lambda p: fire(scope, p, target, confirmed),
+                        confirm_required=verb.confirm_required, idempotent=verb.idempotent, job=verb.job,
+                        label=verb.label)
+    body: dict[str, Any] = {"verb": verb.name, "params": params, "confirm": req.get("confirm") is True}
+    if "idempotency_key" in req:
+        body["idempotency_key"] = req["idempotency_key"]
+    return apply_action(scope, {verb.name: av}, body, job_runtime=job_runtime)
 
 
 def _refuse_unless_c1(verb: VerbSpec, tier: Tier, credential: dict[str, Any], install_class: str) -> None:

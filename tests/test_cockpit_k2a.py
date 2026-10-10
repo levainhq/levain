@@ -228,6 +228,22 @@ class TestCredentialAndTiers:
                  install_class=INSTALL_CLASS, route="action")
         assert ran == []
 
+    def test_a_c1_downstream_verbspec_is_audited_and_replay_guarded(self, tmp_path: Path) -> None:
+        """A downstream VerbSpec rides apply_action's envelope: a receipt in the ledger, and an
+        idempotent one fires once per key (the lane's L1 observation, closed)."""
+        fired: list[dict] = []
+        spec = VerbSpec("note_it", "note", "records a note", "panel", fields=("text",), floor="C1",
+                        tier_fn=lambda *a: "C1", idempotent=True,
+                        fire=lambda scope, p, target, confirm: fired.append(p) or {"summary": "noted"})
+        r = Rig(tmp_path, extra={"note_it": spec})
+        req = {"verb": "note_it", "params": {"text": "hi"}, "idempotency_key": "k1"}
+        for _ in range(2):
+            dispatch(registry=r.reg, cockpit=r.ck, scope=r.src.write_scope, req=dict(req), credential=CRED,
+                     install_class=INSTALL_CLASS, route="action")
+        assert fired == [{"text": "hi"}]
+        ledger = (r.root / ".levain" / "edits.jsonl").read_text()
+        assert '"action": "note_it"' in ledger and '"outcome": "ok"' in ledger
+
     def test_registering_harness_approve_as_a_cockpit_verb_is_refused(self) -> None:
         """'registering harness_approve as a cockpit verb → refused'"""
         spec = VerbSpec("harness_approve", "x", "x", "panel", tier_fn=lambda *a: "C1", fire=lambda *a: {})
