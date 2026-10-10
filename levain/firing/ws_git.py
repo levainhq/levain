@@ -649,12 +649,25 @@ def _check_source_repo(rfd: int, src: Path, hands: Hands) -> None:
             raise WsGitError(f"{src}/.git/{name} present (linked worktrees are not imported)")
         except FileNotFoundError:
             pass
+    # git reads .git/config.worktree after .git/config when extensions.worktreeConfig is on, and the
+    # config checks below read .git/config only, so a second config file is refused whole
+    try:
+        os.stat(".git/config.worktree", dir_fd=rfd, follow_symlinks=False)
+        raise WsGitError(f"{src}/.git/config.worktree present (per-worktree config is not imported)")
+    except FileNotFoundError:
+        pass
     try:
         if os.stat(".git/objects/info/alternates", dir_fd=rfd, follow_symlinks=False).st_size:
             raise WsGitError(f"{src}/.git borrows objects from elsewhere (alternates); refusing")
     except FileNotFoundError:
         pass
-    keys = _operator_git(rfd, "config", "--file", ".git/config", "--list", "--name-only").stdout.splitlines()
+    # A listing git could not finish is no answer. Run inside the repository, git reads its config with
+    # the includes on startup (with --file too), so an include whose target does not parse exits non-zero
+    # with nothing on stdout, and an empty key list would read as "no includes".
+    listed = _operator_git(rfd, "config", "--file", ".git/config", "--list", "--name-only")
+    if listed.returncode != 0:
+        raise WsGitError(f"{src}/.git/config could not be read in full (git exit {listed.returncode}); refusing")
+    keys = listed.stdout.splitlines()
     if any(k.startswith(("include.", "includeif.")) for k in keys):
         raise WsGitError(f"{src}/.git/config includes another file; refusing")
     named = Path(os.path.abspath(src))
@@ -700,7 +713,7 @@ def _remote_ok(rname: str, url: str) -> bool:
     """A remote worth copying to the entity: a name ws-git's allowlist accepts (no dot), an https or
     ssh URL, and no login in it beyond the conventional ``git`` user (a user or token there would
     hand the operator's credential to the entity)."""
-    if "." in rname or not _URL_OK.match(url):
+    if not rname or "." in rname or not _URL_OK.match(url) or any(ord(c) < 0x20 or ord(c) == 0x7F for c in url):
         return False
     if url.startswith(("https://", "ssh://")):
         authority = url.split("://", 1)[1].split("/", 1)[0]
@@ -722,7 +735,7 @@ def cmd_ws_adopt(entity_dir: Path | str, repo: Path | str, name: str | None = No
     try:
         with _exclusive(entity_dir):
             return _adopt(entity_dir, repo, name)
-    except (WsGitError, OSError) as exc:
+    except (WsGitError, OSError, UnicodeDecodeError) as exc:     # git output that is not UTF-8 refuses too
         print(f"ws-adopt: {exc}")
         return 1
 
@@ -757,21 +770,39 @@ def _adopt_pinned(hands: Hands, src: Path, rfd: int, name: str | None) -> int:
         if head.returncode != 0 or not head.stdout.startswith("refs/heads/"):
             raise WsGitError(f"{src} has no branch checked out (a detached HEAD); check one out first")
         head_branch = head.stdout.strip()[len("refs/heads/"):]
-        want = _heads(_operator_git(rfd, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads",
-                                    "refs/tags").stdout)
+        refs = _operator_git(rfd, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads", "refs/tags")
+        if refs.returncode != 0:
+            raise WsGitError(f"{src}: git could not list the branches (git exit {refs.returncode})")
+        want = _heads(refs.stdout)
         if not any(r.startswith("refs/heads/") for r in want):
             raise WsGitError(f"{src} has no branches to import")
-        fmt = _operator_git(rfd, "rev-parse", "--show-object-format").stdout.strip() or "sha1"
+        # a git that does not know the option echoes it back and exits 0, which the check below refuses by name
+        shown = _operator_git(rfd, "rev-parse", "--show-object-format")
+        if shown.returncode != 0:
+            raise WsGitError(f"{src}: git could not tell the object format (git exit {shown.returncode})")
+        fmt = shown.stdout.strip()
         if fmt not in ("sha1", "sha256"):
             raise WsGitError(f"{src} uses the object format {fmt!r}, which ws-adopt does not know")
         remotes, dropped = {}, []
-        for line in _operator_git(rfd, "config", "--get-regexp", r"^remote\..*\.url$").stdout.splitlines():
-            key, _, url = line.partition(" ")
+        # Only the repository's own config (the file the include check just listed), so a global or system
+        # config cannot change the answer. git-config documents exit 1 as "the section or key is invalid"
+        # or "key not present" (https://git-scm.com/docs/git-config); this pattern is fixed and valid, so
+        # 0 or 1 with nothing on stderr is a complete answer. Anything else is not: no remote is copied and
+        # the report says so, rather than refusing the import or passing a partial list as the whole.
+        # -z: NUL after each value, a newline between key and value.
+        urls = _operator_git(rfd, "config", "--file", ".git/config", "-z", "--get-regexp", r"^remote\..*\.url$")
+        remotes_unread = urls.returncode not in (0, 1) or bool(urls.stderr.strip())
+        for entry in ([] if remotes_unread else urls.stdout.split("\0")):
+            key, _, url = entry.partition("\n")
+            if not key:
+                continue
             rname = key.split(".", 1)[1].rsplit(".", 1)[0]
-            if _remote_ok(rname, url):
+            if _remote_ok(rname, url) and rname not in dropped and remotes.get(rname, url) == url:
                 remotes[rname] = url
             else:
-                dropped.append(rname)
+                remotes.pop(rname, None)        # a refused URL, or two different URLs, drops the remote whole
+                if rname not in dropped:
+                    dropped.append(rname)
     except (WsGitError, OSError) as exc:
         print(f"ws-adopt: {exc}")
         return 1
@@ -826,8 +857,10 @@ def _adopt_pinned(hands: Hands, src: Path, rfd: int, name: str | None) -> int:
     n_heads = sum(r.startswith("refs/heads/") for r in want)
     print(f"Imported {src} as {dest} ({n_heads} branch(es), {len(want) - n_heads} tag(s)), owned by the entity's user. Your repository is "
           "unchanged where it is; uncommitted changes and stashes were not copied.")
-    if dropped:
-        print("Remotes not copied (a dotted name, not an https or ssh URL, or one carrying a login): "
+    if remotes_unread:
+        print("Remotes not copied: git reported a problem listing them; add them in the entity's copy if you need them.")
+    elif dropped:
+        print("Remotes not copied (a dotted name, not an https or ssh URL, one carrying a login, or more than one URL): "
               f"{', '.join(sorted(dropped))}.")
     return 0
 

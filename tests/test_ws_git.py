@@ -477,6 +477,68 @@ def test_ws_adopt_refuses_when_a_branch_did_not_come_across_and_keeps_nothing(ad
     assert "did not all come across" in capsys.readouterr().out and not (h.workspace / "mine").exists()
 
 
+@pytest.mark.parametrize("failing,says", [("for-each-ref", "branches"), ("--show-object-format", "object format")])
+def test_ws_adopt_refuses_when_git_cannot_list_the_branches_or_remotes(adopt_env, monkeypatch, capsys, failing, says) -> None:
+    # a listing git could not finish is not an empty listing: the import stops instead of going ahead short
+    h, src = adopt_env
+    real = ws_git._operator_git
+
+    def broken(rfd: int, *args: str) -> subprocess.CompletedProcess:
+        if failing in args:
+            return subprocess.CompletedProcess(args, 128, "", "fatal: simulated")
+        return real(rfd, *args)
+    monkeypatch.setattr(ws_git, "_operator_git", broken)
+    assert ws_git.cmd_ws_adopt(h.home, src) == 1
+    assert f"git could not list the {says}" in (out := capsys.readouterr().out) or f"could not tell the {says}" in out
+    assert not (h.workspace / "mine").exists()
+
+
+def test_ws_adopt_imports_a_repository_with_no_remote(adopt_env, capsys) -> None:
+    h, src = adopt_env
+    for r in ("origin", "local", "tok"):
+        _git(src, "remote", "remove", r)
+    assert ws_git.cmd_ws_adopt(h.home, src) == 0, capsys.readouterr().out
+    assert _git(h.workspace / "mine", "remote") == ""
+
+
+def test_ws_adopt_drops_a_remote_whole_when_one_of_its_urls_is_refused(adopt_env, capsys) -> None:
+    h, src = adopt_env
+    _git(src, "config", "--add", "remote.origin.url", "https://me:ghp_x@github.com/o/r.git")
+    assert ws_git.cmd_ws_adopt(h.home, src) == 0, capsys.readouterr().out
+    assert _git(h.workspace / "mine", "remote") == ""
+
+
+def test_ws_adopt_refuses_cleanly_on_a_remote_url_that_is_not_utf8(adopt_env, capsys) -> None:
+    h, src = adopt_env
+    with open(src / ".git" / "config", "ab") as f:
+        f.write(b'[remote "odd"]\n\turl = https://h/\x80\n')
+    assert ws_git.cmd_ws_adopt(h.home, src) == 1                 # a refusal, not a traceback
+    assert "ws-adopt" in capsys.readouterr().out and not (h.workspace / "mine").exists()
+
+
+@pytest.mark.parametrize("rc", [0, 1, 128])
+def test_ws_adopt_says_so_when_the_remotes_could_not_be_listed_in_full(adopt_env, monkeypatch, capsys, rc) -> None:
+    # neither a refusal nor a silent partial list: the import goes ahead with no remote, and the report says why
+    h, src = adopt_env
+    real = ws_git._operator_git
+
+    def noisy(rfd: int, *args: str) -> subprocess.CompletedProcess:
+        if "--get-regexp" in args:
+            return subprocess.CompletedProcess(args, rc, "remote.origin.url\ngit@github.com:o/r.git\0", "warning: simulated")
+        return real(rfd, *args)
+    monkeypatch.setattr(ws_git, "_operator_git", noisy)
+    assert ws_git.cmd_ws_adopt(h.home, src) == 0
+    assert "reported a problem listing them" in capsys.readouterr().out
+    assert _git(h.workspace / "mine", "remote") == ""
+
+
+def test_ws_adopt_drops_a_remote_with_two_different_urls(adopt_env, capsys) -> None:
+    h, src = adopt_env
+    _git(src, "config", "--add", "remote.origin.url", "https://github.com/o/mirror.git")
+    assert ws_git.cmd_ws_adopt(h.home, src) == 0
+    assert "origin" in capsys.readouterr().out and _git(h.workspace / "mine", "remote") == ""
+
+
 def test_ws_adopt_checks_its_source_like_ws_put(adopt_env, monkeypatch, capsys) -> None:
     h, src = adopt_env
     monkeypatch.setattr(ws_git, "_pin_operator_source", lambda s, hh, want_dir: (_ for _ in ()).throw(WsGitError("chosen")))
@@ -642,12 +704,18 @@ def _src_repo(tmp_path: Path) -> Path:
     return src
 
 
-@pytest.mark.parametrize("plant", ["other-writable", "group-writable", "gitfile", "alternates", "include", "worktrees"])
+@pytest.mark.parametrize("plant", ["other-writable", "group-writable", "gitfile", "alternates", "include",
+                                   "include-unparseable", "config-unparseable", "config-worktree", "worktrees"])
 def test_ws_adopt_lets_your_git_read_only_a_repository_nobody_else_could_have_written(tmp_path: Path, monkeypatch, plant) -> None:
     src = _src_repo(tmp_path)
     h = _hands(tmp_path, uid=4_000_017)
     monkeypatch.setattr(ws_git, "_hands_can_write", lambda hands, tree: None)
-    check = lambda: ws_git._check_source_repo(os.open(src, os.O_RDONLY | os.O_DIRECTORY), src, h)  # noqa: E731
+    def check() -> None:
+        rfd = os.open(src, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            ws_git._check_source_repo(rfd, src, h)
+        finally:
+            os.close(rfd)
     check()                                                              # control: clean
     g = src / ".git"
     if plant == "other-writable":
@@ -661,7 +729,18 @@ def test_ws_adopt_lets_your_git_read_only_a_repository_nobody_else_could_have_wr
         (g / "objects" / "info").mkdir(parents=True, exist_ok=True)
         (g / "objects" / "info" / "alternates").write_text("/x\n")
     elif plant == "include":
-        _set(g, "include.path", "/tmp/x")
+        _set(g, "include.path", str(tmp_path / "absent-include"))       # git skips a missing target; the key alone refuses
+    elif plant == "include-unparseable":
+        # inside the repository git reads the config with its includes, so a target that does not parse fails the listing
+        (tmp_path / "junk").write_text("[core\n")                         # an unterminated section header
+        _set(g, "include.path", str(tmp_path / "junk"))
+    elif plant == "config-worktree":
+        # an include in the per-worktree config is invisible to a listing of .git/config, yet git applies it
+        _set(g, "extensions.worktreeConfig", "true")
+        (g / "config.worktree").write_text(f"[include]\n\tpath = {tmp_path / 'absent-include'}\n")
+    elif plant == "config-unparseable":
+        with open(g / "config", "a") as f:
+            f.write("[core]\n\t===\n")
     else:
         (g / "worktrees").mkdir()
     with pytest.raises(WsGitError):
