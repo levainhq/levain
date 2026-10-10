@@ -2142,7 +2142,9 @@ def _names_install(text: str, install: Path) -> bool | None:
     does, so ``/x/inst`` never claims ``/x/inst2`` and ``..`` cannot climb out; an argument
     that merely mentions the install does not count; L2 HIGH, L3 r2-r3). False when every
     command reads and none is one. None when whose it is cannot be told (not JSON, not this
-    shape, or no command readable), which the caller reports instead of calling it foreign."""
+    shape, or any command unreadable and none a match), which the caller reports instead of
+    calling it foreign (codex L3 r4: one readable foreign command beside an unreadable one
+    was called another install's)."""
     hooks_dir = os.path.normcase(os.path.join(os.path.abspath(str(install)), "activation", "hooks"))
     try:
         data = json.loads(text)
@@ -2151,7 +2153,7 @@ def _names_install(text: str, install: Path) -> bool | None:
     hooks = data.get("hooks") if isinstance(data, dict) else None
     if not isinstance(hooks, dict):
         return None
-    readable = False
+    unreadable = False
     for entries in hooks.values():
         for entry in entries if isinstance(entries, list) else ():
             inner = entry.get("hooks") if isinstance(entry, dict) else None
@@ -2162,15 +2164,15 @@ def _names_install(text: str, install: Path) -> bool | None:
                 try:
                     tokens = shlex.split(cmd, posix=os.name != "nt")
                 except ValueError:
+                    unreadable = True
                     continue
-                readable = True
                 if len(tokens) < 2:
                     continue
                 script = tokens[1].strip('"') if os.name == "nt" else tokens[1]
                 script = os.path.normcase(os.path.normpath(script))
                 if os.path.dirname(script) == hooks_dir and script.endswith(".py"):
                     return True
-    return False if readable else None
+    return None if unreadable else False
 
 def _refresh_decision(
     here: bytes | None, want: bytes, last: str | None, *, levain_code: bool,
@@ -2457,8 +2459,8 @@ def _require_toml(text: str, path: Path, before: str | None) -> str | None:
         return None
     if before is not None and _toml_error(before) is not None:
         return err
-    raise InitError(f"{path} would not parse after levain's change ({err}), so it was left "
-                    f"as it was.")
+    raise InitError(f"{path} would not parse after levain's change ({err}), so levain did not "
+                    f"write it.")
 
 
 def _codex_block_hash(fragment_or_config: str) -> str | None:
