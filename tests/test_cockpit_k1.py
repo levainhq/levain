@@ -1201,7 +1201,6 @@ class TestL3R8Fixes:
         assert ck.freshness()["p"]["status"] == "error"
         ck.panel("p")
         assert ck.freshness()["p"]["status"] == "empty"
-        assert ck._state["p"].fresh[0] == 2          # generations ordered by start
 
     def test_freshness_survives_a_panel_registered_mid_call(self, env) -> None:
         _r, _s, ck = env
@@ -1223,6 +1222,7 @@ class TestStoreLabel:
         from levain.cockpit.providers import _store_label
         assert _store_label(Path.home() / ".anneal-memory" / "memory.db") == "~/.anneal-memory/memory.db"
         assert _store_label(Path("/nonexistent-root/elsewhere/x.db")) == "x.db"
+        assert _store_label(Path.home() / ".." / "outside-secret" / "x.db") == "x.db"      # no sibling-account leak
 
 
 class TestR9Bookkeeping:
@@ -1238,24 +1238,6 @@ class TestR9Bookkeeping:
         from levain.cockpit.engine import ReadContext
         return ReadContext(datetime(2026, 10, 9, 12, minute, tzinfo=timezone.utc))
 
-    def test_an_older_success_finishing_last_does_not_regress_last_good(self) -> None:
-        ck, spec, st = self._setup()
-        ck._process(spec, st, Read(rows=()), self._ctx(10))      # newer read, finished first
-        ck._process(spec, st, Read(rows=()), self._ctx(5))       # older read, finished last
-        assert st.last_good_as_of.startswith("2026-10-09T12:10")
-
-    def test_an_older_fault_finishing_last_does_not_restore_failing_since(self) -> None:
-        ck, spec, st = self._setup()
-        ck._process(spec, st, Read(rows=()), self._ctx(10))
-        snap = ck._process(spec, st, Fault("old"), self._ctx(5))
-        assert st.failing_since is None and "failing since" not in snap.error
-
-    def test_an_older_success_finishing_last_does_not_clear_a_newer_failure(self) -> None:
-        ck, spec, st = self._setup()
-        ck._process(spec, st, Fault("new"), self._ctx(10))
-        ck._process(spec, st, Read(rows=()), self._ctx(5))
-        assert st.failing_since.startswith("2026-10-09T12:10")
-
     def test_a_raising_fault_path_in_snap_for_is_an_error_read_and_freshness_follows(self, monkeypatch) -> None:
         ck, spec, st = self._setup()
         ck.panel("p")
@@ -1263,24 +1245,80 @@ class TestR9Bookkeeping:
         assert ck.panel("p")["status"] == "error"
         assert ck.freshness()["p"]["status"] == "error"
 
-    def test_ordering_is_by_read_start_not_by_the_providers_data_time(self) -> None:
-        ck, spec, st = self._setup()
-        old = datetime(2026, 10, 9, 9, 0, tzinfo=timezone.utc).isoformat()
-        ck._process(spec, st, Read(rows=(), as_of=old), self._ctx(10))        # newer read, data time 09:00
-        ck._process(spec, st, Fault("older"), self._ctx(5))                   # older read faults last
-        assert st.failing_since is None and st.last_good_as_of == old
-        ck._process(spec, st, Fault("newer"), self._ctx(20))
-        ck._process(spec, st, Read(rows=()), self._ctx(20))                   # same start: the failure stays
-        assert st.failing_since.startswith("2026-10-09T12:20")
-
-    def test_a_future_data_time_does_not_suppress_a_real_failure(self) -> None:
-        ck, spec, st = self._setup()
-        future = datetime(2030, 1, 1, tzinfo=timezone.utc).isoformat()
-        ck._process(spec, st, Read(rows=(), as_of=future), self._ctx(10))
-        ck._process(spec, st, Fault("real"), self._ctx(11))
-        assert st.failing_since.startswith("2026-10-09T12:11")
-
     def test_a_store_label_never_raises_or_leaks_on_a_broken_home(self, monkeypatch) -> None:
         from levain.cockpit import providers
         monkeypatch.setattr(Path, "home", classmethod(lambda cls: (_ for _ in ()).throw(RuntimeError("/Users/x/secret"))))
         assert providers._store_label(Path("/Users/x/.anneal-memory/memory.db")) == "memory.db"
+
+
+class TestOneFlightOrdersByConstruction:
+    """Only the flight owner processes and commits; joiners get its snapshot; refresh() joins."""
+
+    def _slow(self, script, release):
+        calls = []
+
+        def read(ctx):
+            n = len(calls)
+            calls.append(n)
+            release.wait(5)
+            step = script[min(n, len(script) - 1)]
+            return Fault("down") if step == "fail" else Read(rows=())
+        return read, calls
+
+    def test_a_burst_runs_one_read_and_every_caller_gets_the_owners_snapshot(self) -> None:
+        release = threading.Event()
+        read, calls = self._slow(["fail"], release)
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=read,
+                                 order="time.desc", facets=frozenset({"at"}), version_fields=("id",), timeout_s=10))
+        out, ts = [], []
+        for _ in range(12):
+            ts.append(threading.Thread(target=lambda: out.append(ck.panel("p")["status"])))
+        [t.start() for t in ts]
+        time.sleep(0.3)
+        release.set()
+        [t.join() for t in ts]
+        assert len(calls) == 1 and out == ["error"] * 12       # one read; all twelve see the owner's result
+        st = ck._state["p"]
+        assert st.failing_since is not None and st.pflight is None
+
+    def test_fail_then_recover_commits_in_start_order(self) -> None:
+        release = threading.Event()
+        release.set()
+        read, calls = self._slow(["fail", "ok"], release)
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=read,
+                                 order="time.desc", facets=frozenset({"at"}), version_fields=("id",), timeout_s=10))
+        assert ck.panel("p")["status"] == "error" and ck.freshness()["p"]["status"] == "error"
+        assert ck.panel("p")["status"] == "empty" and ck.freshness()["p"]["status"] == "empty"
+        st = ck._state["p"]
+        assert st.failing_since is None and st.last_good_as_of == ck.freshness()["p"]["as_of"]
+
+    def test_refresh_during_a_flight_joins_it_instead_of_racing(self) -> None:
+        release = threading.Event()
+        read, calls = self._slow(["ok"], release)
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=read, order="time.desc",
+                                 facets=frozenset({"at"}), version_fields=("id",), timeout_s=10,
+                                 refresh_every_s=60, stale_after_s=100))
+        ts = [threading.Thread(target=lambda: ck.refresh("p")) for _ in range(5)]
+        [t.start() for t in ts]
+        time.sleep(0.3)
+        release.set()
+        [t.join() for t in ts]
+        assert len(calls) == 1 and ck._state["p"].snap.status == "empty"
+
+    def test_a_timed_out_owner_commits_once_and_a_hung_thread_never_commits_late(self) -> None:
+        release = threading.Event()
+        read, calls = self._slow(["ok"], release)
+        ck = Cockpit()
+        ck.register(ProviderSpec(id="p", kind="triage-list", title="p", priority="feed", read=read, order="time.desc",
+                                 facets=frozenset({"at"}), version_fields=("id",), timeout_s=0.3))
+        assert ck.panel("p")["status"] == "error"
+        assert ck.panel("p")["status"] == "error"          # source thread still hung: fail fast, no second read
+        assert len(calls) == 1
+        release.set()
+        time.sleep(0.3)
+        st = ck._state["p"]
+        assert st.pflight is None and ck.freshness()["p"]["status"] == "error"   # the late OK committed nothing
+        assert ck.panel("p")["status"] == "empty"                                 # a new read recovers
