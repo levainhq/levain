@@ -475,7 +475,9 @@
     try { return renderPanel(entry, view, opts); } catch (e) {
       const node = el("div", "panel");
       node.dataset.zone = entry.zone || "";
-      node.appendChild(el("div", "phead", typeof entry.id === "string" ? entry.id : "panel"));
+      node.dataset.editClass = entry.edit_class || "";
+      const name = [entry.title, entry.id].find((v) => typeof v === "string" && v) || "panel";
+      node.appendChild(el("div", "phead", name));
       node.appendChild(el("p", "err", "unavailable — could not be drawn (" + (e && e.message ? e.message : "bad data") + ")"));
       return node;
     }
@@ -813,7 +815,7 @@
     const render = (raw) => {
       const q = raw.trim().toLowerCase();
       const rows = q
-        ? all.filter((s) => (s.text || "").toLowerCase().includes(q) ||
+        ? all.filter((s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
                             String(s.id || "").toLowerCase().includes(q))
         : all;
       results.replaceChildren();

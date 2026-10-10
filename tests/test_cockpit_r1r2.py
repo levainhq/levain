@@ -352,6 +352,15 @@ class TestManifestMapperBoundary:
         out = subprocess.run([NODE, "-e", js, str(WEB / "cockpit_view.js")], capture_output=True, text=True, check=True).stdout
         assert out == "refused,refused"        # a collision is refused whole, in any key order, never resolved by a guess
 
+    def test_a_colliding_key_inside_one_panel_rejects_that_panel_alone(self) -> None:
+        ck = _tray_cockpit()
+        ck.register(ProviderSpec("m", "metric", "M", "gauge", lambda c: Read(value={"metrics": []})))
+        raw = json.dumps(snapshot(ck)).replace('"metrics": []', '"metrics": [], "ops\\u202ey": 1, "ops<U+202E>y": 2')
+        assert '"ops<U+202E>y": 2' in raw           # the replacement happened
+        view = _view(json.loads(raw))
+        assert "payload rejected" in view["extra_panels"]["m"]["error"] or "payload rejected" in json.dumps(view["errors"])
+        assert [e["id"] for e in view["layout"]].count("tray") == 1      # the rest of the cockpit still renders
+
     def test_a_non_string_panel_title_falls_back_to_the_head_title(self) -> None:
         ck = _tray_cockpit()
         snap = snapshot(ck)
