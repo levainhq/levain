@@ -47,7 +47,7 @@ HANDOFF_FRESH_DAYS = 7
 SPORE_ROW_VERBS = ("spore_touch", "spore_descend", "spore_surface_at", "spore_update",
                    "spore_set_disposition", "spore_ascend")
 SPORE_STORED = ("id", "text", "disposition", "tier", "type", "domain", "next", "pointer", "salience", "seen")
-SPORE_VERSION_EXCLUDED = ("seen",)    # a touch moves seen, never the version
+SPORE_VERSION_EXCLUDED = ("seen",)    # seen alone never stales a write (a touch that clears an elapsed next does)
 SPORE_VERSION_FIELDS = tuple(f for f in SPORE_STORED if f not in SPORE_VERSION_EXCLUDED)
 SPORE_FACETS = frozenset({
     "disposition", "domain", "tier", "salience", "spore_type", "due", "overdue_days",

@@ -941,11 +941,49 @@ class TestSporeCas:
         assert after is not None and after["text"] == "landed in the window" and after.get("status") != "resolved"
 
     def test_the_version_anneal_compares_is_the_version_the_panel_rendered(self, rig: Rig) -> None:
+        """Every rendered spore row, odd stored shapes included (L1 #5 on 6ae3218: the first version
+        skipped rows it could not read and held only well-formed spores)."""
         from levain.cockpit.providers import spore_row_version
-        for panel, key in (("tray", "seed"), ("tray", "held"), ("loops", "loop"), ("keep", "parked"), ("keep", "note")):
-            if (row := rig.ck.read_one(panel, f"spore:{rig.ids[key]}")).__class__.__name__ != "Read":
-                continue
-            assert spore_row_version(rig.spore(key)) == row.value["version"], (panel, key)
+        p = rig.root / ".levain" / "memory.spores.json"
+        data = json.loads(p.read_text())
+        loop = next(sp for sp in data["spores"] if sp["id"] == rig.ids["loop"])
+        loop.pop("disposition", None)                  # the loop sentinel: key absent
+        odd = dict(loop, id="spore-odd1", text="odd shapes", salience="2", pointer={"k": 1})
+        odd.pop("next", None)
+        data["spores"].append(odd)
+        p.write_text(json.dumps(data))
+        rows = {r["id"]: r for pid in ("tray", "loops", "keep")
+                for r in (rig.ck.panel(pid, credential_class="token") or {}).get("rows") or []}
+        stored = {sp["id"]: sp for sp in json.loads(p.read_text())["spores"]}
+        assert set(rows) == {f"spore:{i}" for i in stored} - {f"spore:{rig.ids['held']}"}   # held is out of view
+        for rid, row in rows.items():
+            assert spore_row_version(stored[rid[len("spore:"):]]) == row["version"], rid
+
+    def test_a_spore_resolved_between_read_one_and_the_fire_is_409_not_422(self, rig: Rig, monkeypatch) -> None:
+        """L1 #1 on 6ae3218: anneal refuses a resolved spore before it computes a version, and that
+        surfaced as a generic 422."""
+        r = rig.row("tray", "seed")
+        real = rig.ck.read_one
+
+        def read_then_resolve(panel_id: str, row_id: str):
+            res = real(panel_id, row_id)
+            rig.store.descend(rig.ids["seed"], kind="dropped")
+            return res
+        monkeypatch.setattr(rig.ck, "read_one", read_then_resolve)
+        e = _refused("stale", rig.post, "spore_touch", "tray", None, {}, row_id=r["id"], row_version=r["version"])
+        assert e.http_status == 409
+
+    @pytest.mark.parametrize("req", [
+        {"kind": "spore_set_disposition", "disposition": "note", "confirm": True},
+        {"kind": "spore_ascend", "spore_kind": "done", "ref": "r", "confirm": True},
+    ])
+    def test_the_t2_spore_writes_are_guarded_too(self, rig: Rig, req: dict) -> None:
+        """The broker (K2b) fires these; the guard is already on their store call (L1 #5)."""
+        from levain.writes import apply_edit
+        v = rig.row("loops", "loop")["version"]
+        rig.store.update(rig.ids["loop"], text="moved on")
+        e = _refused("stale", apply_edit, rig.src.write_scope, {**req, "spore_id": rig.ids["loop"]}, expected_version=v)
+        assert e.http_status == 409 and rig.spore("loop")["text"] == "moved on"
 
     def test_a_spore_the_kernel_cannot_version_is_refused_stale(self, rig: Rig, monkeypatch) -> None:
         import levain.cockpit.providers as prov

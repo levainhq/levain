@@ -1357,13 +1357,18 @@ class _VersionGuard:
     def __init__(self, expected: str | None) -> None:
         self.expected = expected
         self.found: str | None = None
+        self.error: str | None = None
+        if expected is not None:
+            # resolved before any store lock is taken, so the callback anneal runs under its lock
+            # imports nothing
+            from levain.cockpit.providers import spore_row_version   # lazy: the cockpit imports this module
+            self._version = spore_row_version
 
     def version_of(self, spore: dict[str, Any]) -> str:
-        from levain.cockpit.providers import spore_row_version   # lazy: the cockpit imports this module
         try:
-            self.found = spore_row_version(spore)
-        except Exception:  # noqa: BLE001 - a spore the cockpit cannot version matches no version it rendered
-            self.found = "unversionable"
+            self.found = self._version(spore)
+        except (ValueError, TypeError) as exc:   # a malformed stored row: it matches no version it rendered
+            self.found, self.error = "unversionable", f"{type(exc).__name__}: {exc}"
         return self.found
 
 
@@ -1373,9 +1378,23 @@ def _guard_kwargs(guard: "_VersionGuard | None") -> dict[str, Any]:
     return {"expected_version": guard.expected, "version_of": guard.version_of}
 
 
-def _spore_refusal(guard: "_VersionGuard | None", exc: Exception) -> EditError:
-    if guard is not None and guard.expected is not None and guard.found not in (None, guard.expected):
-        return EditError("stale", 409, "the item changed since it was read; re-read it and retry")
+def _spore_refusal(guard: "_VersionGuard | None", exc: Exception, store: Any = None,
+                   spore_id: str | None = None) -> EditError:
+    """A refused guarded spore write. Stale (409) when anneal's recompute differed, or when the
+    spore the caller read is no longer open (resolved or removed in the window: anneal refuses that
+    before it computes a version, so it is read back here, never matched by message)."""
+    if guard is not None and guard.expected is not None:
+        if guard.error is not None:
+            return EditError("stale", 409, f"the stored item could not be versioned ({guard.error}); re-read it")
+        if guard.found not in (None, guard.expected):
+            return EditError("stale", 409, "the item changed since it was read; re-read it and retry")
+        if guard.found is None and store is not None and spore_id is not None:
+            try:
+                cur = store.get(spore_id)
+            except Exception:  # noqa: BLE001 - the original refusal stands
+                cur = {}
+            if cur is None or cur.get("status") == "resolved":
+                return EditError("stale", 409, "the item was resolved or removed since it was read")
     return EditError("verb_failed", 422, str(exc))
 
 
@@ -1475,7 +1494,7 @@ def _apply_spore_verb(
     except ValueError as exc:  # bad kind for the spore's type (anneal arg validation)
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / already resolved / store drift
-        raise _spore_refusal(guard, exc) from exc
+        raise _spore_refusal(guard, exc, store, spore_id) from exc
     except OSError as exc:  # raw IO from SporeStore._transaction (ENOLCK on a lock-less
         # FS, permission, fsync/replace) — not wrapped by anneal; map to a clean
         # retryable 503 instead of leaking a generic internal 500 [codex L3 MED].
@@ -1709,7 +1728,7 @@ def _apply_spore_set_disposition(
     except ValueError as exc:  # anneal arg validation
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / already resolved / store drift / CAS mismatch
-        raise _spore_refusal(guard, exc) from exc
+        raise _spore_refusal(guard, exc, store, spore_id) from exc
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
 
@@ -1772,7 +1791,7 @@ def _apply_spore_surface_at(
     except ValueError as exc:
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:
-        raise _spore_refusal(guard, exc) from exc
+        raise _spore_refusal(guard, exc, store, spore_id) from exc
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
 
@@ -1887,7 +1906,7 @@ def _apply_spore_update(
     except ValueError as exc:  # anneal arg validation
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / resolved / drift / CAS mismatch
-        raise _spore_refusal(guard, exc) from exc
+        raise _spore_refusal(guard, exc, store, spore_id) from exc
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
 
