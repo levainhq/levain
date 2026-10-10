@@ -796,3 +796,12 @@ def test_an_interrupted_codex_hooks_write_leaves_the_old_file(tmp_path, monkeypa
     monkeypatch.undo()
     _write_codex_hooks(hooks, '{"new": true}\n', lambda _s: None)
     assert hooks.read_text() == '{"new": true}\n'
+    # codex L3 r2, reproduced: a NEW file was forced to 0644 under umask 077.
+    fresh = tmp_path / "new" / "hooks.json"
+    fresh.parent.mkdir()
+    old_umask = os.umask(0o077)
+    try:
+        _write_codex_hooks(fresh, "{}", lambda _s: None)
+    finally:
+        os.umask(old_umask)
+    assert fresh.stat().st_mode & 0o077 == 0

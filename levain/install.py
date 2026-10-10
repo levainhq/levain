@@ -2851,17 +2851,20 @@ def _write_codex_hooks(hooks_target: Path, hooks_text: str,
     # leaves the old file in place (an unlink then a write left none, reproduced with ENOSPC),
     # and a symlink into a dotfiles repo is replaced, never written through.
     try:
-        mode = hooks_target.stat().st_mode & 0o777  # through a link: the target's mode
+        mode: int | None = hooks_target.stat().st_mode & 0o777  # through a link: the target's
     except FileNotFoundError:
-        mode = 0o644
+        mode = None  # a new file keeps mkstemp's 0600, never wider than the umask allowed
     fd, tmp = tempfile.mkstemp(dir=hooks_target.parent, prefix=f".{hooks_target.name}.",
                                suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(hooks_text)
             f.flush()
+            if mode is not None and hasattr(os, "fchmod"):  # Windows has it from 3.13
+                os.fchmod(f.fileno(), mode)  # before the fsync, so the mode is durable too
             os.fsync(f.fileno())
-        os.chmod(tmp, mode)
+        if mode is not None and not hasattr(os, "fchmod"):
+            os.chmod(tmp, mode)
         os.replace(tmp, hooks_target)
     except BaseException:
         with contextlib.suppress(OSError):
