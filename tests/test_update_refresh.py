@@ -201,7 +201,7 @@ def test_codex_global_files_of_another_install_are_left_alone(make_install, tmp_
     assert str(other) in before[0]
     r, out = _refresh(install)
     assert not r.review and (hooks.read_text(), config.read_text()) == before
-    assert "belongs to another install" in out and "another store" in out
+    assert "does not name this install" in out and "another store" in out
 
 
 def test_codex_global_files_of_this_install_are_refreshed(make_install, tmp_path):
