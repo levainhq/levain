@@ -35,8 +35,10 @@
     if (typeof x === "string") return visible(x);
     if (Array.isArray(x)) return x.map(clean);
     if (x && typeof x === "object") {
-      const o = {};
-      for (const k of Object.keys(x)) o[k] = clean(x[k]);
+      // null-prototype with own data properties: a wire key such as "__proto__" is data, never the prototype.
+      // Keys are cleaned like values, so an id and the references to it still agree after cleaning.
+      const o = Object.create(null);
+      for (const k of Object.keys(x)) Object.defineProperty(o, visible(k), { value: clean(x[k]), enumerable: true, writable: true, configurable: true });
       return o;
     }
     return x;
@@ -97,7 +99,7 @@
         const meta = [r.panel_id ? r.panel_id : "", grp, badges, prov].filter(Boolean).join(" · ");
         return { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
       });
-      if (panel.degraded && panel.degraded.length) out.note = "not complete: " + panel.error || panel.degraded.join(", ");
+      if (panel.degraded && panel.degraded.length) out.note = "not complete: " + (panel.error || panel.degraded.join(", "));
     } else if (head.kind === "line") {
       out.lines = (v.lines || []).map((l) => ({ meta: l.label, text: l.text }));
     } else if (head.kind === "metric") {
@@ -112,11 +114,11 @@
     return out;
   }
 
-  // wraps = null means the wraps panel was unreadable: last-wrap figures are then ABSENT, not "never"
+  // wraps = "unavailable" means the wraps panel was unreadable: last-wrap figures are then ABSENT, not "never"
   function healthOf(metrics, wraps) {
     const m = new Map();
     for (const x of metrics) m.set(x.label, x.value);
-    const last = wraps && wraps[0] ? wraps[0] : null;
+    const last = Array.isArray(wraps) && wraps[0] ? wraps[0] : null;
     return {
       write_path_live: m.get("write path") === "live", total_links: m.get("links"), avg_strength: m.get("avg strength"),
       density: m.get("density"), total_episodes: m.get("episodes"), episodes_since_wrap: m.get("episodes since wrap"),
@@ -124,7 +126,7 @@
       graduations_validated_total: m.get("graduations validated"), graduations_demoted_total: m.get("graduations demoted"),
       // not in the manifest (a K1 gap, routed): max_strength, local_density. The core omits what is absent.
       last_wrap_at: last ? last.wrapped_at : null, continuity_chars: last ? last.continuity_chars : null,
-      wrap_history_unavailable: wraps === null,
+      wrap_history_unavailable: wraps === "unavailable",
     };
   }
 
@@ -146,9 +148,12 @@
     const m = snap.manifest;
     const gen = parseIso(m.generated_at);
     let now = isNaN(gen) ? Date.now() : gen;   // the server's clock, so a skewed browser cannot misreport ages
-    for (const p of Object.values(snap.panels || {})) {   // panels are fetched after the manifest: never older than what they report
+    const genAt = now;
+    for (const p of Object.values(snap.panels || {})) {
+      // panels are fetched after the manifest, so a few minutes may have passed; a stamp further ahead
+      // than that is a bad stamp, and it must not move every other panel's clock
       const t = parseIso(p && p.as_of);
-      if (!isNaN(t) && t > now) now = t;
+      if (!isNaN(t) && t > now && t <= genAt + 300000) now = t;
     }
     const P = new Map(Object.entries(snap.panels || {}));
     const heads = new Map(Object.entries(m.panels || {}));
@@ -166,7 +171,7 @@
     const failure = (pid) => {
       const p = P.get(pid), h = heads.get(pid);
       if (p && p.error !== undefined && p.status === undefined) return p.error;      // our own fetch failure record
-      if (!p) return "no payload";
+      if (!p || typeof p !== "object") return "no payload";
       if (p.status === "error") return p.error || "unavailable";
       return null;
     };
@@ -178,7 +183,7 @@
     };
 
     const wrapsFail = heads.has("wraps") ? failure("wraps") : null;
-    const wrapsData = heads.has("wraps") && !wrapsFail ? (P.get("wraps").value || {}).data || [] : null;
+    const wrapsData = !heads.has("wraps") ? [] : wrapsFail ? "unavailable" : (P.get("wraps").value || {}).data || [];
     if (wrapsFail) view.errors.wraps = wrapsFail;
 
     // header region: focus and state go under the masthead; any other header panel (a downstream's
@@ -238,7 +243,7 @@
         view.graph = (panel.value || {}).data || null;
         view.layout.push(Object.assign(entry, { kind: "graph" }));
       } else if (pid === "wraps" && panel.kind === "visual") {
-        view.wraps = wrapsData || [];
+        view.wraps = Array.isArray(wrapsData) ? wrapsData : [];
         view.layout.push(Object.assign(entry, { kind: "wraps" }));
       } else if (panel.kind === "prose" && pid.indexOf("section:") === 0 && (panel.value || {}).markdown != null) {
         view.sections.push({ heading: panel.title || head.title, body: panel.value.markdown });
