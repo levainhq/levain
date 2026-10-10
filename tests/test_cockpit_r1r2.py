@@ -330,7 +330,7 @@ class TestManifestMapperBoundary:
         ck = _tray_cockpit()
         ck.register(ProviderSpec("focus", "line", "Focus", "gauge", lambda c: Read(value={"lines": [
             {"label": "focus", "text": "x", "at": "2026-10-09T12:00:00+00:00", "source": "s"}]}), region="header"))
-        view = _view(self._snap(ck))
+        view = _view(snapshot(ck))
         assert "focus" not in view and "focus" not in view["errors"]
         assert "focus" not in [e["id"] for e in view["layout"]]
 
