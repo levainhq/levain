@@ -197,6 +197,7 @@ class _Snap:
     stale_hint: bool = False
     empty: str | None = None
     value_version: str | None = None    # a line/prose value's write version; VALUE_ABSENT if no record
+    view_order: dict[str, list[str]] | None = None   # each view's row ids in order (a triage-list with views)
 
 
 @dataclass
@@ -668,7 +669,11 @@ class Cockpit:
                 skipped.append({"count": refused, "reason": "row refused: a facet value of the wrong type"})
             status = "partial" if skipped else ("empty" if not rows else "ok")
             value = None
+            # the views' orders are computed here, in the read worker, like every other ordering: an
+            # ordering key runs on provider data, so its failure is this read's Fault, never a crash
+            view_order = self._view_order(spec, rows, ctx.today) if spec.views else None
         else:
+            view_order = None
             if res.value is None:
                 raise ValueError(f"a {spec.kind} Read carries a value")
             value = self._value(spec, res.value, res.version_of)
@@ -680,7 +685,7 @@ class Cockpit:
         return _Snap(status, rows, value, filtered, skipped, as_of, None,
                      res.note if isinstance(res.note, str) else spec.note, res.stale,
                      res.empty if isinstance(res.empty, str) else None,
-                     value["value_version"] if spec.kind in ("line", "prose") else None)
+                     value["value_version"] if spec.kind in ("line", "prose") else None, view_order)
 
     @staticmethod
     def _value_empty(kind: str, value: Any) -> bool:
@@ -790,14 +795,17 @@ class Cockpit:
         }
 
     # --- heads, panels, the now view --------------------------------------------------
-    def _etag_of(self, snap: _Snap, groups: list[dict[str, Any]] | None, cred: str, today: date) -> str:
+    def _etag_of(self, snap: _Snap, groups: list[dict[str, Any]] | None, cred: str, today: date,
+                 views: tuple[tuple[str, str, str], ...] = ()) -> str:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
         return _sha({"status": snap.status, "rows": snap.rows, "value": snap.value,
                      "filtered": snap.filtered, "skipped": snap.skipped, "error": snap.error,
                      "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat(),
-                     "verbs": self._verb_rev()})
+                     "verbs": self._verb_rev(),
+                     # a panel's views shape view_rows: a kernel that adds or reorders one is not a 304
+                     **({"views": [list(v) for v in views]} if views else {})})
 
     def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date) -> dict[str, Any]:
         listy = spec.kind == "triage-list"
@@ -819,7 +827,7 @@ class Cockpit:
             "count": None if snap.status == "error" else count,
             "filtered": snap.filtered, "skipped": snap.skipped,
             "as_of": snap.as_of, "stale_after_s": spec.stale_after_s,
-            "refresh_every_s": spec.refresh_every_s, "etag": self._etag_of(snap, groups, cred, today),
+            "refresh_every_s": spec.refresh_every_s, "etag": self._etag_of(snap, groups, cred, today, spec.views),
             "error": snap.error, "note": snap.note, "empty": spec.empty if snap.empty is None else snap.empty,
             "order": spec.order, "groups": groups,
             "views": [{"id": i, "title": t, "order": o} for i, t, o in spec.views] or None,
@@ -937,8 +945,9 @@ class Cockpit:
                 errors.append({"source": f"discovery:{i}", "message": res.message})
                 continue
             returned: set[str] = set()
-            # exactly str: a str subclass can carry its own __hash__/__eq__ (None, or one that hangs)
-            # and nothing a discoverer returns is hashed or compared outside its bounded worker
+            # the id exactly str before it is hashed: a str subclass can carry its own __hash__ (None, or
+            # one that hangs). A discoverer is the embedding server's own code; its other fields are not
+            # re-typed here
             ids = Counter(s.id for s in res.value if type(s.id) is str)   # a bad id is an errors entry below
             for spec in res.value:
                 if type(spec.id) is not str:
@@ -1079,13 +1088,14 @@ class Cockpit:
             spec = None
             snap_rows: list[dict[str, Any]] | None = rows
             value = None
+            view_order = None
         else:
             spec = specs_map.get(panel_id)
             if spec is None:
                 return None
             snap = self._snap_for(spec, ctx)
             head = self._head(spec, snap, credential_class, ctx.today)
-            snap_rows, value = snap.rows, snap.value
+            snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
         out: dict[str, Any] = dict(head)
         out["rows"], out["value"], out["next"] = None, None, None
         if head["status"] == "error" and panel_id != NOW_ID:
@@ -1122,8 +1132,9 @@ class Cockpit:
                 out["rows"] = rows_all
             if matched is not None:
                 out["matched"] = matched
-            if spec is not None and spec.views and out["rows"] is not None:
-                out["view_rows"] = self._view_rows(spec, rows_all, ctx.today)
+            if spec is not None and spec.views and out["rows"] is not None and view_order is not None:
+                sent = {r["id"] for r in rows_all}
+                out["view_rows"] = {v: [i for i in ids if i in sent] for v, ids in view_order.items()}
             if out["rows"] is not None and not out.get("rows_by_ref"):
                 out["rows"] = self._with_actions(out["rows"], panel_id, credential_class, ctx.today)
         else:
@@ -1138,9 +1149,9 @@ class Cockpit:
         return out
 
     @staticmethod
-    def _view_rows(spec: ProviderSpec, rows: list[dict[str, Any]], today: date) -> dict[str, list[str]]:
-        """Each view's row ids in that view's order, over the rows this payload sends. The views'
-        orderings key on facets only, which every rendered row carries whole."""
+    def _view_order(spec: ProviderSpec, rows: list[dict[str, Any]], today: date) -> dict[str, list[str]]:
+        """Each view's row ids in that view's order. The views' orderings key on facets only, which
+        every rendered row carries whole."""
         ins = [RowIn(id=r["id"], title=r.get("title") or "", facets=r.get("facets") or {}) for r in rows]
         return {vid: [row.id for row, _g in apply_ordering(vorder, ins, today)] for vid, _t, vorder in spec.views}
 

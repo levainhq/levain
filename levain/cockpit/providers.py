@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -38,6 +39,9 @@ SPORE_CAP = 5000
 # hold filter: ranking and holds decide what is visible, then the cap truncates what is visible.
 VIEW_SPORE_LIMIT = 100_000
 EDITS_LIMIT = 20
+# the entity's own episodes the view reads (newest first); a feed row older than the oldest of them is
+# left out while the cap is hit, so the merged panel is one coherent newest window
+EPISODE_LIMIT = 50
 # An undated handoff stops leading after this many days untouched: it says "pick up here next
 # session", and a calendar that has refuted that must not keep it first (flow, 2026-08-27, where
 # one led the queue for 26 days). A dated handoff never expires.
@@ -59,6 +63,7 @@ TRAY_VIEWS = (("age", "By age", "spore.age"),)
 EPISODE_FACETS = frozenset({"episode_type", "source", "at", "tags", "agent"})
 EPISODE_STORED = ("id", "timestamp", "type", "source", "content", "tags")
 # a federated episode feed's name: it is part of every row id the feed contributes
+FEED_EMPHASIS = ("none", "dim")      # what a feed row may ask for (a quiet agent's rows recede)
 FEED_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 
 
@@ -78,7 +83,8 @@ def _store_label(db: Path) -> str:
 
 
 def _view(source: SubstrateSource, ctx: ReadContext) -> SubstrateView:
-    return ctx.memo("view", lambda: source.build(max_spores=VIEW_SPORE_LIMIT, now=ctx.now))
+    return ctx.memo("view", lambda: source.build(max_spores=VIEW_SPORE_LIMIT, max_episodes=EPISODE_LIMIT,
+                                                 now=ctx.now))
 
 
 def _view_fault(view: SubstrateView, *keys: str) -> Fault | None:
@@ -189,30 +195,58 @@ def _utc_at(v: Any) -> str:
     return d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def _feed_rows(name: str, res: Result) -> tuple[list[RowIn], str | None, str | None]:
+@dataclass
+class _FeedRead:
+    rows: list[RowIn] = field(default_factory=list)
+    skipped: list[tuple[int, str]] = field(default_factory=list)
+    filtered: list[tuple[int, str]] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    stale: bool = False
+
+
+def _feed_rows(name: str, res: Result) -> _FeedRead:
     """One federated feed's rows, re-keyed under the feed (``feed:<name>:<id>``) so no feed row can be
     taken for one of the entity's own episodes (the tombstone verb applies to ``episode:`` rows only).
-    Returns ``(rows, skipped reason, note)``: a feed that faults or breaks the episode row contract
-    contributes NO rows and is named, so the panel is ``partial``, never short and quiet."""
+    A feed that faults or breaks the episode row contract contributes NO rows and is named in
+    ``skipped``, so the panel is ``partial``, never short and quiet. A feed's own ``skipped``,
+    ``filtered``, ``note`` and ``stale`` reach the panel, each named by the feed."""
+    out = _FeedRead()
     if isinstance(res, Absent):
-        return [], None, f"{name}: not configured: {res.reason}"
+        out.notes.append(f"{name}: not configured: {res.reason}")
+        return out
     if isinstance(res, Fault):
-        return [], f"{name} unavailable: {res.message}", None
+        out.skipped.append((1, f"{name} unavailable: {res.message}"))
+        return out
     if not isinstance(res, Read) or res.rows is None:
-        return [], f"{name} unavailable: the feed returned no rows", None
-    out: list[RowIn] = []
+        out.skipped.append((1, f"{name} unavailable: the feed returned no rows"))
+        return out
+    rows: list[RowIn] = []
+    seen: set[str] = set()
     for r in res.rows:
         if not isinstance(r, RowIn):
-            return [], f"{name} unavailable: a row is a {type(r).__name__}, not a RowIn", None
+            out.skipped.append((1, f"{name} unavailable: a row is a {type(r).__name__}, not a RowIn"))
+            return out
         extra = (set(r.facets) - EPISODE_FACETS) | (set(r.stored) - set(EPISODE_STORED))
         if extra:
-            return [], f"{name} unavailable: fields {sorted(extra)} are not episode fields", None
+            out.skipped.append((1, f"{name} unavailable: fields {sorted(extra)} are not episode fields"))
+            return out
+        if type(r.id) is not str or r.id in seen:
+            out.skipped.append((1, f"{name} unavailable: row id {r.id!r} is not a string or repeats"))
+            return out
+        seen.add(r.id)
         facets = {**r.facets, "agent": r.facets.get("agent") or name}
         if "at" in facets:
             facets["at"] = _utc_at(facets["at"])
-        out.append(RowIn(id=f"feed:{name}:{r.id}", title=r.title, body=r.body, facets=facets,
-                         emphasis=r.emphasis, stored=dict(r.stored)))
-    return out, None, None
+        rows.append(RowIn(id=f"feed:{name}:{r.id}", title=r.title, body=r.body, facets=facets,
+                          emphasis=r.emphasis if r.emphasis in FEED_EMPHASIS else "none",
+                          stored=dict(r.stored)))
+    out.rows = rows
+    out.skipped = [(n, f"{name}: {why}") for n, why in res.skipped]
+    out.filtered = [(n, f"{name}: {why}") for n, why in res.filtered]
+    if isinstance(res.note, str) and res.note:
+        out.notes.append(f"{name}: {res.note}")
+    out.stale = bool(res.stale)
+    return out
 
 
 def _episodes(source: SubstrateSource,
@@ -225,6 +259,7 @@ def _episodes(source: SubstrateSource,
         if bad:
             return bad
         own = view.entity_name or "entity"
+        capped = len(view.episodes) >= EPISODE_LIMIT
         rows = [
             RowIn(
                 id=f"episode:{e.id}", title=e.content, body=e.content,
@@ -235,20 +270,29 @@ def _episodes(source: SubstrateSource,
             )
             for e in view.episodes
         ]
+        # the oldest own timestamp, when the cap cut older own rows off: feed rows before it would sit in
+        # a gap where the entity's own rows are missing
+        floor = min((r.facets["at"] for r in rows if r.facets["at"]), default="") if capped else ""
         skipped: list[tuple[int, str]] = []
-        notes: list[str] = []
+        filtered: list[tuple[int, str]] = []
+        notes: list[str] = [f"the entity's newest {EPISODE_LIMIT} episodes"] if capped and feeds else []
+        stale = False
         for name, feed in feeds:
             try:
                 res = feed(ctx)
             except Exception as exc:   # noqa: BLE001 -- one feed's fault names that feed, never blanks the panel
                 res = Fault(f"{type(exc).__name__}: {exc}")
-            got, why, note = _feed_rows(name, res)
-            rows.extend(got)
-            if why:
-                skipped.append((1, why))
-            if note:
-                notes.append(note)
-        return Read(rows=tuple(rows), skipped=tuple(skipped), note="; ".join(notes) or None)
+            got = _feed_rows(name, res)
+            older = {r.id for r in got.rows if floor and r.facets.get("at") and r.facets["at"] < floor}
+            rows.extend(r for r in got.rows if r.id not in older)
+            if older:
+                filtered.append((len(older), f"{name}: older than the entity's newest {EPISODE_LIMIT}"))
+            skipped += got.skipped
+            filtered += got.filtered
+            notes += got.notes
+            stale = stale or got.stale
+        return Read(rows=tuple(rows), skipped=tuple(skipped), filtered=tuple(filtered),
+                    note="; ".join(notes) or None, stale=stale)
     return read
 
 

@@ -199,8 +199,9 @@ def _keep_key(row: RowIn, today: date) -> tuple:
 
 def _time_desc_key(row: RowIn, today: date) -> tuple:
     # newest first: invert the timestamp string character-wise so the key is plain-ascending.
+    # a row with no timestamp cannot be placed in time: it goes last, never first
     at = str(row.facets.get("at") or "")
-    return (tuple(-ord(c) for c in at), row.id)
+    return (0 if at else 1, tuple(-ord(c) for c in at), row.id)
 
 
 def _age_key(row: RowIn, today: date) -> tuple:
