@@ -43,10 +43,11 @@ import json
 import os
 import sys
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 from levain.spores import (
     BUCKET_KEEP,
@@ -625,14 +626,20 @@ class State:
         return self.__dict__.copy()
 
 
+def state_record(data: dict[str, Any]) -> dict[str, Any]:
+    """The stored record a state write binds to: the ``STATE_KEYS`` as stored, other keys ignored.
+    The cockpit's state panel versions this same record (``Read.version_of``)."""
+    return {k: data.get(k) for k in STATE_KEYS}
+
+
 def state_version(data: Any) -> str | None:
-    """The version a state write binds to: the cockpit's value version of the stored record (the
-    three ``STATE_KEYS`` as stored, other keys ignored), so the legacy page and the manifest name
-    the same version. None for a file that is not a JSON object."""
+    """The version a state write binds to: the cockpit's value version of ``state_record``, so
+    the legacy page and the manifest name the same version. None for a file that is not a JSON
+    object."""
     if not isinstance(data, dict):
         return None
     from levain.cockpit.engine import value_version_of   # lazy: the cockpit imports this module
-    return value_version_of({k: data.get(k) for k in STATE_KEYS})
+    return value_version_of(state_record(data))
 
 
 def _read_state(context_json: Path | None, now: datetime) -> "State | None":
@@ -726,25 +733,59 @@ def _write_context_line(context_json: Path, key: str, text: str, *, source: str)
             tmp.unlink(missing_ok=True)
 
 
-def write_state(context_json: Path, text: str, *, source: str = "cli") -> None:
+class StateLockUnavailable(RuntimeError):
+    """A version-bound state write on a platform with no ``flock`` (Windows): refused, since the
+    compare and the write cannot be made one step there."""
+
+
+@contextmanager
+def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
+    """An exclusive lock held across one state write, on a sidecar of the file's REAL path (so a
+    symlinked context file and its target share one lock, and the atomic ``os.replace`` of the file
+    never swaps the locked inode). ``write_state`` takes it, so every writer that sets the line
+    through it is serialised (the test names them). Where ``flock`` does not exist, an unchecked write runs unlocked
+    (last writer wins, as before) and a ``required`` one is refused."""
+    try:
+        import fcntl
+    except ImportError:
+        if required:
+            raise StateLockUnavailable("this platform has no flock: a version-bound state write is refused")
+        yield
+        return
+    lock = os.path.realpath(context_json) + ".lock"
+    os.makedirs(os.path.dirname(lock), exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)    # closing the descriptor releases the flock
+
+
+def write_state(context_json: Path, text: str, *, source: str = "cli",
+                check: "Callable[[], None] | None" = None) -> None:
     """Set (or, with blank ``text``, clear) the operator's freeform state line: the
     write-peer of ``_read_state``, kept adjacent so the contract (the three keys, a
     tz-aware ISO stamp) cannot drift between read and write.
 
     MERGE-preserving: reads the existing object and updates ONLY the three state keys,
     so a file that carries other keys (a sensor app's superset, or keys an older
-    version wrote) keeps them. Last-writer-wins and atomic (temp + ``os.replace``, so a
-    reader never sees a torn file), NO CAS / lock. For a generic adopter the operator's
-    own ``levain state`` is the only writer of ``.levain/context.json``; where the file
-    is a foreign-multi-writer superset, a concurrent whole-object writer holding an
-    older snapshot can revert a just-set line (re-set is one keystroke). A blank text
+    version wrote) keeps them. Atomic (temp + ``os.replace``, so a reader never sees a torn
+    file) and serialised with every other levain state writer by ``_state_lock``;
+    ``check`` (the cockpit's version compare) runs under that lock, so the compare and the
+    write are one step. A writer outside levain (a sensor app, flow's own state CLI) does
+    not take the lock: a concurrent whole-object writer holding an older snapshot can
+    revert a just-set line (re-set is one keystroke). A blank text
     CLEARS by popping all three keys. The parent dir is created if absent; a
     corrupt/unreadable existing file is replaced rather than failing the set. The text is
     stored verbatim apart from whitespace collapse; nothing reads meaning into it."""
     collapsed = " ".join(text.split())
     if len(collapsed) > STATE_MAX_TEXT_LEN:
         raise ValueError(f"state exceeds {STATE_MAX_TEXT_LEN} chars")
-    _write_context_line(context_json, "state", collapsed, source=source)
+    with _state_lock(context_json, required=check is not None):
+        if check is not None:
+            check()
+        _write_context_line(context_json, "state", collapsed, source=source)
 
 
 @dataclass

@@ -611,27 +611,6 @@ def recent_edits(ledger_root: Path, limit: int = 20) -> list[dict[str, Any]]:
 # The public entry — apply_edit, routed by kind.
 # ---------------------------------------------------------------------------
 
-@contextmanager
-def context_lock(scope: WriteScope) -> Iterator[None]:
-    """An exclusive lock on the operator's live-context file, held across a cockpit write's version
-    compare and its write (design §4.4: the check and the write are one step under the source's
-    lock). A sidecar ``<context>.lock`` file, so the atomic ``os.replace`` of the context file
-    never swaps the locked inode. Only writers that take it are serialised by it."""
-    import fcntl
-
-    path = scope.context_json
-    if path is None:
-        yield
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        os.close(fd)    # closing the descriptor releases the flock
-
-
 def _require_install_root(scope: WriteScope, kind_label: str) -> Path:
     """A ``config`` / ``entity_name`` edit targets the install's seed/config surface —
     which only exists when the scope has an ``install_root``. A non-install substrate
@@ -986,7 +965,10 @@ def _idempotency_claim(
                         f"'idempotency_key' exceeds {MAX_IDEMPOTENCY_KEY_LEN} characters")
     store = IdempotencyStore(scope.ledger_root / "idempotency.json")
     try:
-        fingerprint = request_fingerprint(verb, params if bind is None else {"params": params, "bind": bind})
+        # a bound request is fingerprinted under "cockpit:<verb>", a name no registered verb can
+        # have (the registry refuses ':'), so it never equals an unbound request's fingerprint
+        fingerprint = request_fingerprint(verb, params) if bind is None else \
+            request_fingerprint("cockpit:" + verb, {"params": params, "bind": bind})
     except ValueError as exc:
         # params that can't be canonically fingerprinted (non-string dict key / non-finite float —
         # L3 codex LOW). Unreachable via HTTP (JSON keys are strings); a clean 400 for the API path.
@@ -1086,9 +1068,11 @@ def _apply_config_edit(scope: WriteScope, req: dict[str, Any], now: str | None) 
     )
 
 
-def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
+def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None,
+                               check: "Callable[[], None] | None" = None) -> dict[str, Any]:
     """Set (or clear) the operator's freeform state line, the ``operator_state`` kind:
-    live-state in ``scope.context_json`` (last-writer-wins, no continuity lock or backup),
+    live-state in ``scope.context_json`` (``write_state``'s lock, no continuity lock or backup;
+    ``check`` is the cockpit's version compare, run under that lock),
     bounded by ``dashboard.STATE_MAX_TEXT_LEN`` with an allowlisted provenance tag. The text is stored verbatim apart from whitespace collapse and
     is never interpreted. Refuses 422 ``no_state_target`` without a ``context_json``."""
     ctx = scope.context_json
@@ -1110,9 +1094,12 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
     source = raw_source if isinstance(raw_source, str) and raw_source in _CONTEXT_SOURCE_ALLOWLIST else "web"
     # The bound is the kernel's (dashboard.STATE_MAX_TEXT_LEN), so the governed edit, the CLI
     # write and every reader agree; imported lazily to avoid the writes↔dashboard cycle.
-    from levain.dashboard import write_state
+    from levain.dashboard import StateLockUnavailable, write_state
 
-    write_state(ctx, collapsed, source=source)
+    try:
+        write_state(ctx, collapsed, source=source, check=check)
+    except StateLockUnavailable as exc:
+        raise EditError("lock_unavailable", 501, str(exc)) from exc
     return {"ok": True, "kind": "operator_state", "cleared": collapsed == ""}
 
 

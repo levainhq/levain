@@ -39,8 +39,8 @@ from levain.cockpit.engine import VALUE_ABSENT
 from levain.cockpit.external import ID_PREFIX as EXTERNAL_PREFIX
 from levain.cockpit.registry import parse_date
 from levain.cockpit.results import Absent, Fault, Read
-from levain.writes import (ActionVerb, EditError, _normalize_expect_disposition, apply_action, apply_edit,
-                           context_lock)
+from levain.writes import (ActionVerb, EditError, _apply_operator_state_edit, _normalize_expect_disposition,
+                           apply_action, apply_edit)
 
 if TYPE_CHECKING:
     from levain.cockpit.engine import Cockpit
@@ -271,14 +271,12 @@ _SURFACE_SOURCE = {"browser": "web", "flowconnect": "app"}
 
 def _operator_state_fire(scope: "WriteScope", params: dict[str, Any], target: dict[str, Any],
                          confirm: bool) -> dict[str, Any]:
-    """The version compare and the write in one step under the context file's lock (§4.4). A writer
-    that does not take this lock (flow's own state CLI) is outside it: routed to M1."""
-    with context_lock(scope):
-        check = target.get("check")
-        if check is not None:
-            check()
-        return apply_edit(scope, {"kind": "operator_state", "text": params.get("text"),
-                                  "source": target.get("source", "web")})
+    """The version compare and the write in one step under the state file's lock (§4.4,
+    ``dashboard.write_state``). A writer outside levain (flow's own state CLI) does not take that
+    lock: routed to M1."""
+    return _apply_operator_state_edit(scope, {"kind": "operator_state", "text": params.get("text"),
+                                              "source": target.get("source", "web")}, None,
+                                      check=target.get("check"))
 
 
 def _unbuilt_fire(why: str) -> Callable[..., dict[str, Any]]:
@@ -364,6 +362,9 @@ class VerbRegistry:
             self.register_downstream(name, spec)
 
     def _add(self, spec: VerbSpec) -> None:
+        if not isinstance(spec.name, str) or not spec.name or ":" in spec.name:
+            # ':' is reserved: a cockpit fire's idempotency fingerprint is taken under "cockpit:<verb>"
+            raise ValueError(f"verb name {spec.name!r} must be a non-empty string without ':'")
         if spec.name in BROKER_HEADS:
             raise ValueError(f"{spec.name!r} is answered on the broker path; it is never a cockpit verb")
         if spec.name in self._specs:
@@ -497,11 +498,12 @@ def _read_target(cockpit: "Cockpit", verb: VerbSpec, panel_id: str, row_id: str 
 
 
 def _check_value_version(cockpit: "Cockpit", panel_id: str, supplied: Any) -> None:
-    if not isinstance(supplied, str) or not supplied:
-        raise _refuse("bad_request", 400, "'panel_version' is required for a write to a stored value")
     res = cockpit.read_value_version(panel_id)
     if isinstance(res, Fault):
+        # first: a value no one can read (a corrupt file) has no version to name, so say that
         raise _refuse("source_unavailable", 503, f"could not read {panel_id!r} from its source: {res.message}")
+    if not isinstance(supplied, str) or not supplied:
+        raise _refuse("bad_request", 400, "'panel_version' is required for a write to a stored value")
     # a value that is not stored yet binds to VALUE_ABSENT, so the first write has something to name
     current = VALUE_ABSENT if isinstance(res, Absent) else res.value
     if current != supplied:

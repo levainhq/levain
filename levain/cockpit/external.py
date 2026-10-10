@@ -71,14 +71,20 @@ class ExternalPanels:
         self._last: tuple[float, _Call] | None = None
         self.calls = 0           # how many times the callable ran (the burst measurement reads it)
 
-    def take(self) -> _Call:
+    def take(self, *, fresh: bool = False) -> _Call:
+        """``fresh`` (a write's read): never the reused answer and never a flight already running,
+        which may have started before the source changed. Its own flight, not shared, under the same
+        parked bound; a fresh flight that times out is parked like any other."""
         with self._lock:
             now = self._clock()
-            if self._last is not None and now - self._last[0] < self._reuse_s:
-                return self._last[1]
-            flight = self._flight
-            if flight is not None and now >= flight.deadline:
-                return self._abandon_locked(flight, now)
+            if fresh:
+                flight = None
+            else:
+                if self._last is not None and now - self._last[0] < self._reuse_s:
+                    return self._last[1]
+                flight = self._flight
+                if flight is not None and now >= flight.deadline:
+                    return self._abandon_locked(flight, now)
             if flight is None:
                 if len(self._parked) >= self._max_parked:
                     return self._record_locked(_Call(None, f"{len(self._parked)} earlier calls of the external "
@@ -88,9 +94,10 @@ class ExternalPanels:
                     threading.Thread(target=self._run, args=(flight,), name="levain-external-panels",
                                      daemon=True).start()
                 except RuntimeError as exc:      # "can't start new thread": nothing is left waiting on it
-                    return self._record_locked(_Call(None, f"could not start the external panels call: {exc}",
-                                                     _now_iso()), now)
-                self._flight = flight
+                    failed = _Call(None, f"could not start the external panels call: {exc}", _now_iso())
+                    return failed if fresh else self._record_locked(failed, now)
+                if not fresh:
+                    self._flight = flight
                 self.calls += 1
         flight.done.wait(max(0.0, flight.deadline - self._clock()))
         with self._lock:
@@ -107,8 +114,8 @@ class ExternalPanels:
             flight.timeout = _Call(None, f"the external panels did not answer within {self._wait_s:g} s", _now_iso())
             if self._flight is flight:
                 self._flight = None
-                self._parked.add(flight)
                 self._record_locked(flight.timeout, now)
+            self._parked.add(flight)     # a fresh flight is no one's current one, and is bounded too
         return flight.timeout     # every reader of an abandoned flight gets that flight's own reading
 
     def _run(self, flight: _Flight) -> None:
@@ -235,7 +242,7 @@ def _rows(p: dict[str, Any]) -> tuple[tuple[RowIn, ...], int]:
 def _take(ext: ExternalPanels, ctx: ReadContext) -> _Call:
     """One call per read cycle: a manifest build's discovery and every panel it reads share the cycle's
     answer even if the build outlives the reuse window."""
-    got: _Call = ctx.memo(f"levain.external:{id(ext)}", ext.take)
+    got: _Call = ctx.memo(f"levain.external:{id(ext)}", lambda: ext.take(fresh=ctx.fresh))
     return got
 
 

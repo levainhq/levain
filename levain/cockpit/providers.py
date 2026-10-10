@@ -22,11 +22,11 @@ from levain.dashboard import (
     CLASS_A,
     CLASS_B,
     CLASS_C,
-    STATE_KEYS,
     SubstrateSource,
     SubstrateView,
     _one_clause,
     state_from_data,
+    state_record,
 )
 
 # The view caps each spore bucket at ``max_spores``. The cockpit asks for far more than any store
@@ -351,7 +351,7 @@ def _context_line(source: SubstrateSource) -> Callable[[ReadContext], Result]:
         if problem is not None:
             return problem
         assert data is not None
-        stored = {k: data.get(k) for k in STATE_KEYS}
+        stored = state_record(data)
         item = state_from_data(data, ctx.now)
         if not item.text:
             return Read(value={"lines": []}, version_of=stored)

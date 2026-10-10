@@ -60,6 +60,7 @@ VISUALS = ("sky", "constellation", "cognition-graph", "wrap-history")
 TITLE_MAX = 160
 SOON_DAYS = 3
 WRITE_READ_CAP = 32       # source reads made inside writes that may run at once (design §4.4)
+WRITE_READ_CAP_PER_SOURCE = 4   # of those, reads of one source (a panel or a discoverer)
 WRITE_READ_GRACE_S = 0.5  # an added write read counts as live this long before its flight exists
 POLICY_REVISION = 1  # hashed into the manifest etag; bumped when a tier or gesture policy changes
 NOW_ID = "now"
@@ -124,10 +125,12 @@ class ProviderSpec:
 
 class ReadContext:
     """One read cycle: a fixed instant and a memo, so every built-in provider in a cycle sees one
-    view of the substrate instead of building its own."""
+    view of the substrate instead of building its own. ``fresh``: a write's read, so a source with
+    its own answer cache must answer anew (``ExternalPanels.take``)."""
 
-    def __init__(self, now: datetime, *, memo_timeout_s: float = 10.0) -> None:
+    def __init__(self, now: datetime, *, memo_timeout_s: float = 10.0, fresh: bool = False) -> None:
         self.now = now
+        self.fresh = fresh
         self.today: date = now.astimezone().date()
         self._memo: dict[str, Future] = {}
         self._dead: set[str] = set()
@@ -247,7 +250,7 @@ class Cockpit:
         self._discoverers: list[Callable[[ReadContext], list[ProviderSpec]]] = []
         self._entity_state = _State()
         self._discovery_states: list[_State] = []
-        self._discovered: frozenset[str] = frozenset()   # panel ids a discoverer registered
+        self._discovered: dict[str, int] = {}   # panel id -> the index of the discoverer that registered it
         self._entity_timeout_s = ENTITY_TIMEOUT_S
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
@@ -270,31 +273,28 @@ class Cockpit:
 
     def offer_spec(self, panel_id: str) -> "ProviderSpec | Fault | None":
         """The registration a WRITE checks its verb against. A panel registered in code is its
-        registration. A DISCOVERED panel's verbs are what its source offers now, so every
-        discoverer is run again here on a fresh read that never joins an earlier flight, and the
-        write is bound to that answer: the panel's spec with the verbs just discovered, ``None``
-        when no discoverer returns the panel any more, ``Fault`` when a discoverer failed and none
-        returned it (fail closed: an unconfirmed offer is no offer). A source with its own answer
-        cache (``ExternalPanels``' reuse window) is as fresh as that cache."""
+        registration. A DISCOVERED panel's verbs are what its OWNER (the discoverer that registered
+        it) offers now: the owner is run again here on a fresh read that never joins an earlier
+        flight (``ReadContext.fresh``: a source with its own answer cache answers anew), and the
+        write is bound to that answer: the spec with the verbs just discovered, ``None`` when the
+        owner no longer returns the panel, ``Fault`` when the owner failed (fail closed: an
+        unconfirmed offer is no offer)."""
         spec = self.spec(panel_id, discover=True)
-        if spec is None or panel_id not in self._discovered:
+        owner = self._discovered.get(panel_id)
+        if spec is None or owner is None:
             return spec
-        ctx = ReadContext(self._clock())
+        ctx = ReadContext(self._clock(), fresh=True)
         with self._lock:
-            discoverers = list(self._discoverers)
-        fault: Fault | None = None
-        for fn in discoverers:
-            res = self._bounded_fresh(self._entity_timeout_s, self._discover_one, fn, ctx)
-            if isinstance(res, Fault):
-                fault = res
-                continue
-            for got in res.value:
-                if got.id != panel_id:
-                    continue
+            fn = self._discoverers[owner]
+        res = self._bounded_fresh(f"discovery:{owner}", self._entity_timeout_s, self._discover_one, fn, ctx)
+        if isinstance(res, Fault):
+            return res
+        for got in res.value:
+            if got.id == panel_id:
                 if got.title != spec.title:
                     return Fault(f"id collision: {got.title!r} maps to the id of {spec.title!r}")
                 return dataclasses.replace(spec, verbs=tuple(got.verbs))
-        return fault
+        return None
 
     def today(self) -> date:
         return ReadContext(self._clock()).today
@@ -910,10 +910,12 @@ class Cockpit:
             if isinstance(res, Fault):
                 errors.append({"source": f"discovery:{i}", "message": res.message})
                 continue
+            returned: set[str] = set()
             for spec in res.value:
                 if not isinstance(spec.id, str):
                     errors.append({"source": f"discovery:{i}", "message": "a discovered panel id must be a string"})
                     continue
+                returned.add(spec.id)
                 with self._lock:
                     have = self._specs.get(spec.id)
                     if have is None:
@@ -921,19 +923,27 @@ class Cockpit:
                             if spec.refresh_every_s is not None:
                                 raise CockpitRegistrationError("a discovered panel cannot carry a refresher")
                             self._register_locked(spec)
-                            self._discovered = self._discovered | {spec.id}
+                            self._discovered = {**self._discovered, spec.id: i}
                         except Exception as exc:  # noqa: BLE001 - a bad spec is an errors entry, never a 500
                             errors.append({"source": f"discovery:{spec.id}", "message": _safe_str(exc)})
-                    elif have.title != spec.title:
+                    elif self._discovered.get(spec.id) != i or have.title != spec.title:
+                        # one id, one owner: another source never takes over or relabels a panel
                         errors.append({"source": f"discovery:{spec.id}",
                                        "message": f"id collision: {spec.title!r} maps to the id of {have.title!r}"})
-                    elif spec.id in self._discovered and tuple(have.verbs) != tuple(spec.verbs):
-                        # what a discovered panel offers is its source's answer, read per pass
-                        # (copy-on-write, like a registration)
-                        specs = dict(self._specs)
-                        specs[spec.id] = dataclasses.replace(have, verbs=tuple(spec.verbs))
-                        self._specs = specs
+                    elif tuple(have.verbs) != tuple(spec.verbs):
+                        # what a discovered panel offers is its owner's answer, read per pass
+                        self._set_verbs_locked(spec.id, tuple(spec.verbs))
+            with self._lock:
+                # a panel its owner no longer returns keeps its provider (it reads Absent) and offers nothing
+                for pid in [p for p, o in self._discovered.items() if o == i and p not in returned]:
+                    if self._specs[pid].verbs:
+                        self._set_verbs_locked(pid, ())
         return errors
+
+    def _set_verbs_locked(self, panel_id: str, verbs: tuple[str, ...]) -> None:
+        specs = dict(self._specs)       # copy-on-write, like a registration
+        specs[panel_id] = dataclasses.replace(specs[panel_id], verbs=verbs)
+        self._specs = specs
 
     @staticmethod
     def _ordered_specs(specs_map: dict[str, ProviderSpec]) -> list[ProviderSpec]:
@@ -1115,7 +1125,7 @@ class Cockpit:
                 return Read(value=rows[0])
             except Exception as exc:  # noqa: BLE001
                 return Fault(f"provider output refused: {_safe_str(exc)}")
-        return self._bounded_fresh(spec.timeout_s, once, ctx)
+        return self._bounded_fresh(panel_id, spec.timeout_s, once, ctx)
 
     def read_value_version(self, panel_id: str) -> Result:
         """Read a line or prose panel's value from the SOURCE (never the refresher snapshot) and
@@ -1133,20 +1143,25 @@ class Cockpit:
                 return Read(value=self._value(spec, res.value, res.version_of)["value_version"])
             except Exception as exc:  # noqa: BLE001
                 return Fault(f"provider output refused: {_safe_str(exc)}")
-        return self._bounded_fresh(spec.timeout_s, once, ctx)
+        return self._bounded_fresh(panel_id, spec.timeout_s, once, ctx)
 
-    def _bounded_fresh(self, timeout_s: float, fn: Callable[..., Any], *args: Any) -> Any:
+    def _bounded_fresh(self, source: str, timeout_s: float, fn: Callable[..., Any], *args: Any) -> Any:
         """A source read made inside a write. It never joins a flight another request started: a
         flight that began before this write's own read could hand it a version older than the source.
-        The bound is on reads still running (a hung source's threads), not on requests."""
+        The bound is on reads still running (a hung source's threads), not on requests: at most
+        ``WRITE_READ_CAP_PER_SOURCE`` per source (a panel, a discoverer), so one hung source refuses
+        its own writes and leaves the rest of the cap to the others, and ``WRITE_READ_CAP`` in all."""
         st = _State()
-        entry = [st, time.monotonic(), False]     # state, added at, returned
+        entry = [st, time.monotonic(), False, source]     # state, added at, returned, source
         with self._lock:
             now = time.monotonic()
             # live: a flight still running (a hung source), or one added but not yet started; a read
             # that returned and whose worker ended is dropped at once
             self._one_live = [e for e in self._one_live
                               if e[0].pflight is not None or (not e[2] and now - e[1] < WRITE_READ_GRACE_S)]
+            if sum(1 for e in self._one_live if e[3] == source) >= WRITE_READ_CAP_PER_SOURCE:
+                return Fault(f"{WRITE_READ_CAP_PER_SOURCE} reads of {source!r} are still running "
+                             "(a hung source?); refused")
             if len(self._one_live) >= WRITE_READ_CAP:
                 return Fault(f"{WRITE_READ_CAP} source reads are still running (a hung source?); refused")
             self._one_live.append(entry)

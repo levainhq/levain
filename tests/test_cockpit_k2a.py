@@ -5,6 +5,8 @@ hold are named at the bottom with where they are held instead."""
 from __future__ import annotations
 
 import json
+import os
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -715,3 +717,119 @@ class TestL3Round1:
         boot = (Path(ws.__file__).parent / "templates" / "web" / "dashboard_boot.js").read_text()
         m = _re.search(r"if \(/\^(\[[^\]]+\])\+\$/\.test\(tok\)\)", boot)
         assert m and m.group(1) == ws._HEADER_SAFE_TOKEN.pattern[:-1]
+
+
+class TestL1Round2:
+    def test_a_write_reads_the_external_feed_anew_inside_its_reuse_window(self, tmp_path: Path) -> None:
+        """L1 #1 on c0d4e21: offer_spec's discovery answered from ExternalPanels' reuse window, so a
+        verb the feed withdrew still fired for up to reuse_s."""
+        from levain.cockpit.external import ExternalPanels, discoverer
+        fired: list[dict] = []
+        r = Rig(tmp_path, extra={"note_it": _note_spec(fired)})
+        feed = {"action": {"verb": "note_it"}}
+        ext = ExternalPanels(lambda: [{"id": "n", "title": "N", "lines": [], **feed}], reuse_s=3600)
+        r.ck.discover(discoverer(ext))
+        r.ck.manifest(CRED)
+        r.post("note_it", "ext:n", None, {"text": "one"}, idempotency_key="k1")
+        feed.clear()                               # the source withdraws the verb
+        _refused("not_offered", r.post, "note_it", "ext:n", None, {"text": "two"}, idempotency_key="k2")
+        assert [f["text"] for f in fired] == ["one"]
+
+    def test_a_verb_name_with_a_colon_is_refused(self) -> None:
+        """L1 #5: the bound idempotency fingerprint lives under 'cockpit:<verb>'."""
+        with pytest.raises(ValueError, match="without ':'"):
+            VerbRegistry({"cockpit:x": ActionVerb(handler=lambda p: {})})
+
+    def test_the_page_and_the_manifest_version_the_same_record(self, rig: Rig) -> None:
+        """L1 #3: one stored-record projection, extra keys ignored, for both renderers."""
+        from levain.dashboard import _read_state
+        cj = rig.root / ".levain" / "context.json"
+        for data in ({"state": "a", "state_set_at": rig.clock().isoformat(), "state_source": "cli", "location": "x"},
+                     {"location": "only"}):
+            cj.write_text(json.dumps(data))
+            assert _read_state(cj, rig.clock()).version == rig.ck.read_value_version("state").value
+
+    def test_one_hung_source_does_not_refuse_another_sources_writes(self, rig: Rig, monkeypatch) -> None:
+        """complement #6 (r1): WRITE_READ_CAP was global, so one hung source starved every write."""
+        import levain.cockpit.engine as eng
+        gate = threading.Event()
+        spec = rig.ck.spec("tray")
+        monkeypatch.setattr(spec, "read_one", lambda ctx, rid: (gate.wait(5), Absent("x"))[1])
+        monkeypatch.setattr(spec, "timeout_s", 0.05)
+        outs = [rig.ck.read_one("tray", "spore:x") for _ in range(eng.WRITE_READ_CAP + 1)]
+        try:
+            assert "reads of 'tray' are still running" in outs[-1].message
+            assert rig.tier("spore_touch", "loops", "loop") == "C1"      # another source still reads
+        finally:
+            gate.set()
+
+
+class TestL2Round2:
+    @pytest.mark.skipif(sys.platform == "win32", reason="no flock: an unchecked write is unlocked there")
+    def test_every_levain_state_writer_takes_one_lock_on_the_real_path(self, rig: Rig, monkeypatch) -> None:
+        """L2 #1/#2 on c0d4e21: the lock lived only in the cockpit fire (the TUI, levain state and
+        apply_edit wrote unlocked) and was keyed on the unresolved path."""
+        import fcntl
+        from levain import dashboard
+        from levain.writes import apply_edit
+        cj = rig.root / ".levain" / "context.json"
+        link = rig.root / "ctx-link.json"
+        link.symlink_to(cj)
+        opened: list[str] = []
+        real_open = os.open
+        monkeypatch.setattr(os, "open", lambda path, *a, **k: (opened.append(str(path)), real_open(path, *a, **k))[1])
+        dashboard.write_state(link, "via link")                         # levain state
+        apply_edit(rig.src.write_scope, {"kind": "operator_state", "text": "via kernel api"})   # TUI, kernel API
+        rig.edit({"kind": "operator_state", "text": "via edit",
+                  "panel_version": rig.ck.read_value_version("state").value})                # the cockpit alias
+        locks = [p for p in opened if p.endswith(".lock")]
+        assert locks == [os.path.realpath(cj) + ".lock"] * 3
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no flock: an unchecked write is unlocked there")
+    def test_the_cockpit_check_runs_under_the_writers_lock(self, rig: Rig, monkeypatch) -> None:
+        """L2 #1: another levain writer waits behind the cockpit's in-lock compare and write."""
+        from levain import dashboard
+        cj = rig.root / ".levain" / "context.json"
+        v = rig.ck.read_value_version("state").value
+        calls, inside, release = [0], threading.Event(), threading.Event()
+        real_check = verbs_mod._check_value_version
+
+        def check(ck, pid, supplied):
+            real_check(ck, pid, supplied)
+            calls[0] += 1
+            if calls[0] == 2:            # the second compare is the one under the lock
+                inside.set()
+                release.wait(5)
+        monkeypatch.setattr(verbs_mod, "_check_value_version", check)
+        t = threading.Thread(target=rig.post, args=("operator_state", "state", None, {"text": "cockpit"}),
+                             kwargs={"panel_version": v})
+        t.start()
+        assert inside.wait(5)
+        other = threading.Thread(target=dashboard.write_state, args=(cj, "tui"))
+        other.start()
+        other.join(0.3)
+        assert other.is_alive()          # blocked behind the cockpit's compare + write
+        release.set()
+        t.join(5)
+        other.join(5)
+        assert json.loads(cj.read_text())["state"] == "tui"     # serialised: the later writer lands last
+
+    def test_an_unreadable_state_file_says_so_not_panel_version_required(self, rig: Rig) -> None:
+        """L2 #4: a corrupt context file answered the page's write with "'panel_version' is required"."""
+        (rig.root / ".levain" / "context.json").write_text("{not json")
+        e = _refused("source_unavailable", rig.edit, {"kind": "operator_state", "text": "x", "panel_version": None})
+        assert e.http_status == 503 and "unreadable" in str(e)
+
+    def test_a_discovered_panel_has_one_owner_and_offers_nothing_once_gone(self, tmp_path: Path) -> None:
+        """L2 #7/#8: a second discoverer could set a panel's verbs, and a vanished panel kept
+        advertising its verb in the manifest."""
+        fired: list[dict] = []
+        r, feed = _discovered_rig(tmp_path, fired)
+        r.ck.discover(lambda ctx: [ProviderSpec("ext:a", "line", "ext:a", "feed",
+                                                lambda ctx: Read(value={"lines": []}), verbs=())])
+        m = r.ck.manifest(CRED)
+        assert any(e["source"] == "discovery:ext:a" and "collision" in e["message"] for e in m["errors"])
+        assert [a["verb"] for a in m["panels"]["ext:a"]["actions"]] == ["note_it"]   # the owner's offer stands
+        del feed["panels"]["ext:a"]
+        m = r.ck.manifest(CRED)
+        assert m["panels"]["ext:a"]["actions"] == [] and m["panels"]["ext:b"]["actions"]
