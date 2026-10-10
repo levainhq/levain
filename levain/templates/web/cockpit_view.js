@@ -134,8 +134,6 @@
   const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
   const isNum = (x) => typeof x === "number" && Number.isFinite(x);
   function need(ok, what) { if (!ok) throw new Error("malformed " + what); }
-  // text where text belongs; absent (null/undefined) is allowed and stays absent
-  function textOrAbsent(x, what) { need(x === undefined || x === null || typeof x === "string", what); return x === null ? undefined : x; }
   // a line list (line and visual kinds): absent is empty; each line is an object whose text is a string
   function labelled(x, what) {
     if (x === undefined || x === null) return [];
@@ -203,8 +201,10 @@
 
   function lineOf(panel, head, now) {
     if (head.status === "error") return null;
-    const l = ((panel.value || {}).lines || [])[0];
+    // the state line is the operator's own words: a malformed panel must never read as "no state set"
+    const l = labelled((panel.value || {}).lines, "state lines")[0];
     if (!l) return { text: null };
+    need(typeof l.at === "string" && (l.source == null || typeof l.source === "string"), "state line");
     const t = parseIso(l.at);
     const known = !isNaN(t) && t <= now + 60000;   // an unparseable or future stamp is "age unknown", never "fresh"
     const out = { text: l.text, set_at: l.at, source: l.source, age_label: known ? ageLabel(l.at, now, "set ") : "" };
@@ -284,7 +284,8 @@
       if (pid === "focus") continue;
       if (pid === "state") {
         if (bad) { view.errors[pid] = bad; continue; }
-        view.state = lineOf(P.get(pid), P.get(pid), now);
+        try { view.state = lineOf(P.get(pid), P.get(pid), now); }
+        catch (e) { view.state = null; view.errors[pid] = String(e && e.message || e); }
       } else headerExtra.push(pid);
     }
 

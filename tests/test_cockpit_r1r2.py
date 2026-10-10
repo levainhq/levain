@@ -237,6 +237,18 @@ class TestManifestMapperAdversarial:
         assert view["state"] is None and "HTTP 500" in view["errors"]["state"]
         assert view["extra_panels"]["weather"]["lines"][0]["text"] == "cloudy"
 
+    def test_a_malformed_state_line_is_an_error_never_no_state_set(self) -> None:
+        # the operator's own words: a panel with the wrong shape must not render as "no state set"
+        for bad in ("abc", {}, [{"label": "state", "text": 5, "at": "2026-10-09T12:00:00+00:00"}],
+                    [{"label": "state", "text": "x", "at": 7}]):
+            ck = _tray_cockpit()
+            ck.register(ProviderSpec("state", "line", "State", "gauge", lambda c: Read(value={"lines": [
+                {"label": "state", "text": "x", "at": "2026-10-09T12:00:00+00:00", "source": "s"}]}), region="header"))
+            snap = self._snap(ck)
+            snap["panels"]["state"]["value"]["lines"] = bad
+            view = _view(snap)
+            assert view["state"] is None and "malformed" in view["errors"]["state"], bad
+
     def test_an_unreadable_wraps_panel_is_an_error_not_a_never(self) -> None:
         ck = _tray_cockpit()
         ck.register(ProviderSpec("health", "metric", "Health", "gauge", lambda c: Read(value={"metrics": _full_metrics(wraps=4), "alerts": [
