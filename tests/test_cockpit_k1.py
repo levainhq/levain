@@ -1088,3 +1088,35 @@ class TestL3R4Fixes:
             assert sum(1 for t in threading.enumerate() if t.name == "cockpit-refresh-slow") == 1
         finally:
             assert ck.stop() == []
+
+
+class TestL3R4CodexFixes:
+    def test_a_string_valued_tags_field_is_one_tag_list_not_characters(self, env) -> None:
+        root, _s, ck = env
+        (root / ".levain" / "memory.crystal.json").write_text(json.dumps({"crystal": [
+            {"name": "a", "status": "crystallized", "level": 1, "explanation": "x", "tags": "operator,ergonomics"}]}))
+        assert ck.panel("crystals")["rows"][0]["facets"]["tags"] == ["operator", "ergonomics"]
+
+    def test_a_crystal_file_vanishing_mid_first_read_is_error_not_healthy(self, tmp_path: Path, monkeypatch) -> None:
+        root, src = _install(tmp_path)
+        ck = build_default_cockpit(src)
+        from anneal_memory.crystal import CrystalStore
+        path = root / ".levain" / "memory.crystal.json"
+        real = CrystalStore.active
+
+        def active(self):
+            out = real(self)
+            path.unlink()
+            return out
+        monkeypatch.setattr(CrystalStore, "active", active)
+        assert ck.panel("crystals")["status"] == "error"
+
+    def test_the_now_etag_covers_its_groups(self, env) -> None:
+        from levain.cockpit.engine import _Snap
+        _r, _s, ck = env
+        now = ck.panel(NOW_ID)
+        assert now["groups"] and now["etag"] == ck.manifest(NONE_CRED)["panels"][NOW_ID]["etag"]
+        snap = _Snap(now["status"], now["rows"], None, [], [], now["as_of"], now["error"], now["note"])
+        today = ck._clock().astimezone().date()
+        assert ck._etag_of(snap, None, "none", today) != ck._etag_of(snap, now["groups"], "none", today)
+        assert now["etag"] == ck._etag_of(snap, now["groups"], "none", today)

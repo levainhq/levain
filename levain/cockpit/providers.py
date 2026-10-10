@@ -205,7 +205,7 @@ def _tag_list(raw: Any) -> list[str]:
     one-element list (``["operator,ergonomics"]``), so every element is split on commas, trimmed,
     emptied of blanks and de-duplicated in first-seen order."""
     seen: dict[str, None] = {}
-    for t in raw or []:
+    for t in [raw] if isinstance(raw, str) else (raw or []):
         for part in str(t).split(","):
             if part.strip():
                 seen.setdefault(part.strip(), None)
@@ -221,8 +221,8 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
             from anneal_memory.crystal import CrystalStore
 
             raw = CrystalStore(path).active()   # the ONE read this panel makes; the view's copy is not used
-            if not path.exists():           # anneal reads a vanished file as an empty store
-                return Absent(f"no crystal store at {path}")
+            if not path.exists():           # it was there when the read began: vanishing now is a fault
+                return Fault(f"crystal store vanished during the read: {path}")
         except Exception as exc:  # noqa: BLE001 - any store fault is a Fault, not an empty list
             return Fault(f"crystal store unreadable: {type(exc).__name__}: {exc}")
         rows, dropped = [], 0

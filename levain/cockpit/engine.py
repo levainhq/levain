@@ -639,6 +639,7 @@ class Cockpit:
             if r["group"] in union:
                 union[r["group"]]["count"] += 1
         head["groups"] = list(union.values()) or None
+        head["etag"] = self._etag_of(snap, head["groups"], cred, ctx.today)   # groups are content
         return head, rows
 
     def _entity(self, ctx: ReadContext) -> tuple[dict[str, Any], list[dict[str, Any]]]:
