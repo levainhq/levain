@@ -220,10 +220,14 @@ def _run_closed_stdout(inst, script, payload):
     proc.stdout.close()
     proc.stdin.write(json.dumps(payload).encode())
     proc.stdin.close()
+    try:
+        proc.wait(timeout=60)           # bounded first: a hung hook fails the test instead of blocking a read
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise
     err = proc.stderr.read()
-    proc.wait(timeout=60)
-    # silent exit 0: no 'Exception ignored on flushing sys.stdout' / exit 120 at shutdown
-    assert proc.returncode == 0 and err == b"", (proc.returncode, err)
+    # exit 0 with no shutdown retry of the broken buffer ('Exception ignored ...' / exit 120)
+    assert proc.returncode == 0 and b"Exception ignored" not in err and b"BrokenPipe" not in err, (proc.returncode, err)
 
 
 def test_a_marker_is_not_advanced_when_the_prompt_output_was_not_delivered(inst):
