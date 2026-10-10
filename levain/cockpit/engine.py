@@ -250,7 +250,11 @@ class Cockpit:
         rows unchanged (design §9 K2a)."""
         self._verb_view = view
 
-    def spec(self, panel_id: str) -> "ProviderSpec | None":
+    def spec(self, panel_id: str, *, discover: bool = False) -> "ProviderSpec | None":
+        """A panel's registration. ``discover`` runs discovery first when the id is unknown, as
+        ``panel()`` does, so a write naming a heading added since the last read finds its panel."""
+        if discover and panel_id not in self._specs and panel_id != NOW_ID:
+            self._ensure_discovered(ReadContext(self._clock()))
         return self._specs.get(panel_id)
 
     def today(self) -> date:
@@ -597,7 +601,7 @@ class Cockpit:
         else:
             if res.value is None:
                 raise ValueError(f"a {spec.kind} Read carries a value")
-            value = self._value(spec, res.value)
+            value = self._value(spec, res.value, res.version_of)
             rows = None
             status = "partial" if skipped else ("empty" if self._value_empty(spec.kind, value) else "ok")
         stale = res.stale or (ctx.now - _parse_iso(as_of)) > timedelta(seconds=spec.stale_after_s)
@@ -613,7 +617,7 @@ class Cockpit:
         return bool(key) and not value.get(key)
 
     @staticmethod
-    def _value(spec: ProviderSpec, v: Any) -> Any:
+    def _value(spec: ProviderSpec, v: Any, version_of: Any = None) -> Any:
         if not isinstance(v, dict):
             raise ValueError(f"{spec.kind} value must be an object")
         need = {"line": "lines", "metric": "metrics", "prose": "markdown", "visual": "visual"}[spec.kind]
@@ -625,7 +629,7 @@ class Cockpit:
             # the version a value write binds to (§4.4): a hash of the stored value as read, never of
             # provenance (a render-time label) or of itself
             stored = {k: x for k, x in v.items() if k not in ("provenance", "value_version")}
-            v = {**v, "value_version": _sha(stored)[:16]}
+            v = {**v, "value_version": _sha(stored if version_of is None else {"stored": version_of})[:16]}
         if spec.kind == "visual":
             if v["visual"] not in VISUALS:
                 raise ValueError(f"unknown visual {v['visual']!r}")
@@ -1075,7 +1079,7 @@ class Cockpit:
             if not isinstance(res, Read):
                 return res
             try:
-                return Read(value=self._value(spec, res.value)["value_version"])
+                return Read(value=self._value(spec, res.value, res.version_of)["value_version"])
             except Exception as exc:  # noqa: BLE001
                 return Fault(f"provider output refused: {_safe_str(exc)}")
         return self._bounded_keyed(("\x00value", panel_id), spec.timeout_s, once, ctx)

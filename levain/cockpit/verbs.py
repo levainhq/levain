@@ -384,8 +384,8 @@ class VerbRegistry:
 # --- what a panel offers ------------------------------------------------------------------------
 
 
-def offered(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str) -> list[VerbSpec]:
-    spec = cockpit.spec(panel_id)
+def offered(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, *, discover: bool = False) -> list[VerbSpec]:
+    spec = cockpit.spec(panel_id, discover=discover)
     if spec is None:
         return []
     return [v for n in spec.verbs if (v := registry.get(n)) is not None]
@@ -529,7 +529,7 @@ def dispatch(
     if verb is None:
         raise _refuse("unknown_verb", 404, f"no such verb: {name!r}")
     panel_id = req.get("panel_id")
-    if not isinstance(panel_id, str) or verb not in offered(registry, cockpit, panel_id):
+    if not isinstance(panel_id, str) or verb not in offered(registry, cockpit, panel_id, discover=True):
         raise _refuse("not_offered", 404, f"panel {panel_id!r} does not offer {verb.name!r}")
     params = req.get("params", {})
     if not isinstance(params, dict):

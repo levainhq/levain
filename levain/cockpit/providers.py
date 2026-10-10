@@ -342,20 +342,28 @@ def _context_state(source: SubstrateSource) -> tuple[Path | None, Fault | Absent
 
 def _context_line(source: SubstrateSource) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
-        _cj, problem = _context_state(source)
+        cj, problem = _context_state(source)
         if problem is not None:
             return problem
+        # the stored record, read BEFORE the view: a write landing between the two makes the version
+        # older than the display, so a write bound to it is refused, never let through
+        try:
+            raw = json.loads(cj.read_text(encoding="utf-8")) if cj is not None else {}
+        except (OSError, ValueError) as exc:
+            return Fault(f"context file unreadable: {type(exc).__name__}: {exc}")
+        stored = {k: raw.get(k) for k in ("state", "state_set_at", "state_source")} if isinstance(raw, dict) else None
         view = _view(source, ctx)
         item = view.state
         if item is None or not item.text:
-            return Read(value={"lines": []})
+            return Read(value={"lines": []}, version_of=stored)
         # an expired or age-unknown line is already dropped by the reader, so what arrives is fresh. The stamp
         # goes out in ECMA-262's Date Time String Format (what toISOString emits), the one form every JS engine
         # must parse; any other string is implementation-defined, so the client checks the round trip.
         ts = datetime.fromisoformat(item.set_at)
         at = (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
         at = at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-        return Read(value={"lines": [{"label": "state", "text": item.text, "at": at, "source": item.source}]})
+        return Read(value={"lines": [{"label": "state", "text": item.text, "at": at, "source": item.source}]},
+                    version_of=stored)
     return read
 
 

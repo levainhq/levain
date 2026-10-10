@@ -45,6 +45,9 @@ class Read:
     as_of: str | None = None
     note: str | None = None      # this read's own note line; None keeps the registration's ``note``
     empty: str | None = None     # this read's own sentence for status empty; None keeps the registration's
+    # the STORED record a line or prose value's ``value_version`` hashes, when what is displayed is a
+    # projection of it (a hidden expired state line still has a stored value a write must bind to)
+    version_of: Any = None
 
 
 @dataclass(frozen=True)
