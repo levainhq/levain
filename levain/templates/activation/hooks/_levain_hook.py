@@ -37,6 +37,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import unicodedata
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -534,42 +535,152 @@ def _humanize_age(delta_seconds: float) -> str:
     return f"set {s // 86400}d ago"
 
 
-def state_notice() -> str | None:
-    """The operator's freeform state line ("what's going on"), at primacy, VERBATIM
-    with its age: the READ half of dashboard._read_state (keys state / state_set_at in
-    .levain/context.json). Never parsed, scored or used to gate, soften or reduce scope:
-    the operator is the authority on their own state. EXPIRES: a state whose age cannot
-    be established, is in the future, or is older than _STATE_EXPIRES_AFTER_HOURS is
-    dropped (None), because a stale state is worse than none. Over-cap text is absent
-    too. Fail-soft: any fault -> None."""
+def state_line() -> tuple[str, str | None] | None:
+    """The state line's (signature, rendered line), the ONE place its rules live: the
+    operator's freeform state ("what's going on"), VERBATIM with its age: the READ half of
+    dashboard._read_state (keys state / state_set_at / state_source in .levain/context.json).
+    Never parsed, scored or used to gate, soften or reduce scope: the operator is the
+    authority on their own state. EXPIRES: a state whose age cannot be established, is in
+    the future, or is older than _STATE_EXPIRES_AFTER_HOURS is no live line, because a stale
+    state is worse than none. Over-cap text is absent too.
+
+    ('', None) = no live line (file absent, key absent or dropped by a rule above). Otherwise
+    the signature is a digest of text + set-at + source, so a re-write of identical text
+    still counts as a change and no state text is ever stored in a marker. None = the
+    context is unreadable, which is NOT evidence the line cleared. Fail-soft: any fault ->
+    None."""
     try:
-        data = json.loads((install_root() / ".levain" / "context.json").read_text(encoding="utf-8"))
+        try:
+            data = json.loads((install_root() / ".levain" / "context.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return "", None
+        if not isinstance(data, dict):
+            return None
+        rt = data.get("state")
+        text = " ".join(rt.split()) if isinstance(rt, str) and rt.split() else None
+        if text is None or len(text) > _STATE_MAX_TEXT_LEN:
+            return "", None
+        set_at = data.get("state_set_at")
+        if not isinstance(set_at, str) or not set_at.strip():
+            return "", None
+        try:
+            ts = datetime.fromisoformat(set_at)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            delta = (datetime.now(timezone.utc) - ts).total_seconds()
+        except (ValueError, TypeError, OverflowError):
+            return "", None
+        if delta < -_STATE_CLOCK_SKEW_SECONDS or delta >= _STATE_EXPIRES_AFTER_HOURS * 3600:
+            return "", None
+        delta = max(delta, 0.0)
+        source = data.get("state_source")
+        digest = hashlib.sha1(
+            f"{text}\n{set_at}\n{source if isinstance(source, str) else ''}".encode("utf-8", "replace")
+        ).hexdigest()
+        return digest, (
+            f'[state] The operator\'s own words for what is going on right now '
+            f'({_humanize_age(delta)}): {json.dumps(text, ensure_ascii=False)}. '
+            f'Their report, reflected back verbatim.'
+        )
     except Exception:
         return None
-    if not isinstance(data, dict):
-        return None
-    rt = data.get("state")
-    text = " ".join(rt.split()) if isinstance(rt, str) and rt.split() else None
-    if text is None or len(text) > _STATE_MAX_TEXT_LEN:
-        return None
-    set_at = data.get("state_set_at")
-    if not isinstance(set_at, str) or not set_at.strip():
-        return None
+
+
+def state_notice() -> str | None:
+    """The state line to show at session start, or None (see state_line for the rules)."""
+    result = state_line()
+    return result[1] if result else None
+
+
+# Per-session "seen" markers for the change-only per-prompt state line (the behaviour
+# reference is flow's scripts/state_line_hook.py). One file per session, so concurrent
+# sessions never share a write; the content is a signature, never state text.
+_STATE_SEEN_KEEP = 200
+_STATE_CLEARED_LINE = "[state] line cleared or expired"
+
+
+def _state_seen_path(session_id: str) -> Path:
+    key = hashlib.sha1(session_id.encode("utf-8", "replace")).hexdigest()[:24]
+    return install_root() / ".levain" / "state_line_seen" / key
+
+
+def _state_seen_read(path: Path) -> str | None:
+    """The signature this session last saw ('' = saw no live line), None = unknown."""
     try:
-        ts = datetime.fromisoformat(set_at)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        delta = (datetime.now(timezone.utc) - ts).total_seconds()
-    except (ValueError, TypeError, OverflowError):
+        return path.read_text(encoding="utf-8")
+    except Exception:
         return None
-    if delta < -_STATE_CLOCK_SKEW_SECONDS or delta >= _STATE_EXPIRES_AFTER_HOURS * 3600:
+
+
+def _state_seen_prune(directory: Path) -> None:
+    """Bound the store: stale *.tmp leaks go, then past _STATE_SEEN_KEEP files the least
+    recently prompted (by mtime) go."""
+    now = time.time()
+    for p in directory.glob("*.tmp"):
+        try:
+            if now - p.stat().st_mtime > 3600:
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    files = sorted((p for p in directory.iterdir() if not p.name.endswith(".tmp")), key=mtime)
+    for p in files[: max(0, len(files) - _STATE_SEEN_KEEP)]:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def state_seen_record(session_id: str, signature: str) -> None:
+    """Record what this session has now seen. Atomic (tmp + replace). Fail-soft."""
+    try:
+        if not session_id:
+            return
+        path = _state_seen_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(signature, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        _state_seen_prune(path.parent)
+    except Exception:
+        pass
+
+
+def state_line_if_changed(session_id: str) -> str | None:
+    """The per-prompt state line: emitted only when it differs from what this session last
+    saw. Unknown marker (never seeded, or pruned) shows a live line: a repeat is harmless, a
+    swallowed change is not. A line that went away says so once. The marker is recorded
+    AFTER the decision, so a failed write can repeat a line but never lose one. Unreadable
+    context emits and records nothing. Fail-soft: any fault -> None."""
+    try:
+        if not session_id:
+            return None
+        result = state_line()
+        if result is None:
+            return None
+        sig, line = result
+        path = _state_seen_path(session_id)
+        prior = _state_seen_read(path)
+        if prior == sig:
+            try:
+                os.utime(path)  # recency = last prompt, so an active session is never pruned
+            except OSError:
+                pass
+            return None
+        out = line if sig else (_STATE_CLEARED_LINE if prior else None)
+        state_seen_record(session_id, sig)
+        return out
+    except Exception:
         return None
-    delta = max(delta, 0.0)
-    return (
-        f'[state] The operator\'s own words for what is going on right now '
-        f'({_humanize_age(delta)}): {json.dumps(text, ensure_ascii=False)}. '
-        f'Their report, reflected back verbatim.'
-    )
 
 
 def _is_migrate_check(data: object) -> bool:

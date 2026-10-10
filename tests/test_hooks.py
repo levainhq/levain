@@ -309,7 +309,8 @@ _PORTED_FNS = (
     # entity-name coherence surface — byte-identical across both copies
     "config_entity_name", "origin_birth_name", "entity_name_notice",
     # state-line reader surface — byte-identical across both copies
-    "_humanize_age", "state_notice",
+    "_humanize_age", "state_line", "state_notice", "_state_seen_path", "_state_seen_read",
+    "_state_seen_prune", "state_seen_record", "state_line_if_changed",
 )
 
 

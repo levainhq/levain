@@ -124,6 +124,18 @@ def main() -> int:
         if directives:
             sections.append(random.choice(directives))
 
+        # The operator's state line, CHANGE-ONLY per session: session_start showed it and
+        # seeded the marker, so this speaks only when it changed or went away. Its own try:
+        # a fault here drops only this section. No session id -> silent (never an invented one).
+        try:
+            session_id = payload.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                changed = hook.state_line_if_changed(session_id)
+                if changed:
+                    sections.append(changed)
+        except Exception:
+            pass
+
         # Event-based spore germination — open loops whose content collides with
         # this prompt surface on their own (the intelligent prospective surface;
         # the effortful full-list poll stays opt-in, per the seed). Precision-
