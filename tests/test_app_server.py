@@ -46,7 +46,7 @@ def _store_with_data(tmp_path: Path) -> AnnealPaths:
         type="task", text="an open loop", tier="hot", salience=2
     )
     (tmp_path / "memory.continuity.md").write_text(
-        "## State\ncurrent focus line\n\n## Active Threads\n- thread one\n",
+        "## State\ncurrent state line\n\n## Active Threads\n- thread one\n",
         encoding="utf-8",
     )
     return AnnealPaths.from_db(db)
@@ -72,7 +72,7 @@ class TestRenderSummary:
         assert "Hebbian links" in s
         assert "Open loops: 1" in s
         # the entity's own State headline surfaces, not the whole dump
-        assert "current focus line" in s
+        assert "current state line" in s
         assert "Active Threads:" in s
 
     def test_missing_store_is_named(self, tmp_path: Path) -> None:

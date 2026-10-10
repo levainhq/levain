@@ -77,17 +77,14 @@ __all__ = [
     "WrapRow",
     "ConfigDoc",
     "Section",
-    "Focus",
     "State",
     "Jar",
     "SubstrateView",
     "build_substrate_view",
-    "write_focus",
     "write_state",
     "render_text",
     "render_summary",
     "run_dashboard",
-    "run_focus",
     "run_state",
 ]
 
@@ -197,10 +194,10 @@ class SubstrateSource:
     entity_name: str | None = None
     brand_wordmark: str | None = None
     brand_model: str | None = None
-    # WHERE the live operator-context (focus) is read from. ``.local()`` defaults it
-    # to the install's ``.levain/context.json``; a downstream control plane with an
+    # WHERE the live operator-context (the state line) is read from. ``.local()`` defaults
+    # it to the install's ``.levain/context.json``; a downstream control plane with an
     # N-of-1 source overrides it to wherever its own sensor app writes. None →
-    # ``view.focus`` is None (no live-context source).
+    # ``view.state`` is None (no live-context source).
     context_json: Path | None = None
 
     @classmethod
@@ -470,134 +467,6 @@ class Section:
         return self.__dict__.copy()
 
 
-# Past ~a working day plus an overnight, an unchanged focus is more likely stale
-# than current → the render flags it so the operator can re-confirm (operator-
-# reports-first: a prompt, never a verdict). A coarse, deliberately un-tuned bound.
-FOCUS_STALE_AFTER_HOURS = 18
-
-
-@dataclass
-class Focus:
-    """The operator's live, self-authored attention context — "what I'm on right
-    now" — set via the ``levain focus`` CLI or a sensor/companion app, and read by
-    every session so the partner orients to the operator's OWN declared frame across
-    sessions (``the substrate escapes the session``, applied to attention). The
-    cockpits (web / TUI) RENDER it read-only; the set-path is the CLI or the app.
-
-    PURE-ECHO operator self-report: the operator authors it, the partner reflects
-    it — so it carries NO deference-risk (you cannot defer to your own input) and
-    needs no machine interpretation. This is what makes it the cleanest piece of
-    live operator-context to generalize, and it is distinct from BOTH the neocortex
-    ``State`` (consolidated memory, the consolidate's single-writer territory) and
-    any machine-SENSED signal (an OS focus-mode, measured energy/HRV) — those don't
-    generalize / carry deference-risk and stay out of the primitive.
-
-    Live-state, last-writer-wins, freshness-bearing: a stale focus presented as
-    current is a lie, so ``set_at`` is half the signal — the render shows the age
-    and FLAGS a stale one rather than passing an old focus off as live."""
-
-    text: str | None  # the authored focus; None when unset → render "no focus set"
-    set_at: str | None  # the stored ISO-8601 timestamp, verbatim; None if absent
-    source: str | None  # who set it: "cli" / a sensor app / …; None if absent
-    age_label: str = ""  # human "set 3h ago"; "" when set_at is absent/unparseable (unknown ≠ fresh)
-    stale: bool = False  # older than FOCUS_STALE_AFTER_HOURS; False when age is unknown
-    # Tri-state freshness so a focus whose AGE can't be established (missing /
-    # unparseable / future stamp) never renders as implicitly-CURRENT — the honesty
-    # floor (unknown ≠ fresh). "fresh" | "stale" | "unknown". Only meaningful when
-    # ``text`` is set (a None focus renders "no focus set", freshness ignored).
-    freshness: str = "unknown"
-
-    def to_dict(self) -> dict[str, Any]:
-        return self.__dict__.copy()
-
-
-def _humanize_focus_age(delta_seconds: float) -> str:
-    """``set just now`` / ``set 12m ago`` / ``set 3h ago`` / ``set 2d ago``. Coarse
-    by design — focus is a daily-ish signal, not a stopwatch. A negative delta (a
-    future ``set_at`` — clock skew / bad data) is unparseable-as-age → "" (never a
-    fabricated freshness)."""
-    if delta_seconds < 0:
-        return ""  # guard the FLOAT — int(-0.5)==0 would slip a sub-second future stamp
-    s = int(delta_seconds)
-    if s < 90:
-        return "set just now"
-    if s < 3600:
-        return f"set {s // 60}m ago"
-    if s < 86400:
-        return f"set {s // 3600}h ago"
-    return f"set {s // 86400}d ago"
-
-
-def _read_focus(context_json: Path | None, now: datetime) -> "Focus | None":
-    """Read the live operator focus from the minimal context contract
-    ``{focus, focus_set_at, focus_source}``.
-
-    Returns ``None`` when there is NO context source at all (a substrate with no
-    live-context file → render nothing, not an empty "no focus"). Returns a
-    ``Focus`` with ``text=None`` when the file exists but carries no focus (render
-    "no focus set"). FAIL-SOFT: a missing/unreadable/malformed file → ``text=None``,
-    never raises (an operator-context read must not blank the cockpit).
-
-    The file MAY be a SUPERSET — a sensor app's context file may also carry
-    location/body/sensors — but ONLY the three focus keys are read; everything else
-    is ignored. That superset-tolerance is exactly what keeps the primitive general:
-    a generic adopter's ``.levain/context.json`` holds just the three keys, a sensor
-    app keeps writing its richer file untouched, and both satisfy the same
-    contract."""
-    if context_json is None:
-        return None
-    try:
-        if not context_json.exists():
-            return None
-        data = json.loads(context_json.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return Focus(text=None, set_at=None, source=None)
-    if not isinstance(data, dict):
-        return Focus(text=None, set_at=None, source=None)
-
-    raw_text = data.get("focus")
-    # Collapse internal whitespace/newlines on READ too (write_focus collapses on
-    # write, but this is the GENERAL ingress for hand-edited / foreign context files):
-    # a newline in the focus would split the single-line render_text / TUI rule row.
-    text = " ".join(raw_text.split()) if isinstance(raw_text, str) and raw_text.split() else None
-    raw_at = data.get("focus_set_at")
-    set_at = raw_at if isinstance(raw_at, str) and raw_at.strip() else None
-    raw_src = data.get("focus_source")
-    source = raw_src if isinstance(raw_src, str) and raw_src.strip() else None
-
-    age_label = ""
-    stale = False
-    freshness = "unknown"  # tri-state; only an established age flips it off "unknown"
-    if text and set_at:  # age is meaningless without a focus to be the age OF
-        if now.tzinfo is None:
-            # a direct caller may pass a naive `now`; this helper documents "never
-            # raises", so coerce rather than crash the aware-minus-naive subtraction.
-            now = now.replace(tzinfo=timezone.utc)
-        try:
-            ts = datetime.fromisoformat(set_at)
-        except (ValueError, TypeError):
-            ts = None  # unparseable stamp → unknown age, NOT stale (don't lie)
-        if ts is not None:
-            if ts.tzinfo is None:
-                # the `levain focus` writer always stamps tz-aware; a naive stamp only
-                # arrives on a hand-edited / foreign file → treat as UTC to compare.
-                ts = ts.replace(tzinfo=timezone.utc)
-            try:
-                delta = (now - ts).total_seconds()
-            except (TypeError, OverflowError):
-                delta = None  # belt-and-braces — degrade to unknown, never raise
-            # A NEGATIVE delta (future stamp) yields age_label "" → freshness stays
-            # "unknown" (the honest read of a clock-skewed stamp), not a false "fresh".
-            if delta is not None and delta >= 0:
-                age_label = _humanize_focus_age(delta)
-                stale = delta >= FOCUS_STALE_AFTER_HOURS * 3600
-                freshness = "stale" if stale else "fresh"
-    return Focus(
-        text=text, set_at=set_at, source=source,
-        age_label=age_label, stale=stale, freshness=freshness,
-    )
-
-
 # The starter jar: how full today is against this entity's own typical day. Every number
 # is a count read from the entity's own episodic store; with no store or too little
 # history the jar is EMPTY and says why (never a faked level).
@@ -710,9 +579,25 @@ def _read_jar(episodic_db: Path | None, now: datetime) -> "Jar":
                f"{n_today} today \u00b7 typical {typical:g} (median of {span} d)", day_iso)
 
 
-# A state older than this is not shown or injected: a stale "how I am" presented as
-# current is worse than none. UNLIKE focus (which flags a stale one), state DROPS it.
-STATE_EXPIRES_AFTER_HOURS = 8
+def _humanize_age(delta_seconds: float) -> str:
+    """``set just now`` / ``set 12m ago`` / ``set 3h ago`` / ``set 2d ago``. Coarse
+    by design: the state line is a daily-ish signal, not a stopwatch. A negative delta
+    (a future stamp) reads as "" (never a fabricated freshness)."""
+    if delta_seconds < 0:
+        return ""  # guard the FLOAT: int(-0.5)==0 would slip a sub-second future stamp
+    s = int(delta_seconds)
+    if s < 90:
+        return "set just now"
+    if s < 3600:
+        return f"set {s // 60}m ago"
+    if s < 86400:
+        return f"set {s // 3600}h ago"
+    return f"set {s // 86400}d ago"
+
+
+# A state older than this is not shown or injected: a stale line presented as
+# current is worse than none, so an expired state is DROPPED, never flagged.
+STATE_EXPIRES_AFTER_HOURS = 12
 # One bound, enforced at write (``write_state`` refuses) AND at read (an over-cap state
 # reads as unset), so no surface shows a line another surface cannot. Mirrored by the hooks.
 STATE_MAX_TEXT_LEN = 500
@@ -723,9 +608,8 @@ STATE_CLOCK_SKEW_SECONDS = 300
 
 @dataclass
 class State:
-    """The operator's optional, freeform "how I am right now" line, the sibling of
-    ``Focus`` in the same context file (keys ``state`` / ``state_set_at`` /
-    ``state_source``). Rendered VERBATIM with its age, and NOTHING more: it is never
+    """The operator's optional, freeform "what's going on" line, in their own words
+    (keys ``state`` / ``state_set_at`` / ``state_source`` in the context file). Rendered VERBATIM with its age, and NOTHING more: it is never
     parsed, scored, classified, or used to gate, soften or reduce scope — the human is
     the authority on their own state. Expires after ``STATE_EXPIRES_AFTER_HOURS``: an
     expired, age-unknown or future-stamped state reads as unset (``text=None``)."""
@@ -740,10 +624,9 @@ class State:
 
 
 def _read_state(context_json: Path | None, now: datetime) -> "State | None":
-    """Read ``{state, state_set_at, state_source}`` from the live-context file. Same
-    ingress rules as ``_read_focus`` (None = no source at all; fail-soft to
-    ``text=None`` on a missing/unreadable/malformed file; whitespace collapsed;
-    superset-tolerant) plus EXPIRY: a state whose age cannot be established, is further
+    """Read ``{state, state_set_at, state_source}`` from the live-context file. None = no
+    source at all; fail-soft to ``text=None`` on a missing/unreadable/malformed file;
+    whitespace collapsed; superset-tolerant (other keys are ignored). EXPIRY: a state whose age cannot be established, is further
     in the future than ``STATE_CLOCK_SKEW_SECONDS``, is older than
     ``STATE_EXPIRES_AFTER_HOURS``, or is over ``STATE_MAX_TEXT_LEN`` reads as unset."""
     if context_json is None:
@@ -777,43 +660,12 @@ def _read_state(context_json: Path | None, now: datetime) -> "State | None":
     if delta < -STATE_CLOCK_SKEW_SECONDS or delta >= STATE_EXPIRES_AFTER_HOURS * 3600:
         return empty
     delta = max(delta, 0.0)
-    return State(text=text, set_at=set_at, source=source, age_label=_humanize_focus_age(delta))
-
-
-def write_focus(context_json: Path, text: str, *, source: str = "cli") -> None:
-    """Set the operator's live focus — the WRITE-PEER of ``_read_focus``, kept
-    adjacent so the contract (the three keys, a tz-aware ISO stamp) cannot drift
-    between read and write.
-
-    MERGE-preserving: reads the existing object and updates ONLY the three focus
-    keys, so a file that carries other keys (a sensor app's superset) keeps them.
-    Live-state, last-writer-wins — a plain ATOMIC write (temp + ``os.replace``, so a
-    reader never sees a torn/half-written file), NO CAS / lock.
-
-    CONCURRENCY (honest scope): for a GENERIC adopter this is a SINGLE-WRITER-per-file
-    path — the only writer of ``.levain/context.json`` is the operator's own ``levain
-    focus`` (a re-set IS the re-confirm), so the read-merge-write is race-free. flow's
-    N-of-1 DELIBERATELY points this at the sensor-written SUPERSET
-    ``state/context_state.json`` (see ``WriteScope.context_json`` + the bridge), which
-    IS foreign-multi-writer. There, ``os.replace`` still prevents a torn read, but the
-    read→merge→replace WINDOW is a genuine lost-update race: a concurrent whole-object
-    writer (e.g. the perception sweep) holding a snapshot from BEFORE this write will
-    revert the just-set focus on its own swap. Unlike resampled sensor keys
-    (body/battery), focus is NOT resampled → NO self-heal; a clobbered focus stays lost
-    until re-set. Accepted as low-stakes for flow (a focus set is rare, the window is
-    ~ms–seconds, re-set is one keystroke, and this is the SAME race flow's pre-existing
-    focus channel already carries) — the proper fix is a shared cross-process lock/CAS on
-    ``context_state.json`` across all its writers (tracked separately), NOT the continuity
-    lock. An all-blank ``text`` CLEARS the focus by POPPING all three keys (matching the
-    CLI/sensor clear shape; ``_read_focus`` reads the absence as unset). The parent dir is
-    created if absent. A corrupt/unreadable existing file is replaced rather than failing
-    the set (the operator's intent to set wins)."""
-    _write_context_line(context_json, "focus", text, source=source)
+    return State(text=text, set_at=set_at, source=source, age_label=_humanize_age(delta))
 
 
 def _write_context_line(context_json: Path, key: str, text: str, *, source: str) -> None:
     """Merge-preserving atomic write of one ``{key, key_set_at, key_source}`` triple
-    (the shared body of ``write_focus`` and ``write_state``)."""
+    (the body of ``write_state``)."""
     text = " ".join(text.split())  # collapse whitespace; "" → clear
     data: dict[str, Any] = {}
     try:
@@ -829,11 +681,11 @@ def _write_context_line(context_json: Path, key: str, text: str, *, source: str)
         data[f"{key}_source"] = source
     else:
         # CLEAR: POP all three keys — the exact shape the CLI/sensor clear writes
-        # (drain_context_signals / perception_sweep pop, they don't leave a focus="" +
+        # (drain_context_signals / perception_sweep pop, they don't leave a state="" +
         # a fresh live stamp). One on-disk contract for "unset", not two: an empty-string
-        # tombstone carrying a current focus_source/focus_set_at is misleading to any raw-JSON
-        # reader that doesn't replicate the truthiness-gate (codex/nemotron L3). `_read_focus`
-        # already reads BOTH a missing key and "" as unset, so this is read-invisible.
+        # tombstone carrying a current source/stamp is misleading to any raw-JSON reader
+        # that doesn't replicate the truthiness-gate. `_read_state` already reads BOTH a
+        # missing key and "" as unset, so this is read-invisible.
         data.pop(key, None)
         data.pop(f"{key}_set_at", None)
         data.pop(f"{key}_source", None)
@@ -857,10 +709,19 @@ def _write_context_line(context_json: Path, key: str, text: str, *, source: str)
 
 def write_state(context_json: Path, text: str, *, source: str = "cli") -> None:
     """Set (or, with blank ``text``, clear) the operator's freeform state line: the
-    write-peer of ``_read_state``, same merge-preserving atomic write and clear shape
-    (pop all three keys) as ``write_focus``, whose CONCURRENCY note applies unchanged.
-    The text is stored verbatim apart from whitespace collapse; nothing reads meaning
-    into it."""
+    write-peer of ``_read_state``, kept adjacent so the contract (the three keys, a
+    tz-aware ISO stamp) cannot drift between read and write.
+
+    MERGE-preserving: reads the existing object and updates ONLY the three state keys,
+    so a file that carries other keys (a sensor app's superset, or keys an older
+    version wrote) keeps them. Last-writer-wins and atomic (temp + ``os.replace``, so a
+    reader never sees a torn file), NO CAS / lock. For a generic adopter the operator's
+    own ``levain state`` is the only writer of ``.levain/context.json``; where the file
+    is a foreign-multi-writer superset, a concurrent whole-object writer holding an
+    older snapshot can revert a just-set line (re-set is one keystroke). A blank text
+    CLEARS by popping all three keys. The parent dir is created if absent; a
+    corrupt/unreadable existing file is replaced rather than failing the set. The text is
+    stored verbatim apart from whitespace collapse; nothing reads meaning into it."""
     collapsed = " ".join(text.split())
     if len(collapsed) > STATE_MAX_TEXT_LEN:
         raise ValueError(f"state exceeds {STATE_MAX_TEXT_LEN} chars")
@@ -899,11 +760,10 @@ class SubstrateView:
     config_docs: list[ConfigDoc] = field(default_factory=list)
     wraps: list[WrapRow] = field(default_factory=list)
     recent_edits: list[dict[str, Any]] = field(default_factory=list)
-    # The operator's live self-authored attention context (set from any surface,
-    # read by every session). None when there is no live-context source. NOT one of
-    # the anneal memory stores — live-state, not consolidated cognition.
-    focus: Focus | None = None
-    state: State | None = None  # the optional freeform state line; same file, expires
+    # The operator's live self-authored state line (set from any surface, read by
+    # every session). None when there is no live-context source. NOT one of the anneal
+    # memory stores: live-state, not consolidated cognition.
+    state: State | None = None
     jar: Jar | None = None  # today's episode count against the entity's own typical day
     errors: dict[str, str] = field(default_factory=dict)
 
@@ -1029,7 +889,6 @@ class SubstrateView:
             "config_docs": [d.to_dict() for d in self.config_docs],
             "wraps": [w.to_dict() for w in self.wraps],
             "recent_edits": self.recent_edits,
-            "focus": self.focus.to_dict() if self.focus else None,
             "state": self.state.to_dict() if self.state else None,
             "jar": self.jar.to_dict() if self.jar else None,
             "layout": self.layout(),
@@ -1477,18 +1336,17 @@ def build_substrate_view(
     tier is simply absent (no error — there is nothing to read there).
 
     ``context_json`` (when given) locates the live operator-context file holding the
-    minimal ``{focus, focus_set_at, focus_source}`` contract — read fail-soft into
-    ``view.focus`` (None when absent). ``now`` is the reference instant for focus
-    freshness (defaults to UTC-now; passed explicitly in tests)."""
+    minimal ``{state, state_set_at, state_source}`` contract, read fail-soft into
+    ``view.state`` (None when absent). ``now`` is the reference instant for the state
+    line's expiry (defaults to UTC-now; passed explicitly in tests)."""
     view = SubstrateView(paths=paths, scope=scope)
 
-    # --- live operator context (focus) — independent of the anneal stores; its own
-    # fail-soft read (never raises). A daily-driver cockpit must not blank on an
-    # operator-context read fault, so _read_focus degrades to text=None internally.
+    # --- live operator context (the state line), independent of the anneal stores; its
+    # own fail-soft read (never raises). A daily-driver cockpit must not blank on an
+    # operator-context read fault, so _read_state degrades to text=None internally.
     _now = now if now is not None else datetime.now(timezone.utc)
     if _now.tzinfo is None:  # a naive caller-supplied now → compare in UTC
         _now = _now.replace(tzinfo=timezone.utc)
-    view.focus = _read_focus(context_json, _now)
     view.state = _read_state(context_json, _now)
     view.jar = _read_jar(paths.episodic_db, _now)
 
@@ -1814,14 +1672,6 @@ def render_text(view: SubstrateView) -> str:
     # consistent with the TUI/web wordmark (which also key off brand_wordmark). [L1]
     masthead = view.brand_wordmark or "Levain substrate"
     out: list[str] = [f"{masthead} — {title}", f"  store: {view.paths.episodic_db}"]
-    if view.focus is not None and view.focus.text:
-        if view.focus.freshness == "unknown":
-            meta = " (age unknown)"
-        elif view.focus.stale:
-            meta = f" ({view.focus.age_label}) — stale; still live?"
-        else:
-            meta = f" ({view.focus.age_label})"
-        out.append(f"  focus: ⊙ {view.focus.text}{meta}")
     if view.state is not None and view.state.text:
         out.append(f"  state: {view.state.text} ({view.state.age_label})")
     if view.jar is not None:
@@ -1950,17 +1800,6 @@ def render_summary(view: SubstrateView) -> str:
     # consistent with the TUI/web wordmark (which also key off brand_wordmark). [L1]
     masthead = view.brand_wordmark or "Levain substrate"
     lines: list[str] = [f"{masthead} — {title}"]
-    # The operator's live focus, FIRST — for a generic MCP adopter the partner IS the
-    # model and reasons over THIS digest, so the "every session orients to the
-    # operator's declared frame" telos has to land here, not only on the cockpit.
-    if view.focus is not None and view.focus.text:
-        if view.focus.freshness == "unknown":
-            meta = " (age unknown — confirm still live)"
-        elif view.focus.stale:
-            meta = f" ({view.focus.age_label}) — STALE; confirm still live"
-        else:
-            meta = f" ({view.focus.age_label})"
-        lines.append(f"Focus: {view.focus.text}{meta}")
     if view.state is not None and view.state.text:  # fresh only: _read_state drops an expired one
         lines.append(  # quoted, like the hook: the operator's words, delimited
             f"State: {json.dumps(view.state.text, ensure_ascii=False)} ({view.state.age_label})"
@@ -2037,55 +1876,13 @@ def run_dashboard(path: Path, as_json: bool = False) -> int:
     return 1 if "store" in view.errors else 0
 
 
-def run_focus(
-    path: Path, text: str | None = None, *, source: str = "cli", clear: bool = False
-) -> int:
-    """``levain focus`` entry point — set / show / clear the operator's live focus.
-
-    Resolves the install's ``.levain/context.json`` from ``path``. With ``text`` (or
-    ``--clear``) it SETS (clear = an empty focus); with neither it SHOWS the current
-    focus + freshness. The general (non-sensor-app) operator's set-path; a downstream
-    with its own sensor app sets focus into that app's context file, not here."""
-    install_root = Path(path).expanduser().resolve()
-    context_json = install_root / ".levain" / "context.json"
-    # Soft guard: setting focus in a dir with NO Levain store writes a stray
-    # `.levain/context.json` no cockpit will ever read (a typo'd --path). Warn, but
-    # still honor the set (an operator may legitimately set focus before `levain init`).
-    if (text is not None or clear) and not (install_root / ".levain" / "memory.db").exists():
-        print(
-            f"note: no Levain store at {install_root} — setting focus here anyway; "
-            "run `levain init` (or pass --path to an install) so a cockpit reads it.",
-            file=sys.stderr,
-        )
-    if clear:
-        text = ""
-    if text is not None:
-        write_focus(context_json, text, source=source)
-        print(f"focus set: {text.strip()}" if text.strip() else "focus cleared")
-        return 0
-    focus = _read_focus(context_json, datetime.now(timezone.utc))
-    if focus is None or focus.text is None:
-        print("no focus set")
-        return 0
-    bits = []
-    if focus.freshness == "unknown":
-        bits.append("age unknown")
-    elif focus.age_label:
-        bits.append(focus.age_label)
-    if focus.source:
-        bits.append(f"via {focus.source}")
-    meta = f"  ({' · '.join(bits)})" if bits else ""
-    stale = "  — stale; still live?" if focus.stale else ""
-    print(f"⊙ {focus.text}{meta}{stale}")
-    return 0
-
-
 def run_state(
     path: Path, text: str | None = None, *, source: str = "cli", clear: bool = False
 ) -> int:
     """``levain state`` entry point — set / show / clear the operator's state line.
-    Mirrors ``run_focus`` (same ``.levain/context.json``). With ``text`` (or ``--clear``)
-    it SETS; with neither it SHOWS the state while it is still within its 8 h life.
+    Reads and writes the install's ``.levain/context.json``. With ``text`` (or
+    ``--clear``) it SETS; with neither it SHOWS the state while it is still within its
+    12 h life.
     The text is echoed verbatim and never interpreted."""
     install_root = Path(path).expanduser().resolve()
     context_json = install_root / ".levain" / "context.json"

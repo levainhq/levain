@@ -1,5 +1,5 @@
-"""The operator `state` line: the freeform, expiring sibling of `focus` in the
-live-context file. Budget: contract read, expiry, fail-soft, hook/dashboard agreement."""
+"""The operator `state` line: the one freeform, expiring "what's going on" line in the
+live-context file (it replaced the separate `focus` field). Budget: contract read, expiry, fail-soft, hook/dashboard agreement."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ HOOKS = Path(__file__).resolve().parents[1] / "levain" / "templates" / "activati
 sys.path.insert(0, str(HOOKS))
 import _levain_hook as hook  # noqa: E402
 
-from levain.dashboard import _read_state, render_summary, render_text, write_state, write_focus  # noqa: E402
+from levain.dashboard import _read_state, render_summary, render_text, write_state  # noqa: E402
 
 NOW = datetime(2026, 10, 9, 20, 0, tzinfo=timezone.utc)
 
@@ -38,7 +38,7 @@ def test_contract_reads_the_three_keys_verbatim_and_superset_tolerant(tmp_path):
 
 
 def test_expiry_drops_the_line_and_write_clear_pops_all_three(tmp_path):
-    for hours in (8, 30):  # at the boundary and well past it
+    for hours in (12, 30):  # at the boundary and well past it
         p = _ctx(tmp_path, state="old", state_set_at=_stamp(hours), state_source="cli")
         assert _read_state(p, NOW).text is None
     # clock skew within the tolerance reads as just-now; far-future and a missing stamp: not shown
@@ -47,7 +47,8 @@ def test_expiry_drops_the_line_and_write_clear_pops_all_three(tmp_path):
     assert _read_state(_ctx(tmp_path, state="x", state_set_at=_stamp(-1)), NOW).text is None
     assert _read_state(_ctx(tmp_path, state="y" * 501, state_set_at=_stamp(1)), NOW).text is None  # over-cap
     assert _read_state(_ctx(tmp_path, state="x"), NOW).text is None
-    # a newer write replaces, an explicit clear removes all three keys, focus untouched
+    # a newer write replaces, an explicit clear removes all three keys, other keys untouched
+    # (an older install's focus keys are such keys: never migrated, never deleted)
     p = _ctx(tmp_path, focus="f", focus_set_at=_stamp(1), focus_source="cli")
     write_state(p, "one", source="cli"); write_state(p, "two", source="app")
     assert json.loads(p.read_text())["state"] == "two"
@@ -55,8 +56,8 @@ def test_expiry_drops_the_line_and_write_clear_pops_all_three(tmp_path):
     data = json.loads(p.read_text())
     assert not {"state", "state_set_at", "state_source"} & data.keys()
     assert data["focus"] == "f"
-    write_focus(p, "g", source="cli"); write_state(p, "s", source="cli")  # focus write keeps state
-    assert json.loads(p.read_text())["focus"] == "g"
+    write_state(p, "s", source="cli")  # a later write still keeps the legacy keys
+    assert json.loads(p.read_text())["focus"] == "f" and json.loads(p.read_text())["state"] == "s"
     import pytest
     with pytest.raises(ValueError):
         write_state(p, "z" * 501)  # the writer refuses what every reader would drop
@@ -92,7 +93,31 @@ def test_hook_text_and_dashboard_agree(tmp_path, monkeypatch):
     p.write_text(json.dumps({"state": "sharp, go deep", "state_set_at": stamp, "state_source": "cli"}))
     # expiry agrees on both surfaces, and the hook's mirrored bound IS the kernel's
     from levain.dashboard import STATE_EXPIRES_AFTER_HOURS
-    assert hook._STATE_EXPIRES_AFTER_HOURS == STATE_EXPIRES_AFTER_HOURS == 8
-    p.write_text(json.dumps({"state": "sharp", "state_set_at": (now - timedelta(hours=9)).isoformat()}))
+    assert hook._STATE_EXPIRES_AFTER_HOURS == STATE_EXPIRES_AFTER_HOURS == 12
+    p.write_text(json.dumps({"state": "sharp", "state_set_at": (now - timedelta(hours=13)).isoformat()}))
     view.state = _read_state(p, now)
     assert hook.state_notice() is None and "state:" not in render_text(view)
+
+
+def test_focus_is_gone_from_the_hooks_the_cli_and_the_write_seam(tmp_path, monkeypatch):
+    # the two live-context fields collapsed into one: nothing of `focus` remains as a surface
+    import pytest
+    from levain import cli
+    from levain.writes import EditError, WriteScope, apply_edit
+
+    assert not hasattr(hook, "focus_notice")
+    for hooks_dir in (HOOKS, HOOKS.parents[1] / "adapters" / "codex" / "activation" / "hooks"):
+        for name in ("_levain_hook.py", "session_start.py"):
+            assert "focus" not in (hooks_dir / name).read_text(encoding="utf-8").lower(), (hooks_dir, name)
+
+    with pytest.raises(SystemExit) as ei:
+        cli.main(["focus", "x"])  # argparse: invalid choice
+    assert ei.value.code == 2
+
+    p = _ctx(tmp_path, focus="legacy", focus_set_at=_stamp(1), focus_source="cli")
+    scope = WriteScope.from_install_root(tmp_path)
+    assert scope.context_json == p
+    with pytest.raises(EditError) as ee:
+        apply_edit(scope, {"kind": "focus", "text": "x"})
+    assert ee.value.code == "bad_kind" and ee.value.http_status == 400
+    assert json.loads(p.read_text())["focus"] == "legacy"  # refused, not applied

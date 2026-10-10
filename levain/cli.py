@@ -307,44 +307,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     tui_p.set_defaults(func=_cmd_tui)
 
-    focus_p = subparsers.add_parser(
-        "focus",
-        help="Set / show the operator's live focus — what you're working on now.",
-        description=(
-            "The operator's live, self-authored attention context — 'what I'm on "
-            "right now' — that every session reads to orient (it travels across "
-            "sessions, like the rest of the substrate). With TEXT, sets it; with no "
-            "argument, shows the current focus + its freshness; --clear unsets it. "
-            "Stored in the install's .levain/context.json and read into the "
-            "dashboard / TUI / web cockpit. (A sensor app may write the same "
-            "three-key contract into its own context file instead.)"
-        ),
-    )
-    focus_p.add_argument(
-        "text", nargs="?", default=None,
-        help="The focus to set (omit to show the current one).",
-    )
-    focus_p.add_argument(
-        "--path", type=Path, default=Path.cwd(),
-        help="Install directory (default: cwd).",
-    )
-    focus_p.add_argument("--clear", action="store_true", help="Unset the focus.")
-    focus_p.add_argument(
-        "--source", default="cli",
-        help="Provenance tag for who set it (default: cli).",
-    )
-    focus_p.set_defaults(func=_cmd_focus)
-
     state_p = subparsers.add_parser(
         "state",
-        help="Set / show your freeform state line — how you are right now.",
+        help="Set / show your freeform state line — what's going on right now.",
         description=(
             "An optional, freeform line in your own words ('wiped, keep it light', "
-            "'sharp') that every session reads at start, shown verbatim with its age. "
+            "'on the billing refactor') that every session reads at start and the "
+            "cockpit shows, verbatim with its age. "
             "It is never parsed, scored or used to limit what the partner does; you are "
             "the authority on your own state. With TEXT, sets it; with no argument, shows "
-            "it; --clear removes it. It expires after 8 hours: a stale state is dropped, "
-            "not shown. Lives beside the focus in .levain/context.json."
+            "it; --clear removes it. It expires after 12 hours: a stale state is dropped, "
+            "not shown. Stored in .levain/context.json."
         ),
     )
     state_p.add_argument(
@@ -1236,14 +1209,6 @@ def _cmd_tui(args: argparse.Namespace) -> int:
     from levain.tui import run_tui
 
     return run_tui(path=args.path, read_only=args.read_only, manifest=args.manifest)
-
-
-def _cmd_focus(args: argparse.Namespace) -> int:
-    from levain.dashboard import run_focus
-
-    return run_focus(
-        path=args.path, text=args.text, source=args.source, clear=args.clear
-    )
 
 
 def _cmd_state(args: argparse.Namespace) -> int:

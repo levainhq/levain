@@ -206,10 +206,6 @@ def _loop(
             model = move_in_panel(model, +10_000)
         elif ch == ord("r"):
             model = _rebuild(model, source, "refreshed")
-        elif ch == ord("f") and not model.read_only:
-            # Global write: set/edit the masthead focus (not a row-scoped verb — focus
-            # isn't a selectable panel). Read-only cockpit → 'f' falls through to a no-op.
-            model = _edit_focus(stdscr, model, source)
         elif ch == ord("S") and not model.read_only:
             # Global write: set/edit the freeform state line (shift-S: lowercase s is a verb key).
             model = _edit_state(stdscr, model, source)
@@ -286,9 +282,10 @@ def _rebuild(model: TuiModel, source: SubstrateSource, status: str) -> TuiModel:
 def _edit_state(
     stdscr: "curses.window", model: TuiModel, source: SubstrateSource,
 ) -> TuiModel:
-    """Set / edit the operator's freeform state line ('S'): the twin of ``_edit_focus``
-    (same ``$EDITOR`` idiom, an empty buffer clears, same governed ``apply_edit`` seam,
-    ``kind='operator_state'``). The text is the operator's own words, stored verbatim."""
+    """Set / edit the operator's freeform state line ('S'): a GLOBAL write, not a
+    row-scoped verb (the line isn't a selectable panel). Opens ``$EDITOR`` seeded with the
+    current line; an empty buffer clears it; routed through the governed ``apply_edit``
+    seam (``kind='operator_state'``). The text is the operator's own words, stored verbatim."""
     view = model.view
     state = getattr(view, "state", None) if view is not None else None
     current = state.text if (state is not None and state.text) else ""
@@ -700,29 +697,6 @@ def _edit_via_editor(stdscr: "curses.window", initial_text: str) -> str | None:
             pass
 
 
-def _edit_focus(
-    stdscr: "curses.window", model: TuiModel, source: SubstrateSource,
-) -> TuiModel:
-    """Set / edit the operator's live focus — the masthead 'what I'm on now'. A GLOBAL
-    write ('f'), NOT a row-scoped verb: focus isn't a selectable panel, so it can't ride
-    ``_active_verbs``. Opens ``$EDITOR`` seeded with the current focus (the TUI's edit
-    idiom); an empty buffer CLEARS it (distinct from an editor crash → ``None`` → no-op).
-    Live-state, last-writer-wins — routed through the same governed ``apply_edit`` seam
-    (``kind='focus'``) every write funnels through. The 'f' keybind is gated on
-    ``not model.read_only``; ``_apply`` is the un-bypassable read-only backstop."""
-    view = model.view
-    focus = getattr(view, "focus", None) if view is not None else None
-    current = focus.text if (focus is not None and focus.text) else ""
-    edited = _edit_via_editor(stdscr, current)
-    if edited is None:
-        return replace(model, status="⚠ focus unchanged — $EDITOR is missing or exited non-zero")
-    new = " ".join(edited.split())  # single line (write_focus collapses on write too)
-    if new == current:
-        return replace(model, status="focus — no change")
-    ok = "focus cleared" if new == "" else "focus set"
-    return _apply(model, source, {"kind": "focus", "text": new, "source": "tui"}, ok)
-
-
 # ---------------------------------------------------------------------------
 # Painting.
 # ---------------------------------------------------------------------------
@@ -778,35 +752,19 @@ def _paint(stdscr: "curses.window", model: TuiModel) -> TuiModel:
         attr = curses.A_REVERSE if i == model.zone_idx else curses.A_NORMAL
         _safe_addstr(stdscr, 1, x, tab, attr)
         x += len(tab) + 1
-    # Rule row (row 2) — overlay the operator's live focus on the separator: their
-    # OWN declared frame (pure-echo), freshness-tagged. NO-THEATER: a stale focus
-    # dims + carries a "?" re-confirm nudge; no live-context source → a plain rule.
+    # Rule row (row 2): the operator's state line rides the separator, verbatim with its
+    # age. An expired line is already dropped by the reader; no live-context source → a
+    # plain rule.
     _safe_addstr(stdscr, 2, 0, "─" * w, curses.A_DIM)
-    focus = view.focus
-    if focus is not None and w > 12:
-        if focus.text and focus.freshness == "unknown":
-            # age can't be established — say so, dimmed (unknown ≠ fresh).
-            tag = f" ⊙ {focus.text} · age unknown "
-            f_attr = curses.A_DIM
-        elif focus.text:
-            age = focus.age_label.replace("set ", "") if focus.age_label else ""
-            suffix = f" · {age}{' ?' if focus.stale else ''}" if age else ""
-            tag = f" ⊙ {focus.text}{suffix} "
-            f_attr = curses.A_DIM if focus.stale else curses.A_NORMAL
-        else:
-            tag = " ⊙ no focus set "
-            f_attr = curses.A_DIM
-        st = view.state
+    st = view.state
+    if st is not None and w > 12:
         avail = max(w - 4, 0)
-        if st is not None and st.text:
-            # State gets its own width budget (up to a third of the row) so a long focus
-            # can never clip it away entirely; each part truncates within its own share.
-            st_tag = f"· {st.text} · {st.age_label.replace('set ', '')} "
-            st_w = min(len(st_tag), max(avail // 3, avail - len(tag)))
-            _safe_addstr(stdscr, 2, 2, tag[: max(avail - st_w, 0)], f_attr)
-            _safe_addstr(stdscr, 2, 2 + min(len(tag), max(avail - st_w, 0)), st_tag[:st_w])
+        if st.text:
+            age = st.age_label.replace("set ", "")
+            tag = f" ⊙ {st.text} · {age} " if age else f" ⊙ {st.text} "
+            _safe_addstr(stdscr, 2, 2, tag[:avail])
         else:
-            _safe_addstr(stdscr, 2, 2, tag[:avail], f_attr)
+            _safe_addstr(stdscr, 2, 2, " ⊙ no state set "[:avail], curses.A_DIM)
 
     left_w = min(_LEFT_W, w // 3)
     body_top, body_bottom = 3, h - 3  # inclusive rows for the body
@@ -902,8 +860,7 @@ _HELP_LINES = [
     "    j / k          move (select item in a list panel, else scroll)",
     "    PgDn / PgUp    page · g / G  first / last (or top / bottom)",
     "    r              refresh (rebuild the substrate view)",
-    "    f              set / edit your focus — 'what I'm on now' (writable cockpit)",
-    "    S              set / edit your state — how you are, in your words (expires in 8 h)",
+    "    S              set / edit your state — what's going on, in your words (expires in 12 h)",
     "    q / Esc        quit · ?  this help (any key dismisses)",
     "",
     "  verbs (only where the SELECTED panel + row affords them)",

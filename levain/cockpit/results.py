@@ -33,7 +33,7 @@ class Read:
     """The source was read. ``rows`` for the list kind, ``value`` for the others. ``skipped`` /
     ``filtered`` are ``(count, reason)`` pairs: skipped = rows the provider could not read
     (status ``partial``), filtered = rows excluded on purpose (status stays ok). ``stale`` is the
-    provider's assertion that the CONTENT is past its own freshness window (a focus nobody
+    provider's assertion that the CONTENT is past its own freshness window (a line nobody
     re-confirmed): the read itself succeeded, the engine renders ``stale``. ``as_of`` overrides
     the read time only when the source carries its own read-confirmation instant."""
 
