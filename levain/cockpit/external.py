@@ -68,13 +68,16 @@ class ExternalPanels:
         self._lock = threading.Lock()
         self._flight: _Flight | None = None
         self._parked: set[_Flight] = set()
+        self._fresh_live: set[_Flight] = set()   # fresh flights running, not yet parked or done
         self._last: tuple[float, _Call] | None = None
         self.calls = 0           # how many times the callable ran (the burst measurement reads it)
 
     def take(self, *, fresh: bool = False) -> _Call:
         """``fresh`` (a write's read): never the reused answer and never a flight already running,
-        which may have started before the source changed. Its own flight, not shared, under the same
-        parked bound; a fresh flight that times out is parked like any other."""
+        which may have started before the source changed. Its own flight, not shared, and it never
+        touches the shared state (a fresh refusal or failure is not recorded as the reused answer).
+        A fresh flight counts against ``max_parked`` from the moment it starts (running fresh
+        flights and parked ones together never exceed it), and one that times out stays parked."""
         with self._lock:
             now = self._clock()
             if fresh:
@@ -86,9 +89,13 @@ class ExternalPanels:
                 if flight is not None and now >= flight.deadline:
                     return self._abandon_locked(flight, now)
             if flight is None:
-                if len(self._parked) >= self._max_parked:
-                    return self._record_locked(_Call(None, f"{len(self._parked)} earlier calls of the external "
-                                                     "panels have not returned; not starting another", _now_iso()), now)
+                # a fresh flight reserves its place for as long as it runs; the one current shared
+                # flight is the only other thread, so threads never exceed max_parked + 1
+                held = len(self._parked) + (len(self._fresh_live) if fresh else 0)
+                if held >= self._max_parked:
+                    refused = _Call(None, f"{held} earlier calls of the external panels have not returned; "
+                                    "not starting another", _now_iso())
+                    return refused if fresh else self._record_locked(refused, now)
                 flight = _Flight(now + self._wait_s)
                 try:
                     threading.Thread(target=self._run, args=(flight,), name="levain-external-panels",
@@ -96,7 +103,9 @@ class ExternalPanels:
                 except RuntimeError as exc:      # "can't start new thread": nothing is left waiting on it
                     failed = _Call(None, f"could not start the external panels call: {exc}", _now_iso())
                     return failed if fresh else self._record_locked(failed, now)
-                if not fresh:
+                if fresh:
+                    self._fresh_live.add(flight)
+                else:
                     self._flight = flight
                 self.calls += 1
         flight.done.wait(max(0.0, flight.deadline - self._clock()))
@@ -115,6 +124,7 @@ class ExternalPanels:
             if self._flight is flight:
                 self._flight = None
                 self._record_locked(flight.timeout, now)
+            self._fresh_live.discard(flight)
             self._parked.add(flight)     # a fresh flight is no one's current one, and is bounded too
         return flight.timeout     # every reader of an abandoned flight gets that flight's own reading
 
@@ -132,6 +142,7 @@ class ExternalPanels:
                 if flight.timeout is None:
                     flight.result = call      # the first transition; after a timeout the answer is dropped
                 self._parked.discard(flight)
+                self._fresh_live.discard(flight)
                 # golang.org/x/sync/singleflight's rule: only the current (unforgotten) call may touch
                 # the shared state
                 if self._flight is flight:

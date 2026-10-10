@@ -644,7 +644,7 @@ def state_version(data: Any) -> str | None:
 
 def _read_state(context_json: Path | None, now: datetime) -> "State | None":
     """Read ``{state, state_set_at, state_source}`` from the live-context file. None = no
-    source at all; fail-soft to ``text=None`` on a missing/unreadable/malformed file;
+    source configured; fail-soft to ``text=None`` on a missing/unreadable/malformed file;
     whitespace collapsed; superset-tolerant (other keys are ignored). EXPIRY: a state whose age cannot be established, is further
     in the future than ``STATE_CLOCK_SKEW_SECONDS``, is older than
     ``STATE_EXPIRES_AFTER_HOURS``, or is over ``STATE_MAX_TEXT_LEN`` reads as unset."""
@@ -653,7 +653,9 @@ def _read_state(context_json: Path | None, now: datetime) -> "State | None":
     empty = State(text=None, set_at=None, source=None)
     try:
         if not context_json.exists():
-            return None
+            # a source with no file yet: unset, and its first write names the cockpit's VALUE_ABSENT
+            from levain.cockpit.engine import VALUE_ABSENT   # lazy: the cockpit imports this module
+            return State(text=None, set_at=None, source=None, version=VALUE_ABSENT)
         data = json.loads(context_json.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return empty
@@ -744,7 +746,8 @@ def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
     symlinked context file and its target share one lock, and the atomic ``os.replace`` of the file
     never swaps the locked inode). ``write_state`` takes it, so every writer that sets the line
     through it is serialised (the test names them). Where ``flock`` does not exist, an unchecked write runs unlocked
-    (last writer wins, as before) and a ``required`` one is refused."""
+    (last writer wins, as before) and a ``required`` one is refused; the same holds when the lock
+    file cannot be created."""
     try:
         import fcntl
     except ImportError:
@@ -753,8 +756,14 @@ def _state_lock(context_json: Path, *, required: bool) -> Iterator[None]:
         yield
         return
     lock = os.path.realpath(context_json) + ".lock"
-    os.makedirs(os.path.dirname(lock), exist_ok=True)
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        os.makedirs(os.path.dirname(lock), exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        if required:
+            raise
+        yield            # an unchecked write that cannot make its lock file writes as before it existed
+        return
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield

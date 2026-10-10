@@ -113,9 +113,9 @@ def _get_h(url: str, *, headers: dict | None = None, method: str = "GET"):
 
 def _state_pv(src) -> str:
     """The panel_version a state write names (K2a): the stored record's version, or 'absent'."""
-    from levain.dashboard import state_version
-    ctx = src.install_root / ".levain" / "context.json"
-    return state_version(json.loads(ctx.read_text())) if ctx.exists() else "absent"
+    from datetime import datetime, timezone
+    from levain.dashboard import _read_state
+    return _read_state(src.install_root / ".levain" / "context.json", datetime.now(timezone.utc)).version
 
 
 class TestSubstrateJson:

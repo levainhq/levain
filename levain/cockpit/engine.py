@@ -61,7 +61,6 @@ TITLE_MAX = 160
 SOON_DAYS = 3
 WRITE_READ_CAP = 32       # source reads made inside writes that may run at once (design §4.4)
 WRITE_READ_CAP_PER_SOURCE = 4   # of those, reads of one source (a panel or a discoverer)
-WRITE_READ_GRACE_S = 0.5  # an added write read counts as live this long before its flight exists
 POLICY_REVISION = 1  # hashed into the manifest etag; bumped when a tier or gesture policy changes
 NOW_ID = "now"
 VALUE_ABSENT = "absent"   # the value_version of a line/prose value with no stored record yet
@@ -286,15 +285,17 @@ class Cockpit:
         ctx = ReadContext(self._clock(), fresh=True)
         with self._lock:
             fn = self._discoverers[owner]
-        res = self._bounded_fresh(f"discovery:{owner}", self._entity_timeout_s, self._discover_one, fn, ctx)
+        res = self._bounded_fresh(("discovery", owner), self._entity_timeout_s, self._discover_one, fn, ctx)
         if isinstance(res, Fault):
             return res
-        for got in res.value:
-            if got.id == panel_id:
-                if got.title != spec.title:
-                    return Fault(f"id collision: {got.title!r} maps to the id of {spec.title!r}")
-                return dataclasses.replace(spec, verbs=tuple(got.verbs))
-        return None
+        found = [got for got in res.value if got.id == panel_id]
+        if len(found) > 1:
+            return Fault(f"discoverer {owner} returned {panel_id!r} {len(found)} times")
+        if not found:
+            return None
+        if found[0].title != spec.title:
+            return Fault(f"id collision: {found[0].title!r} maps to the id of {spec.title!r}")
+        return dataclasses.replace(spec, verbs=tuple(found[0].verbs))
 
     def today(self) -> date:
         return ReadContext(self._clock()).today
@@ -911,9 +912,21 @@ class Cockpit:
                 errors.append({"source": f"discovery:{i}", "message": res.message})
                 continue
             returned: set[str] = set()
+            ids = [s.id for s in res.value]
             for spec in res.value:
                 if not isinstance(spec.id, str):
                     errors.append({"source": f"discovery:{i}", "message": "a discovered panel id must be a string"})
+                    continue
+                if ids.count(spec.id) > 1:
+                    # one id returned twice in one answer: neither copy is believed (a write asks the
+                    # same question, offer_spec, and refuses too)
+                    if spec.id not in returned:
+                        errors.append({"source": f"discovery:{spec.id}",
+                                       "message": f"discoverer {i} returned this id {ids.count(spec.id)} times"})
+                    returned.add(spec.id)
+                    with self._lock:
+                        if self._discovered.get(spec.id) == i and self._specs[spec.id].verbs:
+                            self._set_verbs_locked(spec.id, ())
                     continue
                 returned.add(spec.id)
                 with self._lock:
@@ -1125,7 +1138,7 @@ class Cockpit:
                 return Read(value=rows[0])
             except Exception as exc:  # noqa: BLE001
                 return Fault(f"provider output refused: {_safe_str(exc)}")
-        return self._bounded_fresh(panel_id, spec.timeout_s, once, ctx)
+        return self._bounded_fresh(("panel", panel_id), spec.timeout_s, once, ctx)
 
     def read_value_version(self, panel_id: str) -> Result:
         """Read a line or prose panel's value from the SOURCE (never the refresher snapshot) and
@@ -1143,32 +1156,31 @@ class Cockpit:
                 return Read(value=self._value(spec, res.value, res.version_of)["value_version"])
             except Exception as exc:  # noqa: BLE001
                 return Fault(f"provider output refused: {_safe_str(exc)}")
-        return self._bounded_fresh(panel_id, spec.timeout_s, once, ctx)
+        return self._bounded_fresh(("panel", panel_id), spec.timeout_s, once, ctx)
 
-    def _bounded_fresh(self, source: str, timeout_s: float, fn: Callable[..., Any], *args: Any) -> Any:
+    def _bounded_fresh(self, source: tuple[str, Any], timeout_s: float, fn: Callable[..., Any], *args: Any) -> Any:
         """A source read made inside a write. It never joins a flight another request started: a
         flight that began before this write's own read could hand it a version older than the source.
         The bound is on reads still running (a hung source's threads), not on requests: at most
         ``WRITE_READ_CAP_PER_SOURCE`` per source (a panel, a discoverer), so one hung source refuses
         its own writes and leaves the rest of the cap to the others, and ``WRITE_READ_CAP`` in all."""
         st = _State()
-        entry = [st, time.monotonic(), False, source]     # state, added at, returned, source
-        with self._lock:
-            now = time.monotonic()
-            # live: a flight still running (a hung source), or one added but not yet started; a read
-            # that returned and whose worker ended is dropped at once
-            self._one_live = [e for e in self._one_live
-                              if e[0].pflight is not None or (not e[2] and now - e[1] < WRITE_READ_GRACE_S)]
-            if sum(1 for e in self._one_live if e[3] == source) >= WRITE_READ_CAP_PER_SOURCE:
-                return Fault(f"{WRITE_READ_CAP_PER_SOURCE} reads of {source!r} are still running "
-                             "(a hung source?); refused")
+        entry = [st, False, source]     # state, returned, (kind, id): a namespaced key, so a panel
+        with self._lock:                # id never shares a discoverer's count
+            # live: a read whose call has not returned (reserved from here to its finally, so no
+            # scheduler stall can make it uncounted), or one that returned while its worker still
+            # runs (a hung source); a returned read whose worker ended is dropped at once
+            self._one_live = [e for e in self._one_live if not e[1] or e[0].pflight is not None]
+            if sum(1 for e in self._one_live if e[2] == source) >= WRITE_READ_CAP_PER_SOURCE:
+                return Fault(f"{WRITE_READ_CAP_PER_SOURCE} reads of {source[0]} {source[1]!r} are still "
+                             "running (a hung source?); refused")
             if len(self._one_live) >= WRITE_READ_CAP:
                 return Fault(f"{WRITE_READ_CAP} source reads are still running (a hung source?); refused")
             self._one_live.append(entry)
         try:
             return self._bounded(timeout_s, st, fn, *args)
         finally:
-            entry[2] = True
+            entry[1] = True
 
 
 def _safe_str(exc: object) -> str:

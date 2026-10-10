@@ -1100,6 +1100,8 @@ def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str 
         write_state(ctx, collapsed, source=source, check=check)
     except StateLockUnavailable as exc:
         raise EditError("lock_unavailable", 501, str(exc)) from exc
+    except OSError as exc:      # the lock file or the write itself: retryable, never a bare 500
+        raise EditError("store_unavailable", 503, f"state file unavailable: {exc}") from exc
     return {"ok": True, "kind": "operator_state", "cleared": collapsed == ""}
 
 

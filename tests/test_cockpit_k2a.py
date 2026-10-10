@@ -758,7 +758,7 @@ class TestL1Round2:
         monkeypatch.setattr(spec, "timeout_s", 0.05)
         outs = [rig.ck.read_one("tray", "spore:x") for _ in range(eng.WRITE_READ_CAP + 1)]
         try:
-            assert "reads of 'tray' are still running" in outs[-1].message
+            assert "reads of panel 'tray' are still running" in outs[-1].message
             assert rig.tier("spore_touch", "loops", "loop") == "C1"      # another source still reads
         finally:
             gate.set()
@@ -833,3 +833,86 @@ class TestL2Round2:
         del feed["panels"]["ext:a"]
         m = r.ck.manifest(CRED)
         assert m["panels"]["ext:a"]["actions"] == [] and m["panels"]["ext:b"]["actions"]
+
+
+class TestL3Round2:
+    def test_the_legacy_page_can_write_the_first_state_line(self, rig: Rig) -> None:
+        """complement #1 + codex #2 (r2): with no context file the page got state null and could
+        name no version, so the first line could never be created."""
+        from levain.dashboard import _read_state
+        cj = rig.root / ".levain" / "context.json"
+        cj.unlink()
+        st = _read_state(cj, rig.clock())
+        assert st is not None and st.text is None and st.version == verbs_mod.VALUE_ABSENT
+        assert rig.edit({"kind": "operator_state", "text": "first", "panel_version": st.version})["ok"]
+
+    def test_a_fresh_read_never_rewrites_the_shared_answer(self) -> None:
+        """codex #4 + complement #2 (r2): a refused fresh read was recorded as the reused answer."""
+        from levain.cockpit.external import ExternalPanels
+        gate = threading.Event()
+        calls = [0]
+
+        def fn():
+            calls[0] += 1
+            if calls[0] > 1:
+                gate.wait(5)
+            return [{"id": "a", "lines": []}]
+        ext = ExternalPanels(fn, reuse_s=3600, wait_s=0.05, max_parked=1)
+        good = ext.take()
+        assert good.panels is not None
+        try:
+            assert ext.take(fresh=True).panels is None      # hangs, parks: the one place is held
+            assert ext.take(fresh=True).panels is None      # refused: no place left
+            assert ext.take() is good                       # the shared answer is untouched
+        finally:
+            gate.set()
+
+    def test_running_fresh_flights_hold_their_places(self) -> None:
+        """codex #3 (r2): concurrent fresh flights were not counted until they timed out."""
+        from levain.cockpit.external import ExternalPanels
+        gate = threading.Event()
+        ext = ExternalPanels(lambda: (gate.wait(5), [])[1], reuse_s=0, wait_s=2, max_parked=2)
+        outs: list[Any] = []
+        ts = [threading.Thread(target=lambda: outs.append(ext.take(fresh=True))) for _ in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(0.3)
+        try:
+            assert ext.calls == 2                            # two started, two refused while they run
+            assert sum(1 for o in outs if o.panels is None and "not starting another" in (o.error or "")) == 2
+        finally:
+            gate.set()
+            for t in ts:
+                t.join(5)
+
+    def test_an_id_returned_twice_in_one_answer_is_believed_nowhere(self, tmp_path: Path) -> None:
+        """codex #1 (r2): the render took the last copy and the write the first (fail open)."""
+        fired: list[dict] = []
+        r, feed = _discovered_rig(tmp_path, fired)
+        twice = [ProviderSpec("ext:a", "line", "ext:a", "feed", lambda ctx: Read(value={"lines": []}), verbs=v)
+                 for v in (("note_it",), ())]
+        r.ck._discoverers[-1] = lambda ctx: twice
+        m = r.ck.manifest(CRED)
+        assert m["panels"]["ext:a"]["actions"] == []
+        assert any("2 times" in e["message"] for e in m["errors"])
+        _refused("source_unavailable", r.post, "note_it", "ext:a", None, {"text": "x"}, idempotency_key="k")
+        assert fired == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="no flock")
+    def test_a_lock_file_that_cannot_be_made_fails_only_a_checked_write(self, rig: Rig, monkeypatch) -> None:
+        """complement #4 (r2): levain state and the TUI could newly fail on the lock file."""
+        from levain import dashboard
+        cj = rig.root / ".levain" / "context.json"
+        real_open = os.open
+
+        def no_lock(path, *a, **k):
+            if str(path).endswith(".lock"):
+                raise PermissionError(13, "denied", str(path))
+            return real_open(path, *a, **k)
+        monkeypatch.setattr(os, "open", no_lock)
+        dashboard.write_state(cj, "unchecked")                       # writes as before
+        assert json.loads(cj.read_text())["state"] == "unchecked"
+        e = _refused("store_unavailable", rig.edit, {"kind": "operator_state", "text": "checked",
+                                                     "panel_version": rig.ck.read_value_version("state").value})
+        assert e.http_status == 503 and json.loads(cj.read_text())["state"] == "unchecked"
