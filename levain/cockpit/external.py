@@ -38,10 +38,11 @@ class _Call:
 
 
 class _Flight:
-    def __init__(self, deadline: float) -> None:
+    def __init__(self, deadline: float, gen: int) -> None:
         self.done = threading.Event()
         self.result: _Call | None = None
         self.deadline = deadline       # on the instance's clock: a flight is abandoned once past it
+        self.gen = gen                 # start order: a late answer never replaces a newer flight's
 
 
 class ExternalPanels:
@@ -64,6 +65,7 @@ class ExternalPanels:
         self._flight: _Flight | None = None
         self._parked: set[_Flight] = set()
         self._last: tuple[float, _Call] | None = None
+        self._published = 0      # the newest flight generation whose answer is in _last
         self.calls = 0           # how many times the callable ran (the burst measurement reads it)
 
     def take(self) -> _Call:
@@ -78,7 +80,7 @@ class ExternalPanels:
                 if len(self._parked) >= self._max_parked:
                     return self._record_locked(_Call(None, f"{len(self._parked)} earlier calls of the external "
                                                      "panels have not returned; not starting another", _now_iso()), now)
-                flight = _Flight(now + self._wait_s)
+                flight = _Flight(now + self._wait_s, self.calls + 1)
                 try:
                     threading.Thread(target=self._run, args=(flight,), name="levain-external-panels",
                                      daemon=True).start()
@@ -107,20 +109,31 @@ class ExternalPanels:
         return self._last[1] if self._last is not None else _Call(None, "the external panels failed", _now_iso())
 
     def _run(self, flight: _Flight) -> None:
+        call = _Call(None, "the external panels call ended without an answer", _now_iso())
         try:
             got = self._fn()
             if not isinstance(got, (list, tuple)):
                 raise TypeError(f"extra_panels returned a {type(got).__name__}, not a list")
             call = _Call(tuple(got), None, _now_iso())
         except BaseException as exc:  # noqa: BLE001 - every failure is a reading, reused like one
-            call = _Call(None, f"{type(exc).__name__}: {exc}", _now_iso())
-        with self._lock:
-            flight.result = call
-            self._parked.discard(flight)
-            self._last = (self._clock(), call)     # a late answer is still a reading, dated by its own as_of
-            if self._flight is flight:
-                self._flight = None
-        flight.done.set()
+            call = _Call(None, _describe(exc), _now_iso())
+        finally:
+            with self._lock:
+                flight.result = call
+                self._parked.discard(flight)
+                if flight.gen > self._published:   # a late answer is a reading only if nothing newer landed
+                    self._published = flight.gen
+                    self._last = (self._clock(), call)
+                if self._flight is flight:
+                    self._flight = None
+            flight.done.set()
+
+
+def _describe(exc: BaseException) -> str:
+    try:
+        return f"{type(exc).__name__}: {exc}"
+    except Exception:  # noqa: BLE001 - an exception whose text itself raises still names its type
+        return type(exc).__name__
 
 
 def _now_iso() -> str:
@@ -215,9 +228,16 @@ def _rows(p: dict[str, Any]) -> tuple[tuple[RowIn, ...], int]:
     return tuple(rows), bad
 
 
+def _take(ext: ExternalPanels, ctx: ReadContext) -> _Call:
+    """One call per read cycle: a manifest build's discovery and every panel it reads share the cycle's
+    answer even if the build outlives the reuse window."""
+    got: _Call = ctx.memo(f"levain.external:{id(ext)}", ext.take)
+    return got
+
+
 def _reader(ext: ExternalPanels, pid: str, prose: bool) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
-        call = ext.take()
+        call = _take(ext, ctx)
         if call.panels is None:
             return Fault(call.error or "the external panels failed")
         p = dict(_usable(call.panels)).get(pid)
@@ -230,6 +250,8 @@ def _reader(ext: ExternalPanels, pid: str, prose: bool) -> Callable[[ReadContext
         if prose:
             note = _note(_title(p, pid, None)[1], _str(p.get("note")))
             return Read(value={"markdown": p["markdown"]}, as_of=call.as_of, note=note, empty=_empty(p))
+        if not isinstance(p.get("lines"), list):
+            return Fault("the external panel's lines are not a list")
         rows, bad = _rows(p)
         note = _note(_title(p, pid, len(rows))[1], _str(p.get("note")))
         return Read(rows=rows, skipped=((bad, "a line that is not {meta, text}"),) if bad else (),
@@ -242,7 +264,7 @@ def discoverer(ext: ExternalPanels) -> Callable[[ReadContext], list[ProviderSpec
     per read (the title's live clause, the note, the empty sentence) is read per read; only the name, zone,
     kind and rank are fixed here."""
     def discover(ctx: ReadContext) -> list[ProviderSpec]:
-        call = ext.take()
+        call = _take(ext, ctx)
         if call.panels is None:
             raise RuntimeError(call.error or "the external panels failed")
         specs: list[ProviderSpec] = []

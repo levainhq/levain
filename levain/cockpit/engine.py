@@ -28,6 +28,7 @@ reader, ``levain tui --manifest``, ends and stops the Cockpit on an interrupt.]"
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import threading
@@ -513,8 +514,7 @@ class Cockpit:
         # a cached snapshot ages: re-evaluate its freshness against THIS request's clock
         if snap.status in ("ok", "empty", "partial") and snap.as_of and \
                 (ctx.now - _parse_iso(snap.as_of)) > timedelta(seconds=spec.stale_after_s):
-            return _Snap("stale", snap.rows, snap.value, snap.filtered, snap.skipped, snap.as_of,
-                         snap.error, snap.note, snap.stale_hint)
+            return dataclasses.replace(snap, status="stale")    # every other field, the read's empty included
         return snap
 
     # --- result -> snapshot ----------------------------------------------------------

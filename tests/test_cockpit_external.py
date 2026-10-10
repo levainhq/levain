@@ -305,3 +305,77 @@ def test_bounds_on_ids_titles_notes_and_meta() -> None:
     p = snap["panels"]["ext:ok"]
     assert p["title"].startswith("ok") and len(p["note"]) <= 500
     assert len(p["rows"][0]["facets"]["legacy_meta"]) <= 200
+
+
+# --- L3 r1 findings ---------------------------------------------------------------------------------
+
+def test_a_late_answer_never_replaces_a_newer_flights() -> None:
+    release_a = threading.Event()
+    n = {"c": 0}
+
+    def fn():
+        n["c"] += 1
+        if n["c"] == 1:
+            release_a.wait(10)
+            return [{"id": "old", "title": "Old", "lines": []}]
+        return [{"id": "new", "title": "New", "lines": []}]
+    now = [0.0]
+    ext = ExternalPanels(fn, reuse_s=5, wait_s=0.2, clock=lambda: now[0])
+    ext.take()                                     # flight A abandoned
+    now[0] = 10.0
+    b = ext.take()
+    assert [p["id"] for p in b.panels] == ["new"]
+    release_a.set()
+    time.sleep(0.2)                                # A answers late
+    assert [p["id"] for p in ext.take().panels] == ["new"]
+
+
+def test_lines_that_are_not_a_list_are_an_error_never_empty() -> None:
+    fn = _Counted([{"id": "x", "title": "X", "lines": {"bad": "shape"}, "empty": "nothing pending."}])
+    ck, _ = _cockpit(fn)
+    p = snapshot(ck)["panels"]["ext:x"]
+    assert p["status"] == "error" and "not a list" in p["error"]
+
+
+def test_an_exception_whose_text_raises_does_not_wedge_the_source() -> None:
+    class Nasty(Exception):
+        def __str__(self):
+            raise ValueError("no text")
+    n = {"c": 0}
+
+    def fn():
+        n["c"] += 1
+        if n["c"] <= 3:
+            raise Nasty()
+        return _panels()
+    ext = ExternalPanels(fn, reuse_s=0, max_parked=2)
+    for _ in range(3):
+        assert ext.take().error == "Nasty"
+    assert ext.take().panels is not None
+
+
+def test_one_manifest_build_is_one_call_even_past_the_reuse_window() -> None:
+    fn = _Counted()
+    ck, ext = _cockpit(fn, reuse_s=0)
+    ck.register(ProviderSpec("slow", "line", "Slow", "feed",
+                             lambda c: (time.sleep(0.05), Read(value={"lines": []}))[1]))
+    from levain.cockpit.text import LOCAL_CREDENTIAL
+    ck.manifest(LOCAL_CREDENTIAL)
+    assert ext.calls == 1
+
+
+def test_a_per_read_empty_sentence_survives_the_snapshot_going_stale() -> None:
+    # the aging branch: a refresher alive, its last snapshot older than stale_after_s
+    from datetime import datetime, timedelta, timezone
+
+    from levain.cockpit.engine import _Snap
+    ck = Cockpit()
+    ck.register(ProviderSpec("r", "line", "R", "feed", lambda c: Read(value={"lines": []}),
+                             refresh_every_s=60, stale_after_s=1))
+    now = datetime.now(timezone.utc)
+    st = ck._state["r"]
+    st.snap = _Snap("empty", None, {"lines": []}, [], [], (now - timedelta(seconds=30)).isoformat(), None, "",
+                    False, "live sentence")
+    st.last_completion = now
+    got = ck.panel("r")
+    assert got["status"] == "stale" and got["empty"] == "live sentence", got
