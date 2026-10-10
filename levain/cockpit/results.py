@@ -44,6 +44,7 @@ class Read:
     stale: bool = False
     as_of: str | None = None
     note: str | None = None      # this read's own note line; None keeps the registration's ``note``
+    empty: str | None = None     # this read's own sentence for status empty; None keeps the registration's
 
 
 @dataclass(frozen=True)

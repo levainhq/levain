@@ -38,38 +38,73 @@ class _Call:
 
 
 class _Flight:
-    def __init__(self) -> None:
+    def __init__(self, deadline: float) -> None:
         self.done = threading.Event()
         self.result: _Call | None = None
+        self.deadline = deadline       # on the instance's clock: a flight is abandoned once past it
 
 
 class ExternalPanels:
-    """Single-flight, briefly reused calls of one ``extra_panels`` callable."""
+    """Single-flight, briefly reused calls of one ``extra_panels`` callable.
+
+    A flight carries its own deadline (``wait_s`` from its start), so every reader of one burst waits on the
+    same instant. Past it the flight is abandoned: a timeout is recorded and reused like any other reading,
+    so the burst's later readers return at once, and the next reuse window starts a fresh flight. A callable
+    that hangs therefore parks its thread; at most ``max_parked`` such threads live at once, and while that
+    many are parked no new flight starts (the timeout reading stands)."""
 
     def __init__(self, fn: Callable[[], Any], *, reuse_s: float = 5.0, wait_s: float = 8.0,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 max_parked: int = 2, clock: Callable[[], float] = time.monotonic) -> None:
         self._fn = fn
         self._reuse_s = reuse_s
         self._wait_s = wait_s
+        self._max_parked = max_parked
         self._clock = clock
         self._lock = threading.Lock()
         self._flight: _Flight | None = None
+        self._parked: set[_Flight] = set()
         self._last: tuple[float, _Call] | None = None
         self.calls = 0           # how many times the callable ran (the burst measurement reads it)
 
     def take(self) -> _Call:
         with self._lock:
-            if self._last is not None and self._clock() - self._last[0] < self._reuse_s:
+            now = self._clock()
+            if self._last is not None and now - self._last[0] < self._reuse_s:
                 return self._last[1]
             flight = self._flight
+            if flight is not None and now >= flight.deadline:
+                return self._abandon_locked(flight, now)
             if flight is None:
-                flight = self._flight = _Flight()
+                if len(self._parked) >= self._max_parked:
+                    return self._record_locked(_Call(None, f"{len(self._parked)} earlier calls of the external "
+                                                     "panels have not returned; not starting another", _now_iso()), now)
+                flight = _Flight(now + self._wait_s)
+                try:
+                    threading.Thread(target=self._run, args=(flight,), name="levain-external-panels",
+                                     daemon=True).start()
+                except RuntimeError as exc:      # "can't start new thread": nothing is left waiting on it
+                    return self._record_locked(_Call(None, f"could not start the external panels call: {exc}",
+                                                     _now_iso()), now)
+                self._flight = flight
                 self.calls += 1
-                threading.Thread(target=self._run, args=(flight,), name="levain-external-panels",
-                                 daemon=True).start()
-        if not flight.done.wait(self._wait_s) or flight.result is None:
-            return _Call(None, f"the external panels did not answer within {self._wait_s:g} s", _now_iso())
-        return flight.result
+        if flight.done.wait(max(0.0, flight.deadline - self._clock())) and flight.result is not None:
+            return flight.result
+        with self._lock:
+            if flight.result is not None:
+                return flight.result
+            return self._abandon_locked(flight, self._clock())
+
+    def _record_locked(self, call: _Call, now: float) -> _Call:
+        self._last = (now, call)
+        return call
+
+    def _abandon_locked(self, flight: _Flight, now: float) -> _Call:
+        if self._flight is flight:
+            self._flight = None
+            self._parked.add(flight)
+            return self._record_locked(
+                _Call(None, f"the external panels did not answer within {self._wait_s:g} s", _now_iso()), now)
+        return self._last[1] if self._last is not None else _Call(None, "the external panels failed", _now_iso())
 
     def _run(self, flight: _Flight) -> None:
         try:
@@ -81,8 +116,10 @@ class ExternalPanels:
             call = _Call(None, f"{type(exc).__name__}: {exc}", _now_iso())
         with self._lock:
             flight.result = call
-            self._last = (self._clock(), call)
-            self._flight = None
+            self._parked.discard(flight)
+            self._last = (self._clock(), call)     # a late answer is still a reading, dated by its own as_of
+            if self._flight is flight:
+                self._flight = None
         flight.done.set()
 
 
@@ -94,40 +131,76 @@ def _str(v: Any, default: str = "") -> str:
     return v if isinstance(v, str) else default
 
 
+_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
+NOTE_MAX = 500          # a note is one line on the panel head; a source's runaway string is cut, never shipped whole
+META_MAX = 200
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def _usable(panels: tuple[dict[str, Any], ...]) -> list[tuple[str, dict[str, Any]]]:
-    """The adaptable panels, in order: a dict with a non-empty string id; of two with one id, the first."""
+    """The adaptable panels, in order: a dict whose id is 1-64 of [A-Za-z0-9._-] (it becomes a URL path
+    segment); of two with one id, the first."""
     out: list[tuple[str, dict[str, Any]]] = []
     seen: set[str] = set()
     for p in panels:
         if not isinstance(p, dict):
             continue
         pid = p.get("id")
-        if not isinstance(pid, str) or not pid or pid in seen:
+        if not isinstance(pid, str) or not _ID.fullmatch(pid) or pid in seen:
             continue
         seen.add(pid)
         out.append((pid, p))
     return out
 
 
-_TITLE_CLAUSE = re.compile(r"^(.*\S)\s*\(([^()]*)\)$")
+_DECORATION = re.compile(r"\s+(?:\(|[—–]\s)")
 
 
-def _title(p: dict[str, Any], pid: str) -> tuple[str, str]:
-    """A legacy title carries its live figures in a trailing parenthetical ("Inbox (3 unread)"). A manifest
-    title is static and the kernel appends the row count, so the clause moves to the read's note; a bare
-    number is that count already and is dropped."""
-    t = _str(p.get("title"), pid)
-    m = _TITLE_CLAUSE.match(t)
+def _title(p: dict[str, Any], pid: str, n_lines: int | None) -> tuple[str, str]:
+    """(static title, live clause). A legacy title carries live figures after its name, in parentheses
+    ("Inbox (3 unread)") or after a dash ("Stream — stale"). A manifest title is static (the kernel appends
+    the row count), so the name is the title and the rest is said in the read's note. A bare number that
+    equals the rows drawn is the kernel's count already; any other number is kept."""
+    t = _str(p.get("title")) or pid
+    m = _DECORATION.search(t)
     if not m:
         return t, ""
-    return m.group(1), "" if m.group(2).strip().isdigit() else m.group(2).strip()
+    name, rest = t[: m.start()], t[m.start():].strip()
+    rest = rest[1:-1].strip() if rest.startswith("(") and rest.endswith(")") else rest.lstrip("—–").strip()
+    if rest.isdigit() and n_lines is not None and int(rest) == n_lines:
+        rest = ""
+    return name, rest
+
+
+def _note(clause: str, note: str) -> str:
+    """The read's note: the title's live clause first, unless the source's note already has it as one of its
+    own ` · ` segments (a substring is not enough: "3 unread" is not "13 unread")."""
+    if clause and clause not in {seg.strip() for seg in note.split("·")}:
+        note = f"{clause} · {note}" if note else clause
+    return _cut(note, NOTE_MAX)
 
 
 def _is_prose(p: dict[str, Any]) -> bool:
     return isinstance(p.get("markdown"), str)
 
 
+def _n_lines(p: dict[str, Any]) -> int:
+    lines = p.get("lines")
+    return len(lines) if isinstance(lines, list) else 0
+
+
+def _empty(p: dict[str, Any]) -> str:
+    # an action panel's empty sentence may point at its compose box, which this read-only source does not
+    # draw, so it takes the kernel's default sentence
+    return "" if p.get("action") else _str(p.get("empty"))
+
+
 def _rows(p: dict[str, Any]) -> tuple[tuple[RowIn, ...], int]:
+    """Row ids are positions: the legacy shape has no ids, and nothing writes through these rows (the
+    manifest source is read-only). A verb on them needs a source id first (K2a)."""
     rows: list[RowIn] = []
     bad = 0
     lines = p.get("lines")
@@ -135,7 +208,7 @@ def _rows(p: dict[str, Any]) -> tuple[tuple[RowIn, ...], int]:
         if not isinstance(ln, dict) or not isinstance(ln.get("text"), str):
             bad += 1
             continue
-        meta = _str(ln.get("meta"))
+        meta = _cut(_str(ln.get("meta")), META_MAX)
         emphasis = "accent" if ln.get("accent") is True else ("dim" if ln.get("dim") is True else "none")
         rows.append(RowIn(f"line-{i}", ln["text"], {"legacy_meta": meta} if meta else {}, emphasis=emphasis,
                           stored={"meta": meta, "text": ln["text"], "emphasis": emphasis}))
@@ -154,39 +227,36 @@ def _reader(ext: ExternalPanels, pid: str, prose: bool) -> Callable[[ReadContext
             return Fault(_str(p.get("error"), "the external panel reported an error"))
         if _is_prose(p) != prose:
             return Fault("the external panel changed between markdown and lines; restart the server")
-        clause, note = _title(p, pid)[1], _str(p.get("note"))
-        if clause and clause not in note:    # a source whose note already carries its title's figures says it once
-            note = f"{clause} · {note}" if note else clause
         if prose:
-            return Read(value={"markdown": p["markdown"]}, as_of=call.as_of, note=note)
+            note = _note(_title(p, pid, None)[1], _str(p.get("note")))
+            return Read(value={"markdown": p["markdown"]}, as_of=call.as_of, note=note, empty=_empty(p))
         rows, bad = _rows(p)
+        note = _note(_title(p, pid, len(rows))[1], _str(p.get("note")))
         return Read(rows=rows, skipped=((bad, "a line that is not {meta, text}"),) if bad else (),
-                    as_of=call.as_of, note=note)
+                    as_of=call.as_of, note=note, empty=_empty(p))
     return read
 
 
 def discoverer(ext: ExternalPanels) -> Callable[[ReadContext], list[ProviderSpec]]:
-    """A ``Cockpit.discover`` function: one manifest panel per usable external panel."""
+    """A ``Cockpit.discover`` function: one manifest panel per usable external panel. What the source writes
+    per read (the title's live clause, the note, the empty sentence) is read per read; only the name, zone,
+    kind and rank are fixed here."""
     def discover(ctx: ReadContext) -> list[ProviderSpec]:
         call = ext.take()
         if call.panels is None:
             raise RuntimeError(call.error or "the external panels failed")
         specs: list[ProviderSpec] = []
         for i, (pid, p) in enumerate(_usable(call.panels)):
-            prose = _is_prose(p)
             zone = p.get("zone")
-            # an action panel's empty sentence may point at its compose box, which this read-only source does
-            # not draw, so it takes the kernel's default sentence
-            empty = "" if p.get("action") else _str(p.get("empty"))
             region = zone if isinstance(zone, str) and zone in _ZONE_IDS else "operate"
-            if prose:
-                specs.append(ProviderSpec(ID_PREFIX + pid, "prose", _title(p, pid)[0], "feed",
-                                          _reader(ext, pid, True), region=region, rank=RANK_BASE + i,
-                                          empty=empty))
+            name = _title(p, pid, _n_lines(p))[0]
+            if _is_prose(p):
+                specs.append(ProviderSpec(ID_PREFIX + pid, "prose", name, "feed", _reader(ext, pid, True),
+                                          region=region, rank=RANK_BASE + i, empty=_empty(p)))
             else:
-                specs.append(ProviderSpec(ID_PREFIX + pid, "triage-list", _title(p, pid)[0], "feed",
-                                          _reader(ext, pid, False), order="legacy.source",
-                                          facets=frozenset({"legacy_meta"}), version_fields=("*",),
-                                          region=region, rank=RANK_BASE + i, empty=empty))
+                specs.append(ProviderSpec(ID_PREFIX + pid, "triage-list", name, "feed", _reader(ext, pid, False),
+                                          order="legacy.source", facets=frozenset({"legacy_meta"}),
+                                          version_fields=("*",), region=region, rank=RANK_BASE + i,
+                                          empty=_empty(p)))
         return specs
     return discover

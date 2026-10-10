@@ -164,6 +164,7 @@ class _Snap:
     error: str | None
     note: str
     stale_hint: bool = False
+    empty: str | None = None
 
 
 @dataclass
@@ -583,7 +584,8 @@ class Cockpit:
         if stale and _STATUS_RANK["stale"] > _STATUS_RANK[status]:
             status = "stale"
         return _Snap(status, rows, value, filtered, skipped, as_of, None,
-                     res.note if isinstance(res.note, str) else spec.note, res.stale)
+                     res.note if isinstance(res.note, str) else spec.note, res.stale,
+                     res.empty if isinstance(res.empty, str) else None)
 
     @staticmethod
     def _value_empty(kind: str, value: Any) -> bool:
@@ -698,7 +700,7 @@ class Cockpit:
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
         return _sha({"status": snap.status, "rows": snap.rows, "value": snap.value,
                      "filtered": snap.filtered, "skipped": snap.skipped, "error": snap.error,
-                     "note": snap.note, "groups": groups, "credential": cred, "date": today.isoformat()})
+                     "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat()})
 
     def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date) -> dict[str, Any]:
         listy = spec.kind == "triage-list"
@@ -721,7 +723,7 @@ class Cockpit:
             "filtered": snap.filtered, "skipped": snap.skipped,
             "as_of": snap.as_of, "stale_after_s": spec.stale_after_s,
             "refresh_every_s": spec.refresh_every_s, "etag": self._etag_of(snap, groups, cred, today),
-            "error": snap.error, "note": snap.note, "empty": spec.empty,
+            "error": snap.error, "note": snap.note, "empty": spec.empty if snap.empty is None else snap.empty,
             "order": spec.order, "groups": groups,
             "search": ({"fields": list(spec.search_fields), "default_visible": spec.search_default_visible}
                        if spec.search_fields else None),

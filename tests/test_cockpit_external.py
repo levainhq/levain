@@ -25,7 +25,8 @@ def _panels() -> list[dict[str, Any]]:
         {"id": "brief", "zone": "mind", "title": "Brief", "markdown": "# hello"},
         {"id": "consult", "title": "Consult", "lines": [], "empty": "Compose a consult above.",
          "action": {"verb": "consult", "fields": []}},
-        {"id": "decisions", "title": "Decisions waiting (4)", "note": "dated first", "lines": []},
+        {"id": "decisions", "title": "Decisions waiting (4)", "note": "dated first",
+         "lines": [{"meta": "due", "text": f"d{i}"} for i in range(4)]},
     ]
 
 
@@ -83,13 +84,13 @@ def test_a_live_title_clause_moves_to_the_note_and_a_bare_count_is_left_to_the_k
     snap = snapshot(ck)
     tray, dec = snap["panels"]["ext:tray"], snap["panels"]["ext:decisions"]
     assert tray["note"] == "2 overdue · 40 pending" and tray["title"].startswith("Tray by age")
-    assert dec["note"] == "dated first" and "(4)" not in dec["title"]
+    assert dec["note"] == "dated first" and dec["title"] == "Decisions waiting (4)"   # the kernel's count
 
 
 def test_a_title_clause_the_note_already_carries_is_said_once() -> None:
     fn = _Counted([{"id": "inbox", "title": "Inbox (10 unread)", "note": "10 unread · 50 shown", "lines": []}])
     ck, _ = _cockpit(fn)
-    assert snapshot(ck)["panels"]["ext:inbox"]["note"] == "10 unread · 50 shown"
+    assert snapshot(ck)["panels"]["ext:inbox"]["note"] == "10 unread · 50 shown"   # whole-segment match
 
 
 def test_a_changing_live_title_keeps_one_panel_and_no_collision_error() -> None:
@@ -188,6 +189,119 @@ def test_the_server_adapts_extra_panels_into_its_manifest(tmp_path: Path) -> Non
         assert st == 200
         ids = json.loads(body)["panels"]
         assert "ext:tray" in ids
+        t0 = time.monotonic()
         for pid in ids:
             assert _http(f"{base}/cockpit/panel/{pid}.json?profile=full")[0] == 200
-        assert fn.n == 1 and httpd.external_panels.calls == 1
+        if time.monotonic() - t0 < 4:            # inside one reuse window the burst is one call
+            assert fn.n == 1 and httpd.external_panels.calls == 1
+
+
+# --- L1 + L2 review findings, each reproduced before it was fixed ---------------------------------
+
+def test_a_hung_callable_costs_one_wait_for_the_whole_manifest_not_one_per_panel() -> None:
+    fn = _Counted()
+    ck, ext = _cockpit(fn, wait_s=1.0)
+    snapshot(ck)                                   # discovered healthy
+    fn.gate.clear()                                # now it hangs
+    ext._last = None                               # the reuse window is over
+    t0 = time.monotonic()
+    snap = snapshot(ck)
+    took = time.monotonic() - t0
+    assert took < 2.5, took                        # one shared deadline (was ~1 s per panel)
+    assert all(snap["panels"][p]["status"] == "error" for p in snap["panels"] if p.startswith("ext:"))
+    fn.gate.set()
+
+
+def test_an_abandoned_flight_does_not_wedge_the_next_window_and_a_recovered_source_reads_again() -> None:
+    forever = threading.Event()
+    n = {"c": 0}
+
+    def fn():
+        n["c"] += 1
+        if n["c"] == 1:
+            forever.wait(30)                       # the first call never answers in this test's lifetime
+        return _panels()
+    now = [0.0]
+    ext = ExternalPanels(fn, reuse_s=5, wait_s=0.2, clock=lambda: now[0])
+    assert ext.take().panels is None               # times out; that flight is abandoned, its thread parked
+    now[0] = 10.0                                  # a later refresh starts a fresh flight
+    got = ext.take()
+    assert got.panels is not None and n["c"] == 2
+    forever.set()
+
+
+def test_parked_threads_are_bounded() -> None:
+    fn = _Counted()
+    fn.gate.clear()
+    ext = ExternalPanels(fn, reuse_s=1, wait_s=0.05, max_parked=2, clock=time.monotonic)
+    for _ in range(6):
+        ext.take()
+        ext._last = None
+        time.sleep(0.06)
+    assert ext.calls == 2 and "not starting another" in (ext.take().error or "")
+    fn.gate.set()
+
+
+def test_a_thread_that_cannot_start_is_a_fault_and_the_next_call_retries(monkeypatch) -> None:
+    fn = _Counted()
+    ext = ExternalPanels(fn, reuse_s=0)
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(threading.Thread, "start", boom)
+    assert "could not start" in (ext.take().error or "")
+    monkeypatch.undo()
+    assert ext.take().panels is not None
+
+
+def test_a_dash_title_is_a_name_and_a_live_clause_and_never_a_collision() -> None:
+    fn = _Counted([{"id": "stream", "title": "Stream", "note": "", "lines": [{"meta": "a", "text": "x"}],
+                    "empty": "no constellation episodes."}])
+    ck, _ = _cockpit(fn, reuse_s=0)
+    snapshot(ck)
+    fn.panels = [{"id": "stream", "title": "Stream — no digest", "note": "⚠ no digest", "lines": [],
+                  "empty": "constellation feed age unknown."}]
+    snap = snapshot(ck)
+    p = snap["panels"]["ext:stream"]
+    assert snap["manifest"]["errors"] == []
+    assert p["note"] == "no digest · ⚠ no digest" and p["title"].startswith("Stream")
+    assert p["empty"] == "constellation feed age unknown."      # the source's sentence for THIS read
+
+
+def test_the_empty_sentence_follows_the_source_per_read() -> None:
+    fn = _Counted([{"id": "decisions", "title": "Decisions waiting", "lines": [],
+                    "empty": "nothing is waiting on you."}])
+    ck, _ = _cockpit(fn, reuse_s=0)
+    assert snapshot(ck)["panels"]["ext:decisions"]["empty"] == "nothing is waiting on you."
+    fn.panels = [{"id": "decisions", "title": "Decisions waiting", "lines": [],
+                  "note": "⚠ 2 unreadable log line(s): this list may be INCOMPLETE",
+                  "empty": "no readable decision rows — the log has unreadable lines."}]
+    p = snapshot(ck)["panels"]["ext:decisions"]
+    assert p["empty"].startswith("no readable decision rows") and "INCOMPLETE" in p["note"]
+
+
+def test_a_note_segment_is_matched_whole_not_as_a_substring() -> None:
+    fn = _Counted([{"id": "w", "title": "W (3 unread)", "note": "13 unread", "lines": []}])
+    ck, _ = _cockpit(fn)
+    assert snapshot(ck)["panels"]["ext:w"]["note"] == "3 unread · 13 unread"
+
+
+def test_a_title_number_that_is_not_the_rows_drawn_is_kept() -> None:
+    lines = [{"meta": "", "text": f"t{i}"} for i in range(12)]
+    fn = _Counted([{"id": "tray", "title": "Tray (40)", "lines": lines},
+                   {"id": "keep", "title": "Keep (2)", "lines": lines[:2]}])
+    ck, _ = _cockpit(fn)
+    snap = snapshot(ck)
+    assert snap["panels"]["ext:tray"]["note"] == "40" and snap["panels"]["ext:tray"]["count"] == 12
+    assert snap["panels"]["ext:keep"]["note"] == ""
+
+
+def test_bounds_on_ids_titles_notes_and_meta() -> None:
+    fn = _Counted([{"id": "a/b c", "title": "bad", "lines": []},
+                   {"id": "ok", "title": "", "note": "n" * 5000, "lines": [{"meta": "m" * 5000, "text": "x"}]}])
+    ck, _ = _cockpit(fn)
+    snap = snapshot(ck)
+    assert "ext:a/b c" not in snap["panels"]
+    p = snap["panels"]["ext:ok"]
+    assert p["title"].startswith("ok") and len(p["note"]) <= 500
+    assert len(p["rows"][0]["facets"]["legacy_meta"]) <= 200

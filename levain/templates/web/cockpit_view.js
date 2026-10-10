@@ -110,7 +110,10 @@
           .filter(Boolean).join(" · ");
         return { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
       });
-      if (panel.degraded && panel.degraded.length) out.note = "not complete: " + (panel.error || panel.degraded.join(", "));
+      if (panel.degraded && panel.degraded.length) {
+        const why = "not complete: " + (panel.error || panel.degraded.join(", "));
+        out.note = out.note ? out.note + " · " + why : why;   // added to the source's note, never in place of it
+      }
     } else if (head.kind === "line") {
       out.lines = labelled(v.lines, "lines").map((l) => ({ meta: l.label, text: l.text }));
     } else if (head.kind === "metric") {
