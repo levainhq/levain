@@ -443,17 +443,21 @@ def _refuse_root() -> None:
 
 
 def _private_logs(spec: "DaemonSpec") -> None:
-    """Create the unit's log files owner-only (0600) before the service manager opens them.
+    """Keep the unit's logs owner-only: a writable serve prints its per-launch write token to
+    stdout, which is this log.
 
-    A writable serve prints its per-launch write token to stdout, which is this log. systemd's
-    ``append:`` creates a missing file 0664 and keeps an existing file's mode (both measured on
-    Ubuntu 24.04, 2026-10-11), so a log it creates is readable by any local user who can traverse
-    the operator's home, the party the write token keeps out. An existing log is narrowed too. A
-    log deleted after install is recreated by the service manager: owner-only under the cockpit
-    unit's ``UMask=0077`` on systemd, and inside ``~/Library`` (owner-only by default) on macOS."""
+    systemd's ``append:`` creates a missing log 0664 in a 0775 directory (measured on Ubuntu 24.04,
+    2026-10-11), readable by any local user who can traverse the operator's home, the party the
+    write token keeps out. So levain's own Linux log directory is made 0700, which also covers a
+    log deleted, rotated or recreated after install, and each log is created or narrowed to 0600.
+    macOS's default, ``~/Library/Logs``, is shared with other apps and is left alone: ``~/Library``
+    is owner-only by default."""
+    own_dir = platform.system() != "Darwin" and spec.stdout_log.parent == _default_log_dir().expanduser().resolve()
     for path in (spec.stdout_log, spec.stderr_log):
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            if own_dir and path.parent == spec.stdout_log.parent:
+                os.chmod(path.parent, 0o700)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             try:
                 os.fchmod(fd, 0o600)
@@ -862,13 +866,6 @@ class SystemdUserProvider(DaemonProvider):
             # `DaemonSpec` already refuses a periodic spec with keep_alive, and on systemd a Restart
             # on a oneshot is how a seat becomes a hot loop.
             lines += ["Restart=always", "RestartSec=5"]
-        if not periodic:
-            # The resident cockpit prints its write token to stdout. systemd creates a missing
-            # `append:` log under the service's UMask (0664 by default, 0600 under 0077: both
-            # measured on systemd 255), so a log deleted or rotated after install comes back
-            # owner-only too. Not on a seat: its confined hands may run as another uid that writes
-            # files the operator must read.
-            lines.append("UMask=0077")
         if periodic:
             # A seat's service is started by its TIMER only. With an [Install] section it could be
             # enabled on its own (a resident -> periodic reinstall left exactly that) and start at
