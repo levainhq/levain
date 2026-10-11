@@ -15,7 +15,7 @@ Every state transition is one method and one ``BEGIN IMMEDIATE`` transaction:
 - :meth:`CockpitDB.record_fault` — a transient fault on one unit, terminal at the tenth (§4.1.2);
 - :meth:`CockpitDB.finish` — ``COMMITTED`` / ``COMMITTED_INCOMPLETE`` once no unit is planned (§3.4);
 - :meth:`CockpitDB.cancel` — the ``WAITING``-predicate cancel (§3.5);
-- :meth:`CockpitDB.expire_due` — the one definition of expiry (§3.1).
+- :meth:`CockpitDB.expire_due` — expiry (§3.1), whose one definition is ``_expire``: off the signed record.
 
 The effect plan is never copied out of the signed record: every reader parses it from ``record`` and
 fails closed with :class:`JournalCorruptError` on a sha mismatch, an ``effects`` row disagreeing with
@@ -114,9 +114,6 @@ _SCHEMA = (
     "CREATE INDEX IF NOT EXISTS labels_lookup ON labels (resource_key, field, value_sha256)",
 )
 
-# §3.1: the one SQL definition of expiry; every caller runs this statement and no other
-_EXPIRE_SQL = ("UPDATE pendings SET state = 'EXPIRED', reason = 'expired', terminal_at = expires_at "
-               "WHERE state = 'WAITING' AND expires_at <= ?")
 # an op the settler found corrupt is marked in ``meta`` (``corrupt:<id>``) and leaves the due set; its
 # rows are left as they are, as evidence
 _NOT_CORRUPT = "NOT EXISTS (SELECT 1 FROM meta WHERE key = 'corrupt:' || p.pending_id)"
@@ -336,6 +333,26 @@ def _check_stamp(op: str, name: str, value: Any, *, nullable: bool = True) -> No
         raise _corrupt(op, f"{name} does not parse: {value!r}") from exc
 
 
+def _expire(conn: sqlite3.Connection, now: datetime) -> list[str]:
+    """§3.1, the one definition of expiry, run inside the caller's write transaction: every
+    ``WAITING`` pending whose SIGNED ``expires_at`` has come ends ``EXPIRED`` at that instant; the
+    ids it ended. The ``expires_at`` column is a mirror a writer of cockpit.db can move, so it is
+    never read here (codex L3 r5 #1). A row whose record does not parse is skipped, not raised: its
+    own reads fail closed, and one corrupt row must not stop every issue, cancel and start."""
+    ended: list[str] = []
+    for row in conn.execute("SELECT pending_id, record, record_sha256 FROM pendings "
+                            "WHERE state = 'WAITING'").fetchall():
+        try:
+            record = _parse_record(row[0], row[1], row[2])
+        except JournalCorruptError:
+            continue
+        if parse_stamp(record["expires_at"]) <= now:
+            conn.execute("UPDATE pendings SET state = 'EXPIRED', reason = 'expired', terminal_at = ? "
+                         "WHERE pending_id = ? AND state = 'WAITING'", (record["expires_at"], row[0]))
+            ended.append(row[0])
+    return ended
+
+
 def _effect_rows(op: str, record: dict[str, Any], rows: list[sqlite3.Row],
                  state: str) -> tuple[EffectRow, ...]:
     plan = record["effects"]
@@ -507,9 +524,9 @@ class CockpitDB:
     # -- expiry (§3.1) -------------------------------------------------------------------------
 
     def expire_due(self, now: datetime) -> int:
-        """Mark every WAITING pending whose ``expires_at`` has come ``EXPIRED``; the count."""
+        """Mark every WAITING pending whose signed ``expires_at`` has come ``EXPIRED``; the count."""
         with self.write() as conn:
-            return conn.execute(_EXPIRE_SQL, (utc_stamp(now),)).rowcount
+            return len(_expire(conn, now))
 
     # -- issue (§3.1 step 2) -------------------------------------------------------------------
 
@@ -530,7 +547,7 @@ class CockpitDB:
         if not isinstance(idempotency_key, str) or not idempotency_key:
             raise ValueError("idempotency_key must be a non-empty string")
         with self.write() as conn:
-            conn.execute(_EXPIRE_SQL, (utc_stamp(now),))
+            _expire(conn, now)
             prior = conn.execute(
                 "SELECT * FROM pendings WHERE principal_base = ? AND idempotency_key = ?",
                 (base, idempotency_key)).fetchone()
@@ -591,12 +608,7 @@ class CockpitDB:
             want_kind = {"sign": "ALLOWED", "reported": "ALLOWED_REPORTED"}[record["intent"]]
             if decision_kind != want_kind:
                 raise ValueError(f"a {record.get('intent')!r} pending cannot take {decision_kind}")
-            conn.execute(_EXPIRE_SQL, (stamp,))
-            if _pending_row(conn, operation_id)["state"] == "EXPIRED":
-                return DecideOutcome(operation_id, "EXPIRED", "expired", written=True)
-            if parse_stamp(record["expires_at"]) <= now:
-                conn.execute("UPDATE pendings SET state = 'EXPIRED', reason = 'expired', terminal_at = ? "
-                             "WHERE pending_id = ? AND state = 'WAITING'", (record["expires_at"], operation_id))
+            if operation_id in _expire(conn, now):
                 return DecideOutcome(operation_id, "EXPIRED", "expired", written=True)
 
             def terminal(state: str, reason: str) -> DecideOutcome:
@@ -777,7 +789,7 @@ class CockpitDB:
         The broker checks the canceller's tier before calling."""
         stamp = utc_stamp(now)
         with self.write() as conn:
-            conn.execute(_EXPIRE_SQL, (stamp,))
+            _expire(conn, now)
             row = _pending_row(conn, operation_id)
             _parse_record(operation_id, row["record"], row["record_sha256"])
             changed = conn.execute(
@@ -812,7 +824,7 @@ class CockpitDB:
             raise ValueError("a rotation moves the generation by exactly one")
         stamp = utc_stamp(now)
         with self.write() as conn:
-            conn.execute(_EXPIRE_SQL, (stamp,))
+            _expire(conn, now)
             row = conn.execute("SELECT generation FROM tokens WHERE name = ?", (name,)).fetchone()
             if row is not None and row[0] == new_generation:
                 return "already"
@@ -830,7 +842,7 @@ class CockpitDB:
         CANCELLED, recording the cancelling operation."""
         stamp = utc_stamp(now)
         with self.write() as conn:
-            conn.execute(_EXPIRE_SQL, (stamp,))
+            _expire(conn, now)
             row = conn.execute("SELECT state FROM pendings WHERE pending_id = ?", (target_id,)).fetchone()
             if row is not None and row[0] == "CANCELLED":
                 return "already"

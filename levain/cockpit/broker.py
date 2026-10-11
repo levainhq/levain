@@ -841,7 +841,7 @@ class Broker:
         state, reason = ("applying" if view.state == "DECIDED" else view.state), view.reason
         if view.state == "WAITING" and parse_stamp(view.record["expires_at"]) <= self._now():
             # expiry is a time, not a write: a read past it answers what the next write would record
-            # (``_EXPIRE_SQL``'s own comparison), and never hands out a record to sign
+            # (the same signed field ``firejournal._expire`` compares), and never hands out a record to sign
             state, reason = "EXPIRED", "expired"
         out: dict[str, Any] = {"ok": True, "pending_id": pid, "state": state, "reason": reason,
                                "verb": view.record.get("verb"), "tier": view.record.get("tier"),

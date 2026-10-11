@@ -2,6 +2,7 @@
 rev 8 §1, §2, §3.1-§3.5, §4.1.2, §5)."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 import sys
@@ -579,3 +580,55 @@ def test_label_for_takes_the_latest_fire_in_the_current_epoch_ties_to_insertion(
     with db.write() as conn:
         conn.execute("UPDATE meta SET value = '2' WHERE key = 'epoch'")
     assert db.label_for("ok-0", "text", "h") is None
+
+
+# codex L3 r5 #1: expiry has ONE source, the signed record; the ``expires_at`` column is a mirror a
+# writer of cockpit.db can move, and moving it neither ends a pending early nor keeps one alive
+
+def _move_expiry_column(db, pid: str, when: datetime) -> None:
+    with db.write() as conn:
+        conn.execute("UPDATE pendings SET expires_at = ? WHERE pending_id = ?", (utc_stamp(when), pid))
+
+
+def test_a_column_moved_earlier_does_not_expire_a_signed_pending(db):
+    pid, _ = issue(db, key="a", ttl=timedelta(hours=1))
+    _move_expiry_column(db, pid, T0 - timedelta(days=1))
+    assert db.expire_due(T0 + timedelta(minutes=1)) == 0
+    assert db.outcome(pid).state == "WAITING"
+    issue(db, key="b")                                          # issue's own sweep
+    assert db.outcome(pid).state == "WAITING"
+
+
+def test_a_column_moved_later_neither_extends_the_signed_expiry_nor_lets_a_cancel_win(db):
+    pid, raw = issue(db, key="a", ttl=timedelta(hours=1))
+    _move_expiry_column(db, pid, T0 + timedelta(days=365))
+    after = T0 + timedelta(hours=1)
+    out = db.cancel(pid, "k-laptop", after)
+    assert (out.state, out.reason) == ("EXPIRED", "expired")
+    with db.read() as conn:
+        (terminal,) = conn.execute("SELECT terminal_at FROM pendings WHERE pending_id = ?",
+                                   (pid,)).fetchone()
+    assert terminal == json.loads(raw)["expires_at"]
+
+
+def test_a_column_moved_later_frees_its_cap_slot_at_the_signed_expiry(db):
+    from levain.cockpit.firejournal import PENDING_CAP
+
+    first, _ = issue(db, key="k0", ttl=timedelta(minutes=10))
+    _move_expiry_column(db, first, T0 + timedelta(days=365))
+    for i in range(1, PENDING_CAP):
+        issue(db, key=f"k{i}")
+    pid, raw = make_record()
+    res = db.issue(record_bytes=raw, principal=PHONE, idempotency_key="late",
+                   now=T0 + timedelta(minutes=10))
+    assert res.outcome.state == "WAITING"
+    assert db.outcome(first).state == "EXPIRED"
+
+
+def test_a_corrupt_waiting_row_does_not_stop_the_sweep(db):
+    bad, _ = issue(db, key="bad", ttl=timedelta(minutes=1))
+    good, _ = issue(db, key="good", ttl=timedelta(minutes=1))
+    with db.write() as conn:
+        conn.execute("UPDATE pendings SET record_sha256 = 'x' WHERE pending_id = ?", (bad,))
+    assert db.expire_due(T0 + timedelta(minutes=1)) == 1
+    assert db.outcome(good).state == "EXPIRED"
