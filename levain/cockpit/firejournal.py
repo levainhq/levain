@@ -605,7 +605,8 @@ class CockpitDB:
             # label row always has one to carry
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('epoch', '1')")
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('policy_rev', '0')")
-            # after the epoch insert, so a fresh journal's label_rev starts at 0
+            # the triggers are created AFTER these inserts, so seeding epoch and label_rev bumps nothing and a
+            # fresh journal's label_rev starts at 0 (an INSERT OR IGNORE that ignores fires no trigger later)
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('label_rev', '0')")
             for stmt in _TRIGGERS:
                 conn.execute(stmt)
