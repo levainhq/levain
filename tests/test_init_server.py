@@ -74,7 +74,7 @@ _TOKENS: dict[str, str] = {}
 
 def _post(url: str, payload, *, headers: dict | None = None, content_type="application/json"):
     h = dict(headers or {})
-    tok = next((v for b, v in _TOKENS.items() if url.startswith(b)), None)
+    tok = next((v for b, v in _TOKENS.items() if url.startswith(b + "/")), None)
     if tok is not None and "X-Levain-Write-Token" not in h:
         h["X-Levain-Write-Token"] = tok
     if content_type is not None:

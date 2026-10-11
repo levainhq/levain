@@ -137,7 +137,9 @@ class _InitServer(ThreadingHTTPServer):
     allowed_hosts: frozenset[str]
     request_gate: threading.BoundedSemaphore
     install_lock: threading.Lock
-    write_token: str
+    # make_init_server mints the run's token; this default matches no header (the empty header is
+    # refused too), so a server built without it refuses every write
+    write_token: str = secrets.token_urlsafe(32)
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family (idle keep-alive resets)
@@ -701,9 +703,10 @@ def run_init_web(
     # the plain URL opens and the page asks for the token printed here.
     unlocked = f"{url}#write_token={urllib.parse.quote(httpd.write_token, safe='')}"
     print(f"Levain init → {url}")
+    # flushed: a piped or captured stdout must show the token while it is still valid (L3 codex)
     print(f"  write token (send as {_WRITE_TOKEN_HEADER}; valid until this server stops): "
-          f"{httpd.write_token}")
-    print(f"  open the form, unlocked: {unlocked}")
+          f"{httpd.write_token}", flush=True)
+    print(f"  open the form, unlocked: {unlocked}", flush=True)
     print(f"  install target: {install}{'  (--force)' if force else ''}")
     if httpd.pack_names:
         print(f"  composing packs: {', '.join(httpd.pack_names)}")

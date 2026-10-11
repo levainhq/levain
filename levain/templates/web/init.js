@@ -47,7 +47,9 @@
       if (tok === null) return "";
       params.delete("write_token");
       var rest = params.toString();
-      history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
+      try {
+        history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
+      } catch (_) { /* no history API: the token still works for this page */ }
       return /^[\x21-\x7e]+$/.test(tok) ? tok : "";
     } catch (_) { return ""; }
   })();
@@ -358,7 +360,6 @@
         setNote("HTTP " + res.status + " — see below", true);
       }
     } catch (e) {
-      writeToken = "";      // a token fetch() refused as a header value must not stick
       setNote("network error: " + (e && e.message ? e.message : e), true);
     } finally {
       installing = false;
