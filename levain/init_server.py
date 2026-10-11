@@ -11,7 +11,11 @@ write-half (``apply_init``), so the questions, order, and writes can't drift.
 LOOPBACK-ONLY by construction. Onboarding writes operator-private seed/config
 and (for the codex adapter) mutates the global ``~/.codex`` — it has no business
 reachable off the machine, so unlike ``levain serve`` there is NO ``--host``
-off-box mode and NO write token: the loopback bind IS the auth. It REUSES the
+off-box mode. Loopback is NOT the auth: every local uid can reach 127.0.0.1 (K2a's premise), and a
+cross-uid ``POST /init`` with no token was reproduced writing the operator's seed (1011+40, argushub,
+0.7.2). So, as ``levain serve --write`` does since K2a, the server mints a write token per run, the
+link it prints and opens carries it in the URL fragment, and ``POST /init`` refuses
+``403 credential_required`` without it, before the body is read. It REUSES the
 web-app's security primitives — the DNS-rebinding Host allowlist
 (``host_header_allowed``), the Sec-Fetch-Site CSRF check, ``application/json``
 enforcement, the CSP, and a concurrency bound — shared rather than
@@ -27,7 +31,10 @@ answers}``, so a page can never redirect the install target.
 from __future__ import annotations
 
 import contextlib
+import hmac
 import json
+import secrets
+import urllib.parse
 import sys
 import threading
 from collections.abc import Sequence
@@ -54,6 +61,7 @@ from levain.packs import PackError, load_pack_manifest, order_activation_roots
 from levain.http_guards import GuardedHandler
 from levain.web_server import (
     _LOOPBACK_HOSTS,
+    _WRITE_TOKEN_HEADER,
     _is_loopback_host,
     load_web_asset,
 )
@@ -129,6 +137,7 @@ class _InitServer(ThreadingHTTPServer):
     allowed_hosts: frozenset[str]
     request_gate: threading.BoundedSemaphore
     install_lock: threading.Lock
+    write_token: str
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         """Swallow the benign client-disconnect family (idle keep-alive resets)
@@ -207,8 +216,8 @@ class _InitHandler(GuardedHandler):
 
     def do_POST(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler contract
         """``POST /init`` — run the install from the submitted ``{adapter,
-        answers}``. The cheap fail-closed checks (Host → CSRF → Content-Type →
-        route → Content-Length) run BEFORE any body read and each closes the
+        answers}``. The cheap fail-closed checks (Host → CSRF → write token →
+        Content-Type → route → Content-Length) run BEFORE any body read and each closes the
         connection on rejection. The install itself is serialized by
         ``install_lock`` (one install at a time — two into one dir would race) and
         owns its try/except → HTTP + partial-install reporting (no rollback; codex
@@ -216,6 +225,10 @@ class _InitHandler(GuardedHandler):
         # Host, then CSRF layer 1 (same-origin or a non-browser client only).
         if self._refuse_write_origin():
             return
+        # The write token (K2a's construct): another local uid reaches loopback too.
+        supplied = self.headers.get(_WRITE_TOKEN_HEADER, "").encode("utf-8")
+        if not hmac.compare_digest(supplied, self.server.write_token.encode("utf-8")):
+            return self._reject(403, "credential_required", "missing or invalid write token")
         # CSRF layer 2: require application/json (a cross-origin page can't send it
         # without a CORS preflight this server never answers).
         if self._refuse_non_json():
@@ -622,6 +635,7 @@ def make_init_server(
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {bound.lower()}
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
     httpd.install_lock = threading.Lock()
+    httpd.write_token = secrets.token_urlsafe(32)
     return httpd
 
 
@@ -682,7 +696,14 @@ def run_init_web(
     bound_host, bound_port = str(httpd.server_address[0]), httpd.server_address[1]
     host_for_url = f"[{bound_host}]" if ":" in bound_host else bound_host
     url = f"http://{host_for_url}:{bound_port}/"
+    # The token rides the URL FRAGMENT, which a browser never sends to a server; init.js takes it and
+    # strips it from the address bar. Opened through the osascript controller only (no argv); elsewhere
+    # the plain URL opens and the page asks for the token printed here.
+    unlocked = f"{url}#write_token={urllib.parse.quote(httpd.write_token, safe='')}"
     print(f"Levain init → {url}")
+    print(f"  write token (send as {_WRITE_TOKEN_HEADER}; valid until this server stops): "
+          f"{httpd.write_token}")
+    print(f"  open the form, unlocked: {unlocked}")
     print(f"  install target: {install}{'  (--force)' if force else ''}")
     if httpd.pack_names:
         print(f"  composing packs: {', '.join(httpd.pack_names)}")
@@ -691,7 +712,7 @@ def run_init_web(
     if open_browser:
         from levain.launch import open_browser as _open   # an allowlisted env; no browser is fine
 
-        _open(url)
+        _open(url, unlocked)
 
     try:
         httpd.serve_forever()

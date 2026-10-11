@@ -48,9 +48,12 @@ def _serving(install: Path, *, adapter=None, force=False, packs=(), result=_OK):
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
         host, port = httpd.server_address[0], httpd.server_address[1]
+        base = f"http://{host}:{port}"
+        _TOKENS[base] = httpd.write_token
         try:
-            yield f"http://{host}:{port}", port
+            yield base, port
         finally:
+            _TOKENS.pop(base, None)
             httpd.shutdown()
             httpd.server_close()
             thread.join(timeout=5)
@@ -65,8 +68,15 @@ def _req(url: str, *, method: str = "GET", headers: dict | None = None, data: by
         return e.code, dict(e.headers), e.read()
 
 
+# base URL -> that server's write token; _post sends it unless the test passes its own header
+_TOKENS: dict[str, str] = {}
+
+
 def _post(url: str, payload, *, headers: dict | None = None, content_type="application/json"):
     h = dict(headers or {})
+    tok = next((v for b, v in _TOKENS.items() if url.startswith(b)), None)
+    if tok is not None and "X-Levain-Write-Token" not in h:
+        h["X-Levain-Write-Token"] = tok
     if content_type is not None:
         h["Content-Type"] = content_type
     body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
@@ -215,6 +225,21 @@ class TestReads:
 # --------------------------------------------------------------------------
 
 class TestSecurity:
+    def test_a_post_without_the_runs_write_token_is_refused_and_writes_nothing(self, tmp_path: Path) -> None:
+        """Reproduced 1011+40 on argushub (levain 0.7.2): uid `nobody` POSTed /init with no browser
+        headers, got 200, and its answers became the operator's seed. Loopback is reachable by every
+        local uid, so a POST carries the run's write token (K2a's construct)."""
+        install = tmp_path / "i"
+        with _serving(install) as (base, _port):
+            plan = json.loads(_req(base + "/init-plan.json")[2])
+            payload = {"adapter": "claude-code", "answers": _all_answers(plan)}
+            for bad in ({"X-Levain-Write-Token": ""}, {"X-Levain-Write-Token": "not-the-token"}):
+                status, body = _post(base + "/init", payload, headers=bad)
+                assert (status, body["error"]) == (403, "credential_required")
+                assert not install.exists()
+            status, body = _post(base + "/init", payload)
+            assert status == 200 and body["ok"] is True
+
     def test_bad_host_rejected(self, tmp_path: Path) -> None:
         with _serving(tmp_path / "i") as (base, _port):
             status, _hd, _b = _req(base + "/init-plan.json", headers={"Host": "evil.com"})
@@ -494,7 +519,8 @@ class TestApparatusFixes:
             try:
                 httpd.install_lock.acquire()  # simulate an install in progress
                 try:
-                    status, body = _post(base + "/init", {"adapter": "claude-code", "answers": {}})
+                    status, body = _post(base + "/init", {"adapter": "claude-code", "answers": {}},
+                                         headers={"X-Levain-Write-Token": httpd.write_token})
                 finally:
                     httpd.install_lock.release()
                 assert status == 503
@@ -800,7 +826,8 @@ class TestOversizeWithALyingContentLength:
         try:
             s.sendall(
                 f"POST /init HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
-                f"Content-Type: application/json\r\nContent-Length: {declared}\r\n\r\n".encode()
+                f"Content-Type: application/json\r\nContent-Length: {declared}\r\n"
+                f"X-Levain-Write-Token: {_TOKENS.get(base, '')}\r\n\r\n".encode()
                 + actually_send
             )
             chunks: list[bytes] = []

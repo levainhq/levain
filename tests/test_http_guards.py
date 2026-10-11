@@ -66,6 +66,7 @@ def _server(kind: str, tmp_path: Path):
         httpd = make_docs_server(tmp_path, port=0)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
+    _TOKEN[kind] = getattr(httpd, "write_token", None)
     try:
         yield httpd.server_address[1]
     finally:
@@ -119,6 +120,7 @@ def test_each_security_header_appears_once_on_a_normal_response(tmp_path, kind):
 
 
 WRITE_ROUTES = {"serve": "/edit", "init": "/init"}
+_TOKEN: dict[str, str | None] = {}
 
 
 def _raw_post(port: int, path: str, headers: dict, body: bytes = b""):
@@ -164,7 +166,10 @@ def test_every_write_server_runs_the_shared_write_preamble(tmp_path, kind, heade
         with _server(kind, tmp_path) as port:
             # No body: a refused request's unread bytes can make the kernel reset the socket before
             # the response is read (complement L3).
-            got, resp_headers, _ = _raw_post(port, WRITE_ROUTES[kind], headers)
+            # init's write token is checked right after the origin checks (K2a's order); send it so the
+            # later refusals are reached. The bad-host and cross-site cases refuse before it is read.
+            tok = {"X-Levain-Write-Token": _TOKEN[kind]} if kind == "init" else {}
+            got, resp_headers, _ = _raw_post(port, WRITE_ROUTES[kind], {**tok, **headers})
     finally:
         sys.set_int_max_str_digits(old_limit)
     assert got == status, f"{kind}: {headers} -> {got}"
