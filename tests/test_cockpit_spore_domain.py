@@ -59,3 +59,36 @@ def test_the_legacy_spore_update_refuses_a_domain_rather_than_dropping_it(rig_br
         apply_edit(rig.src.write_scope, {"kind": "spore_update", "spore_id": sid, "text": "t", "domain": "d"})
     assert exc.value.http_status == 422
     assert store.get(sid)["text"] == before["text"] and store.get(sid).get("domain") == before.get("domain")
+
+
+def _keep_row(rig):
+    return next((p, r) for p in ("keep", "loops") for r in (rig.ck.panel(p)["rows"] or []))
+
+
+def test_the_broker_refuses_a_type_change_outside_the_tray(rig_broker) -> None:
+    # L2 HIGH (reproduced): the Tray-only reclassify lock lived only in the legacy write, so a T2 type
+    # change on a Keep note or a loop committed through the broker
+    rig, b, _db = rig_broker
+    pid, row = _keep_row(rig)
+    sid = row["id"].split(":", 1)[1]
+    store = SporeStore(rig.root / ".levain" / "memory.spores.json")
+    before = store.get(sid)["type"]
+    new = "question" if before != "question" else "task"
+    with pytest.raises(EditError):
+        _fire(rig, b, pid, row["id"], "spore_update", {"type": new}, "type-1")
+    assert store.get(sid)["type"] == before
+    # domain carries no such lock: it lands on the same row
+    _fire(rig, b, pid, row["id"], "spore_update", {"domain": "kept"}, "type-2")
+    assert store.get(sid)["domain"] == "kept"
+
+
+@pytest.mark.parametrize("bad", [0, False, [], {}])
+def test_a_non_string_domain_is_refused_not_read_as_a_clear(rig_broker, bad) -> None:
+    rig, b, _db = rig_broker
+    pid, row = next((p, r) for p in ("tray",) for r in (rig.ck.panel(p)["rows"] or []))
+    sid = row["id"].split(":", 1)[1]
+    store = SporeStore(rig.root / ".levain" / "memory.spores.json")
+    _fire(rig, b, pid, row["id"], "spore_update", {"domain": "set"}, f"nd-{bad!r}-0")
+    with pytest.raises(EditError):
+        _fire(rig, b, pid, row["id"], "spore_update", {"domain": bad}, f"nd-{bad!r}")
+    assert store.get(sid)["domain"] == "set"

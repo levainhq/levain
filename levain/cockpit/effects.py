@@ -545,7 +545,8 @@ def _norm_update_field(f: str, value: Any) -> Any:
             raise ValueError("text cannot be cleared to empty")
         return text
     if f == "domain":
-        return _norm(value) if value else ""
+        # None and "" clear it; anything else must be a string (a 0 or [] is refused, never a clear)
+        return "" if value is None or value == "" else _norm(value)
     if f == "disposition":
         if value is None:
             return None
@@ -623,6 +624,13 @@ def _ce_update(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, orig
     stray = sorted(set(params) - set(allowed))
     if stray or not params:
         raise ValueError(f"spore_update changes one or more of {list(allowed)} (got {sorted(params)})")
+    if "type" in params:
+        from levain.spores import is_tray
+
+        # the reclassify gate writes._apply_spore_update holds on the legacy path: type is plastic
+        # only while an item is forming in the Tray
+        if not is_tray(pre):
+            raise ValueError("type is only reclassifiable while an item is forming in the Tray")
     return _existing_effect(pre, {f: _norm_update_field(f, params[f]) for f in params}, version_of)
 
 

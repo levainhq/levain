@@ -314,9 +314,9 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              escalates=lambda row, prov, today: _date_escalates(row, prov, today, "surface_at"),
              fire=_spore_fire("spore_surface_at"), legacy_kind="spore_surface_at", applies_to=_SPORE_ROW),
     VerbSpec("spore_update", "edit", "changes the item's text, domain, tier or type", "row",
-             # design §4.2 also allowlists next; levain's handler has no write for it, and a field the
-             # handler drops must be refused, never reported ok. domain is always T2 (_update_tier), so it
-             # lands through the broker's effect and never reaches the legacy write, which refuses it
+             # design §4.2 also allowlists next; here a date moves only through spore_surface_at. domain
+             # is always T2 (_update_tier), so it lands through the broker's effect and never reaches the
+             # legacy write, which refuses it rather than drop it
              fields=("text", "domain", "tier", "type"), floor="C1", tier_fn=_update_tier,
              row_tier=_const("C1"), escalates=_update_escalates,
              fire=_spore_fire("spore_update"), legacy_kind="spore_update", applies_to=_SPORE_ROW),
