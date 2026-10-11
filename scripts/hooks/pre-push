@@ -41,11 +41,10 @@ fi
 # on an older branch, every branch delete, and the release tag itself. git
 # writes one "<local ref> <local sha> <remote ref> <remote sha>" line per ref on
 # stdin; an all-zero local sha is a delete, which publishes nothing.
-zero="0000000000000000000000000000000000000000"
 shas=""
-while read -r _lref lsha _rref _rsha; do
+while read -r _lref lsha _rref _rsha || [ -n "${_lref:-}" ]; do
     [ -z "${lsha:-}" ] && continue
-    [ "$lsha" = "$zero" ] && continue
+    [ -z "${lsha//0/}" ] && continue   # all zeros (sha1 or sha256): a delete
     if ! c="$(git rev-parse --verify -q "${lsha}^{commit}")"; then
         echo "pre-push: pushed object $lsha is not a commit; the release-stamp gate cannot read it." >&2
         echo "          Push deliberately with --no-verify if this is intended." >&2
@@ -62,6 +61,7 @@ if ! LEVAIN_PUSHED_SHAS="$shas" "$PY" -m pytest tests/test_manifest.py -q -p no:
     echo "⛔ pre-push BLOCKED — the release-stamp gate failed:" >&2
     echo >&2
     sed -n '/FAILED\|AssertionError\|Error/p' "$out" | head -8 >&2
+    grep -q 'FAILED\|AssertionError\|Error' "$out" || tail -5 "$out" >&2
     echo >&2
     echo "   A pushed commit is stamped at an already-released version, or its two" >&2
     echo "   stamps disagree. Bump BOTH (pyproject.toml, levain/__init__.py) to the next" >&2

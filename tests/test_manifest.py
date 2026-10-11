@@ -617,7 +617,7 @@ class TestReleaseStampIsNotAPublishedVersion:
             f"put the changes under '## [Unreleased]'. See CHANGELOG 'Versioning'."
         )
 
-    def test_the_committed_head_stamp_is_not_a_released_version(self):
+    def test_the_committed_stamp_of_each_pushed_commit_is_not_released(self):
         """The twin above, with the subject a PUSH actually publishes.
 
         ⛔ THE TEST ABOVE READS THE WORKING TREE AND A PUSH SHIPS COMMITS.
@@ -675,11 +675,15 @@ class TestReleaseStampIsNotAPublishedVersion:
         if self._git(root, "rev-parse", "--git-dir") is None:
             pytest.skip("no git available / not a git checkout")
         all_tags = self._git(root, "tag", "--list", "v*")
+        pushed = os.environ.get("LEVAIN_PUSHED_SHAS")
         if not all_tags:
+            # Driven by the hook, a skip would exit 0 and pass the push unread.
+            assert pushed is None, (
+                "this clone carries no release tags, so the pushed stamps cannot "
+                "be checked: run `git fetch --tags`, or push with --no-verify")
             pytest.skip("clone carries no release tags — nothing to compare against")
         released = {t[1:] for t in all_tags.split("\n") if t.startswith("v")}
 
-        pushed = os.environ.get("LEVAIN_PUSHED_SHAS")
         subjects = pushed.split() if pushed is not None else ["HEAD"]
         assert subjects, "LEVAIN_PUSHED_SHAS is set but names no commit"
 
@@ -725,9 +729,9 @@ class TestReleaseStampIsNotAPublishedVersion:
         root = TestReadmePinClaim()._repo_root()
         if self._git(root, "rev-parse", "--git-dir") is None:
             pytest.skip("not a git checkout")
-        zero = "0" * 40
-        r = self._run_hook(root, f"(delete) {zero} refs/heads/gone {'1' * 40}\n")
-        assert r.returncode == 0, r.stderr
+        for zero in ("0" * 40, "0" * 64):   # sha1 and sha256 deletes
+            r = self._run_hook(root, f"(delete) {zero} refs/heads/gone {'1' * 40}\n")
+            assert r.returncode == 0, r.stderr
 
     def test_pre_push_refuses_a_pushed_object_it_cannot_read_as_a_commit(self):
         root = TestReadmePinClaim()._repo_root()
