@@ -5,8 +5,10 @@ forms through the DevTools protocol and assert on the store, not on the DOM."""
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +20,7 @@ from tests._inbox_fake import inbox_downstream
 from tests.test_cockpit_k2a import _install, _serve
 from tests.test_cockpit_r1_write import INBOX_PANELS
 
-CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME = os.environ.get("CHROME") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 NODE = shutil.which("node")
 DRIVE = Path(__file__).with_name("_page_drive.mjs")
 needs_browser = pytest.mark.skipif(NODE is None or not Path(CHROME).exists(), reason="node and Chrome are needed")
@@ -30,6 +32,16 @@ def _drive(tmp_path: Path, url: str, steps: list[dict[str, Any]]) -> dict[str, A
     res = subprocess.run([NODE, str(DRIVE), CHROME, url, str(f)], capture_output=True, text=True, timeout=120)
     assert res.returncode == 0, res.stderr
     return json.loads(res.stdout)
+
+
+def _eventually(read: Any, want: Any, seconds: float = 20.0) -> Any:
+    """The store read once it equals `want`, or the last read when the time runs out."""
+    deadline = time.monotonic() + seconds
+    got = read()
+    while got != want and time.monotonic() < deadline:
+        time.sleep(0.1)
+        got = read()
+    return got
 
 
 def _verb_posts(out: dict[str, Any]) -> list[dict[str, Any]]:
@@ -48,28 +60,30 @@ def test_the_default_page_edits_the_state_section_through_the_broker(tmp_path: P
     new = "the State as edited on the default page"
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
-            {"wait": 4000},
-            {"eval": f"(() => {{ const p = {STATE_PANEL}; return p ? [p.dataset.editClass, !!p.querySelector('.edit-btn')] : null; }})()"},
+            {"until": f"{STATE_PANEL} && [{STATE_PANEL}.dataset.editClass, !!{STATE_PANEL}.querySelector('.edit-btn')]"},
             {"eval": f"{STATE_PANEL}.querySelector('.edit-btn').click(); 1"},
-            {"wait": 300},
-            {"eval": f"(() => {{ const ta = {STATE_PANEL}.querySelector('.edit-ta'); ta.value = {json.dumps(new)};"
-                     " ta.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()"},
+            {"until": f"(() => {{ const ta = {STATE_PANEL}.querySelector('.edit-ta'); if (!ta) return null; ta.value = {json.dumps(new)};"
+                      " ta.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()"},
             {"eval": f"{STATE_PANEL}.querySelector('.edit-save').click(); 1"},
-            {"wait": 2000},
-            {"eval": f"{STATE_PANEL}.querySelector('.edit-msg').className"},
+            {"until": f"/preview/.test({STATE_PANEL}.querySelector('.edit-msg').className) && {STATE_PANEL}.querySelector('.edit-msg').className"},
             {"eval": f"{STATE_PANEL}.querySelector('.edit-save').click(); 1"},
-            {"wait": 3000},
+            {"posts": 2},
         ])
+        state = _eventually(lambda: _state(db), new)
     assert out["values"][0] == ["A", True], out
     assert "preview" in out["values"][4], out          # the first click shows what fires and fires nothing
+    assert state == new
     posts = _verb_posts(out)
     assert [p.get("dry_run") is True for p in posts] == [True, False], posts
     fired = posts[1]
     assert fired["verb"] == "section_edit" and fired["panel_id"] == "section:state"
     assert fired["params"] == {"new_body": new}
     assert isinstance(fired.get("panel_version"), str) and fired["panel_version"]
+
+
+def _state(db: Path) -> str:
     with Store(str(db), read_only=True) as st:
-        assert st.read_section("State")[0].strip() == new
+        return st.read_section("State")[0].strip()
 
 
 @needs_browser
@@ -79,8 +93,7 @@ def test_a_state_section_the_page_cannot_fire_draws_no_edit_button(tmp_path: Pat
     _root, src, _ids = _install(tmp_path)
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/", [
-            {"wait": 4000},
-            {"eval": f"(() => {{ const p = {STATE_PANEL}; return p ? [p.dataset.editClass, !!p.querySelector('.edit-btn')] : null; }})()"},
+            {"until": f"{STATE_PANEL} && [{STATE_PANEL}.dataset.editClass, !!{STATE_PANEL}.querySelector('.edit-btn')]"},
         ])
     assert out["values"][0] == ["", False], out
 
@@ -102,24 +115,21 @@ def test_the_default_page_submits_a_downstream_send_through_the_broker(tmp_path:
                 extra_effects={"send_inbox": effect}, surface_tokens={"browser": "T"},
                 install_class="reported") as (url, _httpd):
         out = _drive(tmp_path, f"{url}/#write_token=T", [
-            {"wait": 4000},
-            {"eval": "(() => { const m = document.querySelector('[aria-label=body]'); m.value = 'hello from the page';"
-                     " m.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()"},
+            {"until": "(() => { const m = document.querySelector('[aria-label=body]'); if (!m) return null;"
+                      " m.value = 'hello from the page'; m.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()"},
             # send, then the fat-finger confirm: the dry run answers with the preview and fires nothing
             {"eval": f"{box}.querySelector('.tray-dump-btn').click(); 1"},
-            {"wait": 300},
-            {"eval": f"{box}.querySelector('.verb-confirm').click(); 1"},
-            {"wait": 2000},
-            {"eval": f"{box}.querySelector('.edit-msg').className"},
+            {"until": f"{box}.querySelector('.verb-confirm') && ({box}.querySelector('.verb-confirm').click(), 1)"},
+            {"until": f"/preview/.test({box}.querySelector('.edit-msg').className) && {box}.querySelector('.edit-msg').className"},
             # the same content again: the preview's tier is what fires
             {"eval": f"{box}.querySelector('.tray-dump-btn').click(); 1"},
-            {"wait": 300},
-            {"eval": f"{box}.querySelector('.verb-confirm').click(); 1"},
-            {"wait": 3000},
+            {"until": f"{box}.querySelector('.verb-confirm') && ({box}.querySelector('.verb-confirm').click(), 1)"},
+            {"posts": 2},
         ])
+        bodies = _eventually(lambda: [n.get("body") for n in inbox.notes.values()], ["hello from the page"])
     assert "preview" in out["values"][3], out
     posts = _verb_posts(out)
     assert [p.get("dry_run") is True for p in posts] == [True, False], (posts, out["values"])
     assert posts[1]["verb"] == "send_inbox" and posts[1]["params"].get("body") == "hello from the page"
-    assert [n.get("body") for n in inbox.notes.values()] == ["hello from the page"], inbox.notes
+    assert bodies == ["hello from the page"], inbox.notes
     assert ran == []

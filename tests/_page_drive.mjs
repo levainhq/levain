@@ -1,7 +1,9 @@
 // Drives a served cockpit page in headless Chrome over the DevTools protocol, for tests that must
-// submit a form rather than read the DOM. argv: <chrome> <url> <steps.json>. A step is
-// {"eval": "<expression>"} (its value is collected) or {"wait": <ms>}. A dialog is declined. Prints
-// {"values": [...], "posts": ["<path> <body>", ...]} as JSON on stdout.
+// submit a form rather than read the DOM. argv: <chrome> <url> <steps.json>. A step is one of
+//   {"eval": "<expression>"}                 its value is collected
+//   {"until": "<expression>", "ms": <n>}     polled until truthy; collected, or {"timeout": ...}
+//   {"posts": <n>, "ms": <n>}                waits until n POSTs have been sent
+// A dialog is declined. Prints {"values": [...], "posts": ["<path> <body>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,11 +37,26 @@ const send = (method, params = {}) => new Promise((r) => { const i = ++id; pend.
 await send("Page.enable"); await send("Network.enable");
 await send("Page.navigate", { url });
 const values = [];
+const evaluate = async (expression) => {
+  const r = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true });
+  return r.result?.exceptionDetails ? { error: r.result.exceptionDetails.text + " " + (r.result.exceptionDetails.exception?.description || "") }
+    : r.result?.result?.value ?? null;
+};
 for (const s of steps) {
-  if (s.wait) { await sleep(s.wait); continue; }
-  const r = await send("Runtime.evaluate", { expression: s.eval, awaitPromise: true, returnByValue: true });
-  values.push(r.result?.exceptionDetails ? { error: r.result.exceptionDetails.text + " " + (r.result.exceptionDetails.exception?.description || "") }
-    : r.result?.result?.value ?? null);
+  const deadline = Date.now() + (s.ms || 20000);
+  if (s.posts !== undefined) {
+    while (posts.length < s.posts && Date.now() < deadline) await sleep(100);
+  } else if (s.until !== undefined) {
+    let v = null;
+    for (;;) {
+      v = await evaluate(`(() => { try { return (${s.until}); } catch (e) { return null; } })()`);
+      if (v || Date.now() >= deadline) break;
+      await sleep(100);
+    }
+    values.push(v || { timeout: s.until });
+  } else {
+    values.push(await evaluate(s.eval));
+  }
 }
 process.stdout.write(JSON.stringify({ values, posts }));
 ws.close(); done(0);
