@@ -340,8 +340,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Enroll, revoke and list the cockpit's signing keys (a reported install).",
         description=(
             "The keys that sign the cockpit's T2/T3 writes. `enroll` adds an OpenSSH public key "
-            "(class laptop-presence signs T2 and T3, display-phone T2); `revoke` retires one, and "
-            "refuses the last laptop-presence key; `keys` lists them. Run at the laptop: in a "
+            "(class laptop-presence signs T2 and T3, display-phone T2); `revoke` retires one (the "
+            "last laptop-presence key only with --compromised-since); `keys` lists them. Run at the laptop: in a "
             "reported install this CLI is how a key gets enrolled. A governed install's keys are "
             "written by the root installer, so these refuse it."
         ),
@@ -366,7 +366,8 @@ def main(argv: list[str] | None = None) -> int:
     ck_revoke.add_argument("ref", help="The key's fingerprint (SHA256:...) or principal.")
     ck_revoke.add_argument("--compromised-since", dest="compromised_since", default=None,
                            help="ISO time the key may have been in other hands since; its signatures "
-                                "from then on stop reading verified.")
+                                "from then on stop reading verified, and the last laptop-presence key "
+                                "can be revoked with it.")
     _ck_common(ck_revoke)
     ck_revoke.set_defaults(func=_cmd_cockpit_revoke)
     ck_keys = ck_sub.add_parser("keys", help="List enrolled keys.")
@@ -1536,15 +1537,33 @@ def _cockpit_root(args: argparse.Namespace) -> Path:
     return scope.ledger_root / "cockpit"
 
 
+_KEY_FILE_MAX = 16 * 1024
+
+
+def _cockpit_refusals() -> tuple[type[BaseException], ...]:
+    """What a key command answers as a refusal, never a traceback: its own refusals, an unreadable
+    file, and the journal's (busy while the broker writes, not a cockpit journal, corrupt)."""
+    import sqlite3
+
+    from levain.cockpit.firejournal import CockpitFormatError
+    from levain.cockpit.keys import KeyError_
+
+    return (KeyError_, OSError, UnicodeDecodeError, sqlite3.Error, CockpitFormatError)
+
+
 def _cmd_cockpit_enroll(args: argparse.Namespace) -> int:
     from datetime import datetime, timezone
 
     from levain.cockpit.keys import KeyError_, enroll
 
     try:
-        text = args.key.expanduser().read_text(encoding="utf-8")
-        row, created = enroll(_cockpit_root(args), text, args.key_class, now=datetime.now(timezone.utc))
-    except (KeyError_, OSError, UnicodeDecodeError) as exc:
+        with args.key.expanduser().open("rb") as fh:
+            raw = fh.read(_KEY_FILE_MAX + 1)
+        if len(raw) > _KEY_FILE_MAX:
+            raise KeyError_(f"{args.key} is larger than a public key file ({_KEY_FILE_MAX} bytes)")
+        row, created = enroll(_cockpit_root(args), raw.decode("utf-8"), args.key_class,
+                              now=datetime.now(timezone.utc))
+    except _cockpit_refusals() as exc:
         print(f"enroll refused: {exc}", file=sys.stderr)
         return 1
     print(f"{'enrolled' if created else 'already enrolled'}: {row.fingerprint} as {row.key_class} "
@@ -1564,7 +1583,7 @@ def _cmd_cockpit_revoke(args: argparse.Namespace) -> int:
             if since.tzinfo is None:
                 raise KeyError_("--compromised-since needs a zone (e.g. 2026-10-11T09:00:00-04:00)")
         row = revoke(_cockpit_root(args), args.ref, now=datetime.now(timezone.utc), compromised_since=since)
-    except (KeyError_, ValueError) as exc:
+    except (*_cockpit_refusals(), ValueError) as exc:
         print(f"revoke refused: {exc}", file=sys.stderr)
         return 1
     print(f"revoked: {row.fingerprint} at {row.revoked_at}"
@@ -1577,7 +1596,7 @@ def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
 
     try:
         rows = keys(_cockpit_root(args))
-    except KeyError_ as exc:
+    except _cockpit_refusals() as exc:
         print(f"keys: {exc}", file=sys.stderr)
         return 1
     if not rows:

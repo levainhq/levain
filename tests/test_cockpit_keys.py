@@ -77,6 +77,8 @@ def test_enroll_revoke_rules(tmp_path: Path) -> None:
     revoke(root, phone.principal, **kw)          # by principal; a phone key is never the last laptop key
     with pytest.raises(KeyError_, match="last unrevoked laptop-presence"):
         revoke(root, a.fingerprint, **kw)
+    with pytest.raises(KeyError_, match="keeps its class"):
+        enroll(root, (tmp_path / "a.pub").read_text(), "display-phone", **kw)
     with pytest.raises(KeyError_, match="in the future"):
         revoke(root, a.fingerprint, compromised_since=datetime(2027, 1, 1, tzinfo=timezone.utc), **kw)
     with pytest.raises(KeyError_, match="stays revoked"):
@@ -102,12 +104,21 @@ def test_revoke_lands_when_another_laptop_key_exists_and_records_the_compromise(
     a, _ = enroll(root, _key(tmp_path, "a"), "laptop-presence", **kw)
     again, created = enroll(root, (tmp_path / "a.pub").read_text(), "laptop-presence", **kw)
     assert not created and again == a
-    enroll(root, _key(tmp_path, "c"), "laptop-presence", **kw)
+    c, _ = enroll(root, _key(tmp_path, "c"), "laptop-presence", **kw)
     since = datetime(2026, 10, 11, 9, 0, tzinfo=timezone.utc)
     r = revoke(root, a.fingerprint, compromised_since=since, **kw)
     assert r.revoked_at == "2026-10-11T12:00:00.000000Z" and r.compromised_since == "2026-10-11T09:00:00.000000Z"
-    assert [k.fingerprint for k in keys(root, **{"marker_directory": tmp_path / "m"}) if k.revoked_at is None] \
-        != [a.fingerprint]
+    assert [k.fingerprint for k in keys(root, marker_directory=tmp_path / "m") if k.revoked_at is None] \
+        == [c.fingerprint]
+    # the last laptop key: a plain revoke refuses, a compromised one lands (enroll needs only this CLI)
+    with pytest.raises(KeyError_, match="pass --compromised-since"):
+        revoke(root, c.fingerprint, **kw)
+    assert revoke(root, c.fingerprint, compromised_since=since, **kw).revoked_at is not None
+    with pytest.raises(KeyError_, match="needs a zone"):
+        revoke(root, "x", compromised_since=datetime(2026, 10, 11, 9, 0), **kw)
+    with pytest.raises(KeyError_, match="needs a zone"):
+        enroll(root, (tmp_path / "a.pub").read_text(), "laptop-presence", now=datetime(2026, 10, 11),
+               marker_directory=tmp_path / "m")
 
 
 def test_the_cli_enrolls_revokes_and_refuses_with_exit_codes(tmp_path: Path, capsys, monkeypatch) -> None:
@@ -128,3 +139,30 @@ def test_the_cli_enrolls_revokes_and_refuses_with_exit_codes(tmp_path: Path, cap
     assert run("revoke", fp, "--compromised-since", "2026-10-11T09:00:00Z") == 0
     assert run("keys") == 0
     assert "revoked" in capsys.readouterr().out
+
+
+def test_a_busy_journal_is_a_refusal_not_a_traceback(tmp_path: Path, capsys) -> None:
+    import sqlite3
+
+    from levain import cli
+
+    root = _journal(tmp_path)
+    _key(tmp_path, "a")
+    hold = sqlite3.connect(root / "cockpit.db", timeout=0)
+    hold.execute("BEGIN EXCLUSIVE")
+    try:
+        rc = cli.main(["cockpit", "enroll", str(tmp_path / "a.pub"), "--data-root", str(root)])
+    finally:
+        hold.rollback()
+        hold.close()
+    assert rc == 1 and "enroll refused" in capsys.readouterr().err
+
+
+def test_an_oversized_key_file_is_refused(tmp_path: Path, capsys) -> None:
+    from levain import cli
+
+    root = _journal(tmp_path)
+    big = tmp_path / "big.pub"
+    big.write_bytes(b"ssh-ed25519 " + b"A" * 20000)
+    assert cli.main(["cockpit", "enroll", str(big), "--data-root", str(root)]) == 1
+    assert "larger than a public key file" in capsys.readouterr().err

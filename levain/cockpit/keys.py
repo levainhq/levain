@@ -91,7 +91,7 @@ def fingerprint_of(public_key: str, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYG
     broker looks up)."""
     fd, path = tempfile.mkstemp(prefix=".enroll-", suffix=".pub")
     try:
-        with os.fdopen(fd, "w", encoding="ascii") as fh:
+        with open(fd, "w", encoding="ascii", closefd=True) as fh:
             fh.write(public_key + "\n")
         out = subprocess.run([str(ssh_keygen), "-l", "-E", "sha256", "-f", path],
                              capture_output=True, text=True, timeout=10, check=False)
@@ -117,10 +117,21 @@ def _journal(data_root: Path | str, *, marker_directory: Path | None = None) -> 
                         "`levain serve --write --install-class reported`")
     db = CockpitDB(root)
     with db.read() as conn:
-        cls = _meta(conn, "install_class")
+        _check_reported(conn)
+    return db
+
+
+def _check_reported(conn: object) -> None:
+    """Refuse a journal not started as ``reported``. Called again inside every key write's own
+    transaction, so a class change between the first read and the write is seen."""
+    cls = _meta(conn, "install_class")  # type: ignore[arg-type]
     if cls != REPORTED:
         raise KeyError_(f"this journal's install class is {cls!r}; enrolling here is for a reported install")
-    return db
+
+
+def _aware(when: datetime | None, name: str) -> None:
+    if when is not None and (when.tzinfo is None or when.utcoffset() is None):
+        raise KeyError_(f"{name} needs a zone")
 
 
 def _row(r: object) -> KeyRow:
@@ -132,18 +143,21 @@ def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, now: 
            ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN, marker_directory: Path | None = None) -> tuple[KeyRow, bool]:
     """Enroll one key. Returns ``(row, created)``: ``created`` is False when this exact key is already
     enrolled, unrevoked, with this class (nothing changes)."""
+    _aware(now, "now")
     if key_class not in _CLASS_RANK:
         raise KeyError_(f"unknown key class {key_class!r}; one of {', '.join(KEY_CLASSES)}")
     public_key = normalise_public_key(public_key_text)
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
     db = _journal(data_root, marker_directory=marker_directory)
     with db.write() as conn:
+        _check_reported(conn)
         old = conn.execute("SELECT * FROM keys WHERE fingerprint = ?", (fp,)).fetchone()
         if old is not None:
             if old["revoked_at"] is not None:
                 raise KeyError_(f"{fp} was revoked at {old['revoked_at']}; a revoked key stays revoked")
             if old["class"] != key_class:
-                raise KeyError_(f"{fp} is enrolled as {old['class']!r}; revoke it to change its class")
+                raise KeyError_(f"{fp} is enrolled as {old['class']!r}; a key keeps its class (enroll a new "
+                               "key for another class)")
             return _row(old), False
         conn.execute("INSERT INTO keys (fingerprint, principal, public_key, class, enrolled_at, enrolled_via) "
                      "VALUES (?, ?, ?, ?, ?, ?)",
@@ -154,24 +168,28 @@ def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, now: 
 
 def revoke(data_root: Path | str, ref: str, *, now: datetime, compromised_since: datetime | None = None,
            marker_directory: Path | None = None) -> KeyRow:
-    """Revoke the key ``ref`` names (its fingerprint or principal). Refused when it is the last
-    unrevoked ``laptop-presence`` key (§13): a reported install would be left with no key that can
-    sign a T3."""
+    """Revoke the key ``ref`` names (its fingerprint or principal). A plain revoke of the last
+    unrevoked ``laptop-presence`` key is refused (§13: it would leave no key that can sign a T3). With
+    ``compromised_since`` it lands: a stolen key must stop signing now, and enrolling a new key needs
+    only this CLI, so nobody is locked out."""
+    _aware(now, "now")
+    _aware(compromised_since, "compromised_since")
     if compromised_since is not None and compromised_since > now:
         raise KeyError_("--compromised-since is in the future")
     db = _journal(data_root, marker_directory=marker_directory)
     with db.write() as conn:
+        _check_reported(conn)
         row = conn.execute("SELECT * FROM keys WHERE fingerprint = ? OR principal = ?", (ref, ref)).fetchone()
         if row is None:
             raise KeyError_(f"no enrolled key {ref!r}")
         if row["revoked_at"] is not None:
             raise KeyError_(f"{row['fingerprint']} is already revoked (at {row['revoked_at']})")
-        if row["class"] == _LAPTOP:
+        if row["class"] == _LAPTOP and compromised_since is None:
             others = conn.execute("SELECT COUNT(*) FROM keys WHERE class = ? AND revoked_at IS NULL "
                                   "AND fingerprint != ?", (_LAPTOP, row["fingerprint"])).fetchone()[0]
             if others == 0:
                 raise KeyError_(f"{row['fingerprint']} is the last unrevoked laptop-presence key; enroll "
-                                "another first (until then it still signs, compromised or not)")
+                                "another first, or pass --compromised-since if it is lost or stolen")
         conn.execute("UPDATE keys SET revoked_at = ?, compromised_since = ? WHERE fingerprint = ?",
                      (utc_stamp(now), utc_stamp(compromised_since) if compromised_since else None,
                       row["fingerprint"]))
