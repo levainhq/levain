@@ -69,7 +69,7 @@ BROKER_HEADS: dict[str, dict[str, Any]] = {
 _ENVELOPE = frozenset({"verb", "panel_id", "row_id", "row_version", "panel_version", "params",
                        "intent", "dry_run", "confirm", "idempotency_key", "tier_seen", "gesture_seen"})
 _INTENTS = ("reported", "sign")
-GESTURES = ("direct", "direct-reported", "sign", "refused", "laptop-only")   # gesture_for's answers
+GESTURES = ("direct", "direct-reported", "sign", "refused", "laptop-only")
 
 
 def tier_max(*tiers: Tier) -> Tier:

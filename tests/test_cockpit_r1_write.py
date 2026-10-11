@@ -281,3 +281,14 @@ def test_a_killed_send_inbox_applies_exactly_once_after_recovery(home: Path, poi
     assert [(n["body"], n["origin_key"]) for n in store.notes.values()] == \
         [("killed mid-send", "ck." + pid.removeprefix("cp") + ".0")]
     assert _ops(data) == [(pid, "COMMITTED")]
+
+
+def test_gestures_is_exactly_what_gesture_for_answers() -> None:
+    # the envelope check refuses a gesture_seen outside GESTURES, so the set must be gesture_for's range
+    from itertools import product
+
+    from levain.cockpit.verbs import GESTURES, TIERS, gesture_for
+
+    got = {gesture_for(t, c, i) for t, c, i in product(TIERS, ("token", "device", "none"),
+                                                        ("reported", "governed", "none"))}
+    assert got == set(GESTURES)
