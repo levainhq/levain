@@ -1267,9 +1267,18 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
     no-op, so a caller can hold it across ``apply_init`` (which takes it too) and the
     work after it: ``run_init`` and the web init handler both do, around the docs
     refresh. A second ``flock`` on a fresh fd would refuse even its own process,
-    because a BSD ``flock`` belongs to the open file, not the process. Without
-    ``fcntl`` (Windows) there is no lock and this yields unguarded."""
+    because a BSD ``flock`` belongs to the open file, not the process. Where no lock can be
+    taken (no ``flock`` on the platform, or the filesystem answers "not supported") this raises
+    :class:`InstallUnlockable` unless ``LEVAIN_UNLOCKED=1`` is set: one lock protocol for both
+    of levain's single-writer locks (Phill 10-11, frame A). Run unguarded, two such inits were
+    reproduced interleaving their activation swaps (1011+40, argushub, flock answering ENOTSUP)."""
     path = install.joinpath(*INSTALL_LOCK_REL)
+
+    def unlockable(why: str) -> InstallLockError:
+        return InstallUnlockable(
+            f"{path} cannot be locked ({why}), so two levain processes writing {install} at once "
+            f"could interleave. Nothing was written. If no other `init` or `update` writes this "
+            f"install at the same time, re-run with {UNLOCKED_ENV}=1.")
 
     def precheck() -> None:
         if not create and not path.parent.is_dir():
@@ -1283,8 +1292,14 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
         busy=lambda: InstallBusy(
             f"another levain process (an `init` or `update`) is writing {install} "
             f"right now. This run installed nothing; re-run once that one has finished."),
+        unlockable=None if _unlocked(UNLOCKED_ENV) else unlockable,
     ):
         yield
+
+
+class InstallUnlockable(InstallLockError):
+    """The install cannot be locked here (no ``flock`` on the platform, or the filesystem
+    answers "not supported") and :data:`UNLOCKED_ENV` is not ``1``; nothing was written."""
 
 
 class CodexHomeBusy(InstallLockError):
@@ -1294,14 +1309,20 @@ class CodexHomeBusy(InstallLockError):
 
 class CodexHomeUnlockable(InstallLockError):
     """CODEX_HOME cannot be locked here (no ``flock`` on the platform, or the filesystem
-    answers "not supported") and :data:`CODEX_HOME_UNLOCKED_ENV` is not ``1``; nothing was
-    written."""
+    answers "not supported") and neither :data:`UNLOCKED_ENV` nor :data:`CODEX_HOME_UNLOCKED_ENV`
+    is ``1``; nothing was written."""
 
 
 CODEX_HOME_LOCK_NAME = "levain.lock"
-# The named override for a CODEX_HOME that cannot be locked (Phill 2026-10-10, option B:
-# fail closed there, with a named override). Exactly "1" opts in; any other value refuses.
+# The named override where a lock cannot be taken (Phill 2026-10-10, option B, then 10-11 frame A:
+# one protocol for both locks). Exactly "1" opts in; any other value refuses. The 0.7.1 name
+# CODEX_HOME_UNLOCKED_ENV stays as an alias for the CODEX_HOME lock only.
+UNLOCKED_ENV = "LEVAIN_UNLOCKED"
 CODEX_HOME_UNLOCKED_ENV = "LEVAIN_CODEX_HOME_UNLOCKED"
+
+
+def _unlocked(*names: str) -> bool:
+    return any(os.environ.get(n) == "1" for n in names)
 
 
 @contextmanager
@@ -1316,8 +1337,8 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
     on 0.7.0). Taken after the install lock, never before, so two levain processes
     cannot wait on each other. Same semantics as :func:`install_lock`, except where no lock
     can be taken: there it raises :class:`CodexHomeUnlockable` (fail closed) unless
-    ``LEVAIN_CODEX_HOME_UNLOCKED=1`` is set, the operator's statement that no other install
-    writes this codex home at the same time."""
+    ``LEVAIN_UNLOCKED=1`` (or its 0.7.1 alias ``LEVAIN_CODEX_HOME_UNLOCKED=1``) is set, the
+    operator's statement that no other install writes this codex home at the same time."""
     lock = codex_home / CODEX_HOME_LOCK_NAME
 
     def unlockable(why: str) -> InstallLockError:
@@ -1325,7 +1346,7 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
             f"{lock} cannot be locked ({why}), so two codex installs writing {codex_home} at "
             f"once could mix config.toml and hooks.json. Nothing was written there. If no other "
             f"levain install writes this codex home at the same time, re-run with "
-            f"{CODEX_HOME_UNLOCKED_ENV}=1.")
+            f"{UNLOCKED_ENV}=1.")
 
     with _single_writer_lock(
         lock, what="the CODEX_HOME lock",
@@ -1334,7 +1355,7 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
             f"another levain process (an `init` or `update` of a codex install) is "
             f"writing {codex_home} right now. This run wrote nothing there; re-run once "
             f"that one has finished."),
-        unlockable=None if os.environ.get(CODEX_HOME_UNLOCKED_ENV) == "1" else unlockable,
+        unlockable=None if _unlocked(UNLOCKED_ENV, CODEX_HOME_UNLOCKED_ENV) else unlockable,
     ):
         yield
 
@@ -1343,11 +1364,18 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
 def _single_writer_lock(
     path: Path, *, what: str, guards: str, busy: Callable[[], InstallLockError],
     precheck: Callable[[], None] | None = None,
-    unlockable: Callable[[str], InstallLockError] | None = None,
+    unlockable: Callable[[str], InstallLockError] | None,
 ) -> Iterator[None]:
     """An exclusive non-blocking ``flock`` on ``path``, reentrant per (path, thread); the
-    body of :func:`install_lock` and :func:`codex_home_lock`. Where no lock can be taken,
-    ``unlockable`` (when given) builds the refusal to raise instead of running unguarded."""
+    body of :func:`install_lock` and :func:`codex_home_lock`, the one lock protocol both use.
+    Where no lock can be taken, ``unlockable`` builds the refusal; it is ``None`` only when the
+    operator set the override, and then this runs unguarded and says so.
+
+    flock, because the kernel owns it: a holder killed by SIGTERM or SIGKILL releases it, so no
+    lock goes stale, and every levain release takes the same lock, so they exclude each other
+    (Linux NFS clients emulate it as a POSIX lock the server arbitrates). The O_EXCL marker
+    fallback was deleted (0.7.1 L3 r2/r3: it did not exclude a flock holder, and went stale
+    after SIGTERM); a filesystem with no lock at all is refused, never guessed at."""
     try:
         import fcntl
     except ImportError:
@@ -1412,10 +1440,9 @@ def _single_writer_lock(
             if e.errno in unsupported:
                 if unlockable is not None:
                     raise unlockable(f"the filesystem answers {e.strerror or e}") from None
-                # A filesystem without lock support (NFS without lockd, some SMB/FUSE
-                # homes) is not "another process": proceed unguarded, and say so.
+                # the operator's override: proceed unguarded, and say so
                 print(f"  note: this filesystem cannot lock {path} ({e.strerror or e}); "
-                      f"continuing without the guard against {guards}.",
+                      f"continuing without the guard against {guards}, as {UNLOCKED_ENV}=1 asks.",
                       file=sys.stderr)
                 os.close(fd)
                 fd = -1
