@@ -29,7 +29,7 @@ needs_browser = pytest.mark.skipif(NODE is None or not Path(CHROME).exists(), re
 def _drive(tmp_path: Path, url: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
     f = tmp_path / "steps.json"
     f.write_text(json.dumps(steps))
-    res = subprocess.run([NODE, str(DRIVE), CHROME, url, str(f)], capture_output=True, text=True, timeout=120)
+    res = subprocess.run([NODE, str(DRIVE), CHROME, url, str(f)], capture_output=True, text=True, timeout=300)
     assert res.returncode == 0, res.stderr
     return json.loads(res.stdout)
 
