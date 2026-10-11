@@ -297,8 +297,8 @@ class TestBinding:
         _refused("stale", rig.post, "operator_state", "state", None, {"text": "y"}, panel_version=state_v)
         # discovered panels, named before any read discovered them: the write path discovers them itself
         _refused("stale", rig.post, "config", "config:posture", None, {"new_body": "x"}, panel_version="0" * 16)
-        # section_edit is not offered until anneal's section writer ships (Phill ruled (i), 2026-10-10)
-        _refused("not_offered", rig.post, "section_edit", "section:state", None, {"new_body": "x"},
+        # section_edit is offered on the Class-A section once anneal's section writer ships (0.9.43)
+        _refused("stale", rig.post, "section_edit", "section:state", None, {"new_body": "x"},
                  panel_version="0" * 16)
 
     def test_touch_session_open_and_midnight_leave_the_version_alone(self, rig: Rig) -> None:

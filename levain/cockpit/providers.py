@@ -606,6 +606,42 @@ def _slug(heading: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", heading.lower()).strip("-") or "section"
 
 
+def section_panel_id(heading: str) -> str:
+    """The panel id a neocortex section renders under (before ``discover``'s collision suffix)."""
+    return f"section:{_slug(heading)}"
+
+
+def _anneal_section(source: SubstrateSource, heading: str) -> Callable[[ReadContext], Result]:
+    """A writable (Class-A) section, read by anneal's ``Store.read_section``: the text and the version
+    ``replace_section`` checks come from one read, so the panel's ``value_version`` is
+    ``value_version_of(anneal's version)`` and the broker binds the write to that same version
+    (SECTION_ADAPTER_DESIGN.md)."""
+    def read(ctx: ReadContext) -> Result:
+        db = source.anneal.episodic_db
+        if not Path(db).is_file():
+            return Fault("the episodic store is absent")
+        from anneal_memory import AnnealMemoryError, Store
+
+        try:
+            with Store(str(db), read_only=True) as st:
+                got = st.read_section(heading)
+        except (AnnealMemoryError, OSError, ValueError) as exc:
+            return Fault(f"{type(exc).__name__}: {exc}")
+        if got is None:
+            return Absent(f"section {heading!r} is no longer in the substrate")
+        text, version = got
+        return Read(value={"markdown": text, "headline": heading}, version_of=version)
+    return read
+
+
+def _section_writer_shipped() -> bool:
+    """anneal's section writer (``Store.replace_section``, 0.9.43): Phill ruled (i) on 2026-10-10, so
+    no section_edit is offered on an anneal without it."""
+    from anneal_memory import Store
+
+    return hasattr(Store, "replace_section")
+
+
 def _scan_read_one(read: Callable[[ReadContext], Result]) -> Callable[[ReadContext, str], Result]:
     """``read_one`` for a provider whose source is read whole: a FRESH read (never the memoised
     view of a render) and the row found by id."""
@@ -707,16 +743,20 @@ def build_default_cockpit(
                 raise RuntimeError(f"{key}: {v.errors[key]}")
         specs: list[ProviderSpec] = []
         used: set[str] = set()
+        writable = _section_writer_shipped()
         for i, s_ in enumerate(v.sections):
-            pid = f"section:{_slug(s_.heading)}"
+            pid = section_panel_id(s_.heading)
             while pid in used:
                 pid += "-2"
             used.add(pid)
+            # a Class-A section is read by anneal (the write's version space) and offers section_edit;
+            # the rest render from the dashboard's parse and are never writable
+            edit = writable and s_.edit_class == CLASS_A
             specs.append(ProviderSpec(pid, "prose", s_.heading, "feed",
-                                      _prose(source, "section", s_.heading), region="mind", rank=20 + i,
-                                      # no section_edit offered until anneal's section writer
-                                      # (Store.replace_section) ships: Phill ruled (i), 2026-10-10
-                                      edit_class=s_.edit_class))
+                                      _anneal_section(source, s_.heading) if edit
+                                      else _prose(source, "section", s_.heading),
+                                      region="mind", rank=20 + i, edit_class=s_.edit_class,
+                                      verbs=("section_edit",) if edit else ()))
         for i, d in enumerate(v.config_docs):
             pid = f"config:{d.key}"
             if pid not in used:

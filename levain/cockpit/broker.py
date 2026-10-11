@@ -47,7 +47,16 @@ from levain.autonomic.confirm import (
     verify_cockpit_signature,
 )
 from levain.autonomic.journal import JournalCorruptError
-from levain.cockpit.anneal_effects import EPISODE_CANONICAL, EPISODES, TOMBSTONE_VERB, tombstone_effects
+from levain.cockpit.anneal_effects import (
+    EPISODE_CANONICAL,
+    EPISODES,
+    SECTION_CANONICAL,
+    SECTION_VERB,
+    SECTIONS,
+    TOMBSTONE_VERB,
+    section_effects,
+    tombstone_effects,
+)
 from levain.cockpit.consent import ConsentError, build_record, encode, parse_stamp, utc_stamp, value_sha256
 from levain.cockpit.effects import (
     SPORE_AUTHORITY_FIELDS,
@@ -204,7 +213,8 @@ class _Unbuildable(Exception):
 
 
 # each store name the broker registers, and the verbs its canonical_effect builds (K2b §13)
-_STORE_CANONICAL: dict[str, Mapping[str, Any]] = {SPORES: SPORE_CANONICAL, EPISODES: EPISODE_CANONICAL}
+_STORE_CANONICAL: dict[str, Mapping[str, Any]] = {SPORES: SPORE_CANONICAL, EPISODES: EPISODE_CANONICAL,
+                                                   SECTIONS: SECTION_CANONICAL}
 
 
 # --- the broker -------------------------------------------------------------------------------------
@@ -545,6 +555,8 @@ class Broker:
                 return self._build_spore(verb, params, target, pid, at_issue=at_issue)
             if verb == TOMBSTONE_VERB:
                 return self._build_tombstone(params, target, pid, at_issue=at_issue)
+            if verb == SECTION_VERB:
+                return self._build_section(params, target, at_issue=at_issue)
             if verb == "pending_cancel":
                 return self._build_cancel(db, target)
             if verb == "token_rotate":
@@ -626,6 +638,53 @@ class Broker:
         pre = {"id": got.row["id"], "type": got.row["type"]}
         return _Built({"kind": "row", "panel_id": target.get("panel_id"), "row_id": target.get("row_id"),
                        "origin_key": ok}, effects, [None, pre])
+
+    def _build_section(self, params: Mapping[str, Any], target: Mapping[str, Any], *, at_issue: bool) -> _Built:
+        """A section edit's one effect off one anneal read (``anneal_effects.SectionEffectStore``).
+        At issue the heading comes from the panel through the store's own schema, never the
+        request; the version the operator was shown is compared with that read's rendered version,
+        and the effect binds to anneal's version from the same read (SECTION_ADAPTER_DESIGN.md)."""
+        from levain.dashboard import CLASS_A, _section_edit_class
+        from levain.writes import MAX_BODY_BYTES
+
+        ss: Any = self.stores.get(SECTIONS)     # a SectionEffectStore: heading_for and read
+        if ss is None:
+            raise BrokerError("not_built", 501, "no section store is registered with the broker")
+        if set(params) != {"new_body"} or not isinstance(params["new_body"], str):
+            raise ValueError(f"section_edit takes one string param, new_body (got {sorted(params)})")
+        body = params["new_body"]
+        if len(body.encode("utf-8")) > MAX_BODY_BYTES:
+            raise BrokerError("too_large", 413, f"body exceeds {MAX_BODY_BYTES} bytes")
+        if at_issue:
+            shown = target.get("panel_version")
+            if not isinstance(shown, str) or not shown:
+                raise BrokerError("bad_request", 400, "'panel_version' is required for a section edit")
+            heading = ss.heading_for(str(target.get("panel_id")))
+            if heading is None:
+                raise BrokerError("stale", 409, f"panel {target.get('panel_id')!r} names no section now")
+            if _section_edit_class(heading) != CLASS_A:
+                raise BrokerError("not_editable", 403, f"the {heading!r} section is consolidated cognition "
+                                                       "(Class C); only the operator's sections are editable")
+        else:
+            heading = target.get("heading")
+            if not isinstance(heading, str) or not heading:
+                raise ValueError("the record's target names no heading")
+        got = ss.read(heading)
+        if got is None:
+            if at_issue:
+                raise BrokerError("stale", 409, f"the {heading!r} section is gone")
+            raise ValueError("the section is gone")
+        if at_issue:
+            if got.rendered != target["panel_version"]:
+                raise BrokerError("stale", 409, f"panel {target.get('panel_id')!r} changed since it was rendered")
+            if got.wrap_open:
+                # a consented edit would wait out a whole wrap in capped retries and could end refused;
+                # nothing is consented while one is open
+                raise BrokerError("wrap_in_progress", 409, "a wrap is open on the memory store; edit after it saves")
+        effects = section_effects(heading, got.version, body)
+        return _Built({"kind": "value", "panel_id": target.get("panel_id"), "heading": heading,
+                       "panel_version": target.get("panel_version")}, effects,
+                      [{"heading": heading, "body": got.text}])
 
     @staticmethod
     def _origin_key_of_row(es: Any, target: Mapping[str, Any]) -> str:
