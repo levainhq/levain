@@ -940,8 +940,9 @@ def test_codex_home_fails_closed_where_it_cannot_be_locked(
     assert not (tmp_path / "second" / "seed").exists()
 
 
-def test_codex_home_lock_fails_closed_without_fcntl(tmp_path, monkeypatch):
-    # Windows has no fcntl: same refusal, same override.
+def test_codex_home_lock_fails_closed_without_fcntl(tmp_path, monkeypatch, capsys):
+    # Windows has no fcntl: same refusal, same override. With only the alias set, the note must not
+    # name LEVAIN_UNLOCKED, which is unset (L3 r1 LOW).
     from levain.install import CODEX_HOME_UNLOCKED_ENV, CodexHomeUnlockable, codex_home_lock
 
     import sys
@@ -952,8 +953,11 @@ def test_codex_home_lock_fails_closed_without_fcntl(tmp_path, monkeypatch):
         with codex_home_lock(tmp_path):
             pass
     monkeypatch.setenv(CODEX_HOME_UNLOCKED_ENV, "1")
+    monkeypatch.delenv("LEVAIN_UNLOCKED", raising=False)
     with codex_home_lock(tmp_path):
         pass
+    err = capsys.readouterr().err
+    assert "unlocked override" in err and "LEVAIN_UNLOCKED" not in err
 
 
 def _pair_failing_hooks(tmp_path, monkeypatch, meddle):

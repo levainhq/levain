@@ -3206,9 +3206,10 @@ def test_install_lock_refuses_where_the_filesystem_cannot_lock(tmp_path, monkeyp
             pytest.fail("the body ran without a lock")
 
 
-def test_a_refused_lock_leaves_a_fresh_target_empty_so_the_advised_rerun_works(tmp_path, monkeypatch):
-    # L2 MED (1011+40): the refusal says "Nothing was written ... re-run with LEVAIN_UNLOCKED=1", but
-    # the lock file, .levain/ and its .gitignore were already created, so the re-run met "not empty".
+def test_a_refused_lock_leaves_only_the_lock_file_so_the_advised_rerun_works(tmp_path, monkeypatch):
+    # L2 MED (1011+40): the advised LEVAIN_UNLOCKED=1 re-run met "not empty". L3 r1 (codex HIGH): the
+    # r1 fix unlinked the lock file on refusal, which on a shared filesystem can be another client's
+    # live lock. Now the lock file stays and the emptiness check tolerates exactly that bookkeeping.
     import errno
 
     from levain.install import UNLOCKED_ENV, InstallUnlockable, _is_safe_install_target
@@ -3220,18 +3221,59 @@ def test_a_refused_lock_leaves_a_fresh_target_empty_so_the_advised_rerun_works(t
     monkeypatch.delenv(UNLOCKED_ENV, raising=False)
     target = tmp_path / "fresh"
     target.mkdir()
-    with pytest.raises(InstallUnlockable):
+    with pytest.raises(InstallUnlockable, match="Nothing was written but the empty lock file"):
         with install_lock(target):
             pass
-    assert list(target.iterdir()) == [] and _is_safe_install_target(target)
-    existing = tmp_path / "existing"
-    (existing / ".levain").mkdir(parents=True)
-    (existing / ".levain" / "keep.txt").write_text("x")
+    assert [p.relative_to(target).as_posix() for p in sorted(target.rglob("*"))] == [
+        ".levain", ".levain/install.lock"]
+    assert _is_safe_install_target(target)
+
+
+def test_a_refused_lock_leaves_an_existing_gitignore_byte_identical(tmp_path, monkeypatch):
+    # L3 r1 (codex MED): the lock's .gitignore line was appended before flock, so a refusal left it
+    # behind and "Nothing was written" was false. The line is written only once the lock is taken.
+    import errno
+
+    from levain.install import UNLOCKED_ENV, InstallUnlockable
+
+    real_flock = fcntl.flock
+
+    def no_locks(_fd, _op):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    gi = tmp_path / ".levain" / ".gitignore"
+    gi.parent.mkdir()
+    gi.write_bytes(b"answers.json")  # no trailing newline: an append would show
+    before = gi.read_bytes()
+    monkeypatch.setattr(fcntl, "flock", no_locks)
+    monkeypatch.delenv(UNLOCKED_ENV, raising=False)
     with pytest.raises(InstallUnlockable):
-        with install_lock(existing):
+        with install_lock(tmp_path):
             pass
-    # an existing .levain keeps exactly what it held: the lock file and the .gitignore this call made go
-    assert sorted(p.name for p in (existing / ".levain").iterdir()) == ["keep.txt"]
+    assert gi.read_bytes() == before
+    assert sorted(p.name for p in gi.parent.iterdir()) == [".gitignore", "install.lock"]
+    monkeypatch.setattr(fcntl, "flock", real_flock)
+    with install_lock(tmp_path):  # a taken lock records itself
+        pass
+    assert gi.read_text(encoding="utf-8").splitlines() == ["answers.json", "install.lock"]
+
+
+def test_the_emptiness_check_tolerates_exactly_the_lock_bookkeeping(tmp_path):
+    from levain.install import _is_safe_install_target
+
+    lv = tmp_path / ".levain"
+    lv.mkdir()
+    (lv / "install.lock").touch()
+    (lv / ".gitignore").write_text("install.lock\n", encoding="utf-8")
+    assert _is_safe_install_target(tmp_path)
+    (lv / ".gitignore").write_text("install.lock\nanswers.json\n", encoding="utf-8")
+    assert not _is_safe_install_target(tmp_path)
+    (lv / ".gitignore").unlink()
+    (lv / "install.lock").write_text("x", encoding="utf-8")
+    assert not _is_safe_install_target(tmp_path)
+    (lv / "install.lock").write_text("", encoding="utf-8")
+    (tmp_path / "notes.md").touch()
+    assert not _is_safe_install_target(tmp_path)
 
 
 @pytest.mark.parametrize("override", [None, "1"])
@@ -3253,8 +3295,9 @@ def test_install_lock_without_fcntl_refuses_unless_the_override_is_set(tmp_path,
     if override:
         monkeypatch.setenv(UNLOCKED_ENV, override)
         with install_lock(tmp_path):
-            pass
-        assert "this platform cannot lock" in capsys.readouterr().err
+            with install_lock(tmp_path):  # reentrant here too: the note prints once
+                pass
+        assert capsys.readouterr().err.count("this platform cannot lock") == 1
         return
     with pytest.raises(InstallUnlockable, match="no flock"):
         with install_lock(tmp_path):
