@@ -136,9 +136,10 @@ def _is_write_route(route: str) -> bool:
 
 def broker_install_class(httpd: Any) -> str:
     """The install class gestures are decided under, for a render and a dispatch alike: the broker's
-    own, which is set only when its install check passed; with none, no gesture is the reported one."""
+    own while it is write-enabled; a broker that is disabled, on standby or stopped (and no broker)
+    is "none", so no gesture renders that a write would then refuse."""
     broker = getattr(httpd, "broker", None)
-    return (broker.install_class if broker is not None else None) or "none"
+    return (broker.install_class if broker is not None and broker.enabled else None) or "none"
 
 __all__ = [
     "DEFAULT_HOST",

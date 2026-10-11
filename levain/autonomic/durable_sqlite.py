@@ -37,12 +37,14 @@ def rollback(conn: sqlite3.Connection) -> None:
         pass
 
 
-def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None) -> sqlite3.Connection:
+def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None,
+                 needs: str = "this store") -> sqlite3.Connection:
     """A connection to ``path`` with the durability PRAGMAs applied, in autocommit mode so the caller
-    owns every ``BEGIN``. Closed again if any PRAGMA fails. ``min_sqlite`` refuses an older library."""
+    owns every ``BEGIN``. Closed again if any PRAGMA fails. ``min_sqlite`` refuses an older library,
+    naming what ``needs`` it."""
     if min_sqlite is not None and _library_version() < min_sqlite:
         raise RuntimeError(f"SQLite {sqlite3.sqlite_version} is older than "
-                           f"{'.'.join(map(str, min_sqlite))} (RETURNING is required)")
+                           f"{'.'.join(map(str, min_sqlite))}, which {needs} needs")
     conn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
     try:
         conn.execute("PRAGMA busy_timeout = 30000")

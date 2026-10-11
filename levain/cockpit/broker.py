@@ -488,28 +488,36 @@ class Broker:
         """A replayed POST's recorded pending and outcome, found by its idempotency key BEFORE the
         target is read again (the fire it made has moved the target's version), or None when the key
         is new. The same key with other params, or aimed at another target, is a 409 (§2). A reported
-        pending still WAITING is left
-        to ``issue``, which decides it."""
-        base = self.principal_base_of(credential)
-        if base is None:
-            return None
+        pending still WAITING is left to ``issue``, which decides it."""
         with self._admitted() as db:
-            pid = db.find_idempotent(base, idempotency_key)
-            if pid is None:
-                return None
-            view = self._load(db, pid)
-            rec = view.record
-            asked = request_shape(verb=verb, intent=intent or "sign", params=dict(params), target=target)
-            if asked != request_shape(verb=rec.get("verb"), intent=rec.get("intent"), params=rec.get("params"),
-                                      target=rec.get("target")):
-                raise BrokerError("idempotency_conflict", 409,
-                                  f"idempotency key {idempotency_key!r} is bound to another request")
-            if rec.get("intent") == "reported" and view.state == "WAITING":
-                return None
-            out = self.result(db, pid, replay=True)
-        if out["state"] == "applying":
+            out = self._replayed(db, verb=verb, params=params, intent=intent, credential=credential,
+                                 idempotency_key=idempotency_key, target=target)
+        if out is not None and out["state"] == "applying":
             self.wake()
         return out
+
+    def _replayed(self, db: CockpitDB, *, verb: str, params: Mapping[str, Any], intent: str | None,
+                  credential: Mapping[str, Any], idempotency_key: str | None,
+                  target: Mapping[str, Any]) -> dict[str, Any] | None:
+        """``replay``'s lookup, run inside the caller's admission: every issue runs it before its
+        target is built, so a replay of an act that moved or ended its target (a cancel, a rotation)
+        answers from the journal instead of refusing the target."""
+        base = self.principal_base_of(credential)
+        if base is None or idempotency_key is None:
+            return None
+        pid = db.find_idempotent(base, idempotency_key)
+        if pid is None:
+            return None
+        view = self._load(db, pid)
+        rec = view.record
+        asked = request_shape(verb=verb, intent=intent or "sign", params=dict(params), target=target)
+        if asked != request_shape(verb=rec.get("verb"), intent=rec.get("intent"), params=rec.get("params"),
+                                  target=rec.get("target")):
+            raise BrokerError("idempotency_conflict", 409,
+                              f"idempotency key {idempotency_key!r} is bound to another request")
+        if rec.get("intent") == "reported" and view.state == "WAITING":
+            return None
+        return self.result(db, pid, replay=True)
 
     # -- building a verb's effects (§3.1.1) -------------------------------------------------------
 
@@ -630,6 +638,12 @@ class Broker:
                 if why is not None:
                     raise BrokerError("refused", 403, why)
             principal = self.principal_of(db, credential)
+            replayed = self._replayed(db, verb=verb, params=params, intent=intent, credential=credential,
+                                      idempotency_key=idempotency_key, target=target)
+            if replayed is not None:
+                if replayed["state"] == "applying":
+                    self.wake()
+                return replayed
             pid = new_pending_id()
             try:
                 built = self._build(db, verb, params, target, pid, at_issue=True)

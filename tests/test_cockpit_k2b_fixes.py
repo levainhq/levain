@@ -361,7 +361,7 @@ def test_the_returning_floor_is_the_cockpit_journals_alone(home, monkeypatch):
     monkeypatch.setattr(durable_sqlite, "_library_version", lambda: (3, 31, 1))
     AutonomicDB(home / "autonomic")._connect().close()
     (home / "data").mkdir()
-    with pytest.raises(RuntimeError, match="RETURNING is required"):
+    with pytest.raises(RuntimeError, match="RETURNING"):
         CockpitDB(home / "data")._connect()
 
 
@@ -444,3 +444,84 @@ def test_the_manifest_renders_gestures_under_the_brokers_install_class(tmp_path)
         reported = gestures(url)
     assert "direct-reported" in reported, reported
     assert "direct-reported" not in none and "sign" in none, none
+
+
+# --- code L3 r2 (complement + codex, 2026-10-10) -----------------------------------------------------
+
+
+def test_a_disabled_or_standby_broker_renders_no_reported_gesture(tmp_path, monkeypatch):
+    """complement + codex L3 r2: a declared `reported` broker whose start then fails (or that waits on
+    another broker's lock) is not write-enabled, so the manifest renders no direct-reported."""
+    import json as _json
+
+    from tests.test_cockpit_k2a import _get, _install, _serve
+
+    _root, src, _ids = _install(tmp_path)
+
+    def disabled(self: Broker) -> bool:
+        self._disable("test: the start sequence failed")
+        return False
+
+    monkeypatch.setattr(Broker, "_attempt", disabled)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, httpd):
+        raw = _json.dumps(_get(f"{url}/cockpit/panel/tray.json", token="T"))
+        assert httpd.broker.install_class == "reported" and not httpd.broker.enabled
+    assert '"direct-reported"' not in raw and '"sign"' in raw
+
+
+def test_a_replayed_cross_principal_cancel_answers_from_the_journal(home, spores):
+    """codex L3 r2: the cancel ended its target, so a retried identical cancel must not refuse that
+    target: every issue looks its key up before it builds."""
+    from tests.test_cockpit_k2b_broker import PHONE
+
+    b = _broker(home, spores)
+    try:
+        pid = _move(b, spores)["pending_id"]
+        done = b.cancel(pid, credential=PHONE, intent="reported", idempotency_key="c1")
+        assert done["state"] == "COMMITTED"
+        again = b.cancel(pid, credential=PHONE, intent="reported", idempotency_key="c1")
+        assert (again["pending_id"], again["state"], again["replay"]) == (done["pending_id"], "COMMITTED", True)
+    finally:
+        b.stop()
+
+
+def test_an_op_whose_expiry_column_differs_from_its_record_is_corrupt(home, spores):
+    """codex L3 r2: expiry is enforced on the journal column and read off the signed record; a row
+    where the two differ is refused as corrupt, never read one way and decided the other."""
+    from datetime import datetime, timezone
+
+    from levain.cockpit.consent import utc_stamp
+    from levain.cockpit.firejournal import JournalCorruptError
+
+    b = _broker(home, spores)
+    try:
+        pid = _move(b, spores)["pending_id"]
+        conn = sqlite3.connect(b.data_root / "cockpit.db")
+        later = utc_stamp(datetime(2099, 1, 1, tzinfo=timezone.utc))
+        conn.execute("UPDATE pendings SET expires_at = ? WHERE pending_id = ?", (later, pid))
+        conn.commit()
+        conn.close()
+        assert b.db is not None
+        with pytest.raises(JournalCorruptError, match="expires_at column differs"):
+            b.db.load(pid)
+    finally:
+        b.stop()
+
+
+def test_a_replay_with_a_non_string_row_id_is_a_bad_request(tmp_path):
+    """complement L3 r2: the replay's target is checked before it is compared."""
+    from tests.test_cockpit_k2a import _install, _post, _serve
+
+    from tests.test_cockpit_k2a import _get
+
+    _root, src, ids = _install(tmp_path)
+    body = {"verb": "spore_set_disposition", "panel_id": "tray", "params": {"disposition": "note"},
+            "intent": "reported", "idempotency_key": "k"}
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        row = next(r for r in _get(f"{url}/cockpit/panel/tray.json", token="T")["rows"]
+                   if r["id"] == f"spore:{ids['seed']}")
+        status, fired = _post(f"{url}/cockpit/verb", {**body, "row_id": row["id"], "row_version": row["version"]},
+                              token="T")
+        assert (status, fired["state"]) == (200, "COMMITTED"), fired
+        status, out = _post(f"{url}/cockpit/verb", {**body, "row_id": 5, "row_version": "x"}, token="T")
+    assert (status, out["error"]) == (400, "bad_request"), out

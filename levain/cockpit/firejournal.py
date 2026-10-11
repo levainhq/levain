@@ -434,7 +434,7 @@ class CockpitDB:
                 raise CockpitFormatError(f"journal {self.path} has disappeared")
         elif not self.data_root.is_dir():
             raise CockpitFormatError(f"data root {self.data_root} is not a directory")
-        conn = open_durable(self.path, min_sqlite=MIN_SQLITE)
+        conn = open_durable(self.path, min_sqlite=MIN_SQLITE, needs="the cockpit journal's RETURNING")
         conn.row_factory = sqlite3.Row
         try:
             if not self._ready:
@@ -967,6 +967,9 @@ def _load(conn: sqlite3.Connection, operation_id: str) -> OpView:
     record = _parse_record(operation_id, row["record"], row["record_sha256"])
     for name in ("issued_at", "expires_at"):
         _check_stamp(operation_id, name, row[name], nullable=False)
+        if record.get(name) != row[name]:
+            # expiry is enforced on the column and read off the record: one value, or no op
+            raise _corrupt(operation_id, f"its {name} column differs from its record")
     _check_stamp(operation_id, "decided_at", row["decided_at"],
                  nullable=row["state"] not in _PLANNED_STATES)
     rows = conn.execute("SELECT * FROM effects WHERE operation_id = ? ORDER BY idx",

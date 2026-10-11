@@ -577,7 +577,9 @@ def dispatch(
 
     asked_target: dict[str, Any] = {"kind": verb.binding, "panel_id": panel_id}
     if verb.binding == "row":
-        asked_target["row_id"] = req.get("row_id")
+        if not isinstance(req.get("row_id"), str):
+            raise _refuse("bad_request", 400, f"{verb.name!r} names a row: 'row_id' is required")
+        asked_target["row_id"] = req["row_id"]
     replayed = _broker_replay(broker, verb, params, intent, credential, req.get("idempotency_key"),
                               asked_target)
     if replayed is not None:
