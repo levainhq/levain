@@ -620,10 +620,14 @@ def test_a_dry_run_never_resumes_a_pending_a_dead_request_left(tmp_path):
 
 
 @pytest.mark.parametrize("field,value", [("intent", "x"), ("intent", None), ("tier", "C1"),
-                                         ("expires_at", "9999"), ("issued_at", None)])
+                                         ("expires_at", "9999"), ("issued_at", None),
+                                         ("issued_at", "2026-02-31T20:00:00.000000Z"),
+                                         ("expires_at", "2026-10-10T19:00:00.000000Z"),
+                                         ("expires_at", "２026-10-10T20:15:00.000000Z")])
 def test_a_record_whose_authority_fields_do_not_parse_is_corrupt(field, value):
     """complement L3 r4: decide reads intent, tier and expiry off the record, so the one parse checks
-    them; an unknown intent never falls through to the reported path."""
+    them; an unknown intent never falls through to the reported path. L3 r5 (both seats, codex): an
+    impossible calendar date, a non-ASCII digit and an expiry not after issue are corrupt too."""
     from levain.cockpit.consent import encode
     from levain.cockpit.firejournal import JournalCorruptError, _parse_record, new_pending_id, record_sha256
 

@@ -33,7 +33,7 @@ Intent = Literal["sign", "reported"]
 INTENTS: tuple[str, ...] = ("sign", "reported")
 MAX_SAFE_INT = 2**53 - 1
 
-_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
+_STAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z")
 _STAMP_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 _OPERATION_ID = re.compile(r"cp[0-9a-f]{32}")
 
@@ -53,7 +53,10 @@ def parse_stamp(text: str) -> datetime:
     """The aware UTC datetime a :func:`utc_stamp` string names; anything else is refused."""
     if not isinstance(text, str) or _STAMP.fullmatch(text) is None:
         raise ConsentError(f"not a fixed-width UTC timestamp: {text!r}")
-    return datetime.strptime(text, _STAMP_FORMAT).replace(tzinfo=timezone.utc)
+    try:
+        return datetime.strptime(text, _STAMP_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError as exc:       # the right shape, an impossible calendar date
+        raise ConsentError(f"not a UTC timestamp: {text!r}") from exc
 
 
 def _nfc(text: str) -> str:

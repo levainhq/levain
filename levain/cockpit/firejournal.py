@@ -322,6 +322,8 @@ def _parse_record(op: str | None, blob: Any, sha: Any) -> dict[str, Any]:
         raise _corrupt(op, f"record tier {record.get('tier')!r} is neither T2 nor T3")
     for name in ("issued_at", "expires_at"):
         _check_stamp(str(op), f"record {name}", record.get(name), nullable=False)
+    if parse_stamp(record["issued_at"]) >= parse_stamp(record["expires_at"]):
+        raise _corrupt(op, "record expires_at is not after its issued_at")
     return record
 
 
