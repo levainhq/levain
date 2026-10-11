@@ -597,11 +597,15 @@ class Broker:
             if not row_id.startswith("episode:"):
                 raise BrokerError("bad_target", 400, f"{row_id!r} is not one of the entity's episodes")
             try:
-                ok = es.origin_key_of(row_id[len("episode:"):])
+                ok, source = es.origin_key_of(row_id[len("episode:"):])
             except KeyError:
                 raise BrokerError("stale", 409, f"row {row_id!r} is gone") from None
             if ok is None:
                 raise BrokerError("refused", 409, f"row {row_id!r} has no origin_key: no label resource yet")
+            if source.startswith("team:"):
+                # anneal's next v3 team replace brings back an entry its stream enforces unless the
+                # delete carries team_operator, which only anneal's CLI sets (L2 r1 C)
+                raise BrokerError("refused", 409, f"row {row_id!r} is a team entry: remove it with anneal's CLI")
         else:
             ok = target.get("origin_key")
             if not isinstance(ok, str) or not ok:
@@ -611,6 +615,8 @@ class Broker:
             if at_issue:
                 raise BrokerError("stale", 409, f"row {target.get('row_id')!r} is gone")
             raise ValueError("the episode is gone")
+        if at_issue and got.row["id"] != str(target.get("row_id"))[len("episode:"):]:
+            raise BrokerError("stale", 409, f"row {target.get('row_id')!r} changed since it was rendered")
         if at_issue and target.get("row_version") is not None and got.rendered != target["row_version"]:
             raise BrokerError("stale", 409, f"row {target.get('row_id')!r} changed since it was rendered")
         effects = tombstone_effects(ok, got.version, effect_id=create_origin_key(pid, 0))

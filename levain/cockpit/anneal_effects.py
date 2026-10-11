@@ -48,6 +48,14 @@ def _key_after(prefix: str, resource_key: str) -> str:
     return resource_key[len(prefix):]
 
 
+def _read_faults() -> tuple[type[BaseException], ...]:
+    """Every way an anneal read fails that a retry can outlive. ``RecursionError``: anneal parses an
+    episode's ``metadata`` with ``json.loads``, and a deeply nested one raises it (L1 r1 #1)."""
+    from anneal_memory import AnnealMemoryError
+
+    return (AnnealMemoryError, OSError, ValueError, RecursionError)
+
+
 def _episode_dict(ep: Any) -> dict[str, Any]:
     return {"id": ep.id, "timestamp": ep.timestamp, "type": getattr(ep.type, "value", ep.type),
             "source": ep.source, "content": ep.content, "metadata": ep.metadata,
@@ -109,8 +117,6 @@ class EpisodeEffectStore:
     def read(self, origin_key: str) -> EpisodeRead | None:
         """The live episode carrying ``origin_key``, or None. ``TransientApplyFault`` for a read that
         faulted."""
-        from anneal_memory import AnnealMemoryError
-
         from levain.cockpit.providers import episode_row_version
 
         if not self.db.is_file():
@@ -118,42 +124,31 @@ class EpisodeEffectStore:
         try:
             with self._store(read_only=True) as store:
                 got = store.read_episode_versioned(origin_key)
-        except (AnnealMemoryError, OSError, ValueError) as exc:
+            if got is None:
+                return None
+            ep, version = got
+            return EpisodeRead(_episode_dict(ep), version, episode_row_version(ep))
+        except _read_faults() as exc:
             raise TransientApplyFault.of(exc) from exc
-        if got is None:
-            return None
-        ep, version = got
-        return EpisodeRead(_episode_dict(ep), version, episode_row_version(ep))
 
-    def origin_key_of(self, episode_id: str) -> str | None:
-        """The ``origin_key`` of the live episode ``episode_id``; ``KeyError`` when there is none."""
-        from anneal_memory import AnnealMemoryError
-
+    def origin_key_of(self, episode_id: str) -> tuple[str | None, str]:
+        """The live episode ``episode_id``'s ``origin_key`` and ``source``; ``KeyError`` when there
+        is none."""
         if not self.db.is_file():
             raise KeyError(episode_id)
         try:
             with self._store(read_only=True) as store:
                 ep = store.get(episode_id)
-        except (AnnealMemoryError, OSError, ValueError) as exc:
+        except _read_faults() as exc:
             raise TransientApplyFault.of(exc) from exc
         if ep is None:
             raise KeyError(episode_id)
         ok = ep.origin_key
-        return ok if isinstance(ok, str) and ok else None
+        return (ok if isinstance(ok, str) and ok else None), str(ep.source)
 
     def snapshot(self, resource_key: str) -> Snapshot:
-        from anneal_memory import AnnealMemoryError
-
-        if resource_key.startswith(TOMB_KEY_PREFIX):
-            ok = _key_after(TOMB_KEY_PREFIX, resource_key)
-            if not self.db.is_file():
-                return Snapshot(None, None)
-            try:
-                with self._store(read_only=True) as store:
-                    status = store.origin_key_status(ok)
-            except (AnnealMemoryError, OSError, ValueError) as exc:
-                raise TransientApplyFault.of(exc) from exc
-            return Snapshot({"origin_key": ok} if status.state == "retired" else None, None)
+        """An episode's snapshot. A tomb has none: who retired a key is known only to the
+        ``apply_unit`` that compares its own ``effect_id`` (L1 r1 #4, L2 r1 B)."""
         got = self.read(_key_after(EPISODE_KEY_PREFIX, resource_key))
         return Snapshot(None, None) if got is None else Snapshot(got.row, got.version)
 
@@ -196,8 +191,13 @@ class EpisodeEffectStore:
         version = ep.expect.get("version")
         if set(ep.expect) != {"version"} or not isinstance(version, str) or not version or dict(ep.changes):
             raise PermanentApplyRefusal("the episode effect is a version precondition and writes nothing")
-        if not isinstance(effect_id, str) or not effect_id:
-            raise PermanentApplyRefusal("a tomb's effect_id is a non-empty string")
+        from anneal_memory.origin import validate_origin_key
+
+        try:
+            validate_origin_key(ok)
+            validate_origin_key(effect_id, what="effect_id")
+        except ValueError as exc:
+            raise PermanentApplyRefusal(str(exc)) from exc
         return ok, version, effect_id
 
     def apply_unit(self, unit: ApplyUnit) -> UnitApplyResult:
@@ -214,8 +214,6 @@ class EpisodeEffectStore:
                 res = store.delete_by_origin_key(ok, expected_version=version, effect_id=effect_id)
         except (AnnealMemoryError, OSError) as exc:
             raise TransientApplyFault.of(exc) from exc
-        except ValueError as exc:          # the key grammar: the same refusal on every retry
-            raise PermanentApplyRefusal(f"{type(exc).__name__}: {exc}") from exc
         if res.outcome in ("deleted", "already_applied"):
             outcome = ApplyOutcome.APPLIED if res.outcome == "deleted" else ApplyOutcome.ALREADY
             return UnitApplyResult(outcome, (MemberApply(res.episode_id, {"origin_key": ok}),

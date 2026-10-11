@@ -6,6 +6,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Iterator
 
+import sqlite3
+
 import pytest
 from anneal_memory import Store
 
@@ -14,9 +16,11 @@ from levain.cockpit.broker import Broker
 from levain.cockpit.effects import (
     ApplyOutcome,
     ApplyUnit,
+    Effect,
     PermanentApplyRefusal,
     SporeEffectStore,
     StoreGone,
+    TransientApplyFault,
     plan_units,
 )
 from tests.test_cockpit_k2b_broker import BROWSER, Key, _label, _refused, _rows, home, keydir, spores  # noqa: F401
@@ -139,9 +143,56 @@ def test_a_missing_store_is_gone_and_is_not_created(home, db):
         EpisodeEffectStore(missing).apply_unit(unit)
     assert not missing.exists()
 
-def test_the_tomb_snapshot_reads_retirement(db):
+def test_a_tomb_has_no_snapshot_and_a_gone_episode_reads_absent(db):
+    """Who retired a key is known only to apply_unit, which compares its own effect_id (L1 r1 #4)."""
     es = EpisodeEffectStore(db)
-    assert es.snapshot(tomb_resource_key("ok.target")).row is None
+    with pytest.raises(PermanentApplyRefusal):
+        es.snapshot(tomb_resource_key("ok.target"))
     es.apply_unit(_unit(db, "ck.ff.0"))
-    assert es.snapshot(tomb_resource_key("ok.target")).row == {"origin_key": "ok.target"}
     assert es.snapshot("episode:ok.target").row is None
+
+
+def test_an_origin_key_no_episode_ever_carried_is_refused(db):
+    es = EpisodeEffectStore(db)
+    unit = ApplyUnit(EPISODES, (0, 1), tuple(tombstone_effects("ok.never", "0" * 64, effect_id="ck.gg.0")))
+    with pytest.raises(PermanentApplyRefusal, match="no episode ever carried"):
+        es.apply_unit(unit)
+
+
+def test_a_bad_effect_id_is_refused_before_the_store_opens(home, db):
+    tomb, ep = _unit(db, "ck.hh.0").effects
+    bad = Effect(tomb.resource_key, tomb.store, tomb.expect, {"effect_id": "has space"}, tomb.projection,
+                 tomb.writes, ())
+    with pytest.raises(PermanentApplyRefusal, match="effect_id"):
+        EpisodeEffectStore(home / "nowhere.db").apply_unit(ApplyUnit(EPISODES, (0, 1), (bad, ep)))
+    assert not (home / "nowhere.db").exists()
+
+
+def test_a_row_whose_rendered_fields_moved_is_stale_while_the_episode_stays(broker, db):
+    t = dict(_target(db), row_version="0123456789abcdef")
+    _refused("stale", broker.issue, verb="episode_tombstone", params={}, target=t, tier="T2",
+             credential=BROWSER, intent="reported")
+    assert _episode(db, "ok.target") is not None
+
+
+def test_deeply_nested_metadata_is_a_transient_read_fault_not_a_recursion_error(db):
+    """L1 r1 #1: anneal parses metadata with json.loads; a nested value must not escape the read."""
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE episodes SET metadata = ? WHERE origin_key = 'ok.target'",
+                 ("[" * 100_000 + "]" * 100_000,))
+    conn.commit()
+    conn.close()
+    with pytest.raises(TransientApplyFault):
+        EpisodeEffectStore(db).read("ok.target")
+
+
+def test_a_team_entry_is_refused_with_its_reason(broker, db):
+    with Store(str(db)) as st:
+        st.record("a teammate's episode", "observation", source="team:alice", origin_key="ok.team")
+    ep = _episode(db, "ok.team")
+    got = EpisodeEffectStore(db).read("ok.team")
+    t = {"kind": "row", "panel_id": "episodes", "row_id": f"episode:{ep.id}", "row_version": got.rendered}
+    err = _refused("refused", broker.issue, verb="episode_tombstone", params={}, target=t, tier="T2",
+                   credential=BROWSER, intent="reported")
+    assert "team entry" in str(err)
+    assert _episode(db, "ok.team") is not None
