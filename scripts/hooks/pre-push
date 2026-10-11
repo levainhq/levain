@@ -44,14 +44,15 @@ fi
 # all-zero local sha is a delete, which publishes nothing.
 #
 # What is checked is every commit the push makes newly reachable on the
-# destination: remote sha..local sha for an existing ref; for a new ref,
-# everything the destination's advertised refs do not already reach (git's own
-# pre-push.sample walks the whole history there). "Already on the remote" is
-# what the DESTINATION advertises (`git ls-remote` on the URL git passes as $2),
-# never local remote-tracking refs, which go stale. The release record is the
-# destination's tags plus the tags this push sets, never the local tags: a
-# release tag lands after main is pushed, so a clone can hold the release
-# commit without its tag. Research and L3 raws: levain project_memory/1011-gate/.
+# destination: what neither the destination's advertised refs nor the ref's
+# old tip already reach (with nothing advertised, the whole history, as git's
+# own templates/hooks--pre-push.sample walks a new branch). "Already on the
+# remote" is what the DESTINATION advertises (`git ls-remote` on the location
+# git passes as $2, githooks(5)), never local remote-tracking refs, which go
+# stale. The release record is the destination's tags plus the tags this push
+# sets, never the local tags: a release tag lands after main is pushed, so a
+# clone can hold the release commit without its tag. A release-tag push also
+# checks the destination's commits past the tag's target.
 push=""; out=""; adv=""
 trap 'rm -f "$push" "$out" "$adv"' EXIT
 trap 'exit 1' HUP INT TERM
