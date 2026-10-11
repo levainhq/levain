@@ -450,6 +450,9 @@
         view.layout.push(Object.assign(entry, { kind: "wraps" }));
       } else if (panel.kind === "prose" && pid.indexOf("section:") === 0 && (panel.value || {}).markdown != null) {
         view.sections.push({ heading: titleOf(panel.title, titleOf(head.title, pid)), body: panel.value.markdown });
+        // a section the kernel offers section_edit on is the operator's to edit; its panel id stands as the
+        // write address, and the save posts the action the panel offered
+        if (view.writable && pActions.some((a) => a.verb === "section_edit")) { entry.edit_class = "A"; entry.source = pid; }
         view.layout.push(Object.assign(entry, { kind: "section", ref: sectionRef++, heading: titleOf(panel.title, titleOf(head.title, pid)) }));
       } else {
         view.extra_panels[pid] = externalOf(panel, panel, groupTitles);

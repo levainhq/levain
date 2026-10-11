@@ -38,7 +38,7 @@ The cockpit's write side: K2a (one write route, the write token, writes bound to
 - Without `flock` (Windows), a version-bound write (the cockpit's state line and spore writes) is refused; an unchecked `levain state` writes as before.
 - A downstream verb with no `extra_effects` entry is T2 and has no broker effect, so it is refused (`needs_broker` on `/action`, `not_built` on `/cockpit/verb`). An embedding server that sent messages through `/action` before this release needs an effect store for that verb.
 - The preview binds the tier and the gesture, not the params; the page sends exactly the params it previewed.
-- Downstream jobs (`job=True` verbs) have no manifest-page path yet.
+- A downstream verb declared `job=True` runs no job. The broker applies the verb's effect store once and never calls its handler; `/action`, the route that runs handlers, refuses a T2 downstream verb. Asynchronous downstream work has no path through the broker yet.
 - An embedding server's downstream write verb that worked through `/action` before this release (a message send, for example) is refused after the upgrade until that server passes an effect store for it (`extra_effects`). Upgrade the embedder and levain together.
 - Neither the page nor the CLI signs a pending yet: a T3 write, or a T2 write outside a reported install, waits until something posts an `ssh-keygen -Y sign` signature over its record. The full pending card comes with the governed install.
 - **Erased means erased at the API.** A tombstoned episode's content can remain in freed pages of the SQLite files and in anneal's tombstone record (a content hash), and a State section edit keeps the section's previous text in `cockpit.db` with no retention bound.
