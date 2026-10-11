@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-11
+
 The cockpit's write side: K2a (one write route, the write token, writes bound to what was rendered) and K2b (the broker, which turns a write that needs more than the token into a consented, journalled fire). They ship together.
 
 ### Added
