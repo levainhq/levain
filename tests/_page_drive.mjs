@@ -1,6 +1,6 @@
 // Drives a served cockpit page in headless Chrome over the DevTools protocol, for tests that must
 // submit a form rather than read the DOM. argv: <chrome> <url> <steps.json>. A step is
-// {"eval": "<expression>"} (its value is collected) or {"wait": <ms>}. Prints
+// {"eval": "<expression>"} (its value is collected) or {"wait": <ms>}. A dialog is declined. Prints
 // {"values": [...], "posts": ["<path> <body>", ...]} as JSON on stdout.
 import { spawn } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -27,6 +27,8 @@ ws.addEventListener("message", (m) => {
   if (d.method === "Network.requestWillBeSent" && d.params.request.method === "POST") {
     posts.push(d.params.request.url.replace(/^https?:\/\/[^/]+/, "") + " " + (d.params.request.postData || ""));
   }
+  // a prompt (the write-token ask) is declined, as an operator who has no token would
+  if (d.method === "Page.javascriptDialogOpening") ws.send(JSON.stringify({ id: ++id, method: "Page.handleJavaScriptDialog", params: { accept: false } }));
   if (d.id && pend.has(d.id)) { pend.get(d.id)(d); pend.delete(d.id); }
 });
 const send = (method, params = {}) => new Promise((r) => { const i = ++id; pend.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); });

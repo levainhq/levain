@@ -73,6 +73,19 @@ def test_the_default_page_edits_the_state_section_through_the_broker(tmp_path: P
 
 
 @needs_browser
+def test_a_state_section_the_page_cannot_fire_draws_no_edit_button(tmp_path: Path) -> None:
+    """Read without the write token (its prompt declined), the server offers section_edit as `refused`:
+    the page must not draw an editor whose save cannot post (L3 r2 codex MED)."""
+    _root, src, _ids = _install(tmp_path)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        out = _drive(tmp_path, f"{url}/", [
+            {"wait": 4000},
+            {"eval": f"(() => {{ const p = {STATE_PANEL}; return p ? [p.dataset.editClass, !!p.querySelector('.edit-btn')] : null; }})()"},
+        ])
+    assert out["values"][0] == ["", False], out
+
+
+@needs_browser
 @pytest.mark.parametrize("job", [False, True])
 def test_the_default_page_submits_a_downstream_send_through_the_broker(tmp_path: Path, job: bool) -> None:
     """L3 r1's codex MED feared a `job=True` verb launched from this page goes unpolled and a retry starts
