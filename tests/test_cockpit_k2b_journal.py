@@ -632,3 +632,28 @@ def test_a_corrupt_waiting_row_does_not_stop_the_sweep(db):
         conn.execute("UPDATE pendings SET record_sha256 = 'x' WHERE pending_id = ?", (bad,))
     assert db.expire_due(T0 + timedelta(minutes=1)) == 1
     assert db.outcome(good).state == "EXPIRED"
+
+
+def test_a_deeply_nested_record_is_corrupt_and_the_sweep_passes_it(db):
+    """codex L3 r6: a record that parses past the recursion limit is corrupt, not a RecursionError
+    that stops every sweep (and so every issue, cancel and start)."""
+    from levain.cockpit.firejournal import record_sha256
+
+    bad, _ = issue(db, key="bad", ttl=timedelta(minutes=1))
+    good, _ = issue(db, key="good", ttl=timedelta(minutes=1))
+    deep = b"[" * 100_000 + b"]" * 100_000
+    with db.write() as conn:
+        conn.execute("UPDATE pendings SET record = ?, record_sha256 = ? WHERE pending_id = ?",
+                     (deep, record_sha256(deep), bad))
+    assert db.expire_due(T0 + timedelta(minutes=1)) == 1
+    assert db.outcome(good).state == "EXPIRED"
+    with pytest.raises(JournalCorruptError):
+        db.cancel(bad, "k-laptop", T0)
+
+
+def test_a_naive_now_is_refused_whatever_the_journal_holds(db):
+    with pytest.raises(ConsentError):
+        db.expire_due(datetime(2026, 10, 10, 12, 0))
+    issue(db, key="a")
+    with pytest.raises(ConsentError):
+        db.expire_due(datetime(2026, 10, 10, 12, 0))

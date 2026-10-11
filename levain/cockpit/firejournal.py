@@ -295,8 +295,8 @@ def _parse_record(op: str | None, blob: Any, sha: Any) -> dict[str, Any]:
     try:
         record = json.loads(blob.decode("utf-8"))
         canonical = encode(record)
-    except (UnicodeDecodeError, ValueError) as exc:     # ConsentError is a ValueError
-        raise _corrupt(op, f"record does not parse: {exc}") from exc
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:   # ConsentError is a ValueError
+        raise _corrupt(op, f"record does not parse: {type(exc).__name__}") from exc
     if canonical != blob:
         raise _corrupt(op, "record is not in canonical form")
     if not isinstance(record, dict):
@@ -339,6 +339,7 @@ def _expire(conn: sqlite3.Connection, now: datetime) -> list[str]:
     ids it ended. The ``expires_at`` column is a mirror a writer of cockpit.db can move, so it is
     never read here (codex L3 r5 #1). A row whose record does not parse is skipped, not raised: its
     own reads fail closed, and one corrupt row must not stop every issue, cancel and start."""
+    cutoff = parse_stamp(utc_stamp(now))        # a naive ``now`` is refused before any row is read
     ended: list[str] = []
     for row in conn.execute("SELECT pending_id, record, record_sha256 FROM pendings "
                             "WHERE state = 'WAITING'").fetchall():
@@ -346,7 +347,7 @@ def _expire(conn: sqlite3.Connection, now: datetime) -> list[str]:
             record = _parse_record(row[0], row[1], row[2])
         except JournalCorruptError:
             continue
-        if parse_stamp(record["expires_at"]) <= now:
+        if parse_stamp(record["expires_at"]) <= cutoff:
             conn.execute("UPDATE pendings SET state = 'EXPIRED', reason = 'expired', terminal_at = ? "
                          "WHERE pending_id = ? AND state = 'WAITING'", (record["expires_at"], row[0]))
             ended.append(row[0])
@@ -603,8 +604,9 @@ class CockpitDB:
             record = _parse_record(operation_id, row["record"], row["record_sha256"])
             if row["state"] != "WAITING":
                 return DecideOutcome(operation_id, row["state"], row["reason"], written=False)
-            # authority is read off the signed record, never its mirror columns (they index the
-            # journal; a writer of cockpit.db can move them, a signature binds the record)
+            # intent, tier and expiry are read off the signed record, never its mirror columns (they
+            # index the journal; a writer of cockpit.db can move them, a signature binds the record).
+            # The principal is a column: the record carries none (declared, L3 r4)
             want_kind = {"sign": "ALLOWED", "reported": "ALLOWED_REPORTED"}[record["intent"]]
             if decision_kind != want_kind:
                 raise ValueError(f"a {record.get('intent')!r} pending cannot take {decision_kind}")
