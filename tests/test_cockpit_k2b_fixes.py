@@ -185,6 +185,7 @@ def test_a_corrupt_op_is_set_aside_and_never_spun_on(home, spores, monkeypatch):
     root, (pid,) = _decided(home, spores, ("k.seed",))
     _set_due(root, PAST)
     with sqlite3.connect(root / "cockpit.db") as conn:
+        conn.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_TRIGGER, False)   # a tamper past the triggers
         conn.execute("UPDATE pendings SET record_sha256 = ? WHERE pending_id = ?", ("0" * 64, pid))
     passes = {"n": 0}
     real = Broker._settle_pass
