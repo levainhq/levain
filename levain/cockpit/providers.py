@@ -27,6 +27,7 @@ from levain.dashboard import (
     SubstrateView,
     OpenSpore,
     _episode_row,
+    _read_levain_config,
     _one_clause,
     open_spore_from,
     state_from_data,
@@ -290,17 +291,27 @@ def _episode_rowin(e: Any, own: str) -> RowIn:
     )
 
 
+def _entity_label(source: SubstrateSource) -> str:
+    """The ``agent`` facet of the entity's own rows, read narrowly (no substrate view): the source's
+    name, else the install config's. The panel's view also falls back to origin.md's H1; a facet
+    is display only (the row version covers the stored record)."""
+    if source.entity_name:
+        return source.entity_name
+    if source.install_root is not None:
+        name = _read_levain_config(source.install_root).get("entity_name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return "entity"
+
+
 def _episode_read_one(source: SubstrateSource) -> Callable[[ReadContext, str], Result]:
     """One of the entity's episodes by id, read from the store, NOT through the panel's newest-N
     list: an episode that newer ones pushed off the list still exists, and a write that names it
-    must find it (codex K2b-3a r1)."""
+    must find it (codex K2b-3a r1). It reads only that episode, so a fault in another row does not
+    make it unreadable (codex r2)."""
     def read_one(ctx: ReadContext, row_id: str) -> Result:
         if not row_id.startswith("episode:"):
             return Absent(f"row {row_id!r} is not one of the entity's episodes")
-        view = _view(source, ReadContext(ctx.now))
-        bad = _view_fault(view, "episodes")
-        if bad:
-            return bad
         db = source.anneal.episodic_db
         if not Path(db).is_file():
             return Fault("the episodic store is absent")
@@ -316,7 +327,7 @@ def _episode_read_one(source: SubstrateSource) -> Callable[[ReadContext, str], R
             return Fault(f"{type(exc).__name__}: {exc}")
         if ep is None or hidden:
             return Absent(f"row {row_id!r} is gone")
-        return Read(rows=(_episode_rowin(_episode_row(ep), view.entity_name or "entity"),))
+        return Read(rows=(_episode_rowin(_episode_row(ep), _entity_label(source)),))
     return read_one
 
 

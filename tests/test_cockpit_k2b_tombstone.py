@@ -265,3 +265,38 @@ def test_a_tombstone_issued_without_the_rendered_version_is_refused(broker, db):
     _refused("bad_target", broker.issue, verb="episode_tombstone", params={}, target=t, tier="T2",
              credential=BROWSER, intent="reported")
     assert _episode(db, "ok.target") is not None
+
+def _supersede(db: Path) -> None:
+    with Store(str(db)) as st:
+        st.record("the episode to tombstone, corrected", "observation", supersedes=[_episode(db, "ok.target").id])
+
+def test_a_tombstone_of_an_episode_superseded_before_issue_is_stale(broker, db):
+    # codex r2 MED: the panel (recall) hides a superseded episode, so a tombstone issued after the
+    # supersession lands on a row the operator can no longer see; it is gone, one definition of live
+    target = _target(db)
+    _supersede(db)
+    _refused("stale", broker.issue, verb="episode_tombstone", params={}, target=target, tier="T2",
+             credential=BROWSER, intent="reported")
+    assert _episode(db, "ok.target") is not None
+
+def test_the_episodes_read_one_needs_no_newest_list(home):
+    # codex r2 MED: read_one rebuilt the whole newest-N view, so a fault in an unrelated recent row
+    # made a readable older target a Fault
+    from levain.cockpit.providers import _episode_read_one
+    from levain.cockpit.engine import ReadContext
+    from levain.cockpit.results import Read
+    from datetime import datetime, timezone
+    from tests.test_cockpit_k2a import Rig
+
+    rig = Rig(home)
+    db = Path(rig.src.anneal.episodic_db)
+    with Store(str(db)) as st:
+        st.record("an older episode", "observation", origin_key="ok.old")
+    eid = _episode(db, "ok.old").id
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO episodes (id, timestamp, type, content, source, metadata) "
+                  "VALUES ('bad00001', '2999-01-01T00:00:00+00:00', 'not-a-type', 'x', 'probe', NULL)")
+    conn.commit()
+    conn.close()
+    res = _episode_read_one(rig.src)(ReadContext(datetime.now(timezone.utc)), f"episode:{eid}")
+    assert isinstance(res, Read), res

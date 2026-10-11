@@ -122,14 +122,17 @@ class EpisodeEffectStore:
             raise TransientApplyFault("FileNotFoundError", f"{self.db} is absent")
 
     def read(self, origin_key: str) -> EpisodeRead | None:
-        """The live episode carrying ``origin_key``, or None. ``TransientApplyFault`` for a read that
-        faulted, the store's absence included."""
+        """The live episode carrying ``origin_key``, or None: a superseded episode is not live, as
+        the episodes panel (anneal's ``recall``) never lists it. ``TransientApplyFault`` for a read
+        that faulted, the store's absence included."""
         from levain.cockpit.providers import episode_row_version
 
         self._require_db()
         try:
             with self._store(read_only=True) as store:
                 got = store.read_episode_versioned(origin_key)
+                if got is not None and store.superseded_by_map([got[0].id]):
+                    got = None    # one definition of live: the panel's (recall's), which hides it
             if got is None:
                 return None
             ep, version = got
@@ -144,9 +147,10 @@ class EpisodeEffectStore:
         try:
             with self._store(read_only=True) as store:
                 ep = store.get(episode_id)
+                hidden = ep is not None and bool(store.superseded_by_map([episode_id]))
         except _read_faults() as exc:
             raise TransientApplyFault.of(exc) from exc
-        if ep is None:
+        if ep is None or hidden:
             raise KeyError(episode_id)
         ok = ep.origin_key
         return (ok if isinstance(ok, str) and ok else None), str(ep.source)
