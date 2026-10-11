@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Any
 
 from levain.autonomic.journal import JournalCorruptError
+from levain.cockpit.authority import LabelKey, unavailable
 from levain.cockpit.broker import label_class
 from levain.cockpit.consent import ConsentError, parse_stamp, value_sha256
 from levain.cockpit.firejournal import CockpitDB, _parse_record
@@ -32,17 +33,6 @@ LABEL_ORDER = ("verified", "signed · reported", "claims cockpit token", "signed
 UNVERIFIED = LABEL_ORDER[-1]
 REVOKED = "signed by a revoked key"
 _RANK = {label: i for i, label in enumerate(LABEL_ORDER)}
-
-
-@dataclass(frozen=True)
-class LabelKey:
-    """What a row's provenance is asked of: ``values`` maps each authority field to its CURRENT stored
-    value. ``operation_id`` set selects exactly that op's label row; ``gate`` (tomb rows only) other
-    than ``"match"`` renders every field unverified."""
-    resource_key: str
-    values: Mapping[str, Any]
-    operation_id: str | None = None
-    gate: str | None = None
 
 
 @dataclass(frozen=True)
@@ -114,9 +104,8 @@ class LabelSnapshot:
         return max(cands, key=lambda c: (c.fired, c.rowid), default=None)
 
 
-def UNAVAILABLE_SNAPSHOT(reason: str) -> LabelSnapshot:  # noqa: N802 (the contract's name)
-    """A snapshot that labels every field unverified and says why."""
-    return LabelSnapshot(revision=None, error=f"provenance unavailable: {reason}")
+# the ONE "provenance unavailable" snapshot: the engine answers the same for a labeller that raises
+UNAVAILABLE_SNAPSHOT = unavailable
 
 
 _ROWS = (

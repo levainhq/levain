@@ -368,6 +368,9 @@ class OpenSpore:
     ascend_kinds: list[str] = field(default_factory=list)
     # when the spore was created, as stored ("" when the store has none): the Tray's age, never versioned
     created: str = ""
+    # anneal's store-assigned origin key ("" when the store has none): the key a cockpit label is
+    # written under (K2b-3b), so a rendered row can name its own label resource. Never versioned
+    origin_key: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -403,6 +406,7 @@ def open_spore_from(s: Mapping[str, Any]) -> "OpenSpore":
         disposition=str(disposition_of(s)),
         descend_kinds=sorted(DESCEND_BY_TYPE.get(stype, frozenset())),
         ascend_kinds=sorted(ASCEND_BY_TYPE.get(stype, frozenset())),
+        origin_key=ok if isinstance(ok := s.get("origin_key"), str) else "",
         created=str(s.get("created") or ""),
     )
 

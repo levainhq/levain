@@ -457,7 +457,7 @@ class TestRowVersions:
             "source": "s", "content": "c", "tags": ["a"], "name": "n", "level": 1, "one_clause": "o",
             "permanence": "x", "activation_mode": "m", "last_activated_on": "2026-01-01", "job_id": "j",
             "verb": "v", "status": "pending", "created_at": "c", "started_at": None, "finished_at": None,
-            "result": None, "error": None, "kind": "k", "action": "a", "ts": "t",
+            "result": None, "error": None, "kind": "k", "action": "a", "ts": "t", "origin_key": "ok-1",
         }
         checked = 0
         for pid, spec in self._specs(env).items():
