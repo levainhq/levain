@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from levain.autonomic.confirm import DEFAULT_SSH_KEYGEN
+from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, DB_NAME, CockpitDB, _meta
 from levain.cockpit.install import REPORTED, marker_path
@@ -94,7 +94,8 @@ def fingerprint_of(public_key: str, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYG
         with open(fd, "w", encoding="ascii", closefd=True) as fh:
             fh.write(public_key + "\n")
         out = subprocess.run([str(ssh_keygen), "-l", "-E", "sha256", "-f", path],
-                             capture_output=True, text=True, timeout=10, check=False)
+                             capture_output=True, text=True, timeout=10, check=False,
+                             env=dict(_VERIFY_ENV))   # the verifier's fixed environment, so its parse matches
     except subprocess.TimeoutExpired:
         raise KeyError_("ssh-keygen did not answer reading the key") from None
     finally:
