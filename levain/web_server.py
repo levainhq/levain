@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import Any
 
 from levain.cockpit.broker import Broker, BrokerError
+from levain.cockpit.anneal_effects import EPISODES, EpisodeEffectStore
 from levain.cockpit.effects import SPORES, SporeEffectStore
 from levain.cockpit.engine import Cockpit
 from levain.cockpit.external import ExternalPanels, discoverer
@@ -1186,13 +1187,15 @@ _PENDING_KEYS = {"signature": frozenset({"signature"}),
 def _build_broker(source: SubstrateSource, install_class: str | None,
                   httpd: "_LevainHTTPServer") -> "Broker | None":
     """The cockpit broker over a writable source (K2b §4.2, §6): its data root is
-    ``<ledger_root>/cockpit``, its one store the source's spores, its tier recompute the kernel's."""
+    ``<ledger_root>/cockpit``, its stores the source's spores and episodes, its tier recompute the
+    kernel's."""
     scope = source.write_scope
     if scope is None:
         return None
-    spores = scope.anneal.spores_json
-    return Broker(scope.ledger_root / "cockpit", stores={SPORES: SporeEffectStore(spores)},
-                  install_class=install_class, store_paths=[spores],
+    spores, episodes = scope.anneal.spores_json, scope.anneal.episodic_db
+    return Broker(scope.ledger_root / "cockpit",
+                  stores={SPORES: SporeEffectStore(spores), EPISODES: EpisodeEffectStore(episodes)},
+                  install_class=install_class, store_paths=[spores, episodes],
                   tier_of=lambda verb, params, target: retier(
                       httpd.verb_registry, httpd.get_cockpit(), verb, dict(params), dict(target)))
 

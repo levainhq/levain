@@ -47,6 +47,7 @@ from levain.autonomic.confirm import (
     verify_cockpit_signature,
 )
 from levain.autonomic.journal import JournalCorruptError
+from levain.cockpit.anneal_effects import EPISODE_CANONICAL, EPISODES, TOMBSTONE_VERB, tombstone_effects
 from levain.cockpit.consent import ConsentError, build_record, encode, parse_stamp, utc_stamp, value_sha256
 from levain.cockpit.effects import (
     SPORE_AUTHORITY_FIELDS,
@@ -202,6 +203,10 @@ class _Unbuildable(Exception):
     """The verb's effect cannot be built from the object as it now stands (it moved since issue)."""
 
 
+# each store name the broker registers, and the verbs its canonical_effect builds (K2b §13)
+_STORE_CANONICAL: dict[str, Mapping[str, Any]] = {SPORES: SPORE_CANONICAL, EPISODES: EPISODE_CANONICAL}
+
+
 # --- the broker -------------------------------------------------------------------------------------
 
 class Broker:
@@ -222,7 +227,7 @@ class Broker:
                  ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                  marker_directory: Path | None = None) -> None:
         for name, store in stores.items():
-            canonical = SPORE_CANONICAL if name == SPORES else None
+            canonical = _STORE_CANONICAL.get(name)
             refusals = registration_refusals(store, canonical)
             if refusals or name == COCKPIT_STORE:
                 raise ValueError(f"store {name!r} refused at registration: {refusals or ['reserved name']}")
@@ -538,6 +543,8 @@ class Broker:
         try:
             if verb in SPORE_CANONICAL:
                 return self._build_spore(verb, params, target, pid, at_issue=at_issue)
+            if verb == TOMBSTONE_VERB:
+                return self._build_tombstone(params, target, pid, at_issue=at_issue)
             if verb == "pending_cancel":
                 return self._build_cancel(db, target)
             if verb == "token_rotate":
@@ -574,6 +581,42 @@ class Broker:
         pre = None if snap.row is None else {f: _stored_authority(snap.row, f) for f in SPORE_AUTHORITY_FIELDS}
         return _Built({"kind": "row", "panel_id": target.get("panel_id"), "row_id": target.get("row_id"),
                        "origin_key": ok}, [eff], [pre])
+
+    def _build_tombstone(self, params: Mapping[str, Any], target: Mapping[str, Any], pid: str,
+                         *, at_issue: bool) -> _Built:
+        """A tombstone's two effects (``anneal_effects``) off one anneal snapshot. Its pre-image keeps
+        the episode's id and type, never its content: the journal must not hold what the delete
+        erases."""
+        es: Any = self.stores.get(EPISODES)      # an EpisodeEffectStore: read and origin_key_of
+        if es is None:
+            raise BrokerError("not_built", 501, "no episode store is registered with the broker")
+        if params:
+            raise ValueError(f"episode_tombstone takes no params (got {sorted(params)})")
+        if at_issue:
+            row_id = str(target.get("row_id") or "")
+            if not row_id.startswith("episode:"):
+                raise BrokerError("bad_target", 400, f"{row_id!r} is not one of the entity's episodes")
+            try:
+                ok = es.origin_key_of(row_id[len("episode:"):])
+            except KeyError:
+                raise BrokerError("stale", 409, f"row {row_id!r} is gone") from None
+            if ok is None:
+                raise BrokerError("refused", 409, f"row {row_id!r} has no origin_key: no label resource yet")
+        else:
+            ok = target.get("origin_key")
+            if not isinstance(ok, str) or not ok:
+                raise ValueError("the record's target names no origin_key")
+        got = es.read(ok)
+        if got is None:
+            if at_issue:
+                raise BrokerError("stale", 409, f"row {target.get('row_id')!r} is gone")
+            raise ValueError("the episode is gone")
+        if at_issue and target.get("row_version") is not None and got.rendered != target["row_version"]:
+            raise BrokerError("stale", 409, f"row {target.get('row_id')!r} changed since it was rendered")
+        effects = tombstone_effects(ok, got.version, effect_id=create_origin_key(pid, 0))
+        pre = {"id": got.row["id"], "type": got.row["type"]}
+        return _Built({"kind": "row", "panel_id": target.get("panel_id"), "row_id": target.get("row_id"),
+                       "origin_key": ok}, effects, [None, pre])
 
     @staticmethod
     def _origin_key_of_row(es: Any, target: Mapping[str, Any]) -> str:

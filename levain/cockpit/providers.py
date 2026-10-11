@@ -26,6 +26,7 @@ from levain.dashboard import (
     SubstrateSource,
     SubstrateView,
     OpenSpore,
+    _episode_row,
     _one_clause,
     open_spore_from,
     state_from_data,
@@ -267,6 +268,19 @@ def _feed_read(name: str, res: Result) -> _FeedRead:
     return out
 
 
+def episode_stored(e: Any) -> dict[str, Any]:
+    """An episode row's stored record, from the dashboard's ``EpisodeRow``: the one shape its
+    rendered version is computed over."""
+    return {"id": e.id, "timestamp": e.timestamp, "type": e.type, "source": e.source,
+            "content": e.content, "tags": list(e.tags)}
+
+
+def episode_row_version(ep: Any) -> str:
+    """The version the episodes panel renders for a raw anneal episode, so a write's issue can check
+    what the operator saw against the store's own snapshot."""
+    return row_version_of(episode_stored(_episode_row(ep)), EPISODE_STORED)
+
+
 def _episodes(source: SubstrateSource,
               feeds: Sequence[tuple[str, Callable[[ReadContext], Result]]] = ()) -> Callable[[ReadContext], Result]:
     """The entity's own episodes (``agent`` = the entity's name), then each federated feed's. A feed
@@ -283,8 +297,7 @@ def _episodes(source: SubstrateSource,
                 id=f"episode:{e.id}", title=e.content, body=e.content,
                 facets={"episode_type": e.type, "source": e.source, "at": _utc_at(e.timestamp),
                         "tags": list(e.tags), "agent": own},
-                stored={"id": e.id, "timestamp": e.timestamp, "type": e.type, "source": e.source,
-                        "content": e.content, "tags": list(e.tags)},
+                stored=episode_stored(e),
             )
             for e in view.episodes
         ]
