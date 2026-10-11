@@ -342,8 +342,8 @@
       // the operator opened/typed an editor WHILE this fetch was in flight — rebuilding
       // now would still discard it. The save path (passive:false) always applies.
       if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
-      // Track whether THIS surface demands the off-box write token (spore-129) so commit()'s
-      // writeHeaders attaches it. False on a loopback/read-only surface (the default).
+      // Track whether THIS surface demands the write token so commit()'s writeHeaders attaches it.
+      // True on any writable surface (K2a), false on a read-only one.
       writeTokenRequired = view.write_token_required === true;
       // Gate the write transport on the substrate being writable (NO THEATER): a
       // read-only source (no install root → POST /edit 422s) renders with no edit

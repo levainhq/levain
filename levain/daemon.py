@@ -448,7 +448,9 @@ def _private_logs(spec: "DaemonSpec") -> None:
     A writable serve prints its per-launch write token to stdout, which is this log. systemd's
     ``append:`` creates a missing file 0664 and keeps an existing file's mode (both measured on
     Ubuntu 24.04, 2026-10-11), so a log it creates is readable by any local user who can traverse
-    the operator's home, the party the write token keeps out. An existing log is narrowed too."""
+    the operator's home, the party the write token keeps out. An existing log is narrowed too. A
+    log deleted after install is recreated by the service manager: owner-only under the cockpit
+    unit's ``UMask=0077`` on systemd, and inside ``~/Library`` (owner-only by default) on macOS."""
     for path in (spec.stdout_log, spec.stderr_log):
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -860,6 +862,13 @@ class SystemdUserProvider(DaemonProvider):
             # `DaemonSpec` already refuses a periodic spec with keep_alive, and on systemd a Restart
             # on a oneshot is how a seat becomes a hot loop.
             lines += ["Restart=always", "RestartSec=5"]
+        if not periodic:
+            # The resident cockpit prints its write token to stdout. systemd creates a missing
+            # `append:` log under the service's UMask (0664 by default, 0600 under 0077: both
+            # measured on systemd 255), so a log deleted or rotated after install comes back
+            # owner-only too. Not on a seat: its confined hands may run as another uid that writes
+            # files the operator must read.
+            lines.append("UMask=0077")
         if periodic:
             # A seat's service is started by its TIMER only. With an [Install] section it could be
             # enabled on its own (a resident -> periodic reinstall left exactly that) and start at
@@ -1245,7 +1254,7 @@ def select_provider(system: str | None = None) -> DaemonProvider:
 THREAT_MODEL_NOTE = (
     "An always-on serve is a 24/7 loopback-LOCAL cockpit. Every write needs its write token, on "
     "loopback too. The token changes each time the daemon starts and is printed only to the "
-    "daemon's log, owner-readable, with an `open the cockpit, unlocked:` link: open the link from "
+    "daemon's log (owner-only) with an `open the cockpit, unlocked:` link: open the link from "
     "the latest start (after a login or a restart the page asks again). Cross-origin/browser "
     "attacks stay blocked. Off-box (--host <mesh>) is NOT daemonized: an install-bearing serve is "
     "loopback-only."
