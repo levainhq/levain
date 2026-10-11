@@ -285,6 +285,10 @@ def _corrupt(op: str | None, why: str) -> JournalCorruptError:
     return JournalCorruptError(f"cockpit op {op}: {why}")
 
 
+# every way a stored JSON column can fail to parse; the one list the three parse sites catch
+_UNPARSEABLE = (TypeError, UnicodeDecodeError, ValueError, RecursionError)   # ConsentError is a ValueError
+
+
 def _parse_record(op: str | None, blob: Any, sha: Any) -> dict[str, Any]:
     """The record a pending holds, or JournalCorruptError. ``op`` None (at issue, before the row
     exists) checks the id's form instead of its equality."""
@@ -295,8 +299,8 @@ def _parse_record(op: str | None, blob: Any, sha: Any) -> dict[str, Any]:
     try:
         record = json.loads(blob.decode("utf-8"))
         canonical = encode(record)
-    except (UnicodeDecodeError, ValueError, RecursionError) as exc:   # ConsentError is a ValueError
-        raise _corrupt(op, f"record does not parse: {type(exc).__name__}") from exc
+    except _UNPARSEABLE as exc:
+        raise _corrupt(op, f"record does not parse: {type(exc).__name__}: {str(exc)[:200]}") from exc
     if canonical != blob:
         raise _corrupt(op, "record is not in canonical form")
     if not isinstance(record, dict):
@@ -375,7 +379,7 @@ def _effect_rows(op: str, record: dict[str, Any], rows: list[sqlite3.Row],
         _check_stamp(op, f"effects[{idx}].applied_at", r["applied_at"])
         try:
             pre = None if r["pre_image"] is None else json.loads(r["pre_image"])
-        except (TypeError, ValueError) as exc:
+        except _UNPARSEABLE as exc:
             raise _corrupt(op, f"effects row {idx} pre_image does not parse") from exc
         if r["status"] == "PLANNED" and r["applied_at"] is not None:
             raise _corrupt(op, f"effects row {idx} is planned with an applied_at")
@@ -1064,7 +1068,7 @@ def _classify_difference(stored: dict[str, Any], recomputed: bytes) -> tuple[str
     ``REFUSED "normaliser"``."""
     try:
         fresh = json.loads(recomputed.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except _UNPARSEABLE:
         return "REFUSED", "normaliser"
     if not isinstance(fresh, dict):
         return "REFUSED", "normaliser"

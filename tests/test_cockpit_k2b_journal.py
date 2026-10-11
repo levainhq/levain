@@ -657,3 +657,24 @@ def test_a_naive_now_is_refused_whatever_the_journal_holds(db):
     issue(db, key="a")
     with pytest.raises(ConsentError):
         db.expire_due(datetime(2026, 10, 10, 12, 0))
+
+
+DEEP = b"[" * 100_000 + b"]" * 100_000
+
+
+def test_a_deeply_nested_pre_image_is_corrupt(db):
+    """complement L3 r7: the effects row's pre_image parses through the same failure list as the
+    record, so a nested one is JournalCorruptError, never a RecursionError out of a load."""
+    pid = decided(db)
+    with db.write() as conn:
+        conn.execute("UPDATE effects SET pre_image = ? WHERE operation_id = ? AND idx = 0",
+                     (DEEP.decode(), pid))
+    with pytest.raises(JournalCorruptError, match="pre_image"):
+        db.load(pid)
+
+
+def test_a_deeply_nested_recompute_is_refused_normaliser(db):
+    pid, _ = issue(db)
+    out = db.decide(operation_id=pid, decision_kind="ALLOWED", recomputed=DEEP,
+                    now=T0 + timedelta(minutes=1), signer_fp=FP_PHONE, signature="sig")
+    assert (out.state, out.reason) == ("REFUSED", "normaliser")
