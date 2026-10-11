@@ -1180,7 +1180,27 @@ def _is_safe_install_target(path: Path) -> bool:
         return True
     if not path.is_dir():
         return False
-    return not any(path.iterdir())
+    return _holds_only_lock_bookkeeping(path)
+
+
+def _holds_only_lock_bookkeeping(path: Path) -> bool:
+    """True when ``path`` holds nothing but what :func:`install_lock` itself leaves: a
+    ``.levain/`` with the empty lock file and, once a lock was taken, the ``.gitignore`` that
+    names only it. A refused lock leaves the lock file (it is never unlinked: another process
+    may hold it), and the advised ``LEVAIN_UNLOCKED=1`` re-run must not meet "not empty"."""
+    for entry in path.iterdir():
+        if entry.name != INSTALL_LOCK_REL[0] or entry.is_symlink() or not entry.is_dir():
+            return False
+        for e in entry.iterdir():
+            if e.is_symlink() or not e.is_file():
+                return False
+            if e.name == INSTALL_LOCK_REL[1] and e.stat().st_size == 0:
+                continue
+            if e.name == ".gitignore" and e.read_text(
+                    encoding="utf-8", errors="replace").split() == [INSTALL_LOCK_REL[1]]:
+                continue
+            return False
+    return True
 
 
 def _is_safe_install_target_locked(path: Path) -> bool:
@@ -1267,14 +1287,24 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
     no-op, so a caller can hold it across ``apply_init`` (which takes it too) and the
     work after it: ``run_init`` and the web init handler both do, around the docs
     refresh. A second ``flock`` on a fresh fd would refuse even its own process,
-    because a BSD ``flock`` belongs to the open file, not the process. Without
-    ``fcntl`` (Windows) there is no lock and this yields unguarded."""
+    because a BSD ``flock`` belongs to the open file, not the process. Where no lock can be
+    taken (no ``flock`` on the platform, or the filesystem answers "not supported") this raises
+    :class:`InstallUnlockable` unless ``LEVAIN_UNLOCKED=1`` is set: one lock protocol for both
+    of levain's single-writer locks (Phill 10-11, frame A). Run unguarded, two such inits were
+    reproduced interleaving their activation swaps (1011+40, argushub, flock answering ENOTSUP)."""
     path = install.joinpath(*INSTALL_LOCK_REL)
+
+    def unlockable(why: str) -> InstallLockError:
+        return InstallUnlockable(
+            f"{path} cannot be locked ({why}), so two levain processes writing {install} at once "
+            f"could interleave. Nothing was written but the empty lock file. If no other `init` "
+            f"or `update` writes this "
+            f"install at the same time, re-run with {UNLOCKED_ENV}=1.")
 
     def precheck() -> None:
         if not create and not path.parent.is_dir():
             # `update` / `adopt-answers` on a path that is not an install must not leave a
-            # .levain/ behind, which would make a later `init` there refuse a non-empty dir.
+            # .levain/ behind, which would make the next `update` there take it for an install.
             raise InstallLockError(
                 f"{install} is not a levain install (no .levain/ directory).")
 
@@ -1283,8 +1313,14 @@ def install_lock(install: Path, *, create: bool = True) -> Iterator[None]:
         busy=lambda: InstallBusy(
             f"another levain process (an `init` or `update`) is writing {install} "
             f"right now. This run installed nothing; re-run once that one has finished."),
+        unlockable=None if _unlocked(UNLOCKED_ENV) else unlockable,
     ):
         yield
+
+
+class InstallUnlockable(InstallLockError):
+    """The install cannot be locked here (no ``flock`` on the platform, or the filesystem
+    answers "not supported") and :data:`UNLOCKED_ENV` is not ``1``; nothing was written."""
 
 
 class CodexHomeBusy(InstallLockError):
@@ -1294,14 +1330,20 @@ class CodexHomeBusy(InstallLockError):
 
 class CodexHomeUnlockable(InstallLockError):
     """CODEX_HOME cannot be locked here (no ``flock`` on the platform, or the filesystem
-    answers "not supported") and :data:`CODEX_HOME_UNLOCKED_ENV` is not ``1``; nothing was
-    written."""
+    answers "not supported") and neither :data:`UNLOCKED_ENV` nor :data:`CODEX_HOME_UNLOCKED_ENV`
+    is ``1``; nothing was written."""
 
 
 CODEX_HOME_LOCK_NAME = "levain.lock"
-# The named override for a CODEX_HOME that cannot be locked (Phill 2026-10-10, option B:
-# fail closed there, with a named override). Exactly "1" opts in; any other value refuses.
+# The named override where a lock cannot be taken (Phill 2026-10-10, option B, then 10-11 frame A:
+# one protocol for both locks). Exactly "1" opts in; any other value refuses. The 0.7.1 name
+# CODEX_HOME_UNLOCKED_ENV stays as an alias for the CODEX_HOME lock only.
+UNLOCKED_ENV = "LEVAIN_UNLOCKED"
 CODEX_HOME_UNLOCKED_ENV = "LEVAIN_CODEX_HOME_UNLOCKED"
+
+
+def _unlocked(*names: str) -> bool:
+    return any(os.environ.get(n) == "1" for n in names)
 
 
 @contextmanager
@@ -1316,16 +1358,17 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
     on 0.7.0). Taken after the install lock, never before, so two levain processes
     cannot wait on each other. Same semantics as :func:`install_lock`, except where no lock
     can be taken: there it raises :class:`CodexHomeUnlockable` (fail closed) unless
-    ``LEVAIN_CODEX_HOME_UNLOCKED=1`` is set, the operator's statement that no other install
-    writes this codex home at the same time."""
+    ``LEVAIN_UNLOCKED=1`` (or its 0.7.1 alias ``LEVAIN_CODEX_HOME_UNLOCKED=1``) is set, the
+    operator's statement that no other install writes this codex home at the same time."""
     lock = codex_home / CODEX_HOME_LOCK_NAME
 
     def unlockable(why: str) -> InstallLockError:
         return CodexHomeUnlockable(
             f"{lock} cannot be locked ({why}), so two codex installs writing {codex_home} at "
-            f"once could mix config.toml and hooks.json. Nothing was written there. If no other "
+            f"once could mix config.toml and hooks.json. Nothing was written there but the empty "
+            f"lock file. If no other "
             f"levain install writes this codex home at the same time, re-run with "
-            f"{CODEX_HOME_UNLOCKED_ENV}=1.")
+            f"{UNLOCKED_ENV}=1.")
 
     with _single_writer_lock(
         lock, what="the CODEX_HOME lock",
@@ -1334,7 +1377,7 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
             f"another levain process (an `init` or `update` of a codex install) is "
             f"writing {codex_home} right now. This run wrote nothing there; re-run once "
             f"that one has finished."),
-        unlockable=None if os.environ.get(CODEX_HOME_UNLOCKED_ENV) == "1" else unlockable,
+        unlockable=None if _unlocked(UNLOCKED_ENV, CODEX_HOME_UNLOCKED_ENV) else unlockable,
     ):
         yield
 
@@ -1343,20 +1386,21 @@ def codex_home_lock(codex_home: Path) -> Iterator[None]:
 def _single_writer_lock(
     path: Path, *, what: str, guards: str, busy: Callable[[], InstallLockError],
     precheck: Callable[[], None] | None = None,
-    unlockable: Callable[[str], InstallLockError] | None = None,
+    unlockable: Callable[[str], InstallLockError] | None,
 ) -> Iterator[None]:
     """An exclusive non-blocking ``flock`` on ``path``, reentrant per (path, thread); the
-    body of :func:`install_lock` and :func:`codex_home_lock`. Where no lock can be taken,
-    ``unlockable`` (when given) builds the refusal to raise instead of running unguarded."""
-    try:
-        import fcntl
-    except ImportError:
-        if precheck is not None:
-            precheck()  # a path that is not an install is refused here too, lock or none
-        if unlockable is not None:
-            raise unlockable("this platform has no flock") from None
-        yield
-        return
+    body of :func:`install_lock` and :func:`codex_home_lock`, the one lock protocol both use.
+    Where no lock can be taken, ``unlockable`` builds the refusal; it is ``None`` only when the
+    operator set the override, and then this runs unguarded and says so.
+
+    flock, because the kernel owns it: a holder killed by SIGTERM or SIGKILL releases it, so no
+    lock goes stale, and every levain release that has these locks takes the same flock, so they
+    exclude each other (a Linux NFS client emulates it as a POSIX lock the server arbitrates,
+    unless the mount sets ``local_lock=flock|all``, which keeps it client-local). The O_EXCL marker
+    fallback was deleted (0.7.1 L3 r2/r3: it did not exclude a flock holder, and went stale
+    after SIGTERM); a filesystem with no lock at all is refused, never guessed at. On a Linux NFS
+    client the flock is a POSIX lock, which closing ANY other descriptor of the same file in this
+    process releases: nothing else may open the lock file while it is held."""
     key = (path.resolve(), threading.get_ident())
     with _held_install_locks_guard:
         if key in _held_install_locks:
@@ -1373,14 +1417,46 @@ def _single_writer_lock(
         return
     if precheck is not None:
         precheck()
+
+    @contextmanager
+    def held() -> Iterator[None]:
+        with _held_install_locks_guard:
+            _held_install_locks[key] = 1
+        try:
+            yield
+        finally:
+            with _held_install_locks_guard:
+                del _held_install_locks[key]
+
+    def unguarded(who: str, why: str = "") -> None:
+        # the operator's override (unlockable is None only then): proceed, and say so
+        print(f"  note: {who} cannot lock {path}{why}; continuing without the guard against "
+              f"{guards}, as the unlocked override asks.", file=sys.stderr)
+
+    try:
+        import fcntl
+    except ImportError:
+        if unlockable is not None:
+            raise unlockable("this platform has no flock") from None
+        unguarded("this platform")
+        with held():
+            yield
+        return
+
+    def bookkeep() -> None:
+        # only once the lock is taken or the override accepted: a refusal leaves an
+        # operator's .gitignore exactly as it was
+        if path.parent.name == ".levain":
+            _ensure_gitignored(path.parent, path.name)
+
     fd = -1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Never through a link: a lock file swapped for a symlink to a file levain later
         # replaces would hand a second process a different inode, and so a second lock.
+        # The lock file is never unlinked, refusal included: another process may hold it,
+        # and a third one would then lock a fresh inode beside it.
         fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
-        if path.parent.name == ".levain":
-            _ensure_gitignored(path.parent, path.name)
     except OSError as e:
         if fd >= 0:
             os.close(fd)
@@ -1412,30 +1488,20 @@ def _single_writer_lock(
             if e.errno in unsupported:
                 if unlockable is not None:
                     raise unlockable(f"the filesystem answers {e.strerror or e}") from None
-                # A filesystem without lock support (NFS without lockd, some SMB/FUSE
-                # homes) is not "another process": proceed unguarded, and say so.
-                print(f"  note: this filesystem cannot lock {path} ({e.strerror or e}); "
-                      f"continuing without the guard against {guards}.",
-                      file=sys.stderr)
+                unguarded("this filesystem", f" ({e.strerror or e})")
                 os.close(fd)
                 fd = -1
-                with _held_install_locks_guard:
-                    _held_install_locks[key] = 1
-                try:
+                bookkeep()
+                with held():
                     yield
-                finally:
-                    with _held_install_locks_guard:
-                        del _held_install_locks[key]
                 return
             raise busy() from None
-        with _held_install_locks_guard:
-            _held_install_locks[key] = 1
-        try:
-            yield
-        finally:
-            with _held_install_locks_guard:
-                del _held_install_locks[key]
-            fcntl.flock(fd, fcntl.LOCK_UN)
+        bookkeep()
+        with held():
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         if fd >= 0:
             os.close(fd)

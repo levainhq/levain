@@ -894,16 +894,19 @@ def test_codex_home_is_one_writer_across_installs(make_install, tmp_path, capsys
     assert not (tmp_path / "second" / "seed").exists()
 
 
-@pytest.mark.parametrize("override", [None, "true", "1"])
+@pytest.mark.parametrize("env", [None, ("LEVAIN_CODEX_HOME_UNLOCKED", "true"),
+                                 ("LEVAIN_CODEX_HOME_UNLOCKED", "1"), ("LEVAIN_UNLOCKED", "1")])
 def test_codex_home_fails_closed_where_it_cannot_be_locked(
-        make_install, tmp_path, capsys, monkeypatch, override):
-    # Phill 2026-10-10, option B: where flock answers "not supported" (some SMB/NFS homes),
-    # codex init and update refuse before writing, unless LEVAIN_CODEX_HOME_UNLOCKED is
-    # exactly "1". Before this, both ran unguarded with a stderr note.
+        make_install, tmp_path, capsys, monkeypatch, env):
+    # Phill 2026-10-10, option B, then 10-11 frame A (one protocol for both locks): where flock
+    # answers "not supported" (some SMB/NFS homes), codex init and update refuse before writing,
+    # unless LEVAIN_UNLOCKED is exactly "1". The 0.7.1 name LEVAIN_CODEX_HOME_UNLOCKED still
+    # unlocks the CODEX_HOME lock, but the install lock is taken first and refuses without
+    # LEVAIN_UNLOCKED, so the alias alone writes nothing.
     import errno
     import fcntl
 
-    from levain.install import CODEX_HOME_UNLOCKED_ENV
+    from levain.install import CODEX_HOME_UNLOCKED_ENV, UNLOCKED_ENV
     from levain.update import run_update
     from tests.test_init_answers import _filled
 
@@ -912,10 +915,10 @@ def test_codex_home_fails_closed_where_it_cannot_be_locked(
     before = {p.name: p.read_bytes() for p in codex_home.iterdir() if p.is_file()}
     af = tmp_path / "second-answers.json"
     af.write_text(json.dumps(_filled(capsys)), encoding="utf-8")
-    if override is None:
-        monkeypatch.delenv(CODEX_HOME_UNLOCKED_ENV, raising=False)
-    else:
-        monkeypatch.setenv(CODEX_HOME_UNLOCKED_ENV, override)
+    for name in (CODEX_HOME_UNLOCKED_ENV, UNLOCKED_ENV):
+        monkeypatch.delenv(name, raising=False)
+    if env is not None:
+        monkeypatch.setenv(*env)
 
     def no_locks(_fd, _op):
         raise OSError(errno.ENOTSUP, "Operation not supported")
@@ -925,20 +928,21 @@ def test_codex_home_fails_closed_where_it_cannot_be_locked(
     init_rc = run_init(tmp_path / "second", "codex", force=False, answers_file=af)
     update_rc = run_update(first, no_pip=True, emit=lines.append)
     out = capsys.readouterr()
-    if override == "1":
-        assert init_rc == 0
+    if env == (UNLOCKED_ENV, "1"):
+        assert (init_rc, update_rc) == (0, 0)
         assert (tmp_path / "second" / "seed").exists()
         assert "cannot lock" in out.err
         return
     assert (init_rc, update_rc) == (1, 1)
-    assert f"{CODEX_HOME_UNLOCKED_ENV}=1" in out.out
-    assert any(f"{CODEX_HOME_UNLOCKED_ENV}=1" in ln and "NOT refreshed" in ln for ln in lines)
+    assert f"{UNLOCKED_ENV}=1" in out.out
+    assert any(f"{UNLOCKED_ENV}=1" in ln for ln in lines)
     assert {p.name: p.read_bytes() for p in codex_home.iterdir() if p.is_file()} == before
     assert not (tmp_path / "second" / "seed").exists()
 
 
-def test_codex_home_lock_fails_closed_without_fcntl(tmp_path, monkeypatch):
-    # Windows has no fcntl: same refusal, same override.
+def test_codex_home_lock_fails_closed_without_fcntl(tmp_path, monkeypatch, capsys):
+    # Windows has no fcntl: same refusal, same override. With only the alias set, the note must not
+    # name LEVAIN_UNLOCKED, which is unset (L3 r1 LOW).
     from levain.install import CODEX_HOME_UNLOCKED_ENV, CodexHomeUnlockable, codex_home_lock
 
     import sys
@@ -949,8 +953,11 @@ def test_codex_home_lock_fails_closed_without_fcntl(tmp_path, monkeypatch):
         with codex_home_lock(tmp_path):
             pass
     monkeypatch.setenv(CODEX_HOME_UNLOCKED_ENV, "1")
+    monkeypatch.delenv("LEVAIN_UNLOCKED", raising=False)
     with codex_home_lock(tmp_path):
         pass
+    err = capsys.readouterr().err
+    assert "unlocked override" in err and "LEVAIN_UNLOCKED" not in err
 
 
 def _pair_failing_hooks(tmp_path, monkeypatch, meddle):
