@@ -743,7 +743,12 @@ def build_default_cockpit(
                 raise RuntimeError(f"{key}: {v.errors[key]}")
         specs: list[ProviderSpec] = []
         used: set[str] = set()
-        writable = _section_writer_shipped()
+        from levain.cockpit.anneal_effects import section_paths_agree
+
+        ws = source.write_scope
+        # the panel reads the store the broker writes, and that store's continuity is the one named
+        writable = (_section_writer_shipped() and ws is not None and ws.anneal == source.anneal
+                    and section_paths_agree(source.anneal))
         for i, s_ in enumerate(v.sections):
             pid = section_panel_id(s_.heading)
             while pid in used:

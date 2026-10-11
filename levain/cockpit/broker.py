@@ -691,8 +691,8 @@ class Broker:
                 raise BrokerError("wrap_in_progress", 409, "a wrap is open on the memory store; edit after it saves")
         elif got.wrap_open:
             # a wrap opened after issue (a pending lives PENDING_TTL): the decision waits, the signature
-            # stays unspent, and the operator signs again once the wrap saves (L2 r1)
-            raise TransientApplyFault("WrapOpen", "a wrap is open on the memory store; sign after it saves")
+            # stays unspent, and the operator retries once the wrap saves (L2 r1, L3 r1 complement #3)
+            raise TransientApplyFault("WrapOpen", "a wrap is open on the memory store; retry after it saves")
         effects = section_effects(heading, got.version, body)
         return _Built({"kind": "value", "panel_id": target.get("panel_id"), "heading": heading,
                        "panel_version": target.get("panel_version")}, effects,

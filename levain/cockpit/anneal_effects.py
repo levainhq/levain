@@ -268,6 +268,14 @@ def section_effects(heading: str, version: str, body: str) -> list[Effect]:
 SECTION_CANONICAL = {SECTION_VERB: section_effects}
 
 
+def section_paths_agree(paths: Any) -> bool:
+    """Whether ``paths.continuity_md`` is the file anneal's ``Store`` opens for ``paths.episodic_db``
+    (``<stem>.continuity.md``): the section reader and writer open the store by its db, so a section is
+    offered for editing only where that is the continuity file the substrate names (L3 r1 codex)."""
+    db = Path(paths.episodic_db)
+    return Path(paths.continuity_md) == db.with_name(f"{db.stem}.continuity.md")
+
+
 def _written_version(body: str) -> str:
     """The version anneal gives ``body`` once written (its canonical form, hashed as read_section
     hashes a span), so a retry after a lost acknowledgement reads ALREADY."""
@@ -338,10 +346,15 @@ class SectionEffectStore:
             with self._store(read_only=True) as store:
                 got = store.read_section(heading)
                 wrap_open = bool(store.get_wrap_started_at())
+                role = next((s["role"] for s in store.section_schema
+                             if s["heading"].lower() == heading.strip().lower()), None)
         except SectionError as exc:
             raise ValueError(f"the {heading!r} section is unreadable: {exc}") from exc
         except _read_faults() as exc:
             raise TransientApplyFault.of(exc) from exc
+        if role == "graduating":
+            # replace_section refuses it, but only after consent: a schema may declare any heading so
+            raise ValueError(f"the {heading!r} section graduates; it changes only through a wrap")
         if got is None:
             return None
         text, version = got
