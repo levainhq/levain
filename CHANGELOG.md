@@ -6,7 +6,16 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
-The cockpit's write side, part one (K2a). It ships in one release with K2b (the broker), which these notes will gain.
+The cockpit's write side: K2a (one write route, the write token, writes bound to what was rendered) and K2b (the broker, which turns a write that needs more than the token into a consented, journalled fire). They ship together.
+
+### Added
+
+- **The cockpit broker.** A T2 or T3 write from the cockpit no longer fires inside the request: it is issued as a pending that holds a consent record (what will change, on which row and version, at which tier, and when the pending expires), decided in one transaction, then applied store by store and finished. Every step is journalled in `cockpit.db` under the install's cockpit data root, so a crash at any point is recovered at the next start and an apply that hit a transient fault is retried in the background, with a backoff that caps at two minutes. One broker owns a data root (an exclusive lock on `cockpit.lock` beside it); a second server on the same root waits in standby and its broker-backed reads say so.
+- **Signing a pending.** A pending waiting for a signature shows on its row with a cancel button. It is signed with an enrolled OpenSSH key over the record's exact bytes (`ssh-keygen -Y sign -n levain-cockpit`) and the signature is posted to `/cockpit/pending/<id>/signature`. An unsigned pending expires after 15 minutes, and each key holds a bounded number of waiting pendings.
+- **`levain cockpit enroll | revoke | keys`** manage a reported install's signing keys: a `laptop-presence` key signs T2 and T3, a `display-phone` key T2. The last laptop-presence key is revoked only with `--compromised-since`, and from that time on its signatures stop reading verified.
+- **A reported install** (`levain serve --install-class reported`) may fire a T2 write on the write token alone; the write is recorded as reported and the page labels it `claims cockpit token`. T3 always needs a signature. A governed install (a root-written marker) is not built yet: a governed marker disables the broker and every write route says so.
+- **An episode can be tombstoned from the cockpit** (the entity's own episodes; T2, irreversible, confirmed first), and **the neocortex State section is editable again**, written through anneal's own section writer on anneal's section version (anneal-memory 0.9.43's `Store.replace_section`), so an edit against a section another writer changed is refused.
+- **Recent edits shows the broker's applied writes** beside the ledger's, and the decisions panel shows the broker's waiting pendings.
 
 ### Changed
 
@@ -17,7 +26,6 @@ The cockpit's write side, part one (K2a). It ships in one release with K2b (the 
 - **Requires anneal-memory 0.9.43 or later** (the spore compare uses `expected_version`, first in 0.9.42; the cockpit broker is built and tested on 0.9.43).
 - **Open loops comes before the Tray**, and the Tray has a **By age** view: the same box, the same rows, oldest first, with each item's age. The page switches between the Tray's order and By age without re-sorting anything itself: the server sends both orders.
 - **The Episodes panel can show other agents' episodes.** An embedding server passes `episode_feeds={name: read}` to `build_default_cockpit`; each feed's rows appear with their agent, and the page gets an agent filter. A feed that fails, or sends rows that are not episodes, is named on the panel and shows nothing, and the entity's own episodes stay. Only the entity's own episodes can be tombstoned. The entity's own episodes are its newest few dozen, and the panel says so; other agents' rows are not cut to that window, so a busy entity never hides them.
-- **The neocortex section panels offer no edit for now.** Editing a section returns with anneal's section writer.
 - **The manifest page writes (`/?source=manifest`, opt-in).** Every affordance posts `/cockpit/verb` with the row it was shown. A write that may rise above its rendered tier first asks the server for a preview (`dry_run`), shows the tier it rises to and what it does, and fires the exact request you saw only on a second click; a fire that names an `intent` must also name the previewed `tier_seen` and `gesture_seen`, and the server refuses `409 tier_moved` / `gesture_moved` when either has changed. A T2 write in a reported install is labelled `claims cockpit token`. Each fire above C1 carries one idempotency key, kept for the tab, so a retry after a lost answer lands once. A pending your signature is waiting on shows on its row with a cancel button. The manifest names the server's write capability (`transport: {writable, write_token_required}`), and a resolve or promote action names the kinds its row's type takes (`options`). A row whose text holds characters the page cannot show faithfully (a zero-width space, a line separator) offers no inline edit; edit it with the CLI. Rename shows only where the cockpit offers it.
 - **A spore's domain is editable** (`spore_update` takes `domain`; the inline edit has a domain field). The broker refuses a type change on a Keep note or an open loop, as the legacy route does.
 - **A downstream verb can fire through the broker.** An embedding server passes `make_server(extra_effects={verb: DownstreamEffect(store, canonical)})`: an `EffectStore` and its `canonical_effect` for that verb, checked at construction. An `ActionVerb` may declare `fields`, which the manifest publishes and the route enforces.
@@ -29,6 +37,12 @@ The cockpit's write side, part one (K2a). It ships in one release with K2b (the 
 - A downstream verb with no `extra_effects` entry is T2 and has no broker effect, so it is refused (`needs_broker` on `/action`, `not_built` on `/cockpit/verb`). An embedding server that sent messages through `/action` before this release needs an effect store for that verb.
 - The preview binds the tier and the gesture, not the params; the page sends exactly the params it previewed.
 - Downstream jobs (`job=True` verbs) have no manifest-page path yet.
+- An embedding server's downstream write verb that worked through `/action` before this release (a message send, for example) is refused after the upgrade until that server passes an effect store for it (`extra_effects`). Upgrade the embedder and levain together.
+- Neither the page nor the CLI signs a pending yet: a T3 write, or a T2 write outside a reported install, waits until something posts an `ssh-keygen -Y sign` signature over its record. The full pending card comes with the governed install.
+- **Erased means erased at the API.** A tombstoned episode's content can remain in freed pages of the SQLite files and in anneal's tombstone record (a content hash), and a State section edit keeps the section's previous text in `cockpit.db` with no retention bound.
+- A write that touches more than one store takes no lock across them, and a store records no receipt per effect: the broker's journal is the record of what it applied.
+- In a reported install the write token's secret has no levain-owned file: a server mints a fresh token each start, and under `levain daemon install` it is printed only to the daemon's owner-only log.
+- The broker refuses to start when its data root or a registered store is on a network filesystem (NFS, SMB, FUSE), because its lock may not hold there; the cockpit's writes above C1 are then refused.
 
 ## [0.7.2] — 2026-10-10
 
