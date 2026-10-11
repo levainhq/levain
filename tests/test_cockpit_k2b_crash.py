@@ -8,7 +8,7 @@ kill point implies), so a kill point that did not fire fails the control. Then a
 recovers and the invariants are asserted: inv 3 (APPLIED exactly once, the store at the signed
 post-values), inv 4 (every field of every ``changes`` holds its pre-image or its consent value).
 
-Not covered here (K2b-3): section, inbox, decision, tombstone, config and policy effects.
+Episode tombstone and section edit: see the K2b-3 block at the end. Not covered: inbox, decision, config and policy effects.
 """
 
 from __future__ import annotations
@@ -359,3 +359,144 @@ def test_decide_wins_race_and_cancel_is_refused(home: Path, spores: Path) -> Non
         b.stop()
     assert _ops(home / "data") == [(pid, "COMMITTED")]
     assert _row(spores, ok)["text"] == "edited"
+
+
+# --- K2b-3: the anneal kinds (episode tombstone, section edit) x the same kill points -----------------
+
+from anneal_memory import Store                                                    # noqa: E402
+
+from levain.cockpit.anneal_effects import (                                         # noqa: E402
+    EPISODES, SECTIONS, EpisodeEffectStore, SectionEffectStore)
+
+NEW_BODY = "the crash-harness State body"
+
+
+@pytest.fixture
+def adb(home: Path) -> Path:
+    p = home / "memory.db"
+    (home / "memory.continuity.md").write_text(
+        "# Continuity\n\n## State\nthe pre-image State body\n\n## Durable Facts\n- f1\n\n## Patterns\n- p1\n\n"
+        "## Decisions\n- d1\n\n## Context\nctx\n", encoding="utf-8")
+    with Store(str(p)) as st:
+        st.record("the episode to tombstone", "observation", origin_key="ok.target")
+        st.record("a neighbour that stays", "observation", origin_key="ok.other")
+    return p
+
+
+def _a_broker(home: Path, spores: Path, db: Path) -> Broker:
+    b = Broker(home / "data", stores={"spores": SporeEffectStore(spores), EPISODES: EpisodeEffectStore(db),
+                                      SECTIONS: SectionEffectStore(db)},
+               store_paths=[spores, db], install_class="reported")
+    b.start()
+    return b
+
+
+def _ep_target(db: Path) -> dict[str, Any]:
+    with Store(str(db), read_only=True) as st:
+        ep = st.get_by_origin_key("ok.target")
+    got = EpisodeEffectStore(db).read("ok.target")
+    assert ep is not None and got is not None
+    return {"kind": "row", "panel_id": "episodes", "row_id": f"episode:{ep.id}", "row_version": got.rendered}
+
+
+def _sec_target(db: Path) -> dict[str, Any]:
+    got = SectionEffectStore(db).read("State")
+    assert got is not None
+    return {"kind": "value", "panel_id": "section:state", "panel_version": got.rendered}
+
+
+ANNEAL = {"tombstone": ("episode_tombstone", {}, _ep_target),
+          "section": ("section_edit", {"new_body": NEW_BODY}, _sec_target)}
+
+
+def _episode_state(db: Path) -> tuple[bool, bool, int]:
+    """(target episode present, neighbour present, origin_key 'ok.target' retired)."""
+    with Store(str(db), read_only=True) as st:
+        return (st.get_by_origin_key("ok.target") is not None, st.get_by_origin_key("ok.other") is not None,
+                st.origin_key_status("ok.target").state == "retired")
+
+
+def _state_body(db: Path) -> str:
+    with Store(str(db), read_only=True) as st:
+        return st.read_section("State")[0].strip()
+
+
+def _store_is(kind: str, db: Path, which: str) -> bool:
+    if kind == "tombstone":
+        present, neighbour, retired = _episode_state(db)
+        assert neighbour, "the neighbour episode must survive in every state"
+        return (present and not retired) if which == "pre" else (not present and retired)
+    body = _state_body(db)
+    return body == ("the pre-image State body" if which == "pre" else NEW_BODY)
+
+
+def _run_anneal(home: Path, spores: Path, db: Path, kind: str, kill_at: str | None) -> subprocess.CompletedProcess:
+    verb, params, target = ANNEAL[kind]
+    cfg = {"data_root": str(home / "data"), "spores": str(spores), "db": str(db), "kill_at": kill_at,
+           "verb": verb, "params": params, "target": target(db), "idempotency_key": "idem-1"}
+    return subprocess.run([sys.executable, str(ENTRY), json.dumps(cfg)], capture_output=True, text=True,
+                          timeout=120, cwd=str(Path(__file__).parent.parent))
+
+
+@pytest.mark.parametrize("kind", list(ANNEAL))
+def test_anneal_control_no_kill(home: Path, spores: Path, adb: Path, kind: str) -> None:
+    """CONTROL: the same drive with no kill point commits, applies once, and the store holds the effect."""
+    proc = _run_anneal(home, spores, adb, kind, None)
+    assert proc.returncode == 0, proc.stderr
+    data = home / "data"
+    (pid, state), = _ops(data)
+    assert state == "COMMITTED"
+    assert [r[1] for r in _effects(data, pid)] == ["APPLIED"] * len(_effects(data, pid))
+    assert _store_is(kind, adb, "consent")
+
+
+@pytest.mark.parametrize("point", KILL_POINTS)
+@pytest.mark.parametrize("kind", list(ANNEAL))
+def test_anneal_kill_matrix(home: Path, spores: Path, adb: Path, kind: str, point: str) -> None:
+    verb, params, target = ANNEAL[kind]
+    data = home / "data"
+    assert _store_is(kind, adb, "pre")
+    proc = _run_anneal(home, spores, adb, kind, point)
+    assert proc.returncode == 137, f"the kill point {point!r} did not fire: rc={proc.returncode}\n{proc.stderr}"
+
+    # --- CONTROL: journal and store before any recovery ---------------------------------------------
+    (pid, state), = _ops(data)
+    assert state == EXPECT_STATE[point], f"at the kill the op is {state}, not {EXPECT_STATE[point]}"
+    jrows = _effects(data, pid)
+    n = len(_record(data, pid)["effects"])
+    if point in EXPECT_STATUS:
+        assert [r[1] for r in jrows] == [EXPECT_STATUS[point]] * n
+    else:
+        assert jrows == [], "no effect row exists before the commit point"
+    want = "consent" if point in STORE_APPLIED else "pre"
+    assert _store_is(kind, adb, want), f"at {point} the store should hold the {want} state"
+
+    # --- recover with a fresh broker on the same root ------------------------------------------------
+    b = _a_broker(home, spores, adb)
+    try:
+        assert b.state is Lifecycle.ACTIVE
+        b.recover()
+        if point in ("issued", "verified"):
+            assert _ops(data) == [(pid, "WAITING")]
+            assert _store_is(kind, adb, "pre")
+            tgt = target(adb)
+            out = b.issue(verb=verb, params=params, target=tgt, tier="T2", credential=BROWSER,
+                          intent="reported", idempotency_key="idem-1")
+            assert out["pending_id"] == pid, "the replay found the pending the dead process made"
+        assert _wait_state(data, pid, "COMMITTED"), _ops(data)
+    finally:
+        b.stop()
+
+    # --- exactly once, consistent with the journal ---------------------------------------------------
+    jrows = _effects(data, pid)
+    assert len(jrows) == n and all(r[1] == "APPLIED" for r in jrows), jrows
+    assert _store_is(kind, adb, "consent")
+    assert len(_ops(data)) == 1
+    b2 = _a_broker(home, spores, adb)
+    try:
+        b2.recover()
+    finally:
+        b2.stop()
+    assert _ops(data) == [(pid, "COMMITTED")]
+    assert [r[1] for r in _effects(data, pid)] == ["APPLIED"] * n
+    assert _store_is(kind, adb, "consent")
