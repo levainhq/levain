@@ -60,10 +60,11 @@ def _matches(if_none_match: str | None, etag: str) -> bool:
 
 def handle_get(
     cockpit: Cockpit, raw_path: str, *, if_none_match: str | None, credential: dict[str, Any] | None = None,
-    token: str = "", expected_token: str | None = None,
+    token: str = "", expected_token: str | None = None, transport: dict[str, Any] | None = None,
 ) -> tuple[int, bytes, list[tuple[str, str]]]:
     """Return ``(status, body, extra headers)`` for a cockpit GET. Never raises on a provider
-    fault: a panel's fault is carried in that panel's own ``status``/``error``."""
+    fault: a panel's fault is carried in that panel's own ``status``/``error``. ``transport`` is the
+    server's write capability, published in the manifest."""
     parts = urlsplit(raw_path)
     path = parts.path
     qs = parse_qs(parts.query)
@@ -85,7 +86,7 @@ def handle_get(
         # client that revalidated a panel always reads that panel's current age here.
         return 200, json.dumps(cockpit.freshness(), separators=(",", ":")).encode("utf-8"), base_headers
     if path == MANIFEST_PATH:
-        return ok(cockpit.manifest(cred), ["manifest", cred["class"]])
+        return ok(cockpit.manifest(cred, transport=transport), ["manifest", cred["class"]])
     panel_id = unquote(path[len(PANEL_PREFIX): -len(PANEL_SUFFIX)])
     profile = (qs.get("profile") or ["full"])[0]
     if profile not in PROFILES:

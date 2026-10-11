@@ -5,13 +5,14 @@ code before its fix and seen to fail."""
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from levain.cockpit.verbs import dispatch
-from tests.test_cockpit_k2a import CRED, INSTALL_CLASS, Rig, _refused
+from tests.test_cockpit_k2a import CRED, INSTALL_CLASS, Rig, _refused, rig  # noqa: F401 - fixture
 from tests.test_cockpit_k2b_broker import home  # noqa: F401 - fixture
 from tests.test_cockpit_k2b_section import rig_broker  # noqa: F401 - fixture
 
@@ -78,3 +79,31 @@ def test_a_gesture_that_moved_since_the_preview_is_refused_gesture_moved(rig_bro
                    intent="reported", idempotency_key="k-g", confirm=True, tier_seen="T2", gesture_seen="sign")
     assert err.http_status == 409 and (err.extra["gesture"], err.extra["gesture_seen"]) == ("direct-reported", "sign")
     assert rig.spore("seed").get("domain") in (None, "")
+
+
+# --- 2. transport in the manifest ---------------------------------------------------------------
+
+
+def test_the_manifest_names_the_transport_from_the_substrate_views_flags(tmp_path: Path) -> None:
+    from tests.test_cockpit_k2a import _get, _install, _serve
+    from levain.dashboard import SubstrateSource
+
+    _root, src, _ids = _install(tmp_path / "w")
+    with _serve(src, surface_tokens={"browser": "T"}) as (url, _httpd):
+        man = _get(f"{url}/cockpit/manifest.json", token="T")
+        sub = _get(f"{url}/substrate.json", token="T")
+    assert man["transport"] == {"writable": sub["writable"], "write_token_required": sub["write_token_required"]}
+    assert man["transport"] == {"writable": True, "write_token_required": True}
+    assert man["schema"] == "levain.cockpit/1"
+
+    root, _src, _ids = _install(tmp_path / "r")
+    ro = dataclasses.replace(SubstrateSource.local(root), write_scope=None)
+    with _serve(ro) as (url, _httpd):
+        man = _get(f"{url}/cockpit/manifest.json")
+    assert man["transport"] == {"writable": False, "write_token_required": False}
+
+
+def test_the_transport_is_in_the_manifest_etag(rig) -> None:
+    a = rig.ck.manifest(CRED, transport={"writable": True, "write_token_required": True})
+    b = rig.ck.manifest(CRED, transport={"writable": False, "write_token_required": False})
+    assert a["etag"] != b["etag"]

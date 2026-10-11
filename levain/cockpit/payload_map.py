@@ -89,7 +89,8 @@ _add(S, "drop", "edit_class becomes the verb's tier on VerbHead (K2a); ref is a 
      "those verbs' fields. §6.2 maps only layout[].kind/id/zone/title: this is a gap the diff found", False,
      "layout[].edit_class", "layout[].ref", "layout[].source", "layout[].heading")
 _add(S, "map", "manifest errors", True, "errors", "errors.*")
-_add(S, "map", "manifest credential + each VerbHead.gesture", True, "writable", "write_token_required")
+_add(S, "map", "manifest transport of the same name (R1 write plan rev 2; the gestures still come from "
+     "credential + each VerbHead.gesture)", False, "writable", "write_token_required")
 _add(S, "map", "manifest verbs", True, "action_verbs.**")
 _add(S, "map", "PanelHead note / empty / error", True,
      "extra_panels.*.note", "extra_panels.*.empty", "extra_panels.*.error")

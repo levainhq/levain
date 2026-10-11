@@ -739,6 +739,11 @@ class _Handler(GuardedHandler):
             return {"class": "none", "device_class": None}
         return {"class": "token", "name": name, "device_class": None}
 
+    def _transport(self) -> dict[str, bool]:
+        """The manifest's ``transport``: the same two flags ``/substrate.json`` carries."""
+        return {"writable": self.server.levain_source.write_scope is not None,
+                "write_token_required": self._write_token_required() or self._writes_need_credential()}
+
     def _writes_need_credential(self) -> bool:
         """K2a: a writable surface needs a credential on every write, on every bind."""
         return self.server.levain_source.write_scope is not None
@@ -816,7 +821,7 @@ class _Handler(GuardedHandler):
             try:
                 status, body, hdrs = handle_cockpit_get(
                     self._cockpit(), self.path, credential=self._credential(),
-                    if_none_match=self.headers.get("If-None-Match"),
+                    if_none_match=self.headers.get("If-None-Match"), transport=self._transport(),
                 )
             except Exception as exc:  # noqa: BLE001 - never 500 with a dead connection
                 status, hdrs = 500, [("Vary", COCKPIT_VARY)]

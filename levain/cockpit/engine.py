@@ -1336,7 +1336,10 @@ class Cockpit:
         return sorted(specs_map.values(),
                       key=lambda s: (-1 if s.region == HEADER else zi.index(s.region), s.rank, s.id))
 
-    def manifest(self, credential: dict[str, Any], *, install_class: str | None = None) -> dict[str, Any]:
+    def manifest(self, credential: dict[str, Any], *, install_class: str | None = None,
+                 transport: dict[str, Any] | None = None) -> dict[str, Any]:
+        """``transport`` is the serving transport's write capability (``writable``,
+        ``write_token_required``), which only the server knows; it is published when given."""
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
         errors = self._ensure_discovered(ctx)
@@ -1362,14 +1365,18 @@ class Cockpit:
         order = [NOW_ID] + [s.id for s in specs]
         etag = _sha({"panels": [heads[i]["etag"] for i in order], "credential": credential, "verbs": self._verb_rev(),
                      "install_class": install_class, "policy_revision": POLICY_REVISION,
-                     "entity": entity, "errors": errors})   # identity and manifest faults are content too
-        return {
+                     "entity": entity, "errors": errors,    # identity and manifest faults are content too
+                     "transport": transport})
+        out = {
             "schema": SCHEMA, "entity": entity, "generated_at": _iso(ctx.now), "etag": etag,
             "credential": credential, "regions": regions,
             "panels": {i: heads[i] for i in order},
             "verbs": self._verb_view.verbs_map(credential["class"]) if self._verb_view is not None else {},
             "errors": errors,
         }
+        if transport is not None:
+            out["transport"] = dict(transport)
+        return out
 
     def freshness(self) -> dict[str, dict[str, Any]]:
         """``{panel_id: {as_of, status}}`` for every registered panel, ``now`` included (design §3.4).
