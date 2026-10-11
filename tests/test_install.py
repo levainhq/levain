@@ -3234,6 +3234,33 @@ def test_a_refused_lock_leaves_a_fresh_target_empty_so_the_advised_rerun_works(t
     assert sorted(p.name for p in (existing / ".levain").iterdir()) == ["keep.txt"]
 
 
+@pytest.mark.parametrize("override", [None, "1"])
+def test_install_lock_without_fcntl_refuses_unless_the_override_is_set(tmp_path, monkeypatch, capsys, override):
+    # L1 LOW: the no-flock platform branch (Windows) refuses too, and the override says what it does
+    import builtins
+
+    from levain.install import UNLOCKED_ENV, InstallUnlockable
+
+    real_import = builtins.__import__
+
+    def no_fcntl(name, *a, **kw):
+        if name == "fcntl":
+            raise ImportError("no fcntl")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", no_fcntl)
+    monkeypatch.delenv(UNLOCKED_ENV, raising=False)
+    if override:
+        monkeypatch.setenv(UNLOCKED_ENV, override)
+        with install_lock(tmp_path):
+            pass
+        assert "this platform cannot lock" in capsys.readouterr().err
+        return
+    with pytest.raises(InstallUnlockable, match="no flock"):
+        with install_lock(tmp_path):
+            pytest.fail("ran without a lock")
+
+
 def test_install_lock_names_an_unwritable_levain_dir(tmp_path):
     # L2 LOW, reproduced: a read-only .levain gave a PermissionError traceback.
     from levain.install import InstallLockError

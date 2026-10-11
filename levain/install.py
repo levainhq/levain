@@ -1372,10 +1372,13 @@ def _single_writer_lock(
     operator set the override, and then this runs unguarded and says so.
 
     flock, because the kernel owns it: a holder killed by SIGTERM or SIGKILL releases it, so no
-    lock goes stale, and every levain release takes the same lock, so they exclude each other
-    (Linux NFS clients emulate it as a POSIX lock the server arbitrates). The O_EXCL marker
+    lock goes stale, and every levain release that has these locks takes the same flock, so they
+    exclude each other (a Linux NFS client emulates it as a POSIX lock the server arbitrates,
+    unless the mount sets ``local_lock=flock|all``, which keeps it client-local). The O_EXCL marker
     fallback was deleted (0.7.1 L3 r2/r3: it did not exclude a flock holder, and went stale
-    after SIGTERM); a filesystem with no lock at all is refused, never guessed at."""
+    after SIGTERM); a filesystem with no lock at all is refused, never guessed at. On a Linux NFS
+    client the flock is a POSIX lock, which closing ANY other descriptor of the same file in this
+    process releases: nothing else may open the lock file while it is held."""
     try:
         import fcntl
     except ImportError:
@@ -1383,6 +1386,8 @@ def _single_writer_lock(
             precheck()  # a path that is not an install is refused here too, lock or none
         if unlockable is not None:
             raise unlockable("this platform has no flock") from None
+        print(f"  note: this platform cannot lock {path}; continuing without the guard against "
+              f"{guards}, as {UNLOCKED_ENV}=1 asks.", file=sys.stderr)
         yield
         return
     key = (path.resolve(), threading.get_ident())

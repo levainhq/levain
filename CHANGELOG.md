@@ -25,6 +25,7 @@ The cockpit's write side, part one (K2a). It ships in one release with K2b (the 
 ### Known limits
 
 - A filesystem with no lock support at all cannot be locked: there levain refuses unless `LEVAIN_UNLOCKED=1` says no other writer runs.
+- An NFS mount with `local_lock=flock` or `local_lock=all` keeps the lock on that client, so two clients do not exclude each other.
 - Two NFS clients that present the same NFSv4 client identity (cloned machines or containers sharing a hostname and client identifier) are one client to the server, and their locks do not exclude each other; measured with two network namespaces sharing the host's identity.
 
 - The TUI's spore writes are compared on the item's list (`expect_disposition`), not on its version.
