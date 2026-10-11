@@ -85,12 +85,19 @@ have="$(cut -f1 "$adv" | sort -u | git cat-file --batch-check='%(objectname) %(o
 while read -r lref lsha rref rsha; do
     [ -z "${lsha:-}" ] && continue
     c="$(git rev-parse --verify -q "${lsha}^{commit}")" || exit 1
+    echo "T $c" >>"$push"
     case "$rref" in refs/tags/v*) echo "P ${rref#refs/tags/} $c" >>"$push" ;; esac
     if [ -n "${rsha//0/}" ] && git cat-file -e "${rsha}^{commit}" 2>/dev/null; then
-        new="$(git rev-list "${rsha}..${c}")" || exit 1
+        new="$(git rev-list "${rsha}..${c}")" \
+            || { echo "pre-push: could not list the commits this push publishes." >&2; exit 1; }
     else
         # `--not` does not reach revisions read from --stdin, so each is `^sha`.
-        new="$( { [ -n "$have" ] && printf '^%s\n' $have; } | git rev-list --stdin "$c")" || exit 1
+        # An empty $have (a fresh destination) walks the whole history.
+        if [ -n "$have" ]; then
+            new="$(printf '^%s\n' $have | git rev-list --stdin "$c")"
+        else
+            new="$(git rev-list "$c")"
+        fi || { echo "pre-push: could not list the commits this push publishes." >&2; exit 1; }
     fi
     [ -n "$new" ] && printf 'C %s\n' $new >>"$push"
 done <<EOF_LINES

@@ -663,7 +663,8 @@ class TestReleaseStampIsNotAPublishedVersion:
         and the release tag itself, and passed a released-stamp commit pushed
         from a clean main. Driven by ``scripts/hooks/pre-push``,
         ``LEVAIN_PUSH_FILE`` names a file of lines: ``C <sha>``, a commit the
-        push makes newly reachable; ``R <sha>\t<ref>``, a tag the remote
+        push makes newly reachable; ``T <sha>``, a pushed tip, whose two stamps
+        must agree (a half-bumped commit inside a range claims nothing); ``R <sha>\t<ref>``, a tag the remote
         advertises (``git ls-remote --tags``); ``P <tag> <sha>``, a tag this
         push sets. The release record is the remote's tags plus this push's,
         never the local tags: a release tag lands after main is pushed, so a
@@ -684,12 +685,14 @@ class TestReleaseStampIsNotAPublishedVersion:
         push_file = os.environ.get("LEVAIN_PUSH_FILE")
         tag_at = {}
         if push_file is not None:
-            commits, pushed_tags = [], {}
+            commits, pushed_tags, tips = [], {}, set()
             peeled = {}
             for line in open(push_file, encoding="utf-8").read().splitlines():
                 kind, _, rest = line.partition(" ")
                 if kind == "C":
                     commits.append(rest.strip())
+                elif kind == "T":
+                    tips.add(rest.strip())
                 elif kind == "P":
                     name, sha = rest.split()
                     pushed_tags[name] = sha
@@ -713,7 +716,7 @@ class TestReleaseStampIsNotAPublishedVersion:
                 tag_at[parts[0]] = parts[1]   # *objectname is empty for a lightweight tag
             head = self._git(root, "rev-parse", "HEAD")
             assert head, "HEAD does not resolve"
-            commits = [head]
+            commits, tips = [head], {head}
         released = {name[1:]: sha for name, sha in tag_at.items() if name.startswith("v")}
 
         commits = list(dict.fromkeys(commits))
@@ -744,22 +747,23 @@ class TestReleaseStampIsNotAPublishedVersion:
             committed = m.group(1)
 
             t = re.search(r'^version = "([^"]+)"', toml, re.M)
-            assert t and t.group(1) == committed, (
-                f"{ref}: pyproject.toml says {t.group(1) if t else None!r}, "
-                f"levain/__init__.py says {committed!r}"
-            )
+            if ref in tips:
+                assert t and t.group(1) == committed, (
+                    f"{ref}: pyproject.toml says {t.group(1) if t else None!r}, "
+                    f"levain/__init__.py says {committed!r}"
+                )
+            stamps = {committed} | ({t.group(1)} if t else set())
 
-            if committed not in released:
-                continue   # a .devN or an unreleased number — correct by construction
-
-            assert released[committed] == ref, (
-                f"THE COMMIT {ref} is stamped {committed!r}, which is already the "
-                f"released tag v{committed} pointing at a DIFFERENT commit "
-                f"({released[committed]}). A clean working tree is not the question: "
-                f"a push publishes THIS COMMIT. Bump both stamps (pyproject.toml, "
-                f"levain/__init__.py) to the next .dev0 and COMMIT the bump. See "
-                f"spore-710 and CHANGELOG 'Versioning'."
-            )
+            for stamp in sorted(stamps & released.keys()):
+                committed = stamp
+                assert released[committed] == ref, (
+                    f"THE COMMIT {ref} is stamped {committed!r}, which is already the "
+                    f"released tag v{committed} pointing at a DIFFERENT commit "
+                    f"({released[committed]}). A clean working tree is not the question: "
+                    f"a push publishes THIS COMMIT. Bump both stamps (pyproject.toml, "
+                    f"levain/__init__.py) to the next .dev0 and COMMIT the bump. See "
+                    f"spore-710 and CHANGELOG 'Versioning'."
+                )
 
     def _run_hook(self, root, stdin):
         import shutil
