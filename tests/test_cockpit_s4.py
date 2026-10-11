@@ -25,7 +25,7 @@ from levain.cockpit.providers import build_default_cockpit
 from levain.cockpit.registry import ORDERINGS, apply_ordering
 from levain.cockpit.verbs import VerbRegistry, VerbView
 from levain.dashboard import SubstrateSource
-from levain.web_server import INSTALL_CLASS
+from levain.cockpit.install import REPORTED as INSTALL_CLASS
 from tests.test_dashboard import _make_levain_install
 
 TODAY = date(2026, 10, 10)

@@ -653,8 +653,9 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Serve the GOVERNED WRITABLE cockpit instead of a read-only glance — "
             "enables State / spore touch/descend/ascend / Tray-Keep / episode-tombstone "
-            "edits through the governed write seam. Loopback-sovereign (the localhost "
-            "bind + Host/CSRF guards are the auth; no token) and loopback-ONLY — there "
+            "edits through the governed write seam. Every write carries the write token "
+            "this server prints at startup (the printed link puts it in the page), on "
+            "loopback too; the server is loopback-ONLY — there "
             "is no off-box writable serve (an install's seed/config is operator-private). "
             "Default is read-only."
         ),

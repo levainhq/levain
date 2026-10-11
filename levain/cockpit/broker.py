@@ -80,6 +80,7 @@ from levain.cockpit.firejournal import (
     UnitResult,
     UnknownPending,
     new_pending_id,
+    request_shape,
 )
 from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
 from levain.cockpit.results import Absent, Fault
@@ -482,10 +483,12 @@ class Broker:
         return None
 
     def replay(self, *, verb: str, params: Mapping[str, Any], intent: str | None,
-               credential: Mapping[str, Any], idempotency_key: str) -> dict[str, Any] | None:
+               credential: Mapping[str, Any], idempotency_key: str,
+               target: Mapping[str, Any]) -> dict[str, Any] | None:
         """A replayed POST's recorded pending and outcome, found by its idempotency key BEFORE the
         target is read again (the fire it made has moved the target's version), or None when the key
-        is new. The same key with other params is a 409 (§2). A reported pending still WAITING is left
+        is new. The same key with other params, or aimed at another target, is a 409 (§2). A reported
+        pending still WAITING is left
         to ``issue``, which decides it."""
         base = self.principal_base_of(credential)
         if base is None:
@@ -496,8 +499,9 @@ class Broker:
                 return None
             view = self._load(db, pid)
             rec = view.record
-            asked = encode({"verb": verb, "intent": intent or "sign", "params": dict(params)})
-            if asked != encode({"verb": rec.get("verb"), "intent": rec.get("intent"), "params": rec.get("params")}):
+            asked = request_shape(verb=verb, intent=intent or "sign", params=dict(params), target=target)
+            if asked != request_shape(verb=rec.get("verb"), intent=rec.get("intent"), params=rec.get("params"),
+                                      target=rec.get("target")):
                 raise BrokerError("idempotency_conflict", 409,
                                   f"idempotency key {idempotency_key!r} is bound to another request")
             if rec.get("intent") == "reported" and view.state == "WAITING":
@@ -811,14 +815,18 @@ class Broker:
 
     def result(self, db: CockpitDB, pid: str, *, replay: bool = False) -> dict[str, Any]:
         view = self._load(db, pid)
-        state = "applying" if view.state == "DECIDED" else view.state
-        out: dict[str, Any] = {"ok": True, "pending_id": pid, "state": state, "reason": view.reason,
+        state, reason = ("applying" if view.state == "DECIDED" else view.state), view.reason
+        if view.state == "WAITING" and str(view.record.get("expires_at")) <= utc_stamp(self._now()):
+            # expiry is a time, not a write: a read past it answers what the next write would record
+            # (``_EXPIRE_SQL``'s own comparison), and never hands out a record to sign
+            state, reason = "EXPIRED", "expired"
+        out: dict[str, Any] = {"ok": True, "pending_id": pid, "state": state, "reason": reason,
                                "verb": view.record.get("verb"), "tier": view.record.get("tier"),
                                "intent": view.record.get("intent"), "decision_kind": view.decision_kind,
                                "replay": replay}
         if view.decision_kind is not None:
             out["label"] = label_class(view.decision_kind, self.install_class)
-        if view.state == "WAITING":
+        if state == "WAITING":
             out["record"] = view.record_bytes.decode("utf-8")
             out["expires_at"] = view.record.get("expires_at")
         return out

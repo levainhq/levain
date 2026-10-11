@@ -575,7 +575,11 @@ def dispatch(
     if intent is not None and intent not in _INTENTS:
         raise _refuse("bad_request", 400, f"'intent' must be one of {list(_INTENTS)}")
 
-    replayed = _broker_replay(broker, verb, params, intent, credential, req.get("idempotency_key"))
+    asked_target: dict[str, Any] = {"kind": verb.binding, "panel_id": panel_id}
+    if verb.binding == "row":
+        asked_target["row_id"] = req.get("row_id")
+    replayed = _broker_replay(broker, verb, params, intent, credential, req.get("idempotency_key"),
+                              asked_target)
     if replayed is not None:
         return replayed
     row = _read_target(cockpit, verb, panel_id, req.get("row_id"))
@@ -662,7 +666,7 @@ def _refuse_unless_c1(verb: VerbSpec, tier: Tier, credential: dict[str, Any], in
 
 
 def _broker_replay(broker: "Broker | None", verb: VerbSpec, params: dict[str, Any], intent: str | None,
-                   credential: dict[str, Any], key: Any) -> dict[str, Any] | None:
+                   credential: dict[str, Any], key: Any, target: dict[str, Any]) -> dict[str, Any] | None:
     """K2b §2: a replayed POST returns its recorded pending and outcome. It is looked up before the
     target's version is compared, because the fire it made moved that version."""
     if broker is None or not broker.enabled or not isinstance(key, str) or not key:
@@ -671,7 +675,7 @@ def _broker_replay(broker: "Broker | None", verb: VerbSpec, params: dict[str, An
 
     try:
         return broker.replay(verb=verb.name, params=params, intent=intent, credential=credential,
-                             idempotency_key=key)
+                             idempotency_key=key, target=target)
     except BrokerError as exc:
         raise EditError(exc.code, exc.status, str(exc), exc.extra) from exc
 
@@ -831,12 +835,20 @@ def _is_const(verb: VerbSpec) -> bool:
 
 class VerbView:
     """What the engine asks of the registry at render time (``Cockpit.attach_verbs``). The install
-    class and the policy revision are hashed into every etag through ``revision``."""
+    class and the policy revision are hashed into every etag through ``revision``. ``install_class``
+    may be a callable, read at every render: a server passes its broker's live class, so a broker
+    that is disabled renders no reported gesture and one that heals changes the etag."""
 
-    def __init__(self, registry: VerbRegistry, cockpit: "Cockpit", install_class: str) -> None:
+    def __init__(self, registry: VerbRegistry, cockpit: "Cockpit",
+                 install_class: "str | Callable[[], str]") -> None:
         self.registry = registry
         self.cockpit = cockpit
-        self.install_class = install_class
+        self._install_class = install_class
+
+    @property
+    def install_class(self) -> str:
+        ic = self._install_class
+        return ic() if callable(ic) else ic
 
     def revision(self) -> list[Any]:
         return [self.install_class, POLICY.revision, sorted(self.registry.names())]

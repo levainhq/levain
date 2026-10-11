@@ -6,8 +6,9 @@ One definition so every store carries the same durability (K2b design §0.1): WA
 ``busy_timeout`` that waits for the write lock. Every write is one ``BEGIN IMMEDIATE``, so writers
 are serialized by SQLite itself.
 
-``RETURNING`` (SQLite 3.35) is required (K2b design §4.1.2), so an older library is refused at open
-rather than failing mid-transaction.
+A store that uses ``RETURNING`` (the cockpit journal, K2b design §4.1.2) passes ``min_sqlite=MIN_SQLITE``,
+so an older library is refused at its open rather than failing mid-transaction. The autonomic store
+uses no ``RETURNING`` and passes no floor: it keeps running on whatever SQLite it ran on before.
 
 Stdlib only.
 """
@@ -36,12 +37,12 @@ def rollback(conn: sqlite3.Connection) -> None:
         pass
 
 
-def open_durable(path: Path | str) -> sqlite3.Connection:
+def open_durable(path: Path | str, *, min_sqlite: tuple[int, ...] | None = None) -> sqlite3.Connection:
     """A connection to ``path`` with the durability PRAGMAs applied, in autocommit mode so the caller
-    owns every ``BEGIN``. Closed again if any PRAGMA fails."""
-    if _library_version() < MIN_SQLITE:
+    owns every ``BEGIN``. Closed again if any PRAGMA fails. ``min_sqlite`` refuses an older library."""
+    if min_sqlite is not None and _library_version() < min_sqlite:
         raise RuntimeError(f"SQLite {sqlite3.sqlite_version} is older than "
-                           f"{'.'.join(map(str, MIN_SQLITE))} (RETURNING is required)")
+                           f"{'.'.join(map(str, min_sqlite))} (RETURNING is required)")
     conn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
     try:
         conn.execute("PRAGMA busy_timeout = 30000")

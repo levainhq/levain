@@ -44,7 +44,7 @@ from levain.cockpit.consent import (
     record_sha256,
     utc_stamp,
 )
-from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
+from levain.autonomic.durable_sqlite import MIN_SQLITE, open_durable, read_transaction, write_transaction
 
 _OPERATION_ID = re.compile(r"cp[0-9a-f]{32}")
 
@@ -392,11 +392,26 @@ def _principal_base(principal: str) -> str:
     raise ValueError(f"principal is neither token:<name>:<gen> nor device:<fingerprint>: {principal!r}")
 
 
+TARGET_IDENTITY_KEYS = ("kind", "panel_id", "row_id", "pending_id", "name")
+
+
+def target_identity(target: Mapping[str, Any] | None) -> dict[str, Any]:
+    """What a write is AIMED AT, without its versions: one key reused for another row is another
+    request, while a replay after its own fire (which moved the row's version) is the same one."""
+    target = target or {}
+    return {k: target[k] for k in TARGET_IDENTITY_KEYS if target.get(k) is not None}
+
+
+def request_shape(*, verb: Any, intent: Any, params: Any, target: Mapping[str, Any] | None) -> bytes:
+    """What makes two POSTs "the same request" for idempotency (§2): the verb, its intent, its params
+    and its target's identity; the effects' expect versions and the row version may move between a
+    POST and its replay."""
+    return encode({"verb": verb, "intent": intent, "params": params, "target": target_identity(target)})
+
+
 def _request_shape(record: Mapping[str, Any]) -> bytes:
-    # what makes two POSTs "the same request" for idempotency (§2): the verb, its intent and its
-    # params; the effects' expect versions may move between a POST and its replay
-    return encode({"verb": record.get("verb"), "intent": record.get("intent"),
-                   "params": record.get("params")})
+    return request_shape(verb=record.get("verb"), intent=record.get("intent"), params=record.get("params"),
+                         target=record.get("target"))
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -419,7 +434,7 @@ class CockpitDB:
                 raise CockpitFormatError(f"journal {self.path} has disappeared")
         elif not self.data_root.is_dir():
             raise CockpitFormatError(f"data root {self.data_root} is not a directory")
-        conn = open_durable(self.path)
+        conn = open_durable(self.path, min_sqlite=MIN_SQLITE)
         conn.row_factory = sqlite3.Row
         try:
             if not self._ready:

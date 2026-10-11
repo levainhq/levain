@@ -24,7 +24,8 @@ from levain.cockpit.results import Absent, Read
 from levain.cockpit.providers import build_default_cockpit
 from levain.cockpit.verbs import VerbRegistry, VerbSpec, VerbView, dispatch
 from levain.dashboard import SubstrateSource
-from levain.web_server import INSTALL_CLASS, make_server
+from levain.cockpit.install import REPORTED as INSTALL_CLASS
+from levain.web_server import make_server
 from levain.writes import ActionVerb, EditError
 from tests.test_dashboard import _make_levain_install
 

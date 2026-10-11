@@ -132,9 +132,13 @@ def _pending_route(route: str) -> "tuple[str, str] | None":
 
 def _is_write_route(route: str) -> bool:
     return route in _WRITE_ROUTES or _pending_route(route) is not None
-# The class the cockpit manifest renders gestures under (design §4.6). A dispatch decides under the
-# broker's own class instead (``_Handler._install_class``).
-INSTALL_CLASS = "reported"
+
+
+def broker_install_class(httpd: Any) -> str:
+    """The install class gestures are decided under, for a render and a dispatch alike: the broker's
+    own, which is set only when its install check passed; with none, no gesture is the reported one."""
+    broker = getattr(httpd, "broker", None)
+    return (broker.install_class if broker is not None else None) or "none"
 
 __all__ = [
     "DEFAULT_HOST",
@@ -643,7 +647,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 built = build_default_cockpit(
                     self.levain_source,
                     job_store=self.job_runtime.store if self.job_runtime is not None else None)
-                built.attach_verbs(VerbView(self.verb_registry, built, INSTALL_CLASS))
+                built.attach_verbs(VerbView(self.verb_registry, built, lambda: broker_install_class(self)))
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
@@ -701,13 +705,10 @@ class _Handler(GuardedHandler):
         return bool(self.server.is_loopback_bind) and _peer_is_loopback(self.client_address[0])
 
     def _write_token_required(self) -> bool:
-        """True iff this surface requires the ``X-Levain-Write-Token`` — i.e. it is writable AND
-        bound off-loopback. The off-box governance factor that replaces loopback-is-auth once the
-        surface leaves the machine now gates BOTH the substrate-bearing READS (spore-220) and the
-        writes (spore-129), so a read can never be served under weaker auth than a write. Mirrors
-        the do_POST + _route gates EXACTLY, so the frontend ``write_token_required`` signal can
-        never disagree with the server's enforcement. Loopback-bound or read-only → False (a
-        read-only mesh bind stays token-free — iPad/iPhone VIEWING is unauthenticated by design)."""
+        """True iff a substrate-bearing READ on this surface requires the ``X-Levain-Write-Token``:
+        it is writable AND bound off-loopback (spore-220). A read-only mesh bind stays token-free
+        (iPad/iPhone VIEWING is unauthenticated by design). Writes are gated separately, on every
+        bind (``_writes_need_credential``, K2a)."""
         return (
             not self.server.is_loopback_bind
             and self.server.levain_source.write_scope is not None
@@ -1041,10 +1042,7 @@ class _Handler(GuardedHandler):
                    status=status, head=head)
 
     def _install_class(self) -> str:
-        """The install class a dispatch decides gestures under: the broker's own, which is set only
-        when its install check passed; with none, no gesture is the reported one."""
-        broker = self.server.broker
-        return (broker.install_class if broker is not None else None) or "none"
+        return broker_install_class(self.server)
 
     def _pending_post(self, pending_id: str, action: str, req: Any) -> dict[str, Any]:
         """``POST /cockpit/pending/<id>/signature`` (K2b §3.2: a signature over the stored bytes) and
@@ -1086,13 +1084,9 @@ class _Handler(GuardedHandler):
         # our own page (same-origin) or a non-browser client (no Sec-Fetch-Site at all).
         if self._refuse_write_origin():
             return
-        # OFF-BOX governance factor (spore-129 writes / spore-220 reads): when this surface is bound
-        # off-loopback, loopback-is-auth no longer holds, so the write MUST carry the shared device-
-        # held token. SAME predicate + constant-time compare as the read gate in _route, factored
-        # into the two shared helpers so a write can never be served under weaker auth than a read
-        # (or vice-versa). Fail CLOSED if off-loopback yet token-less (make_server refuses to bind a
-        # writable off-loopback source WITHOUT a token, so reaching here token-less is defense-in-
-        # depth). A loopback bind skips this — the localhost-sovereign token-free path is unchanged.
+        # Two gates, one constant-time compare (``_off_box_token_valid``): a WRITE carries a credential
+        # on every bind, loopback included (K2a, design §4.3); a substrate-bearing READ needs the
+        # token only off-loopback (spore-220), where loopback-is-auth no longer holds.
         # The predicate requires write_scope (writability): a READ-ONLY off-box surface has no write
         # path, so it falls through to the 422 'read_only' refusal below, NOT a token-403 [codex L3].
         route = self.path.split("?", 1)[0]
@@ -1463,18 +1457,16 @@ def make_server(
     httpd.cockpit = cockpit
     httpd.verb_registry = verb_registry
     if cockpit is not None:
-        cockpit.attach_verbs(VerbView(verb_registry, cockpit, INSTALL_CLASS))
+        cockpit.attach_verbs(VerbView(verb_registry, cockpit, lambda: broker_install_class(httpd)))
     httpd._cockpit_lock = threading.Lock()
     # K2b §6: `--install-class reported` is the only way to reported; no flag (and no governed
     # marker) leaves the broker write-disabled, answering "run the installer"
     httpd.broker = _build_broker(source, install_class, httpd)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
-    # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
-    # (un-foolable — the real socket, not the requested ``host`` string). A loopback-bound
-    # server skips the POST /edit token check (the token-free localhost-sovereign path is
-    # unchanged); an off-loopback writable bind enforces ``write_token`` (the bind-refusal
-    # above already guaranteed a writable off-loopback source was given one).
+    # The READ gate keys on the ACTUAL bound address (un-foolable — the real socket, not the
+    # requested ``host`` string): off-loopback, a substrate-bearing read needs ``write_token``.
+    # Writes are gated on every bind instead (``_writes_need_credential``, K2a).
     httpd.is_loopback_bind = _is_loopback_host(str(httpd.server_address[0]))
     httpd.write_token = tokens.get("browser")
     httpd.surface_tokens = tokens

@@ -281,7 +281,8 @@ def test_a_replay_of_an_applying_op_wakes_the_thread(home, spores):
         woke = {"n": 0}
         b.wake = lambda: woke.__setitem__("n", woke["n"] + 1)  # type: ignore[method-assign]
         out = b.replay(verb="spore_set_disposition", params={"disposition": "note"}, intent="reported",
-                       credential=BROWSER, idempotency_key="r1")
+                       credential=BROWSER, idempotency_key="r1",
+                       target={"kind": "row", "panel_id": "tray", "row_id": held_row_id(spores)})
         assert out is not None and out["state"] == "applying" and woke["n"] == 1
     finally:
         b.stop()
@@ -346,3 +347,100 @@ def test_a_read_transaction_never_masks_the_blocks_error(tmp_path):
         with read_transaction(connect) as conn:
             conn.execute("ROLLBACK")       # what SQLite does to a transaction on some errors
             raise ValueError("the real error")
+
+
+# --- code L3 r1 (complement + codex, 2026-10-10) -----------------------------------------------------
+
+
+def test_the_returning_floor_is_the_cockpit_journals_alone(home, monkeypatch):
+    """complement L3 r1: the SQLite >= 3.35 floor exists for the journal's RETURNING; the autonomic
+    store, which K2b moved onto open_durable, runs on an older library as it did before."""
+    from levain.autonomic import durable_sqlite
+    from levain.autonomic.db import AutonomicDB
+
+    monkeypatch.setattr(durable_sqlite, "_library_version", lambda: (3, 31, 1))
+    AutonomicDB(home / "autonomic")._connect().close()
+    (home / "data").mkdir()
+    with pytest.raises(RuntimeError, match="RETURNING is required"):
+        CockpitDB(home / "data")._connect()
+
+
+def test_an_idempotency_key_is_bound_to_its_target(home, spores):
+    """codex L3 r1: one key and the same params aimed at another row is another request: the replay
+    lookup and the journal's own issue both refuse it, instead of answering (or firing) the first."""
+    from tests.test_cockpit_k2b_broker import _target
+
+    broker = _broker(home, spores)
+    try:
+        _key_bound_to_target(broker, spores, _target)
+    finally:
+        broker.stop()
+
+
+def _key_bound_to_target(broker: Broker, spores: Path, _target: Any) -> None:
+    first = _move(broker, spores, "k.seed", intent="reported", idempotency_key="same")
+    assert first["state"] == "COMMITTED"
+    other = _target(spores, "k.seed2")
+    e = _refused_code(broker.replay, verb="spore_set_disposition", params={"disposition": "note"},
+                      intent="reported", credential=BROWSER, idempotency_key="same", target=other)
+    assert e == "idempotency_conflict"
+    # the journal's issue (the crash window: a key whose pending was issued and never decided)
+    held = _move(broker, spores, "k.loop", idempotency_key="held")
+    assert held["state"] == "WAITING"
+    assert _refused_code(_move, broker, spores, "k.seed2", idempotency_key="held") == "idempotency_conflict"
+    assert SporeStore(spores).get_by_origin_key("k.seed2")["disposition"] == "seed"
+    # the same row again is still a replay, though its version moved with the fire
+    again = broker.replay(verb="spore_set_disposition", params={"disposition": "note"}, intent="reported",
+                          credential=BROWSER, idempotency_key="same", target=_target(spores, "k.seed"))
+    assert again is not None and again["pending_id"] == first["pending_id"] and again["replay"] is True
+
+
+def _refused_code(fn: Any, *a: Any, **kw: Any) -> str:
+    with pytest.raises(BrokerError) as ei:
+        fn(*a, **kw)
+    return ei.value.code
+
+
+def test_a_read_past_the_ttl_answers_expired_and_hands_out_no_record(home, spores):
+    """codex L3 r1: expiry is a time; outcome and replay read past it answer EXPIRED, not WAITING."""
+    from datetime import datetime, timedelta, timezone
+
+    now = [datetime(2026, 10, 10, 20, 0, tzinfo=timezone.utc)]
+    b = _broker(home, spores, clock=lambda: now[0])
+    try:
+        held = _move(b, spores, "k.seed", idempotency_key="sig")
+        assert held["state"] == "WAITING" and "record" in held
+        now[0] += timedelta(minutes=16)
+        out = b.outcome(held["pending_id"])
+        assert (out["state"], out["reason"], "record" in out) == ("EXPIRED", "expired", False), out
+        again = b.replay(verb="spore_set_disposition", params={"disposition": "note"}, intent=None,
+                         credential=BROWSER, idempotency_key="sig",
+                         target={"kind": "row", "panel_id": "tray", "row_id": held_row_id(spores)})
+        assert again is not None and again["state"] == "EXPIRED" and "record" not in again
+    finally:
+        b.stop()
+
+
+def held_row_id(spores: Path) -> str:
+    return f"spore:{SporeStore(spores).get_by_origin_key('k.seed')['id']}"
+
+
+def test_the_manifest_renders_gestures_under_the_brokers_install_class(tmp_path):
+    """codex L3 r1: with no --install-class the broker is disabled, so no action renders
+    direct-reported (dispatch would refuse it 'run the installer'); a reported install renders it."""
+    import json as _json
+
+    from tests.test_cockpit_k2a import _get, _install, _serve
+
+    _root, src, _ids = _install(tmp_path)
+
+    def gestures(url: str) -> set[str]:
+        raw = _json.dumps(_get(f"{url}/cockpit/panel/tray.json", token="T"))
+        return {g for g in ("direct-reported", "sign", "laptop-only") if f'"{g}"' in raw}
+
+    with _serve(src, surface_tokens={"browser": "T"}) as (url, _httpd):
+        none = gestures(url)
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
+        reported = gestures(url)
+    assert "direct-reported" in reported, reported
+    assert "direct-reported" not in none and "sign" in none, none

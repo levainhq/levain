@@ -443,8 +443,8 @@ _KILL_CHILD = textwrap.dedent("""
     from datetime import datetime, timezone
     import levain.cockpit.firejournal as fj
     real = fj.open_durable
-    def dying(path):
-        conn = real(path)
+    def dying(path, **kw):
+        conn = real(path, **kw)
         conn.set_trace_callback(lambda sql: os._exit(137) if sql.strip() == sys.argv[3] else None)
         return conn
     fj.open_durable = dying
