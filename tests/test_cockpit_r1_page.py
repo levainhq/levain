@@ -95,7 +95,7 @@ function makeEnv(over) {
     return resp(404, {});
   }
   const win = { LevainCockpitView: View, localStorage, sessionStorage, location: { search: "?source=manifest", hash: "", pathname: "/" },
-    crypto: { randomUUID: () => "key-" + (++n) }, prompt: () => "",
+    crypto: { randomUUID: () => "key-" + (++n) }, prompt: over.prompt ? () => over.prompt(env) : () => "",
     LevainDashboard: { render: (view, opts) => renders.push({ view, opts }), hasUnsavedEdit: () => false, jobsActive: () => false } };
   const doc = { getElementById: () => null, addEventListener() {}, querySelectorAll: () => [], visibilityState: "visible" };
   env.start = async () => {
@@ -339,6 +339,97 @@ cases.send_inbox_501_shows_the_server_text = async () => {
   ok(env.posts[1].body.idempotency_key !== "ignored-key", "the page mints its own key");
 };
 
+// the Tray offers the create; the Keep is empty and offers nothing itself
+function withTrayAndKeep(env) {
+  const head = (id) => ({ id, kind: "triage-list", title: id, status: "ok", as_of: "2026-10-11T12:00:00+00:00" });
+  for (const id of ["tray", "keep"]) {
+    env.fx.manifest.panels[id] = head(id);
+    env.fx.manifest.regions.zones[0].panels.push(id);
+    env.fx.panels[id] = Object.assign(head(id), { rows: [], actions: [] });
+  }
+  env.fx.panels.tray.actions = [{ verb: "spore_seed", tier: "C1", gesture: "direct", escalates: [], target: { panel_id: "tray", panel_version: "tv" } }];
+  env.fx.manifest.verbs.spore_seed = { label: "capture", tier: "C1", confirm: false, idempotent: false, fields: ["text", "type", "disposition"], effect: "adds a seed", gesture: "direct" };
+}
+
+cases.a_note_capture_posts_the_trays_create_with_the_disposition = async () => {
+  const env = makeEnv();
+  withTrayAndKeep(env);
+  await env.start();
+  const r = await env.opts().commit({ kind: "spore_seed", text: "keep this", disposition: "note" });
+  ok(r.ok === true, "the note capture landed");
+  const b = env.posts[0].body;
+  ok(b.verb === "spore_seed" && b.panel_id === "tray" && b.params.disposition === "note" && b.params.text === "keep this", "the tray's create, disposition in params");
+  const keep = env.view().layout.find((e) => e.id === "keep");
+  ok(keep && keep.edit_class === "B", "an empty Keep shows its capture box while the Tray offers the create");
+};
+
+cases.without_a_tray_create_the_keep_has_no_capture_box = async () => {
+  const env = makeEnv();
+  withTrayAndKeep(env);
+  env.fx.panels.tray.actions = [];
+  await env.start();
+  const keep = env.view().layout.find((e) => e.id === "keep");
+  ok(keep && keep.edit_class !== "B", "no create offered, no capture box");
+};
+
+cases.an_undefined_param_is_dropped_and_never_throws_in_the_preview = async () => {
+  const env = makeEnv();
+  env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
+  await env.start();
+  const r = await env.opts().commit({ kind: "spore_update", spore_id: "spore-1", text: "x", domain: undefined });
+  ok(r.preview === true, "the preview is drawn");
+  ok(!("domain" in env.posts[0].body.params), "an undefined value is not sent");
+  ok(!/domain/.test(r.message), "nor previewed");
+};
+
+cases.a_cancel_after_a_lost_answer_replays_its_envelope_and_an_answer_clears_it = async () => {
+  const env = makeEnv();
+  env.verbAnswers = ["net"];
+  await env.start();
+  const c = env.view().extra_panels.decisions.lines[0].cancel;
+  const r1 = await env.opts().cancelPending(c);
+  ok(r1.ok === false && r1.error === "network", "a lost answer is reported");
+  ok(!/same key/.test(r1.message), "the message promises nothing a path does not do");
+  ok(Object.keys(JSON.parse(env.ss.levain_cockpit_keys)).length === 1, "the envelope is kept");
+  const r2 = await env.opts().cancelPending(c);
+  ok(r2.ok === true, "the second click lands");
+  ok(JSON.stringify(env.posts[1].body) === JSON.stringify(env.posts[0].body), "the same envelope and key");
+  ok(Object.keys(JSON.parse(env.ss.levain_cockpit_keys)).length === 0, "an answer clears it");
+  await env.opts().cancelPending(c);
+  ok(env.posts[2].body.idempotency_key !== env.posts[0].body.idempotency_key, "a later cancel mints a new key");
+};
+
+cases.a_token_required_manifest_read_without_a_token_prompts_then_rereads = async () => {
+  let asked = 0;
+  const env = makeEnv({ local: {}, transport: { writable: true, write_token_required: true },
+    prompt: (e) => { asked++; e.fx.manifest.credential = { class: "token" }; return "newtok"; } });
+  env.fx.manifest.credential = { class: "none" };
+  await env.start();
+  ok(asked === 1, "one prompt");
+  ok(env.reads.filter((u) => u.indexOf("/cockpit/manifest.json") >= 0).length === 2, "the manifest is read again");
+  ok(env.view().writable === true, "drawn writable");
+  const r = await env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  ok(r.ok === true && env.posts[0].headers["X-Levain-Write-Token"] === "newtok", "the entered token rides the write");
+};
+
+cases.a_hidden_character_row_offers_no_inline_text_edit = async () => {
+  const env = makeEnv();
+  env.fx.panels.loops.rows[0].body = "one​two";
+  env.fx.panels.loops.rows.push(Object.assign({}, env.fx.panels.loops.rows[0], { id: "spore:spore-2", body: "plain" }));
+  await env.start();
+  const [a, b] = env.view().open_spores;
+  ok(/hidden characters/.test(a.text_locked || ""), "the altered row is locked with a reason");
+  ok(a.text.indexOf("<U+200B>") >= 0, "and still shows the marker");
+  ok(b.text_locked === undefined, "a plain row is not");
+};
+
+cases.offered_verbs_lists_only_what_a_postable_action_offers = async () => {
+  const env = await makeEnv({ actions: [ROW("spore_touch", "C1", "direct"), ROW("spore_update", "T3", "laptop-only")] }).start();
+  const o = env.view().offered_verbs;
+  ok(o.spore_touch === true && o.operator_state === true && o.entity_name === undefined, "touch and the state line, not rename");
+  ok(o.spore_update === undefined, "a laptop-only action is not postable");
+};
+
 (async () => {
   for (const name of Object.keys(cases)) {
     if (only && only !== name) continue;
@@ -374,7 +465,7 @@ def test_page_write_case(case: str, tmp_path: Path) -> None:
 
 
 def test_every_case_is_listed() -> None:
-    assert len(_cases()) >= 18
+    assert len(_cases()) >= 25
 
 
 @pytest.mark.skipif(NODE is None, reason="node is not installed")

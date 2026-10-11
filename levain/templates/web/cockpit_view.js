@@ -100,7 +100,8 @@
     return [];
   }
 
-  function sporeOf(pid, row, groupTitles) {
+  const HIDDEN_TEXT = "contains hidden characters; edit with the CLI";
+  function sporeOf(pid, row, groupTitles, hidden) {
     const f = row.facets || {};
     const t = targetOf(pid, row);
     return Object.assign({
@@ -108,7 +109,7 @@
       disposition: f.disposition, text: row.body || row.title, next: f.due || null,
       descend_kinds: kindsOf(t.actions, "spore_descend"), ascend_kinds: kindsOf(t.actions, "spore_ascend"),
       group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
-    }, t);
+    }, t, hidden && hidden.has(row.id) ? { text_locked: HIDDEN_TEXT } : {});
   }
 
   // a stale or partial panel keeps rendering its rows, under a banner saying so
@@ -276,6 +277,15 @@
     // clean to one) rejects that panel alone; a collision in the manifest or between two panel ids is
     // refused whole, since the references between them cannot then be told apart.
     const snap = { manifest: clean(raw.manifest), panels: Object.create(null) };
+    // the rows whose text the sanitiser would change: known here, while the raw string is still in hand
+    const hiddenRows = new Set();
+    for (const key of Object.keys(raw.panels || {})) {
+      const rp = raw.panels[key];
+      for (const r of (isObj(rp) && Array.isArray(rp.rows) ? rp.rows : [])) {
+        if (!isObj(r) || typeof r.id !== "string") continue;
+        if ([r.body, r.title].some((t) => typeof t === "string" && visible(t) !== t)) hiddenRows.add(visible(r.id));
+      }
+    }
     for (const key of Object.keys(raw.panels || {})) {
       const k = visible(key);
       if (Object.prototype.hasOwnProperty.call(snap.panels, k)) throw new Error("two panel ids collide once cleaned: " + k);
@@ -390,10 +400,13 @@
       for (const r of rows) if (r && typeof r.id === "string" && Array.isArray(r.actions) && r.actions.length) {
         view.targets.rows[r.id] = targetOf(pid, r);
       }
-      if ((rowsAct || pActions.length) && (pid === "tray" || pid === "loops" || pid === "keep" || pid === "episodes")) entry.edit_class = "B";
+      // every capture is the Tray's create, so the Keep's capture box shows whenever the Tray offers one
+      const tp = P.get("tray");
+      const traySeeds = isObj(tp) && Array.isArray(tp.actions) && tp.actions.some((a) => isObj(a) && a.verb === "spore_seed");
+      if ((rowsAct || pActions.length || (pid === "keep" && traySeeds)) && (pid === "tray" || pid === "loops" || pid === "keep" || pid === "episodes")) entry.edit_class = "B";
       const lists = { tray: "tray", loops: "open_spores", keep: "keep" };
       if ((pid === "tray" || pid === "loops" || pid === "keep") && panel.kind === "triage-list") {
-        view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles));
+        view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows));
         if (pid === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
           // the kernel's named orderings and the row ids in each; the renderer picks one, never sorts
           const named = head.views.filter((v) => isObj(v) && typeof v.id === "string" && Array.isArray(panel.view_rows[v.id]));
@@ -471,6 +484,12 @@
     };
     for (const pid of headerExtra) placeOnce(pid, "operate");
     for (const zone of (m.regions.zones || [])) for (const pid of (zone.panels || [])) placeOnce(pid, zone.id);
+    // the verbs the kernel offered somewhere with a gesture a browser can perform: an affordance whose
+    // verb is not here has nothing to post to
+    view.offered_verbs = Object.create(null);
+    const postable = (a) => isObj(a) && typeof a.verb === "string" && a.gesture !== "refused" && a.gesture !== "laptop-only";
+    for (const t of Object.values(view.targets.panels)) for (const a of t.actions) if (postable(a)) view.offered_verbs[a.verb] = true;
+    for (const t of Object.values(view.targets.rows)) for (const a of t.actions) if (postable(a)) view.offered_verbs[a.verb] = true;
     return view;
   }
 

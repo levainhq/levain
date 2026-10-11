@@ -417,7 +417,7 @@ class VerbRegistry:
         self._downstream[name] = spec
         self._downstream_names.add(name)
         self._add(VerbSpec(
-            name, spec.label or name, spec.label or name, "panel", fields=None, floor="T2", tier_fn=None,
+            name, spec.label or name, spec.label or name, "panel", fields=spec.fields, floor="T2", tier_fn=None,
             confirm_required=spec.confirm_required, idempotent=spec.idempotent, job=spec.job,
             reversible=False))
 

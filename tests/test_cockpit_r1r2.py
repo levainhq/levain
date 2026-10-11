@@ -596,7 +596,7 @@ class TestTheDashboardPageFromTheManifest:
         from tests.test_cockpit_k1 import _install
 
         _root, src = _install(tmp_path)
-        httpd = make_server(src, host="127.0.0.1", port=0, cockpit=ck)
+        httpd = make_server(src, host="127.0.0.1", port=0, cockpit=ck, write_token="T")
         t = threading.Thread(target=httpd.serve_forever, daemon=True)
         t.start()
         return httpd, t
@@ -608,7 +608,7 @@ class TestTheDashboardPageFromTheManifest:
         served = [r["id"].split(":")[1] for r in ck.panel("tray")["rows"]]
         httpd, t = self._serve(tmp_path, ck)
         try:
-            dom = _dump_dom(f"http://127.0.0.1:{httpd.server_address[1]}/?source=manifest")
+            dom = _dump_dom(f"http://127.0.0.1:{httpd.server_address[1]}/?source=manifest#write_token=T")
         finally:
             httpd.shutdown()
             httpd.server_close()

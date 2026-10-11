@@ -1487,13 +1487,21 @@
     showFail(m, res, "failed");
   }
 
+  // A row whose text the page shows altered (hidden characters) offers no inline text edit: saving the
+  // shown text would write the sanitiser's marker over the real characters.
+  function editBtn(wrap, s) {
+    const b = verbBtn("edit", "refine the text", () => openTextEdit(wrap, s));
+    if (s.text_locked) { b.disabled = true; b.title = s.text_locked; }
+    return b;
+  }
+
   function buildSporeVerbs(s, panelKind) {
     const wrap = el("span", "verb-actions");
 
     // A TRAY item (the forming workbench): edit + reclassify (plastic WHILE forming) are
     // first-class — the item isn't ready for the lifecycle verbs yet. Then the route levers.
     if (panelKind === "tray") {
-      wrap.appendChild(verbBtn("edit", "refine the text", () => openTextEdit(wrap, s)));
+      wrap.appendChild(editBtn(wrap, s));
       wrap.appendChild(verbBtn("reclassify", "change the type — it's still forming", () =>
         openReclassify(wrap, s)));
       // metabolize — promote into cognition as a live loop (Tray->loop is never the
@@ -1517,7 +1525,7 @@
     // lifecycle (→ tray / activate / remind me); a pinned-dormant LOOP reactivates (un-park).
     // Both end with remove.
     if (panelKind === "keep") {
-      wrap.appendChild(verbBtn("edit", "refine the text", () => openTextEdit(wrap, s)));
+      wrap.appendChild(editBtn(wrap, s));
       if (s.disposition === "note") {
         // The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a deferred someday/maybe note re-enters
         // the flow without delete+recreate (lineage preserved). A pure reference note simply
@@ -1571,7 +1579,7 @@
       b.disabled = false;
       verbErr(wrap, res);
     }));
-    wrap.appendChild(verbBtn("edit", "refine the text", () => openTextEdit(wrap, s)));
+    wrap.appendChild(editBtn(wrap, s));
     wrap.appendChild(verbBtn("schedule", "resurface on a future date", () => openSurfaceForm(wrap, s)));
     // park — pin to Keep: hide from active cognition but the loop stays OPEN (exempt from the
     // dormancy→compost prompt), resurfaceable. The exact inverse of Keep's "reactivate"; a tier
@@ -2306,7 +2314,10 @@
       row.appendChild(el("span", "edit-act" + (isUndo ? " undo" : ""), isUndo ? "undo" : (e.action || "edit")));
       const label = String(e.source || "") + (e.heading ? " · " + e.heading : "");
       row.appendChild(el("span", "clause", label));
-      if (commit && !isUndo && e.id && e.undoable !== false && !claimed.has(e.source)) {
+      // a manifest row lists its actions: undo shows only where the kernel offered it (a legacy row lists none)
+      const undoOffered = !Array.isArray(e.actions) || e.actions.some((a) => a && a.verb === "undo"
+        && a.gesture !== "refused" && a.gesture !== "laptop-only");
+      if (commit && undoOffered && !isUndo && e.id && e.undoable !== false && !claimed.has(e.source)) {
         const u = el("button", "undo-btn", "undo");
         u.type = "button";
         u.addEventListener("click", async () => {
@@ -2326,8 +2337,13 @@
   }
 
   // The masthead "Unit" name is a Class-A input too — a commit-gated rename.
+  // A manifest view lists the verbs it offered; the rename shows only where the kernel offered it.
+  function verbOffered(view, verb) {
+    return !view || !view.offered_verbs || view.offered_verbs[verb] === true;
+  }
+
   function wireEntityName(entityEl, view) {
-    if (!commit) return;
+    if (!commit || !verbOffered(view, "entity_name")) return;
     const unit = entityEl.parentElement;
     if (!unit || unit.querySelector(".name-edit") || unit.querySelector(".name-editor")) return;
     const btn = el("button", "name-edit", "rename");

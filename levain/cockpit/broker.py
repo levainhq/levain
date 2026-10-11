@@ -634,6 +634,7 @@ class Broker:
         except (ValueError, ConsentError, TransientApplyFault):
             raise
         except Exception as exc:  # noqa: BLE001 - a registrant's failure is not a refusal of the params
+            _log.warning("downstream %r canonical failed; treated as transient", verb, exc_info=True)
             raise TransientApplyFault.of(exc) from exc
         if not isinstance(eff, Effect) or eff.store != d.store.name or not eff.is_create:
             raise ValueError(f"{verb!r}'s canonical_effect must build one create on {d.store.name!r}")

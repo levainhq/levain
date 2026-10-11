@@ -293,7 +293,7 @@
     return { ok: res.ok, status: res.status, data: data || {} };
   }
 
-  const NETWORK_MESSAGE = "no answer: the request may or may not have landed. Click again to send the same request (it carries the same key, so it lands once).";
+  const NETWORK_MESSAGE = "no answer: the request may or may not have landed. Re-read the page to see; sending it again lands once only if it carries a key.";
   // answers after which the page's picture of the row or of the install is stale or unavailable
   const REREAD = new Set(["needs_intent", "stale", "tier_moved", "gesture_moved", "needs_broker", "standby", "not_built"]);
 
@@ -313,7 +313,7 @@
   function previewText(head, action, tier, gesture, base) {
     const how = gesture === "sign" ? "waits for a signature" : "fires now, recorded as reported (claims cockpit token)";
     const from = action.tier && action.tier !== tier ? " (rises from " + action.tier + ")" : "";
-    const cut = (v) => { const t = typeof v === "string" ? v : JSON.stringify(v); return JSON.stringify(t.length > 60 ? t.slice(0, 57) + "..." : t); };
+    const cut = (v) => { const t = typeof v === "string" ? v : String(JSON.stringify(v)); return JSON.stringify(t.length > 60 ? t.slice(0, 57) + "..." : t); };
     const vals = Object.keys(base.params).map((k) => k + " = " + cut(base.params[k])).join(", ") || "no values";
     return (head.label || base.verb) + " is " + tier + from + ": " + how + ". " + (head.effect ? head.effect + ". " : "")
       + "Sending " + vals + ". Click again to fire.";
@@ -323,6 +323,10 @@
     opts = opts || {};
     const head = (live && live.heads && live.heads[action.verb]) || {};
     const label = head.label || action.verb;
+    // an undefined value is no value: it is not sent, not fingerprinted and not previewed
+    const given = {};
+    for (const k of Object.keys(params || {})) if (params[k] !== undefined) given[k] = params[k];
+    params = given;
     if (action.gesture === "refused" || action.gesture === "laptop-only") {
       return { ok: false, error: "gesture", message: label + " is " + action.gesture + " here: it cannot be done from this page." };
     }
@@ -398,8 +402,8 @@
   const VERB_OF_KIND = { state: "section_edit" };
 
   function panelActionFor(verb, req) {
-    // a capture lands in the Keep when it is a note, else in the Tray
-    const want = verb === "spore_seed" ? (req && req.disposition === "note" ? "keep" : "tray") : null;
+    // every capture, a note included, is the Tray's create; the disposition rides in params
+    const want = verb === "spore_seed" ? "tray" : null;
     for (const pid of Object.keys(live.panels)) {
       if (want && pid !== want) continue;
       const a = live.panels[pid].actions.find((x) => x && x.verb === verb);
@@ -433,13 +437,22 @@
     return postVerb(action, params, { confirm: confirm === true });
   }
 
-  // cancel a waiting pending: the gesture's intent, no preview, and a key of its own
+  // cancel a waiting pending: the gesture's intent, no preview, and a key of its own. The whole envelope
+  // is kept by pending id until the kernel answers, so a click after a lost answer replays the same key.
   async function cancelPending(c) {
-    const body = { idempotency_key: newKey() };
-    if (c.tier && c.tier !== "C1") body.intent = c.gesture === "sign" ? "sign" : "reported";
+    const slot = "cancel:" + c.pending_id;
+    const keys = readKeys();
+    let body = keys[slot] && keys[slot].envelope;
+    if (!body) {
+      body = { idempotency_key: newKey() };
+      if (c.tier && c.tier !== "C1") body.intent = c.gesture === "sign" ? "sign" : "reported";
+      keys[slot] = { envelope: body };
+      writeKeys(keys);
+    }
     const route = c.route || "/cockpit/pending/" + encodeURIComponent(c.pending_id) + "/cancel";
     const r = await send(route, body);
-    if (r.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };
+    if (r.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };   // the envelope stays
+    const after = readKeys(); delete after[slot]; writeKeys(after);
     if (!r.ok) return fault(r, { row_id: null, label: "cancel" });
     const d = r.data;
     notice = { key: null, text: "cancel: " + (d.state || "done") + (d.label ? " · " + d.label : ""), cls: "note" };
@@ -481,7 +494,16 @@
   }
 
   async function loadManifestView(passive) {
-    const manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
+    let manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
+    // A writable install that wants a token and read the manifest without one (a loopback read needs none)
+    // would draw every action refused. Ask for the token now, then read again as that credential.
+    const cred = manifest && manifest.credential;
+    const wantsToken = !!(manifest && manifest.transport && manifest.transport.write_token_required === true
+      && cred && cred.class === "none");
+    if (wantsToken && !(passive && editInProgress())) {
+      if (promptForToken()) manifest = await authedReadJson("/cockpit/manifest.json");
+      else dropToken();
+    }
     const fetchedAt = Date.now();
     const ids = Object.keys(manifest.panels);
     const panels = Object.create(null);

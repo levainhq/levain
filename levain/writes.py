@@ -292,13 +292,17 @@ class ActionVerb:
       from launching a DUPLICATE expensive job). The handler runs in the worker, so its input
       validation surfaces via poll as a ``failed`` job (the frontend validates required fields
       client-side before the propose — server-side validation is defense-in-depth).
-    - ``label`` — a short human label for the audit trail + the operator affordance."""
+    - ``label`` — a short human label for the audit trail + the operator affordance.
+    - ``fields`` — the param names the verb takes. Declared, the cockpit allowlist refuses any other
+      param and the manifest publishes them for the page's compose box; ``None`` leaves the handler
+      to validate its own params."""
 
     handler: Callable[[dict[str, Any]], dict[str, Any]]
     confirm_required: bool = True
     idempotent: bool = False
     job: bool = False
     label: str = ""
+    fields: tuple[str, ...] | None = None
 
 
 @contextmanager
