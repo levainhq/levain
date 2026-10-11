@@ -237,6 +237,10 @@ class TestSecurity:
                 status, body = _post(base + "/init", payload, headers=bad)
                 assert (status, body["error"]) == (403, "credential_required")
                 assert not install.exists()
+            # the token is checked before Content-Type, as serve does (K2a's order)
+            status, body = _post(base + "/init", payload, headers={"X-Levain-Write-Token": ""},
+                                 content_type="text/plain")
+            assert (status, body["error"]) == (403, "credential_required")
             status, body = _post(base + "/init", payload)
             assert status == 200 and body["ok"] is True
 

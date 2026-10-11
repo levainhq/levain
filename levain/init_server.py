@@ -151,8 +151,8 @@ class _InitServer(ThreadingHTTPServer):
 
 class _InitHandler(GuardedHandler):
     """Serves the init form (GET/HEAD) + the one governed write route
-    (``POST /init``). Behind the same DNS-rebinding Host allowlist + CSRF +
-    application/json boundary the dashboard server uses (the shared
+    (``POST /init``). Behind the same DNS-rebinding Host allowlist + CSRF + write
+    token + application/json boundary the dashboard server uses (the shared
     :class:`~levain.http_guards.GuardedHandler`)."""
 
     server_version = "levain-init"

@@ -336,6 +336,8 @@
           var typed = window.prompt("The write token `levain init --web` printed in your terminal:");
           if (typed === null) { setNote("not installed: the write token is needed", true); return; }
           writeToken = typed.trim();
+          // a token travels in a request header: printable ASCII without spaces, as the link's is
+          if (!/^[\x21-\x7e]+$/.test(writeToken)) { writeToken = ""; continue; }
         }
         res = await fetch("/init", {
           method: "POST",
@@ -347,6 +349,7 @@
         if (res.status !== 403 || data.error !== "credential_required") break;
         writeToken = "";      // a wrong or missing token: ask once more
       }
+      if (!res) { setNote("not installed: that is not a write token", true); return; }
       if (res.ok) {
         renderResult(data);
         setNote(data.ok ? "done" : "partial — see below", !data.ok);
@@ -355,6 +358,7 @@
         setNote("HTTP " + res.status + " — see below", true);
       }
     } catch (e) {
+      writeToken = "";      // a token fetch() refused as a header value must not stick
       setNote("network error: " + (e && e.message ? e.message : e), true);
     } finally {
       installing = false;
