@@ -153,6 +153,19 @@ class ProviderSpec:
     label_key: Callable[[dict[str, Any]], LabelKey | None] | None = None
 
 
+def _label_note(note: str | None, labels: "LabelSnapshot | None") -> str | None:
+    """A panel's note plus what its label snapshot could not read: the snapshot's error, and how many
+    label rows were unreadable (§8d row 3: a corrupt label row degrades only its resource, and says so).
+    ``labels`` is None for a panel whose rows carry no label."""
+    if labels is not None and labels.error:
+        note = f"{note}; {labels.error}" if note else labels.error
+    degraded = getattr(labels, "degraded", 0) if labels is not None else 0
+    if degraded:
+        msg = f"{degraded} label row(s) unreadable: their resources read unverified"
+        note = f"{note}; {msg}" if note else msg
+    return note
+
+
 class ReadContext:
     """One read cycle: a fixed instant and a memo, so every built-in provider in a cycle sees one
     view of the substrate instead of building its own. ``fresh``: a write's read, so a source with
@@ -1115,14 +1128,7 @@ class Cockpit:
         listy = spec.kind == "triage-list"
         # only a panel whose rows (or value) carry labels renders the snapshot
         labelled = labels if spec.label_key is not None else None
-        note = snap.note
-        if labelled is not None and labelled.error:
-            note = f"{note}; {labelled.error}" if note else labelled.error
-        degraded = getattr(labelled, "degraded", 0) if labelled is not None else 0
-        if degraded:
-            # §8d row 3: a corrupt label row degrades only its resource, and says so
-            msg = f"{degraded} label row(s) unreadable: their resources read unverified"
-            note = f"{note}; {msg}" if note else msg
+        note = _label_note(snap.note, labelled)
         # an ordering's uncounted groups (K2b-3b §3) are carried, never counted
         count = (len(counted_rows(spec.order, snap.rows)) if (listy and snap.rows is not None)
                  else (0 if listy and snap.status != "error" else None))
@@ -1205,7 +1211,9 @@ class Cockpit:
             "priority": "gate", "rank": -100, "status": worst, "count": len(rows) if worst != "error" else None,
             "actionable_count": len(rows) if worst != "error" else None,
             "filtered": [], "skipped": [], "as_of": snap.as_of, "stale_after_s": 0, "refresh_every_s": None,
-            "etag": self._etag_of(snap, None, cred, ctx.today), "error": err, "note": snap.note,
+            "etag": self._etag_of(snap, None, cred, ctx.today), "error": err,
+            # the Now view applies the snapshot to its rows, so it explains a degraded one as _head does
+            "note": _label_note(snap.note, labels if labelled else None),
             "empty": "Nothing needs you now.", "order": None, "groups": None, "search": None,
             "actions": [], "degraded": degraded, "edit_class": None,
         }

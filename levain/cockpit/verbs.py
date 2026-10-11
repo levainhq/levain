@@ -576,7 +576,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         raise _refuse("bad_request", 400, "request must be a JSON object")
     if scope is None:
         raise _refuse("read_only", 422, "this source is read-only; nothing editable")
-    today = cockpit.today()
+    today = auth.now.astimezone().date()   # the snapshot's instant: a second clock read could cross midnight
 
     if route == "edit":
         return _legacy_edit(registry, cockpit, scope, req, credential, install_class, today, broker, auth)
@@ -790,7 +790,7 @@ def retier(registry: "VerbRegistry", cockpit: "Cockpit", verb_name: str, params:
         if not isinstance(res, Read):
             return None
         row = res.value
-    return verb.tier(dict(params), row, row_label(row), cockpit.today())
+    return verb.tier(dict(params), row, row_label(row), auth.now.astimezone().date())   # one instant per decide
 
 
 def _governed(cockpit: "Cockpit") -> bool:
