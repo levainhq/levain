@@ -736,7 +736,8 @@ class TestReleaseStampIsNotAPublishedVersion:
         for i, ref in enumerate(commits):
             blob, toml = blobs[2 * i], blobs[2 * i + 1] or ""
             if blob is None:
-                assert push_file is None, f"pushed commit {ref} carries no levain/__init__.py"
+                if push_file is not None:
+                    continue   # no stamp, so it claims no version (old history, an orphan)
                 pytest.skip("HEAD carries no levain/__init__.py")
             m = re.search(r'__version__ = "([^"]+)"', blob)
             assert m, f"{ref}'s levain/__init__.py no longer declares __version__"

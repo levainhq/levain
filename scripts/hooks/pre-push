@@ -43,17 +43,22 @@ fi
 # "<local ref> <local sha> <remote ref> <remote sha>" line per ref on stdin; an
 # all-zero local sha is a delete, which publishes nothing.
 #
-# What is checked is every commit the push makes newly reachable on the remote
-# (remote sha..local sha; for a new ref, whatever no remote-tracking ref already
-# holds), against the tags the REMOTE advertises plus the tags this push sets.
-# Local tags are not the release record: a release tag lands after main is
-# pushed, so a clone can hold the release commit without its tag.
-push="$(mktemp)" || exit 1
-out="$(mktemp)" || { rm -f "$push"; exit 1; }
-trap 'rm -f "$push" "$out"' EXIT
+# What is checked is every commit the push makes newly reachable on the
+# destination: remote sha..local sha for an existing ref; for a new ref,
+# everything the destination's advertised refs do not already reach (git's own
+# pre-push.sample walks the whole history there). "Already on the remote" is
+# what the DESTINATION advertises (`git ls-remote` on the URL git passes as $2),
+# never local remote-tracking refs, which go stale. The release record is the
+# destination's tags plus the tags this push sets, never the local tags: a
+# release tag lands after main is pushed, so a clone can hold the release
+# commit without its tag. Research and L3 raws: levain project_memory/1011-gate/.
+push=""; out=""; adv=""
+trap 'rm -f "$push" "$out" "$adv"' EXIT
 trap 'exit 1' HUP INT TERM
+push="$(mktemp)" && out="$(mktemp)" && adv="$(mktemp)" || exit 1
 
-while read -r _lref lsha rref rsha || [ -n "${_lref:-}" ]; do
+lines=""
+while read -r lref lsha rref rsha || [ -n "${lref:-}" ]; do
     [ -z "${lsha:-}" ] && continue
     [ -z "${lsha//0/}" ] && continue   # all zeros (sha1 or sha256): a delete
     if ! c="$(git rev-parse --verify -q "${lsha}^{commit}")"; then
@@ -61,22 +66,37 @@ while read -r _lref lsha rref rsha || [ -n "${_lref:-}" ]; do
         echo "          Push deliberately with --no-verify if this is intended." >&2
         exit 1
     fi
-    case "${rref:-}" in refs/tags/v*) echo "P ${rref#refs/tags/} $c" >>"$push" ;; esac
-    if [ -n "${rsha//0/}" ] && git cat-file -e "${rsha}^{commit}" 2>/dev/null; then
-        new="$(git rev-list "${rsha}..${c}")" || exit 1
-    else
-        new="$(git rev-list "$c" --not --remotes)" || exit 1
-    fi
-    [ -n "$new" ] && printf 'C %s\n' $new >>"$push"
+    lines="$lines$lref $lsha $rref ${rsha:-0}
+"
 done
-grep -q '^C ' "$push" || exit 0   # nothing newly published: deletes, or tips the remote holds
+[ -z "$lines" ] && exit 0   # deletes only
 
-if ! tags="$(git ls-remote --tags "${1:-origin}" 'refs/tags/v*')"; then
-    echo "pre-push: could not read the remote's release tags; the gate cannot check this push." >&2
+dest="${2:-${1:-origin}}"
+if ! git ls-remote "$dest" >"$adv"; then
+    echo "pre-push: could not read what $dest advertises; the gate cannot check this push." >&2
     echo "          Push deliberately with --no-verify if this is intended." >&2
     exit 1
 fi
-[ -n "$tags" ] && printf '%s\n' "$tags" | sed 's/^/R /' >>"$push"
+grep -E $'\trefs/tags/v' "$adv" | sed 's/^/R /' >>"$push"
+# The destination's commits that this clone holds bound every new-ref walk.
+have="$(cut -f1 "$adv" | sort -u | git cat-file --batch-check='%(objectname) %(objecttype)' \
+        | awk '$2 == "commit" {print $1}')"
+
+while read -r lref lsha rref rsha; do
+    [ -z "${lsha:-}" ] && continue
+    c="$(git rev-parse --verify -q "${lsha}^{commit}")" || exit 1
+    case "$rref" in refs/tags/v*) echo "P ${rref#refs/tags/} $c" >>"$push" ;; esac
+    if [ -n "${rsha//0/}" ] && git cat-file -e "${rsha}^{commit}" 2>/dev/null; then
+        new="$(git rev-list "${rsha}..${c}")" || exit 1
+    else
+        # `--not` does not reach revisions read from --stdin, so each is `^sha`.
+        new="$( { [ -n "$have" ] && printf '^%s\n' $have; } | git rev-list --stdin "$c")" || exit 1
+    fi
+    [ -n "$new" ] && printf 'C %s\n' $new >>"$push"
+done <<EOF_LINES
+$lines
+EOF_LINES
+grep -q '^C ' "$push" || exit 0   # nothing newly published: tips the destination holds
 
 test_id="tests/test_manifest.py::TestReleaseStampIsNotAPublishedVersion::test_the_committed_stamp_of_each_pushed_commit_is_not_released"
 if ! LEVAIN_PUSH_FILE="$push" "$PY" -m pytest "$test_id" -q -rs -p no:cacheprovider >"$out" 2>&1 \
