@@ -453,18 +453,20 @@ def _private_logs(spec: "DaemonSpec") -> None:
     macOS's default, ``~/Library/Logs``, is shared with other apps and is left alone: ``~/Library``
     is owner-only by default."""
     own_dir = platform.system() != "Darwin" and spec.stdout_log.parent == _default_log_dir().expanduser().resolve()
-    for path in (spec.stdout_log, spec.stderr_log):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            if own_dir and path.parent == spec.stdout_log.parent:
-                os.chmod(path.parent, 0o700)
+    path = spec.stdout_log
+    try:
+        for d in {spec.stdout_log.parent, spec.stderr_log.parent}:
+            d.mkdir(parents=True, exist_ok=True)
+        if own_dir:
+            os.chmod(spec.stdout_log.parent, 0o700)
+        for path in (spec.stdout_log, spec.stderr_log):
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             try:
                 os.fchmod(fd, 0o600)
             finally:
                 os.close(fd)
-        except OSError as exc:
-            raise DaemonError(f"cannot make the log {path} owner-only: {exc}. Nothing was installed.") from exc
+    except OSError as exc:
+        raise DaemonError(f"cannot make the log {path} owner-only: {exc}. Nothing was installed.") from exc
 
 
 # --- macOS: launchd USER agent ---------------------------------------------------------------
