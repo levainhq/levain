@@ -107,3 +107,25 @@ def test_the_transport_is_in_the_manifest_etag(rig) -> None:
     a = rig.ck.manifest(CRED, transport={"writable": True, "write_token_required": True})
     b = rig.ck.manifest(CRED, transport={"writable": False, "write_token_required": False})
     assert a["etag"] != b["etag"]
+
+
+# --- 3. resolve kinds per row -------------------------------------------------------------------
+
+
+def test_a_resolve_row_action_names_the_kinds_its_rows_type_takes(rig) -> None:
+    from anneal_memory.spores import ASCEND_BY_TYPE, DESCEND_BY_TYPE
+
+    rows = rig.ck.panel("loops", credential_class="token")["rows"]
+    seen = set()
+    for row in rows:
+        stype = row["facets"]["spore_type"]
+        for a in row["actions"]:
+            if a["verb"] == "spore_descend":
+                assert a["options"] == {"spore_kind": sorted(DESCEND_BY_TYPE[stype])}, a
+            elif a["verb"] == "spore_ascend":
+                assert a["options"] == {"spore_kind": sorted(ASCEND_BY_TYPE[stype])}, a
+            else:
+                assert "options" not in a, a
+                continue
+            seen.add(a["verb"])
+    assert seen == {"spore_descend", "spore_ascend"}

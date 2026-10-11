@@ -129,6 +129,7 @@ class VerbSpec:
     fire: Callable[..., dict[str, Any]] | None = None
     legacy_kind: str | None = None           # the ``/edit`` kind this verb aliases
     applies_to: Callable[[dict[str, Any]], bool] | None = None   # rows a row verb offers itself on
+    options: Callable[[dict[str, Any]], dict[str, list[Any]]] | None = None   # a row action's allowed values per param
 
     def tier(self, params: dict[str, Any], row: dict[str, Any] | None, provenance: str, today: date) -> Tier:
         base: Tier = "T2" if self.tier_fn is None else self.tier_fn(params, row, provenance, today)
@@ -301,6 +302,16 @@ def _unbuilt_fire(why: str) -> Callable[..., dict[str, Any]]:
 
 _SPORE_ROW = lambda r: str(r.get("id", "")).startswith("spore:")   # noqa: E731
 
+
+def _resolve_kinds(direction: str) -> Callable[[dict[str, Any]], dict[str, list[Any]]]:
+    """The ``spore_kind`` values anneal takes for this row's type, so a renderer offers only those."""
+    def options(row: dict[str, Any]) -> dict[str, list[Any]]:
+        from anneal_memory.spores import ASCEND_BY_TYPE, DESCEND_BY_TYPE
+
+        by_type = ASCEND_BY_TYPE if direction == "ascend" else DESCEND_BY_TYPE
+        return {"spore_kind": sorted(by_type.get(str(_facet(row, "spore_type")), ()))}
+    return options
+
 KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("spore_touch", "touch", "marks the item seen now (moves its seen-recency)", "row",
              floor="C1", tier_fn=_const("C1"), fire=_spore_fire("spore_touch"), legacy_kind="spore_touch",
@@ -308,7 +319,7 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("spore_descend", "resolve", "resolves the item (it leaves the open set; recoverable in anneal)",
              "row", fields=("spore_kind",), floor="C1", tier_fn=_const("C1"), confirm_required=True,
              reversible=False, fire=_spore_fire("spore_descend"), legacy_kind="spore_descend",
-             applies_to=_SPORE_ROW),
+             applies_to=_SPORE_ROW, options=_resolve_kinds("descend")),
     VerbSpec("spore_surface_at", "snooze", "sets the date the item next surfaces", "row",
              fields=("surface_at",), floor="C1", tier_fn=_surface_at_tier,
              row_tier=_const("C1"),
@@ -328,7 +339,7 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
     VerbSpec("spore_ascend", "promote", "resolves the loop into what it became, with a reference", "row",
              fields=("spore_kind", "ref"), floor="T2", tier_fn=_const("T2"), confirm_required=True,
              reversible=False, fire=_spore_fire("spore_ascend"), legacy_kind="spore_ascend",
-             applies_to=_SPORE_ROW),
+             applies_to=_SPORE_ROW, options=_resolve_kinds("ascend")),
     VerbSpec("spore_seed", "capture", "adds a new item that agents will read", "create",
              fields=("text", "type", "disposition"), floor="T2", tier_fn=_const("T2"),
              fire=_unbuilt_fire("spore_seed fires through the broker (K2b)"), legacy_kind="spore_seed"),
@@ -462,9 +473,12 @@ def row_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, row: 
         if v.binding != "row" or (v.applies_to is not None and not v.applies_to(row)):
             continue
         t = v.rendered_tier(row, label, today)
-        out.append({"verb": v.name, "tier": t, "gesture": gesture_for(t, credential_class, install_class),
-                    "escalates": v.escalates(row, label, today) if v.escalates else [],
-                    "target": {"panel_id": panel_id, "row_id": row["id"], "row_version": row["version"]}})
+        action = {"verb": v.name, "tier": t, "gesture": gesture_for(t, credential_class, install_class),
+                  "escalates": v.escalates(row, label, today) if v.escalates else [],
+                  "target": {"panel_id": panel_id, "row_id": row["id"], "row_version": row["version"]}}
+        if v.options is not None:
+            action["options"] = v.options(row)
+        out.append(action)
     return out
 
 
