@@ -617,10 +617,11 @@ class TestTheDashboardPageFromTheManifest:
         assert dom.index("Odd ids") < dom.index("Even ids")
         assert "disk on fire" in dom and "unavailable" in dom
 
-    def test_the_default_page_still_reads_the_substrate(self, tmp_path: Path) -> None:
+    def test_the_legacy_page_still_reads_the_substrate(self, tmp_path: Path) -> None:
+        # the useManifest flip made the manifest the default; `?source=substrate` keeps the legacy page
         httpd, t = self._serve(tmp_path, _tray_cockpit())
         try:
-            dom = _dump_dom(f"http://127.0.0.1:{httpd.server_address[1]}/")
+            dom = _dump_dom(f"http://127.0.0.1:{httpd.server_address[1]}/?source=substrate")
         finally:
             httpd.shutdown()
             httpd.server_close()

@@ -300,7 +300,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/dashboard_team.js": ("dashboard_team.js", "text/javascript; charset=utf-8"),
     "/dashboard_chat.js": ("dashboard_chat.js", "text/javascript; charset=utf-8"),
     # The manifest mapper (levain.cockpit; design §7): builds the dashboard's view from
-    # /cockpit/manifest.json, so the dashboard page is the cockpit renderer (`/?source=manifest`).
+    # /cockpit/manifest.json, so the dashboard page is the cockpit renderer (the default page).
     "/cockpit_view.js": ("cockpit_view.js", "text/javascript; charset=utf-8"),
 }
 

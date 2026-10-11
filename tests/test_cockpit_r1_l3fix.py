@@ -120,3 +120,23 @@ def test_action_verb_fields_must_be_none_or_a_tuple_of_unique_non_empty_strings(
     for bad in ("message", ["message"], ("a", "a"), ("a", ""), ("a", 1)):
         with pytest.raises(ValueError):
             ActionVerb(handler=h, fields=bad)
+
+
+@pytest.mark.skipif(not Path(CHROME).exists(), reason="Chrome is not installed")
+def test_the_default_page_draws_the_manifest_and_offers_a_downstream_send(tmp_path: Path) -> None:
+    """The useManifest flip (HANDOFF OPEN #2): the default page is the manifest source, so an embedder's
+    downstream send fires through /cockpit/verb and the broker. Before the flip `/` drew the legacy page,
+    whose send posted /action, which K2b refuses for a T2 verb (measured by 1011+37 on a served Bridge).
+    `?source=substrate` keeps the legacy page reachable."""
+    from tests._inbox_fake import inbox_downstream
+    from tests.test_cockpit_r1_write import INBOX_PANELS
+
+    _root, src, _ids = _install(tmp_path)
+    verb = ActionVerb(handler=lambda p: {"summary": "sent"}, label="send", fields=("message", "for"))
+    with _serve(src, extra_verbs={"send_inbox": verb}, extra_panels=lambda: INBOX_PANELS,
+                extra_effects={"send_inbox": inbox_downstream()[1]}, surface_tokens={"browser": "T"},
+                install_class="reported") as (url, _httpd):
+        default = _dump(f"{url}/#write_token=T")
+        legacy = _dump(f"{url}/?source=substrate#write_token=T")
+    assert "<h2>Now (" in default and 'aria-label="message"' in default, default[:400]
+    assert "<h2>Now (" not in legacy and 'aria-label="message"' not in legacy

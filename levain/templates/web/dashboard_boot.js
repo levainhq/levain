@@ -243,11 +243,11 @@
     return window.LevainDashboard.hasUnsavedEdit();
   }
 
-  // DATA SOURCE (cockpit design §7). `/?source=manifest` draws the page from the kernel's cockpit
-  // manifest + panel routes (cockpit_view.js maps them onto the same components); the default stays
-  // /substrate.json until the flip is ruled. The manifest source writes through /cockpit/verb (postVerb
-  // below). The flip is this one constant.
-  const useManifest = new URLSearchParams(window.location.search).get("source") === "manifest";
+  // DATA SOURCE (cockpit design §7). The page draws from the kernel's cockpit manifest + panel routes
+  // (cockpit_view.js maps them onto the same components) and writes through /cockpit/verb (postVerb
+  // below). `/?source=substrate` draws the legacy /substrate.json page, whose writes post /edit and
+  // /action (a T2 write there is refused: it fires only through the broker).
+  const useManifest = new URLSearchParams(window.location.search).get("source") !== "substrate";
 
   // ---- MANIFEST WRITES (R1): every affordance on the manifest source posts /cockpit/verb ----
   //
