@@ -50,6 +50,7 @@ from levain.cockpit.registry import (
     parse_date,
     validate_facets,
 )
+from levain.cockpit.authority import NO_LABELS, LabelKey, LabelSnapshot, RequestAuthority, current, unavailable
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 
 SCHEMA = "levain.cockpit/1"
@@ -137,6 +138,9 @@ class ProviderSpec:
     rowset: str | None = None
     edit_class: str = ""              # the dashboard's A/B/C edit class chip; "" = none (read-side label only)
     verbs: tuple[str, ...] = ()       # the verbs this panel offers (K2a, design §4.1): only these may target it
+    # K2b-3b: what a row's (or a line/prose value's) label is computed over, from its stored record (a
+    # value's: the value as read, ``provenance`` and ``value_version`` aside). None: provenance stays null.
+    label_key: Callable[[dict[str, Any]], LabelKey | None] | None = None
 
 
 class ReadContext:
@@ -144,9 +148,13 @@ class ReadContext:
     view of the substrate instead of building its own. ``fresh``: a write's read, so a source with
     its own answer cache must answer anew (``ExternalPanels.take``)."""
 
-    def __init__(self, now: datetime, *, memo_timeout_s: float = 10.0, fresh: bool = False) -> None:
+    def __init__(self, now: datetime, *, memo_timeout_s: float = 10.0, fresh: bool = False,
+                 authority: RequestAuthority | None = None) -> None:
         self.now = now
         self.fresh = fresh
+        # the request's one authority snapshot (K2b-3b §0.1); None in a refresher's own cycle, which
+        # computes label keys only and leaves provenance to the request that renders them
+        self.authority = authority
         self.today: date = now.astimezone().date()
         self._memo: dict[str, Future] = {}
         self._dead: set[str] = set()
@@ -198,6 +206,10 @@ class _Snap:
     empty: str | None = None
     value_version: str | None = None    # a line/prose value's write version; VALUE_ABSENT if no record
     view_order: dict[str, list[str]] | None = None   # each view's row ids in order (a triage-list with views)
+    # computed in the read worker from ``stored`` (a row dict carries no stored record); provenance is
+    # applied from these at render, from the request's snapshot
+    label_keys: dict[str, LabelKey] | None = None
+    value_label_key: LabelKey | None = None
 
 
 @dataclass
@@ -272,6 +284,7 @@ class Cockpit:
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
         self._verb_view: Any = None      # levain.cockpit.verbs.VerbView, attached by the server (K2a)
+        self._labeller: Callable[[], LabelSnapshot] | None = None    # the broker's, attached by the server (K2b)
         # source reads made inside a write still running (a hung source keeps its flight here)
         self._one_live: list[list[Any]] = []
 
@@ -280,6 +293,29 @@ class Cockpit:
         the revision (install class + policy) hashed into every etag, since a gesture can change with
         rows unchanged (design §9 K2a)."""
         self._verb_view = view
+
+    def attach_labeller(self, fn: Callable[[], LabelSnapshot]) -> None:
+        """Attach the labeller: ``fn()`` is ONE journal read, taken once per request (design §0.1)."""
+        self._labeller = fn
+
+    def labels(self) -> LabelSnapshot:
+        """One label snapshot. A labeller that raises is an error snapshot, never a failed panel: a
+        label is never a gate on reading."""
+        fn = self._labeller
+        if fn is None:
+            return NO_LABELS
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - every labeller fault is "provenance unavailable"
+            return unavailable(f"{type(exc).__name__}: {_safe_str(exc)}")
+
+    def authority(self) -> RequestAuthority:
+        """The authority one outer request renders and tiers from, captured once (§0.1)."""
+        return RequestAuthority(self._clock(), self.labels())
+
+    def install_class(self) -> str | None:
+        """The install class gestures are decided under (the attached verb view's), or None."""
+        return self._verb_view.install_class if self._verb_view is not None else None
 
     def spec(self, panel_id: str, *, discover: bool = False) -> "ProviderSpec | None":
         """A panel's registration. ``discover`` runs discovery first when the id is unknown, as
@@ -672,6 +708,8 @@ class Cockpit:
             # the views' orders are computed here, in the read worker, like every other ordering: an
             # ordering key runs on provider data, so its failure is this read's Fault, never a crash
             view_order = self._view_order(spec, rows, ctx.today) if spec.views else None
+            label_keys = self._label_keys(spec, list(res.rows), {r["id"] for r in rows})
+            value_key = None
         else:
             view_order = None
             if res.value is None:
@@ -679,13 +717,45 @@ class Cockpit:
             value = self._value(spec, res.value, res.version_of)
             rows = None
             status = "partial" if skipped else ("empty" if self._value_empty(spec.kind, value) else "ok")
+            label_keys, value_key = None, self._value_label_key(spec, value)
         stale = res.stale or (ctx.now - _parse_iso(as_of)) > timedelta(seconds=spec.stale_after_s)
         if stale and _STATUS_RANK["stale"] > _STATUS_RANK[status]:
             status = "stale"
         return _Snap(status, rows, value, filtered, skipped, as_of, None,
                      res.note if isinstance(res.note, str) else spec.note, res.stale,
                      res.empty if isinstance(res.empty, str) else None,
-                     value["value_version"] if spec.kind in ("line", "prose") else None, view_order)
+                     value["value_version"] if spec.kind in ("line", "prose") else None, view_order,
+                     label_keys, value_key)
+
+    @staticmethod
+    def _label_key(spec: ProviderSpec, stored: dict[str, Any]) -> LabelKey | None:
+        """A row's (or value's) label key. One that cannot be computed is no key (provenance null,
+        label ``unverified``): a label never fails a read."""
+        if spec.label_key is None:
+            return None
+        try:
+            key = spec.label_key(stored)
+        except Exception:  # noqa: BLE001
+            return None
+        return key if isinstance(key, LabelKey) else None
+
+    def _label_keys(self, spec: ProviderSpec, rows_in: list[RowIn], ids: set[str]) -> dict[str, LabelKey] | None:
+        if spec.label_key is None:
+            return None
+        keys = {r.id: self._label_key(spec, dict(r.stored)) for r in rows_in if r.id in ids}
+        return {i: k for i, k in keys.items() if k is not None}
+
+    def _value_label_key(self, spec: ProviderSpec, value: dict[str, Any]) -> LabelKey | None:
+        return self._label_key(spec, {k: x for k, x in value.items() if k not in ("provenance", "value_version")})
+
+    @staticmethod
+    def _with_provenance(rows: list[dict[str, Any]], keys: dict[str, LabelKey] | None,
+                         labels: LabelSnapshot) -> list[dict[str, Any]]:
+        """Each row's provenance from the request's snapshot (design §0.1). A panel with no label keys
+        renders as read: its rows keep ``provenance: null``."""
+        if keys is None:
+            return rows
+        return [{**r, "provenance": labels.provenance(keys.get(r["id"]))} for r in rows]
 
     @staticmethod
     def _value_empty(kind: str, value: Any) -> bool:
@@ -796,7 +866,7 @@ class Cockpit:
 
     # --- heads, panels, the now view --------------------------------------------------
     def _etag_of(self, snap: _Snap, groups: list[dict[str, Any]] | None, cred: str, today: date,
-                 views: tuple[tuple[str, str, str], ...] = ()) -> str:
+                 views: tuple[tuple[str, str, str], ...] = (), labels: LabelSnapshot | None = None) -> str:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
@@ -805,10 +875,21 @@ class Cockpit:
                      "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat(),
                      "verbs": self._verb_rev(),
                      # a panel's views shape view_rows: a kernel that adds or reorders one is not a 304
-                     **({"views": [list(v) for v in views]} if views else {})})
+                     **({"views": [list(v) for v in views]} if views else {}),
+                     # K2b-3b §0.3: provenance is applied at render, so the journal's revision (and a
+                     # snapshot's error) is content; with no labeller there is neither
+                     **({"labels": [list(labels.revision) if labels.revision is not None else None, labels.error]}
+                        if labels is not None and (labels.revision is not None or labels.error is not None)
+                        else {})})
 
-    def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date) -> dict[str, Any]:
+    def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date,
+              labels: LabelSnapshot = NO_LABELS) -> dict[str, Any]:
         listy = spec.kind == "triage-list"
+        # only a panel whose rows (or value) carry labels renders the snapshot
+        labelled = labels if spec.label_key is not None else None
+        note = snap.note
+        if labelled is not None and labelled.error:
+            note = f"{note}; {labelled.error}" if note else labelled.error
         count = len(snap.rows) if (listy and snap.rows is not None) else (0 if listy and snap.status != "error" else None)
         groups = None
         if listy and spec.order and ORDERINGS[spec.order].groups:
@@ -827,13 +908,15 @@ class Cockpit:
             "count": None if snap.status == "error" else count,
             "filtered": snap.filtered, "skipped": snap.skipped,
             "as_of": snap.as_of, "stale_after_s": spec.stale_after_s,
-            "refresh_every_s": spec.refresh_every_s, "etag": self._etag_of(snap, groups, cred, today, spec.views),
-            "error": snap.error, "note": snap.note, "empty": spec.empty if snap.empty is None else snap.empty,
+            "refresh_every_s": spec.refresh_every_s,
+            "etag": self._etag_of(snap, groups, cred, today, spec.views, labelled),
+            "error": snap.error, "note": note, "empty": spec.empty if snap.empty is None else snap.empty,
             "order": spec.order, "groups": groups,
             "views": [{"id": i, "title": t, "order": o} for i, t, o in spec.views] or None,
             "search": ({"fields": list(spec.search_fields), "default_visible": spec.search_default_visible}
                        if spec.search_fields else None),
-            "actions": (self._verb_view.panel_actions(spec.id, cred, today, snap.value_version)
+            "actions": (self._verb_view.panel_actions(spec.id, cred, today, snap.value_version,
+                                                      labels.label(snap.value_label_key))
                         if self._verb_view is not None else []),
             "edit_class": spec.edit_class or None,
         }
@@ -855,6 +938,8 @@ class Cockpit:
         worst = "ok"
         as_ofs: list[str] = []
         snaps = snaps if snaps is not None else {}
+        labels = ctx.authority.labels if ctx.authority is not None else NO_LABELS
+        labelled = False
         for s in sources:
             if s.id not in snaps:   # one read per source per cycle: the heads and this view agree
                 snaps[s.id] = self._snap_for(s, ctx)
@@ -866,7 +951,8 @@ class Cockpit:
                 worst = snap.status
             if snap.as_of:
                 as_ofs.append(snap.as_of)
-            for r in snap.rows or []:
+            labelled = labelled or s.label_key is not None
+            for r in self._with_provenance(snap.rows or [], snap.label_keys, labels):
                 if r["band"] == "now":
                     rows.append({**r, "panel_id": s.id})
         if worst in ("ok", "empty"):
@@ -895,7 +981,8 @@ class Cockpit:
             if r["group"] in union:
                 union[r["group"]]["count"] += 1
         head["groups"] = list(union.values()) or None
-        head["etag"] = self._etag_of(snap, head["groups"], cred, ctx.today)   # groups are content
+        head["etag"] = self._etag_of(snap, head["groups"], cred, ctx.today,   # groups are content
+                                     labels=labels if labelled else None)
         return head, rows
 
     def _entity(self, ctx: ReadContext) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1001,7 +1088,8 @@ class Cockpit:
                       key=lambda s: (-1 if s.region == HEADER else zi.index(s.region), s.rank, s.id))
 
     def manifest(self, credential: dict[str, Any], *, install_class: str | None = None) -> dict[str, Any]:
-        ctx = ReadContext(self._clock())
+        auth = self.authority()
+        ctx = ReadContext(auth.now, authority=auth)
         errors = self._ensure_discovered(ctx)
         entity, entity_errors = self._entity(ctx)
         errors += entity_errors
@@ -1010,7 +1098,7 @@ class Cockpit:
         specs_map = self._specs      # one snapshot for the whole manifest
         for spec in self._ordered_specs(specs_map):
             snaps[spec.id] = self._snap_for(spec, ctx)
-            heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today)
+            heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today, auth.labels)
         now_head, _ = self._now_head_and_rows(ctx, credential["class"], specs_map, snaps)
         heads[NOW_ID] = now_head
         specs = self._ordered_specs(specs_map)
@@ -1078,7 +1166,8 @@ class Cockpit:
         """The ``Panel`` payload, or None for an unknown panel id. ``profile`` is ``full`` or
         ``compact``; ``q`` is the server-side search over row bodies; ``row`` returns one row in
         full."""
-        ctx = ReadContext(self._clock())
+        auth = self.authority()
+        ctx = ReadContext(auth.now, authority=auth)
         specs_map = self._specs
         if panel_id != NOW_ID and panel_id not in specs_map:
             self._ensure_discovered(ctx)      # a panel we do not know yet may be a heading added since
@@ -1094,8 +1183,12 @@ class Cockpit:
             if spec is None:
                 return None
             snap = self._snap_for(spec, ctx)
-            head = self._head(spec, snap, credential_class, ctx.today)
+            head = self._head(spec, snap, credential_class, ctx.today, auth.labels)
             snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
+            if snap_rows is not None:
+                snap_rows = self._with_provenance(snap_rows, snap.label_keys, auth.labels)
+            if spec.label_key is not None and spec.kind in ("line", "prose") and isinstance(value, dict):
+                value = {**value, "provenance": auth.labels.provenance(snap.value_label_key)}
         out: dict[str, Any] = dict(head)
         out["rows"], out["value"], out["next"] = None, None, None
         if head["status"] == "error" and panel_id != NOW_ID:
@@ -1163,14 +1256,17 @@ class Cockpit:
         return [{**r, "actions": self._verb_view.row_actions(r.get("panel_id") or panel_id, r, cred, today)}
                 for r in rows]
 
-    def read_one(self, panel_id: str, row_id: str) -> Result:
+    def read_one(self, panel_id: str, row_id: str, *, authority: RequestAuthority | None = None) -> Result:
         """Read ONE row from the SOURCE through the provider's ``read_one``, never from a refresher
         snapshot (design §4.4). Returns ``Read`` with the finished row dict in ``Read.value``,
-        ``Absent`` when the row is gone, or ``Fault``."""
+        ``Absent`` when the row is gone, or ``Fault``. The row's provenance is ``authority``'s, or the
+        one the caller's request bound (``authority.bound``): the caller's one snapshot, never a
+        second journal read. With neither, this read is its own outer boundary and takes one."""
         spec = self._specs.get(panel_id)
         if spec is None or spec.read_one is None:
             return Fault(f"panel {panel_id!r} offers no read_one")
-        ctx = ReadContext(self._clock())
+        auth = authority or current() or self.authority()
+        ctx = ReadContext(auth.now, authority=auth)
 
         def once(ctx: ReadContext) -> Result:
             res = spec.read_one(ctx, row_id)       # type: ignore[misc]
@@ -1182,7 +1278,8 @@ class Cockpit:
                 rows, refused = self._rows(spec, list(res.rows), ctx)   # type: ignore[arg-type]
                 if refused or len(rows) != 1:
                     return Fault("read_one row refused: a facet value of the wrong type")
-                return Read(value=rows[0])
+                keys = self._label_keys(spec, list(res.rows), {rows[0]["id"]})   # type: ignore[arg-type]
+                return Read(value=self._with_provenance(rows, keys, auth.labels)[0])
             except Exception as exc:  # noqa: BLE001
                 return Fault(f"provider output refused: {_safe_str(exc)}")
         return self._bounded_fresh(("panel", panel_id), spec.timeout_s, once, ctx)
@@ -1190,17 +1287,25 @@ class Cockpit:
     def read_value_version(self, panel_id: str) -> Result:
         """Read a line or prose panel's value from the SOURCE (never the refresher snapshot) and
         return its ``value_version`` in ``Read.value`` (design §4.4)."""
+        res = self.read_value_head(panel_id, authority=RequestAuthority(self._clock()))   # no label wanted
+        return Read(value=res.value[0]) if isinstance(res, Read) else res
+
+    def read_value_head(self, panel_id: str, *, authority: RequestAuthority | None = None) -> Result:
+        """``read_value_version``'s read, returning ``(value_version, label)`` in ``Read.value``: the
+        value's label from ``authority``'s snapshot, or the request's bound one (K2b-3b §0.1)."""
         spec = self._specs.get(panel_id)
         if spec is None or spec.kind not in ("line", "prose"):
             return Fault(f"panel {panel_id!r} has no stored value")
-        ctx = ReadContext(self._clock())
+        auth = authority or current() or self.authority()
+        ctx = ReadContext(auth.now, authority=auth)
 
         def once(ctx: ReadContext) -> Result:
             res = spec.read(ctx)
             if not isinstance(res, Read):
                 return res
             try:
-                return Read(value=self._value(spec, res.value, res.version_of)["value_version"])
+                value = self._value(spec, res.value, res.version_of)
+                return Read(value=(value["value_version"], auth.labels.label(self._value_label_key(spec, value))))
             except Exception as exc:  # noqa: BLE001
                 return Fault(f"provider output refused: {_safe_str(exc)}")
         return self._bounded_fresh(("panel", panel_id), spec.timeout_s, once, ctx)
