@@ -93,6 +93,8 @@ from levain.cockpit.firejournal import (
     request_shape,
 )
 from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
+from levain.cockpit.labels import BrokerLabeller, LabelSnapshot, label_class
+from levain.cockpit.authority import inactive
 from levain.cockpit.results import Absent, Fault
 
 __all__ = ["Broker", "BrokerError", "COCKPIT_STORE", "INTERNAL_VERBS", "LOCK_NAME", "Lifecycle",
@@ -132,16 +134,6 @@ def _transient(exc: BaseException) -> bool:
     """SQLite's busy/locked: another process holds the journal's write lock for now."""
     return isinstance(exc, sqlite3.OperationalError) and any(
         w in str(exc).lower() for w in ("locked", "busy"))
-
-
-def label_class(decision_kind: str | None, install_class: str | None) -> str:
-    """A fire's label class (§5) before revocation: ALLOWED_REPORTED -> ``claims cockpit token``;
-    ALLOWED in a reported install -> ``signed · reported``; ALLOWED governed -> ``verified``."""
-    if decision_kind == "ALLOWED_REPORTED":
-        return "claims cockpit token"
-    if decision_kind == "ALLOWED":
-        return "signed · reported" if install_class == REPORTED else "verified"
-    return "unverified"
 
 
 # --- cockpit.db's own objects as an EffectStore (§3.5, §4.1.4, §13) ---------------------------------
@@ -266,6 +258,7 @@ class Broker:
         self._op_locks: dict[str, list[Any]] = {}       # pid -> [mutex, users], pruned at zero users
         self._lock_fd: int | None = None
         self.db: CockpitDB | None = None
+        self._labeller: BrokerLabeller | None = None
         self._thread: threading.Thread | None = None
         self._healer: threading.Thread | None = None
         self._stop = threading.Event()
@@ -280,6 +273,20 @@ class Broker:
     @property
     def enabled(self) -> bool:
         return self.state is Lifecycle.ACTIVE
+
+    def labels(self) -> LabelSnapshot:
+        """The cockpit's labeller (K2b-3b §0.1): one read of THIS broker's journal through
+        ``CockpitDB.read``, served only while ACTIVE, when the broker has opened and initialised the
+        journal. Any other state reads no file and labels nothing (§8d row 1: there is no read-only
+        opener, since one would create ``-shm``/``-wal`` or miss an uncheckpointed WAL)."""
+        with self._mu:
+            db = self.db if self._state is Lifecycle.ACTIVE else None
+        if db is None:
+            return inactive("provenance is served by the active broker")
+        labeller = self._labeller
+        if labeller is None or labeller.db is not db:
+            labeller = self._labeller = BrokerLabeller(db)
+        return labeller.snapshot()
 
     def start(self) -> Lifecycle:
         """Run the start sequence once now; on a held lock stay STANDBY and heal in the background:

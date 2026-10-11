@@ -74,6 +74,27 @@ class _Unavailable:
         return UNVERIFIED
 
 
+@dataclass(frozen=True)
+class _Inactive:
+    """A server whose broker is not ACTIVE (STANDBY, or write-disabled): it holds no journal it may read,
+    so every row's provenance is null, as with no labeller, and the panel says where it is served
+    (K2b-3b §8d row 1)."""
+
+    error: str
+    revision: tuple[str, int, int] | None = None
+    degraded: int = 0
+
+    def provenance(self, key: LabelKey | None) -> dict[str, Any] | None:
+        return None
+
+    def label(self, key: LabelKey | None) -> str:
+        return UNVERIFIED
+
+
+def inactive(note: str) -> LabelSnapshot:
+    return _Inactive(note)
+
+
 def unavailable(reason: str) -> LabelSnapshot:
     return _Unavailable(f"provenance unavailable: {reason}")
 

@@ -654,6 +654,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                     self.levain_source,
                     job_store=self.job_runtime.store if self.job_runtime is not None else None)
                 built.attach_verbs(VerbView(self.verb_registry, built, lambda: broker_install_class(self)))
+                if self.broker is not None:
+                    built.attach_labeller(self.broker.labels)    # labels and tiers per request (K2b-3b)
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
@@ -1474,6 +1476,8 @@ def make_server(
     # K2b §6: `--install-class reported` is the only way to reported; no flag (and no governed
     # marker) leaves the broker write-disabled, answering "run the installer"
     httpd.broker = _build_broker(source, install_class, httpd)
+    if cockpit is not None and httpd.broker is not None:
+        cockpit.attach_labeller(httpd.broker.labels)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address

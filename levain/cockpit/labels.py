@@ -3,7 +3,7 @@
 
 A label is a pure function of (stored value, journal, install class, keys): per authority field, the
 latest ``labels`` row in the current epoch whose ``value_sha256`` equals the sha256 of the stored
-value's JCS. Its class comes from :func:`~levain.cockpit.broker.label_class` over the JOINED pending's
+value's JCS. Its class comes from :func:`label_class` over the JOINED pending's
 ``decision_kind`` and the JOURNAL's ``meta.install_class``, lowered to ``signed by a revoked key`` when
 the signer's ``compromised_since <= fired_at``. A row's label is its weakest field's.
 
@@ -22,11 +22,11 @@ from typing import Any
 
 from levain.autonomic.journal import JournalCorruptError
 from levain.cockpit.authority import LabelKey, unavailable
-from levain.cockpit.broker import label_class
+from levain.cockpit.install import REPORTED
 from levain.cockpit.consent import ConsentError, parse_stamp, value_sha256
 from levain.cockpit.firejournal import CockpitDB, _parse_record
 
-__all__ = ["BrokerLabeller", "LABEL_ORDER", "LabelKey", "LabelSnapshot", "UNAVAILABLE_SNAPSHOT"]
+__all__ = ["BrokerLabeller", "LABEL_ORDER", "LabelKey", "LabelSnapshot", "UNAVAILABLE_SNAPSHOT", "label_class"]
 
 # strongest first; a row's label is the WEAKEST field label (the highest index)
 LABEL_ORDER = ("verified", "signed · reported", "claims cockpit token", "signed by a revoked key", "unverified")
@@ -102,6 +102,16 @@ class LabelSnapshot:
                  if c.value_sha256 == digest
                  and (operation_id is None or c.operation_id == operation_id)]
         return max(cands, key=lambda c: (c.fired, c.rowid), default=None)
+
+
+def label_class(decision_kind: str | None, install_class: str | None) -> str:
+    """A fire's label class (§5) before revocation: ALLOWED_REPORTED -> ``claims cockpit token``;
+    ALLOWED in a reported install -> ``signed · reported``; ALLOWED governed -> ``verified``."""
+    if decision_kind == "ALLOWED_REPORTED":
+        return "claims cockpit token"
+    if decision_kind == "ALLOWED":
+        return "signed · reported" if install_class == REPORTED else "verified"
+    return "unverified"
 
 
 # the ONE "provenance unavailable" snapshot: the engine answers the same for a labeller that raises
