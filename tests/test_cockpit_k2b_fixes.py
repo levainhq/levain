@@ -510,7 +510,8 @@ def test_decide_reads_authority_off_the_signed_record_not_its_mirror_columns(hom
         out = b.db.decide(operation_id=pid, decision_kind="ALLOWED", recomputed=None, now=now[0],
                           signer_fp="SHA256:x", signature="sig")
         assert (out.state, out.reason) == ("EXPIRED", "expired")
-        assert _state(b, pid) == "EXPIRED"
+        signed = _json_loads(_rows(b, "SELECT record FROM pendings WHERE pending_id = ?", pid)[0][0])["expires_at"]
+        assert _rows(b, "SELECT state, terminal_at FROM pendings WHERE pending_id = ?", pid) == [("EXPIRED", signed)]
     finally:
         b.stop()
 
@@ -547,7 +548,7 @@ def test_a_reported_pending_whose_request_died_resumes_on_replay_even_after_its_
                              idempotency_key="h", harness="other") == "idempotency_conflict"
         out = b.issue(verb="spore_set_disposition", params={"disposition": "note"}, target=tgt, tier="T2",
                       credential=BROWSER, intent="reported", idempotency_key="died")
-        assert (out["pending_id"], out["state"]) == (dead, "STALE"), out
+        assert (out["pending_id"], out["state"], out["replay"]) == (dead, "STALE", True), out
         assert SporeStore(spores).get_by_origin_key("k.seed")["disposition"] == "seed"
     finally:
         b.stop()
@@ -575,3 +576,65 @@ def test_a_replay_with_a_non_string_row_id_is_a_bad_request(tmp_path):
         assert (status, fired["state"]) == (200, "COMMITTED"), fired
         status, out = _post(f"{url}/cockpit/verb", {**body, "row_id": 5, "row_version": "x"}, token="T")
     assert (status, out["error"]) == (400, "bad_request"), out
+
+
+def _json_loads(raw: Any) -> Any:
+    import json as _json
+    return _json.loads(raw)
+
+
+# --- code L3 r4 (complement + codex, 2026-10-10) -----------------------------------------------------
+
+
+def test_a_dry_run_never_resumes_a_pending_a_dead_request_left(tmp_path):
+    """codex HIGH + complement L3 r4: a dry run is a preview; with a crash-left reported pending under
+    the same key it must not decide (fire) it."""
+    from datetime import timedelta
+
+    from levain.cockpit.firejournal import new_pending_id
+    from tests.test_cockpit_k2a import _get, _install, _post, _serve
+
+    _root, src, ids = _install(tmp_path)
+    store = SporeStore(_root / ".levain" / "memory.spores.json")
+    with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, httpd):
+        b = httpd.broker
+        _get(f"{url}/cockpit/panel/tray.json", token="T")           # the broker starts with the cockpit
+        row = next(r for r in _get(f"{url}/cockpit/panel/tray.json", token="T")["rows"]
+                   if r["id"] == f"spore:{ids['seed']}")
+        tgt = {"kind": "row", "panel_id": "tray", "row_id": row["id"], "row_version": row["version"]}
+        dead = new_pending_id()
+        with b._admitted() as db:
+            built = b._build(db, "spore_set_disposition", {"disposition": "note"}, tgt, dead, at_issue=True)
+            n = b._now()
+            raw = b._record(pid=dead, verb="spore_set_disposition", intent="reported", built=built,
+                            params={"disposition": "note"}, tier="T2", fence={"policy_rev": db.policy_rev()},
+                            issued_at=utc(n), expires_at=utc(n + timedelta(minutes=15)))
+            db.issue(record_bytes=raw, principal="token:browser:1", idempotency_key="died", now=n, cap_exempt=True)
+        status, out = _post(f"{url}/cockpit/verb", {"verb": "spore_set_disposition", "panel_id": "tray",
+                                                    "params": {"disposition": "note"}, "row_id": row["id"],
+                                                    "row_version": row["version"], "intent": "reported",
+                                                    "idempotency_key": "died", "dry_run": True}, token="T")
+        assert (status, out.get("dry_run")) == (200, True), out
+        assert store.get(ids["seed"])["disposition"] == "seed"
+        assert _rows(b, "SELECT state FROM pendings WHERE pending_id = ?", dead) == [("WAITING",)]
+
+
+@pytest.mark.parametrize("field,value", [("intent", "x"), ("intent", None), ("tier", "C1"),
+                                         ("expires_at", "9999"), ("issued_at", None)])
+def test_a_record_whose_authority_fields_do_not_parse_is_corrupt(field, value):
+    """complement L3 r4: decide reads intent, tier and expiry off the record, so the one parse checks
+    them; an unknown intent never falls through to the reported path."""
+    from levain.cockpit.consent import encode
+    from levain.cockpit.firejournal import JournalCorruptError, _parse_record, new_pending_id, record_sha256
+
+    pid = new_pending_id()
+    rec = {"operation_id": pid, "verb": "spore_set_disposition", "intent": "sign", "tier": "T2",
+           "issued_at": "2026-10-10T20:00:00.000000Z", "expires_at": "2026-10-10T20:15:00.000000Z", "effects": []}
+    _parse_record(pid, encode(rec), record_sha256(encode(rec)))
+    if value is None:
+        del rec[field]
+    else:
+        rec[field] = value
+    blob = encode(rec)
+    with pytest.raises(JournalCorruptError):
+        _parse_record(pid, blob, record_sha256(blob))

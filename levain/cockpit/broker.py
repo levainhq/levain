@@ -47,7 +47,7 @@ from levain.autonomic.confirm import (
     verify_cockpit_signature,
 )
 from levain.autonomic.journal import JournalCorruptError
-from levain.cockpit.consent import ConsentError, build_record, encode, utc_stamp, value_sha256
+from levain.cockpit.consent import ConsentError, build_record, encode, parse_stamp, utc_stamp, value_sha256
 from levain.cockpit.effects import (
     SPORE_AUTHORITY_FIELDS,
     SPORE_CANONICAL,
@@ -525,7 +525,7 @@ class Broker:
             why = self._reported_refusal(str(rec.get("tier")), credential, harness)
             if why is not None:
                 raise BrokerError("refused", 403, why)
-            return self._decide(db, pid, "ALLOWED_REPORTED", None, None)
+            return {**self._decide(db, pid, "ALLOWED_REPORTED", None, None), "replay": True}
         return self.result(db, pid, replay=True)
 
     # -- building a verb's effects (§3.1.1) -------------------------------------------------------
@@ -839,7 +839,7 @@ class Broker:
     def result(self, db: CockpitDB, pid: str, *, replay: bool = False) -> dict[str, Any]:
         view = self._load(db, pid)
         state, reason = ("applying" if view.state == "DECIDED" else view.state), view.reason
-        if view.state == "WAITING" and str(view.record.get("expires_at")) <= utc_stamp(self._now()):
+        if view.state == "WAITING" and parse_stamp(view.record["expires_at"]) <= self._now():
             # expiry is a time, not a write: a read past it answers what the next write would record
             # (``_EXPIRE_SQL``'s own comparison), and never hands out a record to sign
             state, reason = "EXPIRED", "expired"

@@ -315,6 +315,13 @@ def _parse_record(op: str | None, blob: Any, sha: Any) -> dict[str, Any]:
             isinstance(e, dict) and isinstance(e.get("store"), str)
             and isinstance(e.get("resource_key"), str) for e in effects):
         raise _corrupt(op, "record.effects is not a list of effects")
+    # the fields a decision reads off the record (its authority), each checked here, at the one parse
+    if record.get("intent") not in ("sign", "reported"):
+        raise _corrupt(op, f"record intent {record.get('intent')!r} is neither sign nor reported")
+    if record.get("tier") not in ("T2", "T3"):
+        raise _corrupt(op, f"record tier {record.get('tier')!r} is neither T2 nor T3")
+    for name in ("issued_at", "expires_at"):
+        _check_stamp(str(op), f"record {name}", record.get(name), nullable=False)
     return record
 
 
@@ -579,15 +586,15 @@ class CockpitDB:
                 return DecideOutcome(operation_id, row["state"], row["reason"], written=False)
             # authority is read off the signed record, never its mirror columns (they index the
             # journal; a writer of cockpit.db can move them, a signature binds the record)
-            want_kind = "ALLOWED" if record.get("intent") == "sign" else "ALLOWED_REPORTED"
+            want_kind = {"sign": "ALLOWED", "reported": "ALLOWED_REPORTED"}[record["intent"]]
             if decision_kind != want_kind:
                 raise ValueError(f"a {record.get('intent')!r} pending cannot take {decision_kind}")
             conn.execute(_EXPIRE_SQL, (stamp,))
             if _pending_row(conn, operation_id)["state"] == "EXPIRED":
                 return DecideOutcome(operation_id, "EXPIRED", "expired", written=True)
-            if str(record.get("expires_at")) <= stamp:
+            if parse_stamp(record["expires_at"]) <= now:
                 conn.execute("UPDATE pendings SET state = 'EXPIRED', reason = 'expired', terminal_at = ? "
-                             "WHERE pending_id = ? AND state = 'WAITING'", (stamp, operation_id))
+                             "WHERE pending_id = ? AND state = 'WAITING'", (record["expires_at"], operation_id))
                 return DecideOutcome(operation_id, "EXPIRED", "expired", written=True)
 
             def terminal(state: str, reason: str) -> DecideOutcome:
@@ -599,7 +606,7 @@ class CockpitDB:
             refusal = _credential_problem(conn, row["principal"])
             enrolled_at: str | None = None
             if refusal is None and decision_kind == "ALLOWED":
-                refusal, enrolled_at = _key_problem(conn, signer_fp, str(record.get("tier")))
+                refusal, enrolled_at = _key_problem(conn, signer_fp, record["tier"])
             if refusal is not None:
                 return terminal("REFUSED", refusal)
             fence = record.get("fence")

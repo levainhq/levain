@@ -580,8 +580,9 @@ def dispatch(
         if not isinstance(req.get("row_id"), str) or not req["row_id"]:
             raise _refuse("bad_request", 400, f"{verb.name!r} names a row: 'row_id' is required")
         asked_target["row_id"] = req["row_id"]
-    replayed = _broker_replay(broker, verb, params, intent, credential, req.get("idempotency_key"),
-                              asked_target)
+    # a dry run never touches the journal: a replay could resume (decide) a pending a dead request left
+    replayed = None if req.get("dry_run") is True else _broker_replay(
+        broker, verb, params, intent, credential, req.get("idempotency_key"), asked_target)
     if replayed is not None:
         return replayed
     row = _read_target(cockpit, verb, panel_id, req.get("row_id"))
