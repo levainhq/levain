@@ -12,6 +12,7 @@ reads ``deleted_by_other``."""
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -268,12 +269,18 @@ def section_effects(heading: str, version: str, body: str) -> list[Effect]:
 SECTION_CANONICAL = {SECTION_VERB: section_effects}
 
 
-def section_paths_agree(paths: Any) -> bool:
-    """Whether ``paths.continuity_md`` is the file anneal's ``Store`` opens for ``paths.episodic_db``
-    (``<stem>.continuity.md``): the section reader and writer open the store by its db, so a section is
-    offered for editing only where that is the continuity file the substrate names (L3 r1 codex)."""
-    db = Path(paths.episodic_db)
-    return Path(paths.continuity_md) == db.with_name(f"{db.stem}.continuity.md")
+def section_paths_agree(read: Any, write: Any | None = None) -> bool:
+    """Whether the section edit's reader and writer name one store: ``read.continuity_md`` is the file
+    anneal's ``Store`` opens for ``read.episodic_db`` (``<stem>.continuity.md``), and ``write`` (when
+    given) names the same db and continuity file. Only those two paths, resolved (L3 r1 codex, r2)."""
+    def real(p: Any) -> str:
+        return os.path.realpath(Path(p).expanduser())
+
+    db = Path(read.episodic_db)
+    if real(read.continuity_md) != real(db.with_name(f"{db.stem}.continuity.md")):
+        return False
+    return write is None or (real(write.episodic_db) == real(read.episodic_db)
+                             and real(write.continuity_md) == real(read.continuity_md))
 
 
 def _written_version(body: str) -> str:
@@ -346,7 +353,7 @@ class SectionEffectStore:
             with self._store(read_only=True) as store:
                 got = store.read_section(heading)
                 wrap_open = bool(store.get_wrap_started_at())
-                role = next((s["role"] for s in store.section_schema
+                role = next((s.get("role") for s in store.section_schema
                              if s["heading"].lower() == heading.strip().lower()), None)
         except SectionError as exc:
             raise ValueError(f"the {heading!r} section is unreadable: {exc}") from exc
