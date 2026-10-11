@@ -29,8 +29,8 @@ from levain.cockpit.consent import utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, DB_NAME, CockpitDB, _meta
 from levain.cockpit.install import REPORTED, marker_path
 
-__all__ = ["ENROLLED_VIA", "KEY_CLASSES", "KeyError_", "KeyRow", "enroll", "keys", "normalise_public_key",
-           "principal_of", "revoke"]
+__all__ = ["ENROLLED_VIA", "KEY_CLASSES", "KeyError_", "KeyRow", "enroll", "keys", "fingerprint_of",
+           "normalise_public_key", "principal_of", "revoke"]
 
 ENROLLED_VIA = "laptop cli"
 KEY_CLASSES = tuple(sorted(_CLASS_RANK, key=_CLASS_RANK.__getitem__))
@@ -95,11 +95,14 @@ def fingerprint_of(public_key: str, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYG
             fh.write(public_key + "\n")
         out = subprocess.run([str(ssh_keygen), "-l", "-E", "sha256", "-f", path],
                              capture_output=True, text=True, timeout=10, check=False)
+    except subprocess.TimeoutExpired:
+        raise KeyError_("ssh-keygen did not answer reading the key") from None
     finally:
         os.unlink(path)
     m = _FP.match(out.stdout)
     if out.returncode != 0 or m is None:
-        raise KeyError_(f"ssh-keygen could not read the key: {(out.stderr or out.stdout).strip()[:200]}")
+        why = (out.stderr or out.stdout).replace(path, "<key>").strip()[:200]
+        raise KeyError_(f"ssh-keygen could not read the key: {why}")
     return m.group(1)
 
 
@@ -168,7 +171,7 @@ def revoke(data_root: Path | str, ref: str, *, now: datetime, compromised_since:
                                   "AND fingerprint != ?", (_LAPTOP, row["fingerprint"])).fetchone()[0]
             if others == 0:
                 raise KeyError_(f"{row['fingerprint']} is the last unrevoked laptop-presence key; enroll "
-                                "another first")
+                                "another first (until then it still signs, compromised or not)")
         conn.execute("UPDATE keys SET revoked_at = ?, compromised_since = ? WHERE fingerprint = ?",
                      (utc_stamp(now), utc_stamp(compromised_since) if compromised_since else None,
                       row["fingerprint"]))

@@ -358,7 +358,8 @@ def main(argv: list[str] | None = None) -> int:
     ck_enroll.add_argument("key", type=Path, help="The public key file (e.g. ~/.ssh/id_ed25519.pub).")
     ck_enroll.add_argument("--class", dest="key_class", default="laptop-presence",
                            choices=("laptop-presence", "display-phone", "presence"),
-                           help="What the key may sign (default: laptop-presence).")
+                           help="What the key may sign (default: laptop-presence): laptop-presence "
+                                "signs T2 and T3, display-phone T2, presence nothing yet.")
     _ck_common(ck_enroll)
     ck_enroll.set_defaults(func=_cmd_cockpit_enroll)
     ck_revoke = ck_sub.add_parser("revoke", help="Revoke an enrolled key.")

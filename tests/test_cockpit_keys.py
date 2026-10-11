@@ -94,3 +94,37 @@ def test_the_cli_helps_tier_claims_hold() -> None:
     assert signs("laptop-presence") == {"T2", "T3"}
     assert signs("display-phone") == {"T2"}
     assert signs("presence") == set()
+
+
+def test_revoke_lands_when_another_laptop_key_exists_and_records_the_compromise(tmp_path: Path) -> None:
+    root = _journal(tmp_path)
+    kw = {"now": NOW, "marker_directory": tmp_path / "m"}
+    a, _ = enroll(root, _key(tmp_path, "a"), "laptop-presence", **kw)
+    again, created = enroll(root, (tmp_path / "a.pub").read_text(), "laptop-presence", **kw)
+    assert not created and again == a
+    enroll(root, _key(tmp_path, "c"), "laptop-presence", **kw)
+    since = datetime(2026, 10, 11, 9, 0, tzinfo=timezone.utc)
+    r = revoke(root, a.fingerprint, compromised_since=since, **kw)
+    assert r.revoked_at == "2026-10-11T12:00:00.000000Z" and r.compromised_since == "2026-10-11T09:00:00.000000Z"
+    assert [k.fingerprint for k in keys(root, **{"marker_directory": tmp_path / "m"}) if k.revoked_at is None] \
+        != [a.fingerprint]
+
+
+def test_the_cli_enrolls_revokes_and_refuses_with_exit_codes(tmp_path: Path, capsys, monkeypatch) -> None:
+    from levain import cli
+    from levain.cockpit import install
+
+    monkeypatch.setattr(install, "marker_dir", lambda: tmp_path / "m")   # no real governed marker dir
+    root = _journal(tmp_path)
+    _key(tmp_path, "a"), _key(tmp_path, "c")
+    run = lambda *a: cli.main(["cockpit", *a, "--data-root", str(root)])   # noqa: E731
+    assert run("enroll", str(tmp_path / "a.pub")) == 0
+    assert run("enroll", str(tmp_path / "nope.pub")) == 1
+    assert run("enroll", str(tmp_path / "c.pub")) == 0
+    fp = keys(root, marker_directory=tmp_path / "m")[0].fingerprint
+    assert run("revoke", fp, "--compromised-since", "2026-10-11T09:00:00") == 1       # naive: refused
+    assert "needs a zone" in capsys.readouterr().err
+    assert run("revoke", fp, "--compromised-since", "garbage") == 1
+    assert run("revoke", fp, "--compromised-since", "2026-10-11T09:00:00Z") == 0
+    assert run("keys") == 0
+    assert "revoked" in capsys.readouterr().out
