@@ -232,3 +232,189 @@ class EpisodeEffectStore:
         if res.outcome == "unknown":
             raise PermanentApplyRefusal(f"no episode ever carried origin_key {ok!r}")
         raise TransientApplyFault("ValueError", f"anneal delete outcome {res.outcome!r}")
+
+
+# --- the neocortex section edit (K2b-3a section adapter; design SECTION_ADAPTER_DESIGN.md) ----------
+#
+# A section edit is ONE effect on ``section:<heading>``: ``expect: {version}`` with anneal's own section
+# version (``Store.read_section``, sha256 of the span), ``changes: {body}``, applied by
+# ``Store.replace_section(expected_version=...)`` under anneal's continuity lock. The Class-A section
+# panel renders from the same ``read_section`` (``providers._anneal_section``), so the version it shows
+# is ``value_version_of(anneal's version)``: issue compares that against what the operator was shown
+# and binds the effect to anneal's version from the SAME read, so no second read sits between them.
+
+SECTIONS = "sections"
+SECTION_KEY_PREFIX = "section:"
+SECTION_VERB = "section_edit"
+# replace_section refusals a retry can outlive (a writer, a wrap, a wrap's tmp); every other reason
+# is the effect's own, and a retry fails the same way
+_SECTION_TRANSIENT = frozenset({"store_busy", "wrap_in_progress", "pipeline_tmp_present"})
+
+
+def section_resource_key(heading: str) -> str:
+    return SECTION_KEY_PREFIX + heading
+
+
+def section_effects(heading: str, version: str, body: str) -> list[Effect]:
+    """A section edit's one effect."""
+    if not isinstance(version, str) or not version:
+        raise ValueError("a section edit needs the section's version")
+    if not isinstance(body, str):
+        raise ValueError("a section edit's body is a string")
+    return [Effect(section_resource_key(heading), SECTIONS, {"version": version}, {"body": body},
+                   {"heading": heading}, (), ("heading",))]
+
+
+SECTION_CANONICAL = {SECTION_VERB: section_effects}
+
+
+def section_paths_agree(read: Any, write: Any | None = None) -> bool:
+    """Whether the section edit's reader and writer name one store: ``read.continuity_md`` is exactly
+    the file anneal's ``Store`` opens for ``read.episodic_db`` (``<stem>.continuity.md``), and
+    ``write`` (when given) names the same two paths. Compared as written, the way ``Store`` and every
+    reader here receive them: a symlink, an alias or a ``~`` reads as a disagreement and the edit is
+    not offered (L3 r1 codex; r2 and r3 found that resolving the paths equates ones Store treats apart)."""
+    db = Path(read.episodic_db)
+    if Path(read.continuity_md) != db.with_name(f"{db.stem}.continuity.md"):
+        return False
+    return write is None or (Path(write.episodic_db) == db and Path(write.continuity_md) == Path(read.continuity_md))
+
+
+def _written_version(body: str) -> str:
+    """The version anneal gives ``body`` once written (its canonical form, hashed as read_section
+    hashes a span), so a retry after a lost acknowledgement reads ALREADY."""
+    import hashlib
+
+    from anneal_memory.origin import canonical_section_markdown
+
+    return hashlib.sha256(canonical_section_markdown(body).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class SectionRead:
+    """One section read in ONE read-only anneal open: its text, anneal's version (the store's
+    precondition), the version the section panel renders for it, and whether a wrap is open."""
+
+    text: str
+    version: str
+    rendered: str
+    wrap_open: bool
+
+
+class SectionEffectStore:
+    """The ``EffectStore`` over the continuity sidecar of the anneal store at ``db``."""
+
+    name = SECTIONS
+    version_fields = ("heading", "body")
+    authority_fields = ("heading",)
+    store_assigned_fields = ()
+
+    def __init__(self, db: str | Path) -> None:
+        self.db = Path(db)
+
+    def _store(self, *, read_only: bool) -> Any:
+        from anneal_memory import Store
+
+        return Store(str(self.db), read_only=read_only)
+
+    def _require_db(self) -> None:
+        if not self.db.is_file():
+            raise TransientApplyFault("FileNotFoundError", f"{self.db} is absent")
+
+    # -- reads --
+
+    def heading_for(self, panel_id: str) -> str | None:
+        """The schema heading the section panel ``panel_id`` renders (the providers' own slug), so
+        the write's address comes from the store, never the request."""
+        from levain.cockpit.providers import section_panel_id
+
+        self._require_db()
+        try:
+            with self._store(read_only=True) as store:
+                headings = [s["heading"] for s in store.section_schema]
+        except _read_faults() as exc:
+            raise TransientApplyFault.of(exc) from exc
+        found = [h for h in headings if section_panel_id(h) == panel_id]
+        return found[0] if len(found) == 1 else None
+
+    def read(self, heading: str) -> SectionRead | None:
+        """The section under ``heading``, or None when the file has no such section. A section
+        anneal cannot read as one span (two headers claim it, not UTF-8) is ``ValueError``: no
+        version can bind to it, and a retry reads it the same way."""
+        from anneal_memory import SectionError
+
+        from levain.cockpit.engine import value_version_of
+
+        self._require_db()
+        try:
+            with self._store(read_only=True) as store:
+                got = store.read_section(heading)
+                wrap_open = bool(store.get_wrap_started_at())
+                role = next((s.get("role") for s in store.section_schema
+                             if s["heading"].lower() == heading.strip().lower()), None)
+        except SectionError as exc:
+            raise ValueError(f"the {heading!r} section is unreadable: {exc}") from exc
+        except _read_faults() as exc:
+            raise TransientApplyFault.of(exc) from exc
+        if role == "graduating":
+            # replace_section refuses it, but only after consent: a schema may declare any heading so
+            raise ValueError(f"the {heading!r} section graduates; it changes only through a wrap")
+        if got is None:
+            return None
+        text, version = got
+        return SectionRead(text, version, value_version_of(version), wrap_open)
+
+    def snapshot(self, resource_key: str) -> Snapshot:
+        heading = _key_after(SECTION_KEY_PREFIX, resource_key)
+        got = self.read(heading)
+        return Snapshot(None, None) if got is None else Snapshot({"heading": heading, "body": got.text},
+                                                                 got.version)
+
+    def units(self, effects: Sequence[tuple[int, Effect]]) -> list[ApplyUnit]:
+        return [ApplyUnit(SECTIONS, (i,), (e,)) for i, e in effects]
+
+    def label_fields(self, effect: Effect, stored: Mapping[str, Any] | None) -> tuple[str, ...]:
+        return ()
+
+    # -- apply --
+
+    @staticmethod
+    def _plan(unit: ApplyUnit) -> tuple[str, str, str]:
+        if unit.store != SECTIONS or len(unit.effects) != 1:
+            raise PermanentApplyRefusal("a section unit is one section effect")
+        (e,) = unit.effects
+        heading = _key_after(SECTION_KEY_PREFIX, e.resource_key)
+        version, body = e.expect.get("version"), e.changes.get("body")
+        if set(e.expect) != {"version"} or not isinstance(version, str) or not version:
+            raise PermanentApplyRefusal("a section effect expects the section's version")
+        if set(e.changes) != {"body"} or not isinstance(body, str):
+            raise PermanentApplyRefusal("a section effect changes the body and nothing else")
+        return heading, version, body
+
+    def apply_unit(self, unit: ApplyUnit) -> UnitApplyResult:
+        """One ``replace_section``. A store without it (anneal below 0.9.43) or without a continuity
+        lock refuses permanently: neither appears on a retry."""
+        from anneal_memory import AnnealMemoryError, ContinuityLockUnavailable
+
+        heading, version, body = self._plan(unit)
+        if not self.db.is_file():
+            raise StoreGone(f"{self.db} is absent")
+        try:
+            with self._store(read_only=False) as store:
+                if not hasattr(store, "replace_section"):
+                    raise PermanentApplyRefusal("this anneal has no Store.replace_section (0.9.43 or later)")
+                res = store.replace_section(heading, body, expected_version=version)
+        except ContinuityLockUnavailable as exc:
+            raise PermanentApplyRefusal(f"no continuity lock on this filesystem: {exc}") from exc
+        except (AnnealMemoryError, OSError) as exc:
+            raise TransientApplyFault.of(exc) from exc
+        stored = {"heading": heading}
+        if res.outcome == "written":
+            return UnitApplyResult(ApplyOutcome.APPLIED, (MemberApply(None, stored),))
+        if res.outcome == "version_mismatch":
+            if res.version == _written_version(body):
+                return UnitApplyResult(ApplyOutcome.ALREADY, (MemberApply(None, stored),))
+            return UnitApplyResult(ApplyOutcome.PRECONDITION_LOST, (MemberApply(None, None),))
+        if res.reason in _SECTION_TRANSIENT:
+            raise TransientApplyFault("SectionRefused", f"{res.reason}: {res.message}")
+        raise PermanentApplyRefusal(f"anneal refused the section edit: {res.reason}: {res.message}")

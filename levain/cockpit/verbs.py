@@ -609,7 +609,8 @@ def dispatch(
     if tier != "C1":
         _require_confirm(verb, req)
         return _to_broker(verb, tier, credential, install_class, broker, params=params, row=row,
-                          panel_id=panel_id, intent=intent, idempotency_key=req.get("idempotency_key"))
+                          panel_id=panel_id, intent=intent, idempotency_key=req.get("idempotency_key"),
+                          panel_version=req.get("panel_version"))
     _require_confirm(verb, req)
     if registry.is_downstream(verb.name):
         return _fire_downstream(registry, verb, scope, params, req, job_runtime, panel_id)
@@ -685,7 +686,8 @@ def _broker_replay(broker: "Broker | None", verb: VerbSpec, params: dict[str, An
 
 def _to_broker(verb: VerbSpec, tier: Tier, credential: dict[str, Any], install_class: str,
                broker: "Broker | None", *, params: dict[str, Any], row: dict[str, Any] | None,
-               panel_id: str | None, intent: str | None, idempotency_key: Any) -> dict[str, Any]:
+               panel_id: str | None, intent: str | None, idempotency_key: Any,
+               panel_version: Any = None) -> dict[str, Any]:
     """§4.3, K2b §3.1: a T2/T3 becomes a broker pending. ``intent`` absent is ``sign``; ``reported``
     fires in this request in a reported install (T2 on a token only, the broker's check)."""
     if broker is None or not broker.enabled:
@@ -699,6 +701,10 @@ def _to_broker(verb: VerbSpec, tier: Tier, credential: dict[str, Any], install_c
                                   "row_version": row["version"]}
     elif verb.binding == "create":
         target = {"kind": "create", "panel_id": panel_id}
+    elif verb.binding == "value":
+        # the version the operator was shown: the broker compares it with its own read of the source
+        # and binds the effect to that read (SECTION_ADAPTER_DESIGN.md)
+        target = {"kind": "value", "panel_id": panel_id, "panel_version": panel_version}
     else:
         target = {"kind": verb.binding, "panel_id": panel_id}
     try:

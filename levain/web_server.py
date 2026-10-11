@@ -92,7 +92,13 @@ from pathlib import Path
 from typing import Any
 
 from levain.cockpit.broker import Broker, BrokerError
-from levain.cockpit.anneal_effects import EPISODES, EpisodeEffectStore
+from levain.cockpit.anneal_effects import (
+    EPISODES,
+    SECTIONS,
+    EpisodeEffectStore,
+    SectionEffectStore,
+    section_paths_agree,
+)
 from levain.cockpit.effects import SPORES, SporeEffectStore
 from levain.cockpit.engine import Cockpit
 from levain.cockpit.external import ExternalPanels, discoverer
@@ -1193,7 +1199,9 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
         return None
     spores, episodes = scope.anneal.spores_json, scope.anneal.episodic_db
     return Broker(scope.ledger_root / "cockpit",
-                  stores={SPORES: SporeEffectStore(spores), EPISODES: EpisodeEffectStore(episodes)},
+                  stores={SPORES: SporeEffectStore(spores), EPISODES: EpisodeEffectStore(episodes),
+                          **({SECTIONS: SectionEffectStore(episodes)} if section_paths_agree(scope.anneal)
+                             else {})},
                   install_class=install_class, store_paths=[spores, episodes],
                   tier_of=lambda verb, params, target: retier(
                       httpd.verb_registry, httpd.get_cockpit(), verb, dict(params), dict(target)))
