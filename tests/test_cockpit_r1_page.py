@@ -97,7 +97,8 @@ function makeEnv(over) {
   const win = { LevainCockpitView: View, localStorage, sessionStorage, location: { search: "?source=manifest", hash: "", pathname: "/" },
     crypto: { randomUUID: () => "key-" + (++n) }, prompt: over.prompt ? () => over.prompt(env) : () => "",
     LevainDashboard: { render: (view, opts) => renders.push({ view, opts }), hasUnsavedEdit: () => false, jobsActive: () => false } };
-  const doc = { getElementById: () => null, addEventListener() {}, querySelectorAll: () => [], visibilityState: "visible" };
+  env.listeners = {};
+  const doc = { getElementById: () => null, addEventListener(t, f) { (env.listeners[t] = env.listeners[t] || []).push(f); }, querySelectorAll: () => [], visibilityState: "visible" };
   env.start = async () => {
     new Function("window", "document", "location", "history", "fetch", "console", bootSrc)(win, doc, win.location, { replaceState() {} }, fetchFn, console);
     await new Promise((r) => setTimeout(r, 30));
@@ -370,6 +371,40 @@ cases.without_a_tray_create_the_keep_has_no_capture_box = async () => {
   await env.start();
   const keep = env.view().layout.find((e) => e.id === "keep");
   ok(keep && keep.edit_class !== "B", "no create offered, no capture box");
+};
+
+cases.a_5xx_cancel_answer_keeps_its_envelope_and_a_4xx_clears_it = async () => {
+  const env = makeEnv();
+  env.verbAnswers = [[503, { error: "unavailable", message: "try later" }], [409, { error: "gone", message: "no" }]];
+  await env.start();
+  const c = env.view().extra_panels.decisions.lines[0].cancel;
+  await env.opts().cancelPending(c);
+  ok(Object.keys(JSON.parse(env.ss.levain_cockpit_keys)).length === 1, "a 5xx is indeterminate: the envelope stays");
+  await env.opts().cancelPending(c);
+  ok(env.posts[1].body.idempotency_key === env.posts[0].body.idempotency_key, "the retry replays the same key");
+  ok(Object.keys(JSON.parse(env.ss.levain_cockpit_keys)).length === 0, "a 4xx answer clears it");
+};
+
+cases.a_declined_token_prompt_stays_quiet_on_refresh_and_a_passive_load_never_asks = async () => {
+  let asked = 0;
+  const env = makeEnv({ local: {}, transport: { writable: true, write_token_required: true }, prompt: () => { asked++; return ""; } });
+  env.fx.manifest.credential = { class: "none" };
+  await env.start();
+  ok(asked === 1, "the first load asks once");
+  for (const f of env.listeners.visibilitychange || []) f();
+  await env.settle();
+  ok(asked === 1, "a passive refresh after a decline does not ask again");
+  await env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  ok(asked === 2, "a write gesture asks for the token");
+};
+
+cases.the_keep_capture_box_needs_a_postable_tray_create = async () => {
+  const env = makeEnv();
+  withTrayAndKeep(env);
+  env.fx.panels.tray.actions[0].gesture = "laptop-only";
+  await env.start();
+  const keep = env.view().layout.find((e) => e.id === "keep");
+  ok(keep && keep.edit_class !== "B", "a laptop-only create gives the Keep no capture box");
 };
 
 cases.an_undefined_param_is_dropped_and_never_throws_in_the_preview = async () => {

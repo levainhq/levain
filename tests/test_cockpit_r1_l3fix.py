@@ -106,3 +106,17 @@ def test_the_default_cockpit_in_a_browser_offers_no_rename_and_no_text_edit_on_a
     edits = re.findall(r'<button[^>]*data-verb="spore_update"[^>]*>edit</button>', dom)
     locked = [b for b in edits if "hidden characters" in b]
     assert len(edits) == 2 and len(locked) == 1 and "disabled" in locked[0], edits
+
+
+def test_action_verb_fields_must_be_none_or_a_tuple_of_unique_non_empty_strings() -> None:
+    import pytest
+
+    def h(p):
+        return {}
+
+    assert ActionVerb(handler=h).fields is None
+    assert ActionVerb(handler=h, fields=()).fields == ()
+    assert ActionVerb(handler=h, confirm_required=True, label="x", fields=("message", "for")).fields == ("message", "for")
+    for bad in ("message", ["message"], ("a", "a"), ("a", ""), ("a", 1)):
+        with pytest.raises(ValueError):
+            ActionVerb(handler=h, fields=bad)

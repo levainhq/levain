@@ -72,8 +72,10 @@
   // Prompt for + persist the write token; returns the entered token ("" if cancelled). The
   // desktop-browser STOPGAP entry point (flowConnect's native shell injects the same header from
   // the keychain). One token gates BOTH the reads (spore-220) and the writes (spore-129).
+  let tokenDeclined = false;   // this page load: the operator declined the prompt; passive refreshes stay quiet
   function promptForToken() {
     const tok = (window.prompt("Write token (printed when this server started: on its startup line, or in the daemon's log):") || "").trim();
+    if (tok) tokenDeclined = false;
     if (tok) { try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); } catch (_) { /* ignore */ } }
     return tok;
   }
@@ -452,7 +454,7 @@
     const route = c.route || "/cockpit/pending/" + encodeURIComponent(c.pending_id) + "/cancel";
     const r = await send(route, body);
     if (r.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };   // the envelope stays
-    const after = readKeys(); delete after[slot]; writeKeys(after);
+    if (r.status < 500) { const after = readKeys(); delete after[slot]; writeKeys(after); }   // a 5xx is indeterminate: keep it
     if (!r.ok) return fault(r, { row_id: null, label: "cancel" });
     const d = r.data;
     notice = { key: null, text: "cancel: " + (d.state || "done") + (d.label ? " · " + d.label : ""), cls: "note" };
@@ -500,9 +502,9 @@
     const cred = manifest && manifest.credential;
     const wantsToken = !!(manifest && manifest.transport && manifest.transport.write_token_required === true
       && cred && cred.class === "none");
-    if (wantsToken && !(passive && editInProgress())) {
+    if (wantsToken && !passive && !tokenDeclined) {
       if (promptForToken()) manifest = await authedReadJson("/cockpit/manifest.json");
-      else dropToken();
+      else { tokenDeclined = true; dropToken(); }
     }
     const fetchedAt = Date.now();
     const ids = Object.keys(manifest.panels);
@@ -519,7 +521,9 @@
           // a passive refresh never steals focus with a prompt over an open editor (as the legacy path does)
           reauth = reauth || Promise.resolve().then(() => {
             if (passive && editInProgress()) return false;
+            if (passive && tokenDeclined) return false;
             if (promptForToken()) return true;
+            tokenDeclined = true;
             dropToken();
             return false;
           });

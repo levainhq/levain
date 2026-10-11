@@ -304,6 +304,15 @@ class ActionVerb:
     label: str = ""
     fields: tuple[str, ...] | None = None
 
+    def __post_init__(self) -> None:
+        f = self.fields
+        if f is None:
+            return
+        # a bare string, or the one-tuple ("message") written without its comma, would publish letters
+        if (not isinstance(f, tuple) or not all(isinstance(x, str) and x for x in f)
+                or len(set(f)) != len(f)):
+            raise ValueError(f"ActionVerb.fields must be None or a tuple of unique non-empty strings, got {f!r}")
+
 
 @contextmanager
 def _governed_continuity_lock(path: Path) -> Iterator[bool]:

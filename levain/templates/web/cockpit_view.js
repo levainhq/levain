@@ -176,6 +176,8 @@
   // panel still renders. Nothing here repairs a bad field into a value that reads as data: a default such
   // as 0 or "" is a reading the renderer would print as true.
   const isObj = (x) => x !== null && typeof x === "object" && !Array.isArray(x);
+  // an action a browser can perform: refused and laptop-only gestures have nothing to post
+  const isPostable = (a) => isObj(a) && typeof a.verb === "string" && a.gesture !== "refused" && a.gesture !== "laptop-only";
   const isNum = (x) => typeof x === "number" && Number.isFinite(x);
   function need(ok, what) { if (!ok) throw new Error("malformed " + what); }
   // a line list (line and visual kinds): absent is empty; each line is an object whose text is a string
@@ -402,7 +404,7 @@
       }
       // every capture is the Tray's create, so the Keep's capture box shows whenever the Tray offers one
       const tp = P.get("tray");
-      const traySeeds = isObj(tp) && Array.isArray(tp.actions) && tp.actions.some((a) => isObj(a) && a.verb === "spore_seed");
+      const traySeeds = isObj(tp) && Array.isArray(tp.actions) && tp.actions.some((a) => isObj(a) && a.verb === "spore_seed" && isPostable(a));
       if ((rowsAct || pActions.length || (pid === "keep" && traySeeds)) && (pid === "tray" || pid === "loops" || pid === "keep" || pid === "episodes")) entry.edit_class = "B";
       const lists = { tray: "tray", loops: "open_spores", keep: "keep" };
       if ((pid === "tray" || pid === "loops" || pid === "keep") && panel.kind === "triage-list") {
@@ -487,7 +489,7 @@
     // the verbs the kernel offered somewhere with a gesture a browser can perform: an affordance whose
     // verb is not here has nothing to post to
     view.offered_verbs = Object.create(null);
-    const postable = (a) => isObj(a) && typeof a.verb === "string" && a.gesture !== "refused" && a.gesture !== "laptop-only";
+    const postable = isPostable;
     for (const t of Object.values(view.targets.panels)) for (const a of t.actions) if (postable(a)) view.offered_verbs[a.verb] = true;
     for (const t of Object.values(view.targets.rows)) for (const a of t.actions) if (postable(a)) view.offered_verbs[a.verb] = true;
     return view;
