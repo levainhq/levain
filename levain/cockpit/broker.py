@@ -487,21 +487,24 @@ class Broker:
                target: Mapping[str, Any]) -> dict[str, Any] | None:
         """A replayed POST's recorded pending and outcome, found by its idempotency key BEFORE the
         target is read again (the fire it made has moved the target's version), or None when the key
-        is new. The same key with other params, or aimed at another target, is a 409 (§2). A reported
-        pending still WAITING is left to ``issue``, which decides it."""
+        is new. The same key with other params, or aimed at another target, is a 409 (§2)."""
         with self._admitted() as db:
             out = self._replayed(db, verb=verb, params=params, intent=intent, credential=credential,
-                                 idempotency_key=idempotency_key, target=target)
+                                 idempotency_key=idempotency_key, target=target, harness="cockpit")
         if out is not None and out["state"] == "applying":
             self.wake()
         return out
 
     def _replayed(self, db: CockpitDB, *, verb: str, params: Mapping[str, Any], intent: str | None,
                   credential: Mapping[str, Any], idempotency_key: str | None,
-                  target: Mapping[str, Any]) -> dict[str, Any] | None:
+                  target: Mapping[str, Any], harness: str) -> dict[str, Any] | None:
         """``replay``'s lookup, run inside the caller's admission: every issue runs it before its
-        target is built, so a replay of an act that moved or ended its target (a cancel, a rotation)
-        answers from the journal instead of refusing the target."""
+        target is built. A key names one request (verb, intent, params, target identity, harness;
+        IETF draft-ietf-httpapi-idempotency-key-header §2), and its replay answers from the journal,
+        never from the target again: a finished op returns its outcome, and a reported pending its
+        request died before deciding resumes there, decided from its stored record (whose decide-time
+        recompute ends a moved target STALE), the way a Stripe-style key resumes at its recovery
+        point."""
         base = self.principal_base_of(credential)
         if base is None or idempotency_key is None:
             return None
@@ -515,8 +518,14 @@ class Broker:
                                   target=rec.get("target")):
             raise BrokerError("idempotency_conflict", 409,
                               f"idempotency key {idempotency_key!r} is bound to another request")
+        if view.harness != harness:
+            raise BrokerError("idempotency_conflict", 409,
+                              f"idempotency key {idempotency_key!r} is bound to another harness's request")
         if rec.get("intent") == "reported" and view.state == "WAITING":
-            return None
+            why = self._reported_refusal(str(rec.get("tier")), credential, harness)
+            if why is not None:
+                raise BrokerError("refused", 403, why)
+            return self._decide(db, pid, "ALLOWED_REPORTED", None, None)
         return self.result(db, pid, replay=True)
 
     # -- building a verb's effects (§3.1.1) -------------------------------------------------------
@@ -639,7 +648,7 @@ class Broker:
                     raise BrokerError("refused", 403, why)
             principal = self.principal_of(db, credential)
             replayed = self._replayed(db, verb=verb, params=params, intent=intent, credential=credential,
-                                      idempotency_key=idempotency_key, target=target)
+                                      idempotency_key=idempotency_key, target=target, harness=harness)
             if replayed is not None:
                 if replayed["state"] == "applying":
                     self.wake()

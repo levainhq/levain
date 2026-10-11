@@ -485,27 +485,77 @@ def test_a_replayed_cross_principal_cancel_answers_from_the_journal(home, spores
         b.stop()
 
 
-def test_an_op_whose_expiry_column_differs_from_its_record_is_corrupt(home, spores):
-    """codex L3 r2: expiry is enforced on the journal column and read off the signed record; a row
-    where the two differ is refused as corrupt, never read one way and decided the other."""
-    from datetime import datetime, timezone
+def test_decide_reads_authority_off_the_signed_record_not_its_mirror_columns(home, spores):
+    """codex L3 r3 (HIGH): the journal's tier/intent/expires_at columns index it; a writer of
+    cockpit.db can move them, a signature binds the record. A sign pending whose intent column is
+    flipped to reported is not fired as reported, and an expiry column pushed later does not extend
+    the signed expiry."""
+    from datetime import datetime, timedelta, timezone
 
     from levain.cockpit.consent import utc_stamp
-    from levain.cockpit.firejournal import JournalCorruptError
 
-    b = _broker(home, spores)
+    now = [datetime(2026, 10, 10, 20, 0, tzinfo=timezone.utc)]
+    b = _broker(home, spores, clock=lambda: now[0])
     try:
         pid = _move(b, spores)["pending_id"]
         conn = sqlite3.connect(b.data_root / "cockpit.db")
         later = utc_stamp(datetime(2099, 1, 1, tzinfo=timezone.utc))
-        conn.execute("UPDATE pendings SET expires_at = ? WHERE pending_id = ?", (later, pid))
+        conn.execute("UPDATE pendings SET intent = 'reported', expires_at = ? WHERE pending_id = ?", (later, pid))
         conn.commit()
         conn.close()
         assert b.db is not None
-        with pytest.raises(JournalCorruptError, match="expires_at column differs"):
-            b.db.load(pid)
+        with pytest.raises(ValueError, match="'sign' pending cannot take ALLOWED_REPORTED"):
+            b.db.decide(operation_id=pid, decision_kind="ALLOWED_REPORTED", recomputed=None, now=now[0])
+        now[0] += timedelta(minutes=16)
+        out = b.db.decide(operation_id=pid, decision_kind="ALLOWED", recomputed=None, now=now[0],
+                          signer_fp="SHA256:x", signature="sig")
+        assert (out.state, out.reason) == ("EXPIRED", "expired")
+        assert _state(b, pid) == "EXPIRED"
     finally:
         b.stop()
+
+
+def test_a_reported_pending_whose_request_died_resumes_on_replay_even_after_its_row_moved(home, spores):
+    """codex + complement L3 r3: a reported pending left WAITING by a request that died after issue is
+    decided from its stored record on replay (never rebuilt from the target), so a row moved meanwhile
+    ends it STALE instead of a refusal that leaves it orphaned; a replay under another harness is a
+    409."""
+    from tests.test_cockpit_k2b_broker import _target
+
+    b = _broker(home, spores)
+    try:
+        tgt = _target(spores, "k.seed")
+        assert b.db is not None
+        # the request that died after `issued`: a reported pending recorded, never decided
+        from levain.cockpit.firejournal import new_pending_id
+
+        dead = new_pending_id()
+        with b._admitted() as db:
+            built = b._build(db, "spore_set_disposition", {"disposition": "note"}, tgt, dead, at_issue=True)
+            from datetime import timedelta
+            n = b._now()
+            raw = b._record(pid=dead, verb="spore_set_disposition", intent="reported", built=built,
+                            params={"disposition": "note"}, tier="T2", fence={"policy_rev": db.policy_rev()},
+                            issued_at=utc(n), expires_at=utc(n + timedelta(minutes=15)))
+            db.issue(record_bytes=raw, principal="token:browser:1", idempotency_key="died", now=n,
+                     cap_exempt=True)
+        SporeStore(spores).update(SporeStore(spores).get_by_origin_key("k.seed")["id"], text="moved meanwhile")
+        signed = _move(b, spores, "k.loop", idempotency_key="h")
+        assert signed["state"] == "WAITING"
+        assert _refused_code(b.issue, verb="spore_set_disposition", params={"disposition": "note"},
+                             target=_target(spores, "k.loop"), tier="T2", credential=BROWSER,
+                             idempotency_key="h", harness="other") == "idempotency_conflict"
+        out = b.issue(verb="spore_set_disposition", params={"disposition": "note"}, target=tgt, tier="T2",
+                      credential=BROWSER, intent="reported", idempotency_key="died")
+        assert (out["pending_id"], out["state"]) == (dead, "STALE"), out
+        assert SporeStore(spores).get_by_origin_key("k.seed")["disposition"] == "seed"
+    finally:
+        b.stop()
+
+
+def utc(when: Any) -> str:
+    from levain.cockpit.consent import utc_stamp
+    return utc_stamp(when)
 
 
 def test_a_replay_with_a_non_string_row_id_is_a_bad_request(tmp_path):

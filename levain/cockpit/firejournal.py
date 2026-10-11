@@ -577,11 +577,17 @@ class CockpitDB:
             record = _parse_record(operation_id, row["record"], row["record_sha256"])
             if row["state"] != "WAITING":
                 return DecideOutcome(operation_id, row["state"], row["reason"], written=False)
-            want_kind = "ALLOWED" if row["intent"] == "sign" else "ALLOWED_REPORTED"
+            # authority is read off the signed record, never its mirror columns (they index the
+            # journal; a writer of cockpit.db can move them, a signature binds the record)
+            want_kind = "ALLOWED" if record.get("intent") == "sign" else "ALLOWED_REPORTED"
             if decision_kind != want_kind:
-                raise ValueError(f"a {row['intent']!r} pending cannot take {decision_kind}")
+                raise ValueError(f"a {record.get('intent')!r} pending cannot take {decision_kind}")
             conn.execute(_EXPIRE_SQL, (stamp,))
             if _pending_row(conn, operation_id)["state"] == "EXPIRED":
+                return DecideOutcome(operation_id, "EXPIRED", "expired", written=True)
+            if str(record.get("expires_at")) <= stamp:
+                conn.execute("UPDATE pendings SET state = 'EXPIRED', reason = 'expired', terminal_at = ? "
+                             "WHERE pending_id = ? AND state = 'WAITING'", (stamp, operation_id))
                 return DecideOutcome(operation_id, "EXPIRED", "expired", written=True)
 
             def terminal(state: str, reason: str) -> DecideOutcome:
@@ -593,7 +599,7 @@ class CockpitDB:
             refusal = _credential_problem(conn, row["principal"])
             enrolled_at: str | None = None
             if refusal is None and decision_kind == "ALLOWED":
-                refusal, enrolled_at = _key_problem(conn, signer_fp, row["tier"])
+                refusal, enrolled_at = _key_problem(conn, signer_fp, str(record.get("tier")))
             if refusal is not None:
                 return terminal("REFUSED", refusal)
             fence = record.get("fence")
@@ -967,9 +973,6 @@ def _load(conn: sqlite3.Connection, operation_id: str) -> OpView:
     record = _parse_record(operation_id, row["record"], row["record_sha256"])
     for name in ("issued_at", "expires_at"):
         _check_stamp(operation_id, name, row[name], nullable=False)
-        if record.get(name) != row[name]:
-            # expiry is enforced on the column and read off the record: one value, or no op
-            raise _corrupt(operation_id, f"its {name} column differs from its record")
     _check_stamp(operation_id, "decided_at", row["decided_at"],
                  nullable=row["state"] not in _PLANNED_STATES)
     rows = conn.execute("SELECT * FROM effects WHERE operation_id = ? ORDER BY idx",
