@@ -23,7 +23,7 @@ from levain.cockpit.effects import (
     TransientApplyFault,
     plan_units,
 )
-from tests.test_cockpit_k2b_broker import BROWSER, Key, _label, _refused, _rows, home, keydir, spores  # noqa: F401
+from tests.test_cockpit_k2b_broker import BROWSER, Key, _label, _refused, _rows, _state, home, keydir, spores  # noqa: F401
 
 @pytest.fixture
 def db(home: Path) -> Path:
@@ -196,3 +196,72 @@ def test_a_team_entry_is_refused_with_its_reason(broker, db):
                    credential=BROWSER, intent="reported")
     assert "team entry" in str(err)
     assert _episode(db, "ok.team") is not None
+
+
+# --- r2: reproduced MEDs from L3 r1 (raw: levain project_memory/1010-cockpit/L3_k2b/code_tomb_r1.txt) ----
+
+def _kernel_broker(home: Path) -> tuple[Any, Broker, Path]:
+    """A broker whose decide-time tier comes from the kernel's own ``retier`` over a real install's
+    cockpit, as ``web_server._build_broker`` wires it."""
+    from levain.cockpit.verbs import retier
+    from tests.test_cockpit_k2a import Rig
+
+    rig = Rig(home)
+    db = Path(rig.src.anneal.episodic_db)
+    spores = rig.root / ".levain" / "memory.spores.json"
+    b = Broker(home / "data", stores={"spores": SporeEffectStore(spores), EPISODES: EpisodeEffectStore(db)},
+               store_paths=[spores, db], install_class="reported",
+               tier_of=lambda verb, params, target: retier(rig.reg, rig.ck, verb, dict(params), dict(target)))
+    return rig, b, db
+
+def test_a_signed_tombstone_survives_newer_episodes_pushing_its_row_off_the_panel(home, keydir):
+    # codex r1 MED: decide retiered through the episodes panel's newest-50 scan, so the row's
+    # falling off that list read as "gone" and the signed delete ended STALE
+    from levain.cockpit.providers import EPISODE_LIMIT
+
+    rig, b, db = _kernel_broker(home)
+    with Store(str(db)) as st:
+        st.record("the episode to tombstone", "observation", origin_key="ok.target")
+        for i in range(EPISODE_LIMIT - 1):
+            st.record(f"a newer episode {i}", "observation", origin_key=f"ok.newer{i}")
+    b.start()
+    try:
+        laptop = Key(keydir, "laptop").enroll(b, "laptop-presence")
+        out = b.issue(verb="episode_tombstone", params={}, target=_target(db), tier="T2", credential=BROWSER)
+        assert out["state"] == "WAITING"
+        with Store(str(db)) as st:
+            st.record("one more, recorded while the operator signs", "observation", origin_key="ok.later")
+        done = b.submit(out["pending_id"], laptop.sign(out["record"].encode()))
+        assert done["state"] == "COMMITTED", done
+        assert _episode(db, "ok.target") is None
+    finally:
+        b.stop()
+
+def test_an_absent_episode_store_at_submit_leaves_the_signature_unspent(broker, db, keydir):
+    # codex r1 MED: an absent store read as "the episode is gone", so a signed pending ended STALE
+    # for good; it is a read that faulted, and the same signature lands once the store is back
+    laptop = Key(keydir, "laptop").enroll(broker, "laptop-presence")
+    out = _tombstone(broker, db)
+    aside = db.with_name("memory.db.aside")
+    db.rename(aside)
+    signature = laptop.sign(out["record"].encode())
+    _refused("source_unavailable", broker.submit, out["pending_id"], signature)
+    assert _state(broker, out["pending_id"]) == "WAITING"
+    aside.rename(db)
+    done = broker.submit(out["pending_id"], signature)
+    assert done["state"] == "COMMITTED", done
+    assert _episode(db, "ok.target") is None
+
+def test_an_absent_episode_store_at_issue_is_a_fault_not_a_gone_row(broker, db):
+    target = _target(db)
+    db.rename(db.with_name("memory.db.aside"))
+    _refused("source_unavailable", broker.issue, verb="episode_tombstone", params={}, target=target,
+             tier="T2", credential=BROWSER, intent="reported")
+
+def test_a_tombstone_issued_without_the_rendered_version_is_refused(broker, db):
+    # complement r1 MED: with no row_version the rendered-version check was skipped, so a delete was
+    # bound to whatever the episode held at issue, seen or not
+    t = {k: v for k, v in _target(db).items() if k != "row_version"}
+    _refused("bad_target", broker.issue, verb="episode_tombstone", params={}, target=t, tier="T2",
+             credential=BROWSER, intent="reported")
+    assert _episode(db, "ok.target") is not None

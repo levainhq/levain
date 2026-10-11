@@ -114,13 +114,19 @@ class EpisodeEffectStore:
 
     # -- reads --
 
+    def _require_db(self) -> None:
+        """An absent store at a READ is a fault a retry can outlive (a restore, a move in
+        progress), never proof the episode is gone (codex K2b-3a r1). ``apply_unit`` keeps
+        ``StoreGone``, the settle mapping."""
+        if not self.db.is_file():
+            raise TransientApplyFault("FileNotFoundError", f"{self.db} is absent")
+
     def read(self, origin_key: str) -> EpisodeRead | None:
         """The live episode carrying ``origin_key``, or None. ``TransientApplyFault`` for a read that
-        faulted."""
+        faulted, the store's absence included."""
         from levain.cockpit.providers import episode_row_version
 
-        if not self.db.is_file():
-            return None
+        self._require_db()
         try:
             with self._store(read_only=True) as store:
                 got = store.read_episode_versioned(origin_key)
@@ -134,8 +140,7 @@ class EpisodeEffectStore:
     def origin_key_of(self, episode_id: str) -> tuple[str | None, str]:
         """The live episode ``episode_id``'s ``origin_key`` and ``source``; ``KeyError`` when there
         is none."""
-        if not self.db.is_file():
-            raise KeyError(episode_id)
+        self._require_db()
         try:
             with self._store(read_only=True) as store:
                 ep = store.get(episode_id)

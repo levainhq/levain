@@ -596,6 +596,9 @@ class Broker:
             row_id = str(target.get("row_id") or "")
             if not row_id.startswith("episode:"):
                 raise BrokerError("bad_target", 400, f"{row_id!r} is not one of the entity's episodes")
+            if not isinstance(target.get("row_version"), str) or not target["row_version"]:
+                # an irreversible delete binds to the version the operator was shown (complement r1)
+                raise BrokerError("bad_target", 400, f"a tombstone of {row_id!r} names the row_version it rendered")
             try:
                 ok, source = es.origin_key_of(row_id[len("episode:"):])
             except KeyError:
@@ -617,7 +620,7 @@ class Broker:
             raise ValueError("the episode is gone")
         if at_issue and got.row["id"] != str(target.get("row_id"))[len("episode:"):]:
             raise BrokerError("stale", 409, f"row {target.get('row_id')!r} changed since it was rendered")
-        if at_issue and target.get("row_version") is not None and got.rendered != target["row_version"]:
+        if at_issue and got.rendered != target["row_version"]:
             raise BrokerError("stale", 409, f"row {target.get('row_id')!r} changed since it was rendered")
         effects = tombstone_effects(ok, got.version, effect_id=create_origin_key(pid, 0))
         pre = {"id": got.row["id"], "type": got.row["type"]}

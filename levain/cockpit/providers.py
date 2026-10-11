@@ -281,6 +281,45 @@ def episode_row_version(ep: Any) -> str:
     return row_version_of(episode_stored(_episode_row(ep)), EPISODE_STORED)
 
 
+def _episode_rowin(e: Any, own: str) -> RowIn:
+    return RowIn(
+        id=f"episode:{e.id}", title=e.content, body=e.content,
+        facets={"episode_type": e.type, "source": e.source, "at": _utc_at(e.timestamp),
+                "tags": list(e.tags), "agent": own},
+        stored=episode_stored(e),
+    )
+
+
+def _episode_read_one(source: SubstrateSource) -> Callable[[ReadContext, str], Result]:
+    """One of the entity's episodes by id, read from the store, NOT through the panel's newest-N
+    list: an episode that newer ones pushed off the list still exists, and a write that names it
+    must find it (codex K2b-3a r1)."""
+    def read_one(ctx: ReadContext, row_id: str) -> Result:
+        if not row_id.startswith("episode:"):
+            return Absent(f"row {row_id!r} is not one of the entity's episodes")
+        view = _view(source, ReadContext(ctx.now))
+        bad = _view_fault(view, "episodes")
+        if bad:
+            return bad
+        db = source.anneal.episodic_db
+        if not Path(db).is_file():
+            return Fault("the episodic store is absent")
+        from anneal_memory import AnnealMemoryError, Store
+
+        try:
+            eid = row_id[len("episode:"):]
+            with Store(str(db), read_only=True) as st:
+                ep = st.get(eid)
+                # the panel lists what ``recall`` returns, which leaves superseded episodes out
+                hidden = ep is not None and eid in st.superseded_by_map([eid])
+        except (AnnealMemoryError, OSError, ValueError, RecursionError) as exc:
+            return Fault(f"{type(exc).__name__}: {exc}")
+        if ep is None or hidden:
+            return Absent(f"row {row_id!r} is gone")
+        return Read(rows=(_episode_rowin(_episode_row(ep), view.entity_name or "entity"),))
+    return read_one
+
+
 def _episodes(source: SubstrateSource,
               feeds: Sequence[tuple[str, Callable[[ReadContext], Result]]] = ()) -> Callable[[ReadContext], Result]:
     """The entity's own episodes (``agent`` = the entity's name), then each federated feed's. A feed
@@ -292,15 +331,7 @@ def _episodes(source: SubstrateSource,
             return bad
         own = view.entity_name or "entity"
         capped = len(view.episodes) >= EPISODE_LIMIT
-        rows = [
-            RowIn(
-                id=f"episode:{e.id}", title=e.content, body=e.content,
-                facets={"episode_type": e.type, "source": e.source, "at": _utc_at(e.timestamp),
-                        "tags": list(e.tags), "agent": own},
-                stored=episode_stored(e),
-            )
-            for e in view.episodes
-        ]
+        rows = [_episode_rowin(e, own) for e in view.episodes]
         skipped: list[tuple[int, str]] = []
         filtered: list[tuple[int, str]] = []
         notes: list[str] = [f"the entity's newest {EPISODE_LIMIT} episodes"] if capped and feeds else []
@@ -628,7 +659,7 @@ def build_default_cockpit(
     ck.register(ProviderSpec(
         "episodes", "triage-list", "Recent episodes", "feed", _episodes(source, feeds), region="operate", rank=3,
         # a write's read: the entity's own rows only (a feed row is never a tombstone target)
-        read_one=_scan_read_one(_episodes(source)), verbs=("episode_tombstone",),
+        read_one=_episode_read_one(source), verbs=("episode_tombstone",),
         order="time.desc", rowset="episodes", facets=EPISODE_FACETS,
         version_fields=EPISODE_STORED,
         search_fields=("title", "body", "source"), edit_class=CLASS_B, empty="No recent episodes."))
