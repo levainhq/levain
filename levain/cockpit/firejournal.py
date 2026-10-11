@@ -49,18 +49,21 @@ from levain.autonomic.durable_sqlite import MIN_SQLITE, open_durable, read_trans
 _OPERATION_ID = re.compile(r"cp[0-9a-f]{32}")
 
 __all__ = [
-    "CAP_ATTEMPTS", "CockpitDB", "CockpitFormatError", "DB_NAME", "DecideOutcome", "EffectRow",
-    "FaultOutcome", "FIRST_RETRY_DELAY", "IdempotencyConflict", "IssueResult", "JournalCorruptError",
-    "LabelRow", "OpView", "Outcome", "PENDING_CAP", "PendingCapExceeded", "STORE_FORMAT",
+    "CAP_ATTEMPTS", "CockpitDB", "CockpitFormatError", "DB_NAME", "DecideOutcome", "DecisionRows",
+    "EditRow", "EditsPage", "EffectRow", "FaultOutcome", "FIRST_RETRY_DELAY", "IdempotencyConflict",
+    "IssueResult", "JournalCorruptError", "LabelRow", "OpView", "Outcome", "OUTCOME_WINDOW",
+    "OUTCOMES_LIMIT", "OutcomeRow", "PENDING_CAP", "PendingCapExceeded", "PendingRow", "STORE_FORMAT",
     "UnitResult", "UnitOutcome", "UnknownPending", "backoff_seconds", "new_pending_id",
 ]
 
-STORE_FORMAT = "levain-cockpit/1"
+STORE_FORMAT = "levain-cockpit/2"
 DB_NAME = "cockpit.db"
 PENDING_CAP = 8                        # WAITING pendings per principal generation (§3.1)
 CAP_ATTEMPTS = 10                      # recorded transient faults before a unit ends `store error` (§4.1.2)
 FIRST_RETRY_DELAY = timedelta(seconds=5)   # decided_at + this is a never-faulted unit's due time (§4.2)
 _MAX_BACKOFF = 120
+OUTCOME_WINDOW = timedelta(days=7)     # the decisions panel's outcomes reach back this far (K2b-3b §3)
+OUTCOMES_LIMIT = 50                    # and show at most this many, newest first
 
 TERMINAL = ("COMMITTED", "COMMITTED_INCOMPLETE", "STALE", "REFUSED", "EXPIRED", "CANCELLED")
 _PLANNED_STATES = ("DECIDED", "COMMITTED", "COMMITTED_INCOMPLETE")
@@ -112,6 +115,46 @@ _SCHEMA = (
     " revoked_at TEXT, compromised_since TEXT)",
     "CREATE INDEX IF NOT EXISTS pendings_waiting ON pendings (state, expires_at)",
     "CREATE INDEX IF NOT EXISTS labels_lookup ON labels (resource_key, field, value_sha256)",
+    # the edits reader pages APPLIED effects newest first (K2b-3b §0.6)
+    "CREATE INDEX IF NOT EXISTS effects_applied ON effects (applied_at DESC, operation_id, idx) "
+    "WHERE status = 'APPLIED'",
+)
+
+# ``meta.label_rev`` moves whenever anything a label snapshot reads may have changed, by TRIGGER, never
+# by a call site (K2b-3b §0.3); what the snapshot also reads and is not watched is made immutable here
+# instead. ``meta.value`` is TEXT, so every comparison and bump CASTs to INTEGER: a text compare reads
+# '10' < '9' and would abort the tenth labelled fire (§8d row 2)
+_BUMP = ("UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'label_rev';")
+_TRIGGERS = (
+    f"CREATE TRIGGER IF NOT EXISTS label_rev_on_label AFTER INSERT ON labels BEGIN {_BUMP} END",
+    f"CREATE TRIGGER IF NOT EXISTS label_rev_on_key_insert AFTER INSERT ON keys BEGIN {_BUMP} END",
+    f"CREATE TRIGGER IF NOT EXISTS label_rev_on_key_update AFTER UPDATE ON keys BEGIN {_BUMP} END",
+    f"CREATE TRIGGER IF NOT EXISTS label_rev_on_key_delete AFTER DELETE ON keys BEGIN {_BUMP} END",
+    "CREATE TRIGGER IF NOT EXISTS label_rev_on_meta_insert AFTER INSERT ON meta "
+    f"WHEN NEW.key IN ('epoch', 'install_class') BEGIN {_BUMP} END",
+    "CREATE TRIGGER IF NOT EXISTS label_rev_on_meta_update AFTER UPDATE ON meta "
+    f"WHEN NEW.key IN ('epoch', 'install_class') OR OLD.key IN ('epoch', 'install_class') BEGIN {_BUMP} END",
+    # label_rev only rises, and only as a canonical integer text ('07' would compare equal to 7)
+    "CREATE TRIGGER IF NOT EXISTS label_rev_rises BEFORE UPDATE ON meta WHEN OLD.key = 'label_rev' BEGIN "
+    "SELECT RAISE(ABORT, 'meta.label_rev only rises, as a canonical integer') "
+    "WHERE NEW.key IS NOT 'label_rev' OR typeof(NEW.value) IS NOT 'text' "
+    "OR CAST(NEW.value AS INTEGER) || '' IS NOT NEW.value "
+    "OR CAST(NEW.value AS INTEGER) <= CAST(OLD.value AS INTEGER); END",
+    "CREATE TRIGGER IF NOT EXISTS meta_keeps_its_authority BEFORE DELETE ON meta "
+    "WHEN OLD.key IN ('epoch', 'install_class', 'label_rev') BEGIN "
+    "SELECT RAISE(ABORT, 'meta epoch, install_class and label_rev are never deleted'); END",
+    "CREATE TRIGGER IF NOT EXISTS labels_immutable_update BEFORE UPDATE ON labels BEGIN "
+    "SELECT RAISE(ABORT, 'a label row is immutable'); END",
+    "CREATE TRIGGER IF NOT EXISTS labels_immutable_delete BEFORE DELETE ON labels BEGIN "
+    "SELECT RAISE(ABORT, 'a label row is immutable'); END",
+    # the code writes each authority column of a pending once, in decide (record and its sha at issue)
+    "CREATE TRIGGER IF NOT EXISTS pendings_authority_immutable BEFORE UPDATE ON pendings "
+    "WHEN NEW.record IS NOT OLD.record OR NEW.record_sha256 IS NOT OLD.record_sha256 "
+    "OR (OLD.decision_kind IS NOT NULL AND NEW.decision_kind IS NOT OLD.decision_kind) "
+    "OR (OLD.signer_fp IS NOT NULL AND NEW.signer_fp IS NOT OLD.signer_fp) "
+    "OR (OLD.credential IS NOT NULL AND NEW.credential IS NOT OLD.credential) "
+    "OR (OLD.decided_at IS NOT NULL AND NEW.decided_at IS NOT OLD.decided_at) BEGIN "
+    "SELECT RAISE(ABORT, 'a pending''s record and decision are written once'); END",
 )
 
 # an op the settler found corrupt is marked in ``meta`` (``corrupt:<id>``) and leaves the due set; its
@@ -276,6 +319,67 @@ class LabelRow:
     credential: str | None
     fired_at: str
     epoch: int
+
+
+@dataclass(frozen=True)
+class EditRow:
+    """One APPLIED effect of a COMMITTED or COMMITTED_INCOMPLETE op with non-empty ``changes`` (K2b-3b
+    §0.6): ``verb``, ``resource_key``, ``store``, ``changes`` and ``target`` from the validated signed
+    record, ``credential`` from the op's pending row (the record carries none), ``applied_at`` the
+    broker's observation time at settle."""
+    operation_id: str
+    idx: int
+    state: str
+    verb: str | None
+    resource_key: str
+    store: str
+    changes: Mapping[str, Any]
+    target: Mapping[str, Any]
+    decision_kind: str | None
+    credential: str | None
+    applied_at: str
+
+
+@dataclass(frozen=True)
+class EditsPage:
+    """``rows`` newest first; ``skipped`` the corrupt ops passed over."""
+    rows: tuple[EditRow, ...]
+    skipped: int
+
+
+@dataclass(frozen=True)
+class PendingRow:
+    """A pending whose effective state is WAITING; every fact but ``principal`` from its signed record."""
+    pending_id: str
+    verb: str | None
+    target: Mapping[str, Any]
+    principal: str
+    tier: str
+    issued_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class OutcomeRow:
+    """An op terminal inside the outcome window (K2b-3b §3). ``outcome`` is its effective state, or
+    ``deleted`` for a COMMITTED op whose plan holds a ``{"deleted": true}`` change; ``unapplied`` the
+    resource keys of its UNAPPLIED effects."""
+    operation_id: str
+    state: str
+    outcome: str
+    terminal_at: str
+    verb: str | None
+    reason: str | None
+    unapplied: tuple[str, ...]
+    cancelled_by: str | None
+    record_sha256: str
+
+
+@dataclass(frozen=True)
+class DecisionRows:
+    pendings: tuple[PendingRow, ...]
+    outcomes: tuple[OutcomeRow, ...]
+    skipped: int
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -497,6 +601,10 @@ class CockpitDB:
             # label row always has one to carry
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('epoch', '1')")
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('policy_rev', '0')")
+            # after the epoch insert, so a fresh journal's label_rev starts at 0
+            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('label_rev', '0')")
+            for stmt in _TRIGGERS:
+                conn.execute(stmt)
 
     @contextmanager
     def write(self) -> Iterator[sqlite3.Connection]:
@@ -959,6 +1067,111 @@ class CockpitDB:
                         operation_id=row["operation_id"], value_sha256=row["value_sha256"],
                         decision_kind=row["decision_kind"], signer_fp=row["signer_fp"],
                         credential=row["credential"], fired_at=row["fired_at"], epoch=row["epoch"])
+
+    def edits(self, limit: int) -> EditsPage:
+        """The newest ``limit`` broker edits (K2b-3b §0.6, §8d row 7), in one read transaction: pages
+        the APPLIED effects newest first, keeps those of a COMMITTED or COMMITTED_INCOMPLETE op whose
+        signed effect has non-empty ``changes``, and stops at ``limit`` KEPT rows. An op that fails
+        its integrity checks is skipped and counted once."""
+        if limit <= 0:
+            return EditsPage((), 0)
+        kept: list[EditRow] = []
+        views: dict[str, OpView | None] = {}
+        corrupt: set[str] = set()
+        with self.read() as conn:
+            cur = conn.execute("SELECT operation_id, idx FROM effects WHERE status = 'APPLIED' "
+                               "ORDER BY applied_at DESC, operation_id, idx")
+            for op, idx in cur:
+                if op not in views:
+                    state = conn.execute("SELECT state FROM pendings WHERE pending_id = ?",
+                                         (op,)).fetchone()
+                    if state is None or state[0] not in ("COMMITTED", "COMMITTED_INCOMPLETE"):
+                        views[op] = None
+                        continue
+                    try:
+                        views[op] = _load(conn, op)
+                    except JournalCorruptError:
+                        views[op] = None
+                        corrupt.add(op)
+                        continue
+                view = views[op]
+                if view is None:
+                    continue
+                eff = view.effects[idx]
+                changes = view.record["effects"][idx].get("changes")
+                if eff.status != "APPLIED" or eff.applied_at is None \
+                        or not isinstance(changes, dict) or not changes:
+                    continue
+                target = view.record.get("target")
+                kept.append(EditRow(
+                    operation_id=op, idx=idx, state=view.state, verb=view.record.get("verb"),
+                    resource_key=eff.resource_key, store=eff.store, changes=changes,
+                    target=target if isinstance(target, dict) else {},
+                    decision_kind=view.decision_kind, credential=view.credential,
+                    applied_at=eff.applied_at))
+                if len(kept) >= limit:
+                    break
+        return EditsPage(tuple(kept), len(corrupt))
+
+    def decision_rows(self, now: datetime) -> DecisionRows:
+        """The broker's rows of the ``decisions`` panel (K2b-3b §3), in one read transaction.
+        ``pendings``: every pending whose EFFECTIVE state is WAITING, soonest signed expiry first.
+        ``outcomes``: the newest ``OUTCOMES_LIMIT`` ops terminal inside ``OUTCOME_WINDOW`` whose
+        effective state is COMMITTED_INCOMPLETE, STALE, REFUSED, EXPIRED or CANCELLED, plus every
+        COMMITTED op whose plan deletes. One ``effective_state`` serves both: a stored WAITING row
+        past its signed ``expires_at`` IS EXPIRED at that instant. A corrupt op is skipped and
+        counted."""
+        cutoff = parse_stamp(utc_stamp(now))       # a naive ``now`` is refused before any row is read
+        since = cutoff - OUTCOME_WINDOW
+        pendings: list[tuple[datetime, int, PendingRow]] = []
+        outcomes: list[tuple[datetime, int, OutcomeRow]] = []
+        skipped = 0
+        with self.read() as conn:
+            rows = conn.execute(
+                "SELECT rowid, * FROM pendings WHERE state = 'WAITING' OR (state IN "
+                "('COMMITTED', 'COMMITTED_INCOMPLETE', 'STALE', 'REFUSED', 'EXPIRED', 'CANCELLED') "
+                "AND terminal_at >= ?)", (utc_stamp(since),)).fetchall()
+            for row in rows:
+                op = row["pending_id"]
+                try:
+                    if row["state"] in _PLANNED_STATES:
+                        view = _load(conn, op)
+                        record, effects = view.record, view.effects
+                    else:
+                        record, effects = _parse_record(op, row["record"], row["record_sha256"]), ()
+                    if row["state"] == "WAITING":
+                        expires = parse_stamp(record["expires_at"])
+                        if expires > cutoff:
+                            pendings.append((expires, row["rowid"], PendingRow(
+                                pending_id=op, verb=record.get("verb"),
+                                target=record["target"] if isinstance(record.get("target"), dict) else {},
+                                principal=row["principal"], tier=record["tier"],
+                                issued_at=record["issued_at"], expires_at=record["expires_at"])))
+                            continue
+                        state, reason, terminal_at = "EXPIRED", "expired", record["expires_at"]
+                    else:
+                        state, reason, terminal_at = row["state"], row["reason"], row["terminal_at"]
+                    at = parse_stamp(terminal_at)
+                except (JournalCorruptError, ConsentError):
+                    skipped += 1
+                    continue
+                if at < since:
+                    continue
+                outcome = state
+                if state == "COMMITTED":
+                    if not any(isinstance(e.get("changes"), dict) and e["changes"] == {"deleted": True}
+                               for e in record["effects"]):
+                        continue
+                    outcome = "deleted"
+                outcomes.append((at, row["rowid"], OutcomeRow(
+                    operation_id=op, state=state, outcome=outcome, terminal_at=terminal_at,
+                    verb=record.get("verb"), reason=reason,
+                    unapplied=tuple(e.resource_key for e in effects if e.status == "UNAPPLIED"),
+                    cancelled_by=row["cancelled_by"], record_sha256=row["record_sha256"])))
+        pendings.sort(key=lambda t: (t[0], t[1]))
+        outcomes.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        return DecisionRows(pendings=tuple(p for *_, p in pendings),
+                            outcomes=tuple(o for *_, o in outcomes[:OUTCOMES_LIMIT]), skipped=skipped)
 
 
 # ---------------------------------------------------------------------------------------------------

@@ -85,6 +85,13 @@ def raw_conn(db) -> sqlite3.Connection:
     return sqlite3.connect(db.path, isolation_level=None)
 
 
+def untriggered(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """A writer of cockpit.db that is not the broker and bypasses its triggers: the tamper the
+    integrity checks exist for (the K2b-3b immutability triggers refuse it through any other path)."""
+    conn.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_TRIGGER, False)
+    return conn
+
+
 # ---------------------------------------------------------------------------------------------------
 # consent: JCS
 
@@ -536,7 +543,7 @@ def test_earliest_due_never_hides_a_never_faulted_unit(db):
 ])
 def test_a_tampered_op_fails_closed_for_every_reader(db, tamper):
     pid = decided(db)
-    other = raw_conn(db)
+    other = untriggered(raw_conn(db))
     other.execute(tamper)
     other.close()
     with pytest.raises(JournalCorruptError):
@@ -550,7 +557,7 @@ def test_a_tampered_op_fails_closed_for_every_reader(db, tamper):
 def test_a_record_rehashed_but_not_canonical_is_corrupt(db):
     pid, raw = issue(db)
     loose = raw.replace(b",", b", ", 1)
-    other = raw_conn(db)
+    other = untriggered(raw_conn(db))
     other.execute("UPDATE pendings SET record = ?, record_sha256 = ?",
                   (loose, consent.record_sha256(loose)))
     other.close()
@@ -572,7 +579,7 @@ def test_label_for_takes_the_latest_fire_in_the_current_epoch_ties_to_insertion(
     assert db.label_for("ok-0", "text", "h").operation_id == b
     assert db.label_for("ok-0", "text", "other") is None
     with db.write() as conn:
-        conn.execute("UPDATE pendings SET decided_at = '2026-10-10T13:00:00.000000Z' "
+        untriggered(conn).execute("UPDATE pendings SET decided_at = '2026-10-10T13:00:00.000000Z' "
                      "WHERE pending_id = ?", (a,))
         conn.execute("UPDATE labels SET fired_at = '2026-10-10T13:00:00.000000Z' "
                      "WHERE operation_id = ?", (a,))
@@ -629,7 +636,7 @@ def test_a_corrupt_waiting_row_does_not_stop_the_sweep(db):
     bad, _ = issue(db, key="bad", ttl=timedelta(minutes=1))
     good, _ = issue(db, key="good", ttl=timedelta(minutes=1))
     with db.write() as conn:
-        conn.execute("UPDATE pendings SET record_sha256 = 'x' WHERE pending_id = ?", (bad,))
+        untriggered(conn).execute("UPDATE pendings SET record_sha256 = 'x' WHERE pending_id = ?", (bad,))
     assert db.expire_due(T0 + timedelta(minutes=1)) == 1
     assert db.outcome(good).state == "EXPIRED"
 
@@ -643,8 +650,8 @@ def test_a_deeply_nested_record_is_corrupt_and_the_sweep_passes_it(db):
     good, _ = issue(db, key="good", ttl=timedelta(minutes=1))
     deep = b"[" * 100_000 + b"]" * 100_000
     with db.write() as conn:
-        conn.execute("UPDATE pendings SET record = ?, record_sha256 = ? WHERE pending_id = ?",
-                     (deep, record_sha256(deep), bad))
+        untriggered(conn).execute("UPDATE pendings SET record = ?, record_sha256 = ? WHERE pending_id = ?",
+                                  (deep, record_sha256(deep), bad))
     assert db.expire_due(T0 + timedelta(minutes=1)) == 1
     assert db.outcome(good).state == "EXPIRED"
     with pytest.raises(JournalCorruptError):
