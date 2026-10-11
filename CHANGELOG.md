@@ -42,6 +42,8 @@ The cockpit's write side: K2a (one write route, the write token, writes bound to
 - **Erased means erased at the API.** A tombstoned episode's content can remain in freed pages of the SQLite files and in anneal's tombstone record (a content hash), and a State section edit keeps the section's previous text in `cockpit.db` with no retention bound.
 - A write that touches more than one store takes no lock across them, and a store records no receipt per effect: the broker's journal is the record of what it applied.
 - In a reported install the write token's secret has no levain-owned file: a server mints a fresh token each start, and under `levain daemon install` it is printed only to the daemon's owner-only log.
+- An embedding server that calls `make_server` itself with neither `write_token` nor `surface_tokens` gets a fresh write token on each start, kept only on the server object (`levain serve` prints its own). Pass `write_token` to keep one across restarts.
+- One broker owns a data root: two servers over the same data root (two listeners for one install, say) leave the second in standby, so it fires no T2/T3 write and shows no pending rows. Run one server per data root.
 - The broker refuses to start when its data root or a registered store is on a network filesystem (NFS, SMB, FUSE), because its lock may not hold there; the cockpit's writes above C1 are then refused.
 
 ## [0.7.2] — 2026-10-10
