@@ -1838,6 +1838,10 @@ def _apply_spore_update(
     )
 
     spore_id = _require_str(req, "spore_id")
+    if "domain" in req:
+        # this write has no domain field; dropping it would report a partial edit as ok. A cockpit
+        # domain edit is T2 and lands through the broker's effect instead
+        raise EditError("bad_verb_arg", 422, "spore_update here does not take domain")
     has_text, has_type, has_tier = "text" in req, "type" in req, "tier" in req
     if not (has_text or has_type or has_tier):
         raise EditError("bad_verb_arg", 422,

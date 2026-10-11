@@ -546,9 +546,12 @@ class TestRound1:
                  panel_version=verbs_mod.VALUE_ABSENT)
 
     def test_spore_update_refuses_fields_its_handler_cannot_write(self, rig: Rig) -> None:
-        """L1 M3 / L2 L1: next and domain were allowlisted and silently dropped."""
-        for f, val in (("next", "2030-01-01"), ("domain", "x")):
-            _refused("field_not_allowed", rig.post, "spore_update", "loops", "loop", {"tier": "warm", f: val})
+        """L1 M3 / L2 L1: next and domain were allowlisted and silently dropped. domain is now a field
+        (Phill 10-11): always T2, so with no broker it refuses rather than reach the legacy write."""
+        _refused("field_not_allowed", rig.post, "spore_update", "loops", "loop", {"tier": "warm", "next": "2030-01-01"})
+        _refused("needs_broker", rig.post, "spore_update", "loops", "loop", {"tier": "warm", "domain": "x"},
+                 intent="reported", confirm=True, idempotency_key="dom")
+        assert rig.spore("loop").get("domain") != "x"
 
     def test_an_external_panel_cannot_offer_a_kernel_verb(self, tmp_path: Path) -> None:
         """L1 #12 / L2 L3."""

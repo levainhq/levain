@@ -219,7 +219,8 @@ def _update_tier(params: dict[str, Any], row: dict[str, Any] | None, prov: str, 
 
 
 def _update_escalates(row: dict[str, Any] | None, prov: str, today: date) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = [{"param": "text", "op": "present", "tier": "T2"}]
+    out: list[dict[str, Any]] = [{"param": "text", "op": "present", "tier": "T2"},
+                                 {"param": "domain", "op": "present", "tier": "T2"}]
     if prov != "verified":
         out.append({"param": "type", "op": "present", "tier": "T2"})
         if _facet(row, "tier") == "parked":
@@ -312,10 +313,11 @@ KERNEL_VERBS: tuple[VerbSpec, ...] = (
              row_tier=_const("C1"),
              escalates=lambda row, prov, today: _date_escalates(row, prov, today, "surface_at"),
              fire=_spore_fire("spore_surface_at"), legacy_kind="spore_surface_at", applies_to=_SPORE_ROW),
-    VerbSpec("spore_update", "edit", "changes the item's text, tier or type", "row",
-             # design §4.2 also allowlists domain and next; levain's handler has no write for either, and a
-             # field the handler drops must be refused, never reported ok
-             fields=("text", "tier", "type"), floor="C1", tier_fn=_update_tier,
+    VerbSpec("spore_update", "edit", "changes the item's text, domain, tier or type", "row",
+             # design §4.2 also allowlists next; levain's handler has no write for it, and a field the
+             # handler drops must be refused, never reported ok. domain is always T2 (_update_tier), so it
+             # lands through the broker's effect and never reaches the legacy write, which refuses it
+             fields=("text", "domain", "tier", "type"), floor="C1", tier_fn=_update_tier,
              row_tier=_const("C1"), escalates=_update_escalates,
              fire=_spore_fire("spore_update"), legacy_kind="spore_update", applies_to=_SPORE_ROW),
     VerbSpec("spore_set_disposition", "move", "moves the item to another list (Tray, Keep, loops)", "row",
