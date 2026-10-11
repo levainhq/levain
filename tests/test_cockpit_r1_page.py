@@ -88,6 +88,7 @@ function makeEnv(over) {
       if (a) return resp(a[0], a[1]);
       return resp(200, { ok: true, state: "COMMITTED", label: "claims cockpit token" });
     }
+    if (env.holdReads && url.indexOf("/cockpit/panel/") >= 0) await env.holdReads;
     reads.push(url);
     if (url.indexOf("/cockpit/manifest.json") >= 0) return resp(200, fx.manifest);
     const m = /\/cockpit\/panel\/([^/.]+)\.json/.exec(url);
@@ -98,7 +99,7 @@ function makeEnv(over) {
     crypto: { randomUUID: () => "key-" + (++n) }, prompt: over.prompt ? () => over.prompt(env) : () => "",
     LevainDashboard: { render: (view, opts) => renders.push({ view, opts }), hasUnsavedEdit: () => false, jobsActive: () => false } };
   env.listeners = {};
-  const doc = { getElementById: () => null, addEventListener(t, f) { (env.listeners[t] = env.listeners[t] || []).push(f); }, querySelectorAll: () => [], visibilityState: "visible" };
+  const doc = { getElementById: () => null, addEventListener(t, f) { (env.listeners[t] = env.listeners[t] || []).push(f); }, querySelectorAll: (q) => (env.rows && q === "[data-row-key]" ? env.rows : []), createElement: () => ({ className: "", textContent: "" }), visibilityState: "visible" };
   env.start = async () => {
     new Function("window", "document", "location", "history", "fetch", "console", bootSrc)(win, doc, win.location, { replaceState() {} }, fetchFn, console);
     await new Promise((r) => setTimeout(r, 30));
@@ -463,6 +464,49 @@ cases.offered_verbs_lists_only_what_a_postable_action_offers = async () => {
   const o = env.view().offered_verbs;
   ok(o.spore_touch === true && o.operator_state === true && o.entity_name === undefined, "touch and the state line, not rename");
   ok(o.spore_update === undefined, "a laptop-only action is not postable");
+};
+
+
+// A tiny row in a fake document: the answer must reach the row before the page's re-read resolves.
+function fakeRow(key) {
+  const mk = () => ({ disabled: false });
+  const row = { dataset: { rowKey: key }, btns: [mk(), mk()], msg: null };
+  const host = { appendChild(m) { row.msg = m; },
+    querySelector: (q) => (q === ".edit-msg" ? row.msg : null) };
+  row.querySelector = (q) => (q === ".verb-actions" ? host : null);
+  row.querySelectorAll = (q) => (/button/.test(q) ? row.btns : []);
+  return row;
+}
+cases.the_answer_reaches_the_row_before_the_reread_resolves = async () => {
+  const env = makeEnv();
+  await env.start();
+  const row = fakeRow("spore:spore-1");
+  // the page's doc is the one handed to the boot function: patch its row query
+  env.rows = [row];
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  env.holdReads = gate;
+  const p = env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  await env.settle();
+  ok(row.msg && /COMMITTED/.test(row.msg.textContent) && /claims cockpit token/.test(row.msg.textContent), "committed text on the row before the re-read: " + (row.msg && row.msg.textContent));
+  ok(row.btns.every((b) => b.disabled === true), "edit controls disabled while the re-read is pending");
+  release();
+  await p;
+};
+
+cases.a_refusal_shows_its_text_at_once = async () => {
+  const env = makeEnv();
+  env.verbAnswers = [[409, { ok: false, error: "stale", message: "the row moved" }]];
+  await env.start();
+  const row = fakeRow("spore:spore-1");
+  env.rows = [row];
+  let release;
+  env.holdReads = new Promise((r) => { release = r; });
+  const p = env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  await env.settle();
+  ok(row.msg && /the row moved/.test(row.msg.textContent), "refusal text on the row before the re-read: " + (row.msg && row.msg.textContent));
+  release();
+  await p;
 };
 
 (async () => {
