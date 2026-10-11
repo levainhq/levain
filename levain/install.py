@@ -1402,6 +1402,17 @@ def _single_writer_lock(
     if precheck is not None:
         precheck()
     fd = -1
+    # what existed before this call: a refusal removes only what the call itself created, so its
+    # "Nothing was written" holds and the advised re-run is not refused as a non-empty target
+    gitignore = path.parent / ".gitignore"
+    made = [q for q in (path, gitignore, path.parent) if not q.exists() and not q.is_symlink()]
+
+    def refuse(err: InstallLockError) -> InstallLockError:
+        for q in made:
+            with contextlib.suppress(OSError):
+                q.rmdir() if q == path.parent else q.unlink()
+        return err
+
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         # Never through a link: a lock file swapped for a symlink to a file levain later
@@ -1439,7 +1450,9 @@ def _single_writer_lock(
                 ) from None
             if e.errno in unsupported:
                 if unlockable is not None:
-                    raise unlockable(f"the filesystem answers {e.strerror or e}") from None
+                    os.close(fd)
+                    fd = -1
+                    raise refuse(unlockable(f"the filesystem answers {e.strerror or e}")) from None
                 # the operator's override: proceed unguarded, and say so
                 print(f"  note: this filesystem cannot lock {path} ({e.strerror or e}); "
                       f"continuing without the guard against {guards}, as {UNLOCKED_ENV}=1 asks.",

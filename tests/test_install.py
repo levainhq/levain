@@ -3206,6 +3206,34 @@ def test_install_lock_refuses_where_the_filesystem_cannot_lock(tmp_path, monkeyp
             pytest.fail("the body ran without a lock")
 
 
+def test_a_refused_lock_leaves_a_fresh_target_empty_so_the_advised_rerun_works(tmp_path, monkeypatch):
+    # L2 MED (1011+40): the refusal says "Nothing was written ... re-run with LEVAIN_UNLOCKED=1", but
+    # the lock file, .levain/ and its .gitignore were already created, so the re-run met "not empty".
+    import errno
+
+    from levain.install import UNLOCKED_ENV, InstallUnlockable, _is_safe_install_target
+
+    def no_locks(_fd, _op):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(fcntl, "flock", no_locks)
+    monkeypatch.delenv(UNLOCKED_ENV, raising=False)
+    target = tmp_path / "fresh"
+    target.mkdir()
+    with pytest.raises(InstallUnlockable):
+        with install_lock(target):
+            pass
+    assert list(target.iterdir()) == [] and _is_safe_install_target(target)
+    existing = tmp_path / "existing"
+    (existing / ".levain").mkdir(parents=True)
+    (existing / ".levain" / "keep.txt").write_text("x")
+    with pytest.raises(InstallUnlockable):
+        with install_lock(existing):
+            pass
+    # an existing .levain keeps exactly what it held: the lock file and the .gitignore this call made go
+    assert sorted(p.name for p in (existing / ".levain").iterdir()) == ["keep.txt"]
+
+
 def test_install_lock_names_an_unwritable_levain_dir(tmp_path):
     # L2 LOW, reproduced: a read-only .levain gave a PermissionError traceback.
     from levain.install import InstallLockError
