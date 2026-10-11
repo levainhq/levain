@@ -16,7 +16,7 @@ from levain.cockpit.broker import Broker
 from levain.cockpit.effects import SporeEffectStore
 from levain.cockpit.verbs import dispatch, retier
 from tests.test_cockpit_k2a import CRED, INSTALL_CLASS, Rig, _refused
-from tests.test_cockpit_k2b_broker import home  # noqa: F401
+from tests.test_cockpit_k2b_broker import Key, _refused as _broker_refused, _rows, _state as _pending_state, home, keydir  # noqa: F401
 
 
 @pytest.fixture
@@ -89,3 +89,33 @@ def test_an_open_wrap_refuses_the_edit_and_state_is_unchanged(rig_broker):
     finally:
         with Store(str(db)) as w:
             w.wrap_cancelled(expect_token="sec-test-wrap")
+
+
+def test_a_body_with_a_header_line_is_refused_at_issue_and_nothing_is_consented(rig_broker):
+    rig, b, db = rig_broker
+    before = _state(db)
+    err = _refused("invalid_body", _edit, rig, b, _pv(rig), "fine line\n## Next\nmore", "sec-hdr")
+    assert err.http_status == 400
+    assert _rows(b, "SELECT COUNT(*) FROM pendings")[0][0] == 0
+    assert _state(db) == before
+
+
+def test_a_wrap_opened_after_issue_leaves_the_signature_unspent_until_it_saves(rig_broker, keydir):
+    rig, b, db = rig_broker
+    laptop = Key(keydir, "laptop").enroll(b, "laptop-presence")
+    before = _state(db)
+    out = _edit(rig, b, _pv(rig), "signed State body", "sec-sign", intent=None)
+    assert out["state"] == "WAITING", out
+    pid, signature = out["pending_id"], laptop.sign(out["record"].encode())
+    with Store(str(db)) as w:
+        w.wrap_started(token="sec-decide-wrap", episode_ids=[])
+    try:
+        _broker_refused("source_unavailable", b.submit, pid, signature)
+        assert _pending_state(b, pid) == "WAITING"
+        assert _state(db) == before
+    finally:
+        with Store(str(db)) as w:
+            w.wrap_cancelled(expect_token="sec-decide-wrap")
+    done = b.submit(pid, signature)
+    assert done["state"] == "COMMITTED", done
+    assert _state(db)[0].strip() == "signed State body"
