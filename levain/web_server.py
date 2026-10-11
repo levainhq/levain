@@ -43,11 +43,13 @@ Sovereignty boundary (load-bearing, not incidental):
   cross-origin). So every request's ``Host`` is checked against a loopback
   allowlist and anything else is a 403. The same check now also fronts the write
   route — it IS the Slice-2a write/auth boundary it was the seed of.
-- **no-token localhost-sovereign write/auth (Slice 2a)** — there is no password/
-  token (a startup token is SaaS thinking; principle #6 rejects it at the seat
-  layer). The ``/chat`` routes are the one exception: they make an entity act, so they
-  take a per-launch token (``_CHAT_TOKEN_HEADER``; spore-1310). The auth for a write is the loopback bind + the Host allowlist + two
-  CSRF layers: (1) ``Sec-Fetch-Site`` must be absent (a non-browser client like the
+- **write auth (Slice 2a, then K2a)** — Slice 2a made the loopback bind the write
+  auth, with no token. K2a (design §4.3) reversed that: 127.0.0.1 is reachable by every
+  local uid, so every write carries a per-surface write token on every bind
+  (``_WRITE_TOKEN_HEADER``; a writable serve with none given mints a per-launch one). The
+  ``/chat`` routes take their own per-launch token (``_CHAT_TOKEN_HEADER``; spore-1310).
+  Reads on a loopback bind stay token-free. Around the token, a write still passes the
+  Host allowlist and two CSRF layers: (1) ``Sec-Fetch-Site`` must be absent (a non-browser client like the
   operator's own curl) or ``same-origin`` (our own dashboard page) — a hostile
   cross-site page's request carries ``cross-site`` and is refused; (2) the body
   must be ``application/json``, which a cross-origin page cannot send without a
@@ -178,20 +180,16 @@ _DRAIN_CAP = _MAX_POST_BYTES * 4
 # 503. Static assets (cached bytes) bypass the gate.
 _MAX_INFLIGHT = 8
 
-# The OFF-BOX write governance factor (spore-129). The no-token rule above is for the
-# LOCALHOST-SOVEREIGN seat: when the surface is bound to loopback, the bind IS the auth and
-# a token there is theater (principle #6). But the MOMENT a writable surface binds an
-# off-loopback (private-mesh / Tailscale) address, loopback-is-auth no longer holds — so a
-# write MUST then carry a shared token the device holds, in this header, constant-time
-# compared against the token ``make_server`` was given. This is NOT a seat-layer password;
-# it is the factor that replaces loopback when the write surface leaves the machine.
-# Loopback binds stay token-free (the check below is skipped for a loopback-bound server).
+# The write token header. spore-129 introduced it for an off-loopback writable bind; since K2a
+# (design §4.3) every write carries a surface token in it on EVERY bind, loopback included,
+# constant-time compared against the surface tokens ``make_server`` holds. Off-box, the same
+# token also gates the substrate-bearing reads (spore-220); loopback reads stay token-free.
 _WRITE_TOKEN_HEADER = "X-Levain-Write-Token"
 _HEADER_SAFE_TOKEN = re.compile(r"[\x21-\x7e]+")   # printable ASCII, no spaces: it travels in a header
 
-# The CHAT factor (spore-1310, rec B, ruled by Phill 2026-10-03). The no-token rule above rests on
-# "anything that can reach loopback can already edit the files". That holds for /edit and fails for
-# /chat, which makes an entity execute and spend the model endpoint: a container reaching host
+# The CHAT factor (spore-1310, rec B, ruled by Phill 2026-10-03). Slice 2a's token-free loopback write
+# rested on "anything that can reach loopback can already edit the files" (K2a later dropped it for
+# writes too). It always failed for /chat, which makes an entity execute and spend the model endpoint: a container reaching host
 # loopback through host.docker.internal, a sandboxed app with a network entitlement, or another OS
 # user can reach loopback without being able to edit your files. So every /chat route requires a
 # per-launch token, generated at startup, held only in this process and printed once to the
@@ -447,9 +445,9 @@ def build_substrate_json(
     payload["writable"] = source.write_scope is not None
     # OFF-BOX write signal (spore-129): true iff this surface is writable AND bound off-loopback,
     # i.e. the server's POST /edit will REQUIRE the X-Levain-Write-Token header (see do_POST).
-    # It tells the frontend to attach the device-held token; on a loopback-bound (or read-only)
-    # surface it stays false and the localhost-sovereign token-free path is unchanged. The
-    # handler computes the predicate (it owns the bound-address fact); default False here.
+    # It tells the frontend to attach the device-held token. The handler computes the predicate
+    # (it owns the bound-address fact) and, since K2a, also sets it on any writable surface,
+    # because every write needs the token there; default False here.
     assert "write_token_required" not in payload, "to_dict() collided with transport `write_token_required`"
     payload["write_token_required"] = write_token_required
     # Inline external panels (the read-only extra-PANEL seam): a per-request provider returns
@@ -598,10 +596,10 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     levain_assets: dict[str, bytes]
     allowed_hosts: frozenset[str]
     request_gate: threading.BoundedSemaphore
-    # OFF-BOX write auth (spore-129). ``is_loopback_bind`` is computed from the ACTUAL bound
-    # address (un-foolable) and gates whether POST /edit requires a token. ``write_token`` is
-    # the shared secret an off-loopback writable surface demands; None on a loopback-bound or
-    # read-only server (then the token check is skipped — the localhost path stays token-free).
+    # ``is_loopback_bind`` is computed from the ACTUAL bound address (un-foolable) and gates
+    # whether the substrate READS need a token (spore-220). ``write_token`` is the ``browser``
+    # surface's token: minted on a writable server given no tokens at all, None when the caller's
+    # ``surface_tokens`` name no browser surface, and None on a read-only server.
     is_loopback_bind: bool
     write_token: str | None
     # K2a (design §4.3, §9): one write token per surface (``browser``, ``flowconnect``), required on
@@ -707,10 +705,12 @@ class _Handler(GuardedHandler):
         return bool(self.server.is_loopback_bind) and _peer_is_loopback(self.client_address[0])
 
     def _write_token_required(self) -> bool:
-        """True iff a substrate-bearing READ on this surface requires the ``X-Levain-Write-Token``:
-        it is writable AND bound off-loopback (spore-220). A read-only mesh bind stays token-free
-        (iPad/iPhone VIEWING is unauthenticated by design). Writes are gated separately, on every
-        bind (``_writes_need_credential``, K2a)."""
+        """True iff this surface is writable AND bound off-loopback: the off-box half of the token
+        rule, which gates the substrate-bearing READS (spore-220) and every non-write POST
+        (spore-129). Writes are gated by ``_writes_need_credential`` on every bind (K2a); the
+        frontend's ``write_token_required`` signal is the OR of the two. Loopback-bound or
+        read-only → False (a read-only mesh bind stays token-free — iPad/iPhone VIEWING is
+        unauthenticated by design)."""
         return (
             not self.server.is_loopback_bind
             and self.server.levain_source.write_scope is not None
@@ -734,12 +734,10 @@ class _Handler(GuardedHandler):
         return self.server.levain_source.write_scope is not None
 
     def _off_box_token_valid(self) -> bool:
-        """True iff the request carries the correct off-box token (constant-time compare against the
-        token ``make_server`` was given). The SINGLE compare shared by the read gate (``_route``) and
-        the write gate (``do_POST``) so the two can never diverge on the auth check
-        (``structural_invariants_beat_discipline``). Only meaningful when ``_write_token_required()``
-        — the callers check that first; a missing server token (``write_token=None``) or an empty
-        supplied token fails CLOSED (``bool(expected)`` gates before the compare)."""
+        """True iff the request carries any surface's token (``_credential``). The SINGLE compare
+        shared by the read gate (``_route``) and the write gate (``do_POST``) so the two can never
+        diverge on the auth check (``structural_invariants_beat_discipline``); each caller gates on
+        its own predicate first. An empty surface token never matches."""
         return self._credential()["class"] == "token"
 
     def _cockpit(self) -> "Cockpit":
@@ -1086,11 +1084,12 @@ class _Handler(GuardedHandler):
         # our own page (same-origin) or a non-browser client (no Sec-Fetch-Site at all).
         if self._refuse_write_origin():
             return
-        # Two gates, one constant-time compare (``_off_box_token_valid``): a WRITE carries a credential
-        # on every bind, loopback included (K2a, design §4.3); a substrate-bearing READ needs the
-        # token only off-loopback (spore-220), where loopback-is-auth no longer holds.
-        # The predicate requires write_scope (writability): a READ-ONLY off-box surface has no write
-        # path, so it falls through to the 422 'read_only' refusal below, NOT a token-403 [codex L3].
+        # The write gate: a write route on a writable surface needs a surface token on every bind
+        # (K2a). Any other POST on an off-box writable surface needs it too (spore-129/220), with
+        # the same constant-time compare as the read gate in _route, so a write is never served
+        # under weaker auth than a read. Both predicates require write_scope (writability): a
+        # READ-ONLY surface has no write path, so it falls through to the 422 'read_only' refusal
+        # below, NOT a token-403 [codex L3].
         route = self.path.split("?", 1)[0]
         if _is_write_route(route) and self._writes_need_credential() and not self._off_box_token_valid():
             # K2a (design §4.3): every write carries a credential on every bind, loopback included;
@@ -1104,10 +1103,10 @@ class _Handler(GuardedHandler):
         if self._refuse_non_json():
             return
         # The write routes: substrate edits (/edit) + governed channel actions (/action).
-        # Both ride this ONE auth gate above (Host → CSRF → off-box token → Content-Type) —
-        # /action carries no second, weaker auth path. The off-box token check keys on
+        # Both ride this ONE auth gate above (Host → CSRF → write token → Content-Type) —
+        # /action carries no second, weaker auth path. The write-token check keys on
         # write_scope, and action verbs REQUIRE a write_scope (make_server enforces it), so
-        # the spore-129 governance already covers /action with no change here.
+        # it already covers /action with no change here.
         is_chat = route in _CHAT_POST_ROUTES and self.server.chat_host is not None
         if not _is_write_route(route) and not is_chat:
             return self._reject(404, "not_found", "no such route")
@@ -1255,9 +1254,10 @@ def make_server(
       WireGuard) is the access boundary;
     - a WRITABLE source MAY bind off-loopback ONLY with ``write_token`` (spore-129) — the
       off-box governance factor that replaces loopback-is-auth. Then POST /edit requires the
-      ``X-Levain-Write-Token`` header (constant-time compared); a loopback bind needs no token
-      (the localhost-sovereign path is unchanged). Without a token a writable source stays
-      loopback-only;
+      ``X-Levain-Write-Token`` header (constant-time compared). Since K2a every write needs
+      a surface token on a loopback bind too; there a writable source given neither
+      ``write_token`` nor ``surface_tokens`` gets a per-launch browser token. Without a token
+      a writable source stays loopback-only;
     - an INSTALL-bearing source stays loopback-only UNCONDITIONALLY (its seed/config is
       operator-private; a token does not relax this — a different concern than spore-129).
     Raises ``ValueError`` (before binding) on a disallowed non-loopback bind. [codex L3 MED]"""
@@ -1289,8 +1289,8 @@ def make_server(
                 "NO-INSTALL source MAY bind a non-loopback address for private-mesh access."
             )
         # A WRITABLE source MAY bind off-loopback (spore-129) — but ONLY with a write_token,
-        # the off-box governance factor that replaces loopback-is-auth. Without one it stays
-        # loopback-only (its no-token localhost-sovereign POST /edit boundary assumes loopback).
+        # the off-box factor that also gates its reads. Without one it stays loopback-only, where
+        # make_server mints a per-launch token for its writes.
         # `not write_token` (not `is None`): an EMPTY-string token must also refuse the bind, not
         # bind-then-brick. The per-request gate already treats "" as no-token (`not expected` →
         # 403), so without this an off-box writable bind with write_token="" would pass here and
@@ -1301,7 +1301,7 @@ def make_server(
                 "(private-mesh / Tailscale) address ONLY with a write_token — the off-box "
                 "governance factor that replaces the loopback bind as the write auth. Pass "
                 "write_token=<shared secret the device holds>, or bind loopback "
-                "(127.0.0.1 / localhost) for the token-free localhost-sovereign write path."
+                "(127.0.0.1 / localhost), where the server mints a per-launch write token."
             )
     # Validate downstream routes BEFORE binding a socket — a collision is a packaging
     # bug, caught at registration, never a silent shadow at request time.
@@ -1468,9 +1468,10 @@ def make_server(
     httpd.broker = _build_broker(source, install_class, httpd)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
-    # The READ gate keys on the ACTUAL bound address (un-foolable — the real socket, not the
-    # requested ``host`` string): off-loopback, a substrate-bearing read needs ``write_token``.
-    # Writes are gated on every bind instead (``_writes_need_credential``, K2a).
+    # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
+    # (un-foolable — the real socket, not the requested ``host`` string). It decides whether the
+    # READS need a token; every write needs one on every bind (K2a). The bind-refusal above
+    # already guaranteed a writable off-loopback source was given one.
     httpd.is_loopback_bind = _is_loopback_host(str(httpd.server_address[0]))
     httpd.write_token = tokens.get("browser")
     httpd.surface_tokens = tokens
@@ -1501,8 +1502,8 @@ def make_server(
     # verify-the-bound-address, don't trust the resolver (the same structural discipline the flow
     # Bridge applies at its own exposure point). Two cases the actual-address check closes:
     #   (a) an INSTALL-bearing source → its operator-private seed/config is READABLE off-box via GET;
-    #   (b) a WRITABLE (non-install) source given NO token → it was meant to be the token-free
-    #       loopback-sovereign write path, but resolved off-box, so its substrate reads (and the
+    #   (b) a WRITABLE (non-install) source given NO token → it was meant to be a loopback
+    #       serve with a minted per-launch token, but resolved off-box, so its substrate reads (and the
     #       /action verbs) would be served off-box without the token the off-box factor requires
     #       (writes still token-gate / 422, but the GET read path does not) [L2 LOW]. A writable
     #       source WITH a token is a legitimate off-box mesh bind — not refused here.
@@ -1567,8 +1568,8 @@ def run_web_server(
     so every edit affordance is dark and ``POST /edit`` 422s — a pure inspection
     cockpit. ``write=True`` (``levain serve --write``) serves the GOVERNED WRITABLE
     cockpit — State / spore / Tray-Keep / episode edits through the same ``apply_edit``
-    seam ``levain tui`` uses, under the localhost-sovereign auth (the loopback bind +
-    the Host/CSRF guards ARE the auth; no token on loopback). An install-bearing
+    seam ``levain tui`` uses. Every write needs the write token this function prints at start
+    (with a link that carries it), loopback included, behind the Host/CSRF guards. An install-bearing
     substrate is loopback-only either way (its seed/config is operator-private), so
     ``serve`` never binds off-box — a posture that fits a network surface: read-only
     is the safe default, writes are an explicit opt-in (mirrors flow's bridge cockpit).

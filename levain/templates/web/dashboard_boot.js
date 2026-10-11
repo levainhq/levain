@@ -30,12 +30,11 @@
   // job finishes — so the sibling write's saved state still lands, just after the job.
   let deferredReload = false;
 
-  // OFF-BOX write token (spore-129). When the substrate is served off-loopback (a Tailscale
-  // mesh write surface) the server REQUIRES the X-Levain-Write-Token header on /edit — the
-  // factor that replaces loopback-is-auth once the surface leaves the machine. The server
-  // signals it via `view.write_token_required` (set in load()); we hold the device's token in
-  // localStorage and attach it. On a loopback (default) surface this stays false and the
-  // localhost-sovereign token-free path is unchanged. (This localStorage entry is the
+  // The write token (spore-129, then K2a). A writable server REQUIRES the X-Levain-Write-Token
+  // header on every write, on loopback too (K2a); off-box it also gates the reads (spore-220).
+  // The server signals it via `view.write_token_required` (set in load()); we hold the token in
+  // localStorage and attach it. The server prints the token at start, with a link carrying it
+  // in the fragment, which the page takes on load. (This localStorage entry is the
   // desktop-browser STOPGAP; flowConnect's native shell later holds the token in the keychain
   // and injects the same header — the server gate underneath is identical.)
   //
@@ -70,11 +69,11 @@
   function storedToken() {
     try { return window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { return ""; }
   }
-  // Prompt for + persist the off-box token; returns the entered token ("" if cancelled). The
+  // Prompt for + persist the write token; returns the entered token ("" if cancelled). The
   // desktop-browser STOPGAP entry point (flowConnect's native shell injects the same header from
   // the keychain). One token gates BOTH the reads (spore-220) and the writes (spore-129).
   function promptForToken() {
-    const tok = (window.prompt("Off-box token (shown on the bridge --write startup line):") || "").trim();
+    const tok = (window.prompt("Write token (printed when this server started: on its startup line, or in the daemon's log):") || "").trim();
     if (tok) { try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); } catch (_) { /* ignore */ } }
     return tok;
   }
@@ -343,8 +342,8 @@
       // the operator opened/typed an editor WHILE this fetch was in flight — rebuilding
       // now would still discard it. The save path (passive:false) always applies.
       if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
-      // Track whether THIS surface demands the off-box write token (spore-129) so commit()'s
-      // writeHeaders attaches it. False on a loopback/read-only surface (the default).
+      // Track whether THIS surface demands the write token so commit()'s writeHeaders attaches it.
+      // True on any writable surface (K2a), false on a read-only one.
       writeTokenRequired = view.write_token_required === true;
       // Gate the write transport on the substrate being writable (NO THEATER): a
       // read-only source (no install root → POST /edit 422s) renders with no edit
