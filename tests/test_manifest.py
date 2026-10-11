@@ -789,8 +789,11 @@ class TestReleaseStampIsNotAPublishedVersion:
         tree = self._git(root, "rev-parse", "HEAD^{tree}")
         if tree is None:
             pytest.skip("not a git checkout")
-        r = self._run_hook(root, f"refs/heads/x {tree} refs/heads/x {'0' * 40}\n")
+        r = self._run_hook(root, f"refs/tags/v9.9.9 {tree} refs/tags/v9.9.9 {'0' * 40}\n")
         assert r.returncode == 1 and "is not a commit" in r.stderr, r.stderr
+        # Outside the release namespace a tag on a tree carries no stamp: nothing to check.
+        r = self._run_hook(root, f"refs/tags/notes {tree} refs/tags/notes {'0' * 40}\n")
+        assert r.returncode == 0, r.stderr
 
     def test_the_two_version_stamps_agree(self):
         """One fact, two files. They drifted apart is the *other* way this breaks."""

@@ -62,7 +62,9 @@ while read -r lref lsha rref rsha || [ -n "${lref:-}" ]; do
     [ -z "${lsha:-}" ] && continue
     [ -z "${lsha//0/}" ] && continue   # all zeros (sha1 or sha256): a delete
     if ! c="$(git rev-parse --verify -q "${lsha}^{commit}")"; then
-        echo "pre-push: pushed object $lsha is not a commit; the release-stamp gate cannot read it." >&2
+        # A tag on a tree or blob carries no stamp; a release tag must be a commit.
+        case "${rref:-}" in refs/tags/v*) ;; *) continue ;; esac
+        echo "pre-push: release tag ${rref} names $lsha, which is not a commit." >&2
         echo "          Push deliberately with --no-verify if this is intended." >&2
         exit 1
     fi
@@ -78,7 +80,7 @@ if ! git ls-remote "$dest" >"$adv"; then
     exit 1
 fi
 grep -E $'\trefs/tags/v' "$adv" | sed 's/^/R /' >>"$push"
-# The destination's commits that this clone holds bound every new-ref walk.
+# The destination's commits that this clone holds bound every walk.
 have="$(cut -f1 "$adv" | sort -u | git cat-file --batch-check='%(objectname) %(objecttype)' \
         | awk '$2 == "commit" {print $1}')"
 
@@ -86,20 +88,27 @@ while read -r lref lsha rref rsha; do
     [ -z "${lsha:-}" ] && continue
     c="$(git rev-parse --verify -q "${lsha}^{commit}")" || exit 1
     echo "T $c" >>"$push"
-    case "$rref" in refs/tags/v*) echo "P ${rref#refs/tags/} $c" >>"$push" ;; esac
+    # What this push makes newly reachable: commits no advertised ref (and not
+    # the ref's own old tip) already reaches. `--not` does not reach revisions
+    # read from --stdin, so each exclusion is `^sha`; none (a fresh
+    # destination) walks the whole history.
+    excl="$have"
     if [ -n "${rsha//0/}" ] && git cat-file -e "${rsha}^{commit}" 2>/dev/null; then
-        new="$(git rev-list "${rsha}..${c}")" \
-            || { echo "pre-push: could not list the commits this push publishes." >&2; exit 1; }
-    else
-        # `--not` does not reach revisions read from --stdin, so each is `^sha`.
-        # An empty $have (a fresh destination) walks the whole history.
-        if [ -n "$have" ]; then
-            new="$(printf '^%s\n' $have | git rev-list --stdin "$c")"
-        else
-            new="$(git rev-list "$c")"
-        fi || { echo "pre-push: could not list the commits this push publishes." >&2; exit 1; }
+        excl="$excl $rsha"
     fi
+    new="$( { [ -z "${excl// /}" ] || printf '^%s\n' $excl; } | git rev-list --stdin "$c")" \
+        || { echo "pre-push: could not list the commits this push publishes." >&2; exit 1; }
     [ -n "$new" ] && printf 'C %s\n' $new >>"$push"
+    case "$rref" in refs/tags/v*)
+        echo "P ${rref#refs/tags/} $c" >>"$push"
+        # A release tag also judges what the destination already holds past
+        # its commit: a non-bumped descendant pushed before the tag existed.
+        if [ -n "$have" ]; then
+            desc="$(printf '%s\n' $have | git rev-list --stdin --ancestry-path "^$c")" \
+                || { echo "pre-push: could not list what follows $rref." >&2; exit 1; }
+            [ -n "$desc" ] && printf 'C %s\n' $desc >>"$push"
+        fi ;;
+    esac
 done <<EOF_LINES
 $lines
 EOF_LINES
