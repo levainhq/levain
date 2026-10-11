@@ -64,6 +64,7 @@ from levain.cockpit.effects import (
     SPORES,
     ApplyOutcome,
     ApplyUnit,
+    DownstreamEffect,
     Effect,
     EffectState,
     EffectStatus,
@@ -229,14 +230,16 @@ class Broker:
                  lock_wait: float = 10.0, lock_retry: float = 5.0, lock_poll: float = 0.25,
                  drain_timeout: float = 5.0, min_wait: float = 0.2, max_wait: float = 5.0,
                  ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-                 marker_directory: Path | None = None) -> None:
+                 marker_directory: Path | None = None,
+                 downstream: Mapping[str, DownstreamEffect] | None = None) -> None:
         for name, store in stores.items():
             canonical = _STORE_CANONICAL.get(name)
             refusals = registration_refusals(store, canonical)
             if refusals or name == COCKPIT_STORE:
                 raise ValueError(f"store {name!r} refused at registration: {refusals or ['reserved name']}")
+        self.downstream = self.check_downstream(downstream or {})
         self.data_root = Path(data_root)
-        self.stores = dict(stores)
+        self.stores = {**stores, **{d.store.name: d.store for d in self.downstream.values()}}
         self.declared = install_class
         self.install_class: str | None = None
         self.store_paths = tuple(Path(p) for p in store_paths)
@@ -264,6 +267,29 @@ class Broker:
         self._thread: threading.Thread | None = None
         self._healer: threading.Thread | None = None
         self._stop = threading.Event()
+
+    @staticmethod
+    def check_downstream(downstream: Mapping[str, Any]) -> dict[str, DownstreamEffect]:
+        """The downstream verbs' effects, refused at registration (K2b §13) when one is not a
+        ``DownstreamEffect``, names a kernel verb, fails ``registration_refusals``, takes a kernel
+        store's name, or names a store another verb registered as a different object."""
+        out: dict[str, DownstreamEffect] = {}
+        by_name: dict[str, Any] = {}
+        for verb, d in downstream.items():
+            if not isinstance(d, DownstreamEffect):
+                raise ValueError(f"downstream effect {verb!r} must be a DownstreamEffect")
+            if verb in SPORE_CANONICAL or verb in (TOMBSTONE_VERB, SECTION_VERB, *INTERNAL_VERBS):
+                raise ValueError(f"{verb!r} is a kernel verb; its effect is the kernel's")
+            refusals = registration_refusals(d.store, {verb: d.canonical} if callable(d.canonical) else None)
+            if refusals:
+                raise ValueError(f"downstream effect {verb!r} refused at registration: {refusals}")
+            name = d.store.name
+            if not isinstance(name, str) or not name or name in _STORE_CANONICAL or name == COCKPIT_STORE:
+                raise ValueError(f"downstream effect {verb!r}: store name {name!r} is reserved or empty")
+            if by_name.setdefault(name, d.store) is not d.store:
+                raise ValueError(f"downstream effect {verb!r}: another store is registered as {name!r}")
+            out[verb] = d
+        return out
 
     # -- lifecycle -------------------------------------------------------------------------------
 
@@ -575,6 +601,8 @@ class Broker:
         ``TransientApplyFault`` for a read that faulted, ``_Unbuildable`` (at decide) for an object
         that moved so far the effect no longer builds."""
         try:
+            if verb in self.downstream:
+                return self._build_downstream(verb, params, target, pid)
             if verb in SPORE_CANONICAL:
                 return self._build_spore(verb, params, target, pid, at_issue=at_issue)
             if verb == TOMBSTONE_VERB:
@@ -591,6 +619,17 @@ class Broker:
             raise BrokerError("refused", 409, str(exc)) from exc
         raise BrokerError("not_built", 501, f"{verb!r} has no EffectStore adapter; it cannot fire "
                                             "through the broker")
+
+    def _build_downstream(self, verb: str, params: Mapping[str, Any], target: Mapping[str, Any],
+                          pid: str) -> _Built:
+        """A downstream verb's one create, keyed by the pending as a spore seed is."""
+        d = self.downstream[verb]
+        eff = d.canonical(dict(params), origin_key=create_origin_key(pid, 0))
+        if not isinstance(eff, Effect) or eff.store != d.store.name or not eff.is_create:
+            raise ValueError(f"{verb!r}'s canonical_effect must build one create on {d.store.name!r}")
+        if d.store.snapshot(eff.resource_key).row is not None:
+            raise ValueError("a create's origin_key is already in use")
+        return _Built({"kind": target.get("kind"), "panel_id": target.get("panel_id")}, [eff], [None])
 
     def _spores(self) -> Any:
         store = self.stores.get(SPORES)

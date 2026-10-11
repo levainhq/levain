@@ -129,3 +129,155 @@ def test_a_resolve_row_action_names_the_kinds_its_rows_type_takes(rig) -> None:
                 continue
             seen.add(a["verb"])
     assert seen == {"spore_descend", "spore_ascend"}
+
+
+# --- 4. the downstream effect seam --------------------------------------------------------------
+
+INBOX_PANELS = [{"id": "inbox", "title": "Inbox", "lines": [], "empty": "Compose a note above.",
+                 "action": {"verb": "send_inbox", "fields": [{"name": "body"}, {"name": "for"}]}}]
+
+
+def _send_inbox_verb(ran: list) -> Any:
+    from levain.writes import ActionVerb
+
+    return ActionVerb(handler=lambda p: ran.append(p) or {"summary": "sent"}, label="send")
+
+
+def _inbox_server(src: Any, ran: list, **kw: Any) -> Any:
+    from tests.test_cockpit_k2a import _serve
+
+    return _serve(src, extra_verbs={"send_inbox": _send_inbox_verb(ran)}, extra_panels=lambda: INBOX_PANELS,
+                  surface_tokens={"browser": "T"}, install_class="reported", **kw)
+
+
+def _inbox_panel(url: str) -> str:
+    from tests.test_cockpit_k2a import _get
+
+    man = _get(f"{url}/cockpit/manifest.json", token="T")
+    (pid,) = [p for p in man["panels"] if p.endswith("inbox") and p != "inbox"]
+    return pid
+
+
+def test_a_reported_send_inbox_lands_one_labelled_note_and_a_replay_lands_none(tmp_path: Path) -> None:
+    from tests._inbox_fake import inbox_downstream
+    from tests.test_cockpit_k2a import _install, _post
+
+    _root, src, _ids = _install(tmp_path)
+    store, effect = inbox_downstream()
+    ran: list = []
+    with _inbox_server(src, ran, extra_effects={"send_inbox": effect}) as (url, _httpd):
+        pid = _inbox_panel(url)
+        body = {"verb": "send_inbox", "panel_id": pid, "params": {"body": "hello from the page", "for": "cli"},
+                "confirm": True}
+        status, pre = _post(f"{url}/cockpit/verb", {**body, "dry_run": True}, token="T")
+        assert (status, pre["tier"], pre["gesture"]) == (200, "T2", "direct-reported"), pre
+        fire = {**body, "intent": "reported", "idempotency_key": "send-1", "tier_seen": pre["tier"],
+                "gesture_seen": pre["gesture"]}
+        status, out = _post(f"{url}/cockpit/verb", fire, token="T")
+        assert (status, out["state"], out["label"]) == (200, "COMMITTED", "claims cockpit token"), out
+        status, again = _post(f"{url}/cockpit/verb", fire, token="T")
+        assert (status, again["pending_id"], again["replay"]) == (200, out["pending_id"], True), again
+    notes = list(store.notes.values())
+    assert [(n["body"], n["for"]) for n in notes] == [("hello from the page", "cli")]
+    assert notes[0]["origin_key"] == "ck." + out["pending_id"].removeprefix("cp") + ".0"
+    assert ran == [], "a broker-fired downstream verb never runs its /action handler"
+
+
+def test_a_store_less_downstream_t2_verb_stays_not_built(tmp_path: Path) -> None:
+    from tests.test_cockpit_k2a import _install, _post
+
+    _root, src, _ids = _install(tmp_path)
+    ran: list = []
+    with _inbox_server(src, ran) as (url, _httpd):
+        pid = _inbox_panel(url)
+        status, out = _post(f"{url}/cockpit/verb", {
+            "verb": "send_inbox", "panel_id": pid, "params": {"body": "x"}, "confirm": True, "intent": "reported",
+            "idempotency_key": "k", "tier_seen": "T2", "gesture_seen": "direct-reported"}, token="T")
+        assert (status, out["error"]) == (501, "not_built"), out
+    assert ran == []
+
+
+def test_a_downstream_effect_is_refused_at_server_construction(tmp_path: Path) -> None:
+    from levain.cockpit.effects import DownstreamEffect
+    from levain.web_server import make_server
+    from tests._inbox_fake import FakeInbox, inbox_downstream, send_inbox_effect
+    from tests.test_cockpit_k2a import _install
+
+    _root, src, _ids = _install(tmp_path)
+    verbs = {"send_inbox": _send_inbox_verb([])}
+
+    class NoAuthority(FakeInbox):
+        authority_fields = ()
+
+    class Squatter(FakeInbox):
+        name = "spores"
+
+    cases = {
+        "no authority_fields": {"send_inbox": DownstreamEffect(NoAuthority(), send_inbox_effect)},
+        "reserved": {"send_inbox": DownstreamEffect(Squatter(), send_inbox_effect)},
+        "not a downstream verb": {"spore_seed": inbox_downstream()[1]},
+        "no such verb": {"nope": inbox_downstream()[1]},
+        "no canonical_effect": {"send_inbox": DownstreamEffect(FakeInbox(), None)},  # type: ignore[arg-type]
+        "not a DownstreamEffect": {"send_inbox": FakeInbox()},
+    }
+    for why, effects in cases.items():
+        with pytest.raises(ValueError):
+            make_server(src, host="127.0.0.1", port=0, extra_verbs=verbs, extra_effects=effects,
+                        install_class="reported")
+            pytest.fail(f"{why}: not refused")
+    # two verbs on two different stores under one name
+    verbs2 = {**verbs, "send_other": _send_inbox_verb([])}
+    with pytest.raises(ValueError, match="inbox"):
+        make_server(src, host="127.0.0.1", port=0, extra_verbs=verbs2, install_class="reported",
+                    extra_effects={"send_inbox": inbox_downstream()[1], "send_other": inbox_downstream()[1]})
+
+
+@pytest.mark.parametrize("point", ["issued", "verified", "decided", "applied:0", "journaled:0", "finished"])
+def test_a_killed_send_inbox_applies_exactly_once_after_recovery(home: Path, point: str) -> None:  # noqa: F811
+    import json
+    import subprocess
+    import sys
+
+    from anneal_memory.spores import SporeStore
+    from levain.cockpit.broker import Broker
+    from levain.cockpit.effects import SporeEffectStore
+    from tests._inbox_fake import inbox_downstream
+    from tests.test_cockpit_k2b_crash import ENTRY, _ops, _wait_state
+
+    spores, inbox, data = home / "spores.json", home / "inbox.json", home / "data"
+    SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
+    params, target = {"body": "killed mid-send", "for": "cli"}, {"kind": "panel", "panel_id": "ext:inbox"}
+    cfg = {"data_root": str(data), "spores": str(spores), "inbox": str(inbox), "kill_at": point,
+           "verb": "send_inbox", "params": params, "target": target, "idempotency_key": "send-k"}
+    proc = subprocess.run([sys.executable, str(ENTRY), json.dumps(cfg)], capture_output=True, text=True,
+                          timeout=120, cwd=str(Path(__file__).parent.parent))
+    assert proc.returncode == 137, f"the kill point {point!r} did not fire: rc={proc.returncode}\n{proc.stderr}"
+    (pid, _state), = _ops(data)
+
+    def broker() -> tuple[Any, Broker]:
+        store, effect = inbox_downstream(inbox)
+        b = Broker(data, stores={"spores": SporeEffectStore(spores)}, store_paths=[spores],
+                   install_class="reported", downstream={"send_inbox": effect})
+        b.start()
+        return store, b
+
+    store, b = broker()
+    try:
+        b.recover()
+        if point in ("issued", "verified"):
+            assert store.notes == {}, "an undecided pending applies nothing"
+            out = b.issue(verb="send_inbox", params=params, target=target, tier="T2",
+                          credential={"class": "token", "name": "browser"}, intent="reported",
+                          idempotency_key="send-k")
+            assert out["pending_id"] == pid
+        assert _wait_state(data, pid, "COMMITTED"), _ops(data)
+    finally:
+        b.stop()
+    store, b2 = broker()
+    try:
+        b2.recover()
+    finally:
+        b2.stop()
+    assert [(n["body"], n["origin_key"]) for n in store.notes.values()] == \
+        [("killed mid-send", "ck." + pid.removeprefix("cp") + ".0")]
+    assert _ops(data) == [(pid, "COMMITTED")]

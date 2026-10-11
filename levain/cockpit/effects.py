@@ -267,6 +267,20 @@ def registration_refusals(store: Any, canonical: Mapping[str, Callable[..., Any]
     return out
 
 
+@dataclass(frozen=True)
+class DownstreamEffect:
+    """A downstream T2/T3 verb's broker effect (flow design §4.6, K2b §13): the ``EffectStore`` it
+    applies through and its ``canonical_effect``. The broker registers ``store`` under ``store.name``
+    and builds the verb's one effect as ``canonical(params, origin_key=...)``: a create on ``store``
+    keyed by ``create_origin_key(pending_id, 0)``, idempotent there on that key. ``ValueError`` from
+    ``canonical`` refuses the params. ``canonical`` is a pure function of its arguments: the decision
+    rebuilds the effect and compares it with the consented one. A downstream verb binds to its panel,
+    so an effect on an existing object is not built here."""
+
+    store: EffectStore
+    canonical: Callable[..., Effect]
+
+
 def plan_units(effects: Sequence[Effect], stores: Mapping[str, EffectStore]) -> list[ApplyUnit]:
     """The record's effects grouped into apply units in record order: each maximal run of effects on
     one store is handed to that store's grouping (§4.0). An effect on a store no longer registered

@@ -5,7 +5,8 @@ starts it, and drives ONE reported write. A kill point that fires ends this proc
 a run that reaches the end prints the result as JSON and exits 0.
 
 argv[1]: JSON ``{data_root, spores, kill_at, verb, params, target, idempotency_key}``; the anneal kinds
-add ``db`` (the anneal store), which registers the episode and section stores beside the spore store.
+add ``db`` (the anneal store), which registers the episode and section stores beside the spore store;
+``inbox`` (a file path) registers the fake downstream inbox (``tests/_inbox_fake.py``) for ``send_inbox``.
 """
 from __future__ import annotations
 
@@ -24,8 +25,13 @@ def main() -> int:
     if cfg.get("db"):
         stores.update({EPISODES: EpisodeEffectStore(cfg["db"]), SECTIONS: SectionEffectStore(cfg["db"])})
         paths.append(cfg["db"])
+    downstream = {}
+    if cfg.get("inbox"):
+        from _inbox_fake import inbox_downstream   # this script's directory is on sys.path
+
+        downstream["send_inbox"] = inbox_downstream(cfg["inbox"])[1]
     broker = Broker(cfg["data_root"], stores=stores, store_paths=paths, install_class="reported",
-                    kill_at=cfg["kill_at"])
+                    kill_at=cfg["kill_at"], downstream=downstream)
     broker.start()
     out = broker.issue(verb=cfg["verb"], params=cfg["params"], target=cfg["target"], tier="T2",
                        credential={"class": "token", "name": "browser"}, intent="reported",

@@ -99,7 +99,7 @@ from levain.cockpit.anneal_effects import (
     SectionEffectStore,
     section_paths_agree,
 )
-from levain.cockpit.effects import SPORES, SporeEffectStore
+from levain.cockpit.effects import SPORES, DownstreamEffect, SporeEffectStore
 from levain.cockpit.engine import Cockpit
 from levain.cockpit.external import ExternalPanels, discoverer
 from levain.cockpit.routes import CACHE_CONTROL as COCKPIT_CACHE_CONTROL
@@ -1199,10 +1199,11 @@ _PENDING_KEYS = {"signature": frozenset({"signature"}),
 
 
 def _build_broker(source: SubstrateSource, install_class: str | None,
-                  httpd: "_LevainHTTPServer") -> "Broker | None":
+                  httpd: "_LevainHTTPServer",
+                  downstream: "Mapping[str, DownstreamEffect] | None" = None) -> "Broker | None":
     """The cockpit broker over a writable source (K2b §4.2, §6): its data root is
-    ``<ledger_root>/cockpit``, its stores the source's spores and episodes, its tier recompute the
-    kernel's."""
+    ``<ledger_root>/cockpit``, its stores the source's spores and episodes plus each downstream
+    verb's, its tier recompute the kernel's."""
     scope = source.write_scope
     if scope is None:
         return None
@@ -1211,7 +1212,7 @@ def _build_broker(source: SubstrateSource, install_class: str | None,
                   stores={SPORES: SporeEffectStore(spores), EPISODES: EpisodeEffectStore(episodes),
                           **({SECTIONS: SectionEffectStore(episodes)} if section_paths_agree(scope.anneal)
                              else {})},
-                  install_class=install_class, store_paths=[spores, episodes],
+                  install_class=install_class, store_paths=[spores, episodes], downstream=downstream,
                   tier_of=lambda verb, params, target: retier(
                       httpd.verb_registry, httpd.get_cockpit(), verb, dict(params), dict(target)))
 
@@ -1232,6 +1233,7 @@ def make_server(
     chat_token: str | None = None,
     cockpit: "Cockpit | None" = None,
     install_class: str | None = None,
+    extra_effects: "Mapping[str, DownstreamEffect] | None" = None,
 ) -> _LevainHTTPServer:
     """Build a configured, bound (but not-yet-serving) web server over a substrate.
 
@@ -1427,6 +1429,14 @@ def make_server(
             if not isinstance(spec.label, str):
                 raise ValueError(f"refusing action verb {name!r}: label must be a string.")
 
+    # A downstream T2/T3 verb's broker effect (K2b §13): an EffectStore and its canonical_effect, per
+    # verb in extra_verbs. Refused here, pre-bind; a T2/T3 downstream verb without one is not_built.
+    extra_effects = dict(extra_effects or {})
+    stray = sorted(v for v in extra_effects if v not in extra_verbs)
+    if stray:
+        raise ValueError(f"refusing extra_effects {stray}: each must name a verb in extra_verbs")
+    Broker.check_downstream(extra_effects)
+
     # The async-job runtime for I/O-BOUND (``job=True``) verbs. AUTO-CREATE one when a job verb is
     # registered and the caller didn't inject its own (tests inject; production auto-creates): the
     # store lives under the write_scope's ledger_root (the same governed location as the idempotency
@@ -1482,7 +1492,7 @@ def make_server(
     httpd._cockpit_lock = threading.Lock()
     # K2b §6: `--install-class reported` is the only way to reported; no flag (and no governed
     # marker) leaves the broker write-disabled, answering "run the installer"
-    httpd.broker = _build_broker(source, install_class, httpd)
+    httpd.broker = _build_broker(source, install_class, httpd, extra_effects)
     if cockpit is not None and httpd.broker is not None:
         cockpit.attach_labeller(httpd.broker.labels)
         cockpit.attach_edits_reader(httpd.broker.edits)
