@@ -217,7 +217,8 @@ class TestCredentialAndTiers:
                  ("spore_update", "loops", "loop", {"text": "new"}),
                  ("spore_seed", "tray", None, {"text": "planted"})]
         for verb, panel, key, params in cases:
-            e = _refused("needs_broker", rig.post, verb, panel, key, params, confirm=True, intent="reported")
+            e = _refused("needs_broker", rig.post, verb, panel, key, params, confirm=True, intent="reported",
+                         tier_seen="T2", gesture_seen="direct-reported")
             assert e.http_status == 403
         assert rig.store.get(rig.ids["loop"]) == before
         assert len(rig.store.list_open()) == 5
@@ -389,7 +390,7 @@ class TestTierLadder:
             assert rig.tier("spore_surface_at", "tray", "held", {"surface_at": new}) == "T2", new
             _refused("needs_intent", rig.post, "spore_surface_at", "tray", "held", {"surface_at": new})
             _refused("needs_broker", rig.post, "spore_surface_at", "tray", "held", {"surface_at": new},
-                     intent="reported")
+                     intent="reported", tier_seen="T2", gesture_seen="direct-reported")
         rig.clock.advance(2)    # past every rejected date, still before the stored one
         held = f"spore:{rig.ids['held']}"
         assert held not in rig.panel_ids("tray")
@@ -550,7 +551,7 @@ class TestRound1:
         (Phill 10-11): always T2, so with no broker it refuses rather than reach the legacy write."""
         _refused("field_not_allowed", rig.post, "spore_update", "loops", "loop", {"tier": "warm", "next": "2030-01-01"})
         _refused("needs_broker", rig.post, "spore_update", "loops", "loop", {"tier": "warm", "domain": "x"},
-                 intent="reported", confirm=True, idempotency_key="dom")
+                 intent="reported", confirm=True, idempotency_key="dom", tier_seen="T2", gesture_seen="direct-reported")
         assert rig.spore("loop").get("domain") != "x"
 
     def test_an_external_panel_cannot_offer_a_kernel_verb(self, tmp_path: Path) -> None:

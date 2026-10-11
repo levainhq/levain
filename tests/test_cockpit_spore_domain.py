@@ -18,7 +18,8 @@ from tests.test_cockpit_k2b_section import rig_broker  # noqa: F401 - fixture
 def _fire(rig, b, pid, row_id, verb, params, key):
     row = next(x for x in rig.ck.panel(pid)["rows"] if x["id"] == row_id)
     req = {"verb": verb, "panel_id": pid, "row_id": row_id, "row_version": row["version"],
-           "params": params, "intent": "reported", "idempotency_key": key, "confirm": True}
+           "params": params, "intent": "reported", "idempotency_key": key, "confirm": True,
+           "tier_seen": "T2", "gesture_seen": "direct-reported"}
     return dispatch(registry=rig.reg, cockpit=rig.ck, scope=rig.src.write_scope, req=req,
                     credential=CRED, install_class=INSTALL_CLASS, route="cockpit", broker=b)
 

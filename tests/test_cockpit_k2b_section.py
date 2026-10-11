@@ -47,7 +47,7 @@ def _pv(rig: Rig) -> str:
 
 def _edit(rig: Rig, b: Broker, pv: str, text: str, key: str, **kw: Any) -> dict[str, Any]:
     req = {"verb": "section_edit", "panel_id": "section:state", "params": {"new_body": text},
-           "panel_version": pv, "confirm": True, "intent": "reported", "idempotency_key": key, **kw}
+           "panel_version": pv, "confirm": True, "intent": "reported", "idempotency_key": key, "tier_seen": "T2", "gesture_seen": "direct-reported", **kw}
     return dispatch(registry=rig.reg, cockpit=rig.ck, scope=rig.src.write_scope, req=req,
                     credential=CRED, install_class=INSTALL_CLASS, route="cockpit", broker=b)
 

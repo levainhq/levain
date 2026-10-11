@@ -568,7 +568,7 @@ def test_a_replay_with_a_non_string_row_id_is_a_bad_request(tmp_path):
 
     _root, src, ids = _install(tmp_path)
     body = {"verb": "spore_set_disposition", "panel_id": "tray", "params": {"disposition": "note"},
-            "intent": "reported", "idempotency_key": "k"}
+            "intent": "reported", "idempotency_key": "k", "tier_seen": "T2", "gesture_seen": "direct-reported"}
     with _serve(src, surface_tokens={"browser": "T"}, install_class="reported") as (url, _httpd):
         row = next(r for r in _get(f"{url}/cockpit/panel/tray.json", token="T")["rows"]
                    if r["id"] == f"spore:{ids['seed']}")

@@ -43,10 +43,13 @@ def _row(rig):
 def test_dispatch_tiers_on_the_snapshots_date_not_a_second_clock_read(rig_broker, monkeypatch) -> None:
     rig, b, _db = rig_broker
     pid, row = _row(rig)
+    req = {"verb": "spore_surface_at", "panel_id": pid, "row_id": row["id"], "row_version": row["version"],
+           "params": {"surface_at": "2026-10-20"}}
+    pre = dispatch(registry=rig.reg, cockpit=rig.ck, scope=rig.src.write_scope, req={**req, "dry_run": True},
+                   credential=CRED, install_class=INSTALL_CLASS, route="cockpit", broker=b)
+    req.update(intent="reported", tier_seen=pre["tier"], gesture_seen=pre["gesture"])
     seen = _spy_held(monkeypatch)
     monkeypatch.setattr(rig.ck, "_clock", _midnight_clock())
-    req = {"verb": "spore_surface_at", "panel_id": pid, "row_id": row["id"], "row_version": row["version"],
-           "params": {"surface_at": "2026-10-20"}, "intent": "reported"}
     dispatch(registry=rig.reg, cockpit=rig.ck, scope=rig.src.write_scope, req=req,
              credential=CRED, install_class=INSTALL_CLASS, route="cockpit", broker=b)
     assert seen and set(seen) == {_EVE.date()}

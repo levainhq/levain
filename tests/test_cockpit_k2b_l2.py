@@ -42,7 +42,8 @@ def test_a_fire_edits_row_carries_no_label_and_the_resource_row_tracks_the_store
     rig.ck.attach_edits_reader(b.edits)
     pid, row = next((p, r) for p in ("loops", "tray", "keep") for r in (rig.ck.panel(p)["rows"] or []))
     req = {"verb": "spore_update", "panel_id": pid, "row_id": row["id"], "row_version": row["version"],
-           "params": {"text": "fired text"}, "intent": "reported", "idempotency_key": "l2-1", "confirm": True}
+           "params": {"text": "fired text"}, "intent": "reported", "idempotency_key": "l2-1", "confirm": True,
+           "tier_seen": "T2", "gesture_seen": "direct-reported"}
     dispatch(registry=rig.reg, cockpit=rig.ck, scope=rig.src.write_scope, req=req,
              credential=CRED, install_class=INSTALL_CLASS, route="cockpit", broker=b)
 

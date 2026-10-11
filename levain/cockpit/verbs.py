@@ -67,8 +67,9 @@ BROKER_HEADS: dict[str, dict[str, Any]] = {
 
 # Keys every route may carry beside the params (the envelope), per route.
 _ENVELOPE = frozenset({"verb", "panel_id", "row_id", "row_version", "panel_version", "params",
-                       "intent", "dry_run", "confirm", "idempotency_key"})
+                       "intent", "dry_run", "confirm", "idempotency_key", "tier_seen", "gesture_seen"})
 _INTENTS = ("reported", "sign")
+GESTURES = ("direct", "direct-reported", "sign", "refused", "laptop-only")   # gesture_for's answers
 
 
 def tier_max(*tiers: Tier) -> Tier:
@@ -624,6 +625,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
     intent = req.get("intent")
     if intent is not None and intent not in _INTENTS:
         raise _refuse("bad_request", 400, f"'intent' must be one of {list(_INTENTS)}")
+    _check_seen(req, intent)
 
     asked_target: dict[str, Any] = {"kind": verb.binding, "panel_id": panel_id}
     if verb.binding == "row":
@@ -648,10 +650,12 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
 
     tier = verb.tier(params, row, label, today)
     floor = verb.rendered_tier(row, label, today)
+    gesture = gesture_for(tier, credential["class"], install_class)
+    # before the key check: a fire previewed at T2 carries a key, so a T2->C1 move must answer as one
+    _check_moved(req, tier, gesture)
     # a broker pending's replay is keyed by it (K2b §2), so a T2/T3 takes one on any verb
     if "idempotency_key" in req and not verb.idempotent and tier == "C1":
         raise _refuse("bad_request", 400, f"{verb.name!r} is not idempotent; it takes no idempotency_key")
-    gesture = gesture_for(tier, credential["class"], install_class)
     if req.get("dry_run") is True:
         return {"ok": True, "dry_run": True, "verb": verb.name, "tier": tier, "rendered_tier": floor,
                 "gesture": gesture, "route": verb.route}
@@ -674,6 +678,36 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         supplied = req.get("panel_version")
         target["check"] = lambda: _check_value_version(cockpit, panel_id, supplied)
     return verb.fire(scope, params, target, req.get("confirm") is True)
+
+
+def _check_seen(req: dict[str, Any], intent: str | None) -> None:
+    """A fire carrying ``intent`` names the tier and gesture its dry run showed (``tier_seen``,
+    ``gesture_seen``), so the server, not the page, refuses a fire whose preview no longer holds. This
+    binds the tier and the gesture, not the params. A dry run is the preview, so it carries neither."""
+    named = [k for k in ("tier_seen", "gesture_seen") if k in req]
+    if req.get("dry_run") is True:
+        if named:
+            raise _refuse("bad_request", 400, f"a dry run is the preview; it takes no {named}")
+        return
+    if intent is not None and len(named) < 2:
+        raise _refuse("bad_request", 400, "a fire with 'intent' names its preview: 'tier_seen' and "
+                                          "'gesture_seen' are required")
+    if "tier_seen" in req and req["tier_seen"] not in TIERS:
+        raise _refuse("bad_request", 400, f"'tier_seen' must be one of {list(TIERS)} (got {req['tier_seen']!r})")
+    if "gesture_seen" in req and req["gesture_seen"] not in GESTURES:
+        raise _refuse("bad_request", 400,
+                      f"'gesture_seen' must be one of {list(GESTURES)} (got {req['gesture_seen']!r})")
+
+
+def _check_moved(req: dict[str, Any], tier: Tier, gesture: str) -> None:
+    if req.get("dry_run") is True:
+        return
+    if "tier_seen" in req and req["tier_seen"] != tier:
+        raise EditError("tier_moved", 409, f"the tier moved from {req['tier_seen']} to {tier} since the "
+                        "preview; preview again", {"tier": tier, "tier_seen": req["tier_seen"]})
+    if "gesture_seen" in req and req["gesture_seen"] != gesture:
+        raise EditError("gesture_moved", 409, f"the gesture moved from {req['gesture_seen']} to {gesture} "
+                        "since the preview; preview again", {"gesture": gesture, "gesture_seen": req["gesture_seen"]})
 
 
 def _fire_downstream(registry: VerbRegistry, verb: VerbSpec, scope: "WriteScope", params: dict[str, Any],

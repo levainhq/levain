@@ -581,7 +581,8 @@ def test_the_post_routes_reach_the_broker_only_in_a_declared_install(tmp_path, m
     with _serve(src, surface_tokens={"browser": "T"}) as (url, httpd):
         r = row(url)
         status, out = _post(f"{url}/cockpit/verb", {**body, "row_id": r["id"], "row_version": r["version"],
-                                                    "intent": "reported"}, token="T")
+                                                    "intent": "reported", "tier_seen": "T2",
+                                                    "gesture_seen": "sign"}, token="T")
         assert (status, out["error"]) == (403, "needs_broker") and "run the installer" in out["message"]
         assert store.get(ids["seed"]).get("disposition") == "seed"
 
@@ -589,13 +590,14 @@ def test_the_post_routes_reach_the_broker_only_in_a_declared_install(tmp_path, m
     with _serve(src, surface_tokens={"browser": "T", "flowconnect": "P"}, install_class="reported") as (url, httpd):
         r = row(url)
         at = {**body, "row_id": r["id"], "row_version": r["version"]}
+        seen = {"tier_seen": "T2", "gesture_seen": "direct-reported"}
         status, held = _post(f"{url}/cockpit/verb", at, token="T")
         assert (status, held["state"], held["intent"]) == (200, "WAITING", "sign"), held
         pid = held["pending_id"]
-        status, out = _post(f"{url}/cockpit/verb", {**at, "intent": "reported", "idempotency_key": "i1"}, token="T")
+        status, out = _post(f"{url}/cockpit/verb", {**at, **seen, "intent": "reported", "idempotency_key": "i1"}, token="T")
         assert (status, out["state"], out["label"]) == (200, "COMMITTED", "claims cockpit token"), out
         assert store.get(ids["seed"]).get("disposition") == "note"
-        status, again = _post(f"{url}/cockpit/verb", {**at, "intent": "reported", "idempotency_key": "i1"}, token="T")
+        status, again = _post(f"{url}/cockpit/verb", {**at, **seen, "intent": "reported", "idempotency_key": "i1"}, token="T")
         assert (status, again["pending_id"], again["replay"]) == (200, out["pending_id"], True)
         status, bad = _post(f"{url}/cockpit/pending/{pid}/signature", {"signature": "nope"}, token="T")
         assert (status, bad["error"]) == (400, "bad_signature")
