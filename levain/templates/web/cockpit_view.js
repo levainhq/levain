@@ -7,7 +7,9 @@
 // is `error` (or whose fetch failed) never reaches a native component, where an empty array would read
 // "nothing waiting": it becomes an explicit unavailable panel carrying the reason and last-good time.
 // Anything the native components do not know (the `now` view, a downstream's own panels, extra header
-// panels) is drawn by the core's generic external panel. READ HALF: no verbs, tiers or write state.
+// panels) is drawn by the core's generic external panel. The mapper also carries what a write needs
+// (each row's panel, full id, version and offered actions; the panels' own actions; the verb heads and
+// the transport flags) and decides nothing about a tier or a gesture: whoever writes asks the kernel.
 (function (root) {
   "use strict";
 
@@ -81,14 +83,32 @@
     return "";
   }
 
-  function sporeOf(row, groupTitles) {
+  // the write target a row carries: the panel it was read on, its full id (the source-scoped one), its
+  // version and the actions the kernel offers on it. Nothing here is chosen by the page.
+  function targetOf(pid, row) {
+    return { panel_id: pid, row_id: row.id, row_version: row.version, actions: Array.isArray(row.actions) ? row.actions : [] };
+  }
+
+  // the kind options a resolve action carries (the kernel's taxonomy for this row's type); none when the
+  // row does not offer the action
+  function kindsOf(actions, verb) {
+    for (const a of actions) {
+      if (a && a.verb === verb && isObj(a.options) && Array.isArray(a.options.spore_kind)) {
+        return a.options.spore_kind.filter((k) => typeof k === "string");
+      }
+    }
+    return [];
+  }
+
+  function sporeOf(pid, row, groupTitles) {
     const f = row.facets || {};
-    return {
+    const t = targetOf(pid, row);
+    return Object.assign({
       id: bare(row.id), age: ageOf(row), type: f.spore_type || "task", tier: f.tier, salience: f.salience, domain: f.domain,
       disposition: f.disposition, text: row.body || row.title, next: f.due || null,
-      descend_kinds: [], ascend_kinds: [],
+      descend_kinds: kindsOf(t.actions, "spore_descend"), ascend_kinds: kindsOf(t.actions, "spore_ascend"),
       group_title: row.group ? (groupTitles.get(row.group) || row.group) : null, group: row.group || null,
-    };
+    }, t);
   }
 
   // a stale or partial panel keeps rendering its rows, under a banner saying so
@@ -114,7 +134,19 @@
         const legacy = (r.facets || {}).legacy_meta;   // an adapted extra panel's own meta line (design §6.2)
         const meta = [typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grp, badges, prov]
           .filter(Boolean).join(" · ");
-        return { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
+        const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
+        // a pending (or its outcome) names its state; a WAITING one can be cancelled from here
+        if (typeof r.id === "string" && r.id.indexOf("pend:") === 0) {
+          const f = r.facets || {};
+          const stateWord = typeof f.state === "string" && f.state ? f.state : (r.group ? (groupTitles.get(r.group) || r.group) : "");
+          if (stateWord && line.meta.indexOf(stateWord) < 0) line.meta = [stateWord, line.meta].filter(Boolean).join(" · ");
+          const c = (Array.isArray(r.actions) ? r.actions : []).find((a) => a && a.verb === "pending_cancel");
+          if (c && isObj(c.target) && typeof c.target.pending_id === "string") {
+            line.cancel = { verb: "pending_cancel", tier: c.tier, gesture: c.gesture, pending_id: c.target.pending_id,
+                            route: typeof c.route === "string" ? c.route : "" };
+          }
+        }
+        return line;
       });
       if (panel.degraded && panel.degraded.length) {
         const why = "not complete: " + (panel.error || panel.degraded.join(", "));
@@ -228,6 +260,14 @@
     return { text: l.text, set_at: l.at, source: l.source, age_label: known ? ageLabel(l.at, now, "set ") : "" };
   }
 
+  // a compose field from a name alone: free text for a message-like name, a comma list for `for`
+  const LONG_TEXT = new Set(["message", "body", "text", "content", "note"]);
+  function composeField(name) {
+    if (name === "for") return { name: name, label: "Readers (comma list; none = broadcast)", kind: "csv", required: false };
+    const long = LONG_TEXT.has(name);
+    return { name: name, label: name, kind: long ? "textarea" : "text", required: long };
+  }
+
   // snap = {manifest, panels}; returns the SubstrateView-shaped object dashboard_core.js renders.
   // `snap.panels` maps a panel id to its payload, or to {error} when its fetch failed.
   function fromManifest(raw, opts) {
@@ -264,7 +304,15 @@
       health: null, graph: null, crystal_index: [], open_spores: [], tray: [], keep: [], episodes: [],
       sections: [], config_docs: [], wraps: [], recent_edits: [], state: null, jar: ent.jar,
       layout: [], errors: view_errors, extra_panels: Object.create(null), writable: false, write_token_required: false,
+      // the write surface: the transport's own flags, the verb heads, and every target a write names. A
+      // page without `transport` (an older server) is read-only, never writable by default.
+      verb_heads: isObj(m.verbs) ? m.verbs : Object.create(null), action_verbs: Object.create(null),
+      targets: { rows: Object.create(null), panels: Object.create(null) },
     };
+    if (isObj(m.transport)) {
+      view.writable = m.transport.writable === true;
+      view.write_token_required = m.transport.write_token_required === true;
+    }
     for (const e of m.errors || []) view.errors[e.source || "manifest"] = e.message;
 
     // a panel is unreadable when its payload is missing, a fetch failure, or the kernel said `error`
@@ -301,8 +349,18 @@
       if (pid === "focus") continue;
       if (pid === "state") {
         if (bad) { view.errors[pid] = bad; continue; }
-        try { view.state = lineOf(P.get(pid), P.get(pid), now); }
-        catch (e) { view.state = null; view.errors[pid] = String(e && e.message || e); }
+        try {
+          view.state = lineOf(P.get(pid), P.get(pid), now);
+          // the version the line was rendered with, which a write to it names (the kernel refuses a changed line)
+          const sp = P.get(pid);
+          const acts = Array.isArray(sp.actions) ? sp.actions.filter((a) => isObj(a) && typeof a.verb === "string") : [];
+          const sv = isObj(sp.value) && typeof sp.value.value_version === "string" ? sp.value.value_version : null;
+          if (acts.length) view.targets.panels[pid] = { actions: acts, panel_version: sv };
+          if (view.state && view.writable) {
+            view.state.version = sv;
+            view.state.can_edit = acts.some((a) => a.verb === "operator_state");
+          }
+        } catch (e) { view.state = null; view.errors[pid] = String(e && e.message || e); }
       } else headerExtra.push(pid);
     }
 
@@ -321,9 +379,21 @@
       if (panel.as_of) entry.fresh = ageLabel(panel.as_of, now, "read ");
       const rows = panel.rows || [];
       const kind = NATIVE.get(pid);
+      // what this panel lets the operator do: its own actions (a create, a value write, a downstream verb)
+      // and the actions its rows carry. The page offers a verb only where the kernel offered one.
+      const pActions = Array.isArray(panel.actions) ? panel.actions.filter((a) => isObj(a) && typeof a.verb === "string") : [];
+      const rowsAct = rows.some((r) => r && Array.isArray(r.actions) && r.actions.length);
+      if (pActions.length) {
+        const pv = isObj(panel.value) && typeof panel.value.value_version === "string" ? panel.value.value_version : null;
+        view.targets.panels[pid] = { actions: pActions, panel_version: pv };
+      }
+      for (const r of rows) if (r && typeof r.id === "string" && Array.isArray(r.actions) && r.actions.length) {
+        view.targets.rows[r.id] = targetOf(pid, r);
+      }
+      if ((rowsAct || pActions.length) && (pid === "tray" || pid === "loops" || pid === "keep" || pid === "episodes")) entry.edit_class = "B";
       const lists = { tray: "tray", loops: "open_spores", keep: "keep" };
       if ((pid === "tray" || pid === "loops" || pid === "keep") && panel.kind === "triage-list") {
-        view[lists[pid]] = rows.map((r) => sporeOf(r, groupTitles));
+        view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles));
         if (pid === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
           // the kernel's named orderings and the row ids in each; the renderer picks one, never sorts
           const named = head.views.filter((v) => isObj(v) && typeof v.id === "string" && Array.isArray(panel.view_rows[v.id]));
@@ -335,13 +405,14 @@
         }
         view.layout.push(Object.assign(entry, { kind: kind }));
       } else if (pid === "episodes" && panel.kind === "triage-list") {
-        view.episodes = rows.map((r) => ({ id: bare(r.id), timestamp: (r.facets || {}).at, type: (r.facets || {}).episode_type,
+        view.episodes = rows.map((r) => ({ panel_id: pid, row_id: r.id, row_version: r.version, id: bare(r.id), timestamp: (r.facets || {}).at, type: (r.facets || {}).episode_type,
           source: (r.facets || {}).source, agent: titleOf((r.facets || {}).agent, ""),
           actions: Array.isArray(r.actions) ? r.actions : undefined, tags: tagsOf((r.facets || {}).tags), content: r.body || r.title,
           emphasis: r.emphasis }));
         view.layout.push(Object.assign(entry, { kind: "episodes" }));
       } else if (pid === "edits" && panel.kind === "triage-list") {
-        view.recent_edits = rows.map((r) => ({ id: bare(r.id), ts: (r.facets || {}).at, action: (r.facets || {}).edit_kind,
+        view.recent_edits = rows.map((r) => ({ panel_id: pid, row_id: r.id, row_version: r.version,
+          actions: Array.isArray(r.actions) ? r.actions : [], id: bare(r.id), ts: (r.facets || {}).at, action: (r.facets || {}).edit_kind,
           source: r.title, undoable: (r.facets || {}).undoable }));
         view.layout.push(Object.assign(entry, { kind: "edits" }));
       } else if (pid === "crystals" && panel.kind === "triage-list") {
@@ -367,6 +438,14 @@
         view.layout.push(Object.assign(entry, { kind: "section", ref: sectionRef++, heading: titleOf(panel.title, titleOf(head.title, pid)) }));
       } else {
         view.extra_panels[pid] = externalOf(panel, panel, groupTitles);
+        // a downstream's own verb on this panel becomes the compose box. The manifest names the verb's
+        // fields and not their widgets, so a widget is chosen from the field's name (a known edge).
+        const own = pActions.find((a) => !isObj(a.target) || typeof a.target.row_id !== "string");
+        const vh = own && isObj(view.verb_heads[own.verb]) ? view.verb_heads[own.verb] : null;
+        if (vh && !NATIVE.has(pid)) {
+          view.extra_panels[pid].action = { verb: own.verb, fields: (Array.isArray(vh.fields) ? vh.fields : []).filter((n) => typeof n === "string").map(composeField) };
+          view.action_verbs[own.verb] = { label: vh.label, confirm_required: vh.confirm === true, idempotent: vh.idempotent === true, job: false };
+        }
         // the external renderer draws the note itself, so the banner must not draw it a second time
         if (entry.banner && panel.note) {
           entry.banner = entry.banner.filter((b) => !(b.tone === "dim" && b.text === panel.note));

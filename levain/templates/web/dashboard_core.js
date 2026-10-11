@@ -86,6 +86,8 @@
   // NO board reload — the result lands in the box, not a rebuild) and returns a job HANDLE;
   // `pollJob` reads GET /job.json for the terminal result. Both null on a read-only port.
   let commitJob = null;
+  // Cancel a waiting pending (the manifest source only): `cancelPending(cancel) → Promise<{ok}|{ok:false,...}>`.
+  let cancelPending = null;
   let pollJob = null;
   // The episode-search READ transport (GET /recall.json), injected by the boot layer so the core
   // stays token-agnostic — the boot layer attaches the off-box token (spore-220 gates /recall.json
@@ -201,7 +203,7 @@
       sEl.appendChild(el("span", "ftext", state.text));
       if (state.age_label) sEl.appendChild(el("span", "fage", state.age_label));
     }
-    if (!commit) return;
+    if (!commit || state.can_edit === false) return;
     const has = !!(state && state.text);
     const btn = el("button", "state-edit", has ? "edit" : "set");
     btn.type = "button";
@@ -220,6 +222,7 @@
     commit = opts && typeof opts.commit === "function" ? opts.commit : null;
     commitAction = opts && typeof opts.commitAction === "function" ? opts.commitAction : null;
     commitJob = opts && typeof opts.commitJob === "function" ? opts.commitJob : null;
+    cancelPending = opts && typeof opts.cancelPending === "function" ? opts.cancelPending : null;
     pollJob = opts && typeof opts.pollJob === "function" ? opts.pollJob : null;
     onJobsIdle = opts && typeof opts.onJobsIdle === "function" ? opts.onJobsIdle : null;
     recall = opts && typeof opts.recall === "function" ? opts.recall : null;
@@ -672,6 +675,7 @@
   // turns on the governed dump/sort/park verbs — edit_class "" → isVerbPanel false → none).
   function sporeRow(s, verbs, badgeField, panelKind) {
     const row = el("div", "row");
+    if (s.row_id) row.dataset.rowKey = s.row_id;   // where a transport notice lands after the board is rebuilt
     // the spore id is the common reference handle (how flow tracks + you name it,
     // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
@@ -863,6 +867,7 @@
   // module-level closure, available to dynamically-added rows.
   function episodeRow(e, verbs, showAgent) {
     const row = el("div", "row" + (e.emphasis === "dim" ? " ext-dim" : ""));
+    if (e.row_id) row.dataset.rowKey = e.row_id;
     if (showAgent && e.agent) row.appendChild(el("span", "tier", `[${e.agent}]`));
     if (e.type) row.appendChild(el("span", "etype", e.type));
     appendClause(row, e.content);  // FULL content + per-item expand (no truncation)
@@ -1432,8 +1437,7 @@
         new_body: ta.value,
       });
       if (res && res.ok) return;  // shim re-fetched + re-rendered → this DOM is gone
-      msg.className = "edit-msg err";
-      msg.textContent = (res && (res.message || res.error)) || "save failed";
+      showFail(msg, res, "save failed");
       save.disabled = false; cancel.disabled = false;
     });
   }
@@ -1443,19 +1447,44 @@
   // verbs (never raw writes). A metal button per row; destructive verbs open a small
   // confirm/kind form that sends confirm:true (the server requires it regardless).
 
+  // The cockpit verb each spore button fires. On a manifest row (one that lists its `actions`) a button
+  // is kept only when the kernel offered that verb on the row, and is disabled, with the gesture as its
+  // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
+  const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", reclassify: "spore_update", park: "spore_update",
+    reactivate: "spore_update", schedule: "spore_surface_at", metabolize: "spore_set_disposition",
+    "→ tray": "spore_set_disposition", activate: "spore_set_disposition", "remind me": "spore_set_disposition",
+    dismiss: "spore_descend", remove: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
+    tombstone: "episode_tombstone" };
+
   function verbBtn(label, title, onClick) {
     const b = el("button", "verb-btn", label);
     b.type = "button";
     if (title) b.title = title;
+    if (Object.prototype.hasOwnProperty.call(BUTTON_VERB, label)) b.dataset.verb = BUTTON_VERB[label];
     b.addEventListener("click", onClick);
     return b;
+  }
+
+  function gateByActions(wrap, actions) {
+    if (!Array.isArray(actions)) return wrap;
+    for (const b of Array.prototype.slice.call(wrap.querySelectorAll(".verb-btn[data-verb]"))) {
+      const a = actions.find((x) => x && x.verb === b.dataset.verb);
+      if (!a) { b.remove(); continue; }
+      if (a.gesture === "refused" || a.gesture === "laptop-only") { b.disabled = true; b.title = a.gesture; }
+    }
+    return wrap;
+  }
+
+  // A failed (or previewed) answer in a message span. A preview is not an error: it asks for a second click.
+  function showFail(msg, res, fallback) {
+    msg.className = "edit-msg " + (res && res.preview ? "preview" : "err");
+    msg.textContent = (res && (res.message || res.error)) || fallback;
   }
 
   function verbErr(wrap, res) {
     let m = wrap.querySelector(".edit-msg");
     if (!m) { m = el("span", "edit-msg", ""); wrap.appendChild(m); }
-    m.className = "edit-msg err";
-    m.textContent = (res && (res.message || res.error)) || "failed";
+    showFail(m, res, "failed");
   }
 
   function buildSporeVerbs(s, panelKind) {
@@ -1481,7 +1510,7 @@
         wrap.appendChild(verbBtn("dismiss", "compost this inbox item", () =>
           openResolveForm(wrap, "spore_descend", "dismiss", s, s.descend_kinds, false)));
       }
-      return wrap;
+      return gateByActions(wrap, s.actions);
     }
 
     // KEEP — durable reference, NOT loop-lifecycle. Always editable. A NOTE gets the promote
@@ -1531,7 +1560,7 @@
       if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
         wrap.appendChild(verbBtn("remove", "delete this from Keep", () => openRemoveConfirm(wrap, s)));
       }
-      return wrap;
+      return gateByActions(wrap, s.actions);
     }
 
     // OPEN LOOPS — the entity's live cognition: the lifecycle verbs (+ edit + schedule).
@@ -1568,7 +1597,7 @@
       wrap.appendChild(verbBtn("promote", "transmute into memory / project", () =>
         openResolveForm(wrap, "spore_ascend", "promote", s, s.ascend_kinds, true)));
     }
-    return wrap;
+    return gateByActions(wrap, s.actions);
   }
 
   // The schedule form: a date input + confirm -> spore_surface_at (clear = explicit empty).
@@ -1602,7 +1631,7 @@
       msg.className = "edit-msg busy"; msg.textContent = "…";
       const res = await commit({ kind: "spore_surface_at", spore_id: s.id, surface_at: value });
       if (res && res.ok) return;  // re-rendered
-      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
       go.disabled = false; clearBtn.disabled = false; cancel.disabled = false;
     };
     go.addEventListener("click", () => {
@@ -1644,13 +1673,21 @@
       msg.className = "edit-msg busy"; msg.textContent = "…";
       const res = await commit(req);
       if (res && res.ok) return;  // re-rendered
-      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
       go.disabled = false; cancel.disabled = false;
     });
   }
 
-  // Inline text edit — the forming-workbench refine (spore_update{text}). Any spore.
+  // Inline text edit — the forming-workbench refine (spore_update{text}). Any spore. When the kernel offers
+  // `domain` on this row's edit, the form carries a domain input too (prefilled from the row): domain is
+  // sent only when it differs from what was shown, and as "" only when the operator clears a domain on
+  // purpose. A text-only edit keeps the same request.
+  function offersDomain(s) {
+    const a = Array.isArray(s.actions) ? s.actions.find((x) => x && x.verb === "spore_update") : null;
+    return !!a && Array.isArray(a.escalates) && a.escalates.some((x) => x && x.param === "domain");
+  }
   function openTextEdit(host, s) {
+    const withDomain = offersDomain(s);
     openRowForm(host, () => {
       const ta = el("textarea", "verb-edit-ta");
       ta.value = s.text || "";  // FULL canonical text — the wire no longer truncates, so edit
@@ -1660,14 +1697,27 @@
       const lines = ta.value.split("\n").length;
       ta.rows = Math.min(16, Math.max(3, lines, Math.ceil(ta.value.length / 56)));
       ta.dataset.orig = ta.value;  // dirty baseline for hasUnsavedEdit (spore-108)
-      return { nodes: [ta], focus: ta, ta };
+      if (!withDomain) return { nodes: [ta], focus: ta, ta };
+      const dom = el("input", "verb-domain");
+      dom.type = "text"; dom.maxLength = 64; dom.placeholder = "domain";
+      dom.setAttribute("aria-label", "domain");
+      dom.value = s.domain || "";
+      dom.dataset.orig = dom.value;
+      return { nodes: [ta, dom], focus: ta, ta, dom };
     }, (f, msg) => {
       // Save the value VERBATIM — only trim for the empty-CHECK. trimming the saved text
       // would silently strip a spore's structural leading/trailing newlines on its first
       // edit (the small sibling of the truncation data-loss this slice fixes) [complement L3].
       const text = f.ta.value;
       if (!text.trim()) { msg.className = "edit-msg err"; msg.textContent = "text can't be empty"; return null; }
-      return { kind: "spore_update", spore_id: s.id, text };
+      if (!f.dom) return { kind: "spore_update", spore_id: s.id, text };
+      const req = { kind: "spore_update", spore_id: s.id };
+      const textChanged = text !== (s.text || "");
+      const domChanged = f.dom.value.trim() !== (s.domain || "");
+      if (!textChanged && !domChanged) { msg.className = "edit-msg err"; msg.textContent = "nothing changed"; return null; }
+      if (textChanged) req.text = text;
+      if (domChanged) req.domain = f.dom.value.trim();   // "" only when a non-empty domain was cleared
+      return req;
     }, "save", false);
   }
 
@@ -1747,7 +1797,7 @@
       const res = await commit(buildReq(text, sel && sel.value));
       if (res && res.ok) return;  // re-rendered → fresh panel carrying the new item
       go.disabled = false;
-      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
     };
     go.addEventListener("click", submit);
     // Cmd/Ctrl+Enter submits; plain Enter newlines (a capture may be multi-line).
@@ -1832,7 +1882,7 @@
       msg.className = "edit-msg busy"; msg.textContent = "…";
       const res = await commit(req);
       if (res && res.ok) return;  // re-rendered
-      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
       go.disabled = false; cancel.disabled = false;
     });
   }
@@ -1841,7 +1891,7 @@
     const wrap = el("span", "verb-actions");
     wrap.appendChild(verbBtn("tombstone", "delete this input — the consolidate re-derives without it", () =>
       openTombstoneConfirm(wrap, e)));
-    return wrap;
+    return gateByActions(wrap, e.actions);
   }
 
   function openTombstoneConfirm(host, e) {
@@ -1871,7 +1921,7 @@
       msg.className = "edit-msg busy"; msg.textContent = "…";
       const res = await commit({ kind: "episode_tombstone", episode_id: e.id, confirm: true });
       if (res && res.ok) return;  // re-rendered
-      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
       go.disabled = false; cancel.disabled = false;
     });
   }
@@ -2068,8 +2118,7 @@
 
     const failed = (res) => {
       setDisabled(false);
-      msg.className = "edit-msg err";
-      msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
     };
 
     // ── async-job (spec.job) result area + poll loop ──
@@ -2184,6 +2233,22 @@
     return box;
   }
 
+  // A waiting pending's cancel: posted with the gesture's intent and no preview. A gesture a browser
+  // cannot perform is disabled with the gesture as its title.
+  function buildPendingCancel(c) {
+    const wrap = el("span", "verb-actions");
+    const b = verbBtn("cancel", "cancel this waiting request", async () => {
+      b.disabled = true;
+      const res = await cancelPending(c);
+      if (res && res.ok) return;  // re-rendered
+      b.disabled = false;
+      verbErr(wrap, res);
+    });
+    if (c.gesture === "refused" || c.gesture === "laptop-only") { b.disabled = true; b.title = c.gesture; }
+    wrap.appendChild(b);
+    return wrap;
+  }
+
   function renderExternal(entry, view) {
     const p = panel(entry);
     const data = (view.extra_panels || {})[entry.id] || {};
@@ -2223,6 +2288,7 @@
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.meta) row.appendChild(el("span", "ext-meta", String(o.meta)));
       appendClause(row, o.text != null ? String(o.text) : "");  // per-item expand, like episodes
+      if (o.cancel && cancelPending) row.appendChild(buildPendingCancel(o.cancel));
       p.appendChild(row);
     }
     return p;
@@ -2307,8 +2373,7 @@
       const res = await commit({ kind: "entity_name", value: input.value });
       if (res && res.ok) return;  // reloaded — the save render tore this editor down
       delete editor.dataset.saving;  // save FAILED: re-arm the guard so passive reloads defer again
-      msg.className = "edit-msg err";
-      msg.textContent = (res && (res.message || res.error)) || "save failed";
+      showFail(msg, res, "save failed");
       save.disabled = false; cancel.disabled = false;
     };
     cancel.addEventListener("click", restore);
@@ -2362,8 +2427,7 @@
       const res = await commit({ kind, text: input.value, panel_version: state && state.version });
       if (res && res.ok) return;  // reloaded — the save render rebuilt #state, removing this editor
       delete editor.dataset.saving;  // save FAILED: re-arm the guard so passive reloads defer again
-      msg.className = "edit-msg err";
-      msg.textContent = (res && (res.message || res.error)) || "save failed";
+      showFail(msg, res, "save failed");
       save.disabled = false; cancel.disabled = false;
     };
     cancel.addEventListener("click", restore);

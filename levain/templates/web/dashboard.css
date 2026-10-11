@@ -720,6 +720,10 @@
   .edit-msg.err { color: var(--hot); }
   .edit-msg.err::before { content: "▲ "; }
   .edit-msg.busy { color: var(--dim); }
+  /* a preview asks for a second click: it names a tier, and is neither a fault nor a busy state */
+  .edit-msg.preview { color: var(--operate); }
+  .edit-msg.preview::before { content: "\2192 "; }
+  .edit-msg.note { color: var(--dim); }
 
   /* entity-name rename — the masthead "Unit" name is a Class-A input too. A clearly-
      labeled metal button (was a near-invisible faint glyph), so it's discoverable. */
@@ -814,12 +818,12 @@
   .verb-btn:active { transform: translateY(1px); }
   .verb-btn:disabled { opacity: .4; cursor: default; box-shadow: none; }
   .verb-form { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
-  .verb-kind, .verb-ref {
+  .verb-kind, .verb-ref, .verb-domain {
     font: 11px/1.4 var(--mono); color: var(--ink); background: #0a0f0e;
     border: 1px solid var(--line-hot); border-radius: 3px; padding: 3px 7px; outline: none;
   }
-  .verb-ref { min-width: 140px; }
-  .verb-kind:focus, .verb-ref:focus {
+  .verb-ref, .verb-domain { min-width: 140px; }
+  .verb-kind:focus, .verb-ref:focus, .verb-domain:focus {
     border-color: color-mix(in srgb, var(--operate) 55%, var(--line-hot));
     box-shadow: 0 0 10px -4px var(--operate);
   }
@@ -981,13 +985,14 @@
        landscape rotation. */
     .edit-ta,
     .verb-ref,
+    .verb-domain,
     .verb-kind,
     .state-input,
     .ep-search-input { font-size: 16px; }
     /* tap-target floor on the focusable fields. .name-input (the masthead rename)
        is 18px so it needs no zoom-fix, but its base height is ~30px — under the
        floor — so it gets min-height here for a consistent thumb target (L3: complement). */
-    .name-input, .state-input, .verb-kind, .verb-ref, .ep-search-input { min-height: 38px; }
+    .name-input, .state-input, .verb-kind, .verb-ref, .verb-domain, .ep-search-input { min-height: 38px; }
     html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   }
 

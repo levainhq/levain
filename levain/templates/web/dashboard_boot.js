@@ -243,10 +243,242 @@
 
   // DATA SOURCE (cockpit design §7). `/?source=manifest` draws the page from the kernel's cockpit
   // manifest + panel routes (cockpit_view.js maps them onto the same components); the default stays
-  // /substrate.json until the write verbs (K2a/K2b) and flow's provider module (M1) land, because the
-  // manifest source is READ-ONLY and would drop a writable serve's edit affordances and flow's own
-  // Bridge panels. The flip is this one constant.
+  // /substrate.json until the flip is ruled. The manifest source writes through /cockpit/verb (postVerb
+  // below). The flip is this one constant.
   const useManifest = new URLSearchParams(window.location.search).get("source") === "manifest";
+
+  // ---- MANIFEST WRITES (R1): every affordance on the manifest source posts /cockpit/verb ----
+  //
+  // The page decides no tier. A gesture that may escalate asks the kernel first (a dry run), shows the
+  // tier it would take, and fires only on the operator's second click, with exactly the request it showed.
+  // `live` is the write surface of the view last RENDERED: a write names the row version the operator saw,
+  // so a re-read never moves it under an open form (the kernel's `stale` answer is the backstop).
+  let live = null;
+  let frozen = null;        // the previewed request: {fp0, tier, gesture, intent}
+  let notice = null;        // what the last write said, drawn on its row once the board is rebuilt
+
+  const KEYS_STORE = "levain_cockpit_keys";
+  function readKeys() {
+    try { const o = JSON.parse(window.sessionStorage.getItem(KEYS_STORE) || "{}"); return o && typeof o === "object" ? o : {}; }
+    catch (_) { return {}; }
+  }
+  function writeKeys(o) { try { window.sessionStorage.setItem(KEYS_STORE, JSON.stringify(o)); } catch (_) { /* no storage: no replay */ } }
+
+  // a stable string for a JSON value: keys sorted, so one request always has one fingerprint
+  function canon(v) {
+    if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
+    if (v && typeof v === "object") return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}";
+    return JSON.stringify(v === undefined ? null : v);
+  }
+  function newKey() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") return window.crypto.randomUUID();
+      const a = new Uint8Array(16);
+      window.crypto.getRandomValues(a);
+      return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+    } catch (_) { return "idem-" + Date.now() + "-" + Math.random().toString(16).slice(2); }
+  }
+
+  // POST a body; {net:true} when the outcome is unknown (no answer, or a proxy's non-JSON 5xx), else
+  // {ok, status, data}. An answer from the server is authoritative, whatever it says.
+  async function send(route, body) {
+    let res;
+    try { res = await fetch(route, { method: "POST", headers: writeHeaders(), body: JSON.stringify(body) }); }
+    catch (e) { return { net: true, message: e && e.message ? e.message : String(e) }; }
+    let data = {};
+    let parsed = true;
+    try { data = await res.json(); } catch (_) { parsed = false; }
+    if (!parsed && res.status >= 500) return { net: true, message: "HTTP " + res.status };
+    if (res.status === 403 && writeTokenRequired && /token/i.test((data && data.message) || "")) dropToken();
+    return { ok: res.ok, status: res.status, data: data || {} };
+  }
+
+  const NETWORK_MESSAGE = "no answer: the request may or may not have landed. Click again to send the same request (it carries the same key, so it lands once).";
+  // answers after which the page's picture of the row or of the install is stale or unavailable
+  const REREAD = new Set(["needs_intent", "stale", "tier_moved", "gesture_moved", "needs_broker", "standby", "not_built"]);
+
+  function fault(r, what) {
+    const d = r.data || {};
+    const code = d.error || "HTTP " + r.status;
+    const text = d.message || code;
+    if (REREAD.has(code) || r.status === 501) {
+      frozen = null;
+      notice = { key: what.row_id || null, text: what.label + ": " + text + " (re-read)", cls: "err" };
+      load({ passive: true });   // a re-read that never discards an open form: it defers while one is dirty
+      return { ok: false, error: code, message: text + " Re-read the page; review and click again." };
+    }
+    return { ok: false, error: code, message: text };
+  }
+
+  function previewText(head, action, tier, gesture, base) {
+    const how = gesture === "sign" ? "waits for a signature" : "fires now, recorded as reported (claims cockpit token)";
+    const from = action.tier && action.tier !== tier ? " (rises from " + action.tier + ")" : "";
+    const cut = (v) => { const t = typeof v === "string" ? v : JSON.stringify(v); return JSON.stringify(t.length > 60 ? t.slice(0, 57) + "..." : t); };
+    const vals = Object.keys(base.params).map((k) => k + " = " + cut(base.params[k])).join(", ") || "no values";
+    return (head.label || base.verb) + " is " + tier + from + ": " + how + ". " + (head.effect ? head.effect + ". " : "")
+      + "Sending " + vals + ". Click again to fire.";
+  }
+
+  async function postVerb(action, params, opts) {
+    opts = opts || {};
+    const head = (live && live.heads && live.heads[action.verb]) || {};
+    const label = head.label || action.verb;
+    if (action.gesture === "refused" || action.gesture === "laptop-only") {
+      return { ok: false, error: "gesture", message: label + " is " + action.gesture + " here: it cannot be done from this page." };
+    }
+    const t = action.target || {};
+    const base = { verb: action.verb, panel_id: t.panel_id, params: params || {} };
+    if (typeof t.row_id === "string") { base.row_id = t.row_id; base.row_version = t.row_version; }
+    const pv = opts.panelVersion !== undefined && opts.panelVersion !== null ? opts.panelVersion : t.panel_version;
+    if (typeof pv === "string") base.panel_version = pv;
+    if (head.confirm === true && opts.confirm === true) base.confirm = true;
+    const what = { row_id: base.row_id, label: label };
+    const fp0 = canon(base);
+
+    let tier = "C1", gesture = action.gesture, intent = null;
+    if (frozen && frozen.fp0 === fp0) {
+      tier = frozen.tier; gesture = frozen.gesture; intent = frozen.intent;
+    } else {
+      frozen = null;
+      const mayEscalate = !(action.gesture === "direct" && (!Array.isArray(action.escalates) || action.escalates.length === 0));
+      if (mayEscalate) {
+        const d = await send("/cockpit/verb", Object.assign({}, base, { dry_run: true }));
+        if (d.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };
+        if (!d.ok) return fault(d, what);
+        tier = d.data.tier; gesture = d.data.gesture;
+        if (gesture === "refused" || gesture === "laptop-only") {
+          return { ok: false, error: "gesture", message: label + " is " + tier + " with these values, and its gesture is " + gesture + ": it cannot be done from this page." };
+        }
+        if (tier !== "C1") {
+          intent = gesture === "sign" ? "sign" : "reported";
+          frozen = { fp0: fp0, tier: tier, gesture: gesture, intent: intent };
+          return { ok: false, preview: true, error: "preview", message: previewText(head, action, tier, gesture, base) };
+        }
+      }
+    }
+
+    let env = Object.assign({}, base);
+    if (intent) { env.intent = intent; env.tier_seen = tier; env.gesture_seen = gesture; }
+    // A T2+ fire (or an idempotent verb's) carries one key, minted for this frozen request and kept with
+    // the whole request until the kernel answers, so a lost answer is replayed, never re-decided.
+    let fpKey = null;
+    if (tier !== "C1" || head.idempotent === true) {
+      fpKey = canon([base.verb, base.panel_id, base.row_id || null, base.row_version || base.panel_version || null,
+                     base.params, intent, base.confirm === true]);
+      const keys = readKeys();
+      if (keys[fpKey] && keys[fpKey].envelope) env = keys[fpKey].envelope;
+      else { env.idempotency_key = newKey(); keys[fpKey] = { envelope: env }; writeKeys(keys); }
+    }
+    const r = await send("/cockpit/verb", env);
+    if (r.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };   // key and preview stay
+    frozen = null;
+    if (fpKey) { const keys = readKeys(); delete keys[fpKey]; writeKeys(keys); }
+    if (!r.ok) return fault(r, what);
+    const d = r.data;
+    const state = typeof d.state === "string" && d.state ? d.state : "done";
+    notice = { key: base.row_id || null, text: label + ": " + state + (d.label ? " · " + d.label : ""), cls: state === "COMMITTED" || state === "done" ? "note" : "preview" };
+    await afterWrite();
+    return { ok: true, data: d };
+  }
+
+  // reload after a landed write, deferring while an async job polls (as postWrite does)
+  async function afterWrite() {
+    if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()) {
+      deferredReload = true;
+    } else {
+      await load();
+    }
+  }
+
+  // The legacy request kinds the render core still speaks, translated onto cockpit verbs. Only the verb
+  // name, the params and the target are read from the request; everything else the kernel decides.
+  const ROW_KEY = { spore_id: "spore:", episode_id: "episode:", edit_id: "edit:" };
+  const NOT_PARAMS = new Set(["kind", "spore_id", "episode_id", "edit_id", "expect_disposition", "confirm",
+    "panel_version", "source", "heading", "expected_body"]);
+  const VERB_OF_KIND = { state: "section_edit" };
+
+  function panelActionFor(verb, req) {
+    // a capture lands in the Keep when it is a note, else in the Tray
+    const want = verb === "spore_seed" ? (req && req.disposition === "note" ? "keep" : "tray") : null;
+    for (const pid of Object.keys(live.panels)) {
+      if (want && pid !== want) continue;
+      const a = live.panels[pid].actions.find((x) => x && x.verb === verb);
+      if (a) return a;
+    }
+    return null;
+  }
+
+  async function manifestCommit(req) {
+    if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
+    const verb = Object.prototype.hasOwnProperty.call(VERB_OF_KIND, req.kind) ? VERB_OF_KIND[req.kind] : req.kind;
+    const params = {};
+    for (const k of Object.keys(req)) if (!NOT_PARAMS.has(k)) params[k] = req[k];
+    let action = null;
+    const rk = Object.keys(ROW_KEY).find((k) => Object.prototype.hasOwnProperty.call(req, k));
+    if (rk) {
+      const row = live.rows[ROW_KEY[rk] + req[rk]];
+      action = row ? row.actions.find((a) => a && a.verb === verb) : null;
+    } else {
+      action = panelActionFor(verb, req);
+    }
+    if (!action) return { ok: false, error: "not_offered", message: "the cockpit did not offer " + verb + " here" };
+    return postVerb(action, params, { confirm: req.confirm === true, panelVersion: req.panel_version });
+  }
+
+  // a downstream verb's compose box: found by verb name on the panels that offer it
+  async function manifestAction(verb, params, confirm) {
+    if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
+    const action = panelActionFor(verb, null);
+    if (!action) return { ok: false, error: "not_offered", message: "the cockpit did not offer " + verb + " here" };
+    return postVerb(action, params, { confirm: confirm === true });
+  }
+
+  // cancel a waiting pending: the gesture's intent, no preview, and a key of its own
+  async function cancelPending(c) {
+    const body = { idempotency_key: newKey() };
+    if (c.tier && c.tier !== "C1") body.intent = c.gesture === "sign" ? "sign" : "reported";
+    const route = c.route || "/cockpit/pending/" + encodeURIComponent(c.pending_id) + "/cancel";
+    const r = await send(route, body);
+    if (r.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };
+    if (!r.ok) return fault(r, { row_id: null, label: "cancel" });
+    const d = r.data;
+    notice = { key: null, text: "cancel: " + (d.state || "done") + (d.label ? " · " + d.label : ""), cls: "note" };
+    await afterWrite();
+    return { ok: true, data: d };
+  }
+
+  // Draw what the last write said on its row (or in the status line when the row is gone). The status
+  // line carries it either way.
+  function showNotice() {
+    if (!notice) return;
+    const n = notice;
+    notice = null;
+    status(n.text);
+    if (!n.key) return;
+    const rows = document.querySelectorAll("[data-row-key]");
+    for (const row of rows) {
+      if (row.dataset.rowKey !== n.key) continue;
+      const host = row.querySelector(".verb-actions") || row;
+      let m = host.querySelector(".edit-msg");
+      if (!m) { m = document.createElement("span"); host.appendChild(m); }
+      m.className = "edit-msg " + n.cls;
+      m.textContent = n.text;
+      return;
+    }
+  }
+
+  // Any edit to a form discards the preview: the operator fires only what they were shown.
+  function discardPreview(ev) {
+    if (!frozen) return;
+    frozen = null;
+    const t = ev && ev.target && ev.target.closest ? ev.target.closest(".verb-form, .tray-dump, .edit-controls, .editor, .state-editor") : null;
+    const m = t ? t.querySelector(".edit-msg.preview") : null;
+    if (m) { m.className = "edit-msg"; m.textContent = ""; }
+  }
+  if (useManifest) {
+    document.addEventListener("input", discardPreview, true);
+    document.addEventListener("change", discardPreview, true);
+  }
 
   async function loadManifestView(passive) {
     const manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
@@ -307,9 +539,14 @@
     try {
       if (useManifest) {
         const mview = await loadManifestView(passive);
-        if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
-        window.LevainDashboard.render(mview, { recall });
+        if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return; }
+        writeTokenRequired = mview.write_token_required === true;
+        frozen = null;   // a rebuilt board shows no preview, so none may be fired
+        window.LevainDashboard.render(mview, mview.writable
+          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, onJobsIdle, recall } : { recall });
+        live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
         status("read " + new Date().toLocaleTimeString());
+        showNotice();
         return;
       }
       let res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
