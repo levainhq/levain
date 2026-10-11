@@ -67,3 +67,26 @@ def test_the_now_view_notes_an_unreadable_label_snapshot(rig_broker) -> None:
     rig.ck.attach_labeller(lambda: unavailable("journal busy"))
     note = rig.ck.panel("now")["note"] or ""
     assert "provenance unavailable: journal busy" in note
+
+
+class _Degraded:
+    """A readable snapshot with unreadable label rows (§8d row 3)."""
+    revision = ("levain-cockpit/2", 7, 3)
+    error = None
+    degraded = 2
+
+    def provenance(self, key):
+        return None
+
+    def label(self, key):
+        return "unverified"
+
+
+def test_the_now_view_notes_degraded_rows_and_its_etag_moves_with_the_snapshot(rig_broker) -> None:
+    rig, _b, _db = rig_broker
+    rig.ck.attach_labeller(lambda: _Degraded())
+    degraded = rig.ck.panel("now")
+    assert "2 label row(s) unreadable" in (degraded["note"] or "")
+    rig.ck.attach_labeller(lambda: unavailable("journal busy"))
+    busy = rig.ck.panel("now")
+    assert busy["etag"] != degraded["etag"]       # a 304 never hides the changed note
