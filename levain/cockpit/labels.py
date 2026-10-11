@@ -22,7 +22,7 @@ from typing import Any
 
 from levain.autonomic.journal import JournalCorruptError
 from levain.cockpit.authority import LabelKey, unavailable
-from levain.cockpit.install import REPORTED
+from levain.cockpit.install import GOVERNED, REPORTED
 from levain.cockpit.consent import ConsentError, parse_stamp, value_sha256
 from levain.cockpit.firejournal import CockpitDB, _parse_record
 
@@ -110,7 +110,10 @@ def label_class(decision_kind: str | None, install_class: str | None) -> str:
     if decision_kind == "ALLOWED_REPORTED":
         return "claims cockpit token"
     if decision_kind == "ALLOWED":
-        return "signed · reported" if install_class == REPORTED else "verified"
+        if install_class == REPORTED:
+            return "signed · reported"
+        # verified only in a governed journal: an empty or unknown class fails closed
+        return "verified" if install_class == GOVERNED else "unverified"
     return "unverified"
 
 

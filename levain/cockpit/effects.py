@@ -609,7 +609,10 @@ def _ce_seed(params: Mapping[str, Any], pre: Mapping[str, Any] | None, *, origin
     if params.get("domain"):
         changes["domain"] = _norm_update_field("domain", params["domain"])
     projection = {f: _stored_authority(changes, f) for f in SPORE_AUTHORITY_FIELDS}
-    writes = tuple(f for f in SPORE_AUTHORITY_FIELDS if projection[f] not in (None, ""))
+    # a create sets EVERY authority field, an empty domain included, so it labels all of them (flow §4.5
+    # invariant 5 makes the row's label its weakest field's: an unlabelled empty field would hold a row this
+    # fire wrote whole at unverified). label_fields still labels only a field the store holds as projected
+    writes = SPORE_AUTHORITY_FIELDS
     return Effect(spore_resource_key(origin_key), SPORES, {"absent": True}, changes, projection, writes, ())
 
 

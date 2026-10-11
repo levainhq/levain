@@ -772,7 +772,7 @@ def retier(registry: "VerbRegistry", cockpit: "Cockpit", verb_name: str, params:
 
     One snapshot per decide (K2b-3b §0.1). A snapshot that could not read the journal is ``None`` in a
     governed install, where a label can lower a tier, so a decision never settles on a guessed label;
-    in a reported install no label is ever ``verified`` (``broker.label_class``), so the tier is the
+    in a reported install no label is ever ``verified`` (``labels.label_class``), so the tier is the
     one ``unverified`` gives. A value target tiers as unlabelled (every kernel value verb's tier is a
     constant; a downstream value verb whose tier reads a label is a known edge)."""
     verb = registry.get(verb_name)

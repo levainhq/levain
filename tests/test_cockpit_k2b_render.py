@@ -44,7 +44,7 @@ class FakeLabels:
 
 
 def _fake_spore_key(stored: Mapping[str, Any]) -> LabelKey:
-    # the view's spores carry no origin_key yet (an observation for the seat), so the test keys on the id
+    # keyed on the id with one field, to test render apart from the spore key function
     return LabelKey(f"spore:{stored['id']}", {"text": stored["text"]})
 
 

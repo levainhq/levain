@@ -62,6 +62,9 @@ PENDING_CAP = 8                        # WAITING pendings per principal generati
 CAP_ATTEMPTS = 10                      # recorded transient faults before a unit ends `store error` (§4.1.2)
 FIRST_RETRY_DELAY = timedelta(seconds=5)   # decided_at + this is a never-faulted unit's due time (§4.2)
 _MAX_BACKOFF = 120
+# the `outcome` facet's enum is flow's (cockpit_manifest_DESIGN_1009 §3.2.1 "COMMITTED-INCOMPLETE/STALE/REFUSED/
+# EXPIRED/cancelled/deleted"), not the journal's state names
+_OUTCOME_NAMES = {"COMMITTED_INCOMPLETE": "COMMITTED-INCOMPLETE", "CANCELLED": "cancelled"}
 OUTCOME_WINDOW = timedelta(days=7)     # the decisions panel's outcomes reach back this far (K2b-3b §3)
 OUTCOMES_LIMIT = 50                    # and show at most this many, newest first
 
@@ -1124,9 +1127,9 @@ class CockpitDB:
     def decision_rows(self, now: datetime) -> DecisionRows:
         """The broker's rows of the ``decisions`` panel (K2b-3b §3), in one read transaction.
         ``pendings``: every pending whose EFFECTIVE state is WAITING, soonest signed expiry first.
-        ``outcomes``: the newest ``OUTCOMES_LIMIT`` ops terminal inside ``OUTCOME_WINDOW`` whose
-        effective state is COMMITTED_INCOMPLETE, STALE, REFUSED, EXPIRED or CANCELLED, plus every
-        COMMITTED op whose plan deletes. One ``effective_state`` serves both: a stored WAITING row
+        ``outcomes``: ops terminal inside ``OUTCOME_WINDOW`` whose effective state is
+        COMMITTED_INCOMPLETE, STALE, REFUSED, EXPIRED or CANCELLED, and COMMITTED ops whose plan
+        deletes, merged and cut ONCE at the newest ``OUTCOMES_LIMIT`` (design §3: "newest 50" over both). One ``effective_state`` serves both: a stored WAITING row
         past its signed ``expires_at`` IS EXPIRED at that instant. A corrupt op is skipped and
         counted."""
         cutoff = parse_stamp(utc_stamp(now))       # a naive ``now`` is refused before any row is read
@@ -1165,7 +1168,7 @@ class CockpitDB:
                     continue
                 if at < since:
                     continue
-                outcome = state
+                outcome = _OUTCOME_NAMES.get(state, state)
                 if state == "COMMITTED":
                     if not any(isinstance(e.get("changes"), dict) and e["changes"] == {"deleted": True}
                                for e in record["effects"]):

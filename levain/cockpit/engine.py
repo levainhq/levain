@@ -1118,6 +1118,11 @@ class Cockpit:
         note = snap.note
         if labelled is not None and labelled.error:
             note = f"{note}; {labelled.error}" if note else labelled.error
+        degraded = getattr(labelled, "degraded", 0) if labelled is not None else 0
+        if degraded:
+            # §8d row 3: a corrupt label row degrades only its resource, and says so
+            msg = f"{degraded} label row(s) unreadable: their resources read unverified"
+            note = f"{note}; {msg}" if note else msg
         # an ordering's uncounted groups (K2b-3b §3) are carried, never counted
         count = (len(counted_rows(spec.order, snap.rows)) if (listy and snap.rows is not None)
                  else (0 if listy and snap.status != "error" else None))

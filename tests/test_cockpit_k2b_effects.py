@@ -91,7 +91,7 @@ def test_each_kind_applies_then_reapplies_as_already(path, name, verb, params, k
     assert path.read_bytes() == before
     if verb == "spore_seed":
         assert first.members[0].native_id == row["id"] == again.members[0].native_id
-        assert set(first.members[0].label_fields) == {"text", "disposition"}
+        assert set(first.members[0].label_fields) == {"text", "disposition", "domain"}   # a create labels every field, the empty domain too
 
 
 def test_ascend_kind_validated_against_spore_type(path):
@@ -137,9 +137,9 @@ def test_create_found_by_origin_key_after_another_writer_is_already(path, other)
     assert r.members[0].native_id == native
     labels = set(r.members[0].label_fields)
     if other == "edit":
-        assert labels == {"disposition"}            # text moved: no label on it
+        assert labels == {"disposition", "domain"}   # text moved: no label on it
     else:
-        assert labels == {"text"}                    # disposition moved
+        assert labels == {"text", "domain"}          # disposition moved
     assert len(st.list_open()) + len(json.loads(path.read_text())["resolved"]) == 4
 
 

@@ -172,7 +172,7 @@ def test_only_outcomes_is_empty_with_the_history_still_carried(tmp_path):
 # --- (d) Recent edits: broker fires from the journal ----------------------------------------------------
 
 
-def test_edits_with_no_ledger_shows_the_journal_fire_with_its_label(tmp_path):
+def test_edits_with_no_ledger_shows_the_journal_fire(tmp_path):
     rig = Rig(tmp_path)
     j = _journal(tmp_path)
     pid = fire(j, "k1")
@@ -184,8 +184,8 @@ def test_edits_with_no_ledger_shows_the_journal_fire_with_its_label(tmp_path):
     (row,) = p["rows"]
     assert row["id"] == f"fire:{pid}:0"
     assert row["facets"] == {"edit_kind": "spore_update", "at": "2026-10-10T12:01:00.000000Z", "undoable": False}
-    assert row["provenance"]["label"] == "claims cockpit token"
-    assert row["provenance"]["operation_id"] == pid
+    assert row["provenance"] is None               # a fire: row is history; only tomb: rows carry a label (L2 F2)
+    assert "token" in row["title"]                 # who made the edit: its credential
     assert row["actions"] == []                    # undo applies to undoable rows only
 
 

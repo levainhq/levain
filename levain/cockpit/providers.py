@@ -26,6 +26,7 @@ from levain.dashboard import (
     CLASS_A,
     CLASS_B,
     CLASS_C,
+    LOOP_DISPOSITION,
     SubstrateSource,
     SubstrateView,
     OpenSpore,
@@ -133,7 +134,12 @@ def spore_label_key(stored: Mapping[str, Any]) -> LabelKey | None:
     ok = stored.get("origin_key")
     if not isinstance(ok, str) or not ok:
         return None
-    return LabelKey(spore_resource_key(ok), {f: _stored_authority(stored, f) for f in SPORE_AUTHORITY_FIELDS})
+    values = {f: _stored_authority(stored, f) for f in SPORE_AUTHORITY_FIELDS}
+    if values["disposition"] == LOOP_DISPOSITION:
+        # the view names a plain loop's absent disposition LOOP_DISPOSITION; the store, and so the label,
+        # hold it as absent (None), so the hash is taken over None
+        values["disposition"] = None
+    return LabelKey(spore_resource_key(ok), values)
 
 
 def section_label_key(heading: str) -> Callable[[Mapping[str, Any]], LabelKey | None]:
@@ -467,8 +473,7 @@ def _journal_edits(source: SubstrateSource, page: Any) -> list[RowIn]:
         stored: dict[str, Any] = {
             "_fire": True, "operation_id": e.operation_id, "idx": e.idx, "state": e.state, "verb": e.verb,
             "resource_key": e.resource_key, "store": e.store, "changes": dict(e.changes),
-            "credential": e.credential, "applied_at": e.applied_at,
-            "label_values": {f: proj[f] for f in e.label_fields if f in proj}}
+            "credential": e.credential, "applied_at": e.applied_at}
         facets = {"edit_kind": str(e.verb or ""), "at": _utc_at(e.applied_at), "undoable": False}
         who = f" ({e.credential})" if e.credential else ""
         if e.resource_key.startswith(TOMB_KEY_PREFIX):
@@ -489,17 +494,17 @@ def _journal_edits(source: SubstrateSource, page: Any) -> list[RowIn]:
 
 
 def edit_label_key(stored: Mapping[str, Any]) -> LabelKey | None:
-    """A Recent edits row's label key: a broker fire's own labels row (bound to its op); a ``tomb:``
-    row's under the gate read once into ``stored`` (§8d row 5). A ledger row has none."""
-    if stored.get("_fire") is not True:
+    """A Recent edits row's label key: only a ``tomb:`` row has one, its op's labels row under the gate
+    read once into ``stored`` (§8d row 5), because a label describes the STORE's state (flow §4.5). A
+    ``fire:`` row is history: it shows who made the edit (its credential) and carries no label, since a
+    fire's own signed values always match its own labels row whatever the store holds now. A ledger
+    row has none."""
+    if stored.get("_fire") is not True or "_tomb_gate" not in stored:
         return None
-    op = stored.get("operation_id")
-    if "_tomb_gate" in stored:
-        from levain.cockpit.anneal_effects import tomb_resource_key
+    from levain.cockpit.anneal_effects import tomb_resource_key
 
-        ok = stored["origin_key"]
-        return LabelKey(tomb_resource_key(ok), {"origin_key": ok}, op, stored["_tomb_gate"])
-    return LabelKey(stored["resource_key"], dict(stored.get("label_values") or {}), op)
+    ok = stored["origin_key"]
+    return LabelKey(tomb_resource_key(ok), {"origin_key": ok}, stored.get("operation_id"), stored["_tomb_gate"])
 
 
 def _edits(source: SubstrateSource,
