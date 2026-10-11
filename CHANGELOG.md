@@ -18,11 +18,17 @@ The cockpit's write side, part one (K2a). It ships in one release with K2b (the 
 - **Open loops comes before the Tray**, and the Tray has a **By age** view: the same box, the same rows, oldest first, with each item's age. The page switches between the Tray's order and By age without re-sorting anything itself: the server sends both orders.
 - **The Episodes panel can show other agents' episodes.** An embedding server passes `episode_feeds={name: read}` to `build_default_cockpit`; each feed's rows appear with their agent, and the page gets an agent filter. A feed that fails, or sends rows that are not episodes, is named on the panel and shows nothing, and the entity's own episodes stay. Only the entity's own episodes can be tombstoned. The entity's own episodes are its newest few dozen, and the panel says so; other agents' rows are not cut to that window, so a busy entity never hides them.
 - **The neocortex section panels offer no edit for now.** Editing a section returns with anneal's section writer.
+- **The manifest page writes (`/?source=manifest`, opt-in).** Every affordance posts `/cockpit/verb` with the row it was shown. A write that may rise above its rendered tier first asks the server for a preview (`dry_run`), shows the tier it rises to and what it does, and fires the exact request you saw only on a second click; a fire that names an `intent` must also name the previewed `tier_seen` and `gesture_seen`, and the server refuses `409 tier_moved` / `gesture_moved` when either has changed. A T2 write in a reported install is labelled `claims cockpit token`. Each fire above C1 carries one idempotency key, kept for the tab, so a retry after a lost answer lands once. A pending your signature is waiting on shows on its row with a cancel button. The manifest names the server's write capability (`transport: {writable, write_token_required}`), and a resolve or promote action names the kinds its row's type takes (`options`). A row whose text holds characters the page cannot show faithfully (a zero-width space, a line separator) offers no inline edit; edit it with the CLI. Rename shows only where the cockpit offers it.
+- **A spore's domain is editable** (`spore_update` takes `domain`; the inline edit has a domain field). The broker refuses a type change on a Keep note or an open loop, as the legacy route does.
+- **A downstream verb can fire through the broker.** An embedding server passes `make_server(extra_effects={verb: DownstreamEffect(store, canonical)})`: an `EffectStore` and its `canonical_effect` for that verb, checked at construction. An `ActionVerb` may declare `fields`, which the manifest publishes and the route enforces.
 
 ### Known limits
 
 - The TUI's spore writes are compared on the item's list (`expect_disposition`), not on its version.
 - Without `flock` (Windows), a version-bound write (the cockpit's state line and spore writes) is refused; an unchecked `levain state` writes as before.
+- A downstream verb with no `extra_effects` entry is T2 and has no broker effect, so it is refused (`needs_broker` on `/action`, `not_built` on `/cockpit/verb`). An embedding server that sent messages through `/action` before this release needs an effect store for that verb.
+- The preview binds the tier and the gesture, not the params; the page sends exactly the params it previewed.
+- Downstream jobs (`job=True` verbs) have no manifest-page path yet.
 
 ## [0.7.2] — 2026-10-10
 
