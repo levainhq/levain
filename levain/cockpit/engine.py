@@ -45,8 +45,11 @@ from levain.cockpit.registry import (
     FACETS,
     ORDERINGS,
     CockpitRegistrationError,
+    OUTCOME_ROW_PREFIX,
+    PENDING_ROW_PREFIX,
     FacetValueError,
     apply_ordering,
+    counted_rows,
     parse_date,
     validate_facets,
 )
@@ -71,6 +74,13 @@ _VIEW_ID = re.compile(r"(?!default\Z)[a-z0-9][a-z0-9_-]{0,31}")     # matched wh
 VALUE_ABSENT = "absent"   # the value_version of a line/prose value with no stored record yet
 PROCESS_GRACE_S = 5.0     # how long a joiner waits for the owner to process a finished read
 _STATUS_RANK = {"ok": 0, "empty": 0, "partial": 1, "stale": 2, "error": 3}
+
+
+DECISIONS_ID = "decisions"
+DECISION_ORDER = "decision.queue"
+KERNEL_DECISION_PREFIXES = (PENDING_ROW_PREFIX, OUTCOME_ROW_PREFIX)
+KERNEL_DECISION_FACETS = frozenset({"principal", "pending_tier", "expires_at", "due", "at", "outcome", "verb",
+                                    "reason", "unapplied", "cancelled_by"})
 
 
 def _canon(obj: Any) -> bytes:
@@ -263,6 +273,61 @@ class _Refresher:
         self.stop_event.set()
 
 
+@dataclass
+class _Decisions:
+    """The ``decisions`` panel's contributors (K2b-3b §0.4): a downstream's ``open`` source, kept whole,
+    and the broker's reader. ``spec`` is the panel the kernel registered for them, None while a
+    downstream's own ``register(ProviderSpec("decisions", ...))`` holds the id (today's panel)."""
+
+    source: "ProviderSpec | None" = None
+    rows: Callable[[datetime], Any] | None = None
+    spec: "ProviderSpec | None" = None
+
+
+def _composed(ctx: "ReadContext") -> Result:
+    return Fault("the decisions panel is composed by the kernel; it has no read of its own")
+
+
+def _broker_decision_spec() -> "ProviderSpec":
+    """The spec the broker's rows are read and versioned under (never registered): ``stored`` is
+    exactly what a row's version covers, ``(state, expires_at)`` for a pending and
+    ``(record_sha256, state)`` for an outcome (§3)."""
+    return ProviderSpec(DECISIONS_ID, "triage-list", "Decisions", "gate", _composed, order=DECISION_ORDER,
+                        facets=KERNEL_DECISION_FACETS, version_fields=("*",))
+
+
+def _due_of(stamp: str) -> str:
+    return _parse_iso(stamp).astimezone().date().isoformat()
+
+
+def _target_text(target: Any) -> str:
+    t = target if isinstance(target, dict) else {}
+    for k in ("row_id", "panel_id", "pending_id", "kind"):
+        if isinstance(t.get(k), str) and t[k]:
+            return t[k]
+    return "?"
+
+
+def _decision_rows_in(got: Any) -> list[RowIn]:
+    """The broker's ``DecisionRows`` as rows (§3): ``pend:<id>`` per pending waiting on a signature,
+    ``out:<operation_id>`` per outcome."""
+    rows: list[RowIn] = []
+    for p in got.pendings:
+        rows.append(RowIn(
+            id=f"{PENDING_ROW_PREFIX}{p.pending_id}", title=f"{p.verb or '?'} on {_target_text(p.target)}",
+            facets={"principal": p.principal, "pending_tier": p.tier, "expires_at": p.expires_at,
+                    "due": _due_of(p.expires_at), "at": p.issued_at},
+            stored={"state": "WAITING", "expires_at": p.expires_at}))
+    for o in got.outcomes:
+        rows.append(RowIn(
+            id=f"{OUTCOME_ROW_PREFIX}{o.operation_id}", title=f"{o.verb or '?'}: {o.outcome}",
+            body=o.reason,
+            facets={"at": o.terminal_at, "outcome": o.outcome, "verb": o.verb or "", "reason": o.reason,
+                    "unapplied": list(o.unapplied), "cancelled_by": o.cancelled_by},
+            stored={"record_sha256": o.record_sha256, "state": o.state}))
+    return rows
+
+
 class Cockpit:
     def __init__(
         self,
@@ -285,6 +350,10 @@ class Cockpit:
         self._life = threading.Lock()    # start() and stop() never run at once
         self._verb_view: Any = None      # levain.cockpit.verbs.VerbView, attached by the server (K2a)
         self._labeller: Callable[[], LabelSnapshot] | None = None    # the broker's, attached by the server (K2b)
+        self._dec = _Decisions()          # the decisions panel's contributors (K2b-3b §0.4)
+        self._broker_dec_spec = _broker_decision_spec()
+        # the broker's Recent edits reader (fn(limit) -> EditsPage), attached by the server (K2b-3b §0.6)
+        self._edits_reader: Callable[[int], Any] | None = None
         # source reads made inside a write still running (a hung source keeps its flight here)
         self._one_live: list[list[Any]] = []
 
@@ -297,6 +366,80 @@ class Cockpit:
     def attach_labeller(self, fn: Callable[[], LabelSnapshot]) -> None:
         """Attach the labeller: ``fn()`` is ONE journal read, taken once per request (design §0.1)."""
         self._labeller = fn
+
+    def attach_edits_reader(self, fn: Callable[[int], Any]) -> None:
+        """Attach the broker's journal edits reader: ``fn(limit)`` returns an ``EditsPage``, None while
+        the broker is not ACTIVE, or raises (K2b-3b §0.6). Recent edits merges it with the ledger."""
+        self._edits_reader = fn
+
+    @property
+    def edits_reader(self) -> Callable[[int], Any] | None:
+        return self._edits_reader
+
+    def attach_decision_source(self, spec: ProviderSpec) -> None:
+        """A downstream's ``open`` decisions, as a CONTRIBUTOR of the kernel's ``decisions`` panel (K2b-3b
+        §0.4): read and normalised under its own spec (facets, versions, ``read_one``, Fault), then
+        grouped under ``decision.queue`` with the broker's rows. Refused while a downstream's own
+        ``register(ProviderSpec("decisions", ...))`` holds the id."""
+        if spec.kind != "triage-list" or not spec.version_fields:
+            raise CockpitRegistrationError("a decision source is a triage-list declaring version_fields")
+        for f in spec.facets:
+            if f not in FACETS:
+                raise CockpitRegistrationError(f"decision source: unregistered facet {f!r}")
+        if spec.order is not None and spec.order not in ORDERINGS:
+            raise CockpitRegistrationError(f"decision source: unknown ordering {spec.order!r}")
+        with self._lock:
+            if self._dec.source is not None:
+                raise CockpitRegistrationError("a decision source is already attached")
+            if DECISIONS_ID in self._specs and self._specs[DECISIONS_ID] is not self._dec.spec:
+                raise CockpitRegistrationError(
+                    "panel 'decisions' is registered by a downstream: attach its source instead of registering it")
+            self._dec.source = spec
+            self._install_decisions_locked()
+
+    def attach_decision_rows(self, fn: Callable[[datetime], Any]) -> None:
+        """The broker's reader of its own decisions rows: ``fn(now)`` returns ``DecisionRows``, None
+        while the broker is not ACTIVE, or raises. With no downstream ``decisions`` registered the
+        kernel registers its own panel; a downstream that registered one keeps exactly its panel."""
+        with self._lock:
+            self._dec.rows = fn
+            if DECISIONS_ID not in self._specs or self._specs[DECISIONS_ID] is self._dec.spec:
+                self._install_decisions_locked()
+
+    def _install_decisions_locked(self) -> None:
+        """(Re)register the kernel's ``decisions`` panel over the current contributors."""
+        src = self._dec.source
+        spec = ProviderSpec(
+            DECISIONS_ID, "triage-list", src.title if src else "Decisions waiting", "gate", _composed,
+            region=src.region if src else "operate", rank=src.rank if src else -1,
+            refresh_every_s=src.refresh_every_s if src else None,
+            stale_after_s=src.stale_after_s if src else 900.0, timeout_s=src.timeout_s if src else 10.0,
+            order=DECISION_ORDER, facets=KERNEL_DECISION_FACETS | (src.facets if src else frozenset()),
+            version_fields=("*",), search_fields=src.search_fields if src else ("title", "body"),
+            search_default_visible=src.search_default_visible if src else 10,
+            read_one=lambda ctx, row_id: Fault("the decisions panel routes read_one by row id"),
+            note=src.note if src else "", empty=src.empty if src else "Nothing is waiting on you.",
+            rowset=src.rowset if src else None, edit_class=src.edit_class if src else "",
+            verbs=src.verbs if src else (), label_key=src.label_key if src else None)
+        old = self._dec.spec
+        if old is not None and self._specs.get(DECISIONS_ID) is old:
+            self._unregister_locked(DECISIONS_ID)
+        self._register_locked(spec)
+        self._dec.spec = spec
+
+    def _unregister_locked(self, sid: str) -> None:
+        specs = dict(self._specs)
+        old = specs.pop(sid)
+        if old.rowset is not None and self._rowsets.get(old.rowset) == sid:
+            del self._rowsets[old.rowset]
+        states = dict(self._state)
+        states.pop(sid, None)
+        self._specs = specs
+        self._state = states
+
+    def _is_composed(self, panel_id: str, specs_map: dict[str, ProviderSpec] | None = None) -> bool:
+        spec = (specs_map if specs_map is not None else self._specs).get(panel_id)
+        return spec is not None and spec is self._dec.spec
 
     def labels(self) -> LabelSnapshot:
         """One label snapshot. A labeller that raises is an error snapshot, never a failed panel: a
@@ -367,6 +510,12 @@ class Cockpit:
 
     def _register_locked(self, spec: ProviderSpec) -> None:
         sid = spec.id
+        if sid == DECISIONS_ID and spec is not self._dec.spec and self._is_composed(sid):
+            if self._dec.source is not None:
+                raise CockpitRegistrationError("panel 'decisions' composes an attached decision source")
+            # a downstream's own decisions panel is exactly today's: the broker's rows leave with the kernel's
+            self._unregister_locked(sid)
+            self._dec.spec = None
         if not sid or sid in self._specs or sid == NOW_ID:
             raise CockpitRegistrationError(f"panel id {sid!r} is empty, reserved or already registered")
         if spec.kind not in KINDS:
@@ -600,6 +749,8 @@ class Cockpit:
         turns its output into a snapshot (or a Fault) in the worker; ``commit`` is the owner's
         bookkeeping and publication of ``snap``, ``last_completion`` and ``fresh``."""
         def produce() -> Any:
+            if spec is self._dec.spec:
+                return self._compose_decisions(ctx)
             return self._normalize(spec, ctx, spec.read(ctx))
 
         def commit(raw: Any) -> _Snap:
@@ -660,6 +811,90 @@ class Cockpit:
         except Exception as exc:  # noqa: BLE001 - malformed provider output of ANY shape is a Fault, never a crash
             return Fault(f"provider output refused: {_safe_str(exc)}")
 
+    def _compose_decisions(self, ctx: ReadContext) -> Any:
+        """The kernel's ``decisions`` panel (K2b-3b §0.4, §3, §8d row 4), in the read worker. Each
+        contributor is read and normalised under its OWN spec; finished rows are never sent back
+        through ``_rows``. The open source's Fault (or Absent) is the panel's (the M3 rule); a broker
+        that cannot be read leaves the open rows and says so in the note. A downstream row whose id
+        carries a broker prefix is skipped and counted on the downstream."""
+        dec, now_iso = self._dec, _iso(ctx.now)
+        rows: list[dict[str, Any]] = []
+        keys: dict[str, LabelKey] = {}
+        skipped: list[dict[str, Any]] = []
+        filtered: list[dict[str, Any]] = []
+        notes: list[str] = []
+        as_ofs: list[str] = []
+        stale = False
+        empty: str | None = None
+        src = dec.source
+        if src is not None:
+            try:
+                raw = src.read(ctx)
+            except Exception as exc:  # noqa: BLE001 - a provider exception is its Fault
+                return Fault(f"{type(exc).__name__}: {_safe_str(exc)}")
+            out = self._normalize(src, ctx, raw)
+            if not isinstance(out, _Snap):
+                return out
+            mine = [r for r in out.rows or [] if r["id"].startswith(KERNEL_DECISION_PREFIXES)]
+            rows += [r for r in out.rows or [] if not r["id"].startswith(KERNEL_DECISION_PREFIXES)]
+            keys.update({i: k for i, k in (out.label_keys or {}).items()
+                         if not i.startswith(KERNEL_DECISION_PREFIXES)})
+            skipped += out.skipped
+            if mine:
+                skipped.append({"count": len(mine), "reason": "open row skipped: its id carries a broker "
+                                                               "prefix (pend:/out:)"})
+            filtered += out.filtered
+            if out.note:
+                notes.append(out.note)
+            if out.as_of:
+                as_ofs.append(out.as_of)
+            stale = out.status == "stale"
+            empty = out.empty
+        if dec.rows is None:
+            notes.append("no cockpit broker: decisions waiting on a signature are not shown")
+        else:
+            try:
+                got = dec.rows(ctx.now)
+                if got is None:
+                    notes.append("decisions waiting on a signature are served by the active broker")
+                else:
+                    bs = self._read_snap(self._broker_dec_spec, Read(
+                        rows=tuple(_decision_rows_in(got)),
+                        skipped=((got.skipped, "unreadable cockpit op"),) if got.skipped else ()), ctx, now_iso)
+                    rows += bs.rows or []
+                    skipped += bs.skipped
+            except Exception as exc:  # noqa: BLE001 - the gate panel never goes dark over a journal fault
+                notes.append(f"broker decisions unavailable: {type(exc).__name__}: {_safe_str(exc)}")
+        rows = self._regroup(rows, ctx.today)
+        status = "partial" if skipped else ("empty" if not counted_rows(DECISION_ORDER, rows) else "ok")
+        if stale and _STATUS_RANK["stale"] > _STATUS_RANK[status]:
+            status = "stale"
+        return _Snap(status, rows, None, filtered, skipped, min(as_ofs) if as_ofs else now_iso, None,
+                     "; ".join(n for n in notes if n), stale, empty, label_keys=keys if src is not None and
+                     src.label_key is not None else None)
+
+    @staticmethod
+    def _regroup(rows: list[dict[str, Any]], today: date) -> list[dict[str, Any]]:
+        """Finished rows under ``decision.queue``: its group, its order and its band; nothing else of a
+        row (version, facets, provenance) changes."""
+        o = ORDERINGS[DECISION_ORDER]
+        by_id = {r["id"]: r for r in rows}
+        ins = [RowIn(id=r["id"], title=r.get("title") or "", facets=r.get("facets") or {}) for r in rows]
+        return [{**by_id[rin.id], "group": g, "band": _band(by_id[rin.id].get("facets") or {}, g, o, today)}
+                for rin, g in apply_ordering(DECISION_ORDER, ins, today)]
+
+    def _broker_decision_one(self, ctx: ReadContext, row_id: str) -> Result:
+        fn = self._dec.rows
+        if fn is None:
+            return Absent("no cockpit broker")
+        got = fn(ctx.now)
+        if got is None:
+            return Fault("decisions waiting on a signature are served by the active broker")
+        for r in _decision_rows_in(got):
+            if r.id == row_id:
+                return Read(rows=(r,))
+        return Absent(f"decision {row_id!r} is gone")
+
     def _book(self, spec: ProviderSpec, st: _State, out: Any, ctx: ReadContext) -> _Snap:
         """The owner's bookkeeping for one outcome: failure start, last good, presence. It reads only
         our own types, so it cannot be held by a provider."""
@@ -703,7 +938,7 @@ class Cockpit:
             rows, refused = self._rows(spec, list(res.rows), ctx)
             if refused:
                 skipped.append({"count": refused, "reason": "row refused: a facet value of the wrong type"})
-            status = "partial" if skipped else ("empty" if not rows else "ok")
+            status = "partial" if skipped else ("empty" if not counted_rows(spec.order, rows) else "ok")
             value = None
             # the views' orders are computed here, in the read worker, like every other ordering: an
             # ordering key runs on provider data, so its failure is this read's Fault, never a crash
@@ -841,14 +1076,7 @@ class Cockpit:
             badges.append({"kind": "age_days", "value": f["age_days"]})
         if due:
             badges.append({"kind": "due", "value": due.isoformat()})
-        if group is not None and group in o.urgent:
-            band = "now"
-        elif due and (due < today or due == today) and not o.urgent:
-            band = "now"
-        elif due and 0 < (due - today).days <= SOON_DAYS:
-            band = "soon"
-        else:
-            band = "later"
+        band = _band(f, group, o, today)
         return {
             "id": row.id,
             "version": self.row_version(spec, row.stored),
@@ -890,13 +1118,17 @@ class Cockpit:
         note = snap.note
         if labelled is not None and labelled.error:
             note = f"{note}; {labelled.error}" if note else labelled.error
-        count = len(snap.rows) if (listy and snap.rows is not None) else (0 if listy and snap.status != "error" else None)
+        # an ordering's uncounted groups (K2b-3b §3) are carried, never counted
+        count = (len(counted_rows(spec.order, snap.rows)) if (listy and snap.rows is not None)
+                 else (0 if listy and snap.status != "error" else None))
         groups = None
         if listy and spec.order and ORDERINGS[spec.order].groups:
             tally: dict[str, int] = {}
             for r in snap.rows or []:
                 tally[r["group"]] = tally.get(r["group"], 0) + 1
-            groups = [{"id": gid, "title": t, "count": tally.get(gid, 0)} for gid, t in ORDERINGS[spec.order].groups]
+            o = ORDERINGS[spec.order]
+            groups = [{"id": gid, "title": t, "count": tally.get(gid, 0),
+                       **({"uncounted": True} if gid in o.uncounted else {})} for gid, t in o.groups]
         title = spec.title
         if snap.status == "error":
             title += " (unavailable)"
@@ -906,6 +1138,7 @@ class Cockpit:
             "id": spec.id, "kind": spec.kind, "title": title, "priority": spec.priority,
             "rank": spec.rank, "status": snap.status,
             "count": None if snap.status == "error" else count,
+            "actionable_count": None if snap.status == "error" else count,
             "filtered": snap.filtered, "skipped": snap.skipped,
             "as_of": snap.as_of, "stale_after_s": spec.stale_after_s,
             "refresh_every_s": spec.refresh_every_s,
@@ -952,7 +1185,7 @@ class Cockpit:
             if snap.as_of:
                 as_ofs.append(snap.as_of)
             labelled = labelled or s.label_key is not None
-            for r in self._with_provenance(snap.rows or [], snap.label_keys, labels):
+            for r in self._with_provenance(counted_rows(s.order, snap.rows or []), snap.label_keys, labels):
                 if r["band"] == "now":
                     rows.append({**r, "panel_id": s.id})
         if worst in ("ok", "empty"):
@@ -965,6 +1198,7 @@ class Cockpit:
         head = {
             "id": NOW_ID, "kind": "triage-list", "title": f"Now ({len(rows)})" if worst != "error" else "Now (unavailable)",
             "priority": "gate", "rank": -100, "status": worst, "count": len(rows) if worst != "error" else None,
+            "actionable_count": len(rows) if worst != "error" else None,
             "filtered": [], "skipped": [], "as_of": snap.as_of, "stale_after_s": 0, "refresh_every_s": None,
             "etag": self._etag_of(snap, None, cred, ctx.today), "error": err, "note": snap.note,
             "empty": "Nothing needs you now.", "order": None, "groups": None, "search": None,
@@ -976,6 +1210,8 @@ class Cockpit:
         for src in sources:
             if src.order and ORDERINGS[src.order].groups:
                 for gid, title in ORDERINGS[src.order].groups:
+                    if gid in ORDERINGS[src.order].uncounted:
+                        continue      # the now view takes counted groups only
                     union.setdefault(gid, {"id": gid, "title": title, "count": 0})
         for r in rows:
             if r["group"] in union:
@@ -1253,8 +1489,17 @@ class Cockpit:
         gesture plus the param values that escalate it). A now-view row takes its source panel's."""
         if self._verb_view is None:
             return rows
-        return [{**r, "actions": self._verb_view.row_actions(r.get("panel_id") or panel_id, r, cred, today)}
-                for r in rows]
+        out = []
+        for r in rows:
+            pid = r.get("panel_id") or panel_id
+            if self._is_composed(pid) and str(r["id"]).startswith(KERNEL_DECISION_PREFIXES):
+                # a broker row offers no panel verb; a pending offers its own cancel (§3)
+                acts = (self._verb_view.pending_actions(r, cred)
+                        if str(r["id"]).startswith(PENDING_ROW_PREFIX) else [])
+            else:
+                acts = self._verb_view.row_actions(pid, r, cred, today)
+            out.append({**r, "actions": acts})
+        return out
 
     def read_one(self, panel_id: str, row_id: str, *, authority: RequestAuthority | None = None) -> Result:
         """Read ONE row from the SOURCE through the provider's ``read_one``, never from a refresher
@@ -1263,13 +1508,23 @@ class Cockpit:
         one the caller's request bound (``authority.bound``): the caller's one snapshot, never a
         second journal read. With neither, this read is its own outer boundary and takes one."""
         spec = self._specs.get(panel_id)
-        if spec is None or spec.read_one is None:
+        composed = spec is not None and spec is self._dec.spec
+        if composed:
+            # the decisions panel routes by row id to the contributor that owns it (§0.4, §8d row 4)
+            if row_id.startswith(KERNEL_DECISION_PREFIXES):
+                spec, reader = self._broker_dec_spec, self._broker_decision_one
+            else:
+                src = self._dec.source
+                spec, reader = src, (src.read_one if src is not None else None)
+        else:
+            reader = spec.read_one if spec is not None else None
+        if spec is None or reader is None:
             return Fault(f"panel {panel_id!r} offers no read_one")
         auth = authority or current() or self.authority()
         ctx = ReadContext(auth.now, authority=auth)
 
         def once(ctx: ReadContext) -> Result:
-            res = spec.read_one(ctx, row_id)       # type: ignore[misc]
+            res = reader(ctx, row_id)
             if not isinstance(res, Read):
                 return res
             try:
@@ -1278,6 +1533,8 @@ class Cockpit:
                 rows, refused = self._rows(spec, list(res.rows), ctx)   # type: ignore[arg-type]
                 if refused or len(rows) != 1:
                     return Fault("read_one row refused: a facet value of the wrong type")
+                if composed:
+                    rows = self._regroup(rows, ctx.today)
                 keys = self._label_keys(spec, list(res.rows), {rows[0]["id"]})   # type: ignore[arg-type]
                 return Read(value=self._with_provenance(rows, keys, auth.labels)[0])
             except Exception as exc:  # noqa: BLE001
@@ -1333,6 +1590,19 @@ class Cockpit:
             return self._bounded(timeout_s, st, fn, *args)
         finally:
             entry[1] = True
+
+
+def _band(facets: dict[str, Any], group: str | None, o: Any, today: date) -> str:
+    """A row's band under ordering ``o``: an urgent group is ``now``; else a due date today or past is
+    ``now`` (when the ordering names no urgent groups), one within ``SOON_DAYS`` is ``soon``."""
+    due = parse_date(facets.get("due"))
+    if group is not None and group in o.urgent:
+        return "now"
+    if due and (due < today or due == today) and not o.urgent:
+        return "now"
+    if due and 0 < (due - today).days <= SOON_DAYS:
+        return "soon"
+    return "later"
 
 
 def _safe_str(exc: object) -> str:

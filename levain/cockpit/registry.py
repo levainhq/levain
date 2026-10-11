@@ -85,6 +85,14 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     # the one closed registry, rather than invented by the provider.
     "job_status": ("enum", _enum("pending", "running", "done", "failed")),
     "verb": ("str", _is_str),
+    # K2b-3b §3: the broker's rows of the decisions panel (a pending waiting on a signature, an outcome)
+    "principal": ("str", _is_str),
+    "pending_tier": ("enum", _enum("C1", "T2", "T3")),
+    "expires_at": ("timestamp", _is_str),
+    "outcome": ("str", _is_str),
+    "reason": ("str|null", _opt(_is_str)),
+    "unapplied": ("list[str]", _is_str_list),
+    "cancelled_by": ("str|null", _opt(_is_str)),
 }
 
 
@@ -112,13 +120,16 @@ class Ordering:
     """``key`` is the sort key within a group; ``group`` assigns a group id (or None when the
     ordering declares no groups); ``groups`` lists the group ids in display order with titles;
     ``urgent`` names the groups whose rows are ``band == "now"`` (one definition of urgent per
-    row set, owned by its ordering, design §3.2.4)."""
+    row set, owned by its ordering, design §3.2.4). ``uncounted`` names the groups a panel still
+    carries but does not count: history beside the queue (K2b-3b §3), outside ``count``, ``empty``
+    and the ``now`` view."""
 
     name: str
     key: Callable[[RowIn, date], tuple]
     group: Callable[[RowIn, date], str] | None = None
     groups: tuple[tuple[str, str], ...] = ()
     urgent: frozenset[str] = frozenset()
+    uncounted: frozenset[str] = frozenset()
 
 
 KERNEL_PREFIXES = frozenset({"spore", "time", "decision", "exposure", "crystal", "legacy"})
@@ -215,6 +226,27 @@ def _decision_key(row: RowIn, today: date) -> tuple:
     return (0 if d else 1, d.toordinal() if d else 0, row.id)
 
 
+# the decisions panel's row ids by owner (K2b-3b §0.4, §8d row 4): the broker's two prefixes; every
+# other id is the downstream's open row
+PENDING_ROW_PREFIX = "pend:"
+OUTCOME_ROW_PREFIX = "out:"
+
+
+def _queue_group(row: RowIn, today: date) -> str:
+    if row.id.startswith(PENDING_ROW_PREFIX):
+        return "waiting"
+    if row.id.startswith(OUTCOME_ROW_PREFIX):
+        return "outcomes"
+    return "open"
+
+
+def _queue_key(row: RowIn, today: date) -> tuple:
+    # open and waiting: dated first (a pending's due is its expiry date); history: newest first
+    if _queue_group(row, today) in ("open", "waiting"):
+        return _decision_key(row, today)
+    return _time_desc_key(row, today)
+
+
 def _exposure_key(row: RowIn, today: date) -> tuple:
     v = row.facets.get("exposure_count")
     return (-(v if isinstance(v, int) else 0), row.id)
@@ -241,7 +273,8 @@ def register_ordering(o: Ordering, *, builtin: bool = False) -> None:
     if o.name in ORDERINGS:
         raise CockpitRegistrationError(f"ordering {o.name!r} is already registered")
     ids = [g[0] for g in o.groups]
-    if len(set(ids)) != len(ids) or not o.urgent <= set(ids):
+    if len(set(ids)) != len(ids) or not o.urgent <= set(ids) or not o.uncounted <= set(ids) \
+            or o.urgent & o.uncounted:
         raise CockpitRegistrationError(f"ordering {o.name!r}: bad groups")
     if bool(o.groups) != (o.group is not None):
         raise CockpitRegistrationError(f"ordering {o.name!r}: groups and group() go together")
@@ -261,11 +294,27 @@ register_ordering(Ordering("spore.keep", _keep_key), builtin=True)
 register_ordering(Ordering("spore.age", _age_key), builtin=True)   # the Tray's "by age" view
 register_ordering(Ordering("time.desc", _time_desc_key), builtin=True)
 register_ordering(Ordering("decision.dated", _decision_key), builtin=True)
+register_ordering(
+    Ordering(
+        "decision.queue", _queue_key, _queue_group,
+        (("open", "Waiting on you"), ("waiting", "Waiting on a signature"), ("resolved", "Resolved"),
+         ("outcomes", "Outcomes")),
+        uncounted=frozenset({"resolved", "outcomes"}),
+    ),
+    builtin=True,
+)
 register_ordering(Ordering("exposure.desc", _exposure_key), builtin=True)
 register_ordering(Ordering("crystal.level", _crystal_key), builtin=True)
 # rows a migrated source already ordered (an external panel, design §6.2): one constant key, and the stable
 # sort keeps the source's own order
 register_ordering(Ordering("legacy.source", lambda row, today: ()), builtin=True)
+
+
+def counted_rows(order: str | None, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The rows of ``rows`` (finished rows, each with its ``group``) outside the ordering's uncounted
+    groups: what ``count``, ``empty`` and the ``now`` view see (K2b-3b §3)."""
+    uncounted = ORDERINGS[order].uncounted if order in ORDERINGS else frozenset()
+    return [r for r in rows if r.get("group") not in uncounted] if uncounted else list(rows)
 
 
 def apply_ordering(name: str, rows: list[RowIn], today: date) -> list[tuple[RowIn, str | None]]:

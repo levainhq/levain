@@ -142,8 +142,9 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
 
 def _rows(head: dict[str, Any], panel: dict[str, Any], width: int, top_n: int) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
-    rows = panel.get("rows") or []
     group_counts = {g["id"]: g for g in head.get("groups") or []}
+    # the queue only: an uncounted group (a panel's history, K2b-3b §3) is not drawn here
+    rows = [r for r in panel.get("rows") or [] if not (group_counts.get(r.get("group")) or {}).get("uncounted")]
     drawn: dict[Any, int] = {}
     current: Any = object()
     for r in rows:

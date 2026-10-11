@@ -155,6 +155,17 @@ class EpisodeEffectStore:
         ok = ep.origin_key
         return (ok if isinstance(ok, str) and ok else None), str(ep.source)
 
+    def origin_key_status(self, origin_key: str) -> Any:
+        """anneal's ``origin_key_status`` from a read-only open: ``state`` (live / retired / unknown),
+        ``episode_id``, ``effect_id``. ``TransientApplyFault`` for a read that faulted (K2b-3b §0.7:
+        a tomb row's gate reads it once per request)."""
+        self._require_db()
+        try:
+            with self._store(read_only=True) as store:
+                return store.origin_key_status(origin_key)
+        except _read_faults() as exc:
+            raise TransientApplyFault.of(exc) from exc
+
     def snapshot(self, resource_key: str) -> Snapshot:
         """An episode's snapshot. A tomb has none: who retired a key is known only to the
         ``apply_unit`` that compares its own ``effect_id`` (L1 r1 #4, L2 r1 B)."""

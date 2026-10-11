@@ -12,11 +12,12 @@ The engine consumes only ``revision``, ``error``, ``provenance(key)`` and ``labe
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterator, Mapping, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 
 UNVERIFIED = "unverified"
 
@@ -103,6 +104,23 @@ def unavailable(reason: str) -> LabelSnapshot:
 class RequestAuthority:
     now: datetime
     labels: LabelSnapshot = NO_LABELS
+    # journal reads one request shares (K2b-3b §0.6: Recent edits' broker side), so a write's probes
+    # through ``_scan_read_one`` read the journal once, never once per probe
+    _memo: dict[str, tuple[bool, Any]] = field(default_factory=dict, compare=False, repr=False)
+    _memo_lock: threading.Lock = field(default_factory=threading.Lock, compare=False, repr=False)
+
+    def memo(self, key: str, fn: Callable[[], Any]) -> Any:
+        """``fn()`` once per request; its exception, too, is the answer every later caller gets."""
+        with self._memo_lock:
+            if key not in self._memo:
+                try:
+                    self._memo[key] = (True, fn())
+                except Exception as exc:  # noqa: BLE001 - re-raised to every caller
+                    self._memo[key] = (False, exc)
+            ok, got = self._memo[key]
+        if not ok:
+            raise got
+        return got
 
 
 # The outer boundary's authority for the reads it makes through ``Cockpit.read_one`` /

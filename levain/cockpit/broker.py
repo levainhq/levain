@@ -85,6 +85,8 @@ from levain.cockpit.effects import (
 from levain.cockpit.firejournal import (
     CockpitDB,
     CockpitFormatError,
+    DecisionRows,
+    EditsPage,
     IdempotencyConflict,
     PendingCapExceeded,
     UnitResult,
@@ -287,6 +289,21 @@ class Broker:
         if labeller is None or labeller.db is not db:
             labeller = self._labeller = BrokerLabeller(db)
         return labeller.snapshot()
+
+    def _active_db(self) -> CockpitDB | None:
+        with self._mu:
+            return self.db if self._state is Lifecycle.ACTIVE else None
+
+    def decision_rows(self, now: datetime) -> DecisionRows | None:
+        """The ``decisions`` panel's broker rows (K2b-3b §3) from THIS broker's journal, served only
+        while ACTIVE (§8d row 1); None otherwise. Raises on a journal fault (the panel notes it)."""
+        db = self._active_db()
+        return None if db is None else db.decision_rows(now)
+
+    def edits(self, limit: int) -> EditsPage | None:
+        """Recent edits' broker rows (K2b-3b §0.6), served only while ACTIVE; None otherwise."""
+        db = self._active_db()
+        return None if db is None else db.edits(limit)
 
     def start(self) -> Lifecycle:
         """Run the start sequence once now; on a held lock stay STANDBY and heal in the background:

@@ -338,6 +338,10 @@ class EditRow:
     decision_kind: str | None
     credential: str | None
     applied_at: str
+    # the signed effect's projection and the fields it may label (``writes`` + ``binds``): what a
+    # Recent edits row's label key names, bound to this op (K2b-3b §0.6)
+    projection: Mapping[str, Any] | None = None
+    label_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1103,12 +1107,15 @@ class CockpitDB:
                         or not isinstance(changes, dict) or not changes:
                     continue
                 target = view.record.get("target")
+                rec_eff = view.record["effects"][idx]
+                proj = rec_eff.get("projection")
                 kept.append(EditRow(
                     operation_id=op, idx=idx, state=view.state, verb=view.record.get("verb"),
                     resource_key=eff.resource_key, store=eff.store, changes=changes,
                     target=target if isinstance(target, dict) else {},
                     decision_kind=view.decision_kind, credential=view.credential,
-                    applied_at=eff.applied_at))
+                    applied_at=eff.applied_at, projection=proj if isinstance(proj, dict) else None,
+                    label_fields=tuple(str(f) for f in (*rec_eff.get("writes", ()), *rec_eff.get("binds", ())))))
                 if len(kept) >= limit:
                     break
         return EditsPage(tuple(kept), len(corrupt))

@@ -401,45 +401,147 @@ def _ledger_path(source: SubstrateSource) -> Path | None:
     return None
 
 
-def _edits(source: SubstrateSource) -> Callable[[ReadContext], Result]:
-    def read(ctx: ReadContext) -> Result:
-        path = _ledger_path(source)
-        if path is None:
-            return Absent("no edit ledger is configured for this source")
-        if not path.exists():
-            # the ledger's one writer (levain.writes' audit append) creates it at the first edit; the path stays
-            # off the wire, as the store path does (entity.store_label)
-            return Absent("no edit recorded yet (the first edit creates the ledger)")
+def _ledger_edits(source: SubstrateSource) -> Result:
+    """The ``levain.writes`` ledger's newest ``EDITS_LIMIT`` records as rows (its own best-effort
+    contract): ``Read``, ``Absent`` (no ledger yet) or ``Fault``."""
+    path = _ledger_path(source)
+    if path is None:
+        return Absent("no edit ledger is configured for this source")
+    if not path.exists():
+        # the ledger's one writer (levain.writes' audit append) creates it at the first edit; the path stays
+        # off the wire, as the store path does (entity.store_label)
+        return Absent("no edit recorded yet (the first edit creates the ledger)")
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, ValueError) as exc:
+        return Fault(f"edit ledger unreadable: {type(exc).__name__}: {exc}")
+    recs: list[tuple[str, dict[str, Any]]] = []
+    bad = 0
+    for n, ln in enumerate(lines):
+        if not ln.strip():
+            continue
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except (OSError, ValueError) as exc:
-            return Fault(f"edit ledger unreadable: {type(exc).__name__}: {exc}")
-        recs: list[tuple[str, dict[str, Any]]] = []
-        bad = 0
-        for n, ln in enumerate(lines):
-            if not ln.strip():
-                continue
-            try:
-                rec = json.loads(ln)
-            except ValueError:
-                bad += 1
-                continue
-            if not isinstance(rec, dict):
-                bad += 1
-                continue
-            # some audit records (an action's) carry id "": still a readable record, so it keeps a
-            # row, named by its line (the ledger is append-only, so a line number is stable).
-            rid = rec.get("id")
-            recs.append((rid if isinstance(rid, str) and rid else f"line{n}", rec))
-        rows = tuple(
-            RowIn(
-                id=f"edit:{rid}", title=f"{r.get('kind', '')} {r.get('action', '')} {r.get('source', '')}".strip(),
-                facets={"edit_kind": str(r.get("kind", "")), "at": _ts(r.get("ts")), "undoable": bool(r.get("undoable"))},
-                stored=r,
-            )
-            for rid, r in reversed(recs[-EDITS_LIMIT:])
+            rec = json.loads(ln)
+        except ValueError:
+            bad += 1
+            continue
+        if not isinstance(rec, dict):
+            bad += 1
+            continue
+        # some audit records (an action's) carry id "": still a readable record, so it keeps a
+        # row, named by its line (the ledger is append-only, so a line number is stable).
+        rid = rec.get("id")
+        recs.append((rid if isinstance(rid, str) and rid else f"line{n}", rec))
+    rows = tuple(
+        RowIn(
+            id=f"edit:{rid}", title=f"{r.get('kind', '')} {r.get('action', '')} {r.get('source', '')}".strip(),
+            facets={"edit_kind": str(r.get("kind", "")), "at": _utc_at(r.get("ts")), "undoable": bool(r.get("undoable"))},
+            stored=r,
         )
-        return Read(rows=rows, skipped=((bad, "unreadable ledger line"),) if bad else ())
+        for rid, r in reversed(recs[-EDITS_LIMIT:])
+    )
+    return Read(rows=rows, skipped=((bad, "unreadable ledger line"),) if bad else ())
+
+
+def _tomb_gate(store: Any, origin_key: str, effect_id: Any, episode_id: str) -> str:
+    """A ``tomb:`` row's gate (K2b-3b §0.7, §8d row 5): ``match`` only while anneal reads the key
+    retired by THIS op's ``effect_id`` and episode; ``unavailable`` when anneal cannot be read."""
+    try:
+        st = store.origin_key_status(origin_key)
+    except Exception:  # noqa: BLE001 - an unreadable store labels nothing
+        return "unavailable"
+    if getattr(st, "state", None) == "retired" and st.effect_id == effect_id and st.episode_id == episode_id:
+        return "match"
+    return "mismatch"
+
+
+def _journal_edits(source: SubstrateSource, page: Any) -> list[RowIn]:
+    """The broker's applied effects as Recent edits rows (K2b-3b §0.6, §0.7): ``fire:<op>:<idx>``,
+    or ``tomb:<episode_id>:<op>`` for a tombstone's create, its gate read here once."""
+    from levain.cockpit.anneal_effects import TOMB_KEY_PREFIX, EpisodeEffectStore
+
+    episodes = None
+    rows: list[RowIn] = []
+    for e in page.rows:
+        proj = e.projection or {}
+        stored: dict[str, Any] = {
+            "_fire": True, "operation_id": e.operation_id, "idx": e.idx, "state": e.state, "verb": e.verb,
+            "resource_key": e.resource_key, "store": e.store, "changes": dict(e.changes),
+            "credential": e.credential, "applied_at": e.applied_at,
+            "label_values": {f: proj[f] for f in e.label_fields if f in proj}}
+        facets = {"edit_kind": str(e.verb or ""), "at": _utc_at(e.applied_at), "undoable": False}
+        who = f" ({e.credential})" if e.credential else ""
+        if e.resource_key.startswith(TOMB_KEY_PREFIX):
+            ok = e.resource_key[len(TOMB_KEY_PREFIX):]
+            row_id = str((e.target or {}).get("row_id") or "")
+            episode_id = row_id[len("episode:"):] if row_id.startswith("episode:") else row_id
+            if episodes is None:
+                ws = source.write_scope
+                episodes = EpisodeEffectStore((ws.anneal if ws is not None else source.anneal).episodic_db)
+            stored.update(origin_key=ok, episode_id=episode_id, effect_id=e.changes.get("effect_id"),
+                          _tomb_gate=_tomb_gate(episodes, ok, e.changes.get("effect_id"), episode_id))
+            rows.append(RowIn(id=f"tomb:{episode_id}:{e.operation_id}", title=f"{e.verb} episode {episode_id}{who}",
+                              facets=facets, stored=stored))
+        else:
+            rows.append(RowIn(id=f"fire:{e.operation_id}:{e.idx}", title=f"{e.verb} {e.resource_key}{who}",
+                              facets=facets, stored=stored))
+    return rows
+
+
+def edit_label_key(stored: Mapping[str, Any]) -> LabelKey | None:
+    """A Recent edits row's label key: a broker fire's own labels row (bound to its op); a ``tomb:``
+    row's under the gate read once into ``stored`` (§8d row 5). A ledger row has none."""
+    if stored.get("_fire") is not True:
+        return None
+    op = stored.get("operation_id")
+    if "_tomb_gate" in stored:
+        from levain.cockpit.anneal_effects import tomb_resource_key
+
+        ok = stored["origin_key"]
+        return LabelKey(tomb_resource_key(ok), {"origin_key": ok}, op, stored["_tomb_gate"])
+    return LabelKey(stored["resource_key"], dict(stored.get("label_values") or {}), op)
+
+
+def _edits(source: SubstrateSource,
+           journal: Callable[[], Callable[[int], Any] | None] = lambda: None) -> Callable[[ReadContext], Result]:
+    """Recent edits: the ledger's rows merged with the broker's journal (K2b-3b §0.6), one sort and ONE
+    cut at ``EDITS_LIMIT``. Each contributor faults on its own: a failed journal keeps the ledger's
+    rows (``partial``), a missing ledger with a healthy journal shows the journal's, and only both
+    failing is a Fault. The journal side is read once per request (memoised on its authority)."""
+    def read(ctx: ReadContext) -> Result:
+        led = _ledger_edits(source)
+        reader = journal()
+        if reader is None:
+            return led
+        try:
+            def jread() -> tuple[list[RowIn], int] | None:
+                page = reader(EDITS_LIMIT)
+                return None if page is None else (_journal_edits(source, page), page.skipped)
+            got = ctx.authority.memo("edits:journal", jread) if ctx.authority is not None else jread()
+        except Exception as exc:  # noqa: BLE001 - a journal fault is this contributor's, never the panel's alone
+            jfault: str | None = f"broker edits unreadable: {type(exc).__name__}: {exc}"
+            got = None
+        else:
+            jfault = None
+        if got is None:
+            if jfault is None:     # the broker is not ACTIVE: the ledger alone, as before the broker
+                return led
+            if isinstance(led, Read):
+                return Read(rows=led.rows, skipped=(*led.skipped, (1, jfault)))
+            return Fault(f"{jfault}; ledger: {led.reason if isinstance(led, Absent) else led.message}")
+        jrows, jskipped = got
+        skipped: list[tuple[int, str]] = [(jskipped, "unreadable cockpit op")] if jskipped else []
+        if isinstance(led, Read):
+            lrows = list(led.rows or ())
+            skipped += list(led.skipped)
+        else:
+            lrows = []
+            if isinstance(led, Fault):
+                skipped.append((1, led.message))
+        merged = [("ledger", r) for r in lrows] + [("journal", r) for r in jrows]
+        merged.sort(key=lambda p: (p[0], p[1].id))
+        merged.sort(key=lambda p: p[1].facets.get("at") or "", reverse=True)   # stable: at desc, source, id
+        return Read(rows=tuple(r for _s, r in merged[:EDITS_LIMIT]), skipped=tuple(skipped))
     return read
 
 
@@ -710,6 +812,7 @@ def build_default_cockpit(
                 "store_label": _store_label(source.anneal.episodic_db)}
 
     ck = Cockpit(entity=entity, clock=clock)
+    edits_read = _edits(source, lambda: ck.edits_reader)
     spore_common = dict(
         facets=SPORE_FACETS,
         version_fields=SPORE_VERSION_FIELDS, version_excluded=SPORE_VERSION_EXCLUDED,
@@ -738,8 +841,8 @@ def build_default_cockpit(
         version_fields=EPISODE_STORED,
         search_fields=("title", "body", "source"), edit_class=CLASS_B, empty="No recent episodes."))
     ck.register(ProviderSpec(
-        "edits", "triage-list", "Recent edits", "feed", _edits(source), region="operate", rank=4,
-        read_one=_scan_read_one(_edits(source)), verbs=("undo",),
+        "edits", "triage-list", "Recent edits", "feed", edits_read, region="operate", rank=4,
+        read_one=_scan_read_one(edits_read), verbs=("undo",), label_key=edit_label_key,
         optional=True, order="time.desc", rowset="edits",
         facets=frozenset({"edit_kind", "at", "undoable"}), version_fields=("*",), empty="No edits yet."))
     if job_store is not None:

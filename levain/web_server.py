@@ -656,6 +656,8 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                 built.attach_verbs(VerbView(self.verb_registry, built, lambda: broker_install_class(self)))
                 if self.broker is not None:
                     built.attach_labeller(self.broker.labels)    # labels and tiers per request (K2b-3b)
+                    built.attach_edits_reader(self.broker.edits)  # Recent edits' broker rows (§0.6)
+                    built.attach_decision_rows(self.broker.decision_rows)   # the decisions panel (§3)
                 if self.extra_panels is not None:
                     # one callable call per refresh feeds the discovery and every adapted panel (design §6.2)
                     self.external_panels = ExternalPanels(self.extra_panels)
@@ -1478,6 +1480,9 @@ def make_server(
     httpd.broker = _build_broker(source, install_class, httpd)
     if cockpit is not None and httpd.broker is not None:
         cockpit.attach_labeller(httpd.broker.labels)
+        cockpit.attach_edits_reader(httpd.broker.edits)
+        # a downstream that registered its own "decisions" keeps exactly that panel (K2b-3b §0.4)
+        cockpit.attach_decision_rows(httpd.broker.decision_rows)
     # A chat surface always has a token: the caller's, or a fresh per-launch one.
     httpd.chat_token = (chat_token or secrets.token_urlsafe(32)) if chat_host is not None else None
     # OFF-BOX write auth (spore-129): key the token requirement on the ACTUAL bound address
