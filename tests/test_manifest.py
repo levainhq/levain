@@ -641,9 +641,9 @@ class TestReleaseStampIsNotAPublishedVersion:
         pass is not a gate.
 
         ⛔ AND THE HOOK COULD NOT HAVE CAUGHT THIS, WHICH IS THE POINT.
-        ``scripts/hooks/pre-push`` holds NO version logic — it runs ``pytest -k
-        ReleaseStampIsNotAPublishedVersion`` and delegates its entire verdict to
-        this class. It was ported from anneal-memory byte-for-byte correct and
+        ``scripts/hooks/pre-push`` held NO version logic when ported — it ran
+        ``pytest -k ReleaseStampIsNotAPublishedVersion`` and delegated its entire
+        verdict to this class (it still delegates the verdict). It was ported from anneal-memory byte-for-byte correct and
         was fail-open here anyway, because **a selector carries none of its own
         correctness: porting it moved the NAME and left the PROPERTY**, which
         lived in a test anneal had (``tests/test_integrity.py``, commit
@@ -657,12 +657,17 @@ class TestReleaseStampIsNotAPublishedVersion:
         working-tree test is the right one there. Two tests because they are
         two claims, not because one is a better version of the other.
 
-        ⚠ SCOPE IS HEAD-ONLY, stated rather than implied. A push of a non-HEAD
-        branch or an older range is NOT covered. HEAD is what the hook's pytest
-        run is scoped to anyway, and widening this to walk the pushed range
-        would make a GATE bigger — deliberately refused (``spore-551``: the
-        gate list is small and fixed). anneal refused the identical widening.
+        ⚠ THE SUBJECT IS THE PUSHED COMMIT, NOT THE PUSHING CHECKOUT (2026-10-11,
+        reproduced). Reading HEAD refused a correctly stamped push made from a
+        checkout parked on an older branch, refused a branch DELETE, and
+        refused the release tag itself. ``scripts/hooks/pre-push`` now reads the
+        shas git hands it on stdin, skips deletes, and passes the tips here in
+        ``LEVAIN_PUSHED_SHAS`` (space-separated commit shas). Unset, the
+        subject is HEAD, which is what a plain suite run means. Each pushed TIP
+        is checked, not the range behind it: widening a gate to walk ranges was
+        refused (``spore-551``), and anneal refused the same widening.
         """
+        import os
         import re
 
         root = TestReadmePinClaim()._repo_root()   # skips a non-source checkout
@@ -672,26 +677,65 @@ class TestReleaseStampIsNotAPublishedVersion:
         all_tags = self._git(root, "tag", "--list", "v*")
         if not all_tags:
             pytest.skip("clone carries no release tags — nothing to compare against")
-
-        blob = self._git(root, "show", "HEAD:levain/__init__.py")
-        if blob is None:
-            pytest.skip("HEAD carries no levain/__init__.py")
-        m = re.search(r'__version__ = "([^"]+)"', blob)
-        assert m, "HEAD's levain/__init__.py no longer declares __version__"
-        committed = m.group(1)
-
         released = {t[1:] for t in all_tags.split("\n") if t.startswith("v")}
-        if committed not in released:
-            return   # a .devN or an unreleased number — correct by construction
 
-        at_head = (self._git(root, "tag", "--points-at", "HEAD") or "").split("\n")
-        assert f"v{committed}" in at_head, (
-            f"THE COMMIT AT HEAD is stamped {committed!r}, which is already the "
-            f"released tag v{committed} pointing at a DIFFERENT commit. A clean "
-            f"working tree is not the question — a push publishes THIS COMMIT. "
-            f"Bump both stamps (pyproject.toml, levain/__init__.py) to the next "
-            f".dev0 and COMMIT the bump. See spore-710 and CHANGELOG 'Versioning'."
-        )
+        pushed = os.environ.get("LEVAIN_PUSHED_SHAS")
+        subjects = pushed.split() if pushed is not None else ["HEAD"]
+        assert subjects, "LEVAIN_PUSHED_SHAS is set but names no commit"
+
+        for ref in subjects:
+            blob = self._git(root, "show", f"{ref}:levain/__init__.py")
+            if blob is None:
+                assert ref == "HEAD", f"pushed commit {ref} carries no levain/__init__.py"
+                pytest.skip("HEAD carries no levain/__init__.py")
+            m = re.search(r'__version__ = "([^"]+)"', blob)
+            assert m, f"{ref}'s levain/__init__.py no longer declares __version__"
+            committed = m.group(1)
+
+            toml = self._git(root, "show", f"{ref}:pyproject.toml") or ""
+            t = re.search(r'^version = "([^"]+)"', toml, re.M)
+            assert t and t.group(1) == committed, (
+                f"{ref}: pyproject.toml says {t.group(1) if t else None!r}, "
+                f"levain/__init__.py says {committed!r}"
+            )
+
+            if committed not in released:
+                continue   # a .devN or an unreleased number — correct by construction
+
+            at_ref = (self._git(root, "tag", "--points-at", ref) or "").split("\n")
+            assert f"v{committed}" in at_ref, (
+                f"THE COMMIT {ref} is stamped {committed!r}, which is already the "
+                f"released tag v{committed} pointing at a DIFFERENT commit. A clean "
+                f"working tree is not the question — a push publishes THIS COMMIT. "
+                f"Bump both stamps (pyproject.toml, levain/__init__.py) to the next "
+                f".dev0 and COMMIT the bump. See spore-710 and CHANGELOG 'Versioning'."
+            )
+
+    def _run_hook(self, root, stdin):
+        import subprocess
+        import sys
+        if sys.platform == "win32":
+            pytest.skip("the pre-push hook is a bash script")
+        return subprocess.run(["bash", str(root / "scripts" / "hooks" / "pre-push"),
+                               "origin", "unused-url"], input=stdin, cwd=root,
+                              capture_output=True, text=True, timeout=60)
+
+    def test_pre_push_lets_a_delete_through_without_reading_any_stamp(self):
+        """A delete publishes nothing; 2026-10-11 the gate refused one anyway."""
+        root = TestReadmePinClaim()._repo_root()
+        if self._git(root, "rev-parse", "--git-dir") is None:
+            pytest.skip("not a git checkout")
+        zero = "0" * 40
+        r = self._run_hook(root, f"(delete) {zero} refs/heads/gone {'1' * 40}\n")
+        assert r.returncode == 0, r.stderr
+
+    def test_pre_push_refuses_a_pushed_object_it_cannot_read_as_a_commit(self):
+        root = TestReadmePinClaim()._repo_root()
+        tree = self._git(root, "rev-parse", "HEAD^{tree}")
+        if tree is None:
+            pytest.skip("not a git checkout")
+        r = self._run_hook(root, f"refs/heads/x {tree} refs/heads/x {'0' * 40}\n")
+        assert r.returncode == 1 and "is not a commit" in r.stderr, r.stderr
 
     def test_the_two_version_stamps_agree(self):
         """One fact, two files. They drifted apart is the *other* way this breaks."""
