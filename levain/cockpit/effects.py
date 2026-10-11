@@ -272,10 +272,21 @@ class DownstreamEffect:
     """A downstream T2/T3 verb's broker effect (flow design §4.6, K2b §13): the ``EffectStore`` it
     applies through and its ``canonical_effect``. The broker registers ``store`` under ``store.name``
     and builds the verb's one effect as ``canonical(params, origin_key=...)``: a create on ``store``
-    keyed by ``create_origin_key(pending_id, 0)``, idempotent there on that key. ``ValueError`` from
-    ``canonical`` refuses the params. ``canonical`` is a pure function of its arguments: the decision
-    rebuilds the effect and compares it with the consented one. A downstream verb binds to its panel,
-    so an effect on an existing object is not built here."""
+    keyed by ``create_origin_key(pending_id, 0)``, idempotent there on that key. The build refuses a key
+    already in use, so the object exists only after the apply, and the build never runs again once the
+    pending is decided: recovery settles the consented effect, it does not rebuild it. ``ValueError``
+    or ``ConsentError`` from ``canonical`` refuses the params; any other failure of ``canonical``, and
+    any failure of ``store.snapshot``, is a transient read fault.
+
+    The store's create is not rolled back (an HTTP insert), so recovery may find it already made:
+    ``apply_unit`` answers ``ALREADY`` with the object as it is stored now, and the effect is APPLIED.
+    A stored value that differs from ``changes`` is APPLIED without that field's label, never a
+    refusal. A key the store reports used and since deleted is ``ALREADY`` with ``stored=None``: APPLIED,
+    with no label, and nothing is created again.
+
+    ``canonical`` is a pure function of its arguments: the decision rebuilds the effect and compares
+    it with the consented one. A downstream verb binds to its panel, so an effect on an existing object
+    is not built here."""
 
     store: EffectStore
     canonical: Callable[..., Effect]

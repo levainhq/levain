@@ -99,6 +99,7 @@ from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
 from levain.cockpit.labels import BrokerLabeller, LabelSnapshot, label_class
 from levain.cockpit.authority import inactive
 from levain.cockpit.results import Absent, Fault
+from levain.cockpit.verbs import KERNEL_VERBS
 
 __all__ = ["Broker", "BrokerError", "COCKPIT_STORE", "INTERNAL_VERBS", "LOCK_NAME", "Lifecycle",
            "PENDING_TTL", "STANDBY_FAULT", "label_class"]
@@ -278,7 +279,8 @@ class Broker:
         for verb, d in downstream.items():
             if not isinstance(d, DownstreamEffect):
                 raise ValueError(f"downstream effect {verb!r} must be a DownstreamEffect")
-            if verb in SPORE_CANONICAL or verb in (TOMBSTONE_VERB, SECTION_VERB, *INTERNAL_VERBS):
+            if verb in SPORE_CANONICAL or verb in (TOMBSTONE_VERB, SECTION_VERB, *INTERNAL_VERBS) \
+                    or verb in {v.name for v in KERNEL_VERBS}:
                 raise ValueError(f"{verb!r} is a kernel verb; its effect is the kernel's")
             refusals = registration_refusals(d.store, {verb: d.canonical} if callable(d.canonical) else None)
             if refusals:
@@ -622,12 +624,26 @@ class Broker:
 
     def _build_downstream(self, verb: str, params: Mapping[str, Any], target: Mapping[str, Any],
                           pid: str) -> _Built:
-        """A downstream verb's one create, keyed by the pending as a spore seed is."""
+        """A downstream verb's one create, keyed by the pending as a spore seed is. The store is a
+        client of another process, so any failure of its read is transient (a non-JSON body is a
+        ``ValueError`` too); ``canonical`` refuses params by ``ValueError`` or ``ConsentError`` and any
+        other failure of it is transient."""
         d = self.downstream[verb]
-        eff = d.canonical(dict(params), origin_key=create_origin_key(pid, 0))
+        try:
+            eff = d.canonical(dict(params), origin_key=create_origin_key(pid, 0))
+        except (ValueError, ConsentError, TransientApplyFault):
+            raise
+        except Exception as exc:  # noqa: BLE001 - a registrant's failure is not a refusal of the params
+            raise TransientApplyFault.of(exc) from exc
         if not isinstance(eff, Effect) or eff.store != d.store.name or not eff.is_create:
             raise ValueError(f"{verb!r}'s canonical_effect must build one create on {d.store.name!r}")
-        if d.store.snapshot(eff.resource_key).row is not None:
+        try:
+            row = d.store.snapshot(eff.resource_key).row
+        except TransientApplyFault:
+            raise
+        except Exception as exc:  # noqa: BLE001 - every read fault of a downstream store is transient
+            raise TransientApplyFault.of(exc) from exc
+        if row is not None:
             raise ValueError("a create's origin_key is already in use")
         return _Built({"kind": target.get("kind"), "panel_id": target.get("panel_id")}, [eff], [None])
 

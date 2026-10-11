@@ -9,6 +9,8 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from anneal_memory.spores import normalize_spore_field
+
 from levain.cockpit.effects import (
     ApplyOutcome,
     ApplyUnit,
@@ -31,9 +33,11 @@ class FakeInbox:
     authority_fields = FIELDS
     store_assigned_fields = ("id", "origin_key")
 
-    def __init__(self, path: Path | str | None = None) -> None:
+    def __init__(self, path: Path | str | None = None, *, faults: Sequence[BaseException | None] = ()) -> None:
         self.path = None if path is None else Path(path)
         self._notes: dict[str, dict[str, Any]] = {}
+        self._retired: dict[str, str] = {}
+        self.faults = list(faults)
 
     @property
     def notes(self) -> dict[str, dict[str, Any]]:
@@ -41,15 +45,43 @@ class FakeInbox:
             return json.loads(self.path.read_text()) if self.path.exists() else {}
         return self._notes
 
-    def _save(self, notes: dict[str, dict[str, Any]]) -> None:
+    @property
+    def retired(self) -> dict[str, str]:
+        """origin_key -> the id of a note sent on that key and since deleted."""
+        if self.path is not None:
+            side = self.path.with_suffix(".retired.json")
+            return json.loads(side.read_text()) if side.exists() else {}
+        return self._retired
+
+    def _save(self, notes: dict[str, dict[str, Any]], retired: dict[str, str] | None = None) -> None:
         if self.path is None:
             self._notes = notes
+            if retired is not None:
+                self._retired = retired
         else:
             self.path.write_text(json.dumps(notes))
+            if retired is not None:
+                self.path.with_suffix(".retired.json").write_text(json.dumps(retired))
+
+    def retire(self, key: str) -> None:
+        notes = self.notes
+        note = notes.pop(key)
+        self._save(notes, {**self.retired, key: note["id"]})
+
+    def _get(self, key: str) -> tuple[dict[str, Any] | None, bool]:
+        """GET by origin_key: the stored note, and whether the key was ever used."""
+        note = self.notes.get(key)
+        return note, note is not None or key in self.retired
 
     def snapshot(self, resource_key: str) -> Snapshot:
-        row = self.notes.get(resource_key.removeprefix(PREFIX))
-        return Snapshot(row, None if row is None else "v1")
+        if self.faults:
+            fault = self.faults.pop(0)
+            if fault is not None:
+                raise fault
+        note, used = self._get(resource_key.removeprefix(PREFIX))
+        if note is None and used:
+            return Snapshot({"retired": True}, "retired")
+        return Snapshot(note, None if note is None else "v1")
 
     def units(self, effects: Sequence[tuple[int, Effect]]) -> list[ApplyUnit]:
         return [ApplyUnit(INBOX, (i,), (e,)) for i, e in effects]
@@ -59,10 +91,15 @@ class FakeInbox:
         if not effect.is_create:
             raise PermanentApplyRefusal("the inbox takes creates only")
         key = effect.resource_key.removeprefix(PREFIX)
+        stored, used = self._get(key)
+        if used:
+            # the key was used: ALREADY with the note as a GET by origin_key reads it now, which
+            # label_fields compares with the projection, or with nothing when it was since deleted
+            if stored is None:
+                return UnitApplyResult(ApplyOutcome.ALREADY, (MemberApply(self.retired[key], None),))
+            return UnitApplyResult(ApplyOutcome.ALREADY, (MemberApply(stored["id"], dict(stored)),))
         notes = self.notes
-        if key in notes:
-            return UnitApplyResult(ApplyOutcome.ALREADY, (MemberApply(notes[key]["id"], notes[key]),))
-        note = {"id": f"note-{len(notes) + 1}", "origin_key": key, **dict(effect.changes)}
+        note = {"id": f"note-{len(notes) + len(self.retired) + 1}", "origin_key": key, **dict(effect.changes)}
         notes[key] = note
         self._save(notes)
         return UnitApplyResult(ApplyOutcome.APPLIED, (MemberApply(note["id"], note),))
@@ -75,9 +112,9 @@ class FakeInbox:
 
 def send_inbox_effect(params: Mapping[str, Any], *, origin_key: str) -> Effect:
     body, to = params.get("body"), params.get("for", "cli")
-    if not isinstance(body, str) or not body.strip():
+    if not isinstance(body, str) or not normalize_spore_field(body):
         raise ValueError("a note needs a body")
-    changes = {"body": body.strip(), "for": to}
+    changes = {"body": normalize_spore_field(body), "for": to}
     return Effect(PREFIX + origin_key, INBOX, {"absent": True}, changes, dict(changes), FIELDS, ())
 
 

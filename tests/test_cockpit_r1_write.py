@@ -6,6 +6,7 @@ code before its fix and seen to fail."""
 from __future__ import annotations
 
 import dataclasses
+import json
 from pathlib import Path
 from typing import Any
 
@@ -212,16 +213,18 @@ def test_a_downstream_effect_is_refused_at_server_construction(tmp_path: Path) -
     class Squatter(FakeInbox):
         name = "spores"
 
-    cases = {
-        "no authority_fields": {"send_inbox": DownstreamEffect(NoAuthority(), send_inbox_effect)},
-        "reserved": {"send_inbox": DownstreamEffect(Squatter(), send_inbox_effect)},
-        "not a downstream verb": {"spore_seed": inbox_downstream()[1]},
-        "no such verb": {"nope": inbox_downstream()[1]},
-        "no canonical_effect": {"send_inbox": DownstreamEffect(FakeInbox(), None)},  # type: ignore[arg-type]
-        "not a DownstreamEffect": {"send_inbox": FakeInbox()},
+    cases = {   # each case's effects, and the words its refusal names
+        "no authority_fields": ({"send_inbox": DownstreamEffect(NoAuthority(), send_inbox_effect)},
+                                "refused at registration"),
+        "reserved": ({"send_inbox": DownstreamEffect(Squatter(), send_inbox_effect)}, "reserved or empty"),
+        "not a downstream verb": ({"spore_seed": inbox_downstream()[1]}, "must name a verb in extra_verbs"),
+        "no such verb": ({"nope": inbox_downstream()[1]}, "must name a verb in extra_verbs"),
+        "no canonical_effect": ({"send_inbox": DownstreamEffect(FakeInbox(), None)},  # type: ignore[arg-type]
+                                "refused at registration"),
+        "not a DownstreamEffect": ({"send_inbox": FakeInbox()}, "must be a DownstreamEffect"),
     }
-    for why, effects in cases.items():
-        with pytest.raises(ValueError):
+    for why, (effects, reason) in cases.items():
+        with pytest.raises(ValueError, match=reason):
             make_server(src, host="127.0.0.1", port=0, extra_verbs=verbs, extra_effects=effects,
                         install_class="reported")
             pytest.fail(f"{why}: not refused")
@@ -230,6 +233,16 @@ def test_a_downstream_effect_is_refused_at_server_construction(tmp_path: Path) -
     with pytest.raises(ValueError, match="inbox"):
         make_server(src, host="127.0.0.1", port=0, extra_verbs=verbs2, install_class="reported",
                     extra_effects={"send_inbox": inbox_downstream()[1], "send_other": inbox_downstream()[1]})
+
+
+@pytest.mark.parametrize("verb", ["spore_seed", "spore_touch", "operator_state", "episode_tombstone",
+                                  "pending_cancel"])
+def test_the_broker_refuses_a_downstream_effect_on_any_kernel_verb(home: Path, verb: str) -> None:  # noqa: F811
+    from levain.cockpit.broker import Broker
+    from tests._inbox_fake import inbox_downstream
+
+    with pytest.raises(ValueError, match="is a kernel verb"):
+        Broker(home / "data", stores={}, install_class="reported", downstream={verb: inbox_downstream()[1]})
 
 
 @pytest.mark.parametrize("point", ["issued", "verified", "decided", "applied:0", "journaled:0", "finished"])
@@ -281,6 +294,142 @@ def test_a_killed_send_inbox_applies_exactly_once_after_recovery(home: Path, poi
     assert [(n["body"], n["origin_key"]) for n in store.notes.values()] == \
         [("killed mid-send", "ck." + pid.removeprefix("cp") + ".0")]
     assert _ops(data) == [(pid, "COMMITTED")]
+
+
+_READ_FAULTS = [OSError("argushub unreachable"), json.JSONDecodeError("not JSON", "<html>", 0)]
+
+
+@pytest.mark.parametrize("fault", _READ_FAULTS, ids=["oserror", "non-json"])
+def test_a_downstream_read_fault_at_issue_is_503_source_unavailable(tmp_path: Path, fault: Exception) -> None:
+    from tests._inbox_fake import inbox_downstream
+    from tests.test_cockpit_k2a import _install, _post
+
+    _root, src, _ids = _install(tmp_path)
+    store, effect = inbox_downstream()
+    with _inbox_server(src, [], extra_effects={"send_inbox": effect}) as (url, _httpd):
+        pid = _inbox_panel(url)
+        store.faults = [fault]
+        status, out = _post(f"{url}/cockpit/verb", {
+            "verb": "send_inbox", "panel_id": pid, "params": {"body": "x"}, "confirm": True, "intent": "reported",
+            "idempotency_key": "k", "tier_seen": "T2", "gesture_seen": "direct-reported"}, token="T")
+        assert (status, out["error"]) == (503, "source_unavailable"), out
+    assert store.notes == {}
+
+
+def _inbox_broker(home: Path, store: Any) -> Any:
+    from levain.cockpit.broker import Broker
+    from levain.cockpit.effects import DownstreamEffect
+    from tests._inbox_fake import send_inbox_effect
+
+    b = Broker(home / "data", stores={}, install_class="reported",
+               downstream={"send_inbox": DownstreamEffect(store, send_inbox_effect)})
+    b.start()
+    return b
+
+
+_PANEL = {"kind": "panel", "panel_id": "ext:inbox"}
+
+
+@pytest.mark.parametrize("fault", _READ_FAULTS, ids=["oserror", "non-json"])
+def test_a_downstream_read_fault_at_decide_leaves_the_signature_unspent(home: Path, fault: Exception) -> None:  # noqa: F811
+    from tests._inbox_fake import FakeInbox
+    from tests.test_cockpit_k2b_broker import Key, _refused as _broker_refused, _state as _pending_state
+
+    keydir = home / "keys"
+    keydir.mkdir(mode=0o700)
+    store = FakeInbox()
+    b = _inbox_broker(home, store)
+    try:
+        laptop = Key(keydir, "laptop").enroll(b, "laptop-presence")
+        out = b.issue(verb="send_inbox", params={"body": "signed note"}, target=_PANEL, tier="T2",
+                      credential={"class": "token", "name": "browser"}, idempotency_key="sig")
+        assert out["state"] == "WAITING", out
+        pid, signature = out["pending_id"], laptop.sign(out["record"].encode())
+        store.faults = [fault]
+        _broker_refused("source_unavailable", b.submit, pid, signature)
+        assert _pending_state(b, pid) == "WAITING"
+        assert store.notes == {}
+        done = b.submit(pid, signature)
+        assert done["state"] == "COMMITTED", done
+    finally:
+        b.stop()
+    assert [n["body"] for n in store.notes.values()] == ["signed note"]
+
+
+@pytest.mark.parametrize("fault", _READ_FAULTS, ids=["oserror", "non-json"])
+def test_a_downstream_read_fault_at_a_reported_decide_is_source_unavailable_never_stale(
+        home: Path, fault: Exception) -> None:  # noqa: F811
+    from tests._inbox_fake import FakeInbox
+
+    store = FakeInbox(faults=[None, fault])      # the issue reads, the decision's rebuild faults
+    b = _inbox_broker(home, store)
+    try:
+        out = b.issue(verb="send_inbox", params={"body": "reported note"}, target=_PANEL, tier="T2",
+                      credential={"class": "token", "name": "browser"}, intent="reported",
+                      idempotency_key="rep")
+    finally:
+        b.stop()
+    assert (out["state"], out["reason"]) == ("REFUSED", "source unavailable"), out
+    assert store.notes == {}
+
+
+def test_a_retired_note_recovers_applied_unlabelled_and_is_never_sent_twice(home: Path) -> None:  # noqa: F811
+    import subprocess
+    import sys
+
+    from anneal_memory.spores import SporeStore
+    from levain.cockpit.broker import Broker
+    from levain.cockpit.effects import SporeEffectStore
+    from tests._inbox_fake import inbox_downstream
+    from tests.test_cockpit_k2b_broker import _rows
+    from tests.test_cockpit_k2b_crash import ENTRY, _effects, _ops, _wait_state
+
+    spores, inbox, data = home / "spores.json", home / "inbox.json", home / "data"
+    SporeStore(spores).add(type="task", text="a loop", origin_key="k.loop")
+    cfg = {"data_root": str(data), "spores": str(spores), "inbox": str(inbox), "kill_at": "applied:0",
+           "verb": "send_inbox", "params": {"body": "then deleted", "for": "cli"}, "target": _PANEL,
+           "idempotency_key": "send-r"}
+    proc = subprocess.run([sys.executable, str(ENTRY), json.dumps(cfg)], capture_output=True, text=True,
+                          timeout=120, cwd=str(Path(__file__).parent.parent))
+    assert proc.returncode == 137, proc.stderr
+    (pid, _state), = _ops(data)
+    store, effect = inbox_downstream(inbox)
+    (key,) = store.notes
+    store.retire(key)
+    b = Broker(data, stores={"spores": SporeEffectStore(spores)}, store_paths=[spores],
+               install_class="reported", downstream={"send_inbox": effect})
+    b.start()
+    try:
+        b.recover()
+        assert _wait_state(data, pid, "COMMITTED"), _ops(data)
+        assert [e[1] for e in _effects(data, pid)] == ["APPLIED"]
+        assert _rows(b, "SELECT COUNT(*) FROM labels")[0][0] == 0
+    finally:
+        b.stop()
+    assert store.notes == {} and list(store.retired) == [key]
+
+
+def test_a_stored_note_that_differs_from_the_changes_settles_applied_unlabelled() -> None:
+    from levain.cockpit.effects import EffectStatus, settle
+    from tests._inbox_fake import FakeInbox, send_inbox_effect
+
+    store = FakeInbox()
+    eff = send_inbox_effect({"body": "as sent"}, origin_key="ck.ab.0")
+    (unit,) = store.units([(0, eff)])
+    store._save({"ck.ab.0": {"id": "note-1", "origin_key": "ck.ab.0", "body": "as argushub stored it",
+                             "for": "cli"}})
+    got = settle(unit, store, {})
+    assert got.status is EffectStatus.APPLIED
+    assert [m.label_fields for m in got.members] == [("for",)]
+
+
+def test_the_fake_inbox_stores_the_body_as_anneal_normalises_a_spore_field() -> None:
+    from tests._inbox_fake import send_inbox_effect
+
+    eff = send_inbox_effect({"body": "  line one  \r\nline two‮  "}, origin_key="ck.ab.0")
+    assert eff.changes["body"] == "  line one\nline two"
+    with pytest.raises(ValueError):
+        send_inbox_effect({"body": "‮ \r\n"}, origin_key="ck.ab.0")
 
 
 def test_gestures_is_exactly_what_gesture_for_answers() -> None:

@@ -1266,6 +1266,11 @@ def make_server(
     appears in BOTH mappings raises ``ValueError`` (a registration-time packaging bug,
     surfaced loud — never a silent shadow of the dashboard or the write route).
 
+    ``extra_effects`` maps a verb in ``extra_verbs`` to its ``DownstreamEffect`` (the EffectStore a
+    downstream T2/T3 verb applies through, and its ``canonical_effect``), which the broker fires. One
+    naming a verb outside ``extra_verbs`` or a kernel verb, or failing ``Broker.check_downstream``,
+    raises ``ValueError`` before binding. A T2/T3 downstream verb with none answers ``not_built``.
+
     Non-loopback binding (a LAN / Tailscale IP) is governed by the source's nature:
     - a READ-ONLY, NO-INSTALL source (``write_scope is None`` AND ``install_root is None`` —
       e.g. flow's self-ops cockpit over a bare anneal store) MAY bind off-loopback: the write

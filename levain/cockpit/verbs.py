@@ -697,7 +697,9 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
 def _check_seen(req: dict[str, Any], intent: str | None) -> None:
     """A fire carrying ``intent`` names the tier and gesture its dry run showed (``tier_seen``,
     ``gesture_seen``), so the server, not the page, refuses a fire whose preview no longer holds. This
-    binds the tier and the gesture, not the params. A dry run is the preview, so it carries neither."""
+    binds the tier and the gesture, not the params. A dry run is the preview, so it carries neither.
+    A fire with no ``intent`` is the sign path and carries no preview binding: the operator signs the
+    record itself, and the record names the tier."""
     named = [k for k in ("tier_seen", "gesture_seen") if k in req]
     if req.get("dry_run") is True:
         if named:
