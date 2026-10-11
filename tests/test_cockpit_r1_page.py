@@ -489,7 +489,9 @@ cases.the_answer_reaches_the_row_before_the_reread_resolves = async () => {
   const p = env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
   await env.settle();
   ok(row.msg && /COMMITTED/.test(row.msg.textContent) && /claims cockpit token/.test(row.msg.textContent), "committed text on the row before the re-read: " + (row.msg && row.msg.textContent));
-  ok(row.btns.every((b) => b.disabled === true), "edit controls disabled while the re-read is pending");
+  // not locked: a re-read that defers (a dirty form) or fails would leave a locked row stuck; the kernel
+  // refuses an edit against the old row version "stale"
+  ok(row.btns.every((b) => b.disabled !== true), "the row stays usable while the re-read is pending");
   release();
   await p;
 };

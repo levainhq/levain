@@ -300,9 +300,9 @@
   const REREAD = new Set(["needs_intent", "stale", "tier_moved", "gesture_moved", "needs_broker", "standby", "not_built"]);
 
   // The kernel's answer, drawn on its row the moment it arrives: the full re-read can take seconds, and a
-  // row that says "…" until then hides a landed write. `lock` keeps the row's controls off until the
-  // re-read rebuilds it, so nobody edits against the old row version.
-  function paintNow(n, lock) {
+  // row that says "…" until then hides a landed write. The row is not locked meanwhile: an edit sent
+  // against the old row version is refused "stale" by the kernel.
+  function paintNow(n) {
     if (!n || !n.key) return;
     for (const row of document.querySelectorAll("[data-row-key]")) {
       if (row.dataset.rowKey !== n.key) continue;
@@ -311,7 +311,6 @@
       if (!m) { m = document.createElement("span"); host.appendChild(m); }
       m.className = "edit-msg " + n.cls;
       m.textContent = n.text;
-      if (lock) for (const c of row.querySelectorAll("button, input, textarea, select")) c.disabled = true;
       return;
     }
   }
@@ -323,7 +322,7 @@
     if (REREAD.has(code) || r.status === 501) {
       frozen = null;
       notice = { key: what.row_id || null, text: what.label + ": " + text + " (re-read)", cls: "err" };
-      paintNow(notice, true);
+      paintNow(notice);
       load({ passive: true });   // a re-read that never discards an open form: it defers while one is dirty
       return { ok: false, error: code, message: text + " Re-read the page; review and click again." };
     }
@@ -401,7 +400,7 @@
     const d = r.data;
     const state = typeof d.state === "string" && d.state ? d.state : "done";
     notice = { key: base.row_id || null, text: label + ": " + state + (d.label ? " · " + d.label : ""), cls: state === "COMMITTED" || state === "done" ? "note" : "preview" };
-    paintNow(notice, !(window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()));
+    paintNow(notice);
     await afterWrite();
     return { ok: true, data: d };
   }
