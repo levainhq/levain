@@ -168,21 +168,30 @@ def test_an_oversized_key_file_is_refused(tmp_path: Path, capsys) -> None:
     assert "larger than a public key file" in capsys.readouterr().err
 
 
-def test_an_unreadable_marker_path_refuses_and_is_never_read_as_absent(tmp_path: Path) -> None:
+def test_an_unreadable_marker_path_refuses_and_is_never_read_as_absent(tmp_path: Path, monkeypatch) -> None:
     # L3 r1 codex + codex-pack HIGH: os.path.lexists read an EACCES on the marker as "no marker", so a
-    # governed root whose marker directory the operator cannot search took reported keys
+    # governed root whose marker the operator cannot lstat took reported keys. The EACCES is injected
+    # (a chmod does not deny root), for the marker path only.
+    import errno
+    import os
+
     from levain.cockpit.install import decide_install
 
     root = _journal(tmp_path)
     mdir = tmp_path / "m"
     mdir.mkdir()
-    marker_path(root, mdir).write_text("{}")
-    mdir.chmod(0o600)   # readable listing, no search: lstat of the marker answers EACCES
-    try:
-        with pytest.raises(KeyError_, match="cannot read the governed marker"):
-            keys(root, marker_directory=mdir)
-        decision = decide_install("reported", root, marker_directory=mdir)
-        assert decision.install_class is None and "cannot read the governed marker" in str(decision.reason)
-    finally:
-        mdir.chmod(0o700)
+    marker = marker_path(root, mdir)
+    real_lstat = os.lstat
+
+    def lstat(path, *a, **kw):
+        if os.fspath(path) == os.fspath(marker):
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+        return real_lstat(path, *a, **kw)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    with pytest.raises(KeyError_, match="cannot read the governed marker"):
+        keys(root, marker_directory=mdir)
+    decision = decide_install("reported", root, marker_directory=mdir)
+    assert decision.install_class is None and "cannot read the governed marker" in str(decision.reason)
+    monkeypatch.undo()
     assert decide_install("reported", root, marker_directory=tmp_path / "absent").install_class == "reported"
