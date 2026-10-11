@@ -12,7 +12,6 @@ reads ``deleted_by_other``."""
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -270,17 +269,15 @@ SECTION_CANONICAL = {SECTION_VERB: section_effects}
 
 
 def section_paths_agree(read: Any, write: Any | None = None) -> bool:
-    """Whether the section edit's reader and writer name one store: ``read.continuity_md`` is the file
-    anneal's ``Store`` opens for ``read.episodic_db`` (``<stem>.continuity.md``), and ``write`` (when
-    given) names the same db and continuity file. Only those two paths, resolved (L3 r1 codex, r2)."""
-    def real(p: Any) -> str:
-        return os.path.realpath(Path(p).expanduser())
-
+    """Whether the section edit's reader and writer name one store: ``read.continuity_md`` is exactly
+    the file anneal's ``Store`` opens for ``read.episodic_db`` (``<stem>.continuity.md``), and
+    ``write`` (when given) names the same two paths. Compared as written, the way ``Store`` and every
+    reader here receive them: a symlink, an alias or a ``~`` reads as a disagreement and the edit is
+    not offered (L3 r1 codex; r2 and r3 found that resolving the paths equates ones Store treats apart)."""
     db = Path(read.episodic_db)
-    if real(read.continuity_md) != real(db.with_name(f"{db.stem}.continuity.md")):
+    if Path(read.continuity_md) != db.with_name(f"{db.stem}.continuity.md"):
         return False
-    return write is None or (real(write.episodic_db) == real(read.episodic_db)
-                             and real(write.continuity_md) == real(read.continuity_md))
+    return write is None or (Path(write.episodic_db) == db and Path(write.continuity_md) == Path(read.continuity_md))
 
 
 def _written_version(body: str) -> str:
