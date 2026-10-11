@@ -103,6 +103,15 @@ while read -r lref lsha rref rsha; do
         echo "P ${rref#refs/tags/} $c" >>"$push"
         # A release tag also judges what the destination already holds past
         # its commit: a non-bumped descendant pushed before the tag existed.
+        # That walk can only see branch tips this clone holds, so a missing
+        # one refuses rather than passing unseen.
+        missing="$(grep -E $'\trefs/heads/' "$adv" | cut -f1 \
+                   | git cat-file --batch-check='%(objectname) %(objecttype)' | awk '$2 == "missing" {print $1}')"
+        if [ -n "$missing" ]; then
+            echo "pre-push: $dest has branch commits this clone lacks, so ${rref} cannot be checked" >&2
+            echo "          against them. Run: git fetch $dest   then push the tag again." >&2
+            exit 1
+        fi
         if [ -n "$have" ]; then
             desc="$(printf '%s\n' $have | git rev-list --stdin --ancestry-path "^$c")" \
                 || { echo "pre-push: could not list what follows $rref." >&2; exit 1; }
@@ -116,7 +125,7 @@ grep -q '^C ' "$push" || exit 0   # nothing newly published: tips the destinatio
 
 test_id="tests/test_manifest.py::TestReleaseStampIsNotAPublishedVersion::test_the_committed_stamp_of_each_pushed_commit_is_not_released"
 if ! LEVAIN_PUSH_FILE="$push" "$PY" -m pytest "$test_id" -q -rs -p no:cacheprovider >"$out" 2>&1 \
-        || grep -qi 'skipped' "$out"; then
+        || grep -qE '[0-9]+ skipped|^SKIPPED' "$out"; then
     echo >&2
     echo "⛔ pre-push BLOCKED — the release-stamp gate failed or could not run:" >&2
     echo >&2
