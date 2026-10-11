@@ -655,6 +655,14 @@ class Broker:
         body = params["new_body"]
         if len(body.encode("utf-8")) > MAX_BODY_BYTES:
             raise BrokerError("too_large", 413, f"body exceeds {MAX_BODY_BYTES} bytes")
+        from anneal_memory.origin import canonical_section_markdown
+
+        # anneal's own header test on the canonical body: a '## ' line would split the section, and
+        # replace_section refuses it only AFTER the operator consented (L4 section_drive, L2 r1)
+        if any(line.startswith("## ") for line in canonical_section_markdown(body).split("\n")):
+            if at_issue:
+                raise BrokerError("invalid_body", 400, "a line starting '## ' would start a new section")
+            raise ValueError("the body has a '## ' line")
         if at_issue:
             shown = target.get("panel_version")
             if not isinstance(shown, str) or not shown:
@@ -681,6 +689,10 @@ class Broker:
                 # a consented edit would wait out a whole wrap in capped retries and could end refused;
                 # nothing is consented while one is open
                 raise BrokerError("wrap_in_progress", 409, "a wrap is open on the memory store; edit after it saves")
+        elif got.wrap_open:
+            # a wrap opened after issue (a pending lives PENDING_TTL): the decision waits, the signature
+            # stays unspent, and the operator signs again once the wrap saves (L2 r1)
+            raise TransientApplyFault("WrapOpen", "a wrap is open on the memory store; sign after it saves")
         effects = section_effects(heading, got.version, body)
         return _Built({"kind": "value", "panel_id": target.get("panel_id"), "heading": heading,
                        "panel_version": target.get("panel_version")}, effects,
