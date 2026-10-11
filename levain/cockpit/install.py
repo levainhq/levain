@@ -60,6 +60,22 @@ def marker_path(data_root: Path | str, directory: Path | None = None) -> Path | 
     return d / f"{digest}.json"
 
 
+def marker_present(marker: Path | None) -> bool:
+    """Whether a governed marker exists. Only ENOENT is absence: any other ``lstat`` failure (EACCES,
+    EIO, ELOOP) raises, so an unreadable marker is never taken for a reported root."""
+    if marker is None:
+        return False
+    try:
+        os.lstat(marker)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def marker_unreadable(marker: Path | None, exc: OSError) -> str:
+    return f"cannot read the governed marker path ({marker}): {exc.strerror or exc}"
+
+
 def decide_install(declared: str | None, data_root: Path | str, *,
                    marker_directory: Path | None = None) -> InstallDecision:
     """The install class the broker starts under, from the ``--install-class`` declaration and the
@@ -67,7 +83,10 @@ def decide_install(declared: str | None, data_root: Path | str, *,
     if declared is not None and declared not in INSTALL_CLASSES:
         return InstallDecision(None, f"unknown install class {declared!r}")
     marker = marker_path(data_root, marker_directory)
-    has_marker = marker is not None and os.path.lexists(marker)
+    try:
+        has_marker = marker_present(marker)
+    except OSError as exc:
+        return InstallDecision(None, marker_unreadable(marker, exc))
     if has_marker and declared == REPORTED:
         return InstallDecision(None, f"a governed marker names this data root ({marker}); "
                                      "--install-class reported cannot declare it away")

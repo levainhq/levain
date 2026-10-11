@@ -166,3 +166,23 @@ def test_an_oversized_key_file_is_refused(tmp_path: Path, capsys) -> None:
     big.write_bytes(b"ssh-ed25519 " + b"A" * 20000)
     assert cli.main(["cockpit", "enroll", str(big), "--data-root", str(root)]) == 1
     assert "larger than a public key file" in capsys.readouterr().err
+
+
+def test_an_unreadable_marker_path_refuses_and_is_never_read_as_absent(tmp_path: Path) -> None:
+    # L3 r1 codex + codex-pack HIGH: os.path.lexists read an EACCES on the marker as "no marker", so a
+    # governed root whose marker directory the operator cannot search took reported keys
+    from levain.cockpit.install import decide_install
+
+    root = _journal(tmp_path)
+    mdir = tmp_path / "m"
+    mdir.mkdir()
+    marker_path(root, mdir).write_text("{}")
+    mdir.chmod(0o600)   # readable listing, no search: lstat of the marker answers EACCES
+    try:
+        with pytest.raises(KeyError_, match="cannot read the governed marker"):
+            keys(root, marker_directory=mdir)
+        decision = decide_install("reported", root, marker_directory=mdir)
+        assert decision.install_class is None and "cannot read the governed marker" in str(decision.reason)
+    finally:
+        mdir.chmod(0o700)
+    assert decide_install("reported", root, marker_directory=tmp_path / "absent").install_class == "reported"

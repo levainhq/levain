@@ -27,7 +27,7 @@ from pathlib import Path
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN
 from levain.cockpit.consent import utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, DB_NAME, CockpitDB, _meta
-from levain.cockpit.install import REPORTED, marker_path
+from levain.cockpit.install import REPORTED, marker_path, marker_present, marker_unreadable
 
 __all__ = ["ENROLLED_VIA", "KEY_CLASSES", "KeyError_", "KeyRow", "enroll", "keys", "fingerprint_of",
            "normalise_public_key", "principal_of", "revoke"]
@@ -111,7 +111,11 @@ def _journal(data_root: Path | str, *, marker_directory: Path | None = None) -> 
     """The reported install's journal at ``data_root``; never creates one."""
     root = Path(data_root)
     marker = marker_path(root, marker_directory)
-    if marker is not None and os.path.lexists(marker):
+    try:
+        governed = marker_present(marker)
+    except OSError as exc:
+        raise KeyError_(marker_unreadable(marker, exc)) from exc
+    if governed:
         raise KeyError_(f"a governed marker names this data root ({marker}): its keys are the root helper's")
     if not (root / DB_NAME).is_file():
         raise KeyError_(f"no cockpit journal at {root / DB_NAME}: start the cockpit once with "
