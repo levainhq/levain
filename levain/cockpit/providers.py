@@ -16,6 +16,9 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from levain.cockpit.anneal_effects import section_resource_key
+from levain.cockpit.authority import LabelKey
+from levain.cockpit.effects import SPORE_AUTHORITY_FIELDS, _stored_authority, spore_resource_key
 from levain.cockpit.engine import Cockpit, ProviderSpec, ReadContext, row_version_of
 from levain.cockpit.registry import parse_date
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
@@ -121,6 +124,25 @@ def spore_stored(s: OpenSpore) -> dict[str, Any]:
     return {f: getattr(s, f) for f in SPORE_STORED}
 
 
+def spore_label_key(stored: Mapping[str, Any]) -> LabelKey | None:
+    """A spore row's label key (K2b-3b §2): its authority fields as stored, under its origin key. A
+    spore with no origin_key was never a cockpit target, so it has none. NOTE: the substrate view's
+    ``OpenSpore`` does not carry ``origin_key`` yet, so no rendered spore row has one today."""
+    ok = stored.get("origin_key")
+    if not isinstance(ok, str) or not ok:
+        return None
+    return LabelKey(spore_resource_key(ok), {f: _stored_authority(stored, f) for f in SPORE_AUTHORITY_FIELDS})
+
+
+def section_label_key(heading: str) -> Callable[[Mapping[str, Any]], LabelKey | None]:
+    """A Class-A section's value label key: the text ``read_section`` returned, under its heading. The
+    label was written over ``canonical_section_markdown(body)``, which is that text (K2b-3b §0.5)."""
+    def key(value: Mapping[str, Any]) -> LabelKey | None:
+        text = value.get("markdown")
+        return LabelKey(section_resource_key(heading), {"body": text}) if isinstance(text, str) else None
+    return key
+
+
 def spore_row_version(raw: Mapping[str, Any]) -> str:
     """The ``version`` the spore panels render for this stored spore, from anneal's raw dict. A
     spore write passes it to anneal as ``version_of``, so the compare runs inside anneal's write
@@ -164,11 +186,11 @@ def _spore_provider(
 
 def _spore_read_one(source: SubstrateSource, bucket: str) -> Callable[[ReadContext, str], Result]:
     def read_one(ctx: ReadContext, row_id: str) -> Result:
-        # a fresh read of the SOURCE (its own context, never the cycle's memoised view)
-        fresh = ReadContext(ctx.now)
-        # the row by its id, NOT through the list's visibility rules: a row rescheduled into the
+        # a fresh read of the SOURCE: ``ctx`` is the write's own (``Cockpit.read_one`` makes one per
+        # read, never the render cycle's), passed through so it keeps the request's authority (§8d row 6).
+        # The row by its id, NOT through the list's visibility rules: a row rescheduled into the
         # future since the render still exists, and a write must find it
-        res = _spore_provider(source, bucket, apply_hold=False)(fresh)
+        res = _spore_provider(source, bucket, apply_hold=False)(ctx)
         if not isinstance(res, Read):
             return res
         for r in res.rows or ():
@@ -644,9 +666,11 @@ def _section_writer_shipped() -> bool:
 
 def _scan_read_one(read: Callable[[ReadContext], Result]) -> Callable[[ReadContext, str], Result]:
     """``read_one`` for a provider whose source is read whole: a FRESH read (never the memoised
-    view of a render) and the row found by id."""
+    view of a render: ``ctx`` is the write's own, ``Cockpit.read_one`` makes one per read) and the
+    row found by id. The caller's context is passed through, so a journal read memoised on its
+    authority is read once per request, never per probe (K2b-3b §8d row 6)."""
     def read_one(ctx: ReadContext, row_id: str) -> Result:
-        res = read(ReadContext(ctx.now))
+        res = read(ctx)
         if not isinstance(res, Read):
             return res
         for r in res.rows or ():
@@ -701,6 +725,7 @@ def build_default_cockpit(
         ck.register(ProviderSpec(
             pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank,
             order=order, views=views, rowset=f"spore:{bucket}", read_one=_spore_read_one(source, bucket),
+            label_key=spore_label_key,
             empty="Nothing waiting.", verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
             **spore_common))
     ck.register(ProviderSpec(
@@ -761,7 +786,8 @@ def build_default_cockpit(
                                       _anneal_section(source, s_.heading) if edit
                                       else _prose(source, "section", s_.heading),
                                       region="mind", rank=20 + i, edit_class=s_.edit_class,
-                                      verbs=("section_edit",) if edit else ()))
+                                      verbs=("section_edit",) if edit else (),
+                                      label_key=section_label_key(s_.heading) if edit else None))
         for i, d in enumerate(v.config_docs):
             pid = f"config:{d.key}"
             if pid not in used:

@@ -255,14 +255,22 @@ def section_resource_key(heading: str) -> str:
     return SECTION_KEY_PREFIX + heading
 
 
+def _canonical(body: str) -> str:
+    from anneal_memory.origin import canonical_section_markdown
+
+    return canonical_section_markdown(body)
+
+
 def section_effects(heading: str, version: str, body: str) -> list[Effect]:
-    """A section edit's one effect."""
+    """A section edit's one effect. Its authority projection carries the body as anneal stores it
+    (``canonical_section_markdown``, the text ``read_section`` returns once written), so the label
+    is over what the section panel renders (K2b-3b §0.5, §4)."""
     if not isinstance(version, str) or not version:
         raise ValueError("a section edit needs the section's version")
     if not isinstance(body, str):
         raise ValueError("a section edit's body is a string")
     return [Effect(section_resource_key(heading), SECTIONS, {"version": version}, {"body": body},
-                   {"heading": heading}, (), ("heading",))]
+                   {"heading": heading, "body": _canonical(body)}, ("body",), ("heading",))]
 
 
 SECTION_CANONICAL = {SECTION_VERB: section_effects}
@@ -285,9 +293,7 @@ def _written_version(body: str) -> str:
     hashes a span), so a retry after a lost acknowledgement reads ALREADY."""
     import hashlib
 
-    from anneal_memory.origin import canonical_section_markdown
-
-    return hashlib.sha256(canonical_section_markdown(body).encode("utf-8")).hexdigest()
+    return hashlib.sha256(_canonical(body).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -306,7 +312,7 @@ class SectionEffectStore:
 
     name = SECTIONS
     version_fields = ("heading", "body")
-    authority_fields = ("heading",)
+    authority_fields = ("heading", "body")
     store_assigned_fields = ()
 
     def __init__(self, db: str | Path) -> None:
@@ -374,7 +380,10 @@ class SectionEffectStore:
         return [ApplyUnit(SECTIONS, (i,), (e,)) for i, e in effects]
 
     def label_fields(self, effect: Effect, stored: Mapping[str, Any] | None) -> tuple[str, ...]:
-        return ()
+        """``body`` when the stored body is the one this effect wrote (its canonical form)."""
+        if stored is None or effect.projection is None or "body" not in effect.projection:
+            return ()
+        return ("body",) if stored.get("body") == effect.projection["body"] else ()
 
     # -- apply --
 
@@ -408,7 +417,7 @@ class SectionEffectStore:
             raise PermanentApplyRefusal(f"no continuity lock on this filesystem: {exc}") from exc
         except (AnnealMemoryError, OSError) as exc:
             raise TransientApplyFault.of(exc) from exc
-        stored = {"heading": heading}
+        stored = {"heading": heading, "body": _canonical(body)}
         if res.outcome == "written":
             return UnitApplyResult(ApplyOutcome.APPLIED, (MemberApply(None, stored),))
         if res.outcome == "version_mismatch":

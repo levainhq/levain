@@ -21,9 +21,12 @@ has no tier function and is therefore T2. The steps of ``/cockpit/verb``:
    "needs the broker" (§4.3);
 8. the verb's ``confirm`` is checked, and only a C1 reaches its handler.
 
-Provenance: no row carries a label before K2b's fire journal exists, so every ``tier_fn`` receives
-``"unverified"`` (§9 K2a). The standing policy that may raise a tier is a T3 store that does not
-exist yet; :data:`POLICY` is the identity policy and its revision is hashed into every etag.
+Provenance: every ``tier_fn`` receives the row's label (``row["provenance"]["label"]``, ``"unverified"``
+when null) from ONE authority snapshot per outer request (K2b-3b §0.1): the render's for the actions it
+shows, a fresh one taken by ``dispatch`` and by ``retier`` for the tier that governs. With no labeller
+attached every label is ``"unverified"``, as in K2a. The standing policy that may raise a tier is a
+T3 store that does not exist yet; :data:`POLICY` is the identity policy and its revision is hashed
+into every etag.
 
 The credential is verified by the HTTP layer before this module runs and handed in as a dict;
 ``dispatch`` refuses a ``none`` class itself as well, so a caller that forgets the check fails
@@ -35,6 +38,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
+from levain.cockpit.authority import bound
 from levain.cockpit.engine import VALUE_ABSENT
 from levain.cockpit.external import ID_PREFIX as EXTERNAL_PREFIX
 from levain.cockpit.registry import parse_date
@@ -43,6 +47,7 @@ from levain.writes import (ActionVerb, EditError, _apply_operator_state_edit, _n
                            apply_action, apply_edit)
 
 if TYPE_CHECKING:
+    from levain.cockpit.authority import RequestAuthority
     from levain.cockpit.broker import Broker
     from levain.cockpit.engine import Cockpit
     from levain.jobs import JobRuntime
@@ -438,29 +443,38 @@ def offered(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, *, fresh:
             and (not external or registry.is_downstream(n))]
 
 
+def row_label(row: dict[str, Any] | None) -> str:
+    """The label a row was rendered (or read) with: its provenance, which the engine applied from the
+    request's one snapshot; ``unverified`` when it carries none."""
+    prov = (row or {}).get("provenance")
+    label = prov.get("label") if isinstance(prov, dict) else None
+    return label if isinstance(label, str) and label else UNVERIFIED
+
+
 def row_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, row: dict[str, Any],
                 credential_class: str, install_class: str, today: date) -> list[dict[str, Any]]:
     out = []
+    label = row_label(row)
     for v in offered(registry, cockpit, panel_id):
         if v.binding != "row" or (v.applies_to is not None and not v.applies_to(row)):
             continue
-        t = v.rendered_tier(row, UNVERIFIED, today)
+        t = v.rendered_tier(row, label, today)
         out.append({"verb": v.name, "tier": t, "gesture": gesture_for(t, credential_class, install_class),
-                    "escalates": v.escalates(row, UNVERIFIED, today) if v.escalates else [],
+                    "escalates": v.escalates(row, label, today) if v.escalates else [],
                     "target": {"panel_id": panel_id, "row_id": row["id"], "row_version": row["version"]}})
     return out
 
 
 def panel_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str,
                   credential_class: str, install_class: str, today: date,
-                  value_version: str | None = None) -> list[dict[str, Any]]:
+                  value_version: str | None = None, label: str = UNVERIFIED) -> list[dict[str, Any]]:
     """A value write's target names the version of the value it was rendered with (§4.4), so a
     renderer sends back what it showed; with no readable value there is none to name."""
     out = []
     for v in offered(registry, cockpit, panel_id):
         if v.binding == "row":
             continue
-        t = v.rendered_tier(None, UNVERIFIED, today)
+        t = v.rendered_tier(None, label, today)
         target: dict[str, Any] = {"panel_id": panel_id}
         if v.binding == "value":
             target["panel_version"] = value_version
@@ -495,7 +509,7 @@ def _read_target(cockpit: "Cockpit", verb: VerbSpec, panel_id: str, row_id: str 
         return None
     if not isinstance(row_id, str) or not row_id:
         raise _refuse("bad_request", 400, f"{verb.name!r} names a row: 'row_id' is required")
-    res = cockpit.read_one(panel_id, row_id)
+    res = cockpit.read_one(panel_id, row_id)     # under the request's bound authority
     if isinstance(res, Absent):
         raise _refuse("stale", 409, f"row {row_id!r} is gone")
     if isinstance(res, Fault):
@@ -517,11 +531,32 @@ def _check_value_version(cockpit: "Cockpit", panel_id: str, supplied: Any) -> No
         raise _refuse("stale", 409, f"panel {panel_id!r} changed since it was rendered")
 
 
+def _value_label(cockpit: "Cockpit", verb: VerbSpec, panel_id: str, authority: "RequestAuthority") -> str:
+    """A stored value's label for a value write's tier, from the request's snapshot. A verb whose
+    tier reads no label (a constant, or none) takes ``unverified`` without a second source read."""
+    if verb.tier_fn is None or _is_const(verb):
+        return authority.labels.label(None)
+    res = cockpit.read_value_head(panel_id, authority=authority)
+    if isinstance(res, Fault):
+        raise _refuse("source_unavailable", 503, f"could not read {panel_id!r} from its source: {res.message}")
+    return res.value[1] if isinstance(res, Read) else UNVERIFIED
+
+
 def dispatch(
     *, registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | None", req: Any,
     credential: dict[str, Any], install_class: str, route: Literal["cockpit", "edit", "action"],
     job_runtime: "JobRuntime | None" = None, broker: "Broker | None" = None,
 ) -> dict[str, Any]:
+    # the tier at issue governs, from a FRESH snapshot taken once for this request and bound for its
+    # source reads (K2b-3b §0.1, §8d row 6)
+    auth = cockpit.authority()
+    with bound(auth):
+        return _dispatch(registry, cockpit, scope, req, credential, install_class, route, job_runtime, broker, auth)
+
+
+def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | None", req: Any,
+              credential: dict[str, Any], install_class: str, route: Literal["cockpit", "edit", "action"],
+              job_runtime: "JobRuntime | None", broker: "Broker | None", auth: "RequestAuthority") -> dict[str, Any]:
     if credential.get("class") not in ("token", "device"):
         raise _refuse("credential_required", 403, "a write needs a credential (the write token)")
     if not isinstance(req, dict):
@@ -531,7 +566,7 @@ def dispatch(
     today = cockpit.today()
 
     if route == "edit":
-        return _legacy_edit(registry, cockpit, scope, req, credential, install_class, today, broker)
+        return _legacy_edit(registry, cockpit, scope, req, credential, install_class, today, broker, auth)
 
     if route == "action":
         name = req.get("verb")
@@ -546,7 +581,7 @@ def dispatch(
         bad = sorted(set(params) - set(verb.fields)) if verb.fields is not None else []
         if bad:
             raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
-        tier = verb.tier(params, None, UNVERIFIED, today)
+        tier = verb.tier(params, None, auth.labels.label(None), today)    # no row, no label
         _refuse_unless_c1(verb, tier, credential, install_class)
         return _fire_downstream(registry, verb, scope, params, req, job_runtime)
 
@@ -586,6 +621,7 @@ def dispatch(
     if replayed is not None:
         return replayed
     row = _read_target(cockpit, verb, panel_id, req.get("row_id"))
+    label = row_label(row)
     if row is not None:
         if verb.applies_to is not None and not verb.applies_to(row):
             raise _refuse("stale", 409, f"panel {panel_id!r} no longer offers {verb.name!r} on this row")
@@ -593,9 +629,10 @@ def dispatch(
             raise _refuse("stale", 409, f"row {row['id']!r} changed since it was rendered")
     elif verb.binding == "value":
         _check_value_version(cockpit, panel_id, req.get("panel_version"))
+        label = _value_label(cockpit, verb, panel_id, auth)
 
-    tier = verb.tier(params, row, UNVERIFIED, today)
-    floor = verb.rendered_tier(row, UNVERIFIED, today)
+    tier = verb.tier(params, row, label, today)
+    floor = verb.rendered_tier(row, label, today)
     # a broker pending's replay is keyed by it (K2b §2), so a T2/T3 takes one on any verb
     if "idempotency_key" in req and not verb.idempotent and tier == "C1":
         raise _refuse("bad_request", 400, f"{verb.name!r} is not idempotent; it takes no idempotency_key")
@@ -718,19 +755,37 @@ def retier(registry: "VerbRegistry", cockpit: "Cockpit", verb_name: str, params:
            target: dict[str, Any]) -> Tier | Absent | None:
     """The kernel's tier for a pending's verb against its target read fresh (K2b §3.2.1), the
     broker's ``tier_of``. ``Absent`` when the row is gone (the decision ends STALE); ``None`` when
-    the read faulted (the decision leaves a signed pending unspent, and refuses a reported one)."""
+    the read faulted (the decision leaves a signed pending unspent, and refuses a reported one).
+
+    One snapshot per decide (K2b-3b §0.1). A snapshot that could not read the journal is ``None`` in a
+    governed install, where a label can lower a tier, so a decision never settles on a guessed label;
+    in a reported install no label is ever ``verified`` (``broker.label_class``), so the tier is the
+    one ``unverified`` gives. A value target tiers as unlabelled (every kernel value verb's tier is a
+    constant; a downstream value verb whose tier reads a label is a known edge)."""
     verb = registry.get(verb_name)
     if verb is None:
         return None
+    auth = cockpit.authority()
+    if auth.labels.error is not None and _governed(cockpit):
+        return None
     row = None
     if target.get("kind") == "row":
-        res = cockpit.read_one(str(target.get("panel_id")), str(target.get("row_id")))
+        with bound(auth):
+            res = cockpit.read_one(str(target.get("panel_id")), str(target.get("row_id")))
         if isinstance(res, Absent):
             return res
         if not isinstance(res, Read):
             return None
         row = res.value
-    return verb.tier(dict(params), row, UNVERIFIED, cockpit.today())
+    return verb.tier(dict(params), row, row_label(row), cockpit.today())
+
+
+def _governed(cockpit: "Cockpit") -> bool:
+    """Whether a label can change a tier here: any install class but ``reported`` (fail closed on an
+    unknown one: the decision waits rather than settle on a label it could not read)."""
+    from levain.cockpit.install import REPORTED
+
+    return cockpit.install_class() != REPORTED
 
 
 def _require_confirm(verb: VerbSpec, req: dict[str, Any]) -> None:
@@ -756,7 +811,7 @@ def _legacy_target(cockpit: "Cockpit", verb: VerbSpec, req: dict[str, Any]) -> t
     for pid in panels:
         if cockpit.spec(pid) is None:
             continue
-        res = cockpit.read_one(pid, rid)
+        res = cockpit.read_one(pid, rid)    # the request's bound authority: one snapshot across the panels
         if isinstance(res, Read):
             found.append((pid, res.value))
         elif isinstance(res, Fault):
@@ -777,7 +832,7 @@ _LEGACY_NEEDS_SNAPSHOT = frozenset({"spore_descend"})
 
 def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope", req: dict[str, Any],
                  credential: dict[str, Any], install_class: str, today: date,
-                 broker: "Broker | None" = None) -> dict[str, Any]:
+                 broker: "Broker | None", authority: "RequestAuthority") -> dict[str, Any]:
     """``POST /edit``: the legacy body translated onto the cockpit path. One row read, one tier, the
     kernel's CAS key and the verb's own ``fire``; ``apply_edit`` never receives the client's body.
     What the client rendered still binds: a body's ``expect_disposition`` must match the row as read
@@ -795,10 +850,13 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
         raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
     if (verb.tier_fn is None or _is_const(verb)) and (broker is None or not broker.enabled):
         # a verb whose tier does not depend on the row: refuse a T2/T3 before reading anything
-        _refuse_unless_c1(verb, verb.tier(params, None, UNVERIFIED, today), credential, install_class, broker)
+        _refuse_unless_c1(verb, verb.tier(params, None, authority.labels.label(None), today), credential,
+                          install_class, broker)
     panel_id, row = (None, None)
+    label = authority.labels.label(None)
     if verb.binding == "row":
         panel_id, row = _legacy_target(cockpit, verb, req)
+        label = row_label(row)
         if verb.name in _LEGACY_NEEDS_SNAPSHOT and "expect_disposition" not in req:
             raise _refuse("bad_request", 400, f"{verb.name!r} on /edit names the disposition it rendered "
                           "('expect_disposition')")
@@ -810,8 +868,9 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
         if panel_id is None:
             raise _refuse("not_offered", 404, f"{verb.name!r} is not a /edit value write")
         _check_value_version(cockpit, panel_id, req.get("panel_version"))
-    tier = verb.tier(params, row, UNVERIFIED, today)
-    floor = verb.rendered_tier(row, UNVERIFIED, today)
+        label = _value_label(cockpit, verb, panel_id, authority)
+    tier = verb.tier(params, row, label, today)
+    floor = verb.rendered_tier(row, label, today)
     # A legacy body carries no intent: a reported install sends "reported" for a write that escalates
     # nothing and refuses an escalating one; a governed one sends "sign" (§9 Order).
     if TIERS.index(tier) > TIERS.index(floor):
@@ -866,8 +925,9 @@ class VerbView:
         return row_actions(self.registry, self.cockpit, panel_id, row, cred, self.install_class, today)
 
     def panel_actions(self, panel_id: str, cred: str, today: date,
-                      value_version: str | None = None) -> list[dict[str, Any]]:
-        return panel_actions(self.registry, self.cockpit, panel_id, cred, self.install_class, today, value_version)
+                      value_version: str | None = None, label: str = UNVERIFIED) -> list[dict[str, Any]]:
+        return panel_actions(self.registry, self.cockpit, panel_id, cred, self.install_class, today,
+                             value_version, label)
 
     def verbs_map(self, cred: str) -> dict[str, dict[str, Any]]:
         return verbs_map(self.registry, self.cockpit, cred, self.install_class)
