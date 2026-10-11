@@ -789,6 +789,13 @@ class _Handler(GuardedHandler):
         # downstream ``extra_asset``) — they carry NO substrate data, and the browser must load them
         # to supply the token on the data fetches (the bootstrap). Everything else off-box requires
         # the token, so a 404-class path returns a uniform 403 to an unauthed node (no path probing).
+        # One exception: the chat routes on a server with no chat host answer 404 here. dashboard_chat.js
+        # probes /chat.json with its chat token only and reads 404 as "no chat panel"; chat is never
+        # served off loopback (make_server refuses it), and the route names are public, so the 404 tells
+        # an unauthed node nothing a probe could learn.
+        if path in _CHAT_GET_ROUTES and self.server.chat_host is None:
+            self._send(b"not found\n", "text/plain; charset=utf-8", status=404, head=head)
+            return
         if (
             self._write_token_required()
             and path not in _ASSETS

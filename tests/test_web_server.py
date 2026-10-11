@@ -1728,6 +1728,19 @@ class TestOffBoxWriteToken:
             for path in ("/", "/dashboard.css", "/dashboard_core.js", "/dashboard_boot.js"):
                 assert _get_h(base + path)[0] == 200, path
 
+    def test_offbox_chat_paths_answer_404_without_a_chat_host(self, tmp_path: Path) -> None:
+        # dashboard_chat.js probes GET /chat.json with only its chat token: 404 means "no chat panel".
+        # An off-box writable surface never has a chat host (make_server refuses chat off loopback), yet
+        # the read gate answered the probe 403 "missing or invalid write token", and the page showed
+        # "Chat is unavailable" (seen by Phill on flow's :7421, traced by 1011+43). The chat routes do
+        # not exist there, so they answer 404 before the gate; every other path still answers 403.
+        with _serving(self._writable_noinstall(tmp_path)) as (base, httpd):
+            httpd.is_loopback_bind = False
+            _set_token(httpd, "s3cret")
+            for path in ("/chat.json", "/chat/session.json", "/chat/job.json"):
+                assert _get_h(base + path)[0] == 404, path
+            assert _get_h(base + "/no-such-path")[0] == 403
+
     def test_offbox_read_token_403_carries_json_token_message(self, tmp_path: Path) -> None:
         # The read token-403 body is JSON with a token message so the frontend distinguishes it from
         # a Host/cross-site 403 (plain text) and prompts + retries (dashboard_boot.js), rather than
