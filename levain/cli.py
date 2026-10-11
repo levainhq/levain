@@ -335,6 +335,43 @@ def main(argv: list[str] | None = None) -> int:
     )
     state_p.set_defaults(func=_cmd_state)
 
+    ck_p = subparsers.add_parser(
+        "cockpit",
+        help="Enroll, revoke and list the cockpit's signing keys (a reported install).",
+        description=(
+            "The keys that sign the cockpit's T2/T3 writes. `enroll` adds an OpenSSH public key "
+            "(class laptop-presence signs T2 and T3, display-phone T2); `revoke` retires one, and "
+            "refuses the last laptop-presence key; `keys` lists them. Run at the laptop: in a "
+            "reported install this CLI is how a key gets enrolled. A governed install's keys are "
+            "written by the root installer, so these refuse it."
+        ),
+    )
+    ck_sub = ck_p.add_subparsers(dest="cockpit_cmd", required=True)
+
+    def _ck_common(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--path", type=Path, default=Path.cwd(),
+                        help="Install directory (default: cwd); the journal is its ledger's cockpit/.")
+        sp.add_argument("--data-root", type=Path, default=None, dest="data_root",
+                        help="The cockpit data root itself (an embedder's, e.g. flow's state/bridge/cockpit).")
+
+    ck_enroll = ck_sub.add_parser("enroll", help="Enroll an OpenSSH public key.")
+    ck_enroll.add_argument("key", type=Path, help="The public key file (e.g. ~/.ssh/id_ed25519.pub).")
+    ck_enroll.add_argument("--class", dest="key_class", default="laptop-presence",
+                           choices=("laptop-presence", "display-phone", "presence"),
+                           help="What the key may sign (default: laptop-presence).")
+    _ck_common(ck_enroll)
+    ck_enroll.set_defaults(func=_cmd_cockpit_enroll)
+    ck_revoke = ck_sub.add_parser("revoke", help="Revoke an enrolled key.")
+    ck_revoke.add_argument("ref", help="The key's fingerprint (SHA256:...) or principal.")
+    ck_revoke.add_argument("--compromised-since", dest="compromised_since", default=None,
+                           help="ISO time the key may have been in other hands since; its signatures "
+                                "from then on stop reading verified.")
+    _ck_common(ck_revoke)
+    ck_revoke.set_defaults(func=_cmd_cockpit_revoke)
+    ck_keys = ck_sub.add_parser("keys", help="List enrolled keys.")
+    _ck_common(ck_keys)
+    ck_keys.set_defaults(func=_cmd_cockpit_keys)
+
     run_p = subparsers.add_parser(
         "run",
         help="Run a sovereign entity as an interactive partner on an open model.",
@@ -1483,6 +1520,71 @@ def _cmd_wrap(args: argparse.Namespace) -> int:
         ),
         unattended=getattr(args, "unattended", False),
     )
+
+
+def _cockpit_root(args: argparse.Namespace) -> Path:
+    """The broker's data root: ``--data-root``, else the one ``levain serve --write`` uses for
+    ``--path`` (its write scope's ledger root's ``cockpit/``)."""
+    if args.data_root is not None:
+        return args.data_root
+    from levain.dashboard import _resolve_source
+
+    scope = _resolve_source(args.path).write_scope
+    if scope is None:
+        raise SystemExit(f"{args.path} has no writable install; pass --data-root")
+    return scope.ledger_root / "cockpit"
+
+
+def _cmd_cockpit_enroll(args: argparse.Namespace) -> int:
+    from datetime import datetime, timezone
+
+    from levain.cockpit.keys import KeyError_, enroll
+
+    try:
+        text = args.key.expanduser().read_text(encoding="utf-8")
+        row, created = enroll(_cockpit_root(args), text, args.key_class, now=datetime.now(timezone.utc))
+    except (KeyError_, OSError, UnicodeDecodeError) as exc:
+        print(f"enroll refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"{'enrolled' if created else 'already enrolled'}: {row.fingerprint} as {row.key_class} "
+          f"(principal {row.principal})")
+    return 0
+
+
+def _cmd_cockpit_revoke(args: argparse.Namespace) -> int:
+    from datetime import datetime, timezone
+
+    from levain.cockpit.keys import KeyError_, revoke
+
+    try:
+        since = None
+        if args.compromised_since is not None:
+            since = datetime.fromisoformat(args.compromised_since)
+            if since.tzinfo is None:
+                raise KeyError_("--compromised-since needs a zone (e.g. 2026-10-11T09:00:00-04:00)")
+        row = revoke(_cockpit_root(args), args.ref, now=datetime.now(timezone.utc), compromised_since=since)
+    except (KeyError_, ValueError) as exc:
+        print(f"revoke refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"revoked: {row.fingerprint} at {row.revoked_at}"
+          + (f" (compromised since {row.compromised_since})" if row.compromised_since else ""))
+    return 0
+
+
+def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
+    from levain.cockpit.keys import KeyError_, keys
+
+    try:
+        rows = keys(_cockpit_root(args))
+    except KeyError_ as exc:
+        print(f"keys: {exc}", file=sys.stderr)
+        return 1
+    if not rows:
+        print("no keys enrolled")
+    for r in rows:
+        state = f"revoked {r.revoked_at}" if r.revoked_at else "active"
+        print(f"{r.fingerprint}  {r.key_class:<16} {state:<34} enrolled {r.enrolled_at} via {r.enrolled_via}")
+    return 0
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
