@@ -615,7 +615,8 @@ def main(argv: list[str] | None = None) -> int:
             "default — it binds a socket, so read-only is the safe default (unlike "
             "`levain tui`, a local terminal, which defaults writable); pass --write for "
             "the GOVERNED WRITABLE cockpit (operate State / spores / Tray-Keep through "
-            "the same governed seam `levain tui` uses, under localhost-sovereign auth). "
+            "the same governed seam `levain tui` uses; every write needs the write token "
+            "the server prints at start). "
             "This is the sovereign v2 control surface; the in-host `serve-app` MCP App "
             "is the parked alternative."
         ),
@@ -653,8 +654,9 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Serve the GOVERNED WRITABLE cockpit instead of a read-only glance — "
             "enables State / spore touch/descend/ascend / Tray-Keep / episode-tombstone "
-            "edits through the governed write seam. Loopback-sovereign (the localhost "
-            "bind + Host/CSRF guards are the auth; no token) and loopback-ONLY — there "
+            "edits through the governed write seam. Every write needs the write token "
+            "this server prints at start, with a link that carries it (loopback too: "
+            "127.0.0.1 is reachable by every local user). Loopback-ONLY — there "
             "is no off-box writable serve (an install's seed/config is operator-private). "
             "Default is read-only."
         ),
@@ -1534,6 +1536,7 @@ def _cmd_daemon_install(args: argparse.Namespace) -> int:
         return 1
     print(result)
     print(f"\n  serves http://127.0.0.1:{args.port}  (loopback, governed-writable)")
+    print(f"  write token + unlocked link: the latest start's lines in {spec.stdout_log}")
     print(f"\n⚠ {daemon.THREAT_MODEL_NOTE}")
     return 0
 
