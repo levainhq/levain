@@ -657,46 +657,91 @@ class TestReleaseStampIsNotAPublishedVersion:
         working-tree test is the right one there. Two tests because they are
         two claims, not because one is a better version of the other.
 
-        ⚠ THE SUBJECT IS THE PUSHED COMMIT, NOT THE PUSHING CHECKOUT (2026-10-11,
-        reproduced). Reading HEAD refused a correctly stamped push made from a
-        checkout parked on an older branch, refused a branch DELETE, and
-        refused the release tag itself. ``scripts/hooks/pre-push`` now reads the
-        shas git hands it on stdin, skips deletes, and passes the tips here in
-        ``LEVAIN_PUSHED_SHAS`` (space-separated commit shas). Unset, the
-        subject is HEAD, which is what a plain suite run means. Each pushed TIP
-        is checked, not the range behind it: widening a gate to walk ranges was
-        refused (``spore-551``), and anneal refused the same widening.
+        ⚠ THE SUBJECT IS WHAT A PUSH PUBLISHES, NOT THE PUSHING CHECKOUT
+        (2026-10-11, reproduced). Reading HEAD refused a correctly stamped push
+        made from a checkout parked on an older branch, refused a branch DELETE
+        and the release tag itself, and passed a released-stamp commit pushed
+        from a clean main. Driven by ``scripts/hooks/pre-push``,
+        ``LEVAIN_PUSH_FILE`` names a file of lines: ``C <sha>``, a commit the
+        push makes newly reachable; ``R <sha>\t<ref>``, a tag the remote
+        advertises (``git ls-remote --tags``); ``P <tag> <sha>``, a tag this
+        push sets. The release record is the remote's tags plus this push's,
+        never the local tags: a release tag lands after main is pushed, so a
+        clone can hold the release commit without its tag. Unset, the subject
+        is HEAD against the local tags, which is what a plain suite run means.
+        The L3 r1 of 2026-10-11 (codex) reached a mid-range commit, so ranges are
+        walked; the earlier tips-only scope had cited ``spore-551``, which rules
+        how many gates exist, not how wide one is.
         """
         import os
         import re
+        import subprocess
 
         root = TestReadmePinClaim()._repo_root()   # skips a non-source checkout
-
         if self._git(root, "rev-parse", "--git-dir") is None:
             pytest.skip("no git available / not a git checkout")
-        all_tags = self._git(root, "tag", "--list", "v*")
-        pushed = os.environ.get("LEVAIN_PUSHED_SHAS")
-        if not all_tags:
-            # Driven by the hook, a skip would exit 0 and pass the push unread.
-            assert pushed is None, (
-                "this clone carries no release tags, so the pushed stamps cannot "
-                "be checked: run `git fetch --tags`, or push with --no-verify")
-            pytest.skip("clone carries no release tags — nothing to compare against")
-        released = {t[1:] for t in all_tags.split("\n") if t.startswith("v")}
 
-        subjects = pushed.split() if pushed is not None else ["HEAD"]
-        assert subjects, "LEVAIN_PUSHED_SHAS is set but names no commit"
+        push_file = os.environ.get("LEVAIN_PUSH_FILE")
+        tag_at = {}
+        if push_file is not None:
+            commits, pushed_tags = [], {}
+            peeled = {}
+            for line in open(push_file, encoding="utf-8").read().splitlines():
+                kind, _, rest = line.partition(" ")
+                if kind == "C":
+                    commits.append(rest.strip())
+                elif kind == "P":
+                    name, sha = rest.split()
+                    pushed_tags[name] = sha
+                elif kind == "R":
+                    sha, ref = rest.split("\t")
+                    name = ref[len("refs/tags/"):]
+                    if name.endswith("^{}"):
+                        peeled[name[:-3]] = sha
+                    else:
+                        tag_at.setdefault(name, sha)
+            tag_at.update(peeled)        # an annotated tag's commit, not the tag object
+            tag_at.update(pushed_tags)   # this push sets these
+            assert commits, "LEVAIN_PUSH_FILE names no commit to check"
+        else:
+            refs = self._git(root, "for-each-ref", "--format=%(refname:short) %(*objectname) %(objectname)",
+                             "refs/tags/v*")
+            if not refs:
+                pytest.skip("clone carries no release tags — nothing to compare against")
+            for line in refs.split("\n"):
+                parts = line.split()
+                tag_at[parts[0]] = parts[1]   # *objectname is empty for a lightweight tag
+            head = self._git(root, "rev-parse", "HEAD")
+            assert head, "HEAD does not resolve"
+            commits = [head]
+        released = {name[1:]: sha for name, sha in tag_at.items() if name.startswith("v")}
 
-        for ref in subjects:
-            blob = self._git(root, "show", f"{ref}:levain/__init__.py")
+        commits = list(dict.fromkeys(commits))
+        query = "".join(f"{c}:levain/__init__.py\n{c}:pyproject.toml\n" for c in commits)
+        r = subprocess.run(["git", "-C", str(root), "cat-file", "--batch"], input=query.encode(),
+                           capture_output=True, timeout=120)
+        assert r.returncode == 0, r.stderr.decode(errors="replace")
+        buf, blobs = r.stdout, []
+        while buf:
+            header, _, buf = buf.partition(b"\n")
+            fields = header.split()
+            if len(fields) == 3 and fields[1] == b"blob":
+                size = int(fields[2])
+                blobs.append(buf[:size].decode("utf-8", errors="replace"))
+                buf = buf[size + 1:]
+            else:
+                blobs.append(None)   # "<name> missing"
+        assert len(blobs) == 2 * len(commits), "git cat-file answered a different number of objects"
+
+        for i, ref in enumerate(commits):
+            blob, toml = blobs[2 * i], blobs[2 * i + 1] or ""
             if blob is None:
-                assert ref == "HEAD", f"pushed commit {ref} carries no levain/__init__.py"
+                assert push_file is None, f"pushed commit {ref} carries no levain/__init__.py"
                 pytest.skip("HEAD carries no levain/__init__.py")
             m = re.search(r'__version__ = "([^"]+)"', blob)
             assert m, f"{ref}'s levain/__init__.py no longer declares __version__"
             committed = m.group(1)
 
-            toml = self._git(root, "show", f"{ref}:pyproject.toml") or ""
             t = re.search(r'^version = "([^"]+)"', toml, re.M)
             assert t and t.group(1) == committed, (
                 f"{ref}: pyproject.toml says {t.group(1) if t else None!r}, "
@@ -706,19 +751,20 @@ class TestReleaseStampIsNotAPublishedVersion:
             if committed not in released:
                 continue   # a .devN or an unreleased number — correct by construction
 
-            at_ref = (self._git(root, "tag", "--points-at", ref) or "").split("\n")
-            assert f"v{committed}" in at_ref, (
+            assert released[committed] == ref, (
                 f"THE COMMIT {ref} is stamped {committed!r}, which is already the "
-                f"released tag v{committed} pointing at a DIFFERENT commit. A clean "
-                f"working tree is not the question — a push publishes THIS COMMIT. "
-                f"Bump both stamps (pyproject.toml, levain/__init__.py) to the next "
-                f".dev0 and COMMIT the bump. See spore-710 and CHANGELOG 'Versioning'."
+                f"released tag v{committed} pointing at a DIFFERENT commit "
+                f"({released[committed]}). A clean working tree is not the question: "
+                f"a push publishes THIS COMMIT. Bump both stamps (pyproject.toml, "
+                f"levain/__init__.py) to the next .dev0 and COMMIT the bump. See "
+                f"spore-710 and CHANGELOG 'Versioning'."
             )
 
     def _run_hook(self, root, stdin):
+        import shutil
         import subprocess
         import sys
-        if sys.platform == "win32":
+        if sys.platform == "win32" or shutil.which("bash") is None:
             pytest.skip("the pre-push hook is a bash script")
         return subprocess.run(["bash", str(root / "scripts" / "hooks" / "pre-push"),
                                "origin", "unused-url"], input=stdin, cwd=root,

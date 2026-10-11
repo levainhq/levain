@@ -36,13 +36,24 @@ if [ -z "$PY" ]; then
     exit 1
 fi
 
-# THE SUBJECT IS WHAT IS PUSHED, NOT THIS CHECKOUT'S HEAD (2026-10-11,
+# THE SUBJECT IS WHAT THE PUSH PUBLISHES, NOT THIS CHECKOUT'S HEAD (2026-10-11,
 # reproduced): reading HEAD refused correct pushes made from a checkout parked
-# on an older branch, every branch delete, and the release tag itself. git
-# writes one "<local ref> <local sha> <remote ref> <remote sha>" line per ref on
-# stdin; an all-zero local sha is a delete, which publishes nothing.
-shas=""
-while read -r _lref lsha _rref _rsha || [ -n "${_lref:-}" ]; do
+# on an older branch, every branch delete, and the release tag itself, and let a
+# released-stamp commit through from a clean main. git writes one
+# "<local ref> <local sha> <remote ref> <remote sha>" line per ref on stdin; an
+# all-zero local sha is a delete, which publishes nothing.
+#
+# What is checked is every commit the push makes newly reachable on the remote
+# (remote sha..local sha; for a new ref, whatever no remote-tracking ref already
+# holds), against the tags the REMOTE advertises plus the tags this push sets.
+# Local tags are not the release record: a release tag lands after main is
+# pushed, so a clone can hold the release commit without its tag.
+push="$(mktemp)" || exit 1
+out="$(mktemp)" || { rm -f "$push"; exit 1; }
+trap 'rm -f "$push" "$out"' EXIT
+trap 'exit 1' HUP INT TERM
+
+while read -r _lref lsha rref rsha || [ -n "${_lref:-}" ]; do
     [ -z "${lsha:-}" ] && continue
     [ -z "${lsha//0/}" ] && continue   # all zeros (sha1 or sha256): a delete
     if ! c="$(git rev-parse --verify -q "${lsha}^{commit}")"; then
@@ -50,18 +61,31 @@ while read -r _lref lsha _rref _rsha || [ -n "${_lref:-}" ]; do
         echo "          Push deliberately with --no-verify if this is intended." >&2
         exit 1
     fi
-    shas="$shas $c"
+    case "${rref:-}" in refs/tags/v*) echo "P ${rref#refs/tags/} $c" >>"$push" ;; esac
+    if [ -n "${rsha//0/}" ] && git cat-file -e "${rsha}^{commit}" 2>/dev/null; then
+        new="$(git rev-list "${rsha}..${c}")" || exit 1
+    else
+        new="$(git rev-list "$c" --not --remotes)" || exit 1
+    fi
+    [ -n "$new" ] && printf 'C %s\n' $new >>"$push"
 done
-[ -z "$shas" ] && exit 0   # deletes only
+grep -q '^C ' "$push" || exit 0   # nothing newly published: deletes, or tips the remote holds
 
-out="$(mktemp)"
-if ! LEVAIN_PUSHED_SHAS="$shas" "$PY" -m pytest tests/test_manifest.py -q -p no:cacheprovider \
-        -k "ReleaseStampIsNotAPublishedVersion and committed" >"$out" 2>&1; then
+if ! tags="$(git ls-remote --tags "${1:-origin}" 'refs/tags/v*')"; then
+    echo "pre-push: could not read the remote's release tags; the gate cannot check this push." >&2
+    echo "          Push deliberately with --no-verify if this is intended." >&2
+    exit 1
+fi
+[ -n "$tags" ] && printf '%s\n' "$tags" | sed 's/^/R /' >>"$push"
+
+test_id="tests/test_manifest.py::TestReleaseStampIsNotAPublishedVersion::test_the_committed_stamp_of_each_pushed_commit_is_not_released"
+if ! LEVAIN_PUSH_FILE="$push" "$PY" -m pytest "$test_id" -q -rs -p no:cacheprovider >"$out" 2>&1 \
+        || grep -qi 'skipped' "$out"; then
     echo >&2
-    echo "⛔ pre-push BLOCKED — the release-stamp gate failed:" >&2
+    echo "⛔ pre-push BLOCKED — the release-stamp gate failed or could not run:" >&2
     echo >&2
-    sed -n '/FAILED\|AssertionError\|Error/p' "$out" | head -8 >&2
-    grep -q 'FAILED\|AssertionError\|Error' "$out" || tail -5 "$out" >&2
+    sed -n '/FAILED\|AssertionError\|Error\|SKIPPED/p' "$out" | head -8 >&2
+    grep -q 'FAILED\|AssertionError\|Error\|SKIPPED' "$out" || tail -5 "$out" >&2
     echo >&2
     echo "   A pushed commit is stamped at an already-released version, or its two" >&2
     echo "   stamps disagree. Bump BOTH (pyproject.toml, levain/__init__.py) to the next" >&2
@@ -69,8 +93,6 @@ if ! LEVAIN_PUSHED_SHAS="$shas" "$PY" -m pytest tests/test_manifest.py -q -p no:
     echo "   the tag the SAME commit. See spore-710 and CHANGELOG 'Versioning'." >&2
     echo >&2
     echo "   To push anyway: git push --no-verify" >&2
-    rm -f "$out"
     exit 1
 fi
-rm -f "$out"
 exit 0
