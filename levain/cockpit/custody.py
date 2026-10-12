@@ -11,6 +11,8 @@ why creation is the load-bearing piece here, and why every enrol record declares
   fetches its reference file with ``ssh-keygen -K -w /usr/lib/ssh-keychain.dylib`` and keeps the one whose
   public key is the identity's. The identity's hash column is the SHA-1 of the public key's uncompressed
   point (0x04 || X || Y), measured on macOS 26.6.2 against a reference file ``ssh-keygen -K`` wrote.
+- :func:`default_custody` is ``key create``'s custody when none is given: ``touch-id`` on a Mac whose
+  ``bioutil -r`` prints ``Biometrics for unlock: 1``, ``passphrase`` otherwise (off macOS nothing is run).
 - :func:`create_passphrase` makes an ed25519 key with ``ssh-keygen``, which asks the passphrase on the
   terminal itself, and refuses the key unless the file is encrypted.
 - :func:`passphrase_problem` is that check: the file is an OpenSSH private key of this public key, its
@@ -50,9 +52,10 @@ from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN
 from levain.cockpit.keys import KeyError_, normalise_public_key
 from levain.launch import child_env
 
-__all__ = ["APPLE_PROVIDER", "SC_AUTH", "SIDECAR_SUFFIX", "CreatedKey", "Identity", "Sidecar", "create_passphrase",
-           "create_touch_id", "ctk_status", "custody_note", "declared_custody", "default_key_dir", "is_encrypted_file",
-           "list_identities", "passphrase_problem", "point_sha1", "read_sidecar", "sidecar_path"]
+__all__ = ["APPLE_PROVIDER", "BIOUTIL", "SC_AUTH", "SIDECAR_SUFFIX", "CreatedKey", "Identity", "Sidecar",
+           "create_passphrase", "create_touch_id", "ctk_status", "custody_note", "declared_custody", "default_custody",
+           "default_key_dir", "is_encrypted_file", "list_identities", "passphrase_problem", "point_sha1", "read_sidecar",
+           "sidecar_path"]
 
 APPLE_PROVIDER = "/usr/lib/ssh-keychain.dylib"
 SC_AUTH = Path("/usr/sbin/sc_auth")
@@ -390,6 +393,40 @@ def declared_custody(key_file: Path, given: str | None, key_class: str, public_k
 
 # ---------------------------------------------------------------------------------------------------
 # `levain cockpit key create`
+
+
+BIOUTIL = Path("/usr/bin/bioutil")
+_BIO_LINE = re.compile(r"\s*(Biometrics for unlock|Effective biometrics for unlock):\s*(\d+)\s*")
+
+
+def default_custody(*, platform: str | None = None, bioutil: Path | str = BIOUTIL, sc_auth: Path | str = SC_AUTH,
+                    provider: str = APPLE_PROVIDER) -> tuple[str, str]:
+    """``key create``'s custody when ``--custody`` is not given, and why: ``touch-id`` on a Mac whose
+    ``bioutil -r`` prints ``Biometrics for unlock: 1`` (and, when it prints the line, ``Effective biometrics
+    for unlock: 1``) and that has ``sc_auth`` and the Secure Enclave provider; ``passphrase`` otherwise.
+    Measured, never guessed: off macOS nothing is run, and output this does not read is passphrase."""
+    if (platform or sys.platform) != "darwin":
+        return PASSPHRASE, "touch-id custody is macOS only"
+    try:
+        cp = subprocess.run([str(bioutil), "-r"], stdin=subprocess.DEVNULL, capture_output=True, timeout=_TOOL_TIMEOUT,
+                            check=False, start_new_session=True, env=child_env())
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return PASSPHRASE, f"could not read the Touch ID configuration (bioutil -r: {type(exc).__name__})"
+    values = {}
+    for line in cp.stdout.decode("utf-8", "replace").splitlines():
+        m = _BIO_LINE.fullmatch(line)
+        if m:
+            values[m.group(1)] = m.group(2)
+    if cp.returncode != 0 or "Biometrics for unlock" not in values:
+        return PASSPHRASE, f"could not read the Touch ID configuration (bioutil -r, exit {cp.returncode})"
+    if values["Biometrics for unlock"] != "1":
+        return PASSPHRASE, "Touch ID is not configured for unlock on this Mac (bioutil -r)"
+    if values.get("Effective biometrics for unlock", "1") != "1":
+        return PASSPHRASE, "Touch ID is configured but not in effect for unlock on this Mac (bioutil -r)"
+    for need in (provider, sc_auth):
+        if not Path(need).exists():
+            return PASSPHRASE, f"Touch ID is configured, but this Mac has no {need}"
+    return TOUCH_ID, "Touch ID is configured on this Mac (bioutil -r: Biometrics for unlock: 1)"
 
 
 def default_key_dir() -> Path:

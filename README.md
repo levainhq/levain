@@ -292,6 +292,7 @@ Two of those write targets are your own inbox into the partnership. Dump anythin
 A cockpit write at tier T2 or T3 is signed. The keys that may sign are links in a signed authority log in the cockpit's journal, and the first is written by `levain cockpit ledger init`. Every key states how it is held, its **custody**, and `levain cockpit keys` shows it beside the key's class. Nothing has to be bought: the laptop key works on what the machine already has, and a FIDO key is an optional upgrade.
 
 ```
+levain cockpit key create                         # touch-id where Touch ID is set up, else passphrase; says which
 levain cockpit key create --custody touch-id      # macOS: a Secure Enclave key, Touch ID per signature
 levain cockpit key create --custody passphrase    # anywhere: an encrypted key, its passphrase per signature
 levain cockpit ledger init --signing-key ~/.levain/keys/<label>

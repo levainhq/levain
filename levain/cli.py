@@ -405,8 +405,10 @@ def main(argv: list[str] | None = None) -> int:
             "never requires one."
         ),
     )
-    ck_create.add_argument("--custody", required=True, choices=("touch-id", "passphrase"),
-                           help="touch-id (macOS, Secure Enclave + Touch ID) or passphrase.")
+    ck_create.add_argument("--custody", default=None, choices=("touch-id", "passphrase"),
+                           help="touch-id (macOS, Secure Enclave + Touch ID) or passphrase. Default: touch-id on a "
+                                "Mac where `bioutil -r` shows Touch ID configured for unlock, passphrase otherwise; "
+                                "the command says which it chose and why.")
     ck_create.add_argument("--label", default=None,
                            help="The key's file name and, for touch-id, its CTK identity label "
                                 "(default levain-<date>-<time>).")
@@ -1696,14 +1698,18 @@ def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
 
 
 def _cmd_cockpit_key_create(args: argparse.Namespace) -> int:
-    from levain.cockpit.custody import create_passphrase, create_touch_id
+    from levain.cockpit import custody as _custody
     from levain.cockpit.keys import fingerprint_of
 
     try:
-        if args.custody == "touch-id":
-            made = create_touch_id(args.dir, args.label)
+        chosen = args.custody
+        if chosen is None:
+            chosen, why = _custody.default_custody()
+            print(f"custody: {chosen} ({why}; pass --custody to choose)", flush=True)
+        if chosen == "touch-id":
+            made = _custody.create_touch_id(args.dir, args.label)
         else:
-            made = create_passphrase(args.dir, args.label)
+            made = _custody.create_passphrase(args.dir, args.label)
         fp = fingerprint_of(made.public_key)
     except _cockpit_refusals() as exc:
         print(f"key create refused: {exc}", file=sys.stderr)

@@ -655,6 +655,72 @@ def test_key_create_has_no_option_for_a_no_touch_key(capsys):
         cli.main(["cockpit", "key", "create", "--custody", "fido"])
 
 
+# --- key create's default custody (DESIGN §3.2 rev 6, L3 r1 P6) ---------------------------------------
+
+# `bioutil -r` on the build Mac (macOS 26.6.2, Touch ID enrolled), verbatim
+_BIOUTIL_ON = """User Touch ID configuration:
+\tBiometrics for unlock: 1
+\tBiometrics for ApplePay: 1
+\tEffective biometrics for unlock: 1
+\tEffective biometrics for ApplePay: 1
+Operation performed successfully.
+"""
+
+
+def _bioutil(tmp: Path, text: str, code: int = 0) -> Path:
+    path = tmp / "bioutil"
+    path.write_text(f"#!{PY} -I\nimport sys\nopen({str(tmp / 'bioutil.ran')!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                    f"sys.stdout.write({text!r})\nsys.exit({code})\n")
+    path.chmod(0o755)
+    return path
+
+
+def _default(tmp: Path, text: str = _BIOUTIL_ON, code: int = 0, platform: str = "darwin"):
+    present = tmp / "present"
+    present.write_text("")
+    return custody.default_custody(platform=platform, bioutil=_bioutil(tmp, text, code), sc_auth=present,
+                                   provider=present)
+
+
+def test_key_create_defaults_to_touch_id_on_a_mac_with_touch_id_configured(tmp_path):
+    custody_, why = _default(tmp_path)
+    assert custody_ == "touch-id" and "Touch ID is configured" in why and "bioutil -r" in why
+    assert (tmp_path / "bioutil.ran").read_text() == "-r\n"
+
+
+@pytest.mark.parametrize("text,code,platform,says", [
+    (_BIOUTIL_ON.replace("for unlock: 1", "for unlock: 0", 1), 0, "darwin", "not configured for unlock"),
+    (_BIOUTIL_ON.replace("Effective biometrics for unlock: 1", "Effective biometrics for unlock: 0"), 0, "darwin",
+     "not in effect"),
+    ("", 1, "darwin", "could not read"),
+    ("something else entirely\n", 0, "darwin", "could not read"),
+])
+def test_key_create_defaults_to_passphrase_when_touch_id_is_not_measured(tmp_path, text, code, platform, says):
+    custody_, why = _default(tmp_path, text, code, platform)
+    assert custody_ == "passphrase" and says in why
+
+
+def test_off_macos_the_default_is_passphrase_and_nothing_is_run(tmp_path):
+    custody_, why = _default(tmp_path, platform="linux")
+    assert custody_ == "passphrase" and "macOS only" in why
+    assert not (tmp_path / "bioutil.ran").exists()
+
+
+def test_key_create_with_no_custody_says_what_it_chose_and_why(tmp_path, monkeypatch, capsys):
+    from levain import cli
+    called = []
+    monkeypatch.setattr(custody, "default_custody", lambda: ("touch-id", "WHY-MEASURED"))
+
+    def fake_create(d, label):
+        called.append((d, label))
+        raise KeyError_("stopped here by the test")
+    monkeypatch.setattr(custody, "create_touch_id", fake_create)
+    assert cli.main(["cockpit", "key", "create", "--dir", str(tmp_path / "k"), "--label", "x"]) == 1
+    out = capsys.readouterr()
+    assert "custody: touch-id (WHY-MEASURED; pass --custody to choose)" in out.out
+    assert called == [(tmp_path / "k", "x")] and "stopped here by the test" in out.err
+
+
 def test_the_custody_guarantee_lines_match_the_changelog():
     from levain import cli
     changelog = (Path(__file__).resolve().parents[1] / "CHANGELOG.md").read_text()
