@@ -70,3 +70,13 @@ def test_golden_counts():
     want |= {f"consistency-{m}-{n}" for n in range(1, 9) for m in range(1, n + 1)}
     want |= {f"consistency-{m}-1000" for m in (1, 511, 512, 513, 999)}
     assert want <= got
+
+
+@pytest.mark.parametrize("bad", [True, False, 1.0, "1", None, -1])
+def test_producers_refuse_a_non_int_index_or_size(bad):
+    """The verifiers check_int their sizes; the producers do the same, so True is never read as 1."""
+    data = _leaves(4)
+    with pytest.raises(ContractError):
+        M.inclusion_proof(data, bad)
+    with pytest.raises(ContractError):
+        M.consistency_proof(data, bad)

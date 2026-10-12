@@ -67,6 +67,7 @@ def _subproof(m: int, leaves: list[bytes], whole: bool) -> list[bytes]:
 
 def inclusion_proof(data: list[bytes], index: int) -> list[bytes]:
     """RFC 9162 §2.1.3.1 PATH(index, D_n)."""
+    check_int(index, NOTE_INT_MAX)
     if not 0 <= index < len(data):
         raise ContractError("index is not below the tree size")
     return _path(index, [leaf_hash(d) for d in data])
@@ -74,6 +75,7 @@ def inclusion_proof(data: list[bytes], index: int) -> list[bytes]:
 
 def consistency_proof(data: list[bytes], m: int) -> list[bytes]:
     """RFC 9162 §2.1.4.1 PROOF(m, D_n); empty for m == 0 and m == n (tlog-witness)."""
+    check_int(m, NOTE_INT_MAX)
     n = len(data)
     if not 0 <= m <= n:
         raise ContractError("old size is not within 0..size")
