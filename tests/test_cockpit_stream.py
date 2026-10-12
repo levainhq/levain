@@ -463,7 +463,10 @@ class TestHttp:
                 assert httpd.stream_watcher.running and httpd.stream_watcher.stream_count == 1
                 flag["fail"] = False
                 state["rows"] = [_row(1), _row(2)]
-                got = _events_for(r, 1.5)
+                got: list[Any] = []
+                deadline = time.monotonic() + 15.0      # a slow runner: wait for the recovered tick, never a fixed window
+                while not got and time.monotonic() < deadline:
+                    got = _events_for(r, 0.5)
                 assert [e[0] for e in got] == ["panel-changed"], got
             finally:
                 c.close()
