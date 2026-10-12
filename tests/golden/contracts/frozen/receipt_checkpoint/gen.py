@@ -60,10 +60,12 @@ def proof(m, n, tree=D):
 V = []
 
 
-def anchors(vid, leaves, verdicts, authority=F10, at="ingest"):
+def anchors(vid, leaves, verdicts, authority=F10, at="ingest", first_unverifiable=None):
+    lv = {"verdict": verdicts[-1], "verdicts": verdicts}
+    if first_unverifiable is not None:
+        lv["first_unverifiable"] = first_unverifiable
     V.append(vector(vid, "no_upstream", "anchors",
-                    {"at": at, "leaves": [{"data_hex": d.hex(), "vkey": k} for d, k in leaves]},
-                    {"verdict": verdicts[-1], "verdicts": verdicts}, authority, None))
+                    {"at": at, "leaves": [{"data_hex": d.hex(), "vkey": k} for d, k in leaves]}, lv, authority, None))
 
 
 A5 = leaf(OA, 5, 0, [])
@@ -108,5 +110,19 @@ anchors("old-size-2-53-refused", [(leaf(OA, 5, 0, [], old_size=2**53), VA)], [RE
 anchors("consistency-not-a-list-refused", [(leaf(OA, 5, 0, [], consistency=""), VA)], [REFUSE], SHAPE)
 anchors("v2-refused-at-ingest", [(leaf(OA, 5, 0, [], v=2), VA)], [REFUSE], REG)
 anchors("v2-unverifiable-at-verify", [(leaf(OA, 5, 0, [], v=2), VA)], [UNVERIFIABLE], REG, at="verify")
+
+# rev 11: at verify an UNVERIFIABLE anchor leaf poisons every later leaf of its origin; an unknown (leaf, v) has no
+# origin levain can read, so it poisons every origin. Ingest is unchanged.
+CASCADE = profile("S1_DESIGN F10 rev 11", "at verify, once a receipt_checkpoint leaf is UNVERIFIABLE every later leaf "
+                  "of its origin is UNVERIFIABLE, naming the first; an unknown (leaf, v), whose origin levain cannot "
+                  "read, poisons every origin",
+                  rationale="the unknown leaf could have moved its origin's previous anchor; the rule is positional")
+A5_V2 = leaf(OA, 5, 0, [], v=2)
+anchors("v2-then-a-dependent-anchor-unverifiable-at-verify", [(A5_V2, VA), (A5, VA), (A9, VA)],
+        [UNVERIFIABLE, UNVERIFIABLE, UNVERIFIABLE], CASCADE, at="verify", first_unverifiable=0)
+anchors("v2-then-another-origin-unverifiable-at-verify", [(A5, VA), (A5_V2, VA), (leaf(OB, 7, 0, []), VB)],
+        [ACCEPT, UNVERIFIABLE, UNVERIFIABLE], CASCADE, at="verify", first_unverifiable=1)
+anchors("v2-then-a-dependent-anchor-at-ingest-unchanged", [(A5_V2, VA), (A5, VA), (A9, VA)],
+        [REFUSE, ACCEPT, ACCEPT], CASCADE)
 
 write("F10", "receipt_checkpoint", V, provisional_origins="provisional/receipt_origin/origins.json")

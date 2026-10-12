@@ -229,12 +229,20 @@ def verify_team_lines(leaves: Iterable[tuple[bytes, str]], origin: str) -> list[
     """Walk a team log's line leaves in log order at verify; ``leaves`` = ``(leaf bytes, writer's scope)``.
 
     The snapshot grows by ACCEPTED leaves only, so the first accepted holder of an id wins and a refused leaf holds
-    no id. Returns ``(verdict, reason)`` per leaf.
+    no id. Verification is a replay (rev 11): once a leaf is UNVERIFIABLE (an unknown ``(leaf, v)`` or scope), it
+    could have changed the replay state (an id, a file's head, a target), so every later leaf is UNVERIFIABLE too,
+    naming the first. The rule is positional, never a guess about dependence. Returns ``(verdict, reason)`` per leaf.
     """
     snap = Snapshot()
-    out = []
-    for d, scope in leaves:
+    out: list[tuple[str, str]] = []
+    first: tuple[int, str] | None = None
+    for i, (d, scope) in enumerate(leaves):
+        if first is not None:
+            out.append((canon.UNVERIFIABLE, f"after leaf {first[0]}, which is UNVERIFIABLE: {first[1]}"))
+            continue
         verdict, leaf, reason = judge_line(d, origin=origin, scope=scope, snapshot=snap, at="verify")
+        if verdict == canon.UNVERIFIABLE:
+            first = (i, reason)
         if leaf is not None:
             snap.add(leaf)
         out.append((verdict, reason))

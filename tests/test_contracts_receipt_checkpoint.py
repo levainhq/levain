@@ -17,6 +17,10 @@ def test_vector(v):
     i, want = v["input"], v["expect"]["levain"]
     got = R.judge_anchors([(h(x["data_hex"]), N.parse_vkey(x["vkey"])) for x in i["leaves"]], at=i["at"])
     assert [g for g, _ in got] == want["verdicts"], got
+    if "first_unverifiable" in want:
+        first = want["first_unverifiable"]
+        for _, r in got[first + 1:]:
+            assert r.startswith(f"after leaf {first}, which is UNVERIFIABLE: "), r
 
 
 def test_the_design_lists_are_all_present():

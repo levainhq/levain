@@ -93,20 +93,33 @@ def check_receipt_checkpoint(d: bytes, *, log_key: N.VerifierKey, previous: Anch
 def judge_anchors(leaves: Iterable[tuple[bytes, N.VerifierKey]], *, at: str) -> list[tuple[str, str]]:
     """Walk ``receipt_checkpoint`` leaves in team-log order; each is judged against its origin's previous ACCEPTED
     anchor (a refused leaf moves nothing). Returns ``(verdict, reason)`` per leaf. Ingest and verify apply the same
-    checks; ``at`` decides only how an unknown ``(leaf, v)`` reads (REFUSE at ingest, UNVERIFIABLE at verify)."""
+    checks; ``at`` decides only how an unknown ``(leaf, v)`` reads (REFUSE at ingest, UNVERIFIABLE at verify).
+
+    At verify the walk is a replay (rev 11): once a leaf is UNVERIFIABLE, every later leaf of its origin is
+    UNVERIFIABLE too, naming the first. An unknown ``(leaf, v)`` has no origin levain can read (reading a field of an
+    unknown version would be a guess), so it poisons every origin. Ingest is unchanged."""
     if at not in ("ingest", "verify"):
         raise ValueError("at is 'ingest' or 'verify'")
     anchors: dict[str, Anchor] = {}
+    poisoned: dict[str | None, tuple[int, str]] = {}    # origin (None = every origin) -> the first UNVERIFIABLE leaf
     out = []
-    for d, key in leaves:
+    for i, (d, key) in enumerate(leaves):
         try:
             origin = check_fields(canon.parse(d)).anchor.origin
         except Exception:   # noqa: BLE001 - the full check below gives the refusal its reason
             origin = None
+        first = poisoned.get(None) or (poisoned.get(origin) if origin is not None else None)
+        if first is not None:
+            out.append((canon.UNVERIFIABLE, f"after leaf {first[0]}, which is UNVERIFIABLE: {first[1]}"))
+            continue
         try:
             new = check_receipt_checkpoint(d, log_key=key, previous=anchors.get(origin))
         except canon.UnknownLeafError as e:
-            out.append((canon.REFUSE if at == "ingest" else canon.UNVERIFIABLE, str(e)))
+            if at == "ingest":
+                out.append((canon.REFUSE, str(e)))
+            else:
+                poisoned.setdefault(origin, (i, str(e)))
+                out.append((canon.UNVERIFIABLE, str(e)))
             continue
         except ContractError as e:
             out.append((canon.REFUSE, str(e)))

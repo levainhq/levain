@@ -28,20 +28,23 @@ def test_vector(v):
     elif v["op"] == "line_log":
         now = (datetime.strptime(i["now"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
                if i["at"] == "ingest" else None)
-        snap, verdicts, faults = T.Snapshot(), [], []
-        for leaf in i["leaves"]:
-            verdict, ok, reason = T.judge_line(h(leaf["data_hex"]), origin=i["origin"], scope=leaf["scope"],
-                                               snapshot=snap, at=i["at"], now=now)
-            if ok is not None:
-                snap.add(ok)
-            verdicts.append(verdict)
-            faults.append(reason.startswith("operator fault"))
-        assert verdicts == want["verdicts"]
+        if i["at"] == "verify":     # verification is the replay (rev 11: an UNVERIFIABLE leaf poisons the rest)
+            got = T.verify_team_lines([(h(x["data_hex"]), x["scope"]) for x in i["leaves"]], i["origin"])
+        else:
+            snap, got = T.Snapshot(), []
+            for leaf in i["leaves"]:
+                verdict, ok, reason = T.judge_line(h(leaf["data_hex"]), origin=i["origin"], scope=leaf["scope"],
+                                                   snapshot=snap, at=i["at"], now=now)
+                if ok is not None:
+                    snap.add(ok)
+                got.append((verdict, reason))
+        assert [x for x, _ in got] == want["verdicts"], got
         if "operator_fault" in want:
-            assert faults == want["operator_fault"]
-        if i["at"] == "verify":
-            assert [x for x, _ in T.verify_team_lines([(h(x["data_hex"]), x["scope"]) for x in i["leaves"]],
-                                                      i["origin"])] == want["verdicts"]
+            assert [r.startswith("operator fault") for _, r in got] == want["operator_fault"]
+        if "first_unverifiable" in want:
+            first = want["first_unverifiable"]
+            for _, r in got[first + 1:]:
+                assert r.startswith(f"after leaf {first}, which is UNVERIFIABLE: "), r
     else:
         raise AssertionError(v["op"])
 

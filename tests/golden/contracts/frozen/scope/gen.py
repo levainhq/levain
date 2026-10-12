@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from _genlib import ACCEPT, REFUSE, UNVERIFIABLE, line_leaf, profile, seal_entry, seed, vector, write  # noqa: E402
+from _genlib import ACCEPT, REFUSE, UNVERIFIABLE, canon_json, line_leaf, profile, seal_entry, seed, vector, write  # noqa: E402
 
 ORIGIN = "levain-team/" + "c" * 32
 NOW = "2026-10-12T00:00:00Z"
@@ -39,6 +39,11 @@ CHAIN = profile("S1_DESIGN F9 rev 11", "the snapshot keeps each file's head hash
                 "for a file, or any prev that is not the head, is refused",
                 rationale="team/entry.py chains each file by prev; two accepted children of one parent would be a "
                           "permanent fork in the sealed per-file chain")
+CASCADE = profile("S1_DESIGN F8/F9 rev 11", "verification of a log is a replay: once a leaf is UNVERIFIABLE (an "
+                  "unknown (leaf, v) or scope), every later leaf in that log is UNVERIFIABLE, naming the first; "
+                  "ingest is unchanged (unknown is REFUSE there)",
+                  rationale="an unverifiable leaf could have changed replay state (an id, a head, a target); the rule "
+                            "is positional, not a guess about dependence")
 REG = profile("S1_DESIGN F9", "an unknown scope is refused at ingest and UNVERIFIABLE at verify",
               rationale="scope comes from the key directory; an old levain never calls a newer scope tampering")
 V = []
@@ -94,10 +99,12 @@ DANA, MO, ERIN = seed("scope-device-dana"), seed("scope-device-mo"), seed("scope
 F1, F2 = "ledger/dana/findings.jsonl", "ledger/dana/other.jsonl"
 
 
-def log(vid, at, leaves, verdicts, authority, operator_fault=None):
+def log(vid, at, leaves, verdicts, authority, operator_fault=None, first_unverifiable=None):
     lv = {"verdict": verdicts[-1], "verdicts": verdicts}
     if operator_fault is not None:
         lv["operator_fault"] = operator_fault
+    if first_unverifiable is not None:
+        lv["first_unverifiable"] = first_unverifiable
     V.append(vector(f"log-{vid}", "no_upstream", "line_log",
                     {"origin": ORIGIN, "at": at, "now": NOW if at == "ingest" else None,
                      "leaves": [{"data_hex": d.hex(), "scope": s} for d, s in leaves]}, lv, authority, None))
@@ -191,6 +198,24 @@ for at in ("ingest", "verify"):
         [(C_G_LEAF, "human"), (C_OTHER_LEAF, "human"), (C_CROSS, "human")], [ACCEPT, ACCEPT, REFUSE], CHAIN)
     log(f"chain-non-empty-prev-in-an-empty-file-refused-at-{at}", at, [(C_G_LEAF, "human"), (C_ORPHAN, "human")],
         [ACCEPT, REFUSE], CHAIN)
+
+# ---- rev 11: at verify an UNVERIFIABLE leaf poisons every later leaf in the log (positional, never a guess) -----
+U_X = seal_entry(ent("dana", 90, "finding", words="held by an unknown (line, 2) leaf"), "")
+U_V2 = canon_json({**__import__("json").loads(line_leaf(U_X, F1, DANA, ORIGIN)), "v": 2}).encode("utf-8")
+U_SAME_ID = line_leaf(seal_entry({**U_X, "words": "the same id, a (line, 1) leaf"}, ""), F2, DANA, ORIGIN)
+U_INDEP = line_leaf(seal_entry(ent("mo", 91, "finding", words="independent"), ""), "ledger/mo/u.jsonl", MO, ORIGIN)
+U_BAD = line_leaf(seal_entry(ent("mo", 92, "finding"), ""), "ledger/mo/v.jsonl", MO, ORIGIN, sign_file="x.jsonl")
+log("unknown-leaf-then-a-leaf-reusing-its-id-unverifiable-at-verify", "verify",
+    [(U_V2, "human"), (U_SAME_ID, "human")], [UNVERIFIABLE, UNVERIFIABLE], CASCADE, first_unverifiable=0)
+log("unknown-leaf-then-an-independent-leaf-unverifiable-at-verify", "verify",
+    [(U_V2, "human"), (U_INDEP, "member")], [UNVERIFIABLE, UNVERIFIABLE], CASCADE, first_unverifiable=0)
+log("unknown-scope-then-an-independent-leaf-unverifiable-at-verify", "verify",
+    [(A_LEAF, "auditor"), (U_INDEP, "member")], [UNVERIFIABLE, UNVERIFIABLE], CASCADE, first_unverifiable=0)
+log("accepted-then-unknown-then-a-bad-leaf-unverifiable-at-verify", "verify",
+    [(U_INDEP, "member"), (U_V2, "human"), (U_BAD, "member"), (U_SAME_ID, "human")],
+    [ACCEPT, UNVERIFIABLE, UNVERIFIABLE, UNVERIFIABLE], CASCADE, first_unverifiable=1)
+log("unknown-leaf-then-a-leaf-reusing-its-id-at-ingest-unchanged", "ingest",
+    [(U_V2, "human"), (U_SAME_ID, "human")], [REFUSE, ACCEPT], CASCADE)
 
 log("unknown-scope-refused-at-ingest", "ingest", [(A_LEAF, "auditor")], [REFUSE], REG)
 log("unknown-scope-unverifiable-at-verify", "verify", [(A_LEAF, "auditor")], [UNVERIFIABLE], REG)
