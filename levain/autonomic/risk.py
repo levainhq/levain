@@ -98,17 +98,10 @@ class ActionManifest:
     on; the gate holds its own frozen copy (:meth:`freeze`), so every admission it makes reads one
     manifest whatever is later done to the caller's object. A change to the declarations, a TIGHTENING
     included, takes effect by building a new manifest and a new gate on it, never by editing one a gate
-    holds. The only swap that exists is the process: a new process builds a new gate (flow's adapter
-    built one per CLI command when this was written, 2026-10-09: ``grep -n 'build_gate()'
-    scripts/vagus_efferent.py``). An IN-PROCESS swap needs one handle that every consumer of a
-    gate (``FireDispatcher``, ``ChainExecutor``, the sweeps) reads it through, so no caller keeps an old
-    gate after the swap and an admission in flight sees the old gate or the new, never a mix; no such
-    handle is built. The trust-tiering fold's change to a standing policy MUST build that handle and take
-    effect through it, with a test of the swap's atomicity (owed there: on e3e5010 a tightening
-    registered mid-admission did not reproduce a mixed decision, because the fence read again at
-    admission differed and the hold reopened at the new rung). A binding risk resolver that reads a
-    catalog of its own is not frozen by the gate: within one admission the fence holds it to one read
-    (the same e3e5010 run), and freezing it is the adapter's.
+    holds. In process, the new gate is published through :class:`~levain.autonomic.handle.GateHandle`,
+    which every consumer of a gate reads once per admission, so an admission in flight sees the old gate
+    or the new, never a mix. A binding risk resolver that reads a catalog of its own is not frozen by the
+    gate; ``GateHandle.swap`` builds its resolver over a frozen snapshot of the catalog it is given.
 
     What the freeze is NOT (L3 r6-r7, spore-813): a defence against code running in the gate's own
     process. Such code can reassign or edit any private attribute (``gate._manifest``, its ``_actions``),

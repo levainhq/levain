@@ -86,6 +86,29 @@ _RESOLVED_TRUST = TrustContext(
 )
 
 
+# A gate's STATE: every constructor argument that is not policy, mapped to the attribute that holds it.
+# ``with_policy`` hands each one to the new gate by reference, so pending holds, receipts and the journal
+# are one store across a swap. A constructor argument missing from here would be silently reset to its
+# default by a swap; a test compares this table with the constructor's signature.
+_STATE_COLLABORATORS: dict[str, str] = {
+    "store": "_store",
+    "executor": "_executor",
+    "clock": "_clock",
+    "transport": "_transport",
+    "pending_store": "_pending_store",
+    "summarize": "_summarize",
+    "confirm_window_s": "_confirm_window_s",
+    "auto_fire_actions": "_auto_fire_actions",
+    "trajectory_observer": "_trajectory_observer",
+    "journal": "_journal",
+    "confirm_signers": "_confirm_signers",
+    "ssh_keygen": "_ssh_keygen",
+}
+
+# The constructor arguments a policy swap replaces: everything else is state (above).
+_POLICY_ARGUMENTS = frozenset({"manifest", "binding_risk"})
+
+
 # why a binding's risk could not be re-derived when the registry itself could not be read (a lock, a
 # damaged store): unlike an absent binding, a repair clears it, so the decision stays open
 _REGISTRY_UNREADABLE = "revalidate:registry_unreadable"
@@ -277,9 +300,8 @@ class EfferentGate:
         ssh_keygen: str | Path | None = None,
     ) -> None:
         # The manifest is frozen for this gate's lifetime (desk ruling (a), 2026-10-09): a change to it,
-        # a tightening included, is a NEW gate on a new manifest. The swap that exists today is a new
-        # process; the in-process handle the trust-tiering fold must build is described on
-        # :class:`ActionManifest`.
+        # a tightening included, is a NEW gate on a new manifest (``with_policy``), published in process
+        # through :class:`~levain.autonomic.handle.GateHandle`.
         self._manifest = manifest.freeze()
         # The signature verifier: an absolute path to ``ssh-keygen`` (``/usr/bin/ssh-keygen`` unless set
         # here), never found through PATH, and refused unless root-owned and writable by nobody else.
@@ -324,6 +346,15 @@ class EfferentGate:
         self._pending_store = pending_store
         self._summarize = summarize or _default_summary
         self._confirm_window_s = confirm_window_s
+
+    def with_policy(self, manifest: ActionManifest,
+                    binding_risk: Callable[[Binding, int], ActionRisk]) -> "EfferentGate":
+        """A NEW gate on ``manifest`` and ``binding_risk`` that shares every stateful collaborator of this
+        one by reference (``_STATE_COLLABORATORS``): a swap changes policy, never state. This gate is
+        unchanged. Signers are state here, never an argument: an authenticator change must not ride a
+        policy swap."""
+        state = {arg: getattr(self, attr) for arg, attr in _STATE_COLLABORATORS.items()}
+        return EfferentGate(manifest=manifest, binding_risk=binding_risk, **state)
 
     def get_pending(self, pending_id: str) -> PendingAction | None:
         """The UNDECIDED pending action by id (no claim), or ``None``: a journaled run's undecided hold

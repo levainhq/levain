@@ -51,6 +51,7 @@ Architecture:
   - ``GateReceiptStore`` / ``StoredGateReceipt`` — the append-only efferent decision trace.
   - ``EfferentGate`` / ``GateOutcome`` — the orchestrator (risk → §1.5 → policy → route → receipt;
     + ``resolve`` / ``sweep_timeouts`` for the confirm round-trip).
+  - ``GateHandle`` — the current gate of a process; a policy swap publishes a new gate through it.
   The Slice-3a.5 guard hardening (what makes GRADUATION to on-loop safe):
   - ``kill`` (``kill_outcome`` / ``kill_trips`` / ``assert_kill_pure``) — the DIVERSE, fail-safe kill
     substrate (Kleene three-valued; absent/unevaluable → trip), the kill-purity gate, and the
@@ -124,6 +125,7 @@ from levain.autonomic.chainpath import (
 from levain.autonomic.executor import ActionRequest, ExecutionResult, Executor
 from levain.autonomic.firepath import FireDispatch, FireDispatcher
 from levain.autonomic.gate import EfferentGate, GateOutcome
+from levain.autonomic.handle import GateHandle
 from levain.autonomic.graduation import (
     DEEP_OUTBOUND_MIN_HOPS,
     DEFAULT_MIN_CLEAN_FIRES,
@@ -253,6 +255,7 @@ __all__ = [
     # orchestrator
     "EfferentGate",
     "GateOutcome",
+    "GateHandle",
     # the binding fire-path dispatcher (Slice 4a — single-link)
     "FireDispatcher",
     "FireDispatch",
