@@ -187,9 +187,12 @@
                   search: searchOf(panel), face: panel.face === "count" ? "count" : "" };
     if (kind === "list" || kind === "count-queue") {
       const compose = composeOf(panel.compose);
-      // an addressed list (its compose picks recipients) draws every row as `source -> for`
+      // an addressed list draws every row as `source -> for`. Its address is the compose's recipient field when
+      // the panel declares a compose; a read-only serve declares none (no send verb), but the rows still carry the
+      // `for` facet, so the facet alone addresses them: the address line never depends on the write side.
       const rfield = compose ? compose.fields.find((f) => f.type === "recipient") : null;
-      const addressed = !!rfield;
+      const forName = rfield ? rfield.name : "for";
+      const addressed = !!rfield || (panel.rows || []).some((r) => isObj(r.facets) && Object.prototype.hasOwnProperty.call(r.facets, "for"));
       if (compose) out.compose = compose;
       out.lines = (panel.rows || []).map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
@@ -203,7 +206,7 @@
           const f = r.facets || {};
           // the kernel refuses an addressed compose whose recipient facet is not declared, so a row with no
           // value for it names no reader: everyone
-          const fv = f[rfield.name];
+          const fv = f[forName];
           const to = Array.isArray(fv) ? fv : typeof fv === "string" ? fv.split(",") : [];
           line.addr = { source: typeof f.source === "string" && f.source.trim() ? f.source.trim() : "unknown",
                         to: to.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim()),
