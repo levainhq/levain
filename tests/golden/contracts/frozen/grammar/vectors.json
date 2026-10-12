@@ -431,7 +431,7 @@
    "kind": "upstream_lax",
    "op": "b64",
    "input": {
-    "text": "AA\nAA=="
+    "text": "AAAA\nAQ=="
    },
    "expect": {
     "levain": {
@@ -454,7 +454,7 @@
    "kind": "upstream_lax",
    "op": "b64",
    "input": {
-    "text": "AA\rAA=="
+    "text": "AAAA\rAQ=="
    },
    "expect": {
     "levain": {
