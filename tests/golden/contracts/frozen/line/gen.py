@@ -149,5 +149,9 @@ receipt("device-sig-disagrees-refused", {**RECEIPT, "device_sig": b64(raw + b"\x
 receipt("extra-field-refused", {**RECEIPT, "authority": "owner"}, REFUSE)
 receipt("accepted-malformed-refused", {**RECEIPT, "accepted": "2026-11-02 14:03"}, REFUSE)
 receipt("n-true-refused", {**RECEIPT, "n": True}, REFUSE)
+# rev 11 (T03): the sidecar's accepted check shares TS_RE, ASCII digits only
+receipt("accepted-fullwidth-digits-refused",
+        {**RECEIPT, "accepted": "2026-11-02T14:03:11Z".translate(str.maketrans("0123456789", "０１２３４５６７８９"))},
+        REFUSE)
 
 write("F9", "line", V, origin=ORIGIN, now=NOW)

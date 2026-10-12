@@ -6,6 +6,13 @@ executed from that source text with its wall clock replaced by the vector's fixe
 ``levain/contracts/leaves/entry_v1.py`` is what the test checks against these recorded verdicts. At the freeze, and
 only then, the recorded verdicts come from 31dea1f; regenerating after the freeze must reproduce them byte for byte.
 
+One DECLARED divergence (S1_DESIGN rev 11, T03): ``ID_RE`` and ``TS_RE`` match ASCII digits only (``re.ASCII``).
+31dea1f's bare ``\\d`` matches any Unicode decimal digit (fullwidth, Arabic-Indic, ...) and ``strptime`` parses them,
+so a strict ``[0-9]`` verifier (Go) would disagree with it. The oracle is therefore 31dea1f's source with exactly
+those two ``re.compile`` lines given ``re.ASCII`` (asserted to apply once each). Every vector is also run through the
+unmodified 31dea1f source: a vector on which the two disagree must say so in its ``divergence`` field, and every
+other vector carries 31dea1f's own verdict unchanged.
+
 A refusal records its ``branch``: the 1-based index of the ``raise EntryError`` site that fired, counted in source
 order inside ``validate`` (35 sites at 31dea1f), and its message. The vectors cover every site, every
 ``_MAX_LEN`` / ``_MAX_ITEMS`` / ``_MAX_PATH`` bound at exactly its limit (boundary accepts), and every branch of the
@@ -26,8 +33,21 @@ AT = "31dea1f"
 SRC = subprocess.run(["git", "show", f"{AT}:levain/team/entry.py"], capture_output=True, text=True, check=True,
                      cwd=Path(__file__).resolve().parent).stdout
 FN = "<levain team/entry.py @ 31dea1f>"
+RAW_NS: dict = {"__name__": "entry_31dea1f_raw"}
+exec(compile(SRC, FN, "exec"), RAW_NS)   # noqa: S102 - the design's named oracle, from a fixed commit's source
+ASCII_LINES = {   # rev 11 (T03): the one declared divergence, ASCII digits in ID_RE and TS_RE
+    'ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}-\\d{14}-[0-9a-f]{8}")':
+        'ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}-\\d{14}-[0-9a-f]{8}", re.ASCII)',
+    'TS_RE = re.compile(r"\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z")':
+        'TS_RE = re.compile(r"\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z", re.ASCII)',
+}
+ORACLE_SRC = SRC
+for a, b in ASCII_LINES.items():
+    assert SRC.splitlines().count(a) == 1, a
+    ORACLE_SRC = ORACLE_SRC.replace(a, b)
+assert len(ORACLE_SRC.splitlines()) == len(SRC.splitlines())   # line numbers, so raise-site indices, do not move
 NS: dict = {"__name__": "entry_31dea1f"}
-exec(compile(SRC, FN, "exec"), NS)   # noqa: S102 - the design's named oracle, from a fixed commit's source
+exec(compile(ORACLE_SRC, FN, "exec"), NS)   # noqa: S102
 LINES = SRC.splitlines()
 START = next(i for i, ln in enumerate(LINES, 1) if ln.startswith("def validate("))
 END = next(i for i, ln in enumerate(LINES, 1) if i > START and ln.startswith("def "))
@@ -55,11 +75,11 @@ def fixed_clock(iso: str):
     return Fixed
 
 
-def oracle(entry: dict, known, scan: bool, now: str) -> dict:
-    NS["datetime"] = fixed_clock(now)
+def oracle(entry: dict, known, scan: bool, now: str, ns: dict = NS) -> dict:
+    ns["datetime"] = fixed_clock(now)
     try:
-        NS["validate"](copy.deepcopy(entry), copy.deepcopy(known), scan=scan)
-    except NS["EntryError"] as e:
+        ns["validate"](copy.deepcopy(entry), copy.deepcopy(known), scan=scan)
+    except ns["EntryError"] as e:
         line = [f.lineno for f in traceback.extract_tb(e.__traceback__) if f.filename == FN][-1]
         return {"verdict": REFUSE, "branch": SITES.index(line) + 1, "message": str(e)}
     return {"verdict": ACCEPT}
@@ -68,14 +88,19 @@ def oracle(entry: dict, known, scan: bool, now: str) -> dict:
 V = []
 
 
-def add(vid, entry, *, known=None, scan=False, now=NOW, expect_branch=None):
+def add(vid, entry, *, known=None, scan=False, now=NOW, expect_branch=None, divergence=None):
     want = oracle(entry, known, scan, now)
     if expect_branch is None:
         assert want["verdict"] == ACCEPT, (vid, want)
     else:
         assert want.get("branch") == expect_branch, (vid, want)
-    V.append(vector(vid, "no_upstream", "validate_entry_v1",
-                    {"entry": entry, "known": known, "scan": scan, "now": now}, want, AUTH, None))
+    raw = oracle(entry, known, scan, now, RAW_NS)
+    assert (raw != want) == (divergence is not None), (vid, raw, want)
+    v = vector(vid, "no_upstream", "validate_entry_v1",
+               {"entry": entry, "known": known, "scan": scan, "now": now}, want, AUTH, None)
+    if divergence is not None:
+        v["divergence"] = {"rule": divergence, "at_31dea1f": raw}
+    V.append(v)
 
 
 def e(**kw):
@@ -198,6 +223,18 @@ add("r28-path-dotdot", e(paths=["a/../b"]), expect_branch=28)
 add("r30-unknown-ref", e(refs=["x-9"]), known={TID: {"type": "finding"}}, expect_branch=30)
 add("r35-secret-in-summary", e(summary="-----BEGIN RSA PRIVATE KEY-----"), scan=True, expect_branch=35)
 
+# ---- rev 11 (T03): ASCII digits only in id and ts, the declared divergence from 31dea1f ------------------------
+ASCII_RULE = ("S1_DESIGN rev 11: ID_RE and TS_RE match ASCII [0-9] only; 31dea1f's bare \\d (and strptime) accept "
+              "any Unicode decimal digit, which a strict verifier refuses")
+FW = str.maketrans("0123456789", "０１２３４５６７８９")
+AI = str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")
+add("r05-id-fullwidth-digits", e(id="dana-" + "20261010120000".translate(FW) + "-0123abcd"), expect_branch=5,
+    divergence=ASCII_RULE)
+add("r07-ts-fullwidth-year", e(ts="2026".translate(FW) + "-10-10T12:00:00Z"), expect_branch=7, divergence=ASCII_RULE)
+add("r07-ts-fullwidth-digits", e(ts="2026-10-10T12:00:00Z".translate(FW)), expect_branch=7, divergence=ASCII_RULE)
+add("r07-ts-arabic-indic-year", e(ts="2026".translate(AI) + "-10-10T12:00:00Z"), expect_branch=7,
+    divergence=ASCII_RULE)
+
 # ---- the F9 scope goldens' schema-invalid member findings (Y01 / Z02), recorded here too -----------------------
 add("f9-member-finding-supersedes-empty-string", e(supersedes=""), expect_branch=20)
 add("f9-member-finding-supersedes-object", e(supersedes={}), expect_branch=20)
@@ -219,4 +256,5 @@ V.append(vector("now-none-still-refuses-every-other-branch", "no_upstream", "val
 branches = {v["expect"]["levain"].get("branch") for v in V} - {None}
 assert branches == set(range(1, 36)), sorted(set(range(1, 36)) - branches)
 json.dumps(V)
-write("F9 entry schema", "entry", V, oracle=f"levain team/entry.py validate @ {AT}", raise_sites=len(SITES), now=NOW)
+write("F9 entry schema", "entry", V, oracle=f"levain team/entry.py validate @ {AT}, ID_RE/TS_RE re.ASCII (rev 11)",
+      raise_sites=len(SITES), now=NOW)

@@ -1,7 +1,7 @@
 {
  "item": "F9 entry schema",
  "generator": "gen.py",
- "oracle": "levain team/entry.py validate @ 31dea1f",
+ "oracle": "levain team/entry.py validate @ 31dea1f, ID_RE/TS_RE re.ASCII (rev 11)",
  "raise_sites": 35,
  "now": "2026-10-12T00:00:00Z",
  "vectors": [
@@ -3638,6 +3638,176 @@
     "basis": {
      "kind": "local_bound",
      "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r05-id-fullwidth-digits",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-２０２６１０１０１２００００-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 5,
+     "message": "id 'dana-２０２６１０１０１２００００-0123abcd' is not <author>-<yyyymmddHHMMSS>-<8 hex>"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   },
+   "divergence": {
+    "rule": "S1_DESIGN rev 11: ID_RE and TS_RE match ASCII [0-9] only; 31dea1f's bare \\d (and strptime) accept any Unicode decimal digit, which a strict verifier refuses",
+    "at_31dea1f": {
+     "verdict": "accept"
+    }
+   }
+  },
+  {
+   "id": "r07-ts-fullwidth-year",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "２０２６-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 7,
+     "message": "ts must be ISO-8601 UTC, YYYY-MM-DDTHH:MM:SSZ"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   },
+   "divergence": {
+    "rule": "S1_DESIGN rev 11: ID_RE and TS_RE match ASCII [0-9] only; 31dea1f's bare \\d (and strptime) accept any Unicode decimal digit, which a strict verifier refuses",
+    "at_31dea1f": {
+     "verdict": "accept"
+    }
+   }
+  },
+  {
+   "id": "r07-ts-fullwidth-digits",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "２０２６-１０-１０T１２:００:００Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 7,
+     "message": "ts must be ISO-8601 UTC, YYYY-MM-DDTHH:MM:SSZ"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   },
+   "divergence": {
+    "rule": "S1_DESIGN rev 11: ID_RE and TS_RE match ASCII [0-9] only; 31dea1f's bare \\d (and strptime) accept any Unicode decimal digit, which a strict verifier refuses",
+    "at_31dea1f": {
+     "verdict": "refuse",
+     "branch": 8,
+     "message": "ts is not a real date"
+    }
+   }
+  },
+  {
+   "id": "r07-ts-arabic-indic-year",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "٢٠٢٦-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 7,
+     "message": "ts must be ISO-8601 UTC, YYYY-MM-DDTHH:MM:SSZ"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   },
+   "divergence": {
+    "rule": "S1_DESIGN rev 11: ID_RE and TS_RE match ASCII [0-9] only; 31dea1f's bare \\d (and strptime) accept any Unicode decimal digit, which a strict verifier refuses",
+    "at_31dea1f": {
+     "verdict": "accept"
     }
    }
   },

@@ -21,8 +21,9 @@ from tests._contracts_vectors import FROZEN, check_shape, ids, load
 VECTORS = load("entry")
 DOC = json.loads((FROZEN / "entry" / "vectors.json").read_text(encoding="utf-8"))
 COPY = Path(E.__file__)
-# The copy's source, pinned. Changing entry_v1.py is a new (line, v), never an edit: this line does not move.
-COPY_SHA256 = "bc97b03148a15a963ce5151362795a9c533293551360ad6d4b1bb9d941e6d861"
+# The copy's source, pinned. After the freeze an edit is a new (line, v), never an edit here. Moved once before the
+# freeze, by S1_DESIGN rev 11 (re.ASCII on ID_RE and TS_RE; was bc97b031...e6d861).
+COPY_SHA256 = "d1b2cf44d8de1b95b680b85ad25ea97ac869a056fb6cacd58e42ad2833c25e0f"
 _LINES = COPY.read_text(encoding="utf-8").splitlines()
 _START = next(i for i, ln in enumerate(_LINES, 1) if ln.startswith("def validate_entry_v1("))
 SITES = [i for i in range(_START, len(_LINES) + 1) if "raise EntryError" in _LINES[i - 1]]
@@ -76,6 +77,21 @@ def test_now_none_skips_exactly_the_future_branch():
     assert by["now-none-still-refuses-every-other-branch"]["expect"]["levain"]["branch"] == 13
 
 
+def test_the_declared_ascii_divergence_moves_only_its_own_vectors():
+    """Rev 11 (T03): 31dea1f accepted a fullwidth id / ts; the copy refuses them. Only vectors marked so differ."""
+    moved = {v["id"]: v for v in VECTORS if "divergence" in v}
+    assert set(moved) == {"r05-id-fullwidth-digits", "r07-ts-fullwidth-year", "r07-ts-fullwidth-digits",
+                          "r07-ts-arabic-indic-year"}
+    for v in moved.values():
+        assert v["divergence"]["at_31dea1f"] != v["expect"]["levain"]
+        assert v["expect"]["levain"]["verdict"] == "refuse" and "rev 11" in v["divergence"]["rule"]
+    # measured: 31dea1f ACCEPTS a fullwidth id and a fullwidth-year ts (strptime's %Y takes them); the other two
+    # passed its TS_RE and reached its real-date branch, a refusal for a different reason
+    assert moved["r05-id-fullwidth-digits"]["divergence"]["at_31dea1f"] == {"verdict": "accept"}
+    assert moved["r07-ts-fullwidth-year"]["divergence"]["at_31dea1f"] == {"verdict": "accept"}
+    assert E.ID_RE.flags & __import__("re").ASCII and E.TS_RE.flags & __import__("re").ASCII
+
+
 def test_now_is_required_never_read_from_the_clock():
     with pytest.raises(TypeError):
         E.validate_entry_v1(VECTORS[0]["input"]["entry"])     # no now: the caller must say ingest time or None
@@ -95,6 +111,8 @@ def test_drift_against_live_team_entry_is_informational(monkeypatch, capsys):
     from levain.team import entry as live
     diverged = []
     for v in VECTORS:
+        if "divergence" in v:    # a DECLARED divergence from 31dea1f (rev 11), not a T schema change
+            continue
         i = v["input"]
         fixed = _now(i["now"] or "2099-01-02T00:00:00Z")
 

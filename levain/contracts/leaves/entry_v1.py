@@ -1,15 +1,22 @@
 """The FROZEN entry schema of ``(line, 1)``: a copy of ``levain/team/entry.py`` ``validate`` at levain ``31dea1f``.
 
 ``contracts`` may not import ``team`` (S1_DESIGN §4), and a ``(line, 1)`` verdict must never move when T's schema
-moves, so F9 runs this copy, never ``team.entry``. It is the 31dea1f function with one change (S1_DESIGN rev 10):
-the future-``ts`` branch reads ``now`` from its caller instead of the wall clock. Ingest passes the ingest time;
-verify passes ``None``, which skips that one branch (a C2SP checkpoint carries no time, so a verifier cannot know
-when a leaf was ingested; a far-future ``ts`` admitted by a log operator is a known edge, reachable only by the
-trusted operator).
+moves, so F9 runs this copy, never ``team.entry``. It is the 31dea1f function with two declared divergences:
+
+1. (S1_DESIGN rev 10) the future-``ts`` branch reads ``now`` from its caller instead of the wall clock. Ingest passes
+   the ingest time; verify passes ``None``, which skips that one branch (a C2SP checkpoint carries no time, so a
+   verifier cannot know when a leaf was ingested; a far-future ``ts`` admitted by a log operator is a known edge,
+   reachable only by the trusted operator).
+2. (S1_DESIGN rev 11, T03) ``ID_RE`` and ``TS_RE`` carry ``re.ASCII``: their ``\\d`` matches ``[0-9]`` only. At
+   31dea1f a bare ``\\d`` matches any Unicode decimal digit and ``strptime`` parses one, so an id or ``ts`` written in
+   fullwidth digits passed there and fails any strict ``[0-9]`` verifier. The id's author-prefix check (its
+   ``\\d{14}``) is reached only after ``ID_RE`` matched, so it sees ASCII digits and is left as 31dea1f wrote it.
+   The sidecar's ``accepted`` check (``team.check_receipt``) uses this ``TS_RE``.
 
 Pinned (tests/test_contracts_entry.py): this file's sha256, so an edit is a refusal, not a sentence; its verdicts
 (accept, or refuse plus the refusing ``raise`` site, counted in source order) against the verdicts RECORDED in
-frozen/entry/ at the freeze, which ``entry.validate`` at 31dea1f produced; and 100% branch coverage of
+frozen/entry/ at the freeze, which ``entry.validate`` at 31dea1f produced (divergence 2 applied, and each vector it
+moves marked); and 100% branch coverage of
 ``validate_entry_v1`` by those vectors. A later T schema change is a new ``(line, v)``, never an edit here.
 """
 from __future__ import annotations
@@ -30,8 +37,8 @@ ALLOWED = {
 }
 _STR_FIELDS = ("id", "ts", "author", "agent", "session", "type", "kind", "mode", "owner", "words",
                "summary", "reason", "recheck", "pack", "rule_id", "prev", "hash")
-ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}-\d{14}-[0-9a-f]{8}")
-TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}-\d{14}-[0-9a-f]{8}", re.ASCII)
+TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", re.ASCII)
 
 _SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
