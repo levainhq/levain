@@ -10,17 +10,22 @@ from __future__ import annotations
 
 import ast
 import os
+import shutil
 import sqlite3
+import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import levain
-from levain.authority import VerifierUnavailable
+import levain.authority as authority
+from levain.authority import VerifierUnavailable, anchor_path
 from levain.cockpit.firejournal import CockpitDB, STORE_FORMAT
 from levain.cockpit.keys import KeyError_, fingerprint_of
-from tests.cockpit_authority_rig import RealKey, enrol_any, revoke_any, root_of
+from tests.cockpit_authority_rig import RealKey, enrol, enrol_any, revoke, revoke_any, root_of, widen_laptop_floor
 from tests.test_cockpit_k2b_broker import (  # noqa: F401 - fixtures
     BROWSER,
     Key,
@@ -137,6 +142,68 @@ def test_a_truncated_log_is_refused_by_its_anchor(home, spores, keydir):
         assert phone.fingerprint  # the phone's key is not in any snapshot this store serves
     finally:
         b.stop()
+
+
+# --- a whole-folder restore cannot carry the anchor back (L2 1012+80 A) -----------------------------------
+
+def _phone_after(root: Path) -> tuple[Any, Any]:
+    from levain.cockpit.authority import RequestAuthority
+
+    authority.PROCESS_CACHE.clear()
+    with CockpitDB(root).read() as conn:
+        auth = RequestAuthority.capture(conn, now=datetime.now(timezone.utc), anchor=anchor_path(root), source="t")
+    return auth.authority, auth.authority_error
+
+
+def test_a_restore_without_the_excluded_anchor_dir_cannot_unrevoke_a_key(tmp_path, monkeypatch):
+    """The anchor lives in its own directory, which Time Machine never backs up, so a restore of the
+    data root brings back the old log beside the CURRENT anchor, and the capture refuses."""
+    widen_laptop_floor(monkeypatch)
+    root, keys = tmp_path / "data", tmp_path / "keys"
+    root.mkdir()
+    keys.mkdir()
+    db = CockpitDB(root)
+    db.meta("format")
+    lap, phone = RealKey(keys, "lap"), RealKey(keys, "phone")
+    enrol(db, lap, "laptop-presence")
+    enrol(db, phone, "display-phone", by=lap)
+    excluded = anchor_path(root).parent.name
+    backup = tmp_path / "backup"
+    shutil.copytree(root, backup, ignore=shutil.ignore_patterns(excluded))   # what Time Machine copies
+    revoke(db, phone, by=lap, compromised_since=2)
+    snap, err = _phone_after(root)
+    assert err is None and not snap.key(phone.fingerprint).active
+    for p in root.iterdir():                                                   # the restore
+        if p.name != excluded:
+            shutil.rmtree(p) if p.is_dir() else p.unlink()
+    shutil.copytree(backup, root, dirs_exist_ok=True)
+    snap, err = _phone_after(root)
+    assert snap is None and "behind its anchor" in str(err) and "anchor reset" in str(err)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the Time Machine exclusion is macOS's")
+def test_the_anchor_directory_is_excluded_from_time_machine(tmp_path, monkeypatch):
+    widen_laptop_floor(monkeypatch)
+    root, keys = tmp_path / "data", tmp_path / "keys"
+    root.mkdir()
+    keys.mkdir()
+    db = CockpitDB(root)
+    db.meta("format")
+    enrol(db, RealKey(keys, "lap"), "laptop-presence")
+    anchor = anchor_path(root)
+    assert anchor.is_file() and anchor.parent != root
+    attr = "com.apple.metadata:com_apple_backup_excludeItem"
+
+    def value(p: Path) -> str:
+        return subprocess.run(["xattr", "-px", attr, str(p)], capture_output=True, text=True, check=True).stdout
+    # the oracle is what tmutil itself writes (`tmutil isexcluded` is vacuous here: the test's temp
+    # directory sits under a path Time Machine already skips)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    subprocess.run(["tmutil", "addexclusion", str(scratch)], capture_output=True, check=True)
+    assert value(anchor.parent) == value(scratch)
+    names = subprocess.run(["xattr", str(anchor)], capture_output=True, text=True, check=True).stdout.split()
+    assert attr not in names                         # on the directory, never the file a rename replaces
 
 
 # --- a /2 store migrates and refuses signed acts until init -------------------------------------------

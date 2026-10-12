@@ -10,14 +10,16 @@ A policy link is classified by RECOMPUTE: the declared op is applied to the repl
 difference is classified on its own (:func:`classify`). A declared op that disagrees with the computed
 delta is refused, and so is a link that changes nothing.
 
-The anchor (``authority.anchor`` beside the store) is written only after a commit, so it lags and never
-leads, and only ever moves up. :func:`append` refuses a log behind it, and an empty log beside one; this
+The anchor (``anchor/authority.anchor`` in the store's data root, its directory excluded from Time Machine
+so a restore of the data root cannot roll it back with the log) is written only after a commit, so it lags
+and never leads, and only ever moves up. :func:`append` refuses a log behind it, and an empty log beside one; this
 module reads the log without consulting it (:func:`snapshot`), so a caller that opens a store checks it
 with :func:`check_anchor`.
 """
 from __future__ import annotations
 
 import base64
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -28,6 +30,7 @@ import secrets
 import sqlite3
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import Callable, Iterator, Mapping
@@ -41,7 +44,7 @@ from typing import Any
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_problem
 
 __all__ = [
-    "ANCHOR_NAME", "FORMAT", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
+    "ANCHOR_DIR", "ANCHOR_NAME", "FORMAT", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify", "create_schema",
@@ -55,6 +58,13 @@ NAMESPACE = "levain-authority"
 RESET_FORMAT = "levain-authority-reset/1"
 RESET_NAMESPACE = "levain-authority-reset"
 ANCHOR_NAME = "authority.anchor"
+ANCHOR_DIR = "anchor"
+# The sticky Time Machine exclusion `tmutil addexclusion` writes: a binary plist of the string
+# "com.apple.backupd", as `xattr -px` reads it back.
+_TM_EXCLUDE_ATTR = b"com.apple.metadata:com_apple_backup_excludeItem"
+_TM_EXCLUDE_VALUE = bytes.fromhex(
+    "62706c69737430305f1011636f6d2e6170706c652e6261636b7570640800000000000001010000000000000001000000"
+    "0000000000000000000000001c")
 ANCHOR_FORMAT = "levain-authority-anchor/1"
 
 SCHEMA = ("CREATE TABLE IF NOT EXISTS authority_log (seq INTEGER PRIMARY KEY, prev_hash TEXT NOT NULL, "
@@ -1094,7 +1104,32 @@ _RESET_HINT = "`levain cockpit anchor reset`"
 
 
 def anchor_path(data_root: Path | str) -> Path:
-    return Path(data_root) / ANCHOR_NAME
+    """``<data_root>/anchor/authority.anchor``: its own directory, so a backup can leave it out while it
+    takes the store (:func:`_anchor_dir`)."""
+    return Path(data_root) / ANCHOR_DIR / ANCHOR_NAME
+
+
+def _exclude_from_time_machine(directory: Path) -> None:
+    """Set the sticky Time Machine exclusion on ``directory``, best effort: off macOS, or when the
+    attribute cannot be set, the anchor works as before and nothing is recorded."""
+    if sys.platform != "darwin":
+        return
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fn = libc.setxattr
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint32,
+                       ctypes.c_int]
+        fn(os.fsencode(directory), _TM_EXCLUDE_ATTR, _TM_EXCLUDE_VALUE, len(_TM_EXCLUDE_VALUE), 0, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _anchor_dir(path: Path) -> None:
+    """Make the anchor's directory and exclude it from Time Machine. The exclusion is on the directory,
+    never the file: :func:`_write_anchor`'s rename replaces the file's inode on every advance."""
+    directory = Path(path).parent
+    directory.mkdir(mode=0o700, exist_ok=True)
+    _exclude_from_time_machine(directory)
 
 
 def read_anchor(path: Path) -> Anchor | None:
@@ -1158,6 +1193,7 @@ def _anchor_lock(path: Path) -> Iterator[None]:
     """An exclusive flock on ``<anchor>.lock``: every read-compare-write of the anchor runs under it, so
     two appenders (the cockpit server and the CLI) serialise their advances."""
     path = Path(path)
+    _anchor_dir(path)
     fd = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
@@ -1226,10 +1262,10 @@ def verify_anchor_reset(snap: AuthoritySnapshot, old_anchor: Mapping[str, Any] |
 def _no_live_cockpit(path: Path) -> Iterator[None]:
     """Hold the store's exclusive lock: the non-blocking ``flock`` on ``<data_root>/cockpit.lock`` that
     a live cockpit broker holds for its whole active life (``levain.cockpit.broker.LOCK_NAME``). The
-    anchor sits in that data root (:func:`anchor_path`). Held, a reset is refused rather than waited
+    anchor sits in a directory of that data root (:func:`anchor_path`). Held, a reset is refused rather than waited
     for: a server still holding the abandoned store could advance the anchor back onto it."""
     from levain.cockpit.broker import LOCK_NAME
-    lock = Path(path).parent / LOCK_NAME
+    lock = Path(path).parent.parent / LOCK_NAME
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
         try:
