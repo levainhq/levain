@@ -24,3 +24,13 @@ def test_sixty_three_lines_is_the_limit():
     one = h(v["proof"][0])
     body = C.add_checkpoint_body(5, [one] * 63, v["checkpoint"])
     assert len(body.split(b"\n\n")[0].split(b"\n")) == 64   # the old line + 63 proof lines
+
+
+def test_a_bytes_checkpoint_note_is_decoded_or_refused():
+    v = {x["id"]: x for x in VECTORS}["old-5-new-9"]
+    i = v["input"]
+    proof = [h(p) for p in i["proof"]]
+    assert C.add_checkpoint_body(5, proof, i["checkpoint"].encode()) == v["expect"]["levain"]["body"].encode()
+    for bad in (i["checkpoint"].encode() + b"\xff", None, 7):
+        with pytest.raises(ContractError):
+            C.add_checkpoint_body(5, proof, bad)

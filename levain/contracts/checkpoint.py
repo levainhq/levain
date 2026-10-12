@@ -176,9 +176,16 @@ def check_advance(held: Checkpoint, new: Checkpoint, proof: list[bytes]) -> None
 # ---- F5: the add-checkpoint body --------------------------------------------------------------------------
 
 
-def add_checkpoint_body(old_size: int, proof: list[bytes], checkpoint_note: str) -> bytes:
+def add_checkpoint_body(old_size: int, proof: list[bytes], checkpoint_note: bytes | str) -> bytes:
     """``old <size>\\n``, one base64 line per proof hash, ``\\n``, then the signed checkpoint (tlog-witness)."""
     check_int(old_size, NOTE_INT_MAX)
+    if isinstance(checkpoint_note, bytes):
+        try:
+            checkpoint_note = checkpoint_note.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ContractError("a signed note is not valid UTF-8") from None
+    if not isinstance(checkpoint_note, str):
+        raise ContractError("a signed checkpoint note is text or UTF-8 bytes")
     parsed = N.parse(checkpoint_note)
     cp = parse_text(parsed.text)
     if old_size > cp.size:
