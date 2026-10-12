@@ -158,3 +158,13 @@ def test_make_key_accepts_both_types_and_parse_vkey_reads_them_back():
         k = N.make_key("a.example/k", bytes(32), t)
         assert N.parse_vkey(k.vkey()) == k
 
+
+@pytest.mark.parametrize("note", ["x\n\n— a\ud800 AAAAAAA=\n", "x\ud800\n\n— a AAAAAAA=\n"])
+def test_parse_refuses_a_str_that_is_not_utf8_encodable(note):
+    with pytest.raises(ContractError):
+        N.parse(note)
+
+
+def test_sign_refuses_text_that_is_not_utf8_encodable():
+    with pytest.raises(ContractError):
+        N.sign("x\ud800\n", "a.example/k", bytes(32))

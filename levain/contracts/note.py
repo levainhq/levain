@@ -97,6 +97,10 @@ class Note:
 
 
 def _check_chars(s: str) -> None:
+    try:
+        s.encode("utf-8")   # a str can hold a lone surrogate, which no UTF-8 note can
+    except UnicodeEncodeError:
+        raise ContractError("a signed note is not encodable as UTF-8") from None
     for c in s:
         if ord(c) < 0x20 and c != "\n":
             raise ContractError(f"control character U+{ord(c):04X} in a signed note")
