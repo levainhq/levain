@@ -885,7 +885,7 @@ class CrownJewelsPolicy:
     # to its real spelling and then follows no symlink below it (head ruling 2026-10-07).
     runtime_sockets: tuple[str, ...] = ()  # the operator's allowlist of sockets bound back into the
     # Linux runtime-dir view (step (7) of :func:`_bwrap_plan_impl`), each relative to the runtime dir,
-    # checked by :func:`check_runtime_sockets`. Empty: only the gpg and ssh agents come back.
+    # checked by :func:`check_runtime_sockets`. Empty: only the gpg agent, keyboxd and the ssh agent come back.
 
 
 def _trusted_roots(entity_dir, workspace) -> tuple[tuple[Path, Path], ...]:
@@ -5630,8 +5630,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             hidden_dirs.append(parent)
 
     # (7) EACH USER RUNTIME DIR IS A VIEW (:func:`_runtime_view`; its ops are placed after the pins,
-    # below). A fresh tmpfs over the dir, and only socket FILES bound back into it: the gpg and ssh
-    # agents and the entity's ``runtime_sockets``. Never a directory: a bound directory would carry
+    # below). A fresh tmpfs over the dir, and only socket FILES bound back into it: the gpg agent,
+    # keyboxd, the ssh agent and the entity's ``runtime_sockets``. Never a directory: a bound directory would carry
     # every socket beside the one wanted, and stay renameable. That closes three things at once:
     #   · the user's service manager and session bus (spore-1244, MEASURED 2026-09-30, systemd 255):
     #     reachable, `systemd-run --user --pipe --wait cat <jewel>` from inside bash printed the
