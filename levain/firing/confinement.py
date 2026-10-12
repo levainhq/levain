@@ -641,6 +641,35 @@ def _runtime_dirs() -> list[str]:
     return out
 
 
+def _runtime_socket_refusal(rel: str) -> str | None:
+    """Why ``rel`` (a path relative to a user runtime dir) may not come back into bash's view of that
+    dir, or None. The service manager (``systemd/``) and the session bus (``bus``) run what they are
+    asked outside the sandbox, the whole-floor bypass measured 2026-09-30, and dirmngr fetches over
+    the network for whoever connects (the 2026-10-10 rename attack)."""
+    parts = Path(rel).parts
+    if not rel or Path(rel).is_absolute() or ".." in parts:
+        return "is not a path inside the runtime dir"
+    if parts[0] == "systemd":
+        return "is the user's service manager, which runs any command outside the sandbox"
+    if parts[0] == "bus":
+        return "is the session bus, which reaches the service manager"
+    if "S.dirmngr" in parts:
+        return "is gnupg's dirmngr, which fetches from the network for whoever connects"
+    return None
+
+
+def check_runtime_sockets(entries, *, where: str) -> tuple[str, ...]:
+    """The ``runtime_sockets`` allowlist as given, or :class:`ConfinementError` naming the first entry
+    the runtime-dir view never binds back (:func:`_runtime_socket_refusal`)."""
+    out: list[str] = []
+    for rel in entries:
+        why = _runtime_socket_refusal(rel) if isinstance(rel, str) else "is not a string"
+        if why is not None:
+            raise ConfinementError(f"{where}: {rel!r} {why}. Remove it — fail-closed.")
+        out.append(rel)
+    return tuple(dict.fromkeys(out))
+
+
 def _expand_socket_source(spec: str) -> list[Path]:
     """One roster entry as the paths it names; empty when it names a runtime dir this host does not
     have — a path still containing ``$`` would deny a file nobody can create, and read as cover."""
@@ -861,6 +890,9 @@ class CrownJewelsPolicy:
     # the entity dir and $HOME, resolved ONCE here. A symlink above one of them is the operator's,
     # not the entity's: the file editor's walk (levain.firing.openhands.tools) maps a path under one
     # to its real spelling and then follows no symlink below it (head ruling 2026-10-07).
+    runtime_sockets: tuple[str, ...] = ()  # the operator's allowlist of sockets bound back into the
+    # Linux runtime-dir view (step (7) of :func:`_bwrap_plan_impl`), each relative to the runtime dir,
+    # checked by :func:`check_runtime_sockets`. Empty: only the gpg and ssh agents come back.
 
 
 def _trusted_roots(entity_dir, workspace) -> tuple[tuple[Path, Path], ...]:
@@ -1177,6 +1209,7 @@ def build_policy(
     # operator who genuinely runs containers from the entity and accepts that.
     allow_container_sockets: bool = False,
     deny_localhost_outbound: bool = False,
+    runtime_sockets: tuple[str, ...] = (),
 ) -> CrownJewelsPolicy:
     """Assemble the crown-jewels floor for the entity at ``entity_dir``.
 
@@ -1621,6 +1654,7 @@ def build_policy(
         ro_tool_dirs=tuple(tool_dirs),
         cred_dir_sources=tuple(cred_dir_sources),
         trusted_roots=_trusted_roots(entity_dir, workspace),
+        runtime_sockets=check_runtime_sockets(runtime_sockets, where="runtime_sockets"),
     )
 
 
@@ -2134,6 +2168,11 @@ class ConfinementConfig:
     # M2: the dedicated unprivileged user `sudo levain setup-isolation` created for this entity's
     # bash, its numeric id, and the workspace it created for it outside the operator's home; removed
     # by its `--undo`. All three or none: absent means not set up. Appended last, per the rule above.
+    runtime_sockets: tuple[str, ...] = ()
+    # The sockets under the user runtime dir that bash on Linux may still reach (``podman/podman.sock``),
+    # Flatpak ``--socket=`` style: every other entry of that dir is absent inside bash (step (7) of
+    # :func:`_bwrap_plan_impl`). Naming a daemon's socket here hands bash that daemon, knowingly.
+    # :func:`check_runtime_sockets` refuses the service manager, the session bus and dirmngr.
 
 
 _CONFINEMENT_CONFIG_NAME = "confinement.json"
@@ -2150,7 +2189,8 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
          "deny_standard_creds": false,
          "allow_container_sockets": false,
          "allow_localhost_outbound": false,
-         "efferent_gate": "auto"}
+         "efferent_gate": "auto",
+         "runtime_sockets": ["podman/podman.sock"]}
 
     ``~`` is expanded in every path. Unknown keys are IGNORED (forward-compat). A MISSING file returns
     the default (empty declarations, ``ssh_mode="agent"``, ``efferent_gate="auto"``) — the universal
@@ -2306,6 +2346,11 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
         except HandsSetupError as exc:
             raise ConfinementError(f"{base}: {exc} — fail-closed.") from None
 
+    runtime_sockets = data.get("runtime_sockets", [])
+    if not isinstance(runtime_sockets, list) or not all(isinstance(v, str) for v in runtime_sockets):
+        raise ConfinementError(f"{base}: 'runtime_sockets' must be a list of path strings — fail-closed.")
+    runtime_sockets = check_runtime_sockets(runtime_sockets, where=f"{base}: runtime_sockets")
+
     return ConfinementConfig(
         deny_files=_paths("deny_files"),
         deny_subtrees=_paths("deny_subtrees"),
@@ -2318,6 +2363,7 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
         hands_uid=hands_uid,
         hands_workspace=hands_workspace,
         hands_egress_ports=hands_egress_ports,
+        runtime_sockets=runtime_sockets,
     )
 
 
@@ -4514,7 +4560,7 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
 
     The jewels are the named ones (followed through symlinks) plus every entry under the hidden
     subtrees and the ssh dir (walked without following symlinks), and on Linux the session bus and
-    the systemd manager socket bwrap step (7) masks. An absent jewel is skipped: there is no file to
+    the systemd manager socket bwrap step (7) hides. An absent jewel is skipped: there is no file to
     have other names.
 
     ⛔ A jewel this user cannot stat or list raises :class:`ConfinementError` ("could not check"),
@@ -4937,8 +4983,10 @@ def _dirmngr_sockets() -> list[Path]:
     the operator's directories: one session moves the directory holding a live dirmngr socket, and the
     next reaches it at its new name, where neither source finds it (REPRODUCED 2026-10-10 on argushub,
     63 packets on port 53 carrying a fresh name).
-    No path mask closes that; the frame for the v2.0 must-close is Landlock's RESOLVE_UNIX (inode rules,
-    kernel 7.1+) with an allowlisted runtime-dir view on older kernels."""
+    No path mask closes that. Under a user runtime dir, where gnupg puts its sockets whenever
+    ``/run/user/<uid>`` exists, the runtime-dir view (step (7) of :func:`_bwrap_plan_impl`) does, and
+    the masks here are dropped for those paths. A dirmngr socket in a GNUPGHOME outside every runtime
+    dir (a host with no ``/run/user/<uid>``) is still masked by path only."""
     found: list[Path] = []
     for s in _bound_unix_socket_paths():
         if Path(s).name != "S.dirmngr":
@@ -4968,6 +5016,75 @@ def _dirmngr_sockets() -> list[Path]:
     return list(dict.fromkeys(f for f in found if _reachable(f) and f.exists()))
 
 
+def _gpg_agent_sockets() -> list[Path]:
+    """The operator's gpg-agent sockets, its own and its ssh one, as ``gpgconf`` names them for this
+    process's GNUPGHOME, the default one or not. Empty when gpgconf is missing or fails: gpg inside bash
+    then finds no agent, a degrade rather than an exposure."""
+    exe = shutil.which("gpgconf")
+    if exe is None:
+        return []
+    try:
+        done = subprocess.run([exe, "--list-dirs", "agent-socket", "agent-ssh-socket"],
+                              capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if done.returncode != 0:
+        return []
+    return [Path(line) for line in done.stdout.splitlines() if line.startswith("/")]
+
+
+def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path]]:
+    """Step (7) of :func:`_bwrap_plan_impl` as ``(ops, view_roots)``: each user runtime dir this user
+    owns (:func:`_runtime_dirs`, resolved) becomes a fresh 0700 tmpfs, and only socket FILES come back
+    into it: the gpg-agent's two sockets (:func:`_gpg_agent_sockets`), ``$SSH_AUTH_SOCK``, and the
+    entity's ``runtime_sockets``, each kept only when it resolves under that dir, is a socket now, and
+    is not one :func:`_runtime_socket_refusal` names. The tmpfs and the parent directories the sockets
+    need are made at 0700: with them at 0755, gpg-connect-agent answered "no gpg-agent running in this
+    session" through the bound-back socket, and at 0700 it reached the agent (RUN on argushub
+    2026-10-12, gnupg 2.4.4, bubblewrap 0.9.0). The view stays writable, so an agent a tool starts
+    inside bash can make its socket there; it is gone with the shell."""
+    roots: list[Path] = []
+    for r in _runtime_dirs():
+        rd = Path(r)
+        try:
+            st = os.stat(rd)
+            real = rd.resolve()
+        except (OSError, RuntimeError):
+            continue   # absent, or another user's: nothing of it is reachable to hide
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or real in roots:
+            continue
+        roots.append(real)
+    roots = [r for r in roots if not any(r != o and r.is_relative_to(o) for o in roots)]   # the outer view covers it
+    wanted = list(_gpg_agent_sockets()) if roots else []
+    auth_sock = os.environ.get("SSH_AUTH_SOCK", "")
+    if auth_sock.startswith("/"):
+        wanted.append(Path(auth_sock))
+    wanted += [rt / rel for rt in roots for rel in policy.runtime_sockets]
+    ops: list[str] = []
+    for root in roots:
+        keep: list[Path] = []
+        for s in wanted:
+            try:
+                real = s.resolve()
+                is_sock = stat.S_ISSOCK(os.stat(real).st_mode)
+            except (OSError, RuntimeError):
+                continue
+            if not is_sock or real == root or not real.is_relative_to(root):
+                continue
+            if _runtime_socket_refusal(str(real.relative_to(root))) is not None:
+                continue   # a link in the allowlist pointing at a refused socket
+            keep.append(real)
+        keep = list(dict.fromkeys(keep))
+        ops += ["--perms", "0700", "--tmpfs", str(root)]
+        dirs = sorted({str(a) for s in keep for a in s.parents if a != root and a.is_relative_to(root)})
+        for d in dirs:
+            ops += ["--perms", "0700", "--dir", d]
+        for s in keep:
+            # A read-only bind would not stop connect(), so it buys nothing over a plain one.
+            ops += ["--bind", str(s), str(s)]
+    return ops, roots
+
+
 def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     """THE single source of the bwrap invocation, as ``(argv, dirs_to_create_first)``. :meth:`BwrapProvider.render_profile` renders this
     list as text and :meth:`BwrapProvider.spawn_shell` executes it — deliberately ONE computation
@@ -4978,7 +5095,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     ``/dev/null`` form for a write-denied file, and a 16-byte header read of file-shaped jewels
     (:func:`_refuse_plantable_sqlite_jewels`), and, for bash without network, the kernel's list of bound
     unix sockets (:func:`_bound_unix_socket_paths`, which refuses when it cannot be read). Reads, never
-    a mutation."""
+    a mutation, except one: ``gpgconf --list-dirs`` (:func:`_gpg_agent_sockets`) creates gnupg's socket
+    directory under the runtime dir for a non-default GNUPGHOME, as any gpg command run there does
+    (RUN on argushub 2026-10-12, gnupg 2.4.4)."""
     _refuse_plantable_sqlite_jewels(policy)
     argv: list[str] = [
         BWRAP,
@@ -5439,18 +5558,20 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # for the rest of that shell, and a rootless daemon absent at spawn can be started afterwards.
     # Both run through the user's service manager, which is outside this namespace.
     # That manager is itself the sharper bypass, and step (7) hides it: the entity cannot ask it to
-    # start or restart anything.
-    # Compared RESOLVED, because the socket targets are: a symlinked runtime dir or HOME compared
-    # lexically would get the directory form, a read-only tmpfs over the whole runtime dir (L1 + L2).
+    # start or restart anything. A socket under a user runtime dir is step (7)'s: absent from that
+    # dir's view unless the entity's ``runtime_sockets`` brings it back, so no form here.
+    # Compared RESOLVED, because the socket targets are: a symlinked HOME compared lexically would
+    # get the directory form, a read-only tmpfs over the whole of it (L1 + L2).
+    runtime_ops, runtime_roots = _runtime_view(policy)
     shared = {Path(p).resolve() for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp")}
     shared.add(Path.home().resolve())
-    for runtime in _runtime_dirs():
-        shared.add(Path(runtime).resolve())
     hidden_dirs: list[Path] = []
     for s in sorted(policy.deny_sockets, key=lambda p: str(p)):
         parent = s.parent
         if not _reachable(parent):
             continue   # another user's runtime dir: this user (and so the entity) cannot reach it
+        if any(parent.resolve() == r or parent.resolve().is_relative_to(r) for r in runtime_roots):
+            continue
         if parent.resolve() in shared:
             if s.exists():
                 masks.append(str(s))
@@ -5462,28 +5583,22 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             remount_ro.append(str(parent))
             hidden_dirs.append(parent)
 
-    # (7) THE USER'S SERVICE MANAGER AND SESSION BUS (spore-1244), MEASURED 2026-09-30 in a
-    # systemd-as-PID-1 container with a real `systemd --user` (systemd 255, linger on), driving the
-    # real provider: with neither hidden, `systemd-run --user --pipe --wait cat <jewel>` from INSIDE
-    # the confined shell printed the jewel — the manager runs the command outside this namespace, a
-    # whole-floor bypass. With `$XDG_RUNTIME_DIR/systemd` hidden and `$XDG_RUNTIME_DIR/bus` masked,
-    # both `systemd-run --user` and `systemctl --user` get "Failed to connect to bus". The same
-    # class as the container sockets above (an unsandboxed daemon's socket), so it is denied by
-    # default the same way. The cost: the shell has no `systemctl --user` and no session D-Bus.
-    # ⚠ A bus started AFTER the shell, or a D-Bus on an abstract socket (older distros), is not
-    # covered — the manager that could start one is unreachable from inside, so the entity cannot.
-    for r in _runtime_dirs():
-        rd = Path(r)
-        if not _reachable(rd):
-            continue
-        sysd = rd / "systemd"
-        if _reachable(sysd) and (sysd.is_dir() or (rd.is_dir() and os.access(rd, os.W_OK))):
-            argv += ["--tmpfs", str(sysd)]
-            remount_ro.append(str(sysd))
-        bus = rd / "bus"
-        if _reachable(bus) and bus.exists():
-            masks.append(str(bus))
-
+    # (7) EACH USER RUNTIME DIR IS A VIEW (:func:`_runtime_view`; its ops are placed after the pins,
+    # below). A fresh tmpfs over the dir, and only socket FILES bound back into it: the gpg and ssh
+    # agents and the entity's ``runtime_sockets``. Never a directory: a bound directory would carry
+    # every socket beside the one wanted, and stay renameable. That closes three things at once:
+    #   · the user's service manager and session bus (spore-1244, MEASURED 2026-09-30, systemd 255):
+    #     reachable, `systemd-run --user --pipe --wait cat <jewel>` from inside bash printed the
+    #     jewel; hidden, it is "Failed to connect to bus";
+    #   · gnupg's dirmngr, which fetches what a client asks for over the network. A mask by path did
+    #     not hold: one session renamed the operator's directory holding S.dirmngr and the next reached
+    #     the socket at its new name (argushub 2026-10-10, 63 packets on port 53 carrying a fresh name).
+    #     Inside the view that rename moves only tmpfs content;
+    #   · every other daemon socket in the dir, present or started later, which a roster would miss.
+    # ⚠ A D-Bus on an abstract socket (older distros) is not in any directory: it is closed only where
+    # bash has no network (``--unshare-net``).
+    # The cost: inside bash the runtime dir holds only those sockets. A bound-back socket keeps its
+    # inode, so an agent restarted on the host is unreachable for the rest of that shell.
     # (7b) THE HOST'S NETWORK DEPUTIES, WHENEVER BASH HAS NO IP NETWORK. ``--unshare-net``
     # removes bash's own sockets from the network, but a root daemon reached over a unix socket
     # resolves (and so sends on the wire) whatever name bash hands it, and the name can carry data
@@ -5500,7 +5615,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # /etc/resolv.conf may point at nothing. A daemon whose socket or directory is absent at spawn,
     # or that recreates its socket, is not hidden from then on: the residual step (6) states.
     if policy.deny_localhost_outbound:
-        masks += [str(f) for f in _dirmngr_sockets()]
+        # Those under a runtime dir are absent from its view (step (7)); ~/.gnupg's still need the mask.
+        masks += [str(f) for f in _dirmngr_sockets()
+                  if not any(f.resolve().is_relative_to(r) for r in runtime_roots)]
         for d in _NETWORK_DEPUTY_DIRS:
             real = Path(d).resolve()
             if not _reachable(real) or not real.is_dir() or real in hidden_dirs:
@@ -5587,6 +5704,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # only create a directory on the host for nothing. Below a window it is pinned as usual
             # (complement, L3 r3).
             continue
+        if any(e == r or e.is_relative_to(r) for r in runtime_roots):
+            # In a runtime dir's view (step (7)): its tmpfs is itself a mountpoint and nothing under
+            # it is the host's, so a pin there would bind a host directory back into the view.
+            continue
         if entry[0] not in [p for p, _ in pins]:
             pins.append(entry)
     # (0) $HOME's OWN ENTRIES ARE READ-ONLY (desk ruling 2026-10-07, option (c)), AS A VIEW (head
@@ -5638,7 +5759,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         else:
             ancestors += ["--bind", path, path]
 
-    out = head + outer + home_ops + ancestors + argv
+    # The runtime views after every pin (an ancestor's bind would cover a view) and before the body.
+    out = head + outer + home_ops + ancestors + runtime_ops + argv
     for r in remount_ro:
         out += ["--remount-ro", r]
     if home_ops:
@@ -6113,7 +6235,7 @@ def _mount_plan_paths(
                         and os.path.isdir(dst)):
                     windows.append(pd)
             i += 3
-        elif op in ("--proc", "--dev", "--remount-ro", "--dir"):
+        elif op in ("--proc", "--dev", "--remount-ro", "--dir", "--perms"):
             i += 2
         elif op == "--symlink":   # a link made in a tmpfs view (a tool directory): nothing on the host
             i += 3
@@ -6802,7 +6924,7 @@ _HANDS_VIEW_TMP = ("/tmp", "/var/tmp", "/run")
 #: the transform, so a new op in the plan cannot pass through it unexamined.
 _BWRAP_OP_ARITY = {
     "--bind": 2, "--ro-bind": 2, "--bind-try": 2, "--ro-bind-try": 2, "--symlink": 2,
-    "--tmpfs": 1, "--remount-ro": 1, "--dir": 1, "--proc": 1, "--dev": 1,
+    "--tmpfs": 1, "--remount-ro": 1, "--dir": 1, "--proc": 1, "--dev": 1, "--perms": 1,
     "--die-with-parent": 0, "--unshare-pid": 0, "--unshare-cgroup": 0, "--unshare-net": 0,
 }
 

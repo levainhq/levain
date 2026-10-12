@@ -35,10 +35,12 @@ from typing import Any, Optional, get_args, get_type_hints
 
 from levain.firing.confinement import (
     ConfinementConfig,
+    ConfinementError,
     CrownJewelsPolicy,
     HandsIdentity,
     SshMode,
     build_policy,
+    check_runtime_sockets,
     load_confinement_config,
 )
 from levain.firing.drive import DRIVE_MODES, DriveMode, resolve_cred_floor
@@ -101,6 +103,7 @@ def _policy_to_params(policy: CrownJewelsPolicy) -> dict[str, Any]:
 # `from __future__ import annotations` in confinement.py cannot quietly move fields to "unchecked").
 _PATH, _OPT_PATH, _PATHS, _BOOL, _SSH_MODE = "path", "optional_path", "paths", "bool", "ssh_mode"
 _PATH_PAIRS = "path_pairs"
+_RUNTIME_SOCKETS = "runtime_sockets"
 
 
 def _field_kinds() -> dict[str, str]:
@@ -112,6 +115,7 @@ def _field_kinds() -> dict[str, str]:
         tuple[tuple[Path, Path], ...]: _PATH_PAIRS,
         bool: _BOOL,
         SshMode: _SSH_MODE,
+        tuple[str, ...]: _RUNTIME_SOCKETS,
     }
     kinds: dict[str, str] = {}
     for f in dataclasses.fields(CrownJewelsPolicy):
@@ -157,6 +161,14 @@ def _policy_from_params(data: Any) -> CrownJewelsPolicy:
             kwargs[name] = _abs_path(name, v)
         elif kind == _OPT_PATH:
             kwargs[name] = None if v is None else _abs_path(name, v)
+        elif kind == _RUNTIME_SOCKETS:
+            # The only list of strings in the floor, and re-checked: it decides what bash reaches.
+            if not isinstance(v, list):
+                raise BindingError(f"floor field {name!r} is not a list (fail-closed).")
+            try:
+                kwargs[name] = check_runtime_sockets(v, where=f"floor field {name!r}")
+            except ConfinementError as exc:
+                raise BindingError(str(exc)) from None
         elif kind == _BOOL:
             if not isinstance(v, bool):
                 raise BindingError(f"floor field {name!r} is not a bool (fail-closed).")
@@ -223,6 +235,8 @@ class ConversationBinding:
             # spore-725. NOT drive-resolved: a reachable container daemon is a total bypass in every
             # drive mode, so a watching operator is no mitigation.
             allow_container_sockets=cfg.allow_container_sockets,
+            # The sockets bash on Linux keeps in its view of the user runtime dir (step (7) of the bwrap plan).
+            runtime_sockets=cfg.runtime_sockets,
             # spore-755. Both ssh modes; the only switch is the operator opt-out. The residuals this
             # does not close are documented on levain.firing.confinement (spore-1005).
             deny_localhost_outbound=(not cfg.allow_localhost_outbound),

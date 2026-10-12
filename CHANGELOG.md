@@ -15,6 +15,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **`ChainExecutor.gate`.** The executor now holds a `GateHandle`, exposed as `ChainExecutor.handle`; read the gate with `handle.current()`, once per admission. A gate kept across a policy swap goes stale, so the executor no longer hands one out.
 - **`EfferentGate.sweep_timeouts`.** The silence-default sweep is `GateHandle.sweep_timeouts`, which decides each pending on the gate current for it; a sweep held on one gate decided pendings on that gate's policy after a swap had superseded it. A bare gate sweeps with `as_handle(gate).sweep_timeouts(now)`.
 
+### Fixed
+
+- **On Linux, bash can no longer reach your gnupg dirmngr by renaming one of your directories (the 0.7.1 known limit).** Your user runtime directory (`/run/user/<uid>`, and `$XDG_RUNTIME_DIR`) is now a fresh, empty directory inside bash, holding only your gpg-agent and ssh-agent sockets, bound back as single files. The rename that reached a running dirmngr from the next session now finds nothing to move: measured 2026-10-12 on an Ubuntu host with a packet capture on port 53, the attack put a fresh name on the wire 63 times before this change and 0 times with it, and the host directory was untouched. The same view hides your user service manager and session bus (which bash could ask to run a command outside the sandbox), replacing the masks that did that, and every other daemon socket in that directory, including one started after bash. gpg signing and `ssh-add -l` through the agents keep working. New setting, `runtime_sockets` in `.levain/confinement.json`: sockets of that directory to put back, relative to it (`["podman/podman.sock"]`), each of which hands bash the daemon behind it. `systemd/`, `bus` and `S.dirmngr` are refused there. Known limits: an agent restarted during a session is unreachable from that session's bash; a dirmngr whose socket sits in a GNUPGHOME outside any runtime directory (a host with no `/run/user/<uid>`) is still hidden by path only.
+
 ## [0.9.1] — 2026-10-12
 
 A security fix. Upgrade if you use gpg on a machine where Levain runs bash.
