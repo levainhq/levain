@@ -848,6 +848,18 @@
   }
 
   // ---- one typed panel ----
+  // Everything a panel draws OUTSIDE its body: kind, whether it is typed, whether it has a filter box and where
+  // that searches, its title and notes, the verbs it offers at panel level, and the hero treatment. Two payloads
+  // with the same shape differ only in body data, which paint() redraws in place; a different shape needs the
+  // chrome rebuilt, which only the one mount path (render) does.
+  function shapeOf(entry, data) {
+    const sr = data.search || {};
+    return JSON.stringify([entry.title, entry.edit_class || "", entry.source || "", entry.modes || "", entry.banner || null,
+      data.kind, !!data.typed, data.error || "", data.markdown != null, data.note || "",
+      sr.on === true, sr.scope || "", sr.fields || [],
+      data.action ? [data.action.verb, data.action.fields] : null, data.form ? data.form.verb : null,
+      data.kind === "ambient" && !!data.sky]);
+  }
   // state s: pid, title, data (the mapper's record), body (the node this paints into), query, results.
   function fill(p, data, ctx) {
     const s = { pid: data.pid, title: (p.querySelector("h2") || {}).textContent || data.pid, data: data, p: p, ctx: ctx || {},
@@ -861,10 +873,12 @@
     const rowKind = data.kind === "list" || data.kind === "count-queue" || data.kind === "roster" || data.kind === "log";
     s.searchable = rowKind && sr.on === true;
     if (!s.searchable) s.query = "";     // a filter saved for a panel that has no filter box must not filter it
+    s.shape = shapeOf(ctx && ctx.entry ? ctx.entry : { title: s.title }, data);
     if (data.kind === "count-queue") {
-      const n = isNum(data.count) ? data.count : (data.lines || []).length;
+      // the figure is data, not chrome: paint() keeps it current
       const big = el("div", "cq");
-      big.appendChild(el("span", "cq-n num", n));
+      s.cqN = el("span", "cq-n num", "");
+      big.appendChild(s.cqN);
       big.appendChild(el("span", "cq-l", "waiting"));
       p.appendChild(big);
     }
@@ -898,6 +912,7 @@
     dropSky(s);
     s.body.replaceChildren();
     if (s.fault) { s.body.appendChild(el("p", "err", "unavailable — " + s.fault)); return; }
+    if (s.cqN) s.cqN.textContent = String(isNum(d.count) ? d.count : (d.lines || []).length);
     if (d.kind === "status-dots") { paintStatusDots(s.body, d.metrics || []); if (!(d.metrics || []).length) s.body.appendChild(el("p", "empty", d.empty)); return; }
     if (d.kind === "reading") { paintReading(s.body, d.reading); return; }
     if (d.kind === "metric-grid") { paintGrid(s.body, d.numbers); return; }
@@ -993,12 +1008,14 @@
     return t.readJson("/cockpit/panel/" + encodeURIComponent(pid) + ".json?profile=full" + (extra || ""));
   }
 
-  // Refetch one panel by id and redraw it whole. The streaming lane (CK4) calls this when an event says a
-  // panel moved. The fresh payload goes through the same mapper and the same panel builder as the first
-  // draw, so the count, title, notes, actions and kind classes follow the data; the filter's query, its
-  // focus and an expanded list carry over. Resolves true when a typed panel on the page was redrawn (or a
-  // newer refetch of the same panel took over); false when the page holds no typed panel by that id (a
-  // native panel, or none), which the caller answers with a full reload.
+  // Refetch one panel by id. The streaming lane (CK4) calls this when an event says a panel moved, so it is
+  // the hot path and must disturb nothing the operator is holding: the scroll position, an expanded row, the
+  // filter's caret, a mounted sky. A panel is therefore kept, not rebuilt: when the fresh payload has the same
+  // shape as the one drawn (the chrome is unchanged, only data moved) every live copy of the panel, board and
+  // focus modal alike, repaints its body in place and re-measures its host, and no node is created, moved or
+  // detached. When the shape changed, this declines and the caller answers with a full reload, so the board's
+  // one render path stays the only place a panel is mounted. Resolves true when the page was brought up to
+  // date (or a newer refetch of the same panel took over); false when the caller must reload.
   const refetchGen = new Map();
   const liveOf = (pid) => Array.from(states).filter((s) => s.pid === pid && onPage(s));
   async function refetchPanel(pid) {
@@ -1012,7 +1029,7 @@
     if (!live.length) return false;
     if (fault) { for (const s of live) { s.fault = fault; paint(s); } return true; }
     const core = root.LevainDashboard;
-    if (!lastManifest || !core || typeof core.renderPanel !== "function") return false;
+    if (!lastManifest || !core) return false;
     let view, entry, data;
     try {
       view = mapSnapshot({ manifest: lastManifest, panels: { [pid]: raw } }, { elapsedMs: Date.now() - manifestAt });
@@ -1020,31 +1037,20 @@
       data = view.extra_panels[pid];
     } catch (e) { for (const s of live) { s.fault = "could not be mapped (" + (e && e.message ? e.message : e) + ")"; paint(s); } return true; }
     if (!entry || !data) return false;      // the panel is no longer an external one: a full reload draws it
-    for (const old of live) {
-      const input = old.filterInput;
-      if (input && document.activeElement === input) keepFocus(input, pid);
-      const node = core.renderPanel(entry, view, old.modal ? { modal: true } : undefined);
-      if (old.modal) {
-        // the modal holds only the panel's body: swap the new body in beside the old one's place
-        const fresh = Array.from(states).find((o) => o.p === node);
-        const host = old.body.parentNode;
-        const phead = node.querySelector(".phead");
-        const kids = [];
-        if (phead) { let n = phead.nextSibling; while (n) { kids.push(n); n = n.nextSibling; } }
-        teardown(old);
-        if (host && fresh && kids.length) {
-          host.replaceChildren(...kids);
-          if (old.showAll) { fresh.showAll = true; paint(fresh); }
-        }
-        continue;
+    const shape = shapeOf(entry, data);
+    if (live.some((s) => s.shape !== shape)) return false;
+    for (const s of live) {
+      s.data = data;
+      s.fault = "";
+      paint(s);
+      const sr = data.search || {};
+      if (s.searchable && sr.scope === "store" && sendable(s.query)) runStoreSearch(s);
+      // the host's finalisation, on the node already there: the clause toggles and the overflow cue follow the new rows
+      const host = s.body.closest ? s.body.closest(".pbody, .modal-body") : null;
+      if (host) {
+        if (core.measureClauses) core.measureClauses(host);
+        if (core.measureOverflow && host.classList.contains("clamped")) core.measureOverflow(host);
       }
-      for (const c of Array.from(old.p.classList)) if (c.indexOf("k-") !== 0 && c !== "panel-hero") node.classList.add(c);
-      teardown(old);
-      old.p.replaceWith(node);
-      if (core.finalizeNode) core.finalizeNode(node, entry);     // the board finalisation of the first draw: .pbody, the clamp, the overflow cue
-      if (hoverPanel === old.p) hoverPanel = node;
-      const fresh = Array.from(states).find((o) => o.p === node);
-      if (fresh && old.showAll) { fresh.showAll = true; paint(fresh); }
     }
     return true;
   }
