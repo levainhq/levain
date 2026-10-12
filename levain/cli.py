@@ -372,8 +372,11 @@ def main(argv: list[str] | None = None) -> int:
     ck_revoke.add_argument("ref", help="The key's fingerprint (SHA256:...) or principal.")
     ck_revoke.add_argument("--compromised-since", dest="compromised_since", type=int, default=None,
                            help="The authority seq (as `levain cockpit keys` lists) from which the key "
-                                "may have been in other hands; its fires from then on stop reading as "
-                                "signed, and the last laptop-presence key can be revoked with it.")
+                                "may have been in other hands; its fires decided at or after that seq read "
+                                "\"signed by a revoked key\", and the last laptop-presence key can be revoked "
+                                "with it. The seq is a position in the authority log, which moves only when "
+                                "a link is appended (an enrol, a revoke, a policy change), so it marks every "
+                                "fire since the log's head reached it, not a point in time.")
     ck_revoke.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
                            help="An enrolled key of at least the revoked key's class that signs this "
                                 "revocation (its private key file, or the .pub of a key an agent holds).")
