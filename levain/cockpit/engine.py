@@ -1611,9 +1611,10 @@ class Cockpit:
         empty answer that reads as "nothing matches".
 
         The hook's answer is drained INSIDE the timed worker, at most ``limit`` rows (a generator or a
-        lazy sequence cannot run on the request thread), and one search per panel runs at a time: a
-        hook that outlives its timeout keeps its panel "busy" until it ends, so hung hooks cost one
-        thread per panel, never one per request."""
+        lazy sequence cannot run on the request thread). Searches on one panel may overlap (a newer
+        query while an older one is still running is ordinary typing), but a hook that OUTLIVED its
+        timeout keeps its panel "busy" until it ends, so a hung hook costs one abandoned thread per
+        panel, never one per request."""
         fut: Future = Future()
 
         def run() -> None:
@@ -1636,14 +1637,15 @@ class Cockpit:
 
         worker = threading.Thread(target=run, daemon=True, name=f"cockpit-search-{spec.id}")
         with self._search_mu:
-            live = self._searching.get(spec.id)
-            if live is not None and live.is_alive():
+            hung = self._searching.get(spec.id)
+            if hung is not None and hung.is_alive():
                 return [], None, "search busy"
-            self._searching[spec.id] = worker
             worker.start()
         try:
             exc = fut.exception(timeout=spec.timeout_s)
         except FutureTimeout:
+            with self._search_mu:
+                self._searching[spec.id] = worker      # abandoned: the panel is busy until it ends
             return [], None, f"search timed out after {spec.timeout_s:g}s"
         if exc is not None:
             return [], None, f"search failed: {_safe_str(exc)}"

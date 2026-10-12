@@ -498,6 +498,29 @@ def test_f1_a_hung_hook_holds_one_thread_per_panel_and_the_next_search_is_busy()
     assert "search_error" not in ck.panel("p", q="x")      # the panel is searchable again once the hook ended
 
 
+def test_f1_overlapping_searches_within_the_deadline_are_not_busy() -> None:
+    """A newer query while an older one is still running is ordinary typing; only an abandoned hook makes a panel busy."""
+    started, release = threading.Event(), threading.Event()
+
+    def slow(q: str, n: int) -> Any:
+        if q == "old":
+            started.set()
+            release.wait(2)
+        return []
+
+    ck = _store(slow, timeout_s=3)
+    out: dict[str, Any] = {}
+    t = threading.Thread(target=lambda: out.setdefault("old", ck.panel("p", q="old")))
+    t.start()
+    assert started.wait(2)
+    try:
+        assert "search_error" not in ck.panel("p", q="new")
+    finally:
+        release.set()
+        t.join(3)
+    assert "search_error" not in out["old"]
+
+
 def test_f1_a_hook_that_raises_systemexit_is_a_search_error_not_an_escape() -> None:
     def quit_(q: str, n: int) -> Any:
         raise SystemExit(3)
