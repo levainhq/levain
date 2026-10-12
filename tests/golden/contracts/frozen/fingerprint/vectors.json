@@ -1,0 +1,186 @@
+{
+ "item": "F7",
+ "generator": "gen.py",
+ "ssh_version": "OpenSSH_10.3p1",
+ "vectors": [
+  {
+   "id": "fingerprint-ssh-ed25519",
+   "kind": "spec",
+   "op": "fingerprint",
+   "input": {
+    "line": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKsxT4Tn6Au6ilSPu8fC1/+c7H1rYjM6ifNjPjKdMsSK golden-ssh-ed25519",
+    "file": "ssh-ed25519.pub"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "fp": "SHA256:oVyYgfnDAX262M8AXzBj2LI3tqaTEwANFNTy8U4Ac70",
+     "fp_hex": "a15c9881f9c3017dbad8cf005f3063d8b237b6a69313000d14d4f2f14e0073bd"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -lf",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F7 / F6",
+    "clause": "fp_of_blob = 'SHA256:' + base64(SHA-256(wire blob)) without '=' padding; fp_hex = lowercase hex of the same SHA-256"
+   }
+  },
+  {
+   "id": "fingerprint-ecdsa-sha2-nistp256",
+   "kind": "spec",
+   "op": "fingerprint",
+   "input": {
+    "line": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBGGEcYxw/lsnm5t3BNie+iAQJJoT1qasYMUBT1ffnX6sODC1n32jZE8DDz44hdfuLvDxfio1egi/nIl3K/CY65g= golden-ecdsa-sha2-nistp256",
+    "file": "ecdsa-sha2-nistp256.pub"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "fp": "SHA256:hpiABbGXTXarLm255urRBkMD1UbzgKenenv8vJrLvnU",
+     "fp_hex": "86988005b1974d76ab2e6db9e6ead1064303d546f380a7a77a7bfcbc9acbbe75"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -lf",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F7 / F6",
+    "clause": "fp_of_blob = 'SHA256:' + base64(SHA-256(wire blob)) without '=' padding; fp_hex = lowercase hex of the same SHA-256"
+   }
+  },
+  {
+   "id": "fingerprint-ecdsa-sha2-nistp384",
+   "kind": "spec",
+   "op": "fingerprint",
+   "input": {
+    "line": "ecdsa-sha2-nistp384 AAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAAAIbmlzdHAzODQAAABhBJ+/6FilXJjbmiGE2VIY/R1Y30+8hO79TpoubgXtvWd1TNZKbcBaUytx00eJlfyzI7lM6jFjt2mrEf6A9qPRh8iPxX4axrq0NvC6pKFfiWZfCP6PV/xziN9jIh/+qY08cQ== golden-ecdsa-sha2-nistp384",
+    "file": "ecdsa-sha2-nistp384.pub"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "fp": "SHA256:0E19VP/rXUoOzxzx6RxxmtHTkT4od4hqJ6YQBX0E7YE",
+     "fp_hex": "d04d7d54ffeb5d4a0ecf1cf1e91c719ad1d3913e2877886a27a610057d04ed81"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -lf",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F7 / F6",
+    "clause": "fp_of_blob = 'SHA256:' + base64(SHA-256(wire blob)) without '=' padding; fp_hex = lowercase hex of the same SHA-256"
+   }
+  },
+  {
+   "id": "fingerprint-ecdsa-sha2-nistp521",
+   "kind": "spec",
+   "op": "fingerprint",
+   "input": {
+    "line": "ecdsa-sha2-nistp521 AAAAE2VjZHNhLXNoYTItbmlzdHA1MjEAAAAIbmlzdHA1MjEAAACFBACcj9510Wz0tNyXFPEEtV4I24jc+yXGJ4FkvhcPINDS7eokHiQL4nzxZ64UBmrmN+RS3u6bV4527FaKovJUwNNCegFdNdTmMBKWMRr94vR5HNdCdSOqEgR78PNwnswZFgcGz1omLOesxihCIPXjhUJmPpi2cXMPceF2CXj4qZjoWIzN3g== golden-ecdsa-sha2-nistp521",
+    "file": "ecdsa-sha2-nistp521.pub"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "fp": "SHA256:fzhQSc/ZGOsEfWfDly7yxb2VPBTdyzoGgEemoCIotIo",
+     "fp_hex": "7f385049cfd918eb047d67c3972ef2c5bd953c14ddcb3a068047a6a02228b48a"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -lf",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F7 / F6",
+    "clause": "fp_of_blob = 'SHA256:' + base64(SHA-256(wire blob)) without '=' padding; fp_hex = lowercase hex of the same SHA-256"
+   }
+  },
+  {
+   "id": "fingerprint-sk-ssh-ed25519",
+   "kind": "spec",
+   "op": "fingerprint",
+   "input": {
+    "line": "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIJNT9v9chQTCRmXVsoGTw9+HfDjMsjyB0fPB5RjkuNRPAAAABHNzaDo= golden-sk-ssh-ed25519",
+    "file": "sk-ssh-ed25519.pub"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "fp": "SHA256:Gv6vb+fR0P5q3ny+c8IQDkDVYIgMbs2F8n4KcNP3NSU",
+     "fp_hex": "1afeaf6fe7d1d0fe6ade7cbe73c2100e40d560880c6ecd85f27e0a70d3f73525"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -lf",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F7 / F6",
+    "clause": "fp_of_blob = 'SHA256:' + base64(SHA-256(wire blob)) without '=' padding; fp_hex = lowercase hex of the same SHA-256"
+   }
+  },
+  {
+   "id": "fingerprint-sk-ecdsa-sha2-nistp256",
+   "kind": "spec",
+   "op": "fingerprint",
+   "input": {
+    "line": "sk-ecdsa-sha2-nistp256@openssh.com AAAAInNrLWVjZHNhLXNoYTItbmlzdHAyNTZAb3BlbnNzaC5jb20AAAAIbmlzdHAyNTYAAABBBNf8KFPFWtBKvXarrzcCKN9mLjbQT59f12RqmdJcCEbVzRnIRuxnbwe5E8I7vNOK4oITW++WrIt0T8qs5hAWkKwAAAAEc3NoOg== golden-sk-ecdsa-sha2-nistp256",
+    "file": "sk-ecdsa-sha2-nistp256.pub"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "fp": "SHA256:yOh8FJfy9UDpz6E38KUFPw9Ig+2s+WleXW0wuPUPmlc",
+     "fp_hex": "c8e87c1497f2f540e9cfa137f0a5053f0f4883edacf9695e5d6d30b8f50f9a57"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -lf",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F7 / F6",
+    "clause": "fp_of_blob = 'SHA256:' + base64(SHA-256(wire blob)) without '=' padding; fp_hex = lowercase hex of the same SHA-256"
+   }
+  },
+  {
+   "id": "declared-type-differs-from-blob-refused",
+   "kind": "spec",
+   "op": "fingerprint",
+   "input": {
+    "line": "ssh-ed25519 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBGGEcYxw/lsnm5t3BNie+iAQJJoT1qasYMUBT1ffnX6sODC1n32jZE8DDz44hdfuLvDxfio1egi/nIl3K/CY65g= mismatch"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -lf",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "S1_DESIGN F7",
+    "clause": "the parser requires the blob's embedded type string to equal the line's declared type"
+   }
+  }
+ ]
+}

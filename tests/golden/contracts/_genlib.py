@@ -28,9 +28,12 @@ UPSTREAM = {
     "ed25519": ("crypto/ed25519", GO),
     "decimal": ("strconv.ParseUint", GO),
     "b64": ("encoding/base64.StdEncoding", GO),
+    # F7's observation, not run by xcheck; the version is `ssh -V` on the generating machine (an observation,
+    # never the authority).
+    "ssh-keygen": ("ssh-keygen -lf", "OpenSSH_10.3p1"),
 }
 
-ACCEPT, REFUSE = "accept", "refuse"
+ACCEPT, REFUSE, UNVERIFIABLE = "accept", "refuse", "unverifiable"
 
 
 def spec(source: str, clause: str) -> dict:
@@ -54,7 +57,7 @@ def vector(vid: str, kind: str, op: str, inp: dict, levain: dict, authority: dic
     ``upstream_lax`` = upstream accepts what levain refuses.
     """
     assert kind in ("spec", "levain_profile", "upstream_lax", "no_upstream"), kind
-    assert levain["verdict"] in (ACCEPT, REFUSE)
+    assert levain["verdict"] in (ACCEPT, REFUSE) or (kind == "no_upstream" and levain["verdict"] == UNVERIFIABLE)
     if kind == "no_upstream":
         assert upstream is None
         up: object = "n/a"
