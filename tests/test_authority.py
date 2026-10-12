@@ -470,14 +470,44 @@ def test_loosen_that_only_extends_an_expiry_refused(granted, keys):
     refused(granted, "a loosen link computes to a renew change")
 
 
+def _prepare_then_append(conn, op, signer: Key, *, prepared_at, appended_at):
+    cache = ReplayCache()
+    ln = auth.prepare(conn, op, signer_fp=signer.fp, now=prepared_at, cache=cache)
+    return auth.append(conn, ln, signer.sign(ln.message), now=appended_at, cache=cache, anchor=None)
+
+
 def test_renew_append_checks(granted, keys):
     with pytest.raises(AuthorityError, match="within 10 minutes"):
-        link(granted, _renew(NOW + timedelta(days=20), signed=NOW - timedelta(minutes=11)), keys["phone"])
+        _prepare_then_append(granted, _renew(NOW + timedelta(days=20)), keys["phone"], prepared_at=NOW,
+                             appended_at=NOW + timedelta(minutes=11))
     with pytest.raises(AuthorityError, match="30 days from now"):
-        link(granted, _renew(NOW + timedelta(days=30, seconds=1), signed=NOW + timedelta(seconds=5)), keys["phone"])
+        _prepare_then_append(granted, _renew(NOW + timedelta(days=30)), keys["phone"], prepared_at=NOW,
+                             appended_at=NOW - timedelta(minutes=5))
     later = NOW + timedelta(days=11)
     with pytest.raises(AuthorityError, match="has expired"):
         link(granted, _renew(later + timedelta(days=5), signed=later), keys["phone"], now=later)
+
+
+def test_renew_signed_at_must_equal_at(granted, keys):
+    """F2: a replayed signed_at is not a free input to the 30-day rule; it is the link's own at."""
+    insert(granted, _renew(NOW + timedelta(days=40), signed=NOW + timedelta(days=20)), keys["phone"])
+    refused(granted, "signed_at must equal its at")
+
+
+def test_a_link_earlier_than_its_predecessor_refused(granted, keys):
+    insert(granted, {"op": "raise", "verb": "v", "tier": "T3"}, keys["phone"],
+           at=_stamp(NOW - timedelta(seconds=1)))
+    refused(granted, "earlier than its predecessor")
+
+
+def test_a_future_dated_link_wedges_later_appends_visibly(granted, keys):
+    """F2: a renew inserted with a future at (and signed_at) replays, and every later append is refused
+    by the ordering rule rather than extending anything silently."""
+    future = NOW + timedelta(days=20)
+    insert(granted, _renew(future + timedelta(days=30), signed=future), keys["phone"], at=_stamp(future))
+    assert head(granted).policy.grants["g1"]["expires_at"] == _stamp(future + timedelta(days=30))
+    with pytest.raises(ReplayError, match="earlier than its predecessor"):
+        link(granted, {"op": "raise", "verb": "v", "tier": "T3"}, keys["phone"])
 
 
 def test_classify():
