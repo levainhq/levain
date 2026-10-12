@@ -33,6 +33,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..launch import child_env
 from .transport import _NO_HOOKS, ledger_env
 
 SSH_SIG_BEGIN = "-----BEGIN SSH SIGNATURE-----"
@@ -200,6 +201,14 @@ def _env(**extra: str) -> dict[str, str]:
     return ledger_env(**extra)
 
 
+def _ssh_env(**extra: str) -> dict[str, str]:
+    """For a direct ``ssh-keygen`` call: the allowlist only. It reads no git setting, so no carried ``GIT_*`` value
+    (a ``GIT_CONFIG_VALUE_n`` can hold a credential) rides into its exec-time environment (L3 r1 codex)."""
+    env = child_env()
+    env.update(LC_ALL="C", **extra)
+    return env
+
+
 def _output_tail(cp: subprocess.CompletedProcess) -> str:
     text = (cp.stdout or b"").decode("utf-8", "replace") + "\n" + (cp.stderr or b"").decode("utf-8", "replace")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -268,7 +277,7 @@ def _check_novalidate(sig: bytes, payload: bytes, timeout: float) -> subprocess.
         try:
             return subprocess.run(["ssh-keygen", "-Y", "check-novalidate", "-n", "git", "-s", sig_path],
                                   input=payload, capture_output=True, timeout=timeout,
-                                  env=_env(SSH_ASKPASS_REQUIRE="never"))
+                                  env=_ssh_env(SSH_ASKPASS_REQUIRE="never"))
         except FileNotFoundError:
             return _indeterminate("ssh-keygen is not on PATH")
         except subprocess.TimeoutExpired:
@@ -460,7 +469,7 @@ def prove_can_sign(key: str, pubkey_line: str, *, timeout: float = 15.0) -> None
             args += ["-f", os.path.expanduser(key)]
         try:
             cp = subprocess.run([*args, str(msg)], capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
-                                env=_env(**signing_env()))
+                                env=_ssh_env(**signing_env()))
         except FileNotFoundError:
             raise SigningError("ssh-keygen is not on PATH") from None
         except subprocess.TimeoutExpired:

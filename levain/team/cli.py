@@ -18,7 +18,7 @@ from . import roles as R
 from . import wire as W
 from .export import export_stream
 from .hook import decide
-from .transport import GitLedger, InitIncomplete, JoinIncomplete, Repo, TeamError
+from .transport import _NO_HOOKS, GitLedger, InitIncomplete, JoinIncomplete, Repo, TeamError, ledger_env
 
 
 def _repo(args) -> Repo:
@@ -406,9 +406,8 @@ def cmd_doctor(args) -> int:
         rows.append((not err, f"remote {gl.remote}: last fetch "
                      + (I.age(_iso(st.get('last_fetch_ok'))) if st.get("last_fetch_ok") else "never")
                      + (f"; last error: {err}" if err else "")))
-        ahead = subprocess.run(["git", "log", "--format=%s", f"refs/remotes/{gl.remote}/{gl.branch}..HEAD"],
-                               cwd=gl.wt, capture_output=True, text=True,
-                               env=child_env(prefixes=("GIT_",)))
+        ahead = subprocess.run(["git", *_NO_HOOKS, "log", "--format=%s", f"refs/remotes/{gl.remote}/{gl.branch}..HEAD"],
+                               cwd=gl.wt, capture_output=True, text=True, env=ledger_env())
         subjects = ahead.stdout.splitlines() if ahead.returncode == 0 else ["?"]
         real = [s for s in subjects if not s.startswith("levain team: ack ")]
         rows.append((not real, f"{len(subjects)} local ledger commit(s) not pushed"
