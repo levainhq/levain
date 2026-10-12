@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -114,6 +115,10 @@ def test_a_descendant_holding_stderr_does_not_hang_the_cleanup(tmp_path):
         # and every pipe is closed, so an escaped descendant costs nothing after cleanup
         (p,) = started
         assert p.stderr.closed and p.stdout.closed and p.stdin.closed
+        # verify r4, complement LOW: a cancelled Timer thread can outlive _drive by a moment; poll briefly
+        deadline = time.monotonic() + 2
+        while [th for th in threading.enumerate() if th not in before and th is not t] and time.monotonic() < deadline:
+            time.sleep(0.05)
         assert [th for th in threading.enumerate() if th not in before and th is not t] == []
     finally:
         if pidfile.exists():
@@ -393,6 +398,24 @@ def test_a_listener_close_failure_does_not_mask_the_stranded_activation(entity, 
     assert f"activation-moved-{record['nonce']}" in str(ei.value)
     # the secondary failure stays visible
     assert isinstance(ei.value.__context__, OSError) and "Permission denied" in str(ei.value.__context__)
+    _cleanup_ran(profile, record)
+
+
+def test_an_interrupt_in_flight_is_not_replaced_by_the_stranded_activation(entity, monkeypatch):
+    # verify r4, complement LOW: a KeyboardInterrupt in flight was replaced by ActivationNotRestored, an
+    # Exception, so a caller's `except Exception` could swallow the operator's Ctrl-C. The interrupt
+    # propagates; the stranded activation rides on it as a note naming the moved path.
+    profile, record = _stranding_run(entity, monkeypatch)
+    real_close = hc._Listener.close
+
+    def interrupted_close(self):
+        real_close(self)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(hc._Listener, "close", interrupted_close)
+    with pytest.raises(KeyboardInterrupt) as ei:
+        hc.run_cc_canary(profile)
+    assert any(f"activation-moved-{record['nonce']}" in n for n in getattr(ei.value, "__notes__", []))
     _cleanup_ran(profile, record)
 
 

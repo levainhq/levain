@@ -685,7 +685,9 @@ def _remove_landed(landed: list[Path], work: Path) -> None:
 
 def _raise_stranded(stranded: list[ActivationNotRestored], exc_type: Any, exc: Any, tb: Any) -> bool:
     """ExitStack's last step. With an exception in flight (from the run or from an earlier cleanup
-    step), a stranded activation replaces it, the other kept as __context__ and named in a note.
+    step), a stranded activation replaces an Exception, the other kept as __context__ and named in a
+    note; an interrupt (a BaseException that is not an Exception) is never replaced, it carries the
+    stranded error as a note instead.
     The context is set here by hand: ExitStack runs its callbacks outside any ``except``, so a
     fresh raise from a callback carries no context and ExitStack leaves a None context alone
     (measured by test_a_listener_close_failure_does_not_mask_the_stranded_activation). With none
@@ -693,6 +695,11 @@ def _raise_stranded(stranded: list[ActivationNotRestored], exc_type: Any, exc: A
     attached."""
     if stranded and exc is not None and exc is not stranded[0]:
         err = stranded[0]
+        if not isinstance(exc, Exception):
+            # a KeyboardInterrupt / SystemExit stays what propagates (an ``except Exception`` must not
+            # swallow the operator's interrupt); the stranded activation rides on it as a note
+            exc.add_note(f"the canary could not restore activation/: {err}")
+            return False
         err.__context__ = exc
         err.add_note(f"also raised while the canary was cleaning up: {exc!r}")
         raise err
