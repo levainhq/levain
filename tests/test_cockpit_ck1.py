@@ -552,12 +552,24 @@ def test_f1_a_hook_that_raises_systemexit_is_a_search_error_not_an_escape() -> N
     assert "search failed" in _store(quit_).panel("p", q="x")["search_error"]
 
 
-def test_f2_the_now_view_advertises_no_search() -> None:
+def test_f2_the_now_view_advertises_a_rows_filter_only_when_it_has_rows() -> None:
+    # 1012+100 item 2 (Phill 10-11: long panels carry filter/search): the Now view is row-shaped, so with rows it
+    # carries the same box as Tray / Open loops / Keep, over the rows it holds (scope rows: the page filters them,
+    # the kernel never searches a store for it) and never cut to a first screenful; with no rows it advertises none.
     ck = Cockpit()
-    ck.register(ProviderSpec(id="g", kind="list", title="G", priority="gate", order="time.desc", version_fields=("id",),
-                             read=lambda c: Read(rows=tuple(RowIn(f"r{i}", f"t{i}", stored={"id": f"r{i}"}) for i in range(20)))))
+    rows = [RowIn(f"s:{i}", f"r{i}", {"due": "2026-01-01", "disposition": "seed", "tier": "hot", "salience": 0,
+                                       "handoff_expired": False}, stored={"id": f"s:{i}"}) for i in range(3)]
+    ck.register(ProviderSpec(id="g", kind="triage-list", title="G", priority="gate", read=lambda c: Read(rows=tuple(rows)),
+                             order="spore.tray", version_fields=("id",),
+                             facets=frozenset({"due", "disposition", "tier", "salience", "handoff_expired"})))
     p = ck.panel("now")
-    assert p["searchable"] is False and p["search"] is None
+    assert len(p["rows"]) == 3 and p["searchable"] is True
+    assert p["search"] == {"fields": ["title", "body", "id"], "scope": "rows", "default_visible": 3, "hook": False}
+    quiet = Cockpit()
+    quiet.register(ProviderSpec(id="g", kind="list", title="G", priority="gate", order="time.desc", version_fields=("id",),
+                                read=lambda c: Read(rows=())))
+    p = quiet.panel("now")
+    assert p["rows"] == [] and p["searchable"] is False and p["search"] is None
 
 
 def test_f3_alerts_alone_are_content_and_an_empty_window_still_reports_the_search() -> None:
