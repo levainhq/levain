@@ -427,7 +427,9 @@ def test_a_gnupghome_owned_by_another_user_gets_no_view(tmp_path, gh, monkeypatc
         if Path(p) == gh else real_stat(p, *a, **k)))
     argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
     assert not [a for _, op, a in _ops(argv) if op == "--tmpfs" and a == [str(gh)]]
-    assert not _bound_back(argv, gh)
+    # Nothing of the home is bound back; the one bind under it is the dirmngr's /dev/null mask, which on
+    # Linux is spelled as gh is (on macOS /tmp against /private/tmp, so it never collided).
+    assert not [a for _, op, a in _ops(argv) if op.endswith("bind") and _under(a[1], gh) and a[0] != "/dev/null"]
     assert [a for _, op, a in _ops(argv) if a[:1] == ["/dev/null"] and Path(a[1]).resolve() == gh / "S.dirmngr"]
 
 
