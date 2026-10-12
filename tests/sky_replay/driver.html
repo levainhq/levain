@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>sky replay driver</title>
+<style>
+  :root{--base:#060912;--accent:#ff8a3d;--contrast:#f3f5f9;--label:#9ba6ba;--meta:#7d889c;--hair:#1c2435;--hair-2:#121a2a}
+  html,body{margin:0;background:var(--base);color:var(--contrast);font:13px -apple-system,sans-serif}
+  #host{width:1100px;padding:16px}
+  .sky-bar{display:flex;justify-content:space-between;align-items:center;padding:8px 0;color:var(--label)}
+  .sky-toggle{background:#131a27;color:var(--label);border:1px solid #28324a;border-radius:8px;padding:4px 10px}
+  .sky-legend{color:var(--meta);padding-top:6px}
+  pre{color:var(--label)}
+</style>
+<div id="host"></div>
+<pre id="result">running</pre>
+<script src="../../levain/templates/web/sky.js"></script>
+<script src="replay.js"></script>
+<script>
+// Replays the last events of a real day: the page mounts with the history, then the final commits arrive
+// one by one, and the frame loop must come to rest afterwards.
+(function () {
+  var q = new URLSearchParams(location.search), R = window.REPLAY, S = LevainSky.stats;
+  var t0 = performance.now(), clock = function () { return R.now_ms + (performance.now() - t0); };
+  var commits = R.events.filter(function (e) { return e.kind === 'commit'; });
+  var late = commits.slice(-6), lateSet = new Set(late);
+  var base = R.events.filter(function (e) { return !lateSet.has(e); });
+  var opts = { now: clock };
+  if (q.get('single')) opts.single = q.get('single');
+  var sky = LevainSky.mount(document.getElementById('host'), { events: base, legend: R.legend }, opts);
+  var out = { framesBefore: S.frames, pendingAtMount: S.pending };
+  var feed = base.slice();
+  setTimeout(function () {
+    late.forEach(function (e, i) { setTimeout(function () { feed.push(e); sky.update({ events: feed.slice(), legend: R.legend }); if (i === 0) out.pendingAfterFirst = S.pending; }, i * 150); });
+  }, 300);
+  setTimeout(function () {
+    out.framesAfterArrivals = S.frames; out.pendingAtRest = S.pending;
+    out.restFramesAdvance = null;
+    var f = S.frames;
+    setTimeout(function () {
+      out.restFramesAdvance = S.frames - f;
+      out.pass = out.framesAfterArrivals > 0 && out.pendingAtRest === 0 && out.restFramesAdvance === 0;
+      document.getElementById('result').textContent = 'RESULT ' + JSON.stringify(out);
+    }, 1500);
+  }, 2500);
+})();
+</script>
