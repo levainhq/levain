@@ -441,6 +441,7 @@ import threading
 import time
 
 from levain.cockpit.engine import check_query
+import levain.cockpit.engine as engine
 
 
 def _store(search: Any, **kw: Any) -> Cockpit:
@@ -488,8 +489,9 @@ def test_f1_a_hung_hook_holds_one_thread_per_panel_and_the_next_search_is_busy()
     before = threading.active_count()
     errs = [ck.panel("p", q="x")["search_error"] for _ in range(6)]
     try:
-        assert "timed out" in errs[0] and errs[1:] == ["search busy"] * 5
-        assert len(calls) == 1 and threading.active_count() - before <= 1
+        n = engine.SEARCH_INFLIGHT
+        assert all("timed out" in e for e in errs[:n]) and errs[n:] == ["search busy"] * (6 - n)
+        assert len(calls) == n and threading.active_count() - before <= n
     finally:
         release.set()
     deadline = time.monotonic() + 3
@@ -519,6 +521,28 @@ def test_f1_overlapping_searches_within_the_deadline_are_not_busy() -> None:
         release.set()
         t.join(3)
     assert "search_error" not in out["old"]
+
+
+def test_f1_concurrent_searches_on_a_hung_hook_are_capped_per_panel() -> None:
+    """Requests that all arrive before any timeout must not each start a worker (codex r2 reproduced four)."""
+    release = threading.Event()
+    calls: list[int] = []
+
+    def hang(q: str, n: int) -> Any:
+        calls.append(1)
+        release.wait(5)
+        return []
+
+    ck = _store(hang, timeout_s=0.5)
+    ts = [threading.Thread(target=ck.panel, args=("p",), kwargs={"q": f"x{i}"}) for i in range(6)]
+    try:
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(3)
+        assert len(calls) <= getattr(engine, "SEARCH_INFLIGHT", 2)
+    finally:
+        release.set()
 
 
 def test_f1_a_hook_that_raises_systemexit_is_a_search_error_not_an_escape() -> None:

@@ -77,6 +77,7 @@ SEARCH_THRESHOLD = 8      # a row-shaped panel with MORE rows than this (or a wi
 SEARCH_Q_MAX = 200        # a search query is plain text of at most this many characters
 SEARCH_LIMIT_MAX = 200    # the most rows a store search returns
 SEARCH_LIMIT_DEFAULT = 50
+SEARCH_INFLIGHT = 2       # live store-search workers per panel: the current query plus one superseded by typing
 SCOPES = ("rows", "store")
 FORM_FIELD_TYPES = ("text", "recipient", "date")
 PRIORITIES = ("gate", "gauge", "feed")
@@ -412,7 +413,7 @@ class Cockpit:
         # source reads made inside a write still running (a hung source keeps its flight here)
         self._one_live: list[list[Any]] = []
         # panel id -> its store search still running; one at a time, so a hung hook costs one thread
-        self._searching: dict[str, threading.Thread] = {}
+        self._searching: dict[str, list[threading.Thread]] = {}
         self._search_mu = threading.Lock()
 
     def attach_verbs(self, view: Any) -> None:
@@ -1612,9 +1613,10 @@ class Cockpit:
 
         The hook's answer is drained INSIDE the timed worker, at most ``limit`` rows (a generator or a
         lazy sequence cannot run on the request thread). Searches on one panel may overlap (a newer
-        query while an older one is still running is ordinary typing), but a hook that OUTLIVED its
-        timeout keeps its panel "busy" until it ends, so a hung hook costs one abandoned thread per
-        panel, never one per request."""
+        query while an older one is still running is ordinary typing), up to SEARCH_INFLIGHT live
+        workers per panel, counted whether or not their requests have timed out; past that the panel
+        answers "search busy". So hung hooks cost a bounded number of threads per panel, never one per
+        request."""
         fut: Future = Future()
 
         def run() -> None:
@@ -1637,15 +1639,16 @@ class Cockpit:
 
         worker = threading.Thread(target=run, daemon=True, name=f"cockpit-search-{spec.id}")
         with self._search_mu:
-            hung = self._searching.get(spec.id)
-            if hung is not None and hung.is_alive():
+            live = [t for t in self._searching.get(spec.id, ()) if t.is_alive()]
+            if len(live) >= SEARCH_INFLIGHT:
+                self._searching[spec.id] = live
                 return [], None, "search busy"
+            live.append(worker)
+            self._searching[spec.id] = live
             worker.start()
         try:
             exc = fut.exception(timeout=spec.timeout_s)
         except FutureTimeout:
-            with self._search_mu:
-                self._searching[spec.id] = worker      # abandoned: the panel is busy until it ends
             return [], None, f"search timed out after {spec.timeout_s:g}s"
         if exc is not None:
             return [], None, f"search failed: {_safe_str(exc)}"
