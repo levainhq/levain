@@ -14,6 +14,7 @@ import hashlib
 import struct
 
 from . import ContractError
+from .grammar import b64decode
 
 ED25519_KEY_TYPE = "ssh-ed25519"
 # Equal to ed25519.PUBLIC_KEY_LEN / SIGNATURE_LEN (a test asserts it); not imported, so importing this module
@@ -54,10 +55,7 @@ def parse_pubkey_line(line: str) -> tuple[str, bytes]:
     declared, b64 = fields[0], fields[1]
     if declared.endswith(_CERT_SUFFIX):
         raise ContractError("certificates are outside F7")
-    try:
-        blob = base64.b64decode(b64, validate=True)
-    except ValueError:
-        raise ContractError("the key's base64 does not decode") from None
+    blob = b64decode(b64)   # canonical only: non-zero pad bits are refused, as ssh-keygen refuses them
     embedded, _ = read_string(blob, 0)
     if embedded != declared.encode("utf-8"):
         raise ContractError(f"the line declares {declared} but the blob says {embedded!r}")

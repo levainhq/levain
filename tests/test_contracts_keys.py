@@ -62,3 +62,14 @@ def test_ed25519_blob_round_trip_and_exact_consumption():
     for bad in (blob + b"\x00", blob[:-1], K.ssh_string(b"ssh-ed25519") + K.ssh_string(bytes(31))):
         with pytest.raises(ContractError):
             K.ed25519_pub_from_blob(bad)
+
+
+def test_a_non_canonical_base64_blob_is_refused():
+    """Non-zero pad bits decode to the same blob under a lax decoder; F7 uses the canonical one (verify r2, V3)."""
+    good = (FROZEN / "fingerprint" / "ecdsa-sha2-nistp256.pub").read_text().strip()
+    typ, b64, comment = good.split()
+    assert b64.endswith("g=")   # 2 pad bits, both zero
+    bad = f"{typ} {b64[:-2]}h= {comment}"
+    K.parse_pubkey_line(good)
+    with pytest.raises(ContractError):
+        K.parse_pubkey_line(bad)

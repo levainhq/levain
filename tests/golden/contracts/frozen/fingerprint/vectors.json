@@ -181,6 +181,29 @@
     "source": "S1_DESIGN F7",
     "clause": "the parser requires the blob's embedded type string to equal the line's declared type"
    }
+  },
+  {
+   "id": "non-canonical-base64-pad-bits-refused",
+   "kind": "spec",
+   "op": "fingerprint",
+   "input": {
+    "line": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBGGEcYxw/lsnm5t3BNie+iAQJJoT1qasYMUBT1ffnX6sODC1n32jZE8DDz44hdfuLvDxfio1egi/nIl3K/CY65h= noncanonical"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -lf",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "S1_DESIGN F7 / grammar.b64decode",
+    "clause": "the blob is standard padded base64 decoded canonically: non-zero pad bits are refused"
+   }
   }
  ]
 }

@@ -91,4 +91,15 @@ V.append(vector("declared-type-differs-from-blob-refused", "spec", "fingerprint"
                 {"verdict": REFUSE},
                 {"kind": "spec", "source": "S1_DESIGN F7", "clause": "the parser requires the blob's embedded type "
                  "string to equal the line's declared type"}, "ssh-keygen"))
+# non-zero pad bits: a lax decoder yields the same blob, ssh-keygen and the canonical decoder refuse it
+p256 = base64.b64encode(blobs["ecdsa-sha2-nistp256"]).decode()
+assert p256.endswith("g="), p256   # the last symbol carries 2 pad bits, both zero; "h" sets the low one
+noncanon = f"ecdsa-sha2-nistp256 {p256[:-2]}h= noncanonical"
+assert base64.b64decode(noncanon.split()[1]) == blobs["ecdsa-sha2-nistp256"]
+rc, _ = keygen_rc_out(noncanon)
+assert rc != 0, "ssh-keygen accepted non-canonical base64"
+V.append(vector("non-canonical-base64-pad-bits-refused", "spec", "fingerprint", {"line": noncanon},
+                {"verdict": REFUSE},
+                {"kind": "spec", "source": "S1_DESIGN F7 / grammar.b64decode", "clause": "the blob is standard "
+                 "padded base64 decoded canonically: non-zero pad bits are refused"}, "ssh-keygen"))
 write("F7", "fingerprint", V, ssh_version=SSH_V)
