@@ -423,7 +423,11 @@ def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, time
         proc.wait()
         if drain is not None:
             drain.join(_DRAIN_JOIN_SECONDS)
-        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        # A drain still alive is blocked in read on a stderr some descendant that left the group still
+        # holds, and close() on that buffered reader would wait on the same lock forever. It is left
+        # open; the daemon thread and the pipe go with the process (verify r2, complement LOW).
+        stderr_busy = drain is not None and drain.is_alive()
+        for pipe in (proc.stdin, proc.stdout, None if stderr_busy else proc.stderr):
             if pipe is not None:
                 try:
                     pipe.close()

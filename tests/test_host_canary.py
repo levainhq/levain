@@ -91,6 +91,32 @@ def test_the_pipes_are_closed_after_a_normal_turn(tmp_path):
     assert p.stdout.closed and p.stderr.closed and p.stdin.closed
 
 
+def test_a_descendant_holding_stderr_does_not_hang_the_cleanup(tmp_path):
+    # verify r2, complement LOW: a descendant that left the group (setsid) keeps stderr open, the drain
+    # stays blocked in read, and close() on the buffered reader waited on the same lock forever
+    pidfile = tmp_path / "grandchild.pid"
+    code = ("import json, subprocess, sys, time\n"
+            "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+            "                     start_new_session=True, stdout=subprocess.DEVNULL, stdin=subprocess.DEVNULL)\n"
+            f"open({str(pidfile)!r}, 'w').write(str(g.pid))\n"
+            "print(json.dumps({'type': 'result'})); sys.stdout.flush()\n"
+            "time.sleep(60)\n")
+    factory, started = _child(code)
+    done: list = []
+    t = threading.Thread(target=lambda: done.append(_drive(factory, tmp_path)), daemon=True)
+    try:
+        t.start()
+        t.join(15)
+        assert done, "the canary's cleanup hung on a stderr a surviving descendant still holds"
+        assert all(_dead(p) for p in started)
+    finally:
+        if pidfile.exists():
+            try:
+                os.kill(int(pidfile.read_text()), 9)
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------------------- M4
 
 
