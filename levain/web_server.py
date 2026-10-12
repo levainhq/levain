@@ -664,7 +664,9 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         super().__init__(*args, **kwargs)
 
     def _watch_manifest(self) -> dict[str, Any]:
-        # the watcher reads as ONE fixed credential, the class a loopback page read carries (no token)
+        # the watcher reads as ONE fixed credential, the class a loopback page read carries (no token), so the
+        # etags it announces are class-none ones; a page reading under a token holds class-token etags and
+        # records the one its own panel read returned, never the announced one
         return self.get_cockpit().manifest({"class": "none", "device_class": None})
 
     _cockpit_lock = threading.Lock()
