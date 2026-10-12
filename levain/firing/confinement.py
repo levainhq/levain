@@ -318,6 +318,27 @@ _MAX_OUTPUT_CHARS = 8 * 1024 * 1024   # per-command returned output cap (then tr
 # module's thesis is no claim>enforcement gap. SURGICAL (literal, not ancestor-expanded — see build_policy).
 _SSH_WRITE_DENIED = ("authorized_keys", "authorized_keys2", "config", "rc")
 
+# The GNUPGHOME config files WRITE-denied in every host GNUPGHOME — the gpg analogue of the ssh
+# ``config`` exec vector above, and a strictly worse one. A HOST gpg-agent / scdaemon / dirmngr runs
+# OUTSIDE the sandbox (socket-activated by the user's service manager, or left running by an earlier
+# gpg); its socket is reachable from inside the floor (only ``S.dirmngr`` is ever masked, and only
+# under ``deny_localhost_outbound`` — the agent socket never is, by design, so gpg sign/decrypt keep
+# working). ``gpg-agent.conf``'s ``pinentry-program`` and ``scdaemon.conf``'s ``scdaemon-program``
+# name a program the HOST agent EXECUTES, unconfined, when the client next asks for a passphrase or a
+# card op — which the client can trigger itself over that same socket (``RELOADAGENT`` then
+# ``GET_PASSPHRASE``). So an offline, network-denied confined shell that can WRITE one of these confs
+# plants standing, unconfined, networked RCE as the operator — a whole-floor bypass (the exec reads
+# every jewel the floor hides). REPRODUCED 2026-10-12 on argushub against main fc38d60 (host marker
+# created outside the workspace + DNS egress in host context; ``project_memory/1012-gpgesc/``).
+# ``gpg.conf`` (``keyserver`` / ``auto-key-retrieve``), ``dirmngr.conf`` and ``common.conf`` are the
+# lower-severity option deputies, denied with them: zero legit entity reason to write any of these
+# through confined hands (gpg config is host-REPL operator setup, never an entity's own gpg/sign use).
+# UNCONDITIONAL, like ``_SSH_WRITE_DENIED`` — the exec vector exists whenever a host agent is
+# reachable, independent of ``deny_localhost_outbound`` / ``deny_standard_creds``.
+_GNUPG_CONF_WRITE_DENIED = (
+    "gpg-agent.conf", "scdaemon.conf", "gpg.conf", "dirmngr.conf", "common.conf",
+)
+
 # The entity's OWN store files under ``<entity>/.levain/``, WRITE-denied to its confined hands (read
 # stays allowed). anneal writes these IN THE HOST PROCESS (capture/wrap), never through the sandboxed
 # shell, so the deny fences only the entity's own hands — not the legitimate composer. Load-bearing
@@ -1387,6 +1408,22 @@ def build_policy(
         # ``Path.home()`` (the true lexical path), resolved HOME + un-deref'd .ssh, and the real
         # content target through symlinks. One helper now builds them for every jewel list.
         deny_write_files_l.extend(_spellings(f"~/.ssh/{n}"))
+    # The gnupg host-agent exec vectors: every config file in _GNUPG_CONF_WRITE_DENIED, in every host
+    # GNUPGHOME _gnupg_homes() names (~/.gnupg + an absolute $GNUPGHOME from levain's env), at
+    # the same three spellings and for the same reason as the ssh vectors above (a written
+    # ``pinentry-program`` is RCE on the operator's next passphrase prompt, a strictly worse vector
+    # than reading a key). UNCONDITIONAL — see _GNUPG_CONF_WRITE_DENIED. A conf that EXISTS renders
+    # ``--ro-bind conf conf`` (read OK, write EROFS); an ABSENT conf is masked (write still denied,
+    # read gone). Neither breaks legitimate gpg: the HOST agent reads the conf host-side, outside the
+    # sandbox, and the entity's own ``gpg --sign`` does not read these confs at all — MEASURED on
+    # argushub 2026-10-12, a confined ``gpg --clearsign`` succeeded with ``gpg-agent.conf`` unreadable
+    # (project_memory/1012-gpgesc/FIX_RUN.md). The home is passed UNRESOLVED so _spellings pins its
+    # lexical ancestors (an intermediate symlink in the path must not be swappable), and the GNUPGHOME
+    # dir is ancestor-write-denied (``--bind P P``: rename EBUSY, file creation INSIDE still OK, so
+    # trustdb/keyring writes are unaffected).
+    for home in _gnupg_homes():
+        for conf in _GNUPG_CONF_WRITE_DENIED:
+            deny_write_files_l.extend(_spellings(home / conf))
     # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
     # A trust spelling whose own location (final component unresolved) is already denied both ways
@@ -2024,6 +2061,13 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
             if wf in policy.trust_spellings:
                 return (f"{p} is the derive-trust file — writing it would rebind which repo roots "
                         f"the operator's project memory re-derives against (spore-1308)")
+            # A filename test HERE is cosmetic — the deny already happened by location; this only
+            # picks the human-readable REASON, so it does not reintroduce name-based SECURITY
+            # reasoning (which the module refuses for enforcement, above). It stops a gpg conf being
+            # reported as an "ssh" vector (L3 r1 finding).
+            if wf.name in _GNUPG_CONF_WRITE_DENIED:
+                return (f"{p} is a write-protected gpg host-agent exec vector — a planted "
+                        f"pinentry-program/scdaemon-program is run by the host gpg-agent (1012-gpgesc)")
             return f"{p} is a write-protected ssh persistence/exec vector (authorized_keys/config/rc)"
     for mf in policy.own_memory_files:
         # The file editor renames nothing but its own temp file, and has no legit reason to touch the
@@ -3900,14 +3944,15 @@ class SeatbeltProvider(ConfinementProvider):
             # own path would be misfiled, and name-based reasoning about security-relevant paths
             # is the thing this module refuses.
             _sockets = set(policy.socket_spellings) or set(policy.deny_sockets)
-            _ssh_vectors = [f for f in policy.deny_write_files if f not in _sockets]
+            _exec_vectors = [f for f in policy.deny_write_files if f not in _sockets]
             _socket_files = [f for f in policy.deny_write_files if f in _sockets]
-            if _ssh_vectors:
-                lines.append(";; ssh persistence/exec vectors (authorized_keys*, config, rc) — ALWAYS write-")
-                lines.append(";; denied (both ssh_modes): a planted key / ProxyCommand config / rc is code the")
-                lines.append(";; operator or sshd runs later — a persistent backdoor, zero legit entity use.")
+            if _exec_vectors:
+                lines.append(";; ssh + gpg persistence/exec vectors (ssh authorized_keys*, config, rc;")
+                lines.append(";; gpg-agent.conf/scdaemon.conf/gpg.conf/dirmngr.conf/common.conf) — ALWAYS write-")
+                lines.append(";; denied: a planted key / ProxyCommand config / rc / pinentry-program is code the")
+                lines.append(";; operator, sshd or the host gpg-agent runs later — a backdoor, zero legit entity use.")
                 lines.append("(deny file-write*")
-                for f in _ssh_vectors:
+                for f in _exec_vectors:
                     lines.append(f'    (literal "{_sbpl_string(str(f))}")')
                 lines.append(")")
                 lines.append("")
@@ -4854,6 +4899,61 @@ def _bound_unix_socket_paths() -> list[str]:
         if m.group(1) and not m.group(1).startswith("@"):
             out.append(m.group(1))
     return out
+
+
+def _gnupg_homes() -> list[Path]:
+    """Every GNUPGHOME whose config a HOST gpg process could read, enumerated LIVENESS-INDEPENDENTLY
+    from where gpg looks for its homedir — never from what is running now. The offline bash must not
+    be able to plant an exec hook (``pinentry-program`` / ``scdaemon-program``) a host agent will run.
+
+    ⚠ Two approaches were tried and REJECTED, both MEASURED on argushub 2026-10-12
+    (project_memory/1012-gpgesc/):
+      - the parent of a bound gpg-agent socket — FALSE coverage: when ``/run/user/UID/gnupg`` exists
+        the socket is redirected to a ``d.<hash>`` socketdir there while the conf stays in the
+        homedir, so the parent is the socketdir, not a home;
+      - mapping the socket to its agent pid via ``/proc`` — the socket does not resolve to an owning
+        pid even for a LIVE agent, and a scan would in any case miss an agent the operator autostarts
+        AFTER the shell launched.
+    So the homes are the places gpg resolves a homedir to from a TRUSTED source, which hold
+    independent of any running process and of a later autostart, and which EXIST (so the conf mask is
+    enforceable — an absent file under an absent home is not a mount bwrap can reliably place, the
+    same reason ``_absent_in_ro_store`` declines one):
+      - ``~/.gnupg`` (the default) when it exists — the reachable case, since any user who runs gpg
+        has it, and a later autostart reads from it;
+      - ``$GNUPGHOME`` from levain's OWN environment when it is an existing ABSOLUTE path.
+
+    ⚠ A custom ``GNUPGHOME`` the operator sets OUTSIDE levain's environment (a login profile, while
+    the drive is launched from launchd/systemd) is NOT covered here, and resolving it by sourcing the
+    operator's login shell was REJECTED (L3 r2, codex HIGH): the confined entity can plant
+    ``~/.zprofile``/``~/.zshenv`` (rc/profile are not crown jewels, see this module's ``_SSH_WRITE_DENIED``
+    note), so running ``$SHELL -lc`` from the host would execute entity-planted code unconfined — a
+    worse RCE than the one being closed. That residual, and the pinentry-BINARY replacement vector
+    (a user-writable pinentry executable the entity overwrites without touching any conf), are STATED
+    in project_memory/1012-gpgesc/ and routed to Phill: the complete closure of "a confined entity
+    drives the host gpg-agent to execute code" is a design decision (agent-socket mediation / a
+    separate confined agent), not a path-denial this function can bound.
+
+    Returned UNRESOLVED so the caller's :func:`_spellings` pins the LEXICAL ancestors too — an
+    intermediate symlink in a homedir path must not be swappable (the ssh-anchor class). Duplicates
+    collapse. Any OS; empty on a box with no gnupg."""
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path.home() / ".gnupg")   # the default home
+    except RuntimeError:
+        pass  # no home directory for this user
+    gnupghome = os.environ.get("GNUPGHOME")
+    if gnupghome and os.path.isabs(gnupghome):
+        # ABSOLUTE only: a relative $GNUPGHOME would resolve against levain's cwd, which the sandbox
+        # and gpg need not share, so it would name the wrong path (L3 r2 LOW).
+        candidates.append(Path(gnupghome))
+    out: list[Path] = []
+    for h in candidates:
+        try:
+            if h.is_dir():
+                out.append(h)
+        except OSError:
+            continue  # unreadable: nothing nameable to protect
+    return list(dict.fromkeys(out))
 
 
 def _dirmngr_sockets() -> list[Path]:
