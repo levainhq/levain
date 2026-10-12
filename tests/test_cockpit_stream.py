@@ -262,9 +262,9 @@ def _parse(frame: str) -> tuple[str, str, Any]:
 def _events_for(resp, seconds: float) -> list[tuple[str, str, Any]]:
     """Every non-heartbeat frame that arrives within ``seconds``. A reader thread per response owns the
     blocking socket reads, so a quiet stream is a timeout here and never a broken socket."""
-    q = _pumps.get(id(resp))
+    q = getattr(resp, "_pump_q", None)     # on the response itself: an id() key outlives the object and is reused
     if q is None:
-        q = _pumps[id(resp)] = queue.Queue()
+        q = resp._pump_q = queue.Queue()
 
         def pump() -> None:
             try:
@@ -290,8 +290,6 @@ def _events_for(resp, seconds: float) -> list[tuple[str, str, Any]]:
         if not frame.startswith(":"):
             out.append(_parse(frame))
 
-
-_pumps: dict[int, "queue.Queue[str]"] = {}
 
 
 
@@ -319,6 +317,34 @@ def _cockpit(src: SubstrateSource, rows: list[RowIn]):
 
 def _row(n: int) -> RowIn:
     return RowIn(f"r{n}", f"row {n}", {"at": "2026-10-01T00:00:00+00:00"}, stored={"id": f"r{n}"})
+
+
+class _FakeResp:
+    """Just enough of an HTTPResponse for the frame pump: ``fp.readline`` over fixed bytes, then EOF."""
+
+    def __init__(self, data: bytes) -> None:
+        import io
+        self.fp = io.BytesIO(data)
+
+
+class TestPumpIdentity:
+    def test_a_fresh_response_never_inherits_a_dead_ones_pump(self) -> None:
+        """The pump is per response OBJECT. Keyed by ``id()`` it outlived the object: a later response that
+        reused the address read a queue no thread fed, so a stream that had its event saw ``[]`` (the CI
+        flake in test_resume_replays_inside_the_ring_and_resyncs_outside_it)."""
+        frame = stream.frame("panel-changed", {"id": "od", "etag": "e"}, "ep:1")
+        first = _FakeResp(b"")
+        _events_for(first, 0.05)
+        dead_id = id(first)
+        del first
+        for _ in range(10000):
+            fresh = _FakeResp(frame)
+            if id(fresh) == dead_id:
+                break
+            del fresh
+        else:
+            raise AssertionError("CPython did not reuse the address: the guard cannot be exercised here")
+        assert [e[0] for e in _events_for(fresh, 2.0)] == ["panel-changed"]
 
 
 class TestHttp:
