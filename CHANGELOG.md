@@ -4,7 +4,9 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
-## [Unreleased] — v2.0 team tier
+## [0.9.0] — 2026-10-12
+
+Two things ship together: the signed team tier (team ledgers signed by SSH keys, the team replayed from signed history) and the live cockpit (eleven panel kinds, a page that redraws only what changed, an ambient sky).
 
 Team ledgers are signed, and the team is derived from the ledger's signed history. **Breaking: 0.6.x team ledgers are not read.**
 
