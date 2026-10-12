@@ -50,7 +50,14 @@ class _Result:
 
     @property
     def exit_code(self) -> int:
-        return 0 if self.ok else (4 if self.gated else 3)
+        # levain.session.TurnResult's order (verify r2, codex M5: the host now refuses any other code)
+        if self.timed_out:
+            return 5
+        if self.error is not None:
+            return 3
+        if self.gated:
+            return 4
+        return 0 if self.reply else 1
 
 
 class _Stub:
@@ -223,8 +230,8 @@ def test_a_gated_turn_holds_new_messages_and_accepts_approve_or_reject(tmp_path)
     with pytest.raises(ChatError):
         host.approve(sid)               # nothing is held now
 
-    _wait(host, host.turn(sid, "push again")["job_id"])
-    st = _wait(host, host.reject(sid, "open a PR instead")["job_id"])
+    again = _wait(host, host.turn(sid, "push again")["job_id"])["result"]["decision_id"]
+    st = _wait(host, host.reject(sid, "open a PR instead", expect=again)["job_id"])
     assert st["result"]["reply"] == "ok, a PR instead"
     assert f.made[0].calls[-1] == ("reject_turn", "open a PR instead")
 
@@ -272,7 +279,7 @@ def test_a_broken_sessions_shell_is_released_before_it_reads_broken(tmp_path):
     seen = []
     f.made[0].close = lambda: seen.append(host.session_status(sid)["state"])
     _wait(host, host.turn(sid, "x")["job_id"])
-    assert seen == ["busy"] and host.session_status(sid)["state"] == "broken"
+    _until(lambda: seen == ["busy"] and host.session_status(sid)["state"] == "broken", what="the release")
 
 
 def test_a_failed_open_keeps_the_message_text_and_never_the_exception(tmp_path):
@@ -281,6 +288,8 @@ def test_a_failed_open_keeps_the_message_text_and_never_the_exception(tmp_path):
     out = host.open("alpha")
     st = _wait(host, out["job_id"])
     assert st["status"] == "failed" and st["error"] == "no such model"
+    # the job's outcome is published before the release (glm L3 r2); the record follows it
+    _until(lambda: host.session_status(out["session_id"])["state"] == "failed", what="the release")
     view = host.session_status(out["session_id"])
     assert view["state"] == "failed" and view["error"] == "no such model"
     # Every value the host holds for it is plain data: no exception, so no traceback, so no frame.
@@ -332,7 +341,7 @@ def test_a_broken_session_does_not_hold_a_slot_and_ended_ones_are_pruned(tmp_pat
     host = _host(tmp_path, f, max_sessions=1)
     broken = _opened(host)
     _wait(host, host.turn(broken, "x")["job_id"])
-    assert host.session_status(broken)["state"] == "broken"
+    _until(lambda: host.session_status(broken)["state"] == "broken", what="the release")
     later = []
     for _ in range(3):
         sid = _opened(host)          # the broken one does not count against max_sessions=1
@@ -371,7 +380,7 @@ def test_a_base_exception_from_a_turn_settles_the_job_and_frees_the_slot(tmp_pat
     f.made[0].run_turn = lambda m: (_ for _ in ()).throw(_Escape("stop"))
     st = _wait(host, host.turn(sid, "x")["job_id"])
     assert st["status"] == "failed" and "_Escape" in st["error"]
-    assert host.session_status(sid)["state"] == "broken" and f.made[0].closed
+    _until(lambda: host.session_status(sid)["state"] == "broken" and f.made[0].closed, what="the release")
     _opened(host)   # the slot came back
 
 
@@ -391,7 +400,8 @@ def test_a_fault_while_settling_a_job_still_settles_it(tmp_path):
     out = host.open("alpha")
     st = _wait(host, out["job_id"])
     assert st["status"] == "failed" and "label broke" in st["error"]
-    assert host.session_status(out["session_id"])["state"] == "failed"
+    # the job is published before the release (glm L3 r2); the record follows the driver's report
+    _until(lambda: host.session_status(out["session_id"])["state"] == "failed", what="the release")
     assert made[0].closed
 
 
@@ -407,7 +417,7 @@ def test_shutdown_during_a_turn_closes_the_session_when_the_turn_ends(tmp_path):
     assert host.session_status(sid)["state"] == "busy" and not f.made[0].closed
     hold.set()
     _wait(host, job)
-    assert host.session_status(sid)["state"] == "closed" and f.made[0].closed
+    _until(lambda: host.session_status(sid)["state"] == "closed" and f.made[0].closed, what="the release")
 
 
 def test_shutdown_during_an_open_closes_the_session_it_opened(tmp_path):
@@ -425,7 +435,7 @@ def test_shutdown_during_an_open_closes_the_session_it_opened(tmp_path):
     gate.set()
     st = _wait(host, out["job_id"])
     assert st["status"] == "failed" and "shut down" in st["error"]
-    assert host.session_status(out["session_id"])["state"] == "closed" and made[0].closed
+    _until(lambda: host.session_status(out["session_id"])["state"] == "closed" and made[0].closed, what="the release")
 
 
 def test_a_worker_that_cannot_start_leaves_nothing_behind(tmp_path, monkeypatch):
@@ -639,7 +649,7 @@ def test_shutdown_closes_every_idle_session_and_refuses_new_work(tmp_path):
     sid = _opened(host)
     host.shutdown()
     assert f.made[0].closed is True
-    assert host.session_status(sid)["state"] == "closed"
+    _until(lambda: host.session_status(sid)["state"] == "closed", what="the release")
     with pytest.raises(ChatError) as e:
         host.open("alpha")
     assert e.value.http_status == 503
@@ -916,7 +926,7 @@ def test_a_turn_past_its_deadline_is_stopped_and_its_session_released(tmp_path):
     sid = _opened(host)
     st = _wait(host, host.turn(sid, "long")["job_id"])
     assert st["deadline_hit"] is True and st["result"]["timed_out"] is True
-    assert host.session_status(sid)["state"] == "broken" and made[0].closed
+    _until(lambda: host.session_status(sid)["state"] == "broken" and made[0].closed, what="the release")
     assert made[0].stops >= 1
 
 
@@ -1003,7 +1013,7 @@ def test_a_session_being_closed_still_holds_its_slot(tmp_path):
     assert e.value.http_status == 409
     release.set()
     closer.join(5)
-    assert host.session_status(sid)["state"] == "closed" and made[0].closed
+    _until(lambda: host.session_status(sid)["state"] == "closed" and made[0].closed, what="the release")
     _opened(host, "beta")
 
 
@@ -1143,7 +1153,9 @@ def test_a_refused_jobs_watcher_never_stops_the_session(tmp_path):
 
 def test_a_close_whose_teardown_raises_does_not_leave_the_session_closing(tmp_path):
     """L2 L4: a raising close left the session `closing` forever: counted toward the cap and
-    refusing every operation, including another close."""
+    refusing every operation, including another close. Superseded in part by the 2026-10-07 ruling (a
+    release that failed is not a release): the session no longer reads `closing`, it ends
+    `release_failed`, listed with its error, and its slot stays counted until the server restarts."""
 
     class _RaisingClose(_Stub):
         def close(self):
@@ -1158,11 +1170,17 @@ def test_a_close_whose_teardown_raises_does_not_leave_the_session_closing(tmp_pa
     host = ChatHost({"alpha": tmp_path / "alpha", "beta": tmp_path / "beta"},
                     session_factory=factory, max_sessions=1)
     sid = _opened(host)
-    with pytest.raises(RuntimeError):
-        host.close(sid)
-    assert host.session_status(sid)["state"] == "closed"
-    host.close(sid)                # idempotent once closed
-    _opened(host, "beta")          # the slot came back
+    assert host.close(sid)["state"] == "release_failed"   # reported, never raised (the driver boundary)
+    view = host.session_status(sid)
+    assert view["state"] == "release_failed" and "teardown failed" in view["error"]
+    assert view["release_failed_since"]
+    host.close(sid)                # idempotent: changes nothing
+    assert host.session_status(sid)["state"] == "release_failed"
+    listed = [s for s in host.listing()["sessions"] if s["state"] == "release_failed"]
+    assert len(listed) == 1 and "teardown failed" in listed[0]["error"]
+    with pytest.raises(ChatError) as e:
+        host.open("beta")          # the slot stays counted: its shell may still be live
+    assert e.value.code == "too_many_sessions"
 
 
 # -- the host's own guards, each made to fail when removed (L1 MED-2) -----------------------------
@@ -1223,7 +1241,9 @@ class _StuckStop(_Stub):
 
 def test_a_watcher_that_does_not_exit_breaks_the_session(tmp_path, monkeypatch):
     """The watcher-alive branch: a watcher still inside a stop request when the job ends would land
-    that stop in the session's NEXT turn, so the session is broken instead of handed back idle."""
+    that stop in the session's NEXT turn, so the session is broken instead of handed back idle. The
+    turn that completed keeps its own result (chat L3 r1, complement LOW-4: it was replaced by "the
+    deadline watcher did not exit", as the stop_left path never did)."""
     import levain.chat as chat
 
     monkeypatch.setattr(chat, "_WATCHER_JOIN_SECONDS", 0.05)
@@ -1237,15 +1257,17 @@ def test_a_watcher_that_does_not_exit_breaks_the_session(tmp_path, monkeypatch):
     sid = _opened(host)
     try:
         st = _wait(host, host.turn(sid, "x")["job_id"])
-        assert st["status"] == "failed" and "watcher did not exit" in st["error"]
-        assert host.session_status(sid)["state"] == "broken" and made[0].closed
+        assert st["status"] == "done" and st["result"]["reply"] == "hello", st
+        _until(lambda: host.session_status(sid)["state"] == "broken" and made[0].closed, what="the release")
+        assert "watcher did not exit" in host.session_status(sid)["error"]
     finally:
         made[0].release.set()
 
 
 def test_an_open_landing_after_shutdown_holds_its_slot_until_the_shell_is_released(tmp_path):
     """`_run_open`'s shut path: the session it opened is torn down while the record still reads
-    `opening` (counted, job running), and only then published `closed`."""
+    `opening` (counted), and only then published `closed`. The job's outcome is published at once
+    (L3 r2, glm: a client polling the job must not wait on the teardown; L1 r4 caught this reverted)."""
     gate = threading.Event()
     made: list[_HeldClose] = []
 
@@ -1261,15 +1283,15 @@ def test_an_open_landing_after_shutdown_holds_its_slot_until_the_shell_is_releas
     _until(lambda: made, what="the open")
     assert made[0].closing.wait(5)
     assert host.session_status(out["session_id"])["state"] == "opening"
-    assert host.job_status(out["job_id"])["status"] == "running"
+    assert host.job_status(out["job_id"])["status"] == "failed"
     made[0].release.set()
-    st = _wait(host, out["job_id"])
-    assert st["status"] == "failed" and host.session_status(out["session_id"])["state"] == "closed"
+    _until(lambda: host.session_status(out["session_id"])["state"] == "closed", what="the release")
 
 
 def test_shutdown_publishes_closed_only_after_each_shell_is_released(tmp_path):
     """shutdown()'s order: a session reads `closing` while its teardown runs, and one teardown that
-    raises does not strand the sessions after it."""
+    raises does not strand the sessions after it. That one ends `release_failed`, still counted (the
+    2026-10-07 ruling: a release that failed is not a release)."""
 
     class _RaisingClose(_Stub):
         def close(self):
@@ -1287,11 +1309,12 @@ def test_shutdown_publishes_closed_only_after_each_shell_is_released(tmp_path):
     stopper = threading.Thread(target=host.shutdown)
     stopper.start()
     assert made[1].closing.wait(5)
-    assert host.session_status(first)["state"] == "closed"
+    _until(lambda: host.session_status(first)["state"] == "release_failed", what="the failed release")
     assert host.session_status(second)["state"] == "closing"
     made[1].release.set()
     stopper.join(5)
-    assert host.session_status(second)["state"] == "closed" and made[1].closed
+    _until(lambda: host.session_status(second)["state"] == "closed", what="the release")
+    assert made[1].closed
 
 
 def test_the_longest_accepted_turn_bound_is_one_the_watcher_can_wait_for(tmp_path):
@@ -1511,9 +1534,16 @@ def test_approve_needs_the_decision_id_from_every_caller_and_reject_does_not(tmp
     assert _wait(host, host.approve(sid, res["decision_id"])["job_id"])["result"]["reply"] == "pushed"
 
 
-def test_reject_without_a_decision_id_is_allowed(tmp_path):
+def test_reject_without_a_decision_id_is_refused(tmp_path):
+    """codex release-range review (RAN): a reject by session id alone landed on a LATER halt than the one its
+    caller saw (A kept D1; B rejected D1 and the continuation halted at D2; A's id-less reject rejected D2).
+    Every decision names its halt."""
     host, sid, res, f = _gated_host(tmp_path, [_Result(reply="ok, not pushing")])
-    assert _wait(host, host.reject(sid, "no")["job_id"])["result"]["reply"] == "ok, not pushing"
+    with pytest.raises(ChatError) as e:
+        host.reject(sid, "no")
+    assert e.value.code == "decision_id_required" and host.session_status(sid)["state"] == "gated"
+    st = _wait(host, host.reject(sid, "no", expect=res["decision_id"])["job_id"])
+    assert st["result"]["reply"] == "ok, not pushing"
 
 
 def test_the_approve_route_refuses_a_missing_id_and_session_json_hands_it_out(tmp_path):
@@ -1602,8 +1632,9 @@ def test_a_whitespace_only_full_cannot_be_approved_at_the_server(tmp_path):
 
 def test_an_approve_is_refused_when_the_held_calls_changed_since_they_were_shown(tmp_path):
     """The decision id names the halt; the digest names its bytes. If what the next run() would execute differs
-    from what was recorded with the shown set, approve runs NOTHING, the id is spent, and the hold stays
-    rejectable (session.json still reports it, without an id)."""
+    from what was recorded with the shown set, approve runs NOTHING, the halt becomes reject-only for good,
+    and the SAME id still names it for the reject (complement release-range review: a reject naming the id
+    the screen held was refused as stale)."""
     held = PendingEfferent(tool_name="terminal", detail="ls", reason="bash fans in", full='{"command": "ls"}')
     f = _Factory([_Result(reply=None, gated=True, pending=(held,)), _Result(reply="ok, not running it")])
     host = _host(tmp_path, f)
@@ -1616,12 +1647,13 @@ def test_an_approve_is_refused_when_the_held_calls_changed_since_they_were_shown
     assert e.value.code == "stale_decision" and e.value.http_status == 409
     assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
     view = host.session_status(sid)
-    assert view["state"] == "gated" and "decision_id" not in view and view["pending"][0]["full"] == '{"command": "ls"}'
+    assert view["state"] == "gated" and view["decision_id"] == expect and view["approvable"] is False
+    assert view["pending"][0]["full"] == '{"command": "ls"}'
     f.made[0].live = st["result"].get("held_digest") or "digest:" + repr((held,))   # even back to equal: spent
     with pytest.raises(ChatError) as e:
         host.approve(sid, expect=expect)
-    assert e.value.code == "stale_decision"
-    assert _wait(host, host.reject(sid, "no")["job_id"])["result"]["reply"] == "ok, not running it"
+    assert e.value.code == "undecidable"
+    assert _wait(host, host.reject(sid, "no", expect=expect)["job_id"])["result"]["reply"] == "ok, not running it"
 
 
 @pytest.mark.parametrize("recorded,live", [(None, "d"), ("d", None), (None, None)])
@@ -1636,7 +1668,8 @@ def test_an_approve_with_no_readable_digest_is_refused(tmp_path, recorded, live)
     f.made[0].live = live
     with pytest.raises(ChatError) as e:
         host.approve(sid, expect=expect)
-    assert e.value.code == "stale_decision"
+    # no recorded digest: never approvable (offered as reject-only); no live one: refused at the compare
+    assert e.value.code == ("undecidable" if recorded is None else "stale_decision")
     assert not [c for c in f.made[0].calls if c[0] == "resume_turn"]
 
 

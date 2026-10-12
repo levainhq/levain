@@ -881,6 +881,8 @@ def test_a_hands_session_keeps_its_locks_while_anything_of_its_user_runs(tmp_pat
                       hands_session_fd=ws_git.hold_hands_session(tmp_path), hands_user="_levain_x_000000")
     s.close()
     assert calls == ["_levain_x_000000"] and s.left_running == left
+    # the chat driver reads release_error: a hands user left running is a release that did not happen
+    assert s.release_error == (None if left is None else f"hands user left running: {left}")
     if left is None:
         with ws_git._exclusive(tmp_path):
             pass

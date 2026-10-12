@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -116,13 +117,16 @@ function fetch(path, init) {
   if (path.startsWith("/chat/job.json?id=J-appr") && process.argv[3] === "poll403json") return reply(403, { error: "chat_token", message: "needs token" });
   if (path === "/chat/turn" && process.argv[3] === "turn409") return reply(409, { error: "wrong_state", message: "the session is busy" });
   if (path === "/chat/turn") return reply(202, { job_id: "J-turn" });
+  if (path.startsWith("/chat/job.json?id=J-turn") && process.argv[3] === "served")
+    return reply(200, { status: "done", result: JSON.parse(process.argv[4]) });   // a payload the host built
   if (path.startsWith("/chat/job.json?id=J-turn") && (process.argv[3] === "leak" || process.argv[3] === "prose"))
     return reply(200, { status: "done", result: { reply: LEAK, unreadable_call: process.argv[3] === "leak", gated: false, error: null, timed_out: false, tool_activity: [], pending: [] } });
   if (path.startsWith("/chat/job.json?id=J-turn")) return reply(200, { status: "done", result: { reply: null, gated: true, error: null, timed_out: false, tool_activity: [],
     pending: [{ tool: "bash", detail: "rm -rf x", full: "rm\u200b -rf x", reason: "destructive", recognized: true },
               { tool: "finish", detail: "FinishAction", full: "x\\u{200B}\ty\r", reason: "turn control", recognized: true },
               { tool: "t\nx", detail: "d", full: "q" + String.fromCodePoint(...TBL) + "qA\\u{41}", reason: "r", recognized: true }],
-    decision_id: process.argv[3] === "nodecision" ? undefined : "D1" } });
+    decision_id: process.argv[3] === "nodecision" ? undefined : "D1",
+    approvable: process.argv[3] === "nodecision" ? undefined : process.argv[3] !== "notapprovable" } });
   const M = process.argv[3];
   if ((M === "post500" || M === "ambiguousgated") && path === "/chat/approve") return reply(500, {});
   if (M === "proxy503" && path === "/chat/approve") return reply(503, null);
@@ -132,6 +136,10 @@ function fetch(path, init) {
   if (M === "notstarted" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
     return reply(200, { state: "idle", job_id: null, last_job: { job_id: "J-turn", kind: "turn", status: "done",
       result: { reply: "the earlier turn", tool_activity: ["\u2699 earlier"], gated: true, error: null } } });
+  if (M === "notelastjob" && path === "/chat/approve") return reply(500, {});
+  if (M === "notelastjob" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
+    return reply(200, { state: "idle", job_id: null, last_job: { job_id: "J-other", kind: "approve", status: "done",
+      result: { reply: "the push failed", tool_activity: ["\u2699 terminal: git push", "this may have been denied by the standard credential floor"], gated: false, error: null } } });
   if (M === "leaklastjob" && path === "/chat/approve") return reply(500, {});
   if (M === "leaklastjob" && path.startsWith("/chat/session.json?id=S") && approvals() >= 1)
     return reply(200, { state: "idle", job_id: null, last_job: { job_id: "J-other", kind: "approve", status: "done",
@@ -151,7 +159,7 @@ function fetch(path, init) {
     if (M === "lostok" && jobReads > 5) return reply(200, { status: "done", result: { reply: "done it", gated: false, error: null, timed_out: false, tool_activity: ["bash ok"], pending: [] } });
     return reply(500, {});
   }
-  if (path.startsWith("/chat/session.json?id=S")) return reply(200, { state: "gated", job_id: null, decision_id: "D2",
+  if (path.startsWith("/chat/session.json?id=S")) return reply(200, { state: "gated", job_id: null, decision_id: "D2", approvable: true,
     pending: [{ tool: "bash", detail: "rm -rf y", full: "rm -rf y-after-reload", reason: "destructive", recognized: true }] });
   if (path === "/chat/approve" && process.argv[3] === "resync" && approvals() === 1) return reply(503, { error: "busy", message: "could not start a worker" });
   if (path === "/chat/approve" && process.argv[3] === "stale" && approvals() === 1) return reply(409, { error: "stale_decision", message: "not the one shown" });
@@ -277,6 +285,10 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     ok(!calls.some((c) => c.path === "/chat/approve") && !area.disabled, "nothing is decided and compose is usable again");
     console.log("PASS"); return;
   }
+  if (process.argv[3] === "served") {
+    console.log("TEXT " + JSON.stringify(panel.textContent));
+    console.log("PASS"); return;
+  }
   if (process.argv[3] === "prose") {
     ok(find(panel, (n) => n.className === "chat-text" && n._text === LEAK) && !find(panel, (n) => n.tagName === "details"), "an unflagged reply renders as itself");
     console.log("PASS"); return;
@@ -309,6 +321,13 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     ok(approvals() === 0, "no approve sent");
     console.log("PASS"); return;
   }
+  if (process.argv[3] === "notapprovable") {
+    // chat L3 r1, codex M6: every call shown in full and a decision id, but the server said approvable:false
+    ok(!byText(panel, "Approve") && byText(panel, "Reject"), "approvable is not true: Reject only, no Approve");
+    ok(panel.textContent.includes("Approve is not offered"), "the box says why");
+    ok(approvals() === 0, "no approve sent");
+    console.log("PASS"); return;
+  }
   ok(approvals() === 0, "a pending result alone sends no approve");
   const approve = byText(panel, "Approve"), reject = byText(panel, "Reject");
   ok(approve && reject, "both decision buttons exist");
@@ -319,6 +338,15 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
     await approveTwice(approve); await sleep(150);
     ok(panel.textContent.includes("so that call did not run. The actions listed with this message did run") && !panel.textContent.includes("so nothing ran"), "after actions ran, the notice never says nothing ran");
     ok(panel.textContent.includes("terminal: git push") && !find(panel, (n) => n.tagName === "div" && n.className === "chat-text" && n._text.includes("<arg_key>")), "the activity is listed and the markup is not rendered as the reply");
+    console.log("PASS"); return;
+  }
+  if (process.argv[3] === "notelastjob") {
+    // a note levain adds to the activity (the credential floor's) is not listed among the actions that ran
+    await approveTwice(approve); await sleep(300);
+    byText(panel, "Check what happened").fire("click", { isTrusted: true }); await sleep(150);
+    const acts = find(panel, (n) => n.tagName === "ul" && n.textContent.includes("terminal: git push"));
+    ok(panel.textContent.includes("These actions ran:") && acts && !acts.textContent.includes("credential floor"), "the note is not listed as an action");
+    ok(panel.textContent.includes("this may have been denied by the standard credential floor"), "the note is still shown");
     console.log("PASS"); return;
   }
   if (process.argv[3] === "leaklastjob") {
@@ -440,14 +468,15 @@ const ok = (c, m) => { if (!c) { console.log("FAIL " + m); process.exit(1); } };
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("mode", ["", "nodecision", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
+@pytest.mark.parametrize("mode", ["", "nodecision", "notapprovable", "resync", "stale", "lost", "lostok", "lostloop", "post500", "proxy503",
                                   "evicted", "ambiguousgated", "turn500", "turn409", "proxy503json", "turn403json", "approve403json", "poll403json", "enter", "restart404", "notstarted", "sendkey",
                                   "reject_key", "confirm_open", "confirm_double", "confirm_cancel", "confirm_trap", "confirm_run", "leak", "prose",
                                   "fragment", "stored", "storagethrows", "badfragment", "twoentities",
-                                  "leakafterapprove", "leaklastjob",
+                                  "leakafterapprove", "leaklastjob", "notelastjob",
                                   "malformedfragment", "replacethrows"])
 def test_approve_posts_only_after_a_trusted_click(tmp_path, mode):
     # mode "nodecision": a result with no decision id must render no Approve at all (the panel fails closed)
+    # mode "notapprovable": the server's `approvable` is false, so no Approve either (chat L3 r1, codex M6)
     # modes "lost*", "post500", "proxy503", "evicted", "ambiguousgated", "turn500": no clear answer; the outcome is
     # reported unknown with compose blocked, and the session is read only on a trusted re-read click (chat r7)
     # modes "stale", "resync", "turn409", "proxy503json" (chat r7 L3, codex/gemini/complement): a JSON 4xx/503 proves
@@ -475,7 +504,7 @@ def test_the_consent_shows_the_held_calls_bytes_with_the_short_form_beside_them(
     assert "rm -rf ~/x" in p.full and "rm -rf ~/x" in p.line()   # ... the stored bytes carry it, the REPL shows them
 
     class R:  # the TurnResult fields _turn_payload reads
-        reply, tool_activity, error, nudged, gated, timed_out, ok, exit_code = None, [], None, False, True, False, False, 0
+        reply, tool_activity, error, nudged, gated, timed_out, ok, exit_code = None, [], None, False, True, False, False, 4
         pending = [p]
     assert _turn_payload(R())["pending"][0]["full"] == raw   # ... and the chat payload carries them to the panel,
     js = JS.read_text()
@@ -514,3 +543,47 @@ def test_a_check_row_is_retired_whenever_a_new_request_is_sent():
     assert "retireChecks(); deciding = true;" in src[src.index("function lock()"):]
     judge = src[src.index("function judgeLastJob("):src.index("function resync(")]
     assert "rereadButton(" not in judge
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_an_unchecked_reply_reaches_the_panel_through_the_driver(tmp_path):
+    """The merge of seat/1007-5-reply onto the driver: the host serialises the driver's TurnSnapshot, so the
+    harness's `unreadable_unchecked` reaches the payload (and the panel's own notice) only if the snapshot
+    carries it."""
+    import json
+
+    from levain.chat import ChatHost
+    from levain.chat_driver import OpenHandsDriver
+    from levain.firing.agent_reply import UNREADABLE_CALL_NOTICE, UNREADABLE_CHECK_FAILED_NOTICE
+    from levain.session import TurnResult
+
+    class Sess:
+        release_error = None
+
+        def run_turn(self, message):
+            return TurnResult(reply="All done.", unreadable_call=True, unreadable_unchecked=True)
+
+        def request_stop(self):
+            pass
+
+        def close(self):
+            pass
+
+    host = ChatHost({"ent": tmp_path}, driver_factory=lambda n, p: OpenHandsDriver(p, lambda d, on_event: Sess()))
+    out = host.open("ent")
+    end = time.monotonic() + 5
+    while host.job_status(out["job_id"])["status"] == "running" and time.monotonic() < end:
+        time.sleep(0.01)
+    job = host.turn(out["session_id"], "go")["job_id"]
+    while host.job_status(job)["status"] == "running" and time.monotonic() < end:
+        time.sleep(0.01)
+    payload = host.job_status(job)["result"]
+    host.shutdown()
+    assert payload["unreadable_call"] is True and payload["unreadable_unchecked"] is True
+    h = tmp_path / "harness.js"
+    h.write_text(HARNESS)
+    p = subprocess.run(["node", str(h), str(JS), "served", json.dumps(payload)], capture_output=True, text=True,
+                       timeout=60)
+    assert p.returncode == 0 and "PASS" in p.stdout, p.stdout + p.stderr
+    text = json.loads(p.stdout.split("TEXT ", 1)[1].splitlines()[0])
+    assert UNREADABLE_CHECK_FAILED_NOTICE in text and UNREADABLE_CALL_NOTICE not in text

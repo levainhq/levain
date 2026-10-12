@@ -145,11 +145,12 @@ def test_turn_result_carries_no_task_success_field():
     into it.
 
     ``unreadable_call`` (0.6.8) is admissible on the same rule: the HARNESS's reading of the reply's shape (the
-    model's raw tool-call syntax arrived as text, so no tool ran), never the agent's claim about its own work."""
+    model's raw tool-call syntax arrived as text, so no tool ran), never the agent's claim about its own work. So is
+    ``unreadable_unchecked``: the HARNESS's own record that that reading could not be made."""
     fields = set(TurnResult.__dataclass_fields__)
     assert fields == {
         "reply", "tool_activity", "error", "nudged", "gated", "pending", "timed_out", "held_digest",
-        "unreadable_call",
+        "unreadable_call", "unreadable_unchecked",
     }
     for forbidden in ("succeeded", "success", "task_ok", "passed", "verdict"):
         assert not hasattr(TurnResult(reply="x"), forbidden)
