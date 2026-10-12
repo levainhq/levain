@@ -5103,7 +5103,8 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], lis
     user owns (:func:`_runtime_dirs`, resolved) becomes a fresh 0700 tmpfs, and only socket FILES come
     back into it: gnupg's (:func:`_gpg_sockets`), ``$SSH_AUTH_SOCK``, and the entity's
     ``runtime_sockets``, each kept only when it resolves under that dir, is a socket now, and is not one
-    :func:`_runtime_socket_refusal` names. The tmpfs and the parent directories the sockets need are
+    :func:`_runtime_socket_refusal` names. A name among those that is a link in the dir comes back as
+    the same link, beside the socket it resolves to. The tmpfs and the parent directories the sockets need are
     made at 0700: with them at 0755, gpg-connect-agent answered "no gpg-agent running in this session"
     through the bound-back socket, and at 0700 it reached the agent (RUN on argushub 2026-10-12, gnupg
     2.4.4, bubblewrap 0.9.0). The view stays writable, so an agent a tool starts inside bash can make
@@ -5152,10 +5153,13 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], lis
     ops: list[str] = []
     for root in roots:
         keep: list[Path] = []
+        links: dict[Path, str] = {}   # a wanted name that is a link to a kept socket -> its link value
         for s in wanted:
             try:
                 real = s.resolve()
                 is_sock = stat.S_ISSOCK(os.stat(real).st_mode)
+                lexical = s.parent.resolve() / s.name
+                value = os.readlink(lexical) if lexical != real and os.path.islink(lexical) else None
             except (OSError, RuntimeError):
                 continue
             if not is_sock or real == root or not real.is_relative_to(root):
@@ -5163,14 +5167,23 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], lis
             if _runtime_socket_refusal(str(real.relative_to(root))) is not None:
                 continue   # a link in the allowlist pointing at a refused socket
             keep.append(real)
+            if (value is not None and lexical.is_relative_to(root)
+                    and _runtime_socket_refusal(str(lexical.relative_to(root))) is None):
+                # The name the operator gave ($SSH_AUTH_SOCK, a runtime_sockets entry) is a link: it
+                # comes back as the same link, or a variable naming it would point at nothing (codex
+                # L3 r1). A chain of links comes back as one, to the socket itself.
+                one_hop = os.path.normpath(os.path.join(lexical.parent, value)) == str(real)
+                links[lexical] = value if one_hop else str(real)
         keep = list(dict.fromkeys(keep))
         ops += ["--perms", "0700", "--tmpfs", str(root)]
-        dirs = sorted({str(a) for s in keep for a in s.parents if a != root and a.is_relative_to(root)})
+        dirs = sorted({str(a) for s in (*keep, *links) for a in s.parents if a != root and a.is_relative_to(root)})
         for d in dirs:
             ops += ["--perms", "0700", "--dir", d]
         for s in keep:
             # A read-only bind would not stop connect(), so it buys nothing over a plain one.
             ops += ["--bind", str(s), str(s)]
+        for link, value in links.items():
+            ops += ["--symlink", value, str(link)]
     for g in homes:
         ops += ["--perms", "0700", "--tmpfs", str(g)]
         try:

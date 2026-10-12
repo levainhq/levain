@@ -164,6 +164,32 @@ def test_an_allowlisted_socket_comes_back_and_a_link_to_a_refused_one_does_not(t
     assert str(rd / "podman" / "podman.sock") not in _bound_back(_bwrap_argv(build_policy(_entity(tmp_path / "b"))), rd)
 
 
+def test_a_name_that_is_a_link_comes_back_as_the_link_and_a_link_to_a_refused_socket_does_not(tmp_path, rd, monkeypatch) -> None:
+    """Only the resolved socket was bound back, so ``SSH_AUTH_SOCK=<rd>/agent-link`` (a link to the
+    agent's ssh socket) and an allowlisted link both named nothing inside bash."""
+    os.symlink("gnupg/S.gpg-agent.ssh", rd / "agent-link")
+    os.symlink("podman/podman.sock", rd / "docker.sock")
+    (rd / "sub").mkdir()
+    os.symlink("../docker.sock", rd / "sub" / "chain.sock")
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(rd / "agent-link"))
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True, runtime_sockets=(
+        "docker.sock", "sub/chain.sock", "podman/link.sock")))
+    windows = [argv[k:k + 3] for k in range(len(argv))]
+    assert ["--symlink", "gnupg/S.gpg-agent.ssh", str(rd / "agent-link")] in windows
+    assert ["--symlink", "podman/podman.sock", str(rd / "docker.sock")] in windows
+    # a chain comes back as one link, to the socket itself
+    assert ["--symlink", str(rd / "podman" / "podman.sock"), str(rd / "sub" / "chain.sock")] in windows
+    assert ["--perms", "0700", "--dir", str(rd / "sub")] in [argv[k:k + 4] for k in range(len(argv))]
+    assert _bound_back(argv, rd) >= {str(rd / "gnupg" / "S.gpg-agent.ssh"), str(rd / "podman" / "podman.sock")}
+    ops = _ops(argv)
+    view = max(i for i, op, a in ops if op == "--tmpfs" and a == [str(rd)])
+    links = [i for i, op, a in ops if op == "--symlink" and _under(a[1], rd)]
+    assert links and min(links) > view
+    # podman/link.sock -> gnupg/S.dirmngr: neither the link nor what it resolves to comes back
+    for _, op, a in ops:
+        assert str(rd / "podman" / "link.sock") not in a and str(rd / "gnupg" / "S.dirmngr") not in a, (op, a)
+
+
 @pytest.mark.parametrize("held", ["workspace", "entity", "home"])
 def test_a_runtime_dir_holding_the_workspace_the_entity_or_home_is_refused(tmp_path, rd, monkeypatch, held) -> None:
     """``XDG_RUNTIME_DIR`` pointed at a directory of the operator's: its view would hide what it holds."""
