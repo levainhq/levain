@@ -606,7 +606,11 @@
       const head = node.querySelector(".phead");
       if (!head) return;
       const h2 = head.querySelector("h2");
-      if (h2) h2.textContent = title;
+      // the panel keeps its own title in its h2 (what it is, to a reader and to the jump box); the card's title
+      // is the visible heading, and the tab row is how to reach the others
+      if (h2) h2.classList.add("ck-tab-own");
+      const ct = el("div", "ck-card-title", title);
+      head.insertBefore(ct, h2 ? h2.nextSibling : head.firstChild);
       const nav = el("div", "ck-tabs");
       nav.setAttribute("role", "tablist");
       const group = [];
@@ -618,7 +622,7 @@
         group.push(b); nav.appendChild(b);
       });
       buttons.push(group);
-      head.insertBefore(nav, h2 ? h2.nextSibling : head.firstChild);
+      head.insertBefore(nav, ct.nextSibling);
     });
     show();
   }

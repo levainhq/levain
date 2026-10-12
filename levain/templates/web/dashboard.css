@@ -1152,3 +1152,5 @@ body.ke .pexpand:hover { color: var(--text); background: none; box-shadow: none;
 body.ke .chip-B { color: var(--label); background: none; }
 body.ke .ext-note.stale { color: var(--label); }
 body.ke .row.ext-accent { border-left-color: var(--hair-2); }
+body.ke .ck-zgrid .panel h2.ck-tab-own { display: none; }
+body.ke .ck-card-title { font: 700 16px/1.2 var(--round); color: var(--text); }
