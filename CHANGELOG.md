@@ -27,6 +27,64 @@ Team ledgers are signed, and the team is derived from the ledger's signed histor
 - While verdicts are frozen (a merge, a rewrite), nothing recorded after the freeze counts, team changes included (a revoke made then is not in force), and the edit hook does not stop the edits those waiting rulings govern; `status` counts the waiting lines but does not list them. The hook denies only when it cannot judge at all, unless `LEVAIN_TEAM_UNJUDGED=allow`.
 - A clone holding only a 0.6.x `levain-ledger` enforces nothing until the owner migrates (edits go through with a one-line notice).
 
+### Cockpit: eleven panel kinds, a live page, an ambient sky
+
+The cockpit's panel vocabulary grows from four kinds to eleven, the page stays current without a reload, and the board gets a new look. The schema string is now `levain.cockpit/2`; a server written against `/1` keeps working (see "Changed").
+
+#### Added
+
+- **Eleven panel kinds.** `reading`, `line`, `brief`, `count-queue`, `ambient`, `status-dots`, `metric-grid`, `roster`, `list`, `form` and `log`. Each has a fixed shape (written up in `docs/cockpit-contract.md`); data that does not fit makes that one panel show an error naming the panel and the field, never a half-drawn card. The terminal view and any renderer without a component for a kind draw it as text.
+- **A filter box on long panels.** Any panel that is a list, a queue, a roster or a log gets a filter box once it holds more than 8 rows or declares a window. Type to narrow; terms are matched ignoring case and accents, all terms must match, and the text is plain (`.*` means those three characters). A panel that shows only the newest N says so ("searches the newest N only") unless its provider can search the whole store, in which case the box asks the store and labels the result ("41 matches in the store"). A search that fails or times out says so; it never reads as "no matches". Search text is kept out of the server's journal and its access log.
+- **A live page.** The page opens one change stream (`GET /cockpit/events`) and redraws only the panel that moved, in place, without a reload: your scroll position, an open filter and an expanded row stay where they were. The stream carries no panel data, only which panel changed. A small chip in the header says where it stands: `connecting`, `live`, `paused` (the tab is hidden; a hidden tab closes its stream and catches up when you come back), `stale since HH:MM` (the server went away; the page retries with a growing delay and polls every 30 seconds meanwhile), or `not live` (the page never got a first draw). A server holds at most 8 streams at once; a ninth is told it is busy.
+- **The ambient sky.** A panel of kind `ambient` draws the last 14 hours of events (commits, reviews, memory writes) as a timeline: a row per repository with the busiest rows named and the rest folded into "other", failures in orange, and a short meteor when a new event lands. An "Ambient: on / paused" button stops the motion, and the page honours the operating system's reduced-motion setting. The animation stops entirely when nothing is moving.
+- **A mode bar and a jump box.** Morning, Board and Build modes in the header, and a jump box (Cmd-K) that goes to any panel by name.
+- **Read-age chips.** A panel shows how long ago its data was read, and the chip updates in place when the panel does.
+
+#### Changed
+
+- **`levain.cockpit/2` renames the four `/1` kinds.** `triage-list` is now `list`, `metric` is `status-dots`, `visual` is `ambient`, `prose` is `brief`. A provider that still declares the old name is accepted and its panel carries the new one; the data shapes of the four are unchanged. The schema string is part of every ETag, so a browser holding an older cockpit's copy fetches a fresh one rather than reusing it.
+- **The board is redrawn panel by panel.** A panel that changes shape (a list that becomes a card, say) is rebuilt; one that keeps its shape is updated where it stands.
+
+#### Known edges
+
+Each of these was found in review, judged not reachable in normal use, and left alone. None loses data.
+
+- **Searching and the filter box**
+  - A search with a pasted trailing newline is accepted as its trimmed text.
+  - Searches are kept out of the access log by the name of their parameter (`q=`). A query sent under an escaped spelling of that name (`%71=`) is logged. Only someone typing such URLs by hand in a verbose local log reaches it.
+  - A query made only of accent marks matches every row.
+  - A search URL with an unencoded space in it can give a less helpful error message.
+  - In the filter box the text survives a panel update only through the browser's session storage; with storage blocked, the filter clears when the panel redraws.
+  - After a panel updates, old store-search results stay on screen until the new search returns; there is no "searching" flash.
+  - The jump box shows a limited number of entries, which can push a "Search ..." entry out of view.
+- **Panel data a provider could send**
+  - A panel value that sends an explicit `null` for an optional field (`value`, `unit`, `read`, `silence_is_signal`) is read as if the field were absent.
+  - A `brief` that carries markdown still has its `lines` checked.
+  - A panel declared with `legacy_kind` is trusted: that argument is for our own code.
+  - A provider's `as_of` that is not a valid timestamp makes `/cockpit/freshness.json` answer 500. This is how that route behaved before this release and the live page no longer reads it.
+- **The page**
+  - A panel read for the first time with no read time has no read-age chip until the next full draw. A panel opened in the focus window shows no chip at all.
+  - An expanded long row folds back when its panel redraws.
+  - A stale panel's banner age is part of its shape, so a stale panel that changes redraws as a whole.
+  - A panel whose update loses its typed form leaves the old body in an open focus window until you close it, and the window's title is not refreshed.
+  - Reached from another machine, after the write token has been rotated, two requests refused at the same moment can each raise the token prompt.
+  - A panel that is not given a mode forces the Board view when you jump to it.
+  - Update events arriving faster than the page can fetch can delay the repaint; the server folds them per panel, which keeps this rare.
+- **The sky**
+  - Event times must be extended ISO-8601 (`2026-10-12T01:00:00Z`) or carry no zone, in which case they are read as UTC. The compact form (`20261012T010000Z`) passes the contract but is not drawn correctly.
+  - A feed that sends a `null` event, a repository named `__proto__` or `constructor`, or a non-numeric window length breaks the sky; our own feeds never do.
+  - On time zones that are not on the hour (half-hour offsets), the hour labels sit slightly off.
+  - An event dated in the future never gets a meteor.
+  - Opening one repository's view can still draw meteors for other repositories.
+  - A browser without `ResizeObserver` does not remeasure the label gutter when the window resizes.
+- **The live stream**
+  - The watcher reads panels under one access class. A change visible only to another class (a change in what a signed-in action may do) is not announced by the stream; the page picks it up on its next reload or reconnect.
+  - A server whose connection is blocked mid-write notices a gone browser only after the socket timeout.
+  - The first read when a stream opens on an idle server holds the watcher's lock while it runs, which can delay the first announcement.
+  - After a stream comes back, the chip says `not live` until the first message arrives, a matter of seconds.
+  - Two refetches of one panel that overlap, with the older answer arriving last, followed by a disconnect and an exact revert of the panel, can leave that panel showing the older content until its next change.
+  - A refetch in flight when the tab is hidden that then fails keeps retrying on the hidden tab, on the normal retry schedule, and is not carried over to when you return.
+
 ## [0.8.0] — 2026-10-11
 
 The cockpit's write side: K2a (one write route, the write token, writes bound to what was rendered) and K2b (the broker, which turns a write that needs more than the token into a consented, journalled fire). They ship together.

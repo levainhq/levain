@@ -15,7 +15,7 @@ from levain.cockpit.engine import Cockpit, QueryError, RowNotFound
 
 MANIFEST_PATH = "/cockpit/manifest.json"
 FRESHNESS_PATH = "/cockpit/freshness.json"
-EVENTS_PATH = "/cockpit/events"      # the freshness stream
+EVENTS_PATH = "/cockpit/events"      # the change stream (which panels moved; no panel data)
 PANEL_PREFIX = "/cockpit/panel/"
 PANEL_SUFFIX = ".json"
 TOKEN_HEADER = "X-Levain-Write-Token"

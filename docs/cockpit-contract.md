@@ -107,3 +107,24 @@ that has no component for a kind: `reading` (value, unit, condition, hi/lo, age,
 text projection), `status-dots`, `metric-grid`, `roster` (grouped, with last call or "no data"),
 `form` (fields and recipient choices), `log` (one sentence per row), `list` and `count-queue` (rows).
 A search result's `match_label` or `search_error` is drawn under the panel, an empty one included.
+
+## The change stream
+
+`GET /cockpit/events` is a server-sent-events stream that tells a page which panels moved. It carries
+no panel data: the page reads a moved panel through the panel route, under its own credential. The
+route takes the same Host allowlist, cross-site refusal and off-box token as every other cockpit read,
+and holds its own cap of 8 open streams (a ninth gets `503 busy`).
+
+| frame | data | meaning |
+|---|---|---|
+| `hello` | `{epoch, resync}` | the first frame of every stream. `resync: true` means the server cannot replay what the client missed (a new server run, a position it no longer holds, an unreadable `Last-Event-ID`): the client reconciles against the manifest |
+| `panel-changed` | `{id, etag}` | that panel's content ETag moved |
+| `manifest-changed` | `{}` | the set of panel ids changed (or the watcher's first reading): reload the board |
+| `: hb` | (a comment line) | a heartbeat every 15 s on a quiet stream |
+
+Events carry the id `<epoch>:<seq>`. Within one epoch a reconnecting client that names its last id in
+`Last-Event-ID` is caught up from a ring of the last 256 events; from another epoch it is told to
+resync. The server's watcher builds the manifest every 5 s while at least one stream is open, diffs
+the panel ETags and the id set, and broadcasts; it stops with the last stream, and the next one is a
+new epoch. Change detection rests on the content ETag only: `as_of` is outside it, so a read that
+merely refreshes a panel does not announce itself.

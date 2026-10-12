@@ -307,7 +307,7 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/cockpit_view.js": ("cockpit_view.js", "text/javascript; charset=utf-8"),
     # The ambient panel's sky: its own asset so the renderer and the sky evolve apart.
     "/sky.js": ("sky.js", "text/javascript; charset=utf-8"),
-    # The freshness stream's client: one fetch-read stream per page, through the page's own read transport.
+    # The change stream's client: one fetch-read stream per page, through the page's own read transport.
     "/cockpit_stream.js": ("cockpit_stream.js", "text/javascript; charset=utf-8"),
 }
 
@@ -897,7 +897,7 @@ class _Handler(GuardedHandler):
         if is_cockpit_path(path):
             # The shared cockpit's two read routes (levain.cockpit, design §3): they ride this same
             # envelope, so the Host allowlist, cross-site refusal, the off-box token gate above and
-            # the concurrency gate all apply with no second path. The freshness stream holds its slot for
+            # the concurrency gate all apply with no second path. The change stream holds its slot for
             # its whole life, so it takes its own cap (stream_gate) in place of the request gate.
             if path == EVENTS_PATH:
                 self._serve_stream(head=head)
