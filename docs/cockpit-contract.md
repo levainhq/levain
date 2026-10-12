@@ -80,7 +80,7 @@ of its own (size `medium`, span 1, no tabs). Regions are content: they are hashe
 
 `build_default_cockpit` places: `brief` the state line; `widgets` Health; `operate` (rank order) Now (engine-fixed),
 Tray 10 and Open loops 15 (both `tall`), Recent episodes 40, Keep 50, Recent edits 60, Recent jobs 70 (`medium`);
-`mind` the Neocortex tabs card (one tab per continuity heading, ranks 0-5, span 2, `tall`), Crystallized patterns 100
+`mind` the Neocortex tabs card (one tab per continuity heading, ranked in heading order from 0, span 2, `tall`), Crystallized patterns 100
 (`tall`) and the Cognition card (graph 200 and projection history 210, `tabs="Cognition"`, `short`). Ranks 16-39 of
 `operate` are left for an embedder's Inbox, Fleet and Stream; a rank outside the kernel's bands is the embedder's.
 A zone grid row's height is its tallest card's, and the cards in a row stretch to it.
