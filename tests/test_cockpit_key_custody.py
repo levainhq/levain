@@ -89,6 +89,9 @@ if cmd[0] == "list-ctk-identities":
         print("p-256-ne " + r["hash"] + " " + r["prot"].ljust(4) + " " + r["label"].ljust(lw + 1) + r["label"] + "   10/12/27, 15:28 YES   ")
 elif cmd[0] == "create-ctk-identity":
     label = cmd[cmd.index("-l") + 1]
+    if db.get("concurrent"):               # another run's identity, same label, lands first
+        other = db["next"].pop(0)
+        db["identities"].append({"hash": other["hash"], "prot": "bio", "label": label, "pub": other["pub"]})
     nxt = db["next"].pop(0)
     db["identities"].append({"hash": nxt["hash"], "prot": db.get("prot", cmd[cmd.index("-t") + 1]), "label": label,
                              "pub": nxt["pub"]})
@@ -222,6 +225,75 @@ def test_touch_id_create_deletes_the_identity_when_creation_reports_failure(tmp_
     mac.db["create_exit"] = 3
     mac.save()
     with pytest.raises(KeyError_, match="exit 3.*the identity was deleted"):
+        mac.create(tmp_path / "keys")
+    assert [i["label"] for i in mac.load()["identities"]] == ["other-0"]
+
+
+def test_a_concurrent_same_label_identity_survives_our_refusal(tmp_path, monkeypatch, provider_present):
+    """codex MED (L3 r1): two runs with one label each saw the other's identity as theirs and deleted it.
+    The new identity is the one in after-minus-before carrying the label; two of them is a refusal that
+    deletes neither (by label nothing is ever deleted)."""
+    mac = Mac(tmp_path, monkeypatch)
+    mac.db["concurrent"] = True
+    mac.save()
+    with pytest.raises(KeyError_, match="2 new identities labelled 'levain-test'.*cannot tell which.*deleted none"):
+        mac.create(tmp_path / "keys")
+    assert "delete-ctk-identity" not in mac.log()
+    assert sorted(i["hash"] for i in mac.load()["identities"]) == sorted(
+        [mac.db["identities"][0]["hash"], mac.new[0]["hash"], mac.new[1]["hash"]])
+    assert list((tmp_path / "keys").iterdir()) == []
+
+
+def test_our_failure_deletes_only_our_identity_by_hash(tmp_path, monkeypatch, provider_present):
+    mac = Mac(tmp_path, monkeypatch)
+    mac.db["hide_new"] = "levain-test"
+    mac.save()
+    with pytest.raises(KeyError_, match="the identity was deleted"):
+        mac.create(tmp_path / "keys")
+    deletes = [ln for ln in mac.log().splitlines() if ln.startswith("delete-ctk-identity")]
+    assert deletes == [f"delete-ctk-identity -h {mac.new[0]['hash']}"]
+
+
+def _interrupting_create(monkeypatch, *, after_it_ran: bool) -> None:
+    real = subprocess.run
+
+    def run(argv, *a, **kw):
+        if "create-ctk-identity" in argv:
+            if after_it_ran:
+                real(argv, *a, **kw)
+            raise KeyboardInterrupt
+        return real(argv, *a, **kw)
+    monkeypatch.setattr(custody.subprocess, "run", run)
+
+
+def test_an_interrupt_during_create_leaves_no_identity_of_ours(tmp_path, monkeypatch, provider_present):
+    """codex LOW + complement LOW-2 (L3 r1): Ctrl-C during ``sc_auth create-ctk-identity`` left the
+    identity behind; the cleanup region now opens before the create."""
+    mac = Mac(tmp_path, monkeypatch)
+    _interrupting_create(monkeypatch, after_it_ran=True)
+    with pytest.raises(KeyboardInterrupt):
+        mac.create(tmp_path / "keys")
+    assert [i["label"] for i in mac.load()["identities"]] == ["other-0"]
+    assert list((tmp_path / "keys").iterdir()) == []
+
+
+def test_an_interrupt_before_the_identity_exists_deletes_nothing(tmp_path, monkeypatch, provider_present):
+    mac = Mac(tmp_path, monkeypatch)
+    _interrupting_create(monkeypatch, after_it_ran=False)
+    with pytest.raises(KeyboardInterrupt):
+        mac.create(tmp_path / "keys")
+    assert [i["label"] for i in mac.load()["identities"]] == ["other-0"]
+    assert "delete-ctk-identity" not in mac.log()
+
+
+def test_mkdtemp_failing_after_create_deletes_ours(tmp_path, monkeypatch, provider_present):
+    """codex LOW (L3 r1): the temporary directory was made outside the cleanup region."""
+    mac = Mac(tmp_path, monkeypatch)
+
+    def no_tmp(*a, **kw):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(custody.tempfile, "mkdtemp", no_tmp)
+    with pytest.raises(KeyError_, match="PermissionError.*the identity was deleted"):
         mac.create(tmp_path / "keys")
     assert [i["label"] for i in mac.load()["identities"]] == ["other-0"]
 

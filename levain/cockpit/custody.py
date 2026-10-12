@@ -432,7 +432,8 @@ def create_touch_id(key_dir: Path | None = None, label: str | None = None, *,
                     provider: str = APPLE_PROVIDER, platform: str | None = None,
                     stamp: Callable[[], str] | None = None) -> CreatedKey:
     """A Secure Enclave key whose every signature needs Touch ID, in ``key_dir`` (0700, default
-    :func:`default_key_dir`). Any failure after the identity exists deletes it again."""
+    :func:`default_key_dir`). Any failure or interrupt once the create has started deletes the identity this
+    run made (attributed by the before/after listing, deleted by hash), and only that one."""
     if (platform or sys.platform) != "darwin":
         raise KeyError_("touch-id custody is macOS only (the Secure Enclave via Touch ID); on this machine "
                         "use --custody passphrase")
@@ -443,29 +444,68 @@ def create_touch_id(key_dir: Path | None = None, label: str | None = None, *,
     label = _check_label(label or f"levain-{(stamp or _stamp)()}")
     d = _key_dir(key_dir)
     key, pub = _destinations(d, label)
-    if any(i.label == label for i in list_identities(sc_auth=sc_auth)):
+    before = list_identities(sc_auth=sc_auth)
+    if any(i.label == label for i in before):
         raise KeyError_(f"a CTK identity labelled {label!r} already exists; choose another --label")
-    try:
-        cp = subprocess.run([str(sc_auth), "create-ctk-identity", "-l", label, "-k", "p-256-ne", "-t", "bio"],
-                            stdin=subprocess.DEVNULL, capture_output=True, timeout=_TOOL_TIMEOUT, check=False,
-                            start_new_session=True, env=child_env())
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        created = [i for i in list_identities(sc_auth=sc_auth) if i.label == label]
-        raise KeyError_(f"sc_auth could not create the identity ({type(exc).__name__})"
-                        + _undo(created, sc_auth)) from None
-    mine = [i for i in list_identities(sc_auth=sc_auth) if i.label == label]
-    if cp.returncode != 0 or len(mine) != 1:
-        raise KeyError_(f"sc_auth create-ctk-identity did not leave one identity labelled {label!r} (exit "
-                        f"{cp.returncode}, {len(mine)} found): "
-                        f"{cp.stderr.decode('utf-8', 'replace').strip()[:200]}" + _undo(mine, sc_auth))
-    ident = mine[0]
-    if ident.prot != "bio":
-        raise KeyError_(f"the identity {ident.hash} was created with protection {ident.prot!r}, not bio; "
-                        "nothing is enrolled" + _undo(mine, sc_auth))
-    tmp = Path(tempfile.mkdtemp(prefix=".create-", dir=d))
+    known = {i.hash for i in before}
+    # The identity is attributed, never found by label: it is the one digest in after-minus-before that
+    # carries the label. Another run with the same label can land between the snapshot and the create; two
+    # candidates is a refusal that deletes neither. Cleanup deletes the attributed digest only, by hash.
+    ours: Identity | None = None
+    unattributed = False         # the create may have made one we have not attributed yet
+    tmp: Path | None = None
     made: list[Path] = []
     kept = False
+
+    def cleanup() -> str:
+        nonlocal ours, unattributed
+        if ours is None and unattributed:
+            unattributed = False
+            try:
+                fresh = [i for i in list_identities(sc_auth=sc_auth) if i.hash not in known and i.label == label]
+            except KeyError_ as exc:
+                return f"; could not look for the new identity to delete it ({exc})"
+            if len(fresh) > 1:
+                return (f"; {len(fresh)} new identities labelled {label!r} ({', '.join(i.hash for i in fresh)}): "
+                        "cannot tell which is ours, so deleted none (delete yours with "
+                        "`sc_auth delete-ctk-identity -h <hash>`)")
+            ours = fresh[0] if fresh else None
+        if ours is None:
+            return ""
+        doomed, ours = ours, None
+        why = _delete_identity(doomed.hash, sc_auth)
+        if why is not None:
+            return f"; {why} (delete it with `sc_auth delete-ctk-identity -h {doomed.hash}`)"
+        return f"; the identity was deleted ({doomed.hash})"
+
     try:
+        unattributed = True
+        try:
+            cp = subprocess.run([str(sc_auth), "create-ctk-identity", "-l", label, "-k", "p-256-ne", "-t", "bio"],
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=_TOOL_TIMEOUT, check=False,
+                                start_new_session=True, env=child_env())
+        except OSError as exc:
+            unattributed = False                       # it never started
+            raise KeyError_(f"sc_auth could not create the identity ({type(exc).__name__})") from None
+        except subprocess.TimeoutExpired:
+            raise KeyError_("sc_auth could not create the identity (TimeoutExpired)") from None
+        fresh = [i for i in list_identities(sc_auth=sc_auth) if i.hash not in known and i.label == label]
+        if len(fresh) > 1:
+            unattributed = False
+            raise KeyError_(f"{len(fresh)} new identities labelled {label!r} ({', '.join(i.hash for i in fresh)}): "
+                            "another run used the label at the same time; cannot tell which is ours, so deleted "
+                            "none (delete yours with `sc_auth delete-ctk-identity -h <hash>`)")
+        unattributed = False
+        ours = fresh[0] if fresh else None
+        if cp.returncode != 0 or ours is None:
+            raise KeyError_(f"sc_auth create-ctk-identity did not leave one new identity labelled {label!r} (exit "
+                            f"{cp.returncode}, {len(fresh)} found): "
+                            f"{cp.stderr.decode('utf-8', 'replace').strip()[:200]}")
+        ident = ours
+        if ident.prot != "bio":
+            raise KeyError_(f"the identity {ident.hash} was created with protection {ident.prot!r}, not bio; "
+                            "nothing is enrolled")
+        tmp = Path(tempfile.mkdtemp(prefix=".create-", dir=d))
         refs = _fetch_references(tmp, ssh_keygen=ssh_keygen, provider=provider)
         matches = [(path, normal) for path, normal in refs if point_sha1(normal) == ident.hash]
         if len(matches) != 1:
@@ -476,28 +516,19 @@ def create_touch_id(key_dir: Path | None = None, label: str | None = None, *,
         _write_sidecar(key, Sidecar(TOUCH_ID, provider, ident.hash, label), made)
         kept = True
     except KeyError_ as exc:
-        raise KeyError_(f"{exc}" + _undo(mine, sc_auth)) from None
-    except Exception as exc:  # noqa: BLE001 - any failure after the identity exists deletes it
-        raise KeyError_(f"key create failed ({type(exc).__name__}: {exc})" + _undo(mine, sc_auth)) from None
+        raise KeyError_(f"{exc}" + cleanup()) from None
+    except Exception as exc:  # noqa: BLE001 - any failure after the create started deletes ours
+        raise KeyError_(f"key create failed ({type(exc).__name__}: {exc})" + cleanup()) from None
     except BaseException:
-        _undo(mine, sc_auth)               # Ctrl-C: still never leave the identity behind
+        cleanup()                          # Ctrl-C: still never leave our identity behind
         raise
     finally:
         if not kept:
             for path in made:
                 path.unlink(missing_ok=True)
-        shutil.rmtree(tmp, ignore_errors=True)
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
     return CreatedKey(key, pub, normal, TOUCH_ID, label, ident.hash)
-
-
-def _undo(identities: list[Identity], sc_auth: Path | str) -> str:
-    """Delete each identity this run created; the sentence to add to the refusal."""
-    if not identities:
-        return ""
-    failed = [why for why in (_delete_identity(i.hash, sc_auth) for i in identities) if why]
-    if failed:
-        return "; " + "; ".join(failed) + " (delete it with `sc_auth delete-ctk-identity -h <hash>`)"
-    return f"; the identity was deleted ({', '.join(i.hash for i in identities)})"
 
 
 def _fetch_references(tmp: Path, *, ssh_keygen: Path | str, provider: str) -> list[tuple[Path, str]]:
