@@ -776,11 +776,12 @@
     row.setAttribute("data-ck-row", "");
     row.setAttribute("tabindex", "0");
     const n = el("div", "n");
-    const dot = el("i", alarm ? "bad" : (h.tone === "unknown" || (h.tone === "neutral" && !h.at) ? "off" : ""));
+    // unknown is its own mark (a dashed ring) so it never reads as an on-call "not called yet" hollow dot, and never as accent
+    const dot = el("i", alarm ? "bad" : (h.tone === "unknown" ? "unk" : (h.tone === "neutral" && !h.at ? "off" : "")));
     dot.setAttribute("aria-hidden", "true");
     n.append(dot, document.createTextNode(r.name));
     const when = h.at ? " " + (ago(h.at) || h.at) : "";
-    const d = el("div", "d" + (alarm ? " bad" : ""), (h.text || "") + when);
+    const d = el("div", "d" + (alarm ? " bad" : "") + (h.tone === "unknown" ? " unk" : ""), (h.text || "") + when);
     row.append(n, d);
     const tags = [r.role, h.memory].filter(Boolean).join(" \u00b7 ");
     if (tags) row.appendChild(el("div", "tags", tags));
@@ -794,16 +795,27 @@
       g.setAttribute("data-ck-fleet-group", gid);
       g.appendChild(el("h3", "grp-h", title));
       if (gid === "roundtable") {
-        // stateless seats of one tool fold into one line
-        const last = rs.map((r) => isObj(r.health) && r.health.at).filter(Boolean).sort().pop();
+        // a roundtable's members are on call (the kernel refuses any other): their seats fold into one line
+        let last = NaN, unreadable = false, any = false;
+        for (const r of rs) {
+          const at = isObj(r.health) ? r.health.at : null;
+          if (!at) continue;
+          any = true;
+          const t = parseIso(at);                     // compared as instants, never as strings
+          if (isNaN(t)) unreadable = true; else if (isNaN(last) || t > last) last = t;
+        }
+        const known = !isNaN(last);
         const row = el("div", "fl rrow");
         row.setAttribute("tabindex", "0");
         const n = el("div", "n");
-        const dot = el("i", last ? "" : "off");
+        const dot = el("i", known ? "" : (unreadable ? "unk" : "off"));
         dot.setAttribute("aria-hidden", "true");
         n.append(dot, document.createTextNode("roundtable"));
-        row.append(n, el("div", "d", rs.map((r) => r.name).join(", ") + " \u00b7 last called " + (last ? (ago(last) || last) : "never")),
-                   el("div", "tags", rs.length + " stateless seats, one tool"));
+        const when = known ? (ago(new Date(last).toISOString()) || "unknown") : (unreadable || any ? "unknown" : "never");
+        const stateless = rs.filter((r) => r.memory === "stateless").length;
+        const tag = stateless === rs.length ? rs.length + " stateless seats" : rs.length + " seats, " + (rs.length - stateless) + " with memory";
+        row.append(n, el("div", "d" + (!known && unreadable ? " unk" : ""), rs.map((r) => r.name).join(", ") + " \u00b7 last called " + when),
+                   el("div", "tags", tag));
         g.appendChild(row);
       } else {
         for (const r of rs) g.appendChild(fleetRow(r));

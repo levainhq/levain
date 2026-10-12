@@ -943,8 +943,10 @@
   .fl .n i { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--label); }
   .fl .n i.off { background: none; border: 1.5px solid var(--meta); }
   .fl .n i.bad { background: var(--accent); }
+  .fl .n i.unk { background: none; border: 1.5px dashed var(--label); }
   .fl .d { color: var(--label); }
   .fl .d.bad { color: var(--accent); }
+  .fl .d.unk { font-style: italic; }
   .fl .tags { grid-column: 2; font-size: 11px; color: var(--meta); }
 
   .lrow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: var(--s1); padding: 6px var(--s1); border-top: 1px solid var(--hair); font-size: 13px; }

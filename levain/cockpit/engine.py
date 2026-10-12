@@ -1303,7 +1303,7 @@ class Cockpit:
                         else {})})
 
     def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date,
-              labels: LabelSnapshot = NO_LABELS) -> dict[str, Any]:
+              labels: LabelSnapshot = NO_LABELS, now: datetime | None = None) -> dict[str, Any]:
         listy = spec.kind in ROW_ENGINE_KINDS
         # only a panel whose rows (or value) carry labels renders the snapshot
         labelled = labels if spec.label_key is not None else None
@@ -1329,6 +1329,11 @@ class Cockpit:
             title += " (unavailable)"
         elif count is not None:
             title += f" ({count})"
+        etag = self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose)
+        if spec.kind == "roster" and now is not None and isinstance(snap.value, dict):
+            # a roster's health is read against the clock, so a tone that turns with time is content
+            etag = _sha({"base": etag, "health": [[r["name"], r["health"]["tone"], r["health"]["text"]]
+                                                  for r in _with_health(snap.value, now)["rows"]]})
         return {
             "id": spec.id, "kind": spec.kind, "title": title, "priority": spec.priority,
             "rank": spec.rank, "status": snap.status,
@@ -1337,7 +1342,7 @@ class Cockpit:
             "filtered": snap.filtered, "skipped": snap.skipped,
             "as_of": snap.as_of, "stale_after_s": spec.stale_after_s,
             "refresh_every_s": spec.refresh_every_s,
-            "etag": self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose),
+            "etag": etag,
             "error": snap.error, "note": note, "empty": spec.empty if snap.empty is None else snap.empty,
             "order": spec.order, "groups": groups,
             "views": [{"id": i, "title": t, "order": o} for i, t, o in spec.views] or None,
@@ -1563,7 +1568,7 @@ class Cockpit:
         specs_map = self._specs      # one snapshot for the whole manifest
         for spec in self._ordered_specs(specs_map):
             snaps[spec.id] = self._snap_for(spec, ctx)
-            heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today, auth.labels)
+            heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today, auth.labels, ctx.now)
         now_head, _ = self._now_head_and_rows(ctx, credential["class"], specs_map, snaps)
         heads[NOW_ID] = now_head
         specs = self._ordered_specs(specs_map)
@@ -1681,7 +1686,7 @@ class Cockpit:
             if spec is None:
                 return None
             snap = self._snap_for(spec, ctx)
-            head = self._head(spec, snap, credential_class, ctx.today, auth.labels)
+            head = self._head(spec, snap, credential_class, ctx.today, auth.labels, ctx.now)
             snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
             if snap_rows is not None:
                 snap_rows = self._with_provenance(snap_rows, snap.label_keys, auth.labels)
@@ -1758,6 +1763,8 @@ class Cockpit:
                     value = self._search_value_rows(spec, value, q, limit, out)
                 if head["kind"] == "log":
                     value = self._log_sentences(value, credential_class)
+                if head["kind"] == "roster":
+                    value = _with_health(value, ctx.now)
             if profile == "compact":
                 out["value"] = _compact_value(head["kind"], value)
                 if head["priority"] == "feed" or head["kind"] in ("ambient", "brief"):
@@ -1844,7 +1851,7 @@ class Cockpit:
                 return {**value, "rows": []}
             try:
                 keep = VALUE_VALIDATORS[spec.kind](spec, {"rows": got})["rows"]
-            except ValueError as exc:
+            except Exception as exc:  # noqa: BLE001 - a hook's bad rows are a search fault, not a crash
                 out["search_error"] = f"search hook returned unusable rows: {_safe_str(exc)}"
                 return {**value, "rows": []}
             out["matched"] = total if total is not None else len(keep)
@@ -2223,18 +2230,23 @@ def _v_roster(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             raise _bad(spec, f"{w}.digest", "must be an object or null (null means no data)")
         if isinstance(r.get("digest"), dict) and r["digest"].get("last_wrap_at") is not None and not _is_iso(r["digest"]["last_wrap_at"]):
             raise _bad(spec, f"{w}.digest.last_wrap_at", "must be null or an ISO-8601 timestamp")
+        if r.get("wrap_every") is not None and _wrap_every_s(r["wrap_every"]) is None:
+            raise _bad(spec, f"{w}.wrap_every", f"must be null or a positive count and one unit of m, h, d, w (like '1d'), got {r['wrap_every']!r}")
+        if r.get("group") == "roundtable" and r["cadence"] != "on_call":
+            raise _bad(spec, f"{w}.group", "roundtable members must be cadence on_call: a resident's silence is a signal the folded roundtable line cannot carry")
         lc = r.get("last_call")
         if lc is not None and not (isinstance(lc, dict) and _is_iso(lc.get("at")) and lc.get("outcome") in EVENT_OUTCOMES):
             raise _bad(spec, f"{w}.last_call", f"must be null or {{at (ISO-8601), outcome (one of {list(EVENT_OUTCOMES)})}}")
-    now = datetime.now(timezone.utc)
     shown = []
     for r in rows:
         if r["lifecycle"] == "retired":
             continue                                            # retired members do not render
         r = {**r, "silence_is_signal": (r["silence_is_signal"] if r.get("silence_is_signal") is not None
                                         else r["cadence"] == "resident")}
+        if isinstance(r.get("digest"), dict):
+            # a non-finite number is not representable on the wire: it reads as "not reported"
+            r["digest"] = {k: (None if isinstance(x, float) and not math.isfinite(x) else x) for k, x in r["digest"].items()}
         r["fleet_group"] = fleet_group(r)
-        r["health"] = roster_health(r, now)
         shown.append(r)
     return {**v, "rows": shown, "retired_hidden": len(rows) - len(shown)}
 
@@ -2244,9 +2256,10 @@ _WRAP_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 def _wrap_every_s(text: Any) -> float | None:
     """'1d' / '12h' / '2w' in seconds; anything else is no schedule (never a guess)."""
-    if not isinstance(text, str) or len(text) < 2 or text[-1] not in _WRAP_UNITS or not text[:-1].isdigit():
+    if not isinstance(text, str) or len(text) < 2 or text[-1] not in _WRAP_UNITS or not text[:-1].isascii() or not text[:-1].isdigit():
         return None
-    return int(text[:-1]) * _WRAP_UNITS[text[-1]]
+    n = int(text[:-1])
+    return n * _WRAP_UNITS[text[-1]] if n > 0 else None
 
 
 ROSTER_VISIBLE = 40
@@ -2298,29 +2311,55 @@ def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
         return {**out, "tone": "unknown", "text": "no data"}
     if dg.get("available") is False:
         return {**out, "tone": "alarm", "text": "write path unavailable"}
-    eps = dg.get("episodes_24h")
-    parts: list[str] = []
+    if dg.get("available") is not True:
+        return {**out, "tone": "unknown", "text": "no liveness data"}
+    # tone ranks alarm > unknown > ok; evidence that is missing or unreadable is never read as health
+    rank = {"ok": 0, "unknown": 1, "alarm": 2}
     tone = "ok"
+    parts: list[str] = []
+
+    def note(t: str, text: str) -> None:
+        nonlocal tone
+        if rank[t] > rank[tone]:
+            tone = t
+        parts.append(text)
+
     if not stateful:
         parts.append("running")
-    elif isinstance(eps, bool) or not isinstance(eps, (int, float)):
-        tone = "unknown"
-        parts.append("episodes unknown")
-    elif eps == 0:
-        tone = "alarm"
-        parts.append("no episodes in 24 h, it should be writing")
     else:
-        parts.append(f"{int(eps)} episodes in 24 h")
-    every = _wrap_every_s(row.get("wrap_every")) if stateful else None
-    if every is not None:
-        lw = dg.get("last_wrap_at")
-        if _is_iso(lw) and (now - _parse_iso(lw)).total_seconds() > every:
-            tone = "alarm"
-            parts.append(f"last wrap overdue (due every {row['wrap_every']})")
+        eps = dg.get("episodes_24h")
+        if eps is None:
+            note("unknown", "episodes_24h not reported")
+        elif isinstance(eps, bool) or not isinstance(eps, (int, float)) or not math.isfinite(eps) or eps < 0 or eps != int(eps):
+            note("unknown", "episodes_24h unreadable")
+        elif eps == 0:
+            note("alarm", "no episodes in 24 h, it should be writing")
         else:
-            parts.append(f"wraps every {row['wrap_every']}")
+            parts.append(f"{int(eps)} episodes in 24 h")
+        every = _wrap_every_s(row.get("wrap_every"))
+        if every is not None:
+            lw = dg.get("last_wrap_at")
+            if not _is_iso(lw):
+                note("unknown", f"no wrap time reported (wraps every {row['wrap_every']})")
+            elif (now - _parse_iso(lw)).total_seconds() > every:
+                note("alarm", f"last wrap overdue (due every {row['wrap_every']})")
+            else:
+                parts.append(f"wraps every {row['wrap_every']}")
     out["tone"], out["text"] = tone, " · ".join(parts)
     return out
+
+
+def _with_health(value: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """A roster value with each row's health read at ``now`` (the request's clock): health is derived at
+    render, never stored in a snapshot, so a cached read cannot keep a stale tone."""
+    rows = []
+    for r in value.get("rows") or []:
+        try:
+            h = roster_health(r, now)
+        except Exception:  # noqa: BLE001 - a row that cannot be judged is unknown, never a crashed GET
+            h = {"tone": "unknown", "text": "health unreadable", "at": None, "memory": ""}
+        rows.append({**r, "health": h})
+    return {**value, "rows": rows}
 
 
 def _v_form(spec: "ProviderSpec", v: Any) -> dict[str, Any]:

@@ -5,9 +5,11 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from tests.test_cockpit_ck1 import NOW, ROW, _ok
+from levain.cockpit.engine import Cockpit, ProviderSpec, Read
+from tests.test_cockpit_ck1 import NOW, ROW, _ok, _refused
 
-RES = {**ROW, "digest": {"available": True, "episodes_24h": 4, "store_bytes": 10}}
+RES = {**ROW, "digest": {"available": True, "episodes_24h": 4, "store_bytes": 10,
+                         "last_wrap_at": datetime.now(timezone.utc).isoformat()}}
 OC = {**ROW, "name": "codex", "cadence": "on_call", "memory": "stateless", "silence_is_signal": False,
       "wrap_every": None, "digest": None, "last_call": {"at": NOW, "outcome": "ok"}}
 
@@ -80,3 +82,69 @@ def test_a_roster_is_not_cut_at_the_list_default_of_ten() -> None:
     assert p["search"]["default_visible"] == 40 and p["count"] == 17
     assert roster_visible(type("S", (), {"kind": "list", "search_default_visible": 10})()) == 10
     assert roster_visible(type("S", (), {"kind": "roster", "search_default_visible": 5})()) == 5
+
+
+# --- L3 r1 fixes -----------------------------------------------------------------------------------
+def _at(rows, now=None):
+    """The rows' health read through a Cockpit whose clock is ``now`` (F3)."""
+    ck = Cockpit(clock=(lambda: now) if now else None)
+    ck.register(ProviderSpec(id="p", kind="roster", title="P", priority="feed", read=lambda c: Read(value={"rows": list(rows)})))
+    p = ck.panel("p")
+    assert p["status"] in ("ok", "empty"), p
+    return {r["name"]: r["health"] for r in p["value"]["rows"]}
+
+
+def test_f1_missing_or_unreadable_evidence_is_unknown_never_ok() -> None:
+    dg = {"available": True, "episodes_24h": 4}
+    h = _at([{**RES, "digest": dg},                                           # wrap_every set, no last_wrap_at
+             {**RES, "name": "nullwrap", "digest": {**dg, "last_wrap_at": None}},
+             {**RES, "name": "noavail", "digest": {"episodes_24h": 4, "last_wrap_at": NOW}},
+             {**RES, "name": "empty", "memory": "stateless", "wrap_every": None, "digest": {}},
+             {**RES, "name": "stateless_ok", "memory": "stateless", "wrap_every": None, "digest": {"available": True}}])
+    assert h["flow"]["tone"] == "unknown" and "no wrap time reported" in h["flow"]["text"]
+    assert h["nullwrap"]["tone"] == "unknown"
+    assert h["noavail"]["tone"] == "unknown" and "no liveness data" in h["noavail"]["text"]
+    assert h["empty"]["tone"] == "unknown" and "no liveness data" in h["empty"]["text"]
+    assert h["stateless_ok"]["tone"] == "ok"
+    # an alarm outranks unknown: silent AND no wrap time is still an alarm
+    assert _at([{**RES, "digest": {"available": True, "episodes_24h": 0}}])["flow"]["tone"] == "alarm"
+
+
+def test_f1_unreadable_or_zero_wrap_every_is_refused() -> None:
+    for bad in ("1D", "1 day", "24h ", "0d", "d", "-1d"):
+        _refused("roster", {"rows": [{**RES, "wrap_every": bad}]}, "wrap_every")
+
+
+def test_f2_a_roundtable_member_must_be_on_call() -> None:
+    _refused("roster", {"rows": [{**RES, "group": "roundtable"}]}, "roundtable", "on_call")
+    _ok("roster", {"rows": [{**OC, "group": "roundtable"}]})
+
+
+def test_f3_health_reads_the_cockpits_clock_not_the_hosts() -> None:
+    lw = "2026-10-18T00:00:00+00:00"
+    row = {**RES, "digest": {"available": True, "episodes_24h": 4, "last_wrap_at": lw}}
+    assert _at([row], datetime(2026, 10, 18, 12, tzinfo=timezone.utc))["flow"]["tone"] == "ok"
+    assert _at([row], datetime(2026, 10, 20, tzinfo=timezone.utc))["flow"]["tone"] == "alarm"   # host clock is long past: no matter
+    # and one snapshot ages: the same cached read, a later clock, an overdue tone
+    t = [datetime(2026, 10, 18, 12, tzinfo=timezone.utc)]
+    ck = Cockpit(clock=lambda: t[0])
+    ck.register(ProviderSpec(id="p", kind="roster", title="P", priority="feed", read=lambda c: Read(value={"rows": [row]})))
+    first = ck.panel("p")
+    t[0] = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    later = ck.panel("p")
+    assert first["value"]["rows"][0]["health"]["tone"] == "ok" and later["value"]["rows"][0]["health"]["tone"] == "alarm"
+    assert first["etag"] != later["etag"]
+
+
+def test_f4_digest_numerics_never_crash_and_read_unknown() -> None:
+    for bad in (float("inf"), float("nan"), -3, 0.5, "4", True):
+        h = _at([{**RES, "digest": {"available": True, "episodes_24h": bad, "last_wrap_at": NOW}}], datetime.fromisoformat(NOW))["flow"]
+        assert h["tone"] == "unknown" and "episodes_24h" in h["text"], (bad, h)
+    assert _at([{**RES, "digest": {"available": True, "episodes_24h": 4.0, "last_wrap_at": NOW}}], datetime.fromisoformat(NOW))["flow"]["tone"] == "ok"
+    # the store-search path: a hook's bad numeric is a search fault, not a raise
+    ck = Cockpit()
+    ck.register(ProviderSpec(id="p", kind="roster", title="P", priority="feed", search_scope="store", window=5,
+                             read=lambda c: Read(value={"rows": [RES]}),
+                             search=lambda q, n: [{**RES, "digest": {"available": True, "episodes_24h": float("inf")}}]))
+    p = ck.panel("p", q="flow")
+    assert p["value"]["rows"][0]["health"]["tone"] == "unknown" or "search_error" in p
