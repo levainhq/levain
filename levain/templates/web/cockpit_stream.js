@@ -30,7 +30,8 @@
   var abort = null, watchdog = 0, retryTimer = 0, pollTimer = 0, reloadTimer = 0;
   var attempt = 0, staleSince = null, epoch = null, started = false, paused = false, gaveUp = false;
   var lastId = null, pollTag = null;
-  var pending = false, pendingAttempt = 0, lastReload = 0;
+  var pending = false, pendingAttempt = 0, lastReload = 0, reloadGen = 0, reloading = false;
+  var withPosition = false;           // this connection named a last event, so its hello may be a replay
   var faults = Object.create(null);   // panel id -> { n, timer }
 
   function hhmm(d) { return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); }
@@ -67,19 +68,20 @@
     if (f) { root.clearTimeout(f.timer); delete faults[id]; }
   }
   function cancelFaults() { Object.keys(faults).forEach(clearFault); }
-  function scheduleFault(id) {
+  function scheduleFault(id, etag) {
     var n = faults[id] ? faults[id].n : 0;
     clearFault(id);
     if (n >= FAULT_RETRY_MS.length) return;
     var f = { n: n + 1, timer: 0 };
-    f.timer = root.setTimeout(function () { if (faults[id] === f) { f.timer = 0; refetch(id, f.n); } }, FAULT_RETRY_MS[n]);
+    f.timer = root.setTimeout(function () { if (faults[id] === f) { f.timer = 0; refetch(id, etag); } }, FAULT_RETRY_MS[n]);
     faults[id] = f;
   }
 
   // ---- a wanted reload is pending until the board has been drawn again ----
   function wantReload() {
     pending = true;
-    if (reloadTimer) return;
+    reloadGen++;
+    if (reloadTimer || reloading) return;
     var wait = pendingAttempt === 0
       ? Math.max(500, RELOAD_GAP_MS - (Date.now() - lastReload))
       : PENDING_RETRY_MS[Math.min(pendingAttempt - 1, PENDING_RETRY_MS.length - 1)];
@@ -90,29 +92,33 @@
     if (!pending) return;
     if (document.hidden) return;        // the visible edge flushes it
     lastReload = Date.now();
-    var p;
+    var startGen = reloadGen, p;
+    reloading = true;
     try { p = T.reload(); } catch (_) { p = false; }
     Promise.resolve(p).then(function (ok) { return ok === true; }, function () { return false; }).then(function (ok) {
-      if (ok) { pending = false; pendingAttempt = 0; cancelFaults(); return; }
-      pendingAttempt++;
+      reloading = false;
+      if (ok && startGen === reloadGen) { pending = false; pendingAttempt = 0; cancelFaults(); return; }
+      // a request made while this render was under way is not covered by it
+      pendingAttempt = ok ? 0 : pendingAttempt + 1;
       wantReload();
     });
   }
 
   // the settled answer of one refetch: "applied", "fault" or false
-  function refetch(id) {
+  function refetch(id, etag) {
     var done;
     try { done = V.refetchPanel(id); } catch (_) { done = Promise.resolve("fault"); }
     return Promise.resolve(done).then(function (r) {
-      if (r === "applied" || r === true) clearFault(id);
-      else if (r === "fault") scheduleFault(id);
+      if (r === "applied" || r === true) {
+        clearFault(id);
+        var h = held();
+        if (etag && h[id]) h[id].etag = etag;
+      } else if (r === "fault") scheduleFault(id, etag);
       else wantReload();
       return r;
-    }, function () { scheduleFault(id); return "fault"; });
+    }, function () { scheduleFault(id, etag); return "fault"; });
   }
-  function onEvent(id) { clearFault(id); return refetch(id); }
-
-  function resyncAll() { Object.keys(held()).forEach(function (id) { onEvent(id); }); }
+  function onEvent(id, etag) { clearFault(id); return refetch(id, etag); }
 
   // ---- the frame parser: events are blank-line separated; `:` lines are comments (the heartbeat) ----
   function onFrame(text) {
@@ -136,9 +142,10 @@
       attempt = 0;
       stopPoll();
       paintChip();
-      if (body.resync) resyncAll();
+      // anything but a ring replay is compared with the server's manifest
+      if (body.resync || !withPosition) reconcile(false);
     } else if (event === "panel-changed" && body && body.id) {
-      onEvent(body.id);
+      onEvent(body.id, body.etag);
     } else if (event === "manifest-changed") {
       wantReload();
     }
@@ -169,6 +176,7 @@
     abort = ctl;
     arm();
     var headers = readHeaders();
+    withPosition = !!lastId;
     if (lastId) headers["Last-Event-ID"] = lastId;
     fetch(EVENTS, { cache: "no-store", headers: headers, signal: ctl.signal }).then(function (res) {
       if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
@@ -189,27 +197,28 @@
     });
   }
 
-  // ---- while the stream is down: the manifest, with a validator; refetch what moved ----
+  // ---- the manifest against what the page holds: the poll while the stream is down, and every hello that is not a replay ----
   function diffManifest(m) {
     var heads = (m && m.panels) || {}, h = held();
     var ids = Object.keys(heads), have = Object.keys(h);
     if (ids.length !== have.length || ids.some(function (id) { return !(id in h); })) { wantReload(); return; }
     ids.forEach(function (id) {
       if (h[id] && h[id].etag === heads[id].etag) return;
-      onEvent(id).then(function (r) { if (r === "applied" && h[id]) h[id].etag = heads[id].etag; });
+      onEvent(id, heads[id].etag);
     });
   }
-  function pollOnce() {
+  function reconcile(conditional) {
     if (paused) return;
     var headers = readHeaders();
-    if (pollTag) headers["If-None-Match"] = pollTag;
+    if (conditional && pollTag) headers["If-None-Match"] = pollTag;
     fetch(MANIFEST, { cache: "no-store", headers: headers }).then(function (res) {
       if (res.status === 304) return null;
       if (!res.ok) throw new Error("HTTP " + res.status);
       var tag = res.headers.get("ETag");
-      return res.json().then(function (m) { pollTag = tag; diffManifest(m); });
-    }).catch(function () { /* still down: the chip already says so */ });
+      return res.json().then(function (m) { if (conditional) pollTag = tag; diffManifest(m); });
+    }).catch(function () { /* the next hello or poll tries again */ });
   }
+  function pollOnce() { reconcile(true); }
   function startPoll() { if (!pollTimer) pollTimer = root.setInterval(pollOnce, POLL_MS); }
   function stopPoll() { if (pollTimer) { root.clearInterval(pollTimer); pollTimer = 0; } pollTag = null; }
 
@@ -246,6 +255,13 @@
     if (Date.now() > deadline) { gaveUp = true; paused = true; paintChip(); return; }
     root.setTimeout(function () { whenDrawn(deadline); }, 200);
   }
+
+  // the board's first successful draw after the wait gave up (or the view arrived late) starts the stream
+  function onDrawn() {
+    if (!started) { start(); return; }
+    if (gaveUp) { paused = false; whenDrawn(Date.now() + DRAW_WAIT_MS); }
+  }
+  document.addEventListener("levain:cockpit-held", onDrawn);
 
   function start() {
     if (started) return;

@@ -24,7 +24,7 @@ const settle = async () => { for (let i = 0; i < 8; i++) await tick(); };
 function boot(opts) {
   const timers = [];
   const listeners = {};
-  const fetches = [];
+  const fetches = [], manifests = [];
   const doc = { readyState: "complete", hidden: !!opts.hidden, querySelector: () => null,
     createElement: () => ({ dataset: {}, setAttribute() {}, isConnected: true }),
     addEventListener: (ev, fn) => { (listeners[ev] = listeners[ev] || []).push(fn); } };
@@ -37,6 +37,11 @@ function boot(opts) {
     clearInterval: (t) => { if (t) t.off = true; },
     AbortController: class { constructor() { this.signal = {}; this.aborted = false; } abort() { this.aborted = true; } },
     fetch: (url, o) => {
+      if (url === "/cockpit/manifest.json") {
+        manifests.push({ url, headers: o.headers });
+        const m = opts.manifest ? opts.manifest() : { panels: { a: { etag: "1" }, b: { etag: "1" } } };
+        return Promise.resolve({ ok: true, status: 200, headers: { get: () => "W/m" }, json: () => Promise.resolve(m) });
+      }
       const f = { url, headers: o.headers, ctl: null, push: null };
       fetches.push(f);
       let wake = null, q = [];
@@ -51,7 +56,7 @@ function boot(opts) {
   win.LevainCockpitView = { refetchPanel: async () => "applied" };
   globalThis.window = win; globalThis.document = doc; globalThis.fetch = win.fetch; globalThis.AbortController = win.AbortController; globalThis.URLSearchParams = URLSearchParams;
   new Function("window", "document", src)(win, doc);
-  return { win, doc, timers, listeners, fetches, live: () => timers.filter((t) => !t.off) };
+  return { win, doc, timers, listeners, fetches, manifests, live: () => timers.filter((t) => !t.off) };
 }
 const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: " + JSON.stringify(data) + "\n\n";
 
@@ -157,6 +162,95 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     waits[0].off = true; waits[0].fn(); await settle();
     Date.now = realNow;
     ok(h.live().filter((t) => t.ms === 200).length === 0, "past the bound it stops waiting");
+  }
+  // ---- a first hello (no position) reconciles once through the manifest and refetches only what moved ----
+  {
+    const h = boot({ manifest: () => ({ panels: { a: { etag: "1" }, b: { etag: "2" } } }) });
+    const calls = [];
+    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); return "applied"; };
+    await settle();
+    h.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: false }));
+    await settle();
+    ok(h.manifests.length === 1, "one manifest fetch on the first hello: " + h.manifests.length);
+    ok(h.manifests[0].headers["X-T"] === "tok" && !h.manifests[0].headers["If-None-Match"], "through the page's credential, unconditional");
+    ok(calls.join() === "b", "only the moved panel is refetched: " + calls);
+    ok(h.win.LevainCockpitHeld.b.etag === "2", "applied records the etag from the manifest");
+  }
+  // ---- a replay hello (a position, no resync) does not reconcile; a resync hello does ----
+  {
+    const h = boot({});
+    await settle();
+    h.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: false }));
+    h.fetches[0].push(frame("panel-changed", "E.1:5", { id: "a", etag: "1" }));
+    await settle();
+    h.doc.hidden = true; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    h.doc.hidden = false; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    const before = h.manifests.length;
+    h.fetches[1].push(frame("hello", "E.1:5", { epoch: "E.1", resync: false }));
+    await settle();
+    ok(h.manifests.length === before, "a replay hello reads no manifest");
+    h.fetches[1].push(frame("hello", "E.2:0", { epoch: "E.2", resync: true }));
+    await settle();
+    ok(h.manifests.length === before + 1, "a resync hello reads the manifest");
+  }
+  // ---- a manifest whose id set differs asks for a reload ----
+  {
+    const h = boot({ manifest: () => ({ panels: { a: { etag: "1" }, b: { etag: "1" }, c: { etag: "1" } } }) });
+    const calls = [];
+    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); return "applied"; };
+    await settle();
+    h.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: false }));
+    await settle();
+    ok(h.live().some((t) => t.ms === 500), "an added panel makes a reload pending");
+    ok(calls.length === 0, "and refetches nothing");
+  }
+  // ---- a removed panel (fewer ids, none new) asks for a reload too ----
+  {
+    const h = boot({ manifest: () => ({ panels: { a: { etag: "1" } } }) });
+    await settle();
+    h.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: false }));
+    await settle();
+    ok(h.live().some((t) => t.ms === 500), "a removed panel makes a reload pending");
+  }
+  // ---- a draw after the wait gave up starts the stream ----
+  {
+    const h = boot({ undrawn: true });
+    await settle();
+    const realNow = Date.now;
+    Date.now = () => realNow() + 31000;
+    h.live().filter((t) => t.ms === 200)[0].fn(); await settle();
+    Date.now = realNow;
+    ok(h.fetches.length === 0, "gave up: no stream");
+    h.win.LevainCockpitHeld = { a: { etag: "1" }, b: { etag: "1" } };
+    (h.listeners["levain:cockpit-held"] || []).forEach((f) => f());
+    await settle();
+    ok(h.fetches.length === 1, "a later draw starts the stream");
+  }
+  // ---- applied records the event's etag in held ----
+  {
+    const h = boot({});
+    await settle();
+    h.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: false }));
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "9" }));
+    await settle();
+    ok(h.win.LevainCockpitHeld.a.etag === "9", "held carries the applied etag: " + h.win.LevainCockpitHeld.a.etag);
+  }
+  // ---- a reload wanted during a reload is not lost when that reload returns true ----
+  {
+    const h = boot({});
+    let release = null;
+    h.win.LevainCockpitView.refetchPanel = async () => false;
+    h.win.LevainCockpitTransport.reload = () => new Promise((r) => { release = r; });
+    await settle();
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "2" }));
+    await settle();
+    const t = h.live().find((x) => x.ms === 500);
+    t.off = true; t.fn(); await settle();
+    ok(!!release, "the reload is in flight");
+    h.fetches[0].push(frame("manifest-changed", "E.1:2", {}));
+    await settle();
+    release(true); await settle();
+    ok(h.live().some((x) => !x.every && x.ms >= 500 && x.ms <= 10000), "after that reload returns, a reload is still scheduled");
   }
   process.exit(failed ? 1 : 0);
 })().catch((e) => { console.log("THREW " + (e && e.stack || e)); process.exit(1); });

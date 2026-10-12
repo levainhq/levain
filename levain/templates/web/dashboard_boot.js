@@ -600,7 +600,10 @@
         window.LevainDashboard.render(mview, mview.writable
           ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, onJobsIdle, recall } : { recall });
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
-        if (heldNext) window.LevainCockpitHeld = heldNext;    // published once drawn: only then can a panel be refetched in place
+        if (heldNext) {    // published once drawn: only then can a panel be refetched in place
+          window.LevainCockpitHeld = heldNext;
+          document.dispatchEvent(new CustomEvent("levain:cockpit-held"));   // the change stream starts, or restarts, on this
+        }
         status("read " + new Date().toLocaleTimeString());
         showNotice();
         return true;
