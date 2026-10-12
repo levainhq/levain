@@ -184,7 +184,9 @@
     const v = panel.value || {};
     const kind = ALIAS[head.kind] || head.kind;
     const out = { note: head.note || "", empty: head.empty || "nothing here", kind: kind, pid: head.id, typed: false,
-                  search: searchOf(panel), face: panel.face === "count" ? "count" : "" };
+                  search: searchOf(panel), face: panel.face === "count" ? "count" : "",
+                  // whether the read behind this panel is clean and fresh (a widget's definitive zero needs it)
+                  clean: (head.status === undefined || head.status === "ok") && !(head.skipped || []).length && !(head.filtered || []).length };
     if (kind === "list" || kind === "count-queue") {
       const compose = composeOf(panel.compose);
       // an addressed list draws every row as `source -> for`. Its address is the compose's recipient field when
@@ -978,10 +980,12 @@
     if (d.face === "count") {
       const n = isNum(d.count) ? d.count : (d.lines || []).length;
       host.appendChild(el("div", "big num", n));
-      // at zero the answer is the panel's empty sentence ("Nothing waiting on you"), as the mock draws it; the
-      // provider's note (a caveat about what the count leaves out) is the line only when something is waiting, or
-      // when the panel is alerted (degraded or failed) and the zero may be a failed read
-      if (!n && !s.ctx.alerted) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", e.charAt(0).toUpperCase() + e.slice(1))); }
+      // at zero the answer is the panel's empty sentence ("Nothing waiting on you"), as the mock draws it, but only for
+      // a clean, fresh read: on a degraded one (partial, stale, cached, alerted, something held back) the zero may be a
+      // failed read, so the provider's note stays the line. The sentence is the panel's own: only a plain lowercase
+      // English word at its head is capitalised (an identifier or a path is left as written).
+      const sentence = (e) => /^[a-z]+ /.test(e) ? e.charAt(0).toUpperCase() + e.slice(1) : e;
+      if (!n && !s.ctx.alerted && d.clean !== false) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", sentence(e))); }
       else if (d.note) host.appendChild(el("div", "sub", d.note));
       return;
     }

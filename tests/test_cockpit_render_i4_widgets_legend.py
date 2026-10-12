@@ -16,10 +16,10 @@ from tests._ke_dom import run_node
 
 BODY = r"""
 const NOTE = "needs_phill list, dated first; no cockpit broker: decisions waiting on a signature are not shown";
-const widget = (count, alerted) => {
+const widget = (count, alerted, extra) => {
   const heads = { decisions: head("decisions", "list", "Decisions", { face: "count" }) };
   const rows = Array.from({ length: count }, (_, i) => ({ id: "d" + i, version: "v", title: "t" + i, body: "t" + i, group: null, badges: [], facets: {} }));
-  const payloads = { decisions: head("decisions", "list", "Decisions", { face: "count", count: count, rows: rows, note: NOTE, empty: "nothing is waiting on you." }) };
+  const payloads = { decisions: head("decisions", "list", "Decisions", Object.assign({ face: "count", count: count, rows: rows, note: NOTE, empty: "nothing is waiting on you." }, extra || {})) };
   const v = V.fromManifest(fixture(heads, payloads));
   const host = new N("div");
   K.fill(host, v.extra_panels.decisions, { widget: true, alerted: !!alerted, entry: { title: "Decisions" } });
@@ -28,6 +28,10 @@ const widget = (count, alerted) => {
 out.zero = widget(0, false);
 out.one = widget(1, false);
 out.alertedZero = widget(0, true);
+out.partialZero = widget(0, false, { status: "partial", skipped: [{ count: 2, reason: "unreadable" }] });
+out.staleZero = widget(0, false, { status: "stale" });
+out.heldZero = widget(0, false, { filtered: [{ count: 1, reason: "held" }] });
+out.identZero = widget(0, false, { empty: "npm-registry has nothing" });
 
 const sky = { kind: "ambient", pid: "sky", typed: true, search: {}, note: "", empty: "",
   sky: { events: [{ kind: "commit", at: "2026-10-12T11:00:00+00:00", repo: "levain" }], legend: "kernel sentence" } };
@@ -54,6 +58,9 @@ def test_decisions_zero_answers_with_the_empty_sentence_and_the_legend_is_a_band
     o = run_node(BODY, tmp_path)
     assert o["zero"] == ["Nothing is waiting on you."]
     assert o["one"] and o["one"][0].startswith("needs_phill list")     # something waiting: the provider's note stays
+    for k in ("partialZero", "staleZero", "heldZero"):              # a degraded zero keeps the provider's note
+        assert o[k] and o[k][0].startswith("needs_phill list"), k
+    assert o["identZero"] == ["npm-registry has nothing"]            # not blindly upper-cased
     assert o["alertedZero"] and o["alertedZero"][0].startswith("needs_phill list")
     assert o["bandHasLegend"] == 1 and o["bandShown"] is True and o["hostHasLegend"] == 0
     assert o["glyphs"] >= 5                                            # the real glyph key, not just the sentence
