@@ -91,7 +91,8 @@ def test_ssh_keygen_gives_the_recorded_upstream_verdict(v, tmp_path):
 
 
 @pytest.mark.skipif(not HAVE_KEYGEN, reason="no ssh-keygen")
-@pytest.mark.parametrize("message", [b"", b"x", "unicode é \U0001F35E".encode(), bytes(range(256)) * 9])
+@pytest.mark.parametrize("message", [b"", b"x", "unicode é \U0001F35E".encode(), bytes(range(256)) * 9],
+                         ids=["empty", "x", "unicode", "2304-bytes"])
 def test_every_ssh_keygen_sign_blob_verifies_in_levain(message, tmp_path):
     key, msg = tmp_path / "k", tmp_path / "m"
     msg.write_bytes(message)
