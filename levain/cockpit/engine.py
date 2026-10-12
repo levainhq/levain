@@ -464,8 +464,13 @@ class Cockpit:
     def attach_verbs(self, view: Any) -> None:
         """Attach the verb registry's view: row and panel actions, the manifest ``verbs`` map, and
         the revision (install class + policy) hashed into every etag, since a gesture can change with
-        rows unchanged (design §9 K2a)."""
-        self._verb_view = view
+        rows unchanged (design §9 K2a). Every compose already registered is checked against the
+        registry first (a verb it holds, panel-bound, not a job, fields inside its allowlist), and a
+        refused one refuses the attach: the registry is known from here on."""
+        with self._lock:
+            for spec in self._specs.values():
+                _check_compose_verbs(spec, view)
+            self._verb_view = view
 
     def attach_labeller(self, fn: Callable[[], LabelSnapshot]) -> None:
         """Attach a labels-only source: ``fn()`` is ONE journal read, taken once per request (design
@@ -689,7 +694,11 @@ class Cockpit:
             raise CockpitRegistrationError(f"{sid}: only a list or count-queue has an ordering or views")
         spec = self._place_locked(spec)
         _validate_search_decl(spec)
+        if spec.compose is not None:
+            # stored detached: a provider that keeps its dict cannot change what was validated
+            spec = spec.replaced(compose=copy.deepcopy(spec.compose))
         _validate_compose_decl(spec)
+        _check_compose_verbs(spec, self._verb_view)
         if spec.rowset is not None:
             owner = self._rowsets.get(spec.rowset)
             if owner is not None:
@@ -1273,7 +1282,7 @@ class Cockpit:
     # --- heads, panels, the now view --------------------------------------------------
     def _etag_of(self, snap: _Snap, groups: list[dict[str, Any]] | None, cred: str, today: date,
                  views: tuple[tuple[str, str, str], ...] = (), labels: LabelSnapshot | None = None,
-                 face: str = "") -> str:
+                 face: str = "", compose: dict[str, Any] | None = None) -> str:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
@@ -1285,6 +1294,8 @@ class Cockpit:
                      **({"views": [list(v) for v in views]} if views else {}),
                      # the face is drawn from the head, so changing it is not a 304
                      **({"face": face} if face else {}),
+                     # the compose card is drawn from the head, so a changed declaration is not a 304
+                     **({"compose": compose} if compose else {}),
                      # K2b-3b §0.3: provenance is applied at render, so the journal's revision (and a
                      # snapshot's error) is content; with no labeller there is neither
                      **({"labels": [list(labels.revision) if labels.revision is not None else None, labels.error]}
@@ -1326,7 +1337,7 @@ class Cockpit:
             "filtered": snap.filtered, "skipped": snap.skipped,
             "as_of": snap.as_of, "stale_after_s": spec.stale_after_s,
             "refresh_every_s": spec.refresh_every_s,
-            "etag": self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face),
+            "etag": self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose),
             "error": snap.error, "note": note, "empty": spec.empty if snap.empty is None else snap.empty,
             "order": spec.order, "groups": groups,
             "views": [{"id": i, "title": t, "order": o} for i, t, o in spec.views] or None,
@@ -1504,12 +1515,23 @@ class Cockpit:
                         # one id, one owner: another source never takes over or relabels a panel
                         errors.append({"source": f"discovery:{spec.id}",
                                        "message": f"id collision: {spec.title!r} maps to the id of {have.title!r}"})
-                    elif tuple(have.verbs) != tuple(spec.verbs) or have.rank != spec.rank:
-                        # what a discovered panel offers, and its rank among its owner's panels, are its
-                        # owner's answer, read per pass (a heading moved while serving moves its tab)
-                        # (a non-int rank never gets here: ProviderSpec refuses it inside the discoverer)
+                    elif (tuple(have.verbs) != tuple(spec.verbs) or have.rank != spec.rank
+                          or have.compose != spec.compose):
+                        # what a discovered panel offers, its rank among its owner's panels and its compose
+                        # card are its owner's answer, read per pass (a heading moved while serving moves
+                        # its tab) (a non-int rank never gets here: ProviderSpec refuses it inside the
+                        # discoverer). The new answer is validated as a registration is; one that fails is
+                        # an errors entry and the panel offers nothing until its owner answers validly
+                        new = have.replaced(verbs=tuple(spec.verbs), rank=spec.rank,
+                                            compose=copy.deepcopy(spec.compose))
+                        try:
+                            _validate_compose_decl(new)
+                            _check_compose_verbs(new, self._verb_view)
+                        except Exception as exc:  # noqa: BLE001 - a bad answer is an errors entry, never a 500
+                            errors.append({"source": f"discovery:{spec.id}", "message": _safe_str(exc)})
+                            new = have.replaced(verbs=(), rank=spec.rank)
                         specs = dict(self._specs)       # copy-on-write, like a registration
-                        specs[spec.id] = have.replaced(verbs=tuple(spec.verbs), rank=spec.rank)
+                        specs[spec.id] = new
                         self._specs = specs
             with self._lock:
                 # a panel its owner no longer returns keeps its provider (it reads Absent) and offers nothing
@@ -2229,6 +2251,16 @@ def _v_form(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             en = f.get("enum")
             if not (isinstance(en, list) and en and all(_is_str(x) and x for x in en)):
                 raise _bad(spec, f"{w}.enum", "a recipient field carries a non-empty list of ids from the provider's registry")
+            # the page trims a chosen id and drops a blank one, so a blank id would send no reader (everyone),
+            # and two ids equal after trimming are one reader drawn twice
+            seen_ids: set[str] = set()
+            for j, x in enumerate(en):
+                t = x.strip()
+                if not t:
+                    raise _bad(spec, f"{w}.enum[{j}]", "is blank (a chosen blank id would send to everyone)")
+                if t in seen_ids:
+                    raise _bad(spec, f"{w}.enum[{j}]", f"{t!r} is repeated (after trimming)")
+                seen_ids.add(t)
         elif "enum" in f:
             raise _bad(spec, f"{w}.enum", "belongs to a recipient field only")
     if v.get("verb") is not None and not _is_str(v["verb"]):
@@ -2274,14 +2306,39 @@ def _validate_compose_decl(spec: "ProviderSpec") -> None:
     sid, c = spec.id, spec.compose
     if spec.kind != "list":
         raise CockpitRegistrationError(f"{sid}: only a list carries a compose card")
+    if spec.face == "count":
+        raise CockpitRegistrationError(f"{sid}: a list drawn as a count shows no compose card")
     if not isinstance(c, dict) or set(c) - {"verb", "fields"}:
         raise CockpitRegistrationError(f"{sid}: compose is {{verb, fields}}")
-    if not isinstance(c.get("verb"), str) or c["verb"] not in spec.verbs:
+    if not isinstance(c.get("verb"), str) or not c["verb"] or c["verb"] not in spec.verbs:
         raise CockpitRegistrationError(f"{sid}: compose names a verb the panel offers, got {c.get('verb')!r}")
     try:
         _v_form(spec, {"verb": c["verb"], "fields": c.get("fields")})
     except ValueError as exc:
         raise CockpitRegistrationError(f"{sid}: compose {exc}") from None
+    recipients = [f for f in c["fields"] if f["type"] == "recipient"]
+    if len(recipients) > 1:
+        # the card has one address line and one chip row
+        raise CockpitRegistrationError(f"{sid}: compose carries at most one recipient field, got {len(recipients)}")
+    if recipients:
+        # a row of an addressed list draws `source -> <recipient>` from its facets: both must be declared, so a
+        # row with no reader value names no reader (everyone), never a facet the provider forgot to declare
+        need = {recipients[0]["name"], "source"}
+        if not need <= set(spec.facets):
+            raise CockpitRegistrationError(
+                f"{sid}: a compose with a recipient field declares the facets {sorted(need)}, "
+                f"missing {sorted(need - set(spec.facets))}")
+
+
+def _check_compose_verbs(spec: "ProviderSpec", view: Any) -> None:
+    """Refuse a compose the verb registry cannot honour (``VerbView.compose_refusal``): a no-op until the
+    registry is attached, and for a view that does not answer the question."""
+    if spec.compose is None or view is None:
+        return
+    ask = getattr(view, "compose_refusal", None)
+    why = ask(spec.id, spec.compose) if callable(ask) else None
+    if why:
+        raise CockpitRegistrationError(f"{spec.id}: compose {why}")
 
 
 def _validate_search_decl(spec: "ProviderSpec") -> None:

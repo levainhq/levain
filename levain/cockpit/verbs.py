@@ -457,6 +457,31 @@ def offered(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, *, fresh:
             and (not external or registry.is_downstream(n))]
 
 
+def compose_refusal(registry: VerbRegistry, panel_id: str, compose: dict[str, Any]) -> str | None:
+    """Why a list's compose card cannot post through its verb, or None. The card posts the panel's own
+    action (``panel_actions``): a registered verb the panel may offer by ``offered``'s rule, bound to the
+    panel and not a row, not a job (the card has no job transport), and every compose field a param the
+    verb accepts (``dispatch`` refuses any other with ``field_not_allowed``)."""
+    name = compose.get("verb")
+    if not isinstance(name, str):
+        return f"verb {name!r} is not a verb name"
+    verb = registry.get(name)
+    if verb is None:
+        return f"verb {name!r} is not a registered verb"
+    if panel_id.startswith(EXTERNAL_PREFIX) and not registry.is_downstream(name):
+        return f"verb {name!r} is a kernel verb; a downstream panel offers only a downstream verb"
+    if verb.binding == "row":
+        return f"verb {name!r} binds to a row; a compose card posts the panel's own action"
+    if verb.job:
+        return f"verb {name!r} is a job verb; a compose card has no job transport"
+    if verb.fields is not None:
+        names = {str(f.get("name")) for f in compose.get("fields") or () if isinstance(f, dict)}
+        bad = sorted(names - set(verb.fields))
+        if bad:
+            return f"fields {bad} are not fields of verb {name!r} (it takes {list(verb.fields)})"
+    return None
+
+
 def row_label(row: dict[str, Any] | None) -> str:
     """The label a row was rendered (or read) with: its provenance, which the engine applied from the
     request's one snapshot; ``unverified`` when it carries none."""
@@ -1000,3 +1025,6 @@ class VerbView:
 
     def verbs_map(self, cred: str) -> dict[str, dict[str, Any]]:
         return verbs_map(self.registry, self.cockpit, cred, self.install_class)
+
+    def compose_refusal(self, panel_id: str, compose: dict[str, Any]) -> str | None:
+        return compose_refusal(self.registry, panel_id, compose)

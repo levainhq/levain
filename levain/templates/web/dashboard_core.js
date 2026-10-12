@@ -2294,6 +2294,9 @@
           if (t && !ms.has(t)) { ms.add(t); list.push(t); }
         }
         if (f.required && !list.length) return { error: (f.label || f.name) + " is required" };
+        // something was chosen and none of it is a usable id: refuse, never omit the field (for a recipient
+        // field an omitted value is a send to everyone)
+        if (f.value.length && !list.length) return { error: (f.label || f.name) + " has no usable choice" };
         if (list.length) params[f.name] = list;
         continue;
       }
@@ -2531,7 +2534,7 @@
       if (!spec.confirm_required) {
         setDisabled(true); msg.className = "edit-msg busy"; msg.textContent = "…";
         if (spec.job) { startJob(c.params, sendKey).then(() => setDisabled(false)); return; }
-        commitAction(action.verb, c.params, false, sendKey).then((res) => { if (!(res && res.ok)) failed(res); });
+        commitAction(action.verb, c.params, false, sendKey, action.panel).then((res) => { if (!(res && res.ok)) failed(res); });
         return;
       }
       // confirm step (the fat-finger gate): swap the send button for a confirm/cancel pair AND
@@ -2568,7 +2571,7 @@
           close();
           return;
         }
-        const res = await commitAction(action.verb, c.params, true, sendKey);
+        const res = await commitAction(action.verb, c.params, true, sendKey, action.panel);
         if (res && res.ok) return;  // re-rendered → this box is gone, replaced fresh
         close(); failed(res);
       });
@@ -2651,7 +2654,7 @@
     for (const ln of lines) {
       const o = ln && typeof ln === "object" ? ln : {};
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
-      if (o.meta) row.appendChild(el("span", "ext-meta", String(o.meta)));
+      if (o.meta && !o.addr) row.appendChild(el("span", "ext-meta", String(o.meta)));
       if (o.addr) {
         // an addressed row leads with `source -> for` ("everyone" when it names no reader)
         row.setAttribute("data-ck-row", "");
@@ -2660,6 +2663,8 @@
         src.setAttribute("data-ck-row-source", "");
         a.append(src, document.createTextNode(" \u2192 " + (o.addr.to.length ? o.addr.to.join(", ") : "everyone") + (o.addr.age ? " \u00b7 " + o.addr.age : "")));
         row.appendChild(a);
+        // the row's meta (badges, provenance, group) after the address line, never dropped
+        if (o.meta) row.appendChild(el("span", "ext-meta", String(o.meta)));
       }
       appendClause(row, o.text != null ? String(o.text) : "");  // per-item expand, like episodes
       if (o.cancel && cancelPending) appendRowVerbs(row, buildPendingCancel(o.cancel));

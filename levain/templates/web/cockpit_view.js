@@ -167,9 +167,16 @@
       need(isObj(f) && typeof f.name === "string" && f.name && !names.has(f.name), "compose field name");
       names.add(f.name);
       need(COMPOSE_TYPES.indexOf(f.type) >= 0, "compose field " + f.name + " has a type this page cannot draw (" + String(f.type) + ")");
-      need(f.type !== "recipient" || (Array.isArray(f.enum) && f.enum.length && f.enum.every((x) => typeof x === "string" && x)), "compose recipient list");
+      if (f.type === "recipient") {
+        // the send trims a chosen id: a blank one would send no reader (everyone), and two ids equal after the
+        // trim are one reader drawn twice
+        need(Array.isArray(f.enum) && f.enum.length && f.enum.every((x) => typeof x === "string" && x.trim()), "compose recipient list (a blank id)");
+        need(new Set(f.enum.map((x) => x.trim())).size === f.enum.length, "compose recipient list (an id repeated)");
+      }
       return f;
     });
+    // one address line, one chip row
+    need(fields.filter((f) => f.type === "recipient").length <= 1, "compose: one recipient field at most");
     return { verb: c.verb, fields: fields };
   }
 
@@ -181,7 +188,8 @@
     if (kind === "list" || kind === "count-queue") {
       const compose = composeOf(panel.compose);
       // an addressed list (its compose picks recipients) draws every row as `source -> for`
-      const addressed = !!(compose && compose.fields.some((f) => f.type === "recipient"));
+      const rfield = compose ? compose.fields.find((f) => f.type === "recipient") : null;
+      const addressed = !!rfield;
       if (compose) out.compose = compose;
       out.lines = (panel.rows || []).map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
@@ -193,11 +201,14 @@
         const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
         if (addressed) {
           const f = r.facets || {};
-          const to = Array.isArray(f["for"]) ? f["for"] : typeof f["for"] === "string" ? f["for"].split(",") : [];
+          // the kernel refuses an addressed compose whose recipient facet is not declared, so a row with no
+          // value for it names no reader: everyone
+          const fv = f[rfield.name];
+          const to = Array.isArray(fv) ? fv : typeof fv === "string" ? fv.split(",") : [];
           line.addr = { source: typeof f.source === "string" && f.source.trim() ? f.source.trim() : "unknown",
                         to: to.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim()),
                         age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "" };
-          line.meta = "";
+          // the meta (badges, provenance, group) stays: the renderer draws it after the address line
         }
         // a pending (or its outcome) names its state; a WAITING one can be cancelled from here
         if (typeof r.id === "string" && r.id.indexOf("pend:") === 0) {
@@ -615,8 +626,17 @@
         const formVerb = view.extra_panels[pid].form ? view.extra_panels[pid].form.verb : (view.extra_panels[pid].compose ? view.extra_panels[pid].compose.verb : null);
         const own = pActions.find((a) => (!isObj(a.target) || typeof a.target.row_id !== "string") && (formVerb === null || a.verb === formVerb));
         const vh = own && isObj(view.verb_heads[own.verb]) ? view.verb_heads[own.verb] : null;
+        const cmpDecl = view.extra_panels[pid].compose;
+        if (cmpDecl && view.writable && !NATIVE.has(pid)) {
+          // a writable surface draws the card or says why not, never a silently missing card (a read-only one
+          // draws no verbs at all, so it stays silent)
+          if (!vh) throw new Error("its compose verb " + cmpDecl.verb + " is not offered by this panel");
+          // a job's result arrives by polling, which the card does not do
+          if (vh.job === true) throw new Error("its compose verb " + cmpDecl.verb + " is a job verb, which a compose card cannot send");
+        }
         if (vh && !NATIVE.has(pid)) {
-          view.extra_panels[pid].action = { verb: own.verb, fields: (Array.isArray(vh.fields) ? vh.fields : []).filter((n) => typeof n === "string").map(composeField) };
+          // the action names its own panel: the send posts to THIS panel's offer, never another panel's
+          view.extra_panels[pid].action = { verb: own.verb, panel: pid, fields: (Array.isArray(vh.fields) ? vh.fields : []).filter((n) => typeof n === "string").map(composeField) };
           view.action_verbs[own.verb] = { label: vh.label, confirm_required: vh.confirm === true, idempotent: vh.idempotent === true, job: false };
           // a form panel names its own fields: they win over the widgets guessed from the verb head's names
           const form = view.extra_panels[pid].form;
