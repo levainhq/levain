@@ -781,3 +781,56 @@ def test_append_needs_an_explicit_anchor_and_an_aware_now(base, keys):
     with pytest.raises(AuthorityError, match="aware"):
         auth.prepare(base, {"op": "raise", "verb": "a", "tier": "T3"}, signer_fp=keys["phone"].fp,
                      now=naive, cache=cache)
+
+
+# --- corrupt rows (F7) and non-finite numbers (F8) ------------------------------------------------
+
+
+@pytest.mark.parametrize("column, sql_value", [
+    ("record", "x'7b7d'"),                       # a BLOB, not text
+    ("record", "CAST(x'ff7b' AS TEXT)"),         # text that is not UTF-8
+    ("signature", "42"),
+    ("signature", "'-----BEGIN SSH SIGNATURE-----é'"),
+    ("hash", "1"),
+    ("signer_fp", "3.5"),
+    ("prev_hash", "x'00'"),
+])
+def test_corrupt_stored_cell_is_a_replay_error(granted, column, sql_value):
+    granted.execute(f"UPDATE authority_log SET {column} = {sql_value} WHERE seq = 3")
+    with pytest.raises(ReplayError) as exc:
+        head(granted)
+    assert exc.value.seq == 3
+
+
+@pytest.mark.parametrize("field, value", [("op", ["enrol"]), ("class", ["presence"]),
+                                          ("fingerprint", ["x"]), ("public_key", {"k": 1})])
+def test_wrong_typed_record_field_is_a_replay_error(base, keys, field, value):
+    op = _enrol(keys["other"], "presence")
+    op[field] = value
+    insert(base, op, keys["laptop"])
+    with pytest.raises(ReplayError) as exc:
+        head(base)
+    assert exc.value.seq == 4
+
+
+def test_cache_digest_survives_a_corrupt_cell(granted):
+    cache = ReplayCache()
+    auth.snapshot(granted, cache=cache)
+    granted.execute("UPDATE authority_log SET signature = x'00ff' WHERE seq = 2")
+    with pytest.raises(HeadBelowCache, match="rewritten"):
+        auth.snapshot(granted, cache=cache)
+
+
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_timeouts_refused(base, keys, bad):
+    """F8: _canonical keeps byte parity with team/entry.py (NaN serialises), so replay refuses it."""
+    record_op = {"op": "timeouts", "timeouts": {"k": {"after_s": float(bad.replace("Infinity", "inf"))}}}
+    assert bad in auth._canonical(record_op)
+    insert(base, record_op, keys["laptop"])
+    refused(base, "finite JSON")
+
+
+def test_canonical_parity_with_team_entry():
+    from levain.team.entry import canonical
+    obj = {"b": [1, 2.5, float("nan")], "a": "é", "hash": "dropped-by-team"}
+    assert auth._canonical({k: v for k, v in obj.items() if k != "hash"}) == canonical(obj)
