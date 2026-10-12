@@ -549,6 +549,16 @@ def test_a_call_that_is_one_whole_message_after_a_plan_is_marked(tmp_path):
     assert _multi_part_session(tmp_path, ["I'll run the tests.", fence]).run_turn("x").unreadable_call is True
 
 
+def test_a_call_split_across_two_messages_is_marked(tmp_path):
+    # verify r2 (glm, codex OPEN): each message alone is no call, but the reply joins them with a newline and
+    # the join is one; a JSON call split at a whitespace boundary escaped the per-message check
+    head, tail = '{"name": "terminal",', '"arguments": {"command": "pytest"}}'
+    assert not unreadable_tool_call(head, TOOLS) and not unreadable_tool_call(tail, TOOLS)
+    result = _multi_part_session(tmp_path, [head, tail]).run_turn("x")
+    assert result.reply == head + "\n" + tail
+    assert result.unreadable_call is True and result.exit_code == 7
+
+
 def test_a_finish_whose_arguments_are_a_json_string_is_unwrapped_and_never_raises(tmp_path):
     from levain.firing.agent_reply import humanize_finish_json
 

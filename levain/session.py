@@ -1338,9 +1338,10 @@ class EntitySession:
         """Whether the turn's reply is flagged, the flagged texts sent beside a parsed ``finish``, and whether the
         check itself failed.
 
-        Each agent message is checked on its own, never their join: a call that is the whole of one message (a plan,
-        the act-now nudge, then the call) is not the whole of the join, and the shapes that need the whole text would
-        miss it. The text a model sent beside a parsed ``finish`` (that action's ``thought``) is checked too, even
+        Each agent message is checked on its own AND their join (``reply``, the text shown): a call that is the whole
+        of one message (a plan, the act-now nudge, then the call) is not the whole of the join, and the shapes that
+        need the whole text would miss it; a call split across messages at a whitespace boundary is a call only in
+        the join (verify r2, glm). The text a model sent beside a parsed ``finish`` (that action's ``thought``) is checked too, even
         when the finish carried no message: otherwise it is never shown. Thoughts beside other actions are not: such
         an action ran, and its thought often restates that very call. A classifier failure fails CLOSED: the reply
         and every thought beside a finish count as flagged (the reply alone when those thoughts cannot be read; a
@@ -1352,7 +1353,8 @@ class EntitySession:
         try:
             names = self._tool_names()
             beside = [t for t in thoughts if unreadable_tool_call(t, names)]
-            parts = bool(reply) and any(unreadable_tool_call(t, names) for t in _agent_parts(events))
+            parts = bool(reply) and (unreadable_tool_call(reply, names)
+                                     or any(unreadable_tool_call(t, names) for t in _agent_parts(events)))
         except Exception:  # noqa: BLE001 — undeterminable is not "readable"
             # every thought beside a finish is unchecked, so it is flagged and shown, as a flagged one would be
             flagged = bool(reply) or bool(thoughts)
