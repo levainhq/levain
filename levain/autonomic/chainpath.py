@@ -565,7 +565,16 @@ class ChainExecutor:
 
         results: list[ChainLinkResult] = list(prior)
         for i in range(start, len(binding.goal)):
-            request, outcome = self._fire_link(binding, event, ctx, i, gate if i == start else None)
+            try:
+                request, outcome = self._fire_link(binding, event, ctx, i, gate if i == start else None)
+            except Exception as e:  # noqa: BLE001 — a link that cannot be built ends the chain HERE
+                # the links before it may have fired (and an effect is not undone), so the outcome keeps
+                # them: a later link's policy can differ from the pre-flight's (a swap between links, a
+                # tool the new policy does not classify), and a raise here must not report "no links ran"
+                _log.error("chainpath: binding %s link %d FAILED before admission (%s): %s — chain aborted",
+                           binding.binding_id, i, type(e).__name__, e)
+                return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
+                                    paused_at=i, reason=f"link_{i}_error:{type(e).__name__}")
             results.append(ChainLinkResult(link_index=i, outcome=outcome))
 
             if outcome.fired:

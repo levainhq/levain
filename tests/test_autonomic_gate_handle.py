@@ -240,6 +240,40 @@ def test_each_chain_link_captures_its_own_gate(tmp_path):
     assert w.outbox() == [("link0", "e1-0")]
 
 
+# A later link reads a newer policy than the pre-flight did; one that cannot classify its tool raises while
+# the link is built. The links already fired stay in the outcome (L3 r1 codex MED).
+_SEND_UNCLASSIFIED = (ActionManifest({"link0": HIGH, "link1": HIGH}), {"mail.read": HIGH})
+
+
+def test_a_link_that_cannot_be_built_keeps_the_links_fired_before_it(tmp_path):
+    swapped = []
+
+    def hook(i):
+        if i == 0 and not swapped:
+            swapped.append(handle.swap(*_SEND_UNCLASSIFIED, _first_tool))
+
+    w, handle = _handled_world(tmp_path, hook)
+    w.mint(chain=True)
+    d = w.dispatch("e1")
+    assert d.chain.aborted and d.chain.paused_at == 1 and d.chain.reason == "link_1_error:KeyError"
+    assert [(r.link_index, r.outcome.fired) for r in d.chain.links] == [(0, True)]
+    assert w.outbox() == [("link0", "e1-0")]
+
+
+def test_a_resumed_chain_keeps_its_fired_link_when_the_next_cannot_be_built(tmp_path):
+    w, handle = _handled_world(tmp_path, lambda i: None)
+    w.tool_risk[0] = HIGH
+    w.mint(chain=True)
+    assert w.dispatch("e1").chain.paused_at == 0
+    # link 0 keeps the rung it was shown (its manifest entry and its tool's risk unchanged); link 1's tool
+    # leaves the catalog
+    handle.swap(ActionManifest({"link0": LOW, "link1": HIGH}), {"mail.read": HIGH}, _first_tool)
+    out = w.resolve_open_as(signed_yes(w.gate, w.open_pending_id()))
+    assert out.aborted and out.paused_at == 1 and out.reason == "link_1_error:KeyError"
+    assert [(r.link_index, r.outcome.fired) for r in out.links] == [(0, True)]
+    assert w.outbox() == [("link0", "e1-0")]
+
+
 # --- the holders, counted: exactly one read of the handle per admission -----------------------------
 # A holder that reads the handle twice in one admission (a decision on one gate, its resolve on the next)
 # is the mixed-policy shape the handle exists to prevent, and no swap-timing test reliably lands a swap
