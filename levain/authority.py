@@ -11,11 +11,14 @@ difference is classified on its own (:func:`classify`). A declared op that disag
 delta is refused, and so is a link that changes nothing.
 
 The anchor (``authority.anchor`` beside the store) is written only after a commit, so it lags and never
-leads; a log behind it refuses to open.
+leads, and only ever moves up. :func:`append` refuses a log behind it, and an empty log beside one; this
+module reads the log without consulting it (:func:`snapshot`), so a caller that opens a store checks it
+with :func:`check_anchor`.
 """
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -26,7 +29,8 @@ import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -257,6 +261,8 @@ class AuthoritySnapshot:
     _hashes: tuple[str, ...] = field(repr=False, default=())
     # the head link's ``at``: the next link's ``at`` may not be earlier (an ordering rule, never a grant)
     head_at: datetime | None = None
+    # set only on what append returns: the link committed but the anchor could not be advanced
+    anchor_warning: str | None = field(default=None, compare=False)
 
     def key(self, fingerprint: str) -> AuthorityKey | None:
         return self.keys.get(fingerprint)
@@ -854,6 +860,11 @@ class UnsignedLink:
         return _message(self.prev_hash, self.record)
 
 
+def _require_aware(now: Any) -> None:
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise AuthorityError("`now` must be an aware datetime; a naive one has no zone")
+
+
 def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
     """The rules a replay cannot hold because they need the appender's clock (§3.3a, §6)."""
     if rec["op"] != "renew":
@@ -876,6 +887,7 @@ def prepare(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str, 
     """The next link carrying ``op`` (its op fields, ``op`` included), checked against the current head
     by every rule but the signature, so a doomed link is refused before anyone touches a key.
     ``store_id`` is for the genesis link only (a fresh one is drawn when it is None)."""
+    _require_aware(now)
     if "op" not in op or set(op) & (_BASE_FIELDS - {"op"}):
         raise AuthorityError("an op names `op` and its own fields, never format/store_id/seq/at")
     state = _replay(conn, PROCESS_CACHE if cache is None else cache, ssh_keygen)
@@ -896,20 +908,31 @@ def prepare(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str, 
 
 
 def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now: datetime,
-           cache: ReplayCache | None = None, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-           anchor: Path | None = None) -> AuthoritySnapshot:
+           anchor: Path | None, cache: ReplayCache | None = None,
+           ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> AuthoritySnapshot:
     """Append a signed link in one ``BEGIN IMMEDIATE``: replay to the head, refuse a moved head
     (:class:`StaleHead`), verify the link against that state as a replay would, apply the append-only
-    clock checks, insert. ``conn`` must be in autocommit mode with no open transaction. With ``anchor``,
-    a log behind the anchor refuses, and the anchor advances after the commit."""
+    clock checks, insert. ``conn`` must be in autocommit mode with no open transaction.
+
+    ``anchor`` is required: the anchor file's path, or an explicit None for an unanchored store. With
+    one, a log behind it refuses (an empty log beside an existing anchor included), and after the commit
+    the anchor advances. Once committed the link stands: if the anchor cannot then be advanced, the
+    snapshot comes back with ``anchor_warning`` set rather than as a failed append."""
+    _require_aware(now)
     if conn.in_transaction:
         raise AuthorityError("append owns its transaction; the connection has one open")
     cache = PROCESS_CACHE if cache is None else cache
     conn.execute("BEGIN IMMEDIATE")
     try:
         state = _replay(conn, cache, ssh_keygen)
-        if anchor is not None and state is not None:
-            check_anchor(state, read_anchor(anchor))
+        if anchor is not None:
+            current = read_anchor(anchor)
+            if state is None and current is not None:
+                raise AnchorError(f"the authority log is empty but its anchor names store {current.store_id} at "
+                                  f"seq {current.seq}; a new genesis here would fork it. If this store was "
+                                  f"emptied on purpose, run {_RESET_HINT}")
+            if state is not None:
+                check_anchor(state, current)
         head = (0, "") if state is None else (state.seq, state.head_hash)
         if head != (link.seq - 1, link.prev_hash):
             raise StaleHead(f"the authority log's head moved to seq {head[0]} since this link was prepared")
@@ -931,16 +954,19 @@ def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now:
         raise
     cache._store((_db_identity(conn), new.store_id), _Entry(new, digests))
     if anchor is not None:
-        advance_anchor(anchor, new)
+        try:
+            advance_anchor(anchor, new)
+        except (AnchorError, OSError) as exc:
+            return replace(new, anchor_warning=f"committed at seq {new.seq}; the anchor is behind ({exc})")
     return new
 
 
 def sign_and_append(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str,
-                    sign: Callable[[bytes], str], now: datetime, store_id: str | None = None,
-                    cache: ReplayCache | None = None, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
-                    anchor: Path | None = None) -> AuthoritySnapshot:
+                    sign: Callable[[bytes], str], now: datetime, anchor: Path | None,
+                    store_id: str | None = None, cache: ReplayCache | None = None,
+                    ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> AuthoritySnapshot:
     """:func:`prepare`, then ``sign(message)`` OUTSIDE any transaction (a touch can take seconds),
-    then :func:`append`."""
+    then :func:`append` (``anchor`` as there: required, None for an unanchored store)."""
     link = prepare(conn, op, signer_fp=signer_fp, now=now, store_id=store_id, cache=cache, ssh_keygen=ssh_keygen)
     return append(conn, link, sign(link.message), now=now, cache=cache, ssh_keygen=ssh_keygen, anchor=anchor)
 
@@ -1022,15 +1048,33 @@ def _write_anchor(path: Path, payload: Mapping[str, Any]) -> None:
         os.close(dfd)
 
 
+@contextmanager
+def _anchor_lock(path: Path) -> Iterator[None]:
+    """An exclusive flock on ``<anchor>.lock``: every read-compare-write of the anchor runs under it, so
+    two appenders (the cockpit server and the CLI) serialise their advances."""
+    path = Path(path)
+    fd = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def advance_anchor(path: Path, snap: AuthoritySnapshot) -> Anchor:
     """Check the anchor at ``path`` against ``snap`` and move it up to ``snap``'s head; call only after
-    the commit that produced ``snap``, so the anchor never leads the log."""
-    current = read_anchor(path)
-    check_anchor(snap, current)
-    new = Anchor(snap.store_id, snap.seq, snap.head_hash)
-    if current != new:
-        _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict()})
-    return new
+    the commit that produced ``snap``, so the anchor never leads the log. An anchor of this store already
+    past ``snap`` (a later append's advance landed first) is left where it is: the anchor never moves
+    down, and a stale advance is a no-op that returns the anchor as it stands."""
+    with _anchor_lock(path):
+        current = read_anchor(path)
+        if current is not None and current.store_id == snap.store_id and current.seq > snap.seq:
+            return current
+        check_anchor(snap, current)
+        new = Anchor(snap.store_id, snap.seq, snap.head_hash)
+        if current != new:
+            _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict()})
+        return new
 
 
 def reset_message(store_id: str, old_anchor: Mapping[str, Any] | None, new_seq: int, new_head: str) -> bytes:
@@ -1075,9 +1119,10 @@ def reset_anchor(path: Path, snap: AuthoritySnapshot, *, signer_fp: str, signatu
                  ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> Anchor:
     """Move the anchor at ``path`` to ``snap``'s head on a verified reset signature, storing the proof
     in the anchor file (the log refuses to open, so it cannot be a log link)."""
-    old = _old_anchor_view(path)
-    verify_anchor_reset(snap, old, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen)
-    new = Anchor(snap.store_id, snap.seq, snap.head_hash)
-    _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict(),
-                         "reset": {"old_anchor": old, "signer_fp": signer_fp, "signature": signature}})
-    return new
+    with _anchor_lock(path):
+        old = _old_anchor_view(path)
+        verify_anchor_reset(snap, old, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen)
+        new = Anchor(snap.store_id, snap.seq, snap.head_hash)
+        _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict(),
+                             "reset": {"old_anchor": old, "signer_fp": signer_fp, "signature": signature}})
+        return new
