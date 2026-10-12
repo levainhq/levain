@@ -25,7 +25,7 @@ from levain.cockpit.broker import STANDBY_FAULT, Broker, BrokerError, Lifecycle,
 from levain.cockpit.consent import value_sha256
 from levain.cockpit.effects import SporeEffectStore, TransientApplyFault
 from levain.cockpit.results import Fault
-from tests.cockpit_authority_rig import RealKey, enrol_any, revoke_any, widen_laptop_floor
+from tests.cockpit_authority_rig import RealKey, enrol_any, revoke_any
 
 BROWSER = {"class": "token", "name": "browser"}
 PHONE = {"class": "token", "name": "flowconnect"}
@@ -133,11 +133,6 @@ class Key(RealKey):
         assert b.db is not None
         enrol_any(b.db, self, cls)
         return self
-
-
-@pytest.fixture(autouse=True)
-def _laptop_floor(monkeypatch):
-    widen_laptop_floor(monkeypatch)
 
 
 @pytest.fixture

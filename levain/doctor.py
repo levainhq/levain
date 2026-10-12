@@ -1142,7 +1142,8 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
     if len(laptops) == 1:
         return [CheckResult(
             name, True, f"one {LAPTOP} key is enrolled ({laptops[0]})",
-            f"Enrol a second {LAPTOP} key now: `levain cockpit enroll <key.pub> --signing-key <the enrolled key>`; "
+            f"Enrol a second {LAPTOP} key now: make one with `levain cockpit key create`, then `levain cockpit "
+            "enroll <key.pub> --signing-key <the enrolled key>`; "
             f"{recovery}.",
             warn=True)]
     if not laptops:

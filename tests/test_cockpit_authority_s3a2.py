@@ -25,12 +25,11 @@ import levain.authority as authority
 from levain.authority import VerifierUnavailable, anchor_path
 from levain.cockpit.firejournal import CockpitDB, STORE_FORMAT
 from levain.cockpit.keys import KeyError_, fingerprint_of
-from tests.cockpit_authority_rig import RealKey, enrol, enrol_any, revoke, revoke_any, root_of, widen_laptop_floor
+from tests.cockpit_authority_rig import RealKey, enrol, enrol_any, revoke, revoke_any, root_of
 from tests.test_cockpit_k2b_broker import (  # noqa: F401 - fixtures
     BROWSER,
     Key,
     _broker,
-    _laptop_floor,
     _move,
     _refused,
     _rows,
@@ -159,7 +158,6 @@ def _phone_after(root: Path) -> tuple[Any, Any]:
 def test_a_restore_without_the_excluded_anchor_dir_cannot_unrevoke_a_key(tmp_path, monkeypatch):
     """The anchor lives in its own directory, which Time Machine never backs up, so a restore of the
     data root brings back the old log beside the CURRENT anchor, and the capture refuses."""
-    widen_laptop_floor(monkeypatch)
     root, keys = tmp_path / "data", tmp_path / "keys"
     root.mkdir()
     keys.mkdir()
@@ -184,7 +182,6 @@ def test_a_restore_without_the_excluded_anchor_dir_cannot_unrevoke_a_key(tmp_pat
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="the Time Machine exclusion is macOS's")
 def test_the_anchor_directory_is_excluded_from_time_machine(tmp_path, monkeypatch):
-    widen_laptop_floor(monkeypatch)
     root, keys = tmp_path / "data", tmp_path / "keys"
     root.mkdir()
     keys.mkdir()
@@ -421,7 +418,7 @@ def test_a_pending_issued_on_a_replaced_suffix_ends_stale(broker, spores, keydir
     a, b = RealKey(keydir, "a"), RealKey(keydir, "b")
     with broker.db.autocommit() as conn:                              # suffix A; its anchor advance failed
         authority.sign_and_append(conn, {"op": "enrol", "fingerprint": a.fingerprint, "public_key": a.public,
-                                         "class": "presence"}, signer_fp=root.fingerprint, sign=root.sign_link,
+                                         "class": "presence", "custody": "unstated"}, signer_fp=root.fingerprint, sign=root.sign_link,
                                   clock=lambda: datetime.now(timezone.utc), anchor=None)
     issued_on = broker.capture().authority
     pid, sig = _sign_pending(broker, spores, phone)

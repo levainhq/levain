@@ -36,8 +36,8 @@ from pathlib import Path
 from typing import Any
 
 from levain import authority as _authority
-from levain.authority import (LAPTOP, NAMESPACE, AnchorError, AuthorityError, AuthorityKey, AuthoritySnapshot,
-                              VerifierUnavailable, _pipe_reading, anchor_path, sign_and_append)
+from levain.authority import (LAPTOP, NAMESPACE, UNSTATED, AnchorError, AuthorityError, AuthorityKey,
+                              AuthoritySnapshot, VerifierUnavailable, _pipe_reading, anchor_path, sign_and_append)
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN
 from levain.cockpit.authority import RequestAuthority
 from levain.cockpit.firejournal import _CLASS_RANK, DB_NAME, UNINITIALISED, CockpitDB, _meta
@@ -70,6 +70,8 @@ class KeyRow:
     revoked_seq: int | None
     compromised_since: int | None
     legacy_enrolled_at: str | None = None
+    custody: str = UNSTATED          # what its enrol record declares (a declaration, never a proof)
+    public_key: str | None = None
 
 
 # what signs a link's message (namespace ``levain-authority``); returns the armored SSHSIG
@@ -160,7 +162,7 @@ def _check_reported(conn: object) -> None:
 
 def _row(k: AuthorityKey) -> KeyRow:
     return KeyRow(k.fingerprint, k.principal, k.key_class, k.enrolled_seq, k.enrolled_at, k.revoked_seq,
-                  k.compromised_since, k.legacy_enrolled_at)
+                  k.compromised_since, k.legacy_enrolled_at, k.custody, k.public_key)
 
 
 def _capture(db: CockpitDB, now: datetime, ssh_keygen: Path | str) -> RequestAuthority:
@@ -194,14 +196,19 @@ def _append(db: CockpitDB, op: Mapping[str, Any], *, signer_fp: str, sign: Signe
 
 
 def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, signer_fp: str, sign: Signer,
-           clock: Callable[[], datetime], ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+           clock: Callable[[], datetime], custody: str = UNSTATED, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
            marker_directory: Path | None = None) -> tuple[KeyRow, bool, str | None]:
-    """Enrol one key by a link ``signer_fp`` signs (a laptop-presence key). Returns ``(row, created,
+    """Enrol one key, declaring its ``custody``, by a link ``signer_fp`` signs (a laptop-presence key).
+    The custody table (``levain.authority.custody_problem``, the replay's own rule) is checked before
+    anything is signed; a laptop-presence key must state a real custody. Returns ``(row, created,
     warning)``: ``created`` is False when this exact key is already enrolled, unrevoked, with this class
-    (nothing is signed); ``warning`` says the link committed but its anchor did not advance."""
+    and custody (nothing is signed); ``warning`` says the link committed but its anchor did not advance."""
     if key_class not in _CLASS_RANK:
         raise KeyError_(f"unknown key class {key_class!r}; one of {', '.join(KEY_CLASSES)}")
     public_key = normalise_public_key(public_key_text)
+    problem = _authority.custody_problem(key_class, custody, public_key.split()[0])
+    if problem is not None:
+        raise KeyError_(problem)
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
     db = _journal(data_root, marker_directory=marker_directory)
     state = _signing_authority(_capture(db, _now(clock), ssh_keygen))
@@ -212,9 +219,11 @@ def enroll(data_root: Path | str, public_key_text: str, key_class: str, *, signe
         if old.key_class != key_class:
             raise KeyError_(f"{fp} is enrolled as {old.key_class!r}; a key keeps its class (enroll a new "
                             "key for another class)")
+        if old.custody != custody:
+            raise KeyError_(f"{fp} is enrolled with custody {old.custody!r}; a key keeps its custody")
         return _row(old), False, None
-    new = _append(db, {"op": "enrol", "fingerprint": fp, "public_key": public_key, "class": key_class},
-                  signer_fp=signer_fp, sign=sign, clock=clock, ssh_keygen=ssh_keygen)
+    new = _append(db, {"op": "enrol", "fingerprint": fp, "public_key": public_key, "class": key_class,
+                       "custody": custody}, signer_fp=signer_fp, sign=sign, clock=clock, ssh_keygen=ssh_keygen)
     key = new.key(fp)
     assert key is not None
     return _row(key), True, new.anchor_warning
@@ -317,10 +326,11 @@ def _legacy_row(raw: Any, state: AuthoritySnapshot | None, ssh_keygen: Path | st
                 problem = "its public key's fingerprint is not the row's"
         except KeyError_ as exc:
             normal, problem = None, f"its public key cannot be read ({exc})"
-        # read through the module at call time: the class floor is authority's, never a copy here
-        if problem is None and cls == LAPTOP and key_type not in _authority._LAPTOP_KEY_TYPES:
-            problem = (f"key type {key_type} is not eligible for {LAPTOP} (one of "
-                       f"{', '.join(sorted(_authority._LAPTOP_KEY_TYPES))})")
+        # read through the module at call time: the floor is authority's custody table, never a copy here.
+        # A carried row is re-enrolled with its custody unstated (/2 never recorded one), which the replay
+        # admits for a laptop-presence key only on a record carrying legacy_enrolled_at (its enrol time).
+        if problem is None:
+            problem = _authority.custody_problem(cls, UNSTATED, key_type, legacy=isinstance(enrolled_at, str))
     held = None if state is None else state.key(fp)
     return LegacyRow(fp, str(cls), key_type, enrolled_at if isinstance(enrolled_at, str) else None,
                      revoked_at is not None, compromised is not None, normal, problem,
@@ -366,10 +376,16 @@ def init_plan(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = 
 
 
 def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str, sign: Signer,
-                clock: Callable[[], datetime], confirmed: Collection[str], drop_unlisted: bool = False,
-                ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN, marker_directory: Path | None = None) -> InitResult:
-    """Initialise the authority log, every link signed by ``signer_fp`` (a laptop-presence key: a
-    touch-required one asks once per link).
+                clock: Callable[[], datetime], confirmed: Collection[str], signer_custody: str,
+                drop_unlisted: bool = False, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                marker_directory: Path | None = None) -> InitResult:
+    """Initialise the authority log, every link signed by ``signer_fp`` (a laptop-presence key, of any
+    custody the custody table admits, ``signer_custody``: a touch-id or fido key asks a touch per link, a
+    passphrase key its passphrase).
+
+    The genesis declares ``signer_custody`` (a real one: a laptop-presence key states its custody, a
+    carried legacy signing key included, because its custody is what the operator says now); each other
+    carried legacy row is re-enrolled with custody ``unstated``.
 
     A fresh store (no migration marker, an empty log) gets one link, the genesis: ``signer_fp``
     enrolled as laptop-presence, signed by itself (the trust on first use of DESIGN §3.2). A migrated
@@ -395,6 +411,9 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
     signer_key = normalise_public_key(signer_public_key)
     if fingerprint_of(signer_key, ssh_keygen=ssh_keygen) != signer_fp:
         raise KeyError_("the signing key's public half is not the key that signs")
+    problem = _authority.custody_problem(LAPTOP, signer_custody, signer_key.split()[0])
+    if problem is not None:
+        raise KeyError_(f"the signing key: {problem}")
     confirmed = set(confirmed)
     by_fp = {r.fingerprint: r for r in plan.rows}
     unknown = sorted(confirmed - set(by_fp) - {signer_fp} - ({plan.genesis} if plan.genesis else set()))
@@ -464,14 +483,16 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
         links.append(f"seq {new.seq}: {what}")
         return new
 
-    def enrol_op(fp: str, public_key: str, cls: str, legacy_at: str | None) -> dict[str, Any]:
-        op: dict[str, Any] = {"op": "enrol", "fingerprint": fp, "public_key": public_key, "class": cls}
+    def enrol_op(fp: str, public_key: str, cls: str, legacy_at: str | None, custody: str) -> dict[str, Any]:
+        op: dict[str, Any] = {"op": "enrol", "fingerprint": fp, "public_key": public_key, "class": cls,
+                              "custody": custody}
         if legacy_at is not None:
             op["legacy_enrolled_at"] = legacy_at
         return op
 
     if state is None:
-        state = put(enrol_op(signer_fp, signer_key, LAPTOP, None if mine is None else mine.enrolled_at),
+        state = put(enrol_op(signer_fp, signer_key, LAPTOP, None if mine is None else mine.enrolled_at,
+                             signer_custody),
                     f"enrol {signer_fp} as {LAPTOP} (the genesis, signed by itself)")
     kept, dropped, skipped = [], [], []
     for r in plan.rows:
@@ -494,7 +515,7 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
             continue
         if have is None:
             assert r.public_key is not None
-            state = put(enrol_op(r.fingerprint, r.public_key, r.key_class, r.enrolled_at),
+            state = put(enrol_op(r.fingerprint, r.public_key, r.key_class, r.enrolled_at, UNSTATED),
                         f"enrol {r.fingerprint} as {r.key_class}")
             have = state.key(r.fingerprint)
             assert have is not None
@@ -564,19 +585,32 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -
     """``(fingerprint, sign)`` for the signing key at ``key_path``: a private key (or an agent-held
     key's public half) that ``ssh-keygen -Y sign -f`` accepts, its public half read from ``<path>.pub``
     (or ``key_path`` itself when it is the ``.pub``). ``sign`` runs ``ssh-keygen -Y sign`` in the
-    authority namespace with the terminal's stderr, so a touch-required key's prompt reaches the
-    operator."""
+    authority namespace with the terminal's stderr, so a touch or passphrase prompt reaches the operator.
+
+    The key's sidecar (``levain.cockpit.custody``, written by ``levain cockpit key create``) names its
+    provider, which ``sign`` sets as ``SSH_SK_PROVIDER`` itself; an ``SSH_SK_PROVIDER`` in the environment
+    still wins. A passphrase key (its sidecar says so, or its file is encrypted) is always signed from the
+    file with no agent, so ssh-keygen asks the passphrase for every signature and nothing caches it."""
+    from levain.cockpit.custody import PASSPHRASE, is_encrypted_file, read_sidecar
     key_path = Path(key_path).expanduser()
     fp = fingerprint_of(signing_public_key(key_path), ssh_keygen=ssh_keygen)
+    sidecar = read_sidecar(key_path)
+    no_agent = is_encrypted_file(key_path) or (sidecar is not None and sidecar.custody == PASSPHRASE)
 
     def sign(message: bytes) -> str:
         from levain.launch import child_env
+
+        # the launch allowlist (it carries SSH_AUTH_SOCK, for an agent-held key) and a configured
+        # security key provider; stderr stays the terminal's, for the touch or passphrase prompt
+        env = child_env("SSH_SK_PROVIDER")
+        if "SSH_SK_PROVIDER" not in env and sidecar is not None and sidecar.provider is not None:
+            env["SSH_SK_PROVIDER"] = sidecar.provider
+        if no_agent:
+            env.pop("SSH_AUTH_SOCK", None)
         try:
-            # the launch allowlist (it carries SSH_AUTH_SOCK, for an agent-held key) and a configured
-            # FIDO provider; stderr stays the terminal's, for the touch prompt
             cp = subprocess.run([str(ssh_keygen), "-Y", "sign", "-f", str(key_path), "-n", NAMESPACE],
                                 input=message, stdout=subprocess.PIPE, timeout=_SIGN_TIMEOUT, check=False,
-                                env=child_env("SSH_SK_PROVIDER"))
+                                env=env)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise KeyError_(f"ssh-keygen could not sign ({type(exc).__name__})") from None
         if cp.returncode != 0:

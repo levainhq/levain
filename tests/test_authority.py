@@ -1,10 +1,10 @@
 """The authority log (trust-tiering DESIGN §3, §4.3, §3.8): verified replay, the recompute classifier,
 append, the per-process cache and the anchor.
 
-Keys are real ssh-keygen keys made in a temp directory. A laptop-presence key must be an ``sk-`` FIDO key,
-which cannot be generated without a security key attached, so most tests widen the class floor to admit
-software ed25519 keys (``_widen_laptop_floor``); the floor itself is tested on its own with the real set,
-on a public-key line constructed with an ``sk-ssh-ed25519`` blob (no private half exists for it).
+Keys are real ssh-keygen keys made in a temp directory. Every enrol states its custody (rev 6 presence
+floor, DESIGN §3.2): the software ed25519 laptop keys here declare ``passphrase`` (the replay checks the
+declared custody against the key type, never the file, which it cannot see), the rest ``unstated``. The
+``sk-`` custodies are tested on public-key lines constructed with an ``sk-`` blob (no private half exists).
 
 Every replay refusal is shown on a DIRECTLY INSERTED, validly signed link, so the rule is proven to live
 in the replay and not only in ``prepare``/``append``.
@@ -27,13 +27,6 @@ import levain.authority as auth
 from levain.authority import (AnchorError, AuthorityError, HeadBelowCache, ReplayCache, ReplayError, StaleHead)
 
 NOW = datetime(2026, 10, 12, 9, 0, tzinfo=timezone.utc)
-
-
-@pytest.fixture(autouse=True)
-def _widen_laptop_floor(monkeypatch, request):
-    """TEST ONLY: admit software ed25519 keys as laptop-presence (see the module docstring)."""
-    if "real_floor" not in request.node.name:
-        monkeypatch.setattr(auth, "_LAPTOP_KEY_TYPES", auth._LAPTOP_KEY_TYPES | {"ssh-ed25519"})
 
 
 class Key:
@@ -65,8 +58,10 @@ def conn(tmp_path):
     c.close()
 
 
-def _enrol(k: Key, cls: str) -> dict:
-    return {"op": "enrol", "fingerprint": k.fp, "public_key": k.public_key, "class": cls}
+def _enrol(k: Key, cls: str, custody: str | None = None) -> dict:
+    if custody is None:
+        custody = "passphrase" if cls == "laptop-presence" else "unstated"
+    return {"op": "enrol", "fingerprint": k.fp, "public_key": k.public_key, "class": cls, "custody": custody}
 
 
 def link(conn, op, signer: Key, *, cache=None, now=NOW, anchor=None):
@@ -171,11 +166,6 @@ def test_signer_not_enrolled_refused(base, keys):
     refused(base, "is not enrolled")
 
 
-def test_real_floor_refuses_a_software_laptop_key(conn, keys):
-    insert(conn, _enrol(keys["laptop"], "laptop-presence"), keys["laptop"])
-    refused(conn, "laptop-presence key must be one of sk-ecdsa")
-
-
 def _sk_public_key() -> str:
     def s(b: bytes) -> bytes:
         return struct.pack(">I", len(b)) + b
@@ -183,16 +173,144 @@ def _sk_public_key() -> str:
     return "sk-ssh-ed25519@openssh.com " + base64.b64encode(blob).decode()
 
 
-def test_laptop_floor_admits_an_sk_key(base, keys):
-    """The floor accepts an sk key line (the real set stays in the widened one); its fingerprint is
-    recomputed by ssh-keygen like any other."""
-    pk = _sk_public_key()
+def _sk_ecdsa_public_key(ecdsa_public_key: str) -> str:
+    """An sk-ecdsa line shaped like the Secure Enclave reference key's (``ssh-keygen -K -w
+    /usr/lib/ssh-keychain.dylib``): the point of a real nistp256 key (ssh-keygen checks it is on the
+    curve) and application ``ssh:``."""
+    def s(b: bytes) -> bytes:
+        return struct.pack(">I", len(b)) + b
+    raw = base64.b64decode(ecdsa_public_key.split()[1])
+    fields, i = [], 0
+    while i < len(raw):
+        (n,) = struct.unpack(">I", raw[i:i + 4])
+        fields.append(raw[i + 4:i + 4 + n])
+        i += 4 + n
+    blob = s(b"sk-ecdsa-sha2-nistp256@openssh.com") + s(b"nistp256") + s(fields[2]) + s(b"ssh:")
+    return "sk-ecdsa-sha2-nistp256@openssh.com " + base64.b64encode(blob).decode()
+
+
+def _line_op(pk: str, cls: str, custody: str, **extra) -> dict:
     from levain.cockpit.keys import fingerprint_of
-    fp = fingerprint_of(pk)
-    snap = link(base, {"op": "enrol", "fingerprint": fp, "public_key": pk, "class": "laptop-presence"},
-                keys["laptop"])
-    assert snap.key(fp).key_class == "laptop-presence"
+    return {"op": "enrol", "fingerprint": fingerprint_of(pk), "public_key": pk, "class": cls,
+            "custody": custody, **extra}
+
+
+def test_laptop_floor_admits_an_sk_key(base, keys):
+    """The floor accepts an sk key line; its fingerprint is recomputed by ssh-keygen like any other."""
+    pk = _sk_public_key()
+    op = _line_op(pk, "laptop-presence", "fido")
+    snap = link(base, op, keys["laptop"])
+    assert snap.key(op["fingerprint"]).key_class == "laptop-presence"
+    assert snap.key(op["fingerprint"]).custody == "fido"
     assert "no-touch-required" not in auth._signers_line("p", auth.NAMESPACE, pk)
+
+
+# --- custody (rev 6 presence floor, DESIGN §3.2 items 1-3) -----------------------------------------
+
+
+@pytest.fixture(scope="module")
+def ecdsa_key(tmp_path_factory):
+    d = tmp_path_factory.mktemp("authority-ecdsa")
+    subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-b", "256", "-N", "", "-f", str(d / "e")], check=True,
+                   capture_output=True, timeout=30)
+    return " ".join((d / "e.pub").read_text().split()[:2])
+
+
+def test_an_enrol_without_custody_is_refused_in_replay(conn, keys):
+    op = _enrol(keys["laptop"], "laptop-presence")
+    del op["custody"]
+    insert(conn, op, keys["laptop"])
+    refused(conn, "a enrol record carries exactly .*custody")
+
+
+def test_the_snapshot_holds_each_key_s_custody(base, keys):
+    snap = head(base)
+    assert snap.key(keys["laptop"].fp).custody == "passphrase"
+    assert snap.key(keys["phone"].fp).custody == "unstated"
+
+
+@pytest.mark.parametrize("custody", ["touch-id", "fido", "windows-hello"])
+def test_an_sk_custody_on_a_plain_key_is_refused(base, keys, custody):
+    insert(base, _enrol(keys["laptop2"], "laptop-presence", custody), keys["laptop"])
+    refused(base, f"custody {custody} needs a key of type sk-ecdsa-sha2-nistp256@openssh.com, "
+                  "sk-ssh-ed25519@openssh.com, not ssh-ed25519")
+
+
+@pytest.mark.parametrize("custody", ["touch-id", "fido", "windows-hello"])
+def test_an_sk_custody_on_an_sk_key_lands(base, keys, custody, ecdsa_key):
+    op = _line_op(_sk_ecdsa_public_key(ecdsa_key), "laptop-presence", custody)
+    assert link(base, op, keys["laptop"]).key(op["fingerprint"]).custody == custody
+
+
+def test_passphrase_custody_on_an_sk_key_is_refused(base, keys):
+    insert(base, _line_op(_sk_public_key(), "laptop-presence", "passphrase"), keys["laptop"])
+    refused(base, "custody passphrase needs a key of type ecdsa-sha2-nistp256, ssh-ed25519, not sk-ssh-ed25519")
+
+
+def test_tpm_custody_needs_plain_nistp256(base, keys, ecdsa_key):
+    insert(base, _enrol(keys["laptop2"], "laptop-presence", "tpm"), keys["laptop"])
+    refused(base, "custody tpm needs a key of type ecdsa-sha2-nistp256, not ssh-ed25519")
+    base.execute("DELETE FROM authority_log WHERE seq = 4")
+    op = _line_op(ecdsa_key, "laptop-presence", "tpm")
+    assert link(base, op, keys["laptop"]).key(op["fingerprint"]).custody == "tpm"
+
+
+def test_passphrase_custody_admits_nistp256(base, keys, ecdsa_key):
+    op = _line_op(ecdsa_key, "laptop-presence", "passphrase")
+    assert link(base, op, keys["laptop"]).key(op["fingerprint"]).custody == "passphrase"
+
+
+def test_fido_attested_is_refused_until_attestation_at_enrol(base, keys):
+    insert(base, _line_op(_sk_public_key(), "laptop-presence", "fido-attested"), keys["laptop"])
+    refused(base, "fido-attested is refused until attestation at enrol is built .*governed install.*"
+                  "an unattested FIDO key is custody fido")
+
+
+def test_an_unknown_custody_is_refused(base, keys):
+    insert(base, _enrol(keys["laptop2"], "laptop-presence", "yubikey"), keys["laptop"])
+    refused(base, "unknown custody 'yubikey'")
+
+
+def test_a_laptop_key_must_state_a_real_custody(conn, keys):
+    insert(conn, _enrol(keys["laptop"], "laptop-presence", "unstated"), keys["laptop"])
+    refused(conn, "a laptop-presence key must state its custody")
+
+
+def test_a_laptop_key_with_unstated_custody_is_refused_after_the_genesis_too(base, keys):
+    insert(base, _enrol(keys["laptop2"], "laptop-presence", "unstated"), keys["laptop"])
+    refused(base, "a laptop-presence key must state its custody")
+
+
+def test_a_carried_legacy_laptop_key_may_be_unstated(base, keys):
+    op = {**_enrol(keys["laptop2"], "laptop-presence", "unstated"), "legacy_enrolled_at": "2026-10-01T00:00:00.000000Z"}
+    assert link(base, op, keys["laptop"]).key(keys["laptop2"].fp).custody == "unstated"
+
+
+def test_a_carried_legacy_laptop_key_stays_inside_the_floor(base, keys, tmp_path):
+    """unstated never widens the laptop floor: a carried key's type must be one some custody admits."""
+    subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-b", "384", "-N", "", "-f", str(tmp_path / "e384")],
+                   check=True, capture_output=True, timeout=30)
+    pk = " ".join((tmp_path / "e384.pub").read_text().split()[:2])
+    insert(base, _line_op(pk, "laptop-presence", "unstated", legacy_enrolled_at="2026-10-01T00:00:00.000000Z"),
+           keys["laptop"])
+    refused(base, "key type ecdsa-sha2-nistp384 is not eligible for laptop-presence")
+
+
+@pytest.mark.parametrize("cls", ["display-phone", "presence"])
+def test_display_phone_and_presence_keys_may_be_unstated(base, keys, cls):
+    assert link(base, _enrol(keys["other"], cls, "unstated"), keys["laptop"]).key(keys["other"].fp).custody \
+        == "unstated"
+
+
+def test_the_custody_table_binds_every_class(base, keys):
+    insert(base, _enrol(keys["other"], "display-phone", "touch-id"), keys["laptop"])
+    refused(base, "custody touch-id needs a key of type sk-")
+
+
+def test_the_laptop_floor_is_the_union_of_the_custody_table():
+    assert auth._LAPTOP_KEY_TYPES == frozenset().union(*auth._CUSTODY_KEY_TYPES.values()) == {
+        "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com", "ssh-ed25519", "ecdsa-sha2-nistp256"}
+    assert set(auth.CUSTODIES) == set(auth._CUSTODY_KEY_TYPES) | {"unstated"}
 
 
 # --- the signature check (F1) ---------------------------------------------------------------------

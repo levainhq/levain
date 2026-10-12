@@ -8,8 +8,9 @@ revoked row enrolled then revoked, a /2 compromised one with ``compromised_since
 ineligible row skipped, an unconfirmed one dropped; the refusals; a run cut off between links leaving a
 store that still refuses every signed act and that a re-run finishes.
 
-A laptop-presence key must be a FIDO key, which cannot be made headless: every test widens the class
-floor to software ed25519 keys (``widen_laptop_floor``), as the run did.
+Custody (rev 6): the software ed25519 signing keys here are declared ``passphrase`` (the replay holds a
+declaration to its key type; the encrypted-file check is the CLI's, tested in ``test_cockpit_key_custody``);
+carried legacy rows are re-enrolled ``unstated``.
 """
 from __future__ import annotations
 
@@ -27,23 +28,19 @@ from levain import cli
 from levain.cockpit.firejournal import UNINITIALISED, CockpitDB
 from levain.cockpit.keys import KeyError_, enroll, init_plan, keys, ledger_init
 from levain.doctor import _check_cockpit_authority
-from tests.cockpit_authority_rig import RealKey, widen_laptop_floor
+from tests.cockpit_authority_rig import RealKey
 from tests.test_cockpit_authority_s3a2 import _as_v2, _hold_lock
 
 NOW = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
 T0 = "2026-10-01T00:00:00.000000Z"
 
 
-@pytest.fixture(autouse=True)
-def _laptop_floor(monkeypatch):
-    widen_laptop_floor(monkeypatch)
-
-
 class EcdsaKey:
-    """A software ecdsa-p256 key: not eligible for laptop-presence even with the widened floor."""
+    """A software ecdsa-p384 key: no custody admits its type, so it is not eligible for laptop-presence
+    (rev 6: the floor is the custody table's union; a p256 key is now eligible as passphrase or tpm)."""
 
     def __init__(self, d: Path, name: str) -> None:
-        subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-b", "256", "-N", "", "-f", str(d / name)],
+        subprocess.run(["ssh-keygen", "-q", "-t", "ecdsa", "-b", "384", "-N", "", "-f", str(d / name)],
                        check=True, capture_output=True, timeout=30)
         self.public = " ".join((d / f"{name}.pub").read_text().split()[:2])
         self.fingerprint = subprocess.run(["ssh-keygen", "-l", "-E", "sha256", "-f", str(d / f"{name}.pub")],
@@ -82,7 +79,8 @@ def v2(tmp_path: Path):
 
 def _init(root: Path, signer: RealKey, confirmed, *, drop: bool = False, sign=None):
     return ledger_init(root, signer_public_key=signer.public, signer_fp=signer.fingerprint,
-                       sign=sign or signer.sign_link, clock=lambda: NOW, confirmed=confirmed, drop_unlisted=drop)
+                       sign=sign or signer.sign_link, clock=lambda: NOW, confirmed=confirmed, drop_unlisted=drop,
+                       signer_custody="passphrase")
 
 
 def _db(root: Path) -> sqlite3.Connection:
@@ -111,7 +109,16 @@ def _no_tty(monkeypatch, answers: str = "", tty: bool = False) -> None:
 
 
 def _cli(*args: str) -> int:
-    return cli.main(["cockpit", "ledger", "init", *args])
+    """`ledger init` declaring the software signing key's custody passphrase (see the autouse fixture)."""
+    return cli.main(["cockpit", "ledger", "init", *args, *(() if "--custody" in args else ("--custody", "passphrase"))])
+
+
+@pytest.fixture(autouse=True)
+def _software_keys_pass_the_file_check(monkeypatch):
+    """TEST ONLY: the software keys here are unencrypted (ssh-keygen -Y sign cannot ask a passphrase in a
+    test), so the CLI's encrypted-file check is stood down; it is tested in test_cockpit_key_custody."""
+    import levain.cockpit.custody as custody_mod
+    monkeypatch.setattr(custody_mod, "passphrase_problem", lambda *a, **kw: None)
 
 
 # --- a fresh store ---------------------------------------------------------------------------------
@@ -148,7 +155,7 @@ def test_a_migrated_store_re_enrols_the_confirmed_rows(v2, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert f"dropped: {k['X'].fingerprint}" in out and f"skipped: {k['E'].fingerprint}" in out
-    assert "SKIPPED: key type ecdsa-sha2-nistp256 is not eligible for laptop-presence" in out
+    assert "SKIPPED: key type ecdsa-sha2-nistp384 is not eligible for laptop-presence" in out
     a = k["A"].fingerprint
     assert _log(root) == [
         (1, a, "enrol", a, "2026-10-01T00:00:01.000000Z", None),          # the genesis, signed by itself
@@ -254,9 +261,9 @@ def test_a_signed_enrol_refuses_before_init_naming_it_and_lands_after(v2):
     b = RealKey(root.parent, "B")
     by = {"signer_fp": k["A"].fingerprint, "sign": k["A"].sign_link, "clock": lambda: NOW}
     with pytest.raises(KeyError_, match="levain cockpit ledger init"):
-        enroll(root, b.public, "laptop-presence", **by)
+        enroll(root, b.public, "laptop-presence", custody="passphrase", **by)
     _init(root, k["A"], {k["A"].fingerprint, k["P"].fingerprint}, drop=True)
-    row, created, _ = enroll(root, b.public, "laptop-presence", **by)
+    row, created, _ = enroll(root, b.public, "laptop-presence", custody="passphrase", **by)
     assert created and row.enrolled_seq == 3
 
 
@@ -389,7 +396,7 @@ def test_doctor_warns_at_exactly_one_laptop_presence_key(tmp_path):
     [r] = _check_cockpit_authority(install)
     assert r.warn                                   # a phone key is not a second laptop-presence key
     b = RealKey(tmp_path, "B")
-    enroll(root, b.public, "laptop-presence", signer_fp=a.fingerprint, sign=a.sign_link, clock=lambda: NOW)
+    enroll(root, b.public, "laptop-presence", custody="passphrase", signer_fp=a.fingerprint, sign=a.sign_link, clock=lambda: NOW)
     [r] = _check_cockpit_authority(install)
     assert r.ok and not r.warn and r.detail.startswith("2 laptop-presence keys")
 
@@ -546,7 +553,8 @@ def test_l1c_no_link_can_land_between_the_last_transactions_head_check_and_its_d
                 race = sqlite3.connect(root / "cockpit.db", timeout=0.2, isolation_level=None)
                 try:
                     sign_and_append(race, {"op": "enrol", "fingerprint": k["X"].fingerprint,
-                                           "public_key": k["X"].public, "class": "display-phone"},
+                                           "public_key": k["X"].public, "class": "display-phone",
+                                           "custody": "unstated"},
                                     signer_fp=k["A"].fingerprint, sign=k["A"].sign_link, clock=lambda: NOW,
                                     anchor=anchor_path(root))
                     seen["raced"] = "landed"

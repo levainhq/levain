@@ -336,6 +336,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     state_p.set_defaults(func=_cmd_state)
 
+    from levain.authority import CUSTODIES as _CUSTODY_CHOICES
+
+    _CUSTODY_HELP = ("How the key is held, declared in its enrol record and shown on every listing: touch-id "
+                     "(a Secure Enclave key `levain cockpit key create` made), passphrase (an encrypted key file, "
+                     "checked), tpm, fido, windows-hello, or unstated. A declaration, never a proof. "
+                     "fido-attested is refused until attestation at enrol is built.")
     ck_p = subparsers.add_parser(
         "cockpit",
         help="Enroll, revoke and list the cockpit's signing keys, and initialise its authority log (a reported install).",
@@ -363,6 +369,9 @@ def main(argv: list[str] | None = None) -> int:
                            choices=("laptop-presence", "display-phone", "presence"),
                            help="What the key may sign (default: laptop-presence): laptop-presence "
                                 "signs T2 and T3, display-phone T2, presence nothing yet.")
+    ck_enroll.add_argument("--custody", dest="custody", default=None, choices=_CUSTODY_CHOICES,
+                           help=_CUSTODY_HELP + " Default: the key's sidecar (`levain cockpit key create` "
+                                "writes one), else unstated, which only a display-phone or presence key may be.")
     ck_enroll.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
                            help="The enrolled laptop-presence key that signs this enrolment (its private "
                                 "key file, or the .pub of a key an agent holds).")
@@ -382,6 +391,29 @@ def main(argv: list[str] | None = None) -> int:
                                 "revocation (its private key file, or the .pub of a key an agent holds).")
     _ck_common(ck_revoke)
     ck_revoke.set_defaults(func=_cmd_cockpit_revoke)
+    ck_key = ck_sub.add_parser("key", help="Make a signing key levain can vouch for the custody of.")
+    ck_key_sub = ck_key.add_subparsers(dest="key_cmd", required=True)
+    ck_create = ck_key_sub.add_parser(
+        "create",
+        help="Create a laptop-presence signing key: Touch ID (macOS) or a passphrase.",
+        description=(
+            "Create a signing key in a levain-owned 0700 directory, with a sidecar that names its custody. "
+            "touch-id (macOS): a Secure Enclave key every signature of which asks Touch ID; the identity is "
+            "confirmed biometric before anything else happens. passphrase (everywhere): an ed25519 key "
+            "encrypted with a passphrase ssh-keygen asks on the terminal; every signature asks it, and "
+            "nothing caches it. A FIDO key is an optional upgrade, enrolled with --custody fido; levain "
+            "never requires one."
+        ),
+    )
+    ck_create.add_argument("--custody", required=True, choices=("touch-id", "passphrase"),
+                           help="touch-id (macOS, Secure Enclave + Touch ID) or passphrase.")
+    ck_create.add_argument("--label", default=None,
+                           help="The key's file name and, for touch-id, its CTK identity label "
+                                "(default levain-<date>-<time>).")
+    ck_create.add_argument("--dir", type=Path, default=None,
+                           help="Where the key goes (default: <levain home>/keys, i.e. $LEVAIN_HOME/keys or "
+                                "~/.levain/keys; made 0700).")
+    ck_create.set_defaults(func=_cmd_cockpit_key_create)
     ck_keys = ck_sub.add_parser("keys", help="List enrolled keys.")
     _ck_common(ck_keys)
     ck_keys.set_defaults(func=_cmd_cockpit_keys)
@@ -403,6 +435,9 @@ def main(argv: list[str] | None = None) -> int:
     ck_init.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
                          help="The laptop-presence key that signs every link (its private key file, or the "
                               ".pub of a key an agent holds).")
+    ck_init.add_argument("--custody", dest="custody", default=None, choices=_CUSTODY_CHOICES,
+                         help=_CUSTODY_HELP + " For the signing key; default: its sidecar (`levain cockpit key "
+                              "create` writes one), else this is required.")
     ck_init.add_argument("--confirm", dest="confirm", action="append", default=[], metavar="FINGERPRINT",
                          help="Keep this key (SHA256:...); repeatable. With --confirm or --drop-unlisted "
                               "nothing is asked.")
@@ -1595,6 +1630,7 @@ def _utc_now() -> datetime:
 
 
 def _cmd_cockpit_enroll(args: argparse.Namespace) -> int:
+    from levain.cockpit.custody import declared_custody
     from levain.cockpit.keys import KeyError_, enroll, ssh_signer
 
     try:
@@ -1602,14 +1638,16 @@ def _cmd_cockpit_enroll(args: argparse.Namespace) -> int:
             raw = fh.read(_KEY_FILE_MAX + 1)
         if len(raw) > _KEY_FILE_MAX:
             raise KeyError_(f"{args.key} is larger than a public key file ({_KEY_FILE_MAX} bytes)")
+        # checked before anything is signed: the custody table, the sidecar, the encrypted file, the CTK identity
+        custody = declared_custody(args.key, args.custody, args.key_class, raw.decode("utf-8"))
         signer_fp, sign = ssh_signer(args.signing_key)
         row, created, warning = enroll(_cockpit_root(args), raw.decode("utf-8"), args.key_class,
-                                       signer_fp=signer_fp, sign=sign, clock=_utc_now)
+                                       custody=custody, signer_fp=signer_fp, sign=sign, clock=_utc_now)
     except _cockpit_refusals() as exc:
         print(f"enroll refused: {exc}", file=sys.stderr)
         return 1
-    print(f"{'enrolled' if created else 'already enrolled'}: {row.fingerprint} as {row.key_class} "
-          f"at seq {row.enrolled_seq} (principal {row.principal})")
+    print(f"{'enrolled' if created else 'already enrolled'}: {row.fingerprint} as {row.key_class}, custody "
+          f"{row.custody}, at seq {row.enrolled_seq} (principal {row.principal})")
     if warning:
         print(f"warning: {warning}", file=sys.stderr)
     return 0
@@ -1633,10 +1671,12 @@ def _cmd_cockpit_revoke(args: argparse.Namespace) -> int:
 
 
 def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
+    from levain.cockpit.custody import custody_note
     from levain.cockpit.keys import keys
 
     try:
         rows, note = keys(_cockpit_root(args), now=_utc_now())
+        notes = custody_note(rows)
     except _cockpit_refusals() as exc:
         print(f"keys: {exc}", file=sys.stderr)
         return 1
@@ -1648,10 +1688,46 @@ def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
         state = f"revoked at seq {r.revoked_seq}" if r.revoked_seq is not None else "active"
         if r.compromised_since is not None:
             state += f", compromised since seq {r.compromised_since}"
-        print(f"{r.fingerprint}  {r.key_class:<16} {state:<44} enrolled at seq {r.enrolled_seq}"
+        print(f"{r.fingerprint}  {r.key_class:<16} custody {r.custody:<14} {state:<44} enrolled at seq {r.enrolled_seq}"
               + (f" ({r.enrolled_at})" if r.enrolled_at else "")
-              + (f", first enrolled {r.legacy_enrolled_at}" if r.legacy_enrolled_at else ""))
+              + (f", first enrolled {r.legacy_enrolled_at}" if r.legacy_enrolled_at else "")
+              + (f"; {notes[r.fingerprint]}" if r.fingerprint in notes else ""))
     return 0
+
+
+def _cmd_cockpit_key_create(args: argparse.Namespace) -> int:
+    from levain.cockpit.custody import create_passphrase, create_touch_id
+    from levain.cockpit.keys import fingerprint_of
+
+    try:
+        if args.custody == "touch-id":
+            made = create_touch_id(args.dir, args.label)
+        else:
+            made = create_passphrase(args.dir, args.label)
+        fp = fingerprint_of(made.public_key)
+    except _cockpit_refusals() as exc:
+        print(f"key create refused: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("key create cancelled", file=sys.stderr)
+        return 1
+    print(f"created: {made.path} ({made.custody}, {fp})"
+          + (f"; CTK identity {made.ctk_hash}, label {made.label}" if made.ctk_hash else ""))
+    print(f"public key: {made.public_path}")
+    print(_GUARANTEE[made.custody])
+    print(f"next: `levain cockpit ledger init --signing-key {made.path}` for a new log, or `levain cockpit "
+          f"enroll {made.public_path} --signing-key <an enrolled laptop-presence key>` (the custody is read "
+          "from the key's sidecar)")
+    return 0
+
+
+# what each custody guarantees, as the CHANGELOG and README state it (DESIGN §3.2 rev 6 item 6)
+_GUARANTEE = {
+    "touch-id": "guarantee: a fingerprint per signature, on a key that cannot leave this Mac's Secure Enclave. "
+                "Declared custody, not proven: no Mac key carries attestation.",
+    "passphrase": "guarantee: a typed passphrase per signature, and nothing more: malware running as you can "
+                  "keylog it or copy the file, so this is the lowest class.",
+}
 
 
 def _ask(prompt: str) -> bool:
@@ -1662,13 +1738,17 @@ def _ask(prompt: str) -> bool:
 
 
 def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
+    from levain.authority import LAPTOP
+    from levain.cockpit.custody import declared_custody
     from levain.cockpit.keys import init_plan, ledger_init, signing_public_key, ssh_signer
 
     root = plan = None
     try:
         root = _cockpit_root(args)
-        signer_fp, sign = ssh_signer(args.signing_key)
         signer_pub = signing_public_key(args.signing_key)
+        # checked before anything is signed: the custody table, the sidecar, the encrypted file, the CTK identity
+        signer_custody = declared_custody(args.signing_key, args.custody, LAPTOP, signer_pub)
+        signer_fp, sign = ssh_signer(args.signing_key)
         plan = init_plan(root, now=_utc_now())
         if plan.migrated:
             print(f"this store was upgraded from levain-cockpit/2 and held {len(plan.rows)} key(s):")
@@ -1686,7 +1766,8 @@ def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
                     notes.append("the signing key")
                 if k.fingerprint not in {r.fingerprint for r in plan.rows}:
                     notes.append("no legacy row")
-                print(f"  seq {k.enrolled_seq}  {k.fingerprint}  {k.key_class:<16} ({'; '.join(notes)})")
+                print(f"  seq {k.enrolled_seq}  {k.fingerprint}  {k.key_class:<16} custody {k.custody} "
+                      f"({'; '.join(notes)})")
             if plan.rows:
                 print("the legacy keys:")
         for r in plan.rows:
@@ -1697,11 +1778,12 @@ def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
                 notes.append(f"in the log at seq {r.in_log.enrolled_seq}")
             if r.problem:
                 notes.append(f"SKIPPED: {r.problem}")
+            custody = signer_custody if r.fingerprint == signer_fp else "unstated"
             print(f"  {r.fingerprint}  {r.key_class:<16} {r.key_type:<36} enrolled {r.enrolled_at or '?'}  "
-                  f"({'; '.join(notes)})")
+                  f"custody {custody} ({'; '.join(notes)})")
         if not plan.seq and signer_fp not in {r.fingerprint for r in plan.rows}:
-            print(f"  {signer_fp}  {'laptop-presence':<16} {signer_pub.split()[0]:<36} the signing key "
-                  "(new: the genesis)")
+            print(f"  {signer_fp}  {'laptop-presence':<16} {signer_pub.split()[0]:<36} the signing key, custody "
+                  f"{signer_custody} (new: the genesis)")
         if args.confirm or args.drop_unlisted:
             confirmed, drop = set(args.confirm), args.drop_unlisted
         elif sys.stdin is not None and sys.stdin.isatty():
@@ -1723,7 +1805,7 @@ def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
                   "--drop-unlisted to drop the rest", file=sys.stderr)
             return 1
         result = ledger_init(root, signer_public_key=signer_pub, signer_fp=signer_fp, sign=sign, clock=_utc_now,
-                             confirmed=confirmed, drop_unlisted=drop)
+                             confirmed=confirmed, drop_unlisted=drop, signer_custody=signer_custody)
     except _cockpit_refusals() as exc:
         sys.stdout.flush()                    # the listing above, before the refusal under it
         print(f"ledger init refused: {exc}", file=sys.stderr)

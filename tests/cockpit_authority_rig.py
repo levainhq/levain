@@ -7,8 +7,9 @@ Two rigs:
   handed (capture verified it) and checks only that the log's head has not moved, so no signature is
   needed. A capture of such a log is refused, which those tests never take.
 - :class:`RealKey` + :func:`link` for broker, label and CLI tests: real ssh-keygen keys, real signed
-  links appended through ``levain.authority.sign_and_append``. A laptop-presence key must be a FIDO
-  key, which cannot be made headless, so :func:`widen_laptop_floor` admits software ed25519 keys.
+  links appended through ``levain.authority.sign_and_append``. Every enrol states its custody (rev 6):
+  a software ed25519 laptop-presence key declares ``passphrase`` (the replay holds the declaration to the
+  key type; it never sees the file), every other class ``unstated``.
 """
 from __future__ import annotations
 
@@ -48,11 +49,6 @@ def fence(authority: AuthoritySnapshot | None) -> dict:
     return authority_fence(authority)
 
 
-def widen_laptop_floor(monkeypatch) -> None:
-    """TEST ONLY: admit software ed25519 keys as laptop-presence (see the module docstring)."""
-    monkeypatch.setattr(auth, "_LAPTOP_KEY_TYPES", auth._LAPTOP_KEY_TYPES | {"ssh-ed25519"})
-
-
 class RealKey:
     """An ed25519 key made by ssh-keygen in ``d``."""
 
@@ -82,11 +78,15 @@ def link(db: CockpitDB, op: dict, signer: RealKey, *, now: datetime | None = Non
                                anchor=anchor_path(db.data_root))
 
 
+def default_custody(cls: str) -> str:
+    return "passphrase" if cls == "laptop-presence" else "unstated"
+
+
 def enrol(db: CockpitDB, key: RealKey, cls: str, *, by: RealKey | None = None,
-          now: datetime | None = None) -> AuthoritySnapshot:
+          now: datetime | None = None, custody: str | None = None) -> AuthoritySnapshot:
     """Enrol ``key`` as ``cls``, signed by ``by`` (``key`` itself for the genesis link)."""
-    return link(db, {"op": "enrol", "fingerprint": key.fingerprint, "public_key": key.public, "class": cls},
-                by or key, now=now)
+    return link(db, {"op": "enrol", "fingerprint": key.fingerprint, "public_key": key.public, "class": cls,
+                     "custody": custody or default_custody(cls)}, by or key, now=now)
 
 
 def revoke(db: CockpitDB, key: RealKey, *, by: RealKey, compromised_since: int | None = None) -> AuthoritySnapshot:
