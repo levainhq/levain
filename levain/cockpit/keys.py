@@ -386,7 +386,8 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
     still refuses every signed act; a re-run resumes from the log. A resume confirms the log's genesis
     too (whatever key wrote it), else refuses naming it; an earlier run's key that is no longer confirmed
     is revoked with ``compromised_since`` at its own enrol seq, so its seq-less /2-era fires read
-    "signed by a revoked key", the nearest the log can say to a dropped key's "unverified". A refusal
+    "signed by a revoked key", the nearest the log can say to a dropped key's "unverified"; one that run
+    already revoked without a compromise refuses unless confirmed, as no link can make it compromised. A refusal
     after a link landed says where the log stands. Only the last transaction, which finds the log's head where the last
     link left it, drops ``legacy_keys`` and clears the marker."""
     db = _journal(data_root, marker_directory=marker_directory)
@@ -435,6 +436,14 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
         if gone:
             raise KeyError_(f"{', '.join(gone)} was revoked by an earlier, interrupted init (dropped there); "
                             "a revoked key stays revoked: leave it unconfirmed")
+        # no op turns a plain revocation compromised, so dropping such a key would report "dropped" (its
+        # /2-era fires unverified) while the log keeps them "signed by a revoked key"
+        plain = [r.fingerprint for r in plan.rows if r.fingerprint not in confirmed and r.in_log is not None
+                 and r.in_log.revoked_seq is not None and r.in_log.compromised_since is None]
+        if plain:
+            raise KeyError_("; ".join(f"{fp} is already in this log, revoked by the interrupted run; confirm it to "
+                                      "keep that record (its earlier acts read as signed by a revoked key)"
+                                      for fp in plain))
 
     links: list[str] = []
     warning: str | None = None

@@ -566,3 +566,32 @@ def test_l1c_no_link_can_land_between_the_last_transactions_head_check_and_its_d
     _init(root, k["A"], {k["A"].fingerprint, k["P"].fingerprint}, drop=True)
     assert seen["head_before_drop"] is True and seen["raced"] is not None and "locked" in str(seen["raced"])
     assert len(_log(root)) == 2 and not _uninitialised(root)
+
+
+# --- the 2b-1 L3 r1 fix round (s3a2/L3_r1/findings_r1.md) ------------------------------------------
+
+def _plain_revoked_in_log(tmp_path: Path):
+    """A laptop, R phone /2-revoked without a compromise, Q phone. Run 1 confirms all three and is cut at
+    Q's enrol, after R's enrol and plain revoke landed (seq 1-3), so the store is still uninitialised."""
+    root = _fresh(tmp_path)
+    a, r, q = RealKey(tmp_path, "A"), RealKey(tmp_path, "R"), RealKey(tmp_path, "Q")
+    _as_v2(root, [_row(a, "laptop-presence", "2026-10-01T00:00:01.000000Z"),
+                  _row(r, "display-phone", "2026-10-01T00:00:02.000000Z", "2026-10-05T00:00:00.000000Z"),
+                  _row(q, "display-phone", "2026-10-01T00:00:03.000000Z")])
+    with pytest.raises(KeyboardInterrupt):
+        _init(root, a, {a.fingerprint, r.fingerprint, q.fingerprint}, sign=_cut_at(4, a))
+    assert [x[2:] for x in _log(root)][1:] == [("enrol", r.fingerprint, "2026-10-01T00:00:02.000000Z", None),
+                                               ("revoke_key", r.fingerprint, None, None)]
+    return root, a, r, q
+
+
+def test_c1_a_resume_cannot_drop_a_key_the_cut_off_run_left_plainly_revoked(tmp_path):
+    # the log holds R as a plain revocation: "dropped" would be a report the log does not back (its /2-era
+    # fires read signed by a revoked key, not unverified), and no op can turn that revocation compromised
+    root, a, r, q = _plain_revoked_in_log(tmp_path)
+    with pytest.raises(KeyError_, match=f"{re.escape(r.fingerprint)} is already in this log, revoked by the "
+                                        "interrupted run; confirm it to keep that record"):
+        _init(root, a, {a.fingerprint, q.fingerprint}, drop=True)
+    assert len(_log(root)) == 3 and _uninitialised(root)              # refused before any link
+    res = _init(root, a, {a.fingerprint, r.fingerprint, q.fingerprint})
+    assert r.fingerprint in res.kept and not res.dropped and not _uninitialised(root)
