@@ -644,3 +644,16 @@ def test_c2_a_resume_that_appends_nothing_advances_the_anchor_to_the_log_head(v2
     res = _init(root, k["A"], {k["A"].fingerprint, k["P"].fingerprint}, drop=True)
     assert res.links == () and res.warning is None and not _uninitialised(root)
     assert read_anchor(anchor_path(root)).seq == 2
+
+
+@pytest.mark.parametrize("fmt", [None, "levain-cockpit/999", "something-else"])
+def test_c3_doctor_fails_a_journal_format_it_cannot_migrate(tmp_path, fmt):
+    root = _fresh(tmp_path)
+    with _db(root) as c:
+        if fmt is None:
+            c.execute("DELETE FROM meta WHERE key = 'format'")
+        else:
+            c.execute("UPDATE meta SET value = ? WHERE key = 'format'", (fmt,))
+    [r] = _check_cockpit_authority(tmp_path / "inst")
+    assert not r.ok and f"unsupported journal format {fmt!r}" in r.detail
+    assert "this levain reads levain-cockpit/3 and migrates levain-cockpit/2" in r.detail

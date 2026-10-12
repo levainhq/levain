@@ -1096,12 +1096,12 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
     A WARNING, never a failure, while exactly one unrevoked laptop-presence key is enrolled: losing it
     leaves nothing that can enrol a successor. No row at all without a cockpit journal. The journal is
     opened read-only (SQLite may add its WAL side files beside it): a ``levain-cockpit/2`` journal is
-    reported, not migrated, and no schema is created."""
+    reported, not migrated, and no schema is created; any other format but /3 fails."""
     from datetime import datetime, timezone
 
     from levain.authority import LAPTOP, anchor_path
     from levain.cockpit.authority import RequestAuthority
-    from levain.cockpit.firejournal import DB_NAME, STORE_FORMAT
+    from levain.cockpit.firejournal import _MIGRATES_FROM, DB_NAME, STORE_FORMAT
 
     root = install / ".levain" / "cockpit"
     journal = root / DB_NAME
@@ -1112,10 +1112,14 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
         conn = sqlite3.connect(f"file:{journal}?mode=ro", uri=True, timeout=2, isolation_level=None)
         try:
             fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
-            if fmt is None or fmt[0] != STORE_FORMAT:
-                return [CheckResult(name, True, f"journal format {fmt[0] if fmt else None!r}; the next "
+            found = None if fmt is None else fmt[0]
+            if found == _MIGRATES_FROM:
+                return [CheckResult(name, True, f"journal format {found!r}; the next "
                                                 "`levain cockpit keys` (or a restarted `levain serve "
                                                 "--write`) upgrades it")]
+            if found != STORE_FORMAT:                 # missing, unknown or newer: the journal refuses it too
+                return [CheckResult(name, False, f"unsupported journal format {found!r}; this levain reads "
+                                                 f"{STORE_FORMAT} and migrates {_MIGRATES_FROM}")]
             conn.execute("BEGIN")
             auth = RequestAuthority.capture(conn, now=datetime.now(timezone.utc), anchor=anchor_path(root),
                                             source=str(journal))
