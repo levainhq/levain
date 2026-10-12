@@ -36,7 +36,10 @@ package through that package (`golang.org/x/mod v0.42.0` `sumdb/note`, `github.c
 `github.com/transparency-dev/merkle v0.0.2`, `crypto/ed25519` and `strconv`/`encoding/base64` of `go1.27.2`;
 F5's oracle is `github.com/transparency-dev/witness` `NewAddCheckpointHandler` in its own module), fails on an
 unrecognised directory or one below its minimum count, and emits Go-generated vectors that Python verifies. For F10 it
-also runs the F1-F3 layers inside every anchor levain accepts through upstream Go. `ssh-keygen` observations (F7,
+also runs the F1-F3 layers inside every anchor levain accepts through upstream Go, and fails unless the count it
+checked equals the anchors the vectors accept. The CI job fetches the Go toolchain tarball itself and checks its
+sha256 against `tests/golden/contracts/xcheck/go-toolchain.sha256`, committed in this repo from
+`https://go.dev/dl/?mode=json`, before unpacking it; `GOTOOLCHAIN=local` (T35). `ssh-keygen` observations (F7,
 F12) are checked by the Python tests, under the OpenSSH version the vectors recorded (`OpenSSH_10.3p1`).
 
 ## The frozen items

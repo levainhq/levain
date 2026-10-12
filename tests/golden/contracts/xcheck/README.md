@@ -20,8 +20,11 @@ Run locally (with a Go toolchain from https://go.dev/dl/ on `PATH`):
 `-emit` writes vectors made by upstream Go (signed notes, a team checkpoint, cosignatures, Merkle proofs) for
 `tests/test_contracts_gogen.py` to verify in Python.
 
-CI: the `xcheck` job in `.github/workflows/contracts-xcheck.yml` (actions/setup-go with this `go.mod`'s version)
-runs both commands on every push to `main` and `seat/**`.
+CI: the `xcheck` job in `.github/workflows/contracts-xcheck.yml` runs both commands on every push to `main` and
+`seat/**`. It does not use actions/setup-go: it downloads the `go1.27.2.linux-amd64` tarball from https://go.dev/dl/,
+checks it with `sha256sum --check --strict` against `go-toolchain.sha256` (committed here; the value was fetched once
+from https://go.dev/dl/?mode=json on 2026-10-12) before unpacking it, and runs with `GOTOOLCHAIN=local` (T35).
+`tests/test_contracts_ci.py` pins the order and that the pin's version is both modules' `go` directive.
 
 `ssh-keygen -lf` (F7), `ssh-keygen -Y check-novalidate` (F12) and `no_upstream` vectors are counted, not run, here:
 the Python tests check them.
