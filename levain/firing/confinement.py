@@ -5180,7 +5180,8 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], lis
             elif child.name.startswith("S.") and child.name not in _GNUPG_HOME_SOCKETS:
                 continue   # dirmngr's, the agent's forwarding sockets, or one of those names as a file
             elif stat.S_ISSOCK(st.st_mode):
-                ops += ["--bind", str(child), str(child)]
+                if child.name in _GNUPG_HOME_SOCKETS:   # a socket by any other name stays out
+                    ops += ["--bind", str(child), str(child)]
             elif stat.S_ISREG(st.st_mode):
                 ops += ["--bind", str(child), str(child)]
     return ops, roots + homes, pins
