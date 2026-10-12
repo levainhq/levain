@@ -1009,6 +1009,7 @@ body.ke .deck { max-width: var(--page-max); margin: 0 auto; }
 
 /* HERO: the first block on the page. The clock column (brand, time, date, events, weather) and the sky beside it,
    the nav bar's modes / unit / live / sync / jump as a slim strip above the sky. */
+body.ke .hero > .ck-region-err { grid-column: 1 / -1; padding: var(--s2) var(--gutter); }
 body.ke .hero { display: grid; grid-template-columns: 340px minmax(0, 1fr); border-bottom: 1px solid var(--hair);
   background: radial-gradient(1200px 520px at 75% 130%, var(--sky-lo) 0%, var(--base) 70%); }
 body.ke .hero .when { padding: var(--s3) var(--s3) var(--s3) var(--gutter); border-right: 1px solid var(--hair);

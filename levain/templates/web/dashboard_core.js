@@ -452,6 +452,20 @@
   const CK_SIZES = ["short", "medium", "tall"];   // ascending height; a grid row is as tall as its tallest card
   const CK_COLUMNS = 3;
   const tabChoice = new Map();                     // zone/title -> the tab the operator chose, kept across renders
+  // the two structural nodes the KE page moves into its regions. A region that fails restores its own node here, BEFORE
+  // anything is cleared, so no catch can strand them inside a region it is about to wipe.
+  function restoreState() {
+    const state = document.getElementById("state"), store = document.getElementById("store");
+    if (state && store && store.parentNode && state.parentNode !== store.parentNode) store.parentNode.insertBefore(state, store);
+  }
+  function restoreMasthead() {
+    const mast = document.querySelector("header.masthead"), brand = document.querySelector(".brand");
+    const state = document.getElementById("state"), store = document.getElementById("store");
+    if (!mast || !store || !store.parentNode) return;
+    if (brand && !mast.contains(brand)) mast.insertBefore(brand, mast.firstChild);
+    const anchor = state && state.parentNode === store.parentNode ? state : store;
+    if (mast.parentNode !== store.parentNode || mast.nextSibling !== anchor) store.parentNode.insertBefore(mast, anchor);
+  }
   function keShell(on) {
     const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
     if (!hero || !brief || !widgets) return;
@@ -461,11 +475,8 @@
     if (bd) bd.classList.toggle("ke", on);
     if (on) return;
     // back to the pre-KE page: the brand, the masthead and the state line return to where the static page put them
-    const mast = document.querySelector("header.masthead"), brand = document.querySelector(".brand"), state = document.getElementById("state");
-    const store = document.getElementById("store");
-    if (!mast || !store) return;
-    if (brand && !mast.contains(brand)) mast.insertBefore(brand, mast.firstChild);
-    if (mast.parentNode !== store.parentNode || mast.nextSibling !== state) { store.parentNode.insertBefore(mast, store); store.parentNode.insertBefore(state, store); }
+    restoreState();
+    restoreMasthead();
     // what the regions drew is stale once the page is no longer the KE page
     for (const id of ["ck-when", "ck-sky", "ck-brief", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
   }
@@ -522,21 +533,25 @@
     const brand = document.querySelector(".brand");
     const clock = el("div", "clock num"), date = el("div", "date"), events = el("div", "events");
     clock.dataset.ckHero = "clock"; date.dataset.ckHero = "date"; events.dataset.ckHero = "events";
-    when.replaceChildren();
-    if (brand) when.appendChild(brand);
+    // everything that can throw is built off the page; the structural mounts (when, strip, sky) and the masthead
+    // are touched only once all of it exists
+    const whenKids = [], skyKids = [];
     const stamp = el("div", "clockbox");
     stamp.append(clock, date);
-    when.append(stamp, events);
+    whenKids.push(stamp, events);
     if (window.LevainCockpitKinds) window.LevainCockpitKinds.mountClock(clock, date);
     if (wx) {
       const node = bareNode(wx, view, "wx");
       node.dataset.ckHero = "weather";
-      when.appendChild(node);
-    } else when.appendChild(Object.assign(el("div", "wx"), { hidden: true }));
+      whenKids.push(node);
+    } else whenKids.push(Object.assign(el("div", "wx"), { hidden: true }));
+    if (sky) skyKids.push(bareNode(sky, view, "ck-sky", { hero: { events: events } }));
+    for (const e of entries) if (e !== wx && e !== sky) skyKids.push(bareNode(e, view, "ck-card"));
+    when.replaceChildren();
+    if (brand) when.appendChild(brand);
+    when.append(...whenKids);
     if (mast) strip.replaceChildren(mast);
-    skyHost.replaceChildren();
-    if (sky) skyHost.appendChild(bareNode(sky, view, "ck-sky", { hero: { events: events } }));
-    for (const e of entries) if (e !== wx && e !== sky) skyHost.appendChild(bareNode(e, view, "ck-card"));
+    skyHost.replaceChildren(...skyKids);
     hero.hidden = false;
   }
 
@@ -545,11 +560,9 @@
     const state = document.getElementById("state");
     const card = el("div", "ck-card ck-briefcard");
     const entries = view.ke.brief.map((id) => byId.get(id)).filter(Boolean);
+    const bodies = entries.map((e) => bareNode(e, view, "ck-brief-body", { region: "brief" }));   // may throw: #state has not moved yet
     if (state) { state.dataset.ckPanel = "state"; state.dataset.ckKind = "line"; card.appendChild(state); }
-    for (const e of entries) {
-      const node = bareNode(e, view, "ck-brief-body", { region: "brief" });
-      card.appendChild(node);
-    }
+    for (const node of bodies) card.appendChild(node);
     region.replaceChildren(card);
     // no brief entries and no state worth showing: no card (an operator who can set the state keeps the card for its set button)
     const st = view.state;
@@ -558,10 +571,8 @@
 
   function renderWidgets(view, byId) {
     const region = document.getElementById("ck-widgets");
-    region.replaceChildren();
     const entries = view.ke.widgets.map((id) => byId.get(id)).filter(Boolean);
-    region.hidden = !entries.length;
-    region.style.setProperty("--ck-n", String(Math.max(1, entries.length)));
+    const cards = [];
     for (const e of entries) {
       const data = (view.extra_panels || {})[e.id] || {};
       const node = el("div", "ck-card w");
@@ -571,8 +582,11 @@
       // the card is the node the page grades; the typed mount inside it carries the kind class
       body.removeAttribute("data-ck-panel"); body.removeAttribute("data-ck-kind");
       node.appendChild(body);
-      region.appendChild(node);
+      cards.push(node);
     }
+    region.replaceChildren(...cards);
+    region.hidden = !entries.length;
+    region.style.setProperty("--ck-n", String(Math.max(1, entries.length)));
   }
 
   function ckPlaceholder(entry) {
@@ -665,19 +679,30 @@
     show();
   }
 
-  // each region is drawn on its own: one that throws shows a one-line error where it stood and the rest still draw
-  function guardRegion(name, draw, show) {
+  // Each region is drawn on its own, under ONE rule: it builds its fallible content off the page and attaches it last
+  // (structural nodes, the masthead and #state, move only then). So a throw leaves the page as it was, the region's
+  // `restore` hands any structural node it owns back to its non-KE home, and the catch writes a line into the region's
+  // dedicated error child. `fill` regions (the brief, the widgets) have no structural children and show only the error;
+  // the hero keeps its mounts and gains the error line beside them. A zone passes its own `show`.
+  function guardRegion(name, draw, show, restore) {
     try { draw(); } catch (e) {
-      show(el("p", "err", "unavailable — " + name + " could not be drawn (" + (e && e.message ? e.message : "bad data") + ")"));
+      if (restore) restore();
+      show(el("p", "err ck-region-err", "unavailable — " + name + " could not be drawn (" + (e && e.message ? e.message : "bad data") + ")"));
     }
   }
+  const regionErr = (id, fill) => (node) => {
+    const h = document.getElementById(id); if (!h) return;
+    h.hidden = false;
+    if (fill) h.replaceChildren(node);   // only after the region's restore ran: nothing structural is left inside
+    else { for (const old of h.querySelectorAll(":scope > .ck-region-err")) old.remove(); h.appendChild(node); }
+  };
   function renderKe(view, board) {
     const byId = new Map();
     for (const e of view.layout) byId.set(e.id, e);
-    const into = (id) => (node) => { const h = document.getElementById(id); if (h) { h.hidden = false; h.replaceChildren(node); } };
-    guardRegion("the hero", () => renderHero(view, byId), into("ck-hero"));
-    guardRegion("the brief", () => renderBriefRegion(view, byId), into("ck-brief"));
-    guardRegion("the widgets", () => renderWidgets(view, byId), into("ck-widgets"));
+    for (const old of document.querySelectorAll("#ck-hero > .ck-region-err")) old.remove();   // a clean hero render clears its last error line
+    guardRegion("the hero", () => renderHero(view, byId), regionErr("ck-hero", false), restoreMasthead);
+    guardRegion("the brief", () => renderBriefRegion(view, byId), regionErr("ck-brief", true), restoreState);
+    guardRegion("the widgets", () => renderWidgets(view, byId), regionErr("ck-widgets", true));
     // a zone builds its section off to the side and attaches it last, so a throw leaves nothing half-drawn behind
     for (const zone of view.ke.zones) guardRegion(zone.title, () => renderZone(zone, view, byId, board), (node) => board.appendChild(node));
   }
@@ -923,6 +948,14 @@
   // operator-I/O class — seed/handoff/agenda), Open Loops + Keep badge the `tier`. `verbs`
   // rides only on a Class-B panel (Open Loops in 3a; Tray + Keep render read-only until 3b
   // turns on the governed dump/sort/park verbs — edit_class "" → isVerbPanel false → none).
+  // The ONE place a verb-bearing row takes its verbs: every row kind (spore, episode, pending cancel) passes through
+  // here. On the KE page the verbs are clipped until the row is hovered or has focus, so the row itself must be
+  // focusable (tabIndex 0) or a keyboard user never reaches them.
+  function appendRowVerbs(row, group) {
+    if (document.body.classList.contains("ke")) row.tabIndex = 0;
+    row.appendChild(group);
+    return row;
+  }
   function sporeRow(s, verbs, badgeField, panelKind) {
     const row = el("div", "row");
     if (s.row_id) row.dataset.rowKey = s.row_id;   // where a transport notice lands after the board is rebuilt
@@ -943,9 +976,8 @@
       if (isOverdue(s.next)) due.setAttribute("data-ck-tag-state", "overdue");
       row.appendChild(due);
     }
-    if (document.body.classList.contains("ke")) row.tabIndex = 0;   // the KE page: the keyboard-current row shows its verbs while it has focus
     if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
-    if (verbs && s.id) row.appendChild(buildSporeVerbs(s, panelKind));
+    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind));
     return row;
   }
 
@@ -1132,7 +1164,7 @@
     row.appendChild(el("span", "muted", datePart(e.timestamp)));
     // a row that lists its actions offers only those; a row without the field (the legacy path) keeps the panel's
     const offers = !Array.isArray(e.actions) || e.actions.some((a) => a && a.verb === "episode_tombstone");
-    if (verbs && e.id && offers) row.appendChild(buildEpisodeVerbs(e));
+    if (verbs && e.id && offers) appendRowVerbs(row, buildEpisodeVerbs(e));
     return row;
   }
 
@@ -2579,7 +2611,7 @@
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.meta) row.appendChild(el("span", "ext-meta", String(o.meta)));
       appendClause(row, o.text != null ? String(o.text) : "");  // per-item expand, like episodes
-      if (o.cancel && cancelPending) row.appendChild(buildPendingCancel(o.cancel));
+      if (o.cancel && cancelPending) appendRowVerbs(row, buildPendingCancel(o.cancel));
       host.appendChild(row);
     }
   }
