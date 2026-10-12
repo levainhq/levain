@@ -119,7 +119,8 @@ class StaleHead(AuthorityError):
 
 
 class HeadBelowCache(AuthorityError):
-    """The log is behind (or diverges below) a head this process already verified."""
+    """The log differs, at or below a seq both hold, from the chain this process already verified (a
+    rewrite). A log that is merely shorter is a prefix and is served (see :class:`ReplayCache`)."""
 
 
 class AnchorError(AuthorityError):
@@ -794,13 +795,6 @@ def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: 
     return _apply_policy_op(state.policy, rec)
 
 
-def _replay_from(state: AuthoritySnapshot | None, rows: list[_Row], *, ssh_keygen: Path | str) \
-        -> AuthoritySnapshot | None:
-    for row in rows:
-        state = _step(state, row, ssh_keygen=ssh_keygen)
-    return state
-
-
 def _db_identity(conn: sqlite3.Connection) -> str:
     for _seq, name, path in conn.execute("PRAGMA database_list"):
         if name == "main":
@@ -810,15 +804,23 @@ def _db_identity(conn: sqlite3.Connection) -> str:
 
 @dataclass(frozen=True)
 class _Entry:
-    snapshot: AuthoritySnapshot
+    """A verified chain: the state after every link, and the digest of every row."""
+    states: tuple[AuthoritySnapshot, ...]
     digests: tuple[str, ...]
+
+    @property
+    def snapshot(self) -> AuthoritySnapshot:
+        return self.states[-1]
 
 
 class ReplayCache:
-    """Per-process verified heads, keyed by store, each held as ``(seq, head_hash)`` with the digest of
-    every row it verified. A log whose rows match a cached prefix verifies only its suffix. A log behind
-    the cached head, or differing from it below the head, is refused: the cache never re-verifies
-    downward."""
+    """Per-process verified chains, keyed by store: the state after each link and the digest of each
+    row. A log whose rows match the cached chain verifies only its suffix. A log that is a
+    digest-matching PREFIX of the cached chain is served its own head from the cache: that is a reader
+    whose transaction began before a concurrent append (a busy cockpit), and its view is a state this
+    process already verified. A log that differs from the chain at or below a seq both hold is refused
+    (:class:`HeadBelowCache`). A log truncated to a prefix reads as that prefix; the anchor, not this
+    cache, is what refuses a rollback (:func:`check_anchor`)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -860,28 +862,36 @@ def _genesis_store_id(rows: list[_Row]) -> str:
     return store_id if isinstance(store_id, str) else ""
 
 
-def _replay(conn: sqlite3.Connection, cache: ReplayCache, ssh_keygen: Path | str) -> AuthoritySnapshot | None:
+def _replay_entry(conn: sqlite3.Connection, cache: ReplayCache, ssh_keygen: Path | str) -> _Entry | None:
     rows = _rows(conn)
     if not rows:
         return None
     key = (_db_identity(conn), _genesis_store_id(rows))
     entry = cache._load(key)
-    state: AuthoritySnapshot | None = None
-    start = 0
+    digests = tuple(r.digest() for r in rows)
+    states: tuple[AuthoritySnapshot, ...] = ()
     if entry is not None:
-        n = entry.snapshot.seq
-        if len(rows) < n:
-            raise HeadBelowCache(f"the authority log has {len(rows)} links, below the head this process "
-                                 f"verified (seq {n}); it was truncated or restored")
-        if tuple(r.digest() for r in rows[:n]) != entry.digests:
-            raise HeadBelowCache(f"the authority log differs from the head this process verified (seq {n}) "
-                                 "at or below that head; it was rewritten")
-        state, start = entry.snapshot, n
-    state = _replay_from(state, rows[start:], ssh_keygen=ssh_keygen)
-    assert state is not None
-    if start < len(rows):
-        cache._store(key, _Entry(state, tuple(r.digest() for r in rows)))
-    return state
+        n = len(entry.digests)
+        both = min(n, len(rows))
+        if digests[:both] != entry.digests[:both]:
+            raise HeadBelowCache(f"the authority log differs from the chain this process verified (to seq {n}) "
+                                 f"at or below seq {both}; it was rewritten")
+        if len(rows) <= n:
+            return _Entry(entry.states[:len(rows)], digests)
+        states = entry.states
+    state = states[-1] if states else None
+    grown = list(states)
+    for row in rows[len(states):]:
+        state = _step(state, row, ssh_keygen=ssh_keygen)
+        grown.append(state)
+    out = _Entry(tuple(grown), digests)
+    cache._store(key, out)
+    return out
+
+
+def _replay(conn: sqlite3.Connection, cache: ReplayCache, ssh_keygen: Path | str) -> AuthoritySnapshot | None:
+    entry = _replay_entry(conn, cache, ssh_keygen)
+    return None if entry is None else entry.snapshot
 
 
 def snapshot(conn: sqlite3.Connection, *, cache: ReplayCache | None = None,
@@ -976,7 +986,8 @@ def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now:
     cache = PROCESS_CACHE if cache is None else cache
     conn.execute("BEGIN IMMEDIATE")
     try:
-        state = _replay(conn, cache, ssh_keygen)
+        entry = _replay_entry(conn, cache, ssh_keygen)
+        state = None if entry is None else entry.snapshot
         if anchor is not None:
             current = read_anchor(anchor)
             if state is None and current is not None:
@@ -996,7 +1007,6 @@ def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now:
         conn.execute("INSERT INTO authority_log (seq, prev_hash, record, signer_fp, signature, hash) "
                      "VALUES (?, ?, ?, ?, ?, ?)",
                      (row.seq, row.prev_hash, row.record, row.signer_fp, row.signature, row.hash))
-        digests = tuple(r.digest() for r in _rows(conn))
         conn.execute("COMMIT")
     except BaseException:
         try:
@@ -1004,7 +1014,9 @@ def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now:
         except sqlite3.Error:
             pass
         raise
-    cache._store((_db_identity(conn), new.store_id), _Entry(new, digests))
+    prior = _Entry((), ()) if entry is None else entry
+    cache._store((_db_identity(conn), new.store_id),
+                 _Entry(prior.states + (new,), prior.digests + (row.digest(),)))
     if anchor is not None:
         try:
             advance_anchor(anchor, new)

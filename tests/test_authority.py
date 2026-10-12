@@ -635,13 +635,36 @@ def test_cache_verifies_only_the_suffix(base, keys, monkeypatch):
     assert len(calls) == 1
 
 
-def test_cache_refuses_a_head_below_its_cached_seq(granted):
+def test_a_stale_reader_is_served_its_own_head(granted, keys, tmp_path):
+    """F9: a reader whose transaction began before a concurrent append (same process, same cache) gets
+    the state at its own head, from the cache, instead of HeadBelowCache."""
+    granted.execute("PRAGMA journal_mode=WAL")                 # as the cockpit store runs: readers never block
     cache = ReplayCache()
-    auth.snapshot(granted, cache=cache)
+    before = auth.snapshot(granted, cache=cache)
+    reader = sqlite3.connect(tmp_path / "cockpit.db", isolation_level=None)
+    try:
+        reader.execute("BEGIN")
+        assert auth.snapshot(reader, cache=cache).seq == 4                 # the read snapshot is fixed
+        after = link(granted, {"op": "raise", "verb": "a", "tier": "T3"}, keys["phone"], cache=cache)
+        assert after.seq == 5 and auth.snapshot(granted, cache=cache).seq == 5
+        stale = auth.snapshot(reader, cache=cache)
+        assert (stale.seq, stale.head_hash) == (before.seq, before.head_hash) and stale.policy == before.policy
+        reader.execute("COMMIT")
+        assert auth.snapshot(reader, cache=cache).seq == 5
+    finally:
+        reader.close()
+
+
+def test_a_truncated_log_reads_as_its_prefix_and_the_anchor_refuses_it(granted, tmp_path):
+    """F9's price: the cache no longer tells a truncation from a stale reader; the anchor does."""
+    a = auth.anchor_path(tmp_path)
+    cache = ReplayCache()
+    auth.advance_anchor(a, auth.snapshot(granted, cache=cache))
     granted.execute("DELETE FROM authority_log WHERE seq = 4")
-    head(granted)                                   # a cold replay accepts the shorter, valid log
-    with pytest.raises(HeadBelowCache, match="below the head this process verified"):
-        auth.snapshot(granted, cache=cache)
+    snap = auth.snapshot(granted, cache=cache)
+    assert snap.seq == 3
+    with pytest.raises(AnchorError, match="behind its anchor"):
+        auth.check_anchor(snap, auth.read_anchor(a))
 
 
 def test_cache_refuses_a_rewrite_below_its_head(granted, keys):
