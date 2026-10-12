@@ -1010,12 +1010,16 @@ def _unavailable(exc_info) -> None:
 
 
 def test_fingerprint_oserror_is_verifier_unavailable_not_a_replay_error(base, monkeypatch):
-    import levain.cockpit.keys as cockpit_keys
+    # The OSError comes from below fingerprint_of (its ssh-keygen -l), the path a real caller takes:
+    # fingerprint_of turns it into VerifierUnavailable itself.
+    real = subprocess.run
 
-    def gone(*a, **k):
-        raise FileNotFoundError(2, "No such file or directory", "ssh-keygen")
+    def run(argv, *a, **k):
+        if "-l" in argv:
+            raise FileNotFoundError(2, "No such file or directory", argv[0])
+        return real(argv, *a, **k)
 
-    monkeypatch.setattr(cockpit_keys, "fingerprint_of", gone)
+    monkeypatch.setattr(subprocess, "run", run)
     with pytest.raises(AuthorityError) as exc:
         head(base)
     _unavailable(exc)
