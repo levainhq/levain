@@ -1,0 +1,979 @@
+"""levain.authority: the one signed authority log (trust-tiering DESIGN §3, §4).
+
+Who may sign what, and the standing policy, are not stored anywhere: they are what a VERIFIED REPLAY of
+``authority_log`` says. Each link is canonical JSON, hash-chained to its predecessor and signed (SSHSIG,
+namespace :data:`NAMESPACE`) by a key the replay has enrolled. Every link is judged against the state at
+its predecessor: its chain position, its signature, its signer's class and every op rule. A key revoked at
+seq N signs nothing after N, and the links it signed before N stay valid (no retroactive voiding).
+
+A policy link is classified by RECOMPUTE: the declared op is applied to the replayed policy and the
+difference is classified on its own (:func:`classify`). A declared op that disagrees with the computed
+delta is refused, and so is a link that changes nothing.
+
+The anchor (``authority.anchor`` beside the store) is written only after a commit, so it lags and never
+leads; a log behind it refuses to open.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import secrets
+import sqlite3
+import subprocess
+import tempfile
+import threading
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any
+
+from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_problem
+
+__all__ = [
+    "ANCHOR_NAME", "FORMAT", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
+    "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
+    "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead",
+    "UnsignedLink", "append", "advance_anchor", "anchor_path", "check_anchor", "classify", "create_schema",
+    "genesis_policy", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
+    "snapshot", "verify_anchor_reset", "verify_link_sig",
+]
+
+FORMAT = "levain-authority/1"
+# never the cockpit's or the confirm gate's namespace: a link signature verifies as nothing else
+NAMESPACE = "levain-authority"
+RESET_FORMAT = "levain-authority-reset/1"
+RESET_NAMESPACE = "levain-authority-reset"
+ANCHOR_NAME = "authority.anchor"
+ANCHOR_FORMAT = "levain-authority-anchor/1"
+
+SCHEMA = ("CREATE TABLE IF NOT EXISTS authority_log (seq INTEGER PRIMARY KEY, prev_hash TEXT NOT NULL, "
+          "record TEXT NOT NULL, signer_fp TEXT NOT NULL, signature TEXT NOT NULL, hash TEXT NOT NULL UNIQUE)")
+
+LAPTOP = "laptop-presence"
+# The class floor (§3.2): a laptop-presence key must be a FIDO key, which ssh-keygen verifies with the
+# user-presence flag required because the signers line never carries ``no-touch-required``. It stops an
+# accidental weak enrolment; it does not prove hardware custody.
+_LAPTOP_KEY_TYPES = frozenset({"sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"})
+
+# Delta kinds the recompute classifier returns (§4.3).
+NOOP, TIGHTEN, LOOSEN, RENEW, GRANT_REVOKE = "noop", "tighten", "loosen", "renew", "grant_revoke"
+# the signer rank each delta needs: T2 = display-phone, T3 = laptop-presence, a revoke any enrolled key
+_DELTA_RANK = {TIGHTEN: 2, RENEW: 2, LOOSEN: 3, GRANT_REVOKE: 1}
+# what each declared policy op must compute to
+_OP_DELTAS = {"raise": {TIGHTEN}, "revoke_grant": {GRANT_REVOKE}, "renew": {RENEW}, "loosen": {LOOSEN},
+              "create_grant": {LOOSEN}, "timeouts": {TIGHTEN, LOOSEN}}
+
+_BASE_FIELDS = frozenset({"format", "store_id", "seq", "at", "op"})
+# per op: (required fields, optional fields), beyond the base
+_OP_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "enrol": (frozenset({"fingerprint", "public_key", "class"}), frozenset({"legacy_enrolled_at"})),
+    "revoke_key": (frozenset({"fingerprint"}), frozenset({"compromised_since"})),
+    "raise": (frozenset({"verb", "tier"}), frozenset()),
+    "loosen": (frozenset({"policy"}), frozenset()),
+    "revoke_grant": (frozenset({"grant_id"}), frozenset()),
+    "renew": (frozenset({"grant_id", "expires_at", "signed_at"}), frozenset()),
+    "create_grant": (frozenset({"grant"}), frozenset()),
+    "timeouts": (frozenset({"timeouts"}), frozenset()),
+}
+_GRANT_FIELDS = frozenset({"id", "entity", "remote_url", "deploy_key_sha256", "refspecs", "verbs", "expires_at"})
+_GRANT_VERBS = frozenset({"push", "fetch"})
+# a branch glob only: no force (+), no src:dst, no deletion (empty source)
+_REFSPEC = re.compile(r"refs/heads/[A-Za-z0-9._/*-]+")
+_STORE_ID = re.compile(r"[A-Za-z0-9-]{8,64}")
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+_FP = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
+_RENEW_MAX = timedelta(days=30)
+_RENEW_SKEW = timedelta(minutes=10)
+_MAX_SIGNATURE = 16384
+
+
+class AuthorityError(Exception):
+    """A refused authority act or an unusable log; the message is operator-facing."""
+
+
+class ReplayError(AuthorityError):
+    """A link the replay refuses. ``seq`` is the link's position."""
+
+    def __init__(self, seq: int, why: str) -> None:
+        super().__init__(f"authority log link {seq}: {why}")
+        self.seq = seq
+
+
+class NotInitialised(AuthorityError):
+    """The log has no links: nothing may be signed until ``levain cockpit ledger init``."""
+
+
+class StaleHead(AuthorityError):
+    """The head moved between preparing a link and appending it: re-prepare and re-sign."""
+
+
+class HeadBelowCache(AuthorityError):
+    """The log is behind (or diverges below) a head this process already verified."""
+
+
+class AnchorError(AuthorityError):
+    """The anchor refuses this log."""
+
+
+def _ranks() -> Mapping[str, int]:
+    # imported at use: the cockpit modules will import this one
+    from levain.cockpit.firejournal import _CLASS_RANK
+    return _CLASS_RANK
+
+
+def _tiers() -> tuple[str, ...]:
+    from levain.cockpit.verbs import TIERS
+    return TIERS
+
+
+def _stamp(when: datetime) -> str:
+    from levain.cockpit.consent import utc_stamp
+    return utc_stamp(when)
+
+
+def _parse_stamp(text: Any, what: str) -> datetime:
+    from levain.cockpit.consent import parse_stamp
+    if not isinstance(text, str):
+        raise AuthorityError(f"{what} is not a timestamp")
+    try:
+        when = parse_stamp(text)
+    except Exception:  # noqa: BLE001 - any parse failure is the same refusal
+        raise AuthorityError(f"{what} {text[:40]!r} is not a timestamp") from None
+    if _stamp(when) != text:
+        raise AuthorityError(f"{what} {text[:40]!r} is not in the one timestamp form")
+    return when
+
+
+def _canonical(obj: Any) -> str:
+    # sort_keys + compact separators + ensure_ascii=False: one byte form per record
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _link_hash(prev_hash: str, record: str) -> str:
+    return hashlib.sha256((prev_hash + record).encode("utf-8")).hexdigest()
+
+
+def _message(prev_hash: str, record: str) -> bytes:
+    return (prev_hash + "\n" + record).encode("utf-8")
+
+
+def create_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(SCHEMA)
+
+
+# ---------------------------------------------------------------------------------------------------
+# state
+
+
+@dataclass(frozen=True)
+class AuthorityKey:
+    fingerprint: str
+    public_key: str
+    key_class: str
+    enrolled_seq: int
+    revoked_seq: int | None = None
+    compromised_since: int | None = None
+    legacy_enrolled_at: str | None = None
+
+    @property
+    def principal(self) -> str:
+        from levain.cockpit.keys import principal_of
+        return principal_of(self.fingerprint)
+
+    @property
+    def active(self) -> bool:
+        return self.revoked_seq is None
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
+def _thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {k: _thaw(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(v) for v in value]
+    return value
+
+
+@dataclass(frozen=True)
+class AuthorityPolicy:
+    """The standing policy a replay derives: verb tier raises, per-kind timeout defaults (carried, their
+    semantics are S4b's) and egress grants (carried, consumed by S5)."""
+    raise_to: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    timeouts: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    grants: Mapping[str, Mapping[str, Any]] = field(default_factory=lambda: MappingProxyType({}))
+
+    def apply(self, verb: str, tier: str) -> str:
+        """``tier`` raised to this policy's floor for ``verb`` (never lowered)."""
+        floor = self.raise_to.get(verb)
+        if floor is None:
+            return tier
+        tiers = _tiers()
+        return max(tier, floor, key=tiers.index)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"raise_to": _thaw(self.raise_to), "timeouts": _thaw(self.timeouts), "grants": _thaw(self.grants)}
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> AuthorityPolicy:
+        return cls(_freeze(dict(data["raise_to"])), _freeze(dict(data["timeouts"])),
+                   _freeze(dict(data["grants"])))
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, AuthorityPolicy) and _canonical(self.as_dict()) == _canonical(other.as_dict())
+
+    def __hash__(self) -> int:
+        return hash(_canonical(self.as_dict()))
+
+
+def genesis_policy() -> AuthorityPolicy:
+    """The policy before any policy link: the shipped frozen ``verbs.Policy()`` values."""
+    from levain.cockpit.verbs import Policy
+    shipped = Policy()
+    return AuthorityPolicy(raise_to=_freeze(dict(shipped.raise_to)))
+
+
+@dataclass(frozen=True)
+class AuthoritySnapshot:
+    """The replayed state at ``seq``/``head_hash``. ``keys`` holds every key ever enrolled, revoked ones
+    included (``revoked_seq`` set), because a revoked key may never be enrolled again."""
+    store_id: str
+    seq: int
+    head_hash: str
+    keys: Mapping[str, AuthorityKey]
+    policy: AuthorityPolicy
+    _hashes: tuple[str, ...] = field(repr=False, default=())
+
+    def key(self, fingerprint: str) -> AuthorityKey | None:
+        return self.keys.get(fingerprint)
+
+    def active_keys(self) -> list[AuthorityKey]:
+        return [k for k in self.keys.values() if k.active]
+
+    def hash_at(self, seq: int) -> str | None:
+        return self._hashes[seq - 1] if 1 <= seq <= len(self._hashes) else None
+
+
+@dataclass(frozen=True)
+class _Row:
+    seq: Any
+    prev_hash: Any
+    record: Any
+    signer_fp: Any
+    signature: Any
+    hash: Any
+
+    def digest(self) -> str:
+        return hashlib.sha256(_canonical([self.seq, self.prev_hash, self.record, self.signer_fp,
+                                          self.signature, self.hash]).encode("utf-8")).hexdigest()
+
+
+def _rows(conn: sqlite3.Connection) -> list[_Row]:
+    cur = conn.execute("SELECT seq, prev_hash, record, signer_fp, signature, hash FROM authority_log ORDER BY seq")
+    return [_Row(*r) for r in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------------------------------
+# signatures
+
+
+def _signers_line(principal: str, namespace: str, public_key: str) -> str:
+    # no options: in particular never ``no-touch-required``, so an sk key's user-presence flag is required
+    return f'{principal} namespaces="{namespace}" {public_key}\n'
+
+
+def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerprint: str,
+                    namespace: str = NAMESPACE, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                    timeout: float = 10.0) -> bool:
+    """True only if ``signature`` is an SSHSIG over ``message`` in ``namespace`` by ``public_key``, and
+    the verifier reports exactly ``fingerprint`` for the key it verified with. The fingerprint check is the
+    defence against the temporary signers file being swapped by the same uid between write and use.
+    Raises :class:`AuthorityError` when the verifier cannot run (that is never a verdict)."""
+    if not isinstance(signature, str) or len(signature) > _MAX_SIGNATURE \
+            or "-----BEGIN SSH SIGNATURE-----" not in signature:
+        return False
+    problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
+    if problem is not None:
+        raise AuthorityError(f"cannot verify an authority signature: {problem}")
+    principal = "authority-signer"
+    with tempfile.TemporaryDirectory(prefix="levain-authority-") as d:
+        signers = os.path.join(d, "signers")
+        sig = os.path.join(d, "sig")
+        with open(signers, "w", encoding="ascii") as fh:
+            fh.write(_signers_line(principal, namespace, public_key))
+        with open(sig, "w", encoding="ascii") as fh:
+            fh.write(signature.strip() + "\n")
+        try:
+            cp = subprocess.run([str(keygen), "-Y", "verify", "-f", signers, "-I", principal, "-n", namespace,
+                                 "-s", sig], input=message, capture_output=True, timeout=timeout,
+                                env=dict(_VERIFY_ENV))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AuthorityError(f"ssh-keygen could not verify an authority signature ({type(exc).__name__})") \
+                from None
+    if cp.returncode != 0:
+        return False
+    good = re.compile(r'Good "' + re.escape(namespace) + r'" signature for ' + re.escape(principal)
+                      + r' with \S+ key (SHA256:[A-Za-z0-9+/]{43})')
+    out = (cp.stdout or b"").decode("utf-8", "replace") + "\n" + (cp.stderr or b"").decode("utf-8", "replace")
+    found = [m.group(1) for line in out.splitlines() if (m := good.match(line.strip()))]
+    return found == [fingerprint]
+
+
+# ---------------------------------------------------------------------------------------------------
+# policy ops and the recompute classifier
+
+
+def _validate_grant(grant: Any, what: str) -> dict[str, Any]:
+    if not isinstance(grant, Mapping) or set(grant) != _GRANT_FIELDS:
+        raise AuthorityError(f"{what} must carry exactly {', '.join(sorted(_GRANT_FIELDS))}")
+    for name in ("id", "entity", "remote_url", "deploy_key_sha256"):
+        if not isinstance(grant[name], str) or not grant[name]:
+            raise AuthorityError(f"{what}.{name} must be a non-empty string")
+    for name, ok in (("refspecs", _REFSPEC.fullmatch), ("verbs", _GRANT_VERBS.__contains__)):
+        items = grant[name]
+        if not isinstance(items, (list, tuple)) or not items or not all(isinstance(i, str) and ok(i) for i in items):
+            raise AuthorityError(f"{what}.{name} is not a non-empty list of allowed values")
+        # sorted and unique, so equal sets are equal bytes
+        if list(items) != sorted(set(items)):
+            raise AuthorityError(f"{what}.{name} must be sorted and unique")
+    _parse_stamp(grant["expires_at"], f"{what}.expires_at")
+    return _thaw(grant)
+
+
+def _validate_policy(data: Any) -> AuthorityPolicy:
+    if not isinstance(data, Mapping) or set(data) != {"raise_to", "timeouts", "grants"}:
+        raise AuthorityError("a policy must carry exactly raise_to, timeouts and grants")
+    raise_to, timeouts, grants = data["raise_to"], data["timeouts"], data["grants"]
+    tiers = _tiers()
+    if not isinstance(raise_to, Mapping) or not all(isinstance(v, str) and v and t in tiers
+                                                    for v, t in raise_to.items()):
+        raise AuthorityError("policy.raise_to must map verbs to tiers")
+    _validate_timeouts(timeouts)
+    if not isinstance(grants, Mapping):
+        raise AuthorityError("policy.grants must be a mapping")
+    for gid, grant in grants.items():
+        g = _validate_grant(grant, f"policy.grants[{gid!r}]")
+        if g["id"] != gid:
+            raise AuthorityError(f"policy.grants[{gid!r}] carries id {g['id']!r}")
+    return AuthorityPolicy.from_dict(data)
+
+
+def _validate_timeouts(timeouts: Any) -> None:
+    if not isinstance(timeouts, Mapping) or not all(isinstance(k, str) and k for k in timeouts):
+        raise AuthorityError("timeouts must map pending kinds to values")
+
+
+def _apply_policy_op(policy: AuthorityPolicy, rec: Mapping[str, Any]) -> AuthorityPolicy:
+    """The policy after the declared op, refusing a malformed or impossible one. Does NOT judge the
+    delta's kind: that is :func:`classify`, on the result alone."""
+    op = rec["op"]
+    data = policy.as_dict()
+    if op == "raise":
+        verb, tier = rec["verb"], rec["tier"]
+        if not isinstance(verb, str) or not verb or tier not in _tiers():
+            raise AuthorityError("raise needs a verb and a tier")
+        data["raise_to"][verb] = tier
+    elif op == "loosen":
+        return _validate_policy(rec["policy"])
+    elif op == "timeouts":
+        _validate_timeouts(rec["timeouts"])
+        data["timeouts"] = _thaw(rec["timeouts"])
+    elif op == "create_grant":
+        grant = _validate_grant(rec["grant"], "grant")
+        if grant["id"] in data["grants"]:
+            raise AuthorityError(f"grant {grant['id']!r} already exists")
+        data["grants"][grant["id"]] = grant
+    elif op in ("revoke_grant", "renew"):
+        gid = rec["grant_id"]
+        if not isinstance(gid, str) or gid not in data["grants"]:
+            raise AuthorityError(f"no grant {gid!r}")
+        if op == "revoke_grant":
+            del data["grants"][gid]
+        else:
+            old = _parse_stamp(data["grants"][gid]["expires_at"], "the grant's expires_at")
+            new = _parse_stamp(rec["expires_at"], "expires_at")
+            signed = _parse_stamp(rec["signed_at"], "signed_at")
+            if new <= old:
+                raise AuthorityError("a renew must move the grant's expiry later")
+            if new > signed + _RENEW_MAX:
+                raise AuthorityError("a renew may extend a grant at most 30 days past its signing time")
+            data["grants"][gid]["expires_at"] = rec["expires_at"]
+    else:
+        raise AuthorityError(f"{op!r} is not a policy op")
+    return AuthorityPolicy.from_dict(data)
+
+
+def _grant_change(old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
+    """``same``, ``renew`` (only a later expiry), ``tight`` (provably narrower) or ``loose``."""
+    o, n = _thaw(old), _thaw(new)
+    if _canonical(o) == _canonical(n):
+        return "same"
+    o_exp, n_exp = _parse_stamp(o["expires_at"], "expires_at"), _parse_stamp(n["expires_at"], "expires_at")
+    rest = [k for k in _GRANT_FIELDS if k not in ("refspecs", "verbs", "expires_at")]
+    if any(o[k] != n[k] for k in rest):
+        return "loose"
+    narrower_sets = set(n["refspecs"]) <= set(o["refspecs"]) and set(n["verbs"]) <= set(o["verbs"])
+    sets_equal = n["refspecs"] == o["refspecs"] and n["verbs"] == o["verbs"]
+    if sets_equal and n_exp > o_exp:
+        return "renew"
+    if narrower_sets and n_exp <= o_exp:
+        return "tight"
+    return "loose"
+
+
+def classify(old: AuthorityPolicy, new: AuthorityPolicy) -> str:
+    """The kind of the difference from ``old`` to ``new``, computed from the two policies alone (§4.3).
+    Anything not byte-identical or PROVABLY narrower is :data:`LOOSEN`; a grant extended and nothing
+    else changed is :data:`RENEW`; one grant removed and nothing else is :data:`GRANT_REVOKE`."""
+    if old == new:
+        return NOOP
+    changes: list[str] = []
+    tiers = _tiers()
+    for verb in set(old.raise_to) | set(new.raise_to):
+        o, n = old.raise_to.get(verb), new.raise_to.get(verb)
+        if o == n:
+            continue
+        rank_o = -1 if o is None else tiers.index(o)
+        rank_n = -1 if n is None else tiers.index(n)
+        changes.append("tight" if rank_n > rank_o else "loose")
+    # timeout semantics are S4b's: until then no change is provably stricter
+    if _canonical(_thaw(old.timeouts)) != _canonical(_thaw(new.timeouts)):
+        changes.append("loose")
+    for gid in set(old.grants) | set(new.grants):
+        if gid not in new.grants:
+            changes.append("revoke")
+        elif gid not in old.grants:
+            changes.append("loose")
+        else:
+            kind = _grant_change(old.grants[gid], new.grants[gid])
+            if kind != "same":
+                changes.append(kind)
+    if "loose" in changes:
+        return LOOSEN
+    if "renew" in changes:
+        return RENEW if len(changes) == 1 else LOOSEN
+    if changes == ["revoke"]:
+        return GRANT_REVOKE
+    return TIGHTEN
+
+
+# ---------------------------------------------------------------------------------------------------
+# replay
+
+
+def _parse_record(row: _Row) -> dict[str, Any]:
+    seq = row.seq
+    if not isinstance(row.record, str):
+        raise ReplayError(seq, "the record is not text")
+    try:
+        rec = json.loads(row.record)
+    except ValueError:
+        raise ReplayError(seq, "the record is not JSON") from None
+    if not isinstance(rec, dict) or _canonical(rec) != row.record:
+        raise ReplayError(seq, "the record is not a canonical JSON object")
+    if rec.get("format") != FORMAT:
+        raise ReplayError(seq, f"the record's format is not {FORMAT}")
+    op = rec.get("op")
+    if op not in _OP_FIELDS:
+        raise ReplayError(seq, f"unknown op {op!r}")
+    required, optional = _OP_FIELDS[op]
+    have = set(rec) - _BASE_FIELDS
+    if not _BASE_FIELDS <= set(rec) or not required <= have or not have <= required | optional:
+        raise ReplayError(seq, f"a {op} record carries exactly {', '.join(sorted(_BASE_FIELDS | required))}"
+                               + (f" (optionally {', '.join(sorted(optional))})" if optional else ""))
+    if rec["seq"] != seq or type(rec["seq"]) is not int:
+        raise ReplayError(seq, f"the record names seq {rec['seq']!r}")
+    try:
+        _parse_stamp(rec["at"], "at")
+    except AuthorityError as exc:
+        raise ReplayError(seq, str(exc)) from None
+    return rec
+
+
+def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, AuthorityKey],
+                  ssh_keygen: Path | str) -> AuthorityKey:
+    from levain.cockpit.keys import KeyError_, fingerprint_of, normalise_public_key
+    fp, public_key, cls = rec["fingerprint"], rec["public_key"], rec["class"]
+    if cls not in _ranks():
+        raise AuthorityError(f"unknown key class {cls!r}")
+    if not isinstance(public_key, str) or not isinstance(fp, str):
+        raise AuthorityError("enrol needs a fingerprint and a public key")
+    try:
+        normal = normalise_public_key(public_key)
+        if normal != public_key:
+            raise AuthorityError("the public key is not in its normal form (<type> <base64>)")
+        computed = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
+    except KeyError_ as exc:
+        raise AuthorityError(str(exc)) from None
+    if computed != fp:
+        raise AuthorityError(f"the record's fingerprint {fp} is not the key's ({computed})")
+    if cls == LAPTOP and public_key.split()[0] not in _LAPTOP_KEY_TYPES:
+        raise AuthorityError(f"a {LAPTOP} key must be one of {', '.join(sorted(_LAPTOP_KEY_TYPES))}")
+    old = keys.get(fp)
+    if old is not None:
+        if not old.active:
+            raise AuthorityError(f"{fp} was revoked at seq {old.revoked_seq}; a revoked key stays revoked")
+        if old.key_class != cls:
+            raise AuthorityError(f"{fp} is enrolled as {old.key_class!r}; a key keeps its class")
+        raise AuthorityError(f"{fp} is already enrolled")
+    legacy = rec.get("legacy_enrolled_at")
+    if legacy is not None and not isinstance(legacy, str):
+        raise AuthorityError("legacy_enrolled_at must be text")
+    return AuthorityKey(fp, public_key, cls, seq, legacy_enrolled_at=legacy)
+
+
+def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
+          check_signature: bool = True) -> AuthoritySnapshot:
+    """The state after ``row``, judged against ``state`` (its predecessor), or :class:`ReplayError`."""
+    expected = 1 if state is None else state.seq + 1
+    seq = row.seq
+    if type(seq) is not int or seq != expected:
+        raise ReplayError(expected, f"expected seq {expected}, found {seq!r} (a link is missing or out of order)")
+    prev = "" if state is None else state.head_hash
+    if row.prev_hash != prev:
+        raise ReplayError(seq, "prev_hash is not the predecessor's hash (the chain is broken)")
+    if not isinstance(row.record, str) or row.hash != _link_hash(prev, row.record):
+        raise ReplayError(seq, "hash does not match prev_hash + record")
+    rec = _parse_record(row)
+    op = rec["op"]
+    if state is None:
+        if not isinstance(rec["store_id"], str) or not _STORE_ID.fullmatch(rec["store_id"]):
+            raise ReplayError(seq, "the genesis store_id is malformed")
+    elif rec["store_id"] != state.store_id:
+        raise ReplayError(seq, f"the record names store {rec['store_id']!r}, not {state.store_id!r}")
+    if not isinstance(row.signer_fp, str) or not _FP.fullmatch(row.signer_fp):
+        raise ReplayError(seq, "signer_fp is malformed")
+
+    ranks = _ranks()
+    keys = {} if state is None else dict(state.keys)
+    policy = genesis_policy() if state is None else state.policy
+    try:
+        if state is None:
+            # TOFU genesis (§3.2): the first link enrols a laptop-presence key, signed by that key
+            if op != "enrol" or rec["class"] != LAPTOP:
+                raise AuthorityError(f"the first link must enrol a {LAPTOP} key")
+            if row.signer_fp != rec["fingerprint"]:
+                raise AuthorityError("the first link must be signed by the key it enrols")
+            signer = _enrolled_key(rec, seq, keys, ssh_keygen)
+            keys[signer.fingerprint] = signer
+        else:
+            found = keys.get(row.signer_fp)
+            if found is None:
+                raise AuthorityError(f"signer {row.signer_fp} is not enrolled")
+            signer = found
+            if not signer.active:
+                raise AuthorityError(f"signer {row.signer_fp} was revoked at seq {signer.revoked_seq}")
+            need = _apply_op(rec, seq, state, keys, ssh_keygen)
+            if isinstance(need, AuthorityPolicy):
+                delta = classify(policy, need)
+                if delta == NOOP:
+                    raise AuthorityError(f"this {op} changes nothing")
+                if delta not in _OP_DELTAS[op]:
+                    raise AuthorityError(f"a {op} link computes to a {delta} change")
+                rank = _DELTA_RANK[delta]
+                policy = need
+            else:
+                rank = need
+            if ranks[signer.key_class] < rank:
+                raise AuthorityError(f"a {signer.key_class} key cannot sign this {op}")
+    except AuthorityError as exc:
+        if isinstance(exc, ReplayError):
+            raise
+        raise ReplayError(seq, str(exc)) from None
+
+    if check_signature:
+        try:
+            ok = verify_link_sig(_message(prev, row.record), row.signature, public_key=signer.public_key,
+                                 fingerprint=signer.fingerprint, ssh_keygen=ssh_keygen)
+        except AuthorityError as exc:
+            raise ReplayError(seq, str(exc)) from None
+        if not ok:
+            raise ReplayError(seq, f"the signature does not verify as {signer.fingerprint}")
+    hashes = (() if state is None else state._hashes) + (row.hash,)
+    return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes)
+
+
+def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: dict[str, AuthorityKey],
+              ssh_keygen: Path | str) -> int | AuthorityPolicy:
+    """Applies a key op to ``keys`` and returns the signer rank it needs, or returns the new policy for
+    a policy op (whose rank follows from its computed delta)."""
+    op = rec["op"]
+    ranks = _ranks()
+    if op == "enrol":
+        key = _enrolled_key(rec, seq, keys, ssh_keygen)
+        keys[key.fingerprint] = key
+        return ranks[LAPTOP]
+    if op == "revoke_key":
+        fp = rec["fingerprint"]
+        target = keys.get(fp) if isinstance(fp, str) else None
+        if target is None:
+            raise AuthorityError(f"no enrolled key {fp!r}")
+        if not target.active:
+            raise AuthorityError(f"{fp} is already revoked (at seq {target.revoked_seq})")
+        since = rec.get("compromised_since")
+        if since is not None and (type(since) is not int or not target.enrolled_seq <= since <= state.seq):
+            raise AuthorityError(f"compromised_since must be a seq between {target.enrolled_seq} and {state.seq}")
+        if target.key_class == LAPTOP and since is None and not any(
+                k.active and k.key_class == LAPTOP and k.fingerprint != fp for k in keys.values()):
+            raise AuthorityError(f"{fp} is the last unrevoked {LAPTOP} key; enrol another first, or "
+                                 "revoke it with compromised_since if it is lost or stolen")
+        keys[fp] = replace(target, revoked_seq=seq, compromised_since=since)
+        return ranks[target.key_class]
+    return _apply_policy_op(state.policy, rec)
+
+
+def _replay_from(state: AuthoritySnapshot | None, rows: list[_Row], *, ssh_keygen: Path | str) \
+        -> AuthoritySnapshot | None:
+    for row in rows:
+        state = _step(state, row, ssh_keygen=ssh_keygen)
+    return state
+
+
+def _db_identity(conn: sqlite3.Connection) -> str:
+    for _seq, name, path in conn.execute("PRAGMA database_list"):
+        if name == "main":
+            return os.path.realpath(path) if path else f"memory:{id(conn)}"
+    return f"memory:{id(conn)}"
+
+
+@dataclass(frozen=True)
+class _Entry:
+    snapshot: AuthoritySnapshot
+    digests: tuple[str, ...]
+
+
+class ReplayCache:
+    """Per-process verified heads, keyed by store, each held as ``(seq, head_hash)`` with the digest of
+    every row it verified. A log whose rows match a cached prefix verifies only its suffix. A log behind
+    the cached head, or differing from it below the head, is refused: the cache never re-verifies
+    downward."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[tuple[str, str], _Entry] = {}
+
+    def get(self, conn: sqlite3.Connection, store_id: str, seq: int, head_hash: str) -> AuthoritySnapshot | None:
+        """The cached snapshot for exactly this head, or None."""
+        with self._lock:
+            entry = self._entries.get((_db_identity(conn), store_id))
+        if entry is not None and (entry.snapshot.seq, entry.snapshot.head_hash) == (seq, head_hash):
+            return entry.snapshot
+        return None
+
+    def _load(self, key: tuple[str, str]) -> _Entry | None:
+        with self._lock:
+            return self._entries.get(key)
+
+    def _store(self, key: tuple[str, str], entry: _Entry) -> None:
+        with self._lock:
+            old = self._entries.get(key)
+            if old is None or entry.snapshot.seq > old.snapshot.seq:
+                self._entries[key] = entry
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
+PROCESS_CACHE = ReplayCache()
+
+
+def _genesis_store_id(rows: list[_Row]) -> str:
+    first = rows[0]
+    try:
+        rec = json.loads(first.record) if isinstance(first.record, str) else None
+    except ValueError:
+        rec = None
+    store_id = rec.get("store_id") if isinstance(rec, dict) else None
+    return store_id if isinstance(store_id, str) else ""
+
+
+def _replay(conn: sqlite3.Connection, cache: ReplayCache, ssh_keygen: Path | str) -> AuthoritySnapshot | None:
+    rows = _rows(conn)
+    if not rows:
+        return None
+    key = (_db_identity(conn), _genesis_store_id(rows))
+    entry = cache._load(key)
+    state: AuthoritySnapshot | None = None
+    start = 0
+    if entry is not None:
+        n = entry.snapshot.seq
+        if len(rows) < n:
+            raise HeadBelowCache(f"the authority log has {len(rows)} links, below the head this process "
+                                 f"verified (seq {n}); it was truncated or restored")
+        if tuple(r.digest() for r in rows[:n]) != entry.digests:
+            raise HeadBelowCache(f"the authority log differs from the head this process verified (seq {n}) "
+                                 "at or below that head; it was rewritten")
+        state, start = entry.snapshot, n
+    state = _replay_from(state, rows[start:], ssh_keygen=ssh_keygen)
+    assert state is not None
+    if start < len(rows):
+        cache._store(key, _Entry(state, tuple(r.digest() for r in rows)))
+    return state
+
+
+def snapshot(conn: sqlite3.Connection, *, cache: ReplayCache | None = None,
+             ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> AuthoritySnapshot:
+    """The authority as a verified replay of ``authority_log`` in ``conn``'s current snapshot (run it
+    inside the caller's read transaction so it and the caller's other reads see one head)."""
+    state = _replay(conn, PROCESS_CACHE if cache is None else cache, ssh_keygen)
+    if state is None:
+        raise NotInitialised("the authority log is empty: run `levain cockpit ledger init`")
+    return state
+
+
+# ---------------------------------------------------------------------------------------------------
+# append
+
+
+@dataclass(frozen=True)
+class UnsignedLink:
+    """A link ready to sign: ``message`` is what the signer signs (namespace :data:`NAMESPACE`)."""
+    store_id: str
+    seq: int
+    prev_hash: str
+    record: str
+    signer_fp: str
+
+    @property
+    def message(self) -> bytes:
+        return _message(self.prev_hash, self.record)
+
+
+def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: datetime) -> None:
+    """The rules a replay cannot hold because they need the appender's clock (§3.3a, §6)."""
+    if rec["op"] != "renew":
+        return
+    grant = state.policy.grants.get(rec["grant_id"])
+    if grant is None:
+        raise AuthorityError(f"no grant {rec['grant_id']!r}")
+    signed = _parse_stamp(rec["signed_at"], "signed_at")
+    if abs(now - signed) > _RENEW_SKEW:
+        raise AuthorityError("a renew's signed_at must be within 10 minutes of now")
+    if _parse_stamp(grant["expires_at"], "the grant's expires_at") <= now:
+        raise AuthorityError(f"grant {rec['grant_id']!r} has expired; a lapsed grant is re-created at the laptop")
+    if _parse_stamp(rec["expires_at"], "expires_at") > now + _RENEW_MAX:
+        raise AuthorityError("a renew may extend a grant at most 30 days from now")
+
+
+def prepare(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str, now: datetime,
+            store_id: str | None = None, cache: ReplayCache | None = None,
+            ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> UnsignedLink:
+    """The next link carrying ``op`` (its op fields, ``op`` included), checked against the current head
+    by every rule but the signature, so a doomed link is refused before anyone touches a key.
+    ``store_id`` is for the genesis link only (a fresh one is drawn when it is None)."""
+    if "op" not in op or set(op) & (_BASE_FIELDS - {"op"}):
+        raise AuthorityError("an op names `op` and its own fields, never format/store_id/seq/at")
+    state = _replay(conn, PROCESS_CACHE if cache is None else cache, ssh_keygen)
+    if state is None:
+        sid = store_id if store_id is not None else secrets.token_hex(16)
+    else:
+        if store_id is not None and store_id != state.store_id:
+            raise AuthorityError(f"this log's store is {state.store_id!r}")
+        sid = state.store_id
+    seq = 1 if state is None else state.seq + 1
+    prev = "" if state is None else state.head_hash
+    record = _canonical({**op, "format": FORMAT, "store_id": sid, "seq": seq, "at": _stamp(now)})
+    row = _Row(seq, prev, record, signer_fp, "", _link_hash(prev, record))
+    _step(state, row, ssh_keygen=ssh_keygen, check_signature=False)
+    if state is not None:
+        _append_only_checks(state, json.loads(record), now)
+    return UnsignedLink(sid, seq, prev, record, signer_fp)
+
+
+def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now: datetime,
+           cache: ReplayCache | None = None, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+           anchor: Path | None = None) -> AuthoritySnapshot:
+    """Append a signed link in one ``BEGIN IMMEDIATE``: replay to the head, refuse a moved head
+    (:class:`StaleHead`), verify the link against that state as a replay would, apply the append-only
+    clock checks, insert. ``conn`` must be in autocommit mode with no open transaction. With ``anchor``,
+    a log behind the anchor refuses, and the anchor advances after the commit."""
+    if conn.in_transaction:
+        raise AuthorityError("append owns its transaction; the connection has one open")
+    cache = PROCESS_CACHE if cache is None else cache
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        state = _replay(conn, cache, ssh_keygen)
+        if anchor is not None and state is not None:
+            check_anchor(state, read_anchor(anchor))
+        head = (0, "") if state is None else (state.seq, state.head_hash)
+        if head != (link.seq - 1, link.prev_hash):
+            raise StaleHead(f"the authority log's head moved to seq {head[0]} since this link was prepared")
+        row = _Row(link.seq, link.prev_hash, link.record, link.signer_fp, signature,
+                   _link_hash(link.prev_hash, link.record))
+        new = _step(state, row, ssh_keygen=ssh_keygen)
+        if state is not None:
+            _append_only_checks(state, json.loads(link.record), now)
+        conn.execute("INSERT INTO authority_log (seq, prev_hash, record, signer_fp, signature, hash) "
+                     "VALUES (?, ?, ?, ?, ?, ?)",
+                     (row.seq, row.prev_hash, row.record, row.signer_fp, row.signature, row.hash))
+        digests = tuple(r.digest() for r in _rows(conn))
+        conn.execute("COMMIT")
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    cache._store((_db_identity(conn), new.store_id), _Entry(new, digests))
+    if anchor is not None:
+        advance_anchor(anchor, new)
+    return new
+
+
+def sign_and_append(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str,
+                    sign: Callable[[bytes], str], now: datetime, store_id: str | None = None,
+                    cache: ReplayCache | None = None, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                    anchor: Path | None = None) -> AuthoritySnapshot:
+    """:func:`prepare`, then ``sign(message)`` OUTSIDE any transaction (a touch can take seconds),
+    then :func:`append`."""
+    link = prepare(conn, op, signer_fp=signer_fp, now=now, store_id=store_id, cache=cache, ssh_keygen=ssh_keygen)
+    return append(conn, link, sign(link.message), now=now, cache=cache, ssh_keygen=ssh_keygen, anchor=anchor)
+
+
+# ---------------------------------------------------------------------------------------------------
+# the anchor (§3.8)
+
+
+@dataclass(frozen=True)
+class Anchor:
+    store_id: str
+    seq: int
+    head_hash: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"store_id": self.store_id, "seq": self.seq, "head_hash": self.head_hash}
+
+
+_RESET_HINT = "`levain cockpit anchor reset`"
+
+
+def anchor_path(data_root: Path | str) -> Path:
+    return Path(data_root) / ANCHOR_NAME
+
+
+def read_anchor(path: Path) -> Anchor | None:
+    """The anchor at ``path``; None when there is no file. Anything unreadable refuses."""
+    try:
+        raw = Path(path).read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AnchorError(f"the authority anchor {path} cannot be read ({type(exc).__name__}); "
+                          f"after checking the log, run {_RESET_HINT}") from None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        if data.get("format") != ANCHOR_FORMAT:
+            raise ValueError
+        store_id, seq, head = data["store_id"], data["seq"], data["head_hash"]
+        if not isinstance(store_id, str) or type(seq) is not int or seq < 1 or not isinstance(head, str) \
+                or not _SHA256_HEX.fullmatch(head):
+            raise ValueError
+    except (ValueError, KeyError, AttributeError, UnicodeDecodeError):
+        raise AnchorError(f"the authority anchor {path} is unreadable; after checking the log, run "
+                          f"{_RESET_HINT}") from None
+    return Anchor(store_id, seq, head)
+
+
+def check_anchor(snap: AuthoritySnapshot, anchor: Anchor | None) -> None:
+    """Refuse a log behind ``anchor``: another store, fewer links, or another hash at the anchor's seq."""
+    if anchor is None:
+        return
+    here = f"log store {snap.store_id} at seq {snap.seq} ({snap.head_hash[:12]})"
+    there = f"anchor store {anchor.store_id} at seq {anchor.seq} ({anchor.head_hash[:12]})"
+    if anchor.store_id != snap.store_id or snap.seq < anchor.seq or snap.hash_at(anchor.seq) != anchor.head_hash:
+        raise AnchorError(f"the authority log is behind its anchor: {here}, {there}. If this store was "
+                          f"restored on purpose, run {_RESET_HINT}")
+
+
+def _write_anchor(path: Path, payload: Mapping[str, Any]) -> None:
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(prefix=".authority-anchor-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_canonical(payload) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    dfd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def advance_anchor(path: Path, snap: AuthoritySnapshot) -> Anchor:
+    """Check the anchor at ``path`` against ``snap`` and move it up to ``snap``'s head; call only after
+    the commit that produced ``snap``, so the anchor never leads the log."""
+    current = read_anchor(path)
+    check_anchor(snap, current)
+    new = Anchor(snap.store_id, snap.seq, snap.head_hash)
+    if current != new:
+        _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict()})
+    return new
+
+
+def reset_message(store_id: str, old_anchor: Mapping[str, Any] | None, new_seq: int, new_head: str) -> bytes:
+    """What the operator signs (namespace :data:`RESET_NAMESPACE`) to move an anchor to ``new_head``."""
+    return _canonical({"format": RESET_FORMAT, "store_id": store_id, "old_anchor": old_anchor,
+                       "new_head": {"seq": new_seq, "head_hash": new_head}}).encode("utf-8")
+
+
+def _old_anchor_view(path: Path) -> Mapping[str, Any] | None:
+    """The anchor a reset replaces: its fields when readable, else the digest of its bytes."""
+    try:
+        raw = Path(path).read_bytes()
+    except FileNotFoundError:
+        return None
+    try:
+        current = read_anchor(path)
+    except AnchorError:
+        return {"sha256": hashlib.sha256(raw).hexdigest()}
+    return None if current is None else current.as_dict()
+
+
+def verify_anchor_reset(snap: AuthoritySnapshot, old_anchor: Mapping[str, Any] | None, *, signer_fp: str,
+                        signature: str, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> None:
+    """Refuse unless ``signature`` is a laptop-presence signature over the reset of ``old_anchor`` to
+    ``snap``'s head, by a key the log itself holds unrevoked as of that head."""
+    key = snap.key(signer_fp)
+    if key is None or not key.active:
+        raise AnchorError(f"{signer_fp} is not an unrevoked key of this log at seq {snap.seq}")
+    if key.key_class != LAPTOP:
+        raise AnchorError(f"an anchor reset needs a {LAPTOP} key, not {key.key_class}")
+    message = reset_message(snap.store_id, old_anchor, snap.seq, snap.head_hash)
+    try:
+        ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
+                             namespace=RESET_NAMESPACE, ssh_keygen=ssh_keygen)
+    except AuthorityError as exc:
+        raise AnchorError(str(exc)) from None
+    if not ok:
+        raise AnchorError(f"the anchor reset signature does not verify as {signer_fp}")
+
+
+def reset_anchor(path: Path, snap: AuthoritySnapshot, *, signer_fp: str, signature: str,
+                 ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> Anchor:
+    """Move the anchor at ``path`` to ``snap``'s head on a verified reset signature, storing the proof
+    in the anchor file (the log refuses to open, so it cannot be a log link)."""
+    old = _old_anchor_view(path)
+    verify_anchor_reset(snap, old, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen)
+    new = Anchor(snap.store_id, snap.seq, snap.head_hash)
+    _write_anchor(path, {"format": ANCHOR_FORMAT, **new.as_dict(),
+                         "reset": {"old_anchor": old, "signer_fp": signer_fp, "signature": signature}})
+    return new
