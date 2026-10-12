@@ -162,7 +162,9 @@ class RequestAuthority:
         """The request's authority, read in ``conn``'s open read transaction: the verified replay of
         the log's head (the per-process cache's, replayed only if absent), checked against the
         ``anchor`` file, then the labels built from that same snapshot. A refused log captures as no
-        authority with the reason; it never raises (a label is never a gate on reading)."""
+        authority with the reason: no ``AuthorityError`` escapes (a label is never a gate on reading).
+        A ``sqlite3.Error`` reading the journal does escape; at broker start (``Broker._advance_anchor``)
+        it fails that start attempt (a busy journal is retried, any other error disables the broker)."""
         from levain import authority as auth
         from levain.cockpit.firejournal import INIT_HINT, UNINITIALISED, _meta
 
