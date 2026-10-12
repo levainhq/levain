@@ -139,6 +139,19 @@ def test_an_allowlisted_socket_comes_back_and_a_link_to_a_refused_one_does_not(t
     assert str(rd / "podman" / "podman.sock") not in _bound_back(_bwrap_argv(build_policy(_entity(tmp_path / "b"))), rd)
 
 
+@pytest.mark.parametrize("held", ["workspace", "entity", "home"])
+def test_a_runtime_dir_holding_the_workspace_the_entity_or_home_is_refused(tmp_path, rd, monkeypatch, held) -> None:
+    """``XDG_RUNTIME_DIR`` pointed at a directory of the operator's: its view would hide what it holds."""
+    ent = _entity(rd / "e" if held == "entity" else tmp_path)
+    ws = rd / "ws" if held == "workspace" else tmp_path / "ws"
+    ws.mkdir()
+    if held == "home":
+        (rd / "home").mkdir()
+        monkeypatch.setenv("HOME", str(rd / "home"))
+    with pytest.raises(ConfinementError, match="runtime dir"):
+        _bwrap_argv(build_policy(ent, workspace=ws, deny_localhost_outbound=True))
+
+
 def test_a_socket_outside_the_runtime_dir_is_unaffected(tmp_path, rd, monkeypatch) -> None:
     other = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvssh"))
     s = _listen(other / "agent.sock")

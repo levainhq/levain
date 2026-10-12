@@ -5039,7 +5039,9 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], lis
     made at 0700: with them at 0755, gpg-connect-agent answered "no gpg-agent running in this session"
     through the bound-back socket, and at 0700 it reached the agent (RUN on argushub 2026-10-12, gnupg
     2.4.4, bubblewrap 0.9.0). The view stays writable, so an agent a tool starts inside bash can make
-    its socket there; it is gone with the shell.
+    its socket there; it is gone with the shell. A runtime dir that holds the workspace, the entity or
+    ``$HOME`` (``XDG_RUNTIME_DIR`` pointed at one of the operator's directories) is refused: its view
+    would hide them.
 
     Each GNUPGHOME of :func:`_gnupg_home_views` is a view too, whose ancestors go back as ``pins``. Its
     sockets in :data:`_GNUPG_HOME_SOCKETS` and its files come back, the files writable: with the trustdb
@@ -5061,6 +5063,13 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], lis
             continue
         roots.append(real)
     roots = [r for r in roots if not any(r != o and r.is_relative_to(o) for o in roots)]   # the outer view covers it
+    for root in roots:
+        for held in (policy.workspace.resolve(), policy.entity_dir.resolve(), Path.home().resolve()):
+            if held == root or held.is_relative_to(root):
+                raise ConfinementError(
+                    f"the user runtime dir {root} holds {held}. Bash gets a view of that directory "
+                    "holding only its agent sockets, and the view would hide that too. Refusing "
+                    "to grant bash hands (fail-closed). Point XDG_RUNTIME_DIR at a directory of its own.")
     homes, pins = _gnupg_home_views(policy, roots)
     wanted = list(_gpg_sockets()) if roots else []
     auth_sock = os.environ.get("SSH_AUTH_SOCK", "")
