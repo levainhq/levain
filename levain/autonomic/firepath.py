@@ -65,6 +65,7 @@ from levain.autonomic.binding import Binding, BindingStore, binding_invocation
 from levain.autonomic.chainpath import ChainExecutor, ChainOutcome
 from levain.autonomic.executor import ActionRequest
 from levain.autonomic.gate import EfferentGate, GateOutcome
+from levain.autonomic.handle import GateHandle, as_handle
 from levain.autonomic.journal import RunRef, run_id_for
 from levain.autonomic.monitor import guard_trajectory
 from levain.autonomic.posture import Posture
@@ -121,20 +122,24 @@ class FireDispatcher:
     """Dispatch an event to the bindings it could fire (Slice 4a, single-link). Construct with the
     binding registry, the wired efferent gate, the injected ``predicate_match`` (the deterministic
     evaluator the core never imports), ``request_builder`` (the adapter's action fossil), and a ``clock`` (for the
-    ``record_fire`` dormancy timestamp — there is no ambient clock in the core)."""
+    ``record_fire`` dormancy timestamp — there is no ambient clock in the core).
+
+    The gate may be a :class:`GateHandle` (a bare gate is wrapped in one that never swaps). Each
+    binding's admission reads the handle ONCE and runs on that gate; a chain's links are the chain
+    executor's admissions, read through the same handle."""
 
     def __init__(
         self,
         *,
         store: BindingStore,
-        gate: EfferentGate,
+        gate: EfferentGate | GateHandle,
         predicate_match: PredicateMatch,
         request_builder: RequestBuilder,
         clock: Callable[[], _dt.datetime],
         chain_executor: ChainExecutor | None = None,
     ) -> None:
         self._store = store
-        self._gate = gate
+        self._handle = self._shared_handle(gate, chain_executor)
         self._predicate_match = predicate_match
         self._request_builder = request_builder
         self._clock = clock
@@ -144,19 +149,37 @@ class FireDispatcher:
         # half-fired (the May-3 cut-at-seams: 4a fires only single-link).
         self._chain_executor = chain_executor
         # A binding fire is journaled, and the gate fences and admits through the store: both must use
-        # the SAME journal, or a pause would fence a journal the runs are not admitted into.
+        # the SAME journal, or a pause would fence a journal the runs are not admitted into. The journal is
+        # state, shared by every gate a swap publishes, so the gate checked here stands for all of them.
+        gate = self._handle.current()
         if gate.journal is None or getattr(store, "journal", None) is not gate.journal:
             raise ValueError("FireDispatcher: the gate needs a run journal, and it must be the binding "
                              "store's journal")
         if gate.binding_risk is None:
             raise ValueError("FireDispatcher: the gate needs binding_risk (the binding's risk resolver), "
                              "to derive a binding's risk when it fires and when its pending is resolved")
-        if chain_executor is not None and chain_executor.gate is not gate:
-            raise ValueError("FireDispatcher: the chain executor must fire through the same gate")
+        if chain_executor is not None and chain_executor.handle is not self._handle:
+            raise ValueError("FireDispatcher: the chain executor must fire through the same gate handle")
 
-    def _binding_risk(self, binding: Binding) -> ActionRisk:
-        """The single link's risk, from the gate's ``binding_risk`` (non-None: checked at construction)."""
-        resolver = self._gate.binding_risk
+    @staticmethod
+    def _shared_handle(gate: EfferentGate | GateHandle, chain_executor: ChainExecutor | None) -> GateHandle:
+        """The handle to read the gate through. A bare gate that the chain executor already wraps shares
+        the executor's (fixed) handle, so both still fire through one gate; anything else is used as given
+        (a handle) or wrapped (a bare gate), and the construction check then compares the two handles."""
+        if (isinstance(gate, EfferentGate) and chain_executor is not None
+                and not chain_executor.handle.swappable and chain_executor.handle.current() is gate):
+            return chain_executor.handle
+        return as_handle(gate)
+
+    @property
+    def handle(self) -> GateHandle:
+        return self._handle
+
+    @staticmethod
+    def _binding_risk(gate: EfferentGate, binding: Binding) -> ActionRisk:
+        """The single link's risk, from ``gate``'s ``binding_risk`` (non-None: checked at construction,
+        and every gate a swap publishes carries one)."""
+        resolver = gate.binding_risk
         assert resolver is not None
         return resolver(binding, 0)
 
@@ -257,7 +280,8 @@ class FireDispatcher:
         # 2b. no binding effect can run until an executor can prove it runs through the confinement floor
         # (none can yet): refused HERE, before the run is admitted and before a one-shot is claimed, so
         # nothing is spent on an effect that cannot run.
-        refusal = self._gate.binding_effect_refusal()
+        gate = self._handle.current()   # this binding's admission: one gate, read once, passed down
+        refusal = gate.binding_effect_refusal()
         if refusal is not None:
             _log.error("firepath: binding %s matched but not admitted (%s)", binding.binding_id, refusal)
             return FireDispatch(binding_id=binding.binding_id, outcome=GateOutcome(
@@ -281,10 +305,10 @@ class FireDispatcher:
         # the gate fires directly (4a). Both operate on the FRESH (claimed) snapshot.
         if len(fresh.goal) > 1:
             return self._dispatch_chain(fresh, event)
-        return self._dispatch_single_link(fresh, event, one_shot=one_shot, run_id=run_id)
+        return self._dispatch_single_link(gate, fresh, event, one_shot=one_shot, run_id=run_id)
 
-    def _dispatch_single_link(self, fresh: Binding, event: dict[str, Any], *, one_shot: bool,
-                              run_id: str) -> FireDispatch:
+    def _dispatch_single_link(self, gate: EfferentGate, fresh: Binding, event: dict[str, Any], *,
+                              one_shot: bool, run_id: str) -> FireDispatch:
         """The Slice-4a single-link fire-path: build the ACTION-specific request (adapter), OVERLAY the
         governance-critical fields from the FRESH SEALED binding so the adapter cannot forge them
         (``risk`` seam #1, the authority, the effective_guard kills, the prediction trajectory, the
@@ -295,7 +319,7 @@ class FireDispatcher:
         base = self._request_builder(fresh, event)
         request = dataclasses.replace(
             base,
-            risk=self._binding_risk(fresh),
+            risk=self._binding_risk(gate, fresh),
             authority=binding_invocation(fresh, hops=0),
             kill_predicates=_kill_predicates(fresh),
             predicted_trajectory=guard_trajectory(fresh.effective_guard),
@@ -307,7 +331,7 @@ class FireDispatcher:
         # fire the gate (it decides FIRE / KILL / PROPOSE / REFUSE and writes the receipt; it never
         # raises). The known-danger kill (request.kill_predicates vs the trigger event) + the
         # prediction-error monitor (request.predicted_trajectory vs the injected observer) run INSIDE it.
-        outcome = self._gate.gate(request)
+        outcome = gate.gate(request)
 
         # bookkeeping: record an IMMEDIATE FIRE on a STANDING binding (the §2.6 graduation evidence + the
         # dormancy sensor; UNSEALED, untrusted). NOT for a one-shot (revoked/spent), NOT for a non-fire.

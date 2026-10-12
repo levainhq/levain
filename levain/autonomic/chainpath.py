@@ -86,6 +86,7 @@ from typing import Any
 from levain.autonomic.binding import Binding, BindingStore, binding_invocation
 from levain.autonomic.executor import ActionRequest, ExecutionResult
 from levain.autonomic.gate import EfferentGate, GateOutcome
+from levain.autonomic.handle import GateHandle, as_handle
 from levain.autonomic.journal import RunRef, hold_id_for, run_id_for
 from levain.autonomic.monitor import guard_trajectory
 from levain.autonomic.risk import ActionRisk
@@ -444,21 +445,27 @@ class ChainExecutor:
     """Walk a multi-link binding's goal chain with the gate travelling with it (Slice 4b). Construct
     with the wired efferent gate (whose ``binding_risk`` derives each link's risk), the injected
     per-link ``request_builder`` / ``trust_resolver`` (the adapter's seams), and a ``clock``. The gate must carry a run journal: a chain
-    is a journaled run, and its pause/resume state lives in the run's holds."""
+    is a journaled run, and its pause/resume state lives in the run's holds.
+
+    The gate may be a :class:`GateHandle` (a bare gate is wrapped in one that never swaps). Each
+    admission reads the handle ONCE and runs on that gate: one per link fired, one per resume, one per
+    swept hold. A link in flight completes on the gate it captured; the next link reads the handle
+    again."""
 
     def __init__(
         self,
         *,
-        gate: EfferentGate,
+        gate: EfferentGate | GateHandle,
         request_builder: ChainRequestBuilder,
         trust_resolver: ChainTrustResolver,
         clock: Callable[[], _dt.datetime],
         binding_store: BindingStore | None = None,
     ) -> None:
-        self._gate = gate
+        self._handle = as_handle(gate)
         self._request_builder = request_builder
         self._trust_resolver = trust_resolver
         self._clock = clock
+        gate = self._handle.current()
         if gate.journal is None:
             raise ValueError("ChainExecutor: the gate must carry a run journal (a binding fire is journaled)")
         if gate.binding_risk is None:
@@ -467,10 +474,19 @@ class ChainExecutor:
         # The registry, for the §2.6 graduation evidence of a completed chain (``record_fire``) only. A
         # revoke or pause of the grant mid-chain is stopped by the run journal's fence at the next link.
         self._binding_store = binding_store
+        # The journal is state, shared by reference by every gate a swap publishes, so it is read once
+        # here; every policy read goes through a gate captured per admission.
+        self._journal = gate.journal
 
     @property
-    def gate(self) -> EfferentGate:
-        return self._gate
+    def gate(self) -> GateHandle:
+        """The handle this executor reads its gate through (never a gate: a gate held here would go stale
+        at the next swap)."""
+        return self._handle
+
+    @property
+    def handle(self) -> GateHandle:
+        return self._handle
 
     # ---------------------------------------------------------------------------------------------
     # Entry: walk a fresh (re-acquired, one-shot-claimed) multi-link binding from link 0.
@@ -493,7 +509,7 @@ class ChainExecutor:
             return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=(),
                                 reason=f"chain_error:{type(e).__name__}")
 
-    def _unclassifiable_barred(self, binding: Binding) -> str | None:
+    def _unclassifiable_barred(self, gate: EfferentGate, binding: Binding) -> str | None:
         """Pre-flight (chain START only): every link's risk + trust must be RESOLVABLE — an undeclared
         tool → ``UnknownAction`` → the chain is BARRED before ANY link fires (fail-closed: never
         partially execute a chain with an unclassifiable link). Returns a bar-reason or ``None``.
@@ -510,15 +526,17 @@ class ChainExecutor:
         the only drift vector is a reviewed code edit to the manifest)."""
         for i in range(len(binding.goal)):
             try:
-                self._link_risk(binding, i)
+                self._link_risk(gate, binding, i)
                 self._trust_resolver(binding, i)
             except Exception as e:  # noqa: BLE001 — an unclassifiable link (undeclared tool) bars, fail-closed
                 return f"unclassifiable_link_{i}:{type(e).__name__}"
         return None
 
-    def _link_risk(self, binding: Binding, i: int) -> ActionRisk:
-        """Link i's risk, from the gate's ``binding_risk`` (non-None: checked at construction)."""
-        resolver = self._gate.binding_risk
+    @staticmethod
+    def _link_risk(gate: EfferentGate, binding: Binding, i: int) -> ActionRisk:
+        """Link i's risk, from ``gate``'s ``binding_risk`` (non-None: checked at construction, and every
+        gate a swap publishes carries one)."""
+        resolver = gate.binding_risk
         assert resolver is not None
         return resolver(binding, i)
 
@@ -532,7 +550,7 @@ class ChainExecutor:
         # floor in _fire_link applies to the resume continuation too). An unclassifiable link bars the
         # whole chain before any link fires.
         if start == 0:
-            bar = self._unclassifiable_barred(binding)
+            bar = self._unclassifiable_barred(self._handle.current(), binding)
             if bar is not None:
                 _log.warning("chainpath: binding %s BARRED pre-flight — %s (a link's risk/trust is "
                              "unclassifiable; fail-closed)", binding.binding_id, bar)
@@ -558,7 +576,7 @@ class ChainExecutor:
                 # pending (the request's continuation), so there is nothing to write here and no second
                 # store to disagree. Report the chain the journal holds (the first proposal's, when this
                 # is a re-delivery reaching an already-open hold).
-                hold = self._gate.journal.get_hold(hold_id_for(request.run.run_id, request.run.effect_id))  # type: ignore[union-attr]
+                hold = self._journal.get_hold(hold_id_for(request.run.run_id, request.run.effect_id))  # type: ignore[union-attr]
                 chain = hold.get("chain") if hold is not None else None
                 chain_id = chain.get("chain_id") if isinstance(chain, dict) else None
                 _log.info("chainpath: binding %s PAUSED at link %d (%s) — pending %s, chain %s",
@@ -621,6 +639,7 @@ class ChainExecutor:
         continuation the terminal link is the last index, so the floor applies there too. INTERMEDIATE
         links carry ``ratified_posture=None`` — they run at their natural per-link posture (§A: early
         on-loop links fire). The middle-link drift residual remains (per-link sealed postures = 4c)."""
+        gate = self._handle.current()   # this link's admission: one gate, read once, passed down
         base = self._request_builder(binding, ctx, i)
         is_terminal = i == len(binding.goal) - 1
         run = RunRef(run_id_for(binding.binding_id, event), f"link-{i}", chained=True)
@@ -632,7 +651,7 @@ class ChainExecutor:
         ).to_dict()
         request = dataclasses.replace(
             base,
-            risk=self._link_risk(binding, i),
+            risk=self._link_risk(gate, binding, i),
             trust=self._trust_resolver(binding, i),
             authority=binding_invocation(binding, hops=i),
             kill_predicates=_kill_predicates(binding),
@@ -642,7 +661,7 @@ class ChainExecutor:
             run=run,
             continuation=continuation,
         )
-        return request, self._gate.gate(request)
+        return request, gate.gate(request)
 
     # ---------------------------------------------------------------------------------------------
     # Resume: the operator resolved a paused link → fire it + continue the chain.
@@ -654,20 +673,24 @@ class ChainExecutor:
         makes the one write-once decision and fires the paused link through the run journal (at most
         once) → on fired, append its output + CONTINUE from the next link (which may pause again, into
         that link's hold, or COMPLETE). A denied or dropped resolve ENDS the chain. NEVER raises."""
+        return self._resume_on(self._handle.current(), pending_id, decision)
+
+    def _resume_on(self, gate: EfferentGate, pending_id: str, decision: ConfirmDecision) -> ChainOutcome | None:
+        """``resume`` on the gate the caller captured for this admission."""
         try:
-            return self._resume(pending_id, decision)
+            return self._resume(gate, pending_id, decision)
         except Exception as e:  # noqa: BLE001 — resume, like the gate, never raises into the caller
             _log.error("chainpath resume UNEXPECTED error (%s): %s — failing closed", type(e).__name__, e)
             return ChainOutcome(binding_id="?", state="aborted", links=(),
                                 reason=f"resume_error:{type(e).__name__}")
 
-    def _resume(self, pending_id: str, decision: ConfirmDecision) -> ChainOutcome | None:
-        hold = self._gate.journal.find_pending(pending_id)  # type: ignore[union-attr]
+    def _resume(self, gate: EfferentGate, pending_id: str, decision: ConfirmDecision) -> ChainOutcome | None:
+        hold = self._journal.find_pending(pending_id)  # type: ignore[union-attr]
         if hold is None or not (hold.get("chained") or hold.get("chain") is not None):
             return None   # not a chain link's pending: the caller's plain resolve
-        return self._resume_journaled(pending_id, hold, decision)
+        return self._resume_journaled(gate, pending_id, hold, decision)
 
-    def _resume_journaled(self, pending_id: str, hold: dict[str, Any],
+    def _resume_journaled(self, gate: EfferentGate, pending_id: str, hold: dict[str, Any],
                           decision: ConfirmDecision) -> ChainOutcome:
         """Resume a journaled chain from the hold that paused it. The chain state is READ from the hold
         (written with the pending, in one record); nothing is claimed or removed. The decision is the
@@ -690,7 +713,7 @@ class ChainExecutor:
         if bad is not None:
             # the continuation is unreadable or altered: the link must not fire without its chain
             _log.error("chainpath resume: chain continuation of %s unusable (%s) — rejecting", pending_id, bad)
-            rejected = self._gate.resolve(pending_id, ConfirmDecision(approved=False, by="on-loop",
+            rejected = gate.resolve(pending_id, ConfirmDecision(approved=False, by="on-loop",
                                                                       reason=f"chain_aborted:{bad}"),
                                           chain_owned=True)
             paused_at = state.paused_at_link if state is not None else None
@@ -701,7 +724,7 @@ class ChainExecutor:
             return ChainOutcome(binding_id=binding_id, state="aborted", links=(), paused_at=paused_at,
                                 reason=bad)
         assert state is not None
-        link_outcome = self._gate.resolve(pending_id, decision, chain_owned=True)
+        link_outcome = gate.resolve(pending_id, decision, chain_owned=True)
         results = [ChainLinkResult(link_index=state.paused_at_link, outcome=link_outcome)]
         if not link_outcome.fired:
             if link_outcome.pending:
@@ -733,7 +756,7 @@ class ChainExecutor:
         """The silence default for journaled chain links: every open chained hold whose pending has
         expired is resumed with the gate's silence decision (an allowlisted cooling-off link approves
         and the chain continues; anything else rejects and the chain ends). Fail-soft per hold."""
-        journal = self._gate.journal
+        journal = self._journal
         try:
             now = now or self._clock()
             holds = journal.open_holds()  # type: ignore[union-attr]
@@ -745,10 +768,11 @@ class ChainExecutor:
             if not (h.get("chained") or h.get("chain") is not None) or not isinstance(h.get("pending"), dict):
                 continue
             try:
-                decision = self._gate.silence_decision(h, now)
+                gate = self._handle.current()   # this hold's admission: its silence decision and its resolve
+                decision = gate.silence_decision(h, now)
                 if decision is None:
                     continue
-                result = self.resume(str(h["pending"].get("pending_id")), decision)
+                result = self._resume_on(gate, str(h["pending"].get("pending_id")), decision)
             except Exception as e:  # noqa: BLE001 — one bad hold never stops the sweep
                 _log.error("chainpath sweep: hold %s FAILED (%s): %s", h.get("hold_id"), type(e).__name__, e)
                 continue

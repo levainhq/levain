@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from levain.autonomic import ConfirmDecision
+from levain.autonomic import ConfirmDecision, GateHandle
 
 SIGNER = "operator"
 
@@ -46,7 +46,10 @@ def sign(message: bytes) -> str:
 
 
 def signed_yes(gate: Any, pending_id: str, **kw: Any) -> ConfirmDecision:
-    """The operator's signed approval of ``pending_id`` as ``gate`` would check it now."""
+    """The operator's signed approval of ``pending_id`` as ``gate`` (a gate, or a handle's current gate)
+    would check it now."""
+    if isinstance(gate, GateHandle):
+        gate = gate.current()
     message = gate.confirm_challenge(pending_id)
     if message is None:
         return ConfirmDecision(approved=True, by="human", **kw)
