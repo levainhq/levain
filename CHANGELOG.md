@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-10-12
+
 ### Added
 
 - **The roster kernel computes health per kind and the Fleet card draws it grouped.** Each shown roster row carries `fleet_group` (`resident` / `on_call` / `roundtable`, the roundtable's seats fold into one line) and `health: {tone, text, at, memory}`: only a resident member whose silence is a signal can be an `alarm` (no episodes in 24 h, write path unavailable, or a `digest.last_wrap_at` older than `wrap_every`, resident + stateful only); an on-call member's last call, failed or not, is a neutral fact. A roster is no longer cut at the list default of 10 rows. Health is derived at render against the cockpit's clock, never stored; a resident whose evidence is missing or unreadable (no wrap time, no liveness data, a bad `episodes_24h`) reads `unknown` with the reason, never `ok`; an unreadable or zero `wrap_every` and a non-on-call roundtable member are refused.
