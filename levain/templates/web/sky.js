@@ -229,7 +229,7 @@
       g.font = FONT_MONO; g.textAlign = 'right';
       model.rows.forEach(function (r) {
         var y = rowY(r.id);
-        g.globalAlpha = 1; g.fillStyle = P.hair; g.fillRect(gutter, y, nowX - gutter, 1);
+        g.globalAlpha = 1; g.fillStyle = P.hair; g.fillRect(gutter, y, W - PAD_R - gutter, 1);
         g.fillStyle = P.meta;
         var shown = fit(r.label, gutter - GUTTER_PAD * 2 + 8);
         g.fillText(shown, gutter - GUTTER_PAD, y + 4);

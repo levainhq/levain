@@ -1082,8 +1082,11 @@ body.ke .ck-card.w { height: var(--widget-h); padding: 18px var(--s3); display: 
 .w .wbody { min-height: 0; display: flex; flex-direction: column; gap: 6px; overflow: hidden; }
 .w .xbody { display: flex; flex-direction: column; gap: 6px; }
 .w .big { font: 800 34px/1 var(--round); letter-spacing: -.02em; }
-.w .sub { font-size: 12.5px; color: var(--label); }
-.w .row { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12.5px; color: var(--label); padding: 0; }
+.w .sub { font: 400 12.5px/1.4 var(--sans); color: var(--label); overflow-wrap: break-word; word-break: normal; hyphens: manual; }
+body.ke .dot.ok { background: var(--ok, #6fcf97); }
+.w .bigrow { display: flex; align-items: baseline; gap: 10px; }
+.w .bigrow .bl { font-size: 12.5px; color: var(--label); }
+.w .row { display: flex; gap: 4px 18px; flex-wrap: wrap; font-size: 12.5px; color: var(--label); padding: 0; }
 .w .row:hover { background: none; }
 .w .row b { color: var(--text); font: 700 15px var(--round); margin-right: 4px; }
 .w .dots { display: flex; flex-direction: column; gap: 2px; }
@@ -1130,8 +1133,15 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
 /* THE ORANGE BUDGET (KE page). Accent only where attention goes: the now-line, a failed review, "N failed", an overdue tag,
    and the one primary button of a compose. Verbs are 12px neutral outline buttons shown on the row you are on; tags are
    plain meta text. */
-body.ke .row .verb-actions { display: none; margin-left: auto; }
-body.ke .row:hover .verb-actions, body.ke .row:focus-within .verb-actions { display: inline-flex; }
+/* the verbs of a row stay in the tab order (clipped, not removed) so a keyboard reaches them, and show on hover or focus;
+   a screen with no hover shows them always */
+body.ke .row .verb-actions { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+body.ke .row:hover .verb-actions, body.ke .row:focus-within .verb-actions { position: static; width: auto; height: auto; margin: 0 0 0 auto; overflow: visible; clip: auto; white-space: normal; display: inline-flex; }
+@media (hover: none) { body.ke .row .verb-actions { position: static; width: auto; height: auto; margin: 0 0 0 auto; overflow: visible; clip: auto; white-space: normal; display: inline-flex; } }
+/* panel chrome follows the row: the edit-class chip and the expand control show on the card you are on */
+body.ke .panel .phead .chip, body.ke .panel .phead .pexpand { opacity: 0; transition: opacity .12s ease; }
+body.ke .panel:hover .phead .chip, body.ke .panel:hover .phead .pexpand, body.ke .panel:focus-within .phead .chip, body.ke .panel:focus-within .phead .pexpand { opacity: 1; }
+@media (hover: none) { body.ke .panel .phead .chip, body.ke .panel .phead .pexpand { opacity: 1; } }
 body.ke .row:focus-visible { outline: 1px solid var(--hair-2); outline-offset: -1px; border-radius: 12px; }
 body.ke .verb-btn, body.ke .undo-btn {
   font: 500 12px/1.4 var(--sans); letter-spacing: 0; text-transform: none; color: var(--label); background: none;
