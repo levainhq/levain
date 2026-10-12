@@ -681,7 +681,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
                     job_store=self.job_runtime.store if self.job_runtime is not None else None)
                 built.attach_verbs(VerbView(self.verb_registry, built, lambda: broker_install_class(self)))
                 if self.broker is not None:
-                    built.attach_labeller(self.broker.labels)    # labels and tiers per request (K2b-3b)
+                    built.attach_authority(self.broker.capture)    # authority, labels and tiers per request
                     built.attach_edits_reader(self.broker.edits)  # Recent edits' broker rows (§0.6)
                     built.attach_decision_rows(self.broker.decision_rows)   # the decisions panel (§3)
                 if self.extra_panels is not None:
@@ -1588,7 +1588,7 @@ def make_server(
     # marker) leaves the broker write-disabled, answering "run the installer"
     httpd.broker = _build_broker(source, install_class, httpd, extra_effects)
     if cockpit is not None and httpd.broker is not None:
-        cockpit.attach_labeller(httpd.broker.labels)
+        cockpit.attach_authority(httpd.broker.capture)
         cockpit.attach_edits_reader(httpd.broker.edits)
         # a downstream that registered its own "decisions" keeps exactly that panel (K2b-3b §0.4)
         cockpit.attach_decision_rows(httpd.broker.decision_rows)

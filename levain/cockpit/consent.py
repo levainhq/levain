@@ -171,8 +171,9 @@ def build_record(
     """The consent record (flow design §4.5) as a normalised dict, ready for :func:`encode`.
 
     Each effect carries ``store`` and ``resource_key`` (the journal cross-checks its ``effects`` rows
-    against them, K2b §2) plus the shape lane B's ``Effect`` gives it. ``fence`` carries the policy
-    revision the decision compares (K2b §3.2.2) as ``policy_rev``."""
+    against them, K2b §2) plus the shape lane B's ``Effect`` gives it. ``fence`` carries the authority
+    log head the decision compares (trust-tiering DESIGN §3.4) as exactly ``authority_store_id`` (text)
+    and ``authority_seq`` (an integer, 0 for an empty log)."""
     if not isinstance(operation_id, str) or _OPERATION_ID.fullmatch(operation_id) is None:
         raise ConsentError(f"operation_id is not 'cp' + 32 lowercase hex: {operation_id!r}")
     if intent not in INTENTS:
@@ -181,9 +182,11 @@ def build_record(
     _need_str("tier", tier)
     if not isinstance(target, Mapping) or not isinstance(params, Mapping):
         raise ConsentError("target and params must be objects")
-    if not isinstance(fence, Mapping) or isinstance(fence.get("policy_rev"), bool) \
-            or not isinstance(fence.get("policy_rev"), int):
-        raise ConsentError("fence must be an object carrying an integer policy_rev")
+    if not isinstance(fence, Mapping) or set(fence) != {"authority_store_id", "authority_seq"} \
+            or not isinstance(fence["authority_store_id"], str) or type(fence["authority_seq"]) is not int \
+            or fence["authority_seq"] < 0:
+        raise ConsentError("fence must be an object carrying exactly authority_store_id (text) and "
+                           "authority_seq (an integer >= 0)")
     if isinstance(effects, (str, bytes)) or not isinstance(effects, Sequence):
         raise ConsentError("effects must be a list")
     for i, eff in enumerate(effects):

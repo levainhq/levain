@@ -27,6 +27,7 @@ from levain.cockpit.broker import STANDBY_FAULT, Broker, BrokerError, Lifecycle,
 from levain.cockpit.consent import value_sha256
 from levain.cockpit.effects import SporeEffectStore, TransientApplyFault
 from levain.cockpit.results import Fault
+from tests.cockpit_authority_rig import RealKey, enrol_any, revoke_any, widen_laptop_floor
 
 BROWSER = {"class": "token", "name": "browser"}
 PHONE = {"class": "token", "name": "flowconnect"}
@@ -124,30 +125,21 @@ def _state(b: Broker, pid: str) -> str:
 
 # --- keys --------------------------------------------------------------------------------------------
 
-class Key:
-    """A throwaway ed25519 key, enrolled into the broker's ``keys`` table at a class."""
+class Key(RealKey):
+    """A throwaway ed25519 key, enrolled into the broker's signed authority log at a class."""
 
     def __init__(self, d: Path, name: str) -> None:
-        self.path = d / name
-        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", str(self.path)],
-                       check=True, timeout=30, capture_output=True)
-        self.public = (d / f"{name}.pub").read_text().strip()
-        out = subprocess.run(["ssh-keygen", "-lf", str(d / f"{name}.pub")], check=True, timeout=30,
-                             capture_output=True, text=True).stdout.split()
-        self.fingerprint = out[1]
-        self.principal = "k" + hashlib.sha256(self.fingerprint.encode()).hexdigest()[:32]
-
-    def sign(self, message: bytes, namespace: str = "levain-cockpit") -> str:
-        return subprocess.run(["ssh-keygen", "-Y", "sign", "-q", "-f", str(self.path), "-n", namespace],
-                              input=message, capture_output=True, timeout=30, check=True).stdout.decode()
+        super().__init__(d, name)
 
     def enroll(self, b: Broker, cls: str) -> "Key":
         assert b.db is not None
-        with b.db.write() as conn:
-            conn.execute("INSERT INTO keys (fingerprint, principal, public_key, class, enrolled_at, "
-                         "enrolled_via) VALUES (?, ?, ?, ?, '2026-10-10T00:00:00.000000Z', 'laptop cli')",
-                         (self.fingerprint, self.principal, self.public, cls))
+        enrol_any(b.db, self, cls)
         return self
+
+
+@pytest.fixture(autouse=True)
+def _laptop_floor(monkeypatch):
+    widen_laptop_floor(monkeypatch)
 
 
 @pytest.fixture
@@ -219,9 +211,7 @@ def test_a_presence_key_cannot_sign_a_t2_and_a_revoked_key_is_not_in_the_signers
     out = broker.submit(pid, weak.sign(rec))
     assert (out["state"], out["reason"]) == ("REFUSED", "key class presence does not cover T2")
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
-    with broker.db.write() as conn:
-        conn.execute("UPDATE keys SET revoked_at = '2026-10-10T00:00:00.000000Z' WHERE fingerprint = ?",
-                     (phone.fingerprint,))
+    revoke_any(broker.db, phone)
     pid2 = _move(broker, spores, "k.seed2")["pending_id"]
     _refused("bad_signature", broker.submit, pid2, phone.sign(broker.outcome(pid2)["record"].encode()))
     assert _state(broker, pid2) == "WAITING"
@@ -600,7 +590,8 @@ def test_the_post_routes_reach_the_broker_only_in_a_declared_install(tmp_path, m
         status, again = _post(f"{url}/cockpit/verb", {**at, **seen, "intent": "reported", "idempotency_key": "i1"}, token="T")
         assert (status, again["pending_id"], again["replay"]) == (200, out["pending_id"], True)
         status, bad = _post(f"{url}/cockpit/pending/{pid}/signature", {"signature": "nope"}, token="T")
-        assert (status, bad["error"]) == (400, "bad_signature")
+        # no key is enrolled in this store: a signature is refused unspent, naming the init (DESIGN §3.7)
+        assert (status, bad["error"]) == (409, "not_initialised") and "ledger init" in bad["message"], bad
         status, other = _post(f"{url}/cockpit/pending/{pid}/cancel", {}, token="P")
         assert (status, other["verb"], other["state"]) == (200, "pending_cancel", "WAITING"), other
         status, mine = _post(f"{url}/cockpit/pending/{pid}/cancel", {}, token="T")

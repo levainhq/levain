@@ -194,6 +194,8 @@ class AuthorityKey:
     revoked_seq: int | None = None
     compromised_since: int | None = None
     legacy_enrolled_at: str | None = None
+    # the enrol link's ``at``: provenance only, never authority
+    enrolled_at: str | None = None
 
     @property
     def principal(self) -> str:
@@ -699,7 +701,7 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
     legacy = rec.get("legacy_enrolled_at")
     if legacy is not None and not isinstance(legacy, str):
         raise AuthorityError("legacy_enrolled_at must be text")
-    return AuthorityKey(fp, public_key, cls, seq, legacy_enrolled_at=legacy)
+    return AuthorityKey(fp, public_key, cls, seq, legacy_enrolled_at=legacy, enrolled_at=rec["at"])
 
 
 def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,

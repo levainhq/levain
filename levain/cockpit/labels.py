@@ -1,16 +1,21 @@
 """levain.cockpit.labels — the label a row's provenance carries at render, read from the journal
 (K2b-3b design §0.1-§0.3, §2, §8d).
 
-A label is a pure function of (stored value, journal, install class, keys): per authority field, the
-latest ``labels`` row in the current epoch whose ``value_sha256`` equals the sha256 of the stored
+A label is a pure function of (stored value, journal, install class, authority): per authority field,
+the latest ``labels`` row in the current epoch whose ``value_sha256`` equals the sha256 of the stored
 value's JCS. Its class comes from :func:`label_class` over the JOINED pending's
-``decision_kind`` and the JOURNAL's ``meta.install_class``, lowered to ``signed by a revoked key`` when
-the signer's ``compromised_since <= fired_at``. A row's label is its weakest field's.
+``decision_kind`` and the JOURNAL's ``meta.install_class``. A signed fire's signer is looked up in the
+REQUEST's authority snapshot (trust-tiering DESIGN §3.4): it reads ``signed by a revoked key`` when the
+fire's authority seq (its record's fence) is at or past the key's ``compromised_since``, and
+``unverified`` when the snapshot does not hold the signer or there is no snapshot. A row's label is its
+weakest field's.
 
-:class:`BrokerLabeller` reads through :meth:`CockpitDB.read` only, in ONE transaction per snapshot, and
+:class:`BrokerLabeller` reads only the connection it is handed, inside the request's one read
+transaction (``RequestAuthority.capture``), and never fetches an authority snapshot of its own. It
 exists only where the broker is ACTIVE (§8d row 1). Its index is memoised on the journal revision
-``(install_class, epoch, label_rev)``, which triggers move (§0.3); a memo is replaced, never mutated, so
-a request holding an old snapshot keeps a consistent one.
+``(install_class, epoch, label_rev)``, which triggers move (§0.3; an appended authority link moves
+``label_rev``), and on the snapshot's head; a memo is replaced, never mutated, so a request holding an
+old snapshot keeps a consistent one.
 """
 from __future__ import annotations
 
@@ -18,13 +23,16 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from levain.autonomic.journal import JournalCorruptError
 from levain.cockpit.authority import LabelKey, unavailable
 from levain.cockpit.install import GOVERNED, REPORTED
 from levain.cockpit.consent import ConsentError, parse_stamp, value_sha256
 from levain.cockpit.firejournal import CockpitDB, _parse_record
+
+if TYPE_CHECKING:
+    from levain.authority import AuthoritySnapshot
 
 __all__ = ["BrokerLabeller", "LABEL_ORDER", "LabelKey", "LabelSnapshot", "UNAVAILABLE_SNAPSHOT", "label_class"]
 
@@ -125,10 +133,8 @@ _ROWS = (
     "SELECT l.rowid AS l_rowid, l.resource_key, l.field, l.operation_id, l.value_sha256, "
     "l.decision_kind AS l_kind, l.signer_fp AS l_fp, l.credential AS l_cred, l.fired_at, "
     "p.rowid AS p_rowid, p.pending_id, p.record, p.record_sha256, p.decision_kind AS p_kind, "
-    "p.signer_fp AS p_fp, p.credential AS p_cred, p.decided_at AS p_decided, "
-    "k.principal AS k_principal, k.enrolled_at AS k_enrolled, k.compromised_since AS k_compromised "
-    "FROM labels l LEFT JOIN pendings p ON p.pending_id = l.operation_id "
-    "LEFT JOIN keys k ON k.fingerprint = p.signer_fp WHERE l.epoch = ?")
+    "p.signer_fp AS p_fp, p.credential AS p_cred, p.decided_at AS p_decided "
+    "FROM labels l LEFT JOIN pendings p ON p.pending_id = l.operation_id WHERE l.epoch = ?")
 
 
 class BrokerLabeller:
@@ -136,45 +142,48 @@ class BrokerLabeller:
 
     def __init__(self, db: CockpitDB) -> None:
         self.db = db
-        self._memo: LabelSnapshot | None = None
+        self._memo: tuple[tuple[int, str] | None, LabelSnapshot] | None = None
 
-    def snapshot(self) -> LabelSnapshot:
+    def snapshot(self, conn: sqlite3.Connection, authority: AuthoritySnapshot | None) -> LabelSnapshot:
+        """The labels read on ``conn`` (the request's open read transaction), their signers judged
+        by ``authority`` (that request's snapshot)."""
+        head = None if authority is None else (authority.seq, authority.head_hash)
         try:
-            with self.db.read() as conn:
-                meta = dict(conn.execute("SELECT key, value FROM meta WHERE key IN "
-                                         "('install_class', 'epoch', 'label_rev')").fetchall())
-                if "epoch" not in meta or "label_rev" not in meta:
-                    return UNAVAILABLE_SNAPSHOT("the journal has no epoch or label_rev")
-                install_class = meta.get("install_class") or ""
-                revision = (install_class, int(meta["epoch"]), int(meta["label_rev"]))
-                memo = self._memo
-                if memo is not None and memo.revision == revision:
-                    return memo
-                snap = _build(conn, revision)
+            meta = dict(conn.execute("SELECT key, value FROM meta WHERE key IN "
+                                     "('install_class', 'epoch', 'label_rev')").fetchall())
+            if "epoch" not in meta or "label_rev" not in meta:
+                return UNAVAILABLE_SNAPSHOT("the journal has no epoch or label_rev")
+            install_class = meta.get("install_class") or ""
+            revision = (install_class, int(meta["epoch"]), int(meta["label_rev"]))
+            memo = self._memo
+            if memo is not None and memo[0] == head and memo[1].revision == revision:
+                return memo[1]
+            snap = _build(conn, revision, authority)
         except Exception as exc:        # a label is never a gate on reading: any fault is "unavailable"
             return UNAVAILABLE_SNAPSHOT(f"{type(exc).__name__}: {str(exc)[:200]}")
-        self._memo = snap
+        self._memo = (head, snap)
         return snap
 
 
-def _build(conn: sqlite3.Connection, revision: tuple[str, int, int]) -> LabelSnapshot:
+def _build(conn: sqlite3.Connection, revision: tuple[str, int, int],
+           authority: AuthoritySnapshot | None) -> LabelSnapshot:
     install_class, epoch, _ = revision
     index: dict[tuple[str, str], list[_Fire]] = {}
     degraded_keys: set[str] = set()
     degraded = 0
-    records_ok: dict[str, bool] = {}
+    records: dict[str, dict[str, Any] | None] = {}
     for r in conn.execute(_ROWS, (epoch,)).fetchall():
         op = r["operation_id"]
         fire = None
         if r["pending_id"] is not None:
-            if op not in records_ok:
+            if op not in records:
                 try:
-                    _parse_record(op, r["record"], r["record_sha256"])
-                    records_ok[op] = True
+                    records[op] = _parse_record(op, r["record"], r["record_sha256"])
                 except JournalCorruptError:
-                    records_ok[op] = False
-            if records_ok[op]:
-                fire = _fire_of(r, install_class)
+                    records[op] = None
+            record = records[op]
+            if record is not None:
+                fire = _fire_of(r, install_class, record, authority)
         if fire is None:
             degraded += 1
             degraded_keys.add(r["resource_key"])
@@ -185,7 +194,16 @@ def _build(conn: sqlite3.Connection, revision: tuple[str, int, int]) -> LabelSna
                          _degraded_keys=frozenset(degraded_keys))
 
 
-def _fire_of(r: sqlite3.Row, install_class: str) -> _Fire | None:
+def _authority_seq(record: Mapping[str, Any]) -> int | None:
+    """The authority seq a fire was decided under: its record's fence (a decision requires the fence
+    to name the head it decides at). None for a record fenced before the authority log."""
+    fence = record.get("fence")
+    seq = fence.get("authority_seq") if isinstance(fence, Mapping) else None
+    return seq if type(seq) is int else None
+
+
+def _fire_of(r: sqlite3.Row, install_class: str, record: Mapping[str, Any],
+             authority: AuthoritySnapshot | None) -> _Fire | None:
     """The label row's fire, its authority facts from the JOINED pending; None when a copy disagrees
     with the pending or a stamp does not parse (the row is dropped, its resource degraded)."""
     kind = r["p_kind"]
@@ -199,8 +217,14 @@ def _fire_of(r: sqlite3.Row, install_class: str) -> _Fire | None:
         label = label_class(kind, install_class)
         signer = None
         if kind == "ALLOWED":
-            signer = {"name": r["k_principal"], "fingerprint": r["p_fp"], "enrolled_at": r["k_enrolled"]}
-            if r["k_compromised"] is not None and parse_stamp(r["k_compromised"]) <= fired:
+            key = None if authority is None else authority.key(r["p_fp"])
+            signer = {"name": None if key is None else key.principal, "fingerprint": r["p_fp"],
+                      "enrolled_at": None if key is None else key.legacy_enrolled_at or key.enrolled_at}
+            seq = _authority_seq(record)
+            if key is None:
+                # no snapshot, or one that does not hold the signer: nothing proves who signed
+                label = UNVERIFIED
+            elif key.compromised_since is not None and (seq is None or seq >= key.compromised_since):
                 label = REVOKED
     except ConsentError:
         return None

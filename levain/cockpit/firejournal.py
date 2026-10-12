@@ -32,10 +32,12 @@ import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from levain.authority import SCHEMA as AUTHORITY_SCHEMA
+from levain.authority import AuthoritySnapshot
 from levain.autonomic.journal import JournalCorruptError
 from levain.cockpit.consent import (
     ConsentError,
@@ -52,11 +54,16 @@ __all__ = [
     "CAP_ATTEMPTS", "CockpitDB", "CockpitFormatError", "DB_NAME", "DecideOutcome", "DecisionRows",
     "EditRow", "EditsPage", "EffectRow", "FaultOutcome", "FIRST_RETRY_DELAY", "IdempotencyConflict",
     "IssueResult", "JournalCorruptError", "LabelRow", "OpView", "Outcome", "OUTCOME_WINDOW",
-    "OUTCOMES_LIMIT", "OutcomeRow", "PENDING_CAP", "PendingCapExceeded", "PendingRow", "STORE_FORMAT",
+    "INIT_HINT", "OUTCOMES_LIMIT", "OutcomeRow", "PENDING_CAP", "PendingCapExceeded", "PendingRow", "STORE_FORMAT", "UNINITIALISED", "authority_fence",
     "UnitResult", "UnitOutcome", "UnknownPending", "backoff_seconds", "new_pending_id",
 ]
 
-STORE_FORMAT = "levain-cockpit/2"
+STORE_FORMAT = "levain-cockpit/3"
+# the format a store is migrated FROM at first open (DESIGN §3.7); any other format is refused
+_MIGRATES_FROM = "levain-cockpit/2"
+# set by the migration until `levain cockpit ledger init` re-enrols the keys: every signed act refuses
+UNINITIALISED = "authority_uninitialised"
+INIT_HINT = "`levain cockpit ledger init`"
 DB_NAME = "cockpit.db"
 PENDING_CAP = 8                        # WAITING pendings per principal generation (§3.1)
 CAP_ATTEMPTS = 10                      # recorded transient faults before a unit ends `store error` (§4.1.2)
@@ -110,12 +117,9 @@ _SCHEMA = (
     " value_sha256 TEXT NOT NULL, decision_kind TEXT NOT NULL, signer_fp TEXT, credential TEXT,"
     " fired_at TEXT NOT NULL, epoch INTEGER NOT NULL,"
     " PRIMARY KEY (resource_key, field, operation_id))",
-    "CREATE TABLE IF NOT EXISTS policy (key TEXT PRIMARY KEY, value TEXT NOT NULL, rev INTEGER NOT NULL)",
     "CREATE TABLE IF NOT EXISTS tokens (name TEXT PRIMARY KEY, generation INTEGER NOT NULL)",
-    "CREATE TABLE IF NOT EXISTS keys ("
-    " fingerprint TEXT PRIMARY KEY, principal TEXT NOT NULL UNIQUE, public_key TEXT NOT NULL,"
-    " class TEXT NOT NULL, enrolled_at TEXT NOT NULL, enrolled_via TEXT NOT NULL,"
-    " revoked_at TEXT, compromised_since TEXT)",
+    # who may sign is a verified replay of this log (levain.authority), never a stored projection
+    AUTHORITY_SCHEMA,
     "CREATE INDEX IF NOT EXISTS pendings_waiting ON pendings (state, expires_at)",
     "CREATE INDEX IF NOT EXISTS labels_lookup ON labels (resource_key, field, value_sha256)",
     # the edits reader pages APPLIED effects newest first (K2b-3b §0.6)
@@ -130,9 +134,8 @@ _SCHEMA = (
 _BUMP = ("UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'label_rev';")
 _TRIGGERS = (
     f"CREATE TRIGGER IF NOT EXISTS label_rev_on_label AFTER INSERT ON labels BEGIN {_BUMP} END",
-    f"CREATE TRIGGER IF NOT EXISTS label_rev_on_key_insert AFTER INSERT ON keys BEGIN {_BUMP} END",
-    f"CREATE TRIGGER IF NOT EXISTS label_rev_on_key_update AFTER UPDATE ON keys BEGIN {_BUMP} END",
-    f"CREATE TRIGGER IF NOT EXISTS label_rev_on_key_delete AFTER DELETE ON keys BEGIN {_BUMP} END",
+    # a label reads its signer's key from the authority snapshot, which moves only by an appended link
+    f"CREATE TRIGGER IF NOT EXISTS label_rev_on_authority AFTER INSERT ON authority_log BEGIN {_BUMP} END",
     "CREATE TRIGGER IF NOT EXISTS label_rev_on_meta_insert AFTER INSERT ON meta "
     f"WHEN NEW.key IN ('epoch', 'install_class') BEGIN {_BUMP} END",
     "CREATE TRIGGER IF NOT EXISTS label_rev_on_meta_update AFTER UPDATE ON meta "
@@ -598,8 +601,11 @@ class CockpitDB:
                                          "a cockpit journal, and is not taken over")
             row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() \
                 if marked else None
-            if row is not None and row[0] != STORE_FORMAT:
+            migrate = row is not None and row[0] == _MIGRATES_FROM
+            if row is not None and row[0] != STORE_FORMAT and not migrate:
                 raise CockpitFormatError(f"journal format {row[0]!r} is not {STORE_FORMAT!r}")
+            if migrate:
+                _migrate_to_3(conn)
             for stmt in _SCHEMA:
                 conn.execute(stmt)
             if row is None:
@@ -607,7 +613,6 @@ class CockpitDB:
             # the install step sets the epoch and moves it (§6); a fresh journal starts at 1 so a
             # label row always has one to carry
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('epoch', '1')")
-            conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('policy_rev', '0')")
             # the triggers are created AFTER these inserts, so seeding epoch and label_rev bumps nothing and a
             # fresh journal's label_rev starts at 0 (an INSERT OR IGNORE that ignores fires no trigger later)
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('label_rev', '0')")
@@ -621,6 +626,16 @@ class CockpitDB:
             yield conn
 
     @contextmanager
+    def autocommit(self) -> Iterator[sqlite3.Connection]:
+        """A connection with no transaction open, closed after: for a caller that owns its own
+        transactions (an authority-log append)."""
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
     def read(self) -> Iterator[sqlite3.Connection]:
         """A consistent read snapshot."""
         with read_transaction(self._connect) as conn:
@@ -632,10 +647,6 @@ class CockpitDB:
         with self.read() as conn:
             row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row[0] if row else None
-
-    def policy_rev(self) -> int:
-        """The policy revision a record's fence names and a render caches on (§2 meta)."""
-        return _int_meta("-", self.meta("policy_rev"), "policy_rev")
 
     def token_generation(self, name: str) -> int | None:
         with self.read() as conn:
@@ -701,16 +712,20 @@ class CockpitDB:
     # -- decide (§3.2.2) -----------------------------------------------------------------------
 
     def decide(self, *, operation_id: str, decision_kind: Literal["ALLOWED", "ALLOWED_REPORTED"],
-               recomputed: bytes | None, now: datetime, signer_fp: str | None = None,
-               signature: str | None = None,
+               recomputed: bytes | None, now: datetime, authority: AuthoritySnapshot | None,
+               signer_fp: str | None = None, signature: str | None = None,
                pre_images: Sequence[Any] = ()) -> DecideOutcome:
         """The decision transaction. ``signer_fp`` is the fingerprint the caller VERIFIED over the
         stored bytes (§6.5), never a request field; ``recomputed`` is the record the caller rebuilt
         from a fresh snapshot (§3.2.1), or ``None`` when that snapshot faulted. ``pre_images`` holds
         one JSON value per effect, kept for the ``outcomes`` render.
 
-        Checks, in order: WAITING → not expired → credential current → policy revision equals the
-        record's fence → the recompute equals the stored bytes. The first that fails ends the op
+        ``authority`` is the request's captured snapshot (``RequestAuthority.capture``), None when the
+        log is empty; the signer is judged against it, never against a second read.
+
+        Checks, in order: WAITING → not expired → credential current → the authority log's head is
+        still the captured one → the signer → the record's fence names that head → the recompute
+        equals the stored bytes. The first that fails ends the op
         ``STALE`` (state moved) or ``REFUSED`` (authority, policy, normaliser), nothing written to
         any store. A faulted snapshot leaves a signed op ``WAITING`` (its signature unspent) and
         refuses a reported one."""
@@ -740,16 +755,20 @@ class CockpitDB:
                 return DecideOutcome(operation_id, state, reason, written=True)
 
             refusal = _credential_problem(conn, row["principal"])
-            enrolled_at: str | None = None
-            if refusal is None and decision_kind == "ALLOWED":
-                refusal, enrolled_at = _key_problem(conn, signer_fp, record["tier"])
             if refusal is not None:
                 return terminal("REFUSED", refusal)
-            fence = record.get("fence")
-            rev = _int_meta(operation_id, _meta(conn, "policy_rev"), "policy_rev")
-            if not isinstance(fence, dict) or fence.get("policy_rev") != rev:
+            # the snapshot was verified outside this transaction (no ssh-keygen under the write lock);
+            # a head that moved since is a re-sign, as every append is for a waiting pending (§3.4)
+            if _authority_head(conn) != _head_of(authority):
+                return terminal("STALE", "authority changed")
+            enrolled_at: str | None = None
+            if decision_kind == "ALLOWED":
+                refusal, enrolled_at = _key_problem(conn, authority, signer_fp, record["tier"])
+                if refusal is not None:
+                    return terminal("REFUSED", refusal)
+            if record.get("fence") != authority_fence(authority):
                 # seat ruling R1: a policy change is a re-sign, never an authority refusal (§9)
-                return terminal("STALE", "policy changed")
+                return terminal("STALE", "authority changed")
             if recomputed is None:
                 if decision_kind == "ALLOWED":
                     return DecideOutcome(operation_id, "WAITING", "source unavailable",
@@ -974,19 +993,6 @@ class CockpitDB:
                          "cancelled_by = ?, terminal_at = ? WHERE pending_id = ? AND state = 'WAITING'",
                          (by, stamp, target_id))
         return "applied"
-
-    def signer_keys(self) -> list[tuple[str, str]]:
-        """``(principal, public_key)`` of every unrevoked key: the one source a signers file is
-        generated from (§6.5, invariant 8)."""
-        with self.read() as conn:
-            rows = conn.execute("SELECT principal, public_key FROM keys WHERE revoked_at IS NULL "
-                                "ORDER BY principal").fetchall()
-        return [(r[0], r[1]) for r in rows]
-
-    def key_fingerprint(self, principal: str) -> str | None:
-        with self.read() as conn:
-            row = conn.execute("SELECT fingerprint FROM keys WHERE principal = ?", (principal,)).fetchone()
-        return None if row is None else row[0]
 
     def set_install_class(self, install_class: str) -> str:
         """The install class this journal was started under (§6); a journal never changes class
@@ -1268,21 +1274,65 @@ def _credential_problem(conn: sqlite3.Connection, principal: str) -> str | None:
     return None
 
 
-def _key_problem(conn: sqlite3.Connection, fingerprint: str | None,
+def _key_problem(conn: sqlite3.Connection, authority: AuthoritySnapshot | None, fingerprint: str | None,
                  tier: str) -> tuple[str | None, str | None]:
-    """The verified signer is an enrolled, unrevoked key whose class covers the tier (invariant 8).
-    Returns (refusal, enrolled_at)."""
-    row = conn.execute("SELECT class, enrolled_at, revoked_at FROM keys WHERE fingerprint = ?",
-                       (fingerprint,)).fetchone()
-    if row is None:
+    """The verified signer is an enrolled, unrevoked key of the captured authority whose class covers
+    the tier (invariant 8), in a store whose authority is initialised. Returns (refusal, enrolled_at)."""
+    if authority is None or _meta(conn, UNINITIALISED) is not None:
+        return f"authority not initialised: run {INIT_HINT}", None
+    key = authority.key(fingerprint) if isinstance(fingerprint, str) else None
+    if key is None:
         return "key not enrolled", None
-    if row["revoked_at"] is not None:
+    if not key.active:
         return "key revoked", None
     need = _TIER_NEEDS.get(tier)
-    have = _CLASS_RANK.get(row["class"])
+    have = _CLASS_RANK.get(key.key_class)
     if need is None or have is None or have < need:
-        return f"key class {row['class']} does not cover {tier}", None
-    return None, row["enrolled_at"]
+        return f"key class {key.key_class} does not cover {tier}", None
+    return None, key.legacy_enrolled_at or key.enrolled_at
+
+
+def authority_fence(authority: AuthoritySnapshot | None) -> dict[str, Any]:
+    """The fence a record carries and a decision compares: the authority log's head it was issued
+    under. An empty log (no authority yet) is store "" at seq 0."""
+    if authority is None:
+        return {"authority_store_id": "", "authority_seq": 0}
+    return {"authority_store_id": authority.store_id, "authority_seq": authority.seq}
+
+
+def _head_of(authority: AuthoritySnapshot | None) -> tuple[int, str]:
+    return (0, "") if authority is None else (authority.seq, authority.head_hash)
+
+
+def _authority_head(conn: sqlite3.Connection) -> tuple[int, str]:
+    row = conn.execute("SELECT seq, hash FROM authority_log ORDER BY seq DESC LIMIT 1").fetchone()
+    return (0, "") if row is None else (row[0], row[1])
+
+
+def _migrate_to_3(conn: sqlite3.Connection) -> None:
+    """``levain-cockpit/2`` -> ``/3`` inside the open transaction (DESIGN §3.7). The ``keys`` rows are
+    kept as ``legacy_keys``, read only by ``levain cockpit ledger init`` and authorising nothing; the
+    ``keys`` and ``policy`` tables and ``meta.policy_rev`` are dropped; the store is marked
+    uninitialised, so every signed act refuses until init; every WAITING pending ends STALE."""
+    stamp = utc_stamp(datetime.now(timezone.utc))
+    conn.execute("CREATE TABLE IF NOT EXISTS legacy_keys (fingerprint TEXT PRIMARY KEY, principal TEXT, "
+                 "public_key TEXT, class TEXT, enrolled_at TEXT, enrolled_via TEXT, revoked_at TEXT, "
+                 "compromised_since TEXT)")
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if "keys" in tables:
+        conn.execute("INSERT OR IGNORE INTO legacy_keys SELECT fingerprint, principal, public_key, class, "
+                     "enrolled_at, enrolled_via, revoked_at, compromised_since FROM keys")
+    conn.execute("DROP TABLE IF EXISTS keys")        # its label_rev triggers go with it
+    conn.execute("DROP TABLE IF EXISTS policy")
+    conn.execute("DELETE FROM meta WHERE key = 'policy_rev'")
+    conn.execute("UPDATE meta SET value = ? WHERE key = 'format'", (STORE_FORMAT,))
+    conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, 'authority migrated')", (UNINITIALISED,))
+    if "pendings" in tables:
+        conn.execute("UPDATE pendings SET state = 'STALE', reason = 'authority migrated', terminal_at = ? "
+                     "WHERE state = 'WAITING'", (stamp,))
+    if "meta" in tables and conn.execute("SELECT 1 FROM meta WHERE key = 'label_rev'").fetchone():
+        # labels read keys from the authority now: a memo built over the dropped table is stale
+        conn.execute(_BUMP)
 
 
 def _classify_difference(stored: dict[str, Any], recomputed: bytes) -> tuple[str, str]:
