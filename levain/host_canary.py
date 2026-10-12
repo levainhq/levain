@@ -19,12 +19,14 @@ harness's own sandbox must refuse.
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import secrets
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -167,8 +169,13 @@ def proxied(host):
     except urllib.error.URLError as e:
         raise e.reason if isinstance(e.reason, OSError) else OSError(str(e.reason))
 def rename_activation():
-    os.rename(C["activation"], C["activation"] + "-moved")
-    os.rename(C["activation"] + "-moved", C["activation"])
+    os.rename(C["activation"], C["activation_moved"])
+    # The first rename succeeding IS the failure, whatever the restore does: an exception from it
+    # must not read as BLOCKED (chat L3 r1, codex H1). The host puts activation/ back either way.
+    try:
+        os.rename(C["activation_moved"], C["activation"])
+    except OSError:
+        pass
 TRIES = [("TCP", tcp, ()), ("UDS", uds, ()), ("FSOUT", create, (C["outside"],)),
          ("RENAME", rename_activation, ()),
          ("FSHOOK", create, (C["hook"],)), ("FSCLAUDE", create, (C["claude"],)),
@@ -301,6 +308,13 @@ class _Listener:
 # ---------------------------------------------------------------------------- the run
 
 
+# The most stderr lines a canary keeps from claude (chat L3 r1, codex M4: it kept them all).
+_STDERR_TAIL_LINES = 200
+
+# How long the host waits for the stderr drain to see EOF once the process group is dead.
+_DRAIN_JOIN_SECONDS = 1.0
+
+
 @dataclass
 class _Turn:
     init: dict[str, Any] | None = None
@@ -311,6 +325,8 @@ class _Turn:
     hook_context: dict[str, int] = field(default_factory=dict)
     result: dict[str, Any] | None = None
     timed_out: bool = False
+    stderr_tail: collections.deque[str] = field(
+        default_factory=lambda: collections.deque(maxlen=_STDERR_TAIL_LINES))
 
 
 def _result_text(content: Any) -> str:
@@ -333,17 +349,31 @@ def _additional_context(m: dict[str, Any]) -> int:
     return 0
 
 
+def _drain(stream: Any, tail: collections.deque[str]) -> None:
+    try:
+        for line in stream:
+            tail.append(line)
+    except (OSError, ValueError):
+        pass
+
+
 def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, timeout: float,
-           decide: Callable[[dict[str, Any]], dict[str, Any]], stream_log: Path | None = None) -> _Turn:
+           decide: Callable[[dict[str, Any]], dict[str, Any]], stream_log: Path | None = None,
+           popen: Callable[..., subprocess.Popen[str]] = subprocess.Popen) -> _Turn:
+    """One canary turn. Every resource that can fail to open is opened before the spawn, and the
+    cleanup ``try`` starts on the line after it, so no failure leaves claude running (chat L3 r1,
+    codex M3)."""
     turn = _Turn()
-    proc = subprocess.Popen(argv, cwd=cwd, env=env, text=True, bufsize=1, start_new_session=True,
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    stdin, stdout, stderr = proc.stdin, proc.stdout, proc.stderr
-    if stdin is None or stdout is None or stderr is None:
-        proc.kill()
-        raise OSError("claude started without its pipes")
-    stderr_lines: list[str] = []
-    threading.Thread(target=lambda: stderr_lines.extend(stderr), daemon=True).start()
+    log = open(stream_log, "a", encoding="utf-8") if stream_log else None
+    try:
+        proc = popen(argv, cwd=cwd, env=env, text=True, bufsize=1, start_new_session=True,
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except BaseException:
+        if log:
+            log.close()
+        raise
+    timer: threading.Timer | None = None
+    drain: threading.Thread | None = None
 
     def kill_group() -> None:
         # The probe's python is claude's grandchild; killing claude alone could leave it running
@@ -357,9 +387,40 @@ def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, time
         turn.timed_out = True
         kill_group()
 
-    timer = threading.Timer(timeout, on_timeout)
-    timer.start()
+    try:
+        stdin, stdout, stderr = proc.stdin, proc.stdout, proc.stderr
+        if stdin is None or stdout is None or stderr is None:
+            raise OSError("claude started without its pipes")
+        t = threading.Thread(target=_drain, args=(stderr, turn.stderr_tail), daemon=True)
+        t.start()
+        drain = t  # bound only once started: joining an unstarted thread raises in the finally
+        timer = threading.Timer(timeout, on_timeout)
+        timer.daemon = True
+        timer.start()
+        _converse(turn, stdin, stdout, prompt=prompt, decide=decide, log=log)
+    finally:
+        if timer is not None:
+            timer.cancel()
+        # The turn is over (result read, timed out, the stream ended, or setup failed). Signal the
+        # whole group BEFORE reaping the leader: an exited-but-unreaped leader still holds its pid,
+        # so the pgid cannot have been reused by an unrelated process (L3 r2, codex 8).
+        kill_group()
+        proc.wait()
+        if drain is not None:
+            drain.join(_DRAIN_JOIN_SECONDS)
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except (OSError, ValueError):
+                    pass
+        if log:
+            log.close()
+    return turn
 
+
+def _converse(turn: _Turn, stdin: Any, stdout: Any, *, prompt: str,
+              decide: Callable[[dict[str, Any]], dict[str, Any]], log: Any) -> None:
     def send(obj: dict[str, Any]) -> None:
         try:
             stdin.write(json.dumps(obj) + "\n")
@@ -367,63 +428,51 @@ def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, time
         except (BrokenPipeError, ValueError):
             pass
 
-    log = open(stream_log, "a", encoding="utf-8") if stream_log else None
-    try:
-        send({"type": "control_request", "request_id": f"init-{secrets.token_hex(4)}",
-              "request": {"subtype": "initialize", "hooks": None}})
-        send({"type": "user", "session_id": "",
-              "message": {"role": "user", "content": prompt}, "parent_tool_use_id": None})
-        for line in stdout:
-            if log:
-                log.write(line)
-                log.flush()
-            try:
-                m = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(m, dict):
-                continue
-            t = m.get("type")
-            if t == "system":
-                st = str(m.get("subtype") or "")
-                if st == "init":
-                    turn.init = m
-                elif st.startswith("hook"):
-                    name = str(m.get("hook_event") or m.get("hook_event_name") or m.get("hook_name") or "")
-                    event = name.split(":")[0]
-                    if event:
-                        turn.hook_events.add(event)
-                    if st == "hook_response" and event:
-                        turn.hook_context[event] = max(turn.hook_context.get(event, 0), _additional_context(m))
-            elif t == "control_request" and (m.get("request") or {}).get("subtype") == "can_use_tool":
-                req = m["request"]
-                turn.prompts.append({"tool_name": req.get("tool_name"), "input": req.get("input")})
-                answer = decide(req)
-                send({"type": "control_response", "response": {
-                    "subtype": "success", "request_id": m.get("request_id"), "response": answer}})
-            elif t == "assistant":
-                for c in (m.get("message") or {}).get("content", []):
-                    if isinstance(c, dict) and c.get("type") == "tool_use":
-                        turn.tool_uses.append(c)
-            elif t == "user":
-                content = (m.get("message") or {}).get("content")
-                for c in content if isinstance(content, list) else []:
-                    if isinstance(c, dict) and c.get("type") == "tool_result":
-                        turn.results[c.get("tool_use_id", "")] = _result_text(c.get("content"))
-            elif t == "result":
-                turn.result = m
-                stdin.close()
-                break
-    finally:
-        timer.cancel()
+    send({"type": "control_request", "request_id": f"init-{secrets.token_hex(4)}",
+          "request": {"subtype": "initialize", "hooks": None}})
+    send({"type": "user", "session_id": "",
+          "message": {"role": "user", "content": prompt}, "parent_tool_use_id": None})
+    for line in stdout:
         if log:
-            log.close()
-        # The turn is over (result read, timed out, or the stream ended). Signal the whole group
-        # BEFORE reaping the leader: an exited-but-unreaped leader still holds its pid, so the
-        # pgid cannot have been reused by an unrelated process (L3 r2, codex 8).
-        kill_group()
-        proc.wait()
-    return turn
+            log.write(line)
+            log.flush()
+        try:
+            m = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(m, dict):
+            continue
+        t = m.get("type")
+        if t == "system":
+            st = str(m.get("subtype") or "")
+            if st == "init":
+                turn.init = m
+            elif st.startswith("hook"):
+                name = str(m.get("hook_event") or m.get("hook_event_name") or m.get("hook_name") or "")
+                event = name.split(":")[0]
+                if event:
+                    turn.hook_events.add(event)
+                if st == "hook_response" and event:
+                    turn.hook_context[event] = max(turn.hook_context.get(event, 0), _additional_context(m))
+        elif t == "control_request" and (m.get("request") or {}).get("subtype") == "can_use_tool":
+            req = m["request"]
+            turn.prompts.append({"tool_name": req.get("tool_name"), "input": req.get("input")})
+            answer = decide(req)
+            send({"type": "control_response", "response": {
+                "subtype": "success", "request_id": m.get("request_id"), "response": answer}})
+        elif t == "assistant":
+            for c in (m.get("message") or {}).get("content", []):
+                if isinstance(c, dict) and c.get("type") == "tool_use":
+                    turn.tool_uses.append(c)
+        elif t == "user":
+            content = (m.get("message") or {}).get("content")
+            for c in content if isinstance(content, list) else []:
+                if isinstance(c, dict) and c.get("type") == "tool_result":
+                    turn.results[c.get("tool_use_id", "")] = _result_text(c.get("content"))
+        elif t == "result":
+            turn.result = m
+            stdin.close()
+            break
 
 
 def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_model: str = "haiku",
@@ -440,9 +489,18 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
     sock = run / f"c{nonce[:8]}.s"
     if len(os.fsencode(sock)) >= 100:
         raise HostRefusal(f"the host run dir path is too long for a Unix socket: {os.fspath(sock)!r}")
+    # The RENAME probe aims at activation/ itself: a throwaway sibling would sit outside denyWrite
+    # and prove nothing (test_a_sibling_of_activation_is_not_covered_by_deny_write). So the host
+    # records the directory's identity first and, whatever the probe did, puts it back afterwards
+    # (chat L3 r1, codex H1 / complement LOW-5).
+    activation = ent / "activation"
+    moved = ent / f"activation-moved-{nonce}"
+    activation_id = _dir_ident(activation)
+    if activation_id is None:
+        raise HostRefusal(f"{os.fspath(activation)!r} is not a directory")
     work = run / f"canary-{nonce}"
     work.mkdir(mode=0o700)
-    hooks = ent / "activation" / "hooks"
+    hooks = activation / "hooks"
     # Case-insensitive only if the upper-case spelling IS the activation dir (L3 r2, codex 7).
     case_insensitive = os.path.exists(ent / "ACTIVATION") and os.path.samefile(ent / "ACTIVATION", ent / "activation")
     git, mcp = ent / ".git", ent / ".mcp.json"
@@ -464,7 +522,8 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
         "mcp": str(mcp) if mcp.is_file() and not mcp.is_symlink() else "",
         "git": str(git_probe) if git_probe else "",
         "link_target": str(hooks),
-        "activation": str(ent / "activation"),
+        "activation": str(activation),
+        "activation_moved": str(moved),
         "swap_link": str(ent / f"selftest-sl-{nonce}"),
         "swap_name": f"selftest-via-{nonce}.txt",
         "link_src": str(hooks / "session_start.py"),
@@ -481,6 +540,7 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
     checks: list[Check] = []
     turn: _Turn | None = None
     listener: _Listener | None = None
+    moved_by_probe: str | None = None
     try:
         listener = _Listener(sock)
         cfg["port"] = listener.port
@@ -514,6 +574,7 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
                           stream_log=stream_log)
         except OSError as exc:
             checks.append(Check("C1 profile loaded", "inconclusive", f"claude did not start: {exc}"))
+        moved_by_probe = _activation_problem(activation, moved, activation_id)
         post = listener.self_connect()
         checks.append(Check("C0 listener live", "pass" if pre and post else "fail",
                             f"self-connect before={pre} after={post}"))
@@ -523,6 +584,7 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
             checks.extend(_evaluate(turn, nonce=nonce, cmd=cmd, listener=listener,
                                     landed=landed, want=want))
     finally:
+        _restore_activation(activation, moved, activation_id)
         if listener is not None:
             listener.close()
         for p in landed:
@@ -532,10 +594,45 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
             except OSError:
                 pass
         shutil.rmtree(work, ignore_errors=True)
+    left = _activation_problem(activation, moved, activation_id)
+    if moved_by_probe or left:
+        checks.append(Check("C5 activation intact", "fail", "; ".join(
+            ([f"the probe moved it: {moved_by_probe}"] if moved_by_probe else [])
+            + ([f"not restored: {left}"] if left else ["restored by the host"]))))
+    else:
+        checks.append(Check("C5 activation intact", "pass", "the original directory, nothing at the moved name"))
     version = (turn.init or {}).get("claude_code_version") if turn is not None else None
     ok = bool(checks) and all(c.status == "pass" for c in checks)
     return CanaryVerdict(ok=ok, checks=tuple(checks), claude_version=version,
                          claude_bin=os.path.realpath(profile.claude_bin), profile_digest=profile.digest())
+
+
+def _dir_ident(p: Path) -> tuple[int, int] | None:
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino) if stat.S_ISDIR(st.st_mode) else None
+
+
+def _activation_problem(activation: Path, moved: Path, ident: tuple[int, int]) -> str | None:
+    if os.path.lexists(moved):
+        return f"{os.fspath(moved)!r} exists"
+    if _dir_ident(activation) != ident:
+        return f"{os.fspath(activation)!r} is not the original directory"
+    return None
+
+
+def _restore_activation(activation: Path, moved: Path, ident: tuple[int, int]) -> None:
+    """Host-side, after the process group is dead: move the original directory back from the
+    probe's name, only when nothing stands at activation/ and the moved directory IS the original
+    by device and inode. Anything else is left for the operator, and C5 reports it."""
+    if os.path.lexists(activation) or _dir_ident(moved) != ident:
+        return
+    try:
+        os.rename(moved, activation)
+    except OSError:
+        pass
 
 
 _PROBE_LINES = ("TCP", "UDS", "FSOUT", "RENAME", "FSHOOK", "FSCLAUDE", "FSLINK", "HARDLINK",

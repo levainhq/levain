@@ -1,0 +1,237 @@
+"""Chat L3 r1: the canary's own failure paths (H1, M3, M4, complement LOW-2/3/5).
+
+No test here launches `claude`. `_drive` takes its process factory as an argument, and the tests
+hand it a factory that starts a small Python child instead, so the cleanup they check (process
+group killed, leader reaped, pipes closed) is done on a real process.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+
+import pytest
+
+from levain import host_canary as hc
+from levain import host_guard as hg
+
+
+# ---------------------------------------------------------------------------- helpers
+
+
+def _child(code: str):
+    """A process factory for `_drive` that starts ``python -c code`` with the kwargs `_drive`
+    passes, and records the process so the test can inspect it afterwards."""
+    started: list[subprocess.Popen] = []
+
+    def factory(argv, **kw):
+        p = subprocess.Popen([sys.executable, "-c", code], **kw)
+        started.append(p)
+        return p
+
+    return factory, started
+
+
+_RESULT_THEN_SLEEP = ("import json, sys, time\n"
+                      "print(json.dumps({'type': 'result'})); sys.stdout.flush()\n"
+                      "time.sleep(60)\n")
+
+_SLEEP = "import time; time.sleep(60)\n"
+
+
+def _drive(factory, tmp_path: Path, **kw) -> hc._Turn:
+    return hc._drive(["claude-not-run"], cwd=tmp_path, env=dict(os.environ), prompt="p",
+                     timeout=kw.pop("timeout", 30), decide=lambda req: {"behavior": "deny"},
+                     popen=factory, **kw)
+
+
+def _dead(p: subprocess.Popen) -> bool:
+    return p.returncode is not None
+
+
+# ---------------------------------------------------------------------------- M3 / LOW-2 / LOW-3
+
+
+def test_an_unwritable_stream_log_never_leaves_the_child_running(tmp_path):
+    # codex MED-3 / complement LOW-2: the log was opened after Popen, outside the cleanup try
+    factory, started = _child(_SLEEP)
+    with pytest.raises(OSError):
+        _drive(factory, tmp_path, stream_log=tmp_path / "no-such-dir" / "log")
+    assert all(_dead(p) for p in started), "claude left running after a setup failure"
+
+
+def test_a_setup_failure_after_spawn_kills_and_reaps_the_group(tmp_path, monkeypatch):
+    # codex MED-3: the stderr thread or the timer failing to start left no timer at all
+    factory, started = _child(_SLEEP)
+
+    class Boom(threading.Thread):
+        def start(self):
+            raise RuntimeError("cannot start a thread")
+
+    monkeypatch.setattr(hc.threading, "Thread", Boom)
+    with pytest.raises(RuntimeError):
+        _drive(factory, tmp_path)
+    assert started and all(_dead(p) for p in started)
+    assert all(s.closed for p in started for s in (p.stdin, p.stdout, p.stderr))
+
+
+def test_the_pipes_are_closed_after_a_normal_turn(tmp_path):
+    # complement LOW-3: stdout and stderr were never closed, two fds leaked per canary
+    factory, started = _child(_RESULT_THEN_SLEEP)
+    turn = _drive(factory, tmp_path)
+    assert turn.result == {"type": "result"}
+    (p,) = started
+    assert _dead(p)
+    assert p.stdout.closed and p.stderr.closed and p.stdin.closed
+
+
+# ---------------------------------------------------------------------------- M4
+
+
+def test_stderr_is_kept_only_as_a_bounded_tail(tmp_path):
+    # codex MED-4: every stderr line was kept in a list nobody read
+    n = hc._STDERR_TAIL_LINES * 5
+    code = ("import json, sys, time\n"
+            f"for i in range({n}): sys.stderr.write('e%d\\n' % i)\n"
+            "sys.stderr.flush()\n"
+            "print(json.dumps({'type': 'result'})); sys.stdout.flush()\n"
+            "time.sleep(60)\n")
+    factory, _ = _child(code)
+    turn = _drive(factory, tmp_path)
+    assert len(turn.stderr_tail) == hc._STDERR_TAIL_LINES
+    assert turn.stderr_tail[-1] == f"e{n - 1}\n"
+
+
+# ---------------------------------------------------------------------------- H1 / LOW-5, the probe
+
+
+def _probe_cfg(tmp_path: Path) -> dict:
+    ent = tmp_path / "ent"
+    hooks = ent / "activation" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "session_start.py").write_text("x")
+    return {"nonce": "n0", "port": 1, "sock": str(tmp_path / "none.sock"),
+            "outside": str(tmp_path / "nodir" / "f"), "hook": str(hooks / "h"), "hook_case": "",
+            "claude": str(tmp_path / "c"), "mcp": "", "git": "",
+            "link_target": str(hooks), "swap_link": str(tmp_path / "sl"), "swap_name": "via.txt",
+            "link_src": str(hooks / "session_start.py"), "link_dst": str(tmp_path / "dst"),
+            "activation": str(ent / "activation"),
+            "activation_moved": str(ent / "activation-moved-n0")}
+
+
+def _run_probe(tmp_path: Path, cfg: dict, *, block_second_rename: bool) -> dict[str, str]:
+    script = tmp_path / "p.py"
+    script.write_text(hc.probe_script(cfg))
+    # The probe runs unsandboxed here. To stand in for a sandbox that let the first rename
+    # through and refused the restore, a wrapper makes every rename after the first raise EPERM.
+    wrapper = ("import errno, os, sys\n"
+               "real = os.rename\n"
+               "calls = []\n"
+               "def rename(a, b, *k, **kw):\n"
+               "    calls.append(a)\n"
+               f"    if {block_second_rename!r} and len(calls) > 1:\n"
+               "        raise PermissionError(errno.EPERM, 'Operation not permitted')\n"
+               "    return real(a, b, *k, **kw)\n"
+               "os.rename = rename\n"
+               "sys.argv = [sys.argv[1]]\n"
+               "exec(compile(open(sys.argv[0]).read(), sys.argv[0], 'exec'))\n")
+    env = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+    out = subprocess.run([sys.executable, "-c", wrapper, str(script)], env=env,
+                         capture_output=True, text=True, timeout=60).stdout
+    return {ln.split(" ", 2)[1]: ln.split(" ", 2)[2] for ln in out.splitlines() if ln.count(" ") >= 2}
+
+
+def test_a_rename_that_succeeds_is_open_even_when_the_restore_is_refused(tmp_path):
+    # codex HIGH H1: the restore's EPERM printed "RENAME BLOCKED" over a successful rename
+    cfg = _probe_cfg(tmp_path)
+    lines = _run_probe(tmp_path, cfg, block_second_rename=True)
+    assert lines["RENAME"] == "OPEN", lines
+    os.rename(cfg["activation_moved"], cfg["activation"])  # tidy for tmp_path
+
+
+def test_a_rename_that_succeeds_and_is_restored_is_open(tmp_path):
+    cfg = _probe_cfg(tmp_path)
+    lines = _run_probe(tmp_path, cfg, block_second_rename=False)
+    assert lines["RENAME"] == "OPEN", lines
+    assert os.path.isdir(cfg["activation"]) and not os.path.lexists(cfg["activation_moved"])
+
+
+# ---------------------------------------------------------------------------- H1 / LOW-5, the host
+
+
+def _profile(ent: Path) -> hg.CCHostProfile:
+    run = Path(tempfile.mkdtemp(prefix="lvc", dir="/tmp"))  # AF_UNIX paths are capped
+    return hg.CCHostProfile(entity=ent, claude_bin=sys.executable, settings={}, mcp_config={},
+                            env={}, run_dir=run, state_dir=run, pin_status="ok")
+
+
+@pytest.fixture
+def entity(tmp_path: Path) -> Path:
+    ent = tmp_path / "ent"
+    (ent / "activation" / "hooks").mkdir(parents=True)
+    (ent / ".levain").mkdir()
+    return Path(os.path.realpath(ent))
+
+
+def _nonce_from(prompt: str) -> str:
+    return re.search(r"canary-([0-9a-f]+)", prompt).group(1)
+
+
+def test_the_host_restores_activation_a_failed_sandbox_left_renamed(entity, monkeypatch):
+    # codex HIGH H1 / complement LOW-5: a canary killed (or refused) between the two renames
+    # left the entity's activation/ moved away, and the verdict could still read ok
+    act = entity / "activation"
+    ino = os.lstat(act).st_ino
+
+    def fake_drive(argv, *, prompt, **kw):
+        os.rename(act, entity / f"activation-moved-{_nonce_from(prompt)}")
+        return hc._Turn(timed_out=True)
+
+    monkeypatch.setattr(hc, "_drive", fake_drive)
+    verdict = hc.run_cc_canary(_profile(entity))
+    assert not verdict.ok
+    c5 = [c for c in verdict.checks if c.name.startswith("C5")]
+    assert c5 and c5[0].status == "fail", verdict.checks
+    assert act.is_dir() and os.lstat(act).st_ino == ino
+    assert not [p for p in entity.iterdir() if p.name.startswith("activation-moved")]
+
+
+def test_the_host_never_moves_a_directory_that_is_not_the_original(entity, monkeypatch):
+    # The restore is by identity: a different directory left at the moved name stays where it is
+    act = entity / "activation"
+
+    def fake_drive(argv, *, prompt, **kw):
+        moved = entity / f"activation-moved-{_nonce_from(prompt)}"
+        os.rename(act, entity / "elsewhere")
+        moved.mkdir()
+        return hc._Turn(timed_out=True)
+
+    monkeypatch.setattr(hc, "_drive", fake_drive)
+    verdict = hc.run_cc_canary(_profile(entity))
+    assert not verdict.ok
+    assert not act.exists()
+    c5 = [c for c in verdict.checks if c.name.startswith("C5")]
+    assert c5 and c5[0].status == "fail" and "not restored" in c5[0].evidence, verdict.checks
+
+
+def test_an_untouched_activation_passes_c5(entity, monkeypatch):
+    monkeypatch.setattr(hc, "_drive", lambda argv, **kw: hc._Turn(timed_out=True))
+    verdict = hc.run_cc_canary(_profile(entity))
+    c5 = [c for c in verdict.checks if c.name.startswith("C5")]
+    assert c5 and c5[0].status == "pass", verdict.checks
+
+
+def test_a_sibling_of_activation_is_not_covered_by_deny_write(entity):
+    # Why H1 probes activation/ itself and restores host-side instead of renaming a throwaway
+    # sibling: denyWrite names activation/, so a sibling in the entity root is writable and its
+    # rename would pass under a working sandbox too, proving nothing.
+    deny = [Path(d) for d in hg.cc_sandbox_block(entity)["filesystem"]["denyWrite"]]
+    sibling = entity / "activation-moved-x"
+    assert entity / "activation" in deny
+    assert not any(sibling == d or d in sibling.parents for d in deny)
