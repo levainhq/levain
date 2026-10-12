@@ -470,12 +470,15 @@
   // error line would read as current); the structural mounts (#ck-hero, #ck-skycol, #ck-strip) stay for the next render
   function restoreHero() {
     restoreMasthead();
-    for (const id of ["ck-when", "ck-sky"]) { const m = document.getElementById(id); if (m) m.replaceChildren(); }
+    for (const id of ["ck-when", "ck-sky", "ck-legend"]) { const m = document.getElementById(id); if (m) { m.replaceChildren(); if (id === "ck-legend") m.hidden = true; } }
   }
   function keShell(on) {
     const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
     if (!hero || !brief || !widgets) return;
     hero.hidden = brief.hidden = widgets.hidden = !on;
+    // the hero's legend band follows the hero: shown by the sky's own render, hidden with the region
+    const band = document.getElementById("ck-legend");
+    if (band) band.hidden = true;
     // the section headers are page chrome that follows its region: hidden here, set by the region's own render
     for (const id of ["ck-h-brief", "ck-h-widgets"]) { const h = document.getElementById(id); if (h) h.hidden = true; }
     document.body.classList.toggle("ke", on);
@@ -486,7 +489,7 @@
     restoreState();
     restoreMasthead();
     // what the regions drew is stale once the page is no longer the KE page
-    for (const id of ["ck-when", "ck-sky", "ck-brief", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
+    for (const id of ["ck-when", "ck-sky", "ck-legend", "ck-brief", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
   }
 
   function ckAttrs(node, entry, kind) {

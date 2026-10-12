@@ -970,9 +970,13 @@
   function paintWidget(s, host) {
     const d = s.data;
     if (d.face === "count") {
-      host.appendChild(el("div", "big num", isNum(d.count) ? d.count : (d.lines || []).length));
-      if (d.note) host.appendChild(el("div", "sub", d.note));
-      else if (!(isNum(d.count) ? d.count : (d.lines || []).length) && !s.ctx.alerted) host.appendChild(el("div", "sub", d.empty));
+      const n = isNum(d.count) ? d.count : (d.lines || []).length;
+      host.appendChild(el("div", "big num", n));
+      // at zero the answer is the panel's empty sentence ("Nothing waiting on you"), as the mock draws it; the
+      // provider's note (a caveat about what the count leaves out) is the line only when something is waiting, or
+      // when the panel is alerted (degraded or failed) and the zero may be a failed read
+      if (!n && !s.ctx.alerted) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", e.charAt(0).toUpperCase() + e.slice(1))); }
+      else if (d.note) host.appendChild(el("div", "sub", d.note));
       return;
     }
     if (d.kind === "status-dots") {
@@ -1151,7 +1155,10 @@
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
     const legend = el("div", "legendbar" + (hero ? "" : " frame"));
     paintLegend(legend, sky);
-    host.appendChild(legend);
+    // the hero's key is a full-width band BELOW the hero (mock-e), not a row inside the sky column: it goes to the
+    // page's own #ck-legend mount; a sky anywhere else, or a page without the mount, keeps it under its plot
+    const band = hero && document.getElementById ? document.getElementById("ck-legend") : null;
+    if (band) { band.replaceChildren(legend); band.hidden = false; } else host.appendChild(legend);
     s.skyParts = { plot: plot, win: win, legend: legend };
   }
 

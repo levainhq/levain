@@ -1071,7 +1071,6 @@ body.ke .hero .stamp { font-size: 12px; }
 body.ke .hero .ck-sky { min-width: 0; }
 body.ke .hero .sky-hero { display: block; border: 0; }
 body.ke .hero .sky-hero .plot { padding: 0; min-height: 200px; }
-body.ke .hero .ck-sky .legendbar { padding-block: 12px; font-size: 12px; color: var(--label); }
 body.ke .hero .ck-sky .xbody { padding: 0; }
 
 /* BRIEF: his state line and where to begin, one wide card */
@@ -1117,7 +1116,10 @@ body.ke .ck-zone { margin-top: var(--s4); }
 .lg-g .lg-ring { fill: none; stroke: var(--label); stroke-width: 1.3; }
 .lg-g .lg-ring.lg-bad { stroke: var(--accent); stroke-width: 2; }
 .lg-g .lg-mem { fill: var(--meta); }
-body.ke .hero .legendbar { border-bottom: 1px solid var(--hair); }
+/* the sky's key: a full-width band under the hero (mock-e), aligned to the page gutter */
+body.ke .ck-legend { border-bottom: 1px solid var(--hair); }
+body.ke .ck-legend .legendbar { padding: 14px var(--gutter); font-size: 12px; color: var(--label); }
+body.ke .hero .ck-sky .legendbar { padding-block: 12px; font-size: 12px; color: var(--label); }   /* a page without the mount keeps it here */
 body.ke .ck-secthead { display: flex; align-items: baseline; gap: 12px; padding-top: var(--s4); }
 body.ke .ck-secthead[hidden] { display: none; }
 /* a mode that hides every card in a region hides its header too (the cards' own mode rule is near the top) */
