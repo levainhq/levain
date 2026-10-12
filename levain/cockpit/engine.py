@@ -1494,9 +1494,12 @@ class Cockpit:
                         # one id, one owner: another source never takes over or relabels a panel
                         errors.append({"source": f"discovery:{spec.id}",
                                        "message": f"id collision: {spec.title!r} maps to the id of {have.title!r}"})
-                    elif tuple(have.verbs) != tuple(spec.verbs):
-                        # what a discovered panel offers is its owner's answer, read per pass
-                        self._set_verbs_locked(spec.id, tuple(spec.verbs))
+                    elif tuple(have.verbs) != tuple(spec.verbs) or have.rank != spec.rank:
+                        # what a discovered panel offers, and its rank among its owner's panels, are its
+                        # owner's answer, read per pass (a heading moved while serving moves its tab)
+                        specs = dict(self._specs)       # copy-on-write, like a registration
+                        specs[spec.id] = have.replaced(verbs=tuple(spec.verbs), rank=spec.rank)
+                        self._specs = specs
             with self._lock:
                 # a panel its owner no longer returns keeps its provider (it reads Absent) and offers nothing
                 for pid in [p for p, o in self._discovered.items() if o == i and p not in returned]:

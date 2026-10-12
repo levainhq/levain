@@ -99,3 +99,22 @@ def test_zero_or_one_neocortex_section(tmp_path, headings, want) -> None:
         assert neo == []
     else:
         assert len(neo) == 1 and len(neo[0]["panels"]) == 1
+
+
+class TestDiscoveredRankFollowsItsOwner:
+    """L3 r1 (codex MED): a discovered panel's rank is its owner's answer per pass, like its verbs, so a
+    heading reordered or inserted while the server runs moves its tab without a restart."""
+
+    def test_reordered_headings_reorder_their_tabs_on_the_next_manifest(self) -> None:
+        from levain.cockpit import Cockpit
+        from tests.test_cockpit_k1 import NONE_CRED, _simple
+
+        order = ["a", "b"]
+        ck = Cockpit()
+        ck.discover(lambda ctx: [_simple(h, region="mind", rank=i, tabs="Neocortex", span=2, size="tall")
+                                 for i, h in enumerate(order)])
+        first = _zone(ck.manifest(NONE_CRED)["regions"], "mind")["cards"][0]["panels"]
+        assert first == ["a", "b"]
+        order[:] = ["c", "b", "a"]                 # a heading inserted, two moved
+        again = _zone(ck.manifest(NONE_CRED)["regions"], "mind")["cards"][0]["panels"]
+        assert again == ["c", "b", "a"]

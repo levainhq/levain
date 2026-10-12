@@ -84,6 +84,7 @@ Tray 10 and Open loops 15 (both `tall`), Recent episodes 40, Keep 50, Recent edi
 (`tall`) and the Cognition card (graph 200 and projection history 210, `tabs="Cognition"`, `short`). Ranks 16-39 of
 `operate` are left for an embedder's Inbox, Fleet and Stream; a rank outside the kernel's bands is the embedder's.
 A zone grid row's height is its tallest card's, and the cards in a row stretch to it.
+The `Neocortex` and `Cognition` tab titles are the kernel's: an embedder panel that joins one with a different `size` or `span` is refused, and so are the sections after it. A discovered panel's rank and verbs are re-read at every manifest, so a heading moved while the server runs moves its tab.
 
 **Reading tokens.** `value.symbol` is optional and one of `clear`, `clear-night`, `partly-cloudy`,
 `partly-cloudy-night`, `cloudy`, `fog`, `drizzle`, `rain`, `heavy-rain`, `thunderstorm`, `snow`, `sleet`, `wind`,
