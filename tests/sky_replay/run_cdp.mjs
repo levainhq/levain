@@ -66,6 +66,10 @@ try {
   console.log('single', await run('?single=repo-alpha', outdir === '-' ? null : 'ck3_sky_single_repo.png'));
   console.log('hidden', await run('?hidden=1', null));
 } finally {
-  if (!exited) { const gone = new Promise((r) => proc.once('exit', r)); proc.kill(); await Promise.race([gone, sleep(5000)]); }
-  rmSync(profile, { recursive: true, force: true });
+  if (!exited) {
+    let timer; const gone = new Promise((r) => proc.once('exit', r));
+    proc.kill(); await Promise.race([gone, new Promise((r) => { timer = setTimeout(r, 5000); })]); clearTimeout(timer);
+  }
+  // cleanup must never fail a run or replace its error: Chrome's helpers can still hold the profile briefly
+  try { rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch {}
 }
