@@ -501,7 +501,8 @@ class _Floored(_Stub):
         super().__init__(on_event, [])
         if deny_localhost is not None:
             policy = type("P", (), {"deny_localhost_outbound": deny_localhost,
-                                    "socket_sources": tuple(Path(x) for x in sockets)})()
+                                    "socket_sources": tuple(Path(x) for x in sockets),
+                                    "runtime_sockets": ()})()
             executor = type("E", (), {"_policy": policy})()
             tool = type("T", (), {"executor": executor})()
             agent = type("A", (), {"tools_map": {"file_editor": tool}})()

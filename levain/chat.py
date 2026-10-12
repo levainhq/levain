@@ -27,7 +27,8 @@ present human, not just a token holder, is driving.)
 
 **An entity that may reach this server is refused.** With ``allow_localhost_outbound`` its shell
 could call these routes itself and approve its own held actions; with ``allow_container_sockets`` it
-could do the same from a container it starts on the host network. Every other entity's shell is
+could do the same from a container it starts on the host network, and with ``runtime_sockets`` through
+whatever daemon it names (a rootless podman is the case it exists for). Every other entity's shell is
 denied loopback and the container daemon sockets its floor lists. (L2 review, codex L3 r1,
 2026-10-03.)
 The refusal fires twice: early from the config, and
@@ -190,6 +191,13 @@ def chat_refusal(entity_dir: Path) -> str | None:
             "this server's chat routes from there, approving its own held actions. Chat refuses to "
             "host it; use `levain run` for this entity."
         )
+    if cfg.runtime_sockets:
+        return (
+            f"{entity_dir} gives its shell daemon sockets from the user runtime dir (runtime_sockets: "
+            f"{', '.join(cfg.runtime_sockets)}), and a daemon such as podman can start a container on the "
+            "host network that calls this server's chat routes, approving its own held actions. Chat "
+            "refuses to host it; use `levain run` for this entity."
+        )
     return None
 
 
@@ -252,8 +260,8 @@ def _turn_payload(result: Any) -> dict[str, Any]:
 
 def _hands_reach_this_server(session: Any) -> str | None:
     """What lets ``session``'s shell reach this server, read from the floor the hands enforce, or
-    ``None``. Two ways: connecting to localhost, and a container daemon socket (a container on the
-    host network connects to localhost). The floor carries no socket sources only when the
+    ``None``. Three ways: connecting to localhost, a container daemon socket (a container on the
+    host network connects to localhost), and a runtime-dir socket the entity lists. The floor carries no socket sources only when the
     entity opted out of the socket denies. An unreadable floor on a session with a shell counts
     as reaching it (fail-closed)."""
     if not getattr(session, "bash_ok", False):
@@ -264,6 +272,8 @@ def _hands_reach_this_server(session: Any) -> str | None:
             return "may connect to localhost"
         if not tuple(floor.socket_sources):
             return "may reach the container daemon sockets"
+        if tuple(floor.runtime_sockets):
+            return "may reach the daemon sockets its runtime_sockets lists"
         return None
     except Exception:  # noqa: BLE001 — cannot read the floor: assume the worst
         return "has a floor that cannot be read"

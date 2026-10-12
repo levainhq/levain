@@ -4,6 +4,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
+### Fixed
+
+- **On Linux, bash can no longer reach your gnupg dirmngr by renaming one of your directories (the 0.7.1 known limit).** Your user runtime directory (`/run/user/<uid>`, and `$XDG_RUNTIME_DIR`) is now a fresh, empty directory inside bash, holding only your gpg-agent and ssh-agent sockets, bound back as single files. The rename that reached a running dirmngr from the next session now finds nothing to move: measured 2026-10-12 on an Ubuntu host with a packet capture on port 53, the attack put a fresh name on the wire 63 times before this change and 0 times with it, and the host directory was untouched. The same view hides your user service manager and session bus (which bash could ask to run a command outside the sandbox), replacing the masks that did that, and every other daemon socket in that directory, including one started after bash. gpg signing and `ssh-add -l` through the agents keep working. New setting, `runtime_sockets` in `.levain/confinement.json`: sockets of that directory to put back, relative to it (`["podman/podman.sock"]`), each of which hands bash the daemon behind it. `systemd/`, `bus` and `S.dirmngr` are refused there. Known limits: an agent restarted during a session is unreachable from that session's bash; a dirmngr whose socket sits in a GNUPGHOME outside any runtime directory (a host with no `/run/user/<uid>`) is still hidden by path only.
+
 ## [0.9.0] — 2026-10-12
 
 Two things ship together: the signed team tier (team ledgers signed by SSH keys, the team replayed from signed history) and the live cockpit (eleven panel kinds, a page that redraws only what changed, an ambient sky).

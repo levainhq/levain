@@ -469,8 +469,11 @@ def test_hands_keys_are_appended_last_to_the_config_dataclass() -> None:
 
     from levain.firing.confinement import ConfinementConfig
 
-    assert [f.name for f in fields(ConfinementConfig)][-4:] == ["hands_user", "hands_uid", "hands_workspace",
-                                                                "hands_egress_ports"]
+    names = [f.name for f in fields(ConfinementConfig)]
+    # They follow the frozen prefix (allow_localhost_outbound is its last); later keys come after them.
+    assert names[names.index("allow_localhost_outbound") + 1:][:4] == ["hands_user", "hands_uid",
+                                                                       "hands_workspace", "hands_egress_ports"]
+    assert names[-1] == "runtime_sockets"
 
 
 # --- preconditions ---------------------------------------------------------------------------------

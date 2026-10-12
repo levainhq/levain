@@ -1945,7 +1945,9 @@ def test_offline_bash_cannot_reach_the_hosts_resolver_deputies(tmp_path, monkeyp
     assert str(run / "absent") not in " ".join(on)  # a mount on an absent root dir aborts bwrap
     dirmngr = str((tmp_path / "home" / ".gnupg").resolve() / "S.dirmngr")
     assert any(on[k:k + 3] == ["--ro-bind", "/dev/null", dirmngr] for k in range(len(on)))
-    assert "S.gpg-agent" not in " ".join(on)  # signing through gpg-agent keeps working
+    # signing through gpg-agent keeps working: no agent socket is masked
+    assert not any(on[k:k + 2] == ["--ro-bind", "/dev/null"] and "S.gpg-agent" in on[k + 2]
+                   for k in range(len(on) - 2))
     assert dbus not in off and snapd not in off and dirmngr not in off
 
 
@@ -2499,6 +2501,10 @@ def test_bwrap_every_tmpfs_is_remounted_ro_except_the_ssh_dir(tmp_path, monkeypa
     tmpfs = {t for _, t in _pairs(argv, "--tmpfs")}
     ro = {t for _, t in _pairs(argv, "--remount-ro")}
     exempt = {str(policy.ssh_dir)} if policy.ssh_dir is not None else set()
+    # The runtime-dir views (step (7)) are the other: a tool that starts its own agent inside bash
+    # makes its socket there.
+    from levain.firing.confinement import _runtime_view
+    exempt |= {str(r) for r in _runtime_view(policy)[1]}
     assert tmpfs - ro == exempt
 
 
@@ -2518,10 +2524,16 @@ def test_bwrap_ancestor_dirs_are_self_bound_parents_before_children(tmp_path, mo
     assert policy.deny_write_dirs, "fixture must produce ancestor dirs"
     argv = _bwrap_argv(policy)
     # $HOME is pinned by its own view (step (0)'s tmpfs), not by a second self-bind.
+    # A runtime dir is pinned by its view (step (7)'s tmpfs), and nothing under it is the host's.
+    from levain.firing.confinement import _runtime_view
+    views = [str(r) for r in _runtime_view(policy)[1]]
     home = str(Path.home().resolve())
-    bound = [argv[k + 2] if a == "--bind" else home for k, a in enumerate(argv[:-2])
-             if (a == "--bind" and argv[k + 1] == argv[k + 2]) or (a == "--tmpfs" and argv[k + 1] == home)]
+    bound = [argv[k + 2] if a == "--bind" else argv[k + 1] for k, a in enumerate(argv[:-2])
+             if (a == "--bind" and argv[k + 1] == argv[k + 2])
+             or (a == "--tmpfs" and argv[k + 1] in (home, *views))]
     for anc in policy.deny_write_dirs:
+        if any(anc.resolve().is_relative_to(v) and str(anc.resolve()) != v for v in views):
+            continue
         # Pinned when it exists (at its RESOLVED path: a mount cannot land on a symlink, /var/run,
         # macOS's /var) or when the argv will CREATE something under it; an absent ancestor nothing
         # lands under is skipped (self-binding a missing source aborted bwrap, 2026-09-30).
@@ -3521,7 +3533,7 @@ def test_offline_bash_masks_every_dirmngr_the_kernel_lists(tmp_path, monkeypatch
     on = _bwrap_argv(build_policy(_entity(tmp_path, "on"), deny_localhost_outbound=True))
     dirmngr = str(elsewhere.resolve() / "S.dirmngr")
     assert any(on[k:k + 3] == ["--ro-bind", "/dev/null", dirmngr] for k in range(len(on)))
-    assert "S.gpg-agent" not in " ".join(on)
+    assert "/dev/null " + str(elsewhere.resolve() / "S.gpg-agent") not in " ".join(on)
 
 
 def test_offline_bash_is_refused_when_the_kernel_socket_list_cannot_be_read(
