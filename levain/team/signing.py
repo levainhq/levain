@@ -32,6 +32,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..contracts import ContractError
+from ..contracts.grammar import b64decode
 from ..contracts.keys import fp_of_blob
 from ..launch import child_env
 from .transport import _NO_HOOKS, ledger_env
@@ -114,9 +116,9 @@ def fingerprint(pubkey_line: str) -> str:
     if declared not in KEY_TYPES:
         raise SigningError(f"unknown or unaccepted key type {declared!r}")
     try:
-        blob = base64.b64decode(b64, validate=True)
-    except (ValueError, TypeError):
-        raise SigningError("the key's base64 does not decode") from None
+        blob = b64decode(b64)
+    except ContractError:
+        raise SigningError("the key's base64 does not decode (canonical, padded base64 only)") from None
     _check_blob(declared, blob)
     return fp_of_blob(blob)
 
