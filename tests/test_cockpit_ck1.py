@@ -433,3 +433,208 @@ def test_a_search_result_label_reaches_the_text_view() -> None:
     snap["panels"]["p"] = ck.panel("p", q="needle")
     out = "\n".join(t for _s, t in render_lines(snap))
     assert "1 of 10" in out
+
+
+# --- CK1 L3 r1 fixes ---------------------------------------------------------------------------
+
+import threading
+import time
+
+from levain.cockpit.engine import check_query
+
+
+def _store(search: Any, **kw: Any) -> Cockpit:
+    """A windowed list panel over an empty window whose store search is ``search``."""
+    ck = Cockpit()
+    ck.register(ProviderSpec(id="p", kind="list", title="P", priority="feed", read=lambda c: Read(rows=()),
+                             order="time.desc", version_fields=("id",), window=2, search_scope="store",
+                             search=search, **kw))
+    return ck
+
+
+def _hit(i: str = "old") -> RowIn:
+    return RowIn(i, f"{i} match", stored={"id": i})
+
+
+def test_f1_a_generator_hook_is_drained_inside_the_deadline_and_cut_at_the_limit() -> None:
+    def slow(q: str, n: int) -> Any:
+        time.sleep(0.6)
+        yield _hit()
+
+    t0 = time.monotonic()
+    p = _store(slow, timeout_s=0.2).panel("p", q="x")
+    assert time.monotonic() - t0 < 0.5 and "timed out" in p["search_error"]
+
+    def endless(q: str, n: int) -> Any:
+        i = 0
+        while True:
+            i += 1
+            yield _hit(f"r{i}")
+
+    p = _store(endless, timeout_s=2).panel("p", q="x", limit=3)
+    assert [r["id"] for r in p["rows"]] == ["r1", "r2", "r3"]
+
+
+def test_f1_a_hung_hook_holds_one_thread_per_panel_and_the_next_search_is_busy() -> None:
+    release = threading.Event()
+    calls: list[int] = []
+
+    def hang(q: str, n: int) -> Any:
+        calls.append(1)
+        release.wait(5)
+        return []
+
+    ck = _store(hang, timeout_s=0.1)
+    before = threading.active_count()
+    errs = [ck.panel("p", q="x")["search_error"] for _ in range(6)]
+    try:
+        assert "timed out" in errs[0] and errs[1:] == ["search busy"] * 5
+        assert len(calls) == 1 and threading.active_count() - before <= 1
+    finally:
+        release.set()
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and "search_error" in ck.panel("p", q="x"):
+        time.sleep(0.05)
+    assert "search_error" not in ck.panel("p", q="x")      # the panel is searchable again once the hook ended
+
+
+def test_f1_a_hook_that_raises_systemexit_is_a_search_error_not_an_escape() -> None:
+    def quit_(q: str, n: int) -> Any:
+        raise SystemExit(3)
+
+    assert "search failed" in _store(quit_).panel("p", q="x")["search_error"]
+
+
+def test_f2_the_now_view_advertises_no_search() -> None:
+    ck = Cockpit()
+    ck.register(ProviderSpec(id="g", kind="list", title="G", priority="gate", order="time.desc", version_fields=("id",),
+                             read=lambda c: Read(rows=tuple(RowIn(f"r{i}", f"t{i}", stored={"id": f"r{i}"}) for i in range(20)))))
+    p = ck.panel("now")
+    assert p["searchable"] is False and p["search"] is None
+
+
+def test_f3_alerts_alone_are_content_and_an_empty_window_still_reports_the_search() -> None:
+    p = _ok("status-dots", {"metrics": [], "alerts": [{"message": "disk full", "severity": "bad"}]})
+    assert p["status"] == "ok"
+    assert "disk full" in _text(_value_panel("status-dots", {"metrics": [], "alerts": [{"message": "disk full"}]}))
+    ck = _store(lambda q, n: StoreMatches(rows=(_hit(),), total=1))
+    p = ck.panel("p", q="old")
+    assert p["status"] == "ok" and [r["id"] for r in p["rows"]] == ["old"]
+    snap = snapshot(ck)
+    snap["panels"]["p"] = p
+    assert "old match" in "\n".join(t for _s, t in render_lines(snap))
+    p = _store(lambda q, n: (_ for _ in ()).throw(RuntimeError("db locked"))).panel("p", q="old")
+    snap["panels"]["p"] = p
+    assert "db locked" in "\n".join(t for _s, t in render_lines(snap))
+    p = _store(lambda q, n: []).panel("p", q="old")
+    assert p["status"] == "empty" and p["match_label"] == "0 matches in the store"
+
+
+def test_f4_a_refused_row_or_a_bad_total_is_a_search_error() -> None:
+    ck = Cockpit()
+    ck.register(ProviderSpec(id="p", kind="list", title="P", priority="feed", read=lambda c: Read(rows=()), order="time.desc",
+                             version_fields=("id",), window=2, search_scope="store", facets=frozenset({"overdue_days"}),
+                             search=lambda q, n: [RowIn("a", "a", facets={"overdue_days": "x"}, stored={"id": "a"})]))
+    p = ck.panel("p", q="z")
+    assert "refused" in p["search_error"] and p["rows"] == []
+    for total in (0, "9", True, -1):
+        p = _store(lambda q, n, t=total: StoreMatches(rows=(_hit(),), total=t)).panel("p", q="z")
+        assert "search_error" in p and p["rows"] == [], total
+    assert _store(lambda q, n: StoreMatches(rows=(_hit(),), total=1)).panel("p", q="z")["matched"] == 1
+
+
+def test_f5_store_rows_carry_provenance() -> None:
+    from levain.cockpit.authority import LabelKey
+
+    class Snap:
+        revision = None
+        error = None
+        degraded = 0
+
+        def provenance(self, key: Any) -> Any:
+            return {"label": "verified"} if key is not None else None
+
+        def label(self, key: Any) -> str:
+            return "verified" if key is not None else "unverified"
+
+    ck = _store(lambda q, n: [_hit()], label_key=lambda stored: LabelKey("r", {"id": stored["id"]}))
+    ck.attach_labeller(lambda: Snap())      # type: ignore[arg-type]
+    assert ck.panel("p", q="z")["rows"][0]["provenance"] == {"label": "verified"}
+
+
+def test_f6_a_searched_validator_covers_what_was_returned() -> None:
+    state = {"ok": False}
+
+    def flaky(q: str, n: int) -> Any:
+        if not state["ok"]:
+            raise RuntimeError("db locked")
+        return [_hit()]
+
+    ck = _store(flaky)
+    _s, _b, h = handle_get(ck, "/cockpit/panel/p.json?q=z", if_none_match=None)
+    etag = dict(h)["ETag"]
+    state["ok"] = True
+    assert handle_get(ck, "/cockpit/panel/p.json?q=z", if_none_match=etag)[0] == 200
+    _s, _b, h2 = handle_get(ck, "/cockpit/panel/p.json?q=z", if_none_match=None)
+    assert handle_get(ck, "/cockpit/panel/p.json?q=z", if_none_match=dict(h2)["ETag"])[0] == 304
+
+
+def test_f7_the_route_validates_q_as_sent() -> None:
+    ck = _rowpanel("list", 10)
+    assert handle_get(ck, "/cockpit/panel/p.json?q=" + "x" * 200 + "%20", if_none_match=None)[0] == 400
+    assert handle_get(ck, "/cockpit/panel/p.json?q=a%0A", if_none_match=None)[0] == 400
+    assert handle_get(ck, "/cockpit/panel/p.json?q=", if_none_match=None)[0] == 200
+
+
+def test_f9_nan_and_infinity_are_not_numbers() -> None:
+    for bad in (float("nan"), float("inf")):
+        _refused("metric-grid", {"numbers": [{"label": "x", "value": bad}]}, "value.numbers[0].value")
+        _refused("reading", {**READING, "hi": bad}, "value.hi")
+
+
+def test_f10_line_at_and_last_call_are_iso_and_the_outcome_is_ok_or_failed() -> None:
+    _refused("line", {"lines": [{"text": "x", "at": "not a time"}]}, "value.lines[0].at")
+    for lc in ({"at": "junk", "outcome": "ok"}, {"at": NOW, "outcome": ""}, {"at": NOW, "outcome": "maybe"}):
+        _refused("roster", {"rows": [{**ROW, "last_call": lc}]}, "value.rows[0].last_call")
+    _ok("roster", {"rows": [{**ROW, "last_call": {"at": NOW, "outcome": "failed"}}]})
+    _refused("log", {"rows": [{"verb": "v", "target": "t", "actor": "a", "at": "junk"}]}, "value.rows[0].at")
+
+
+def test_f11_legacy_kind_is_derived_never_passed_and_survives_a_verbs_copy() -> None:
+    with pytest.raises(TypeError):
+        ProviderSpec(id="p", kind="list", title="P", priority="feed", read=lambda c: Read(rows=()),
+                     legacy_kind="visual")     # type: ignore[call-arg]
+    spec = ProviderSpec(id="v", kind="visual", title="V", priority="feed", read=lambda c: Read(value={}))
+    assert spec.kind == "ambient" and spec.legacy_kind == "visual"
+    assert spec.with_verbs(("snooze",)).legacy_kind == "visual"
+    assert ProviderSpec(id="a", kind="ambient", title="A", priority="feed", read=lambda c: Read(value={})).legacy_kind == ""
+
+
+def test_f12_a_null_silence_is_signal_is_omitted() -> None:
+    p = _ok("roster", {"rows": [{**ROW, "silence_is_signal": None},
+                                {**ROW, "name": "b", "cadence": "on_call", "silence_is_signal": None}]})
+    assert [r["silence_is_signal"] for r in p["value"]["rows"]] == [True, False]
+
+
+def test_f13_text_projections() -> None:
+    out = _text(_value_panel("brief", {"lines": [{"label": "L", "text": "hi"}]})).split("\n")
+    assert not any(ln.strip() == "" and ln.startswith("    ") for ln in out)
+    r = {**READING, "lo": None}
+    assert "(hi 70)" in _text(_value_panel("reading", r))
+    rows = [{"verb": "v", "target": f"t{i}", "actor": "a", "at": NOW} for i in range(60)]
+    assert "+12 more" in _text(_value_panel("log", {"rows": rows}))
+    t = _text(_value_panel("roster", {"rows": [{**ROW, "name": "g1", "group": "G"}, {**ROW, "name": "u1", "group": None}]}))
+    assert t.index("(no group)") < t.index("u1")
+
+
+def test_f14_a_query_with_no_folded_term_is_no_query() -> None:
+    assert check_query("́")[0] is None and check_query("   ")[0] is None and check_query("a")[0] == "a"
+    p = _rowpanel("list", 10).panel("p", q="́")
+    assert "match_label" not in p and len(p["rows"]) == 10
+
+
+def test_f15_a_status_dots_value_unit_and_read_are_renderable_types() -> None:
+    for bad, field in (({"value": {"a": 1}}, "value"), ({"value": float("nan")}, "value"), ({"value": True}, "value"),
+                       ({"unit": 3}, "unit"), ({"read": 3}, "read")):
+        _refused("status-dots", {"metrics": [{"label": "x", **bad}]}, f"value.metrics[0].{field}")
+    _ok("status-dots", {"metrics": [{"label": "x", "value": "3 of 4", "unit": "", "read": "fine"}, {"label": "y"}]})

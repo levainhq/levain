@@ -31,7 +31,9 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 from collections import Counter
+import itertools
 import json
+import math
 import re
 import threading
 import time
@@ -176,13 +178,21 @@ class ProviderSpec:
     search_scope: str = "rows"
     window: int | None = None
     search: Callable[[str, int], Any] | None = None
-    # the levain.cockpit/1 name this spec was declared with, when it declared an alias (set below)
-    legacy_kind: str = ""
+    # the levain.cockpit/1 name this spec was declared with, when it declared an alias. Derived from
+    # ``kind`` alone: a caller cannot set it, so it can never disagree with the kind it normalised.
+    legacy_kind: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
         if self.kind in ALIASES:
             self.legacy_kind = self.kind
             self.kind = ALIASES[self.kind]
+
+    def with_verbs(self, verbs: tuple[str, ...]) -> "ProviderSpec":
+        """A copy offering ``verbs``. ``replace`` re-runs ``__post_init__`` on the already-normalised
+        kind, so the declared name is carried across explicitly."""
+        out = dataclasses.replace(self, verbs=verbs)
+        out.legacy_kind = self.legacy_kind
+        return out
 
 
 def _label_note(note: str | None, labels: "LabelSnapshot | None") -> str | None:
@@ -401,6 +411,9 @@ class Cockpit:
         self._edits_reader: Callable[[int], Any] | None = None
         # source reads made inside a write still running (a hung source keeps its flight here)
         self._one_live: list[list[Any]] = []
+        # panel id -> its store search still running; one at a time, so a hung hook costs one thread
+        self._searching: dict[str, threading.Thread] = {}
+        self._search_mu = threading.Lock()
 
     def attach_verbs(self, view: Any) -> None:
         """Attach the verb registry's view: row and panel actions, the manifest ``verbs`` map, and
@@ -537,7 +550,7 @@ class Cockpit:
             return None
         if found[0].title != spec.title:
             return Fault(f"id collision: {found[0].title!r} maps to the id of {spec.title!r}")
-        return dataclasses.replace(spec, verbs=tuple(found[0].verbs))
+        return spec.with_verbs(tuple(found[0].verbs))
 
     def today(self) -> date:
         return ReadContext(self._clock()).today
@@ -1044,6 +1057,8 @@ class Cockpit:
                "log": "rows", "ambient": "events"}.get(kind)
         if key == "events" and "visual" in value:
             return False           # a levain.cockpit/1 visual: its own data is the content
+        if kind == "status-dots" and value.get("alerts"):
+            return False           # an alert is content even when no metric is
         return bool(key) and not value.get(key)
 
     @staticmethod
@@ -1261,8 +1276,7 @@ class Cockpit:
             # the Now view applies the snapshot to its rows, so it explains a degraded one as _head does
             "note": _label_note(snap.note, labels if labelled else None),
             "empty": "Nothing needs you now.", "order": None, "groups": None,
-            "search": {"fields": list(ROW_SEARCH_DEFAULT["list"]), "scope": "rows", "default_visible": 10, "hook": False},
-            "searchable": len(rows) > SEARCH_THRESHOLD, "window": None,
+            "search": None, "searchable": False, "window": None,
             "actions": [], "degraded": degraded, "edit_class": None,
         }
         # the union of the source panels' declared groups (labels and order), counted over the now
@@ -1375,7 +1389,7 @@ class Cockpit:
 
     def _set_verbs_locked(self, panel_id: str, verbs: tuple[str, ...]) -> None:
         specs = dict(self._specs)       # copy-on-write, like a registration
-        specs[panel_id] = dataclasses.replace(specs[panel_id], verbs=verbs)
+        specs[panel_id] = specs[panel_id].with_verbs(verbs)
         self._specs = specs
 
     @staticmethod
@@ -1514,22 +1528,25 @@ class Cockpit:
                 held = len(rows_all)
                 if spec.search_scope == "store" and spec.search is not None:
                     got, total, err = self._store_search(spec, q, limit)
-                    if err is not None:
-                        out["search_error"] = err
-                        rows_all, matched = [], None
-                    else:
+                    if err is None:
                         try:
-                            ins = [x for x in got]
-                            for x in ins:
+                            for x in got:
                                 if not isinstance(x, RowIn):
                                     raise TypeError(f"a {spec.kind} search hook returns RowIn rows, got {type(x).__name__}")
-                            rows_all, _refused = self._rows(spec, ins, ctx)
-                            rows_all = self._with_provenance(rows_all, None, auth.labels)
+                            found, refused = self._rows(spec, got, ctx)
+                            if refused:
+                                raise ValueError(f"{refused} row(s) refused: a facet value of the wrong type")
+                            if total is not None and total < len(found):
+                                raise ValueError(f"total {total} is below the {len(found)} rows returned")
+                            keys = self._label_keys(spec, got, {r["id"] for r in found})
+                            rows_all = self._with_provenance(found, keys, auth.labels)
                             matched = total if total is not None else len(rows_all)
                             out["match_label"] = f"{matched} matches in the store"
                         except Exception as exc:  # noqa: BLE001 - a hook's bad rows are a search fault, not a crash
-                            out["search_error"] = f"search hook returned unusable rows: {_safe_str(exc)}"
-                            rows_all, matched = [], None
+                            err = f"search hook returned unusable rows: {_safe_str(exc)}"
+                    if err is not None:
+                        out["search_error"] = err
+                        rows_all, matched = [], None
                 else:
                     keep = [r for r in rows_all if _terms_match([_field_text(r, f) for f in fields], q)]
                     matched = len(keep)
@@ -1572,37 +1589,66 @@ class Cockpit:
                     out["value"] = None
             else:
                 out["value"] = value
+        if q and spec is not None and ("match_label" in out or "search_error" in out):
+            self._seal_search(out)
         return out
 
     @staticmethod
-    def _store_search(spec: ProviderSpec, q: str, limit: int) -> tuple[list[Any], int | None, str | None]:
+    def _seal_search(out: dict[str, Any]) -> None:
+        """A searched answer is its own response: its status says whether it returned rows (a window
+        that is empty today can still have store matches), and its validator covers what it returned,
+        so a revalidation never 304s on results that changed or a search that recovered."""
+        shown = out["rows"] if out["rows"] is not None else (out["value"] or {}).get("rows")
+        if out["status"] in ("ok", "empty") and "search_error" not in out:
+            out["status"] = "ok" if shown else "empty"
+        out["etag"] = _sha({"base": out["etag"], "status": out["status"], "rows": out["rows"], "value": out["value"],
+                            "matched": out.get("matched"), "label": out.get("match_label"),
+                            "error": out.get("search_error")})
+
+    def _store_search(self, spec: ProviderSpec, q: str, limit: int) -> tuple[list[Any], int | None, str | None]:
         """Run the provider's ``search(q, limit)`` hook, bounded by the panel's own timeout. Returns
         ``(rows, total, error)``: a hook that fails or overruns is an ERROR the caller reports, never an
-        empty answer that reads as "nothing matches"."""
+        empty answer that reads as "nothing matches".
+
+        The hook's answer is drained INSIDE the timed worker, at most ``limit`` rows (a generator or a
+        lazy sequence cannot run on the request thread), and one search per panel runs at a time: a
+        hook that outlives its timeout keeps its panel "busy" until it ends, so hung hooks cost one
+        thread per panel, never one per request."""
         fut: Future = Future()
 
         def run() -> None:
             try:
-                _set_once(fut, spec.search(q, limit))    # type: ignore[misc]
-            except BaseException as exc:  # noqa: BLE001
+                res = spec.search(q, limit)    # type: ignore[misc]
+                total = None
+                if isinstance(res, StoreMatches):
+                    res, total = res.rows, res.total
+                try:
+                    it = iter(res)
+                except TypeError:
+                    raise TypeError("search hook must return a sequence of rows") from None
+                rows = list(itertools.islice(it, limit))
+                if total is not None and (isinstance(total, bool) or not isinstance(total, int) or total < len(rows)):
+                    raise ValueError(f"search hook total {total!r} is not a count of at least the {len(rows)} rows returned")
+                _set_once(fut, (rows, total))
+            except BaseException as exc:  # noqa: BLE001 - whatever the hook raised is its answer
                 if not fut.done():
                     fut.set_exception(exc)
 
-        threading.Thread(target=run, daemon=True, name=f"cockpit-search-{spec.id}").start()
+        worker = threading.Thread(target=run, daemon=True, name=f"cockpit-search-{spec.id}")
+        with self._search_mu:
+            live = self._searching.get(spec.id)
+            if live is not None and live.is_alive():
+                return [], None, "search busy"
+            self._searching[spec.id] = worker
+            worker.start()
         try:
-            res = fut.result(timeout=spec.timeout_s)
+            exc = fut.exception(timeout=spec.timeout_s)
         except FutureTimeout:
             return [], None, f"search timed out after {spec.timeout_s:g}s"
-        except Exception as exc:  # noqa: BLE001
+        if exc is not None:
             return [], None, f"search failed: {_safe_str(exc)}"
-        total = None
-        if isinstance(res, StoreMatches):
-            res, total = res.rows, res.total
-        try:
-            res = list(res)[:limit]
-        except TypeError:
-            return [], None, "search hook must return a sequence of rows"
-        return res, total, None
+        rows, total = fut.result()
+        return rows, total, None
 
     def _search_value_rows(self, spec: ProviderSpec, value: dict[str, Any], q: str, limit: int,
                            out: dict[str, Any]) -> dict[str, Any]:
@@ -1806,7 +1852,10 @@ def _bad(spec: "ProviderSpec", where: str, why: str) -> ValueError:
 
 
 def _is_num(x: Any) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool)
+    """A JSON number: NaN and the infinities are not representable on the wire."""
+    if isinstance(x, bool):
+        return False
+    return isinstance(x, int) or (isinstance(x, float) and math.isfinite(x))
 
 
 def _is_str(x: Any) -> bool:
@@ -1847,9 +1896,10 @@ def _v_line(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
     for i, ln in enumerate(_need_list(spec, v, "lines")):
         if not _is_str(ln.get("text")):
             raise _bad(spec, f"value.lines[{i}].text", "must be a string")
-        for k in ("label", "at"):
-            if ln.get(k) is not None and not _is_str(ln[k]):
-                raise _bad(spec, f"value.lines[{i}].{k}", "must be a string")
+        if ln.get("label") is not None and not _is_str(ln["label"]):
+            raise _bad(spec, f"value.lines[{i}].label", "must be a string")
+        if ln.get("at") is not None and not _is_iso(ln["at"]):
+            raise _bad(spec, f"value.lines[{i}].at", "must be an ISO-8601 timestamp")
     return v
 
 
@@ -1901,6 +1951,11 @@ def _v_status_dots(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             raise _bad(spec, f"value.metrics[{i}].label", "must be a non-empty string")
         if m.get("status", "unknown") not in ("ok", "warn", "bad", "unknown"):
             raise _bad(spec, f"value.metrics[{i}].status", f"must be ok|warn|bad|unknown, got {m.get('status')!r}")
+        if m.get("value") is not None and not (_is_num(m["value"]) or _is_str(m["value"])):
+            raise _bad(spec, f"value.metrics[{i}].value", "must be a finite number or a string")
+        for k in ("unit", "read"):
+            if m.get(k) is not None and not _is_str(m[k]):
+                raise _bad(spec, f"value.metrics[{i}].{k}", "must be a string")
     if v.get("alerts") is not None:
         for i, a in enumerate(_need_list(spec, v, "alerts")):
             if not _is_str(a.get("message")):
@@ -1982,9 +2037,10 @@ def _v_roster(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         if r.get("digest") is not None and not isinstance(r["digest"], dict):
             raise _bad(spec, f"{w}.digest", "must be an object or null (null means no data)")
         lc = r.get("last_call")
-        if lc is not None and not (isinstance(lc, dict) and _is_str(lc.get("at")) and _is_str(lc.get("outcome"))):
-            raise _bad(spec, f"{w}.last_call", "must be null or {at, outcome}")
-    shown = [{**r, "silence_is_signal": r.get("silence_is_signal", r["cadence"] == "resident")}
+        if lc is not None and not (isinstance(lc, dict) and _is_iso(lc.get("at")) and lc.get("outcome") in EVENT_OUTCOMES):
+            raise _bad(spec, f"{w}.last_call", f"must be null or {{at (ISO-8601), outcome (one of {list(EVENT_OUTCOMES)})}}")
+    shown = [{**r, "silence_is_signal": (r["silence_is_signal"] if r.get("silence_is_signal") is not None
+                                         else r["cadence"] == "resident")}
              for r in rows if r["lifecycle"] != "retired"]      # retired members do not render
     return {**v, "rows": shown, "retired_hidden": len(rows) - len(shown)}
 
@@ -2093,6 +2149,8 @@ def check_query(q: str | None, limit: int | None = None) -> tuple[str | None, in
             raise QueryError(f"q is at most {SEARCH_Q_MAX} characters, got {len(q)}")
         if any(unicodedata.category(ch) in ("Cc", "Cs") for ch in q):
             raise QueryError("q is plain text: control characters are refused")
+        if not _fold(q).split():
+            q = None            # no searchable term (blank, or only combining marks): no query, never "match everything"
     if limit is None:
         limit = SEARCH_LIMIT_DEFAULT
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:

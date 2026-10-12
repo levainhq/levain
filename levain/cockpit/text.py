@@ -106,8 +106,11 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
         out.append((DIM, _fit(f"  {f['count']} held back — {visible(f['reason'])}", width)))
     if head.get("note"):
         out.append((NOTE, _fit(f"  {visible(head['note'])}", width)))
+    searched = bool(panel.get("search_error") or panel.get("match_label"))
     if status == "empty":
-        out.append((DIM, _fit(f"  {visible(head.get('empty') or 'Nothing here.')}", width)))
+        if not searched:
+            out.append((DIM, _fit(f"  {visible(head.get('empty') or 'Nothing here.')}", width)))
+        out.extend(_search_lines(panel, width))
         return out
     kind = ALIASES.get(head["kind"], head["kind"])      # a levain.cockpit/1 kernel's names degrade too
     if panel.get("next") and panel.get("rows") is None and panel.get("value") is None:
@@ -120,11 +123,16 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
             out.append((DIM, _fit(f"  (a {visible(kind)} panel: this view has no text form for it)", width)))
         else:
             out.extend(draw(panel.get("value") or {}, now, width, top_n))
-    if panel.get("search_error"):
-        out.append((ERROR, _fit(f"  SEARCH FAILED: {visible(panel['search_error'])}", width)))
-    elif panel.get("match_label"):
-        out.append((DIM, _fit(f"  {visible(panel['match_label'])}", width)))
+    out.extend(_search_lines(panel, width))
     return out
+
+
+def _search_lines(panel: dict[str, Any], width: int) -> list[tuple[str, str]]:
+    if panel.get("search_error"):
+        return [(ERROR, _fit(f"  SEARCH FAILED: {visible(panel['search_error'])}", width))]
+    if panel.get("match_label"):
+        return [(DIM, _fit(f"  {visible(panel['match_label'])}", width))]
+    return []
 
 
 def _row(text: str, width: int) -> tuple[str, str]:
@@ -174,15 +182,17 @@ def _t_brief(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[t
     for ln in v.get("lines") or []:
         label = f"{visible(ln.get('label'))}: " if ln.get("label") else ""
         out.append(_row(f"  {label}{visible(ln.get('text'))}", width))
-    for ln in str(v.get("markdown") or "").replace("\r\n", "\n").split("\n"):   # only \n breaks a line; every other separator stays visible
-        out.append(_row(f"    {visible(ln)}", width))
+    if v.get("markdown"):
+        for ln in str(v["markdown"]).replace("\r\n", "\n").split("\n"):   # only \n breaks a line; every other separator stays visible
+            out.append(_row(f"    {visible(ln)}", width))
     return out
 
 
 def _t_reading(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
     unit = f" {visible(v['unit'])}" if v.get("unit") else ""
     cond = f", {visible(v['condition'])}" if v.get("condition") else ""
-    span = f" (hi {visible(v['hi'])} / lo {visible(v['lo'])})" if v.get("hi") is not None and v.get("lo") is not None else ""
+    bounds = [f"{name} {visible(v[key])}" for name, key in (("hi", "hi"), ("lo", "lo")) if v.get(key) is not None]
+    span = f" ({' / '.join(bounds)})" if bounds else ""
     out = [_row(f"  {visible(v.get('value'))}{unit}{cond}{span} — {_age(v.get('as_of'), now)}", width)]
     for sr in v.get("sub") or []:
         band = f" [{visible(sr['band'])}]" if sr.get("band") else ""
@@ -197,12 +207,15 @@ def _t_metric_grid(v: dict[str, Any], now: datetime, width: int, top_n: int) -> 
 
 def _t_roster(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
-    group: Any = object()
+    group: Any = None
     for r in v.get("rows") or []:
         if r.get("group") != group:
+            had_group = bool(group)      # an ungrouped row after a group needs its own header
             group = r.get("group")
             if group:
                 out.append((GROUP, _fit(f"  {visible(group)}", width)))
+            elif had_group:
+                out.append((GROUP, "  (no group)"))
         call = r.get("last_call")
         tail = (f"last call {_age(call.get('at'), now)}: {visible(call.get('outcome'))}" if call
                 else ("no data" if r.get("digest") is None else "digest ok"))
@@ -220,9 +233,12 @@ def _t_form(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tu
 
 def _t_log(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
     out = []
-    for r in (v.get("rows") or [])[:top_n * 4]:
+    rows = v.get("rows") or []
+    for r in rows[:top_n * 4]:
         sentence = r.get("sentence") or f"{r.get('verb')} \u00b7 {r.get('target')}"
         out.append(_row(f"  {visible(sentence)} — {visible(r.get('actor'))}, {_age(r.get('at'), now)}", width))
+    if len(rows) > top_n * 4:
+        out.append((DIM, _fit(f"  +{len(rows) - top_n * 4} more (cut by this view)", width)))
     return out
 
 

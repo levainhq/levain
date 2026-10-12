@@ -71,6 +71,12 @@ def _status(ck: Cockpit, pid: str) -> dict[str, Any]:
     return ck.panel(pid)  # type: ignore[return-value]
 
 
+
+def _derived(fields: dict) -> ProviderSpec:
+    """A spec rebuilt from another's ``__dict__`` with some fields changed; ``legacy_kind`` is derived, not an argument."""
+    return ProviderSpec(**{k: v for k, v in fields.items() if k != "legacy_kind"})
+
+
 def _simple(pid: str = "p", *, rows=(), priority="feed", **kw: Any) -> ProviderSpec:
     def read(ctx):
         return Read(rows=tuple(rows))
@@ -244,7 +250,7 @@ class TestRegistrationRefusals:
     def test_empty_comes_only_from_a_read(self) -> None:
         ck = Cockpit()
         ck.register(_simple("ok"))
-        ck.register(ProviderSpec(**{**_simple("gone").__dict__, "read": lambda c: Absent("no source")}))
+        ck.register(_derived({**_simple("gone").__dict__, "read": lambda c: Absent("no source")}))
         assert ck.panel("ok")["status"] == "empty"
         assert ck.panel("gone")["status"] == "error"
 
@@ -272,7 +278,7 @@ class TestRefreshersAndTimeouts:
     def test_a_hung_source_call_is_error_at_its_timeout(self) -> None:
         release = threading.Event()
         ck = Cockpit()
-        ck.register(ProviderSpec(**{**_simple("h").__dict__, "read": lambda c: (release.wait(30), Read(rows=()))[1],
+        ck.register(_derived({**_simple("h").__dict__, "read": lambda c: (release.wait(30), Read(rows=()))[1],
                                     "timeout_s": 0.2}))
         t0 = time.monotonic()
         got = ck.panel("h")
@@ -295,7 +301,7 @@ class TestRefreshersAndTimeouts:
                 raise OSError("disk gone")
             return Read(rows=(RowIn("r", "t", {"at": "1"}, stored={"id": "r"}),))
         ck = Cockpit()
-        ck.register(ProviderSpec(**{**_simple().__dict__, "read": read, "refresh_every_s": 60, "stale_after_s": 60}))
+        ck.register(_derived({**_simple().__dict__, "read": read, "refresh_every_s": 60, "stale_after_s": 60}))
         ck.refresh("p")
         good = ck.panel("p")["as_of"]
         state["fail"] = True
@@ -308,7 +314,7 @@ class TestRefreshersAndTimeouts:
 
     def test_the_provider_exception_is_a_fault_not_a_crash(self) -> None:
         ck = Cockpit()
-        ck.register(ProviderSpec(**{**_simple("x").__dict__, "read": lambda c: 1 / 0}))
+        ck.register(_derived({**_simple("x").__dict__, "read": lambda c: 1 / 0}))
         assert ck.panel("x")["status"] == "error"
         assert ck.manifest(NONE_CRED)["panels"]["x"]["status"] == "error"
 
@@ -650,7 +656,7 @@ class TestL3R1Fixes:
             gate.wait(2)
             return Read(rows=())
         ck = Cockpit()
-        ck.register(ProviderSpec(**{**_simple("s").__dict__, "read": slow, "timeout_s": 5}))
+        ck.register(_derived({**_simple("s").__dict__, "read": slow, "timeout_s": 5}))
         out: list[str] = []
         ts = [threading.Thread(target=lambda: out.append(ck.panel("s")["status"])) for _ in range(4)]
         for t in ts:
@@ -745,7 +751,7 @@ class TestL3R1Fixes:
         def read(ctx):
             calls["n"] += 1
             return Read(rows=())
-        ck.register(ProviderSpec(**{**_simple().__dict__, "read": read, "refresh_every_s": 0.05, "stale_after_s": 0.1}))
+        ck.register(_derived({**_simple().__dict__, "read": read, "refresh_every_s": 0.05, "stale_after_s": 0.1}))
         ck.start()
         orig = ck._book
         flaky = {"n": 0}
@@ -777,7 +783,7 @@ class TestL3R1Fixes:
     def test_stop_keeps_a_refresher_that_is_still_inside_a_read(self) -> None:
         release = threading.Event()
         ck = Cockpit()
-        ck.register(ProviderSpec(**{**_simple().__dict__, "read": lambda c: (release.wait(10), Read(rows=()))[1],
+        ck.register(_derived({**_simple().__dict__, "read": lambda c: (release.wait(10), Read(rows=()))[1],
                                     "refresh_every_s": 0.05, "stale_after_s": 0.1, "timeout_s": 0.1}))
         ck.refresh("p")  # times out at 0.1 s; the read thread lingers
         ck._refreshers["p"] = type("R", (), {"spec": ck._specs["p"], "halt": lambda self: None,
@@ -789,7 +795,7 @@ class TestL3R1Fixes:
     def test_a_row_with_a_wrongly_typed_facet_is_skipped_and_counted_not_a_blanked_panel(self) -> None:
         ck = Cockpit()
         rows = [RowIn("a", "a", {"tier": "hot"}, stored={"id": "a"}), RowIn("b", "b", {"tier": "scorching"}, stored={"id": "b"})]
-        ck.register(ProviderSpec(**{**_simple().__dict__, "read": lambda c: Read(rows=tuple(rows)),
+        ck.register(_derived({**_simple().__dict__, "read": lambda c: Read(rows=tuple(rows)),
                                     "facets": frozenset({"tier"}), "order": "spore.keep"}))
         got = ck.panel("p")
         assert got["status"] == "partial" and [r["id"] for r in got["rows"]] == ["a"] and got["skipped"][0]["count"] == 1

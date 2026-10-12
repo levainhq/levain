@@ -91,7 +91,7 @@ def handle_get(
     profile = (qs.get("profile") or ["full"])[0]
     if profile not in PROFILES:
         return jerr(400, "bad_request", f"profile must be one of {list(PROFILES)}")
-    q = (qs.get("q") or [""])[0].strip() or None
+    q = (qs.get("q") or [""])[0] or None      # the decoded value as sent: the kernel validates it, nothing trims it first
     row = (qs.get("row") or [""])[0] or None
     # Search is a READ on the panel's own auth: nothing here authenticates differently, and ``q`` goes
     # nowhere but the cockpit call (it is hashed into the validator, never logged or journalled).

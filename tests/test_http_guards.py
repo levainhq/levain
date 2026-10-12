@@ -186,3 +186,16 @@ def test_verbose_access_log_never_carries_a_search_query(monkeypatch, capsys) ->
     h.log_request(200)
     err = capsys.readouterr().err
     assert "secret" not in err and "q=-" in err and "limit=5" in err
+
+
+def test_verbose_access_log_redacts_q_by_its_decoded_name_and_on_the_error_path(monkeypatch, capsys) -> None:
+    from levain.http_guards import GuardedHandler
+
+    monkeypatch.setenv("LEVAIN_SERVE_VERBOSE", "1")
+    h = GuardedHandler.__new__(GuardedHandler)
+    h.client_address = ("127.0.0.1", 1)
+    h.requestline = "GET /cockpit/panel/p.json?%71=secret&limit=5&q%3D=kept HTTP/1.1"
+    h.log_request(200)
+    h.log_error("code %d, message %s", 400, "Bad request syntax ('GET /x?a=1&q=hidden HTTP/1.1')")
+    err = capsys.readouterr().err
+    assert "secret" not in err and "hidden" not in err and "%71=-" in err and "limit=5" in err and "a=1" in err

@@ -21,6 +21,7 @@ import os
 import re
 from http.server import BaseHTTPRequestHandler
 from typing import Any
+from urllib.parse import unquote_plus
 
 __all__ = [
     "GuardedHandler",
@@ -34,7 +35,18 @@ __all__ = [
 # ``same-site``, or even ``none`` (a top-level navigation, which can't carry a JSON
 # POST anyway) — is an unexpected/hostile origin and is refused.
 _WRITE_SEC_FETCH_ALLOWED = "same-origin"
-_QUERY_TEXT = re.compile(r"([?&]q=)[^&\s\"]*")
+_QUERY_STRING = re.compile(r"\?\S*")
+
+
+def _redact_query(text: str) -> str:
+    """A cockpit search query (parameter ``q``) never reaches a log line. The query is parsed, not
+    pattern-matched on its encoded spelling: ``%71`` is ``q`` too."""
+    def one(m: "re.Match[str]") -> str:
+        pairs = m.group(0)[1:].split("&")
+        kept = [f"{pair.split('=', 1)[0]}=-" if unquote_plus(pair.split("=", 1)[0]) == "q" and "=" in pair else pair
+                for pair in pairs]
+        return "?" + "&".join(kept)
+    return _QUERY_STRING.sub(one, text)
 
 # The page only ever loads its own same-origin scripts + stylesheet and fetches its
 # own JSON. Lock everything else off. Slice 2a moved the one inline <style> block out
@@ -258,4 +270,4 @@ class GuardedHandler(BaseHTTPRequestHandler):
         is noise in an interactive terminal. ``LEVAIN_SERVE_VERBOSE`` restores it on stderr."""
         if os.environ.get("LEVAIN_SERVE_VERBOSE"):
             # a cockpit search query (``q=``) is never written to a log, verbose or not
-            super().log_message(fmt, *(_QUERY_TEXT.sub(r"\1-", a) if isinstance(a, str) else a for a in args))
+            super().log_message(fmt, *(_redact_query(a) if isinstance(a, str) else a for a in args))
