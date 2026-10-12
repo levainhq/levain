@@ -299,7 +299,7 @@
   .grp-head:first-child { border-top: 0; margin-top: 0; }
   .row.ext-accent { border-left: 2px solid var(--operate); padding-left: 9px; }
   .row.ext-dim .clause { color: var(--dim); }
-  .ext-meta { color: var(--faint); flex: 0 0 auto; font: 700 10px/1.6 var(--label);
+  .ext-meta { color: var(--faint); flex: 0 1 auto; min-width: 0; max-width: 100%; overflow-wrap: anywhere; font: 700 10px/1.6 var(--label);
     letter-spacing: .06em; }
 
   /* episode keyword-search (spore-107): the inline read-only search box on the
