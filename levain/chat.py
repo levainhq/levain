@@ -374,8 +374,8 @@ class _Session:
 def _turn_payload(result: Any) -> dict[str, Any]:
     """A :class:`~levain.session.TurnResult` as JSON-shaped data: it reads ``result`` once
     (:func:`~levain.chat_driver.read_outcome`) and serialises that snapshot. ``ok`` and ``exit_code`` are
-    the result's own derived properties, so a client reads the harness's classification rather than
-    re-deriving it."""
+    the snapshot's, derived from the outcome in the session's order; a result whose own differ is refused
+    there, so a client reads one classification and never re-derives it."""
     return _snapshot_payload(read_outcome(result, strict=False))
 
 

@@ -26,9 +26,9 @@ snapshot that breaks one cannot exist):
   that runs an action while reporting nothing held cannot be told apart from one that did not run it,
   so what is checked here is the half the host can see: the consent row is never empty when the
   driver says it halted, and a halt is never silent.
-* ``ok`` and ``exit_code`` never contradict the outcome they come with: ``ok`` only for a completed,
-  ungated turn whose reply is readable, ``exit_code`` 0 exactly when ``ok``, and 7 exactly when an
-  otherwise-completed turn's reply is an unreadable call (:attr:`levain.session.TurnResult.exit_code`).
+* ``ok`` and ``exit_code`` never contradict the outcome they come with: the snapshot derives them from it
+  in :attr:`levain.session.TurnResult.exit_code`'s order (timeout 5, error 3, gated 4, no reply 1, an
+  unreadable call 7, else 0; ``ok`` exactly at 0), and a harness whose own claims differ is refused.
   A client that read ``ok`` alone would otherwise show a call that never ran as the entity's answer.
 * A halted turn carries ``held_digest``, a string naming those exact bytes, and the driver's
   :meth:`~HarnessDriver.held_digest` reads the same thing again later. The host binds an approval to
@@ -214,10 +214,32 @@ class PendingApproval:
             raise DriverContractError("a held action's `recognized` is not a bool")
 
 
-# levain.session's EXIT_OK and EXIT_UNREADABLE_CALL, mirrored so this module stays harness-agnostic
-# (it imports no session code); test_the_snapshot_codes_are_sessions pins them equal.
+# levain.session's exit codes, mirrored so this module stays harness-agnostic (it imports no session
+# code); test_the_snapshot_codes_are_sessions pins them equal.
 _EXIT_OK = 0
+_EXIT_NO_REPLY = 1
+_EXIT_TURN_FAILED = 3
+_EXIT_GATED = 4
+_EXIT_TIMEOUT = 5
 _EXIT_UNREADABLE_CALL = 7
+
+
+def _outcome_code(*, reply: str | None, error: str | None, gated: bool, timed_out: bool,
+                  unreadable_call: bool) -> tuple[bool, int]:
+    """THE one derivation of a turn's ``(ok, exit_code)`` from its outcome, in
+    :attr:`levain.session.TurnResult.exit_code`'s order: timeout 5, error 3, gated 4, no reply 1,
+    unreadable call 7, else 0; ``ok`` exactly when the code is 0 (verify r2, codex M5)."""
+    if timed_out:
+        code = _EXIT_TIMEOUT
+    elif error is not None:
+        code = _EXIT_TURN_FAILED
+    elif gated:
+        code = _EXIT_GATED
+    elif not reply:
+        code = _EXIT_NO_REPLY
+    else:
+        code = _EXIT_UNREADABLE_CALL if unreadable_call else _EXIT_OK
+    return code == _EXIT_OK, code
 
 
 @dataclass(frozen=True)
@@ -226,10 +248,9 @@ class TurnSnapshot:
     single stop reason, Codex's ``turn/completed``). Every guarantee of the contract (module docstring) is
     checked here, at construction, so a snapshot that exists keeps them; the host serialises this same
     object, and nothing of the outcome is read a second time (the live :meth:`~HarnessDriver.held_digest`
-    is re-read at approve on purpose, to compare with the one recorded here). ``ok`` and ``exit_code`` are the harness's
-    own classification, carried, not re-derived, but never contradicting the outcome: ``ok`` only for a completed,
-    ungated turn with a readable reply, exit 0 exactly when ``ok``, and exit 7 exactly when an otherwise-completed
-    turn's reply is an unreadable call (:attr:`levain.session.TurnResult.exit_code`'s order; chat L3 r1, codex M5)."""
+    is re-read at approve on purpose, to compare with the one recorded here). ``ok`` and ``exit_code`` are not
+    passed: they are DERIVED from the outcome by :func:`_outcome_code`, so they cannot contradict it; a harness's
+    own claims are compared with them in :func:`read_outcome` (verify r2, codex M5)."""
 
     reply: str | None
     tool_activity: tuple[str, ...]
@@ -240,25 +261,23 @@ class TurnSnapshot:
     pending: tuple[PendingApproval, ...]
     held_digest: str | None
     unreadable_call: bool
-    ok: bool
-    exit_code: int
     unreadable_unchecked: bool = False
     """The harness could not check whether ``reply`` is an unreadable tool call. It requires
     ``unreadable_call`` (fail closed: the reply is not shown as an answer); a client shows its own notice."""
+    ok: bool = field(init=False)
+    exit_code: int = field(init=False)
 
     def __post_init__(self) -> None:
         for name in ("reply", "error", "held_digest"):
             if getattr(self, name) is not None and not _is_text(getattr(self, name)):
                 raise DriverContractError(f"the outcome's `{name}` is neither text nor None")
-        for name in ("nudged", "gated", "timed_out", "unreadable_call", "unreadable_unchecked", "ok"):
+        for name in ("nudged", "gated", "timed_out", "unreadable_call", "unreadable_unchecked"):
             if not isinstance(getattr(self, name), bool):
                 raise DriverContractError(
                     f"the outcome's `{name}` is not a bool (a method or a value where a flag was meant)")
         if self.unreadable_unchecked and not self.unreadable_call:
             # Fail closed: a reply nobody could check is never shown as the entity's answer (codex, closing pass)
             raise DriverContractError("the outcome's reply is `unreadable_unchecked` but not `unreadable_call`")
-        if type(self.exit_code) is not int:
-            raise DriverContractError("the outcome's `exit_code` is not an int")
         if type(self.tool_activity) is not tuple or not all(_is_text(x) for x in self.tool_activity):
             raise DriverContractError("the outcome's `tool_activity` is not a sequence of text lines")
         if type(self.pending) is not tuple or not all(type(p) is PendingApproval for p in self.pending):
@@ -269,16 +288,10 @@ class TurnSnapshot:
             raise DriverContractError(
                 "the outcome is timed out but carries no error: a stopped turn did not complete, and an "
                 "outcome without an error would leave the session open for another turn")
-        completed = self.error is None and not self.gated and not self.timed_out and bool(self.reply)
-        if self.ok and not (completed and not self.unreadable_call):
-            raise DriverContractError(
-                "the outcome claims `ok` but it failed, halted, timed out, has no reply or its reply is an "
-                "unreadable call: a client would show it as the entity's answer")
-        if (self.exit_code == _EXIT_OK) != self.ok:
-            raise DriverContractError(f"the outcome's `exit_code` {self.exit_code} disagrees with `ok` {self.ok}")
-        if (self.exit_code == _EXIT_UNREADABLE_CALL) != (completed and self.unreadable_call):
-            raise DriverContractError(
-                f"the outcome's `exit_code` {self.exit_code} disagrees with `unreadable_call` {self.unreadable_call}")
+        ok, code = _outcome_code(reply=self.reply, error=self.error, gated=self.gated,
+                                 timed_out=self.timed_out, unreadable_call=self.unreadable_call)
+        object.__setattr__(self, "ok", ok)
+        object.__setattr__(self, "exit_code", code)
         if self.error is not None:
             return      # failed: the host decides nothing on it (module docstring); its rows were checked
         if self.gated and not self.pending:
@@ -377,7 +390,7 @@ def read_outcome(outcome: Any, *, strict: bool = True) -> TurnSnapshot:
             "the driver's outcome does not carry the fields the host reads (reply, tool_activity, error, "
             "nudged, gated, timed_out, pending, held_digest, ok, exit_code); a missing `gated` or "
             f"`pending` would read as 'nothing held' (missing: {', '.join(missing)})")
-    return TurnSnapshot(
+    snap = TurnSnapshot(
         reply=got["reply"],
         tool_activity=_lines(got["tool_activity"], "tool_activity"),
         error=got["error"],
@@ -388,9 +401,18 @@ def read_outcome(outcome: Any, *, strict: bool = True) -> TurnSnapshot:
         held_digest=None if got["held_digest"] is _ABSENT else got["held_digest"],
         unreadable_call=getattr(outcome, "unreadable_call", False),
         unreadable_unchecked=getattr(outcome, "unreadable_unchecked", False),
-        ok=got["ok"],
-        exit_code=got["exit_code"],
     )
+    # The harness's own claims are compared, never carried: a claim that is not the derived value is a
+    # driver that classifies its turns differently from the host (verify r2, codex M5)
+    if (type(got["ok"]) is not bool or type(got["exit_code"]) is not int
+            or (got["ok"], got["exit_code"]) != (snap.ok, snap.exit_code)):
+        # Shown only when exactly bool / int: anything else is driver code, whose repr could raise
+        said = [repr(v) if type(v) in (bool, int) else f"<{type(v).__name__}>" for v in (got["ok"], got["exit_code"])]
+        raise DriverContractError(
+            f"the outcome claims `ok` {said[0]}, `exit_code` {said[1]}, but its outcome is "
+            f"`ok` {snap.ok}, `exit_code` {snap.exit_code} (timeout 5, error 3, gated 4, no reply 1, unreadable "
+            "call 7, else 0): a claimed `ok` would let a client show it as the entity's answer")
+    return snap
 
 
 class HarnessDriver(abc.ABC):

@@ -53,11 +53,16 @@ class _Out:
 
     @property
     def exit_code(self) -> int:
-        if self.ok:
-            return 0
-        if self.error is None and not self.gated and not self.timed_out and self.reply and self.unreadable_call:
-            return 7
-        return 3
+        # levain.session.TurnResult's order (verify r2, codex M5: the host now refuses any other code)
+        if self.timed_out:
+            return 5
+        if self.error is not None:
+            return 3
+        if self.gated:
+            return 4
+        if not self.reply:
+            return 1
+        return 7 if self.unreadable_call else 0
 
 
 _HELD = PendingEfferent("terminal", "rm x", "bash fans in", full='{"command": "rm x"}')
@@ -576,7 +581,7 @@ def test_outcome_value_shapes_are_checked_never_coerced(bad, needle):
         def ok(self):                                      # a method where a value was meant
             return True
 
-    with pytest.raises(DriverContractError, match="`ok` is not a bool"):
+    with pytest.raises(DriverContractError, match="claims `ok` <method>"):
         read_outcome(Meth())
 
     class BoolCode(_Out):
@@ -2661,16 +2666,18 @@ def test_an_expired_idem_key_pins_nothing(tmp_path, monkeypatch):
 
 
 def _snap(**kw):
-    base = dict(reply="r", tool_activity=(), error=None, nudged=False, gated=False, timed_out=False,
-                pending=(), held_digest=None, unreadable_call=False, ok=True, exit_code=0)
+    """A harness outcome carrying its own `ok` / `exit_code` claims, read the way the host reads one (the
+    snapshot itself no longer takes them: it derives both, verify r2 codex M5)."""
+    from types import SimpleNamespace
+    base = dict(reply="r", tool_activity=[], error=None, nudged=False, gated=False, timed_out=False,
+                pending=[], held_digest=None, unreadable_call=False, ok=True, exit_code=0)
     base.update(kw)
-    return TurnSnapshot(**base)
+    return read_outcome(SimpleNamespace(**base))
 
 
 @pytest.mark.parametrize("kw", [
     dict(error="boom"),
-    dict(gated=True, pending=(PendingApproval("terminal", "rm x", '{"command": "rm x"}', "r", True),),
-         held_digest="d"),
+    dict(gated=True, pending=[_HELD], held_digest="d"),
     dict(timed_out=True, error="timed out"),
     dict(unreadable_call=True),
     dict(reply=None),
@@ -2703,7 +2710,49 @@ def test_an_unreadable_call_carries_exit_7():
 def test_the_snapshot_codes_are_sessions():
     from levain import chat_driver as cd
     from levain import session as s
-    assert (cd._EXIT_OK, cd._EXIT_UNREADABLE_CALL) == (s.EXIT_OK, s.EXIT_UNREADABLE_CALL)
+    assert ((cd._EXIT_OK, cd._EXIT_NO_REPLY, cd._EXIT_TURN_FAILED, cd._EXIT_GATED, cd._EXIT_TIMEOUT,
+             cd._EXIT_UNREADABLE_CALL)
+            == (s.EXIT_OK, s.EXIT_NO_REPLY, s.EXIT_TURN_FAILED, s.EXIT_GATED, s.EXIT_TIMEOUT,
+                s.EXIT_UNREADABLE_CALL))
+
+
+def _claimed(ok, exit_code, **kw):
+    """A harness outcome (a plain object) whose own `ok` and `exit_code` claims are given."""
+    from types import SimpleNamespace
+    base = dict(reply="r", tool_activity=[], error=None, nudged=False, gated=False, timed_out=False,
+                pending=[], held_digest=None, unreadable_call=False)
+    base.update(kw)
+    return SimpleNamespace(ok=ok, exit_code=exit_code, **base)
+
+
+@pytest.mark.parametrize("ok, code, kw", [
+    (False, 3, dict(gated=True, pending=[_HELD], held_digest="d")),      # gated is 4
+    (False, 3, dict(timed_out=True, error="timed out")),                  # a timeout is 5
+    (False, 4, dict(error="boom")),                                       # an error is 3
+    (False, 3, dict(reply=None)),                                         # no reply is 1
+    (False, 3, dict()),                                                   # a readable completed reply is 0
+])
+def test_an_outcome_code_that_is_not_its_outcomes_is_refused(ok, code, kw):
+    # verify r2, codex M5: only ok / 0 / 7 were cross-checked; every other wrong code was carried
+    with pytest.raises(DriverContractError, match="exit_code"):
+        read_outcome(_claimed(ok, code, **kw))
+
+
+@pytest.mark.parametrize("kw, want", [
+    (dict(timed_out=True, error="t", gated=True, pending=(), reply=None), (False, 5)),
+    (dict(error="e", unreadable_call=True), (False, 3)),
+    (dict(gated=True, pending=(PendingApproval("terminal", "rm x", '{"command": "rm x"}', "r", True),),
+          held_digest="d", reply=None), (False, 4)),
+    (dict(reply=None), (False, 1)),
+    (dict(unreadable_call=True), (False, 7)),
+    (dict(), (True, 0)),
+])
+def test_a_snapshot_derives_ok_and_exit_code_from_its_outcome(kw, want):
+    base = dict(reply="r", tool_activity=(), error=None, nudged=False, gated=False, timed_out=False,
+                pending=(), held_digest=None, unreadable_call=False)
+    base.update(kw)
+    snap = TurnSnapshot(**base)
+    assert (snap.ok, snap.exit_code) == want
 
 
 def test_every_real_turn_result_makes_a_snapshot():

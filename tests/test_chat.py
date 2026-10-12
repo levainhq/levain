@@ -50,7 +50,14 @@ class _Result:
 
     @property
     def exit_code(self) -> int:
-        return 0 if self.ok else (4 if self.gated else 3)
+        # levain.session.TurnResult's order (verify r2, codex M5: the host now refuses any other code)
+        if self.timed_out:
+            return 5
+        if self.error is not None:
+            return 3
+        if self.gated:
+            return 4
+        return 0 if self.reply else 1
 
 
 class _Stub:
