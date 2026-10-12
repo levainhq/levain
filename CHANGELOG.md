@@ -15,6 +15,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 - **`ChainExecutor.gate`.** The executor now holds a `GateHandle`, exposed as `ChainExecutor.handle`; read the gate with `handle.current()`, once per admission. A gate kept across a policy swap goes stale, so the executor no longer hands one out.
 - **`EfferentGate.sweep_timeouts`.** The silence-default sweep is `GateHandle.sweep_timeouts`, which decides each pending on the gate current for it; a sweep held on one gate decided pendings on that gate's policy after a swap had superseded it. A bare gate sweeps with `as_handle(gate).sweep_timeouts(now)`.
 
+## [0.9.1] — 2026-10-12
+
+A security fix. Upgrade if you use gpg on a machine where Levain runs bash.
+
+### Security
+
+- **Bash can no longer write gnupg's configuration files.** Bash runs as you, so it could write `gpg-agent.conf` and gnupg's other configuration files. Your gpg-agent runs outside Levain's floor and starts programs those files name, so a bash session could get a program of its choosing run outside the floor, with your network and your files. `gpg-agent.conf`, `scdaemon.conf`, `gpg.conf`, `dirmngr.conf` and `common.conf` are now read-only to bash in `~/.gnupg`, and in `$GNUPGHOME` when Levain's own environment sets it to an absolute path. gpg signing and decryption through your agent keep working. Found in Levain's own review and reproduced on Linux; the fix was verified there against the same reproduction.
+- **Known open issue: bash can still reach your gpg-agent.** This release closes the configuration-file path that was reproduced. It does not keep a bash session from reaching gpg-agent by other means. Levain 2.0 changes how bash reaches local services, so that gpg-agent is out of its reach unless you allow it.
+
 ## [0.9.0] — 2026-10-12
 
 Two things ship together: the signed team tier (team ledgers signed by SSH keys, the team replayed from signed history) and the live cockpit (eleven panel kinds, a page that redraws only what changed, an ambient sky).
