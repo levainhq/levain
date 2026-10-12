@@ -809,6 +809,7 @@
   function dropSky(s) {
     if (s.skyHandle && typeof s.skyHandle.destroy === "function") { try { s.skyHandle.destroy(); } catch (_) { /* a mount that cannot unmount */ } }
     s.skyHandle = null;
+    s.skyParts = null;
     if (s.clock) clocks.delete(s.clock);
     s.clock = null;
   }
@@ -822,6 +823,21 @@
     dropSky(s);
     states.delete(s);
   }
+  function skyCounts(sky) {
+    const repos = new Set(sky.events.map((e) => e.repo).filter((r) => typeof r === "string" && r));
+    const failed = sky.events.filter((e) => e.outcome === "failed").length;
+    return sky.events.length + " events from " + repos.size + " repos" + (failed ? " · " + failed + " failed" : "");
+  }
+  // An ambient panel whose sky is already mounted takes new events through the mount's own update(), so the
+  // animation keeps running instead of restarting. True when it did; false leaves the paint to remount.
+  function updateSky(s, sky) {
+    const k = s.skyParts;
+    if (!k || !s.skyHandle || typeof s.skyHandle.update !== "function" || !k.plot.isConnected || !s.body.contains(k.plot)) return false;
+    try { s.skyHandle.update({ events: sky.events, legend: sky.legend }); } catch (_) { return false; }
+    k.win.textContent = skyCounts(sky);
+    k.legend.textContent = sky.legend;
+    return true;
+  }
   function paintSky(s, host, sky) {
     dropSky(s);
     const wrap = el("div", "sky");
@@ -829,9 +845,8 @@
     const t = el("div", "clock num");
     const date = el("div", "date");
     when.append(t, date);
-    const repos = new Set(sky.events.map((e) => e.repo).filter((r) => typeof r === "string" && r));
-    const failed = sky.events.filter((e) => e.outcome === "failed").length;
-    when.appendChild(el("div", "win", sky.events.length + " events from " + repos.size + " repos" + (failed ? " · " + failed + " failed" : "")));
+    const win = el("div", "win", skyCounts(sky));
+    when.appendChild(win);
     const clk = { node: t, date: date, seen: false, born: Date.now() };
     s.clock = clk;
     clocks.add(clk);
@@ -844,7 +859,9 @@
     if (root.LevainSky && typeof root.LevainSky.mount === "function") {
       try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
-    host.appendChild(el("div", "legendbar frame", sky.legend));
+    const legend = el("div", "legendbar frame", sky.legend);
+    host.appendChild(legend);
+    s.skyParts = { plot: plot, win: win, legend: legend };
   }
 
   // ---- one typed panel ----
@@ -909,6 +926,7 @@
 
   function paint(s) {
     const d = s.data, sr = d.search || {};
+    if (d.kind === "ambient" && !s.fault && updateSky(s, d.sky)) return;
     dropSky(s);
     s.body.replaceChildren();
     if (s.fault) { s.body.appendChild(el("p", "err", "unavailable — " + s.fault)); return; }

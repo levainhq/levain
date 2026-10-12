@@ -105,7 +105,8 @@ from levain.cockpit.external import ExternalPanels, discoverer
 from levain.cockpit.routes import CACHE_CONTROL as COCKPIT_CACHE_CONTROL
 from levain.cockpit.routes import VARY as COCKPIT_VARY
 from levain.cockpit.routes import handle_get as handle_cockpit_get
-from levain.cockpit.routes import is_cockpit_path
+from levain.cockpit.routes import EVENTS_PATH, is_cockpit_path
+from levain.cockpit import stream as cockpit_stream
 from levain.cockpit.verbs import VerbRegistry, VerbSpec, VerbView, dispatch as dispatch_verb, retier
 
 from levain.chat import DEFAULT_TURN_SECONDS, ChatError, ChatHost, chat_refusal
@@ -304,6 +305,8 @@ _ASSETS: dict[str, tuple[str, str]] = {
     "/cockpit_view.js": ("cockpit_view.js", "text/javascript; charset=utf-8"),
     # The ambient panel's sky: its own asset so the renderer and the sky evolve apart.
     "/sky.js": ("sky.js", "text/javascript; charset=utf-8"),
+    # The freshness stream's client: one fetch-read stream per page, through the page's own read transport.
+    "/cockpit_stream.js": ("cockpit_stream.js", "text/javascript; charset=utf-8"),
 }
 
 
@@ -324,7 +327,7 @@ _RESERVED_PATHS: frozenset[str] = frozenset(_ASSETS) | {
     "/job.json",
     "/edit",
     "/action",
-    "/cockpit/manifest.json", "/cockpit/freshness.json", _COCKPIT_VERB_PATH,
+    "/cockpit/manifest.json", "/cockpit/freshness.json", EVENTS_PATH, _COCKPIT_VERB_PATH,
 } | frozenset(_CHAT_GET_ROUTES) | frozenset(_CHAT_POST_ROUTES)
 
 
@@ -644,6 +647,14 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # The cockpit broker (K2b): None on a read-only source; else started with the cockpit and drained
     # by server_close. It is write-disabled unless the install class is declared (design §6).
     broker: "Broker | None" = None
+    # The freshness stream (levain.cockpit.stream): its own cap (a stream holds its slot for its whole
+    # life, so it cannot share the request gate), its pace, and the event every stream loop waits on.
+    # The epoch names this server process in every event id, so a client can tell a restart.
+    stream_gate: threading.BoundedSemaphore = threading.BoundedSemaphore(cockpit_stream.DEFAULT_MAX_STREAMS)
+    stream_tick_s: float = cockpit_stream.DEFAULT_TICK_S
+    stream_heartbeat_s: float = cockpit_stream.DEFAULT_HEARTBEAT_S
+    stream_stop: threading.Event = threading.Event()
+    stream_epoch: str = ""
 
     _cockpit_lock = threading.Lock()
 
@@ -680,6 +691,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     def server_close(self) -> None:
         # K2b §4.2: the broker drains first (write admission closes; an admitted settler is waited
         # for before its lock is released), then the cockpit's refreshers stop
+        self.stream_stop.set()      # open streams end first: nothing is left holding a thread
         if self.broker is not None:
             self.broker.stop()
         if self.cockpit is not None:
@@ -771,6 +783,41 @@ class _Handler(GuardedHandler):
             supplied.encode("utf-8"), expected.encode("utf-8")
         )
 
+    def _serve_stream(self, *, head: bool) -> None:
+        """``GET /cockpit/events``: reached only through ``_route``, so the Host allowlist, the
+        cross-site refusal and the off-box token gate have already answered. Past the stream cap: 503."""
+        srv = self.server
+        if head:
+            self._send(b"", cockpit_stream.CONTENT_TYPE, head=True)
+            return
+        if not srv.stream_gate.acquire(blocking=False):
+            self._send(b"busy\n", "text/plain; charset=utf-8", status=503)
+            return
+        try:
+            cockpit = self._cockpit()
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", cockpit_stream.CONTENT_TYPE)
+            self.send_header("Vary", COCKPIT_VARY)
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.flush()
+
+            def write(chunk: bytes) -> None:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+
+            try:
+                cockpit_stream.run(
+                    write, cockpit.freshness, epoch=srv.stream_epoch,
+                    last_event_id=self.headers.get("Last-Event-ID"), stop=srv.stream_stop,
+                    tick_s=srv.stream_tick_s, heartbeat_s=srv.stream_heartbeat_s)
+            except (OSError, ValueError):
+                pass        # the client went away (or the socket closed under a shutdown): this stream is over
+        finally:
+            srv.stream_gate.release()
+
     def _route(self, *, head: bool) -> None:
         # Host allowlist (DNS rebinding), then the cross-site refusal: a cross-origin page
         # cannot even TRIGGER the per-request store read.
@@ -824,6 +871,9 @@ class _Handler(GuardedHandler):
             # The shared cockpit's two read routes (levain.cockpit, design §3): they ride this same
             # envelope, so the Host allowlist, cross-site refusal, the off-box token gate above and
             # the concurrency gate all apply with no second path.
+            if path == EVENTS_PATH:
+                self._serve_stream(head=head)
+                return
             if not self.server.request_gate.acquire(blocking=False):
                 self._send(b"busy\n", "text/plain; charset=utf-8", status=503, head=head)
                 return
@@ -1581,6 +1631,9 @@ def make_server(
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}
     # Bound the expensive routes (store read + writes); past the cap → 503.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
+    httpd.stream_gate = threading.BoundedSemaphore(cockpit_stream.DEFAULT_MAX_STREAMS)
+    httpd.stream_stop = threading.Event()
+    httpd.stream_epoch = secrets.token_hex(4)
     return httpd
 
 

@@ -15,6 +15,7 @@ from levain.cockpit.engine import Cockpit, QueryError, RowNotFound
 
 MANIFEST_PATH = "/cockpit/manifest.json"
 FRESHNESS_PATH = "/cockpit/freshness.json"
+EVENTS_PATH = "/cockpit/events"      # the freshness stream
 PANEL_PREFIX = "/cockpit/panel/"
 PANEL_SUFFIX = ".json"
 TOKEN_HEADER = "X-Levain-Write-Token"
@@ -29,7 +30,7 @@ REPRESENTATION = 3
 
 
 def is_cockpit_path(path: str) -> bool:
-    return path in (MANIFEST_PATH, FRESHNESS_PATH) or (path.startswith(PANEL_PREFIX) and path.endswith(PANEL_SUFFIX))
+    return path in (MANIFEST_PATH, FRESHNESS_PATH, EVENTS_PATH) or (path.startswith(PANEL_PREFIX) and path.endswith(PANEL_SUFFIX))
 
 
 def credential_for(supplied: str, expected: str | None) -> dict[str, Any]:

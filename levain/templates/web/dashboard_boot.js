@@ -207,7 +207,9 @@
 
   // The read transport for code outside this file (the filter box's store search, a one-panel refetch):
   // the same function, so the same token handling.
-  window.LevainCockpitTransport = { readJson: authedReadJson };
+  // `headers` is the SAME read-header function the reads above use, so the freshness stream (a fetch read that
+  // cannot go through res.json()) carries the same credential; `reload` is the board's one passive re-read.
+  window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }) };
 
   // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
   // /job.json off-box; token-free on loopback/read-only). Throws on a non-OK (incl. the fail-closed
@@ -517,6 +519,7 @@
     document.addEventListener("change", discardPreview, true);
   }
 
+  let heldNext = null;
   async function loadManifestView(passive) {
     let manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
     // A writable install that wants a token and read the manifest without one (a loopback read needs none)
@@ -563,6 +566,8 @@
         panels[id] = { error: e && e.message ? e.message : String(e) };
       }
     }));
+    // what this board was drawn from, per panel: the freshness stream compares it with the server's map
+    heldNext = Object.fromEntries(ids.map((id) => [id, { as_of: panels[id].as_of || null, status: panels[id].status || "error" }]));
     return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: panels }, { elapsedMs: Date.now() - fetchedAt });
   }
 
@@ -593,6 +598,7 @@
         window.LevainDashboard.render(mview, mview.writable
           ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, onJobsIdle, recall } : { recall });
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
+        if (heldNext) window.LevainCockpitHeld = heldNext;    // published once drawn: only then can a panel be refetched in place
         status("read " + new Date().toLocaleTimeString());
         showNotice();
         return;
