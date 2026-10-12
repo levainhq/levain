@@ -255,6 +255,8 @@ class AuthoritySnapshot:
     keys: Mapping[str, AuthorityKey]
     policy: AuthorityPolicy
     _hashes: tuple[str, ...] = field(repr=False, default=())
+    # the head link's ``at``: the next link's ``at`` may not be earlier (an ordering rule, never a grant)
+    head_at: datetime | None = None
 
     def key(self, fingerprint: str) -> AuthorityKey | None:
         return self.keys.get(fingerprint)
@@ -495,6 +497,10 @@ def _apply_policy_op(policy: AuthorityPolicy, rec: Mapping[str, Any]) -> Authori
             old = _parse_stamp(data["grants"][gid]["expires_at"], "the grant's expires_at")
             new = _parse_stamp(rec["expires_at"], "expires_at")
             signed = _parse_stamp(rec["signed_at"], "signed_at")
+            # signed_at IS the link's at, which the ordering rule bounds below; otherwise a replayed
+            # signed_at would be an unbounded input to the 30-day rule
+            if rec["signed_at"] != rec["at"]:
+                raise AuthorityError("a renew's signed_at must equal its at")
             if new <= old:
                 raise AuthorityError("a renew must move the grant's expiry later")
             if new > signed + _RENEW_MAX:
@@ -585,10 +591,6 @@ def _parse_record(row: _Row) -> dict[str, Any]:
                                + (f" (optionally {', '.join(sorted(optional))})" if optional else ""))
     if rec["seq"] != seq or type(rec["seq"]) is not int:
         raise ReplayError(seq, f"the record names seq {rec['seq']!r}")
-    try:
-        _parse_stamp(rec["at"], "at")
-    except AuthorityError as exc:
-        raise ReplayError(seq, str(exc)) from None
     return rec
 
 
@@ -638,6 +640,16 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
         raise ReplayError(seq, "hash does not match prev_hash + record")
     rec = _parse_record(row)
     op = rec["op"]
+    # `at` is an ORDERING constraint, never a grant of authority (amends DESIGN §3.1): a link is never
+    # earlier than its predecessor, so a future-dated inserted link wedges every later append visibly
+    # (an append is stamped now) instead of silently widening a clock-bounded rule such as renew's
+    try:
+        at = _parse_stamp(rec["at"], "at")
+    except AuthorityError as exc:
+        raise ReplayError(seq, str(exc)) from None
+    if state is not None and state.head_at is not None and at < state.head_at:
+        raise ReplayError(seq, f"at {rec['at']} is earlier than its predecessor's "
+                               f"{_stamp(state.head_at)}; the log's times never go back")
     if state is None:
         if not isinstance(rec["store_id"], str) or not _STORE_ID.fullmatch(rec["store_id"]):
             raise ReplayError(seq, "the genesis store_id is malformed")
@@ -692,7 +704,7 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
         if not ok:
             raise ReplayError(seq, f"the signature does not verify as {signer.fingerprint}")
     hashes = (() if state is None else state._hashes) + (row.hash,)
-    return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes)
+    return AuthoritySnapshot(rec["store_id"], seq, row.hash, MappingProxyType(keys), policy, hashes, head_at=at)
 
 
 def _apply_op(rec: Mapping[str, Any], seq: int, state: AuthoritySnapshot, keys: dict[str, AuthorityKey],
