@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Mapping
+from dataclasses import dataclass
+from typing import Callable, Mapping
 
 from . import ContractError
 from .grammar import JSON_INT_MAX, check_int
@@ -26,13 +27,31 @@ from .grammar import JSON_INT_MAX, check_int
 MAX_DEPTH = 32        # levain's bound (no spec governs it)
 LOG_KINDS = ("team", "fleet", "receipt")
 
-# The one global registry: (leaf, v) -> the log kinds that accept it. A leaf name has one meaning across every
-# log; a new v is a new entry and an old (leaf, v) stays verifiable forever. Provisional shapes are never here.
-# A type is registered in the same commit as its field validator, never before: an entry without one would pass
-# on framing alone. Empty until S1-b lands F9 ("line", 1) and F10 ("receipt_checkpoint", 1).
-REGISTRY: dict[tuple[str, int], frozenset[str]] = {}
-
 ACCEPT, REFUSE, UNVERIFIABLE = "accept", "refuse", "unverifiable"
+
+
+@dataclass(frozen=True)
+class LeafType:
+    """One registry entry: the log kinds that accept the type, and its field validator (raises ContractError)."""
+    log_kinds: frozenset[str]
+    check_fields: Callable[[dict], object]
+
+
+# The one global registry, (leaf, v) -> LeafType, lives in ``contracts.leaves`` beside the validators it names (a
+# type is registered in the same commit as its validator, never before). A leaf name has one meaning across every
+# log; a new v is a new entry and an old (leaf, v) stays verifiable forever. Provisional shapes are never in it.
+# ``canon.REGISTRY`` reads it (``__getattr__`` below), since ``leaves`` imports this module.
+
+
+def _shipped_registry() -> Mapping[tuple[str, int], LeafType]:
+    from .leaves import REGISTRY
+    return REGISTRY
+
+
+def __getattr__(name: str):
+    if name == "REGISTRY":
+        return _shipped_registry()
+    raise AttributeError(name)
 
 
 class UnknownLeafError(ContractError):
@@ -142,11 +161,12 @@ def parse(d: bytes) -> object:
 
 
 def check_leaf(d: bytes, log_kind: str, *,
-               registry: Mapping[tuple[str, int], frozenset[str]] | None = None) -> dict:
-    """Ingest-time framing check: canonical bytes, a registered ``(leaf, v)``, accepted on ``log_kind``.
+               registry: Mapping[tuple[str, int], LeafType] | None = None) -> dict:
+    """Canonical bytes, a registered ``(leaf, v)`` accepted on ``log_kind``, and the type's field validator.
 
-    ``registry`` replaces ``REGISTRY`` (the framing goldens inject a test registry). Returns the parsed leaf object. Raises ``UnknownLeafError`` for an unregistered ``(leaf, v)`` and
-    ``ContractError`` for every other refusal. The leaf type's own field rules are its module's (F9, F10).
+    ``registry`` replaces the shipped registry (the framing goldens inject a test registry). Returns the parsed leaf
+    object. Raises ``UnknownLeafError`` for an unregistered ``(leaf, v)`` and ``ContractError`` for every other
+    refusal. Rules that need context (a signature's origin, a scope, the snapshot) are the leaf module's (F9, F10).
     """
     try:
         if log_kind not in LOG_KINDS:
@@ -160,11 +180,12 @@ def check_leaf(d: bytes, log_kind: str, *,
         if not isinstance(leaf, str) or not leaf:
             raise ContractError('a leaf carries a non-empty string "leaf"')
         check_int(v, JSON_INT_MAX)
-        kinds = (REGISTRY if registry is None else registry).get((leaf, v))
-        if kinds is None:
+        entry = (_shipped_registry() if registry is None else registry).get((leaf, v))
+        if entry is None:
             raise UnknownLeafError(f"unknown leaf type ({leaf!r}, {v})")
-        if log_kind not in kinds:
+        if log_kind not in entry.log_kinds:
             raise ContractError(f"leaf {leaf!r} v{v} is not accepted on a {log_kind} log")
+        entry.check_fields(obj)
         return obj
     except ContractError:
         raise
@@ -173,8 +194,8 @@ def check_leaf(d: bytes, log_kind: str, *,
 
 
 def classify_leaf(d: bytes, log_kind: str, *, at: str,
-                  registry: Mapping[tuple[str, int], frozenset[str]] | None = None) -> str:
-    """``ACCEPT``, ``REFUSE`` or ``UNVERIFIABLE`` for leaf framing; ``at`` is ``"ingest"`` or ``"verify"``.
+                  registry: Mapping[tuple[str, int], LeafType] | None = None) -> str:
+    """``ACCEPT``, ``REFUSE`` or ``UNVERIFIABLE`` for ``check_leaf``; ``at`` is ``"ingest"`` or ``"verify"``.
 
     An unknown ``(leaf, v)`` is REFUSE at ingest and UNVERIFIABLE at verify, never tampering.
     """

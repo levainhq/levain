@@ -1,0 +1,3859 @@
+{
+ "item": "F9 entry schema",
+ "generator": "gen.py",
+ "oracle": "levain team/entry.py validate @ 31dea1f",
+ "raise_sites": 35,
+ "now": "2026-10-12T00:00:00Z",
+ "vectors": [
+  {
+   "id": "team-golden-entry-1",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "ana-20261004120000-0a1b2c3d",
+     "ts": "2026-10-04T12:00:00Z",
+     "author": "ana",
+     "agent": "claude-code",
+     "type": "decision",
+     "kind": "ruling",
+     "paths": [
+      "src/billing.py"
+     ],
+     "owner": "client:Dana",
+     "words": "Per-line rounding stays — the bank’s validator rejects mismatched totals.",
+     "supersedes": []
+    },
+    "known": null,
+    "scan": true,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "team-golden-entry-1-sealed",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "ana-20261004120000-0a1b2c3d",
+     "ts": "2026-10-04T12:00:00Z",
+     "author": "ana",
+     "agent": "claude-code",
+     "type": "decision",
+     "kind": "ruling",
+     "paths": [
+      "src/billing.py"
+     ],
+     "owner": "client:Dana",
+     "words": "Per-line rounding stays — the bank’s validator rejects mismatched totals.",
+     "supersedes": [],
+     "prev": "",
+     "hash": "64e621bb36fc63176a4b17966cb58a51921980f27559d0fc4308c2fff80b7e94"
+    },
+    "known": null,
+    "scan": true,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "team-golden-entry-2",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "ana-20261004120100-0a1b2c3e",
+     "ts": "2026-10-04T12:01:00Z",
+     "author": "ana",
+     "type": "ack",
+     "refs": [
+      "ana-20261004120000-0a1b2c3d"
+     ],
+     "session": "s1",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": true,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "team-golden-entry-2-sealed",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "ana-20261004120100-0a1b2c3e",
+     "ts": "2026-10-04T12:01:00Z",
+     "author": "ana",
+     "type": "ack",
+     "refs": [
+      "ana-20261004120000-0a1b2c3d"
+     ],
+     "session": "s1",
+     "paths": [],
+     "supersedes": [],
+     "prev": "64e621bb36fc63176a4b17966cb58a51921980f27559d0fc4308c2fff80b7e94",
+     "hash": "1370dd29f84c9723e0536fc39dfac071fb4356b05db3717f13a2f1eef853417e"
+    },
+    "known": null,
+    "scan": true,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "finding-minimal",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "finding-scanned-clean",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "words": "plain words, no secret"
+    },
+    "known": null,
+    "scan": true,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "secret-looking-text-unscanned",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "words": "token = abcd1234efgh"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "question-with-agent-session-owner",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "question",
+     "paths": [],
+     "supersedes": [],
+     "agent": "codex",
+     "session": "s-1",
+     "owner": "lead"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "tension-practice-kind",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "tension",
+     "paths": [],
+     "supersedes": [],
+     "kind": "practice"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "decision-practice",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "decision",
+     "paths": [],
+     "supersedes": [],
+     "kind": "practice"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "constraint-ruling-with-mode",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "constraint",
+     "paths": [],
+     "supersedes": [],
+     "kind": "ruling",
+     "mode": "block",
+     "owner": "lead",
+     "words": "w"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "ruling-finding-mode-ask-once",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "kind": "ruling",
+     "mode": "ask-once",
+     "owner": "client:x",
+     "words": "w"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "ack-with-refs",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "ack",
+     "paths": [],
+     "supersedes": [],
+     "refs": [
+      "x-1"
+     ]
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "retire-with-supersedes",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "x-1"
+     ]
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "retire-supersedes-a-a",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-20261009120000-0000aaaa",
+      "dana-20261009120000-0000aaaa"
+     ]
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "paths-globs",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      "src/**/x.py",
+      "**",
+      "a/**b/c",
+      "docs/*.md"
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "path-six-starred-segments",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      "a**/a**/a**/a**/a**/a**"
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "known-finding-target",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [
+      "dana-20261009120000-0000aaaa"
+     ],
+     "refs": [
+      "dana-20261009120000-0000aaaa"
+     ]
+    },
+    "known": {
+     "dana-20261009120000-0000aaaa": {
+      "type": "finding"
+     }
+    },
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "known-ruling-target-by-ruling",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "question",
+     "paths": [],
+     "supersedes": [
+      "dana-20261009120000-0000aaaa"
+     ],
+     "kind": "ruling",
+     "owner": "lead",
+     "words": "new words"
+    },
+    "known": {
+     "dana-20261009120000-0000aaaa": {
+      "v": 1,
+      "id": "dana-20261009120000-0000aaaa",
+      "ts": "2026-10-09T12:00:00Z",
+      "author": "dana",
+      "type": "decision",
+      "kind": "ruling",
+      "owner": "lead",
+      "words": "w",
+      "paths": [],
+      "supersedes": []
+     }
+    },
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "known-ruling-target-by-retire",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-20261009120000-0000aaaa"
+     ],
+     "words": "the decider's words"
+    },
+    "known": {
+     "dana-20261009120000-0000aaaa": {
+      "v": 1,
+      "id": "dana-20261009120000-0000aaaa",
+      "ts": "2026-10-09T12:00:00Z",
+      "author": "dana",
+      "type": "decision",
+      "kind": "ruling",
+      "owner": "lead",
+      "words": "w",
+      "paths": [],
+      "supersedes": []
+     }
+    },
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "known-empty-no-links",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": {},
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "future-ts-within-a-day",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-13T00:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-owner-200",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "owner": "oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-words-4000",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "words": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-reason-4000",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "reason": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-summary-2000",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "summary": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-recheck-1000",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "recheck": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-paths-100-items",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      "p0",
+      "p1",
+      "p2",
+      "p3",
+      "p4",
+      "p5",
+      "p6",
+      "p7",
+      "p8",
+      "p9",
+      "p10",
+      "p11",
+      "p12",
+      "p13",
+      "p14",
+      "p15",
+      "p16",
+      "p17",
+      "p18",
+      "p19",
+      "p20",
+      "p21",
+      "p22",
+      "p23",
+      "p24",
+      "p25",
+      "p26",
+      "p27",
+      "p28",
+      "p29",
+      "p30",
+      "p31",
+      "p32",
+      "p33",
+      "p34",
+      "p35",
+      "p36",
+      "p37",
+      "p38",
+      "p39",
+      "p40",
+      "p41",
+      "p42",
+      "p43",
+      "p44",
+      "p45",
+      "p46",
+      "p47",
+      "p48",
+      "p49",
+      "p50",
+      "p51",
+      "p52",
+      "p53",
+      "p54",
+      "p55",
+      "p56",
+      "p57",
+      "p58",
+      "p59",
+      "p60",
+      "p61",
+      "p62",
+      "p63",
+      "p64",
+      "p65",
+      "p66",
+      "p67",
+      "p68",
+      "p69",
+      "p70",
+      "p71",
+      "p72",
+      "p73",
+      "p74",
+      "p75",
+      "p76",
+      "p77",
+      "p78",
+      "p79",
+      "p80",
+      "p81",
+      "p82",
+      "p83",
+      "p84",
+      "p85",
+      "p86",
+      "p87",
+      "p88",
+      "p89",
+      "p90",
+      "p91",
+      "p92",
+      "p93",
+      "p94",
+      "p95",
+      "p96",
+      "p97",
+      "p98",
+      "p99"
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-supersedes-100-items",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [
+      "t0",
+      "t1",
+      "t2",
+      "t3",
+      "t4",
+      "t5",
+      "t6",
+      "t7",
+      "t8",
+      "t9",
+      "t10",
+      "t11",
+      "t12",
+      "t13",
+      "t14",
+      "t15",
+      "t16",
+      "t17",
+      "t18",
+      "t19",
+      "t20",
+      "t21",
+      "t22",
+      "t23",
+      "t24",
+      "t25",
+      "t26",
+      "t27",
+      "t28",
+      "t29",
+      "t30",
+      "t31",
+      "t32",
+      "t33",
+      "t34",
+      "t35",
+      "t36",
+      "t37",
+      "t38",
+      "t39",
+      "t40",
+      "t41",
+      "t42",
+      "t43",
+      "t44",
+      "t45",
+      "t46",
+      "t47",
+      "t48",
+      "t49",
+      "t50",
+      "t51",
+      "t52",
+      "t53",
+      "t54",
+      "t55",
+      "t56",
+      "t57",
+      "t58",
+      "t59",
+      "t60",
+      "t61",
+      "t62",
+      "t63",
+      "t64",
+      "t65",
+      "t66",
+      "t67",
+      "t68",
+      "t69",
+      "t70",
+      "t71",
+      "t72",
+      "t73",
+      "t74",
+      "t75",
+      "t76",
+      "t77",
+      "t78",
+      "t79",
+      "t80",
+      "t81",
+      "t82",
+      "t83",
+      "t84",
+      "t85",
+      "t86",
+      "t87",
+      "t88",
+      "t89",
+      "t90",
+      "t91",
+      "t92",
+      "t93",
+      "t94",
+      "t95",
+      "t96",
+      "t97",
+      "t98",
+      "t99"
+     ]
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-refs-100-items",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "refs": [
+      "r0",
+      "r1",
+      "r2",
+      "r3",
+      "r4",
+      "r5",
+      "r6",
+      "r7",
+      "r8",
+      "r9",
+      "r10",
+      "r11",
+      "r12",
+      "r13",
+      "r14",
+      "r15",
+      "r16",
+      "r17",
+      "r18",
+      "r19",
+      "r20",
+      "r21",
+      "r22",
+      "r23",
+      "r24",
+      "r25",
+      "r26",
+      "r27",
+      "r28",
+      "r29",
+      "r30",
+      "r31",
+      "r32",
+      "r33",
+      "r34",
+      "r35",
+      "r36",
+      "r37",
+      "r38",
+      "r39",
+      "r40",
+      "r41",
+      "r42",
+      "r43",
+      "r44",
+      "r45",
+      "r46",
+      "r47",
+      "r48",
+      "r49",
+      "r50",
+      "r51",
+      "r52",
+      "r53",
+      "r54",
+      "r55",
+      "r56",
+      "r57",
+      "r58",
+      "r59",
+      "r60",
+      "r61",
+      "r62",
+      "r63",
+      "r64",
+      "r65",
+      "r66",
+      "r67",
+      "r68",
+      "r69",
+      "r70",
+      "r71",
+      "r72",
+      "r73",
+      "r74",
+      "r75",
+      "r76",
+      "r77",
+      "r78",
+      "r79",
+      "r80",
+      "r81",
+      "r82",
+      "r83",
+      "r84",
+      "r85",
+      "r86",
+      "r87",
+      "r88",
+      "r89",
+      "r90",
+      "r91",
+      "r92",
+      "r93",
+      "r94",
+      "r95",
+      "r96",
+      "r97",
+      "r98",
+      "r99"
+     ]
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-path-300-chars",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-agent-128-chars",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "agent": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-session-128-chars",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "session": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "boundary-author-handle-64-chars",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r01-unknown-field",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "n": 1
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 1,
+     "message": "unknown field(s): n"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r02-schema-version",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 2,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 2,
+     "message": "schema version must be 1"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r03-agent-not-string",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "agent": 5
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 3,
+     "message": "agent must be a string"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r04-missing-ts",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 4,
+     "message": "missing required field: ts"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r05-id-shape",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "not-an-id",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 5,
+     "message": "id 'not-an-id' is not <author>-<yyyymmddHHMMSS>-<8 hex>"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r06-id-not-author-handle",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "erin",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 6,
+     "message": "id 'dana-20261010120000-0123abcd' does not begin with its author's handle (erin-)"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r07-ts-shape",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10 12:00:00",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 7,
+     "message": "ts must be ISO-8601 UTC, YYYY-MM-DDTHH:MM:SSZ"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r08-ts-not-a-real-date",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-02-30T00:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 8,
+     "message": "ts is not a real date"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r09-ts-future",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2099-01-01T00:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 9,
+     "message": "ts is more than a day in the future"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r10-agent-not-plain",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "agent": "a b"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 10,
+     "message": "agent must be a plain handle ([A-Za-z0-9._:@-], at most 128 chars)"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r11-owner-201",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "owner": "ooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 11,
+     "message": "owner is longer than 200 characters"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r12-owner-not-printable",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "owner": "a\nb"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 12,
+     "message": "owner must be printable text"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r13-type-unknown",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "note",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 13,
+     "message": "type must be one of decision, constraint, finding, question, tension, ack, retire"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r14-decision-without-kind",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "decision",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 14,
+     "message": "a decision needs kind: ruling or practice"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r15-kind-unknown",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "kind": "maybe"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 15,
+     "message": "kind must be ruling or practice"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r16-mode-unknown",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "kind": "ruling",
+     "mode": "loud",
+     "owner": "lead",
+     "words": "w"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 16,
+     "message": "mode must be one of surface, ask-once, block"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r17-mode-on-practice",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "kind": "practice",
+     "mode": "block"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 17,
+     "message": "only a ruling carries a mode (a practice is always surfaced, never denied)"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r18-ruling-without-owner",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "kind": "ruling",
+     "words": "w"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 18,
+     "message": "a ruling needs an owner (client:<name>, lead, or a member handle)"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r19-ruling-without-words",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "kind": "ruling",
+     "owner": "lead"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 19,
+     "message": "a ruling needs the decider's own words in 'words'"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r20-supersedes-not-a-list",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": ""
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 20,
+     "message": "supersedes must be a list of non-empty strings"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r21-paths-101-items",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      "p0",
+      "p1",
+      "p2",
+      "p3",
+      "p4",
+      "p5",
+      "p6",
+      "p7",
+      "p8",
+      "p9",
+      "p10",
+      "p11",
+      "p12",
+      "p13",
+      "p14",
+      "p15",
+      "p16",
+      "p17",
+      "p18",
+      "p19",
+      "p20",
+      "p21",
+      "p22",
+      "p23",
+      "p24",
+      "p25",
+      "p26",
+      "p27",
+      "p28",
+      "p29",
+      "p30",
+      "p31",
+      "p32",
+      "p33",
+      "p34",
+      "p35",
+      "p36",
+      "p37",
+      "p38",
+      "p39",
+      "p40",
+      "p41",
+      "p42",
+      "p43",
+      "p44",
+      "p45",
+      "p46",
+      "p47",
+      "p48",
+      "p49",
+      "p50",
+      "p51",
+      "p52",
+      "p53",
+      "p54",
+      "p55",
+      "p56",
+      "p57",
+      "p58",
+      "p59",
+      "p60",
+      "p61",
+      "p62",
+      "p63",
+      "p64",
+      "p65",
+      "p66",
+      "p67",
+      "p68",
+      "p69",
+      "p70",
+      "p71",
+      "p72",
+      "p73",
+      "p74",
+      "p75",
+      "p76",
+      "p77",
+      "p78",
+      "p79",
+      "p80",
+      "p81",
+      "p82",
+      "p83",
+      "p84",
+      "p85",
+      "p86",
+      "p87",
+      "p88",
+      "p89",
+      "p90",
+      "p91",
+      "p92",
+      "p93",
+      "p94",
+      "p95",
+      "p96",
+      "p97",
+      "p98",
+      "p99",
+      "p100"
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 21,
+     "message": "paths has more than 100 items"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r22-path-301-chars",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      "ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 22,
+     "message": "a path glob is longer than 300 characters"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r23-seven-starred-segments",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      "a**/a**/a**/a**/a**/a**/a**"
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 23,
+     "message": "a path glob has more than 6 segments with ** inside them"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r24-segment-with-two-stars",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      "a/**x**/b"
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 24,
+     "message": "a path segment may contain ** at most once (write `a/**/b/**/c` instead)"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r25-retire-without-supersedes",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 25,
+     "message": "a retire entry must name what it retires in 'supersedes'"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r26-ack-without-refs",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "ack",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 26,
+     "message": "an ack must name the entries it acknowledges in 'refs'"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r27-ack-with-supersedes",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "ack",
+     "paths": [],
+     "supersedes": [
+      "x-2"
+     ],
+     "refs": [
+      "x-1"
+     ]
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 27,
+     "message": "an ack may not supersede anything"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r28-path-absolute",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      "/etc/passwd"
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 28,
+     "message": "paths are repo-relative globs with '/' separators, got '/etc/passwd'"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r29-supersedes-itself",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [
+      "dana-20261010120000-0123abcd"
+     ]
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 29,
+     "message": "an entry cannot supersede itself"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r30-unknown-link",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [
+      "x-1"
+     ]
+    },
+    "known": {},
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 30,
+     "message": "supersedes/refs names unknown entr(ies): x-1"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r31-supersedes-an-ack",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [
+      "dana-20261009120000-0000aaaa"
+     ]
+    },
+    "known": {
+     "dana-20261009120000-0000aaaa": {
+      "type": "ack"
+     }
+    },
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 31,
+     "message": "dana-20261009120000-0000aaaa is an ack; acks are not superseded"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r32-supersedes-a-retire",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [
+      "dana-20261009120000-0000aaaa"
+     ]
+    },
+    "known": {
+     "dana-20261009120000-0000aaaa": {
+      "type": "retire"
+     }
+    },
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 32,
+     "message": "dana-20261009120000-0000aaaa is a retire; to bring back what it retired, record that entry again"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r33-ruling-target-without-words",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-20261009120000-0000aaaa"
+     ]
+    },
+    "known": {
+     "dana-20261009120000-0000aaaa": {
+      "v": 1,
+      "id": "dana-20261009120000-0000aaaa",
+      "ts": "2026-10-09T12:00:00Z",
+      "author": "dana",
+      "type": "decision",
+      "kind": "ruling",
+      "owner": "lead",
+      "words": "w",
+      "paths": [],
+      "supersedes": []
+     }
+    },
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 33,
+     "message": "dana-20261009120000-0000aaaa is a ruling: replacing or retiring it needs the decider's own words in 'words'"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r34-ruling-target-by-a-practice",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [
+      "dana-20261009120000-0000aaaa"
+     ],
+     "kind": "practice",
+     "words": "w"
+    },
+    "known": {
+     "dana-20261009120000-0000aaaa": {
+      "v": 1,
+      "id": "dana-20261009120000-0000aaaa",
+      "ts": "2026-10-09T12:00:00Z",
+      "author": "dana",
+      "type": "decision",
+      "kind": "ruling",
+      "owner": "lead",
+      "words": "w",
+      "paths": [],
+      "supersedes": []
+     }
+    },
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 34,
+     "message": "dana-20261009120000-0000aaaa is a ruling: only another ruling (or a retire) may supersede it"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r35-secret",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "words": "api_key=sk1234567890abcd"
+    },
+    "known": null,
+    "scan": true,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 35,
+     "message": "refused: text in words looks like a secret (key/token/password)"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r02-schema-version-missing",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 2,
+     "message": "schema version must be 1"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r04-missing-id-empty",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 4,
+     "message": "missing required field: id"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r10-session-not-plain",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "session": ""
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 10,
+     "message": "session must be a plain handle ([A-Za-z0-9._:@-], at most 128 chars)"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r11-recheck-1001",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "recheck": "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 11,
+     "message": "recheck is longer than 1000 characters"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r18-ruling-owner-blank",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "kind": "ruling",
+     "owner": "   ",
+     "words": "w"
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 18,
+     "message": "a ruling needs an owner (client:<name>, lead, or a member handle)"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r19-ruling-words-blank",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "kind": "ruling",
+     "owner": "lead",
+     "words": " "
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 19,
+     "message": "a ruling needs the decider's own words in 'words'"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r20-supersedes-an-object",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": {}
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 20,
+     "message": "supersedes must be a list of non-empty strings"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r20-paths-holds-a-number",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      1
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 20,
+     "message": "paths must be a list of non-empty strings"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r20-refs-holds-a-blank",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "refs": [
+      "  "
+     ]
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 20,
+     "message": "refs must be a list of non-empty strings"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r21-refs-101-items",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "refs": [
+      "r0",
+      "r1",
+      "r2",
+      "r3",
+      "r4",
+      "r5",
+      "r6",
+      "r7",
+      "r8",
+      "r9",
+      "r10",
+      "r11",
+      "r12",
+      "r13",
+      "r14",
+      "r15",
+      "r16",
+      "r17",
+      "r18",
+      "r19",
+      "r20",
+      "r21",
+      "r22",
+      "r23",
+      "r24",
+      "r25",
+      "r26",
+      "r27",
+      "r28",
+      "r29",
+      "r30",
+      "r31",
+      "r32",
+      "r33",
+      "r34",
+      "r35",
+      "r36",
+      "r37",
+      "r38",
+      "r39",
+      "r40",
+      "r41",
+      "r42",
+      "r43",
+      "r44",
+      "r45",
+      "r46",
+      "r47",
+      "r48",
+      "r49",
+      "r50",
+      "r51",
+      "r52",
+      "r53",
+      "r54",
+      "r55",
+      "r56",
+      "r57",
+      "r58",
+      "r59",
+      "r60",
+      "r61",
+      "r62",
+      "r63",
+      "r64",
+      "r65",
+      "r66",
+      "r67",
+      "r68",
+      "r69",
+      "r70",
+      "r71",
+      "r72",
+      "r73",
+      "r74",
+      "r75",
+      "r76",
+      "r77",
+      "r78",
+      "r79",
+      "r80",
+      "r81",
+      "r82",
+      "r83",
+      "r84",
+      "r85",
+      "r86",
+      "r87",
+      "r88",
+      "r89",
+      "r90",
+      "r91",
+      "r92",
+      "r93",
+      "r94",
+      "r95",
+      "r96",
+      "r97",
+      "r98",
+      "r99",
+      "r100"
+     ]
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 21,
+     "message": "refs has more than 100 items"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r28-path-backslash",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      "a\\b"
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 28,
+     "message": "paths are repo-relative globs with '/' separators, got 'a\\\\b'"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r28-path-dotdot",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [
+      "a/../b"
+     ],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 28,
+     "message": "paths are repo-relative globs with '/' separators, got 'a/../b'"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r30-unknown-ref",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "refs": [
+      "x-9"
+     ]
+    },
+    "known": {
+     "dana-20261009120000-0000aaaa": {
+      "type": "finding"
+     }
+    },
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 30,
+     "message": "supersedes/refs names unknown entr(ies): x-9"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "r35-secret-in-summary",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "summary": "-----BEGIN RSA PRIVATE KEY-----"
+    },
+    "known": null,
+    "scan": true,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 35,
+     "message": "refused: text in summary looks like a secret (key/token/password)"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "f9-member-finding-supersedes-empty-string",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": ""
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 20,
+     "message": "supersedes must be a list of non-empty strings"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "f9-member-finding-supersedes-object",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": {}
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 20,
+     "message": "supersedes must be a list of non-empty strings"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "f9-member-finding-id-not-author-prefixed",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "erin-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 6,
+     "message": "id 'erin-20261010120000-0123abcd' does not begin with its author's handle (dana-)"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "f9-member-finding-malformed-ts",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2026-10-10T12:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": "2026-10-12T00:00:00Z"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 7,
+     "message": "ts must be ISO-8601 UTC, YYYY-MM-DDTHH:MM:SSZ"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 (rev 7 Y01, rev 8 Z01, rev 9 M-1, rev 10 N1/N2) / levain team/entry.py validate @ 31dea1f",
+    "clause": "(line, 1) entries pass the FROZEN entry schema: entry.validate as it stands at 31dea1f, with the future-ts branch reading the caller's now; the verdict (accept, or refuse plus the refusing raise site) is the one recorded here at the freeze",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no external specification governs levain's entry schema; a later T schema change is a new (line, v), never a moved (line, 1) verdict"
+    }
+   }
+  },
+  {
+   "id": "now-none-skips-the-future-ts-branch",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2099-01-01T00:00:00Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": null
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 rev 10",
+    "clause": "now = None (verify) skips exactly the future-ts branch and no other",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a C2SP checkpoint carries no time, so a verifier cannot know when a leaf was ingested"
+    }
+   }
+  },
+  {
+   "id": "now-none-still-refuses-every-other-branch",
+   "kind": "no_upstream",
+   "op": "validate_entry_v1",
+   "input": {
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120000-0123abcd",
+     "ts": "2099-01-01T00:00:00Z",
+     "author": "dana",
+     "type": "note",
+     "paths": [],
+     "supersedes": []
+    },
+    "known": null,
+    "scan": false,
+    "now": null
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "branch": 13,
+     "message": "type must be one of decision, constraint, finding, question, tension, ack, retire"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 rev 10",
+    "clause": "now = None (verify) skips exactly the future-ts branch and no other",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a C2SP checkpoint carries no time, so a verifier cannot know when a leaf was ingested"
+    }
+   }
+  }
+ ]
+}

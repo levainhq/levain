@@ -1,0 +1,2139 @@
+{
+ "item": "F9 scope",
+ "generator": "gen.py",
+ "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+ "now": "2026-10-12T00:00:00Z",
+ "vectors": [
+  {
+   "id": "may-write-human-finding",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120010-0000000a",
+     "ts": "2026-10-10T12:00:10Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-question",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120011-0000000b",
+     "ts": "2026-10-10T12:00:11Z",
+     "author": "dana",
+     "type": "question",
+     "paths": [],
+     "supersedes": []
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-tension",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120012-0000000c",
+     "ts": "2026-10-10T12:00:12Z",
+     "author": "dana",
+     "type": "tension",
+     "paths": [],
+     "supersedes": []
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-ack",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120013-0000000d",
+     "ts": "2026-10-10T12:00:13Z",
+     "author": "dana",
+     "type": "ack",
+     "paths": [],
+     "supersedes": [],
+     "refs": [
+      "dana-20261010120001-00000001"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-retire",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120014-0000000e",
+     "ts": "2026-10-10T12:00:14Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-20261010120001-00000001"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-decision",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120015-0000000f",
+     "ts": "2026-10-10T12:00:15Z",
+     "author": "dana",
+     "type": "decision",
+     "paths": [],
+     "supersedes": [],
+     "kind": "practice"
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-constraint",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120016-00000010",
+     "ts": "2026-10-10T12:00:16Z",
+     "author": "dana",
+     "type": "constraint",
+     "paths": [],
+     "supersedes": [],
+     "kind": "practice"
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-member-finding",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "member",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120010-0000000a",
+     "ts": "2026-10-10T12:00:10Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-member-question",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "member",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120011-0000000b",
+     "ts": "2026-10-10T12:00:11Z",
+     "author": "dana",
+     "type": "question",
+     "paths": [],
+     "supersedes": []
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-member-tension",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "member",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120012-0000000c",
+     "ts": "2026-10-10T12:00:12Z",
+     "author": "dana",
+     "type": "tension",
+     "paths": [],
+     "supersedes": []
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-member-ack",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "member",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120013-0000000d",
+     "ts": "2026-10-10T12:00:13Z",
+     "author": "dana",
+     "type": "ack",
+     "paths": [],
+     "supersedes": [],
+     "refs": [
+      "dana-20261010120001-00000001"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-member-retire",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "member",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120014-0000000e",
+     "ts": "2026-10-10T12:00:14Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-20261010120001-00000001"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-member-decision",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "member",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120015-0000000f",
+     "ts": "2026-10-10T12:00:15Z",
+     "author": "dana",
+     "type": "decision",
+     "paths": [],
+     "supersedes": [],
+     "kind": "practice"
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-member-constraint",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "member",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120016-00000010",
+     "ts": "2026-10-10T12:00:16Z",
+     "author": "dana",
+     "type": "constraint",
+     "paths": [],
+     "supersedes": [],
+     "kind": "practice"
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-receipt-finding",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "receipt",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120010-0000000a",
+     "ts": "2026-10-10T12:00:10Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-receipt-question",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "receipt",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120011-0000000b",
+     "ts": "2026-10-10T12:00:11Z",
+     "author": "dana",
+     "type": "question",
+     "paths": [],
+     "supersedes": []
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-receipt-tension",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "receipt",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120012-0000000c",
+     "ts": "2026-10-10T12:00:12Z",
+     "author": "dana",
+     "type": "tension",
+     "paths": [],
+     "supersedes": []
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-receipt-ack",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "receipt",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120013-0000000d",
+     "ts": "2026-10-10T12:00:13Z",
+     "author": "dana",
+     "type": "ack",
+     "paths": [],
+     "supersedes": [],
+     "refs": [
+      "dana-20261010120001-00000001"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-receipt-retire",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "receipt",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120014-0000000e",
+     "ts": "2026-10-10T12:00:14Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-20261010120001-00000001"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-receipt-decision",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "receipt",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120015-0000000f",
+     "ts": "2026-10-10T12:00:15Z",
+     "author": "dana",
+     "type": "decision",
+     "paths": [],
+     "supersedes": [],
+     "kind": "practice"
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-receipt-constraint",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "receipt",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120016-00000010",
+     "ts": "2026-10-10T12:00:16Z",
+     "author": "dana",
+     "type": "constraint",
+     "paths": [],
+     "supersedes": [],
+     "kind": "practice"
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-member-finding-supersedes-a-target-refused",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "member",
+    "entry": {
+     "v": 1,
+     "id": "mo-20261010120020-00000014",
+     "ts": "2026-10-10T12:00:20Z",
+     "author": "mo",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [
+      "dana-20261010120001-00000001"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-member-finding-supersedes-empty-list-allowed",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "member",
+    "entry": {
+     "v": 1,
+     "id": "mo-20261010120021-00000015",
+     "ts": "2026-10-10T12:00:21Z",
+     "author": "mo",
+     "type": "finding",
+     "paths": [],
+     "supersedes": []
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-finding-kind-ruling-refused",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120022-00000016",
+     "ts": "2026-10-10T12:00:22Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "kind": "ruling",
+     "owner": "lead",
+     "words": "w"
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-member-finding-kind-ruling-refused",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "member",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120022-00000016",
+     "ts": "2026-10-10T12:00:22Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "kind": "ruling",
+     "owner": "lead",
+     "words": "w"
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-receipt-finding-kind-ruling-refused",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "receipt",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120022-00000016",
+     "ts": "2026-10-10T12:00:22Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [],
+     "kind": "ruling",
+     "owner": "lead",
+     "words": "w"
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-retire-of-a-ruling-refused",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120023-00000017",
+     "ts": "2026-10-10T12:00:23Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-20261010120002-00000002"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     },
+     {
+      "v": 1,
+      "id": "dana-20261010120002-00000002",
+      "ts": "2026-10-10T12:00:02Z",
+      "author": "dana",
+      "type": "decision",
+      "paths": [],
+      "supersedes": [],
+      "kind": "ruling",
+      "owner": "lead",
+      "words": "w"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-retire-of-a-finding-allowed",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120024-00000018",
+     "ts": "2026-10-10T12:00:24Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-20261010120001-00000001"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-retire-target-not-in-snapshot-refused",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120025-00000019",
+     "ts": "2026-10-10T12:00:25Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-x"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-retire-one-allowed-one-ruling-refused",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120026-0000001a",
+     "ts": "2026-10-10T12:00:26Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-20261010120001-00000001",
+      "dana-20261010120002-00000002"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     },
+     {
+      "v": 1,
+      "id": "dana-20261010120002-00000002",
+      "ts": "2026-10-10T12:00:02Z",
+      "author": "dana",
+      "type": "decision",
+      "paths": [],
+      "supersedes": [],
+      "kind": "ruling",
+      "owner": "lead",
+      "words": "w"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-retire-a-a-allowed",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120027-0000001b",
+     "ts": "2026-10-10T12:00:27Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-20261010120001-00000001",
+      "dana-20261010120001-00000001"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-finding-supersedes-a-finding-allowed",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120028-0000001c",
+     "ts": "2026-10-10T12:00:28Z",
+     "author": "dana",
+     "type": "finding",
+     "paths": [],
+     "supersedes": [
+      "dana-20261010120001-00000001"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-retire-target-twice-in-snapshot-refused",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120029-0000001d",
+     "ts": "2026-10-10T12:00:29Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": [
+      "dana-20261010120001-00000001"
+     ]
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     },
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "may-write-human-retire-empty-supersedes-refused",
+   "kind": "no_upstream",
+   "op": "may_write",
+   "input": {
+    "scope": "human",
+    "entry": {
+     "v": 1,
+     "id": "dana-20261010120030-0000001e",
+     "ts": "2026-10-10T12:00:30Z",
+     "author": "dana",
+     "type": "retire",
+     "paths": [],
+     "supersedes": []
+    },
+    "snapshot": [
+     {
+      "v": 1,
+      "id": "dana-20261010120001-00000001",
+      "ts": "2026-10-10T12:00:01Z",
+      "author": "dana",
+      "type": "finding",
+      "paths": [],
+      "supersedes": [],
+      "words": "target finding"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "log-second-leaf-copying-an-accepted-id-refused-at-ingest",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "ingest",
+    "now": "2026-10-12T00:00:00Z",
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142417777735346524564444a7876456146464f314f77673178426c65496666433830353247786d56346e542b4932773462615a542b64734e337762565238543936625065756a73714e747847616d5a6f564c3175566b42773d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2234636265386438363434316331316337653963646437633738373734646233636663626164303738326635656332343864303433383031313662326438336133222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226669727374227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     },
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4b4244794b746a2f30725047515a7a566632726c593566656b4655596f2f52415037436a4131622b58646f222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b4141414167765a78616c7170497a663170396f7452706476757635696a6a6b73646b6c6a63355653346d6237774b445541414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b4141414241724e4e4b7a5662755542743656465877757231696f5158503945724c59325751664f68534b696f45574b666c66547335336c683948354e4856317448444a36724372754b76555a6b446a61734e6256774c76677041413d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2261363234393438653132383063623232356163373231626566303232326362613033313632323331333465313938623965363063366638393637656264633632222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226120646966666572656e7420626f64792c207468652073616d65206964227d2c2266696c65223a226c65646765722f64616e612f6f746865722e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "verdicts": [
+      "accept",
+      "refuse"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 rev 6 X01 / rev 7",
+    "clause": "an entry.id already held by an ACCEPTED leaf is refused at ingest; at verify the second accepted occurrence is refused, the first in log order wins; a refused leaf holds no id",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the duplicate-ID state is made unreachable at ingest (Matrix MSC1659 met this class)"
+    }
+   }
+  },
+  {
+   "id": "log-second-leaf-copying-an-accepted-id-refused-at-verify",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "verify",
+    "now": null,
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142417777735346524564444a7876456146464f314f77673178426c65496666433830353247786d56346e542b4932773462615a542b64734e337762565238543936625065756a73714e747847616d5a6f564c3175566b42773d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2234636265386438363434316331316337653963646437633738373734646233636663626164303738326635656332343864303433383031313662326438336133222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226669727374227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     },
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4b4244794b746a2f30725047515a7a566632726c593566656b4655596f2f52415037436a4131622b58646f222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b4141414167765a78616c7170497a663170396f7452706476757635696a6a6b73646b6c6a63355653346d6237774b445541414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b4141414241724e4e4b7a5662755542743656465877757231696f5158503945724c59325751664f68534b696f45574b666c66547335336c683948354e4856317448444a36724372754b76555a6b446a61734e6256774c76677041413d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2261363234393438653132383063623232356163373231626566303232326362613033313632323331333465313938623965363063366638393637656264633632222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226120646966666572656e7420626f64792c207468652073616d65206964227d2c2266696c65223a226c65646765722f64616e612f6f746865722e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "verdicts": [
+      "accept",
+      "refuse"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 rev 6 X01 / rev 7",
+    "clause": "an entry.id already held by an ACCEPTED leaf is refused at ingest; at verify the second accepted occurrence is refused, the first in log order wins; a refused leaf holds no id",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the duplicate-ID state is made unreachable at ingest (Matrix MSC1659 met this class)"
+    }
+   }
+  },
+  {
+   "id": "log-a-refused-leaf-holds-no-id",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "verify",
+    "now": null,
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b4141414241566f673443557264647251303349436b37557857306a6f7164677077382f6e4a6965686f632f596151635761326a7a494942654e2b577456523154334f336943773550702f6a53756979766162334734696c716c42673d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2234636265386438363434316331316337653963646437633738373734646233636663626164303738326635656332343864303433383031313662326438336133222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226669727374227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     },
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142417777735346524564444a7876456146464f314f77673178426c65496666433830353247786d56346e542b4932773462615a542b64734e337762565238543936625065756a73714e747847616d5a6f564c3175566b42773d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2234636265386438363434316331316337653963646437633738373734646233636663626164303738326635656332343864303433383031313662326438336133222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226669727374227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "verdicts": [
+      "refuse",
+      "accept"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 rev 6 X01 / rev 7",
+    "clause": "an entry.id already held by an ACCEPTED leaf is refused at ingest; at verify the second accepted occurrence is refused, the first in log order wins; a refused leaf holds no id",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the duplicate-ID state is made unreachable at ingest (Matrix MSC1659 met this class)"
+    }
+   }
+  },
+  {
+   "id": "log-repeated-file-hash-refused-at-ingest",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "ingest",
+    "now": "2026-10-12T00:00:00Z",
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142417777735346524564444a7876456146464f314f77673178426c65496666433830353247786d56346e542b4932773462615a542b64734e337762565238543936625065756a73714e747847616d5a6f564c3175566b42773d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2234636265386438363434316331316337653963646437633738373734646233636663626164303738326635656332343864303433383031313662326438336133222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226669727374227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     },
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142417777735346524564444a7876456146464f314f77673178426c65496666433830353247786d56346e542b4932773462615a542b64734e337762565238543936625065756a73714e747847616d5a6f564c3175566b42773d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2234636265386438363434316331316337653963646437633738373734646233636663626164303738326635656332343864303433383031313662326438336133222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226669727374227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "verdicts": [
+      "accept",
+      "refuse"
+     ],
+     "operator_fault": [
+      false,
+      true
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS l.326",
+    "clause": "a second leaf with an accepted leaf's (file, entry.hash) is refused at ingest and is an operator fault at verify",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "TS's POST /lines is idempotent on (file, hash)"
+    }
+   }
+  },
+  {
+   "id": "log-repeated-file-hash-operator-fault-at-verify",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "verify",
+    "now": null,
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142417777735346524564444a7876456146464f314f77673178426c65496666433830353247786d56346e542b4932773462615a542b64734e337762565238543936625065756a73714e747847616d5a6f564c3175566b42773d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2234636265386438363434316331316337653963646437633738373734646233636663626164303738326635656332343864303433383031313662326438336133222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226669727374227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     },
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142417777735346524564444a7876456146464f314f77673178426c65496666433830353247786d56346e542b4932773462615a542b64734e337762565238543936625065756a73714e747847616d5a6f564c3175566b42773d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2234636265386438363434316331316337653963646437633738373734646233636663626164303738326635656332343864303433383031313662326438336133222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226669727374227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "verdicts": [
+      "accept",
+      "refuse"
+     ],
+     "operator_fault": [
+      false,
+      true
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS l.326",
+    "clause": "a second leaf with an accepted leaf's (file, entry.hash) is refused at ingest and is an operator fault at verify",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "TS's POST /lines is idempotent on (file, hash)"
+    }
+   }
+  },
+  {
+   "id": "log-member-finding-supersedes-empty-string-refused",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "ingest",
+    "now": "2026-10-12T00:00:00Z",
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a526a7564796f5675553761305a594778686871374a44746c384f31612b7257313871496658476765662b4d222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141677856504f4a51755444304f623532434d62754249617a695649647131594c633666702f35574f6e34665a7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b4141414241762f36534c70623371574d6232585263635a4677765a3651427756464a2b4658714d44595a35676a726447735457754a6448465a58707231557a51483133744549507270546245436f6f4e7369362b7a536a6c5a43673d3d222c22656e747279223a7b22617574686f72223a226d6f222c2268617368223a2231663131393131376231613930616333643537653234353765616337386631666661303137613331636439353537363266356662663133613531363564386431222c226964223a226d6f2d32303236313031303132303035302d3030303030303332222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a22222c227473223a22323032362d31302d31305431323a30303a35305a222c2274797065223a2266696e64696e67222c2276223a317d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "member"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "verdicts": [
+      "refuse"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 rev 7 Y01 / rev 8 Z01, Z02",
+    "clause": "every leaf's entry passes validate_entry_v1, the frozen entry schema of levain 31dea1f",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "levain's own entry schema; no external specification"
+    }
+   }
+  },
+  {
+   "id": "log-member-finding-supersedes-object-refused",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "ingest",
+    "now": "2026-10-12T00:00:00Z",
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a526a7564796f5675553761305a594778686871374a44746c384f31612b7257313871496658476765662b4d222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141677856504f4a51755444304f623532434d62754249617a695649647131594c633666702f35574f6e34665a7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b414141424133662f7538433171754177614e5957657a5a69734a4b47725034566e48707a675272473251417761327a76325469323770642b6b48654e7032694662554674375668772f4e4736444149695733527938596e543842413d3d222c22656e747279223a7b22617574686f72223a226d6f222c2268617368223a2239643833343766363933343762316435313038643534333066623666613530633236323034353538636632376464373233616566623437646533346366393766222c226964223a226d6f2d32303236313031303132303035312d3030303030303333222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a7b7d2c227473223a22323032362d31302d31305431323a30303a35315a222c2274797065223a2266696e64696e67222c2276223a317d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "member"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "verdicts": [
+      "refuse"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 rev 7 Y01 / rev 8 Z01, Z02",
+    "clause": "every leaf's entry passes validate_entry_v1, the frozen entry schema of levain 31dea1f",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "levain's own entry schema; no external specification"
+    }
+   }
+  },
+  {
+   "id": "log-member-finding-id-not-prefixed-by-author-refused",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "ingest",
+    "now": "2026-10-12T00:00:00Z",
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a526a7564796f5675553761305a594778686871374a44746c384f31612b7257313871496658476765662b4d222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141677856504f4a51755444304f623532434d62754249617a695649647131594c633666702f35574f6e34665a7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b4141414241523351384430464e6f52454f5566682b6371694c562f79762b426f304b57704b5a5051706e67502f54506774767a5a696157666f647a38556f6d2b684e7676555463346757682b737a6966336143697a7433726d41413d3d222c22656e747279223a7b22617574686f72223a226d6f222c2268617368223a2233386562383836393230623734646335353861666165633264343530653561623838376639376130316163393561626331623663646262646234346366666330222c226964223a226572696e2d32303236313031303132303035322d3030303030303334222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a35325a222c2274797065223a2266696e64696e67222c2276223a317d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "member"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "verdicts": [
+      "refuse"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 rev 7 Y01 / rev 8 Z01, Z02",
+    "clause": "every leaf's entry passes validate_entry_v1, the frozen entry schema of levain 31dea1f",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "levain's own entry schema; no external specification"
+    }
+   }
+  },
+  {
+   "id": "log-member-finding-malformed-ts-refused",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "ingest",
+    "now": "2026-10-12T00:00:00Z",
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a526a7564796f5675553761305a594778686871374a44746c384f31612b7257313871496658476765662b4d222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141677856504f4a51755444304f623532434d62754249617a695649647131594c633666702f35574f6e34665a7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b4141414241725955724263327570766642337148586730336b6b3077582b44497a4e6b484f69444d6f4a6178767051525a6a65774e326938424d4b577a53643364697445684a74334d4c416c63456a42686f694b414942656741513d3d222c22656e747279223a7b22617574686f72223a226d6f222c2268617368223a2239333730393936653231316530313364636630313238643637663231613365636565323432313962636162366131396638393130396162396533346562653163222c226964223a226d6f2d32303236313031303132303035332d3030303030303335222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30305a222c2274797065223a2266696e64696e67222c2276223a317d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "member"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "verdicts": [
+      "refuse"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 rev 7 Y01 / rev 8 Z01, Z02",
+    "clause": "every leaf's entry passes validate_entry_v1, the frozen entry schema of levain 31dea1f",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "levain's own entry schema; no external specification"
+    }
+   }
+  },
+  {
+   "id": "log-member-finding-carrying-supersedes-refused",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "ingest",
+    "now": "2026-10-12T00:00:00Z",
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b4141414241396151512b56536643384d7669776c764e7163583357456b4e4c706d4356333061354b6b566b65562b364255376d467a666f5648594a2f3875546e4c5763364b3964576445637270535a376b374d56673147635143413d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2238333431653965383937613466323131323936643534643837376234646366353063343633303162633361326633653061626162643230393563303865343834222c226964223a2264616e612d32303236313031303132303036302d3030303030303363222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30313a30305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a22746172676574227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     },
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a526a7564796f5675553761305a594778686871374a44746c384f31612b7257313871496658476765662b4d222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141677856504f4a51755444304f623532434d62754249617a695649647131594c633666702f35574f6e34665a7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b4141414241434b50316b48394778786276443374703263646e4476496b687371734b64537051744d463942486a74346456544f6c382f2f564b5a702b777835366b70714c69766461464858374876632b4a723666784c65684543513d3d222c22656e747279223a7b22617574686f72223a226d6f222c2268617368223a2238623330333533613064386366643762303637383231336264303537353662636132363238373362633638373334633533343837613732313831613266316230222c226964223a226d6f2d32303236313031303132303036312d3030303030303364222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b2264616e612d32303236313031303132303036302d3030303030303363225d2c227473223a22323032362d31302d31305431323a30313a30315a222c2274797065223a2266696e64696e67222c2276223a317d2c2266696c65223a226c65646765722f6d6f2f612e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "member"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "verdicts": [
+      "accept",
+      "refuse"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "log-member-finding-empty-supersedes-allowed",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "verify",
+    "now": null,
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a526a7564796f5675553761305a594778686871374a44746c384f31612b7257313871496658476765662b4d222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141677856504f4a51755444304f623532434d62754249617a695649647131594c633666702f35574f6e34665a7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142414a5565335a5351343838664f54437472556255792b664b49326971734f61326a6645372f5644694c6853614558377846707a702f58462f704a516f6d6770334e65786f786a41466e6f6b506f766178785339666644413d3d222c22656e747279223a7b22617574686f72223a226d6f222c2268617368223a2230393830393765353430326261633563336562323539316133383766366164326333663562646664386661663663653430383933383363623262363165306231222c226964223a226d6f2d32303236313031303132303036322d3030303030303365222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30313a30325a222c2274797065223a2266696e64696e67222c2276223a317d2c2266696c65223a226c65646765722f6d6f2f612e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "member"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "verdicts": [
+      "accept"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "log-human-retire-of-an-accepted-finding-allowed",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "verify",
+    "now": null,
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b4141414241396151512b56536643384d7669776c764e7163583357456b4e4c706d4356333061354b6b566b65562b364255376d467a666f5648594a2f3875546e4c5763364b3964576445637270535a376b374d56673147635143413d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2238333431653965383937613466323131323936643534643837376234646366353063343633303162633361326633653061626162643230393563303865343834222c226964223a2264616e612d32303236313031303132303036302d3030303030303363222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30313a30305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a22746172676574227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     },
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142414d4a36306161516f305072586d684679464e37554e6d526f76304a78797839445258726b683437423667396c76724135555136777a333950437531794573305a41724552476d50504f4e41467a6c35326438524d41773d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2239343738666263616661363762356139303633663661613432646662396636653466306632613331626166653934383966343334643734636133303965653334222c226964223a2264616e612d32303236313031303132303036332d3030303030303366222c227061746873223a5b5d2c2270726576223a2238333431653965383937613466323131323936643534643837376234646366353063343633303162633361326633653061626162643230393563303865343834222c2273757065727365646573223a5b2264616e612d32303236313031303132303036302d3030303030303363225d2c227473223a22323032362d31302d31305431323a30313a30335a222c2274797065223a22726574697265222c2276223a317d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "verdicts": [
+      "accept",
+      "accept"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "log-human-retire-dangling-target-refused",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "ingest",
+    "now": "2026-10-12T00:00:00Z",
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142415a63335937665653787656494636304c6359303875462f524c5974766e365658534143756e477347512f757833673830316e6e7042684c5269414d41334f79544249757a3257466875304458334f5033676f696441673d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2266666564343339633066336461393963373036303730373465306165653035623030373566643838616130386666366531336139656335653763636162363134222c226964223a2264616e612d32303236313031303132303036342d3030303030303430222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b2264616e612d32303236313030393030303030302d6465616462656566225d2c227473223a22323032362d31302d31305431323a30313a30345a222c2274797065223a22726574697265222c2276223a317d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "human"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "verdicts": [
+      "refuse"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9 / TS (team_server_managed_DESIGN_1006) l.410-412",
+    "clause": "human writes finding, question, tension, ack, retire; member writes only finding, question, tension and may not carry a non-empty supersedes or write ack; receipt writes only receipt_checkpoint leaves; decision, constraint and kind: ruling are refused for every scope until P2; supersedes is default-deny: every target present in the snapshot exactly once and not a ruling",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "A member-scoped device ... may write only `finding`, `question`, `tension`, and may not carry `supersedes` or write `ack`"
+    }
+   }
+  },
+  {
+   "id": "log-unknown-scope-refused-at-ingest",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "ingest",
+    "now": "2026-10-12T00:00:00Z",
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142417777735346524564444a7876456146464f314f77673178426c65496666433830353247786d56346e542b4932773462615a542b64734e337762565238543936625065756a73714e747847616d5a6f564c3175566b42773d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2234636265386438363434316331316337653963646437633738373734646233636663626164303738326635656332343864303433383031313662326438336133222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226669727374227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "auditor"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse",
+     "verdicts": [
+      "refuse"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9",
+    "clause": "an unknown scope is refused at ingest and UNVERIFIABLE at verify",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "scope comes from the key directory; an old levain never calls a newer scope tampering"
+    }
+   }
+  },
+  {
+   "id": "log-unknown-scope-unverifiable-at-verify",
+   "kind": "no_upstream",
+   "op": "line_log",
+   "input": {
+    "origin": "levain-team/cccccccccccccccccccccccccccccccc",
+    "at": "verify",
+    "now": null,
+    "leaves": [
+     {
+      "data_hex": "7b226465766963655f6670223a225348413235363a4479396a4d456b48487a6f565979372f526e666d39354c5170676a694c6f6b45574d496e34734f766a3241222c226465766963655f736967223a2255314e4955306c48414141414151414141444d414141414c63334e6f4c57566b4d6a55314d546b41414141674841385650446e4b6c3142687472674a79703951503736465133634f2f73664437772b58452f54522f2b7341414141526247563259576c754c58526c595730745a573530636e6b414141414141414141426e4e6f595455784d67414141464d414141414c63334e6f4c57566b4d6a55314d546b41414142417777735346524564444a7876456146464f314f77673178426c65496666433830353247786d56346e542b4932773462615a542b64734e337762565238543936625065756a73714e747847616d5a6f564c3175566b42773d3d222c22656e747279223a7b22617574686f72223a2264616e61222c2268617368223a2234636265386438363434316331316337653963646437633738373734646233636663626164303738326635656332343864303433383031313662326438336133222c226964223a2264616e612d32303236313031303132303034302d3030303030303238222c227061746873223a5b5d2c2270726576223a22222c2273757065727365646573223a5b5d2c227473223a22323032362d31302d31305431323a30303a34305a222c2274797065223a2266696e64696e67222c2276223a312c22776f726473223a226669727374227d2c2266696c65223a226c65646765722f64616e612f66696e64696e67732e6a736f6e6c222c226c656166223a226c696e65222c2276223a317d",
+      "scope": "auditor"
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "unverifiable",
+     "verdicts": [
+      "unverifiable"
+     ]
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F9",
+    "clause": "an unknown scope is refused at ingest and UNVERIFIABLE at verify",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "scope comes from the key directory; an old levain never calls a newer scope tampering"
+    }
+   }
+  }
+ ]
+}

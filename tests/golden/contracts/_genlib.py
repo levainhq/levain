@@ -222,3 +222,33 @@ def dearmor(text: str) -> bytes:
 def device_message(origin: str, file: str, chain_hash_hex: str) -> bytes:
     """S1_DESIGN F9: string(origin ASCII) || string(file UTF-8) || string(32 raw bytes of the chain hash)."""
     return ssh_str(origin.encode("ascii")) + ssh_str(file.encode("utf-8")) + ssh_str(bytes.fromhex(chain_hash_hex))
+
+
+# ---- F8 canonical JSON and F9 line leaves, independently -------------------------------------------------------
+
+
+def canon_json(obj) -> str:
+    """The byte form F8 freezes (frozen/canon pins it): sorted keys, no spaces, raw non-ASCII."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def seal_entry(entry: dict, prev: str) -> dict:
+    """team/entry.py's seal, by its formula: hash = sha256(prev || canonical(entry without "hash"))."""
+    body = {k: v for k, v in entry.items() if k != "hash"}
+    body["prev"] = prev
+    return {**body, "hash": hashlib.sha256((prev + canon_json(body)).encode("utf-8")).hexdigest()}
+
+
+def line_leaf(entry: dict, file: str, sd: bytes, origin: str, *, sign_origin: str | None = None,
+              sign_file: str | None = None, device_fp: str | None = None, extra: dict | None = None,
+              drop: tuple = ()) -> bytes:
+    """A (line, 1) leaf's canonical bytes: the sealed entry, its device's fingerprint and a raw SSHSIG blob over
+    string(origin) || string(file) || string(chain hash), namespace levain-team-entry. The keyword arguments build
+    the tampered variants (signed for another origin or file, a different fingerprint, an extra or a missing key)."""
+    msg = device_message(sign_origin or origin, sign_file if sign_file is not None else file, entry["hash"])
+    obj = {"leaf": "line", "v": 1, "file": file, "entry": entry,
+           "device_fp": device_fp or fp(ed_key_blob(pub(sd))), "device_sig": b64(ed_sshsig(sd, b"levain-team-entry", msg))}
+    obj.update(extra or {})
+    for k in drop:
+        obj.pop(k)
+    return canon_json(obj).encode("utf-8")

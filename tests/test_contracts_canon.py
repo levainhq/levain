@@ -11,6 +11,10 @@ from tests._contracts_vectors import check_shape, h, ids, load
 VECTORS = load("canon")
 
 
+def _framing_only(obj):
+    return obj
+
+
 @pytest.mark.parametrize("v", VECTORS, ids=ids(VECTORS))
 def test_vector(v):
     check_shape(v)
@@ -20,7 +24,8 @@ def test_vector(v):
         # the team writer emits the same bytes for an object without "hash"
         assert E.canonical(i["value"]).encode("utf-8").hex() == want["bytes_hex"]
     elif v["op"] == "leaf":
-        reg = {(e["leaf"], e["v"]): frozenset(e["log_kinds"]) for e in i["registry"]}
+        # the injected TEST registry checks framing only; the shipped one adds each type's field validator
+        reg = {(e["leaf"], e["v"]): C.LeafType(frozenset(e["log_kinds"]), _framing_only) for e in i["registry"]}
         assert C.classify_leaf(h(i["data_hex"]), i["log_kind"], at=i["at"], registry=reg) == want["verdict"]
     elif v["op"] == "chain_hash":
         assert C.chain_hash(i["prev"], i["entry"]) == want["hash"]
@@ -58,19 +63,26 @@ def test_unknown_log_kind_and_bad_mode():
         C.classify_leaf(b'{"leaf":"line","v":1}', "team", at="later")
 
 
-def test_the_shipped_registry_is_empty_until_s1b_lands_each_validator():
-    """HEAD_RULINGS #7: a type registered without its field validator would pass on framing alone."""
-    assert C.REGISTRY == {}
-    ok = b'{"leaf":"line","v":1}'
-    assert C.classify_leaf(ok, "team", at="ingest") == C.REFUSE
-    assert C.classify_leaf(ok, "team", at="verify") == C.UNVERIFIABLE
-    with pytest.raises(C.UnknownLeafError):
-        C.check_leaf(ok, "team")
+def test_the_shipped_registry_holds_each_frozen_type_with_its_validator():
+    """HEAD_RULINGS #7: each type is registered with its field validator, so framing alone never accepts a leaf.
+
+    S1-a asserted ``C.REGISTRY == {}``; S1-b registers (line, 1) with F9's validator, team log only.
+    """
+    from levain.contracts.leaves import team
+    assert set(C.REGISTRY) == {("line", 1)}
+    assert C.REGISTRY[("line", 1)] == C.LeafType(frozenset({"team"}), team.check_line_fields)
+    for framed_only in (b'{"leaf":"line","v":1}',):
+        assert C.classify_leaf(framed_only, "team", at="ingest") == C.REFUSE
+        assert C.classify_leaf(framed_only, "team", at="verify") == C.REFUSE
+        with pytest.raises(ContractError):
+            C.check_leaf(framed_only, "team")
+    assert C.classify_leaf(b'{"leaf":"line","v":2}', "team", at="verify") == C.UNVERIFIABLE
 
 
 def test_registry_is_exact_pairs_with_known_log_kinds():
-    for (leaf, v), kinds in C.REGISTRY.items():
-        assert isinstance(leaf, str) and type(v) is int and kinds <= set(C.LOG_KINDS)
+    for (leaf, v), entry in C.REGISTRY.items():
+        assert isinstance(leaf, str) and type(v) is int and entry.log_kinds <= set(C.LOG_KINDS)
+        assert callable(entry.check_fields)
 
 
 def test_an_oversized_leaf_integer_is_a_contract_error_at_its_own_site():

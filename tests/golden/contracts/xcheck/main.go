@@ -51,6 +51,9 @@ var minCount = map[string]int{
 	"fingerprint": 7,
 	"canon":       40,
 	"sshsig":      13,
+	"entry":       80,
+	"line":        40,
+	"scope":       45,
 }
 
 type vector struct {
