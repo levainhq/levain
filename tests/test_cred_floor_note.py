@@ -1,7 +1,7 @@
 """The note that names the standard credential floor when a shell reads like a missing credential.
 
-Since the floor denies the standard credential stores in every drive but the interactive REPL, a
-headless `git push` over HTTPS or a `gh` call fails with the tool's own words, which read like a
+Since the floor denies the standard credential stores in every drive, the interactive REPL included,
+a `git push` over HTTPS or a `gh` call fails with the tool's own words, which read like a
 broken remote or a logged-out tool. The turn's activity says which switch it was instead."""
 import os
 from types import SimpleNamespace
