@@ -458,6 +458,25 @@ def test_a_dirmngr_directly_in_home_keeps_its_mask(tmp_path, rd, monkeypatch) ->
     assert ["--perms", "0700", "--tmpfs", str(home)] not in [argv[k:k + 4] for k in range(len(argv))]
 
 
+@pytest.mark.parametrize("knows_perms", [True, False])
+def test_a_bwrap_without_perms_reads_unavailable_naming_the_minimum(tmp_path, monkeypatch, knows_perms) -> None:
+    """Every runtime view is made with ``--perms``, which bubblewrap has from 0.5.0. A 0.4.x (Ubuntu
+    20.04, Debian 11) passed the probe and every shell then died "Unknown option --perms"."""
+    fake = tmp_path / "bwrap"
+    fake.write_text("#!/bin/sh\n" + ("" if knows_perms else
+                    'for a in "$@"; do [ "$a" = --perms ] && { echo "bwrap: Unknown option --perms" >&2; exit 1; }; done\n')
+                    + "exit 0\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(conf, "BWRAP", str(fake))
+    monkeypatch.setattr(conf, "_cgroup_problem", lambda: None)
+    monkeypatch.setattr(conf, "_leaf_chain_problem", lambda: None)
+    assert bwrap_available() is knows_perms
+    d = conf.diagnose_confinement("Linux")
+    assert d.supported is knows_perms
+    if not knows_perms:
+        assert "0.5.0" in d.reason and "--perms" in d.reason, d.reason
+
+
 def test_gnupghome_passes_the_launch_allowlist() -> None:
     """Under ``levain run`` the re-exec keeps only allowlisted names, and gpgconf needs GNUPGHOME to
     name a non-default home's sockets."""

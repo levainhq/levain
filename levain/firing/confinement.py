@@ -5890,6 +5890,27 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     return out, create_first
 
 
+#: The ops :func:`bwrap_available` adds so that a bubblewrap older than 0.5.0, which has no ``--perms``,
+#: reads unavailable rather than failing every shell.
+_BWRAP_PERMS_PROBE = ("--perms", "0700", "--tmpfs", "/tmp")
+
+
+def _bwrap_lacks_perms() -> bool:
+    """True when bwrap starts WITHOUT ``--perms`` and fails WITH it: a bubblewrap older than 0.5.0."""
+    def runs(*extra: str) -> bool:
+        try:
+            proc = subprocess.run(
+                [BWRAP, "--bind", "/", "/", *extra, "--proc", "/proc", "--dev", "/dev", "--unshare-pid",
+                 "/bin/true"],
+                capture_output=True, timeout=10, env=_probe_env(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0
+
+    return runs() and not runs(*_BWRAP_PERMS_PROBE)
+
+
 def _bwrap_runs_without_a_pid_namespace() -> bool:
     """True when bwrap starts WITHOUT ``--unshare-pid`` and fails WITH it, which pins a refusal on the
     PID namespace rather than on user namespaces in general. Both probes run here, so the answer
@@ -6182,13 +6203,17 @@ def bwrap_available() -> bool:
 
     Deliberately NOT cached. It is one ``bwrap --bind / / /bin/true`` (single-digit milliseconds), and
     a cached answer would survive an operator loading an AppArmor profile or flipping the sysctl —
-    reporting "no confinement" for the life of the process on a box that has just become capable."""
+    reporting "no confinement" for the life of the process on a box that has just become capable.
+
+    It makes a tmpfs with ``--perms``, as every runtime view does (step (7) of :func:`_bwrap_plan_impl`):
+    bubblewrap has the option from 0.5.0, and a 0.4.x (Ubuntu 20.04, Debian 11) passed a probe without
+    it, then failed every shell "Unknown option --perms" (codex L3 r1)."""
     if not (os.path.isfile(BWRAP) and os.access(BWRAP, os.X_OK)):
         return False
     try:
         proc = subprocess.run(
-            [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "--unshare-pid",
-             "/bin/true"],
+            [BWRAP, "--bind", "/", "/", *_BWRAP_PERMS_PROBE, "--proc", "/proc", "--dev", "/dev",
+             "--unshare-pid", "/bin/true"],
             capture_output=True,
             timeout=10,
             env=_probe_env(),
@@ -8400,6 +8425,12 @@ def diagnose_confinement(system: str | None = None) -> ConfinementDiagnosis:
                 f"a command cannot start in its own cgroup scope here ({said})", _LINGER_REMEDY)
         return ConfinementDiagnosis(True, "bwrap (Linux mount namespace)",
                                     "Linux bwrap floor active", None)
+    if _bwrap_lacks_perms():
+        return ConfinementDiagnosis(
+            False, "bwrap (Linux mount namespace)",
+            f"the bubblewrap at {BWRAP} has no --perms option: Levain needs bubblewrap 0.5.0 or later",
+            "install bubblewrap 0.5.0 or later (Ubuntu 22.04 and Debian 12 ship it)",
+        )
     if _bwrap_runs_without_a_pid_namespace():
         # The floor needs `--unshare-pid` (so bash cannot read other processes' environments), and
         # a new PID namespace needs a fresh /proc mount, which the kernel refuses where /proc has
