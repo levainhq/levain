@@ -207,8 +207,9 @@
 
   // The read transport for code outside this file (the filter box's store search, a one-panel refetch):
   // the same function, so the same token handling.
-  // `headers` is the SAME read-header function the reads above use, so the freshness stream (a fetch read that
-  // cannot go through res.json()) carries the same credential; `reload` is the board's one passive re-read.
+  // `headers` is the SAME read-header function the reads above use, so the change stream (a fetch read that
+  // cannot go through res.json()) carries the same credential; `reload` is the board's one passive re-read and
+  // resolves true only once a board was drawn (false: deferred by an edit or a load in flight, or it failed).
   window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }) };
 
   // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
@@ -566,8 +567,9 @@
         panels[id] = { error: e && e.message ? e.message : String(e) };
       }
     }));
-    // what this board was drawn from, per panel: the freshness stream compares it with the server's map
-    heldNext = Object.fromEntries(ids.map((id) => [id, { as_of: panels[id].as_of || null, status: panels[id].status || "error" }]));
+    // the panels this board was drawn from, each with the head etag it was drawn under: the change stream
+    // resyncs over these ids, and the poll fallback compares the etags
+    heldNext = Object.fromEntries(ids.map((id) => [id, { etag: (manifest.panels[id] || {}).etag || null }]));
     return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: panels }, { elapsedMs: Date.now() - fetchedAt });
   }
 
@@ -577,22 +579,22 @@
       // A passive read is droppable (next trigger re-reads); a non-passive save/boot
       // reload must NOT be — latch it to re-run when the in-flight load settles.
       if (!passive) pendingReload = true;
-      return;
+      return false;
     }
     // If the render core didn't load (reorder / serve failure), say so plainly
     // rather than throwing an opaque TypeError after a successful fetch.
     if (!window.LevainDashboard || typeof window.LevainDashboard.render !== "function") {
       status("render core failed to load");
-      return;
+      return false;
     }
     // Pre-fetch fast path: don't even fetch if we already know an edit is open.
-    if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
+    if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
     inflight = true;
     if (btn) btn.disabled = true;
     try {
       if (useManifest) {
         const mview = await loadManifestView(passive);
-        if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return; }
+        if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
         frozen = null;   // a rebuilt board shows no preview, so none may be fired
         window.LevainDashboard.render(mview, mview.writable
@@ -601,7 +603,7 @@
         if (heldNext) window.LevainCockpitHeld = heldNext;    // published once drawn: only then can a panel be refetched in place
         status("read " + new Date().toLocaleTimeString());
         showNotice();
-        return;
+        return true;
       }
       let res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
       // OFF-BOX BOOTSTRAP (spore-220): an off-box writable surface gates the substrate READS. On the
@@ -615,7 +617,7 @@
         // below, so a background token-403 can't steal focus from in-progress text (complement L3
         // FIND-1 / the spore-108 "passive never disrupts an edit" invariant). The next explicit
         // boot/save load (passive:false) re-prompts.
-        if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
+        if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
         if (promptForToken()) res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
         if (res.status === 403) {
           // Still refused after the retry (wrong/rotated token, or the operator cancelled): drop the
@@ -624,7 +626,7 @@
           // so it falls through to the generic read-failed path below with the stored token intact.
           dropToken();
           status("read refused — off-box token missing or invalid");
-          return;
+          return false;
         }
       }
       if (!res.ok) throw new Error("HTTP " + res.status);
@@ -632,7 +634,7 @@
       // Post-fetch race re-check (codex L3 HIGH): a passive load that STARTED clean, then
       // the operator opened/typed an editor WHILE this fetch was in flight — rebuilding
       // now would still discard it. The save path (passive:false) always applies.
-      if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
+      if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
       // Track whether THIS surface demands the write token so commit()'s writeHeaders attaches it.
       // True on any writable surface (K2a), false on a read-only one.
       writeTokenRequired = view.write_token_required === true;
@@ -644,8 +646,10 @@
       // read-only surface too; the write transports stay gated on `writable` (NO THEATER).
       window.LevainDashboard.render(view, view.writable === false ? { recall } : { commit, commitAction, commitJob, pollJob, onJobsIdle, recall });
       status("read " + new Date().toLocaleTimeString());
+      return true;
     } catch (e) {
       status("read failed: " + (e && e.message ? e.message : e));
+      return false;
     } finally {
       inflight = false;
       if (btn) btn.disabled = false;

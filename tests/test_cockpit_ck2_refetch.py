@@ -60,7 +60,7 @@ const ok = (c, w) => { if (!c) { failed++; console.log("FAIL " + w); } };
   // unchanged shape: only the rows moved
   globalThis.__next = payload(5);
   let r = await K.refetchPanel("p");
-  ok(r === true, "same shape returns true");
+  ok(r === "applied", "same shape returns applied");
   ok(renders === 0 && replaced === 0, "no renderPanel and no replaceWith on a same-shape refetch");
   ok(painted[painted.length - 1] === 5, "the body repainted the new rows: " + painted);
   ok(measures >= 1, "the host was re-measured");

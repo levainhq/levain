@@ -1032,8 +1032,9 @@
   // shape as the one drawn (the chrome is unchanged, only data moved) every live copy of the panel, board and
   // focus modal alike, repaints its body in place and re-measures its host, and no node is created, moved or
   // detached. When the shape changed, this declines and the caller answers with a full reload, so the board's
-  // one render path stays the only place a panel is mounted. Resolves true when the page was brought up to
-  // date (or a newer refetch of the same panel took over); false when the caller must reload.
+  // one render path stays the only place a panel is mounted. Resolves "applied" when the page was brought up to
+  // date (or a newer refetch of the same panel took over), "fault" when the read or the mapping failed (the panel
+  // says so, and the caller may retry), and false when the caller must reload.
   const refetchGen = new Map();
   const liveOf = (pid) => Array.from(states).filter((s) => s.pid === pid && onPage(s));
   async function refetchPanel(pid) {
@@ -1042,10 +1043,10 @@
     refetchGen.set(pid, gen);
     let raw, fault = "";
     try { raw = await readPanel(pid); } catch (e) { fault = e && e.message ? e.message : String(e); }
-    if (refetchGen.get(pid) !== gen) return true;      // a newer refetch of this panel owns the answer
+    if (refetchGen.get(pid) !== gen) return "applied";      // a newer refetch of this panel owns the answer
     const live = liveOf(pid);
     if (!live.length) return false;
-    if (fault) { for (const s of live) { s.fault = fault; paint(s); } return true; }
+    if (fault) { for (const s of live) { s.fault = fault; paint(s); } return "fault"; }
     const core = root.LevainDashboard;
     if (!lastManifest || !core) return false;
     let view, entry, data;
@@ -1053,7 +1054,7 @@
       view = mapSnapshot({ manifest: lastManifest, panels: { [pid]: raw } }, { elapsedMs: Date.now() - manifestAt });
       entry = view.layout.find((e) => e.id === pid);
       data = view.extra_panels[pid];
-    } catch (e) { for (const s of live) { s.fault = "could not be mapped (" + (e && e.message ? e.message : e) + ")"; paint(s); } return true; }
+    } catch (e) { for (const s of live) { s.fault = "could not be mapped (" + (e && e.message ? e.message : e) + ")"; paint(s); } return "fault"; }
     if (!entry || !data) return false;      // the panel is no longer an external one: a full reload draws it
     const shape = shapeOf(entry, data);
     if (live.some((s) => s.shape !== shape)) return false;
@@ -1073,7 +1074,7 @@
         if (core.measureOverflow && host.classList.contains("clamped")) core.measureOverflow(host);
       }
     }
-    return true;
+    return "applied";
   }
 
   // ---- the modes and the keys ----

@@ -81,6 +81,8 @@ import hmac
 import re
 import urllib.parse
 import secrets
+import select
+import socket
 import ipaddress
 import json
 import sys
@@ -647,14 +649,23 @@ class _LevainHTTPServer(ThreadingHTTPServer):
     # The cockpit broker (K2b): None on a read-only source; else started with the cockpit and drained
     # by server_close. It is write-disabled unless the install class is declared (design §6).
     broker: "Broker | None" = None
-    # The freshness stream (levain.cockpit.stream): its own cap (a stream holds its slot for its whole
-    # life, so it cannot share the request gate), its pace, and the event every stream loop waits on.
-    # The epoch names this server process in every event id, so a client can tell a restart.
-    stream_gate: threading.BoundedSemaphore = threading.BoundedSemaphore(cockpit_stream.DEFAULT_MAX_STREAMS)
-    stream_tick_s: float = cockpit_stream.DEFAULT_TICK_S
-    stream_heartbeat_s: float = cockpit_stream.DEFAULT_HEARTBEAT_S
-    stream_stop: threading.Event = threading.Event()
-    stream_epoch: str = ""
+    # The change stream (levain.cockpit.stream): set per instance in __init__, before the socket binds,
+    # because a failed bind runs server_close and that reads these.
+    stream_gate: threading.BoundedSemaphore
+    stream_heartbeat_s: float
+    stream_stop: threading.Event
+    stream_watcher: "cockpit_stream.Watcher"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.stream_gate = threading.BoundedSemaphore(cockpit_stream.DEFAULT_MAX_STREAMS)
+        self.stream_heartbeat_s = cockpit_stream.DEFAULT_HEARTBEAT_S
+        self.stream_stop = threading.Event()
+        self.stream_watcher = cockpit_stream.Watcher(self._watch_manifest, epoch=secrets.token_hex(4))
+        super().__init__(*args, **kwargs)
+
+    def _watch_manifest(self) -> dict[str, Any]:
+        # the watcher reads as ONE fixed credential, the class a loopback page read carries (no token)
+        return self.get_cockpit().manifest({"class": "none", "device_class": None})
 
     _cockpit_lock = threading.Lock()
 
@@ -692,6 +703,7 @@ class _LevainHTTPServer(ThreadingHTTPServer):
         # K2b §4.2: the broker drains first (write admission closes; an admitted settler is waited
         # for before its lock is released), then the cockpit's refreshers stop
         self.stream_stop.set()      # open streams end first: nothing is left holding a thread
+        self.stream_watcher.stop()
         if self.broker is not None:
             self.broker.stop()
         if self.cockpit is not None:
@@ -783,6 +795,15 @@ class _Handler(GuardedHandler):
             supplied.encode("utf-8"), expected.encode("utf-8")
         )
 
+    def _peer_open(self) -> bool:
+        """False once the client has closed its end. A stream never reads the request body, so any readable
+        byte-less state is the peer hanging up."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return not readable or self.connection.recv(1, socket.MSG_PEEK) != b""
+        except (OSError, ValueError):
+            return False
+
     def _serve_stream(self, *, head: bool) -> None:
         """``GET /cockpit/events``: reached only through ``_route``, so the Host allowlist, the
         cross-site refusal and the off-box token gate have already answered. Past the stream cap: 503."""
@@ -793,8 +814,14 @@ class _Handler(GuardedHandler):
         if not srv.stream_gate.acquire(blocking=False):
             self._send(b"busy\n", "text/plain; charset=utf-8", status=503)
             return
+        sub = None
         try:
-            cockpit = self._cockpit()
+            try:
+                sub = srv.stream_watcher.subscribe(self.headers.get("Last-Event-ID"))
+            except Exception as exc:  # noqa: BLE001 - the cockpit could not start: an answer, not a dead connection
+                self._send(json.dumps({"error": "internal", "message": f"{type(exc).__name__}: {exc}"}).encode("utf-8"),
+                           "application/json; charset=utf-8", status=500)
+                return
             self.close_connection = True
             self.send_response(200)
             self.send_header("Content-Type", cockpit_stream.CONTENT_TYPE)
@@ -809,13 +836,13 @@ class _Handler(GuardedHandler):
                 self.wfile.flush()
 
             try:
-                cockpit_stream.run(
-                    write, cockpit.freshness, epoch=srv.stream_epoch,
-                    last_event_id=self.headers.get("Last-Event-ID"), stop=srv.stream_stop,
-                    tick_s=srv.stream_tick_s, heartbeat_s=srv.stream_heartbeat_s)
+                cockpit_stream.run(write, sub, stop=srv.stream_stop, heartbeat_s=srv.stream_heartbeat_s,
+                                   alive=self._peer_open)
             except (OSError, ValueError):
                 pass        # the client went away (or the socket closed under a shutdown): this stream is over
         finally:
+            if sub is not None:
+                srv.stream_watcher.unsubscribe(sub)
             srv.stream_gate.release()
 
     def _route(self, *, head: bool) -> None:
@@ -1632,9 +1659,6 @@ def make_server(
     httpd.allowed_hosts = _LOOPBACK_HOSTS | {str(httpd.server_address[0]).lower()}
     # Bound the expensive routes (store read + writes); past the cap → 503.
     httpd.request_gate = threading.BoundedSemaphore(_MAX_INFLIGHT)
-    httpd.stream_gate = threading.BoundedSemaphore(cockpit_stream.DEFAULT_MAX_STREAMS)
-    httpd.stream_stop = threading.Event()
-    httpd.stream_epoch = secrets.token_hex(4)
     return httpd
 
 
