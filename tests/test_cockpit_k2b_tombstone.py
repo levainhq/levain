@@ -23,7 +23,7 @@ from levain.cockpit.effects import (
     TransientApplyFault,
     plan_units,
 )
-from tests.test_cockpit_k2b_broker import BROWSER, Key, _label, _refused, _rows, _state, home, keydir, spores  # noqa: F401
+from tests.test_cockpit_k2b_broker import BROWSER, Key, _label, _laptop_floor, _refused, _rows, _state, home, keydir, spores  # noqa: F401
 
 @pytest.fixture
 def db(home: Path) -> Path:

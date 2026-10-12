@@ -13,6 +13,7 @@ import math
 import os
 import stat
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from levain import __version__
@@ -339,11 +340,13 @@ def main(argv: list[str] | None = None) -> int:
         "cockpit",
         help="Enroll, revoke and list the cockpit's signing keys (a reported install).",
         description=(
-            "The keys that sign the cockpit's T2/T3 writes. `enroll` adds an OpenSSH public key "
-            "(class laptop-presence signs T2 and T3, display-phone T2); `revoke` retires one (the "
-            "last laptop-presence key only with --compromised-since); `keys` lists them. Run at the laptop: in a "
-            "reported install this CLI is how a key gets enrolled. A governed install's keys are "
-            "written by the root installer, so these refuse it."
+            "The keys that sign the cockpit's T2/T3 writes, held as links in the signed authority log. "
+            "`enroll` adds an OpenSSH public key (class laptop-presence signs T2 and T3, display-phone "
+            "T2) by a link a laptop-presence key signs; `revoke` retires one by a link a key of at least "
+            "its class signs (the last laptop-presence key only with --compromised-since); `keys` lists "
+            "them. Each signing key is passed as --signing-key and may ask for a touch. The log's first "
+            "link is `levain cockpit ledger init`'s. A governed install's keys are written by the root "
+            "installer, so these refuse it."
         ),
     )
     ck_sub = ck_p.add_subparsers(dest="cockpit_cmd", required=True)
@@ -360,14 +363,20 @@ def main(argv: list[str] | None = None) -> int:
                            choices=("laptop-presence", "display-phone", "presence"),
                            help="What the key may sign (default: laptop-presence): laptop-presence "
                                 "signs T2 and T3, display-phone T2, presence nothing yet.")
+    ck_enroll.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                           help="The enrolled laptop-presence key that signs this enrolment (its private "
+                                "key file, or the .pub of a key an agent holds).")
     _ck_common(ck_enroll)
     ck_enroll.set_defaults(func=_cmd_cockpit_enroll)
     ck_revoke = ck_sub.add_parser("revoke", help="Revoke an enrolled key.")
     ck_revoke.add_argument("ref", help="The key's fingerprint (SHA256:...) or principal.")
-    ck_revoke.add_argument("--compromised-since", dest="compromised_since", default=None,
-                           help="ISO time the key may have been in other hands since; its signatures "
-                                "from then on stop reading verified, and the last laptop-presence key "
-                                "can be revoked with it.")
+    ck_revoke.add_argument("--compromised-since", dest="compromised_since", type=int, default=None,
+                           help="The authority seq (as `levain cockpit keys` lists) from which the key "
+                                "may have been in other hands; its fires from then on stop reading as "
+                                "signed, and the last laptop-presence key can be revoked with it.")
+    ck_revoke.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                           help="An enrolled key of at least the revoked key's class that signs this "
+                                "revocation (its private key file, or the .pub of a key an agent holds).")
     _ck_common(ck_revoke)
     ck_revoke.set_defaults(func=_cmd_cockpit_revoke)
     ck_keys = ck_sub.add_parser("keys", help="List enrolled keys.")
@@ -1541,69 +1550,78 @@ _KEY_FILE_MAX = 16 * 1024
 
 
 def _cockpit_refusals() -> tuple[type[BaseException], ...]:
-    """What a key command answers as a refusal, never a traceback: its own refusals, an unreadable
-    file, and the journal's (busy while the broker writes, not a cockpit journal, corrupt)."""
+    """What a key command answers as a refusal, never a traceback: its own refusals, the authority
+    log's (a refused link, an unusable log, the verifier), an unreadable file, and the journal's (busy
+    while the broker writes, not a cockpit journal, corrupt)."""
     import sqlite3
 
+    from levain.authority import AuthorityError
     from levain.cockpit.firejournal import CockpitFormatError
     from levain.cockpit.keys import KeyError_
 
-    return (KeyError_, OSError, UnicodeDecodeError, sqlite3.Error, CockpitFormatError)
+    return (KeyError_, AuthorityError, OSError, UnicodeDecodeError, sqlite3.Error, CockpitFormatError)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _cmd_cockpit_enroll(args: argparse.Namespace) -> int:
-    from datetime import datetime, timezone
-
-    from levain.cockpit.keys import KeyError_, enroll
+    from levain.cockpit.keys import KeyError_, enroll, ssh_signer
 
     try:
         with args.key.expanduser().open("rb") as fh:
             raw = fh.read(_KEY_FILE_MAX + 1)
         if len(raw) > _KEY_FILE_MAX:
             raise KeyError_(f"{args.key} is larger than a public key file ({_KEY_FILE_MAX} bytes)")
-        row, created = enroll(_cockpit_root(args), raw.decode("utf-8"), args.key_class,
-                              now=datetime.now(timezone.utc))
+        signer_fp, sign = ssh_signer(args.signing_key)
+        row, created, warning = enroll(_cockpit_root(args), raw.decode("utf-8"), args.key_class,
+                                       signer_fp=signer_fp, sign=sign, clock=_utc_now)
     except _cockpit_refusals() as exc:
         print(f"enroll refused: {exc}", file=sys.stderr)
         return 1
     print(f"{'enrolled' if created else 'already enrolled'}: {row.fingerprint} as {row.key_class} "
-          f"(principal {row.principal})")
+          f"at seq {row.enrolled_seq} (principal {row.principal})")
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
     return 0
 
 
 def _cmd_cockpit_revoke(args: argparse.Namespace) -> int:
-    from datetime import datetime, timezone
-
-    from levain.cockpit.keys import KeyError_, revoke
+    from levain.cockpit.keys import revoke, ssh_signer
 
     try:
-        since = None
-        if args.compromised_since is not None:
-            since = datetime.fromisoformat(args.compromised_since)
-            if since.tzinfo is None:
-                raise KeyError_("--compromised-since needs a zone (e.g. 2026-10-11T09:00:00-04:00)")
-        row = revoke(_cockpit_root(args), args.ref, now=datetime.now(timezone.utc), compromised_since=since)
-    except (*_cockpit_refusals(), ValueError) as exc:
+        signer_fp, sign = ssh_signer(args.signing_key)
+        row, warning = revoke(_cockpit_root(args), args.ref, signer_fp=signer_fp, sign=sign, clock=_utc_now,
+                              compromised_since=args.compromised_since)
+    except _cockpit_refusals() as exc:
         print(f"revoke refused: {exc}", file=sys.stderr)
         return 1
-    print(f"revoked: {row.fingerprint} at {row.revoked_at}"
-          + (f" (compromised since {row.compromised_since})" if row.compromised_since else ""))
+    print(f"revoked: {row.fingerprint} at seq {row.revoked_seq}"
+          + (f" (compromised since seq {row.compromised_since})" if row.compromised_since else ""))
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
     return 0
 
 
 def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
-    from levain.cockpit.keys import KeyError_, keys
+    from levain.cockpit.keys import keys
 
     try:
-        rows = keys(_cockpit_root(args))
+        rows, note = keys(_cockpit_root(args), now=_utc_now())
     except _cockpit_refusals() as exc:
         print(f"keys: {exc}", file=sys.stderr)
         return 1
+    if note:
+        print(note)
     if not rows:
         print("no keys enrolled")
     for r in rows:
-        state = f"revoked {r.revoked_at}" if r.revoked_at else "active"
-        print(f"{r.fingerprint}  {r.key_class:<16} {state:<34} enrolled {r.enrolled_at} via {r.enrolled_via}")
+        state = f"revoked at seq {r.revoked_seq}" if r.revoked_seq is not None else "active"
+        if r.compromised_since is not None:
+            state += f", compromised since seq {r.compromised_since}"
+        print(f"{r.fingerprint}  {r.key_class:<16} {state:<44} enrolled at seq {r.enrolled_seq} ({r.enrolled_at})"
+              + (f", first enrolled {r.legacy_enrolled_at}" if r.legacy_enrolled_at else ""))
     return 0
 
 

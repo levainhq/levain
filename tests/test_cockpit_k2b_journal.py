@@ -23,12 +23,16 @@ from levain.cockpit.firejournal import (
     UnitResult,
     new_pending_id,
 )
+from tests.cockpit_authority_rig import STORE, fake_authority
 
 T0 = datetime(2026, 10, 10, 12, 0, 0, tzinfo=timezone.utc)
 PHONE = "token:phone:1"
 FP_LAPTOP = "SHA256:laptop"
 FP_PHONE = "SHA256:phone"
 FP_WEAK = "SHA256:presence"
+KEYS = {FP_LAPTOP: "laptop-presence", FP_PHONE: "display-phone", FP_WEAK: "presence"}
+# the fence a record issued at the fixture's authority head carries
+FENCE = {"authority_store_id": STORE, "authority_seq": 1}
 
 
 def effect(i: int, version: int = 3) -> dict:
@@ -38,7 +42,7 @@ def effect(i: int, version: int = 3) -> dict:
 
 
 def make_record(*, pid: str | None = None, intent: str = "sign", tier: str = "T2",
-                n_effects: int = 2, params: dict | None = None, policy_rev: int = 0,
+                n_effects: int = 2, params: dict | None = None, fence: dict | None = None,
                 version: int = 3, ttl: timedelta = timedelta(hours=1)) -> tuple[str, bytes]:
     pid = pid or new_pending_id()
     rec = build_record(
@@ -47,7 +51,7 @@ def make_record(*, pid: str | None = None, intent: str = "sign", tier: str = "T2
                 "expected_version": version},
         params=params if params is not None else {"text": "new 0"},
         effects=[effect(i, version) for i in range(n_effects)], tier=tier,
-        fence={"policy_rev": policy_rev}, issued_at=utc_stamp(T0), expires_at=utc_stamp(T0 + ttl))
+        fence=fence or FENCE, issued_at=utc_stamp(T0), expires_at=utc_stamp(T0 + ttl))
     return pid, encode(rec)
 
 
@@ -56,11 +60,8 @@ def db(tmp_path):
     j = CockpitDB(tmp_path)
     with j.write() as conn:
         conn.execute("INSERT INTO tokens (name, generation) VALUES ('phone', 1)")
-        for fp, cls in ((FP_LAPTOP, "laptop-presence"), (FP_PHONE, "display-phone"),
-                        (FP_WEAK, "presence")):
-            conn.execute("INSERT INTO keys (fingerprint, principal, public_key, class, enrolled_at, "
-                         "enrolled_via) VALUES (?, ?, 'ssh-ed25519 AAAA', ?, ?, 'laptop cli')",
-                         (fp, "k" + fp[-6:], cls, utc_stamp(T0 - timedelta(days=1))))
+    # the authority each decide is handed (capture's job, tested in test_cockpit_authority_s3a2)
+    j.auth = fake_authority(j, KEYS)
     return j
 
 
@@ -74,7 +75,7 @@ def issue(db, *, key: str = "k1", principal: str = PHONE, **kw) -> tuple[str, by
 
 def decided(db, *, key: str = "k1", n_effects: int = 2) -> str:
     pid, raw = issue(db, key=key, n_effects=n_effects)
-    out = db.decide(operation_id=pid, decision_kind="ALLOWED", recomputed=raw,
+    out = db.decide(authority=db.auth, operation_id=pid, decision_kind="ALLOWED", recomputed=raw,
                     now=T0 + timedelta(minutes=1), signer_fp=FP_PHONE, signature="sig",
                     pre_images=[{"text": "old"}] * n_effects)
     assert out.decided
@@ -129,8 +130,10 @@ def test_build_record_refuses_a_malformed_record():
         build_record(**{**rec, "operation_id": "cpXYZ"})
     with pytest.raises(ConsentError, match="intent"):
         build_record(**{**rec, "intent": "maybe"})
-    with pytest.raises(ConsentError, match="policy_rev"):
-        build_record(**{**rec, "fence": {"policy_rev": True}})
+    for bad in ({"policy_rev": 0}, {**FENCE, "authority_seq": True}, {**FENCE, "authority_seq": -1},
+                {**FENCE, "authority_store_id": 1}, {**FENCE, "extra": 1}):
+        with pytest.raises(ConsentError, match="authority_seq"):
+            build_record(**{**rec, "fence": bad})
     with pytest.raises(ConsentError, match="store"):
         build_record(**{**rec, "effects": [{"resource_key": "ok-0"}]})
     with pytest.raises(ConsentError, match="after issued_at"):
@@ -178,13 +181,6 @@ def test_an_old_sqlite_is_refused_at_open(tmp_path, monkeypatch):
     monkeypatch.setattr("levain.autonomic.durable_sqlite.sqlite3.sqlite_version", "3.34.1")
     with pytest.raises(RuntimeError, match="RETURNING"):
         CockpitDB(tmp_path).meta("format")
-
-
-def test_policy_rev_reads(db):
-    assert db.policy_rev() == 0
-    with db.write() as conn:
-        conn.execute("UPDATE meta SET value = '1' WHERE key = 'policy_rev'")
-    assert db.policy_rev() == 1
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -259,14 +255,14 @@ def test_an_expired_pending_frees_its_cap_slot(db):
 # decide (§3.2.2)
 
 def _decide(db, pid, raw, *, fp=FP_PHONE, kind="ALLOWED", at=timedelta(minutes=1), n=2):
-    return db.decide(operation_id=pid, decision_kind=kind, recomputed=raw, now=T0 + at,
+    return db.decide(authority=db.auth, operation_id=pid, decision_kind=kind, recomputed=raw, now=T0 + at,
                      signer_fp=fp if kind == "ALLOWED" else None,
                      signature="sig" if kind == "ALLOWED" else None, pre_images=[None] * n)
 
 
 def test_decide_writes_decided_and_one_planned_row_per_effect(db):
     pid, raw = issue(db)
-    out = db.decide(operation_id=pid, decision_kind="ALLOWED", recomputed=raw,
+    out = db.decide(authority=db.auth, operation_id=pid, decision_kind="ALLOWED", recomputed=raw,
                     now=T0 + timedelta(minutes=1), signer_fp=FP_PHONE, signature="sig",
                     pre_images=[{"text": "old 0"}, None])
     assert out.decided
@@ -294,15 +290,21 @@ def test_decide_after_expiry_is_expired(db):
 
 @pytest.mark.parametrize("setup, fp, tier, reason", [
     ("UPDATE tokens SET generation = 2", FP_PHONE, "T2", "token rotated"),
-    ("UPDATE keys SET revoked_at = '2026-10-10T12:00:00.000000Z' WHERE class = 'display-phone'",
-     FP_PHONE, "T2", "key revoked"),
+    ("revoke phone", FP_PHONE, "T2", "key revoked"),
+    ("mark uninitialised", FP_LAPTOP, "T2", "authority not initialised: run `levain cockpit ledger init`"),
     ("", "SHA256:nobody", "T2", "key not enrolled"),
     ("", FP_WEAK, "T2", "key class presence does not cover T2"),
     ("", FP_PHONE, "T3", "key class display-phone does not cover T3"),
 ])
 def test_decide_refuses_on_authority_and_policy(db, setup, fp, tier, reason):
     pid, raw = issue(db, tier=tier)
-    if setup:
+    if setup == "revoke phone":
+        # a revocation appended since issue: the signer is judged first, so it refuses, never stales
+        db.auth = fake_authority(db, KEYS, revoked=(FP_PHONE,))
+    elif setup == "mark uninitialised":
+        with db.write() as conn:
+            conn.execute("INSERT INTO meta (key, value) VALUES ('authority_uninitialised', 'authority migrated')")
+    elif setup:
         with db.write() as conn:
             conn.execute(setup)
     out = _decide(db, pid, raw, fp=fp)
@@ -310,14 +312,31 @@ def test_decide_refuses_on_authority_and_policy(db, setup, fp, tier, reason):
     assert db.load(pid).effects == ()
 
 
-def test_a_policy_change_after_issue_is_stale_not_refused(db):
-    # seat ruling R1: a policy change is a re-sign (§9)
+def test_an_authority_append_after_issue_is_stale_not_refused(db):
+    # seat ruling R1: a policy change is a re-sign (§9); every append is one (DESIGN §3.4)
     pid, raw = issue(db)
-    with db.write() as conn:
-        conn.execute("UPDATE meta SET value = '1' WHERE key = 'policy_rev'")
+    db.auth = fake_authority(db, KEYS)
     out = _decide(db, pid, raw)
-    assert (out.state, out.reason) == ("STALE", "policy changed")
+    assert (out.state, out.reason) == ("STALE", "authority changed")
     assert db.load(pid).effects == ()
+
+
+def test_a_head_that_moved_after_capture_is_stale(db):
+    pid, raw = issue(db)
+    fake_authority(db, KEYS)          # appended after the request captured db.auth
+    out = _decide(db, pid, raw)
+    assert (out.state, out.reason) == ("STALE", "authority changed")
+
+
+def test_a_direct_meta_write_grants_nothing(db):
+    """The retired /2 fence and anything else in meta are not authority: a record fenced on the old
+    integer stales, and a meta row naming a revision moves nothing."""
+    pid, raw = issue(db, fence={"authority_store_id": STORE, "authority_seq": 0})
+    with db.write() as conn:
+        conn.execute("INSERT INTO meta (key, value) VALUES ('policy_rev', '0')")
+        conn.execute("INSERT INTO meta (key, value) VALUES ('authority_seq', '0')")
+    out = _decide(db, pid, raw)
+    assert (out.state, out.reason) == ("STALE", "authority changed")
 
 
 def test_laptop_presence_covers_t3(db):
@@ -342,13 +361,13 @@ def test_decide_compares_the_recompute_byte_for_byte(db):
 
 def test_a_faulted_snapshot_leaves_a_signed_pending_unspent_and_refuses_a_reported_one(db):
     pid, _ = issue(db)
-    out = db.decide(operation_id=pid, decision_kind="ALLOWED", recomputed=None,
+    out = db.decide(authority=db.auth, operation_id=pid, decision_kind="ALLOWED", recomputed=None,
                     now=T0 + timedelta(minutes=1), signer_fp=FP_PHONE, signature="sig")
     assert (out.state, out.written) == ("WAITING", False)
     with db.read() as conn:
         assert conn.execute("SELECT signature FROM pendings").fetchone()[0] is None
     rp, _ = issue(db, key="rep", intent="reported", cap_exempt=True)
-    out = db.decide(operation_id=rp, decision_kind="ALLOWED_REPORTED", recomputed=None,
+    out = db.decide(authority=db.auth, operation_id=rp, decision_kind="ALLOWED_REPORTED", recomputed=None,
                     now=T0 + timedelta(minutes=1))
     assert (out.state, out.reason) == ("REFUSED", "source unavailable")
 
@@ -682,6 +701,6 @@ def test_a_deeply_nested_pre_image_is_corrupt(db):
 
 def test_a_deeply_nested_recompute_is_refused_normaliser(db):
     pid, _ = issue(db)
-    out = db.decide(operation_id=pid, decision_kind="ALLOWED", recomputed=DEEP,
+    out = db.decide(authority=db.auth, operation_id=pid, decision_kind="ALLOWED", recomputed=DEEP,
                     now=T0 + timedelta(minutes=1), signer_fp=FP_PHONE, signature="sig")
     assert (out.state, out.reason) == ("REFUSED", "normaliser")

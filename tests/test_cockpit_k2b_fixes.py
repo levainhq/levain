@@ -506,9 +506,9 @@ def test_decide_reads_authority_off_the_signed_record_not_its_mirror_columns(hom
         conn.close()
         assert b.db is not None
         with pytest.raises(ValueError, match="'sign' pending cannot take ALLOWED_REPORTED"):
-            b.db.decide(operation_id=pid, decision_kind="ALLOWED_REPORTED", recomputed=None, now=now[0])
+            b.db.decide(authority=None, operation_id=pid, decision_kind="ALLOWED_REPORTED", recomputed=None, now=now[0])
         now[0] += timedelta(minutes=16)
-        out = b.db.decide(operation_id=pid, decision_kind="ALLOWED", recomputed=None, now=now[0],
+        out = b.db.decide(authority=None, operation_id=pid, decision_kind="ALLOWED", recomputed=None, now=now[0],
                           signer_fp="SHA256:x", signature="sig")
         assert (out.state, out.reason) == ("EXPIRED", "expired")
         signed = _json_loads(_rows(b, "SELECT record FROM pendings WHERE pending_id = ?", pid)[0][0])["expires_at"]
@@ -537,7 +537,7 @@ def test_a_reported_pending_whose_request_died_resumes_on_replay_even_after_its_
             from datetime import timedelta
             n = b._now()
             raw = b._record(pid=dead, verb="spore_set_disposition", intent="reported", built=built,
-                            params={"disposition": "note"}, tier="T2", fence={"policy_rev": db.policy_rev()},
+                            params={"disposition": "note"}, tier="T2", fence=b.capture().fence,
                             issued_at=utc(n), expires_at=utc(n + timedelta(minutes=15)))
             db.issue(record_bytes=raw, principal="token:browser:1", idempotency_key="died", now=n,
                      cap_exempt=True)
@@ -608,7 +608,7 @@ def test_a_dry_run_never_resumes_a_pending_a_dead_request_left(tmp_path):
             built = b._build(db, "spore_set_disposition", {"disposition": "note"}, tgt, dead, at_issue=True)
             n = b._now()
             raw = b._record(pid=dead, verb="spore_set_disposition", intent="reported", built=built,
-                            params={"disposition": "note"}, tier="T2", fence={"policy_rev": db.policy_rev()},
+                            params={"disposition": "note"}, tier="T2", fence=b.capture().fence,
                             issued_at=utc(n), expires_at=utc(n + timedelta(minutes=15)))
             db.issue(record_bytes=raw, principal="token:browser:1", idempotency_key="died", now=n, cap_exempt=True)
         status, out = _post(f"{url}/cockpit/verb", {"verb": "spore_set_disposition", "panel_id": "tray",

@@ -14,7 +14,7 @@ import pytest
 
 from levain.cockpit.verbs import dispatch
 from tests.test_cockpit_k2a import CRED, INSTALL_CLASS, Rig, _refused, rig  # noqa: F401 - fixture
-from tests.test_cockpit_k2b_broker import home  # noqa: F401 - fixture
+from tests.test_cockpit_k2b_broker import _laptop_floor, home  # noqa: F401 - fixtures
 from tests.test_cockpit_k2b_section import rig_broker  # noqa: F401 - fixture
 
 
