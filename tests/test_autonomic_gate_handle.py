@@ -4,8 +4,9 @@ on the gate it captured.
 Covered here: ``with_policy`` shares every stateful collaborator (checked against the constructor, so a
 new collaborator added later fails here rather than being dropped by a swap); ``swap``'s frozen catalog
 and its refusals; the HOLDERS (``FireDispatcher.dispatch``, ``ChainExecutor`` execute / resume and
-``sweep_timeouts``) reading the handle exactly once per admission, counted by a probe handle; and the
-atomicity CONTRACT test of the handle itself (``test_contract_*``).
+``sweep_timeouts``) reading the handle exactly once per admission, counted by a probe handle; the
+handle's own sweep deciding each pending on the gate current for it; and the atomicity CONTRACT test of
+the handle itself (``test_contract_*``).
 """
 from __future__ import annotations
 
@@ -24,10 +25,12 @@ from levain.autonomic import (
     manual_invocation,
 )
 from levain.autonomic import gate as gate_module
+from levain.autonomic import Binding, BindingStatus, Guard, SubGoal, TriggerSpec
 from levain.autonomic.handle import as_handle
 from levain.autonomic.journal import run_id_for
 from tests.autonomic_confirm_keys import signed_yes
-from tests.test_autonomic_journal_wiring import FIXED, HIGH, LOW, World, _chain_builder, _single_builder, _trust
+from tests.test_autonomic_journal_wiring import (FIXED, HIGH, LOW, TIGHT, World, _chain_builder, _single_builder,
+                                                  _trust)
 
 pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
 
@@ -329,6 +332,61 @@ def test_the_chain_sweep_reads_the_handle_once_per_swept_hold(tmp_path):
     [out], reads = handle.count(lambda: w.chains.sweep_timeouts(FIXED + _dt.timedelta(hours=2)))
     # the silence decision and the resolve it drives: one gate
     assert out.aborted and out.reason == "denied:confirm_window_elapsed" and reads == 1
+
+
+# --- the gate sweep: a scheduler holds the handle (L3 r1 codex HIGH) ------------------------------------
+
+_EXPIRED = FIXED + _dt.timedelta(days=30)
+
+
+def _cooling_off_proposed(tmp_path):
+    """A ``World`` holding one open cooling-off pending of an allowlisted action, proposed on policy A
+    (link0 LOW) and now past its window, and a handle on that gate."""
+    w = World(tmp_path / "w")
+    b = Binding.create(created_by="operator", created_at="2026-10-12T09:00:00co",
+                       trigger=TriggerSpec(type="email", pattern={"field": "from", "value": "a@x.example"}),
+                       goal=(SubGoal(goal="summarize", tools=("mail.read",), output="doc:s"),), tightness=TIGHT,
+                       posture=Posture.COOLING_OFF,
+                       guard=(Guard(rationale="r", dissent_author="codex",
+                                    kill_predicate={"op": "==", "field": "dmarc", "value": "fail"},
+                                    kill_drill={"dmarc": "fail"}, kill_authored_by="operator"),),
+                       status=BindingStatus.PAUSED)
+    w.store.add(b)
+    w.store.ratify(b.binding_id)
+    w.gate._auto_fire_actions = frozenset({"link0"})
+    w.dispatch("co1")
+    [p] = w.gate.open_pendings()
+    assert p.posture == "COOLING_OFF"
+    w.gate._clock = lambda: _EXPIRED   # the window has elapsed: an unattended approval checks the gate's clock
+    return w, GateHandle(w.gate)
+
+
+_CONFIRM_ONLY = (ActionManifest({"link0": HIGH, "link1": HIGH}), {"mail.read": HIGH, "mail.send": HIGH})
+
+
+def test_the_handle_sweep_decides_a_pending_on_the_gate_current_for_it(tmp_path):
+    w, handle = _cooling_off_proposed(tmp_path)
+    handle.swap(*_CONFIRM_ONLY, _first_tool)        # policy B: the action now needs a person
+    [out] = handle.sweep_timeouts(_EXPIRED)
+    assert out.refused and not out.fired and out.reason == "denied:revalidate:risk_floor_rose"
+    assert w.gate.open_pendings() == [] and w.outbox() == []
+    assert handle.sweep_timeouts(_EXPIRED) == []
+
+
+def test_a_stale_gate_sweep_still_decides_on_its_own_superseded_policy(tmp_path):
+    # CONTROL for the test above: the hazard it closes. The gate the sweep was handed before the swap
+    # auto-fires the pending on policy A; that is why a scheduler holds the handle, not a gate.
+    w, handle = _cooling_off_proposed(tmp_path)
+    handle.swap(*_CONFIRM_ONLY, _first_tool)
+    [out] = w.gate.sweep_timeouts(_EXPIRED)
+    assert out.fired and w.outbox() == [("link0", "co1-0")]
+
+
+def test_the_handle_sweep_reads_the_handle_once_per_pending_and_once_to_list_them(tmp_path):
+    w, _ = _cooling_off_proposed(tmp_path)
+    handle = _CountingHandle(w.gate)
+    out, reads = handle.count(lambda: handle.sweep_timeouts(_EXPIRED))
+    assert [o.fired for o in out] == [True] and reads == 2
 
 
 # --- the atomicity CONTRACT test ---------------------------------------------------------------------

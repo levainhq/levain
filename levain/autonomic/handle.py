@@ -18,13 +18,14 @@ Stdlib-only.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from types import MappingProxyType
 from typing import Any
 
 from levain.autonomic.binding import Binding
-from levain.autonomic.gate import EfferentGate
+from levain.autonomic.gate import EfferentGate, GateOutcome
 from levain.autonomic.risk import ActionManifest, ActionRisk
 
 __all__ = ["GateHandle", "Aggregate", "as_handle"]
@@ -86,6 +87,14 @@ class GateHandle:
             new = self._gate.with_policy(manifest, binding_risk)
             self._gate = new   # the publish: one reference store, after the gate is fully built
         return new
+
+    def sweep_timeouts(self, now: _dt.datetime | None = None) -> list[GateOutcome]:
+        """:meth:`EfferentGate.sweep_timeouts`, each pending decided on the gate current for it: the
+        handle is read once per pending, and that pending's silence decision and its resolve run on that
+        one gate. This is the sweep a scheduler calls; a scheduler that held a gate instead would decide
+        pendings proposed under one policy on a policy since superseded. A chain link's hold is left to
+        ``ChainExecutor.sweep_timeouts``, as the gate's sweep leaves it."""
+        return self.current()._sweep(now, self.current)
 
 
 def as_handle(gate: EfferentGate | GateHandle) -> GateHandle:

@@ -1363,7 +1363,19 @@ class EfferentGate:
         stops the sweep). Returns the resolved outcomes. NEVER raises.
 
         JOURNALED pendings (open holds) are swept first (:meth:`_sweep_holds`); a chain link's hold is
-        left to ``ChainExecutor.sweep_timeouts``. Manual pendings are swept from the pending store."""
+        left to ``ChainExecutor.sweep_timeouts``. Manual pendings are swept from the pending store.
+
+        This sweeps on THIS gate's policy. A gate shares its pendings with every gate a
+        :class:`~levain.autonomic.handle.GateHandle` swap publishes, so a scheduler holding this gate
+        after a swap would decide them on the superseded policy (an action tightened from cooling-off
+        to confirm would still auto-fire). A scheduler holds the handle and calls
+        :meth:`GateHandle.sweep_timeouts`, which decides each pending on the gate current for it."""
+        return self._sweep(now, lambda: self)
+
+    def _sweep(self, now: _dt.datetime | None, gate_for: Callable[[], "EfferentGate"]) -> list[GateOutcome]:
+        """The sweep, each pending decided on ``gate_for()``, read once per pending: its silence decision
+        and the resolve it drives run on that one gate. The holds, the pendings and the clock are state
+        every gate a swap publishes shares, so they are read from this one."""
         # NEVER raises (L3 codex ship-gate MED): the clock + EACH item body are fail-soft, so a raising
         # clock or one malformed-but-loaded record can't crash the sweep (resolve has its own net; the
         # sweep's per-item work — seal_matches / _posture_of / claim — runs OUTSIDE resolve and so needs
@@ -1373,7 +1385,7 @@ class EfferentGate:
         except Exception as e:  # noqa: BLE001 — a raising clock fails the whole sweep closed (no fires)
             _log.error("efferent gate sweep: clock FAILED (%s): %s — no sweep", type(e).__name__, e)
             return []
-        outcomes: list[GateOutcome] = self._sweep_holds(now)
+        outcomes: list[GateOutcome] = self._sweep_holds(now, gate_for)
         if self._pending_store is None:
             return outcomes
         try:
@@ -1383,7 +1395,7 @@ class EfferentGate:
             return outcomes   # the journaled decisions this sweep already made stay reported
         for pending in pendings:
             try:
-                outcome = self._sweep_one(pending, now)
+                outcome = gate_for()._sweep_one(pending, now)
             except Exception as e:  # noqa: BLE001 — one bad item never stops the sweep
                 _log.error("efferent gate sweep: item %s FAILED (%s): %s — skipped",
                            getattr(pending, "pending_id", "?"), type(e).__name__, e)
@@ -1438,11 +1450,12 @@ class EfferentGate:
             return None   # snapshot-vs-claim race (another resolver won) — a non-decision
         return outcome
 
-    def _sweep_holds(self, now: _dt.datetime) -> list[GateOutcome]:
+    def _sweep_holds(self, now: _dt.datetime, gate_for: Callable[[], "EfferentGate"]) -> list[GateOutcome]:
         """The silence default for JOURNALED pendings (the open holds): a hold whose pending has expired
         is decided by ``resolve`` — cooling-off on the auto-fire allowlist approves (``by=on-loop``),
         everything else rejects. A chain link's hold is left to ``ChainExecutor.sweep_timeouts`` (the
-        chain resumes from it). Fail-soft per hold."""
+        chain resumes from it). Each hold's silence decision and resolve run on one ``gate_for()``.
+        Fail-soft per hold."""
         if self._journal is None:
             return []
         try:
@@ -1455,10 +1468,11 @@ class EfferentGate:
             if _is_chained(h) or not isinstance(h.get("pending"), dict):
                 continue
             try:
-                decision = self.silence_decision(h, now)
+                gate = gate_for()
+                decision = gate.silence_decision(h, now)
                 if decision is None:
                     continue
-                outcome = self._resolve_hold(h, decision, chain_owned=False)
+                outcome = gate._resolve_hold(h, decision, chain_owned=False)
             except Exception as e:  # noqa: BLE001 — one bad hold never stops the sweep
                 _log.error("efferent gate sweep: hold %s FAILED (%s): %s", h.get("hold_id"), type(e).__name__, e)
                 continue
