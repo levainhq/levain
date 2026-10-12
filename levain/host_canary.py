@@ -20,6 +20,8 @@ harness's own sandbox must refuse.
 from __future__ import annotations
 
 import collections
+import contextlib
+import functools
 import json
 import os
 import secrets
@@ -28,7 +30,6 @@ import shutil
 import socket
 import stat
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -558,10 +559,22 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
         landed.append(git_probe)
     checks: list[Check] = []
     turn: _Turn | None = None
-    listener: _Listener | None = None
     moved_by_probe: str | None = None
-    try:
+    stranded: list[ActivationNotRestored] = []
+    # Cleanup is an ExitStack, not an ordered finally (verify r3: a step that raised skipped every
+    # later step and could mask ActivationNotRestored). Every callback runs even when an earlier
+    # one raised; it unwinds LIFO and the last exception raised is the one that propagates
+    # (_raise_stranded chains what it replaces by hand, see there). Unwind order: listener.close
+    # -> restore activation/ -> remove landed files + the work dir -> re-raise a stranded
+    # activation. The restore runs before the landed cleanup because a hooks/ file the probe
+    # carried away with its rename is only at its landed path once activation/ is back; the
+    # re-raise is registered first so it runs last.
+    with contextlib.ExitStack() as cleanup:
+        cleanup.push(functools.partial(_raise_stranded, stranded))
+        cleanup.callback(_remove_landed, landed, work)
+        cleanup.push(functools.partial(_restore_or_record, activation, moved, activation_id, stranded))
         listener = _Listener(sock)
+        cleanup.callback(listener.close)
         cfg["port"] = listener.port
         script = work / "selftest.py"
         script.write_text(probe_script(cfg), encoding="utf-8")
@@ -602,23 +615,6 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
                                                        ("FSHOOKCASE", cfg["hook_case"])) if v)
             checks.extend(_evaluate(turn, nonce=nonce, cmd=cmd, listener=listener,
                                     landed=landed, want=want))
-    finally:
-        stranded: ActivationNotRestored | None = None
-        try:
-            _restore_activation(activation, moved, activation_id)
-        except ActivationNotRestored as exc:
-            stranded = exc  # raised once the rest of the cleanup has run
-        if listener is not None:
-            listener.close()
-        for p in landed:
-            try:
-                if p.is_symlink() or p.is_file():
-                    p.unlink()
-            except OSError:
-                pass
-        shutil.rmtree(work, ignore_errors=True)
-        if stranded is not None and sys.exc_info()[1] is not None:
-            raise stranded  # the escaping exception rides along as __context__
     left = _activation_problem(activation, moved, activation_id)
     if moved_by_probe or left:
         checks.append(Check("C5 activation intact", "fail", "; ".join(
@@ -630,10 +626,48 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
     ok = bool(checks) and all(c.status == "pass" for c in checks)
     verdict = CanaryVerdict(ok=ok, checks=tuple(checks), claude_version=version,
                             claude_bin=os.path.realpath(profile.claude_bin), profile_digest=profile.digest())
-    if stranded is not None:
-        stranded.verdict = verdict
-        raise stranded
+    if stranded:
+        stranded[0].verdict = verdict
+        raise stranded[0]
     return verdict
+
+
+def _restore_or_record(activation: Path, moved: Path, ident: tuple[int, int],
+                       stranded: list[ActivationNotRestored], *_exc: Any) -> bool:
+    """ExitStack step: put activation/ back. ActivationNotRestored is recorded for _raise_stranded,
+    which runs after the rest of the cleanup; anything else the restore raises propagates through
+    the stack, and the remaining steps still run."""
+    try:
+        _restore_activation(activation, moved, ident)
+    except ActivationNotRestored as exc:
+        stranded.append(exc)
+    return False
+
+
+def _remove_landed(landed: list[Path], work: Path) -> None:
+    for p in landed:
+        try:
+            if p.is_symlink() or p.is_file():
+                p.unlink()
+        except OSError:
+            pass
+    shutil.rmtree(work, ignore_errors=True)
+
+
+def _raise_stranded(stranded: list[ActivationNotRestored], exc_type: Any, exc: Any, tb: Any) -> bool:
+    """ExitStack's last step. With an exception in flight (from the run or from an earlier cleanup
+    step), a stranded activation replaces it, the other kept as __context__ and named in a note.
+    The context is set here by hand: ExitStack runs its callbacks outside any ``except``, so a
+    fresh raise from a callback carries no context and ExitStack leaves a None context alone
+    (measured by test_a_listener_close_failure_does_not_mask_the_stranded_activation). With none
+    in flight, run_cc_canary builds the verdict first and raises the stranded error with it
+    attached."""
+    if stranded and exc is not None and exc is not stranded[0]:
+        err = stranded[0]
+        err.__context__ = exc
+        err.add_note(f"also raised while the canary was cleaning up: {exc!r}")
+        raise err
+    return False
 
 
 def _dir_ident(p: Path) -> tuple[int, int] | None:

@@ -317,3 +317,109 @@ def test_a_failed_host_restore_is_not_hidden_by_a_failure_in_the_run(entity, mon
         hc.run_cc_canary(_profile(entity))
     assert isinstance(ei.value.__context__, RuntimeError)
     assert "activation-moved-" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------- verify r3 R1, the cleanup construct
+
+
+def _stranding_run(entity: Path, monkeypatch, *, plant_landed: bool = True):
+    """Move activation/ away inside the turn, refuse the host's rename back, and plant one landed
+    file. Returns (profile, record) where record collects the nonce and the planted path."""
+    act = entity / "activation"
+    real_rename = os.rename
+    record: dict = {}
+
+    def fake_drive(argv, *, prompt, **kw):
+        nonce = _nonce_from(prompt)
+        record["nonce"] = nonce
+        if plant_landed:
+            (entity / ".claude").mkdir(exist_ok=True)
+            landed = entity / ".claude" / f"selftest-{nonce}.txt"
+            landed.write_text("x")
+            record["landed"] = landed
+        real_rename(act, entity / f"activation-moved-{nonce}")
+        record["driven"] = True
+        return hc._Turn(timed_out=True)
+
+    def refusing_rename(src, dst, *a, **kw):
+        if record.get("driven"):
+            raise OSError(1, "Operation not permitted")
+        return real_rename(src, dst, *a, **kw)
+
+    monkeypatch.setattr(hc, "_drive", fake_drive)
+    monkeypatch.setattr(hc.os, "rename", refusing_rename)
+    return _profile(entity), record
+
+
+def _cleanup_ran(profile: hg.CCHostProfile, record: dict) -> None:
+    nonce = record["nonce"]
+    assert not (profile.run_dir / f"canary-{nonce}").exists(), "the canary work dir was not removed"
+    assert not record["landed"].exists(), "a landed probe file was not removed"
+    assert not (profile.run_dir / f"c{nonce[:8]}.s").exists(), "the listener socket was not removed"
+
+
+def test_a_listener_close_failure_does_not_mask_the_stranded_activation(entity, monkeypatch):
+    # verify r3, codex introduced HIGH: listener.close() raising after a failed restore left the
+    # ordered finally before either raise, so ActivationNotRestored never reached the caller
+    profile, record = _stranding_run(entity, monkeypatch)
+    real_close = hc._Listener.close
+
+    def failing_close(self):
+        real_close(self)
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(hc._Listener, "close", failing_close)
+    with pytest.raises(hc.ActivationNotRestored) as ei:
+        hc.run_cc_canary(profile)
+    assert f"activation-moved-{record['nonce']}" in str(ei.value)
+    # the secondary failure stays visible
+    assert isinstance(ei.value.__context__, OSError) and "Permission denied" in str(ei.value.__context__)
+    _cleanup_ran(profile, record)
+
+
+def test_an_oserror_in_the_restores_identity_check_still_runs_the_cleanup(entity, monkeypatch):
+    # verify r3, complement LOW: an OSError out of _restore_activation's own identity check escaped
+    # the finally before the listener, landed-file and rmtree cleanup ran
+    profile, record = _stranding_run(entity, monkeypatch)
+    real_ident = hc._dir_ident
+
+    def ident(p):
+        if record.get("driven") and Path(p).name.startswith("activation-moved-"):
+            raise OSError(5, "Input/output error")
+        return real_ident(p)
+
+    monkeypatch.setattr(hc, "_dir_ident", ident)
+    with pytest.raises(OSError, match="Input/output error"):
+        hc.run_cc_canary(profile)
+    _cleanup_ran(profile, record)
+
+
+def test_a_keyboard_interrupt_in_the_restore_still_runs_the_cleanup(entity, monkeypatch):
+    # verify r3, complement LOW: a BaseException during the restore skipped the remaining cleanup
+    profile, record = _stranding_run(entity, monkeypatch)
+
+    def interrupted(*a, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(hc, "_restore_activation", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        hc.run_cc_canary(profile)
+    _cleanup_ran(profile, record)
+
+
+def test_a_probe_file_inside_a_moved_activation_is_removed_after_the_restore(entity, monkeypatch):
+    # The restore runs BEFORE the landed-file cleanup: a hooks/ file the probe wrote and then
+    # carried away with the rename is only at its landed path once activation/ is back.
+    act = entity / "activation"
+    record: dict = {}
+
+    def fake_drive(argv, *, prompt, **kw):
+        nonce = _nonce_from(prompt)
+        record["hook"] = act / "hooks" / f"selftest-{nonce}.txt"
+        record["hook"].write_text("x")
+        os.rename(act, entity / f"activation-moved-{nonce}")
+        return hc._Turn(timed_out=True)
+
+    monkeypatch.setattr(hc, "_drive", fake_drive)
+    hc.run_cc_canary(_profile(entity))
+    assert act.is_dir() and not record["hook"].exists()
