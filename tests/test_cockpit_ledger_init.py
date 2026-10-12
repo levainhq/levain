@@ -595,3 +595,52 @@ def test_c1_a_resume_cannot_drop_a_key_the_cut_off_run_left_plainly_revoked(tmp_
     assert len(_log(root)) == 3 and _uninitialised(root)              # refused before any link
     res = _init(root, a, {a.fingerprint, r.fingerprint, q.fingerprint})
     assert r.fingerprint in res.kept and not res.dropped and not _uninitialised(root)
+
+
+def _anchor_stuck_after_genesis(monkeypatch):
+    """Make every anchor advance past seq 1 fail; returns the patch, for a ``monkeypatch.context``."""
+    import levain.authority as authority_mod
+    real_advance = authority_mod.advance_anchor
+
+    def stuck(path, snap):
+        if snap.seq > 1:
+            raise OSError("the anchor's disk is full")
+        return real_advance(path, snap)
+    return lambda m: m.setattr(authority_mod, "advance_anchor", stuck)
+
+
+def _cut_before_the_last_txn(root: Path, k, monkeypatch) -> None:
+    """Run 1 lands A's genesis and P's enrol with the anchor stuck at seq 1, then is cut before its last
+    transaction."""
+    from levain.authority import anchor_path, read_anchor
+    stuck = _anchor_stuck_after_genesis(monkeypatch)
+
+    def cut(self):
+        raise KeyboardInterrupt
+    with monkeypatch.context() as m:
+        stuck(m)
+        m.setattr(CockpitDB, "write", cut)
+        with pytest.raises(KeyboardInterrupt):
+            _init(root, k["A"], {k["A"].fingerprint, k["P"].fingerprint}, drop=True)
+    assert len(_log(root)) == 2 and _uninitialised(root) and read_anchor(anchor_path(root)).seq == 1
+
+
+def test_c2_a_resume_that_appends_nothing_reports_an_anchor_it_cannot_advance(v2, monkeypatch):
+    from levain.authority import anchor_path, read_anchor
+    root, k = v2
+    _cut_before_the_last_txn(root, k, monkeypatch)
+    with monkeypatch.context() as m:
+        _anchor_stuck_after_genesis(monkeypatch)(m)
+        res = _init(root, k["A"], {k["A"].fingerprint, k["P"].fingerprint}, drop=True)
+    assert res.links == () and not _uninitialised(root)
+    assert res.warning is not None and "anchor is behind" in res.warning and "disk is full" in res.warning
+    assert read_anchor(anchor_path(root)).seq == 1
+
+
+def test_c2_a_resume_that_appends_nothing_advances_the_anchor_to_the_log_head(v2, monkeypatch):
+    from levain.authority import anchor_path, read_anchor
+    root, k = v2
+    _cut_before_the_last_txn(root, k, monkeypatch)
+    res = _init(root, k["A"], {k["A"].fingerprint, k["P"].fingerprint}, drop=True)
+    assert res.links == () and res.warning is None and not _uninitialised(root)
+    assert read_anchor(anchor_path(root)).seq == 2

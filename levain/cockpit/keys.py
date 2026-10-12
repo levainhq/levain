@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from levain import authority as _authority
-from levain.authority import (LAPTOP, NAMESPACE, AuthorityError, AuthorityKey, AuthoritySnapshot,
+from levain.authority import (LAPTOP, NAMESPACE, AnchorError, AuthorityError, AuthorityKey, AuthoritySnapshot,
                               VerifierUnavailable, _pipe_reading, anchor_path, sign_and_append)
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN
 from levain.cockpit.authority import RequestAuthority
@@ -298,7 +298,7 @@ class InitResult:
     skipped: tuple[str, ...]         # legacy fingerprints that cannot be re-enrolled
     seq: int
     store_id: str
-    warning: str | None              # the last link committed but its anchor is behind
+    warning: str | None              # the anchor is behind the log's head (the log stands)
 
 
 def _legacy_row(raw: Any, state: AuthoritySnapshot | None, ssh_keygen: Path | str) -> LegacyRow:
@@ -511,6 +511,14 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
             k = state.key(fp)
             if k is None or k.active == by_fp[fp].revoked:
                 raise KeyError_(f"{fp} is not in the log as its legacy row says; run `ledger init` again")
+        # the anchor reaches the final head before the marker clears, even when this run appended nothing
+        # (a resume after a link whose advance failed); this result says so when it cannot, superseding
+        # what any link here reported
+        try:
+            _authority.advance_anchor(anchor_path(db.data_root), state)
+            warning = None
+        except (AnchorError, OSError) as exc:
+            warning = f"the log is at seq {state.seq}; the anchor is behind ({exc})"
         with db.write() as conn:
             if _meta(conn, UNINITIALISED) is None:
                 raise KeyError_("another `ledger init` finished this store while this one ran")
