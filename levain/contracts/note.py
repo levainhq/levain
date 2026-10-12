@@ -29,10 +29,17 @@ _WHITE_SPACE = frozenset(
 )
 
 
+def _is_surrogate(c: str) -> bool:
+    """A lone surrogate: a str can hold one, no UTF-8 text can. It is the only code point a strict UTF-8 encode
+    refuses, so refusing it here makes every later ``.encode("utf-8")`` of a checked str total."""
+    return 0xD800 <= ord(c) <= 0xDFFF
+
+
 def valid_key_name(name: str) -> bool:
-    """signed-note: "Key names MUST be non-empty and MUST NOT contain any Unicode spaces or plus (U+002B)"."""
+    """signed-note: "Key names MUST be non-empty and MUST NOT contain any Unicode spaces or plus (U+002B)";
+    a name is also UTF-8 text (``key_id`` hashes its encoding), so a lone surrogate is refused."""
     return (isinstance(name, str) and name != "" and "+" not in name
-            and not any(ord(c) in _WHITE_SPACE or ord(c) < 0x20 for c in name))
+            and not any(ord(c) in _WHITE_SPACE or ord(c) < 0x20 or _is_surrogate(c) for c in name))
 
 
 def key_id(name: str, sig_type: int, pub: bytes) -> bytes:

@@ -168,3 +168,25 @@ def test_parse_refuses_a_str_that_is_not_utf8_encodable(note):
 def test_sign_refuses_text_that_is_not_utf8_encodable():
     with pytest.raises(ContractError):
         N.sign("x\ud800\n", "a.example/k", bytes(32))
+
+
+# ---- V1/V2 (verify r2): a lone surrogate is refused by one character predicate, names included -----------------
+
+
+@pytest.mark.parametrize("name", ["a\ud800", "\udfff", "a.example/\udc80k"])
+def test_a_key_name_holding_a_lone_surrogate_is_refused(name):
+    assert not N.valid_key_name(name)
+    with pytest.raises(ContractError):
+        N.make_key(name, bytes(32))
+    with pytest.raises(ContractError):
+        N.parse_vkey(name + "+530d903a+AekyeRrm56hApGFkyQR4ZCbV54Id2LKaANYcrnKv3U2k")
+    with pytest.raises(ContractError):
+        N.sign("x\n", name, bytes(32))
+
+
+def test_a_note_with_a_lone_surrogate_in_its_text_is_refused():
+    with pytest.raises(ContractError):
+        N.parse("a\udbff b\n\n— a AAAAAAA=\n")
+    with pytest.raises(ContractError):
+        N.check_text("a\udbff b\n")
+
