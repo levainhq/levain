@@ -2,6 +2,7 @@
 rev 8 §1, §2, §3.1-§3.5, §4.1.2, §5)."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import subprocess
@@ -31,8 +32,8 @@ FP_LAPTOP = "SHA256:laptop"
 FP_PHONE = "SHA256:phone"
 FP_WEAK = "SHA256:presence"
 KEYS = {FP_LAPTOP: "laptop-presence", FP_PHONE: "display-phone", FP_WEAK: "presence"}
-# the fence a record issued at the fixture's authority head carries
-FENCE = {"authority_store_id": STORE, "authority_seq": 1}
+# the fence a record issued at the fixture's authority head carries (fake_authority's seq-1 head hash)
+FENCE = {"authority_store_id": STORE, "authority_seq": 1, "authority_head_hash": hashlib.sha256(b":1").hexdigest()}
 
 
 def effect(i: int, version: int = 3) -> dict:
@@ -131,7 +132,8 @@ def test_build_record_refuses_a_malformed_record():
     with pytest.raises(ConsentError, match="intent"):
         build_record(**{**rec, "intent": "maybe"})
     for bad in ({"policy_rev": 0}, {**FENCE, "authority_seq": True}, {**FENCE, "authority_seq": -1},
-                {**FENCE, "authority_store_id": 1}, {**FENCE, "extra": 1}):
+                {**FENCE, "authority_store_id": 1}, {**FENCE, "extra": 1}, {**FENCE, "authority_head_hash": 1},
+                {k: v for k, v in FENCE.items() if k != "authority_head_hash"}):
         with pytest.raises(ConsentError, match="authority_seq"):
             build_record(**{**rec, "fence": bad})
     with pytest.raises(ConsentError, match="store"):
@@ -331,7 +333,7 @@ def test_a_head_that_moved_after_capture_is_stale(db):
 def test_a_direct_meta_write_grants_nothing(db):
     """The retired /2 fence and anything else in meta are not authority: a record fenced on the old
     integer stales, and a meta row naming a revision moves nothing."""
-    pid, raw = issue(db, fence={"authority_store_id": STORE, "authority_seq": 0})
+    pid, raw = issue(db, fence={"authority_store_id": STORE, "authority_seq": 0, "authority_head_hash": ""})
     with db.write() as conn:
         conn.execute("INSERT INTO meta (key, value) VALUES ('policy_rev', '0')")
         conn.execute("INSERT INTO meta (key, value) VALUES ('authority_seq', '0')")

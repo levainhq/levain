@@ -172,8 +172,9 @@ def build_record(
 
     Each effect carries ``store`` and ``resource_key`` (the journal cross-checks its ``effects`` rows
     against them, K2b §2) plus the shape lane B's ``Effect`` gives it. ``fence`` carries the authority
-    log head the decision compares (trust-tiering DESIGN §3.4) as exactly ``authority_store_id`` (text)
-    and ``authority_seq`` (an integer, 0 for an empty log)."""
+    log head the decision compares (trust-tiering DESIGN §3.4) as exactly ``authority_store_id`` (text),
+    ``authority_seq`` (an integer, 0 for an empty log) and ``authority_head_hash`` (text, "" for an empty
+    log)."""
     if not isinstance(operation_id, str) or _OPERATION_ID.fullmatch(operation_id) is None:
         raise ConsentError(f"operation_id is not 'cp' + 32 lowercase hex: {operation_id!r}")
     if intent not in INTENTS:
@@ -182,11 +183,12 @@ def build_record(
     _need_str("tier", tier)
     if not isinstance(target, Mapping) or not isinstance(params, Mapping):
         raise ConsentError("target and params must be objects")
-    if not isinstance(fence, Mapping) or set(fence) != {"authority_store_id", "authority_seq"} \
+    if not isinstance(fence, Mapping) \
+            or set(fence) != {"authority_store_id", "authority_seq", "authority_head_hash"} \
             or not isinstance(fence["authority_store_id"], str) or type(fence["authority_seq"]) is not int \
-            or fence["authority_seq"] < 0:
-        raise ConsentError("fence must be an object carrying exactly authority_store_id (text) and "
-                           "authority_seq (an integer >= 0)")
+            or fence["authority_seq"] < 0 or not isinstance(fence["authority_head_hash"], str):
+        raise ConsentError("fence must be an object carrying exactly authority_store_id (text), "
+                           "authority_seq (an integer >= 0) and authority_head_hash (text)")
     if isinstance(effects, (str, bytes)) or not isinstance(effects, Sequence):
         raise ConsentError("effects must be a list")
     for i, eff in enumerate(effects):

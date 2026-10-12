@@ -1294,10 +1294,12 @@ def _key_problem(conn: sqlite3.Connection, authority: AuthoritySnapshot | None, 
 
 def authority_fence(authority: AuthoritySnapshot | None) -> dict[str, Any]:
     """The fence a record carries and a decision compares: the authority log's head it was issued
-    under. An empty log (no authority yet) is store "" at seq 0."""
+    under, its hash included (a replaced suffix holds another link at the same seq). An empty log (no
+    authority yet) is store "" at seq 0 with hash ""."""
     if authority is None:
-        return {"authority_store_id": "", "authority_seq": 0}
-    return {"authority_store_id": authority.store_id, "authority_seq": authority.seq}
+        return {"authority_store_id": "", "authority_seq": 0, "authority_head_hash": ""}
+    return {"authority_store_id": authority.store_id, "authority_seq": authority.seq,
+            "authority_head_hash": authority.head_hash}
 
 
 def _head_of(authority: AuthoritySnapshot | None) -> tuple[int, str]:
