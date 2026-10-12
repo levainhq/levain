@@ -97,10 +97,10 @@ def _oneline(s: str) -> str:
     episode content would wrap and desync the highlight (complement L3 MED-1)."""
     return s.replace("\n", " ").replace("\r", " ")
 
-# Zone order = the IA's tab order (Identity · Operate · Mind), keyed 1/2/3.
+# Zone order = the IA's tab order (Identity · Work · Mind), keyed 1/2/3.
 ZONES: tuple[tuple[str, str], ...] = (
     (ZONE_IDENTITY, "Identity"),
-    (ZONE_OPERATE, "Operate"),
+    (ZONE_OPERATE, "Work"),
     (ZONE_MIND, "Mind"),
 )
 

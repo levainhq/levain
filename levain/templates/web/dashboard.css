@@ -26,6 +26,9 @@
 
     /* one spacing scale, on an 8px grid; the page gutter is one token */
     --s1: 8px; --s2: 16px; --s3: 24px; --s4: 32px; --s5: 40px; --gutter: var(--s4);
+    /* the KE page: its own gutter, gap and widest page, and the three card heights (one token each) */
+    --gutter-ke: 64px; --gap: 24px; --page-max: 1640px;
+    --card-tall: 540px; --card-medium: 460px; --card-short: 190px; --widget-h: 138px;
 
     --round: ui-rounded, "SF Pro Rounded", -apple-system, system-ui, sans-serif;
     --sans: -apple-system, "SF Pro Text", ui-sans-serif, system-ui, sans-serif;
@@ -997,3 +1000,155 @@
 .livechip[data-state="live"]::before { background: var(--ok, #4ade80); }
 .livechip[data-state="stale"] { color: var(--accent); }
 .livechip[data-state="stale"]::before { background: var(--accent); }
+
+
+/* ═══════════════════════════ the KE page (body.ke): hero, brief, widgets, a 3-column zone grid ═══════════════════════════
+   A manifest that declares hero / brief / widgets draws these; a pre-KE manifest keeps every rule above unchanged. */
+body.ke { --gutter: var(--gutter-ke); }
+body.ke .deck { max-width: var(--page-max); margin: 0 auto; }
+
+/* HERO: the first block on the page. The clock column (brand, time, date, events, weather) and the sky beside it,
+   the nav bar's modes / unit / live / sync / jump as a slim strip above the sky. */
+body.ke .hero { display: grid; grid-template-columns: 340px minmax(0, 1fr); border-bottom: 1px solid var(--hair);
+  background: radial-gradient(1200px 520px at 75% 130%, var(--sky-lo) 0%, var(--base) 70%); }
+body.ke .hero .when { padding: var(--s3) var(--s3) var(--s3) var(--gutter); border-right: 1px solid var(--hair);
+  display: flex; flex-direction: column; justify-content: flex-start; gap: var(--s2); }
+body.ke .hero .brand .wordmark { font: 800 15px/1 var(--round); color: var(--label); letter-spacing: 0; gap: 7px; }
+body.ke .hero .brand .wordmark::before { width: 8px; height: 8px; }
+body.ke .hero .clock { font: 800 92px/.9 var(--round); letter-spacing: -.045em; margin-top: 2px; }
+body.ke .hero .clock small { font-size: 22px; font-weight: 700; color: var(--label); margin-left: 6px; letter-spacing: 0; }
+body.ke .hero .date { font: 650 16px var(--round); color: var(--text); margin-top: 10px; }
+body.ke .hero .events { font-size: 13px; line-height: 1.55; color: var(--label); margin-top: -6px; }
+body.ke .hero .events .bad { color: var(--accent); }
+body.ke .hero .wx { border-top: 1px solid var(--hair); padding-top: var(--s2); display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+body.ke .hero .wx .xbody { display: flex; flex-direction: column; gap: 12px; }
+.wx-main { display: flex; align-items: center; gap: 14px; flex-wrap: nowrap; }
+.wx-icon { flex: none; }
+.wx-t { display: flex; align-items: baseline; gap: 4px; }
+.wx-t .rd-n { font: 750 38px/1 var(--round); letter-spacing: -.02em; }
+.wx-t .rd-u { font: 650 14px var(--round); color: var(--label); }
+.wx-c { color: var(--label); font-size: 13px; margin-top: 3px; }
+.wx-side { margin-left: auto; text-align: right; font-size: 12.5px; color: var(--label); line-height: 1.6; }
+.wx-side b { color: var(--text); font-weight: 600; }
+.wx-side .rd-sub, .wx-side .rd-b { display: block; margin: 0; padding: 0; border: 0; font-size: 12.5px; color: var(--label); }
+.aqi { display: flex; align-items: center; gap: 8px; font-size: 13px; flex-wrap: wrap; }
+.aqi b { font-weight: 650; }
+.aqi .pill { margin-left: 0; }
+.wx-src { font-size: 11.5px; color: var(--meta); margin-top: -4px; }
+/* the EPA bands: good is calm, every named band above it is hot, an unknown token stays neutral */
+.band-good { color: #6fcf97; } .band-moderate { color: #f2d34b; } .band-unhealthy-sensitive { color: #ff9f40; }
+.band-unhealthy { color: #eb5757; } .band-very-unhealthy { color: #bb6bd9; } .band-hazardous { color: #c0506a; }
+.aqi > b { color: var(--text); }
+.aqi .pill { background: color-mix(in srgb, currentColor 15%, transparent); color: inherit; }
+.aqi.band-other .pill { background: var(--card-2); color: var(--label); }
+
+body.ke .hero .skycol { min-width: 0; display: flex; flex-direction: column; }
+body.ke .hero .tools { display: flex; align-items: center; gap: 12px; padding: var(--s2) var(--gutter) var(--s1) var(--s3); }
+body.ke .hero .masthead { flex: 1; min-width: 0; padding: 0; border: 0; gap: 12px; flex-wrap: wrap; }
+body.ke .hero .masthead.frame { padding-inline: 0; }
+body.ke .hero .seg { border-radius: 10px; }
+body.ke .hero .mode { padding: 4px 11px; font-size: 12px; border-radius: 8px; }
+body.ke .hero .readout { gap: 12px; }
+body.ke .hero .entity { font-size: 13px; }
+body.ke .hero .jar svg { width: 20px; height: 26px; }
+body.ke .hero .jar-label { font-size: 11.5px; }
+body.ke .hero button#refresh, body.ke .hero button#jumpbtn { padding: 4px 10px; border-radius: 8px; font-size: 12px; }
+body.ke .hero .stamp { font-size: 12px; }
+#ck-sky { padding: 0 var(--gutter) 0 var(--s3); min-width: 0; }
+body.ke .hero .ck-sky { min-width: 0; }
+body.ke .hero .sky-hero { display: block; border: 0; }
+body.ke .hero .sky-hero .plot { padding: 0; min-height: 200px; }
+body.ke .hero .ck-sky .legendbar { padding-block: 12px; font-size: 12px; color: var(--label); }
+body.ke .hero .ck-sky .xbody { padding: 0; }
+
+/* BRIEF: his state line and where to begin, one wide card */
+body.ke .ck-brief { padding-top: var(--s3); }
+body.ke .ck-briefcard, body.ke .ck-card { background: var(--card); border: 1px solid var(--hair); border-radius: 18px; min-width: 0; position: relative; }
+body.ke .ck-briefcard { padding: var(--s3); }
+body.ke .ck-briefcard .stateline { padding: 0; margin: 0; }
+body.ke .ck-briefcard .stateline.frame { padding-inline: 0; }
+.ck-brief-body { margin-top: var(--s2); }
+.ck-brief-body .brief-line:first-child { margin-top: 0; }
+.ck-brief-body .xbody.has-side { display: grid; grid-template-columns: minmax(0, 1fr) 300px; column-gap: var(--s4); }
+.ck-brief-body .xbody.has-side .brief-line { grid-column: 1; }
+.brief-side { grid-column: 2; grid-row: 1 / span 6; border-left: 1px solid var(--hair); padding-left: var(--s3); display: flex; flex-direction: column; gap: 8px; align-self: start; }
+.brief-side .side-line { margin: 0; font-size: 13px; line-height: 1.45; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+
+/* WIDGETS: one answer each, equal widths in one row */
+body.ke .ck-widgets { display: grid; grid-template-columns: repeat(var(--ck-n, 4), minmax(0, 1fr)); gap: var(--gap); padding-top: var(--s4); }
+body.ke .ck-widgets[hidden] { display: none; }
+body.ke .ck-card.w { height: var(--widget-h); padding: 18px var(--s3); display: flex; flex-direction: column; gap: 6px; overflow: hidden; }
+.w > .k { flex: none; }
+.w .wbody { min-height: 0; display: flex; flex-direction: column; gap: 6px; overflow: hidden; }
+.w .xbody { display: flex; flex-direction: column; gap: 6px; }
+.w .big { font: 800 34px/1 var(--round); letter-spacing: -.02em; }
+.w .sub { font-size: 12.5px; color: var(--label); }
+.w .row { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12.5px; color: var(--label); padding: 0; }
+.w .row:hover { background: none; }
+.w .row b { color: var(--text); font: 700 15px var(--round); margin-right: 4px; }
+.w .dots { display: flex; flex-direction: column; gap: 2px; }
+.w .op { padding: 2px 0; font-size: 12.5px; }
+
+/* ZONES: a fixed 3-column grid, a row as tall as its tallest card, spans as grid-column spans */
+body.ke #board.ke { display: block; padding-block: 0; }
+body.ke main.frame { padding-block: var(--s2) var(--s5); }
+body.ke .ck-zone { margin-top: var(--s4); }
+body.ke .zone-title { font: 700 13px var(--round); letter-spacing: .06em; text-transform: uppercase; color: var(--label); margin: 0 0 12px; }
+body.ke .ck-zgrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--gap); align-items: stretch; }
+body.ke .ck-zgrid > .panel { grid-column: auto; min-width: 0; overflow: hidden; border-radius: 18px; }
+body.ke .ck-zgrid > .panel.ck-span-2 { grid-column: span 2; }
+body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: span 3; }
+body.ke .ck-zgrid > .panel.ck-h-tall { height: var(--card-tall); }
+body.ke .ck-zgrid > .panel.ck-h-medium { height: var(--card-medium); }
+body.ke .ck-zgrid > .panel.ck-h-short { height: var(--card-short); }
+body.ke .ck-zgrid > .panel.ck-tab-off { display: none; }
+body.ke .ck-zgrid .panel .phead { padding: 18px var(--s3) 12px; flex: none; }
+body.ke .ck-zgrid .panel h2 { font: 700 16px/1.2 var(--round); }
+body.ke .ck-zgrid .panel .pbody { flex: 1; min-height: 0; max-height: none; overflow-y: auto; overflow-x: hidden; overscroll-behavior: auto; padding: 0 var(--s3) var(--s2); }
+body.ke .ck-zgrid .panel .pbody.clamped { max-height: none; overscroll-behavior: auto; }
+body.ke .ck-zgrid .panel > .xbody, body.ke .ck-zgrid .panel > .ext-note, body.ke .ck-zgrid .panel > .xfilter { margin-inline: var(--s3); }
+body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padding-bottom: var(--s2); }
+.ck-tabs { display: flex; gap: 4px; flex-wrap: wrap; flex-basis: 100%; margin-top: 10px; }
+.ck-tab { background: none; border: 0; border-radius: 8px; padding: 4px 10px; color: var(--label); cursor: pointer; font: 600 12px var(--round); }
+.ck-tab[aria-selected="true"] { background: var(--card-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--hair-2); }
+@media (max-width: 1180px) {
+  body.ke { --gutter-ke: 32px; }
+  body.ke .hero { grid-template-columns: 1fr; }
+  body.ke .hero .when { border-right: 0; padding-left: var(--gutter); }
+  body.ke .ck-widgets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body.ke .ck-zgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: span 2; }
+}
+@media (max-width: 720px) {
+  body.ke { --gutter-ke: 16px; }
+  body.ke .ck-widgets, body.ke .ck-zgrid { grid-template-columns: 1fr; }
+  body.ke .ck-zgrid > .panel.ck-span-2, body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: auto; }
+  body.ke .ck-zgrid > .panel { height: auto; max-height: 560px; }
+  body.ke .ck-card.w { height: auto; min-height: var(--widget-h); }
+}
+
+/* THE ORANGE BUDGET (KE page). Accent only where attention goes: the now-line, a failed review, "N failed", an overdue tag,
+   and the one primary button of a compose. Verbs are 12px neutral outline buttons shown on the row you are on; tags are
+   plain meta text. */
+body.ke .row .verb-actions { display: none; margin-left: auto; }
+body.ke .row:hover .verb-actions, body.ke .row:focus-within .verb-actions { display: inline-flex; }
+body.ke .row:focus-visible { outline: 1px solid var(--hair-2); outline-offset: -1px; border-radius: 12px; }
+body.ke .verb-btn, body.ke .undo-btn {
+  font: 500 12px/1.4 var(--sans); letter-spacing: 0; text-transform: none; color: var(--label); background: none;
+  border: 1px solid var(--hair-2); border-radius: 7px; padding: 2px 9px; box-shadow: none; }
+body.ke .undo-btn::before { content: none; }
+body.ke .verb-btn:hover, body.ke .undo-btn:hover { color: var(--text); background: none; border-color: var(--label); box-shadow: none; }
+body.ke .verb-btn:focus-visible, body.ke .undo-btn:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+body.ke [data-ck-tag] { color: var(--meta); font: 500 11.5px/1.5 var(--sans); letter-spacing: 0; text-transform: none;
+  background: none; border: 0; padding: 0; border-radius: 0; text-shadow: none; opacity: 1; }
+body.ke [data-ck-tag][data-ck-tag-state="overdue"] { color: var(--accent); }
+body.ke .sid { color: var(--meta); font: 500 11.5px/1.5 var(--mono); letter-spacing: 0; opacity: 1; text-shadow: none; }
+body.ke .edit-act, body.ke .ext-meta { color: var(--meta); font: 500 11.5px/1.5 var(--sans); letter-spacing: 0; text-transform: none; }
+body.ke .state-edit, body.ke .edit-btn, body.ke .name-edit { background: none; border: 0; box-shadow: none; padding: 0; font: 500 12px var(--sans);
+  letter-spacing: 0; text-transform: none; color: var(--label); text-decoration: underline; text-decoration-color: var(--hair-2); text-underline-offset: 3px; }
+body.ke .state-edit:hover, body.ke .edit-btn:hover, body.ke .name-edit:hover { color: var(--text); background: none; box-shadow: none; }
+body.ke .pexpand { color: var(--meta); background: none; border: 1px solid var(--hair); border-bottom-width: 1px; box-shadow: none; }
+body.ke .pexpand:hover { color: var(--text); background: none; box-shadow: none; }
+body.ke .chip-B { color: var(--label); background: none; }
+body.ke .ext-note.stale { color: var(--label); }
+body.ke .row.ext-accent { border-left-color: var(--hair-2); }

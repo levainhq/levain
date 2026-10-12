@@ -110,7 +110,7 @@
   // Friendly zone labels, in IA order — used for the "All" view separators.
   const ZONE_LABELS = [
     ["identity", "Identity"],
-    ["operate", "Operate"],
+    ["operate", "Work"],
     ["mind", "Mind"],
   ];
 
@@ -244,7 +244,7 @@
     const paths = view.paths || {};
     if (storeEl) {
       storeEl.textContent = paths.episodic_db || "(store path unknown)";
-      storeEl.hidden = !!paths.omitted;   // a manifest source carries no store path: no line, not a false "unknown"
+      storeEl.hidden = !!paths.omitted || !!view.ke;   // a manifest source carries no store path: no line, not a false "unknown"
     }
     if (entityEl) {
       const stem = (paths.episodic_db ? String(paths.episodic_db).split("/").pop() : "") || "substrate";
@@ -306,8 +306,10 @@
     if (document.body) document.body.dataset.vital = live ? "live" : "dark";
 
     const layout = Array.isArray(view.layout) ? view.layout : [];
+    keShell(!!view.ke);
+    if (view.ke) renderKe(view, board);
     let lastZone = null;
-    for (const entry of layout) {
+    for (const entry of view.ke ? [] : layout) {
       // In the "All" view, drop a zone separator before each zone's first panel.
       if (entry.zone !== lastZone) {
         const lbl = (ZONE_LABELS.find((z) => z[0] === entry.zone) || [entry.zone, entry.zone])[1];
@@ -438,6 +440,198 @@
   // `opts` (modal context) is forwarded to the kinds that vary in the focus modal.
   // One panel whose data a renderer cannot draw is an unavailable panel, never a blank board or a
   // stale modal: the board and the focus modal both draw through this.
+  // ---------------------------------------------------------------- the KE page ----
+  // A manifest that declares hero / brief / widgets is drawn as the page's own regions: the hero first (the
+  // clock column with the weather under it, the sky beside it with the tool strip above), the brief, one row
+  // of widgets, then each zone as a 3-column grid of cards. The nav bar's contents live in the hero's strip.
+  const CK_SIZES = ["short", "medium", "tall"];   // ascending height; a grid row is as tall as its tallest card
+  const CK_COLUMNS = 3;
+  const tabChoice = new Map();                     // zone/title -> the tab the operator chose, kept across renders
+  function keShell(on) {
+    const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
+    if (!hero || !brief || !widgets) return;
+    hero.hidden = brief.hidden = widgets.hidden = !on;
+    document.body.classList.toggle("ke", on);
+    const bd = document.getElementById("board");
+    if (bd) bd.classList.toggle("ke", on);
+    if (on) return;
+    // back to the pre-KE page: the brand, the masthead and the state line return to where the static page put them
+    const mast = document.querySelector("header.masthead"), brand = document.querySelector(".brand"), state = document.getElementById("state");
+    const store = document.getElementById("store");
+    if (!mast || !store) return;
+    if (brand && !mast.contains(brand)) mast.insertBefore(brand, mast.firstChild);
+    if (mast.parentNode !== store.parentNode || mast.nextSibling !== state) { store.parentNode.insertBefore(mast, store); store.parentNode.insertBefore(state, store); }
+  }
+
+  function ckAttrs(node, entry, kind) {
+    node.dataset.ckPanel = entry.id;
+    node.dataset.ckKind = kind || "unknown";
+    if (entry.modes) node.dataset.modes = entry.modes;
+    return node;
+  }
+  // a typed panel's kind as the page grades it: a count face is a `count`, never the row kind it came from
+  function ckKindOf(entry, data) {
+    if (data && data.face === "count") return "count";
+    return entry.pkind || (data && data.kind) || entry.kind || "unknown";
+  }
+
+  // one bare typed node (no panel header): the hero's weather and sky, the brief, the widgets
+  function bareNode(entry, view, cls, ctx) {
+    const data = (view.extra_panels || {})[entry.id] || {};
+    const node = el("div", cls);
+    ckAttrs(node, entry, ckKindOf(entry, data));
+    if (data.error || !data.typed || !window.LevainCockpitKinds) {
+      node.appendChild(el("p", "err", "unavailable — " + (data.error || "this panel cannot be drawn here")));
+      return node;
+    }
+    window.LevainCockpitKinds.fill(node, data, Object.assign({ rows: appendExternalLines, entry: entry }, ctx || {}));
+    return node;
+  }
+
+  function renderHero(view, byId) {
+    const hero = document.getElementById("ck-hero"), when = document.getElementById("ck-when"), skycol = document.getElementById("ck-skycol");
+    const strip = document.getElementById("ck-strip"), skyHost = document.getElementById("ck-sky");
+    const mast = document.querySelector("header.masthead");
+    const entries = view.ke.hero.map((id) => byId.get(id)).filter(Boolean);
+    const kindOf = (e) => ((view.extra_panels || {})[e.id] || {}).kind;
+    const wx = entries.find((e) => kindOf(e) === "reading"), sky = entries.find((e) => kindOf(e) === "ambient");
+    // the nav bar's brand sits over the clock; everything else it carried is the strip above the sky
+    const brand = document.querySelector(".brand");
+    const clock = el("div", "clock num"), date = el("div", "date"), events = el("div", "events");
+    clock.dataset.ckHero = "clock"; date.dataset.ckHero = "date"; events.dataset.ckHero = "events";
+    when.replaceChildren();
+    if (brand) when.appendChild(brand);
+    const stamp = el("div", "clockbox");
+    stamp.append(clock, date);
+    when.append(stamp, events);
+    window.LevainCockpitKinds.mountClock(clock, date);
+    if (wx) {
+      const node = bareNode(wx, view, "wx");
+      node.dataset.ckHero = "weather";
+      when.appendChild(node);
+    } else when.appendChild(Object.assign(el("div", "wx"), { hidden: true }));
+    if (mast) strip.replaceChildren(mast);
+    skyHost.replaceChildren();
+    if (sky) skyHost.appendChild(bareNode(sky, view, "ck-sky", { hero: { events: events } }));
+    for (const e of entries) if (e !== wx && e !== sky) skyHost.appendChild(bareNode(e, view, "ck-card"));
+    hero.hidden = false;
+  }
+
+  function renderBriefRegion(view, byId) {
+    const region = document.getElementById("ck-brief");
+    const state = document.getElementById("state");
+    const card = el("div", "ck-card ck-briefcard");
+    const entries = view.ke.brief.map((id) => byId.get(id)).filter(Boolean);
+    if (state) { state.dataset.ckPanel = "state"; state.dataset.ckKind = "line"; card.appendChild(state); }
+    for (const e of entries) {
+      const node = bareNode(e, view, "ck-brief-body", { region: "brief" });
+      card.appendChild(node);
+    }
+    region.replaceChildren(card);
+    region.hidden = !entries.length && !(view.state);
+  }
+
+  function renderWidgets(view, byId) {
+    const region = document.getElementById("ck-widgets");
+    region.replaceChildren();
+    const entries = view.ke.widgets.map((id) => byId.get(id)).filter(Boolean);
+    region.hidden = !entries.length;
+    region.style.setProperty("--ck-n", String(Math.max(1, entries.length)));
+    for (const e of entries) {
+      const data = (view.extra_panels || {})[e.id] || {};
+      const node = el("div", "ck-card w");
+      ckAttrs(node, e, ckKindOf(e, data));
+      node.appendChild(el("div", "k", String(e.title).replace(/\s*\(\d+\)\s*$/, "")));
+      const body = bareNode(e, view, "wbody", { widget: true });
+      // the card is the node the page grades; the typed mount inside it carries the kind class
+      body.removeAttribute("data-ck-panel"); body.removeAttribute("data-ck-kind");
+      node.appendChild(body);
+      region.appendChild(node);
+    }
+  }
+
+  // a zone's cards, in the kernel's order, packed into rows of CK_COLUMNS; a row is as tall as its tallest card
+  function renderZone(zone, view, byId, board) {
+    const cards = [];
+    for (const c of zone.cards) {
+      const entries = c.panels.map((id) => byId.get(id)).filter(Boolean);
+      if (entries.length) cards.push({ entries: entries, size: c.size, span: c.span, tabs: c.tabs });
+    }
+    if (!cards.length) return;
+    const sec = el("section", "ck-zone");
+    sec.dataset.zone = zone.id;
+    sec.appendChild(el("div", "zone-title", zone.title));
+    const grid = el("div", "ck-zgrid");
+    grid.dataset.ckRegion = "zone";
+    grid.dataset.ckZone = zone.id;
+    // rows: sequential fill, the way a 3-column grid auto-places spans
+    const rows = [];
+    let used = CK_COLUMNS + 1;
+    for (const c of cards) {
+      if (used + c.span > CK_COLUMNS) { rows.push([]); used = 0; }
+      rows[rows.length - 1].push(c); used += c.span;
+    }
+    for (const row of rows) {
+      const tallest = row.reduce((m, c) => Math.max(m, CK_SIZES.indexOf(c.size)), 0);
+      for (const c of row) {
+        const nodes = [];
+        for (const e of c.entries) {
+          const node = renderPanelSafe(e, view);
+          if (!node) continue;
+          if (CLAMP_KINDS.has(e.kind)) node.setAttribute("data-clamp", "");
+          ckAttrs(node, e, ckKindOf(e, (view.extra_panels || {})[e.id]));
+          // a kernel kind drawn by one of the page's own components is still a typed mount: it names its kind too
+          if (!Array.from(node.classList).some((k) => /^k-/.test(k))) node.classList.add("k-" + (e.pkind || e.kind));
+          node.classList.add("ck-h-" + CK_SIZES[tallest], "ck-span-" + c.span);
+          nodes.push(node);
+          grid.appendChild(node);
+        }
+        if (c.tabs && nodes.length > 1) wireCardTabs(zone.id + "/" + c.tabs, c.tabs, c.entries, nodes);
+      }
+    }
+    sec.appendChild(grid);
+    board.appendChild(sec);
+  }
+
+  // Tabs of one card: each panel of the group is a full card, only the chosen one shows, and every one carries
+  // the same tab row in its header, so whichever is showing has the card's title and the way to the others.
+  function wireCardTabs(key, title, entries, nodes) {
+    let at = Math.min(tabChoice.has(key) ? tabChoice.get(key) : 0, nodes.length - 1);
+    const buttons = [];
+    const show = () => {
+      nodes.forEach((n, i) => n.classList.toggle("ck-tab-off", i !== at));
+      for (const group of buttons) group.forEach((b, i) => b.setAttribute("aria-selected", i === at ? "true" : "false"));
+    };
+    nodes.forEach((node) => {
+      const head = node.querySelector(".phead");
+      if (!head) return;
+      const h2 = head.querySelector("h2");
+      if (h2) h2.textContent = title;
+      const nav = el("div", "ck-tabs");
+      nav.setAttribute("role", "tablist");
+      const group = [];
+      entries.forEach((e, i) => {
+        const b = el("button", "ck-tab", e.title);
+        b.type = "button";
+        b.setAttribute("role", "tab");
+        b.addEventListener("click", () => { at = i; tabChoice.set(key, i); show(); });
+        group.push(b); nav.appendChild(b);
+      });
+      buttons.push(group);
+      head.insertBefore(nav, h2 ? h2.nextSibling : head.firstChild);
+    });
+    show();
+  }
+
+  function renderKe(view, board) {
+    const byId = new Map();
+    for (const e of view.layout) byId.set(e.id, e);
+    renderHero(view, byId);
+    renderBriefRegion(view, byId);
+    renderWidgets(view, byId);
+    for (const zone of view.ke.zones) renderZone(zone, view, byId, board);
+  }
+
   function renderPanelSafe(entry, view, opts) {
     try { return renderPanel(entry, view, opts); } catch (e) {
       const node = el("div", "panel");
@@ -637,7 +831,7 @@
       const meta = [c.permanence, c.activation_mode].filter(Boolean).join(" · ");
       if (meta) row.appendChild(el("span", "muted", meta));
       if (Array.isArray(c.tags) && c.tags.length) {
-        row.appendChild(el("span", "tags", "#" + c.tags.slice(0, 6).join(" #")));
+        row.appendChild(tagEl("tags", "#" + c.tags.slice(0, 6).join(" #")));
       }
       p.appendChild(row);
     }
@@ -692,9 +886,14 @@
     if (badgeField === "disposition") badge = s.disposition;
     else if (badgeField === "keep") badge = s.disposition === "note" ? "note" : s.tier;
     else badge = s.tier;
-    if (badge) row.appendChild(el("span", "tier", `[${badge}]`));
+    if (badge) row.appendChild(tagEl("tier", `[${badge}]`));
     appendClause(row, s.text);  // FULL text + per-item expand (no truncation, no edit data-loss)
-    if (s.next) row.appendChild(el("span", "muted", "→ " + s.next));
+    if (s.next) {
+      const due = tagEl("muted", "→ " + s.next);
+      if (isOverdue(s.next)) due.setAttribute("data-ck-tag-state", "overdue");
+      row.appendChild(due);
+    }
+    row.tabIndex = 0;   // the keyboard-current row: its verbs show while it has focus
     if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
     if (verbs && s.id) row.appendChild(buildSporeVerbs(s, panelKind));
     return row;
@@ -874,11 +1073,11 @@
   function episodeRow(e, verbs, showAgent) {
     const row = el("div", "row" + (e.emphasis === "dim" ? " ext-dim" : ""));
     if (e.row_id) row.dataset.rowKey = e.row_id;
-    if (showAgent && e.agent) row.appendChild(el("span", "tier", `[${e.agent}]`));
-    if (e.type) row.appendChild(el("span", "etype", e.type));
+    if (showAgent && e.agent) row.appendChild(tagEl("tier", `[${e.agent}]`));
+    if (e.type) row.appendChild(tagEl("etype", e.type));
     appendClause(row, e.content);  // FULL content + per-item expand (no truncation)
     if (Array.isArray(e.tags) && e.tags.length) {
-      row.appendChild(el("span", "tags", "#" + e.tags.slice(0, 5).join(" #")));
+      row.appendChild(tagEl("tags", "#" + e.tags.slice(0, 5).join(" #")));
     }
     row.appendChild(el("span", "muted", datePart(e.timestamp)));
     // a row that lists its actions offers only those; a row without the field (the legacy path) keeps the panel's
@@ -1462,9 +1661,26 @@
     dismiss: "spore_descend", remove: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
     tombstone: "episode_tombstone" };
 
+  // a row tag (a disposition, a tier, a type, hashtags, a due date): plain meta text; the page's CSS decides how it
+  // looks, and only a tag marked overdue may take the accent
+  function tagEl(cls, text) {
+    const t = el("span", cls, text);
+    t.setAttribute("data-ck-tag", "");
+    return t;
+  }
+  // a due stamp ("2026-10-12", or a longer ISO date) before today
+  function isOverdue(due) {
+    const m = /^(\d{4}-\d{2}-\d{2})/.exec(String(due));
+    if (!m) return false;
+    const d = new Date();
+    const today = d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+    return m[1] < today;
+  }
+
   function verbBtn(label, title, onClick) {
     const b = el("button", "verb-btn", label);
     b.type = "button";
+    b.setAttribute("data-ck-verb", "");
     if (title) b.title = title;
     if (Object.prototype.hasOwnProperty.call(BUTTON_VERB, label)) b.dataset.verb = BUTTON_VERB[label];
     b.addEventListener("click", onClick);
@@ -2335,6 +2551,7 @@
         && a.gesture !== "refused" && a.gesture !== "laptop-only");
       if (commit && undoOffered && !isUndo && e.id && e.undoable !== false && !claimed.has(e.source)) {
         const u = el("button", "undo-btn", "undo");
+        u.setAttribute("data-ck-verb", "");
         u.type = "button";
         u.addEventListener("click", async () => {
           u.disabled = true;
