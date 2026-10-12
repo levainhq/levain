@@ -161,7 +161,8 @@ class RequestAuthority:
                 cache: "ReplayCache | None" = None, ssh_keygen: Path | str | None = None) -> "RequestAuthority":
         """The request's authority, read in ``conn``'s open read transaction: the verified replay of
         the log's head (the per-process cache's, replayed only if absent), checked against the
-        ``anchor`` file, then the labels built from that same snapshot. A refused log captures as no
+        ``anchor`` file, then the labels built from that same snapshot. ``conn``'s transaction must not
+        have read yet: the anchor is read first, so its snapshot is pinned after it. A refused log captures as no
         authority with the reason: no ``AuthorityError`` escapes (a label is never a gate on reading).
         A ``sqlite3.Error`` reading the journal does escape; at broker start (``Broker._advance_anchor``)
         it fails that start attempt (a busy journal is retried, any other error disables the broker)."""
@@ -175,17 +176,19 @@ class RequestAuthority:
         error: str | None = None
         empty = False
         try:
+            # the anchor is read BEFORE the replay's first SELECT pins the read snapshot: an append
+            # committing in between can then only put the log ahead of the anchor, never behind it
+            pinned = None if anchor is None else auth.read_anchor(anchor)
             try:
                 snap = auth.snapshot(conn, **kw)
             except auth.NotInitialised:
-                pinned = None if anchor is None else auth.read_anchor(anchor)
                 if pinned is not None:
                     raise auth.AnchorError(f"the authority log is empty but its anchor names store "
                                            f"{pinned.store_id} at seq {pinned.seq}") from None
                 empty = True
                 error = f"authority not initialised: run {INIT_HINT}"
             if snap is not None and anchor is not None:
-                auth.check_anchor(snap, auth.read_anchor(anchor))
+                auth.check_anchor(snap, pinned)
         except auth.AuthorityError as exc:
             snap, empty = None, False
             error = f"the authority log is refused: {exc}"
