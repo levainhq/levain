@@ -44,7 +44,7 @@ __all__ = [
     "ANCHOR_NAME", "FORMAT", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead",
-    "UnsignedLink", "append", "advance_anchor", "anchor_path", "check_anchor", "classify", "create_schema",
+    "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify", "create_schema",
     "genesis_policy", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
     "snapshot", "verify_anchor_reset", "verify_link_sig",
 ]
@@ -110,6 +110,11 @@ class ReplayError(AuthorityError):
         self.seq = seq
 
 
+class VerifierUnavailable(AuthorityError):
+    """The signature verifier (ssh-keygen) could not run. Never a verdict on the log: a replay raises
+    this unconverted, so a caller can tell "retry" from "the log is refused"."""
+
+
 class NotInitialised(AuthorityError):
     """The log has no links: nothing may be signed until ``levain cockpit ledger init``."""
 
@@ -119,8 +124,9 @@ class StaleHead(AuthorityError):
 
 
 class HeadBelowCache(AuthorityError):
-    """The log differs, at or below a seq both hold, from the chain this process already verified (a
-    rewrite). A log that is merely shorter is a prefix and is served (see :class:`ReplayCache`)."""
+    """The log differs, at or below a seq both hold, from the chain this process already verified, and
+    does not verify in full (a rewrite). One that verifies replaces the cached chain, and a log that is
+    merely shorter is a prefix and is served (see :class:`ReplayCache`)."""
 
 
 class AnchorError(AuthorityError):
@@ -406,7 +412,12 @@ def _pipe_reading(data: bytes) -> int:
         except OSError:
             pass
 
-    threading.Thread(target=feed, name="levain-authority-pipe", daemon=True).start()
+    try:
+        threading.Thread(target=feed, name="levain-authority-pipe", daemon=True).start()
+    except BaseException:
+        os.close(r)
+        os.close(w)
+        raise
     return r
 
 
@@ -419,7 +430,7 @@ def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerpr
     ssh-keygen through pipes (``/dev/fd/N``), never a file, so no same-uid process can swap either one
     (say, for a signers line with ``no-touch-required``) between write and use; the presence flag is
     checked here as well, so a no-touch signature is refused whatever the verifier would say.
-    Raises :class:`AuthorityError` when the verifier cannot run (that is never a verdict)."""
+    Raises :class:`VerifierUnavailable` when the verifier cannot run (that is never a verdict)."""
     if not isinstance(signature, str) or len(signature) > _MAX_SIGNATURE:
         return False
     try:
@@ -433,7 +444,7 @@ def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerpr
         return False
     problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
     if problem is not None:
-        raise AuthorityError(f"cannot verify an authority signature: {problem}")
+        raise VerifierUnavailable(f"cannot verify an authority signature: {problem}")
     principal = "authority-signer"
     try:
         signers = _signers_line(principal, namespace, public_key).encode("ascii")
@@ -446,8 +457,9 @@ def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerpr
         cp = subprocess.run([str(keygen), "-Y", "verify", "-f", f"/dev/fd/{fds[0]}", "-I", principal,
                              "-n", namespace, "-s", f"/dev/fd/{fds[1]}"], input=message, capture_output=True,
                             timeout=timeout, env=dict(_VERIFY_ENV), pass_fds=tuple(fds))
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise AuthorityError(f"ssh-keygen could not verify an authority signature ({type(exc).__name__})") \
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        # RuntimeError: a pipe's writer thread could not start (_pipe_reading has closed that pipe)
+        raise VerifierUnavailable(f"ssh-keygen could not verify an authority signature ({type(exc).__name__})") \
             from None
     finally:
         for fd in fds:
@@ -554,9 +566,13 @@ def _apply_policy_op(policy: AuthorityPolicy, rec: Mapping[str, Any]) -> Authori
             # signed_at would be an unbounded input to the 30-day rule
             if rec["signed_at"] != rec["at"]:
                 raise AuthorityError("a renew's signed_at must equal its at")
+            if old <= signed:
+                raise AuthorityError(f"grant {gid!r} has expired ({data['grants'][gid]['expires_at']}) by this "
+                                     "renew's signing time; a lapsed grant is re-created at the laptop")
             if new <= old:
                 raise AuthorityError("a renew must move the grant's expiry later")
-            if new > signed + _RENEW_MAX:
+            # a difference, never `signed + 30 days`, which overflows near year 9999
+            if new - signed > _RENEW_MAX:
                 raise AuthorityError("a renew may extend a grant at most 30 days past its signing time")
             data["grants"][gid]["expires_at"] = rec["expires_at"]
     else:
@@ -630,7 +646,11 @@ def _parse_record(row: _Row) -> dict[str, Any]:
         rec = json.loads(row.record)
     except (ValueError, RecursionError):
         raise ReplayError(seq, "the record is not JSON") from None
-    if not isinstance(rec, dict) or _canonical(rec) != row.record:
+    try:
+        canonical = isinstance(rec, dict) and _canonical(rec) == row.record
+    except RecursionError:
+        raise ReplayError(seq, "the record is nested too deeply") from None
+    if not canonical:
         raise ReplayError(seq, "the record is not a canonical JSON object")
     if rec.get("format") != FORMAT:
         raise ReplayError(seq, f"the record's format is not {FORMAT}")
@@ -662,6 +682,9 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
         computed = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
     except KeyError_ as exc:
         raise AuthorityError(str(exc)) from None
+    except OSError as exc:
+        raise VerifierUnavailable(f"ssh-keygen could not fingerprint an enrolled key ({type(exc).__name__})") \
+            from None
     if computed != fp:
         raise AuthorityError(f"the record's fingerprint {fp} is not the key's ({computed})")
     if cls == LAPTOP and public_key.split()[0] not in _LAPTOP_KEY_TYPES:
@@ -747,19 +770,16 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
             if ranks[signer.key_class] < rank:
                 raise AuthorityError(f"a {signer.key_class} key cannot sign this {op}")
     except AuthorityError as exc:
-        if isinstance(exc, ReplayError):
+        if isinstance(exc, (ReplayError, VerifierUnavailable)):
             raise
         raise ReplayError(seq, str(exc)) from None
-    except (TypeError, ValueError, UnicodeError) as exc:
+    except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError) as exc:
         # a field of a shape no rule above anticipated: still a refusal at this seq, never an escape
         raise ReplayError(seq, f"a malformed field ({type(exc).__name__})") from None
 
     if check_signature:
-        try:
-            ok = verify_link_sig(_message(prev, row.record), row.signature, public_key=signer.public_key,
-                                 fingerprint=signer.fingerprint, ssh_keygen=ssh_keygen)
-        except AuthorityError as exc:
-            raise ReplayError(seq, str(exc)) from None
+        ok = verify_link_sig(_message(prev, row.record), row.signature, public_key=signer.public_key,
+                             fingerprint=signer.fingerprint, ssh_keygen=ssh_keygen)
         if not ok:
             raise ReplayError(seq, f"the signature does not verify as {signer.fingerprint}")
     hashes = (() if state is None else state._hashes) + (row.hash,)
@@ -818,9 +838,10 @@ class ReplayCache:
     row. A log whose rows match the cached chain verifies only its suffix. A log that is a
     digest-matching PREFIX of the cached chain is served its own head from the cache: that is a reader
     whose transaction began before a concurrent append (a busy cockpit), and its view is a state this
-    process already verified. A log that differs from the chain at or below a seq both hold is refused
-    (:class:`HeadBelowCache`). A log truncated to a prefix reads as that prefix; the anchor, not this
-    cache, is what refuses a rollback (:func:`check_anchor`)."""
+    process already verified. A log that differs from the chain at or below a seq both hold is replayed
+    in full: if it verifies it replaces the cached chain (a restore, then an anchor reset), and if it
+    does not it is refused (:class:`HeadBelowCache`). A log truncated to a prefix reads as that prefix;
+    the anchor, not this cache, is what refuses a rollback (:func:`check_anchor`)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -839,9 +860,13 @@ class ReplayCache:
             return self._entries.get(key)
 
     def _store(self, key: tuple[str, str], entry: _Entry) -> None:
+        """Keep the longer of two agreeing chains; a verified chain that disagrees with the cached one
+        below the shorter head replaces it (the last verified chain stands, see :func:`_replay_entry`)."""
         with self._lock:
             old = self._entries.get(key)
-            if old is None or entry.snapshot.seq > old.snapshot.seq:
+            both = 0 if old is None else min(len(old.digests), len(entry.digests))
+            if old is None or entry.snapshot.seq > old.snapshot.seq \
+                    or entry.digests[:both] != old.digests[:both]:
                 self._entries[key] = entry
 
     def clear(self) -> None:
@@ -870,20 +895,27 @@ def _replay_entry(conn: sqlite3.Connection, cache: ReplayCache, ssh_keygen: Path
     entry = cache._load(key)
     digests = tuple(r.digest() for r in rows)
     states: tuple[AuthoritySnapshot, ...] = ()
+    diverged: str | None = None
     if entry is not None:
         n = len(entry.digests)
         both = min(n, len(rows))
         if digests[:both] != entry.digests[:both]:
-            raise HeadBelowCache(f"the authority log differs from the chain this process verified (to seq {n}) "
-                                 f"at or below seq {both}; it was rewritten")
-        if len(rows) <= n:
+            # nothing cached is reusable: replay from genesis, and the result replaces the cached chain
+            diverged = f"the chain this process verified (to seq {n}) at or below seq {both}"
+        elif len(rows) <= n:
             return _Entry(entry.states[:len(rows)], digests)
-        states = entry.states
+        else:
+            states = entry.states
     state = states[-1] if states else None
     grown = list(states)
-    for row in rows[len(states):]:
-        state = _step(state, row, ssh_keygen=ssh_keygen)
-        grown.append(state)
+    try:
+        for row in rows[len(states):]:
+            state = _step(state, row, ssh_keygen=ssh_keygen)
+            grown.append(state)
+    except ReplayError as exc:
+        if diverged is None:
+            raise
+        raise HeadBelowCache(f"the authority log differs from {diverged}; it was rewritten ({exc})") from None
     out = _Entry(tuple(grown), digests)
     cache._store(key, out)
     return out
@@ -938,7 +970,7 @@ def _append_only_checks(state: AuthoritySnapshot, rec: Mapping[str, Any], now: d
         raise AuthorityError("a renew's signed_at must be within 10 minutes of now")
     if _parse_stamp(grant["expires_at"], "the grant's expires_at") <= now:
         raise AuthorityError(f"grant {rec['grant_id']!r} has expired; a lapsed grant is re-created at the laptop")
-    if _parse_stamp(rec["expires_at"], "expires_at") > now + _RENEW_MAX:
+    if _parse_stamp(rec["expires_at"], "expires_at") - now > _RENEW_MAX:      # never now + 30 days: overflow
         raise AuthorityError("a renew may extend a grant at most 30 days from now")
 
 
@@ -960,8 +992,12 @@ def prepare(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str, 
         sid = state.store_id
     seq = 1 if state is None else state.seq + 1
     prev = "" if state is None else state.head_hash
-    record = _canonical({**op, "format": FORMAT, "store_id": sid, "seq": seq, "at": _stamp(now)})
-    row = _Row(seq, prev, record, signer_fp, "", _link_hash(prev, record))
+    try:
+        record = _canonical({**op, "format": FORMAT, "store_id": sid, "seq": seq, "at": _stamp(now)})
+        row = _Row(seq, prev, record, signer_fp, "", _link_hash(prev, record))
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        # not JSON, a lone surrogate (no UTF-8 form), or nested too deeply
+        raise AuthorityError(f"the op has no canonical UTF-8 form ({type(exc).__name__})") from None
     _step(state, row, ssh_keygen=ssh_keygen, check_signature=False)
     if state is not None:
         _append_only_checks(state, json.loads(record), now)
@@ -1025,13 +1061,17 @@ def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now:
 
 
 def sign_and_append(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str,
-                    sign: Callable[[bytes], str], now: datetime, anchor: Path | None,
+                    sign: Callable[[bytes], str], clock: Callable[[], datetime], anchor: Path | None,
                     store_id: str | None = None, cache: ReplayCache | None = None,
                     ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> AuthoritySnapshot:
     """:func:`prepare`, then ``sign(message)`` OUTSIDE any transaction (a touch can take seconds),
-    then :func:`append` (``anchor`` as there: required, None for an unanchored store)."""
-    link = prepare(conn, op, signer_fp=signer_fp, now=now, store_id=store_id, cache=cache, ssh_keygen=ssh_keygen)
-    return append(conn, link, sign(link.message), now=now, cache=cache, ssh_keygen=ssh_keygen, anchor=anchor)
+    then :func:`append` (``anchor`` as there: required, None for an unanchored store). ``clock`` is read
+    once for prepare and again AFTER the signature, so append's clock checks (a renew of a grant that
+    lapsed during the touch) judge the time of the commit, not the time the touch began."""
+    link = prepare(conn, op, signer_fp=signer_fp, now=clock(), store_id=store_id, cache=cache,
+                   ssh_keygen=ssh_keygen)
+    signature = sign(link.message)
+    return append(conn, link, signature, now=clock(), cache=cache, ssh_keygen=ssh_keygen, anchor=anchor)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -1072,7 +1112,7 @@ def read_anchor(path: Path) -> Anchor | None:
         if not isinstance(store_id, str) or type(seq) is not int or seq < 1 or not isinstance(head, str) \
                 or not _SHA256_HEX.fullmatch(head):
             raise ValueError
-    except (ValueError, KeyError, AttributeError, UnicodeDecodeError):
+    except (ValueError, KeyError, AttributeError, UnicodeDecodeError, RecursionError):
         raise AnchorError(f"the authority anchor {path} is unreadable; after checking the log, run "
                           f"{_RESET_HINT}") from None
     return Anchor(store_id, seq, head)
@@ -1172,17 +1212,39 @@ def verify_anchor_reset(snap: AuthoritySnapshot, old_anchor: Mapping[str, Any] |
     try:
         ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
                              namespace=RESET_NAMESPACE, ssh_keygen=ssh_keygen)
+    except VerifierUnavailable:
+        raise
     except AuthorityError as exc:
         raise AnchorError(str(exc)) from None
     if not ok:
         raise AnchorError(f"the anchor reset signature does not verify as {signer_fp}")
 
 
+@contextmanager
+def _no_live_cockpit(path: Path) -> Iterator[None]:
+    """Hold the store's exclusive lock: the non-blocking ``flock`` on ``<data_root>/cockpit.lock`` that
+    a live cockpit broker holds for its whole active life (``levain.cockpit.broker.LOCK_NAME``). The
+    anchor sits in that data root (:func:`anchor_path`). Held, a reset is refused rather than waited
+    for: a server still holding the abandoned store could advance the anchor back onto it."""
+    from levain.cockpit.broker import LOCK_NAME
+    lock = Path(path).parent / LOCK_NAME
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise AnchorError(f"a cockpit server holds {lock}: stop it, then run {_RESET_HINT}") from None
+        yield
+    finally:
+        os.close(fd)
+
+
 def reset_anchor(path: Path, snap: AuthoritySnapshot, *, signer_fp: str, signature: str,
                  ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> Anchor:
     """Move the anchor at ``path`` to ``snap``'s head on a verified reset signature, storing the proof
-    in the anchor file (the log refuses to open, so it cannot be a log link)."""
-    with _anchor_lock(path):
+    in the anchor file (the log refuses to open, so it cannot be a log link). Refused while a cockpit
+    server is live on the store (:func:`_no_live_cockpit`)."""
+    with _no_live_cockpit(path), _anchor_lock(path):
         old = _old_anchor_view(path)
         verify_anchor_reset(snap, old, signer_fp=signer_fp, signature=signature, ssh_keygen=ssh_keygen)
         new = Anchor(snap.store_id, snap.seq, snap.head_hash)

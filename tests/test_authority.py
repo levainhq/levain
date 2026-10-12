@@ -70,7 +70,7 @@ def _enrol(k: Key, cls: str) -> dict:
 
 
 def link(conn, op, signer: Key, *, cache=None, now=NOW, anchor=None):
-    return auth.sign_and_append(conn, op, signer_fp=signer.fp, sign=signer.sign, now=now,
+    return auth.sign_and_append(conn, op, signer_fp=signer.fp, sign=signer.sign, clock=lambda: now,
                                 cache=cache or ReplayCache(), anchor=anchor)
 
 
@@ -532,8 +532,9 @@ def test_a_link_earlier_than_its_predecessor_refused(granted, keys):
 
 def test_a_future_dated_link_wedges_later_appends_visibly(granted, keys):
     """F2: a renew inserted with a future at (and signed_at) replays, and every later append is refused
-    by the ordering rule rather than extending anything silently."""
-    future = NOW + timedelta(days=20)
+    by the ordering rule rather than extending anything silently. (The grant is still live at that at:
+    a renew signed after the expiry is K1's refusal.)"""
+    future = NOW + timedelta(days=5)
     insert(granted, _renew(future + timedelta(days=30), signed=future), keys["phone"], at=_stamp(future))
     assert head(granted).policy.grants["g1"]["expires_at"] == _stamp(future + timedelta(days=30))
     with pytest.raises(ReplayError, match="earlier than its predecessor"):
@@ -883,3 +884,181 @@ def test_canonical_parity_with_team_entry():
     from levain.team.entry import canonical
     obj = {"b": [1, 2.5, float("nan")], "a": "é", "hash": "dropped-by-team"}
     assert auth._canonical({k: v for k, v in obj.items() if k != "hash"}) == canonical(obj)
+
+
+# --- L3 r1 (K1-K6) -------------------------------------------------------------------------------
+
+
+def test_replay_refuses_a_renew_of_a_lapsed_grant(granted, keys):
+    """K1: a display-phone key cannot reactivate a lapsed grant through replay (signed_at is the link's
+    own at, which the ordering rule bounds below, so replay can hold the rule)."""
+    lapsed = NOW + timedelta(days=11)                       # the grant expired at NOW + 10 days
+    insert(granted, _renew(lapsed + timedelta(days=9), signed=lapsed), keys["phone"], at=_stamp(lapsed))
+    refused(granted, "has expired")
+
+
+def test_replay_refuses_a_renew_signed_at_the_expiry_instant(granted, keys):
+    expiry = NOW + timedelta(days=10)
+    insert(granted, _renew(expiry + timedelta(days=9), signed=expiry), keys["phone"], at=_stamp(expiry))
+    refused(granted, "has expired")
+
+
+def test_sign_and_append_reads_the_clock_after_the_signature(granted, keys):
+    """K2: a touch that takes seconds must not let a renew commit after the grant lapsed."""
+    expiry = NOW + timedelta(days=10)
+    t = [expiry - timedelta(seconds=5)]
+
+    def slow_touch(message: bytes) -> str:
+        t[0] = expiry + timedelta(seconds=5)                 # the hardware touch took ten seconds
+        return keys["phone"].sign(message)
+
+    with pytest.raises(AuthorityError, match="has expired"):
+        auth.sign_and_append(granted, _renew(expiry + timedelta(days=20), signed=t[0]), signer_fp=keys["phone"].fp,
+                             sign=slow_touch, clock=lambda: t[0], cache=ReplayCache(), anchor=None)
+    assert head(granted).seq == 4
+
+
+def _reset_setup(base, keys, tmp_path):
+    a = auth.anchor_path(tmp_path)
+    auth.advance_anchor(a, head(base))
+    link(base, {"op": "raise", "verb": "a", "tier": "T3"}, keys["phone"], anchor=a)
+    old = auth.read_anchor(a).as_dict()
+    base.execute("DELETE FROM authority_log WHERE seq = 4")
+    snap = head(base)
+    msg = auth.reset_message(snap.store_id, old, snap.seq, snap.head_hash)
+    return a, snap, keys["laptop"].sign(msg, auth.RESET_NAMESPACE)
+
+
+def test_anchor_reset_refused_while_a_cockpit_server_holds_the_store(base, keys, tmp_path):
+    """K3 (a bound): the broker holds <data_root>/cockpit.lock exclusively while active; a reset needs
+    it, so no live server can hold the abandoned store across a reset."""
+    import fcntl
+    from levain.cockpit.broker import LOCK_NAME
+    a, snap, sig = _reset_setup(base, keys, tmp_path)
+    fd = os.open(tmp_path / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)        # as Broker._attempt takes it
+        with pytest.raises(AnchorError, match="cockpit server holds"):
+            auth.reset_anchor(a, snap, signer_fp=keys["laptop"].fp, signature=sig)
+        assert auth.read_anchor(a).seq == 4
+    finally:
+        os.close(fd)
+    assert auth.reset_anchor(a, snap, signer_fp=keys["laptop"].fp, signature=sig).seq == 3
+
+
+def test_a_verified_restore_replaces_the_cached_chain(granted, keys):
+    """K4: a process that cached seq 4 sees a restored store whose seq 4 differs and verifies: it is
+    served, and appended to, instead of HeadBelowCache forever."""
+    cache = ReplayCache()
+    assert auth.snapshot(granted, cache=cache).seq == 4
+    granted.execute("DELETE FROM authority_log WHERE seq = 4")
+    link(granted, {"op": "raise", "verb": "a", "tier": "T3"}, keys["phone"])      # another process's cache
+    restored = auth.snapshot(granted, cache=cache)
+    assert restored.seq == 4 and restored.policy.raise_to == {"a": "T3"} and not restored.policy.grants
+    assert link(granted, {"op": "raise", "verb": "b", "tier": "T3"}, keys["phone"], cache=cache).seq == 5
+    assert auth.snapshot(granted, cache=cache).seq == 5
+
+
+FAR = datetime(9999, 12, 15, tzinfo=timezone.utc)
+
+
+def test_renew_near_year_9999_replays_without_overflow(granted, keys):
+    """K5: `signed + 30 days` overflowed past 9999-12-31; replay compares differences."""
+    link(granted, {"op": "create_grant", "grant": _grant("g9", expires=FAR + timedelta(days=5))}, keys["laptop"])
+    insert(granted, _renew(FAR + timedelta(days=16), signed=FAR, gid="g9"), keys["phone"], at=_stamp(FAR))
+    assert head(granted).policy.grants["g9"]["expires_at"] == _stamp(FAR + timedelta(days=16))
+
+
+def test_renew_near_year_9999_appends_without_overflow(granted, keys):
+    """K5: append's `now + 30 days` overflowed the same way."""
+    link(granted, {"op": "create_grant", "grant": _grant("g9", expires=FAR + timedelta(days=5))}, keys["laptop"])
+    snap = link(granted, _renew(FAR + timedelta(days=16), signed=FAR, gid="g9"), keys["phone"], now=FAR)
+    assert snap.policy.grants["g9"]["expires_at"] == _stamp(FAR + timedelta(days=16))
+
+
+def test_deeply_nested_timeouts_is_a_replay_error(base, keys):
+    """K6: a record json.loads accepts but the recursive validators cannot walk is a ReplayError."""
+    depth = 3000
+    rec = {"op": "timeouts", "timeouts": {"k": "DEEP"}, "format": auth.FORMAT, "store_id": head(base).store_id,
+           "seq": 4, "at": "2026-10-12T09:00:00.000000Z"}
+    raw = auth._canonical(rec).replace('"DEEP"', "[" * depth + "]" * depth)
+    json.loads(raw)                                          # loadable: the failure is past the parse
+    insert(base, {"op": "timeouts"}, keys["laptop"], raw_record=raw)
+    with pytest.raises(ReplayError) as exc:
+        head(base)
+    assert exc.value.seq == 4
+
+
+def test_deeply_nested_anchor_is_an_anchor_error(tmp_path):
+    a = auth.anchor_path(tmp_path)
+    a.write_text("[" * 100000 + "]" * 100000)
+    with pytest.raises(AnchorError, match="unreadable"):
+        auth.read_anchor(a)
+
+
+def test_prepare_with_a_lone_surrogate_is_an_authority_error(base, keys):
+    with pytest.raises(AuthorityError, match="no canonical UTF-8 form"):
+        auth.prepare(base, {"op": "raise", "verb": "\ud800", "tier": "T3"}, signer_fp=keys["phone"].fp, now=NOW,
+                     cache=ReplayCache())
+
+
+def _unavailable(exc_info) -> None:
+    assert type(exc_info.value).__name__ == "VerifierUnavailable"
+    assert not isinstance(exc_info.value, ReplayError)        # retry, not tamper
+
+
+def test_fingerprint_oserror_is_verifier_unavailable_not_a_replay_error(base, monkeypatch):
+    import levain.cockpit.keys as cockpit_keys
+
+    def gone(*a, **k):
+        raise FileNotFoundError(2, "No such file or directory", "ssh-keygen")
+
+    monkeypatch.setattr(cockpit_keys, "fingerprint_of", gone)
+    with pytest.raises(AuthorityError) as exc:
+        head(base)
+    _unavailable(exc)
+
+
+def test_ssh_keygen_oserror_is_verifier_unavailable_not_a_replay_error(base, monkeypatch):
+    real = subprocess.run
+
+    def run(argv, *a, **k):
+        if "-Y" in argv:
+            raise PermissionError(13, "Permission denied", argv[0])
+        return real(argv, *a, **k)
+
+    monkeypatch.setattr(auth.subprocess, "run", run)
+    with pytest.raises(AuthorityError) as exc:
+        head(base)
+    _unavailable(exc)
+
+
+def test_a_pipe_thread_that_cannot_start_closes_its_fds(keys, monkeypatch):
+    """K6: the second _pipe_reading's thread fails to start: its two fds are closed, and the failure is
+    VerifierUnavailable."""
+    k = keys["laptop"]
+    sig = k.sign(b"m")
+    pipes: list[tuple[int, int]] = []
+    real_pipe, real_thread = os.pipe, auth.threading.Thread
+
+    def recording_pipe():
+        p = real_pipe()
+        pipes.append(p)
+        return p
+
+    class SecondFails(real_thread):
+        def start(self):
+            if self.name == "levain-authority-pipe" and len(pipes) == 2:
+                raise RuntimeError("can't start new thread")
+            super().start()
+
+    monkeypatch.setattr(auth.os, "pipe", recording_pipe)
+    monkeypatch.setattr(auth.threading, "Thread", SecondFails)
+    with pytest.raises(AuthorityError) as exc:
+        auth.verify_link_sig(b"m", sig, public_key=k.public_key, fingerprint=k.fp)
+    monkeypatch.undo()
+    _unavailable(exc)
+    assert len(pipes) == 2                                   # nothing past the failed start ran
+    for fd in pipes[1]:
+        with pytest.raises(OSError):
+            os.fstat(fd)
