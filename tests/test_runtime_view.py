@@ -157,6 +157,7 @@ def test_a_socket_outside_the_runtime_dir_is_unaffected(tmp_path, rd, monkeypatc
     ("systemd/private", "service manager"), ("systemd/x/y", "service manager"), ("bus", "session bus"),
     ("gnupg/S.dirmngr", "dirmngr"), ("gnupg/d.abc/S.dirmngr", "dirmngr"), ("../run/x", "inside the runtime dir"),
     ("/run/user/1000/podman/podman.sock", "inside the runtime dir"), ("", "inside the runtime dir"),
+    (".", "inside the runtime dir"), ("./", "inside the runtime dir"), ("podman/\0x.sock", "NUL"),
 ])
 def test_runtime_sockets_refuses_the_service_manager_the_bus_and_dirmngr(tmp_path, entry, why) -> None:
     ent = _entity(tmp_path)
