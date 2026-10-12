@@ -657,3 +657,30 @@ def test_c3_doctor_fails_a_journal_format_it_cannot_migrate(tmp_path, fmt):
     [r] = _check_cockpit_authority(tmp_path / "inst")
     assert not r.ok and f"unsupported journal format {fmt!r}" in r.detail
     assert "this levain reads levain-cockpit/3 and migrates levain-cockpit/2" in r.detail
+
+
+def test_l1_ctrl_c_at_a_keep_prompt_is_ledger_init_cancelled(v2, monkeypatch, capsys):
+    import builtins
+    root, k = v2
+    _no_tty(monkeypatch, tty=True)
+
+    def ctrl_c(prompt: str = "") -> str:
+        raise KeyboardInterrupt
+    monkeypatch.setattr(builtins, "input", ctrl_c)
+    assert _cli("--signing-key", str(k["A"].path), "--data-root", str(root)) == 1
+    err = capsys.readouterr().err
+    assert err == "ledger init cancelled\n"
+    assert _log(root) == [] and _uninitialised(root)
+
+
+def test_l1_ctrl_c_during_a_signing_touch_says_where_the_log_is(v2, monkeypatch, capsys):
+    import levain.cockpit.keys as keys_mod
+    root, k = v2
+    monkeypatch.setattr(keys_mod, "ssh_signer", lambda path, **kw: (k["A"].fingerprint, _cut_at(3, k["A"])))
+    _no_tty(monkeypatch)
+    rc = _cli("--signing-key", str(k["A"].path), "--data-root", str(root),
+              *(x for n in "APR" for x in ("--confirm", k[n].fingerprint)), "--drop-unlisted")
+    err = capsys.readouterr().err
+    assert rc == 1 and err.startswith("ledger init cancelled") and err.count("\n") == 1
+    assert "the log is at seq 2; the store stays uninitialised; re-run to resume" in err
+    assert len(_log(root)) == 2 and _uninitialised(root)

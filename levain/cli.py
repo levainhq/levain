@@ -1664,6 +1664,7 @@ def _ask(prompt: str) -> bool:
 def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
     from levain.cockpit.keys import init_plan, ledger_init, signing_public_key, ssh_signer
 
+    root = plan = None
     try:
         root = _cockpit_root(args)
         signer_fp, sign = ssh_signer(args.signing_key)
@@ -1726,6 +1727,18 @@ def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
     except _cockpit_refusals() as exc:
         sys.stdout.flush()                    # the listing above, before the refusal under it
         print(f"ledger init refused: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:                 # Ctrl-C at a keep prompt or during a signing touch
+        sys.stdout.flush()
+        where = ""
+        try:
+            # re-read only a store this run already opened (a /2 one is migrated by then, never here)
+            seq = 0 if root is None or plan is None else init_plan(root, now=_utc_now()).seq
+            if seq:
+                where = f"; the log is at seq {seq}; the store stays uninitialised; re-run to resume"
+        except _cockpit_refusals() + (KeyboardInterrupt,):
+            pass                              # where the log stands is a courtesy, never a second traceback
+        print(f"ledger init cancelled{where}", file=sys.stderr)
         return 1
     for line in result.links:
         print(line)
