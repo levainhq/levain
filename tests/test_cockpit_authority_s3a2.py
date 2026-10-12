@@ -234,6 +234,48 @@ def test_a_panel_etag_moves_when_the_authority_is_refused_and_again_when_it_is_r
     assert restored["value"]["provenance"]["label"] == "signed · reported"
 
 
+# --- a replayed reported pending on a refused log is a 503, never STALE (L1 1012+80 C) ------------------
+
+def _refuse_the_log(data_root: Path) -> bytes:
+    """Move the anchor one link past the log, so every capture refuses it; returns the bytes to restore."""
+    anchor = anchor_path(data_root)
+    good = anchor.read_bytes()
+    at = authority.read_anchor(anchor)
+    anchor.write_text(json.dumps({"format": authority.ANCHOR_FORMAT, "store_id": at.store_id,
+                                  "seq": at.seq + 1, "head_hash": "0" * 64}))
+    return good
+
+
+def test_a_replayed_reported_pending_on_a_refused_log_is_unavailable_and_stays_waiting(broker, spores, keydir):
+    from datetime import timedelta
+
+    from levain.cockpit.consent import utc_stamp
+    from levain.cockpit.firejournal import new_pending_id
+    from tests.test_cockpit_k2b_broker import _target
+
+    Key(keydir, "phone").enroll(broker, "display-phone")
+    tgt = _target(spores, "k.seed")
+    dead = new_pending_id()
+    with broker._admitted() as db:                 # the request that died after `issued`
+        built = broker._build(db, "spore_set_disposition", {"disposition": "note"}, tgt, dead, at_issue=True)
+        n = broker._now()
+        raw = broker._record(pid=dead, verb="spore_set_disposition", intent="reported", built=built,
+                             params={"disposition": "note"}, tier="T2", fence=broker.capture().fence,
+                             issued_at=utc_stamp(n), expires_at=utc_stamp(n + timedelta(minutes=15)))
+        db.issue(record_bytes=raw, principal="token:browser:1", idempotency_key="died", now=n, cap_exempt=True)
+    good = _refuse_the_log(broker.data_root)
+
+    def replay() -> dict[str, Any]:
+        return broker.issue(verb="spore_set_disposition", params={"disposition": "note"}, target=tgt, tier="T2",
+                            credential=BROWSER, intent="reported", idempotency_key="died")
+    err = _refused("authority_unavailable", replay)
+    assert err.status == 503
+    assert _state(broker, dead) == "WAITING"
+    anchor_path(broker.data_root).write_bytes(good)
+    out = replay()
+    assert (out["pending_id"], out["state"], out["replay"]) == (dead, "COMMITTED", True), out
+
+
 # --- a /2 store migrates and refuses signed acts until init -------------------------------------------
 
 _V2_KEYS = ("CREATE TABLE keys (fingerprint TEXT PRIMARY KEY, principal TEXT NOT NULL UNIQUE, "

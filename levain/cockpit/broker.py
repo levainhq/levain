@@ -632,6 +632,8 @@ class Broker:
             if why is not None:
                 raise BrokerError("refused", 403, why)
             auth = self._request_authority(db)
+            if auth.fence is None:
+                raise self._authority_refusal(auth)   # as at issue: a refused log is a 503, never a STALE end
             with bound(auth):
                 return {**self._decide(db, auth, pid, "ALLOWED_REPORTED", None, None), "replay": True}
         return self.result(db, pid, replay=True)
