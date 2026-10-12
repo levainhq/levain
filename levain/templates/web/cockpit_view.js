@@ -1114,7 +1114,7 @@
     if (!k || !s.skyHandle || typeof s.skyHandle.update !== "function" || !k.plot.isConnected || !s.body.contains(k.plot)) return false;
     try { s.skyHandle.update({ events: sky.events, legend: sky.legend }); } catch (_) { return false; }
     paintCounts(k.win, sky);
-    k.legend.textContent = sky.legend;
+    paintLegend(k.legend, sky);
     return true;
   }
   // In the hero the clock, the date and the events line are the page's own nodes (ctx.hero), drawn in the clock
@@ -1146,9 +1146,45 @@
     if (root.LevainSky && typeof root.LevainSky.mount === "function") {
       try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend }, { legend: false }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
-    const legend = el("div", "legendbar" + (hero ? "" : " frame"), sky.legend);
+    const legend = el("div", "legendbar" + (hero ? "" : " frame"));
+    paintLegend(legend, sky);
     host.appendChild(legend);
     s.skyParts = { plot: plot, win: win, legend: legend };
+  }
+
+  // The strip chart's key: the real glyphs, drawn like the chart's own marks (sky.js). Page chrome, not data:
+  // the kernel's `legend` sentence stays as the tooltip. Orange is reserved for failed and now, so the diamond is neutral.
+  // The key names only the kinds sky.js draws apart. A feed carrying any other kind gets the kernel's sentence as the
+  // whole legend and no glyph key, because sky.js draws an unknown kind with the memory square.
+  const DRAWN_KINDS = new Set(["commit", "review", "decision", "memory"]);
+  function paintLegend(host, sky) {
+    host.replaceChildren();
+    host.title = sky.legend;
+    const known = (sky.events || []).every((e) => e && DRAWN_KINDS.has(e.kind));
+    if (!known) { host.appendChild(el("span", "lg-note", String(sky.legend || ""))); return; }
+    const NS = "http://www.w3.org/2000/svg";
+    const glyph = (size, build) => {
+      const svg = document.createElementNS(NS, "svg");
+      svg.setAttribute("width", String(size)); svg.setAttribute("height", String(size));
+      svg.setAttribute("viewBox", "0 0 12 12"); svg.setAttribute("aria-hidden", "true");
+      svg.classList.add("lg-g");
+      build((tag, attrs) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); svg.appendChild(n); });
+      return svg;
+    };
+    const items = [
+      ["commit", (a) => a("circle", { cx: 6, cy: 6, r: 2.5, class: "lg-fill" })],
+      ["review", (a) => a("circle", { cx: 6, cy: 6, r: 3.5, class: "lg-ring" })],
+      ["review that failed", (a) => a("circle", { cx: 6, cy: 6, r: 4, class: "lg-ring lg-bad" })],
+      ["memory write", (a) => a("rect", { x: 5, y: 5, width: 2, height: 2, class: "lg-mem" })],
+      ["decision made", (a) => a("path", { d: "M6 2l4 4-4 4-4-4z", class: "lg-fill" })]
+    ];
+    for (const [label, build] of items) {
+      const it = el("span", "lg");
+      it.append(glyph(12, build), document.createTextNode(label));
+      host.appendChild(it);
+    }
+    host.appendChild(el("span", "lg-sp"));
+    host.appendChild(el("span", "lg-note", "Each mark is one real event. Hover for its time, kind and repo."));
   }
 
   // ---- one typed panel ----
