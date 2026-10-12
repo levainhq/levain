@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ast
 import json
-import os
 import shutil
 import sqlite3
 import subprocess
@@ -128,7 +127,7 @@ def test_deleting_the_uninitialised_marker_grants_nothing_on_an_empty_log(broker
 def test_a_truncated_log_is_refused_by_its_anchor(home, spores, keydir):
     b = _broker(home, spores)
     try:
-        phone = Key(keydir, "phone").enroll(b, "display-phone")
+        Key(keydir, "phone").enroll(b, "display-phone")
         assert len(_rows(b, "SELECT seq FROM authority_log")) == 2
     finally:
         b.stop()
@@ -141,7 +140,6 @@ def test_a_truncated_log_is_refused_by_its_anchor(home, spores, keydir):
         assert auth.authority is None and "behind its anchor" in str(auth.authority_error)
         assert "anchor reset" in str(auth.authority_error)
         _refused("authority_unavailable", _move, b, spores, intent="reported")
-        assert phone.fingerprint  # the phone's key is not in any snapshot this store serves
     finally:
         b.stop()
 
@@ -383,8 +381,7 @@ def test_a_compromise_after_the_fire_leaves_its_label(broker, spores, keydir):
     phone = Key(keydir, "phone").enroll(broker, "display-phone")
     pid, sig = _sign_pending(broker, spores, phone)
     broker.submit(pid, sig)
-    other = Key(keydir, "other").enroll(broker, "presence")            # the head moves past the fire
-    assert other.fingerprint
+    Key(keydir, "other").enroll(broker, "presence")                    # the head moves past the fire
     revoke_any(broker.db, phone, compromised_since=broker.capture().authority.seq)
     assert broker.capture().labels.label(LabelKey("spore:k.seed", {"disposition": "note"})) == "signed · reported"
 
@@ -530,7 +527,6 @@ def test_fingerprint_of_a_hung_verifier_is_unavailable_not_a_key_refusal(home):
         fingerprint_of("ssh-ed25519 AAAA", ssh_keygen=missing)
     with pytest.raises(KeyError_, match="could not read the key"):
         fingerprint_of("ssh-ed25519 AAAA")                              # a refusal stays a refusal
-    assert os.path.exists(slow)
 
 
 def test_the_root_is_reachable(broker, keydir):
