@@ -18,6 +18,7 @@ import pytest
 
 from levain.chat import ChatError, ChatHost
 from levain.chat_driver import (
+    DriverCall,
     DriverCaps,
     DriverContractError,
     DriverEvent,
@@ -1496,8 +1497,8 @@ def test_the_host_holds_no_driver_method():
 
     contract = {n for n in dir(HarnessDriver) if not n.startswith("_")}
     exposed = {n for n in dir(_DriverProxy) if not n.startswith("_")}
-    assert exposed == {"call", "read", "harness", "caps", "make", "submit_close", "retire", "release",
-                       "early_report", "stop_idle", "end", "rec"}
+    assert exposed == {"call", "read", "harness", "caps", "make", "start_open", "submit_close", "retire",
+                       "release", "early_report", "stop_idle", "end", "rec"}
     assert exposed & contract == {"harness", "caps"}       # values, read once through the boundary
     proxy = _DriverProxy("t")
     assert proxy.make(lambda: _Fake([]), give_up=time.monotonic() + 2).ok
@@ -2717,3 +2718,93 @@ def test_every_real_turn_result_makes_a_snapshot():
                        pending=(_HELD,) if gated else (), held_digest="d" if gated else None)
         snap = read_outcome(r)
         assert (snap.ok, snap.exit_code) == (r.ok, r.exit_code)
+
+
+# ---------------------------------------------------------------------------- chat L3 r1, complement MED-1
+
+
+def test_an_open_that_never_ran_is_settled_by_the_host(tmp_path, monkeypatch):
+    """`make` can use nearly all of the open bound, so `open` is called with a deadline of about 0 and the
+    lane abandons it unrun. The driver then never got `on_released`, its close from `new` reports nothing,
+    and the session sat counted until release_failed. Made deterministic here: reading `caps` (the last
+    read before open) moves the host's clock past the bound and occupies the turn lane, so `open` is
+    still queued when its zero deadline expires."""
+    import levain.chat as chat
+
+    monkeypatch.setattr(chat, "_REPORT_SECONDS", 0.3)
+    jump, gate = threading.Event(), threading.Event()
+    class HostClock:                             # levain.chat's clock only; the test's waits keep real time
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        @staticmethod
+        def monotonic():
+            return time.monotonic() + (10 * chat._OPEN_SECONDS if jump.is_set() else 0)
+
+    monkeypatch.setattr(chat, "time", HostClock())
+    proxies: list = []
+    real_init = chat._DriverProxy.__init__
+
+    def init(self, name):
+        real_init(self, name)
+        proxies.append(self)
+
+    monkeypatch.setattr(chat._DriverProxy, "__init__", init)
+
+    class Late(_Fake):
+        open_ran = False
+
+        def __init__(self):
+            super().__init__([])
+
+        @property
+        def caps(self):
+            if not jump.is_set():
+                jump.set()
+                proxies[-1]._lanes["turn"].submit("busy", lambda: (gate.wait(5), DriverCall(True))[1])
+            return DriverCaps(approval_timing="after_turn")
+
+        @caps.setter
+        def caps(self, value):
+            pass
+
+        def open(self, on_event, *, on_released, resume=None):
+            Late.open_ran = True
+            return super().open(on_event, on_released=on_released, resume=resume)
+
+    d = Late()
+    host = _host(tmp_path, {"alpha": d}, max_sessions=1)
+    try:
+        out = host.open("alpha")
+        assert _wait(host, out["job_id"])["status"] == "failed"
+        gate.set()
+        time.sleep(0.6)                          # past _REPORT_SECONDS: a report that could come has come
+        assert not Late.open_ran
+        assert host.session_status(out["session_id"])["state"] == "failed"
+        assert host.open("alpha")["session_id"] != out["session_id"]   # the slot is free
+    finally:
+        gate.set()
+
+
+def test_a_lane_call_says_whether_its_call_started():
+    import levain.chat as chat
+
+    lane = chat._Lane("t")
+    lane.start()
+    gate, slow = threading.Event(), threading.Event()
+    try:
+        lane.submit("block", lambda: (gate.wait(5), DriverCall(True))[1])
+        ran: list[int] = []
+        got, started = lane.call_started("x", lambda: (ran.append(1), DriverCall(True))[1], 0)
+        assert got.unanswered and started is False
+        gate.set()
+        _until(lane.idle, what="the lane to drain")
+        assert ran == []                         # reported not started: it never runs
+        got, started = lane.call_started("y", lambda: DriverCall(True, 5), 2)
+        assert got.ok and got.value == 5 and started is True
+        got, started = lane.call_started("z", lambda: (slow.wait(5), DriverCall(True))[1], 0.1)
+        assert got.unanswered and started is True   # running when its caller gave up: it did start
+    finally:
+        gate.set()
+        slow.set()
+        lane.retire()

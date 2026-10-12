@@ -509,22 +509,29 @@ class _Lane:
              on_late: Callable[[DriverCall], None] | None = None) -> DriverCall:
         """Run ``fn`` here and wait up to ``timeout``. ``on_late`` gets a result that arrives after the
         caller gave up (on this lane, decided under the lane's lock, so no result falls between)."""
+        return self.call_started(what, fn, timeout, on_late)[0]
+
+    def call_started(self, what: str, fn: Callable[[], DriverCall], timeout: float | None,
+                     on_late: Callable[[DriverCall], None] | None = None) -> tuple[DriverCall, bool]:
+        """:meth:`call`, and whether ``fn`` started. Decided under the lane's lock: a call reported not
+        started was abandoned while queued (or never queued) and never runs (chat L3 r1, complement MED-1)."""
         box = self.submit(what, fn, on_late=on_late)
         if isinstance(box, DriverCall):
-            return box
+            return box, False
         if timeout is not None:
             timeout = min(timeout, threading.TIMEOUT_MAX)    # past it a wait raises instead of waiting
         if box.done.wait(timeout):
             assert box.result is not None
-            return box.result
+            return box.result, box.started
         with self._cond:
             if box.result is not None:      # it landed between the wait and this lock
-                return box.result
+                return box.result, box.started
             box.abandoned = True
             if self._running_box is box:
                 self._stuck = box           # still running: later calls fail at once until it returns
+            started = box.started
         text = f"{what}: the driver did not answer within {timeout:g}s"
-        return DriverCall(False, None, f"DriverUnresponsive: {text}", text, unanswered=True)
+        return DriverCall(False, None, f"DriverUnresponsive: {text}", text, unanswered=True), started
 
     def end(self, reason: str) -> None:
         """The conversation ended: every call QUEUED here is taken off and answered with ``reason`` now, and
@@ -562,6 +569,7 @@ class _Lane:
                     box.done.set()
                     continue
                 self._running_box = box
+                box.started = True
             result = fn()        # _call_driver: never raises
             with self._cond:
                 late = box.abandoned      # its caller gave up before this result was stored (call())
@@ -589,6 +597,7 @@ class _Pending:
     done: threading.Event = field(default_factory=threading.Event)
     result: DriverCall | None = None
     abandoned: bool = False
+    started: bool = False      # the lane took it to run (under the lane's lock)
     on_late: Callable[[DriverCall], None] | None = None
 
 
@@ -672,6 +681,15 @@ class _DriverProxy:
         drv = self._driver
         return self._lanes[lane].call(
             method, lambda: _invoke(drv, method, args, kwargs, expect, True, convert), timeout)
+
+    def start_open(self, on_event: Callable[[DriverEvent], None], *, timeout: float,
+             on_released: Callable[..., None]) -> tuple[DriverCall, bool]:
+        """The driver's ``open`` on the turn lane, and whether it started: one the host gave up on while it
+        was still queued never runs, so the driver never got ``on_released`` and holds nothing to release."""
+        drv = self._driver
+        return self._lanes["turn"].call_started(
+            "open", lambda: _invoke(drv, "open", (on_event,), {"on_released": on_released}, _ANY, True, None),
+            timeout)
 
     def read(self, attribute: str, *, expect: tuple[type, ...] = _ANY, timeout: float | None = None) -> DriverCall:
         drv = self._driver
@@ -1449,7 +1467,7 @@ class ChatHost:
     def _run_open(self, rec: _Session, job: _Job) -> None:
         error: str | None = None
         driver: _DriverProxy | None = None
-        opening = False         # open() was called: from here on the driver may hold something to release
+        opening = False         # open() started: from here on the driver may hold something to release
         info: dict[str, Any] = {}
         try:
             try:
@@ -1471,11 +1489,11 @@ class ChatHost:
                 raise DriverContractError(
                     f"{driver.harness}: this host drives only after-turn consent; "
                     f"{driver.caps.approval_timing!r} needs the approval state machine, which is not built")
-            opening = True
+            opening = True        # until the lane says otherwise: a raise out of the call below closes it
             driver.rec = rec
-            opened = driver.call("open", self._route_events(rec), lane="turn",
-                                 timeout=max(0.0, give_up - time.monotonic()),
-                                 on_released=self._released_sink([driver]))
+            opened, opening = driver.start_open(self._route_events(rec),
+                                                timeout=max(0.0, give_up - time.monotonic()),
+                                                on_released=self._released_sink([driver]))
             if not opened.ok:
                 error = opened.message
             else:
