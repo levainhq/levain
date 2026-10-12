@@ -345,7 +345,7 @@ def build_seat_spec(
     # `--unattended` is EMITTED, not inferred, so the seat's governance posture is auditable in
     # the unit file itself: anyone reading the plist sees that this drive declares no human in the
     # loop, and therefore that its consolidate may metabolize but never crystallize (the standard
-    # credential stores are denied for any non-REPL drive regardless). Inferring it
+    # credential stores are denied in every drive regardless). Inferring it
     # from "is there a StartInterval" would put the security-relevant fact somewhere an auditor of
     # the argv cannot see.
     argv = [*invocation, "run", str(entity_path), "--task", task, "--unattended"]

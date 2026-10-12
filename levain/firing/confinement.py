@@ -39,7 +39,7 @@ it needed an empirically-hunted "system allow-set"; a default-ALLOW profile need
     symlink-anchor bypass, VERIFIED LIVE). The standard cred stores (``~/.config/gh`` / ``~/.aws/
     credentials`` / ``~/.netrc`` / ``~/.git-credentials``) are folded in by ``build_policy``'s
     ``deny_standard_creds`` switch; :func:`levain.firing.drive.resolve_cred_floor` sets it, denying them in
-    every drive except the interactive REPL unless the entity declares ``deny_standard_creds: false``).
+    every drive, the interactive REPL included, unless the entity declares ``deny_standard_creds: false``).
   - **ancestor-write-deny (apparatus L2 CRITICAL):** each crown jewel is pinned to an ABSOLUTE path,
     so under ``(allow default)`` the entity could ``mv`` a non-denied ANCESTOR directory of a jewel
     to relocate it out from under its deny string, then read it. So every ancestor dir of every jewel
@@ -185,8 +185,8 @@ is tabulated above :func:`_bwrap_argv`.
     — :data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES` (a GitHub token = repo push/admin) — are ≥
     the ssh key in impact. They are not universal: ``build_policy`` folds them in on its
     ``deny_standard_creds`` switch, which :func:`levain.firing.drive.resolve_cred_floor` turns on in every
-    drive except the interactive REPL; an entity that needs gh/aws there declares
-    ``deny_standard_creds: false`` in confinement.json (operational-fit over purity). A
+    drive, the interactive REPL included; an entity that needs gh/aws declares
+    ``deny_standard_creds: false`` in confinement.json. A
     caller can still pin any of them ad-hoc via ``deny_files`` / ``extra_deny_read_write``.
 
 **Gating (v1 REALITY, load-bearing honesty — REWRITTEN 2026-07-29 for the post-K3 world).** This
@@ -351,13 +351,13 @@ _OWN_MEMORY_FILENAMES = (
 
 # Standard, tool-CANONICAL credential locations. Folding these into the floor is an OPT-IN
 # (``deny_standard_creds`` in ``confinement.json``) at THIS layer; the drive layer
-# (levain.firing.drive.resolve_cred_floor) turns it on unless a human drives the session. Two reasons:
+# (levain.firing.drive.resolve_cred_floor) turns it on in every drive, the REPL included. Two reasons:
 # (1) unlike an app secret (``.env.flow``), these ARE structurally knowable — gh / aws / curl look
 # here BY DEFINITION, so naming them is not the FALSE-SECURITY guessing the module otherwise refuses;
 # (2) denying their READ breaks the entity's OWN legitimate ``gh`` / ``aws`` / netrc-``curl`` use, so the
-# switch stays per-entity: an entity that needs those tools outside the REPL declares
+# switch stays per-entity: an entity that needs those tools declares
 # ``deny_standard_creds: false``. They are >= the ssh key in impact (a gh token = repo push/admin; aws
-# creds = infra/$), which is why the drive layer denies them by default wherever no human watches. ``~/.config/gh`` is a DIR (the token
+# creds = infra/$), which is why the drive layer denies them by default. ``~/.config/gh`` is a DIR (the token
 # lives in ``hosts.yml``) → a denied subtree; ``credentials`` / ``.netrc`` are files.
 # The Keychain's mach services (spore-1245). SecurityServer + securityd.xpc were MEASURED to carry the
 # reads (denying them refused `security -w` and the osxkeychain helper); systemkeychain is Apple's
@@ -831,8 +831,8 @@ class CrownJewelsPolicy:
     # is closed only where a drive-layer caller opts in.
     deny_keychain: bool = False   # macOS: deny the Keychain services (spore-1245), set from the SAME
     # resolved switch as the standard cred stores (``deny_standard_creds``: denied by default in every
-    # drive except the interactive REPL, per-entity overridable), so it is never on while a human drives
-    # at the REPL unless the operator asks. Measured 2026-10-01 from inside the confined shell, before this flag:
+    # drive, the interactive REPL included, per-entity overridable), so ``false`` reopens both together.
+    # Measured 2026-10-01 from inside the confined shell, before this flag:
     # ``security find-generic-password -w`` and ``git credential-osxkeychain get`` both read secrets.
     # No Linux counterpart is rendered: no Secret Service existed on any host available to test.
     deny_localhost_outbound: bool = False  # deny outbound connect() to THIS host — the spore-755
@@ -1196,7 +1196,7 @@ def build_policy(
     # The DEFAULT stays permissive on purpose, and it is NOT the security decision (glm L3
     # raised it as fail-open). This function is the MECHANISM — build a floor from explicit
     # inputs. The POLICY (what an undeclared entity should get) lives one layer up in
-    # `levain.firing.drive.resolve_cred_floor`, which is drive-aware; teaching this default
+    # `levain.firing.drive.resolve_cred_floor`; teaching this default
     # to be opinionated would put the same policy in two places that can disagree, and it
     # would reverse a deliberate operational-fit decision (denying these reads breaks the
     # entity's own gh/aws/curl use) at the wrong altitude. The real risk glm named — a FUTURE
@@ -1248,7 +1248,7 @@ def build_policy(
     spellings, and name their tool directories (:data:`_CRED_TOOL_DIRS`) for the Linux plan. These
     are knowable locations (not the false-security guessing the module refuses). This parameter's own default is
     False; the product default comes from :func:`levain.firing.drive.resolve_cred_floor`, which passes
-    True in every drive except the interactive REPL unless the entity declares ``false``. Wired from ``confinement.json`` via :meth:`levain.firing.binding.ConversationBinding.create`.
+    True in every drive, the interactive REPL included, unless the entity declares ``false``. Wired from ``confinement.json`` via :meth:`levain.firing.binding.ConversationBinding.create`.
 
     **Operator-declared crown jewels (the caller MUST pass — this generic, operator-neutral module
     deliberately does NOT guess where an operator's app-specific secrets live):**
@@ -1326,7 +1326,7 @@ def build_policy(
     files: list[Path] = [Path(f).expanduser().resolve() for f in deny_files]
 
     # The standard tool-canonical cred stores, folded in when the caller passes deny_standard_creds
-    # (resolved by levain.firing.drive.resolve_cred_floor: True except at the interactive REPL, unless
+    # (resolved by levain.firing.drive.resolve_cred_floor: True in every drive, unless
     # the entity declares ``deny_standard_creds: false`` in confinement.json). They flow through the SAME subtree/file machinery (read+write deny + ancestor
     # write-deny), so no separate rendering path is needed.
     # Each at all three spellings (:func:`_spellings`): resolved-only left a stow-style
@@ -2122,15 +2122,14 @@ class ConfinementConfig:
     #   True  → deny ALWAYS (an explicit operator pin; the drive mode does not soften it)
     #   False → allow ALWAYS (an explicit operator OPT-IN that deliberately survives an unattended
     #           seat — a seat whose job is "open a PR nightly" genuinely needs gh)
-    #   None  → ABSENT: derive from the DRIVE MODE (allow only interactive, deny otherwise)
+    #   None  → ABSENT: the product default, deny in every drive (the REPL too since 2026-10-12, N7)
     # It was a plain `bool = False` until an unattended seat existed to distinguish, at which point
     # ABSENT and EXPLICIT-FALSE being indistinguishable made the new default either un-overridable
     # or defeated by every config already on disk. The reason this is not the `efferent_gate: "auto"`
     # string enum two fields down — which solves the identical problem — is that a bool→string change
     # invalidates every config already carrying true/false, and this loader is FAIL-CLOSED, so that
-    # is not a graceful degrade: it bricks `levain run`. Resolution + the full argument for why the
-    # floor is drive-dependent AT ALL (the rest of it deliberately is not) →
-    # `levain.firing.drive.resolve_cred_floor`.
+    # is not a graceful degrade: it bricks `levain run`. Resolution, and why absent stays distinct
+    # from false now that the default no longer reads the drive → `levain.firing.drive.resolve_cred_floor`.
     allow_container_sockets: bool = False
     # spore-725. Default FALSE = the container/VM daemon sockets are DENIED (the floor's normal
     # state). Set true ONLY if this entity genuinely needs to drive containers and the operator
@@ -2237,8 +2236,8 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
         )
 
     # ABSENT is its own state — do NOT default it to False here (K4a). The sentinel must survive the
-    # loader so `drive.resolve_cred_floor` can tell "the operator never declared this" (derive from
-    # the drive mode) from "the operator explicitly wants creds reachable" (honour it, even for an
+    # loader so `drive.resolve_cred_floor` can tell "the operator never declared this" (the product
+    # default) from "the operator explicitly wants creds reachable" (honour it, even for an
     # unattended seat). Collapsing them here is exactly what made the unattended default impossible
     # to express in the first place.
     deny_standard_creds = data.get("deny_standard_creds", None)
@@ -2254,8 +2253,8 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
         )
     if "deny_standard_creds" in data and data["deny_standard_creds"] is None:
         raise ConfinementError(
-            f"{base}: deny_standard_creds is present but null. Omit the key entirely to let the "
-            f"drive mode decide (allowed only at the interactive REPL, denied in every other drive), "
+            f"{base}: deny_standard_creds is present but null. Omit the key entirely for the "
+            f"default (denied in every drive, the interactive REPL included), "
             f"or set it to true/false to pin it (false lets the entity read them) — fail-closed."
         )
 

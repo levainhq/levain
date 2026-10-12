@@ -1,10 +1,10 @@
 """Tests for levain.firing.drive — the single drive-mode authority (K4a).
 
 The three-rung mode replaced a ``human_present`` bool. The gate collapses ``headless`` and
-``unattended`` (neither has anyone to fan an action in to), and since 2026-10-07 the cred floor's
-default draws the same line (closed everywhere but the interactive REPL). These pin that line, and
-that an explicit setting still overrides it, because a change to either is a security regression
-no other test would catch.
+``unattended`` (neither has anyone to fan an action in to). The cred floor's default no longer
+reads the drive: since 2026-10-12 (N7) it is closed in every drive, the interactive REPL included.
+These pin both, and that an explicit setting still overrides the floor, because a change to either
+is a security regression no other test would catch.
 """
 
 from __future__ import annotations
@@ -52,19 +52,19 @@ def test_explicit_false_allows_in_every_mode(mode: str) -> None:
     assert resolve_cred_floor(False, mode=mode) is False
 
 
-def test_absent_derives_from_the_drive() -> None:
-    assert resolve_cred_floor(None, mode="interactive") is False
+def test_absent_denies_in_every_drive() -> None:
+    assert resolve_cred_floor(None, mode="interactive") is True   # flipped 2026-10-12 (N7)
     assert resolve_cred_floor(None, mode="headless") is True    # flipped 2026-10-07 (cockpit chat)
     assert resolve_cred_floor(None, mode="unattended") is True
 
 
 @pytest.mark.parametrize("mode", [*DRIVE_MODES, "garbage"])
-def test_the_absent_cred_floor_follows_the_gates_own_line(mode) -> None:
-    """Since 2026-10-07 (Phill ruled the default flipped): the standard credential stores are open by
-    default only at the REPL, where the operator reads each completed turn before the next, which is
-    exactly human_present. A
-    headless turn (a --task run, a cockpit chat turn) is captured before anyone reads it."""
-    assert resolve_cred_floor(None, mode=mode) is (not human_present(mode))
+def test_the_absent_cred_floor_no_longer_reads_presence(mode) -> None:
+    """Since 2026-10-12 (N7, Phill: "agreed on your rec"): the standard credential stores are closed by
+    default at the REPL too. A human at the terminal sees a turn only after its bytes are in the model's
+    context, so presence does not stop a READ a prompt injection asks for. The gate still keys on
+    human_present; the floor does not."""
+    assert resolve_cred_floor(None, mode=mode) is True
 
 
 def test_garbage_mode_denies_on_BOTH_halves_of_the_authority() -> None:
