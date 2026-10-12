@@ -246,6 +246,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import urllib.parse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -4986,7 +4987,9 @@ def _dirmngr_sockets() -> list[Path]:
     No path mask closes that. Under a user runtime dir, where gnupg puts its sockets whenever
     ``/run/user/<uid>`` exists, the runtime-dir view (step (7) of :func:`_bwrap_plan_impl`) does, and
     the masks here are dropped for those paths. A dirmngr socket in a GNUPGHOME outside every runtime
-    dir (a host with no ``/run/user/<uid>``) is still masked by path only."""
+    dir (one started where ``/run/user/<uid>`` was absent) gets a view of its GNUPGHOME the same way
+    (:func:`_gnupg_home_views`); one in ``$HOME``, a directory directly in it (``~/.gnupg``) or
+    ``/tmp`` keeps its mask, since bash can rename none of those."""
     found: list[Path] = []
     for s in _bound_unix_socket_paths():
         if Path(s).name != "S.dirmngr":
@@ -5016,36 +5019,99 @@ def _dirmngr_sockets() -> list[Path]:
     return list(dict.fromkeys(f for f in found if _reachable(f) and f.exists()))
 
 
-def _gpg_agent_sockets() -> list[Path]:
-    """The operator's gpg-agent sockets, its own and its ssh one, as ``gpgconf`` names them for this
-    process's GNUPGHOME, the default one or not. Empty when gpgconf is missing or fails: gpg inside bash
-    then finds no agent, a degrade rather than an exposure."""
+#: The ``gpgconf --list-dirs`` names of the gnupg sockets bash gets back: the agent's own and its ssh
+#: one, and keyboxd's (GnuPG 2.4 ``use-keyboxd``: the public keyring as a local daemon). NOT the agent's
+#: ``.extra`` and ``.browser`` sockets (meant for forwarding to another host) nor dirmngr's.
+_GPG_SOCKET_DIRS = ("agent-socket", "agent-ssh-socket", "keyboxd-socket")
+
+
+def _gpg_sockets() -> list[Path]:
+    """The operator's gnupg sockets named in :data:`_GPG_SOCKET_DIRS`, as ``gpgconf`` names them for this
+    process's GNUPGHOME, the default one or not. All of ``--list-dirs`` is read and the names picked out,
+    so a gnupg without keyboxd (before 2.3) is never asked for a name it does not have. Empty when
+    gpgconf is missing or fails: gpg inside bash then finds no agent, a degrade rather than an exposure."""
     from levain.launch import child_env
 
     exe = shutil.which("gpgconf")
     if exe is None:
         return []
     try:
-        done = subprocess.run([exe, "--list-dirs", "agent-socket", "agent-ssh-socket"],
+        done = subprocess.run([exe, "--list-dirs"],
                               capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/",
                               env=child_env("GNUPGHOME"), timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         return []
     if done.returncode != 0:
         return []
-    return [Path(line) for line in done.stdout.splitlines() if line.startswith("/")]
+    out: list[Path] = []
+    for line in done.stdout.splitlines():
+        name, _, value = line.partition(":")
+        value = urllib.parse.unquote(value)   # gpgconf percent-escapes its values (":" is %3a)
+        if name in _GPG_SOCKET_DIRS and value.startswith("/"):
+            out.append(Path(value))
+    return out
 
 
-def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path]]:
-    """Step (7) of :func:`_bwrap_plan_impl` as ``(ops, view_roots)``: each user runtime dir this user
-    owns (:func:`_runtime_dirs`, resolved) becomes a fresh 0700 tmpfs, and only socket FILES come back
-    into it: the gpg-agent's two sockets (:func:`_gpg_agent_sockets`), ``$SSH_AUTH_SOCK``, and the
-    entity's ``runtime_sockets``, each kept only when it resolves under that dir, is a socket now, and
-    is not one :func:`_runtime_socket_refusal` names. The tmpfs and the parent directories the sockets
-    need are made at 0700: with them at 0755, gpg-connect-agent answered "no gpg-agent running in this
-    session" through the bound-back socket, and at 0700 it reached the agent (RUN on argushub
-    2026-10-12, gnupg 2.4.4, bubblewrap 0.9.0). The view stays writable, so an agent a tool starts
-    inside bash can make its socket there; it is gone with the shell."""
+#: The sockets a view of a GNUPGHOME (:func:`_gnupg_home_views`) binds back, by name.
+_GNUPG_HOME_SOCKETS = frozenset({"S.gpg-agent", "S.gpg-agent.ssh", "S.keyboxd"})
+
+
+def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path]) -> tuple[list[Path], list[Path]]:
+    """The GNUPGHOMEs that hold a dirmngr socket outside every runtime dir, as ``(views, pins)``, for bash
+    without network only (dirmngr is a network deputy only there). gnupg keeps its sockets in GNUPGHOME
+    when it finds no ``/run/user/<uid>``, and a dirmngr started then (a cron job, a login with no user
+    manager, before linger) is still there when the operator runs levain. Masked by path it was moved:
+    one session renamed the GNUPGHOME, or its parent, and the next reached dirmngr at its new name
+    (RUN on argushub 2026-10-12, 60 packets on port 53 carrying a fresh name, both renames).
+
+    Each such directory is a view like a runtime dir's, and its ancestors (``pins``) are pinned so it
+    cannot be moved from above. A directory that is ``/``, ``/run``, ``/var/run``, ``/tmp``,
+    ``/var/tmp`` or ``$HOME``, or one directly in ``$HOME`` (``~/.gnupg``: step (0)'s view of $HOME
+    makes it a mountpoint), is left to the mask: bash cannot rename it or anything above it. A
+    directory that holds the workspace, the entity or ``$HOME`` is refused: a view would hide them."""
+    if not policy.deny_localhost_outbound:
+        return [], []
+    shared = {Path(p).resolve() for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp")}
+    home = Path.home().resolve()
+    shared.add(home)
+    views: list[Path] = []
+    for f in _dirmngr_sockets():
+        g = f.resolve().parent
+        if (g in shared or g.parent == home or g in views
+                or any(g == r or g.is_relative_to(r) for r in runtime_roots)):
+            continue
+        for held in (policy.workspace.resolve(), policy.entity_dir.resolve(), home):
+            if held == g or held.is_relative_to(g):
+                raise ConfinementError(
+                    f"a gnupg dirmngr socket is in {g}, which holds {held}. Bash without network gets a "
+                    "view of that directory without dirmngr, and the view would hide the workspace too. "
+                    "Refusing to grant bash hands (fail-closed). Stop that dirmngr (`gpgconf --homedir "
+                    f"{g} --kill dirmngr`) or move that GNUPGHOME.")
+        views.append(g)
+    views = [g for g in views if not any(g != o and g.is_relative_to(o) for o in views)]
+    pins = sorted({a for g in views for a in g.parents if str(a) != a.anchor})
+    return views, pins
+
+
+def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], list[Path]]:
+    """Step (7) of :func:`_bwrap_plan_impl` as ``(ops, view_roots, pins)``: each user runtime dir this
+    user owns (:func:`_runtime_dirs`, resolved) becomes a fresh 0700 tmpfs, and only socket FILES come
+    back into it: gnupg's (:func:`_gpg_sockets`), ``$SSH_AUTH_SOCK``, and the entity's
+    ``runtime_sockets``, each kept only when it resolves under that dir, is a socket now, and is not one
+    :func:`_runtime_socket_refusal` names. The tmpfs and the parent directories the sockets need are
+    made at 0700: with them at 0755, gpg-connect-agent answered "no gpg-agent running in this session"
+    through the bound-back socket, and at 0700 it reached the agent (RUN on argushub 2026-10-12, gnupg
+    2.4.4, bubblewrap 0.9.0). The view stays writable, so an agent a tool starts inside bash can make
+    its socket there; it is gone with the shell.
+
+    Each GNUPGHOME of :func:`_gnupg_home_views` is a view too, whose ancestors go back as ``pins``. Its
+    sockets in :data:`_GNUPG_HOME_SOCKETS` and its files come back, the files writable: with the trustdb
+    read-only, ``gpg --list-keys`` died "failed to append a record" on its trustdb check (RUN on
+    argushub 2026-10-12). Its directories do not come back (``private-keys-v1.d`` is the agent's,
+    ``public-keys.d`` keyboxd's); links come back as the same links. The costs: gpg inside bash cannot
+    replace a file there (an ``--import`` into a ``pubring.kbx`` keyring renames it, and gets EBUSY),
+    and its lock files land in the view, so a gpg on the host writing the trustdb at the same moment
+    does not see the lock."""
     roots: list[Path] = []
     for r in _runtime_dirs():
         rd = Path(r)
@@ -5058,7 +5124,8 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path]]:
             continue
         roots.append(real)
     roots = [r for r in roots if not any(r != o and r.is_relative_to(o) for o in roots)]   # the outer view covers it
-    wanted = list(_gpg_agent_sockets()) if roots else []
+    homes, pins = _gnupg_home_views(policy, roots)
+    wanted = list(_gpg_sockets()) if roots else []
     auth_sock = os.environ.get("SSH_AUTH_SOCK", "")
     if auth_sock.startswith("/"):
         wanted.append(Path(auth_sock))
@@ -5085,7 +5152,19 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path]]:
         for s in keep:
             # A read-only bind would not stop connect(), so it buys nothing over a plain one.
             ops += ["--bind", str(s), str(s)]
-    return ops, roots
+    for g in homes:
+        ops += ["--perms", "0700", "--tmpfs", str(g)]
+        for child in sorted(g.iterdir(), key=lambda p: p.name):
+            st = os.lstat(child)
+            if stat.S_ISLNK(st.st_mode):
+                ops += ["--symlink", os.readlink(child), str(child)]
+            elif child.name.startswith("S.") and child.name not in _GNUPG_HOME_SOCKETS:
+                continue   # dirmngr's, the agent's forwarding sockets, or one of those names as a file
+            elif stat.S_ISSOCK(st.st_mode):
+                ops += ["--bind", str(child), str(child)]
+            elif stat.S_ISREG(st.st_mode):
+                ops += ["--bind", str(child), str(child)]
+    return ops, roots + homes, pins
 
 
 def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
@@ -5098,7 +5177,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     ``/dev/null`` form for a write-denied file, and a 16-byte header read of file-shaped jewels
     (:func:`_refuse_plantable_sqlite_jewels`), and, for bash without network, the kernel's list of bound
     unix sockets (:func:`_bound_unix_socket_paths`, which refuses when it cannot be read). Reads, never
-    a mutation, except one: ``gpgconf --list-dirs`` (:func:`_gpg_agent_sockets`) creates gnupg's socket
+    a mutation, except one: ``gpgconf --list-dirs`` (:func:`_gpg_sockets`) creates gnupg's socket
     directory under the runtime dir for a non-default GNUPGHOME, as any gpg command run there does
     (RUN on argushub 2026-10-12, gnupg 2.4.4)."""
     _refuse_plantable_sqlite_jewels(policy)
@@ -5565,7 +5644,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # dir's view unless the entity's ``runtime_sockets`` brings it back, so no form here.
     # Compared RESOLVED, because the socket targets are: a symlinked HOME compared lexically would
     # get the directory form, a read-only tmpfs over the whole of it (L1 + L2).
-    runtime_ops, runtime_roots = _runtime_view(policy)
+    runtime_ops, runtime_roots, view_pins = _runtime_view(policy)
     shared = {Path(p).resolve() for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp")}
     shared.add(Path.home().resolve())
     hidden_dirs: list[Path] = []
@@ -5598,6 +5677,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     #     the socket at its new name (argushub 2026-10-10, 63 packets on port 53 carrying a fresh name).
     #     Inside the view that rename moves only tmpfs content;
     #   · every other daemon socket in the dir, present or started later, which a roster would miss.
+    # A GNUPGHOME holding a live dirmngr outside every runtime dir is a view too, for bash without
+    # network (:func:`_gnupg_home_views`), with its parents pinned: renaming it or its parent moved
+    # dirmngr past the mask (argushub 2026-10-12, 60 packets each).
     # ⚠ A D-Bus on an abstract socket (older distros) is not in any directory: it is closed only where
     # bash has no network (``--unshare-net``).
     # The cost: inside bash the runtime dir holds only those sockets. A bound-back socket keeps its
@@ -5618,7 +5700,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # /etc/resolv.conf may point at nothing. A daemon whose socket or directory is absent at spawn,
     # or that recreates its socket, is not hidden from then on: the residual step (6) states.
     if policy.deny_localhost_outbound:
-        # Those under a runtime dir are absent from its view (step (7)); ~/.gnupg's still need the mask.
+        # Those in a view (step (7)) are absent from it; one in $HOME or /tmp itself still needs the mask.
         masks += [str(f) for f in _dirmngr_sockets()
                   if not any(f.resolve().is_relative_to(r) for r in runtime_roots)]
         for d in _NETWORK_DEPUTY_DIRS:
@@ -5681,7 +5763,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         elif op in ("--tmpfs", "--dir"):
             created.append(argv[k + 1])
     pins: list[tuple[str, bool]] = []   # (path, needs creating)
-    for d in sorted(policy.deny_write_dirs, key=lambda p: str(p)):
+    # A GNUPGHOME's view (step (7)) is pinned from above like a jewel: its parents are its ancestors.
+    for d in sorted({*policy.deny_write_dirs, *view_pins}, key=lambda p: str(p)):
         if d.is_symlink():
             # A link directly in $HOME is frozen by step (0)'s read-only bind: pin its target.
             if os.access(d.parent, os.W_OK) and d.parent.resolve() not in frozen_home:
@@ -5708,8 +5791,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # (complement, L3 r3).
             continue
         if any(e == r or e.is_relative_to(r) for r in runtime_roots):
-            # In a runtime dir's view (step (7)): its tmpfs is itself a mountpoint and nothing under
-            # it is the host's, so a pin there would bind a host directory back into the view.
+            # In a runtime dir's or a GNUPGHOME's view (step (7)): its tmpfs is itself a mountpoint and
+            # nothing under it is the host's, so a pin there would bind a host directory back into it.
             continue
         if entry[0] not in [p for p, _ in pins]:
             pins.append(entry)
