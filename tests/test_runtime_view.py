@@ -374,6 +374,31 @@ def test_a_gnupghome_holding_dirmngr_is_a_view_pinned_from_above(tmp_path, gh) -
     assert not [a for _, op, a in ops if a[:1] == ["/dev/null"] and _under(a[1], gh)]   # the view replaces the mask
 
 
+def test_dirmngr_sockets_are_read_once_per_plan(tmp_path, gh, monkeypatch) -> None:
+    """Read twice, a dirmngr that appeared between the view and the masks got a mask only, which a
+    rename moves past (complement L3 r1)."""
+    calls = []
+    monkeypatch.setattr(conf, "_dirmngr_sockets", lambda: calls.append(1) or [gh / "S.dirmngr"])
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+    assert calls == [1]
+    assert [i for i, op, a in _ops(argv) if op == "--tmpfs" and a == [str(gh)]]
+
+
+def test_a_gnupghome_that_vanished_before_its_stat_is_skipped(tmp_path, gh, monkeypatch) -> None:
+    """The dirmngr and its home went away between reading the socket list and the stat: nothing is left
+    to hide, so no view, and no traceback out of the floor."""
+    real_stat = os.stat
+
+    def gone(p, *a, **k):
+        if Path(p) == gh:
+            raise FileNotFoundError(2, "No such file or directory", str(p))
+        return real_stat(p, *a, **k)
+
+    monkeypatch.setattr(conf.os, "stat", gone)
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+    assert not [a for _, op, a in _ops(argv) if op == "--tmpfs" and a == [str(gh)]]
+
+
 def test_a_gnupghome_view_binds_back_no_socket_but_the_agent_and_keyboxd(tmp_path, gh) -> None:
     extra = [_listen(gh / n) for n in ("S.other", "dirmngr.sock", "S.gpg-agent.browser")]
     try:

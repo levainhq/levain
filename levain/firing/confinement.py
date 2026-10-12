@@ -5058,7 +5058,8 @@ def _gpg_sockets() -> list[Path]:
 _GNUPG_HOME_SOCKETS = frozenset({"S.gpg-agent", "S.gpg-agent.ssh", "S.keyboxd"})
 
 
-def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path]) -> tuple[list[Path], list[Path]]:
+def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path],
+                      dirmngr: list[Path]) -> tuple[list[Path], list[Path]]:
     """The GNUPGHOMEs that hold a dirmngr socket outside every runtime dir, as ``(views, pins)``, for bash
     without network only (dirmngr is a network deputy only there). gnupg keeps its sockets in GNUPGHOME
     when it finds no ``/run/user/<uid>``, and a dirmngr started then (a cron job, a login with no user
@@ -5071,19 +5072,24 @@ def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path]) -> t
     ``/var/tmp`` or ``$HOME``, or one directly in ``$HOME`` (``~/.gnupg``: step (0)'s view of $HOME
     makes it a mountpoint), is left to the mask: bash cannot rename it or anything above it. One
     another user owns keeps the mask too: its files are not the operator's to bind back. A directory that holds the workspace, the entity or ``$HOME`` is
-    refused: a view would hide them."""
+    refused: a view would hide them. ``dirmngr`` is the plan's one reading of :func:`_dirmngr_sockets`,
+    which its masks use too: read twice, a dirmngr that appeared between the readings got a mask only."""
     if not policy.deny_localhost_outbound:
         return [], []
     shared = {Path(p).resolve() for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp")}
     home = Path.home().resolve()
     shared.add(home)
     views: list[Path] = []
-    for f in _dirmngr_sockets():
+    for f in dirmngr:
         g = f.resolve().parent
         if (g in shared or g.parent == home or g in views
                 or any(g == r or g.is_relative_to(r) for r in runtime_roots)):
             continue
-        if os.stat(g).st_uid != os.geteuid():
+        try:
+            owner = os.stat(g).st_uid
+        except OSError:
+            continue   # gone since the socket was listed: nothing is left there to hide
+        if owner != os.geteuid():
             continue   # another user's home: its files are not the operator's to bind back; the mask stays
         for held in (policy.workspace.resolve(), policy.entity_dir.resolve(), home):
             if held == g or held.is_relative_to(g):
@@ -5098,7 +5104,8 @@ def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path]) -> t
     return views, pins
 
 
-def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], list[Path]]:
+def _runtime_view(policy: CrownJewelsPolicy,
+                  dirmngr: list[Path] | None = None) -> tuple[list[str], list[Path], list[Path]]:
     """Step (7) of :func:`_bwrap_plan_impl` as ``(ops, view_roots, pins)``: each user runtime dir this
     user owns (:func:`_runtime_dirs`, resolved) becomes a fresh 0700 tmpfs, and only socket FILES come
     back into it: gnupg's (:func:`_gpg_sockets`), ``$SSH_AUTH_SOCK``, and the entity's
@@ -5139,7 +5146,9 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], lis
                     f"the user runtime dir {root} holds {held}. Bash gets a view of that directory "
                     "holding only its agent sockets, and the view would hide that too. Refusing "
                     "to grant bash hands (fail-closed). Point XDG_RUNTIME_DIR at a directory of its own.")
-    homes, pins = _gnupg_home_views(policy, roots)
+    if dirmngr is None:
+        dirmngr = _dirmngr_sockets() if policy.deny_localhost_outbound else []
+    homes, pins = _gnupg_home_views(policy, roots, dirmngr)
     # A runtime dir is pinned from above like a GNUPGHOME view: under a directory bash can rename
     # (``XDG_RUNTIME_DIR=~/.cache/xdg``), renaming that parent carried the host's dir, dirmngr included,
     # to a name the next session has no view of (complement L3 r1). /run/user/<uid>'s parents are
@@ -5682,7 +5691,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # or restart anything.
     # Compared RESOLVED, because the socket targets are: a symlinked HOME compared lexically would
     # get the directory form, a read-only tmpfs over the whole of it (L1 + L2).
-    runtime_ops, runtime_roots, view_pins = _runtime_view(policy)
+    # Read ONCE: the views and the masks of step (7b) must see the same dirmngr sockets.
+    dirmngr = _dirmngr_sockets() if policy.deny_localhost_outbound else []
+    runtime_ops, runtime_roots, view_pins = _runtime_view(policy, dirmngr)
     for r in runtime_roots:
         for t in tool_views:
             if r == t or r.is_relative_to(t):
@@ -5749,7 +5760,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # or that recreates its socket, is not hidden from then on: the residual step (6) states.
     if policy.deny_localhost_outbound:
         # Those in a view (step (7)) are absent from it; one in $HOME or /tmp itself still needs the mask.
-        masks += [str(f) for f in _dirmngr_sockets()
+        masks += [str(f) for f in dirmngr
                   if not any(f.resolve().is_relative_to(r) for r in runtime_roots)]
         for d in _NETWORK_DEPUTY_DIRS:
             real = Path(d).resolve()
