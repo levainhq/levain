@@ -119,7 +119,7 @@ and holds its own cap of 8 open streams (a ninth gets `503 busy`).
 |---|---|---|
 | `hello` | `{epoch, resync}` | the first frame of every stream. `resync: true` means the server cannot replay what the client missed (a new server run, a position it no longer holds, an unreadable `Last-Event-ID`): the client reconciles against the manifest |
 | `panel-changed` | `{id, etag}` | that panel's content ETag moved |
-| `manifest-changed` | `{}` | the set of panel ids changed (or the watcher's first reading): reload the board |
+| `manifest-changed` | `{}` | the set of panel ids changed, or the watcher's first good reading after its starting read failed: reload the board |
 | `: hb` | (a comment line) | a heartbeat every 15 s on a quiet stream |
 
 Events carry the id `<epoch>:<seq>`. Within one epoch a reconnecting client that names its last id in

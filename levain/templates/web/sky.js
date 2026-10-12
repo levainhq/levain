@@ -137,6 +137,7 @@
     tip.style.cssText = 'position:absolute;pointer-events:none;display:none;z-index:2;white-space:nowrap;padding:6px 10px;border-radius:10px;font-size:12px;border:1px solid var(--hair-2,#28324a);background:var(--base,#060912);color:var(--contrast,var(--text,#f3f5f9))';
     var showLegend = o.legend !== false;    // a host that draws its own legend passes legend:false
     var legend = el('div', { class: 'sky-legend' });
+    legend.hidden = !showLegend;   // the host's own legend stands in; an empty strip would still take its padding
     plot.append(cv, axis, tip);
     root.append(bar, plot, legend);
     host.appendChild(root);
