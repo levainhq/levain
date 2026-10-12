@@ -480,3 +480,20 @@ def test_linux_live_a_gnupghome_view_hides_dirmngr_and_keeps_the_agent(tmp_path,
             srv.close()
     assert (gh / "S.dirmngr").exists() and not Path(f"{gh}.moved").exists()
     assert (gh / "trustdb.gpg").read_bytes() == b"trustx\n"
+
+
+def test_a_gnupghome_view_keeps_gnupgs_configuration_files_read_only(tmp_path, gh, monkeypatch) -> None:
+    """The 0.9.1 fix makes gnupg's configuration files read-only to bash in $GNUPGHOME. A GNUPGHOME view
+    is placed after those binds, so its tmpfs covers them: a file it binds back writable would undo
+    that fix for the one home the view exists for."""
+    monkeypatch.setenv("GNUPGHOME", str(gh))
+    (gh / "gpg.conf").unlink()   # a dangling link there is refused by 0.9.1's floor before any view
+    (gh / "gpg-agent.conf").write_text("")
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+    ops = _ops(argv)
+    view = max(i for i, op, a in ops if op == "--tmpfs" and a == [str(gh)])
+    for name in ("gpg-agent.conf", "common.conf"):
+        last = [(i, op) for i, op, a in ops if a and a[-1] == str(gh / name)]
+        assert last and last[-1][0] > view and last[-1][1] == "--ro-bind", (name, last)
+    # trustdb stays writable (RUN 2026-10-12: read-only, `gpg --list-keys` died on its trustdb check)
+    assert ["--bind", str(gh / "trustdb.gpg"), str(gh / "trustdb.gpg")] in [argv[k:k + 3] for k in range(len(argv))]
