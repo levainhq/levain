@@ -7,10 +7,12 @@ PROTOCOL.u2f's field order. stdlib + cryptography only.
 """
 import base64
 import hashlib
+import os
 import re
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -47,12 +49,35 @@ blobs = {
     "sk-ecdsa-sha2-nistp256@openssh.com": s(b"sk-ecdsa-sha2-nistp256@openssh.com") + s(b"nistp256")
     + s(ec_point(ec.SECP256R1(), "fp-sk-p256")) + s(b"ssh:"),
 }
+
+
+def keygen_rc_out(line: str) -> tuple[int, str]:
+    """``ssh-keygen -lf`` on a private copy of ``line``, so concurrent runs never read or unlink each other's file."""
+    with tempfile.TemporaryDirectory() as td:   # removed even on an interrupt
+        tmp = Path(td) / "key.pub"
+        tmp.write_text(line + "\n")
+        r = subprocess.run(["ssh-keygen", "-lf", str(tmp)], capture_output=True, text=True)
+    return r.returncode, r.stdout
+
+
+def publish(path: Path, text: str) -> None:
+    """Replace ``path`` atomically: a concurrent reader sees the old bytes or the new ones, never a truncated file."""
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, prefix=".", suffix=".partial", delete=False) as f:
+        f.write(text)
+    try:
+        os.replace(f.name, path)
+    finally:
+        if os.path.exists(f.name):
+            os.unlink(f.name)
+
+
 V = []
 for typ, blob in blobs.items():
     fname = typ.split("@")[0] + ".pub"
     line = f"{typ} {base64.b64encode(blob).decode()} golden-{typ.split('@')[0]}"
-    (HERE / fname).write_text(line + "\n")
-    out = subprocess.run(["ssh-keygen", "-lf", str(HERE / fname)], capture_output=True, text=True, check=True).stdout
+    rc, out = keygen_rc_out(line)
+    assert rc == 0, (typ, rc)
+    publish(HERE / fname, line + "\n")
     fp = re.search(r"(SHA256:[A-Za-z0-9+/]+)", out).group(1)
     assert fp == "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("="), (typ, out)
     V.append(vector(f"fingerprint-{typ.split('@')[0]}", "spec", "fingerprint", {"line": line, "file": fname},
@@ -60,10 +85,7 @@ for typ, blob in blobs.items():
 
 # declared type != the blob's embedded type
 mismatch = f"ssh-ed25519 {base64.b64encode(blobs['ecdsa-sha2-nistp256']).decode()} mismatch"
-tmp = HERE / "_mismatch.tmp"
-tmp.write_text(mismatch + "\n")
-rc = subprocess.run(["ssh-keygen", "-lf", str(tmp)], capture_output=True, text=True).returncode
-tmp.unlink()
+rc, _ = keygen_rc_out(mismatch)
 assert rc != 0, "ssh-keygen accepted a type-mismatched line"
 V.append(vector("declared-type-differs-from-blob-refused", "spec", "fingerprint", {"line": mismatch},
                 {"verdict": REFUSE},

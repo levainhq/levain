@@ -50,3 +50,26 @@ def test_the_check_catches_a_levain_import(tmp_path):
     bad = ast.parse("import json\nfrom levain.contracts import canon\nx = __import__('levain')\n")
     found = [m for m, _ in _imports(bad)]
     assert "levain.contracts" in found and "levain" in found
+
+
+def test_concurrent_fingerprint_generators_share_no_temp_file():
+    """Two runs of fingerprint/gen.py at once must not unlink each other's ssh-keygen input (S1-a L3 r1, S8)."""
+    import shutil
+    import subprocess
+    gen = GOLDEN / "frozen" / "fingerprint" / "gen.py"
+    if shutil.which("ssh-keygen") is None:
+        pytest.skip("no ssh-keygen")
+    sys.path.insert(0, str(GOLDEN))
+    try:
+        from _genlib import UPSTREAM
+    finally:
+        sys.path.remove(str(GOLDEN))
+    ssh_v = subprocess.run(["ssh", "-V"], capture_output=True, text=True).stderr.strip().split(",")[0]
+    if ssh_v != UPSTREAM["ssh-keygen"][1]:
+        pytest.skip(f"the generator refuses to run under {ssh_v}")
+    before = sorted(p.name for p in gen.parent.iterdir())
+    procs = [subprocess.Popen([sys.executable, str(gen)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+             for _ in range(6)]
+    errs = [p.communicate(timeout=120)[1] for p in procs]
+    assert all(p.returncode == 0 for p in procs), [e for e in errs if e]
+    assert sorted(p.name for p in gen.parent.iterdir()) == before
