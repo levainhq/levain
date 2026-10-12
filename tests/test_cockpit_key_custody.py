@@ -506,12 +506,13 @@ def test_a_sidecar_naming_an_unknown_provider_is_refused(tmp_path):
 
 
 def test_declared_touch_id_rechecks_the_ctk_identity_on_this_mac(tmp_path, monkeypatch, provider_present):
+    """complement LOW-3 (L3 r1): ``platform`` reaches ctk_status, so the re-check runs (against the fakes)
+    on any host; the host here is made to say linux, as CI's does."""
     mac = Mac(tmp_path, monkeypatch)
     made = mac.create(tmp_path / "keys")
+    monkeypatch.setattr(custody.sys, "platform", "linux")
     assert custody.declared_custody(made.path, None, "laptop-presence", made.public_key, sc_auth=mac.sc_auth,
                                     platform="darwin") == "touch-id"
-    if sys.platform != "darwin":
-        return                                    # ctk_status reads the real platform
     db = mac.load()
     db["identities"][-1]["prot"] = "none"
     mac.db = db

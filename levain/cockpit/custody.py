@@ -310,12 +310,12 @@ def _delete_identity(digest: str, sc_auth: Path | str) -> str | None:
     return None
 
 
-def ctk_status(public_key: str, *, sc_auth: Path | str = SC_AUTH,
-               identities: list[Identity] | None = None) -> tuple[bool | None, str]:
+def ctk_status(public_key: str, *, sc_auth: Path | str = SC_AUTH, identities: list[Identity] | None = None,
+               platform: str | None = None) -> tuple[bool | None, str]:
     """A touch-id key's CTK identity on THIS Mac: ``(True, ...)`` present with protection ``bio``,
     ``(False, ...)`` present with any other protection, ``(None, ...)`` not on this Mac (or not a Mac),
     where only the recorded custody can be shown."""
-    if sys.platform != "darwin":
+    if (platform or sys.platform) != "darwin":
         return None, "not a Mac: custody as recorded"
     digest = point_sha1(public_key)
     if digest is None:
@@ -343,7 +343,7 @@ def custody_note(rows: Any, *, sc_auth: Path | str = SC_AUTH, platform: str | No
         return {r.fingerprint: f"CTK identity not re-checked ({exc})" for r in touch}
     out = {}
     for r in touch:
-        ok, why = ctk_status(r.public_key, identities=identities)
+        ok, why = ctk_status(r.public_key, identities=identities, platform=platform)
         out[r.fingerprint] = ("WARNING: " if ok is False else "") + why
     return out
 
@@ -382,7 +382,7 @@ def declared_custody(key_file: Path, given: str | None, key_class: str, public_k
         if problem is not None:
             raise KeyError_(problem)
     if custody == TOUCH_ID and (platform or sys.platform) == "darwin" and Path(sc_auth).exists():
-        ok, why = ctk_status(normal, sc_auth=sc_auth)
+        ok, why = ctk_status(normal, sc_auth=sc_auth, platform=platform)
         if ok is False or (ok is None and sidecar is not None):
             raise KeyError_(f"touch-id custody refused: {why}")
     return custody
