@@ -581,7 +581,7 @@ def create_touch_id(key_dir: Path | None = None, label: str | None = None, *,
 
 def _fetch_references(tmp: Path, *, ssh_keygen: Path | str, provider: str) -> list[tuple[Path, str]]:
     """Every reference key ``ssh-keygen -K -w <provider>`` downloads, as ``(file, normal public key)``, each
-    key once. Every ``*_sk_rk.pub`` a run leaves is kept (an ed25519 resident key lands in ``id_ed25519_sk_rk``
+    key once. Every ``*_sk_rk.pub`` a run leaves (``*_sk_rk*.pub``, an application suffix included) is kept (an ed25519 resident key lands in ``id_ed25519_sk_rk``
     beside the ecdsa one); the caller's public-key match picks, and refuses on none or several.
 
     ``-K`` names each file ``id_ecdsa_sk_rk`` and asks ``Overwrite (y/n)?`` (on stdin) before the second;
@@ -600,7 +600,7 @@ def _fetch_references(tmp: Path, *, ssh_keygen: Path | str, provider: str) -> li
                                 start_new_session=True, env=dict(_VERIFY_ENV))
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise KeyError_(f"ssh-keygen -K could not run ({type(exc).__name__})") from None
-        pubs = sorted(sub.glob("*_sk_rk.pub"))
+        pubs = sorted(sub.glob("*_sk_rk*.pub"))  # a non-ssh: application adds a suffix: id_*_sk_rk_<app>.pub
         said = (cp.stdout + cp.stderr).decode("utf-8", "replace")
         if not pubs:
             if k:
