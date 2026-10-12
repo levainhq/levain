@@ -557,6 +557,9 @@ def _capture_sign(monkeypatch) -> list[dict]:
         seen.append(kw.get("env") or {})
         return subprocess.CompletedProcess(argv, 0, b"-----BEGIN SSH SIGNATURE-----\n", b"")
     monkeypatch.setattr(keys_mod.subprocess, "run", run)
+    # these tests read the env sign hands ssh-keygen; the fake's output is no signature, so the
+    # signing-time self-check (tested on its own below) is stubbed here
+    monkeypatch.setattr(keys_mod._authority, "verify_link_sig", lambda *a, **kw: True)
     return seen
 
 
@@ -591,6 +594,60 @@ def test_ssh_signer_signs_a_passphrase_key_from_the_file_with_no_agent(tmp_path,
     plain_sign(b"m")
     assert "SSH_AUTH_SOCK" not in seen[0] and "SSH_SK_PROVIDER" not in seen[0]
     assert seen[1]["SSH_AUTH_SOCK"] == "/tmp/agent.sock"            # an unencrypted key may be agent-held
+
+
+# --- ssh_signer: a signature the key did not make (a cancelled Touch ID prompt) --------------------------
+# Measured 2026-10-12 on Phill's Mac (desk-driven run, rev 6 presence): cancelling the Touch ID prompt let
+# `ssh-keygen -Y sign` exit 0 with output that is not a signature by the key, and the refusal surfaced only
+# at the log's replay as "the signature does not verify". Phill ruled the wording a fix. The fake below
+# makes a REAL SSHSIG with a different key, so the verifier is the real one.
+
+
+def _signs_with(monkeypatch, other: RealKey) -> None:
+    import levain.cockpit.keys as keys_mod
+    real_run = subprocess.run
+
+    def run(argv, **kw):
+        argv = list(argv)
+        if "-Y" in argv and argv[argv.index("-Y") + 1] == "sign":
+            argv[argv.index("-f") + 1] = str(other.path)
+            kw["env"] = {k: v for k, v in (kw.get("env") or {}).items() if k != "SSH_SK_PROVIDER"}
+        return real_run(argv, **kw)
+    monkeypatch.setattr(keys_mod.subprocess, "run", run)
+
+
+def test_a_touch_id_signature_the_key_did_not_make_reads_as_no_presence_not_a_bad_signature(tmp_path, monkeypatch):
+    import levain.cockpit.keys as keys_mod
+    k, other = RealKey(tmp_path, "k"), RealKey(tmp_path, "other")
+    (tmp_path / "k.levain-key.json").write_text(json.dumps({
+        "format": "levain-key/1", "custody": "touch-id", "provider": "/usr/lib/ssh-keychain.dylib",
+        "ctk_hash": "A" * 40}))
+    _, sign = keys_mod.ssh_signer(k.path)
+    _signs_with(monkeypatch, other)
+    with pytest.raises(KeyError_) as err:
+        sign(b"m")
+    msg = str(err.value)
+    assert "Touch ID" in msg and "cancelled" in msg and k.fingerprint in msg
+    assert "does not verify" not in msg
+
+
+def test_any_key_whose_signature_is_not_its_own_is_refused_at_signing(tmp_path, monkeypatch):
+    import levain.cockpit.keys as keys_mod
+    k, other = RealKey(tmp_path, "k"), RealKey(tmp_path, "other")
+    _, sign = keys_mod.ssh_signer(k.path)
+    _signs_with(monkeypatch, other)
+    with pytest.raises(KeyError_) as err:
+        sign(b"m")
+    assert "no valid signature" in str(err.value) and "Touch ID" not in str(err.value)
+
+
+def test_a_good_signature_still_passes_the_signing_time_check(tmp_path):
+    import levain.cockpit.keys as keys_mod
+    from levain.authority import verify_link_sig
+    k = RealKey(tmp_path, "k")
+    fp, sign = keys_mod.ssh_signer(k.path)
+    sig = sign(b"m")
+    assert verify_link_sig(b"m", sig, public_key=k.public, fingerprint=fp)
 
 
 # --- the CLI ---------------------------------------------------------------------------------------------
