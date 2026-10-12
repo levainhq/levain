@@ -447,7 +447,7 @@ class TestRowVersions:
 
     def _specs(self, env) -> dict[str, ProviderSpec]:
         _r, _s, ck = env
-        return {pid: ck._specs[pid] for pid in ck.panel_ids if ck._specs[pid].kind == "triage-list"}
+        return {pid: ck._specs[pid] for pid in ck.panel_ids if ck._specs[pid].kind == "list"}
 
     def test_each_declared_field_changes_the_version_and_each_excluded_one_does_not(self, env) -> None:
         _r, _s, ck = env

@@ -95,7 +95,7 @@ def test_the_manifest_names_the_transport_from_the_substrate_views_flags(tmp_pat
         sub = _get(f"{url}/substrate.json", token="T")
     assert man["transport"] == {"writable": sub["writable"], "write_token_required": sub["write_token_required"]}
     assert man["transport"] == {"writable": True, "write_token_required": True}
-    assert man["schema"] == "levain.cockpit/1"
+    assert man["schema"] == "levain.cockpit/2"
 
     root, _src, _ids = _install(tmp_path / "r")
     ro = dataclasses.replace(SubstrateSource.local(root), write_scope=None)

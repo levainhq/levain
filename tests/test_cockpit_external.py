@@ -84,7 +84,7 @@ def test_lines_become_rows_in_the_source_order_with_meta_and_emphasis() -> None:
     p = snapshot(ck)["panels"]["ext:tray"]
     assert [(r["facets"].get("legacy_meta"), r["emphasis"]) for r in p["rows"]] == [
         ("spore-9", "accent"), (None, "dim"), ("m", "none")]
-    assert p["order"] == "legacy.source" and p["kind"] == "triage-list"
+    assert p["order"] == "legacy.source" and p["kind"] == "list"
 
 
 def test_a_live_title_clause_moves_to_the_note_and_a_bare_count_is_left_to_the_kernel() -> None:

@@ -35,6 +35,7 @@ import json
 import re
 import threading
 import time
+import unicodedata
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
@@ -56,9 +57,26 @@ from levain.cockpit.registry import (
 from levain.cockpit.authority import NO_LABELS, LabelKey, LabelSnapshot, RequestAuthority, current, unavailable
 from levain.cockpit.results import Absent, Fault, Read, Result, RowIn
 
-SCHEMA = "levain.cockpit/1"
+SCHEMA = "levain.cockpit/2"
 ENTITY_TIMEOUT_S = 10.0
-KINDS = ("triage-list", "line", "metric", "visual", "prose")
+# The eleven kinds of the kernel's vocabulary (docs/cockpit-contract.md). A provider written against
+# levain.cockpit/1 declares an ALIAS; it is normalised to the new kind when the spec is built, so the
+# manifest only ever carries the new names.
+KINDS = ("reading", "line", "brief", "count-queue", "ambient", "status-dots", "metric-grid", "roster", "list",
+         "form", "log")
+ALIASES = {"triage-list": "list", "metric": "status-dots", "visual": "ambient", "prose": "brief"}
+# row-shaped kinds (the searchable property); list and count-queue ride the RowIn engine, roster and log
+# carry their rows inside the value
+ROW_ENGINE_KINDS = ("list", "count-queue")
+VALUE_ROW_KINDS = ("roster", "log")
+ROW_KINDS = ROW_ENGINE_KINDS + VALUE_ROW_KINDS
+VERSIONED_VALUE_KINDS = ("line", "brief")     # a value write binds to the value's version (§4.4)
+SEARCH_THRESHOLD = 8      # a row-shaped panel with MORE rows than this (or a windowed one) gets the box
+SEARCH_Q_MAX = 200        # a search query is plain text of at most this many characters
+SEARCH_LIMIT_MAX = 200    # the most rows a store search returns
+SEARCH_LIMIT_DEFAULT = 50
+SCOPES = ("rows", "store")
+FORM_FIELD_TYPES = ("text", "recipient", "date")
 PRIORITIES = ("gate", "gauge", "feed")
 ZONES = (("operate", "Operate"), ("mind", "Mind"), ("identity", "Identity"))
 HEADER = "header"
@@ -151,6 +169,20 @@ class ProviderSpec:
     # K2b-3b: what a row's (or a line/prose value's) label is computed over, from its stored record (a
     # value's: the value as read, ``provenance`` and ``value_version`` aside). None: provenance stays null.
     label_key: Callable[[dict[str, Any]], LabelKey | None] | None = None
+    # Searchable (contract v2): ``search_fields`` (above) names WHAT is matched; ``search_scope`` says
+    # whether the panel holds the whole set ("rows") or is a window of a larger store ("store").
+    # ``window`` is the newest-N a windowed panel delivers; ``search(q, limit)`` is the provider's hook
+    # over the whole store (a scope-"store" panel only).
+    search_scope: str = "rows"
+    window: int | None = None
+    search: Callable[[str, int], Any] | None = None
+    # the levain.cockpit/1 name this spec was declared with, when it declared an alias (set below)
+    legacy_kind: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind in ALIASES:
+            self.legacy_kind = self.kind
+            self.kind = ALIASES[self.kind]
 
 
 def _label_note(note: str | None, labels: "LabelSnapshot | None") -> str | None:
@@ -394,8 +426,8 @@ class Cockpit:
         §0.4): read and normalised under its own spec (facets, versions, ``read_one``, Fault), then
         grouped under ``decision.queue`` with the broker's rows. Refused while a downstream's own
         ``register(ProviderSpec("decisions", ...))`` holds the id."""
-        if spec.kind != "triage-list" or not spec.version_fields:
-            raise CockpitRegistrationError("a decision source is a triage-list declaring version_fields")
+        if spec.kind != "list" or not spec.version_fields:
+            raise CockpitRegistrationError("a decision source is a list declaring version_fields")
         for f in spec.facets:
             if f not in FACETS:
                 raise CockpitRegistrationError(f"decision source: unregistered facet {f!r}")
@@ -552,11 +584,11 @@ class Cockpit:
         for f in spec.facets:
             if f not in FACETS:
                 raise CockpitRegistrationError(f"{sid}: unregistered facet {f!r}")
-        if spec.kind == "triage-list":
+        if spec.kind in ROW_ENGINE_KINDS:
             if spec.order is None or spec.order not in ORDERINGS:
-                raise CockpitRegistrationError(f"{sid}: a triage-list names a registered ordering, got {spec.order!r}")
+                raise CockpitRegistrationError(f"{sid}: a {spec.kind} names a registered ordering, got {spec.order!r}")
             if not spec.version_fields:
-                raise CockpitRegistrationError(f"{sid}: a triage-list declares version_fields")
+                raise CockpitRegistrationError(f"{sid}: a {spec.kind} declares version_fields")
             seen_views: set[str] = set()
             for v in spec.views:
                 if not (isinstance(v, tuple) and len(v) == 3 and all(isinstance(x, str) for x in v)):
@@ -569,7 +601,8 @@ class Cockpit:
                     raise CockpitRegistrationError(f"{sid}: view {vid!r} names a registered ungrouped ordering")
                 seen_views.add(vid)
         elif spec.order is not None or spec.views:
-            raise CockpitRegistrationError(f"{sid}: only a triage-list has an ordering or views")
+            raise CockpitRegistrationError(f"{sid}: only a list or count-queue has an ordering or views")
+        _validate_search_decl(spec)
         if spec.rowset is not None:
             owner = self._rowsets.get(spec.rowset)
             if owner is not None:
@@ -913,7 +946,7 @@ class Cockpit:
         our own types, so it cannot be held by a provider."""
         with st.mu:
             now_iso = _iso(ctx.now)
-            listy = spec.kind == "triage-list"
+            listy = spec.kind in ROW_ENGINE_KINDS
             if isinstance(out, _Snap):
                 st.ever_present = True
                 st.last_good_as_of = out.as_of
@@ -921,7 +954,7 @@ class Cockpit:
                 return out
             if isinstance(out, Absent):
                 # a value with no stored record binds its first write to VALUE_ABSENT (§4.4)
-                vv = VALUE_ABSENT if spec.kind in ("line", "prose") else None
+                vv = VALUE_ABSENT if spec.kind in VERSIONED_VALUE_KINDS else None
                 if spec.optional and not st.ever_present:
                     return _Snap("ok", [] if listy else None, None, [], [], now_iso, None,
                                  f"not configured: {out.reason}", value_version=vv)
@@ -945,9 +978,9 @@ class Cockpit:
         as_of = res.as_of or now_iso
         filtered = [{"count": c, "reason": r} for c, r in res.filtered if c]
         skipped = [{"count": c, "reason": r} for c, r in res.skipped if c]
-        if spec.kind == "triage-list":
+        if spec.kind in ROW_ENGINE_KINDS:
             if res.rows is None:
-                raise ValueError("a triage-list Read carries rows")
+                raise ValueError(f"a {spec.kind} Read carries rows")
             rows, refused = self._rows(spec, list(res.rows), ctx)
             if refused:
                 skipped.append({"count": refused, "reason": "row refused: a facet value of the wrong type"})
@@ -972,7 +1005,7 @@ class Cockpit:
         return _Snap(status, rows, value, filtered, skipped, as_of, None,
                      res.note if isinstance(res.note, str) else spec.note, res.stale,
                      res.empty if isinstance(res.empty, str) else None,
-                     value["value_version"] if spec.kind in ("line", "prose") else None, view_order,
+                     value["value_version"] if spec.kind in VERSIONED_VALUE_KINDS else None, view_order,
                      label_keys, value_key)
 
     @staticmethod
@@ -1007,32 +1040,27 @@ class Cockpit:
 
     @staticmethod
     def _value_empty(kind: str, value: Any) -> bool:
-        key = {"line": "lines", "metric": "metrics"}.get(kind)
+        key = {"line": "lines", "status-dots": "metrics", "metric-grid": "numbers", "roster": "rows",
+               "log": "rows", "ambient": "events"}.get(kind)
+        if key == "events" and "visual" in value:
+            return False           # a levain.cockpit/1 visual: its own data is the content
         return bool(key) and not value.get(key)
 
     @staticmethod
     def _value(spec: ProviderSpec, v: Any, version_of: Any = None) -> Any:
-        if not isinstance(v, dict):
-            raise ValueError(f"{spec.kind} value must be an object")
-        need = {"line": "lines", "metric": "metrics", "prose": "markdown", "visual": "visual"}[spec.kind]
-        if need not in v:
-            raise ValueError(f"{spec.kind} value lacks {need!r}")
-        if spec.kind == "prose":
-            v = {**v, "provenance": v.get("provenance")}   # Prose.provenance (rev 9, §3.2.2); null until K2b
-        if spec.kind in ("line", "prose"):
+        """The value contract of a value kind (docs/cockpit-contract.md). A provider BUG (the wrong
+        shape) raises ValueError naming the panel and the field, which the read turns into a Fault."""
+        check = VALUE_VALIDATORS.get(spec.kind)
+        if check is None:
+            raise ValueError(f"panel {spec.id!r}: {spec.kind} is not a value kind")
+        v = check(spec, v)
+        if spec.kind in VERSIONED_VALUE_KINDS:
             # the version a value write binds to (§4.4): a hash of the stored value as read, never of
             # provenance (a render-time label) or of itself
             stored = {k: x for k, x in v.items() if k not in ("provenance", "value_version")}
+            if spec.kind == "brief":
+                v = {**v, "provenance": v.get("provenance")}   # Brief.provenance (rev 9, §3.2.2); null until K2b
             v = {**v, "value_version": _sha(stored)[:16] if version_of is None else value_version_of(version_of)}
-        if spec.kind == "visual":
-            if v["visual"] not in VISUALS:
-                raise ValueError(f"unknown visual {v['visual']!r}")
-            if not isinstance(v.get("text"), list):
-                raise ValueError("a visual always ships a text projection")
-        if spec.kind == "metric":
-            for m in v["metrics"]:
-                if m.get("status", "unknown") not in ("ok", "warn", "bad", "unknown"):
-                    raise ValueError(f"metric status {m.get('status')!r}")
         return v
 
     def _rows(self, spec: ProviderSpec, rows_in: list[RowIn], ctx: ReadContext) -> tuple[list[dict[str, Any]], int]:
@@ -1111,7 +1139,7 @@ class Cockpit:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
-        return _sha({"status": snap.status, "rows": snap.rows, "value": snap.value,
+        return _sha({"schema": SCHEMA, "status": snap.status, "rows": snap.rows, "value": snap.value,
                      "filtered": snap.filtered, "skipped": snap.skipped, "error": snap.error,
                      "note": snap.note, "empty": snap.empty, "groups": groups, "credential": cred, "date": today.isoformat(),
                      "verbs": self._verb_rev(),
@@ -1125,13 +1153,18 @@ class Cockpit:
 
     def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date,
               labels: LabelSnapshot = NO_LABELS) -> dict[str, Any]:
-        listy = spec.kind == "triage-list"
+        listy = spec.kind in ROW_ENGINE_KINDS
         # only a panel whose rows (or value) carry labels renders the snapshot
         labelled = labels if spec.label_key is not None else None
         note = _label_note(snap.note, labelled)
         # an ordering's uncounted groups (K2b-3b §3) are carried, never counted
+        vrows = spec.kind in VALUE_ROW_KINDS
         count = (len(counted_rows(spec.order, snap.rows)) if (listy and snap.rows is not None)
                  else (0 if listy and snap.status != "error" else None))
+        if vrows and snap.value is not None:
+            count = len(snap.value["rows"])
+        elif vrows and snap.status != "error":
+            count = 0
         groups = None
         if listy and spec.order and ORDERINGS[spec.order].groups:
             tally: dict[str, int] = {}
@@ -1157,12 +1190,25 @@ class Cockpit:
             "error": snap.error, "note": note, "empty": spec.empty if snap.empty is None else snap.empty,
             "order": spec.order, "groups": groups,
             "views": [{"id": i, "title": t, "order": o} for i, t, o in spec.views] or None,
-            "search": ({"fields": list(spec.search_fields), "default_visible": spec.search_default_visible}
-                       if spec.search_fields else None),
+            **self._search_head(spec, count),
             "actions": (self._verb_view.panel_actions(spec.id, cred, today, snap.value_version,
                                                       labels.label(snap.value_label_key))
                         if self._verb_view is not None else []),
             "edit_class": spec.edit_class or None,
+        }
+
+    @staticmethod
+    def _search_head(spec: ProviderSpec, count: int | None) -> dict[str, Any]:
+        """The searchable property (contract v2): the kernel marks a row-shaped panel ``searchable`` when
+        it holds more rows than SEARCH_THRESHOLD or is windowed. A contributor declares WHAT is searched
+        (``search.fields``, ``scope``), never WHETHER."""
+        if spec.kind not in ROW_KINDS:
+            return {"search": None, "searchable": False, "window": None}
+        searchable = spec.window is not None or (count or 0) > SEARCH_THRESHOLD
+        return {
+            "search": {"fields": list(search_fields_of(spec)), "scope": spec.search_scope,
+                       "default_visible": spec.search_default_visible, "hook": spec.search is not None},
+            "searchable": searchable, "window": spec.window,
         }
 
     def _now_head_and_rows(
@@ -1173,7 +1219,7 @@ class Cockpit:
         rank order, each panel's rows in that panel's own order. No ordering, provider or actions of
         its own; every row keeps its source ``panel_id``. Its status is the worst of its sources'."""
         sources = sorted(
-            (s for s in specs_map.values() if s.priority == "gate" and s.kind == "triage-list"),
+            (s for s in specs_map.values() if s.priority == "gate" and s.kind in ROW_ENGINE_KINDS),
             key=lambda s: (0 if s.region == HEADER else 1 + [z for z, _ in ZONES].index(s.region), s.rank, s.id),
         )
         rows: list[dict[str, Any]] = []
@@ -1207,14 +1253,16 @@ class Cockpit:
         snap = _Snap(worst, rows, None, [], [], min(as_ofs) if as_ofs else None, err,
                      "; ".join(lines))
         head = {
-            "id": NOW_ID, "kind": "triage-list", "title": f"Now ({len(rows)})" if worst != "error" else "Now (unavailable)",
+            "id": NOW_ID, "kind": "list", "title": f"Now ({len(rows)})" if worst != "error" else "Now (unavailable)",
             "priority": "gate", "rank": -100, "status": worst, "count": len(rows) if worst != "error" else None,
             "actionable_count": len(rows) if worst != "error" else None,
             "filtered": [], "skipped": [], "as_of": snap.as_of, "stale_after_s": 0, "refresh_every_s": None,
             "etag": self._etag_of(snap, None, cred, ctx.today), "error": err,
             # the Now view applies the snapshot to its rows, so it explains a degraded one as _head does
             "note": _label_note(snap.note, labels if labelled else None),
-            "empty": "Nothing needs you now.", "order": None, "groups": None, "search": None,
+            "empty": "Nothing needs you now.", "order": None, "groups": None,
+            "search": {"fields": list(ROW_SEARCH_DEFAULT["list"]), "scope": "rows", "default_visible": 10, "hook": False},
+            "searchable": len(rows) > SEARCH_THRESHOLD, "window": None,
             "actions": [], "degraded": degraded, "edit_class": None,
         }
         # the union of the source panels' declared groups (labels and order), counted over the now
@@ -1363,7 +1411,7 @@ class Cockpit:
             ],
         }
         order = [NOW_ID] + [s.id for s in specs]
-        etag = _sha({"panels": [heads[i]["etag"] for i in order], "credential": credential, "verbs": self._verb_rev(),
+        etag = _sha({"schema": SCHEMA, "panels": [heads[i]["etag"] for i in order], "credential": credential, "verbs": self._verb_rev(),
                      "install_class": install_class, "policy_revision": POLICY_REVISION,
                      "entity": entity, "errors": errors,    # identity and manifest faults are content too
                      "transport": transport})
@@ -1411,17 +1459,20 @@ class Cockpit:
                     (ctx.now - _parse_iso(as_of)) > timedelta(seconds=spec.stale_after_s):
                 status = "stale"
             out[spec.id] = {"as_of": as_of, "status": status}
-        gate = [out[s.id] for s in specs_map.values() if s.priority == "gate" and s.kind == "triage-list"]
+        gate = [out[s.id] for s in specs_map.values() if s.priority == "gate" and s.kind in ROW_ENGINE_KINDS]
         order = ("error", "unread", "stale", "partial")
         status = next((o for o in order if any(g["status"] == o for g in gate)), "ok")
         as_ofs = [g["as_of"] for g in gate if g["as_of"]]
         return {NOW_ID: {"as_of": min(as_ofs) if as_ofs and status != "unread" else None, "status": status}, **out}
 
     def panel(self, panel_id: str, *, profile: str = "full", q: str | None = None,
-              row: str | None = None, credential_class: str = "none") -> dict[str, Any] | None:
+              row: str | None = None, credential_class: str = "none",
+              limit: int | None = None) -> dict[str, Any] | None:
         """The ``Panel`` payload, or None for an unknown panel id. ``profile`` is ``full`` or
-        ``compact``; ``q`` is the server-side search over row bodies; ``row`` returns one row in
-        full."""
+        ``compact``; ``q`` is the search (plain text, bounded: ``check_query``) over the panel's declared
+        search fields, answered by the provider's ``search`` hook when the panel is a store-scope window;
+        ``limit`` caps a store search; ``row`` returns one row in full. ``q`` is never logged or journalled."""
+        q, limit = check_query(q, limit)
         auth = self.authority()
         ctx = ReadContext(auth.now, authority=auth)
         specs_map = self._specs
@@ -1443,13 +1494,13 @@ class Cockpit:
             snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
             if snap_rows is not None:
                 snap_rows = self._with_provenance(snap_rows, snap.label_keys, auth.labels)
-            if spec.label_key is not None and spec.kind in ("line", "prose") and isinstance(value, dict):
+            if spec.label_key is not None and spec.kind in VERSIONED_VALUE_KINDS and isinstance(value, dict):
                 value = {**value, "provenance": auth.labels.provenance(snap.value_label_key)}
         out: dict[str, Any] = dict(head)
         out["rows"], out["value"], out["next"] = None, None, None
         if head["status"] == "error" and panel_id != NOW_ID:
             return out    # an error never carries rows or a value: nothing stale passes as a read
-        if head["kind"] == "triage-list":
+        if head["kind"] in ROW_ENGINE_KINDS:
             rows_all = snap_rows or []
             if row is not None:
                 hit = [r for r in rows_all if r["id"] == row]
@@ -1459,11 +1510,32 @@ class Cockpit:
                 return out
             matched = None
             if q and spec is not None:   # the now view declares no search
-                fields = spec.search_fields
-                needle = q.casefold()
-                keep = [r for r in rows_all if any(needle in _field_text(r, f).casefold() for f in fields)]
-                matched = len(keep)
-                rows_all = keep
+                fields = search_fields_of(spec)
+                held = len(rows_all)
+                if spec.search_scope == "store" and spec.search is not None:
+                    got, total, err = self._store_search(spec, q, limit)
+                    if err is not None:
+                        out["search_error"] = err
+                        rows_all, matched = [], None
+                    else:
+                        try:
+                            ins = [x for x in got]
+                            for x in ins:
+                                if not isinstance(x, RowIn):
+                                    raise TypeError(f"a {spec.kind} search hook returns RowIn rows, got {type(x).__name__}")
+                            rows_all, _refused = self._rows(spec, ins, ctx)
+                            rows_all = self._with_provenance(rows_all, None, auth.labels)
+                            matched = total if total is not None else len(rows_all)
+                            out["match_label"] = f"{matched} matches in the store"
+                        except Exception as exc:  # noqa: BLE001 - a hook's bad rows are a search fault, not a crash
+                            out["search_error"] = f"search hook returned unusable rows: {_safe_str(exc)}"
+                            rows_all, matched = [], None
+                else:
+                    keep = [r for r in rows_all if _terms_match([_field_text(r, f) for f in fields], q)]
+                    matched = len(keep)
+                    rows_all = keep
+                    out["match_label"] = (f"searches the newest {spec.window} only: {matched} of {held}"
+                                          if spec.window is not None else f"{matched} of {held}")
             if profile == "compact" and panel_id == NOW_ID:
                 # The now view repeats rows its source gate panels already send whole in this same
                 # profile, so it sends each one's identity and placement and nothing else; the
@@ -1487,15 +1559,85 @@ class Cockpit:
             if out["rows"] is not None and not out.get("rows_by_ref"):
                 out["rows"] = self._with_actions(out["rows"], panel_id, credential_class, ctx.today)
         else:
+            if head["kind"] in VALUE_ROW_KINDS and isinstance(value, dict):
+                if q and spec is not None:
+                    value = self._search_value_rows(spec, value, q, limit, out)
+                if head["kind"] == "log":
+                    value = self._log_sentences(value, credential_class)
             if profile == "compact":
                 out["value"] = _compact_value(head["kind"], value)
-                if head["priority"] == "feed" or head["kind"] in ("visual", "prose"):
+                if head["priority"] == "feed" or head["kind"] in ("ambient", "brief"):
                     out["next"] = f"/cockpit/panel/{panel_id}.json?profile=full"
-                if head["priority"] == "feed" and head["kind"] in ("line", "metric"):
+                if head["priority"] == "feed" and head["kind"] in ("line", "status-dots"):
                     out["value"] = None
             else:
                 out["value"] = value
         return out
+
+    @staticmethod
+    def _store_search(spec: ProviderSpec, q: str, limit: int) -> tuple[list[Any], int | None, str | None]:
+        """Run the provider's ``search(q, limit)`` hook, bounded by the panel's own timeout. Returns
+        ``(rows, total, error)``: a hook that fails or overruns is an ERROR the caller reports, never an
+        empty answer that reads as "nothing matches"."""
+        fut: Future = Future()
+
+        def run() -> None:
+            try:
+                _set_once(fut, spec.search(q, limit))    # type: ignore[misc]
+            except BaseException as exc:  # noqa: BLE001
+                if not fut.done():
+                    fut.set_exception(exc)
+
+        threading.Thread(target=run, daemon=True, name=f"cockpit-search-{spec.id}").start()
+        try:
+            res = fut.result(timeout=spec.timeout_s)
+        except FutureTimeout:
+            return [], None, f"search timed out after {spec.timeout_s:g}s"
+        except Exception as exc:  # noqa: BLE001
+            return [], None, f"search failed: {_safe_str(exc)}"
+        total = None
+        if isinstance(res, StoreMatches):
+            res, total = res.rows, res.total
+        try:
+            res = list(res)[:limit]
+        except TypeError:
+            return [], None, "search hook must return a sequence of rows"
+        return res, total, None
+
+    def _search_value_rows(self, spec: ProviderSpec, value: dict[str, Any], q: str, limit: int,
+                           out: dict[str, Any]) -> dict[str, Any]:
+        """``q`` over a roster or log panel's rows: the delivered rows filtered by the declared fields, or
+        (scope store with a hook) the whole store's answer, validated by the kind's own contract."""
+        rows = value["rows"]
+        fields = search_fields_of(spec)
+        if spec.search_scope == "store" and spec.search is not None:
+            got, total, err = self._store_search(spec, q, limit)
+            if err is not None:
+                out["search_error"] = err
+                return {**value, "rows": []}
+            try:
+                keep = VALUE_VALIDATORS[spec.kind](spec, {"rows": got})["rows"]
+            except ValueError as exc:
+                out["search_error"] = f"search hook returned unusable rows: {_safe_str(exc)}"
+                return {**value, "rows": []}
+            out["matched"] = total if total is not None else len(keep)
+            out["match_label"] = f"{out['matched']} matches in the store"
+            return {**value, "rows": keep}
+        keep = [r for r in rows if _terms_match([str(r.get(f) or "") for f in fields], q)]
+        out["matched"] = len(keep)
+        out["match_label"] = (f"searches the newest {spec.window} only: {len(keep)} of {len(rows)}"
+                              if spec.window is not None else f"{len(keep)} of {len(rows)}")
+        return {**value, "rows": keep}
+
+    def _log_sentences(self, value: dict[str, Any], cred: str) -> dict[str, Any]:
+        """One sentence per log row from the manifest's verb LABELS ("Snoozed · spore-1238"); a verb with
+        no label renders as its raw name."""
+        try:
+            labels = {n: v.get("label") for n, v in (self._verb_view.verbs_map(cred) if self._verb_view else {}).items()}
+        except Exception:  # noqa: BLE001 - a label lookup never fails a read
+            labels = {}
+        return {**value, "rows": [
+            {**r, "sentence": f"{labels.get(r['verb']) or r['verb']} \u00b7 {r['target']}"} for r in value["rows"]]}
 
     @staticmethod
     def _view_order(spec: ProviderSpec, rows: list[dict[str, Any]], today: date) -> dict[str, list[str]]:
@@ -1571,7 +1713,7 @@ class Cockpit:
         """``read_value_version``'s read, returning ``(value_version, label)`` in ``Read.value``: the
         value's label from ``authority``'s snapshot, or the request's bound one (K2b-3b §0.1)."""
         spec = self._specs.get(panel_id)
-        if spec is None or spec.kind not in ("line", "prose"):
+        if spec is None or spec.kind not in VERSIONED_VALUE_KINDS:
             return Fault(f"panel {panel_id!r} has no stored value")
         auth = authority or current() or self.authority()
         ctx = ReadContext(auth.now, authority=auth)
@@ -1648,17 +1790,334 @@ def _parse_iso(s: str) -> datetime:
 def _field_text(row: dict[str, Any], field_name: str) -> str:
     if field_name in ("title", "body", "id"):
         return str(row.get(field_name) or "")
-    v = row["facets"].get(field_name)
+    v = (row.get("facets") or {}).get(field_name)
     if isinstance(v, list):
         return " ".join(map(str, v))
     return "" if v is None else str(v)
 
 
+# --- the per-kind data contracts (docs/cockpit-contract.md) -----------------------------------------
+# One validator per value kind. Each takes the spec and the provider's value and returns the value to
+# store (normalised where the contract says so), or raises ValueError naming the panel and the field.
+
+
+def _bad(spec: "ProviderSpec", where: str, why: str) -> ValueError:
+    return ValueError(f"panel {spec.id!r} ({spec.kind}): {where} {why}")
+
+
+def _is_num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _is_str(x: Any) -> bool:
+    return isinstance(x, str)
+
+
+def _is_iso(x: Any) -> bool:
+    if not isinstance(x, str) or not x:
+        return False
+    try:
+        _parse_iso(x)
+    except ValueError:
+        return False
+    return True
+
+
+def _need_obj(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    if not isinstance(v, dict):
+        raise _bad(spec, "value", "must be an object")
+    return v
+
+
+def _need_list(spec: "ProviderSpec", v: dict[str, Any], key: str, *, of_objects: bool = True) -> list[Any]:
+    if key not in v:
+        raise _bad(spec, f"value.{key}", "is required")
+    items = v[key]
+    if not isinstance(items, list):
+        raise _bad(spec, f"value.{key}", "must be a list")
+    if of_objects:
+        for i, it in enumerate(items):
+            if not isinstance(it, dict):
+                raise _bad(spec, f"value.{key}[{i}]", "must be an object")
+    return items
+
+
+def _v_line(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    v = _need_obj(spec, v)
+    for i, ln in enumerate(_need_list(spec, v, "lines")):
+        if not _is_str(ln.get("text")):
+            raise _bad(spec, f"value.lines[{i}].text", "must be a string")
+        for k in ("label", "at"):
+            if ln.get(k) is not None and not _is_str(ln[k]):
+                raise _bad(spec, f"value.lines[{i}].{k}", "must be a string")
+    return v
+
+
+def _v_brief(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    v = _need_obj(spec, v)
+    if "markdown" not in v and "lines" not in v:
+        raise _bad(spec, "value", "needs 'markdown' (a string) or 'lines' (labelled lines)")
+    if "markdown" in v and not _is_str(v["markdown"]):
+        raise _bad(spec, "value.markdown", "must be a string")
+    if v.get("headline") is not None and not _is_str(v["headline"]):
+        raise _bad(spec, "value.headline", "must be a string")
+    if "lines" in v:
+        for i, ln in enumerate(_need_list(spec, v, "lines")):
+            if not _is_str(ln.get("text")):
+                raise _bad(spec, f"value.lines[{i}].text", "must be a string")
+            if ln.get("label") is not None and not _is_str(ln["label"]):
+                raise _bad(spec, f"value.lines[{i}].label", "must be a string")
+    return v
+
+
+def _v_reading(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    v = _need_obj(spec, v)
+    val = v.get("value")
+    if not (_is_num(val) or (_is_str(val) and val)):
+        raise _bad(spec, "value.value", "must be a number or a non-empty string")
+    for k in ("unit", "condition"):
+        if not _is_str(v.get(k)):
+            raise _bad(spec, f"value.{k}", "must be a string (empty when there is none)")
+    if not _is_iso(v.get("as_of")):
+        raise _bad(spec, "value.as_of", "must be an ISO-8601 timestamp")
+    for k in ("hi", "lo"):
+        if v.get(k) is not None and not _is_num(v[k]):
+            raise _bad(spec, f"value.{k}", "must be a number")
+    if v.get("sub") is not None:
+        for i, sr in enumerate(_need_list(spec, v, "sub")):
+            if not _is_str(sr.get("label")) or not sr["label"]:
+                raise _bad(spec, f"value.sub[{i}].label", "must be a non-empty string")
+            if not (_is_num(sr.get("value")) or _is_str(sr.get("value"))):
+                raise _bad(spec, f"value.sub[{i}].value", "must be a number or a string")
+            if sr.get("band") is not None and not _is_str(sr["band"]):
+                raise _bad(spec, f"value.sub[{i}].band", "must be a string")
+    return v
+
+
+def _v_status_dots(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    v = _need_obj(spec, v)
+    for i, m in enumerate(_need_list(spec, v, "metrics")):
+        if not _is_str(m.get("label")) or not m["label"]:
+            raise _bad(spec, f"value.metrics[{i}].label", "must be a non-empty string")
+        if m.get("status", "unknown") not in ("ok", "warn", "bad", "unknown"):
+            raise _bad(spec, f"value.metrics[{i}].status", f"must be ok|warn|bad|unknown, got {m.get('status')!r}")
+    if v.get("alerts") is not None:
+        for i, a in enumerate(_need_list(spec, v, "alerts")):
+            if not _is_str(a.get("message")):
+                raise _bad(spec, f"value.alerts[{i}].message", "must be a string")
+    return v
+
+
+def _v_metric_grid(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    v = _need_obj(spec, v)
+    for i, n in enumerate(_need_list(spec, v, "numbers")):
+        if not _is_str(n.get("label")) or not n["label"]:
+            raise _bad(spec, f"value.numbers[{i}].label", "must be a non-empty string")
+        if not _is_num(n.get("value")):
+            raise _bad(spec, f"value.numbers[{i}].value", "must be a number")
+        if n.get("unit") is not None and not _is_str(n["unit"]):
+            raise _bad(spec, f"value.numbers[{i}].unit", "must be a string")
+    return v
+
+
+EVENT_OUTCOMES = ("ok", "failed")
+
+
+def _v_ambient(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    v = _need_obj(spec, v)
+    if spec.legacy_kind == "visual":
+        # a levain.cockpit/1 `visual`: a named picture plus its text projection
+        if v.get("visual") not in VISUALS:
+            raise _bad(spec, "value.visual", f"unknown visual {v.get('visual')!r}")
+        if not isinstance(v.get("text"), list):
+            raise _bad(spec, "value.text", "a visual always ships a text projection")
+        return v
+    # the typed event stream; extra keys on an event (flow's `_ts`) are allowed and ignored
+    for i, e in enumerate(_need_list(spec, v, "events")):
+        for k in ("kind", "at", "repo", "agent", "outcome"):
+            if k not in e:
+                raise _bad(spec, f"value.events[{i}].{k}", "is required (repo and agent may be null)")
+        if not _is_str(e["kind"]) or not e["kind"]:
+            raise _bad(spec, f"value.events[{i}].kind", "must be a non-empty string")
+        if not _is_iso(e["at"]):
+            raise _bad(spec, f"value.events[{i}].at", "must be an ISO-8601 timestamp")
+        for k in ("repo", "agent"):
+            if e[k] is not None and not _is_str(e[k]):
+                raise _bad(spec, f"value.events[{i}].{k}", "must be a string or null")
+        if e["outcome"] not in EVENT_OUTCOMES:
+            raise _bad(spec, f"value.events[{i}].outcome", f"must be one of {list(EVENT_OUTCOMES)}, got {e['outcome']!r}")
+    if not _is_str(v.get("legend")) or not v["legend"].strip():
+        raise _bad(spec, "value.legend", "must be a non-empty string (one line saying what the encoding means)")
+    return v
+
+
+ROSTER_MEMORY = ("stateful", "stateless")
+ROSTER_CADENCE = ("resident", "on_call")
+ROSTER_LIFECYCLE = ("active", "retired")
+
+
+def _v_roster(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    v = _need_obj(spec, v)
+    rows = _need_list(spec, v, "rows")
+    seen: set[str] = set()
+    for i, r in enumerate(rows):
+        w = f"value.rows[{i}]"
+        if not _is_str(r.get("name")) or not r["name"]:
+            raise _bad(spec, f"{w}.name", "must be a non-empty string")
+        if r["name"] in seen:
+            raise _bad(spec, f"{w}.name", f"{r['name']!r} is repeated")
+        seen.add(r["name"])
+        if r.get("memory") not in ROSTER_MEMORY:
+            raise _bad(spec, f"{w}.memory", f"must be one of {list(ROSTER_MEMORY)}, got {r.get('memory')!r}")
+        if r.get("cadence") not in ROSTER_CADENCE:
+            raise _bad(spec, f"{w}.cadence", f"must be one of {list(ROSTER_CADENCE)}, got {r.get('cadence')!r}")
+        if r.get("lifecycle") not in ROSTER_LIFECYCLE:
+            raise _bad(spec, f"{w}.lifecycle", f"must be one of {list(ROSTER_LIFECYCLE)}, got {r.get('lifecycle')!r}")
+        for k in ("role", "group", "wrap_every"):
+            if r.get(k) is not None and not _is_str(r[k]):
+                raise _bad(spec, f"{w}.{k}", "must be a string or null")
+        if r.get("silence_is_signal") is not None and not isinstance(r["silence_is_signal"], bool):
+            raise _bad(spec, f"{w}.silence_is_signal", "must be a boolean")
+        # null is the honest "no data": a digest is never a faked zero
+        if r.get("digest") is not None and not isinstance(r["digest"], dict):
+            raise _bad(spec, f"{w}.digest", "must be an object or null (null means no data)")
+        lc = r.get("last_call")
+        if lc is not None and not (isinstance(lc, dict) and _is_str(lc.get("at")) and _is_str(lc.get("outcome"))):
+            raise _bad(spec, f"{w}.last_call", "must be null or {at, outcome}")
+    shown = [{**r, "silence_is_signal": r.get("silence_is_signal", r["cadence"] == "resident")}
+             for r in rows if r["lifecycle"] != "retired"]      # retired members do not render
+    return {**v, "rows": shown, "retired_hidden": len(rows) - len(shown)}
+
+
+def _v_form(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    v = _need_obj(spec, v)
+    fields = _need_list(spec, v, "fields")
+    if not fields:
+        raise _bad(spec, "value.fields", "must hold at least one field")
+    names: set[str] = set()
+    for i, f in enumerate(fields):
+        w = f"value.fields[{i}]"
+        if not _is_str(f.get("name")) or not f["name"]:
+            raise _bad(spec, f"{w}.name", "must be a non-empty string")
+        if f["name"] in names:
+            raise _bad(spec, f"{w}.name", f"{f['name']!r} is repeated")
+        names.add(f["name"])
+        if f.get("type") not in FORM_FIELD_TYPES:
+            raise _bad(spec, f"{w}.type", f"must be one of {list(FORM_FIELD_TYPES)}, got {f.get('type')!r}")
+        if f.get("label") is not None and not _is_str(f["label"]):
+            raise _bad(spec, f"{w}.label", "must be a string")
+        if f["type"] == "recipient":
+            en = f.get("enum")
+            if not (isinstance(en, list) and en and all(_is_str(x) and x for x in en)):
+                raise _bad(spec, f"{w}.enum", "a recipient field carries a non-empty list of ids from the provider's registry")
+        elif "enum" in f:
+            raise _bad(spec, f"{w}.enum", "belongs to a recipient field only")
+    if v.get("verb") is not None and not _is_str(v["verb"]):
+        raise _bad(spec, "value.verb", "must be a string")
+    return v
+
+
+def _v_log(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
+    v = _need_obj(spec, v)
+    for i, r in enumerate(_need_list(spec, v, "rows")):
+        for k in ("verb", "target", "actor"):
+            if not _is_str(r.get(k)) or not r[k]:
+                raise _bad(spec, f"value.rows[{i}].{k}", "must be a non-empty string")
+        if not _is_iso(r.get("at")):
+            raise _bad(spec, f"value.rows[{i}].at", "must be an ISO-8601 timestamp")
+    return v
+
+
+VALUE_VALIDATORS: dict[str, Callable[["ProviderSpec", Any], dict[str, Any]]] = {
+    "reading": _v_reading, "line": _v_line, "brief": _v_brief, "ambient": _v_ambient,
+    "status-dots": _v_status_dots, "metric-grid": _v_metric_grid, "roster": _v_roster, "form": _v_form,
+    "log": _v_log,
+}
+
+# What a row of each row-shaped kind carries, i.e. what ``search.fields`` may name, and the default.
+ROW_SEARCH_FIELDS = {
+    "roster": ("name", "role", "group", "memory", "cadence", "lifecycle", "wrap_every"),
+    "log": ("verb", "target", "actor", "at"),
+}
+ROW_SEARCH_DEFAULT = {"list": ("title", "body", "id"), "count-queue": ("title", "body", "id"),
+                      "roster": ("name", "role", "group"), "log": ("verb", "target", "actor")}
+
+
+def search_fields_of(spec: "ProviderSpec") -> tuple[str, ...]:
+    return spec.search_fields or ROW_SEARCH_DEFAULT.get(spec.kind, ())
+
+
+def _validate_search_decl(spec: "ProviderSpec") -> None:
+    """Refuse a search declaration the row contract cannot honour (registration time)."""
+    sid = spec.id
+    if spec.kind not in ROW_KINDS:
+        if spec.search_fields or spec.search or spec.window is not None or spec.search_scope != "rows":
+            raise CockpitRegistrationError(f"{sid}: only a row-shaped kind ({', '.join(ROW_KINDS)}) is searchable")
+        return
+    if spec.search_scope not in SCOPES:
+        raise CockpitRegistrationError(f"{sid}: search scope must be one of {list(SCOPES)}, got {spec.search_scope!r}")
+    allowed = set(ROW_SEARCH_FIELDS.get(spec.kind) or ("title", "body", "id")) | (
+        set(spec.facets) if spec.kind in ROW_ENGINE_KINDS else set())
+    for f in spec.search_fields:
+        if f not in allowed:
+            raise CockpitRegistrationError(
+                f"{sid}: search field {f!r} is not carried by a {spec.kind} row (carries {sorted(allowed)})")
+    if spec.window is not None and (not isinstance(spec.window, int) or isinstance(spec.window, bool) or spec.window < 1):
+        raise CockpitRegistrationError(f"{sid}: window must be a positive integer, got {spec.window!r}")
+    if spec.search_scope == "store" and spec.window is None:
+        raise CockpitRegistrationError(f"{sid}: scope 'store' is for a windowed panel: declare window=N")
+    if spec.search is not None and spec.search_scope != "store":
+        raise CockpitRegistrationError(f"{sid}: a search(q, limit) hook belongs to a scope 'store' panel")
+    if spec.search is not None and not callable(spec.search):
+        raise CockpitRegistrationError(f"{sid}: search must be callable")
+
+
+@dataclass(frozen=True)
+class StoreMatches:
+    """What a ``search(q, limit)`` hook may return instead of a bare sequence: the rows and the TOTAL
+    the store matched (more than the rows when the limit cut them)."""
+
+    rows: tuple[Any, ...]
+    total: int | None = None
+
+
+class QueryError(ValueError):
+    """A search query the kernel refuses (too long, not plain text, bad limit): HTTP 400."""
+
+
+def check_query(q: str | None, limit: int | None = None) -> tuple[str | None, int]:
+    """The kernel's bounds on a search: ``q`` is plain text of at most SEARCH_Q_MAX characters with no
+    control characters (and no regex meaning, ever); ``limit`` is clamped to SEARCH_LIMIT_MAX."""
+    if q is not None:
+        if len(q) > SEARCH_Q_MAX:
+            raise QueryError(f"q is at most {SEARCH_Q_MAX} characters, got {len(q)}")
+        if any(unicodedata.category(ch) in ("Cc", "Cs") for ch in q):
+            raise QueryError("q is plain text: control characters are refused")
+    if limit is None:
+        limit = SEARCH_LIMIT_DEFAULT
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        raise QueryError("limit must be a positive integer")
+    return q, min(limit, SEARCH_LIMIT_MAX)
+
+
+def _fold(text: str) -> str:
+    """Case- and accent-folded, for the rows-scope substring match."""
+    return "".join(c for c in unicodedata.normalize("NFD", text.casefold()) if unicodedata.category(c) != "Mn")
+
+
+def _terms_match(texts: list[str], q: str) -> bool:
+    """Space-separated terms ANDed; each a substring of some field (plain text, never a pattern)."""
+    hay = _fold(" ".join(texts))
+    return all(t in hay for t in _fold(q).split())
+
+
 def _compact_value(kind: str, value: Any) -> Any:
     if value is None:
         return None
-    if kind == "visual":
-        return {"visual": value["visual"], "text": value["text"]}
-    if kind == "prose":
+    if kind == "ambient":
+        if "visual" in value:       # a levain.cockpit/1 visual
+            return {"visual": value["visual"], "text": value["text"]}
+        return {"legend": value.get("legend", ""), "events": len(value.get("events") or [])}
+    if kind == "brief":
         return {"headline": value.get("headline", "")}
     return value

@@ -11,7 +11,7 @@ import json
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from levain.cockpit.engine import Cockpit, RowNotFound
+from levain.cockpit.engine import Cockpit, QueryError, RowNotFound
 
 MANIFEST_PATH = "/cockpit/manifest.json"
 FRESHNESS_PATH = "/cockpit/freshness.json"
@@ -24,8 +24,8 @@ CACHE_CONTROL = "private, no-cache"
 VARY = TOKEN_HEADER
 PROFILES = ("full", "compact")
 # Hashed into every validator: bumped when a wire projection changes (rev 2: compact `now` rows are
-# refs, panel heads carry edit_class), so a client holding an older body revalidates to a 200.
-REPRESENTATION = 2
+# refs, panel heads carry edit_class; rev 3: kind contract v2, panel heads carry searchable / window), so a client holding an older body revalidates to a 200.
+REPRESENTATION = 3
 
 
 def is_cockpit_path(path: str) -> bool:
@@ -93,11 +93,20 @@ def handle_get(
         return jerr(400, "bad_request", f"profile must be one of {list(PROFILES)}")
     q = (qs.get("q") or [""])[0].strip() or None
     row = (qs.get("row") or [""])[0] or None
+    # Search is a READ on the panel's own auth: nothing here authenticates differently, and ``q`` goes
+    # nowhere but the cockpit call (it is hashed into the validator, never logged or journalled).
+    limit_raw = (qs.get("limit") or [""])[0]
     try:
-        panel = cockpit.panel(panel_id, profile=profile, q=q, row=row, credential_class=cred["class"])
+        limit = int(limit_raw) if limit_raw else None
+    except ValueError:
+        return jerr(400, "bad_request", "limit must be an integer")
+    try:
+        panel = cockpit.panel(panel_id, profile=profile, q=q, row=row, credential_class=cred["class"], limit=limit)
+    except QueryError as exc:
+        return jerr(400, "bad_request", str(exc))
     except RowNotFound:
         return jerr(404, "not_found", f"panel {panel_id!r} has no row {row!r}")
     if panel is None:
         return jerr(404, "not_found", f"no panel {panel_id!r}")
-    variant = ["panel", profile, q, row, cred["class"]]
+    variant = ["panel", profile, q, row, limit, cred["class"]]
     return ok(panel, variant)

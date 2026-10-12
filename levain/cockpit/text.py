@@ -16,7 +16,7 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
-from levain.cockpit.engine import Cockpit
+from levain.cockpit.engine import ALIASES, ROW_ENGINE_KINDS, Cockpit
 
 LOCAL_CREDENTIAL = {"class": "none", "device_class": None}
 DEFAULT_TOP_N = 12   # rows drawn per group before "+N more"; the kernel's group count says the rest
@@ -109,35 +109,126 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
     if status == "empty":
         out.append((DIM, _fit(f"  {visible(head.get('empty') or 'Nothing here.')}", width)))
         return out
-    kind = head["kind"]
+    kind = ALIASES.get(head["kind"], head["kind"])      # a levain.cockpit/1 kernel's names degrade too
     if panel.get("next") and panel.get("rows") is None and panel.get("value") is None:
         out.append((DIM, _fit(f"  (summary only — open {visible(panel['next'])} for the content)", width)))
-    elif kind == "triage-list":
+    elif kind in ROW_ENGINE_KINDS:
         out.extend(_rows(head, panel, width, top_n))
-    elif kind == "line":
-        for ln in (panel.get("value") or {}).get("lines", []):
-            at = f" ({_age(ln.get('at'), now)})" if ln.get("at") else ""
-            out.append((ROW, _fit(f"  {visible(ln.get('label'))}: {visible(ln.get('text'))}{at}", width)))
-    elif kind == "metric":
-        v = panel.get("value") or {}
-        for m in v.get("metrics", []):
-            unit = f" {visible(m['unit'])}" if m.get("unit") else ""
-            read = f" — {visible(m['read'])}" if m.get("read") else ""
-            out.append((ROW, _fit(f"  [{m.get('status', 'unknown')}] {visible(m.get('label'))}: "
-                                  f"{visible(m.get('value'))}{unit}{read}", width)))
-        for a in v.get("alerts", []):
-            out.append((ERROR if a.get("severity") == "bad" else STALE,
-                        _fit(f"  ! {visible(a.get('message'))}", width)))
-    elif kind == "visual":
-        v = panel.get("value") or {}
-        for ln in v.get("text") or []:
-            out.append((ROW, _fit(f"  {visible(ln.get('label'))}: {visible(ln.get('text'))}", width)))
-    elif kind == "prose":
-        v = panel.get("value") or {}
-        out.append((ROW, _fit(f"  {visible(v.get('headline') or '')}", width)))
-        for ln in str(v.get("markdown") or "").replace("\r\n", "\n").split("\n"):   # only \n breaks a line; every other separator stays visible
-            out.append((ROW, _fit(f"    {visible(ln)}", width)))
+    else:
+        draw = _VALUE_TEXT.get(kind)
+        if draw is None:
+            out.append((DIM, _fit(f"  (a {visible(kind)} panel: this view has no text form for it)", width)))
+        else:
+            out.extend(draw(panel.get("value") or {}, now, width, top_n))
+    if panel.get("search_error"):
+        out.append((ERROR, _fit(f"  SEARCH FAILED: {visible(panel['search_error'])}", width)))
+    elif panel.get("match_label"):
+        out.append((DIM, _fit(f"  {visible(panel['match_label'])}", width)))
     return out
+
+
+def _row(text: str, width: int) -> tuple[str, str]:
+    return (ROW, _fit(text, width))
+
+
+def _t_line(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
+    out = []
+    for ln in v.get("lines", []):
+        at = f" ({_age(ln.get('at'), now)})" if ln.get("at") else ""
+        label = f"{visible(ln.get('label'))}: " if ln.get("label") else ""
+        out.append(_row(f"  {label}{visible(ln.get('text'))}{at}", width))
+    return out
+
+
+def _t_status_dots(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
+    out = []
+    for m in v.get("metrics", []):
+        unit = f" {visible(m['unit'])}" if m.get("unit") else ""
+        read = f" — {visible(m['read'])}" if m.get("read") else ""
+        out.append(_row(f"  [{m.get('status', 'unknown')}] {visible(m.get('label'))}: {visible(m.get('value'))}{unit}{read}", width))
+    for a in v.get("alerts", []):
+        out.append((ERROR if a.get("severity") == "bad" else STALE, _fit(f"  ! {visible(a.get('message'))}", width)))
+    return out
+
+
+def _t_ambient(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
+    if "visual" in v:       # a levain.cockpit/1 visual carries its own text projection
+        return [_row(f"  {visible(ln.get('label'))}: {visible(ln.get('text'))}", width) for ln in v.get("text") or []]
+    events = v.get("events") or []
+    out = [_row(f"  {visible(v.get('legend') or '')}", width)]
+    by_repo: dict[str, int] = {}
+    failed = 0
+    for e in events:
+        by_repo[e.get("repo") or "(no repo)"] = by_repo.get(e.get("repo") or "(no repo)", 0) + 1
+        failed += e.get("outcome") == "failed"
+    out.append(_row(f"  {len(events)} events" + (f", {failed} failed" if failed else ""), width))
+    for repo, n in sorted(by_repo.items(), key=lambda kv: (-kv[1], kv[0]))[:top_n]:
+        out.append(_row(f"    {visible(repo)}: {n}", width))
+    return out
+
+
+def _t_brief(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
+    out = []
+    if v.get("headline"):
+        out.append(_row(f"  {visible(v['headline'])}", width))
+    for ln in v.get("lines") or []:
+        label = f"{visible(ln.get('label'))}: " if ln.get("label") else ""
+        out.append(_row(f"  {label}{visible(ln.get('text'))}", width))
+    for ln in str(v.get("markdown") or "").replace("\r\n", "\n").split("\n"):   # only \n breaks a line; every other separator stays visible
+        out.append(_row(f"    {visible(ln)}", width))
+    return out
+
+
+def _t_reading(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
+    unit = f" {visible(v['unit'])}" if v.get("unit") else ""
+    cond = f", {visible(v['condition'])}" if v.get("condition") else ""
+    span = f" (hi {visible(v['hi'])} / lo {visible(v['lo'])})" if v.get("hi") is not None and v.get("lo") is not None else ""
+    out = [_row(f"  {visible(v.get('value'))}{unit}{cond}{span} — {_age(v.get('as_of'), now)}", width)]
+    for sr in v.get("sub") or []:
+        band = f" [{visible(sr['band'])}]" if sr.get("band") else ""
+        out.append(_row(f"    {visible(sr.get('label'))}: {visible(sr.get('value'))}{band}", width))
+    return out
+
+
+def _t_metric_grid(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
+    return [_row(f"  {visible(n.get('label'))}: {visible(n.get('value'))}" + (f" {visible(n['unit'])}" if n.get("unit") else ""), width)
+            for n in v.get("numbers") or []]
+
+
+def _t_roster(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    group: Any = object()
+    for r in v.get("rows") or []:
+        if r.get("group") != group:
+            group = r.get("group")
+            if group:
+                out.append((GROUP, _fit(f"  {visible(group)}", width)))
+        call = r.get("last_call")
+        tail = (f"last call {_age(call.get('at'), now)}: {visible(call.get('outcome'))}" if call
+                else ("no data" if r.get("digest") is None else "digest ok"))
+        out.append(_row(f"    {visible(r.get('name'))} — {visible(r.get('memory'))}, {visible(r.get('cadence'))}; {tail}", width))
+    return out
+
+
+def _t_form(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
+    out = []
+    for f in v.get("fields") or []:
+        opts = f" one of: {', '.join(visible(x) for x in f['enum'])}" if f.get("enum") else ""
+        out.append(_row(f"  {visible(f.get('label') or f.get('name'))} ({visible(f.get('type'))}){opts}", width))
+    return out
+
+
+def _t_log(v: dict[str, Any], now: datetime, width: int, top_n: int) -> list[tuple[str, str]]:
+    out = []
+    for r in (v.get("rows") or [])[:top_n * 4]:
+        sentence = r.get("sentence") or f"{r.get('verb')} \u00b7 {r.get('target')}"
+        out.append(_row(f"  {visible(sentence)} — {visible(r.get('actor'))}, {_age(r.get('at'), now)}", width))
+    return out
+
+
+_VALUE_TEXT = {"line": _t_line, "status-dots": _t_status_dots, "ambient": _t_ambient, "brief": _t_brief,
+               "reading": _t_reading, "metric-grid": _t_metric_grid, "roster": _t_roster, "form": _t_form,
+               "log": _t_log}
 
 
 def _rows(head: dict[str, Any], panel: dict[str, Any], width: int, top_n: int) -> list[tuple[str, str]]:
