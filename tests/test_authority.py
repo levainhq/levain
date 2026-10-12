@@ -729,6 +729,7 @@ def test_anchor_refuses_another_hash_at_its_seq(base, keys, tmp_path):
 
 def test_unreadable_anchor_names_the_reset(tmp_path):
     a = auth.anchor_path(tmp_path)
+    a.parent.mkdir()
     a.write_text("{not json")
     with pytest.raises(AnchorError, match="anchor reset"):
         auth.read_anchor(a)
@@ -991,6 +992,7 @@ def test_deeply_nested_timeouts_is_a_replay_error(base, keys):
 
 def test_deeply_nested_anchor_is_an_anchor_error(tmp_path):
     a = auth.anchor_path(tmp_path)
+    a.parent.mkdir()
     a.write_text("[" * 100000 + "]" * 100000)
     with pytest.raises(AnchorError, match="unreadable"):
         auth.read_anchor(a)
