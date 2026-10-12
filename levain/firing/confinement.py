@@ -5920,19 +5920,24 @@ _BWRAP_PERMS_PROBE = ("--perms", "0700", "--tmpfs", "/tmp")
 
 
 def _bwrap_lacks_perms() -> bool:
-    """True when bwrap starts WITHOUT ``--perms`` and fails WITH it: a bubblewrap older than 0.5.0."""
-    def runs(*extra: str) -> bool:
+    """True when bwrap starts WITHOUT ``--perms`` and, WITH it, fails naming the option: a bubblewrap
+    older than 0.5.0. A failure that does not name ``--perms`` (an LSM refusing the tmpfs) is another
+    cause and is left to the other diagnoses."""
+    def run(*extra: str) -> subprocess.CompletedProcess | None:
         try:
-            proc = subprocess.run(
+            return subprocess.run(
                 [BWRAP, "--bind", "/", "/", *extra, "--proc", "/proc", "--dev", "/dev", "--unshare-pid",
                  "/bin/true"],
                 capture_output=True, timeout=10, env=_probe_env(),
             )
         except (OSError, subprocess.SubprocessError):
-            return False
-        return proc.returncode == 0
+            return None
 
-    return runs() and not runs(*_BWRAP_PERMS_PROBE)
+    plain = run()
+    if plain is None or plain.returncode != 0:
+        return False
+    with_perms = run(*_BWRAP_PERMS_PROBE)
+    return with_perms is not None and with_perms.returncode != 0 and b"--perms" in with_perms.stderr
 
 
 def _bwrap_runs_without_a_pid_namespace() -> bool:

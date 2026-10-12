@@ -429,7 +429,7 @@ def test_a_gnupghome_owned_by_another_user_gets_no_view(tmp_path, gh, monkeypatc
     assert not [a for _, op, a in _ops(argv) if op == "--tmpfs" and a == [str(gh)]]
     # Nothing of the home is bound back; the one bind under it is the dirmngr's /dev/null mask, which on
     # Linux is spelled as gh is (on macOS /tmp against /private/tmp, so it never collided).
-    assert not [a for _, op, a in _ops(argv) if op.endswith("bind") and _under(a[1], gh) and a[0] != "/dev/null"]
+    assert not [a for _, op, a in _ops(argv) if op in conf._MASK_OPS + ("--dev-bind", "--dev-bind-try") and _under(a[1], gh) and a[0] != "/dev/null"]
     assert [a for _, op, a in _ops(argv) if a[:1] == ["/dev/null"] and Path(a[1]).resolve() == gh / "S.dirmngr"]
 
 
@@ -594,3 +594,14 @@ def test_a_gnupghome_view_keeps_gnupgs_configuration_files_read_only(tmp_path, g
         assert last and last[-1][0] > view and last[-1][1] == "--ro-bind", (name, last)
     # trustdb stays writable (RUN 2026-10-12: read-only, `gpg --list-keys` died on its trustdb check)
     assert ["--bind", str(gh / "trustdb.gpg"), str(gh / "trustdb.gpg")] in [argv[k:k + 3] for k in range(len(argv))]
+
+
+def test_a_tmpfs_refusal_that_does_not_name_perms_is_not_read_as_an_old_bwrap(tmp_path, monkeypatch) -> None:
+    """A current bubblewrap whose tmpfs mount an LSM refuses fails the --perms probe too, but its error
+    names the mount, not the option: the doctor must not tell that operator to upgrade."""
+    fake = tmp_path / "bwrap"
+    fake.write_text('#!/bin/sh\nfor a in "$@"; do [ "$a" = --tmpfs ] && { echo "bwrap: Failed to mount tmpfs: '
+                    'Permission denied" >&2; exit 1; }; done\nexit 0\n')
+    fake.chmod(0o755)
+    monkeypatch.setattr(conf, "BWRAP", str(fake))
+    assert conf._bwrap_lacks_perms() is False
