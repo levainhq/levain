@@ -411,7 +411,7 @@ def test_one_request_captures_once(broker, spores, keydir, monkeypatch):
     assert len(calls) == 1
 
 
-# --- L3 r1 (1012+80): the fence names the head hash ---------------------------------------------------
+# --- L3 r1 (1012+80): the fence's head hash, the migration's lock, the anchor read's order ---------------
 
 def test_a_pending_issued_on_a_replaced_suffix_ends_stale(broker, spores, keydir):
     """F1: a fork after a failed anchor advance puts a second validly signed link at the same seq. A
@@ -433,6 +433,47 @@ def test_a_pending_issued_on_a_replaced_suffix_ends_stale(broker, spores, keydir
     assert broker.capture().authority_error is None
     out = broker.submit(pid, sig)
     assert (out["state"], out["reason"]) == ("STALE", "authority changed")
+
+
+@pytest.mark.parametrize("via", ["broker", "keys"])
+def test_the_anchor_is_read_before_the_snapshot_is_pinned(broker, keydir, monkeypatch, via):
+    """F3: an append that commits and advances the anchor after the read transaction pinned its
+    snapshot leaves the snapshot behind the anchor; reading the anchor first, it is not refused. The
+    broker's capture (its start's ``_advance_anchor`` included) pins at the replay's first SELECT;
+    ``levain cockpit keys`` would pin at its install-class check if that ran first."""
+    from levain.cockpit import keys as cockpit_keys
+
+    Key(keydir, "phone").enroll(broker, "display-phone")
+    root = root_of(broker.db)
+    late = RealKey(keydir, "late")
+    fired: list[int] = []
+
+    def advance() -> None:
+        if not fired:
+            fired.append(1)
+            enrol(broker.db, late, "presence", by=root)              # link N+1 commits, the anchor moves
+    if via == "broker":
+        real = authority.snapshot
+
+        def pinned_then_advanced(conn, **kw):
+            snap = real(conn, **kw)                                   # the snapshot is pinned here
+            advance()
+            return snap
+        monkeypatch.setattr(authority, "snapshot", pinned_then_advanced)
+        auth = broker.capture()
+        assert fired and auth.authority_error is None, auth.authority_error
+        seen = auth.authority.seq
+    else:
+        real_check = cockpit_keys._check_reported
+
+        def checked_then_advanced(conn):
+            real_check(conn)                                          # a SELECT: pinned here if it runs first
+            advance()
+        monkeypatch.setattr(cockpit_keys, "_check_reported", checked_then_advanced)
+        rows, note = cockpit_keys.keys(broker.data_root, now=datetime.now(timezone.utc))
+        assert fired and note is None, note
+        seen = max(r.enrolled_seq for r in rows)
+    assert authority.read_anchor(anchor_path(broker.data_root)).seq == seen + 1
 
 
 # --- structural fences ----------------------------------------------------------------------------

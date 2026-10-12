@@ -156,9 +156,11 @@ def _row(k: AuthorityKey) -> KeyRow:
 
 def _capture(db: CockpitDB, now: datetime, ssh_keygen: Path | str) -> RequestAuthority:
     with db.read() as conn:
-        _check_reported(conn)
-        return RequestAuthority.capture(conn, now=now, anchor=anchor_path(db.data_root), source=str(db.path),
+        # capture first: it reads the anchor before the transaction's first SELECT pins the snapshot
+        auth = RequestAuthority.capture(conn, now=now, anchor=anchor_path(db.data_root), source=str(db.path),
                                         ssh_keygen=ssh_keygen)
+        _check_reported(conn)
+        return auth
 
 
 def _signing_authority(auth: RequestAuthority) -> AuthoritySnapshot:
