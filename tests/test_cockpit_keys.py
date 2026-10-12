@@ -1,6 +1,6 @@
 """levain.cockpit.keys (K2b-3c, trust-tiering S3a-2): enrol, revoke and list as signed authority-log
-links, and the refusals the L4 enroll drive does not reach. The drive (project memory
-L4_k2b/enroll_drive.py) runs enroll -> real broker signature -> revoke end to end.
+links, and their refusals. The L4 enroll drive (project memory 1010-cockpit/L4_k2b/enroll_drive.py)
+drove the /2 unsigned enroll end to end; its signed successor waits on `levain cockpit ledger init`.
 
 A laptop-presence key must be a FIDO key, which cannot be made headless: every test here widens the
 class floor to software ed25519 keys (``widen_laptop_floor``); the floor itself is tested in
