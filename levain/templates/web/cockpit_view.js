@@ -1043,7 +1043,7 @@
       s.data = data;
       s.fault = "";
       // the read-age chip is the one piece of chrome that moves with every read: it follows the payload
-      const src = s.p && s.p.querySelector ? s.p.querySelector(".phead .src") : null;
+      const src = s.p && s.p.querySelector ? s.p.querySelector(".phead .src.fresh") : null;
       if (src) src.textContent = entry.fresh || "";
       paint(s);
       const sr = data.search || {};
@@ -1179,7 +1179,8 @@
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", install); else install();
   }
 
-  Object.assign(K, { fill, refetchPanel, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode });
+  const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
+  Object.assign(K, { fill, refetchPanel, pruneModal, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

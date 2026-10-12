@@ -48,7 +48,7 @@
       head.appendChild(el("span", "chip chip-" + entry.edit_class, entry.edit_class));
     }
     if (entry.source) head.appendChild(el("span", "src", entry.source));
-    if (entry.fresh) head.appendChild(el("span", "src", entry.fresh));   // manifest source: when the kernel last read it
+    if (entry.fresh) head.appendChild(el("span", "src fresh", entry.fresh));   // manifest source: when the kernel last read it
     // dense kinds get a ⤢ control in the header → a focused, full-screen re-render
     // (Slice 2). Only the long modules (CLAMP_KINDS) — health/graph stay natural-height.
     if (entry.kind && CLAMP_KINDS.has(entry.kind)) head.appendChild(buildExpandBtn(entry));
@@ -2619,6 +2619,7 @@
     const wasSearchFocused = !!oldSearch && oldSearch === document.activeElement;
     const hadModalFocus = overlay.contains(document.activeElement);
     overlay.replaceChildren(box);
+    pruneModalKinds();  // the typed panels the old modal body held end with it
     measureClauses(box);  // reveal per-item expand toggles inside the focus modal too
     mbody.scrollTop = prevScroll;
     const newSearch = wasSearchFocused ? mbody.querySelector(".ep-search-input") : null;
@@ -2633,9 +2634,16 @@
     buildModal(entry);
   }
 
+  // A typed panel drawn into the focus modal lives exactly while its body is on the page.
+  function pruneModalKinds() {
+    const K = window.LevainCockpitKinds;
+    if (K && typeof K.pruneModal === "function") K.pruneModal();
+  }
+
   function closeModal() {
     const overlay = document.getElementById("levain-modal");
     if (overlay) overlay.remove();
+    pruneModalKinds();
     document.body.classList.remove("modal-open");
     modalKey = null;
     const rf = modalReturnFocus;

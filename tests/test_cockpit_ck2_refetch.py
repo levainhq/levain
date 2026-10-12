@@ -70,6 +70,16 @@ const ok = (c, w) => { if (!c) { failed++; console.log("FAIL " + w); } };
   r = await K.refetchPanel("p");
   ok(r === false, "a changed title declines");
   ok(renders === 0 && replaced === 0, "a declined refetch builds nothing");
+  // a modal copy ends with its modal body: pruneModal tears down only the detached modal state
+  const mp = new N("div"); mp.live = true; mp.className = "modal-body";
+  const ms = K.fill(mp, view.extra_panels.p, { rows: () => {}, entry, modal: true });
+  const seqLive = ms.seq, seqBoard = s.seq;
+  K.pruneModal();
+  ok(ms.seq === seqLive, "a modal state still on the page is kept");
+  mp.live = false;
+  K.pruneModal();
+  ok(ms.seq > seqLive, "a detached modal state is torn down");
+  ok(s.seq === seqBoard, "a board state is not touched by pruneModal");
   process.exit(failed ? 1 : 0);
 })().catch((e) => { console.log("THREW " + (e && e.stack || e)); process.exit(1); });
 """
