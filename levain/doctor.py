@@ -1131,15 +1131,19 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
     if auth.authority_error is not None:              # a migrated store, its keys not yet re-enrolled
         return [CheckResult(name, True, auth.authority_error)]
     laptops = [k.fingerprint for k in auth.authority.active_keys() if k.key_class == LAPTOP]
-    recovery = "if it is lost, `levain cockpit ledger re-genesis` starts a new authority log (every grant void)"
+    # re-genesis (§3.9) is S3a-2b-2's, not this build's: name it as missing, never as a command to run
+    recovery = ("recovery after losing it, `levain cockpit ledger re-genesis` (a new authority log, every grant "
+                "void), is not in this build")
     if len(laptops) == 1:
         return [CheckResult(
             name, True, f"one {LAPTOP} key is enrolled ({laptops[0]})",
-            f"Enrol a second: `levain cockpit enroll <key.pub> --signing-key <the enrolled key>`; {recovery}.",
+            f"Enrol a second {LAPTOP} key now: `levain cockpit enroll <key.pub> --signing-key <the enrolled key>`; "
+            f"{recovery}.",
             warn=True)]
     if not laptops:
         return [CheckResult(name, True, f"no unrevoked {LAPTOP} key: nothing can enrol a key or sign a T3 act",
-                            "`levain cockpit ledger re-genesis` starts a new authority log (every grant void).",
+                            "Recovery, `levain cockpit ledger re-genesis` (a new authority log, every grant void), "
+                            "is not in this build.",
                             warn=True)]
     return [CheckResult(name, True, f"{len(laptops)} {LAPTOP} keys enrolled (head at seq {auth.authority.seq})")]
 

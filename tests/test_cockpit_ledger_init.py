@@ -14,6 +14,7 @@ floor to software ed25519 keys (``widen_laptop_floor``), as the run did.
 from __future__ import annotations
 
 import io
+import re
 import sqlite3
 import subprocess
 import sys
@@ -283,8 +284,10 @@ def test_a_run_cut_off_between_links_still_refuses_and_a_rerun_finishes_it(v2):
     plan = init_plan(root, now=NOW)
     assert plan.seq == 2 and plan.genesis == k["A"].fingerprint
     assert {r.fingerprint for r in plan.rows if r.in_log is not None} == {k["A"].fingerprint, k["P"].fingerprint}
-    # the re-run drops P, which the first run had enrolled: it is revoked, never left standing
+    # the re-run drops P, which the first run had enrolled: it is revoked, never left standing, compromised
+    # from its own enrol so its seq-less /2-era fires read REVOKED, not "signed · reported" (F1)
     res = _init(root, k["A"], confirmed - {k["P"].fingerprint}, drop=True)
+    assert _log(root)[2][2:] == ("revoke_key", k["P"].fingerprint, None, 2)
     assert [x[2:4] for x in _log(root)] == [
         ("enrol", k["A"].fingerprint), ("enrol", k["P"].fingerprint), ("revoke_key", k["P"].fingerprint),
         ("enrol", k["R"].fingerprint), ("revoke_key", k["R"].fingerprint), ("enrol", k["X"].fingerprint)]
@@ -380,7 +383,7 @@ def test_doctor_warns_at_exactly_one_laptop_presence_key(tmp_path):
     _init(root, a, {a.fingerprint})
     [r] = _check_cockpit_authority(install)
     assert r.ok and r.warn and a.fingerprint in r.detail
-    assert "levain cockpit ledger re-genesis" in r.hint
+    assert "levain cockpit enroll" in r.hint and "not in this build" in r.hint
     p = RealKey(tmp_path, "P")
     enroll(root, p.public, "display-phone", signer_fp=a.fingerprint, sign=a.sign_link, clock=lambda: NOW)
     [r] = _check_cockpit_authority(install)
@@ -407,3 +410,159 @@ def test_doctor_leaves_a_v2_journal_unmigrated(tmp_path):
     assert r.ok and "levain-cockpit/2" in r.detail
     with _db(root) as c:
         assert c.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()[0] == "levain-cockpit/2"
+
+
+# --- the 2b-1 fix round (L1 + L2 findings, s3a2/L12_2b1/FINDINGS.md) ---------------------------------
+
+def _cut_at(n: int, key: RealKey):
+    """A signer that signs with ``key`` and is cut off (KeyboardInterrupt) at its ``n``-th link."""
+    calls: list[int] = []
+
+    def sign(message: bytes) -> str:
+        calls.append(1)
+        if len(calls) == n:
+            raise KeyboardInterrupt
+        return key.sign_link(message)
+    return sign
+
+
+def test_f1_a_dropped_key_the_cut_off_run_enrolled_is_revoked_compromised_at_its_enrol(v2):
+    # run 1 enrols the /2-compromised R and is cut before R's revoke link; run 2 drops R. R's /2-era fires
+    # carry no authority seq, so only a compromised_since reads them REVOKED (O3), never "signed · reported"
+    root, k = v2
+    a, p, r, x = (k[n].fingerprint for n in "APRX")
+    with pytest.raises(KeyboardInterrupt):
+        _init(root, k["A"], {a, p, r, x}, sign=_cut_at(4, k["A"]))       # A, P, R enrolled; R's revoke cut
+    assert [x_[2:4] for x_ in _log(root)] == [("enrol", a), ("enrol", p), ("enrol", r)]
+    res = _init(root, k["A"], {a, p, x}, drop=True)
+    assert _log(root)[3][2:] == ("revoke_key", r, None, 3)                # compromised_since = R's enrolled_seq
+    assert res.dropped == (r,) and not _uninitialised(root)
+    rows, _ = keys(root, now=NOW)
+    assert {row.fingerprint: row.compromised_since for row in rows}[r] == 3
+
+
+def _foreign_genesis(tmp_path: Path):
+    """N (no legacy row) wrote the genesis and enrolled legacy A, then stopped before legacy P's enrol."""
+    root = _fresh(tmp_path)
+    a, p, n = RealKey(tmp_path, "A"), RealKey(tmp_path, "P"), RealKey(tmp_path, "N")
+    _as_v2(root, [_row(a, "laptop-presence", "2026-10-01T00:00:01.000000Z"),
+                  _row(p, "display-phone", "2026-10-01T00:00:02.000000Z")])
+    with pytest.raises(KeyboardInterrupt):
+        _init(root, n, {n.fingerprint, a.fingerprint, p.fingerprint}, sign=_cut_at(3, n))
+    assert [x[3] for x in _log(root)] == [n.fingerprint, a.fingerprint]
+    return root, a, p, n
+
+
+def test_f2_a_resume_that_does_not_confirm_the_log_genesis_refuses_naming_it(tmp_path):
+    root, a, p, n = _foreign_genesis(tmp_path)
+    with pytest.raises(KeyError_, match=f"genesis {re.escape(n.fingerprint)}.*not confirmed"):
+        _init(root, a, {a.fingerprint, p.fingerprint}, drop=True)
+    assert len(_log(root)) == 2 and _uninitialised(root)
+    # confirmed, it stays (the operator saw it listed and kept it)
+    _init(root, a, {a.fingerprint, p.fingerprint, n.fingerprint}, drop=True)
+    assert not _uninitialised(root)
+    rows, _ = keys(root, now=NOW)
+    assert {r.fingerprint for r in rows if r.revoked_seq is None} == {n.fingerprint, a.fingerprint, p.fingerprint}
+
+
+def test_f2_a_resume_lists_every_log_key_genesis_first(tmp_path, monkeypatch, capsys):
+    root, a, p, n = _foreign_genesis(tmp_path)
+    _no_tty(monkeypatch)
+    assert _cli("--signing-key", str(a.path), "--confirm", a.fingerprint, "--confirm", p.fingerprint,
+                "--drop-unlisted", "--data-root", str(root)) == 1
+    out, err = capsys.readouterr()
+    lines = out.splitlines()
+    held = [i for i, line in enumerate(lines) if line.startswith("  seq ")]
+    assert [lines[i].split()[2] for i in held] == [n.fingerprint, a.fingerprint]
+    assert "laptop-presence" in lines[held[0]] and "the genesis" in lines[held[0]]
+    assert n.fingerprint in err and "genesis" in err
+    # at a terminal the genesis is asked too
+    _no_tty(monkeypatch, "y\ny\ny\n", tty=True)
+    assert _cli("--signing-key", str(a.path), "--data-root", str(root)) == 0
+    out = capsys.readouterr().out
+    assert f"keep {n.fingerprint}" in out and out.count("? [y/N]") == 3
+    assert not _uninitialised(root)
+
+
+def test_f3_doctor_names_the_act_that_exists_and_says_re_genesis_is_not_in_this_build(tmp_path):
+    root = _fresh(tmp_path)
+    install = tmp_path / "inst"
+    a = RealKey(tmp_path, "A")
+    _init(root, a, {a.fingerprint})
+    [r] = _check_cockpit_authority(install)
+    assert r.warn and "levain cockpit enroll" in r.hint
+    assert "`levain cockpit ledger re-genesis`" in r.hint and "not in this build" in r.hint
+    from levain.cockpit.keys import revoke
+    revoke(root, a.fingerprint, signer_fp=a.fingerprint, sign=a.sign_link, clock=lambda: NOW,
+           compromised_since=1)
+    [r] = _check_cockpit_authority(install)
+    assert r.warn and "not in this build" in r.hint
+
+
+def test_l1a_a_marker_without_a_legacy_table_still_initialises(v2):
+    root, k = v2
+    with _db(root) as c:
+        c.execute("DROP TABLE legacy_keys")
+    _init(root, k["A"], {k["A"].fingerprint}, drop=True)
+    with _db(root) as c:
+        assert c.execute("SELECT 1 FROM meta WHERE key = ?", (UNINITIALISED,)).fetchone() is None
+
+
+def test_l1b_a_refusal_after_links_landed_says_where_the_log_is(v2, monkeypatch, capsys):
+    import levain.cockpit.keys as keys_mod
+    root, k = v2
+    calls: list[int] = []
+
+    def bad_third(message: bytes) -> str:
+        calls.append(1)
+        return "not a signature" if len(calls) == 3 else k["A"].sign_link(message)
+    monkeypatch.setattr(keys_mod, "ssh_signer", lambda path, **kw: (k["A"].fingerprint, bad_third))
+    _no_tty(monkeypatch)
+    rc = _cli("--signing-key", str(k["A"].path), "--data-root", str(root),
+              *(x for n in "APR" for x in ("--confirm", k[n].fingerprint)), "--drop-unlisted")
+    err = capsys.readouterr().err
+    assert rc == 1 and err.startswith("ledger init refused:") and err.count("\n") == 1
+    assert "the log is at seq 2; the store stays uninitialised; re-run to resume" in err
+    assert len(_log(root)) == 2 and _uninitialised(root)
+
+
+def test_l1c_no_link_can_land_between_the_last_transactions_head_check_and_its_drop(v2, monkeypatch):
+    # the competing append is tried INSIDE the last transaction, after its head check and before the drop:
+    # it must not land (the write lock is held), and the head check must be on that same transaction
+    from contextlib import contextmanager
+
+    from levain.authority import anchor_path, sign_and_append
+    root, k = v2
+    real_write = CockpitDB.write
+    seen: dict[str, object] = {"head_checked": False, "raced": None}
+
+    class Proxy:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args):
+            if sql.startswith("DROP TABLE"):
+                seen["head_before_drop"] = seen["head_checked"]
+                race = sqlite3.connect(root / "cockpit.db", timeout=0.2, isolation_level=None)
+                try:
+                    sign_and_append(race, {"op": "enrol", "fingerprint": k["X"].fingerprint,
+                                           "public_key": k["X"].public, "class": "display-phone"},
+                                    signer_fp=k["A"].fingerprint, sign=k["A"].sign_link, clock=lambda: NOW,
+                                    anchor=anchor_path(root))
+                    seen["raced"] = "landed"
+                except sqlite3.OperationalError as exc:
+                    seen["raced"] = str(exc)
+                finally:
+                    race.close()
+            if "FROM authority_log" in sql:
+                seen["head_checked"] = True
+            return self._conn.execute(sql, *args)
+
+    @contextmanager
+    def racing_write(self):
+        with real_write(self) as conn:
+            yield Proxy(conn)
+    monkeypatch.setattr(CockpitDB, "write", racing_write)
+    _init(root, k["A"], {k["A"].fingerprint, k["P"].fingerprint}, drop=True)
+    assert seen["head_before_drop"] is True and seen["raced"] is not None and "locked" in str(seen["raced"])
+    assert len(_log(root)) == 2 and not _uninitialised(root)

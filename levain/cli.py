@@ -1675,7 +1675,19 @@ def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
             print("a fresh store: its first link enrols the signing key as laptop-presence, signed by "
                   "itself (trust on first use)")
         if plan.seq:
-            print(f"an earlier init was cut off with the log's head at seq {plan.seq}; this run resumes it")
+            print(f"an earlier init was cut off with the log's head at seq {plan.seq}; this run resumes it. "
+                  f"the log holds {len(plan.log_keys)} key(s), each kept only if confirmed:")
+            for k in plan.log_keys:
+                notes = ["the genesis" if k.fingerprint == plan.genesis else "enrolled"]
+                if k.revoked_seq is not None:
+                    notes.append(f"revoked at seq {k.revoked_seq}")
+                if k.fingerprint == signer_fp:
+                    notes.append("the signing key")
+                if k.fingerprint not in {r.fingerprint for r in plan.rows}:
+                    notes.append("no legacy row")
+                print(f"  seq {k.enrolled_seq}  {k.fingerprint}  {k.key_class:<16} ({'; '.join(notes)})")
+            if plan.rows:
+                print("the legacy keys:")
         for r in plan.rows:
             notes = ["revoked" + (", compromised" if r.compromised else "") if r.revoked else "active"]
             if r.fingerprint == signer_fp:
@@ -1686,7 +1698,7 @@ def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
                 notes.append(f"SKIPPED: {r.problem}")
             print(f"  {r.fingerprint}  {r.key_class:<16} {r.key_type:<36} enrolled {r.enrolled_at or '?'}  "
                   f"({'; '.join(notes)})")
-        if signer_fp not in {r.fingerprint for r in plan.rows}:
+        if not plan.seq and signer_fp not in {r.fingerprint for r in plan.rows}:
             print(f"  {signer_fp}  {'laptop-presence':<16} {signer_pub.split()[0]:<36} the signing key "
                   "(new: the genesis)")
         if args.confirm or args.drop_unlisted:
@@ -1695,8 +1707,13 @@ def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
             confirmed, drop = set(), True
             asks = [signer_fp] + [r.fingerprint for r in plan.rows
                                   if r.problem is None and r.fingerprint != signer_fp]
+            if plan.genesis is not None and plan.genesis not in asks:
+                asks.insert(0, plan.genesis)             # a resume keeps the log's genesis only if confirmed
             for fp in asks:
-                if _ask(f"keep {fp}{' (the signing key, the genesis)' if fp == signer_fp else ''}? [y/N] "):
+                what = (" (the log's genesis)" if fp == plan.genesis and fp != signer_fp else
+                        " (the signing key, the genesis)" if fp == signer_fp and plan.genesis in (None, fp) else
+                        " (the signing key)" if fp == signer_fp else "")
+                if _ask(f"keep {fp}{what}? [y/N] "):
                     confirmed.add(fp)
         else:
             sys.stdout.flush()

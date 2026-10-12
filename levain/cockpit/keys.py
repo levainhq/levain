@@ -26,6 +26,7 @@ import binascii
 import hashlib
 import os
 import re
+import sqlite3
 import struct
 import subprocess
 from collections.abc import Callable, Collection, Mapping
@@ -280,11 +281,13 @@ class LegacyRow:
 @dataclass(frozen=True)
 class InitPlan:
     """What ``ledger init`` finds: a fresh store (no migration marker, an empty log) or a migrated one,
-    its log's head (0 when empty) and genesis key, and the legacy rows in enrol order."""
+    its log's head (0 when empty) and genesis key, the legacy rows in enrol order, and every key the log
+    already holds (an interrupted init's), in enrol order, the genesis first."""
     migrated: bool
     seq: int
     genesis: str | None
     rows: tuple[LegacyRow, ...]
+    log_keys: tuple[KeyRow, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -349,7 +352,9 @@ def _init_state(db: CockpitDB, now: datetime,
     rows = tuple(_legacy_row(r, state, ssh_keygen) for r in legacy)
     genesis = None if state is None else next(
         (k.fingerprint for k in state.keys.values() if k.enrolled_seq == 1), None)
-    return InitPlan(marker is not None, 0 if state is None else state.seq, genesis, rows), state
+    held = () if state is None else tuple(_row(k) for k in sorted(state.keys.values(),
+                                                                   key=lambda k: k.enrolled_seq))
+    return InitPlan(marker is not None, 0 if state is None else state.seq, genesis, rows, held), state
 
 
 def init_plan(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
@@ -378,8 +383,11 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
     cannot be re-enrolled is skipped; confirming one refuses. An eligible row not confirmed is dropped
     only with ``drop_unlisted``, else this refuses naming them. Each link is its own transaction and
     the migration marker stays set while they land, so a run cut off between links leaves a store that
-    still refuses every signed act; a re-run resumes from the log (an earlier run's key that is no
-    longer confirmed is revoked). Only the last transaction, which finds the log's head where the last
+    still refuses every signed act; a re-run resumes from the log. A resume confirms the log's genesis
+    too (whatever key wrote it), else refuses naming it; an earlier run's key that is no longer confirmed
+    is revoked with ``compromised_since`` at its own enrol seq, so its seq-less /2-era fires read
+    "signed by a revoked key", the nearest the log can say to a dropped key's "unverified". A refusal
+    after a link landed says where the log stands. Only the last transaction, which finds the log's head where the last
     link left it, drops ``legacy_keys`` and clears the marker."""
     db = _journal(data_root, marker_directory=marker_directory)
     plan, state = _init_state(db, _now(clock), ssh_keygen)
@@ -388,7 +396,7 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
         raise KeyError_("the signing key's public half is not the key that signs")
     confirmed = set(confirmed)
     by_fp = {r.fingerprint: r for r in plan.rows}
-    unknown = sorted(confirmed - set(by_fp) - {signer_fp})
+    unknown = sorted(confirmed - set(by_fp) - {signer_fp} - ({plan.genesis} if plan.genesis else set()))
     if unknown:
         raise KeyError_(f"no legacy key {', '.join(unknown)} to confirm")
     if signer_fp not in confirmed:
@@ -413,6 +421,10 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
         if signer is None or not signer.active or signer.key_class != LAPTOP:
             raise KeyError_(f"an earlier ledger init began this log (genesis {plan.genesis}, head at seq "
                             f"{state.seq}); sign with an unrevoked {LAPTOP} key it enrolled")
+        if plan.genesis not in confirmed:
+            raise KeyError_(f"the log's genesis {plan.genesis} (seq 1, written by an earlier, interrupted init) "
+                            "is not confirmed; a resume cannot drop the genesis: confirm it (it stays a "
+                            f"{LAPTOP} key) to resume this log")
         foreign = sorted(k.fingerprint for k in state.keys.values()
                          if k.fingerprint not in by_fp and k.enrolled_seq != 1)
         if foreign:
@@ -427,9 +439,18 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
     links: list[str] = []
     warning: str | None = None
 
+    landed = plan.seq                         # the log's head as this run last saw it land
+
     def put(op: dict[str, Any], what: str) -> AuthoritySnapshot:
-        nonlocal warning
-        new = _append(db, op, signer_fp=signer_fp, sign=sign, clock=clock, ssh_keygen=ssh_keygen)
+        nonlocal warning, landed
+        try:
+            new = _append(db, op, signer_fp=signer_fp, sign=sign, clock=clock, ssh_keygen=ssh_keygen)
+        except (KeyError_, AuthorityError, sqlite3.Error, OSError) as exc:    # what the CLI answers as a refusal
+            if not landed:
+                raise
+            raise KeyError_(f"{exc}; the log is at seq {landed}; the store stays uninitialised; re-run to "
+                            "resume") from exc
+        landed = new.seq
         warning = new.anchor_warning          # a later advance that lands supersedes an earlier miss
         links.append(f"seq {new.seq}: {what}")
         return new
@@ -454,8 +475,12 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
         have = state.key(r.fingerprint)
         if r.fingerprint not in confirmed:
             if have is not None and have.active:
-                state = put({"op": "revoke_key", "fingerprint": r.fingerprint},
-                            f"revoke {r.fingerprint} (an interrupted init enrolled it; now dropped)")
+                # a dropped key's /2-era fires would read UNVERIFIED (no key); the log's nearest is a
+                # compromise from its own enrol, which reads those seq-less fires REVOKED (O3)
+                state = put({"op": "revoke_key", "fingerprint": r.fingerprint,
+                             "compromised_since": have.enrolled_seq},
+                            f"revoke {r.fingerprint} (an interrupted init enrolled it; now dropped, "
+                            "compromised from its enrol)")
             dropped.append(r.fingerprint)
             continue
         if have is None:
@@ -483,7 +508,7 @@ def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str
             head = conn.execute("SELECT seq, hash FROM authority_log ORDER BY seq DESC LIMIT 1").fetchone()
             if head is None or (head[0], head[1]) != (state.seq, state.head_hash):
                 raise KeyError_(f"the authority log moved past seq {state.seq} while init ran; run it again")
-            conn.execute("DROP TABLE legacy_keys")
+            conn.execute("DROP TABLE IF EXISTS legacy_keys")
             conn.execute("DELETE FROM meta WHERE key = ?", (UNINITIALISED,))
     return InitResult(tuple(links), tuple(kept), tuple(dropped), tuple(skipped), state.seq, state.store_id, warning)
 
