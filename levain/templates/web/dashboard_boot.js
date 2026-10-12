@@ -205,6 +205,10 @@
     return res.json();
   }
 
+  // The read transport for code outside this file (the filter box's store search, a one-panel refetch):
+  // the same function, so the same token handling.
+  window.LevainCockpitTransport = { readJson: authedReadJson };
+
   // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
   // /job.json off-box; token-free on loopback/read-only). Throws on a non-OK (incl. the fail-closed
   // 500 a corrupt job store returns); the in-box poll loop retries a few times, then surfaces it.

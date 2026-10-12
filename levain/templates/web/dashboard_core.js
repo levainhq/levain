@@ -41,6 +41,7 @@
     const p = el("div", "panel" + (span2 ? " span2" : ""));
     p.dataset.zone = entry.zone || "";
     p.dataset.editClass = entry.edit_class || "";
+    if (entry.modes) p.dataset.modes = entry.modes;   // which of the Morning / Board / Build modes show this panel
     const head = el("div", "phead");
     head.appendChild(el("h2", null, entry.title));
     if (entry.edit_class) {
@@ -2286,20 +2287,30 @@
       else { p.appendChild(renderMarkdown(md)); }
       return p;
     }
+    // A typed panel of the v2 kinds draws itself (cockpit_view.js); the row engine stays here, so a pending's
+    // cancel and the per-item expand are the same code whichever component asks for rows.
+    if (data.typed && window.LevainCockpitKinds) {
+      window.LevainCockpitKinds.fill(p, data, { rows: appendExternalLines });
+      return p;
+    }
     const lines = Array.isArray(data.lines) ? data.lines : [];
     if (lines.length === 0) {
       p.appendChild(el("p", "empty", data.empty || "nothing here"));
       return p;
     }
+    appendExternalLines(p, lines);
+    return p;
+  }
+
+  function appendExternalLines(host, lines) {
     for (const ln of lines) {
       const o = ln && typeof ln === "object" ? ln : {};
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.meta) row.appendChild(el("span", "ext-meta", String(o.meta)));
       appendClause(row, o.text != null ? String(o.text) : "");  // per-item expand, like episodes
       if (o.cancel && cancelPending) row.appendChild(buildPendingCancel(o.cancel));
-      p.appendChild(row);
+      host.appendChild(row);
     }
-    return p;
   }
 
   function renderEdits(entry, view) {

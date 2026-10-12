@@ -18,6 +18,8 @@
   // id like "constructor" or "__proto__" must never reach an object's prototype.
   const NATIVE = new Map([["tray", "tray"], ["loops", "spores"], ["keep", "keep"], ["episodes", "episodes"],
     ["edits", "edits"], ["health", "health"], ["graph", "graph"], ["crystals", "crystals"], ["wraps", "wraps"]]);
+  // The /1 kind names the kernel normalises to the /2 ones; a payload from an older kernel may still carry them.
+  const ALIAS = { "triage-list": "list", metric: "status-dots", visual: "ambient", prose: "brief" };
   const BADGE_TEXT = {
     overdue_days: (v) => v + "d overdue", age_days: (v) => v + "d old", due: (v) => "due " + v,
   };
@@ -51,6 +53,11 @@
     }
     return x;
   }
+
+  // case- and accent-folded text: the one comparison the filter, the jump box and the kernel's rows scope share
+  function fold(x) { return String(x === null || x === undefined ? "" : x).normalize("NFD").replace(/\p{M}/gu, "").toLowerCase(); }
+  function termsOf(q) { return fold(q).split(/\s+/).filter(Boolean); }
+  function hits(hay, terms) { return terms.every((t) => hay.indexOf(t) >= 0); }
 
   // a title is text: an object or number where one belongs falls back rather than reaching a renderer
   function titleOf(v, fallback) { return typeof v === "string" && v ? v : fallback; }
@@ -124,10 +131,27 @@
     return out.length ? out : null;
   }
 
+  // the text a search matches for one row: the declared fields' values, folded once here
+  function hayOf(parts) { return fold(parts.filter((x) => typeof x === "string" || isNum(x)).join(" ")); }
+
+  function searchOf(panel) {
+    const s = isObj(panel.search) ? panel.search : {};
+    return {
+      on: panel.searchable === true, scope: s.scope === "store" ? "store" : "rows", hook: s.hook === true,
+      window: isNum(panel.window) ? panel.window : null,
+      visible: Number.isInteger(s.default_visible) && s.default_visible > 0 ? s.default_visible : 10,
+      matchLabel: typeof panel.match_label === "string" ? panel.match_label : "",
+      error: typeof panel.search_error === "string" ? panel.search_error : "",
+      matched: isNum(panel.matched) ? panel.matched : null,
+    };
+  }
+
   function externalOf(head, panel, groupTitles) {
     const v = panel.value || {};
-    const out = { note: head.note || "", empty: head.empty || "nothing here" };
-    if ((head.kind === "triage-list" || head.kind === "list")) {
+    const kind = ALIAS[head.kind] || head.kind;
+    const out = { note: head.note || "", empty: head.empty || "nothing here", kind: kind, pid: head.id, typed: false,
+                  search: searchOf(panel) };
+    if (kind === "list" || kind === "count-queue") {
       out.lines = (panel.rows || []).map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
         const badges = (r.badges || []).map(badgeText).join(" · ");
@@ -149,24 +173,65 @@
         }
         return line;
       });
+      out.hays = (panel.rows || []).map((r) => hayOf([bare(r.id), r.title, r.body].concat(
+        Object.values(isObj(r.facets) ? r.facets : {}).filter((x) => typeof x === "string"))));
+      out.typed = true;
+      out.count = isNum(panel.count) ? panel.count : null;
       if (panel.degraded && panel.degraded.length) {
         const why = "not complete: " + (panel.error || panel.degraded.join(", "));
         out.note = out.note ? out.note + " · " + why : why;   // added to the source's note, never in place of it
       }
     } else if (head.kind === "line") {
       out.lines = labelled(v.lines, "lines").map((l) => ({ meta: l.label, text: l.text }));
-    } else if ((head.kind === "metric" || head.kind === "status-dots")) {
+    } else if (kind === "status-dots") {
       const ms = v.metrics === undefined ? [] : v.metrics;
+      // a dot's value is optional: a status with no figure is a legitimate reading
       need(Array.isArray(ms) && ms.every((m) => isObj(m) && typeof m.label === "string"
-        && (typeof m.value === "string" || isNum(m.value)) && (m.unit == null || typeof m.unit === "string")
+        && (m.value == null || typeof m.value === "string" || isNum(m.value)) && (m.unit == null || typeof m.unit === "string")
         && (m.read == null || typeof m.read === "string")), "metrics");
+      out.metrics = ms;
+      out.typed = true;
       out.lines = ms.map((m) => ({
-        meta: m.label, text: m.value + (m.unit ? " " + m.unit : "") + (m.read ? " — " + m.read : ""),
+        meta: m.label,
+        text: [m.value == null ? "" : m.value + (m.unit ? " " + m.unit : ""), m.read || ""].filter(Boolean).join(" — ") || (m.status || "unknown"),
         accent: m.status === "warn" || m.status === "bad", dim: m.status === "unknown" }));
-    } else if ((head.kind === "visual" || head.kind === "ambient")) {
-      out.lines = labelled(v.text, "text").map((l) => ({ meta: l.label, text: l.text }));
-    } else if ((head.kind === "prose" || head.kind === "brief")) {
-      out.markdown = v.markdown || "";
+    } else if (kind === "ambient") {
+      if (Array.isArray(v.events)) {
+        need(v.events.every((e) => isObj(e) && typeof e.kind === "string" && typeof e.at === "string"), "events");
+        need(typeof v.legend === "string", "legend");
+        out.sky = { events: v.events, legend: v.legend };
+        out.typed = true;
+      } else out.lines = labelled(v.text, "text").map((l) => ({ meta: l.label, text: l.text }));
+    } else if (kind === "brief") {
+      const lines = labelled(v.lines, "lines");
+      const head1 = typeof v.headline === "string" && v.headline ? v.headline : "";
+      if (typeof v.markdown === "string" && v.markdown) out.markdown = (head1 ? "**" + head1 + "**\n\n" : "") + v.markdown;
+      else { out.typed = true; out.brief = { headline: head1, lines: lines }; }
+    } else if (kind === "reading") {
+      need(isNum(v.value) || (typeof v.value === "string" && v.value), "reading value");
+      need(v.sub === undefined || (Array.isArray(v.sub) && v.sub.every((s) => isObj(s) && typeof s.label === "string")), "reading sub");
+      out.reading = v;
+      out.typed = true;
+    } else if (kind === "metric-grid") {
+      need(Array.isArray(v.numbers) && v.numbers.every((n) => isObj(n) && typeof n.label === "string" && isNum(n.value)), "numbers");
+      out.numbers = v.numbers;
+      out.typed = true;
+    } else if (kind === "roster") {
+      need(Array.isArray(v.rows) && v.rows.every((r) => isObj(r) && typeof r.name === "string"), "roster rows");
+      const rows = v.rows.filter((r) => r.lifecycle !== "retired");
+      out.roster = rows;
+      out.hays = rows.map((r) => hayOf([r.name, r.role, r.group, r.memory, r.cadence, r.lifecycle, r.wrap_every]));
+      out.retiredHidden = isNum(v.retired_hidden) ? v.retired_hidden : 0;
+      out.typed = true;
+    } else if (kind === "log") {
+      need(Array.isArray(v.rows) && v.rows.every((r) => isObj(r) && typeof r.verb === "string"), "log rows");
+      out.logRows = v.rows;
+      out.hays = v.rows.map((r) => hayOf([r.verb, r.target, r.actor, r.at, r.sentence]));
+      out.typed = true;
+    } else if (kind === "form") {
+      need(Array.isArray(v.fields) && v.fields.length && v.fields.every((f) => isObj(f) && typeof f.name === "string"), "form fields");
+      out.form = { fields: v.fields, verb: typeof v.verb === "string" ? v.verb : "" };
+      out.typed = true;
     }
     return out;
   }
@@ -192,6 +257,20 @@
     if (typeof t === "string") return t.split(",").map((s) => s.trim()).filter(Boolean);
     need(Array.isArray(t) && t.every((s) => typeof s === "string"), "tags");
     return t;
+  }
+
+  // Which of the three modes show a panel. Morning is the intake read (what is waiting, the state, the
+  // sky); Build drops the readings that are only for orientation; Board is everything. The hero sky is in all.
+  const MORNING_KINDS = new Set(["brief", "reading", "count-queue", "ambient", "status-dots", "section"]);
+  const BUILD_DROPS = new Set(["brief", "reading", "section"]);
+  function modesOf(e) {
+    const k = e.pkind || e.kind;
+    if (k === "ambient") return "morning board build";
+    const out = [];
+    if (MORNING_KINDS.has(k) || e.kind === "tray" || e.kind === "section") out.push("morning");
+    out.push("board");
+    if (!BUILD_DROPS.has(k) && e.kind !== "section") out.push("build");
+    return out.join(" ");
   }
 
   // The entity record: a bad masthead string is omitted and named in view.errors.entity; the jar is all-or-null.
@@ -269,6 +348,17 @@
     if (name === "for") return { name: name, label: "Readers (comma list; none = broadcast)", kind: "csv", required: false };
     const long = LONG_TEXT.has(name);
     return { name: name, label: name, kind: long ? "textarea" : "text", required: long };
+  }
+
+  // one form field of the kind contract as the compose box's widget: a recipient is a fixed-set chooser
+  function formField(f) {
+    const label = typeof f.label === "string" && f.label ? f.label : f.name;
+    if (f.type === "recipient") {
+      return { name: f.name, label: label, kind: "multiselect", required: false,
+               options: Array.isArray(f.enum) ? f.enum.filter((x) => typeof x === "string") : [] };
+    }
+    const long = f.type === "text" && LONG_TEXT.has(f.name);
+    return { name: f.name, label: f.type === "date" ? label + " (YYYY-MM-DD)" : label, kind: long ? "textarea" : "text", required: long };
   }
 
   // snap = {manifest, panels}; returns the SubstrateView-shaped object dashboard_core.js renders.
@@ -385,7 +475,8 @@
       const panel = P.get(pid);
       const groupTitles = new Map();
       for (const g of panel.groups || head.groups || []) groupTitles.set(g.id, titleOf(g.title, String(g.id)));
-      const entry = { zone: zoneId, edit_class: "", title: titleOf(panel.title, titleOf(head.title, pid)), id: pid };
+      const entry = { zone: zoneId, edit_class: "", title: titleOf(panel.title, titleOf(head.title, pid)), id: pid,
+                      pkind: ALIAS[panel.kind] || panel.kind };
       const banner = bannerOf(panel, panel, now);
       if (banner) entry.banner = banner;
       if (panel.as_of) entry.fresh = ageLabel(panel.as_of, now, "read ");
@@ -456,6 +547,7 @@
         view.layout.push(Object.assign(entry, { kind: "section", ref: sectionRef++, heading: titleOf(panel.title, titleOf(head.title, pid)) }));
       } else {
         view.extra_panels[pid] = externalOf(panel, panel, groupTitles);
+        view.extra_panels[pid].pid = pid;
         // a downstream's own verb on this panel becomes the compose box. The manifest names the verb's
         // fields and not their widgets, so a widget is chosen from the field's name (a known edge).
         const own = pActions.find((a) => !isObj(a.target) || typeof a.target.row_id !== "string");
@@ -463,6 +555,9 @@
         if (vh && !NATIVE.has(pid)) {
           view.extra_panels[pid].action = { verb: own.verb, fields: (Array.isArray(vh.fields) ? vh.fields : []).filter((n) => typeof n === "string").map(composeField) };
           view.action_verbs[own.verb] = { label: vh.label, confirm_required: vh.confirm === true, idempotent: vh.idempotent === true, job: false };
+          // a form panel names its own fields: they win over the widgets guessed from the verb head's names
+          const form = view.extra_panels[pid].form;
+          if (form && form.verb === own.verb) view.extra_panels[pid].action.fields = form.fields.map(formField);
         }
         // the external renderer draws the note itself, so the banner must not draw it a second time
         if (entry.banner && panel.note) {
@@ -489,6 +584,7 @@
     };
     for (const pid of headerExtra) placeOnce(pid, "operate");
     for (const zone of (m.regions.zones || [])) for (const pid of (zone.panels || [])) placeOnce(pid, zone.id);
+    for (const e of view.layout) e.modes = modesOf(e);
     // the verbs the kernel offered somewhere with a gesture a browser can perform: an affordance whose
     // verb is not here has nothing to post to
     view.offered_verbs = Object.create(null);
@@ -498,7 +594,503 @@
     return view;
   }
 
-  const api = { fromManifest, ageLabel, badgeText, visible, clean };
+  // ───────────────────────────── the typed panel bodies (cockpit contract v2) ─────────────────────────────
+  // One drawing function per kind, a filter box shared by every searchable panel, the mode keys and the jump
+  // box. Everything is built with textContent: a wire string never reaches an HTML sink.
+  const K = {};
+  const states = new Set();             // every live typed panel body (a panel and its expanded copy are two)
+  const FILTER_KEY = "levain_cockpit_filter:";
+  const MODE_KEY = "levain_cockpit_mode";
+  const MODES = ["morning", "board", "build"];
+  const SEARCH_DEBOUNCE_MS = 250;
+  const STORE_LIMIT = 50;
+  let hoverPanel = null;                // the panel the pointer last entered: `/` filters the panel you are looking at
+  let focusKeep = null;                 // {pid, start, end}: the filter being typed in, restored after a re-render
+
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  }
+  function store() { try { return root.sessionStorage; } catch (_) { return null; } }
+  function saved(key) { const s = store(); try { return s ? s.getItem(key) : null; } catch (_) { return null; } }
+  function save(key, val) {
+    const s = store();
+    try { if (s) { if (val) s.setItem(key, val); else s.removeItem(key); } } catch (_) { /* no storage: the query just does not survive */ }
+  }
+  // the query as the kernel accepts it: plain text, no control characters, bounded
+  function sendable(q) { return q.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 200); }
+  function ago(iso) { const a = ageLabel(iso, Date.now(), ""); return a || ""; }
+
+  // ---- the filter box: ONE component, every searchable panel ----
+  function buildFilter(s) {
+    const box = el("div", "xfilter");
+    const input = el("input", "xfilter-input");
+    input.type = "search";
+    input.maxLength = 200;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.placeholder = "Filter";
+    input.setAttribute("aria-label", "Filter " + s.title);
+    input.dataset.pid = s.pid;
+    const count = el("span", "xfilter-count");
+    count.setAttribute("aria-live", "polite");
+    const key = el("kbd", "xfilter-key", "/");
+    key.setAttribute("aria-hidden", "true");
+    box.append(input, count, key);
+    input.value = s.query;
+    input.addEventListener("input", () => { s.setQuery(input.value, false); keepFocus(input, s.pid); });
+    input.addEventListener("focus", () => keepFocus(input, s.pid));
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault();
+      if (input.value) { input.value = ""; s.setQuery("", true); } else { focusKeep = null; input.blur(); }
+    });
+    s.filterInput = input;
+    s.countEl = count;
+    return box;
+  }
+  function keepFocus(input, pid) { focusKeep = { pid: pid, start: input.selectionStart, end: input.selectionEnd }; }
+
+  // ---- row painting by kind ----
+  function dotOf(status) { const d = el("span", "dot " + (status || "unknown")); d.setAttribute("aria-hidden", "true"); return d; }
+
+  function paintRoster(host, rows, d) {
+    const groups = new Map();
+    for (const r of rows) {
+      const g = typeof r.group === "string" && r.group ? r.group : "";
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(r);
+    }
+    for (const [g, rs] of groups) {
+      if (g) host.appendChild(el("h3", "grp-h", g));
+      for (const r of rs) {
+        const row = el("div", "rrow" + (r.cadence === "on_call" ? " oncall" : ""));
+        row.appendChild(dotOf(r.cadence === "on_call" ? "idle" : callStatus(r)));
+        row.appendChild(el("span", "rname", r.name));
+        if (r.role) row.appendChild(el("span", "rrole", r.role));
+        const chips = el("span", "rchips");
+        chips.appendChild(el("span", "chip-s", r.memory || ""));
+        chips.appendChild(el("span", "chip-s", r.cadence === "on_call" ? "on call" : (r.cadence || "")));
+        row.appendChild(chips);
+        const lc = r.last_call;
+        let state;
+        if (isObj(lc) && typeof lc.at === "string") state = (lc.outcome === "failed" ? "failed " : "") + (ago(lc.at) || lc.at);
+        else if (r.cadence === "on_call") state = "on call";
+        else if (r.digest === null || r.digest === undefined) state = "no data";
+        else state = digestText(r.digest);
+        row.appendChild(el("span", "rstate" + (isObj(lc) && lc.outcome === "failed" ? " bad" : ""), state));
+        host.appendChild(row);
+      }
+    }
+    if (d.retiredHidden) host.appendChild(el("p", "xnote", d.retiredHidden + " retired hidden"));
+  }
+  function callStatus(r) {
+    const lc = r.last_call;
+    if (isObj(lc) && lc.outcome === "failed") return "bad";
+    return isObj(lc) ? "ok" : "unknown";
+  }
+  // a roster digest is an object of scalar facts; it is shown as the words it carries, never as zero
+  function digestText(dg) {
+    if (!isObj(dg)) return "no data";
+    const parts = [];
+    for (const k of Object.keys(dg)) if (typeof dg[k] === "string" || isNum(dg[k])) parts.push(k.replace(/_/g, " ") + " " + dg[k]);
+    return parts.slice(0, 3).join(" · ") || "no data";
+  }
+
+  function paintLog(host, rows) {
+    for (const r of rows) {
+      const row = el("div", "lrow");
+      row.appendChild(el("span", "lsent", typeof r.sentence === "string" && r.sentence ? r.sentence : r.verb + " · " + r.target));
+      row.appendChild(el("span", "lactor", r.actor));
+      row.appendChild(el("span", "lage", ago(r.at) || r.at));
+      host.appendChild(row);
+    }
+  }
+
+  function paintStatusDots(host, metrics) {
+    for (const m of metrics) {
+      const st = ["ok", "warn", "bad"].indexOf(m.status) >= 0 ? m.status : "unknown";
+      const row = el("div", "op " + st);
+      row.appendChild(dotOf(st));
+      row.appendChild(el("span", "op-l", m.label));
+      const fig = m.value == null ? "" : m.value + (m.unit ? " " + m.unit : "");
+      // a state is never colour alone: with no figure and no reading, the word stands in
+      row.appendChild(el("span", "v", [fig, m.read || ""].filter(Boolean).join(" · ") || st));
+      host.appendChild(row);
+    }
+  }
+
+  function paintReading(host, v) {
+    const top = el("div", "rd");
+    top.appendChild(el("span", "rd-n num", v.value));
+    if (v.unit) top.appendChild(el("span", "rd-u", v.unit));
+    if (v.condition) top.appendChild(el("span", "rd-c", v.condition));
+    host.appendChild(top);
+    const bounds = [isNum(v.hi) ? "high " + v.hi : "", isNum(v.lo) ? "low " + v.lo : ""].filter(Boolean).join(" · ");
+    if (bounds) host.appendChild(el("div", "rd-b num", bounds));
+    for (const s of Array.isArray(v.sub) ? v.sub : []) {
+      const row = el("div", "rd-sub");
+      row.appendChild(el("span", "k", s.label));
+      row.appendChild(el("span", "num", s.value == null ? "" : s.value));
+      if (typeof s.band === "string" && s.band) row.appendChild(el("span", "pill" + (s.band === "good" ? "" : " hot"), s.band));
+      host.appendChild(row);
+    }
+    const age = typeof v.as_of === "string" ? ago(v.as_of) : "";
+    if (age) host.appendChild(el("div", "xnote", "read " + age));
+  }
+
+  function paintGrid(host, numbers) {
+    const g = el("div", "mgrid");
+    for (const n of numbers) {
+      const c = el("div", "mcell");
+      c.appendChild(el("b", "num", n.value.toLocaleString("en-US")));
+      c.appendChild(el("span", "", n.label + (n.unit ? " (" + n.unit + ")" : "")));
+      g.appendChild(c);
+    }
+    host.appendChild(g);
+  }
+
+  function paintBrief(host, b) {
+    if (b.headline) host.appendChild(el("div", "q", b.headline));
+    for (const l of b.lines) {
+      const row = el("div", "brief-line");
+      if (l.label) row.appendChild(el("span", "k", l.label));
+      row.appendChild(el("p", "", l.text));
+      host.appendChild(row);
+    }
+  }
+
+  // The ambient kind's slot. The picture itself is drawn by sky.js, a separate file that registers
+  // LevainSky.mount; without it the slot says what it holds, in words.
+  const clocks = new Set();
+  let clockTimer = 0;
+  function setClock(c) {
+    const d = new Date();
+    c.node.textContent = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+    c.date.textContent = d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+  }
+  function tickClocks() {
+    for (const c of Array.from(clocks)) {
+      if (c.node.isConnected) c.seen = true;
+      else if (c.seen) { clocks.delete(c); continue; }       // a clock never attached yet is still being built
+      setClock(c);
+    }
+    if (!clocks.size && clockTimer) { root.clearInterval(clockTimer); clockTimer = 0; }
+  }
+  function paintSky(s, host, sky) {
+    const wrap = el("div", "sky");
+    const when = el("div", "when");
+    const t = el("div", "clock num");
+    const date = el("div", "date");
+    when.append(t, date);
+    const repos = new Set(sky.events.map((e) => e.repo).filter((r) => typeof r === "string" && r));
+    const failed = sky.events.filter((e) => e.outcome === "failed").length;
+    when.appendChild(el("div", "win", sky.events.length + " events from " + repos.size + " repos" + (failed ? " · " + failed + " failed" : "")));
+    const clk = { node: t, date: date, seen: false };
+    clocks.add(clk);
+    setClock(clk);
+    if (!clockTimer) clockTimer = root.setInterval(tickClocks, 30000);
+    const plot = el("div", "plot");
+    plot.dataset.skySlot = "1";
+    wrap.append(when, plot);
+    host.appendChild(wrap);
+    if (root.LevainSky && typeof root.LevainSky.mount === "function") {
+      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
+    } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
+    host.appendChild(el("div", "legendbar frame", sky.legend));
+  }
+
+  // ---- one typed panel ----
+  // state s: pid, title, data (the mapper's record), body (the node this paints into), query, results.
+  function fill(p, data, ctx) {
+    const s = { pid: data.pid, title: (p.querySelector("h2") || {}).textContent || data.pid, data: data, p: p, ctx: ctx || {},
+                query: saved(FILTER_KEY + data.pid) || "", results: null, timer: 0, seq: 0, born: Date.now() };
+    // a rebuilt board leaves its old bodies behind: drop the ones that were never going to be seen again
+    for (const o of Array.from(states)) if (!o.p.isConnected && Date.now() - o.born > 5000) states.delete(o);
+    p.classList.add("k-" + data.kind);
+    if (data.kind === "ambient" && data.sky) p.classList.add("panel-hero");
+    s.body = el("div", "xbody");
+    const sr = data.search || {};
+    const rowKind = data.kind === "list" || data.kind === "count-queue" || data.kind === "roster" || data.kind === "log";
+    s.searchable = rowKind && sr.on === true;
+    if (data.kind === "count-queue") {
+      const n = isNum(data.count) ? data.count : (data.lines || []).length;
+      const big = el("div", "cq");
+      big.appendChild(el("span", "cq-n num", n));
+      big.appendChild(el("span", "cq-l", "waiting"));
+      p.appendChild(big);
+    }
+    if (s.searchable) p.appendChild(buildFilter(s));
+    p.appendChild(s.body);
+    s.setQuery = (q, now) => setQuery(s, q, now);
+    s.paint = () => paint(s);
+    states.add(s);
+    paint(s);
+    if (s.searchable && s.query && sr.scope === "store") runStoreSearch(s);
+    if (focusKeep && focusKeep.pid === s.pid && s.filterInput) {
+      const keep = focusKeep;
+      // the panel is attached by the caller after this returns; a node that is not in the page cannot take focus
+      root.setTimeout(() => {
+        if (!s.filterInput.isConnected || (document.activeElement && document.activeElement !== document.body)) return;
+        s.filterInput.focus();
+        try { s.filterInput.setSelectionRange(keep.start, keep.end); } catch (_) { /* a search box that cannot place a caret */ }
+      }, 0);
+    }
+    return s;
+  }
+
+  function itemsOf(d) {
+    if (d.kind === "roster") return d.roster || [];
+    if (d.kind === "log") return d.logRows || [];
+    return d.lines || [];
+  }
+
+  function paint(s) {
+    const d = s.data, sr = d.search || {};
+    s.body.replaceChildren();
+    if (s.fault) { s.body.appendChild(el("p", "err", "unavailable — " + s.fault)); return; }
+    if (d.kind === "status-dots") { paintStatusDots(s.body, d.metrics || []); if (!(d.metrics || []).length) s.body.appendChild(el("p", "empty", d.empty)); return; }
+    if (d.kind === "reading") { paintReading(s.body, d.reading); return; }
+    if (d.kind === "metric-grid") { paintGrid(s.body, d.numbers); return; }
+    if (d.kind === "brief") { paintBrief(s.body, d.brief); return; }
+    if (d.kind === "ambient") { paintSky(s, s.body, d.sky); return; }
+    if (d.kind === "form") {
+      // the compose box (mounted by the core when the verb is offered) is the form; without it, say why
+      if (!d.action) s.body.appendChild(el("p", "xnote", "this form cannot send from here" + (d.form.verb ? " (" + d.form.verb + " is not offered)" : "")));
+      return;
+    }
+    // row-shaped: the window, or the store's answer to the query
+    const terms = termsOf(s.query);
+    const store = sr.scope === "store" && s.query && s.searchable;
+    let items = itemsOf(d), hays = d.hays || [], label = "", err = "";
+    if (store) {
+      if (s.results) { items = s.results.items; hays = s.results.hays; label = s.results.label; err = s.results.error; if (err) items = []; }
+      else { items = []; label = "searching…"; }
+    } else if (terms.length) {
+      const keep = [];
+      items.forEach((it, i) => { if (hits(hays[i] || "", terms)) keep.push(i); });
+      label = keep.length + " of " + items.length;
+      hays = keep.map((i) => hays[i]);
+      items = keep.map((i) => items[i]);
+    } else if (s.searchable) {
+      label = items.length + " rows" + (sr.window ? " · newest " + sr.window : "");
+    }
+    if (s.countEl) { s.countEl.textContent = err ? "search failed" : label; s.countEl.classList.toggle("bad", !!err); }
+    if (err) s.body.appendChild(el("p", "err", "search failed — " + err));
+    else if (!items.length) s.body.appendChild(el("p", "empty", store && !s.results ? "searching…" : (terms.length ? "no match" : d.empty)));
+    // the first screenful, unless the operator asked for all of it or is filtering
+    const cap = s.searchable && !s.query && !s.showAll && items.length > (sr.visible || 10) ? (sr.visible || 10) : items.length;
+    const shown = items.slice(0, cap);
+    if (d.kind === "roster") paintRoster(s.body, shown, d);
+    else if (d.kind === "log") paintLog(s.body, shown);
+    else if (s.ctx.rows) s.ctx.rows(s.body, shown);
+    if (cap < items.length) {
+      const more = el("button", "xmore", "show all " + items.length);
+      more.type = "button";
+      more.addEventListener("click", () => { s.showAll = true; paint(s); });
+      s.body.appendChild(more);
+    }
+    if (store && s.results && s.results.label && !err) s.body.appendChild(el("p", "xnote", s.results.label));
+  }
+
+  function setQuery(s, q, now) {
+    s.query = q;
+    s.showAll = false;
+    save(FILTER_KEY + s.pid, q);
+    for (const o of states) if (o !== s && o.pid === s.pid && o.p.isConnected) { o.query = q; if (o.filterInput) o.filterInput.value = q; paintOrSearch(o, now); }
+    if (s.filterInput && s.filterInput.value !== q) s.filterInput.value = q;
+    paintOrSearch(s, now);
+  }
+  function paintOrSearch(s, now) {
+    const sr = s.data.search || {};
+    if (sr.scope === "store" && s.searchable) {
+      if (!s.query) { s.seq++; s.results = null; root.clearTimeout(s.timer); paint(s); return; }
+      s.results = null;
+      paint(s);
+      root.clearTimeout(s.timer);
+      if (now) runStoreSearch(s); else s.timer = root.setTimeout(() => runStoreSearch(s), SEARCH_DEBOUNCE_MS);
+    } else paint(s);
+  }
+
+  // The store scope: ask the kernel, over the page's own read transport (the same token handling as every
+  // panel read; q rides the query string of a read and is never kept by the kernel).
+  async function runStoreSearch(s) {
+    const q = sendable(s.query);
+    const seq = ++s.seq;
+    if (!q) { s.results = null; paint(s); return; }
+    let out;
+    try {
+      const raw = await readPanel(s.pid, "&q=" + encodeURIComponent(q) + "&limit=" + STORE_LIMIT);
+      out = mapSearch(s, clean(raw));
+    } catch (e) { out = { items: [], hays: [], label: "", error: e && e.message ? e.message : String(e) }; }
+    if (seq !== s.seq || !s.p.isConnected) return;     // a newer query, or the panel is gone
+    s.results = out;
+    paint(s);
+  }
+  function mapSearch(s, payload) {
+    if (typeof payload.search_error === "string" && payload.search_error) return { items: [], hays: [], label: "", error: payload.search_error };
+    if (payload.status === "error") return { items: [], hays: [], label: "", error: payload.error || "unavailable" };
+    const titles = new Map();
+    for (const g of payload.groups || []) titles.set(g.id, titleOf(g.title, String(g.id)));
+    const ext = externalOf(payload, payload, titles);
+    return { items: itemsOf(ext), hays: ext.hays || [], label: ext.search.matchLabel, error: "" };
+  }
+
+  function readPanel(pid, extra) {
+    const t = root.LevainCockpitTransport;
+    if (!t || typeof t.readJson !== "function") return Promise.reject(new Error("no read transport on this page"));
+    return t.readJson("/cockpit/panel/" + encodeURIComponent(pid) + ".json?profile=full" + (extra || ""));
+  }
+
+  // Refetch one panel by id and redraw it in place. The streaming lane (CK4) calls this when an event says a
+  // panel moved. Resolves true when a typed panel on the page was redrawn; false when the page holds no typed
+  // panel by that id (a native panel, or none), which the caller answers with a full reload.
+  async function refetchPanel(pid) {
+    const live = Array.from(states).filter((s) => s.pid === pid && s.p.isConnected);
+    if (!live.length) return false;
+    let payload, fault = "";
+    try { payload = clean(await readPanel(pid)); } catch (e) { fault = e && e.message ? e.message : String(e); }
+    for (const s of live) {
+      if (!fault && (payload.status === "error")) fault = payload.error || "unavailable";
+      if (fault) { s.fault = fault; paint(s); continue; }
+      try {
+        const titles = new Map();
+        for (const g of payload.groups || []) titles.set(g.id, titleOf(g.title, String(g.id)));
+        const ext = externalOf(payload, payload, titles);
+        ext.pid = pid;
+        ext.action = s.data.action;
+        s.data = ext;
+        s.fault = "";
+        s.results = null;
+        paintOrSearch(s, true);
+      } catch (e) { s.fault = "could not be mapped (" + (e && e.message ? e.message : e) + ")"; paint(s); }
+    }
+    return true;
+  }
+
+  // ---- the modes and the keys ----
+  function applyMode(m) {
+    if (MODES.indexOf(m) < 0) m = "board";
+    document.body.dataset.mode = m;
+    save(MODE_KEY, m);
+    for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
+  }
+  function typing(t) { return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable); }
+  function visibleFilters() {
+    return Array.from(document.querySelectorAll(".xfilter-input")).filter((i) => i.offsetParent !== null);
+  }
+
+  // ---- the jump box: one search path with the filters. A panel title, a loaded row, or "search the store" ----
+  let palette = null;
+  function jumpItems(q) {
+    const terms = termsOf(q);
+    const items = [];
+    for (const h of document.querySelectorAll("#board .panel > .phead h2")) {
+      const panel = h.closest(".panel");
+      if (!terms.length || hits(fold(h.textContent), terms)) items.push({ kind: "panel", label: h.textContent, node: panel });
+    }
+    if (terms.length) {
+      for (const s of states) {
+        if (!s.p.isConnected || !s.searchable) continue;
+        const d = s.data, hays = d.hays || [], its = itemsOf(d);
+        let n = 0;
+        its.forEach((it, i) => {
+          if (n < 5 && hits(hays[i] || "", terms)) {
+            n++;
+            const text = d.kind === "roster" ? it.name : d.kind === "log" ? (it.sentence || it.verb + " · " + it.target) : it.text;
+            items.push({ kind: "row", label: String(text), where: s.title, state: s, q: q });
+          }
+        });
+        if ((d.search || {}).scope === "store") items.push({ kind: "store", label: "Search " + s.title + " for “" + q + "”", state: s, q: q });
+      }
+    }
+    return items.slice(0, 14);
+  }
+  function openJump() {
+    if (palette) return;
+    const dlg = el("div", "palette");
+    dlg.setAttribute("role", "dialog");
+    dlg.setAttribute("aria-label", "Jump");
+    const box = el("div", "palette-box");
+    const input = el("input", "palette-input");
+    input.placeholder = "Jump to a panel or a row";
+    input.setAttribute("aria-label", "Jump to");
+    const list = el("ul", "palette-list");
+    list.setAttribute("role", "listbox");
+    box.append(input, list);
+    dlg.appendChild(box);
+    document.body.appendChild(dlg);
+    palette = { dlg: dlg, input: input };
+    let items = [], sel = 0;
+    const close = () => { dlg.remove(); palette = null; };
+    const choose = (it) => {
+      close();
+      if (it.kind === "panel") { it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); return; }
+      applyMode("board");
+      it.state.setQuery(it.q, true);
+      it.state.p.scrollIntoView({ block: "start" });
+      if (it.state.filterInput) it.state.filterInput.focus();
+    };
+    const draw = () => {
+      list.replaceChildren();
+      items.forEach((it, i) => {
+        const li = el("li");
+        li.setAttribute("role", "option");
+        li.setAttribute("aria-selected", i === sel ? "true" : "false");
+        li.append(el("span", "pk", it.kind === "panel" ? "panel" : it.kind === "store" ? "store" : "row"), el("span", "pl", it.label));
+        if (it.where) li.appendChild(el("span", "pw", it.where));
+        li.addEventListener("click", () => choose(it));
+        list.appendChild(li);
+      });
+      if (!items.length) list.appendChild(el("li", "pl-none", "nothing matches"));
+    };
+    const refresh = () => { items = jumpItems(input.value); sel = 0; draw(); };
+    input.addEventListener("input", refresh);
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape") { ev.preventDefault(); close(); }
+      else if (ev.key === "ArrowDown") { ev.preventDefault(); sel = Math.min(items.length - 1, sel + 1); draw(); }
+      else if (ev.key === "ArrowUp") { ev.preventDefault(); sel = Math.max(0, sel - 1); draw(); }
+      else if (ev.key === "Enter" && items[sel]) { ev.preventDefault(); choose(items[sel]); }
+    });
+    dlg.addEventListener("mousedown", (ev) => { if (ev.target === dlg) close(); });
+    refresh();
+    input.focus();
+  }
+
+  function install() {
+    applyMode(saved(MODE_KEY) || "board");
+    document.addEventListener("click", (ev) => {
+      const t = ev.target && ev.target.closest ? ev.target.closest("[data-mode-tab],#jumpbtn") : null;
+      if (!t) return;
+      if (t.id === "jumpbtn") openJump(); else applyMode(t.dataset.modeTab);
+    });
+    // a filter keeps focus through a re-render until the operator goes somewhere else
+    document.addEventListener("mousedown", (ev) => { if (!(ev.target && ev.target.closest && ev.target.closest(".xfilter"))) focusKeep = null; });
+    document.addEventListener("mouseover", (ev) => { const p = ev.target && ev.target.closest ? ev.target.closest(".panel") : null; if (p) hoverPanel = p; });
+    document.addEventListener("keydown", (ev) => {
+      if (ev.defaultPrevented) return;
+      if ((ev.metaKey || ev.ctrlKey) && ev.key && ev.key.toLowerCase() === "k") { ev.preventDefault(); if (palette) palette.dlg.remove(), palette = null; else openJump(); return; }
+      if (ev.metaKey || ev.ctrlKey || ev.altKey || palette || typing(ev.target)) return;
+      if (document.querySelector(".modal-overlay")) return;
+      if (ev.key === "/") {
+        const all = visibleFilters();
+        if (!all.length) return;
+        const near = (hoverPanel && hoverPanel.isConnected && all.find((i) => hoverPanel.contains(i))) || all[0];
+        ev.preventDefault();
+        near.focus();
+        near.select();
+      } else if (ev.key.length === 1 && "123".indexOf(ev.key) >= 0) applyMode(MODES["123".indexOf(ev.key)]);
+    });
+  }
+  if (typeof document !== "undefined") {
+    if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", install); else install();
+  }
+
+  Object.assign(K, { fill, refetchPanel, fold, termsOf, hits, jumpItems, applyMode });
+
+  const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
-  else root.LevainCockpitView = api;
+  else { root.LevainCockpitView = api; root.LevainCockpitKinds = K; }
 })(typeof globalThis !== "undefined" ? globalThis : this);

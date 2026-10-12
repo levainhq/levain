@@ -7,30 +7,17 @@
 <link rel="stylesheet" href="/dashboard.css" />
 </head>
 <body>
-  <!-- the living rings: the substrate's vital-signs, made ambient. JS sets
-       body[data-vital] from health.write_path_live → the organism's health. -->
-  <div class="rings" aria-hidden="true">
-    <div class="ring ring-0"></div><div class="ring ring-1"></div><div class="ring ring-2"></div>
-    <div class="ring ring-3"></div><div class="ring ring-4"></div><div class="ring ring-5"></div>
-    <div class="ring ring-6"></div><div class="ring ring-7"></div><div class="ring ring-8"></div>
-    <div class="ring ring-9"></div><div class="ring ring-10"></div><div class="ring ring-11"></div>
-    <div class="ring ring-12"></div>
-    <div class="core">
-      <span class="hue h1"></span><span class="hue h2"></span><span class="hue h3"></span>
-      <span class="hue h4"></span><span class="hue h5"></span><span class="hue h6"></span>
-    </div>
-    <div class="nucleus">
-      <span class="hue h1"></span><span class="hue h2"></span><span class="hue h3"></span>
-      <span class="hue h4"></span><span class="hue h5"></span><span class="hue h6"></span>
-    </div>
-  </div>
-
   <div class="deck">
-    <header class="masthead">
+    <header class="masthead frame">
       <div class="brand">
         <div class="wordmark">Levain</div>
         <div class="model">your partner's memory, from outside the session</div>
       </div>
+      <nav class="seg" aria-label="Modes">
+        <button class="mode" type="button" data-mode-tab="morning" aria-selected="false"><kbd>1</kbd>Morning</button>
+        <button class="mode" type="button" data-mode-tab="board" aria-selected="true"><kbd>2</kbd>Board</button>
+        <button class="mode" type="button" data-mode-tab="build" aria-selected="false"><kbd>3</kbd>Build</button>
+      </nav>
       <div class="readout">
         <div class="unit">
           <span class="unit-label">Unit</span>
@@ -40,20 +27,14 @@
         <div class="indicators">
           <span class="stamp" id="stamp"></span>
           <button id="refresh" type="button">⟳ sync</button>
+          <button id="jumpbtn" type="button">Jump<kbd>⌘K</kbd></button>
         </div>
       </div>
     </header>
-    <p class="stateline" id="state" hidden></p>
-    <p class="sub" id="store">connecting…</p>
-    <!-- Identity · Operate · Mind — the IA. "All" = the whole mind on one scroll;
-         a zone filters to just that section of the deck. -->
-    <nav class="tabs">
-      <button class="tab active" type="button" data-zone="all">◍ All</button>
-      <button class="tab" type="button" data-zone="identity">▣ Identity</button>
-      <button class="tab" type="button" data-zone="operate">▶ Operate</button>
-      <button class="tab" type="button" data-zone="mind">◆ Mind</button>
-    </nav>
-    <div class="grid" id="board"></div>
+    <p class="stateline frame" id="state" hidden></p>
+    <p class="sub frame" id="store">connecting…</p>
+    <!-- Modes 1 / 2 / 3 show subsets of the board; the keys are ignored while typing. -->
+    <main class="frame"><div class="grid" id="board"></div></main>
     <footer class="deck-foot">sovereign · localhost · governed — the substrate, escaped the session</footer>
   </div>
 
