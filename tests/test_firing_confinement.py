@@ -1019,7 +1019,7 @@ def test_build_policy_default_does_not_deny_standard_creds(tmp_path: Path, monke
     assert (tmp_path / ".aws" / "credentials").resolve() not in policy.deny_files
 
 
-_VECTOR_MARKER = ";; ssh persistence/exec vectors"
+_VECTOR_MARKER = ";; ssh + gpg persistence/exec vectors"
 
 
 def test_render_profile_ssh_exec_vector_block_is_write_only(tmp_path: Path, monkeypatch) -> None:
@@ -1947,6 +1947,50 @@ def test_offline_bash_cannot_reach_the_hosts_resolver_deputies(tmp_path, monkeyp
     assert any(on[k:k + 3] == ["--ro-bind", "/dev/null", dirmngr] for k in range(len(on)))
     assert "S.gpg-agent" not in " ".join(on)  # signing through gpg-agent keeps working
     assert dbus not in off and snapd not in off and dirmngr not in off
+
+
+# Literal, not the module constant: a red on the parent must be the absent PROPERTY (the conf is not
+# write-denied), not an AttributeError on a new symbol (spore-938).
+_GNUPG_CONFS = ("gpg-agent.conf", "scdaemon.conf", "gpg.conf", "dirmngr.conf", "common.conf")
+
+
+def test_gnupg_conf_write_deny_covers_the_default_home(tmp_path, monkeypatch) -> None:
+    """Bash must not write the operator's gnupg configuration files; the host agent starts programs
+    they name. The deny is UNCONDITIONAL, not gated on ``deny_localhost_outbound``."""
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".gnupg").mkdir()
+    policy = build_policy(_entity(tmp_path))                 # DEFAULT deny_localhost_outbound=False
+    denied = set(policy.deny_write_files)
+    for conf in _GNUPG_CONFS:
+        assert (tmp_path / ".gnupg" / conf).resolve() in denied, f"{conf} not write-denied in ~/.gnupg"
+
+
+def test_gnupg_conf_write_deny_covers_an_absolute_gnupghome(tmp_path, monkeypatch) -> None:
+    """A ``$GNUPGHOME`` from levain's own environment gets the same denies. A RELATIVE one is not
+    used (it would resolve against levain's cwd, not the sandbox's)."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    env_home = tmp_path / "env-gnupg"
+    env_home.mkdir()
+    monkeypatch.setenv("GNUPGHOME", str(env_home))
+    policy = build_policy(_entity(tmp_path))
+    denied = set(policy.deny_write_files)
+    for conf in _GNUPG_CONFS:
+        assert (env_home / conf).resolve() in denied, f"{conf} not denied in $GNUPGHOME"
+
+
+def test_gnupg_conf_deny_pins_a_lexical_ancestor_symlink(tmp_path, monkeypatch) -> None:
+    """A symlink in the home's path cannot be swapped to move the denies: the home is passed to
+    ``_spellings`` UNRESOLVED, so the symlink itself is write-deny-pinned, not only its target."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    real = tmp_path / "real-gnupg"
+    real.mkdir()
+    link = tmp_path / "current"           # intermediate symlink the shell could retarget
+    link.symlink_to(real)
+    monkeypatch.setenv("GNUPGHOME", str(link))
+    policy = build_policy(_entity(tmp_path))
+    write_dirs = {str(d) for d in policy.deny_write_dirs}
+    assert str(link) in write_dirs, "the lexical symlink ancestor is not write-deny-pinned"
 
 
 def _tmpfs_then_ro(argv: list[str], d: str) -> bool:
