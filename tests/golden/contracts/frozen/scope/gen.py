@@ -34,6 +34,11 @@ KNOWN = profile("S1_DESIGN F9 rev 11 / levain team/entry.py validate @ 31dea1f (
                 "refs and supersedes target must be held, an ack or a retire is never superseded",
                 rationale="the frozen schema's snapshot rules are T's writer rules; the snapshot is the team log's "
                           "verified prefix")
+CHAIN = profile("S1_DESIGN F9 rev 11", "the snapshot keeps each file's head hash; a leaf is accepted only if "
+                "entry.prev equals that head (\"\" only while the file has no accepted entry); a second prev=\"\" "
+                "for a file, or any prev that is not the head, is refused",
+                rationale="team/entry.py chains each file by prev; two accepted children of one parent would be a "
+                          "permanent fork in the sealed per-file chain")
 REG = profile("S1_DESIGN F9", "an unknown scope is refused at ingest and UNVERIFIABLE at verify",
               rationale="scope comes from the key directory; an old levain never calls a newer scope tampering")
 V = []
@@ -160,6 +165,32 @@ for at in ("ingest", "verify"):
          (line_leaf(seal_entry(ent("dana", 76, "retire", supersedes=[K_RET["id"]]), K_RET["hash"]), F1, DANA, ORIGIN),
           "human")],
         [ACCEPT, ACCEPT, REFUSE], KNOWN)
+
+# ---- rev 11: per-file chain continuity: entry.prev is the file's head ("" only while the file has none) --------
+C_G = seal_entry(ent("dana", 80, "finding", words="genesis"), "")
+C_G_LEAF = line_leaf(C_G, F1, DANA, ORIGIN)
+C_L1 = seal_entry(ent("dana", 81, "finding", words="second link"), C_G["hash"])
+C_L1_LEAF = line_leaf(C_L1, F1, DANA, ORIGIN)
+C_FORK0 = line_leaf(seal_entry(ent("dana", 82, "finding", words="a second genesis"), ""), F1, DANA, ORIGIN)
+C_FORK1 = line_leaf(seal_entry(ent("dana", 83, "finding", words="a second child of genesis"), C_G["hash"]), F1, DANA,
+                    ORIGIN)
+C_OTHER = seal_entry(ent("dana", 84, "finding", words="the other file's genesis"), "")
+C_OTHER_LEAF = line_leaf(C_OTHER, F2, DANA, ORIGIN)
+C_CROSS = line_leaf(seal_entry(ent("dana", 85, "finding", words="prev names the other file's head"), C_OTHER["hash"]),
+                    F1, DANA, ORIGIN)
+C_ORPHAN = line_leaf(seal_entry(ent("dana", 86, "finding", words="prev in an empty file"), C_G["hash"]), F2, DANA,
+                     ORIGIN)
+for at in ("ingest", "verify"):
+    log(f"chain-genesis-accepted-at-{at}", at, [(C_G_LEAF, "human")], [ACCEPT], CHAIN)
+    log(f"chain-second-link-accepted-at-{at}", at, [(C_G_LEAF, "human"), (C_L1_LEAF, "human")], [ACCEPT, ACCEPT], CHAIN)
+    log(f"chain-fork-at-genesis-refused-at-{at}", at, [(C_G_LEAF, "human"), (C_FORK0, "human")], [ACCEPT, REFUSE],
+        CHAIN)
+    log(f"chain-fork-mid-chain-refused-at-{at}", at,
+        [(C_G_LEAF, "human"), (C_L1_LEAF, "human"), (C_FORK1, "human")], [ACCEPT, ACCEPT, REFUSE], CHAIN)
+    log(f"chain-prev-names-a-non-head-hash-refused-at-{at}", at,
+        [(C_G_LEAF, "human"), (C_OTHER_LEAF, "human"), (C_CROSS, "human")], [ACCEPT, ACCEPT, REFUSE], CHAIN)
+    log(f"chain-non-empty-prev-in-an-empty-file-refused-at-{at}", at, [(C_G_LEAF, "human"), (C_ORPHAN, "human")],
+        [ACCEPT, REFUSE], CHAIN)
 
 log("unknown-scope-refused-at-ingest", "ingest", [(A_LEAF, "auditor")], [REFUSE], REG)
 log("unknown-scope-unverifiable-at-verify", "verify", [(A_LEAF, "auditor")], [UNVERIFIABLE], REG)

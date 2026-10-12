@@ -10,7 +10,8 @@ verify both: run the FROZEN entry schema (``entry_v1.validate_entry_v1``, with `
 and ``None`` at verify, and ``known`` = the snapshot's entries by unique id, rev 11); recompute ``entry.hash = chain_hash(entry.prev, entry)``; verify ``device_sig`` (F12,
 namespace ``levain-team-entry``) over ``string(origin) || string(file) || string(32-byte chain hash)``; refuse a
 repeated ``(file, entry.hash)`` (an operator fault at verify) and an ``entry.id`` already held by an accepted leaf;
-and apply ``may_write_team_log`` against the snapshot, the team log's verified prefix before this leaf. A leaf this
+require ``entry.prev`` to be the file's head in the snapshot, ``""`` only while the file has no accepted entry (rev
+11: per-file chain continuity, so a sealed chain never forks); and apply ``may_write_team_log`` against the snapshot, the team log's verified prefix before this leaf. A leaf this
 module refuses is invalid forever; any rule change is a new ``(line, v)``.
 
 Scope is read from the key directory (P1), never from the leaf: callers pass the writing device's scope.
@@ -112,12 +113,18 @@ class Snapshot:
     def __init__(self, leaves: Iterable[LineLeaf] = ()):
         self._by_id: dict[str, list[dict]] = {}
         self._file_hash: set[tuple[str, str]] = set()
+        self._head: dict[str, str] = {}
         for leaf in leaves:
             self.add(leaf)
 
     def add(self, leaf: LineLeaf) -> None:
         self._by_id.setdefault(leaf.entry["id"], []).append(leaf.entry)
         self._file_hash.add((leaf.file, leaf.hash))
+        self._head[leaf.file] = leaf.hash
+
+    def head(self, file: str) -> str:
+        """The file's head: the chain hash of its last accepted entry, or ``""`` while it has none (rev 11)."""
+        return self._head.get(file, "")
 
     def holds_id(self, entry_id: str) -> bool:
         return entry_id in self._by_id
@@ -180,6 +187,8 @@ def check_line(d: bytes, *, origin: str, scope: str, snapshot: Snapshot, now: da
         raise OperatorFault(f"a second leaf for ({leaf.file!r}, {leaf.hash})")
     if snapshot.holds_id(leaf.entry["id"]):
         raise ContractError(f"entry id {leaf.entry['id']!r} is already held by an accepted leaf")
+    if leaf.entry["prev"] != snapshot.head(leaf.file):
+        raise ContractError(f"entry.prev is not the head of {leaf.file!r} (a fork or a broken per-file chain)")
     # rev 11: the frozen schema's snapshot rules (refs and supersedes held; an ack or a retire never superseded)
     validate_entry_v1(leaf.entry, snapshot.known(), scan=False, now=now)
     sshsig.verify(leaf.device_sig, namespace=TEAM_ENTRY_NAMESPACE, device_fp=leaf.device_fp,
