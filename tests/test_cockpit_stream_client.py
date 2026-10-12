@@ -167,14 +167,25 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
   {
     const h = boot({ manifest: () => ({ panels: { a: { etag: "1" }, b: { etag: "2" } } }) });
     const calls = [];
-    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); return "applied"; };
+    // the view records the etag its own panel read returned, as the real refetchPanel does
+    h.win.LevainCockpitView.refetchPanel = async (id) => { calls.push(id); h.win.LevainCockpitHeld[id].etag = "own-" + id; return "applied"; };
     await settle();
     h.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: false }));
     await settle();
     ok(h.manifests.length === 1, "one manifest fetch on the first hello: " + h.manifests.length);
     ok(h.manifests[0].headers["X-T"] === "tok" && !h.manifests[0].headers["If-None-Match"], "through the page's credential, unconditional");
     ok(calls.join() === "b", "only the moved panel is refetched: " + calls);
-    ok(h.win.LevainCockpitHeld.b.etag === "2", "applied records the etag from the manifest");
+    ok(h.win.LevainCockpitHeld.b.etag === "own-b", "the etag held is the one the panel read returned");
+  }
+  // ---- an announced etag is another credential's: the stream never stores it ----
+  {
+    const h = boot({});
+    h.win.LevainCockpitView.refetchPanel = async () => "applied";
+    await settle();
+    h.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: false }));
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "class-none-etag" }));
+    await settle();
+    ok(h.win.LevainCockpitHeld.a.etag === "1", "an event's etag is not planted: " + h.win.LevainCockpitHeld.a.etag);
   }
   // ---- a replay hello (a position, no resync) does not reconcile; a resync hello does ----
   {
@@ -226,29 +237,20 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     await settle();
     ok(h.fetches.length === 1, "a later draw starts the stream");
   }
-  // ---- applied records the event's etag in held ----
+  // ---- a fault owed across hide/show is retried when the tab is visible again ----
   {
     const h = boot({});
     await settle();
-    h.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: false }));
-    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "9" }));
-    await settle();
-    ok(h.win.LevainCockpitHeld.a.etag === "9", "held carries the applied etag: " + h.win.LevainCockpitHeld.a.etag);
-  }
-  // ---- a fault owed across hide/show is retried with its own event's etag ----
-  {
-    const h = boot({});
-    await settle();
+    const retried = [];
     h.win.LevainCockpitView.refetchPanel = async () => "fault";
     h.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: false }));
     h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "7" }));
     h.fetches[0].push(frame("panel-changed", "E.1:2", { id: "b", etag: "8" }));
     await settle();
-    h.win.LevainCockpitView.refetchPanel = async () => "applied";
+    h.win.LevainCockpitView.refetchPanel = async (id) => { retried.push(id); return "applied"; };
     h.doc.hidden = true; h.listeners.visibilitychange.forEach((f) => f()); await settle();
     h.doc.hidden = false; h.listeners.visibilitychange.forEach((f) => f()); await settle();
-    ok(h.win.LevainCockpitHeld.a.etag === "7" && h.win.LevainCockpitHeld.b.etag === "8",
-       "owed retries carry their event etags: " + h.win.LevainCockpitHeld.a.etag + "," + h.win.LevainCockpitHeld.b.etag);
+    ok(retried.sort().join() === "a,b", "owed retries run for both panels: " + retried);
   }
   // ---- a reload wanted during a reload is not lost when that reload returns true ----
   {

@@ -68,12 +68,12 @@
     if (f) { root.clearTimeout(f.timer); delete faults[id]; }
   }
   function cancelFaults() { Object.keys(faults).forEach(clearFault); }
-  function scheduleFault(id, etag) {
+  function scheduleFault(id) {
     var n = faults[id] ? faults[id].n : 0;
     clearFault(id);
     if (n >= FAULT_RETRY_MS.length) return;
-    var f = { n: n + 1, timer: 0, etag: etag };
-    f.timer = root.setTimeout(function () { if (faults[id] === f) { f.timer = 0; refetch(id, etag); } }, FAULT_RETRY_MS[n]);
+    var f = { n: n + 1, timer: 0 };
+    f.timer = root.setTimeout(function () { if (faults[id] === f) { f.timer = 0; refetch(id); } }, FAULT_RETRY_MS[n]);
     faults[id] = f;
   }
 
@@ -105,20 +105,18 @@
   }
 
   // the settled answer of one refetch: "applied", "fault" or false
-  function refetch(id, etag) {
+  function refetch(id) {
     var done;
     try { done = V.refetchPanel(id); } catch (_) { done = Promise.resolve("fault"); }
     return Promise.resolve(done).then(function (r) {
       if (r === "applied" || r === true) {
-        clearFault(id);
-        var h = held();
-        if (etag && h[id]) h[id].etag = etag;
-      } else if (r === "fault") scheduleFault(id, etag);
+        clearFault(id);     // the view recorded the etag its own panel read returned; the announced one is another credential's
+      } else if (r === "fault") scheduleFault(id);
       else wantReload();
       return r;
-    }, function () { scheduleFault(id, etag); return "fault"; });
+    }, function () { scheduleFault(id); return "fault"; });
   }
-  function onEvent(id, etag) { clearFault(id); return refetch(id, etag); }
+  function onEvent(id) { clearFault(id); return refetch(id); }
 
   // ---- the frame parser: events are blank-line separated; `:` lines are comments (the heartbeat) ----
   function onFrame(text) {
@@ -145,7 +143,7 @@
       // anything but a ring replay is compared with the server's manifest
       if (body.resync || !withPosition) reconcile(false);
     } else if (event === "panel-changed" && body && body.id) {
-      onEvent(body.id, body.etag);
+      onEvent(body.id);
     } else if (event === "manifest-changed") {
       wantReload();
     }
@@ -204,7 +202,7 @@
     if (ids.length !== have.length || ids.some(function (id) { return !(id in h); })) { wantReload(); return; }
     ids.forEach(function (id) {
       if (h[id] && h[id].etag === heads[id].etag) return;
-      onEvent(id, heads[id].etag);
+      onEvent(id);
     });
   }
   function reconcile(conditional) {
@@ -227,7 +225,7 @@
   function pause() {
     if (paused) return;
     paused = true;
-    owed = Object.keys(faults).map(function (id) { return { id: id, etag: faults[id].etag }; });
+    owed = Object.keys(faults);
     cancelFaults();
     root.clearTimeout(retryTimer);
     root.clearTimeout(watchdog);
@@ -243,7 +241,7 @@
     staleSince = null;
     paintChip();
     var o = owed; owed = [];
-    o.forEach(function (x) { onEvent(x.id, x.etag); });
+    o.forEach(function (id) { onEvent(id); });
     if (pending) wantReload();
     if (gaveUp) { if (root.LevainCockpitHeld) { gaveUp = false; connect(); } else whenDrawn(Date.now() + DRAW_WAIT_MS); return; }
     connect();
