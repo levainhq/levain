@@ -8453,7 +8453,7 @@ def diagnose_confinement(system: str | None = None) -> ConfinementDiagnosis:
         return ConfinementDiagnosis(
             False, "bwrap (Linux mount namespace)",
             f"the bubblewrap at {BWRAP} has no --perms option: Levain needs bubblewrap 0.5.0 or later",
-            "install bubblewrap 0.5.0 or later (Ubuntu 22.04 and Debian 12 ship it)",
+            "install bubblewrap 0.5.0 or later",
         )
     if _bwrap_runs_without_a_pid_namespace():
         # The floor needs `--unshare-pid` (so bash cannot read other processes' environments), and
