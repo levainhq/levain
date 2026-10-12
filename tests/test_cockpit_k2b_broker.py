@@ -6,11 +6,9 @@ adapter, never by mocking anneal."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import sqlite3
-import subprocess
 import tempfile
 import threading
 import time
