@@ -694,9 +694,6 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
         computed = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
     except KeyError_ as exc:
         raise AuthorityError(str(exc)) from None
-    except OSError as exc:
-        raise VerifierUnavailable(f"ssh-keygen could not fingerprint an enrolled key ({type(exc).__name__})") \
-            from None
     if computed != fp:
         raise AuthorityError(f"the record's fingerprint {fp} is not the key's ({computed})")
     if cls == LAPTOP and public_key.split()[0] not in _LAPTOP_KEY_TYPES:
