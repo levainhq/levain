@@ -30,6 +30,7 @@ out.one = widget(1, false);
 out.alertedZero = widget(0, true);
 out.partialZero = widget(0, false, { status: "partial", skipped: [{ count: 2, reason: "unreadable" }] });
 out.staleZero = widget(0, false, { status: "stale" });
+out.emptyStatusZero = widget(0, false, { status: "empty" });   // the kernel's status for a clean zero-row read
 out.heldZero = widget(0, false, { filtered: [{ count: 1, reason: "held" }] });
 out.identZero = widget(0, false, { empty: "npm-registry has nothing" });
 
@@ -62,6 +63,7 @@ out.hidesAfterBad = hides;
 def test_decisions_zero_answers_with_the_empty_sentence_and_the_legend_is_a_band(tmp_path: Path) -> None:
     o = run_node(BODY, tmp_path)
     assert o["zero"] == ["Nothing is waiting on you."]
+    assert o["emptyStatusZero"] == ["Nothing is waiting on you."]   # status "empty" is a clean zero (L3 r2)
     assert o["one"] and o["one"][0].startswith("needs_phill list")     # something waiting: the provider's note stays
     for k in ("partialZero", "staleZero", "heldZero"):              # a degraded zero keeps the provider's note
         assert o[k] and o[k][0].startswith("needs_phill list"), k
