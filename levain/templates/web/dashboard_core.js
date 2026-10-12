@@ -55,9 +55,12 @@
     p.appendChild(head);
     // A manifest source's status lines (stale / partial / held back / the provider's note), drawn
     // under the header so a degraded panel never reads as a healthy one.
-    for (const b of entry.banner || []) p.appendChild(el("div", "ext-note" + (b.tone === "stale" ? " stale" : ""), b.text));
+    appendBanner(p, entry);
     return p;
   };
+  function appendBanner(host, entry) {
+    for (const b of entry.banner || []) host.appendChild(el("div", "ext-note" + (b.tone === "stale" ? " stale" : ""), b.text));
+  }
   const kv = (parent, k, v) => {
     const row = el("div", "kv");
     row.appendChild(el("span", "k", k));
@@ -238,6 +241,8 @@
     const storeEl = document.getElementById("store");
     if (!view || typeof view !== "object") {
       board.appendChild(el("p", "empty", "No substrate data delivered."));
+      keShell(false);      // the KE regions, the moved masthead and the state line must not outlive the data they showed
+      renderState(null);
       closeModal();  // don't leave a focus-modal open over a view we can't render
       return;
     }
@@ -302,7 +307,7 @@
     // steady phosphor heartbeat; DARK → slow, dim-red. The background IS the pulse.
     // (view.scope stays a data-only seam — the UI surfaces it when team scope is
     // real, not as a PM-style profile selector that does nothing yet.)
-    const live = !!(view.health && view.health.write_path_live);
+    const live = !!(view.health ? view.health.write_path_live : view.write_path_live);
     if (document.body) document.body.dataset.vital = live ? "live" : "dark";
 
     const layout = Array.isArray(view.layout) ? view.layout : [];
@@ -461,6 +466,8 @@
     if (!mast || !store) return;
     if (brand && !mast.contains(brand)) mast.insertBefore(brand, mast.firstChild);
     if (mast.parentNode !== store.parentNode || mast.nextSibling !== state) { store.parentNode.insertBefore(mast, store); store.parentNode.insertBefore(state, store); }
+    // what the regions drew is stale once the page is no longer the KE page
+    for (const id of ["ck-when", "ck-sky", "ck-brief", "ck-widgets"]) { const h = document.getElementById(id); if (h) h.replaceChildren(); }
   }
 
   function ckAttrs(node, entry, kind) {
@@ -475,16 +482,32 @@
     return entry.pkind || (data && data.kind) || entry.kind || "unknown";
   }
 
-  // one bare typed node (no panel header): the hero's weather and sky, the brief, the widgets
+  // one bare node (no panel header): the hero's weather and sky, the brief, the widgets. It draws what a zone card draws
+  // for the same panel: the banner (stale / partial / held back / an alert), the note, then the content in whichever
+  // shape the contract allows (markdown, a typed face, or lines). An alert is content, so it suppresses the empty message.
   function bareNode(entry, view, cls, ctx) {
     const data = (view.extra_panels || {})[entry.id] || {};
     const node = el("div", cls);
     ckAttrs(node, entry, ckKindOf(entry, data));
-    if (data.error || !data.typed || !window.LevainCockpitKinds) {
-      node.appendChild(el("p", "err", "unavailable — " + (data.error || "this panel cannot be drawn here")));
+    const K = window.LevainCockpitKinds;
+    if (data.error) { node.appendChild(el("p", "err", "unavailable — " + data.error)); return node; }
+    appendBanner(node, entry);
+    if (data.note && !(ctx && ctx.widget && data.face === "count")) node.appendChild(el("div", "ext-note", data.note));
+    const alerted = (entry.banner || []).some((b) => b.alert);
+    if (data.markdown != null) {
+      const md = String(data.markdown);
+      if (md.trim() === "") { if (!alerted) node.appendChild(el("p", "empty", data.empty || "nothing here")); }
+      else node.appendChild(renderMarkdown(md));
       return node;
     }
-    window.LevainCockpitKinds.fill(node, data, Object.assign({ rows: appendExternalLines, entry: entry }, ctx || {}));
+    if (data.typed) {
+      if (!K) { node.appendChild(el("p", "err", "unavailable — this panel cannot be drawn here")); return node; }
+      K.fill(node, data, Object.assign({ rows: appendExternalLines, entry: entry, alerted: alerted }, ctx || {}));
+      return node;
+    }
+    if (!Array.isArray(data.lines)) { node.appendChild(el("p", "err", "unavailable — this panel cannot be drawn here")); return node; }
+    if (data.lines.length) appendExternalLines(node, data.lines);
+    else if (!alerted) node.appendChild(el("p", "empty", data.empty || "nothing here"));
     return node;
   }
 
@@ -504,7 +527,7 @@
     const stamp = el("div", "clockbox");
     stamp.append(clock, date);
     when.append(stamp, events);
-    window.LevainCockpitKinds.mountClock(clock, date);
+    if (window.LevainCockpitKinds) window.LevainCockpitKinds.mountClock(clock, date);
     if (wx) {
       const node = bareNode(wx, view, "wx");
       node.dataset.ckHero = "weather";
@@ -528,7 +551,9 @@
       card.appendChild(node);
     }
     region.replaceChildren(card);
-    region.hidden = !entries.length && !(view.state);
+    // no brief entries and no state worth showing: no card (an operator who can set the state keeps the card for its set button)
+    const st = view.state;
+    region.hidden = !entries.length && !(st && (st.text || (commit && st.can_edit !== false)));
   }
 
   function renderWidgets(view, byId) {
@@ -548,6 +573,17 @@
       node.appendChild(body);
       region.appendChild(node);
     }
+  }
+
+  function ckPlaceholder(entry) {
+    const node = el("div", "panel");
+    node.dataset.zone = entry.zone || "";
+    node.dataset.editClass = entry.edit_class || "";
+    const head = el("div", "phead");
+    head.appendChild(el("h2", null, entry.title || entry.id || "panel"));
+    node.appendChild(head);
+    node.appendChild(el("p", "err", "unavailable — this panel could not be drawn"));
+    return node;
   }
 
   // a zone's cards, in the kernel's order, packed into rows of CK_COLUMNS; a row is as tall as its tallest card
@@ -576,8 +612,8 @@
       for (const c of row) {
         const nodes = [];
         for (const e of c.entries) {
-          const node = renderPanelSafe(e, view);
-          if (!node) continue;
+          // a panel that cannot be drawn keeps its place (and its tab) as a placeholder, so tabs and panels stay in step
+          const node = renderPanelSafe(e, view) || ckPlaceholder(e);
           if (CLAMP_KINDS.has(e.kind)) node.setAttribute("data-clamp", "");
           ckAttrs(node, e, ckKindOf(e, (view.extra_panels || {})[e.id]));
           // a kernel kind drawn by one of the page's own components is still a typed mount: it names its kind too
@@ -602,7 +638,9 @@
       nodes.forEach((n, i) => n.classList.toggle("ck-tab-off", i !== at));
       for (const group of buttons) group.forEach((b, i) => b.setAttribute("aria-selected", i === at ? "true" : "false"));
     };
-    nodes.forEach((node) => {
+    nodes.forEach((node, ni) => {
+      // the jump box reaches a panel inside a tab card by showing its tab first
+      node.ckShowTab = () => { at = ni; tabChoice.set(key, ni); show(); };
       const head = node.querySelector(".phead");
       if (!head) return;
       const h2 = head.querySelector("h2");
@@ -627,13 +665,21 @@
     show();
   }
 
+  // each region is drawn on its own: one that throws shows a one-line error where it stood and the rest still draw
+  function guardRegion(name, draw, show) {
+    try { draw(); } catch (e) {
+      show(el("p", "err", "unavailable — " + name + " could not be drawn (" + (e && e.message ? e.message : "bad data") + ")"));
+    }
+  }
   function renderKe(view, board) {
     const byId = new Map();
     for (const e of view.layout) byId.set(e.id, e);
-    renderHero(view, byId);
-    renderBriefRegion(view, byId);
-    renderWidgets(view, byId);
-    for (const zone of view.ke.zones) renderZone(zone, view, byId, board);
+    const into = (id) => (node) => { const h = document.getElementById(id); if (h) { h.hidden = false; h.replaceChildren(node); } };
+    guardRegion("the hero", () => renderHero(view, byId), into("ck-hero"));
+    guardRegion("the brief", () => renderBriefRegion(view, byId), into("ck-brief"));
+    guardRegion("the widgets", () => renderWidgets(view, byId), into("ck-widgets"));
+    // a zone builds its section off to the side and attaches it last, so a throw leaves nothing half-drawn behind
+    for (const zone of view.ke.zones) guardRegion(zone.title, () => renderZone(zone, view, byId, board), (node) => board.appendChild(node));
   }
 
   function renderPanelSafe(entry, view, opts) {
@@ -897,7 +943,7 @@
       if (isOverdue(s.next)) due.setAttribute("data-ck-tag-state", "overdue");
       row.appendChild(due);
     }
-    row.tabIndex = 0;   // the keyboard-current row: its verbs show while it has focus
+    if (document.body.classList.contains("ke")) row.tabIndex = 0;   // the KE page: the keyboard-current row shows its verbs while it has focus
     if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
     if (verbs && s.id) row.appendChild(buildSporeVerbs(s, panelKind));
     return row;

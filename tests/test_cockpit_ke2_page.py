@@ -104,3 +104,56 @@ def test_ke_regions_map_and_the_reading_draws_its_icon_and_pill(tmp_path: Path) 
     assert out["pill"] == [["Moderate", "pill hot"]]
     assert all(n > 0 for n in out["symbols"].values()) and set(out["symbols"]) == set(READING_SYMBOLS)
     assert out["odd"] == [["mauve", "pill"]], "an unknown band renders neutral, in its own words"
+
+
+DRIVER2 = DRIVER.split("const out = {};")[0] + r"""
+const out = {};
+const wm = (pid, kind, value, extra) => ({ manifest: manifest({ hero: [], brief: [], widgets: [pid], header: [], zones: [{ id: "operate", title: "Work", grid: 3, panels: [], cards: [] }] }),
+  panels: { [pid]: head(pid, kind, pid, Object.assign({ value }, extra || {})) } });
+const draw = (pid, kind, value, ctx, extra) => {
+  const m = wm(pid, kind, value, extra);
+  m.manifest.panels = { [pid]: head(pid, kind, pid, extra) };
+  const v = V.fromManifest(m);
+  const host = new N("div");
+  K.fill(host, v.extra_panels[pid], Object.assign({ entry: { title: pid } }, ctx || {}));
+  return { v, host, text: host.textContent };
+};
+// W1: every metric of a status-dots widget is drawn once, whatever its status or value shape
+const w1 = draw("ops", "status-dots", { metrics: [{ label: "load", value: "3 of 4" }, { label: "ratio", value: 0.25, status: "unknown" }, { label: "disk", value: "ok-ish", status: "warn" }] }, { widget: true });
+out.w1 = w1.text;
+out.w1empty = draw("ops", "status-dots", { metrics: [] }, { widget: true }, { empty: "no dots" }).text;
+// W3: the write path read off a widget's own metrics
+const wv = (live) => draw("health", "status-dots", { metrics: [{ label: "write path", value: live, status: "ok" }] }, { widget: true }).v;
+out.w3 = [wv("live").write_path_live, wv("dark").write_path_live, draw("ops", "status-dots", { metrics: [] }, { widget: true }).v.write_path_live];
+// W4: a repeated label keeps its own heading and clamp
+const lines = [];
+for (let i = 0; i < 8; i++) lines.push({ label: "Tasks", text: "t" + i });
+for (let i = 0; i < 2; i++) lines.push({ label: "Risks", text: "r" + i });
+const b = draw("brief", "brief", { lines }, { region: "brief" });
+out.w4 = b.host.all((n) => n.className === "k").map((n) => n.textContent);
+out.w4side = b.host.all((n) => /side-line/.test(n.className)).map((n) => n.textContent);
+out.w4more = b.host.all((n) => n.className === "xnote").map((n) => n.textContent);
+console.log(JSON.stringify(out));
+"""
+
+
+def _run2(tmp_path: Path) -> dict:
+    driver = tmp_path / "driver2.js"
+    driver.write_text(DRIVER2)
+    src = tmp_path / "view.js"
+    src.write_text((WEB / "cockpit_view.js").read_text())
+    run = subprocess.run([NODE, str(driver), str(src), "[]"], capture_output=True, text=True, timeout=60)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout.strip().splitlines()[-1])
+
+
+@pytest.mark.skipif(NODE is None, reason="node is not installed")
+def test_widgets_draw_every_metric_and_the_brief_groups_by_label(tmp_path: Path) -> None:
+    out = _run2(tmp_path)
+    for needle in ("load", "3 of 4", "ratio", "0.25", "disk", "ok-ish"):
+        assert needle in out["w1"], f"{needle!r} missing from the widget: {out['w1']!r}"
+    assert "no dots" in out["w1empty"] and "nothing" not in out["w1"]
+    assert out["w3"] == [True, False, None], "liveness comes from the widget's own write-path metric, or is unknown"
+    assert out["w4"] == ["Tasks", "Risks"]
+    assert out["w4side"] == [f"t{i}" for i in range(6)] + ["r0", "r1"]
+    assert out["w4more"] == ["+2 more"]

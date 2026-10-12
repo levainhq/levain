@@ -127,7 +127,7 @@
     for (const f of head.filtered || []) out.push({ tone: "dim", text: f.count + " held back — " + f.reason });
     if (head.note) out.push({ tone: "dim", text: head.note });
     // a Metric's alerts (e.g. a wrap in progress) are part of its reading, never dropped
-    for (const a of ((panel.value || {}).alerts || [])) out.push({ tone: "stale", text: "! " + a.message });
+    for (const a of ((panel.value || {}).alerts || [])) out.push({ tone: "stale", alert: true, text: "! " + a.message });
     return out.length ? out : null;
   }
 
@@ -577,6 +577,9 @@
       } else {
         view.extra_panels[pid] = externalOf(panel, panel, groupTitles);
         view.extra_panels[pid].pid = pid;
+        // a health widget is drawn as a widget, never as the Health panel, so the page's liveness reads its own write-path metric
+        const wp = (view.extra_panels[pid].metrics || []).find((x) => x.label === "write path");
+        if (region && wp && (wp.value === "live" || wp.value === "dark")) view.write_path_live = wp.value === "live";
         // a downstream's own verb on this panel becomes the compose box. The manifest names the verb's
         // fields and not their widgets, so a widget is chosen from the field's name (a known edge).
         // a form panel names its verb: the action is the one offered under that name, and no other
@@ -891,19 +894,24 @@
 
   // ---- the widget faces: one answer each, never a row (cockpit contract, widgets region) ----
   const WIDGET_DOTS = 4, WIDGET_FIGURES = 4;
-  const figure = (n) => Number.isInteger(n) ? n.toLocaleString("en-US") : String(n);
+  const figure = (n) => Number.isInteger(n) ? n.toLocaleString("en-US") : isNum(n) ? String(Number(n.toPrecision(3))) : String(n);
   function paintWidget(s, host) {
     const d = s.data;
     if (d.face === "count") {
       host.appendChild(el("div", "big num", isNum(d.count) ? d.count : (d.lines || []).length));
       if (d.note) host.appendChild(el("div", "sub", d.note));
-      else if (!(isNum(d.count) ? d.count : (d.lines || []).length)) host.appendChild(el("div", "sub", d.empty));
+      else if (!(isNum(d.count) ? d.count : (d.lines || []).length) && !s.ctx.alerted) host.appendChild(el("div", "sub", d.empty));
       return;
     }
     if (d.kind === "status-dots") {
+      // every metric is drawn once: a status that is ok / warn / bad is a dot row; any other metric carrying a value is a
+      // figure (an integer, a fractional or a string alike); one with neither is a dot row in the unknown state
       const ms = d.metrics || [];
-      const dots = ms.filter((m) => m.status === "ok" || m.status === "warn" || m.status === "bad");
-      const figs = ms.filter((m) => !(m.status === "ok" || m.status === "warn" || m.status === "bad") && isNum(m.value) && Number.isInteger(m.value));
+      const isDot = (m) => m.status === "ok" || m.status === "warn" || m.status === "bad";
+      const dots = ms.filter((m) => isDot(m) || m.value == null);
+      // whole numbers first (they read as the headline figures), then the fractional and the written ones, each in the provider's order
+      const rest = ms.filter((m) => !isDot(m) && m.value != null);
+      const figs = rest.filter((m) => Number.isInteger(m.value)).concat(rest.filter((m) => !Number.isInteger(m.value)));
       if (dots.length) {
         const box = el("div", "dots");
         paintStatusDots(box, dots.slice(0, WIDGET_DOTS));
@@ -911,23 +919,30 @@
       }
       if (figs.length) {
         const row = el("div", "row");
-        for (const m of figs.slice(0, WIDGET_FIGURES)) { const c = el("span"); c.append(el("b", "num", figure(m.value)), document.createTextNode(m.label)); row.appendChild(c); }
+        for (const m of figs.slice(0, WIDGET_FIGURES)) { const c = el("span"); c.append(el("b", "num", figure(m.value) + (m.unit ? " " + m.unit : "")), document.createTextNode(m.label)); row.appendChild(c); }
         host.appendChild(row);
       }
-      if (!ms.length) host.appendChild(el("div", "sub", d.empty || "nothing to show"));
+      const hidden = Math.max(0, dots.length - WIDGET_DOTS) + Math.max(0, figs.length - WIDGET_FIGURES);
+      if (hidden) host.appendChild(el("div", "xnote", "+" + hidden + " more"));
+      if (!ms.length && !s.ctx.alerted) host.appendChild(el("div", "sub", d.empty || "nothing to show"));
       return;
     }
     if (d.kind === "metric-grid") {
       const ns = d.numbers || [];
-      if (ns[0]) { host.appendChild(el("div", "big num", figure(ns[0].value))); }
+      // the first number is the headline, its label beside it; the others follow as a row of figure and label
+      if (ns[0]) {
+        const head = el("div", "bigrow");
+        head.append(el("div", "big num", figure(ns[0].value)), el("span", "bl", ns[0].label + (ns[0].unit ? " (" + ns[0].unit + ")" : "")));
+        host.appendChild(head);
+      }
       const row = el("div", "row");
-      ns.forEach((n, i) => { const c = el("span"); if (i) c.appendChild(el("b", "num", figure(n.value))); c.appendChild(document.createTextNode(n.label)); row.appendChild(c); });
-      if (ns.length) host.appendChild(row);
+      ns.slice(1).forEach((n) => { const c = el("span"); c.append(el("b", "num", figure(n.value)), document.createTextNode(n.label + (n.unit ? " (" + n.unit + ")" : ""))); row.appendChild(c); });
+      if (ns.length > 1) host.appendChild(row);
       return;
     }
     if (d.kind === "reading") { paintReading(host, d.reading); return; }
     for (const l of d.lines || []) host.appendChild(el("div", "sub", l.text));
-    if (!(d.lines || []).length) host.appendChild(el("div", "sub", d.empty || "nothing to show"));
+    if (!(d.lines || []).length && !s.ctx.alerted) host.appendChild(el("div", "sub", d.empty || "nothing to show"));
   }
 
   function paintGrid(host, numbers) {
@@ -948,20 +963,22 @@
     if (b.headline) host.appendChild(el("div", "q", b.headline));
     const count = new Map();
     for (const l of b.lines) count.set(l.label || "", (count.get(l.label || "") || 0) + 1);
-    const side = [];
+    const side = new Map();
     for (const l of b.lines) {
-      if (region && l.label && count.get(l.label) > 1) { side.push(l); continue; }
+      if (region && l.label && count.get(l.label) > 1) { if (!side.has(l.label)) side.set(l.label, []); side.get(l.label).push(l); continue; }
       const row = el("div", "brief-line");
       if (l.label) row.appendChild(el("span", "k", l.label));
       row.appendChild(el("p", "", l.text));
       host.appendChild(row);
     }
-    if (side.length) {
+    if (side.size) {
       host.classList.add("has-side");
       const col = el("div", "brief-side");
-      col.appendChild(el("span", "k", side[0].label));
-      for (const l of side.slice(0, BRIEF_SIDE_LINES)) col.appendChild(el("p", "side-line", l.text));
-      if (side.length > BRIEF_SIDE_LINES) col.appendChild(el("p", "xnote", "+" + (side.length - BRIEF_SIDE_LINES) + " more"));
+      for (const [label, ls] of side) {
+        col.appendChild(el("span", "k", label));
+        for (const l of ls.slice(0, BRIEF_SIDE_LINES)) col.appendChild(el("p", "side-line", l.text));
+        if (ls.length > BRIEF_SIDE_LINES) col.appendChild(el("p", "xnote", "+" + (ls.length - BRIEF_SIDE_LINES) + " more"));
+      }
       host.appendChild(col);
     }
   }
@@ -1134,7 +1151,7 @@
     if (s.fault) { s.body.appendChild(el("p", "err", "unavailable — " + s.fault)); return; }
     if (s.cqN) s.cqN.textContent = String(isNum(d.count) ? d.count : (d.lines || []).length);
     if (s.ctx.widget) { paintWidget(s, s.body); return; }
-    if (d.kind === "status-dots") { paintStatusDots(s.body, d.metrics || []); if (!(d.metrics || []).length) s.body.appendChild(el("p", "empty", d.empty)); return; }
+    if (d.kind === "status-dots") { paintStatusDots(s.body, d.metrics || []); if (!(d.metrics || []).length && !s.ctx.alerted) s.body.appendChild(el("p", "empty", d.empty)); return; }
     if (d.kind === "reading") { paintReading(s.body, d.reading); return; }
     if (d.kind === "metric-grid") { paintGrid(s.body, d.numbers); return; }
     if (d.kind === "brief") { paintBrief(s.body, d.brief, s.ctx.region === "brief"); return; }
@@ -1343,6 +1360,7 @@
       if (it.kind === "panel") {
         // a panel the current mode hides is reached through Board, which shows every panel
         if (document.body.dataset.mode && (it.node.dataset.modes || "").split(" ").indexOf(document.body.dataset.mode) < 0) applyMode("board");
+        if (it.node.ckShowTab) it.node.ckShowTab();
         it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); return; }
       applyMode("board");
       it.state.setQuery(it.q, true);
