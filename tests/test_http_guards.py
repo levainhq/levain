@@ -174,3 +174,15 @@ def test_every_write_server_runs_the_shared_write_preamble(tmp_path, kind, heade
         sys.set_int_max_str_digits(old_limit)
     assert got == status, f"{kind}: {headers} -> {got}"
     assert resp_headers.get("Connection") == "close"
+
+
+def test_verbose_access_log_never_carries_a_search_query(monkeypatch, capsys) -> None:
+    from levain.http_guards import GuardedHandler
+
+    monkeypatch.setenv("LEVAIN_SERVE_VERBOSE", "1")
+    h = GuardedHandler.__new__(GuardedHandler)
+    h.client_address = ("127.0.0.1", 1)
+    h.requestline = "GET /cockpit/panel/episodes.json?limit=5&q=secret%20words HTTP/1.1"
+    h.log_request(200)
+    err = capsys.readouterr().err
+    assert "secret" not in err and "q=-" in err and "limit=5" in err

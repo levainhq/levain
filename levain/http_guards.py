@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 
@@ -33,6 +34,7 @@ __all__ = [
 # ``same-site``, or even ``none`` (a top-level navigation, which can't carry a JSON
 # POST anyway) — is an unexpected/hostile origin and is refused.
 _WRITE_SEC_FETCH_ALLOWED = "same-origin"
+_QUERY_TEXT = re.compile(r"([?&]q=)[^&\s\"]*")
 
 # The page only ever loads its own same-origin scripts + stylesheet and fetches its
 # own JSON. Lock everything else off. Slice 2a moved the one inline <style> block out
@@ -255,4 +257,5 @@ class GuardedHandler(BaseHTTPRequestHandler):
         """Quiet by default: each server prints its own startup line, and a per-request access log
         is noise in an interactive terminal. ``LEVAIN_SERVE_VERBOSE`` restores it on stderr."""
         if os.environ.get("LEVAIN_SERVE_VERBOSE"):
-            super().log_message(fmt, *args)
+            # a cockpit search query (``q=``) is never written to a log, verbose or not
+            super().log_message(fmt, *(_QUERY_TEXT.sub(r"\1-", a) if isinstance(a, str) else a for a in args))

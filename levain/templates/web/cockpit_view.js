@@ -127,7 +127,7 @@
   function externalOf(head, panel, groupTitles) {
     const v = panel.value || {};
     const out = { note: head.note || "", empty: head.empty || "nothing here" };
-    if (head.kind === "triage-list") {
+    if ((head.kind === "triage-list" || head.kind === "list")) {
       out.lines = (panel.rows || []).map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
         const badges = (r.badges || []).map(badgeText).join(" · ");
@@ -155,7 +155,7 @@
       }
     } else if (head.kind === "line") {
       out.lines = labelled(v.lines, "lines").map((l) => ({ meta: l.label, text: l.text }));
-    } else if (head.kind === "metric") {
+    } else if ((head.kind === "metric" || head.kind === "status-dots")) {
       const ms = v.metrics === undefined ? [] : v.metrics;
       need(Array.isArray(ms) && ms.every((m) => isObj(m) && typeof m.label === "string"
         && (typeof m.value === "string" || isNum(m.value)) && (m.unit == null || typeof m.unit === "string")
@@ -163,9 +163,9 @@
       out.lines = ms.map((m) => ({
         meta: m.label, text: m.value + (m.unit ? " " + m.unit : "") + (m.read ? " — " + m.read : ""),
         accent: m.status === "warn" || m.status === "bad", dim: m.status === "unknown" }));
-    } else if (head.kind === "visual") {
+    } else if ((head.kind === "visual" || head.kind === "ambient")) {
       out.lines = labelled(v.text, "text").map((l) => ({ meta: l.label, text: l.text }));
-    } else if (head.kind === "prose") {
+    } else if ((head.kind === "prose" || head.kind === "brief")) {
       out.markdown = v.markdown || "";
     }
     return out;
@@ -407,7 +407,7 @@
       const traySeeds = isObj(tp) && Array.isArray(tp.actions) && tp.actions.some((a) => isObj(a) && a.verb === "spore_seed" && isPostable(a));
       if ((rowsAct || pActions.length || (pid === "keep" && traySeeds)) && (pid === "tray" || pid === "loops" || pid === "keep" || pid === "episodes")) entry.edit_class = "B";
       const lists = { tray: "tray", loops: "open_spores", keep: "keep" };
-      if ((pid === "tray" || pid === "loops" || pid === "keep") && panel.kind === "triage-list") {
+      if ((pid === "tray" || pid === "loops" || pid === "keep") && (panel.kind === "triage-list" || panel.kind === "list")) {
         view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows));
         if (pid === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
           // the kernel's named orderings and the row ids in each; the renderer picks one, never sorts
@@ -419,18 +419,18 @@
           }
         }
         view.layout.push(Object.assign(entry, { kind: kind }));
-      } else if (pid === "episodes" && panel.kind === "triage-list") {
+      } else if (pid === "episodes" && (panel.kind === "triage-list" || panel.kind === "list")) {
         view.episodes = rows.map((r) => ({ panel_id: pid, row_id: r.id, row_version: r.version, id: bare(r.id), timestamp: (r.facets || {}).at, type: (r.facets || {}).episode_type,
           source: (r.facets || {}).source, agent: titleOf((r.facets || {}).agent, ""),
           actions: Array.isArray(r.actions) ? r.actions : undefined, tags: tagsOf((r.facets || {}).tags), content: r.body || r.title,
           emphasis: r.emphasis }));
         view.layout.push(Object.assign(entry, { kind: "episodes" }));
-      } else if (pid === "edits" && panel.kind === "triage-list") {
+      } else if (pid === "edits" && (panel.kind === "triage-list" || panel.kind === "list")) {
         view.recent_edits = rows.map((r) => ({ panel_id: pid, row_id: r.id, row_version: r.version,
           actions: Array.isArray(r.actions) ? r.actions : [], id: bare(r.id), ts: (r.facets || {}).at, action: (r.facets || {}).edit_kind,
           source: r.title, undoable: (r.facets || {}).undoable }));
         view.layout.push(Object.assign(entry, { kind: "edits" }));
-      } else if (pid === "crystals" && panel.kind === "triage-list") {
+      } else if (pid === "crystals" && (panel.kind === "triage-list" || panel.kind === "list")) {
         view.crystal_index = rows.map((r) => {
           const f = r.facets || {};
           const tags = tagsOf(f.tags);
@@ -438,17 +438,17 @@
                    last_activated_on: f.last_activated_on, tags: tags };
         });
         view.layout.push(Object.assign(entry, { kind: "crystals" }));
-      } else if (pid === "health" && panel.kind === "metric") {
+      } else if (pid === "health" && (panel.kind === "metric" || panel.kind === "status-dots")) {
         view.health = healthOf((panel.value || {}).metrics, wrapsData);
         view.layout.push(Object.assign(entry, { kind: "health" }));
-      } else if (pid === "graph" && panel.kind === "visual") {
+      } else if (pid === "graph" && (panel.kind === "visual" || panel.kind === "ambient")) {
         view.graph = (panel.value || {}).data || null;
         view.layout.push(Object.assign(entry, { kind: "graph" }));
-      } else if (pid === "wraps" && panel.kind === "visual") {
+      } else if (pid === "wraps" && (panel.kind === "visual" || panel.kind === "ambient")) {
         if (wrapsShape) throw wrapsShape;
         view.wraps = Array.isArray(wrapsData) ? wrapsData : [];
         view.layout.push(Object.assign(entry, { kind: "wraps" }));
-      } else if (panel.kind === "prose" && pid.indexOf("section:") === 0 && (panel.value || {}).markdown != null) {
+      } else if ((panel.kind === "prose" || panel.kind === "brief") && pid.indexOf("section:") === 0 && (panel.value || {}).markdown != null) {
         view.sections.push({ heading: titleOf(panel.title, titleOf(head.title, pid)), body: panel.value.markdown });
         // a section the kernel offers section_edit on is the operator's to edit; its panel id stands as the
         // write address, and the save posts the action the panel offered
