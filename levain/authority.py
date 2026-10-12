@@ -242,11 +242,15 @@ class AuthorityPolicy:
         return hash(_canonical(self.as_dict()))
 
 
+# The policy before any policy link, pinned for this FORMAT: replay is a pure function of the log, so
+# it never reads live code (``verbs.Policy()`` may change; a log replays the same either way). These
+# are the shipped ``verbs.Policy()`` values when the format was born: no raises.
+_GENESIS_RAISE_TO: Mapping[str, str] = MappingProxyType({})
+
+
 def genesis_policy() -> AuthorityPolicy:
-    """The policy before any policy link: the shipped frozen ``verbs.Policy()`` values."""
-    from levain.cockpit.verbs import Policy
-    shipped = Policy()
-    return AuthorityPolicy(raise_to=_freeze(dict(shipped.raise_to)))
+    """The policy before any policy link: the constant pinned for :data:`FORMAT`."""
+    return AuthorityPolicy(raise_to=_freeze(dict(_GENESIS_RAISE_TO)))
 
 
 @dataclass(frozen=True)

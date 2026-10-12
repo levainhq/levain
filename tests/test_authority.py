@@ -133,10 +133,13 @@ def test_replay_builds_keys_and_policy(granted, keys):
     assert snap.hash_at(4) == snap.head_hash
 
 
-def test_genesis_policy_is_the_shipped_policy():
-    from levain.cockpit.verbs import Policy
-    assert dict(auth.genesis_policy().raise_to) == dict(Policy().raise_to)
+def test_genesis_policy_is_the_pinned_constant(monkeypatch):
+    """F6: replay never reads live verbs.Policy(); the genesis is a constant of the format."""
+    assert dict(auth.genesis_policy().raise_to) == dict(auth._GENESIS_RAISE_TO) == {}
     assert not auth.genesis_policy().grants and not auth.genesis_policy().timeouts
+    import levain.cockpit.verbs as verbs
+    monkeypatch.setattr(verbs, "Policy", lambda: (_ for _ in ()).throw(AssertionError("read live policy")))
+    assert auth.genesis_policy() == auth.AuthorityPolicy()
 
 
 def test_raise_by_phone_applies(base, keys):
