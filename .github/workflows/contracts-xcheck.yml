@@ -1,0 +1,66 @@
+name: contracts-xcheck
+
+# The shared contracts' independent cross-check (S1_DESIGN, T34): every frozen vector under
+# tests/golden/contracts/frozen/ runs through the pinned upstream Go packages, and the vectors Go generates
+# verify in levain's Python. See tests/golden/contracts/xcheck/README.md.
+
+on:
+  push:
+    branches: [main, "seat/**"]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  xcheck:
+    name: xcheck (Go upstream vs frozen vectors)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Go must run the toolchain verified below and never download another one itself (T35).
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v6
+
+      # T35 (S1_DESIGN rev 11): the Go toolchain tarball is fetched here and its sha256 is checked against the value
+      # committed in this repo (go-toolchain.sha256, fetched once from https://go.dev/dl/?mode=json) BEFORE it is
+      # unpacked. The version is the xcheck modules' `go` directive; tests/test_contracts_ci.py pins all three.
+      - name: Go toolchain, sha256-pinned in this repo
+        run: |
+          set -euo pipefail
+          tarball="$(awk '{print $2}' tests/golden/contracts/xcheck/go-toolchain.sha256)"
+          cd "$RUNNER_TEMP"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "$tarball" "https://go.dev/dl/$tarball"
+          sha256sum --check --strict "$GITHUB_WORKSPACE/tests/golden/contracts/xcheck/go-toolchain.sha256"
+          tar -C "$RUNNER_TEMP" -xzf "$tarball"
+          rm -f "$tarball"
+          echo "$RUNNER_TEMP/go/bin" >> "$GITHUB_PATH"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run xcheck over the frozen vectors and emit Go-generated vectors
+        working-directory: tests/golden/contracts/xcheck
+        run: |
+          go version
+          go mod download && go mod verify
+          (cd witnessoracle && go mod download && go mod verify)
+          go run . -emit "$RUNNER_TEMP/go_emitted.json" ../frozen
+
+      - name: Contract tests, Go-generated vectors required
+        env:
+          LEVAIN_REQUIRE_XCHECK: "1"
+          LEVAIN_XCHECK_EMIT: ${{ runner.temp }}/go_emitted.json
+        run: pytest -q -rs tests/test_contracts_*.py

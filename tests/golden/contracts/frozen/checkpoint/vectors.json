@@ -1,0 +1,801 @@
+{
+ "item": "F3",
+ "generator": "gen.py",
+ "team_origin": "levain-team/0123456789abcdef0123456789abcdef",
+ "vectors": [
+  {
+   "id": "team-size-0",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n0\n47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/okkckfA3IwyuCfW/Sbgt88Q1WBG3PQZlD9MMvqTZ6bGaU4BXcOdzGMV0dfe1GdieeKfMVFdoeeNtS+EGKvhdgw=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "origin": "levain-team/0123456789abcdef0123456789abcdef",
+     "size": 0,
+     "root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "The note text of a checkpoint is a sequence of at least three non-empty lines ... origin ... tree size ... encoded as an ASCII decimal ... root hash, the base64 encoding of the root of the [RFC 6962] Merkle hash tree"
+   }
+  },
+  {
+   "id": "team-size-1",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/l9cMqHW7YmDLJUbfMavUFlXhRm7Tn8pF0arHTgjgTmrdI9gnFRc+3sOZqUexzw5rpQGvhujxklo/AZzw04TKQc=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "origin": "levain-team/0123456789abcdef0123456789abcdef",
+     "size": 1,
+     "root": "7e43b4d22a268ccba8b129401305db1c84a16e3ed6b1986afd82228187f0a91e"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "The note text of a checkpoint is a sequence of at least three non-empty lines ... origin ... tree size ... encoded as an ASCII decimal ... root hash, the base64 encoding of the root of the [RFC 6962] Merkle hash tree"
+   }
+  },
+  {
+   "id": "team-size-1048577",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n1048577\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/hlKU3+bH8xQAL/7ldmr+vnH1s8dxXhuBJFgsJBFf5sT6b+JqR5g11/UVl2hmtC7aLREGoUdxX9xKBWHAbDbfQ8=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "origin": "levain-team/0123456789abcdef0123456789abcdef",
+     "size": 1048577,
+     "root": "7e43b4d22a268ccba8b129401305db1c84a16e3ed6b1986afd82228187f0a91e"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "The note text of a checkpoint is a sequence of at least three non-empty lines ... origin ... tree size ... encoded as an ASCII decimal ... root hash, the base64 encoding of the root of the [RFC 6962] Merkle hash tree"
+   }
+  },
+  {
+   "id": "size-max-note-int",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n9223372036854775807\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/hylXCWNcAeKXcuexiXCwhmQCK7m7He7ULHQtgDEdMHP2wPPw8Gv/ok6cmcthDQXS3Rt1I/zNuWw6GogOLCTbQI=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "origin": "levain-team/0123456789abcdef0123456789abcdef",
+     "size": 9223372036854775807,
+     "root": "7e43b4d22a268ccba8b129401305db1c84a16e3ed6b1986afd82228187f0a91e"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "a note-text size is at most 2^63-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "RFC 9162 serialises uint64 and Go's tlog uses int64"
+    }
+   }
+  },
+  {
+   "id": "size-above-max-note-int",
+   "kind": "levain_profile",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n9223372036854775808\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/srdNnPxhumCm0r0Ab8dI3TxXdYwFKLuWQwbC4fspeLW9HLjyg+3RiP6qQIwgEr04qJX2zEXe0kNCUCFOLaLtQE=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "a note-text size is at most 2^63-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "RFC 9162 serialises uint64 and Go's tlog uses int64"
+    }
+   }
+  },
+  {
+   "id": "size-5000-digits-refused",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/nyvwIdneMpLXQTcOj5B7xRkxeT3Y6rGhb3jmFHz3kIfjqobk7pZcAHcVnidZHAxFHO+b9RWhPoxnsVEGg85WAs=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §4.9 (https://www.rfc-editor.org/rfc/rfc9162)",
+    "clause": "TreeHeadSignature: uint64 tree_size"
+   }
+  },
+  {
+   "id": "size-leading-zero-refused",
+   "kind": "upstream_lax",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n01\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/lyXj9xQVT0Y5IBrXR+RINcTbKM/rMT2g38s//xflO8n8+cZ0FyemYZeVCgQzP8pHzq79LEdCZ7YmPjJye7P/g4=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros."
+   }
+  },
+  {
+   "id": "size-negative-refused",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n-1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/txq8WuxQsSAA+dCk9RgEEx+m0RvVQcZiVPnY17I42A5pLSnlJXzMNSpEsxzptp/0qI6rTQf5eN9ODxEWObbBgg=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros."
+   }
+  },
+  {
+   "id": "size-plus-refused",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n+1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/mNh/EJHvr/Ohubq0Lw6PxuVA7ToTCW8l5tm+g2lo6r8e+Znsn1K9fPcEm8DcC4XBhWqzNY1TglbKhUH/N56xAw=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros."
+   }
+  },
+  {
+   "id": "size-space-refused",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n 1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/l6cIA3qcYS/pSN/dOMCqqCpkCYO63GVgFgJpBiTdo9O0GgGbPhm2sl7QcEwlOczYVSTj2QgUjsnToCpbIro3A4=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros."
+   }
+  },
+  {
+   "id": "size-underscore-refused",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n1_0\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/pfaP9ySKtG3xMLXYrrif0i37RKNi5feiFHQjkB2yxZ4/wWo3GWh2h8auCDqE4uY+W+IBLl6ebSODIOVX3lU2A0=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros."
+   }
+  },
+  {
+   "id": "size-fullwidth-refused",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n１\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/koVQHT/DpnzdFa6T+B0WqKb2WwmSzg5K8JFyadu39hfJap2qtVqjHQ/mTFZP9B2GUQvA0nd3igcz198ne6u5Qc=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros."
+   }
+  },
+  {
+   "id": "extension-line-refused",
+   "kind": "levain_profile",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\nan extension\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/oC7k4fmNeYP5pRZaJKRgMTCFhEXD3GBTGKE6dxwNoBM21E6f/cRkllCfdjWyG7xQ07QfFeBF1wK8MGlGtlKDwc=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F3",
+    "clause": "a levain-origin checkpoint carries zero extension lines",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "The use of extension lines is NOT RECOMMENDED"
+    }
+   }
+  },
+  {
+   "id": "size-0-non-empty-root-refused",
+   "kind": "upstream_lax",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n0\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rEXIhny7aqxCbKtoyzP4C4jcl5C2JSTBb9crqRYNHjco9S2Hwajk3UIHah0QzZd7gXLVwKcHMzhiU80sm4FHQg=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "A checkpoint of size zero MUST have the root hash of the empty tree, which [RFC 6962], Section 2.1 defines as the hash of the empty string."
+   }
+  },
+  {
+   "id": "root-31-bytes-refused",
+   "kind": "upstream_lax",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqQ==\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rIKcEYqqt+nmdAi3h9YK7LUFvHsV0CwNmEIKAVb3EwI/AvdgK3711tzz6RKSuXubl45XJYLbX4YajhpiYrZhwA=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "The note text of a checkpoint is a sequence of at least three non-empty lines ... origin ... tree size ... encoded as an ASCII decimal ... root hash, the base64 encoding of the root of the [RFC 6962] Merkle hash tree"
+   }
+  },
+  {
+   "id": "root-non-canonical-base64-refused",
+   "kind": "upstream_lax",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR5=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/hFohfh4BL2D2sNDn4IxpAKwrdrI3b5ygdYtvMWJh4Npn2Fu9syrKLNHbiP2XR7O1X23TZt4/U04lgEnPdhpywA=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "decoders MUST reject non-canonical encodings"
+   }
+  },
+  {
+   "id": "origin-not-key-name-refused",
+   "kind": "levain_profile",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/ffffffffffffffffffffffffffffffff\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/tJdpBouK/ehL9GJnjOeaGkF8mFgxfGFv17wauVGMEXUV2Dg4GZakigJBj3/U1C06q0qPCZVIQ1EHulERGNuwAo=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F3",
+    "clause": "the log's key name equals the origin",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "The key name SHOULD be the log origin."
+    }
+   }
+  },
+  {
+   "id": "origin-no-levain-prefix-refused",
+   "kind": "levain_profile",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "example.com/log\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— example.com/log xUN9qL/bxt/K7CtpquPuHG6qO2oN4zDv232AoLQBCbbA3z0tPQEy2Y+YfKLFOj6QHP7zPLyCaJiZWEYfNFjjLJYUKQQ=\n",
+    "log_vkey": "example.com/log+c5437da8+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": false
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F3/F6",
+    "clause": "a verifier configured for a levain log refuses an origin without a frozen prefix",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a levain verifier reads only levain logs; the prefix is how it knows one"
+    }
+   }
+  },
+  {
+   "id": "origin-prefix-only-refused",
+   "kind": "levain_profile",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/ EtTSEj9klmdN+hy8tWNwRy+9bHmgEV2lIAva8Kq4jTbYYE8c2DXZ3kYkdOWeeBRdf4EZfO3I4Me381+BD8B1cct43wI=\n",
+    "log_vkey": "levain-team/+12d4d212+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": false
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F3/F6",
+    "clause": "a verifier configured for a levain log refuses an origin without a frozen prefix",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a levain verifier reads only levain logs; the prefix is how it knows one"
+    }
+   }
+  },
+  {
+   "id": "team-verifier-31-hex-refused",
+   "kind": "levain_profile",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 7UublGOr/3Su5buL0FB8guqXrA19TaT8AJK8OM/ExdGgt6hS2q6/mNfTNlXrjPkkATnxkt4k2cpB1oR+gR9yokIUTQg=\n",
+    "log_vkey": "levain-team/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa+ed4b9b94+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F3/F6",
+    "clause": "a team-log verifier requires exactly levain-team/<32 lowercase hex>",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the frozen team production; any other form is not a levain team log"
+    }
+   }
+  },
+  {
+   "id": "team-verifier-33-hex-refused",
+   "kind": "levain_profile",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa sSIbEAd7AdqRGGEdCq2Du1LtLldIlURINFpF6Yb/Jum+AjZ4bijmBvW/onSX2DpFz2NLK2wYmyV3BlHpUD13YoLl/Qk=\n",
+    "log_vkey": "levain-team/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa+b1221b10+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F3/F6",
+    "clause": "a team-log verifier requires exactly levain-team/<32 lowercase hex>",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the frozen team production; any other form is not a levain team log"
+    }
+   }
+  },
+  {
+   "id": "team-verifier-uppercase-hex-refused",
+   "kind": "levain_profile",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 413UHG++4i0S7ZFbDLkR0WTLZu4fy8+AYrxlQaD5YyT0ldHUYPQb+vwBOa4Rs7oGveEY9H/2qHYag+98K/kl48TFIAo=\n",
+    "log_vkey": "levain-team/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+e35dd41c+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F3/F6",
+    "clause": "a team-log verifier requires exactly levain-team/<32 lowercase hex>",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the frozen team production; any other form is not a levain team log"
+    }
+   }
+  },
+  {
+   "id": "team-verifier-trailing-segment-refused",
+   "kind": "levain_profile",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef/x\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef/x 4raW2z8+aenCixrj4QL7urxThOQc5wY44Vn8CpdgRqgpdfgCE0CYEdpR9jIiXqKhKsB7i2X3+g/OvEnLTGYnZy4uawU=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef/x+e2b696db+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F3/F6",
+    "clause": "a team-log verifier requires exactly levain-team/<32 lowercase hex>",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the frozen team production; any other form is not a levain team log"
+    }
+   }
+  },
+  {
+   "id": "team-verifier-fleet-prefix-refused",
+   "kind": "levain_profile",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-fleet/0123456789abcdef0123456789abcdef\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-fleet/0123456789abcdef0123456789abcdef CUvS9NZZHRNsPg9nzLVokv2Z3faLvTvqOPs5DjMH2MhYMtdk4Ps+SYgJ0h1FdTz2Gf6fCdfxjgY4tiBWPCuEF41Bxw8=\n",
+    "log_vkey": "levain-fleet/0123456789abcdef0123456789abcdef+094bd2f4+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F3/F6",
+    "clause": "a team-log verifier requires exactly levain-team/<32 lowercase hex>",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the frozen team production; any other form is not a levain team log"
+    }
+   }
+  },
+  {
+   "id": "fleet-origin-at-prefix-verifier",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-fleet/m1\n1\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-fleet/m1 7OKl+7DG7glhJ7QqptOxgDOmsIPSKlSfiKtb+YZwJT1LPzsV6+QMIMGKujdV8ViA0ZGFIYY1aBGXIC5LhJxMTUawPwI=\n",
+    "log_vkey": "levain-fleet/m1+ece2a5fb+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": false
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "origin": "levain-fleet/m1",
+     "size": 1,
+     "root": "7e43b4d22a268ccba8b129401305db1c84a16e3ed6b1986afd82228187f0a91e"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F3/F6",
+    "clause": "a verifier configured for a levain log refuses an origin without a frozen prefix",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a levain verifier reads only levain logs; the prefix is how it knows one"
+    }
+   }
+  },
+  {
+   "id": "duplicate-identical-line-refused",
+   "kind": "upstream_lax",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n7\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/iZDfxhHecllN4wXF1HvvWgkiakLPiPkOLBuc/ydVJb64hxhFaIUIZYZ2zUhtSohtjVSwepehKgRJAAUWQEKOQM=\n— levain-team/0123456789abcdef0123456789abcdef UrMq/iZDfxhHecllN4wXF1HvvWgkiakLPiPkOLBuc/ydVJb64hxhFaIUIZYZ2zUhtSohtjVSwepehKgRJAAUWQEKOQM=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "there MUST NOT be multiple signature lines with both the same key name and the same key id"
+   }
+  },
+  {
+   "id": "duplicate-name-and-id-different-bytes-refused",
+   "kind": "upstream_lax",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n7\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/iZDfxhHecllN4wXF1HvvWgkiakLPiPkOLBuc/ydVJb64hxhFaIUIZYZ2zUhtSohtjVSwepehKgRJAAUWQEKOQM=\n— levain-team/0123456789abcdef0123456789abcdef UrMq/gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "there MUST NOT be multiple signature lines with both the same key name and the same key id"
+   }
+  },
+  {
+   "id": "same-name-different-id-accepted",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n7\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/iZDfxhHecllN4wXF1HvvWgkiakLPiPkOLBuc/ydVJb64hxhFaIUIZYZ2zUhtSohtjVSwepehKgRJAAUWQEKOQM=\n— levain-team/0123456789abcdef0123456789abcdef AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "origin": "levain-team/0123456789abcdef0123456789abcdef",
+     "size": 7,
+     "root": "7e43b4d22a268ccba8b129401305db1c84a16e3ed6b1986afd82228187f0a91e"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "There MAY be multiple signature lines with the same key name."
+   }
+  },
+  {
+   "id": "different-name-same-id-accepted",
+   "kind": "spec",
+   "op": "verify_checkpoint",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n7\nfkO00iomjMuosSlAEwXbHIShbj7WsZhq/YIigYfwqR4=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/iZDfxhHecllN4wXF1HvvWgkiakLPiPkOLBuc/ydVJb64hxhFaIUIZYZ2zUhtSohtjVSwepehKgRJAAUWQEKOQM=\n— golden.example/w UrMq/gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n",
+    "log_vkey": "levain-team/0123456789abcdef0123456789abcdef+52b32afe+Adl2ZCWwQebm23HoRRulXHzleaPrWwd6U45CeuUbzZcq",
+    "team": true
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "origin": "levain-team/0123456789abcdef0123456789abcdef",
+     "size": 7,
+     "root": "7e43b4d22a268ccba8b129401305db1c84a16e3ed6b1986afd82228187f0a91e"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/log.ParseCheckpoint",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "MUST NOT be multiple signature lines with both the same key name and the same key id (a different name with the same ID is a different key)"
+   }
+  }
+ ]
+}

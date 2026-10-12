@@ -42,6 +42,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import re
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,9 +50,11 @@ from typing import Any, Callable
 
 from levain.firing.encoding import scan_text
 from levain.firing.agent_reply import (
+    FINISH_ACTION_KIND,
     LEVAIN_ACT_NUDGE,
     finish_message,
     humanize_finish_json,
+    is_corrective_nudge,
     message_event_text,
     planned_without_acting,
     tool_action_summary,
@@ -59,6 +62,8 @@ from levain.firing.agent_reply import (
     unreadable_tool_call,
 )
 from levain.firing.confinement import (
+    _STANDARD_CRED_FILES,
+    _STANDARD_CRED_SUBTREES,
     ConfinementError,
     confinement_supported,
     hands_for,
@@ -73,6 +78,7 @@ from levain.firing.drive import (
     resolve_cred_floor,
 )
 from levain.firing.gate import (
+    BASH_TOOL_NAMES,
     GateMode,
     PendingEfferent,
     resolve_gate_mode,
@@ -95,6 +101,7 @@ __all__ = [
     "EXIT_TIMEOUT",
     "EXIT_USAGE",
     "EXIT_TURN_FAILED",
+    "EXIT_UNREADABLE_CALL",
     "EntitySession",
     "SessionStartError",
     "TurnResult",
@@ -114,7 +121,7 @@ WORKSPACE_SUBDIR = "workspace"
 # the agent's own account of its work, and none ever should be.
 # ---------------------------------------------------------------------------
 EXIT_OK = 0
-"""The turn ran to completion and the agent produced a reply."""
+"""The turn ran to completion and the agent produced a reply (a readable one: see :data:`EXIT_UNREADABLE_CALL`)."""
 
 EXIT_NO_REPLY = 1
 """The turn ran to completion but the agent produced NO reply.
@@ -170,6 +177,15 @@ model endpoint is sick* — never as *the entity is broken*.
 **Nothing is captured to memory on a timeout**, by the same discipline that refuses to capture a
 gated halt: the turn was killed mid-flight, so what completed is unknowable, and an episode
 asserting a completed turn would be memory recording a fiction."""
+
+EXIT_UNREADABLE_CALL = 7
+"""The turn completed, but its reply is the model's raw tool-call syntax (:attr:`TurnResult.unreadable_call`).
+
+The model tried to call a tool, the call failed to parse upstream, and it did not run. Not
+:data:`EXIT_OK`: there is no answer, and a pipeline that read 0 would take the markup, or an empty
+stdout, as one. Not :data:`EXIT_NO_REPLY` either: the model did act, and asking again or switching
+models is the remedy, not a restart. Not 6, which ``levain doctor`` already uses for a different
+outcome (an upgrade step pending)."""
 
 EXIT_INTERRUPTED = 130
 """The operator interrupted the run (SIGINT / Ctrl-C). POSIX convention: 128 + SIGINT(2).
@@ -236,7 +252,8 @@ class TurnResult:
     """The agent's text for this turn, or ``None`` if it produced none."""
 
     tool_activity: list[str] = field(default_factory=list)
-    """Compact display lines for the tool actions run this turn (workspace-relative)."""
+    """Compact display lines for the tool actions run this turn (workspace-relative), and last, when the
+    turn's shell output read like a credential the floor denied, :data:`CRED_FLOOR_NOTE`."""
 
     error: str | None = None
     """The exception text if the turn raised, else ``None``."""
@@ -270,16 +287,22 @@ class TurnResult:
     pending: tuple[PendingEfferent, ...] = ()
     """What the gate is holding, for the human to judge.
 
-    May be empty even when :attr:`gated` is ``True`` (see above) — an anomaly the report itself
-    surfaces rather than hides. Each entry carries what the entity proposed and why that
-    classification fanned in, because an operator deciding on ``git push --force`` needs the
-    command, not the tool's name."""
+    Never empty when :attr:`gated` is ``True``: a halt the report cannot describe carries one loud
+    ``<unreported>`` placeholder instead (:meth:`EntitySession._gate_report`), because "held,
+    contents unknown" and "nothing held" must not look alike. Each entry carries what the entity
+    proposed and why that classification fanned in, because an operator deciding on
+    ``git push --force`` needs the command, not the tool's name."""
 
     unreadable_call: bool = False
     """:attr:`reply` is the model's raw tool-call syntax, not an answer (:func:`levain.firing.agent_reply.unreadable_tool_call`):
-    its call failed to parse upstream and no tool ran. Display only: a surface shows
-    :data:`~levain.firing.agent_reply.UNREADABLE_CALL_NOTICE` with the text beneath it; :attr:`ok` and
-    :attr:`exit_code` do not read it."""
+    its call failed to parse upstream and no tool ran. A surface shows
+    :data:`~levain.firing.agent_reply.UNREADABLE_CALL_NOTICE` with the text beneath it. Such a turn is not
+    :attr:`ok`, and its :attr:`exit_code` is :data:`EXIT_UNREADABLE_CALL`: the text is not an answer."""
+
+    unreadable_unchecked: bool = False
+    """The check behind :attr:`unreadable_call` could not run, so the reply is flagged without being judged (fail
+    closed). A surface shows :data:`~levain.firing.agent_reply.UNREADABLE_CHECK_FAILED_NOTICE` instead, which says
+    nothing about the model."""
 
     held_digest: str | None = None
     """What an approval of THIS halt binds to (:func:`levain.firing.openhands.gate.held_digest`), read at the
@@ -288,13 +311,14 @@ class TurnResult:
 
     @property
     def ok(self) -> bool:
-        """The turn completed AND produced a reply. Not 'the task succeeded'.
+        """The turn completed AND produced a reply (an unreadable tool call is not one). Not 'the task succeeded'.
 
         A gated turn is not ``ok`` — it has not finished. It is also not an ERROR, which is why
         the two are separate properties rather than one tri-state: a driver that only asks
         ``ok`` still behaves correctly (it does not treat a halt as success), and a driver that
         wants to offer the human a decision asks :attr:`gated`."""
-        return self.error is None and not self.gated and not self.timed_out and bool(self.reply)
+        return (self.error is None and not self.gated and not self.timed_out and bool(self.reply)
+                and not self.unreadable_call)
 
     @property
     def exit_code(self) -> int:
@@ -317,7 +341,9 @@ class TurnResult:
             return EXIT_TURN_FAILED
         if self.gated:
             return EXIT_GATED
-        return EXIT_OK if self.reply else EXIT_NO_REPLY
+        if not self.reply:
+            return EXIT_NO_REPLY
+        return EXIT_UNREADABLE_CALL if self.unreadable_call else EXIT_OK
 
 
 def _apply_drive_policy(cfg: Any, mode: DriveMode) -> bool:
@@ -422,11 +448,36 @@ def resolve_llm_kwargs(model: str, base_url: str, api_key: str | None) -> dict:
             "native_tool_calling": True}
 
 
-def turn_tool_activity(events, workspace: Path) -> list[str]:
+# What git prints over HTTPS when it reaches its prompt with no credential to offer and no terminal to ask on (the
+# confined shell has none). A private or mistyped URL prints the same, so the note says "may".
+_GIT_PROMPT_FAILED = re.compile(r"could not read (?:Username|Password) for 'https://")
+_EPERM = re.compile(r"operation not permitted", re.IGNORECASE)
+CRED_FLOOR_NOTE = (
+    "this may have been denied by the standard credential floor. For git, use an ssh remote if your key is "
+    'in the ssh agent; otherwise set "deny_standard_creds" to false in .levain/confinement.json, which opens '
+    "every listed store and the Keychain in every drive"
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _floor_path() -> re.Pattern[str]:
+    """Each standard credential store as a shell output can name it, as written (``~/...``) and expanded
+    (the confined shell's ``HOME`` is the host's), and not as the prefix of a longer name
+    (``~/.config/ghostty``, ``~/.netrc.bak``); a subtree also matches what is under it."""
+    forms = {form for p in (*_STANDARD_CRED_SUBTREES, *_STANDARD_CRED_FILES) for form in (p, os.path.expanduser(p))}
+    return re.compile("(?:" + "|".join(re.escape(f) for f in sorted(forms)) + r")(?![\w.-])")
+
+
+def turn_tool_activity(events, workspace: Path, *, cred_floor: bool = False) -> list[str]:
     """The tool actions the entity ran THIS turn (since the last genuine user message), as
     compact display lines — so a workspace file op is VISIBLE, never silent. Paths are shown
     workspace-relative; the boundary skips the SDK's synthetic corrective nudge exactly as
-    :func:`latest_agent_text` does, so activity keys on the real turn."""
+    :func:`latest_agent_text` does, so activity keys on the real turn.
+
+    ``cred_floor`` is whether this session's floor denies the standard credential stores. When it
+    does and a shell output this turn reads like a denied or missing credential, one
+    :data:`CRED_FLOOR_NOTE` ends the list (a line that is not an action), so the denial is not
+    mistaken for a broken remote or a logged-out tool."""
     evs = list(events)
     start = turn_start(evs)
     prefix = str(workspace).rstrip(os.sep) + os.sep
@@ -442,7 +493,38 @@ def turn_tool_activity(events, workspace: Path) -> list[str]:
             continue
         tool_name, detail = summary
         lines.append(f"⚙ {tool_name}: {detail.replace(prefix, '')}")
+    if cred_floor and any(_reads_as_cred_failure(e) for e in evs[start:]):
+        lines.append(CRED_FLOOR_NOTE)
     return lines
+
+
+def _reads_as_cred_failure(event) -> bool:
+    """Whether ``event`` is a shell observation whose output reads like a denied or missing credential:
+    a command that failed (non-zero exit, or none reported) with a line naming one of the floor's own
+    stores and "operation not permitted" (what Go, Python and Node print for the sandbox's EPERM: gh,
+    docker, kubectl, aws, twine, npm), or git's HTTPS prompt failing. The Keychain is denied by its
+    services, not a path, and a denied read looks like a missing item; git's helper then reaches the
+    prompt, so the second form covers it. An event with no shell output (a scaffold error, a
+    rejection) does not."""
+    if getattr(event, "tool_name", None) not in BASH_TOOL_NAMES:
+        return False
+    try:
+        text = str(event.observation.text)
+    except Exception:  # noqa: BLE001 — a display note must never break a turn
+        return False
+    if _GIT_PROMPT_FAILED.search(text):
+        return True
+    if getattr(event.observation, "exit_code", None) == 0:
+        return False
+    # only the lines holding an EPERM are read, each once, so a large output is neither copied nor rescanned
+    pos = 0
+    while (m := _EPERM.search(text, pos)) is not None:
+        end = text.find("\n", m.end())
+        end = len(text) if end == -1 else end
+        if _floor_path().search(text, text.rfind("\n", 0, m.start()) + 1, end):
+            return True
+        pos = end + 1
+    return False
 
 
 def _refused_action_ids(events) -> set[str]:
@@ -510,6 +592,27 @@ def latest_agent_text(events) -> str | None:
     anything else is left as it arrived. Without it the person read the damaged reply while the
     store held the repaired one (UD-1, RUN on the released 0.5.4 via ``levain serve --chat``:
     ``café —`` came back as ``cafÃ© â\\x80\\x94``)."""
+    parts = _agent_parts(events)
+    return scan_text("\n".join(parts)).text if parts else None
+
+
+def _finish_thoughts(events) -> list[str]:
+    """The text a model sent beside a parsed ``finish`` this turn (that action's ``thought``). Duck-typed."""
+    evs = list(events)
+    out: list[str] = []
+    for e in evs[turn_start(evs):]:
+        if getattr(e, "source", None) != "agent":
+            continue
+        if getattr(getattr(e, "action", None), "kind", None) != FINISH_ACTION_KIND:
+            continue
+        text = " ".join(t.text for t in (getattr(e, "thought", None) or ()) if isinstance(getattr(t, "text", None), str))
+        if text.strip():
+            out.append(text)
+    return out
+
+
+def _agent_parts(events) -> list[str]:
+    """The turn's agent texts, each unwrapped and deduplicated as :func:`latest_agent_text` joins them."""
     evs = list(events)
     start = turn_start(evs)
     parts: list[str] = []
@@ -521,7 +624,7 @@ def latest_agent_text(events) -> str | None:
             text = humanize_finish_json(text)  # spore-297: unwrap finish/think-as-JSON-text
             if text not in parts:  # dedup a finish echoing a prior MessageEvent
                 parts.append(text)
-    return scan_text("\n".join(parts)).text if parts else None
+    return parts
 
 
 def _one_turn(method: Callable[..., TurnResult]) -> Callable[..., TurnResult]:
@@ -578,6 +681,10 @@ class EntitySession:
     """Why bash was dropped when the cause is THIS entity's floor rather than the host's sandbox
     (the host-side reasons come from ``diagnose_confinement``). The banner prints it verbatim."""
     _closed: bool = field(default=False, init=False, repr=False, compare=False)
+    release_error: str | None = field(default=None, init=False, repr=False, compare=False)
+    """Why :meth:`close` could not release the conversation (its class and text), or ``None``. ``close``
+    never raises, so this is how a caller that must not count a live shell as released (the chat driver)
+    learns that it failed."""
     _stop_requested: bool = field(default=False, init=False, repr=False, compare=False)
     _turn_active: bool = field(default=False, init=False, repr=False, compare=False)
     _turn_start: int | None = field(default=None, init=False, repr=False, compare=False)
@@ -820,7 +927,9 @@ class EntitySession:
                 "visualizer": None,
             }
             if on_event is not None:
-                conv_kwargs["callbacks"] = [_activity_callback(on_event, workspace)]
+                conv_kwargs["callbacks"] = [_activity_callback(
+                    on_event, workspace,
+                    cred_floor=conv_binding is not None and conv_binding.deny_standard_creds)]
             if max_iterations is not None:
                 conv_kwargs["max_iteration_per_run"] = max_iterations
             conversation = Conversation(binding.agent, **conv_kwargs)
@@ -1205,28 +1314,53 @@ class EntitySession:
 
         events = self.conversation.state.events
         reply = latest_agent_text(events)
+        flagged, beside, unchecked = self._unreadable_texts(reply, events)
+        # A flagged text sent beside a parsed finish lives only in that action's thought. It goes in front of the reply
+        # (or is the reply, when the finish carried none): the surfaces show the reply as "what the model sent", and a
+        # notice above "Created x" alone would hide the call that did not run.
+        missing = [t for t in (scan_text(b).text for b in beside) if not reply or t not in reply]
+        if missing:
+            reply = "\n".join([*missing, reply] if reply else missing)
         return TurnResult(
             reply=reply,
-            tool_activity=turn_tool_activity(events, self.workspace),
+            tool_activity=turn_tool_activity(events, self.workspace, cred_floor=self.deny_standard_creds),
             error=None,
             nudged=nudged,
-            unreadable_call=self._unreadable_call(reply),
+            unreadable_call=flagged,
+            unreadable_unchecked=unchecked,
         )
 
-    def _unreadable_call(self, reply: str | None) -> bool:
-        """:func:`unreadable_tool_call` for this turn's reply. A display aid: it never fails a turn that ran."""
+    def _unreadable_texts(self, reply: str | None, events) -> tuple[bool, list[str], bool]:
+        """Whether the turn's reply is flagged, the flagged texts sent beside a parsed ``finish``, and whether the
+        check itself failed.
+
+        Each agent message is checked on its own AND their join (``reply``, the text shown): a call that is the whole
+        of one message (a plan, the act-now nudge, then the call) is not the whole of the join, and the shapes that
+        need the whole text would miss it; a call split across messages at a whitespace boundary is a call only in
+        the join (verify r2, glm). The text a model sent beside a parsed ``finish`` (that action's ``thought``) is checked too, even
+        when the finish carried no message: otherwise it is never shown. Thoughts beside other actions are not: such
+        an action ran, and its thought often restates that very call. A classifier failure fails CLOSED: the reply
+        and every thought beside a finish count as flagged (the reply alone when those thoughts cannot be read; a
+        headless run exits 7); the turn itself never fails."""
         try:
-            return unreadable_tool_call(reply, self._tool_names())
-        except Exception:  # noqa: BLE001 — the reply is then shown as it arrived
-            return False
+            thoughts = _finish_thoughts(events)
+        except Exception:  # noqa: BLE001 — undeterminable is not "readable"
+            return bool(reply), [], bool(reply)
+        try:
+            names = self._tool_names()
+            beside = [t for t in thoughts if unreadable_tool_call(t, names)]
+            parts = bool(reply) and (unreadable_tool_call(reply, names)
+                                     or any(unreadable_tool_call(t, names) for t in _agent_parts(events)))
+        except Exception:  # noqa: BLE001 — undeterminable is not "readable"
+            # every thought beside a finish is unchecked, so it is flagged and shown, as a flagged one would be
+            flagged = bool(reply) or bool(thoughts)
+            return flagged, thoughts, flagged
+        return bool(beside) or parts, beside, False
 
     def _tool_names(self) -> frozenset[str]:
-        """The names of this conversation's tools, or none when they cannot be read (the bare-JSON shape of an
-        unreadable call is then not recognised; the markup shapes still are)."""
-        try:
-            return frozenset(str(n) for n in self.conversation.agent.tools_map)
-        except Exception:  # noqa: BLE001 — a display aid never fails the turn
-            return frozenset()
+        """The names of this conversation's tools. When they cannot be read this raises, so :meth:`_unreadable_texts`
+        fails closed: an empty set would silently stop the shapes that name a tool from being recognised."""
+        return frozenset(str(n) for n in self.conversation.agent.tools_map)
 
     def request_stop(self) -> None:
         """Ask the running turn to stop, from ANOTHER thread: a threaded driver's wall-clock bound.
@@ -1327,7 +1461,7 @@ class EntitySession:
         refuse, and it is what would let the held actions run on the following turn."""
         return TurnResult(
             reply=None,
-            tool_activity=turn_tool_activity(self.conversation.state.events, self.workspace),
+            tool_activity=turn_tool_activity(self.conversation.state.events, self.workspace, cred_floor=self.deny_standard_creds),
             error=(
                 "could not determine whether the efferent gate is holding actions — ending the "
                 "turn rather than continuing blind. Restart the session; do not resume it."
@@ -1381,7 +1515,7 @@ class EntitySession:
                 events = [e for e in events if str(getattr(e, "id", "")) not in held]
         except Exception:  # noqa: BLE001 — a display filter must never break a turn
             pass
-        return turn_tool_activity(events, self.workspace)
+        return turn_tool_activity(events, self.workspace, cred_floor=self.deny_standard_creds)
 
     def _activity_after_fault(self) -> list[str]:
         """Activity for a turn that faulted partway: tools that ran before the fault did run, and an
@@ -1390,7 +1524,7 @@ class EntitySession:
         fault such an action may have been in flight, and partly run, so it stays listed. Never
         raises: an unreadable event log gives an empty list."""
         try:
-            return turn_tool_activity(self.conversation.state.events, self.workspace)
+            return turn_tool_activity(self.conversation.state.events, self.workspace, cred_floor=self.deny_standard_creds)
         except Exception:  # noqa: BLE001 — a display filter must never break a turn
             return []
 
@@ -1484,7 +1618,12 @@ class EntitySession:
         lost. Here the boundary IS the availability of an OS resource — a leaked process group
         outlives the process that made it — so completing the release beats propagating the
         interruption. A genuinely hung teardown is still bounded, by layer 2 taking the whole
-        process down."""
+        process down.
+
+        Never raising is not the same as succeeding: a ``conversation.close()`` that raised did not
+        release the shell, and a hands-user process that could not be stopped was not released
+        either; either is recorded in :attr:`release_error`, which the chat driver reports (codex
+        L3 r5 on the chat driver, run: the driver reported a release that had failed)."""
         with self._close_lock:
             if self._closed:
                 return
@@ -1493,8 +1632,12 @@ class EntitySession:
         try:
             self.conversation.close()
             torn_down = True
-        except BaseException:  # noqa: BLE001 — teardown must never raise; see the docstring
-            pass
+        except BaseException as exc:  # noqa: BLE001 — teardown must never raise; see the docstring
+            try:
+                text = f"{type(exc).__name__}: {exc}"
+            except BaseException:  # noqa: BLE001 — an exception whose text cannot be read
+                text = "the conversation's close raised"
+            self.release_error = text
         finally:
             # After the conversation (and its shell), and only once nothing of the hands user is left
             # running: ws-git may run once nothing of this session can still act in the workspace. A
@@ -1505,6 +1648,8 @@ class EntitySession:
             if self.hands_session_fd is not None and self.hands_user is not None:
                 self.left_running = _stop_hands_user(self.hands_user, self.hands_uid)
                 torn_down = torn_down and self.left_running is None
+                if self.left_running is not None and self.release_error is None:
+                    self.release_error = f"hands user left running: {self.left_running}"
             for name in ("hands_session_fd", "hands_lock_fd"):
                 fd = getattr(self, name)
                 if fd is not None and torn_down:
@@ -1530,17 +1675,27 @@ class EntitySession:
         self.close()
 
 
-def _activity_callback(on_event: Callable[[str], None], workspace: Path):
+def _activity_callback(on_event: Callable[[str], None], workspace: Path, *, cred_floor: bool = False):
     """Adapt the SDK's per-event callback to a display-line emitter.
 
     Filters to agent tool actions and renders them workspace-relative, matching
     :func:`turn_tool_activity`'s formatting exactly so a streamed line and a post-turn line are
-    byte-identical. Fail-soft: a callback that raises would propagate into the SDK's run loop
-    and kill a turn over a display concern."""
+    byte-identical. The :data:`CRED_FLOOR_NOTE` streams when the failing output arrives, where the
+    post-turn list puts it last; at most once a turn, a turn starting where :func:`turn_start` says
+    one does. Fail-soft: a callback that raises would propagate into the
+    SDK's run loop and kill a turn over a display concern."""
     prefix = str(workspace).rstrip(os.sep) + os.sep
+    noted = False
 
     def _cb(event: object) -> None:
+        nonlocal noted
         try:
+            if (getattr(event, "source", None) == "user" and hasattr(event, "llm_message")
+                    and not is_corrective_nudge(event)):
+                noted = False
+            if cred_floor and not noted and _reads_as_cred_failure(event):
+                on_event(CRED_FLOOR_NOTE)
+                noted = True
             if getattr(event, "source", None) != "agent":
                 return
             summary = tool_action_summary(event)

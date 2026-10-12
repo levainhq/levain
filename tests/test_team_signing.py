@@ -125,6 +125,20 @@ def test_fingerprint_refusals(keys, line_fn, needle):
         S.fingerprint(line_fn(keys))
 
 
+def test_fingerprint_refuses_non_canonical_base64_pad_bits(keys):
+    # The S1 contract parser (F7) refuses this spelling, and so does ssh-keygen; T must not fingerprint it.
+    # An ecdsa-p256 blob is 104 bytes, so its base64 ends in one "=" and the char before it carries 2 pad bits.
+    typ, b64 = pub_line(keys["ecdsa"]).split()[:2]
+    assert b64.endswith("=") and not b64.endswith("==")
+    alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    last = alpha.index(b64[-2])
+    assert last & 0b11 == 0
+    forged = b64[:-2] + alpha[last | 0b01] + "="
+    assert base64.b64decode(forged) == base64.b64decode(b64)
+    with pytest.raises(S.SigningError, match="base64"):
+        S.fingerprint(f"{typ} {forged}")
+
+
 def test_fingerprint_refuses_ecdsa_curve_mismatch(keys):
     blob = base64.b64decode(pub_line(keys["ecdsa"]).split()[1])
     typ, off = S._read_string(blob, 0, "type")

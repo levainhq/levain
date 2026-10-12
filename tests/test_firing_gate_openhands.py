@@ -1028,6 +1028,32 @@ def test_a_hold_that_cannot_be_shown_cannot_be_approved_at_the_repl(monkeypatch,
     assert "cannot be shown in full" in capsys.readouterr().out
 
 
+def test_a_hold_that_shows_nothing_cannot_be_approved_at_the_repl(monkeypatch, capsys):
+    """complement L3 (0.6.4..0.6.9), reproduced: a halt with an EMPTY pending list prompted `approve? [y/N]` over
+    nothing, because all() of an empty list is True. The chat host already refuses it; the REPL is reject-only too."""
+    from types import SimpleNamespace
+
+    from levain import run as run_mod
+
+    class Session:
+        approved = rejected = 0
+
+        def resume_turn(self):
+            self.approved += 1
+            return SimpleNamespace(gated=False, error=None)
+
+        def reject_turn(self, reason):
+            self.rejected += 1
+            return SimpleNamespace(gated=False, error=None)
+
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda *a: asked.append(a) or "y")
+    s = Session()
+    run_mod._drain_gate(s, SimpleNamespace(gated=True, pending=(), error=None))
+    assert s.approved == 0 and s.rejected == 1 and asked == []
+    assert "cannot be shown in full" in capsys.readouterr().out
+
+
 def test_the_runtime_still_builds_the_action_from_the_arguments_it_stores():
     """The raw-call frame rests on one fact about the installed SDK (OpenHands ``Agent._get_action_event``): it
     stores ``json.dumps(arguments)`` as the call, THEN pops the narration keys, THEN builds the action from that
