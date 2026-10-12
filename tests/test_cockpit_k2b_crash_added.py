@@ -72,6 +72,19 @@ def _real_clock_broker(home: Path, spores: Path, store: Any = None, **kw: Any) -
     return b
 
 
+def _recover_until(b: Broker, data: Path, query: str, want: Any, timeout: float = 10.0) -> None:
+    """Recover until the journal reads ``want``. The re-drive thread shares the injected clock, so it can hold
+    the op's mutex when ``recover`` arrives (a held mutex skips the pass) and its own pass can carry a stale
+    ``now``; one ``recover`` is therefore not one attempt. Re-recovering is idempotent: a unit not yet due
+    is passed over. Polls to a deadline, never a fixed sleep."""
+    end = time.monotonic() + timeout
+    while True:
+        b.recover()
+        if _sql(data, query)[0][0] == want or time.monotonic() >= end:
+            return
+        time.sleep(0.02)
+
+
 def _issue(b: Broker, spores: Path, name: str, key: str = "i1") -> dict:
     verb, params, ok = VERBS[name]
     return b.issue(verb=verb, params=params, target=_target(spores, ok), tier="T2", credential=BROWSER,
@@ -258,7 +271,7 @@ def test_transient_oserror_leaves_planned_and_redrive_finishes(home: Path, spore
         assert status == "PLANNED" and _row(spores, "k.loop")["text"] == "a loop"
         assert _sql(home / "data", "SELECT attempts FROM effects")[0][0] == 1
         clock.at += timedelta(seconds=6)
-        b.recover()
+        _recover_until(b, home / "data", "SELECT state FROM pendings", "COMMITTED")
         assert _sql(home / "data", "SELECT state FROM pendings")[0][0] == "COMMITTED"
         assert _row(spores, "k.loop")["text"] == "edited"
     finally:
@@ -270,9 +283,9 @@ def test_nine_faults_kill_restart_eleven_minutes_later_applies(home: Path, spore
     b = _real_clock_broker(home, spores, Flaky(spores, fail=None), clock=clock)
     try:
         pid = _issue(b, spores, "update_text")["pending_id"]
-        for _ in range(8):
+        for n in range(2, 10):
             clock.at += timedelta(seconds=130)
-            b.recover()
+            _recover_until(b, home / "data", "SELECT attempts FROM effects", n)
         att = _sql(home / "data", "SELECT attempts, status FROM effects")[0]
         assert att == (9, "PLANNED"), att                                   # CONTROL: nine, still planned
     finally:
@@ -292,9 +305,9 @@ def test_ten_faults_end_store_error_naming_the_last(home: Path, spores: Path) ->
     b = _real_clock_broker(home, spores, Flaky(spores, fail=None), clock=clock)
     try:
         pid = _issue(b, spores, "update_text")["pending_id"]
-        for _ in range(9):
+        for n in range(2, 11):
             clock.at += timedelta(seconds=130)
-            b.recover()
+            _recover_until(b, home / "data", "SELECT attempts FROM effects", n)
         status, reason, att = _sql(home / "data", "SELECT status, reason, attempts FROM effects")[0]
         assert status == "UNAPPLIED" and att == 10
         assert reason.startswith("store error:") and "boom10" in reason, reason
