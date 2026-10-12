@@ -498,7 +498,7 @@ class ChainExecutor:
         NEVER raises — any internal fault aborts the chain cleanly (a chain mid-walk that crashes must
         not propagate into the dispatch loop). Pre-flight: an UNCLASSIFIABLE link (an undeclared tool →
         ``UnknownAction``) BARS the whole chain before any link fires (fail-closed). The seam-#2 fail-up
-        is the per-fire TERMINAL-link ratified floor in :meth:`_fire_link` (the chain can't COMPLETE
+        is the per-fire TERMINAL-link ratified floor in :meth:`_link_request` (the chain can't COMPLETE
         below ``binding.posture``).
 
         ``gate`` is the gate the caller captured for this admission (the dispatcher's, which already ruled
@@ -521,7 +521,7 @@ class ChainExecutor:
         ``max_per_link < binding.posture`` bar spuriously, permanently barred a binding ratified with a
         REQUESTED-posture upgrade (the compiler seals ``max(resolved, requested)``, so ``binding.posture``
         can exceed the per-link max with no drift — L2/codex MED). It is replaced by the TERMINAL-link
-        ratified floor in :meth:`_fire_link` (``ratified_posture=binding.posture`` on the last link), so
+        ratified floor in :meth:`_link_request` (``ratified_posture=binding.posture`` on the last link), so
         the chain can never COMPLETE below the ratified rung — which HONORS a requested upgrade (the chain
         pauses at the requested rung at completion), catches WHOLESALE drift at the completion point, and
         unifies with 4a (a single link == the terminal link). The middle-link drift residual remains
@@ -551,7 +551,7 @@ class ChainExecutor:
         ``links`` reflect the segment ruled on. ``gate`` is the captured gate link ``start`` runs on (and,
         at the chain start, the pre-flight); ``None`` reads the handle. Every later link reads its own."""
         # fail-closed pre-flight (only at the chain START — a resume does not re-run it; the terminal
-        # floor in _fire_link applies to the resume continuation too). An unclassifiable link bars the
+        # floor in _link_request applies to the resume continuation too). An unclassifiable link bars the
         # whole chain before any link fires.
         if start == 0:
             if gate is None:
@@ -566,7 +566,7 @@ class ChainExecutor:
         results: list[ChainLinkResult] = list(prior)
         for i in range(start, len(binding.goal)):
             try:
-                request, outcome = self._fire_link(binding, event, ctx, i, gate if i == start else None)
+                request, link_gate = self._link_request(binding, event, ctx, i, gate if i == start else None)
             except Exception as e:  # noqa: BLE001 — a link that cannot be built ends the chain HERE
                 # the links before it may have fired (and an effect is not undone), so the outcome keeps
                 # them: a later link's policy can differ from the pre-flight's (a swap between links, a
@@ -575,6 +575,15 @@ class ChainExecutor:
                            binding.binding_id, i, type(e).__name__, e)
                 return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
                                     paused_at=i, reason=f"link_{i}_error:{type(e).__name__}")
+            try:
+                outcome = link_gate.gate(request)
+            except Exception as e:  # noqa: BLE001 — the gate never raises; if it does, the same rule holds
+                # the reason names the admission, not the build: link i may have fired inside the gate
+                # before it raised, and there is no outcome to say whether it did
+                _log.error("chainpath: binding %s link %d FAILED in admission (%s): %s — chain aborted",
+                           binding.binding_id, i, type(e).__name__, e)
+                return ChainOutcome(binding_id=binding.binding_id, state="aborted", links=tuple(results),
+                                    paused_at=i, reason=f"link_{i}_admission_error:{type(e).__name__}")
             results.append(ChainLinkResult(link_index=i, outcome=outcome))
 
             if outcome.fired:
@@ -636,9 +645,10 @@ class ChainExecutor:
             _log.error("chainpath: record_fire(%s) FAILED (%s): %s — chain completed, bookkeeping not "
                        "recorded", binding.binding_id, type(e).__name__, e)
 
-    def _fire_link(self, binding: Binding, event: dict[str, Any], ctx: ChainContext, i: int,
-                   gate: EfferentGate | None = None) -> tuple[ActionRequest, GateOutcome]:
-        """Build link i's request (adapter) then OVERLAY the governance-critical fields from the SEALED
+    def _link_request(self, binding: Binding, event: dict[str, Any], ctx: ChainContext, i: int,
+                      gate: EfferentGate | None = None) -> tuple[ActionRequest, EfferentGate]:
+        """Link i's request and the gate that admits it (``_walk`` calls ``gate.gate`` on the pair). Build
+        link i's request (adapter) then OVERLAY the governance-critical fields from the SEALED
         binding (so the adapter cannot forge them): per-link ``risk`` (seam #1) + per-link ``trust``
         (seam #5, hops=i) + ``authority`` (binding_invocation, hops=i) + the ``effective_guard`` kills +
         the prediction trajectory + the IMMUTABLE original trigger event.
@@ -677,7 +687,7 @@ class ChainExecutor:
             run=run,
             continuation=continuation,
         )
-        return request, gate.gate(request)
+        return request, gate
 
     # ---------------------------------------------------------------------------------------------
     # Resume: the operator resolved a paused link → fire it + continue the chain.
