@@ -1646,15 +1646,16 @@ class ChatHost:
                 error = _exc_line(exc)
         finally:
             done.set()
+        stop_left: str | None = None
         if watcher is not None:
             # The next job must not start while this one's stop request can still arrive: it
-            # would land in that job's turn. A watcher that does not exit breaks the session.
+            # would land in that job's turn. A watcher that does not exit breaks the session; the job
+            # keeps its own result, as below (chat L3 r1, complement LOW-4).
             watcher.join(_WATCHER_JOIN_SECONDS)
-            if watcher.is_alive() and error is None:
-                payload, error = None, "the turn's deadline watcher did not exit"
+            if watcher.is_alive():
+                stop_left = "the turn's deadline watcher did not exit, so the session takes no further turn"
         stopping = rec.driver
-        stop_left: str | None = None
-        if stopping is not None and not stopping.stop_idle():
+        if stop_left is None and stopping is not None and not stopping.stop_idle():
             # A stop request that outlived its deadline is still with the driver: it would land in the NEXT
             # turn (L1 r5, RAN). The session is broken for that reason; the job keeps its own result (a turn
             # that finished, or was stopped, as the slow stop came back is still that turn: complement r5).

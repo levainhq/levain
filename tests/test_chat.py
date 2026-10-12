@@ -1234,7 +1234,9 @@ class _StuckStop(_Stub):
 
 def test_a_watcher_that_does_not_exit_breaks_the_session(tmp_path, monkeypatch):
     """The watcher-alive branch: a watcher still inside a stop request when the job ends would land
-    that stop in the session's NEXT turn, so the session is broken instead of handed back idle."""
+    that stop in the session's NEXT turn, so the session is broken instead of handed back idle. The
+    turn that completed keeps its own result (chat L3 r1, complement LOW-4: it was replaced by "the
+    deadline watcher did not exit", as the stop_left path never did)."""
     import levain.chat as chat
 
     monkeypatch.setattr(chat, "_WATCHER_JOIN_SECONDS", 0.05)
@@ -1248,8 +1250,9 @@ def test_a_watcher_that_does_not_exit_breaks_the_session(tmp_path, monkeypatch):
     sid = _opened(host)
     try:
         st = _wait(host, host.turn(sid, "x")["job_id"])
-        assert st["status"] == "failed" and "watcher did not exit" in st["error"]
+        assert st["status"] == "done" and st["result"]["reply"] == "hello", st
         _until(lambda: host.session_status(sid)["state"] == "broken" and made[0].closed, what="the release")
+        assert "watcher did not exit" in host.session_status(sid)["error"]
     finally:
         made[0].release.set()
 
