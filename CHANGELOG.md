@@ -12,7 +12,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Changed
 
-- **The cockpit schema is `levain.cockpit/2`.** The `/1` kinds `triage-list`, `metric`, `visual` and `prose` are accepted as aliases of `list`, `status-dots`, `ambient` and `brief`, and the manifest and every panel carry the new names. Field names are kept, and v2 validates them strictly: a metric needs a non-empty label and a value that is a finite number or a string, prose markdown must be a string, and every prose line must be an object with a string text. A provider whose `/1` value was looser is refused until it sends well-formed values.
+- **The cockpit schema is `levain.cockpit/2`.** The `/1` kinds `triage-list`, `metric`, `visual` and `prose` are accepted as aliases of `list`, `status-dots`, `ambient` and `brief`, and the manifest and every panel carry the new names. Field names are kept, and v2 validates them strictly: a metric needs a non-empty label and, when it sends a value, a finite number or a string; prose needs markdown or lines, markdown must be a string, and every prose line must be an object with a string text; a `visual` value's text must be a list. A provider whose `/1` value was looser is refused until it sends well-formed values.
 
 ### Removed
 

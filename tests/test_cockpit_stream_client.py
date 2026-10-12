@@ -177,6 +177,21 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     ok(calls.join() === "b", "only the moved panel is refetched: " + calls);
     ok(h.win.LevainCockpitHeld.b.etag === "own-b", "the etag held is the one the panel read returned");
   }
+  // ---- a superseded refetch clears no fault: a newer one's retry survives the older answer ----
+  {
+    const h = boot({});
+    const gates = [];
+    h.win.LevainCockpitView.refetchPanel = (id) => { const k = gates.length; if (k === 0) return new Promise((res) => gates.push(res)); gates.push(null); return Promise.resolve("fault"); };
+    await settle();
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "2" }));
+    await settle();
+    h.fetches[0].push(frame("panel-changed", "E.1:2", { id: "a", etag: "3" }));
+    await settle();
+    ok(h.live().some((x) => x.ms === 5000), "the newer refetch's fault scheduled a retry");
+    gates[0]("superseded");
+    await settle();
+    ok(h.live().some((x) => x.ms === 5000), "a superseded answer does not clear the newer fault's retry");
+  }
   // ---- an announced etag is another credential's: the stream never stores it ----
   {
     const h = boot({});
