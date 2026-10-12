@@ -31,3 +31,24 @@ def test_the_pinned_ed25519_row_is_in_the_doc():
 def test_every_vector_directory_is_named():
     for d in sorted(p.parent.name for p in FROZEN.glob("*/vectors.json")):
         assert f"frozen/{d}/" in DOC, d
+
+
+def test_no_frozen_vector_stands_on_fleet_doc_text():
+    """C6 (S1_DESIGN rev 11): no frozen refusal cites the unreviewed fleet doc (FL) as its rationale."""
+    import json
+    for p in sorted(FROZEN.glob("*/vectors.json")):
+        for v in json.loads(p.read_text(encoding="utf-8"))["vectors"]:
+            assert not re.search(r"\bFL\b", json.dumps(v["authority"], ensure_ascii=False)), (p.parent.name, v["id"])
+
+
+def test_c4_the_three_authority_formats_are_recorded_and_wait_on_the_trust_fold():
+    """C4 (S1_DESIGN rev 11): the doc records the three-format conflict and that P1's envelope waits on its ruling."""
+    sec = DOC[DOC.index("## Not frozen (provisional)"):DOC.index("## Vendoring the vectors")]
+    for s in ("C4", "levain-authority/1", "sk-*", "ecdsa-sha2-nistp256", "trust-fold"):
+        assert s in sec, s
+
+
+def test_the_rev_11_rules_are_in_the_doc():
+    for s in ("re.ASCII", "the file's head", "`known`", "every later leaf", "go-toolchain.sha256",
+              "equals the anchors the vectors accept", "classify"):
+        assert s in DOC, s

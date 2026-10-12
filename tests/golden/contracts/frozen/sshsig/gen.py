@@ -40,8 +40,11 @@ SHA256 = profile("S1_DESIGN F12", "the hash algorithm is sha512",
 RESERVED = profile("S1_DESIGN F12", "the reserved field is empty",
                    quote="Implementations should ignore the reserved field if it is not empty.")
 KEYTYPE = profile("S1_DESIGN F12", "the embedded key is ssh-ed25519; a P-256 device line is P11's, as a new (line, v)",
-                  rationale="FL l.264: device keys are Ed25519; ECDSA's (r, s) / (r, n-s) malleability would give "
-                            "one signed entry two leaf hashes unless a low-S rule froze with it")
+                  rationale="(line, 1) freezes one device key type so that one signed entry has one leaf hash. "
+                            "ECDSA verification (FIPS 186-5) accepts any s in [1, n-1], and (r, s) verifies exactly "
+                            "when (r, n-s) does, so anyone holding a P-256 device_sig can make a second valid one "
+                            "for the same entry, a second leaf hash; PROTOCOL.sshsig states no low-S rule, so none "
+                            "can freeze with it here. Ed25519 under F2's pinned row has no such second form")
 BINDING = profile("S1_DESIGN F12", "fp_of_blob(embedded public key) == the leaf's device_fp",
                   rationale="the leaf names its device by device_fp; ssh-keygen -Y check-novalidate has no such input")
 SPLUSL = spec("RFC 8032 §5.1.7 (pinned in levain by the speccheck row, S1_DESIGN F2)",

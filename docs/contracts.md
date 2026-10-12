@@ -123,6 +123,10 @@ F12) are checked by the Python tests, under the OpenSSH version the vectors reco
   validator)`. Registered: `("line", 1)` on the team log (F9) and `("receipt_checkpoint", 1)` on the team log (F10).
   An unknown `(leaf, v)` is refused at ingest and reported UNVERIFIABLE at verify ("needs a newer levain"), never
   tampering. A rule change inside a type is a new `v`. Provisional shapes are never registered.
+- **Verification is a replay** (rev 11). Once a leaf that could change replay state is UNVERIFIABLE (an unknown
+  `(leaf, v)`, or for a line an unknown scope), every later leaf in that log is UNVERIFIABLE too, reported as "after
+  leaf <i>, which is UNVERIFIABLE: <reason>". The rule is positional, never a guess about dependence: an independent
+  later leaf is UNVERIFIABLE as well. Ingest is unchanged (an unknown type or scope is REFUSE there, and moves nothing).
 - Code: `levain/contracts/canon.py`. Vectors: `frozen/canon/` (the framing goldens run against an injected test
   registry).
 
@@ -130,10 +134,17 @@ F12) are checked by the Python tests, under the OpenSSH version the vectors reco
 - Leaf `{"leaf":"line","v":1,"file":<str>,"entry":<the SEALED entry>,"device_fp":<F7>,"device_sig":<canonical base64
   of the raw SSHSIG blob>}`, exactly those keys, no `n`. `entry.hash` must equal `chain_hash(entry.prev, entry)`.
 - **The frozen entry schema.** Every leaf's `entry` passes `validate_entry_v1` (`levain/contracts/leaves/entry_v1.py`),
-  a copy of `levain/team/entry.py` `validate` at levain `31dea1f` whose future-`ts` branch reads `now` from its
-  caller: the ingest time at ingest, `None` at verify (known edge: a far-future `ts` admitted by the trusted operator).
+  a copy of `levain/team/entry.py` `validate` at levain `31dea1f` with two declared divergences. (1) Its future-`ts`
+  branch reads `now` from its caller: the ingest time at ingest, `None` at verify (known edge: a far-future `ts`
+  admitted by the trusted operator). (2) `ID_RE` and `TS_RE` carry `re.ASCII` (rev 11, T03): at 31dea1f a bare `\d`
+  matched any Unicode decimal digit and `strptime`'s `%Y` parses fullwidth digits, so a fullwidth id or `ts` passed
+  there and would fail any strict `[0-9]` verifier; the sidecar's `accepted` check shares `TS_RE`. Ingest and verify
+  pass `known` = the snapshot's entries by unique id (rev 11), so the schema's snapshot rules run on the leaf path:
+  every `refs` and `supersedes` target must be held, and an `ack` or a `retire` is never superseded.
   Pinned: its sha256; its verdicts (accept, or refuse plus the refusing `raise` site and message) against the
-  verdicts recorded in `frozen/entry/` at the freeze, which 31dea1f's own `validate` produced; 100% branch coverage
+  verdicts recorded in `frozen/entry/` at the freeze, which 31dea1f's own `validate` produced with divergence (2)
+  applied (a vector on which unmodified 31dea1f disagrees carries a `divergence` field naming the rule and 31dea1f's
+  verdict, and the drift check skips it); 100% branch coverage
   of the copy by those vectors (`tests/_branch_coverage.py`, measured on CPython 3.12 and 3.13 in CI). A drift check
   against live `team.entry` prints "T schema changed: a new `(line, v)` is needed" and never fails. A later T schema
   change is a new `(line, v)`.
@@ -142,6 +153,10 @@ F12) are checked by the Python tests, under the OpenSSH version the vectors reco
   lowercase hex. `device_sig` is verified in-process (F12) in namespace `levain-team-entry`.
 - Ingest and verify refuse a repeated `(file, entry.hash)` (an operator fault at verify) and an `entry.id` already
   held by an ACCEPTED leaf (the first accepted wins; a refused leaf holds no id).
+- **Per-file chain continuity** (rev 11): the snapshot keeps each file's head, the chain hash of its last accepted
+  entry. A leaf is accepted only if `entry.prev` equals the file's head, `""` only while the file has no accepted
+  entry; a second `prev=""` for a file, a fork mid-chain, or a `prev` naming any other hash is refused, at ingest and
+  at verify, so a sealed per-file chain never forks.
 - **Scope matrix** `may_write_team_log(scope, entry, snapshot)`, the snapshot being the team log's verified prefix:
   `human` writes finding, question, tension, ack, retire; `member` writes finding, question, tension, with no
   non-empty `supersedes`; `receipt` writes no line. For every scope until P2: `decision`, `constraint` and any
@@ -154,13 +169,20 @@ F12) are checked by the Python tests, under the OpenSSH version the vectors reco
 - Code: `levain/contracts/leaves/team.py`, `leaves/entry_v1.py`. Vectors: `frozen/entry/`, `frozen/line/` (the
   hand-built message golden: origin `levain-team/` + 32 × `a`, file `ledger/dana/findings.jsonl`, chain hash
   `00…01`, lengths `0x0000002c`, `0x0000001a`, `0x00000020`; NFC vs NFD; a multibyte file; uppercase refused),
-  `frozen/scope/` (every scope × entry type cell, the supersedes, ruling, uniqueness and idempotency cases).
+  `frozen/scope/` (every scope × entry type cell, the supersedes, ruling, uniqueness and idempotency cases; the
+  `known` cases, the chain-continuity cases and the replay cascade, each as signed leaves through the leaf path).
+  `classify` vectors in `frozen/line/` run the registry's context-free validator alone, which checks the SSHSIG
+  profile without the signature: a `sha256` blob there is refused by the hash-algorithm rule and nothing else.
 
 ### F10. `receipt_checkpoint` leaf
 - `{"leaf":"receipt_checkpoint","v":1,"checkpoint":<signed note text>,"old_size":<int>,"consistency":[<base64 32-byte
   hashes>]}`, team log. The note verifies under the key the directory binds to the writing device (P1/P12, passed by
   the caller); `old_size` equals the same origin's previous accepted anchor's size (0 first); the proof verifies old
   -> new (F1); a fork (equal size, different root) and a smaller size are refused; a size above 2^53-1 is refused.
+- At verify the anchor walk is a replay (F8, rev 11): once a leaf is UNVERIFIABLE, every later leaf of its origin is
+  UNVERIFIABLE; an unknown `(leaf, v)` has no origin levain can read, so it poisons every origin.
+- `classify` vectors run the registry's validator alone, which never reaches the proof: a 31- or 33-byte proof line
+  is refused there by the 32-byte rule and nothing else.
 - Code: `levain/contracts/leaves/receipt.py`. Vectors: `frozen/receipt_checkpoint/`, signed under the PROVISIONAL
   receipt origins in `tests/golden/contracts/provisional/receipt_origin/` (P12; the checks do not depend on their
   form).
@@ -181,6 +203,9 @@ F12) are checked by the Python tests, under the OpenSSH version the vectors reco
   whose F7 fingerprint equals `device_fp`, a 64-byte signature; `sha256`, a non-empty reserved field and other key
   types are `levain_profile` refusals. The signed data (§3) is verified through F2's `ed25519.verify`, never through
   `ssh-keygen` (its Ed25519 verdict moves between OpenSSH versions). P-256 device lines are P11, a new `(line, v)`.
+  Why only `ssh-ed25519` (C6: this stands on the spec and the profile, no fleet-doc text): one signed entry must have
+  one leaf hash, and ECDSA verification (FIPS 186-5) accepts `(r, n-s)` whenever it accepts `(r, s)`, while
+  PROTOCOL.sshsig states no low-S rule to freeze beside it.
 - Code: `levain/contracts/sshsig.py`. Vectors: `frozen/sshsig/` (with `ecdsa-p256.sig`, made once by
   `ssh-keygen -Y sign` with a throwaway key). Test-time cross-check: `ssh-keygen -Y check-novalidate` accepts every
   armored valid control, and every `ssh-keygen -Y sign` blob verifies in levain. Measured: `OpenSSH_10.3p1` accepts
@@ -200,6 +225,13 @@ operator-access leaves · P8 inclusion promises · P9 ML-DSA-44 cosignatures · 
 Secure Enclave SSHSIG vector and P-256 device lines · P12 receipt identity · P13 fleet identity and the up-ledger. They
 live only as fixtures under `tests/golden/contracts/provisional/<item>/` with a `STATUS` file; nothing in the package
 builds or accepts them.
+
+**C4, the first thing P1 must settle: three authority-signature formats.** TS §1.4 asks for one signed envelope for
+every authority signature. Shipped 0.8.0 has `levain-authority/1` links (`authority.py`) with their own verifier and a
+key-class floor that requires `sk-*` keys for laptop presence; T's `fingerprint()` refuses `sk-*`; and the fleet
+design's laptop root is a Secure Enclave `ecdsa-sha2-nistp256` key. S1 does not unify them: it freezes only the
+fingerprint formula (F7) and the namespace registry (F11). The envelope (P1) waits on the trust-fold ruling, which
+must reconcile these three before any envelope-carrying leaf is frozen.
 
 ## Vendoring the vectors (anneal-memory)
 

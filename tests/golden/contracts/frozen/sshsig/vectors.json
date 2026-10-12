@@ -193,7 +193,7 @@
     "clause": "the embedded key is ssh-ed25519; a P-256 device line is P11's, as a new (line, v)",
     "basis": {
      "kind": "local_bound",
-     "rationale": "FL l.264: device keys are Ed25519; ECDSA's (r, s) / (r, n-s) malleability would give one signed entry two leaf hashes unless a low-S rule froze with it"
+     "rationale": "(line, 1) freezes one device key type so that one signed entry has one leaf hash. ECDSA verification (FIPS 186-5) accepts any s in [1, n-1], and (r, s) verifies exactly when (r, n-s) does, so anyone holding a P-256 device_sig can make a second valid one for the same entry, a second leaf hash; PROTOCOL.sshsig states no low-S rule, so none can freeze with it here. Ed25519 under F2's pinned row has no such second form"
     }
    }
   },
