@@ -24,7 +24,13 @@ def parse_decimal(text: str, maximum: int = NOTE_INT_MAX) -> int:
     """An ASCII decimal with no leading zero except ``0`` itself, in ``0..maximum``."""
     if not isinstance(text, str) or not _DECIMAL.fullmatch(text):
         raise ContractError(f"not an ASCII decimal without leading zeros: {text!r}")
-    n = int(text)
+    # the length bound comes first: int() raises a plain ValueError past CPython's digit limit (4300)
+    if len(text) > len(str(maximum)):
+        raise ContractError(f"integer of {len(text)} digits is above {maximum}")
+    try:
+        n = int(text)
+    except ValueError:
+        raise ContractError(f"not a convertible decimal: {text[:32]!r}") from None
     if n > maximum:
         raise ContractError(f"integer {text} is above {maximum}")
     return n

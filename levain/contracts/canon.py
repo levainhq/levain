@@ -92,8 +92,16 @@ def _no_constant(s: str) -> object:
     raise ContractError(f"{s} in a leaf")
 
 
+_JSON_INT_DIGITS = len(str(JSON_INT_MAX))
+
+
 def _int(s: str) -> int:
-    n = int(s)
+    if len(s.lstrip("-")) > _JSON_INT_DIGITS:   # before int(), which raises a plain ValueError past 4300 digits
+        raise ContractError(f"integer of {len(s)} characters is outside ±{JSON_INT_MAX}")
+    try:
+        n = int(s)
+    except ValueError:
+        raise ContractError(f"not a convertible integer: {s[:32]!r}") from None
     if abs(n) > JSON_INT_MAX:
         raise ContractError(f"integer {s} is outside ±{JSON_INT_MAX}")
     return n

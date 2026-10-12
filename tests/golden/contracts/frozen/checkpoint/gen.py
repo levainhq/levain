@@ -53,6 +53,8 @@ for size, root in ((0, EMPTY), (1, R), (2**20 + 1, R)):
     add(f"team-size-{size}", "spec", signed(f"{ORIGIN}\n{size}\n{b64(root)}\n"), ok(ORIGIN, size, root), TEXT)
 add("size-max-note-int", "spec", signed(f"{ORIGIN}\n{2**63 - 1}\n{b64(R)}\n"), ok(ORIGIN, 2**63 - 1, R), NOTE_MAX)
 add("size-above-max-note-int", "levain_profile", signed(f"{ORIGIN}\n{2**63}\n{b64(R)}\n"), NO, NOTE_MAX)
+add("size-5000-digits-refused", "spec", signed(f"{ORIGIN}\n{'9' * 5000}\n{b64(R)}\n"), NO,
+    spec("RFC 9162 §4.9 (https://www.rfc-editor.org/rfc/rfc9162)", "TreeHeadSignature: uint64 tree_size"))
 for vid, s, kind in (("leading-zero", "01", "upstream_lax"), ("negative", "-1", "spec"), ("plus", "+1", "spec"),
                      ("space", " 1", "spec"), ("underscore", "1_0", "spec"), ("fullwidth", "１", "spec")):
     add(f"size-{vid}-refused", kind, signed(f"{ORIGIN}\n{s}\n{b64(R)}\n"), NO, DEC)

@@ -60,3 +60,10 @@ def test_unknown_log_kind_and_bad_mode():
 def test_registry_is_exact_pairs_with_known_log_kinds():
     for (leaf, v), kinds in C.REGISTRY.items():
         assert isinstance(leaf, str) and type(v) is int and kinds <= set(C.LOG_KINDS)
+
+
+def test_an_oversized_leaf_integer_is_a_contract_error_at_its_own_site():
+    with pytest.raises(ContractError):
+        C._int("9" * 5000)
+    with pytest.raises(ContractError):
+        C._int("-" + "9" * 5000)

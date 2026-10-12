@@ -40,6 +40,8 @@ dec("trailing-newline", "spec", "1\n", None)
 dec("above-note-max", "levain_profile", "9223372036854775808", None, NOTE_MAX)
 dec("above-uint64", "spec", "18446744073709551616", None,
     spec("RFC 9162 §4.9 (https://www.rfc-editor.org/rfc/rfc9162)", "TreeHeadSignature: uint64 tree_size"))
+dec("5000-digits", "spec", "9" * 5000, None,
+    spec("RFC 9162 §4.9 (https://www.rfc-editor.org/rfc/rfc9162)", "TreeHeadSignature: uint64 tree_size"))
 
 
 def b64(vid, kind, text, raw):

@@ -49,3 +49,16 @@ def test_int_would_have_accepted_what_the_grammar_refuses(text):
 def test_round_trip_encode():
     for raw in (b"", b"\x00", b"\xff" * 31, bytes(range(32))):
         assert G.b64decode(G.b64encode(raw)) == raw
+
+
+def test_an_oversized_decimal_is_refused_before_int_runs(monkeypatch):
+    """CPython's int() raises a plain ValueError past 4300 digits; the length bound refuses before it is reached."""
+    with pytest.raises(ContractError):
+        G.parse_decimal("9" * 5000)
+    with pytest.raises(ContractError):
+        G.parse_decimal("1" + "0" * 19)   # 20 digits: one longer than 2^63-1
+    def boom(*a, **k):
+        raise ValueError("simulated")
+    monkeypatch.setattr(G, "int", boom, raising=False)
+    with pytest.raises(ContractError):
+        G.parse_decimal("1")
