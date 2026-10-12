@@ -37,7 +37,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from levain.autonomic.confirm import (
     COCKPIT_NAMESPACE,
@@ -97,9 +97,13 @@ from levain.cockpit.firejournal import (
 )
 from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
 from levain.cockpit.labels import BrokerLabeller, LabelSnapshot, label_class
-from levain.cockpit.authority import inactive
+from levain.authority import AnchorError, advance_anchor, anchor_path
+from levain.cockpit.authority import RequestAuthority, bound, current, inactive
 from levain.cockpit.results import Absent, Fault
 from levain.cockpit.verbs import KERNEL_VERBS
+
+if TYPE_CHECKING:
+    from levain.authority import AuthoritySnapshot
 
 __all__ = ["Broker", "BrokerError", "COCKPIT_STORE", "INTERNAL_VERBS", "LOCK_NAME", "Lifecycle",
            "PENDING_TTL", "STANDBY_FAULT", "label_class"]
@@ -304,19 +308,39 @@ class Broker:
     def enabled(self) -> bool:
         return self.state is Lifecycle.ACTIVE
 
-    def labels(self) -> LabelSnapshot:
-        """The cockpit's labeller (K2b-3b §0.1): one read of THIS broker's journal through
-        ``CockpitDB.read``, served only while ACTIVE, when the broker has opened and initialised the
-        journal. Any other state reads no file and labels nothing (§8d row 1: there is no read-only
-        opener, since one would create ``-shm``/``-wal`` or miss an uncheckpointed WAL)."""
-        with self._mu:
-            db = self.db if self._state is Lifecycle.ACTIVE else None
+    def capture(self, now: datetime | None = None) -> RequestAuthority:
+        """One request's authority (K2b-3b §0.1, trust-tiering DESIGN §3.4): one read of THIS broker's
+        journal, the authority log's verified head and the labels built from it, served only while
+        ACTIVE, when the broker has opened and initialised the journal. Any other state reads no file,
+        labels nothing and holds no authority (§8d row 1: there is no read-only opener, since one
+        would create ``-shm``/``-wal`` or miss an uncheckpointed WAL)."""
+        now = self._now() if now is None else now
+        db = self._active_db()
         if db is None:
-            return inactive("provenance is served by the active broker")
+            return RequestAuthority(now, inactive("provenance is served by the active broker"),
+                                    authority_error="the broker is not active")
+        return self._capture(db, now)
+
+    def _capture(self, db: CockpitDB, now: datetime) -> RequestAuthority:
         labeller = self._labeller
         if labeller is None or labeller.db is not db:
             labeller = self._labeller = BrokerLabeller(db)
-        return labeller.snapshot()
+        with db.read() as conn:
+            return RequestAuthority.capture(conn, now=now, anchor=anchor_path(db.data_root), labeller=labeller,
+                                            source=str(db.path), ssh_keygen=self.ssh_keygen)
+
+    def _request_authority(self, db: CockpitDB) -> RequestAuthority:
+        """The authority this request was captured under: the one bound by its outer boundary when it
+        was captured from this journal, else one captured now (a direct broker call is its own
+        request)."""
+        bound_auth = current()
+        if bound_auth is not None and bound_auth.source == str(db.path):
+            return bound_auth
+        return self._capture(db, self._now())
+
+    def labels(self) -> LabelSnapshot:
+        """The labels of a fresh :meth:`capture`."""
+        return self.capture().labels
 
     def _active_db(self) -> CockpitDB | None:
         with self._mu:
@@ -413,6 +437,7 @@ class Broker:
                 raise CockpitFormatError(f"journal was started as {stored!r}, not {self.install_class!r}")
             now = self._clock()
             db.expire_due(now)
+            self._advance_anchor(db, now)
             self.db = db
             self._recover(now, db)
         except Exception as exc:  # noqa: BLE001 - each failure is classified below, the fd closed
@@ -447,6 +472,20 @@ class Broker:
             self._thread = threading.Thread(target=self._redrive, name="cockpit-broker-redrive", daemon=True)
             self._thread.start()
         return True
+
+    def _advance_anchor(self, db: CockpitDB, now: datetime) -> None:
+        """At open, a log at or ahead of its anchor moves the anchor up to its head (DESIGN §3.8). A log
+        the anchor refuses is left refused (every request captures that refusal); it never stops the
+        broker, whose token-reported reads and writes do not depend on it."""
+        auth = self._capture(db, now)
+        if auth.authority is None:
+            if not auth.log_empty:
+                _log.warning("cockpit broker: %s", auth.authority_error)
+            return
+        try:
+            advance_anchor(anchor_path(db.data_root), auth.authority)
+        except (AnchorError, OSError) as exc:
+            _log.warning("cockpit broker: the authority anchor was not advanced: %s", exc)
 
     def stop(self) -> Lifecycle:
         """DRAINING, then CLOSED (§4.2): admission closes, admitted settlers are waited for up to the
@@ -592,7 +631,9 @@ class Broker:
             why = self._reported_refusal(str(rec.get("tier")), credential, harness)
             if why is not None:
                 raise BrokerError("refused", 403, why)
-            return {**self._decide(db, pid, "ALLOWED_REPORTED", None, None), "replay": True}
+            auth = self._request_authority(db)
+            with bound(auth):
+                return {**self._decide(db, auth, pid, "ALLOWED_REPORTED", None, None), "replay": True}
         return self.result(db, pid, replay=True)
 
     # -- building a verb's effects (§3.1.1) -------------------------------------------------------
@@ -845,42 +886,60 @@ class Broker:
         if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key):
             raise BrokerError("bad_request", 400, "'idempotency_key' must be a non-empty string")
         with self._admitted() as db:
-            if intent == "reported":
-                why = self._reported_refusal(tier, credential, harness)
-                if why is not None:
-                    raise BrokerError("refused", 403, why)
-            principal = self.principal_of(db, credential)
-            replayed = self._replayed(db, verb=verb, params=params, intent=intent, credential=credential,
-                                      idempotency_key=idempotency_key, target=target, harness=harness)
-            if replayed is not None:
-                if replayed["state"] == "applying":
-                    self.wake()
-                return replayed
-            pid = new_pending_id()
-            try:
-                built = self._build(db, verb, params, target, pid, at_issue=True)
-            except TransientApplyFault as exc:
-                raise BrokerError("source_unavailable", 503, f"could not read the target: {exc}") from exc
-            now = self._now()
-            raw = self._record(pid=pid, verb=verb, intent=intent, built=built, params=params, tier=tier,
-                               fence={"policy_rev": db.policy_rev()}, issued_at=utc_stamp(now),
-                               expires_at=utc_stamp(now + PENDING_TTL))
-            try:
-                res = db.issue(record_bytes=raw, principal=principal,
-                               idempotency_key=idempotency_key or ("auto:" + pid), now=now,
-                               harness=harness, cap_exempt=intent == "reported")
-            except PendingCapExceeded as exc:
-                raise BrokerError("pending_cap", 429, str(exc), {"occupying": [
-                    {"idempotency_key": o.idempotency_key, "verb": o.verb, "issued_at": o.issued_at}
-                    for o in exc.occupying]}) from exc
-            except IdempotencyConflict as exc:
-                raise BrokerError("idempotency_conflict", 409, str(exc)) from exc
-            self._kp("issued")
-            if intent == "reported" and res.outcome.state == "WAITING":
-                # a reported pending is decided by the request that issued it, or by its replay
-                # when that request died after ``issued``
-                return self._decide(db, res.pending_id, "ALLOWED_REPORTED", None, None)
-            return self.result(db, res.pending_id, replay=res.replay)
+            auth = self._request_authority(db)
+            with bound(auth):
+                return self._issue(db, auth, verb=verb, params=params, target=target, tier=tier,
+                                   credential=credential, intent=intent, idempotency_key=idempotency_key,
+                                   harness=harness)
+
+    def _issue(self, db: CockpitDB, auth: RequestAuthority, *, verb: str, params: Mapping[str, Any],
+               target: Mapping[str, Any], tier: str, credential: Mapping[str, Any], intent: str,
+               idempotency_key: str | None, harness: str) -> dict[str, Any]:
+        if intent == "reported":
+            why = self._reported_refusal(tier, credential, harness)
+            if why is not None:
+                raise BrokerError("refused", 403, why)
+        principal = self.principal_of(db, credential)
+        replayed = self._replayed(db, verb=verb, params=params, intent=intent, credential=credential,
+                                  idempotency_key=idempotency_key, target=target, harness=harness)
+        if replayed is not None:
+            if replayed["state"] == "applying":
+                self.wake()
+            return replayed
+        fence = auth.fence
+        if fence is None:
+            raise self._authority_refusal(auth)
+        pid = new_pending_id()
+        try:
+            built = self._build(db, verb, params, target, pid, at_issue=True)
+        except TransientApplyFault as exc:
+            raise BrokerError("source_unavailable", 503, f"could not read the target: {exc}") from exc
+        now = self._now()
+        raw = self._record(pid=pid, verb=verb, intent=intent, built=built, params=params, tier=tier,
+                           fence=fence, issued_at=utc_stamp(now),
+                           expires_at=utc_stamp(now + PENDING_TTL))
+        try:
+            res = db.issue(record_bytes=raw, principal=principal,
+                           idempotency_key=idempotency_key or ("auto:" + pid), now=now,
+                           harness=harness, cap_exempt=intent == "reported")
+        except PendingCapExceeded as exc:
+            raise BrokerError("pending_cap", 429, str(exc), {"occupying": [
+                {"idempotency_key": o.idempotency_key, "verb": o.verb, "issued_at": o.issued_at}
+                for o in exc.occupying]}) from exc
+        except IdempotencyConflict as exc:
+            raise BrokerError("idempotency_conflict", 409, str(exc)) from exc
+        self._kp("issued")
+        if intent == "reported" and res.outcome.state == "WAITING":
+            # a reported pending is decided by the request that issued it, or by its replay
+            # when that request died after ``issued``
+            return self._decide(db, auth, res.pending_id, "ALLOWED_REPORTED", None, None)
+        return self.result(db, res.pending_id, replay=res.replay)
+
+    @staticmethod
+    def _authority_refusal(auth: RequestAuthority) -> BrokerError:
+        if auth.authority is None and not auth.log_empty:
+            return BrokerError("authority_unavailable", 503, str(auth.authority_error))
+        return BrokerError("not_initialised", 409, str(auth.authority_error))
 
     def _reported_refusal(self, tier: str, credential: Mapping[str, Any], harness: str) -> str | None:
         if self.install_class != REPORTED:
@@ -907,13 +966,19 @@ class Broker:
                 raise BrokerError("refused", 409, "a reported pending takes no signature")
             if not isinstance(signature, str) or not signature:
                 raise BrokerError("bad_request", 400, "'signature' is required")
-            fp = self._verify(db, view.record_bytes, signature)
-            return self._decide(db, pending_id, "ALLOWED", fp, signature)
+            auth = self._request_authority(db)
+            if auth.authority is None or auth.authority_error is not None:
+                # the signature is unspent: the pending stays WAITING
+                raise self._authority_refusal(auth)
+            with bound(auth):
+                fp = self._verify(auth.authority, view.record_bytes, signature)
+                return self._decide(db, auth, pending_id, "ALLOWED", fp, signature)
 
-    def _verify(self, db: CockpitDB, message: bytes, signature: str) -> str:
-        """The verified signer's fingerprint (§6.5), against a signers file generated from ``keys``
-        for this verification into a fresh ``mkstemp`` file in the data root."""
-        keys = db.signer_keys()
+    def _verify(self, authority: AuthoritySnapshot, message: bytes, signature: str) -> str:
+        """The verified signer's fingerprint (§6.5), against a signers file generated from the
+        request's authority snapshot (its unrevoked keys) for this verification into a fresh
+        ``mkstemp`` file in the data root."""
+        keys = sorted((k.principal, k.public_key) for k in authority.active_keys())
         fd, path = tempfile.mkstemp(prefix=".signers-", dir=self.data_root)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -929,7 +994,8 @@ class Broker:
             raise BrokerError("verifier_unavailable", 503, "the signature could not be checked")
         if verdict.status != VERIFIED or verdict.principal is None:
             raise BrokerError("bad_signature", 400, "the signature does not verify over this pending")
-        if db.key_fingerprint(verdict.principal) != verdict.fingerprint:
+        key = authority.key(verdict.fingerprint) if verdict.fingerprint is not None else None
+        if key is None or not key.active or key.principal != verdict.principal:
             raise BrokerError("bad_signature", 400, "the signing key is not the enrolled key")
         assert verdict.fingerprint is not None
         return verdict.fingerprint
@@ -976,7 +1042,7 @@ class Broker:
         except (UnknownPending, JournalCorruptError):
             return None
 
-    def _decide(self, db: CockpitDB, pid: str, kind: str, signer_fp: str | None,
+    def _decide(self, db: CockpitDB, auth: RequestAuthority, pid: str, kind: str, signer_fp: str | None,
                 signature: str | None) -> dict[str, Any]:
         view = self._load(db, pid)
         if view.state != "WAITING":
@@ -984,7 +1050,7 @@ class Broker:
         recomputed, pre_images = self._recompute(db, view)
         self._kp("verified")
         out = db.decide(operation_id=pid, decision_kind=kind, recomputed=recomputed,  # type: ignore[arg-type]
-                        now=self._now(), signer_fp=signer_fp, signature=signature,
+                        now=self._now(), authority=auth.authority, signer_fp=signer_fp, signature=signature,
                         pre_images=pre_images if recomputed is not None else [])
         if out.decided:
             self._bump()

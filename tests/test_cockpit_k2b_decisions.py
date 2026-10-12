@@ -178,7 +178,13 @@ def test_edits_with_no_ledger_shows_the_journal_fire(tmp_path):
     pid = fire(j, "k1")
     assert not (rig.src.write_scope.ledger_root / "edits.jsonl").exists()
     rig.ck.attach_edits_reader(j.edits)
-    rig.ck.attach_labeller(BrokerLabeller(j).snapshot)
+    labeller = BrokerLabeller(j)
+
+    def capture(now):
+        with j.read() as conn:
+            return RequestAuthority.capture(conn, now=now, anchor=None, labeller=labeller, source=str(j.path))
+    rig.ck.attach_authority(capture)
+    assert rig.ck.authority().labels.error is None       # the journal's labels, not a degraded stand-in
     p = rig.ck.panel("edits", credential_class="token")
     assert p["status"] == "ok", p
     (row,) = p["rows"]

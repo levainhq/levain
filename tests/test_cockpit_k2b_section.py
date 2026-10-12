@@ -16,7 +16,7 @@ from levain.cockpit.broker import Broker
 from levain.cockpit.effects import SporeEffectStore
 from levain.cockpit.verbs import dispatch, retier
 from tests.test_cockpit_k2a import CRED, INSTALL_CLASS, Rig, _refused
-from tests.test_cockpit_k2b_broker import Key, _refused as _broker_refused, _rows, _state as _pending_state, home, keydir  # noqa: F401
+from tests.test_cockpit_k2b_broker import Key, _laptop_floor, _refused as _broker_refused, _rows, _state as _pending_state, home, keydir  # noqa: F401
 
 
 @pytest.fixture

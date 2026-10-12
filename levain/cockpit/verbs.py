@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
-from levain.cockpit.authority import bound
+from levain.cockpit.authority import bound, current
 from levain.cockpit.engine import VALUE_ABSENT
 from levain.cockpit.external import ID_PREFIX as EXTERNAL_PREFIX
 from levain.cockpit.registry import parse_date
@@ -830,7 +830,8 @@ def retier(registry: "VerbRegistry", cockpit: "Cockpit", verb_name: str, params:
     verb = registry.get(verb_name)
     if verb is None:
         return None
-    auth = cockpit.authority()
+    # the request's own authority when its boundary bound one (the broker's submit), never a second read
+    auth = current() or cockpit.authority()
     if auth.labels.error is not None and _governed(cockpit):
         return None
     row = None

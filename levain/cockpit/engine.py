@@ -405,7 +405,9 @@ class Cockpit:
         self._lock = threading.Lock()
         self._life = threading.Lock()    # start() and stop() never run at once
         self._verb_view: Any = None      # levain.cockpit.verbs.VerbView, attached by the server (K2a)
-        self._labeller: Callable[[], LabelSnapshot] | None = None    # the broker's, attached by the server (K2b)
+        self._labeller: Callable[[], LabelSnapshot] | None = None    # a labels-only source (tests)
+        # the broker's request capture (its authority and labels), attached by the server (K2b, DESIGN §3.4)
+        self._capture: Callable[[datetime], RequestAuthority] | None = None
         self._dec = _Decisions()          # the decisions panel's contributors (K2b-3b §0.4)
         self._broker_dec_spec = _broker_decision_spec()
         # the broker's Recent edits reader (fn(limit) -> EditsPage), attached by the server (K2b-3b §0.6)
@@ -423,8 +425,14 @@ class Cockpit:
         self._verb_view = view
 
     def attach_labeller(self, fn: Callable[[], LabelSnapshot]) -> None:
-        """Attach the labeller: ``fn()`` is ONE journal read, taken once per request (design §0.1)."""
+        """Attach a labels-only source: ``fn()`` is ONE journal read, taken once per request (design
+        §0.1). A request captured this way holds no signed authority."""
         self._labeller = fn
+
+    def attach_authority(self, fn: Callable[[datetime], RequestAuthority]) -> None:
+        """Attach the broker's capture: ``fn(now)`` is ONE journal read per request, the authority
+        log's verified head and the labels built from it (trust-tiering DESIGN §3.4)."""
+        self._capture = fn
 
     def attach_edits_reader(self, fn: Callable[[int], Any]) -> None:
         """Attach the broker's journal edits reader: ``fn(limit)`` returns an ``EditsPage``, None while
@@ -503,6 +511,8 @@ class Cockpit:
     def labels(self) -> LabelSnapshot:
         """One label snapshot. A labeller that raises is an error snapshot, never a failed panel: a
         label is never a gate on reading."""
+        if self._capture is not None:
+            return self.authority().labels
         fn = self._labeller
         if fn is None:
             return NO_LABELS
@@ -513,7 +523,15 @@ class Cockpit:
 
     def authority(self) -> RequestAuthority:
         """The authority one outer request renders and tiers from, captured once (§0.1)."""
-        return RequestAuthority(self._clock(), self.labels())
+        now = self._clock()
+        capture = self._capture
+        if capture is not None:
+            try:
+                return capture(now)
+            except Exception as exc:  # noqa: BLE001 - a capture fault holds no authority, labels nothing
+                return RequestAuthority(now, unavailable(f"{type(exc).__name__}: {_safe_str(exc)}"),
+                                        authority_error=f"the authority could not be read: {_safe_str(exc)}")
+        return RequestAuthority(now, self.labels())
 
     def install_class(self) -> str | None:
         """The install class gestures are decided under (the attached verb view's), or None."""

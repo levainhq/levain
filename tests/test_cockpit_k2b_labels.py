@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from levain.cockpit.consent import build_record, encode, utc_stamp, value_sha256
-from levain.cockpit.firejournal import CockpitDB, UnitResult, new_pending_id
+from levain.cockpit.firejournal import CockpitDB, UnitResult, authority_fence, new_pending_id
 
 T0 = datetime(2026, 10, 10, 12, 0, 0, tzinfo=timezone.utc)
 PHONE = "token:phone:1"
@@ -28,7 +28,7 @@ def make_record(*, intent: str = "reported", text: str = "new", n_effects: int =
         target={"kind": "row", "panel_id": "loops", "origin_key": "ok-0", "row_id": "spore-1",
                 "expected_version": 3},
         params={"text": text}, effects=effects or [effect(i, text) for i in range(n_effects)],
-        tier="T2", fence={"policy_rev": 0}, issued_at=utc_stamp(T0), expires_at=utc_stamp(T0 + ttl))
+        tier="T2", fence=authority_fence(None), issued_at=utc_stamp(T0), expires_at=utc_stamp(T0 + ttl))
     return pid, encode(rec)
 
 
@@ -40,13 +40,6 @@ def db(tmp_path):
     return j
 
 
-def enrol(db, fp: str = FP_PHONE, cls: str = "display-phone") -> None:
-    with db.write() as conn:
-        conn.execute("INSERT INTO keys (fingerprint, principal, public_key, class, enrolled_at, "
-                     "enrolled_via) VALUES (?, ?, 'ssh-ed25519 AAAA', ?, ?, 'laptop cli')",
-                     (fp, "k" + fp[-6:], cls, utc_stamp(T0 - timedelta(days=1))))
-
-
 def fire(db, key: str, *, text: str = "new", intent: str = "reported", at: datetime | None = None,
          label: bool = True, effects: list | None = None) -> str:
     """One op through the real journal API: issue, decide, record every unit APPLIED, finish."""
@@ -55,7 +48,7 @@ def fire(db, key: str, *, text: str = "new", intent: str = "reported", at: datet
     when = at or T0 + timedelta(minutes=1)
     kw = {"signer_fp": FP_PHONE, "signature": "sig"} if intent == "sign" else {}
     n = len(effects) if effects else 1
-    out = db.decide(operation_id=pid, decision_kind="ALLOWED" if intent == "sign" else "ALLOWED_REPORTED",
+    out = db.decide(authority=None, operation_id=pid, decision_kind="ALLOWED" if intent == "sign" else "ALLOWED_REPORTED",
                     recomputed=raw, now=when, pre_images=[{"text": "old"}] * n, **kw)
     assert out.decided
     for i in range(n):
@@ -95,9 +88,15 @@ def test_a_lowering_or_non_canonical_label_rev_update_aborts(db, value):
 from levain.cockpit.labels import BrokerLabeller, LabelKey  # noqa: E402
 
 
+def labels_of(db):
+    """The labels a request captures (an empty authority log: these fires are token-reported)."""
+    with db.read() as conn:
+        return BrokerLabeller(db).snapshot(conn, None)
+
+
 def test_provenance_labels_the_fired_value_and_not_a_changed_one(db):
     pid = fire(db, "k0", text="fired")
-    snap = BrokerLabeller(db).snapshot()
+    snap = labels_of(db)
     assert snap.error is None and snap.revision == ("", 1, 1)
     prov = snap.provenance(LabelKey("ok-0", {"text": "fired"}))
     assert prov == {"label": "claims cockpit token", "signer": None, "credential": PHONE,
@@ -119,7 +118,7 @@ def test_a_corrupt_label_row_degrades_only_its_resource(db):
     # a copy that claims a stronger decision than its pending took (r1 codex)
     conn.execute("UPDATE labels SET decision_kind = 'ALLOWED' WHERE resource_key = 'ok-0'")
     conn.close()
-    snap = BrokerLabeller(db).snapshot()
+    snap = labels_of(db)
     assert snap.error is None and snap.degraded == 1
     assert snap.label(LabelKey("ok-0", {"text": "a"})) == "unverified"
     assert snap.label(LabelKey("ok-1", {"text": "b"})) == "claims cockpit token"
