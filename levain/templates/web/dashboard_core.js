@@ -476,6 +476,8 @@
     const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
     if (!hero || !brief || !widgets) return;
     hero.hidden = brief.hidden = widgets.hidden = !on;
+    // the section headers are page chrome that follows its region: hidden here, set by the region's own render
+    for (const id of ["ck-h-brief", "ck-h-widgets"]) { const h = document.getElementById(id); if (h) h.hidden = true; }
     document.body.classList.toggle("ke", on);
     const bd = document.getElementById("board");
     if (bd) bd.classList.toggle("ke", on);
@@ -623,7 +625,7 @@
     // the title is the manifest's; the one-line gloss beside it is page chrome (a zone the page has no gloss for gets none)
     const head = el("div", "zone-head");
     head.appendChild(el("div", "zone-title", zone.title));
-    if (ZONE_GLOSS[zone.id]) head.appendChild(el("span", "zone-gloss", ZONE_GLOSS[zone.id]));
+    if (Object.hasOwn(ZONE_GLOSS, zone.id)) head.appendChild(el("span", "zone-gloss", ZONE_GLOSS[zone.id]));
     sec.appendChild(head);
     const grid = el("div", "ck-zgrid");
     grid.dataset.ckRegion = "zone";
@@ -707,6 +709,7 @@
   const regionErr = (id, fill) => (node) => {
     const h = document.getElementById(id); if (!h) return;
     h.hidden = false;
+    const head = document.getElementById("ck-h-" + id.slice(3)); if (head) head.hidden = false;
     if (fill) h.replaceChildren(node);   // only after the region's restore ran: nothing structural is left inside
     else { for (const old of h.querySelectorAll(":scope > .ck-region-err")) old.remove(); h.appendChild(node); }
   };

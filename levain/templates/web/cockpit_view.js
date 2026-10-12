@@ -1097,7 +1097,7 @@
     if (!k || !s.skyHandle || typeof s.skyHandle.update !== "function" || !k.plot.isConnected || !s.body.contains(k.plot)) return false;
     try { s.skyHandle.update({ events: sky.events, legend: sky.legend }); } catch (_) { return false; }
     paintCounts(k.win, sky);
-    k.legend.title = sky.legend;   // the kernel's sentence; the drawn legend is page chrome
+    paintLegend(k.legend, sky);
     return true;
   }
   // In the hero the clock, the date and the events line are the page's own nodes (ctx.hero), drawn in the clock
@@ -1130,15 +1130,20 @@
       try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend }, { legend: false }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
     const legend = el("div", "legendbar" + (hero ? "" : " frame"));
-    paintLegend(legend);
-    legend.title = sky.legend;
+    paintLegend(legend, sky);
     host.appendChild(legend);
     s.skyParts = { plot: plot, win: win, legend: legend };
   }
 
   // The strip chart's key: the real glyphs, drawn like the chart's own marks (sky.js). Page chrome, not data:
   // the kernel's `legend` sentence stays as the tooltip. Orange is reserved for failed and now, so the diamond is neutral.
-  function paintLegend(host) {
+  // The key names only the kinds sky.js draws apart; a feed carrying any other kind gets the kernel's sentence as its
+  // visible note instead, so the fallback square is never silently labelled for a kind the page does not know.
+  const DRAWN_KINDS = new Set(["commit", "review", "decision", "memory"]);
+  function paintLegend(host, sky) {
+    host.replaceChildren();
+    host.title = sky.legend;
+    const known = (sky.events || []).every((e) => e && DRAWN_KINDS.has(e.kind));
     const NS = "http://www.w3.org/2000/svg";
     const glyph = (size, build) => {
       const svg = document.createElementNS(NS, "svg");
@@ -1161,7 +1166,7 @@
       host.appendChild(it);
     }
     host.appendChild(el("span", "lg-sp"));
-    host.appendChild(el("span", "lg-note", "Each mark is one real event. Hover for its time, kind and repo."));
+    host.appendChild(el("span", "lg-note", known ? "Each mark is one real event. Hover for its time, kind and repo." : sky.legend));
   }
 
   // ---- one typed panel ----
