@@ -1128,6 +1128,8 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
   body.ke .ck-zgrid > .panel.ck-span-2, body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: auto; }
   body.ke .ck-zgrid > .panel { height: auto; max-height: 560px; }
   body.ke .ck-card.w { height: auto; min-height: var(--widget-h); }
+  body.ke .ck-brief-body .xbody.has-side { display: block; }
+  .brief-side { border-left: 0; padding-left: 0; margin-top: var(--s3); }
 }
 
 /* THE ORANGE BUDGET (KE page). Accent only where attention goes: the now-line, a failed review, "N failed", an overdue tag,
