@@ -139,7 +139,8 @@ def _journal(data_root: Path | str, *, marker_directory: Path | None = None) -> 
     if not (root / DB_NAME).is_file():
         raise KeyError_(f"no cockpit journal at {root / DB_NAME}: start the cockpit once with "
                         "`levain serve --write --install-class reported`")
-    return CockpitDB(root)
+    # a /2 journal migrates on this open only if it is reported and no server holds cockpit.lock
+    return CockpitDB(root, install_class=REPORTED)
 
 
 def _check_reported(conn: object) -> None:

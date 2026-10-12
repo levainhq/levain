@@ -431,7 +431,8 @@ class Broker:
             self._inflight += 1
         failure: Exception | None = None
         try:
-            db = CockpitDB(self.data_root)
+            # the lock is held: a /2 journal of this install class migrates on this open
+            db = CockpitDB(self.data_root, install_class=self.install_class, owns_lock=True)
             stored = db.set_install_class(self.install_class or "")
             if stored != self.install_class:
                 raise CockpitFormatError(f"journal was started as {stored!r}, not {self.install_class!r}")

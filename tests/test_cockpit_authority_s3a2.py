@@ -435,6 +435,76 @@ def test_a_pending_issued_on_a_replaced_suffix_ends_stale(broker, spores, keydir
     assert (out["state"], out["reason"]) == ("STALE", "authority changed")
 
 
+def _hold_lock(data: Path) -> subprocess.Popen:
+    """Another process holding ``cockpit.lock`` exclusively, as a live ``levain serve`` does."""
+    code = ("import fcntl, os, sys, time\n"
+            "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+            "print('held', flush=True)\n"
+            "time.sleep(120)\n")
+    p = subprocess.Popen([sys.executable, "-c", code, str(data / "cockpit.lock")], stdout=subprocess.PIPE, text=True)
+    assert p.stdout is not None and p.stdout.readline().strip() == "held"
+    return p
+
+
+def _a_v2_store(home: Path, spores: Path, keydir: Path) -> str:
+    """A /2 journal (started reported) holding one WAITING pending; its id."""
+    b = _broker(home, spores)
+    try:
+        waiting = _move(b, spores)["pending_id"]
+    finally:
+        b.stop()
+    phone = RealKey(keydir, "phone")
+    _as_v2(home / "data", [(phone.fingerprint, phone.principal, phone.public, "display-phone",
+                            "2026-10-01T00:00:00.000000Z", None, None)])
+    return waiting
+
+
+def _still_v2(data: Path, waiting: str) -> None:
+    conn = sqlite3.connect(data / "cockpit.db")
+    try:
+        assert conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()[0] == "levain-cockpit/2"
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert "keys" in tables and "legacy_keys" not in tables
+        assert conn.execute("SELECT state FROM pendings WHERE pending_id = ?", (waiting,)).fetchone()[0] == "WAITING"
+    finally:
+        conn.close()
+
+
+def test_a_cli_open_of_a_v2_store_under_a_live_server_refuses_and_migrates_nothing(home, spores, keydir, capsys):
+    """F2 (a): the one-way migration runs only under ``cockpit.lock``; a server holding it (an old
+    ``levain serve`` still running) leaves the store /2 and the command names what to do."""
+    from levain import cli
+
+    waiting = _a_v2_store(home, spores, keydir)
+    data = home / "data"
+    holder = _hold_lock(data)
+    try:
+        assert cli.main(["cockpit", "keys", "--data-root", str(data)]) == 1
+        assert "levain serve" in capsys.readouterr().err
+        _still_v2(data, waiting)
+    finally:
+        holder.kill()
+        holder.wait()
+    assert cli.main(["cockpit", "keys", "--data-root", str(data)]) == 0     # the lock free, it migrates
+    assert sqlite3.connect(data / "cockpit.db").execute(
+        "SELECT value FROM meta WHERE key = 'format'").fetchone()[0] == STORE_FORMAT
+
+
+def test_keys_on_a_governed_v2_store_refuses_before_migrating(home, spores, keydir, capsys):
+    """F2 (b): the install-class check comes before any mutation: a governed /2 journal stays /2."""
+    from levain import cli
+
+    waiting = _a_v2_store(home, spores, keydir)
+    data = home / "data"
+    conn = sqlite3.connect(data / "cockpit.db", isolation_level=None)
+    conn.execute("UPDATE meta SET value = 'governed' WHERE key = 'install_class'")
+    conn.close()
+    assert cli.main(["cockpit", "keys", "--data-root", str(data)]) == 1
+    assert "governed" in capsys.readouterr().err
+    _still_v2(data, waiting)
+
+
 @pytest.mark.parametrize("via", ["broker", "keys"])
 def test_the_anchor_is_read_before_the_snapshot_is_pinned(broker, keydir, monkeypatch, via):
     """F3: an append that commits and advances the anchor after the read transaction pinned its
