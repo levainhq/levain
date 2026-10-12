@@ -764,49 +764,66 @@
   // ---- row painting by kind ----
   function dotOf(status) { const d = el("span", "dot " + (status || "unknown")); d.setAttribute("aria-hidden", "true"); return d; }
 
+  // The Fleet card (KE4): resident / on call / roundtable, drawn from the kernel's own fleet_group and health.
+  // Accent is the kernel's tone "alarm" alone, which only a resident member whose silence is a signal can carry;
+  // an on-call member's last call, failed or not, is a neutral fact.
+  const FLEET_GROUPS = [["resident", "Resident \u00b7 judged by their writing"], ["on_call", "On call \u00b7 judged by their last answer"],
+                        ["roundtable", "Roundtable"]];
+  function fleetRow(r) {
+    const h = isObj(r.health) ? r.health : { tone: "unknown", text: "no data", at: null, memory: "" };
+    const alarm = h.tone === "alarm";
+    const row = el("div", "fl rrow");
+    row.setAttribute("data-ck-row", "");
+    row.setAttribute("tabindex", "0");
+    const n = el("div", "n");
+    // unknown is its own mark (a dashed ring) so it never reads as an on-call "not called yet" hollow dot, and never as accent
+    const dot = el("i", alarm ? "bad" : (h.tone === "unknown" ? "unk" : (h.tone === "neutral" && !h.at ? "off" : "")));
+    dot.setAttribute("aria-hidden", "true");
+    n.append(dot, document.createTextNode(r.name));
+    const when = h.at ? " " + (ago(h.at) || h.at) : "";
+    const d = el("div", "d" + (alarm ? " bad" : "") + (h.tone === "unknown" ? " unk" : ""), (h.text || "") + when);
+    row.append(n, d);
+    const tags = [r.role, h.memory].filter(Boolean).join(" \u00b7 ");
+    if (tags) row.appendChild(el("div", "tags", tags));
+    return row;
+  }
   function paintRoster(host, rows, d) {
-    const groups = new Map();
-    for (const r of rows) {
-      const g = typeof r.group === "string" && r.group ? r.group : "";
-      if (!groups.has(g)) groups.set(g, []);
-      groups.get(g).push(r);
-    }
-    for (const [g, rs] of groups) {
-      if (g) host.appendChild(el("h3", "grp-h", g));
-      for (const r of rs) {
-        const row = el("div", "rrow" + (r.cadence === "on_call" ? " oncall" : ""));
-        row.appendChild(dotOf(r.cadence === "on_call" ? "idle" : callStatus(r)));
-        row.appendChild(el("span", "rname", r.name));
-        if (r.role) row.appendChild(el("span", "rrole", r.role));
-        const chips = el("span", "rchips");
-        chips.appendChild(el("span", "chip-s", r.memory || ""));
-        chips.appendChild(el("span", "chip-s", r.cadence === "on_call" ? "on call" : (r.cadence || "")));
-        row.appendChild(chips);
-        const lc = r.last_call;
-        let state;
-        if (isObj(lc) && typeof lc.at === "string") state = (lc.outcome === "failed" ? "failed " : "") + (ago(lc.at) || lc.at);
-        else if (r.cadence === "on_call") state = "on call";
-        else if (r.digest === null || r.digest === undefined) state = "no data";
-        else state = digestText(r.digest);
-        row.appendChild(el("span", "rstate" + (isObj(lc) && lc.outcome === "failed" ? " bad" : ""), state));
-        host.appendChild(row);
+    for (const [gid, title] of FLEET_GROUPS) {
+      const rs = rows.filter((r) => (r.fleet_group || (r.group === "roundtable" ? "roundtable" : r.cadence === "resident" ? "resident" : "on_call")) === gid);
+      if (!rs.length) continue;
+      const g = el("div", "fl-group");
+      g.setAttribute("data-ck-fleet-group", gid);
+      g.appendChild(el("h3", "grp-h", title));
+      if (gid === "roundtable") {
+        // a roundtable's members are on call (the kernel refuses any other): their seats fold into one line
+        let last = NaN, unreadable = false, any = false;
+        for (const r of rs) {
+          const at = isObj(r.health) ? r.health.at : null;
+          if (!at) continue;
+          any = true;
+          const t = parseIso(at);                     // compared as instants, never as strings
+          if (isNaN(t)) unreadable = true; else if (isNaN(last) || t > last) last = t;
+        }
+        const known = !isNaN(last);
+        const row = el("div", "fl rrow");
+        row.setAttribute("tabindex", "0");
+        const n = el("div", "n");
+        const dot = el("i", known ? "" : (unreadable ? "unk" : "off"));
+        dot.setAttribute("aria-hidden", "true");
+        n.append(dot, document.createTextNode("roundtable"));
+        const when = known ? (ago(new Date(last).toISOString()) || "unknown") : (unreadable || any ? "unknown" : "never");
+        const stateless = rs.filter((r) => r.memory === "stateless").length;
+        const tag = stateless === rs.length ? rs.length + " stateless seats" : rs.length + " seats, " + (rs.length - stateless) + " with memory";
+        row.append(n, el("div", "d" + (!known && unreadable ? " unk" : ""), rs.map((r) => r.name).join(", ") + " \u00b7 last called " + when),
+                   el("div", "tags", tag));
+        g.appendChild(row);
+      } else {
+        for (const r of rs) g.appendChild(fleetRow(r));
       }
+      host.appendChild(g);
     }
-    if (d.retiredHidden) host.appendChild(el("p", "xnote", d.retiredHidden + " retired hidden"));
+    if (d.retiredHidden) host.appendChild(el("p", "xnote", d.retiredHidden + " retired " + (d.retiredHidden === 1 ? "member" : "members") + " not shown"));
   }
-  function callStatus(r) {
-    const lc = r.last_call;
-    if (isObj(lc) && lc.outcome === "failed") return "bad";
-    return isObj(lc) ? "ok" : "unknown";
-  }
-  // a roster digest is an object of scalar facts; it is shown as the words it carries, never as zero
-  function digestText(dg) {
-    if (!isObj(dg)) return "no data";
-    const parts = [];
-    for (const k of Object.keys(dg)) if (typeof dg[k] === "string" || isNum(dg[k])) parts.push(k.replace(/_/g, " ") + " " + dg[k]);
-    return parts.slice(0, 3).join(" · ") || "no data";
-  }
-
   // the kernel's sentence, else the verb and the target when the row has one
   function logLine(r) { return typeof r.sentence === "string" && r.sentence ? r.sentence : typeof r.target === "string" && r.target ? r.verb + " · " + r.target : r.verb; }
   function paintLog(host, rows) {
