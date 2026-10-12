@@ -12,7 +12,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Changed
 
-- **Cockpit signing keys live in a signed authority log.** Who may sign a cockpit write is a verified replay of `authority_log` in `cockpit.db`, read once per request; the `keys` and `policy` tables are gone. `levain cockpit enroll` and `revoke` append a signed link and take `--signing-key`: an enrolment is signed by a laptop-presence key, a revocation by a key of at least the revoked key's class. `--compromised-since` takes an authority seq, which `levain cockpit keys` lists. A pending's fence names the log head it was issued under, so any appended link turns waiting pendings STALE.
+- **Cockpit signing keys live in a signed authority log.** Who may sign a cockpit write is a verified replay of `authority_log` in `cockpit.db`, read once per request; the `keys` and `policy` tables are gone. `levain cockpit enroll` and `revoke` append a signed link and take `--signing-key`: an enrolment is signed by a laptop-presence key, a revocation by a key of at least the revoked key's class. `--compromised-since` takes an authority seq, which `levain cockpit keys` lists. A pending's fence names the log head it was issued under, so a pending still waiting when any link is appended ends STALE at its decision.
 - **Breaking: the journal format is `levain-cockpit/3`.** A 0.9.x journal migrates at first open: its keys are set aside, waiting pendings end STALE, and every signed act is refused, naming `levain cockpit ledger init`, until the keys are enrolled again with a touch on a laptop-presence key. `ledger init` is not in this build yet. A 0.9.x binary refuses a migrated journal.
 
 ### Removed
