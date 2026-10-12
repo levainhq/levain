@@ -870,7 +870,8 @@ class _Handler(GuardedHandler):
         if is_cockpit_path(path):
             # The shared cockpit's two read routes (levain.cockpit, design §3): they ride this same
             # envelope, so the Host allowlist, cross-site refusal, the off-box token gate above and
-            # the concurrency gate all apply with no second path.
+            # the concurrency gate all apply with no second path. The freshness stream holds its slot for
+            # its whole life, so it takes its own cap (stream_gate) in place of the request gate.
             if path == EVENTS_PATH:
                 self._serve_stream(head=head)
                 return
