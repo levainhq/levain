@@ -215,8 +215,8 @@ def revoke(data_root: Path | str, ref: str, *, signer_fp: str, sign: Signer, clo
     """Revoke the key ``ref`` names (its fingerprint or principal) by a link ``signer_fp`` signs (a key
     of at least its class). The replay refuses a plain revoke of the last unrevoked laptop-presence
     key (it would leave nothing to sign a T3); with ``compromised_since`` (an authority seq, which
-    ``levain cockpit keys`` lists) it lands, and that key's fires from that seq on stop reading as
-    signed. Returns ``(row, warning)`` as :func:`enroll`."""
+    ``levain cockpit keys`` lists) it lands, and that key's fires decided at or after that seq read
+    "signed by a revoked key". Returns ``(row, warning)`` as :func:`enroll`."""
     if compromised_since is not None and (type(compromised_since) is not int or compromised_since < 1):
         raise KeyError_("--compromised-since is an authority seq (an integer >= 1)")
     db = _journal(data_root, marker_directory=marker_directory)
