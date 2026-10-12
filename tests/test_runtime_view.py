@@ -115,6 +115,31 @@ def test_the_runtime_dir_is_a_fresh_tmpfs_after_its_ancestors_pins_and_before_an
             assert i > view[0], (op, args)
 
 
+def test_a_runtime_dir_bash_could_move_from_above_is_pinned_from_above(tmp_path, rd, monkeypatch) -> None:
+    """``XDG_RUNTIME_DIR`` two levels under a directory bash can write (``~/.cache/xdg``): renaming its
+    parent would carry the host's runtime dir, dirmngr included, to a name the next session has no view
+    of. Its ancestors are pinned before its view, as a GNUPGHOME view's are. With the container sockets
+    allowed, so that no denied socket under the dir pins its ancestors by another road."""
+    top = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvxd"))
+    root = top / "a" / "xdg"
+    s = _listen(root / "gnupg" / "S.gpg-agent")
+    monkeypatch.setattr(conf, "_runtime_dirs", lambda: [str(root)])
+    try:
+        root = root.resolve()
+        argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True,
+                                        allow_container_sockets=True))
+        ops = _ops(argv)
+        view = [i for i, op, a in ops if op == "--tmpfs" and a == [str(root)]]
+        assert len(view) == 1
+        for anc in (root.parent, root.parent.parent):
+            pins = [i for i, op, a in ops if op == "--bind" and a == [str(anc), str(anc)]]
+            assert pins and max(pins) < view[0], anc
+    finally:
+        s.close()
+        import shutil
+        shutil.rmtree(top)
+
+
 def test_only_socket_files_come_back_never_a_directory(tmp_path, rd) -> None:
     argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
     for _, op, args in _ops(argv):

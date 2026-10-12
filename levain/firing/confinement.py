@@ -5109,7 +5109,7 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], lis
     2.4.4, bubblewrap 0.9.0). The view stays writable, so an agent a tool starts inside bash can make
     its socket there; it is gone with the shell. A runtime dir that holds the workspace, the entity or
     ``$HOME`` (``XDG_RUNTIME_DIR`` pointed at one of the operator's directories) is refused: its view
-    would hide them.
+    would hide them. Each dir's ancestors go back as ``pins``.
 
     Each GNUPGHOME of :func:`_gnupg_home_views` is a view too, whose ancestors go back as ``pins``. Its
     sockets in :data:`_GNUPG_HOME_SOCKETS` and its files come back, the files writable: with the trustdb
@@ -5139,6 +5139,11 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], lis
                     "holding only its agent sockets, and the view would hide that too. Refusing "
                     "to grant bash hands (fail-closed). Point XDG_RUNTIME_DIR at a directory of its own.")
     homes, pins = _gnupg_home_views(policy, roots)
+    # A runtime dir is pinned from above like a GNUPGHOME view: under a directory bash can rename
+    # (``XDG_RUNTIME_DIR=~/.cache/xdg``), renaming that parent carried the host's dir, dirmngr included,
+    # to a name the next session has no view of (complement L3 r1). /run/user/<uid>'s parents are
+    # root's; their self-binds are pins like any other present ancestor.
+    pins = sorted({*pins, *(a for r in roots for a in r.parents if str(a) != a.anchor)})
     wanted = list(_gpg_sockets()) if roots else []
     auth_sock = os.environ.get("SSH_AUTH_SOCK", "")
     if auth_sock.startswith("/"):
