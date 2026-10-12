@@ -126,6 +126,7 @@ def cosigned_message(timestamp: int, checkpoint_text: str) -> bytes:
 
 def cosign(checkpoint_text: str, name: str, seed: bytes, timestamp: int) -> str:
     """One cosignature line (Ed25519 cosignature/v1) for ``checkpoint_text``."""
+    check_int(timestamp, NOTE_INT_MAX)   # before struct.pack, which raises struct.error or packs a bool
     parse_text(checkpoint_text)
     key = N.make_key(name, ed25519.public_from_seed(seed), N.SIG_TYPE_COSIG_V1)
     sig = struct.pack(">Q", timestamp) + ed25519.sign(seed, cosigned_message(timestamp, checkpoint_text))

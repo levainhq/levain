@@ -53,3 +53,11 @@ def test_now_is_validated_and_never_read():
     # the same note far in the past is refused: the verifier uses the caller's clock, not its own
     with pytest.raises(ContractError):
         C.verify_cosignatures(v["note"], keys, 1_000_000_000)
+
+
+@pytest.mark.parametrize("ts", [-1, 2**63, 2**64, True, 1.0])
+def test_cosign_refuses_a_bad_timestamp_before_packing(ts):
+    v = {x["id"]: x for x in VECTORS}["spec-example-input"]["input"]
+    text = v["note"].split("\n\n")[0] + "\n"
+    with pytest.raises(ContractError):
+        C.cosign(text, "w.example/w", bytes(32), ts)
