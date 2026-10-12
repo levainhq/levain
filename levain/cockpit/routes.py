@@ -25,8 +25,8 @@ CACHE_CONTROL = "private, no-cache"
 VARY = TOKEN_HEADER
 PROFILES = ("full", "compact")
 # Hashed into every validator: bumped when a wire projection changes (rev 2: compact `now` rows are
-# refs, panel heads carry edit_class; rev 3: kind contract v2, panel heads carry searchable / window), so a client holding an older body revalidates to a 200.
-REPRESENTATION = 3
+# refs, panel heads carry edit_class; rev 3: kind contract v2, panel heads carry searchable / window; rev 4: panel heads carry their declared facets), so a client holding an older body revalidates to a 200.
+REPRESENTATION = 4
 
 
 def is_cockpit_path(path: str) -> bool:

@@ -188,11 +188,14 @@
     if (kind === "list" || kind === "count-queue") {
       const compose = composeOf(panel.compose);
       // an addressed list draws every row as `source -> for`. Its address is the compose's recipient field when
-      // the panel declares a compose; a read-only serve declares none (no send verb), but the rows still carry the
-      // `for` facet, so the facet alone addresses them: the address line never depends on the write side.
+      // the panel declares a compose; a read-only serve declares none (no send verb), but the panel still DECLARES
+      // the `for` facet (head.facets), so the declaration alone addresses the rows: never the write side, and never
+      // the values the current rows happen to carry (a broadcast-only inbox is still addressed; a list whose rows
+      // carry a `for` key it does not declare is not).
       const rfield = compose ? compose.fields.find((f) => f.type === "recipient") : null;
       const forName = rfield ? rfield.name : "for";
-      const addressed = !!rfield || (panel.rows || []).some((r) => isObj(r.facets) && Object.prototype.hasOwnProperty.call(r.facets, "for"));
+      const declared = Array.isArray(head.facets) ? head.facets : Array.isArray(panel.facets) ? panel.facets : [];
+      const addressed = !!rfield || declared.indexOf("for") >= 0;
       if (compose) out.compose = compose;
       out.lines = (panel.rows || []).map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";

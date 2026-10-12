@@ -1352,6 +1352,9 @@ class Cockpit:
                         if self._verb_view is not None else []),
             "edit_class": spec.edit_class or None,
             **({"face": spec.face} if spec.face else {}),
+            # the facets the panel DECLARES: a renderer decides what its rows mean (an addressed list) from this,
+            # never from the values the current rows happen to carry
+            **({"facets": sorted(spec.facets)} if spec.facets else {}),
             **({"compose": copy.deepcopy(spec.compose)} if spec.compose else {}),
         }
 
