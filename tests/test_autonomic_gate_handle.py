@@ -3,11 +3,13 @@ on the gate it captured.
 
 Covered here: ``with_policy`` shares every stateful collaborator (checked against the constructor, so a
 new collaborator added later fails here rather than being dropped by a swap); ``swap``'s frozen catalog
-and its refusals; the fire path and the chain path capturing the gate once per admission; and the
-atomicity CONTRACT test (``test_contract_*``).
+and its refusals; the HOLDERS (``FireDispatcher.dispatch``, ``ChainExecutor`` execute / resume and
+``sweep_timeouts``) reading the handle exactly once per admission, counted by a probe handle; and the
+atomicity CONTRACT test of the handle itself (``test_contract_*``).
 """
 from __future__ import annotations
 
+import datetime as _dt
 import inspect
 import re
 import threading
@@ -23,6 +25,8 @@ from levain.autonomic import (
 )
 from levain.autonomic import gate as gate_module
 from levain.autonomic.handle import as_handle
+from levain.autonomic.journal import run_id_for
+from tests.autonomic_confirm_keys import signed_yes
 from tests.test_autonomic_journal_wiring import FIXED, HIGH, LOW, World, _chain_builder, _single_builder, _trust
 
 pytestmark = pytest.mark.usefixtures("test_only_confined_executor")
@@ -233,6 +237,100 @@ def test_each_chain_link_captures_its_own_gate(tmp_path):
     assert w.outbox() == [("link0", "e1-0")]
 
 
+# --- the holders, counted: exactly one read of the handle per admission -----------------------------
+# A holder that reads the handle twice in one admission (a decision on one gate, its resolve on the next)
+# is the mixed-policy shape the handle exists to prevent, and no swap-timing test reliably lands a swap
+# between the two reads. So these count the reads instead, driven through each holder's public entry: a
+# second read in any admission, or a capture skipped, changes the count.
+
+class _CountingHandle(GateHandle):
+    """TEST-ONLY: a handle that counts reads of :meth:`current`."""
+
+    def __init__(self, gate: EfferentGate) -> None:
+        super().__init__(gate)
+        self.reads = 0
+
+    def current(self) -> EfferentGate:
+        self.reads += 1
+        return super().current()
+
+    def count(self, admit):
+        """``admit()``'s result and how many times it read the handle."""
+        self.reads = 0
+        result = admit()
+        return result, self.reads
+
+
+def _counted_world(tmp_path):
+    w = World(tmp_path / "w")
+    handle = _CountingHandle(w.gate)
+    w.chains = ChainExecutor(gate=handle, request_builder=_chain_builder, trust_resolver=_trust,
+                             clock=lambda: FIXED, binding_store=w.store)
+    w.dispatcher = FireDispatcher(
+        store=w.store, gate=handle,
+        predicate_match=lambda p, e: e.get("fields", {}).get(p["field"]) == p["value"],
+        request_builder=_single_builder, clock=lambda: FIXED, chain_executor=w.chains)
+    return w, handle
+
+
+def test_a_single_link_dispatch_reads_the_handle_once(tmp_path):
+    w, handle = _counted_world(tmp_path)
+    w.mint(chain=False)
+    d, reads = handle.count(lambda: w.dispatch("e1"))
+    assert d.outcome.fired and reads == 1   # the effect refusal, the risk and the fire: one gate
+
+
+def test_a_chain_dispatch_reads_the_handle_once_per_link(tmp_path):
+    w, handle = _counted_world(tmp_path)
+    w.mint(chain=True)
+    d, reads = handle.count(lambda: w.dispatch("e1"))
+    # the dispatch capture serves the effect refusal, the pre-flight and link 0; link 1 reads its own
+    assert d.chain.paused and d.chain.paused_at == 1 and reads == 2
+
+
+def test_a_chain_that_pauses_at_link_0_reads_the_handle_once(tmp_path):
+    w, handle = _counted_world(tmp_path)
+    w.tool_risk[0] = HIGH
+    w.mint(chain=True)
+    d, reads = handle.count(lambda: w.dispatch("e1"))
+    assert d.chain.paused and d.chain.paused_at == 0 and reads == 1
+
+
+def test_a_chain_executed_without_a_captured_gate_reads_the_handle_once_at_its_start(tmp_path):
+    w, handle = _counted_world(tmp_path)
+    w.tool_risk[0] = HIGH
+    b = w.mint(chain=True)
+    event = {"type": "email", "id": "e1", "fields": {"from": "a@x.example", "dmarc": "pass"}}
+    fresh = w.store.admit(b.binding_id, run_id_for(b.binding_id, event))
+    out, reads = handle.count(lambda: w.chains.execute(fresh, event))
+    assert out.paused and out.paused_at == 0 and reads == 1   # the pre-flight and link 0: one gate
+
+
+def test_a_resume_reads_the_handle_once_per_admission(tmp_path):
+    w, handle = _counted_world(tmp_path)
+    w.tool_risk[0] = HIGH
+    w.mint(chain=True)
+    w.dispatch("e1")
+    yes = signed_yes(w.gate, w.open_pending_id())
+    out, reads = handle.count(lambda: w.resolve_open_as(yes))
+    # link 0's resolve on one gate, then link 1 (which pauses) on its own
+    assert out.paused and out.paused_at == 1 and reads == 2
+    yes = signed_yes(w.gate, w.open_pending_id())
+    out, reads = handle.count(lambda: w.resolve_open_as(yes))
+    assert out.completed and reads == 1   # the terminal link's resolve alone
+
+
+def test_the_chain_sweep_reads_the_handle_once_per_swept_hold(tmp_path):
+    w, handle = _counted_world(tmp_path)
+    w.mint(chain=True)
+    w.dispatch("e1")
+    out, reads = handle.count(lambda: w.chains.sweep_timeouts(FIXED + _dt.timedelta(minutes=30)))
+    assert out == [] and reads == 1   # not expired: the silence decision's gate, and nothing more
+    [out], reads = handle.count(lambda: w.chains.sweep_timeouts(FIXED + _dt.timedelta(hours=2)))
+    # the silence decision and the resolve it drives: one gate
+    assert out.aborted and out.reason == "denied:confirm_window_elapsed" and reads == 1
+
+
 # --- the atomicity CONTRACT test ---------------------------------------------------------------------
 
 class _ProbedHandle(GateHandle):
@@ -298,8 +396,10 @@ def test_contract_every_admission_decides_on_the_one_gate_it_captured(tmp_path):
 
     Each thread's FIRST admission is held inside the gate's own step (the shared clock, the first thing
     ``_resolve`` reads) until the swap has published, so it is deterministic that admissions captured on A
-    are decided after B is live. A handle or holder that read the gate again mid-admission decides those
-    on B and fails here."""
+    are decided after B is live. A swap that changed the gate an admission already holds (an edit in place
+    rather than a new gate) decides those on B and fails here. The admissions here read the handle
+    directly, so this tests the HANDLE, never the holders: that every holder reads it exactly once per
+    admission is pinned by the counting tests (``test_*_reads_the_handle_*``)."""
     oracle = {"A": _oracle(tmp_path / "a", _POLICY_A), "B": _oracle(tmp_path / "b", _POLICY_B)}
     assert oracle["A"]["act.tighten"] != oracle["B"]["act.tighten"]
     assert oracle["A"]["act.gone"] != oracle["B"]["act.gone"] and oracle["B"]["act.gone"][2]
