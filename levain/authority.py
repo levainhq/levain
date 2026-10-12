@@ -21,6 +21,7 @@ import base64
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -155,7 +156,9 @@ def _parse_stamp(text: Any, what: str) -> datetime:
 
 
 def _canonical(obj: Any) -> str:
-    # sort_keys + compact separators + ensure_ascii=False: one byte form per record
+    # sort_keys + compact separators + ensure_ascii=False: one byte form per record. Byte parity with
+    # team/entry.py's canonical, NaN/Infinity included; replay refuses non-finite numbers where they could
+    # appear (only `timeouts` carries free-form values), never by changing this form.
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
@@ -278,6 +281,17 @@ class AuthoritySnapshot:
         return self._hashes[seq - 1] if 1 <= seq <= len(self._hashes) else None
 
 
+_TEXT_COLUMNS = ("prev_hash", "record", "signer_fp", "signature", "hash")
+
+
+@dataclass(frozen=True)
+class _Cell:
+    """A stored value that is not UTF-8 text: its SQLite type and raw bytes, kept so the row still has
+    a digest; the replay refuses it."""
+    kind: str
+    raw: bytes | None
+
+
 @dataclass(frozen=True)
 class _Row:
     seq: Any
@@ -288,13 +302,26 @@ class _Row:
     hash: Any
 
     def digest(self) -> str:
-        return hashlib.sha256(_canonical([self.seq, self.prev_hash, self.record, self.signer_fp,
-                                          self.signature, self.hash]).encode("utf-8")).hexdigest()
+        cells = [self.seq, self.prev_hash, self.record, self.signer_fp, self.signature, self.hash]
+        return hashlib.sha256(json.dumps(cells, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                                         default=repr).encode("ascii")).hexdigest()
+
+
+def _text_cell(kind: str, raw: bytes | None) -> str | _Cell:
+    if kind == "text" and raw is not None:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+    return _Cell(kind, raw)
 
 
 def _rows(conn: sqlite3.Connection) -> list[_Row]:
-    cur = conn.execute("SELECT seq, prev_hash, record, signer_fp, signature, hash FROM authority_log ORDER BY seq")
-    return [_Row(*r) for r in cur.fetchall()]
+    # each text column as (typeof, bytes), decoded here: a corrupt cell becomes a _Cell the replay refuses
+    # at its seq, never an exception out of the driver's own decode
+    cols = ", ".join(f"typeof({c}), CAST({c} AS BLOB)" for c in _TEXT_COLUMNS)
+    cur = conn.execute(f"SELECT seq, {cols} FROM authority_log ORDER BY seq")
+    return [_Row(r[0], *(_text_cell(k, raw) for k, raw in zip(r[1::2], r[2::2]))) for r in cur.fetchall()]
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -472,9 +499,24 @@ def _validate_policy(data: Any) -> AuthorityPolicy:
     return AuthorityPolicy.from_dict(data)
 
 
+def _finite_json(value: Any) -> bool:
+    """Every leaf a finite JSON scalar (NaN and Infinity are not JSON)."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, Mapping):
+        return all(isinstance(k, str) and _finite_json(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return all(_finite_json(v) for v in value)
+    return False
+
+
 def _validate_timeouts(timeouts: Any) -> None:
     if not isinstance(timeouts, Mapping) or not all(isinstance(k, str) and k for k in timeouts):
         raise AuthorityError("timeouts must map pending kinds to values")
+    if not _finite_json(timeouts):
+        raise AuthorityError("timeouts values must be finite JSON (no NaN or Infinity)")
 
 
 def _apply_policy_op(policy: AuthorityPolicy, rec: Mapping[str, Any]) -> AuthorityPolicy:
@@ -585,14 +627,14 @@ def _parse_record(row: _Row) -> dict[str, Any]:
         raise ReplayError(seq, "the record is not text")
     try:
         rec = json.loads(row.record)
-    except ValueError:
+    except (ValueError, RecursionError):
         raise ReplayError(seq, "the record is not JSON") from None
     if not isinstance(rec, dict) or _canonical(rec) != row.record:
         raise ReplayError(seq, "the record is not a canonical JSON object")
     if rec.get("format") != FORMAT:
         raise ReplayError(seq, f"the record's format is not {FORMAT}")
     op = rec.get("op")
-    if op not in _OP_FIELDS:
+    if not isinstance(op, str) or op not in _OP_FIELDS:
         raise ReplayError(seq, f"unknown op {op!r}")
     required, optional = _OP_FIELDS[op]
     have = set(rec) - _BASE_FIELDS
@@ -608,7 +650,7 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
                   ssh_keygen: Path | str) -> AuthorityKey:
     from levain.cockpit.keys import KeyError_, fingerprint_of, normalise_public_key
     fp, public_key, cls = rec["fingerprint"], rec["public_key"], rec["class"]
-    if cls not in _ranks():
+    if not isinstance(cls, str) or cls not in _ranks():
         raise AuthorityError(f"unknown key class {cls!r}")
     if not isinstance(public_key, str) or not isinstance(fp, str):
         raise AuthorityError("enrol needs a fingerprint and a public key")
@@ -643,6 +685,9 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
     seq = row.seq
     if type(seq) is not int or seq != expected:
         raise ReplayError(expected, f"expected seq {expected}, found {seq!r} (a link is missing or out of order)")
+    for name in _TEXT_COLUMNS:
+        if not isinstance(getattr(row, name), str):
+            raise ReplayError(seq, f"{name} is not UTF-8 text")
     prev = "" if state is None else state.head_hash
     if row.prev_hash != prev:
         raise ReplayError(seq, "prev_hash is not the predecessor's hash (the chain is broken)")
@@ -704,6 +749,9 @@ def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,
         if isinstance(exc, ReplayError):
             raise
         raise ReplayError(seq, str(exc)) from None
+    except (TypeError, ValueError, UnicodeError) as exc:
+        # a field of a shape no rule above anticipated: still a refusal at this seq, never an escape
+        raise ReplayError(seq, f"a malformed field ({type(exc).__name__})") from None
 
     if check_signature:
         try:
