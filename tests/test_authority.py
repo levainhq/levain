@@ -17,6 +17,7 @@ import os
 import sqlite3
 import struct
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -590,7 +591,7 @@ def test_append_refuses_a_moved_head(base, keys):
                          now=NOW, cache=cache)
     link(base, {"op": "raise", "verb": "b", "tier": "T3"}, keys["phone"], cache=cache)
     with pytest.raises(StaleHead):
-        auth.append(base, stale, keys["phone"].sign(stale.message), now=NOW, cache=cache)
+        auth.append(base, stale, keys["phone"].sign(stale.message), now=NOW, cache=cache, anchor=None)
     assert head(base).seq == 4
 
 
@@ -599,7 +600,7 @@ def test_append_refuses_a_bad_signature(base, keys):
     ln = auth.prepare(base, {"op": "raise", "verb": "a", "tier": "T3"}, signer_fp=keys["phone"].fp,
                       now=NOW, cache=cache)
     with pytest.raises(ReplayError, match="signature does not verify"):
-        auth.append(base, ln, keys["other"].sign(ln.message), now=NOW, cache=cache)
+        auth.append(base, ln, keys["other"].sign(ln.message), now=NOW, cache=cache, anchor=None)
     assert head(base).seq == 3
 
 
@@ -698,3 +699,82 @@ def test_anchor_reset_verifies_against_the_logs_own_keys(base, keys, tmp_path):
                             signature=keys["laptop"].sign(msg, auth.RESET_NAMESPACE))
     assert new.seq == 3 and auth.read_anchor(a) == new
     auth.check_anchor(head(base), auth.read_anchor(a))
+
+
+def test_empty_log_beside_an_anchor_refuses_before_commit(base, keys, tmp_path):
+    """F3: an emptied log next to an existing anchor must not commit a forked genesis."""
+    a = auth.anchor_path(tmp_path)
+    auth.advance_anchor(a, head(base))
+    base.execute("DELETE FROM authority_log")
+    with pytest.raises(AnchorError, match="empty"):
+        link(base, _enrol(keys["laptop2"], "laptop-presence"), keys["laptop2"], anchor=a)
+    assert base.execute("SELECT count(*) FROM authority_log").fetchone()[0] == 0
+    assert auth.read_anchor(a).seq == 3
+
+
+def test_a_stale_anchor_advance_is_a_noop_never_a_regress(base, keys, tmp_path):
+    """F4: an advance from an older snapshot (a slower appender) leaves a later anchor where it is."""
+    a = auth.anchor_path(tmp_path)
+    older = head(base)
+    newer = link(base, {"op": "raise", "verb": "a", "tier": "T3"}, keys["phone"])
+    auth.advance_anchor(a, newer)
+    assert auth.advance_anchor(a, older) == auth.read_anchor(a)
+    assert auth.read_anchor(a).seq == 4
+
+
+def test_concurrent_anchor_advances_serialise(base, keys, tmp_path, monkeypatch):
+    """F4: two appenders advance at once; the one holding seq 4 reads the anchor (seq 3) and stalls.
+    Unserialised, the seq-5 advance lands meanwhile and the stalled one then writes 4 over it."""
+    import threading
+    a = auth.anchor_path(tmp_path)
+    auth.advance_anchor(a, head(base))
+    s4 = link(base, {"op": "raise", "verb": "a", "tier": "T3"}, keys["phone"])
+    s5 = link(base, {"op": "raise", "verb": "b", "tier": "T3"}, keys["phone"])
+    real, landed = auth.read_anchor, threading.Event()
+
+    def slow_read(path):
+        got = real(path)
+        if threading.current_thread().name == "slow":
+            landed.wait(1.0)
+        return got
+
+    monkeypatch.setattr(auth, "read_anchor", slow_read)
+    slow = threading.Thread(target=auth.advance_anchor, args=(a, s4), name="slow")
+    slow.start()
+    time.sleep(0.1)                       # let the slow advance read the anchor first
+    auth.advance_anchor(a, s5)
+    landed.set()
+    slow.join(5)
+    assert real(a).seq == 5
+
+
+def test_a_failed_anchor_write_after_commit_is_a_warning_not_a_failed_append(base, keys, tmp_path, monkeypatch):
+    """F5: the link is committed and cached; the anchor lagging is reported, not raised."""
+    a = auth.anchor_path(tmp_path)
+    auth.advance_anchor(a, head(base))
+    cache = ReplayCache()
+
+    def disk_full(path, payload):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(auth, "_write_anchor", disk_full)
+    snap = link(base, {"op": "raise", "verb": "a", "tier": "T3"}, keys["phone"], cache=cache, anchor=a)
+    assert snap.seq == 4 and "committed at seq 4; the anchor is behind" in snap.anchor_warning
+    assert cache.get(base, snap.store_id, 4, snap.head_hash) is not None
+    assert auth.read_anchor(a).seq == 3
+    assert head(base).anchor_warning is None
+
+
+def test_append_needs_an_explicit_anchor_and_an_aware_now(base, keys):
+    """F10 + F12: anchor is a required keyword (None = unanchored); a naive now is an AuthorityError."""
+    cache = ReplayCache()
+    ln = auth.prepare(base, {"op": "raise", "verb": "a", "tier": "T3"}, signer_fp=keys["phone"].fp,
+                      now=NOW, cache=cache)
+    with pytest.raises(TypeError, match="anchor"):
+        auth.append(base, ln, keys["phone"].sign(ln.message), now=NOW, cache=cache)  # type: ignore[call-arg]
+    naive = NOW.replace(tzinfo=None)
+    with pytest.raises(AuthorityError, match="aware"):
+        auth.append(base, ln, keys["phone"].sign(ln.message), now=naive, cache=cache, anchor=None)
+    with pytest.raises(AuthorityError, match="aware"):
+        auth.prepare(base, {"op": "raise", "verb": "a", "tier": "T3"}, signer_fp=keys["phone"].fp,
+                     now=naive, cache=cache)
