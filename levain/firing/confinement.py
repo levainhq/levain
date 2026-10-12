@@ -4890,9 +4890,13 @@ def _gnupg_homes() -> list[Path]:
     """Every GNUPGHOME whose configuration a host gpg process reads, taken from where gpg looks for its
     homedir, never from what is running now (an agent the operator starts after the shell launched
     reads the same files).
-      - ``~/.gnupg`` (the default) when it exists;
-      - ``$GNUPGHOME`` from levain's OWN environment when it is an existing ABSOLUTE path.
-    Only existing homes are returned, so every conf deny is enforceable. Homes come only from these
+      - ``~/.gnupg`` (the default);
+      - ``$GNUPGHOME`` from levain's OWN environment when it is an ABSOLUTE path.
+    A home that does not exist YET is returned too: gpg creates it on its first run and then reads
+    its configuration, so the denies must already cover it (macOS denies the path string; on Linux
+    the absent home is created 0700 and pinned before bwrap runs and recorded in the placeholder
+    ledger, see step (1) of ``_bwrap_plan``). A path that exists and is not a directory is skipped:
+    nothing can be placed beneath it. Homes come only from these
     trusted sources: never from a socket's parent directory (a redirected socketdir is not a home) and
     never from running the operator's shell (shell startup files are writable by the entity).
 
@@ -4911,11 +4915,9 @@ def _gnupg_homes() -> list[Path]:
         candidates.append(Path(gnupghome))
     out: list[Path] = []
     for h in candidates:
-        try:
-            if h.is_dir():
-                out.append(h)
-        except OSError:
-            continue  # unreadable: nothing nameable to protect
+        if os.path.lexists(h) and not os.path.isdir(h):
+            continue  # a file where the home would be: gpg cannot use it, nothing lives under it
+        out.append(h)
     return list(dict.fromkeys(out))
 
 

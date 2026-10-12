@@ -1993,6 +1993,103 @@ def test_gnupg_conf_deny_pins_a_lexical_ancestor_symlink(tmp_path, monkeypatch) 
     assert str(link) in write_dirs, "the lexical symlink ancestor is not write-deny-pinned"
 
 
+def test_gnupg_conf_write_deny_covers_an_absent_default_home(tmp_path, monkeypatch) -> None:
+    """gpg creates ~/.gnupg on its first run and then reads its configuration, so a home that does
+    not exist yet must already be covered."""
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy = build_policy(_entity(tmp_path))
+    denied = set(policy.deny_write_files)
+    for conf in _GNUPG_CONFS:
+        assert (tmp_path / ".gnupg" / conf).resolve() in denied, f"{conf} not denied in an absent ~/.gnupg"
+
+
+def test_gnupg_conf_write_deny_covers_an_absent_absolute_gnupghome(tmp_path, monkeypatch) -> None:
+    """An absolute $GNUPGHOME from levain's own environment that does not exist yet is covered too."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    env_home = tmp_path / "later-gnupg"
+    monkeypatch.setenv("GNUPGHOME", str(env_home))
+    policy = build_policy(_entity(tmp_path))
+    denied = set(policy.deny_write_files)
+    for conf in _GNUPG_CONFS:
+        assert (env_home / conf).resolve() in denied, f"{conf} not denied in an absent $GNUPGHOME"
+
+
+def test_gnupg_home_that_is_a_file_is_not_a_home(tmp_path, monkeypatch) -> None:
+    """A file where the home would be cannot hold configuration: no deny is planned beneath it."""
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".gnupg").write_text("")
+    policy = build_policy(_entity(tmp_path))
+    assert not any(str(f).startswith(str((tmp_path / ".gnupg").resolve()) + "/")
+                   for f in policy.deny_write_files)
+
+
+def test_seatbelt_denies_writes_to_the_confs_of_an_absent_gnupg_home(tmp_path, monkeypatch) -> None:
+    """macOS denies the path string, so the confs of a home that does not exist yet are in the
+    profile's write-deny block."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    env_home = tmp_path / "later-gnupg"
+    monkeypatch.setenv("GNUPGHOME", str(env_home))
+    profile = SeatbeltProvider().render_profile(build_policy(_entity(tmp_path)))
+    block = profile[profile.index(_VECTOR_MARKER):]
+    block = block[:block.index("\n)\n")]
+    for conf in _GNUPG_CONFS:
+        assert f'(literal "{(env_home / conf).resolve()}")' in block, f"{conf} not in the write-deny block"
+
+
+def test_bwrap_masks_the_confs_of_an_absent_gnupghome_and_creates_its_pin(tmp_path, monkeypatch) -> None:
+    """On Linux a home that does not exist yet is created 0700 by the provider and pinned before
+    bwrap runs (so it cannot be renamed and replaced), and each conf in it is masked read-only."""
+    from levain.firing.confinement import _bwrap_plan
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    env_home = tmp_path / "later-gnupg"
+    monkeypatch.setenv("GNUPGHOME", str(env_home))
+    argv, create_first = _bwrap_plan(build_policy(_entity(tmp_path)))
+    home = str(env_home.resolve())
+    assert home in create_first, "the absent home is not created and pinned before bwrap"
+    triples = [argv[k:k + 3] for k in range(len(argv))]
+    assert ["--bind", home, home] in triples, "the absent home is not pinned"
+    for conf in _GNUPG_CONFS:
+        assert ["--ro-bind", "/dev/null", f"{home}/{conf}"] in triples, f"{conf} not masked"
+
+
+def test_bwrap_masks_an_absent_conf_in_an_existing_gnupg_home(tmp_path, monkeypatch) -> None:
+    """In a home that exists, a conf that does not is masked read-only (it cannot be created)."""
+    from levain.firing.confinement import _bwrap_plan
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    env_home = tmp_path / "gnupg"
+    env_home.mkdir()
+    (env_home / "gpg.conf").write_text("")
+    monkeypatch.setenv("GNUPGHOME", str(env_home))
+    argv, _ = _bwrap_plan(build_policy(_entity(tmp_path)))
+    triples = [argv[k:k + 3] for k in range(len(argv))]
+    home = str(env_home.resolve())
+    assert ["--ro-bind", "/dev/null", f"{home}/gpg-agent.conf"] in triples
+    assert ["--ro-bind", f"{home}/gpg.conf", f"{home}/gpg.conf"] in triples
+
+
+def test_bwrap_absent_default_gnupg_home_needs_no_mount_under_the_read_only_home_view(
+    tmp_path, monkeypatch
+) -> None:
+    """$HOME is a read-only view inside bash on Linux, so bash cannot create ~/.gnupg: the confs of
+    an absent default home need no mount, and the plan creates nothing on the host for them."""
+    from levain.firing.confinement import _bwrap_plan
+
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    argv, create_first = _bwrap_plan(build_policy(_entity(tmp_path)))
+    gnupg = str((tmp_path / ".gnupg").resolve())
+    home = str(tmp_path.resolve())
+    assert ["--remount-ro", home] in [argv[k:k + 2] for k in range(len(argv))], "no read-only $HOME view"
+    assert not any(d == gnupg or d.startswith(gnupg + "/") for d in create_first)
+    assert not any(a == gnupg or a.startswith(gnupg + "/") for a in argv), "a mount under the absent home"
+
+
 def _tmpfs_then_ro(argv: list[str], d: str) -> bool:
     """A read-only tmpfs over ``d``: mounted, then remounted read-only LATER (remounts are deferred to
     the end of the argv so mountpoints inside the tmpfs can still be created)."""
@@ -2781,7 +2878,10 @@ def test_bwrap_blocks_planting_a_vector_that_does_not_exist_yet(tmp_path, monkey
     ssh.mkdir()
     policy = build_policy(_entity(tmp_path), ssh_mode="raw")
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)  # step (6) owns those
-    missing = [p for p in policy.deny_write_files if not p.exists() and p not in sockets]
+    # A missing vector whose directory exists: one under an absent directory in $HOME's read-only
+    # view needs no mount (bash cannot create the directory; see the absent-gnupg-home test).
+    missing = [p for p in policy.deny_write_files
+               if not p.exists() and p.parent.exists() and p not in sockets]
     assert missing, "fixture must produce at least one not-yet-existing ssh vector"
     argv = _bwrap_argv(policy)
     devnull_targets = [d for s, d in _triples(argv, "--ro-bind") if s == "/dev/null"]
