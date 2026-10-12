@@ -10,9 +10,9 @@ Ties the governance core into one decision: an :class:`ActionRequest` →
        the notify);
      - ``cooling_off``/``confirm``/``confirm_elevated`` (``needs_confirm``) PROPOSE via the injected
        ConfirmTransport: persist a :class:`PendingAction`, surface it (push), return PENDING — the
-       fire-or-drop happens out-of-band at ``resolve`` (the operator's reply) or ``sweep_timeouts``
-       (the silence default). With NO transport wired (a Slice-1 gate) they DEFER (fire nothing you
-       can't gate);
+       fire-or-drop happens out-of-band at ``resolve`` (the operator's reply) or
+       ``GateHandle.sweep_timeouts`` (the silence default). With NO transport wired (a Slice-1 gate)
+       they DEFER (fire nothing you can't gate);
      - ``refuse_escalate`` REFUSE;
   5. emit the gate-receipt (the FILLED action-face) on every TERMINAL decision (fire/deny); a PROPOSE
      writes NO receipt (no decision yet — the pending record carries the proposed action), and the
@@ -1320,7 +1320,7 @@ class EfferentGate:
         """An approval no human gave (``by != "human"``) is the silence default of a cooling-off rung,
         and nothing else: the posture must fail open, the action must be in the code-side auto-fire
         allowlist, and the pending must have expired. Checked in ``resolve`` itself, so a caller other
-        than ``sweep_timeouts`` cannot approve a confirm-class pending on nobody's behalf."""
+        than the sweep cannot approve a confirm-class pending on nobody's behalf."""
         try:
             now = self._clock()
         except Exception:  # noqa: BLE001 — no clock, no proof of expiry
@@ -1356,7 +1356,7 @@ class EfferentGate:
             return f"revalidate:{v.reason}"
         return None
 
-    def sweep_timeouts(self, now: _dt.datetime | None = None) -> list[GateOutcome]:
+    def _sweep(self, now: _dt.datetime | None, gate_for: Callable[[], "EfferentGate"]) -> list[GateOutcome]:
         """Resolve every pending action past its ``expires_at`` by the silence default: cooling-off
         (``fail_open``) AUTO-FIRES (verdict ``auto``, by ``on-loop``); confirm / confirm-elevated DROP
         (verdict ``denied``, by ``on-loop``). Idempotent + fail-soft per item (one bad pending never
@@ -1365,17 +1365,12 @@ class EfferentGate:
         JOURNALED pendings (open holds) are swept first (:meth:`_sweep_holds`); a chain link's hold is
         left to ``ChainExecutor.sweep_timeouts``. Manual pendings are swept from the pending store.
 
-        This sweeps on THIS gate's policy. A gate shares its pendings with every gate a
-        :class:`~levain.autonomic.handle.GateHandle` swap publishes, so a scheduler holding this gate
-        after a swap would decide them on the superseded policy (an action tightened from cooling-off
-        to confirm would still auto-fire). A scheduler holds the handle and calls
-        :meth:`GateHandle.sweep_timeouts`, which decides each pending on the gate current for it."""
-        return self._sweep(now, lambda: self)
-
-    def _sweep(self, now: _dt.datetime | None, gate_for: Callable[[], "EfferentGate"]) -> list[GateOutcome]:
-        """The sweep, each pending decided on ``gate_for()``, read once per pending: its silence decision
-        and the resolve it drives run on that one gate. The holds, the pendings and the clock are state
-        every gate a swap publishes shares, so they are read from this one."""
+        Each pending is decided on ``gate_for()``, read once per pending: its silence decision and the
+        resolve it drives run on that one gate. The holds, the pendings and the clock are state every
+        gate a swap publishes shares, so they are read from this one. There is no public sweep on a gate:
+        a gate shares its pendings with every gate a swap publishes, so a sweep held on one gate would
+        decide them on a superseded policy. The one entry is :meth:`GateHandle.sweep_timeouts`
+        (a bare gate: ``as_handle(gate).sweep_timeouts(now)``)."""
         # NEVER raises (L3 codex ship-gate MED): the clock + EACH item body are fail-soft, so a raising
         # clock or one malformed-but-loaded record can't crash the sweep (resolve has its own net; the
         # sweep's per-item work — seal_matches / _posture_of / claim — runs OUTSIDE resolve and so needs

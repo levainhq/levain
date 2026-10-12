@@ -89,11 +89,12 @@ class GateHandle:
         return new
 
     def sweep_timeouts(self, now: _dt.datetime | None = None) -> list[GateOutcome]:
-        """:meth:`EfferentGate.sweep_timeouts`, each pending decided on the gate current for it: the
-        handle is read once per pending, and that pending's silence decision and its resolve run on that
-        one gate. This is the sweep a scheduler calls; a scheduler that held a gate instead would decide
-        pendings proposed under one policy on a policy since superseded. A chain link's hold is left to
-        ``ChainExecutor.sweep_timeouts``, as the gate's sweep leaves it."""
+        """The silence default for every expired pending (``EfferentGate._sweep``), each decided on the
+        gate current for it: the handle is read once per pending, and that pending's silence decision and
+        its resolve run on that one gate. This is the only sweep; a gate has none of its own, because a
+        scheduler that held a gate would decide pendings proposed under one policy on a policy since
+        superseded (a bare gate: ``as_handle(gate).sweep_timeouts(now)``). A chain link's hold is left to
+        ``ChainExecutor.sweep_timeouts``."""
         return self.current()._sweep(now, self.current)
 
 

@@ -193,7 +193,7 @@ class FireDispatcher:
         and bookkeep the fire. Returns the per-binding gate outcomes (matched bindings only).
 
         NEVER raises — each binding is dispatched in its own fail-soft frame (one bad binding never
-        stops the rest, mirroring the gate's ``sweep_timeouts``); the gate itself never raises."""
+        stops the rest, mirroring the gate sweep); the gate itself never raises."""
         if not isinstance(event, dict):
             _log.warning("firepath dispatch: event is %s, not a dict — nothing to dispatch", type(event).__name__)
             return []

@@ -9,6 +9,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Removed
 
 - **`ChainExecutor.gate`.** The executor now holds a `GateHandle`, exposed as `ChainExecutor.handle`; read the gate with `handle.current()`, once per admission. A gate kept across a policy swap goes stale, so the executor no longer hands one out.
+- **`EfferentGate.sweep_timeouts`.** The silence-default sweep is `GateHandle.sweep_timeouts`, which decides each pending on the gate current for it; a sweep held on one gate decided pendings on that gate's policy after a swap had superseded it. A bare gate sweeps with `as_handle(gate).sweep_timeouts(now)`.
 
 ## [0.9.0] — 2026-10-12
 

@@ -50,8 +50,9 @@ Architecture:
   - ``build_gate_face`` / ``build_gate_verdict`` — FILL the frozen receipt's efferent fields.
   - ``GateReceiptStore`` / ``StoredGateReceipt`` — the append-only efferent decision trace.
   - ``EfferentGate`` / ``GateOutcome`` — the orchestrator (risk → §1.5 → policy → route → receipt;
-    + ``resolve`` / ``sweep_timeouts`` for the confirm round-trip).
+    + ``resolve`` for the confirm round-trip).
   - ``GateHandle`` — the current gate of a process; a policy swap publishes a new gate through it.
+    ``sweep_timeouts`` (the silence default) lives here, never on a gate.
   The Slice-3a.5 guard hardening (what makes GRADUATION to on-loop safe):
   - ``kill`` (``kill_outcome`` / ``kill_trips`` / ``assert_kill_pure``) — the DIVERSE, fail-safe kill
     substrate (Kleene three-valued; absent/unevaluable → trip), the kill-purity gate, and the

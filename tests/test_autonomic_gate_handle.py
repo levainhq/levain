@@ -274,6 +274,25 @@ def test_a_resumed_chain_keeps_its_fired_link_when_the_next_cannot_be_built(tmp_
     assert w.outbox() == [("link0", "e1-0")]
 
 
+def test_a_link_whose_admission_raises_keeps_the_links_fired_before_it(tmp_path, monkeypatch):
+    # The gate never raises; if it did, link 1's admission is named as the cause (link 1 may have fired
+    # inside it), not its build, and link 0's fire stays in the outcome (L3 r2 complement R5).
+    admit = EfferentGate.gate
+
+    def gate(self, request):
+        if request.action_name == "link1":
+            raise RuntimeError("admission")
+        return admit(self, request)
+
+    monkeypatch.setattr(EfferentGate, "gate", gate)
+    w, _ = _handled_world(tmp_path, lambda i: None)
+    w.mint(chain=True)
+    d = w.dispatch("e1")
+    assert d.chain.aborted and d.chain.paused_at == 1 and d.chain.reason == "link_1_admission_error:RuntimeError"
+    assert [(r.link_index, r.outcome.fired) for r in d.chain.links] == [(0, True)]
+    assert w.outbox() == [("link0", "e1-0")]
+
+
 # --- the holders, counted: exactly one read of the handle per admission -----------------------------
 # A holder that reads the handle twice in one admission (a decision on one gate, its resolve on the next)
 # is the mixed-policy shape the handle exists to prevent, and no swap-timing test reliably lands a swap
@@ -407,13 +426,10 @@ def test_the_handle_sweep_decides_a_pending_on_the_gate_current_for_it(tmp_path)
     assert handle.sweep_timeouts(_EXPIRED) == []
 
 
-def test_a_stale_gate_sweep_still_decides_on_its_own_superseded_policy(tmp_path):
-    # CONTROL for the test above: the hazard it closes. The gate the sweep was handed before the swap
-    # auto-fires the pending on policy A; that is why a scheduler holds the handle, not a gate.
-    w, handle = _cooling_off_proposed(tmp_path)
-    handle.swap(*_CONFIRM_ONLY, _first_tool)
-    [out] = w.gate.sweep_timeouts(_EXPIRED)
-    assert out.fired and w.outbox() == [("link0", "co1-0")]
+def test_a_gate_has_no_sweep_of_its_own():
+    # a gate shares its pendings with every gate a swap publishes, so a sweep held on one gate would decide
+    # them on a superseded policy (L3 r2 codex R1): the handle's sweep is the only one
+    assert not hasattr(EfferentGate, "sweep_timeouts")
 
 
 def test_the_handle_sweep_reads_the_handle_once_per_pending_and_once_to_list_them(tmp_path):

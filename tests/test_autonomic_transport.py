@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from levain.autonomic.handle import as_handle
 from levain.autonomic import (
     ActionManifest,
     ActionRequest,
@@ -344,7 +345,7 @@ def test_sweep_autofires_cooling_off_and_drops_confirm(tmp_path):
     conf = _pending(posture="CONFIRM", fail_open=False, expires_at=past, tag="conf")
     later = _pending(posture="CONFIRM", fail_open=False, expires_at=future, tag="later")
     pend.add(cool); pend.add(conf); pend.add(later)
-    outcomes = gate.sweep_timeouts()
+    outcomes = as_handle(gate).sweep_timeouts()
     assert len(outcomes) == 2                                  # only the two expired
     fired = [o for o in outcomes if o.fired]
     dropped = [o for o in outcomes if o.refused]
@@ -363,7 +364,7 @@ def test_sweep_does_not_autofire_non_allowlisted_action(tmp_path):
     cool = _pending(posture="COOLING_OFF", fail_open=True, expires_at="2026-06-24T10:00:00",
                     action="deliver_as_document", tag="cool")
     pend.add(cool)
-    outcomes = gate.sweep_timeouts()
+    outcomes = as_handle(gate).sweep_timeouts()
     assert outcomes == [] and ex.calls == []                 # NOT auto-fired
     assert pend.list_open() == []                            # dropped
 
@@ -382,7 +383,7 @@ def test_sweep_never_raises_on_a_malformed_loaded_record(tmp_path):
     bad = good.to_dict(); bad["pending_id"] = "bad"; bad["producers"] = [123]
     data.append(bad)
     p.write_text(json.dumps(data), encoding="utf-8")
-    outcomes = gate.sweep_timeouts()                          # must NOT raise
+    outcomes = as_handle(gate).sweep_timeouts()                          # must NOT raise
     assert len(outcomes) == 1 and outcomes[0].fired          # the good one still auto-fired
 
 
@@ -391,13 +392,13 @@ def test_sweep_no_expiry_leaves_pending(tmp_path):
     gate, ex, tr, pend, store = make_gate(tmp_path, pending=pend)
     forever = _pending(expires_at=None, tag="forever")        # no window → never auto-resolves
     pend.add(forever)
-    assert gate.sweep_timeouts() == []
+    assert as_handle(gate).sweep_timeouts() == []
     assert {p.pending_id for p in pend.list_open()} == {forever.pending_id}
 
 
 def test_sweep_empty_store_is_noop(tmp_path):
     gate, ex, tr, pend, store = make_gate(tmp_path)
-    assert gate.sweep_timeouts() == []
+    assert as_handle(gate).sweep_timeouts() == []
 
 
 # =================================================================================================
@@ -418,7 +419,7 @@ def test_expired_handles_aware_naive_mismatch(tmp_path):
     gate, ex, tr, pend, store = make_gate(tmp_path, pending=pend, clock=aware)
     pend.add(_pending(posture="COOLING_OFF", fail_open=True, expires_at="2026-06-24T10:00:00",
                       action="deliver_as_document", tag="naive"))
-    outcomes = gate.sweep_timeouts()                          # must NOT raise on aware-vs-naive
+    outcomes = as_handle(gate).sweep_timeouts()                          # must NOT raise on aware-vs-naive
     assert len(outcomes) == 1 and outcomes[0].fired
 
 
@@ -428,7 +429,7 @@ def test_bad_expires_at_does_not_auto_resolve(tmp_path):
     garbage = _pending(expires_at="not-a-date", fail_open=True, posture="COOLING_OFF",
                        action="deliver_as_document", tag="garbage")
     pend.add(garbage)
-    assert gate.sweep_timeouts() == []                       # unparseable → not expired (fail safe)
+    assert as_handle(gate).sweep_timeouts() == []                       # unparseable → not expired (fail safe)
     assert {p.pending_id for p in pend.list_open()} == {garbage.pending_id}
 
 
@@ -476,7 +477,7 @@ def test_sweep_drops_a_failopen_posture_mismatch(tmp_path):
     pend = PendingActionStore(tmp_path / "p.json")
     gate, ex, tr, pend, store = make_gate(tmp_path, pending=pend)
     pend.add(_pending(posture="CONFIRM", fail_open=True, expires_at="2026-06-24T10:00:00", tag="forged"))
-    outcomes = gate.sweep_timeouts()
+    outcomes = as_handle(gate).sweep_timeouts()
     assert ex.calls == []                                    # NOTHING fired
     assert pend.list_open() == []                            # the inconsistent record was dropped
     assert store.read() == []                                # no fire receipt

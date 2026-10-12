@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from levain.autonomic.handle import as_handle
 from levain.autonomic import (
     ActionManifest, ActionRequest, ActionRisk, AuthorityScope, Binding, BindingStatus, BindingStore,
     ChainExecutor, ConfirmDecision, EfferentGate, ExecutionResult, FireDispatcher,
@@ -667,7 +668,7 @@ def test_a_malformed_manual_pending_record_does_not_stop_the_sweep(tmp_path):
     gate = EfferentGate(confirm_signers=confirm_signers(), manifest=ActionManifest({"a": HIGH}), store=GateReceiptStore(tmp_path / "r.jsonl"),
                         executor=OutboxExecutor(tmp_path / "o.jsonl"), clock=lambda: FIXED,
                         transport=_Transport(), pending_store=store)
-    out = gate.sweep_timeouts(FIXED + _dt.timedelta(hours=2))
+    out = as_handle(gate).sweep_timeouts(FIXED + _dt.timedelta(hours=2))
     assert [o.reason for o in out] == ["denied:confirm_window_elapsed"]
 
 
@@ -892,10 +893,10 @@ def test_a_sweep_drop_the_journal_could_not_record_changes_nothing(tmp_path):
     assert len(w.gate.open_pendings()) == 1                        # cooling-off, not on the allowlist
     real = w.journal.decide
     w.journal.decide = lambda *a, **k: (_ for _ in ()).throw(OSError("EIO"))
-    w.gate.sweep_timeouts(FIXED + _dt.timedelta(hours=3))
+    as_handle(w.gate).sweep_timeouts(FIXED + _dt.timedelta(hours=3))
     assert len(w.gate.open_pendings()) == 1 and len(w.journal.open_holds()) == 1
     w.journal.decide = real
-    w.gate.sweep_timeouts(FIXED + _dt.timedelta(hours=3))           # the drop lands once the journal does
+    as_handle(w.gate).sweep_timeouts(FIXED + _dt.timedelta(hours=3))           # the drop lands once the journal does
     assert w.gate.open_pendings() == [] and w.journal.open_holds() == [] and w.outbox() == []
 
 
@@ -946,12 +947,12 @@ def test_the_chain_sweep_resumes_an_expired_link_by_its_silence_default(tmp_path
     w.mint(chain=True)
     w.dispatch("c1")
     assert w.chains.sweep_timeouts(FIXED + _dt.timedelta(minutes=30)) == []    # not expired yet
-    assert w.gate.sweep_timeouts(FIXED + _dt.timedelta(hours=2)) == []         # the gate leaves chain links
+    assert as_handle(w.gate).sweep_timeouts(FIXED + _dt.timedelta(hours=2)) == []         # the gate leaves chain links
     assert len(w.gate.open_pendings()) == 1
     [out] = w.chains.sweep_timeouts(FIXED + _dt.timedelta(hours=2))
     assert out.aborted and out.reason == "denied:confirm_window_elapsed"      # CONFIRM drops on silence
     assert w.gate.open_pendings() == [] and w.outbox() == [("link0", "c1-0")]
-    assert w.gate.sweep_timeouts(FIXED + _dt.timedelta(hours=2)) == []         # the gate leaves chain links
+    assert as_handle(w.gate).sweep_timeouts(FIXED + _dt.timedelta(hours=2)) == []         # the gate leaves chain links
 
 
 def test_a_journaled_run_never_writes_the_pending_store(tmp_path):
@@ -1132,7 +1133,7 @@ def test_a_sweep_keeps_its_journaled_outcomes_when_the_manual_store_faults(tmp_p
     w.store.ratify(b.binding_id)
     w.dispatcher.dispatch({"type": "email", "id": "m1", "fields": {"from": "a@x.example", "dmarc": "pass"}})
     w.pending.list_open = lambda: (_ for _ in ()).throw(OSError("EIO"))
-    out = w.gate.sweep_timeouts(FIXED + _dt.timedelta(hours=2))
+    out = as_handle(w.gate).sweep_timeouts(FIXED + _dt.timedelta(hours=2))
     assert [o.reason for o in out] == ["denied:confirm_window_elapsed"]
 
 
@@ -1609,10 +1610,10 @@ def test_silence_on_a_raised_rung_applies_that_rungs_default(tmp_path):
     assert p.posture == "COOLING_OFF"
     w.gate._manifest = ActionManifest({"link0": HIGH, "link1": HIGH})          # now CONFIRM
     later = FIXED + _dt.timedelta(days=30)
-    [out] = w.gate.sweep_timeouts(later)
+    [out] = as_handle(w.gate).sweep_timeouts(later)
     assert out.refused and not out.fired and out.reason == "denied:revalidate:risk_floor_rose"
     assert w.gate.open_pendings() == [] and w.outbox() == []
-    assert w.gate.sweep_timeouts(later) == []
+    assert as_handle(w.gate).sweep_timeouts(later) == []
 
 
 def test_a_new_proposal_is_made_at_the_raised_rung(tmp_path):
