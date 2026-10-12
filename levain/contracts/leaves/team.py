@@ -7,7 +7,7 @@ Leaf ``(line, 1)``, team log only::
 
 No other key, and no ``n``: a line's position is derived from the log, never carried beside the signature. Ingest and
 verify both: run the FROZEN entry schema (``entry_v1.validate_entry_v1``, with ``now`` = the ingest time at ingest
-and ``None`` at verify); recompute ``entry.hash = chain_hash(entry.prev, entry)``; verify ``device_sig`` (F12,
+and ``None`` at verify, and ``known`` = the snapshot's entries by unique id, rev 11); recompute ``entry.hash = chain_hash(entry.prev, entry)``; verify ``device_sig`` (F12,
 namespace ``levain-team-entry``) over ``string(origin) || string(file) || string(32-byte chain hash)``; refuse a
 repeated ``(file, entry.hash)`` (an operator fault at verify) and an ``entry.id`` already held by an accepted leaf;
 and apply ``may_write_team_log`` against the snapshot, the team log's verified prefix before this leaf. A leaf this
@@ -128,6 +128,11 @@ class Snapshot:
     def holds_file_hash(self, file: str, chain_hash: str) -> bool:
         return (file, chain_hash) in self._file_hash
 
+    def known(self) -> dict[str, dict]:
+        """The frozen schema's ``known`` (S1_DESIGN rev 11): unique entry id -> entry. An id held twice (unreachable
+        after X01) is left out, so a link to it is refused as unknown: default-deny, as the matrix reads it."""
+        return {i: es[0] for i, es in self._by_id.items() if len(es) == 1}
+
 
 def may_write_team_log(scope: str, entry: dict, snapshot: Snapshot) -> str:
     """``ALLOW`` or ``REFUSE`` for a validated entry from a device of ``scope``; total over every entry type.
@@ -169,14 +174,14 @@ def check_line(d: bytes, *, origin: str, scope: str, snapshot: Snapshot, now: da
     if obj["leaf"] != LEAF:
         raise ContractError(f"a {obj['leaf']!r} leaf is not a line")
     leaf = check_line_fields(obj)
-    if now is not None:
-        validate_entry_v1(leaf.entry, None, scan=False, now=now)
     if scope not in SCOPES:
         raise UnknownScopeError(f"unknown scope {scope!r}")
     if snapshot.holds_file_hash(leaf.file, leaf.hash):
         raise OperatorFault(f"a second leaf for ({leaf.file!r}, {leaf.hash})")
     if snapshot.holds_id(leaf.entry["id"]):
         raise ContractError(f"entry id {leaf.entry['id']!r} is already held by an accepted leaf")
+    # rev 11: the frozen schema's snapshot rules (refs and supersedes held; an ack or a retire never superseded)
+    validate_entry_v1(leaf.entry, snapshot.known(), scan=False, now=now)
     sshsig.verify(leaf.device_sig, namespace=TEAM_ENTRY_NAMESPACE, device_fp=leaf.device_fp,
                   message=device_message(origin, leaf.file, leaf.hash))
     if may_write_team_log(scope, leaf.entry, snapshot) != ALLOW:

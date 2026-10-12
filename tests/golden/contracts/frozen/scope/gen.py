@@ -29,6 +29,11 @@ IDEM = profile("S1_DESIGN F9 / TS l.326", "a second leaf with an accepted leaf's
                "ingest and is an operator fault at verify", rationale="TS's POST /lines is idempotent on (file, hash)")
 SCHEMA = profile("S1_DESIGN F9 rev 7 Y01 / rev 8 Z01, Z02", "every leaf's entry passes validate_entry_v1, the frozen "
                  "entry schema of levain 31dea1f", rationale="levain's own entry schema; no external specification")
+KNOWN = profile("S1_DESIGN F9 rev 11 / levain team/entry.py validate @ 31dea1f (known)",
+                "validate_entry_v1 runs at ingest and verify with known = the snapshot's entries by unique id: every "
+                "refs and supersedes target must be held, an ack or a retire is never superseded",
+                rationale="the frozen schema's snapshot rules are T's writer rules; the snapshot is the team log's "
+                          "verified prefix")
 REG = profile("S1_DESIGN F9", "an unknown scope is refused at ingest and UNVERIFIABLE at verify",
               rationale="scope comes from the key directory; an old levain never calls a newer scope tampering")
 V = []
@@ -129,6 +134,33 @@ log("human-retire-of-an-accepted-finding-allowed", "verify",
 DANGLING = seal_entry(ent("dana", 64, "retire", supersedes=["dana-20261009000000-deadbeef"]), "")
 log("human-retire-dangling-target-refused", "ingest", [(line_leaf(DANGLING, F1, DANA, ORIGIN), "human")], [REFUSE],
     MATRIX)
+# ---- rev 11: validate_entry_v1 runs with `known` built from the snapshot, through the leaf path -----------------
+K_FIND = seal_entry(ent("dana", 70, "finding", words="a finding"), "")
+K_FIND_LEAF = line_leaf(K_FIND, F1, DANA, ORIGIN)
+K_ACK = seal_entry(ent("dana", 71, "ack", refs=[K_FIND["id"]]), K_FIND["hash"])
+K_ACK_LEAF = line_leaf(K_ACK, F1, DANA, ORIGIN)
+K_RET = seal_entry(ent("dana", 72, "retire", supersedes=[K_FIND["id"]]), K_FIND["hash"])
+K_RET_LEAF = line_leaf(K_RET, F1, DANA, ORIGIN)
+GHOST = "dana-20261009000000-0badc0de"
+for at in ("ingest", "verify"):
+    log(f"human-ack-of-an-accepted-finding-allowed-at-{at}", at, [(K_FIND_LEAF, "human"), (K_ACK_LEAF, "human")],
+        [ACCEPT, ACCEPT], KNOWN)
+    log(f"human-ack-dangling-ref-refused-at-{at}", at,
+        [(line_leaf(seal_entry(ent("dana", 73, "ack", refs=[GHOST]), ""), F1, DANA, ORIGIN), "human")], [REFUSE], KNOWN)
+    log(f"member-finding-dangling-ref-refused-at-{at}", at,
+        [(line_leaf(seal_entry(ent("mo", 74, "finding", refs=[GHOST]), ""), "ledger/mo/a.jsonl", MO, ORIGIN), "member")],
+        [REFUSE], KNOWN)
+    log(f"human-finding-superseding-an-accepted-ack-refused-at-{at}", at,
+        [(K_FIND_LEAF, "human"), (K_ACK_LEAF, "human"),
+         (line_leaf(seal_entry(ent("dana", 75, "finding", supersedes=[K_ACK["id"]]), K_ACK["hash"]), F1, DANA, ORIGIN),
+          "human")],
+        [ACCEPT, ACCEPT, REFUSE], KNOWN)
+    log(f"human-retire-of-an-accepted-retire-refused-at-{at}", at,
+        [(K_FIND_LEAF, "human"), (K_RET_LEAF, "human"),
+         (line_leaf(seal_entry(ent("dana", 76, "retire", supersedes=[K_RET["id"]]), K_RET["hash"]), F1, DANA, ORIGIN),
+          "human")],
+        [ACCEPT, ACCEPT, REFUSE], KNOWN)
+
 log("unknown-scope-refused-at-ingest", "ingest", [(A_LEAF, "auditor")], [REFUSE], REG)
 log("unknown-scope-unverifiable-at-verify", "verify", [(A_LEAF, "auditor")], [UNVERIFIABLE], REG)
 
