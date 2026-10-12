@@ -80,12 +80,13 @@ def _ids(panel: dict[str, Any]) -> list[str]:
 
 
 class TestOperateOrder:
-    def test_loops_lead_the_tray(self, rig) -> None:
+    def test_the_tray_leads_open_loops(self, rig) -> None:
+        # mock-e (KE1b) reverses the 10-10 order: Tray, then Open loops
         _src, _ids_, ck = rig
         zone = next(z for z in ck.manifest(CRED)["regions"]["zones"] if z["id"] == "operate")
-        assert zone["panels"].index("loops") < zone["panels"].index("tray")
+        assert zone["panels"].index("tray") < zone["panels"].index("loops")
         heads = ck.manifest(CRED)["panels"]
-        assert heads["loops"]["rank"] == 0 and heads["tray"]["rank"] == 1
+        assert heads["tray"]["rank"] < heads["loops"]["rank"]
 
 
 class TestTrayAgeView:
