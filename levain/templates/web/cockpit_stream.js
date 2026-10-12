@@ -72,7 +72,7 @@
     var n = faults[id] ? faults[id].n : 0;
     clearFault(id);
     if (n >= FAULT_RETRY_MS.length) return;
-    var f = { n: n + 1, timer: 0 };
+    var f = { n: n + 1, timer: 0, etag: etag };
     f.timer = root.setTimeout(function () { if (faults[id] === f) { f.timer = 0; refetch(id, etag); } }, FAULT_RETRY_MS[n]);
     faults[id] = f;
   }
@@ -227,7 +227,7 @@
   function pause() {
     if (paused) return;
     paused = true;
-    owed = Object.keys(faults);
+    owed = Object.keys(faults).map(function (id) { return { id: id, etag: faults[id].etag }; });
     cancelFaults();
     root.clearTimeout(retryTimer);
     root.clearTimeout(watchdog);
@@ -243,7 +243,7 @@
     staleSince = null;
     paintChip();
     var o = owed; owed = [];
-    o.forEach(onEvent);
+    o.forEach(function (x) { onEvent(x.id, x.etag); });
     if (pending) wantReload();
     if (gaveUp) { if (root.LevainCockpitHeld) { gaveUp = false; connect(); } else whenDrawn(Date.now() + DRAW_WAIT_MS); return; }
     connect();

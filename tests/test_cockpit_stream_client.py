@@ -235,6 +235,21 @@ const frame = (event, id, data) => "id: " + id + "\nevent: " + event + "\ndata: 
     await settle();
     ok(h.win.LevainCockpitHeld.a.etag === "9", "held carries the applied etag: " + h.win.LevainCockpitHeld.a.etag);
   }
+  // ---- a fault owed across hide/show is retried with its own event's etag ----
+  {
+    const h = boot({});
+    await settle();
+    h.win.LevainCockpitView.refetchPanel = async () => "fault";
+    h.fetches[0].push(frame("hello", "E.1:0", { epoch: "E.1", resync: false }));
+    h.fetches[0].push(frame("panel-changed", "E.1:1", { id: "a", etag: "7" }));
+    h.fetches[0].push(frame("panel-changed", "E.1:2", { id: "b", etag: "8" }));
+    await settle();
+    h.win.LevainCockpitView.refetchPanel = async () => "applied";
+    h.doc.hidden = true; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    h.doc.hidden = false; h.listeners.visibilitychange.forEach((f) => f()); await settle();
+    ok(h.win.LevainCockpitHeld.a.etag === "7" && h.win.LevainCockpitHeld.b.etag === "8",
+       "owed retries carry their event etags: " + h.win.LevainCockpitHeld.a.etag + "," + h.win.LevainCockpitHeld.b.etag);
+  }
   // ---- a reload wanted during a reload is not lost when that reload returns true ----
   {
     const h = boot({});
