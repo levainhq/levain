@@ -1042,6 +1042,9 @@
     for (const s of live) {
       s.data = data;
       s.fault = "";
+      // the read-age chip is the one piece of chrome that moves with every read: it follows the payload
+      const src = s.p && s.p.querySelector ? s.p.querySelector(".phead .src") : null;
+      if (src) src.textContent = entry.fresh || "";
       paint(s);
       const sr = data.search || {};
       if (s.searchable && sr.scope === "store" && sendable(s.query)) runStoreSearch(s);
