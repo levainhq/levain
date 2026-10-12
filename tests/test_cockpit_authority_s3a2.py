@@ -9,6 +9,7 @@ and ``levain.authority.append``.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import shutil
 import sqlite3
@@ -39,6 +40,7 @@ from tests.test_cockpit_k2b_broker import (  # noqa: F401 - fixtures
     keydir,
     spores,
 )
+from tests.test_cockpit_k2b_section import rig_broker  # noqa: F401 - fixture
 
 LEVAIN = Path(levain.__file__).parent
 
@@ -204,6 +206,32 @@ def test_the_anchor_directory_is_excluded_from_time_machine(tmp_path, monkeypatc
     assert value(anchor.parent) == value(scratch)
     names = subprocess.run(["xattr", str(anchor)], capture_output=True, text=True, check=True).stdout.split()
     assert attr not in names                         # on the directory, never the file a rename replaces
+
+
+# --- a panel etag moves when the authority flips (L1 1012+80 B) -----------------------------------------
+
+def test_a_panel_etag_moves_when_the_authority_is_refused_and_again_when_it_is_restored(rig_broker, keydir):
+    from tests.test_cockpit_k2b_section import _edit, _pv
+
+    rig, b, _db = rig_broker
+    rig.ck.attach_authority(b.capture)                                  # as `levain serve` wires it
+    laptop = Key(keydir, "laptop").enroll(b, "laptop-presence")
+    out = _edit(rig, b, _pv(rig), "signed State body", "sec-etag", intent=None)
+    assert b.submit(out["pending_id"], laptop.sign(out["record"].encode()))["state"] == "COMMITTED"
+    signed = rig.ck.panel("section:state")
+    assert signed["value"]["provenance"]["label"] == "signed · reported"
+    anchor = anchor_path(b.data_root)
+    good = anchor.read_bytes()
+    behind = authority.read_anchor(anchor)
+    anchor.write_text(json.dumps({"format": authority.ANCHOR_FORMAT, "store_id": behind.store_id,
+                                  "seq": behind.seq + 1, "head_hash": "0" * 64}))   # the log is now behind it
+    refused = rig.ck.panel("section:state")
+    assert refused["value"]["provenance"]["label"] == "unverified"
+    assert refused["etag"] != signed["etag"]
+    anchor.write_bytes(good)
+    restored = rig.ck.panel("section:state")
+    assert restored["etag"] != refused["etag"]
+    assert restored["value"]["provenance"]["label"] == "signed · reported"
 
 
 # --- a /2 store migrates and refuses signed acts until init -------------------------------------------

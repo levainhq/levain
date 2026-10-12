@@ -42,7 +42,7 @@ class LabelKey:
 
 
 class LabelSnapshot(Protocol):
-    revision: tuple[str, int, int] | None
+    revision: tuple[str, int, int, str] | None
     error: str | None
 
     def provenance(self, key: LabelKey | None) -> dict[str, Any] | None: ...
@@ -53,7 +53,7 @@ class LabelSnapshot(Protocol):
 class _NoLabels:
     """No labeller attached: nothing is labelled, and nothing says provenance is unavailable."""
 
-    revision: tuple[str, int, int] | None = None
+    revision: tuple[str, int, int, str] | None = None
     error: str | None = None
     degraded = 0
 
@@ -73,7 +73,7 @@ class _Unavailable:
     than the journal proves, and the panel says why."""
 
     error: str
-    revision: tuple[str, int, int] | None = None
+    revision: tuple[str, int, int, str] | None = None
     degraded: int = 0
 
     def provenance(self, key: LabelKey | None) -> dict[str, Any] | None:
@@ -93,7 +93,7 @@ class _Inactive:
     (K2b-3b §8d row 1)."""
 
     error: str
-    revision: tuple[str, int, int] | None = None
+    revision: tuple[str, int, int, str] | None = None
     degraded: int = 0
 
     def provenance(self, key: LabelKey | None) -> dict[str, Any] | None:
