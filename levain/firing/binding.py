@@ -35,9 +35,12 @@ from typing import Any, Optional, get_args, get_type_hints
 
 from levain.firing.confinement import (
     ConfinementConfig,
+    ConfinementError,
     CrownJewelsPolicy,
+    HandsIdentity,
     SshMode,
     build_policy,
+    check_runtime_sockets,
     load_confinement_config,
 )
 from levain.firing.drive import DRIVE_MODES, DriveMode, resolve_cred_floor
@@ -89,7 +92,7 @@ def _policy_to_params(policy: CrownJewelsPolicy) -> dict[str, Any]:
         if isinstance(v, Path):
             out[f.name] = str(v)
         elif isinstance(v, tuple):
-            out[f.name] = [str(p) for p in v]
+            out[f.name] = [[str(x) for x in p] if isinstance(p, tuple) else str(p) for p in v]
         else:
             out[f.name] = v
     return out
@@ -99,6 +102,8 @@ def _policy_to_params(policy: CrownJewelsPolicy) -> dict[str, Any]:
 # whose type is not listed here REFUSES rather than passing through unchecked (and a dropped
 # `from __future__ import annotations` in confinement.py cannot quietly move fields to "unchecked").
 _PATH, _OPT_PATH, _PATHS, _BOOL, _SSH_MODE = "path", "optional_path", "paths", "bool", "ssh_mode"
+_PATH_PAIRS = "path_pairs"
+_RUNTIME_SOCKETS = "runtime_sockets"
 
 
 def _field_kinds() -> dict[str, str]:
@@ -107,8 +112,10 @@ def _field_kinds() -> dict[str, str]:
         Path: _PATH,
         Optional[Path]: _OPT_PATH,
         tuple[Path, ...]: _PATHS,
+        tuple[tuple[Path, Path], ...]: _PATH_PAIRS,
         bool: _BOOL,
         SshMode: _SSH_MODE,
+        tuple[str, ...]: _RUNTIME_SOCKETS,
     }
     kinds: dict[str, str] = {}
     for f in dataclasses.fields(CrownJewelsPolicy):
@@ -146,10 +153,22 @@ def _policy_from_params(data: Any) -> CrownJewelsPolicy:
             if not isinstance(v, list):
                 raise BindingError(f"floor field {name!r} is not a list of paths (fail-closed).")
             kwargs[name] = tuple(_abs_path(name, x) for x in v)
+        elif kind == _PATH_PAIRS:
+            if not isinstance(v, list) or not all(isinstance(x, list) and len(x) == 2 for x in v):
+                raise BindingError(f"floor field {name!r} is not a list of path pairs (fail-closed).")
+            kwargs[name] = tuple((_abs_path(name, a), _abs_path(name, b)) for a, b in v)
         elif kind == _PATH:
             kwargs[name] = _abs_path(name, v)
         elif kind == _OPT_PATH:
             kwargs[name] = None if v is None else _abs_path(name, v)
+        elif kind == _RUNTIME_SOCKETS:
+            # The only list of strings in the floor, and re-checked: it decides what bash reaches.
+            if not isinstance(v, list):
+                raise BindingError(f"floor field {name!r} is not a list (fail-closed).")
+            try:
+                kwargs[name] = check_runtime_sockets(v, where=f"floor field {name!r}")
+            except ConfinementError as exc:
+                raise BindingError(str(exc)) from None
         elif kind == _BOOL:
             if not isinstance(v, bool):
                 raise BindingError(f"floor field {name!r} is not a bool (fail-closed).")
@@ -175,6 +194,9 @@ class ConversationBinding:
     mode: DriveMode
     floor: CrownJewelsPolicy
     deny_standard_creds: bool
+    hands: HandsIdentity | None = None
+    """The separate user bash runs as (:func:`~levain.firing.confinement.hands_for`), or None for the
+    operator. When set, the floor is fenced around the hands user's workspace."""
 
     @classmethod
     def create(
@@ -184,6 +206,7 @@ class ConversationBinding:
         mode: DriveMode,
         workspace: Path | str,
         config: ConfinementConfig | None = None,
+        hands: HandsIdentity | None = None,
     ) -> "ConversationBinding":
         """Resolve the floor ONCE, from a live entity.
 
@@ -212,30 +235,49 @@ class ConversationBinding:
             # spore-725. NOT drive-resolved: a reachable container daemon is a total bypass in every
             # drive mode, so a watching operator is no mitigation.
             allow_container_sockets=cfg.allow_container_sockets,
+            # The sockets bash on Linux keeps in its view of the user runtime dir (step (7) of the bwrap plan).
+            runtime_sockets=cfg.runtime_sockets,
             # spore-755. Both ssh modes; the only switch is the operator opt-out. The residuals this
             # does not close are documented on levain.firing.confinement (spore-1005).
             deny_localhost_outbound=(not cfg.allow_localhost_outbound),
         )
-        return cls(entity_dir=ed, mode=mode, floor=floor, deny_standard_creds=deny_creds)
+        if hands is not None and Path(workspace).expanduser().resolve() != hands.workspace:
+            raise BindingError(
+                "a hands-user binding must fence the hands user's own workspace (fail-closed)."
+            )
+        return cls(entity_dir=ed, mode=mode, floor=floor, deny_standard_creds=deny_creds,
+                   hands=hands)
 
     def to_params(self) -> dict[str, Any]:
         """JSON-shaped, so it survives the SDK's fork (``model_dump`` → ``model_validate``) and its
         state autosave."""
-        return {
+        out: dict[str, Any] = {
             "entity_dir": str(self.entity_dir),
             "mode": self.mode,
             "floor": _policy_to_params(self.floor),
             "deny_standard_creds": self.deny_standard_creds,
         }
+        if self.hands is not None:
+            out["hands"] = {"user": self.hands.user, "uid": self.hands.uid, "home": self.hands.home,
+                            "workspace": str(self.hands.workspace)}
+        return out
 
     @classmethod
     def from_params(cls, data: Any) -> "ConversationBinding":
         """Deserialize only — no file is read and nothing is re-resolved, so the floor a tool is built
         with is the one the session resolved. Fails closed on any shape it did not write."""
-        if not isinstance(data, dict) or set(data) != {
+        if not isinstance(data, dict) or set(data) - {"hands"} != {
             "entity_dir", "mode", "floor", "deny_standard_creds"
         }:
             raise BindingError("not a serialized conversation binding (fail-closed).")
+        hands = None
+        if "hands" in data:
+            h = data["hands"]
+            if not (isinstance(h, dict) and set(h) == {"user", "uid", "home", "workspace"}
+                    and all(isinstance(h[k], str) and h[k] for k in ("user", "home", "workspace"))
+                    and isinstance(h["uid"], int) and not isinstance(h["uid"], bool) and h["uid"] > 0):
+                raise BindingError("a serialized conversation binding has a malformed hands user (fail-closed).")
+            hands = HandsIdentity(h["user"], h["uid"], h["home"], Path(h["workspace"]))
         ed, mode, creds = data["entity_dir"], data["mode"], data["deny_standard_creds"]
         if not (isinstance(ed, str) and ed) or mode not in DRIVE_MODES or not isinstance(creds, bool):
             raise BindingError("a serialized conversation binding has a malformed field (fail-closed).")
@@ -244,4 +286,10 @@ class ConversationBinding:
             raise BindingError(
                 "a serialized conversation binding's floor fences a different entity (fail-closed)."
             )
-        return cls(entity_dir=Path(ed), mode=mode, floor=floor, deny_standard_creds=creds)
+        if hands is not None and floor.workspace != hands.workspace:
+            raise BindingError(
+                "a serialized conversation binding's floor fences another workspace than its hands "
+                "user's (fail-closed)."
+            )
+        return cls(entity_dir=Path(ed), mode=mode, floor=floor, deny_standard_creds=creds,
+                   hands=hands)

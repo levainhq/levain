@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from http.server import BaseHTTPRequestHandler
 from typing import Any
+from urllib.parse import unquote_plus
 
 __all__ = [
     "GuardedHandler",
@@ -33,6 +35,18 @@ __all__ = [
 # ``same-site``, or even ``none`` (a top-level navigation, which can't carry a JSON
 # POST anyway) — is an unexpected/hostile origin and is refused.
 _WRITE_SEC_FETCH_ALLOWED = "same-origin"
+_QUERY_STRING = re.compile(r"\?\S*")
+
+
+def _redact_query(text: str) -> str:
+    """A cockpit search query (parameter ``q``) never reaches a log line. The query is parsed, not
+    pattern-matched on its encoded spelling: ``%71`` is ``q`` too."""
+    def one(m: "re.Match[str]") -> str:
+        pairs = m.group(0)[1:].split("&")
+        kept = [f"{pair.split('=', 1)[0]}=-" if unquote_plus(pair.split("=", 1)[0]) == "q" and "=" in pair else pair
+                for pair in pairs]
+        return "?" + "&".join(kept)
+    return _QUERY_STRING.sub(one, text)
 
 # The page only ever loads its own same-origin scripts + stylesheet and fetches its
 # own JSON. Lock everything else off. Slice 2a moved the one inline <style> block out
@@ -103,15 +117,21 @@ class GuardedHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Security-Policy", _CSP)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        # Snapshots are per-request; never let a browser cache a stale one.
-        self.send_header("Cache-Control", "no-store")
+        # Snapshots are per-request; never let a browser cache a stale one. A route that serves a
+        # revalidatable, per-credential body (the cockpit's ETag'd reads) sets ``_cache_control``
+        # for that one response through ``_send(cache_control=...)``; nothing else does.
+        self.send_header("Cache-Control", getattr(self, "_cache_control", None) or "no-store")
         super().end_headers()
 
     def _send(
-        self, body: bytes, content_type: str, status: int = 200, *, head: bool = False
+        self, body: bytes, content_type: str, status: int = 200, *, head: bool = False,
+        headers: "list[tuple[str, str]] | None" = None, cache_control: str | None = None,
     ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
+        for name, value in headers or ():
+            self.send_header(name, value)
+        self._cache_control = cache_control
         # Always the length the GET body WOULD be, so a HEAD reports correct framing without a body.
         self.send_header("Content-Length", str(len(body)))
         # When the connection is being closed (a refused write whose body was not read), say so,
@@ -119,6 +139,7 @@ class GuardedHandler(BaseHTTPRequestHandler):
         if self.close_connection:
             self.send_header("Connection", "close")
         self.end_headers()
+        self._cache_control = None
         if not head:
             self.wfile.write(body)
 
@@ -248,4 +269,5 @@ class GuardedHandler(BaseHTTPRequestHandler):
         """Quiet by default: each server prints its own startup line, and a per-request access log
         is noise in an interactive terminal. ``LEVAIN_SERVE_VERBOSE`` restores it on stderr."""
         if os.environ.get("LEVAIN_SERVE_VERBOSE"):
-            super().log_message(fmt, *args)
+            # a cockpit search query (``q=``) is never written to a log, verbose or not
+            super().log_message(fmt, *(_redact_query(a) if isinstance(a, str) else a for a in args))

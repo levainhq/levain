@@ -45,6 +45,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import unicodedata
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -241,7 +242,7 @@ def _anneal_json(
     error, or a wrong-shape result all return None."""
     db = str(store_path())
     candidates = []
-    if "{{" not in _INSTALL_ANNEAL_BIN:
+    if _INSTALL_ANNEAL_BIN != "{{" + "ANNEAL_MEMORY}}":   # split, so the install fill cannot reach it
         candidates.append([_INSTALL_ANNEAL_BIN, "--db", db, *sub_args])
     candidates.append([sys.executable, "-P", "-m", "anneal_memory", "--db", db, *sub_args])
     for cmd in candidates:
@@ -492,26 +493,22 @@ def entity_name_notice() -> str | None:
     )
 
 
-# ---- Live focus — the operator's declared "what I'm on now" reaches the partner ----
-# The cockpit (levain serve --write) + `levain focus` CLI SET the focus into the
-# live-context contract .levain/context.json {focus, focus_set_at, focus_source}, but
-# until 0.3.11 NOTHING read it into the partner's session — it was surfaced only in the
-# cockpit/TUI render, so a set focus never reached the entity (the writer→store→reader
-# loop had no reader; caught cross-machine by Chip on the 0.3.10 focus edit). These
-# readers mirror the kernel's dashboard._read_focus + _humanize_focus_age +
-# FOCUS_STALE_AFTER_HOURS, so the entity sees the SAME freshness the cockpit renders
-# (and agrees with flow's session_init, which mirrors the same kernel bound). A control
-# plane that REDIRECTS context_json (flow's Bridge → state/context_state.json) owns its
-# own reader; this reads the bare-install default. Stdlib only.
-_FOCUS_STALE_AFTER_HOURS = 18  # mirror dashboard.FOCUS_STALE_AFTER_HOURS
-# a focus the governed write seam would REJECT (over the cap) must not reach primacy —
-# mirror writes.MAX_FOCUS_TEXT_LEN so the reader enforces the same bound as the writer.
-_MAX_FOCUS_TEXT_LEN = 500  # mirror writes.MAX_FOCUS_TEXT_LEN
+# ---- The operator's state line — "what's going on" reaches the partner ----
+# The cockpit, the `levain state` CLI and the TUI SET one freeform line into the
+# live-context contract .levain/context.json {state, state_set_at, state_source}; this
+# reader puts it in the partner's session. It mirrors the kernel's dashboard._read_state
+# and its bounds, so the entity sees the same line the cockpit renders (and agrees with
+# flow's session_init, which mirrors the same bound). A control plane that REDIRECTS
+# context_json (flow's Bridge -> state/context_state.json) owns its own reader; this reads
+# the bare-install default. Stdlib only.
+_STATE_EXPIRES_AFTER_HOURS = 12  # mirror dashboard.STATE_EXPIRES_AFTER_HOURS
+_STATE_MAX_TEXT_LEN = 500  # mirror dashboard.STATE_MAX_TEXT_LEN
+_STATE_CLOCK_SKEW_SECONDS = 300  # mirror dashboard.STATE_CLOCK_SKEW_SECONDS
 
 
-def _humanize_focus_age(delta_seconds: float) -> str:
+def _humanize_age(delta_seconds: float) -> str:
     """'set just now' / 'set 12m ago' / 'set 3h ago' / 'set 2d ago' — byte-parity with
-    the kernel's _humanize_focus_age. A negative (future) delta → '' (never a fabricated
+    the kernel's _humanize_age. A negative (future) delta -> '' (never a fabricated
     freshness)."""
     if delta_seconds < 0:
         return ""
@@ -525,86 +522,159 @@ def _humanize_focus_age(delta_seconds: float) -> str:
     return f"set {s // 86400}d ago"
 
 
-def _focus_freshness(set_at: str | None, now: datetime | None = None) -> tuple[str, str]:
-    """(freshness, age_label) for a focus stamp, mirroring dashboard._read_focus against
-    FOCUS_STALE_AFTER_HOURS: 'fresh'|'stale'|'unknown' + 'set 3h ago'/''. An absent /
-    unparseable / future stamp → ('unknown', '') so an unknown-age focus is never
-    rendered as current (the honesty floor: unknown ≠ fresh). `now` is injectable for
-    testing (parity with the kernel's _read_focus, which takes `now`); default = now."""
-    if not isinstance(set_at, str) or not set_at.strip():
-        return "unknown", ""
+def state_line() -> tuple[str, str | None] | None:
+    """The state line's (signature, rendered line), the ONE place its rules live: the
+    operator's freeform state ("what's going on"), VERBATIM with its age: the READ half of
+    dashboard._read_state (keys state / state_set_at / state_source in .levain/context.json).
+    Never parsed, scored or used to gate, soften or reduce scope: the operator is the
+    authority on their own state. EXPIRES: a state whose age cannot be established, is in
+    the future, or is older than _STATE_EXPIRES_AFTER_HOURS is no live line, because a stale
+    state is worse than none. Over-cap text is absent too.
+
+    ('', None) = no live line (file absent, key absent or dropped by a rule above). Otherwise
+    the signature is a digest of text + set-at + source, so a re-write of identical text
+    still counts as a change and no state text is ever stored in a marker. None = the
+    context is unreadable, which is NOT evidence the line cleared. Fail-soft: any fault ->
+    None."""
     try:
-        ts = datetime.fromisoformat(set_at)
-    except (ValueError, TypeError):
-        return "unknown", ""
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    if now is None:
-        now = datetime.now(timezone.utc)
-    elif now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    try:
-        delta = (now - ts).total_seconds()
-    except (TypeError, OverflowError, ValueError):
-        return "unknown", ""
-    if delta < 0:
-        return "unknown", ""
-    stale = delta >= _FOCUS_STALE_AFTER_HOURS * 3600
-    return ("stale" if stale else "fresh"), _humanize_focus_age(delta)
+        try:
+            data = json.loads((install_root() / ".levain" / "context.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return "", None
+        if not isinstance(data, dict):
+            return None
+        rt = data.get("state")
+        text = " ".join(rt.split()) if isinstance(rt, str) and rt.split() else None
+        if text is None or len(text) > _STATE_MAX_TEXT_LEN:
+            return "", None
+        set_at = data.get("state_set_at")
+        if not isinstance(set_at, str) or not set_at.strip():
+            return "", None
+        try:
+            ts = datetime.fromisoformat(set_at)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            delta = (datetime.now(timezone.utc) - ts).total_seconds()
+        except (ValueError, TypeError, OverflowError):
+            return "", None
+        if delta < -_STATE_CLOCK_SKEW_SECONDS or delta >= _STATE_EXPIRES_AFTER_HOURS * 3600:
+            return "", None
+        delta = max(delta, 0.0)
+        source = data.get("state_source")
+        digest = hashlib.sha1(
+            f"{text}\n{set_at}\n{source if isinstance(source, str) else ''}".encode("utf-8", "replace")
+        ).hexdigest()
+        return digest, (
+            f'[state] The operator\'s own words for what is going on right now '
+            f'({_humanize_age(delta)}): {json.dumps(text, ensure_ascii=False)}. '
+            f'Their report, reflected back verbatim.'
+        )
+    except Exception:
+        return None
 
 
-def _read_focus_fields() -> tuple[str | None, str | None]:
-    """(focus text, focus_set_at) from the live-context contract .levain/context.json —
-    the READ half of dashboard._read_focus (superset-tolerant: only the focus keys are
-    read, so a sensor app's richer file satisfies the same contract). Fail-soft:
-    missing / unreadable / malformed / non-dict → (None, None). Internal whitespace in
-    the focus is collapsed (a newline would split the single-line render), matching
-    _read_focus + write_focus."""
+def state_notice() -> str | None:
+    """The state line to show at session start, or None (see state_line for the rules)."""
+    result = state_line()
+    return result[1] if result else None
+
+
+# Per-session "seen" markers for the change-only per-prompt state line (the behaviour
+# reference is flow's scripts/state_line_hook.py). One file per session, so concurrent
+# sessions never share a write; the content is a signature, never state text.
+_STATE_SEEN_KEEP = 200
+_STATE_CLEARED_LINE = "[state] line cleared or expired"
+
+
+def _state_seen_path(session_id: str) -> Path:
+    key = hashlib.sha1(session_id.encode("utf-8", "replace")).hexdigest()[:24]
+    return install_root() / ".levain" / "state_line_seen" / key
+
+
+def _state_seen_read(path: Path) -> str | None:
+    """The signature this session last saw ('' = saw no live line), None = unknown."""
     try:
-        raw = (install_root() / ".levain" / "context.json").read_text(encoding="utf-8")
-        data = json.loads(raw)
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+
+def _state_seen_prune(directory: Path) -> None:
+    """Bound the store: stale *.tmp leaks go, then past _STATE_SEEN_KEEP files the least
+    recently prompted (by mtime) go."""
+    now = time.time()
+    for p in directory.glob("*.tmp"):
+        try:
+            if now - p.stat().st_mtime > 3600:
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    files = sorted((p for p in directory.iterdir() if not p.name.endswith(".tmp")), key=mtime)
+    for p in files[: max(0, len(files) - _STATE_SEEN_KEEP)]:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def state_seen_record(session_id: str, signature: str) -> None:
+    """Record what this session has now seen. Atomic (tmp + replace). Fail-soft."""
+    try:
+        if not session_id:
+            return
+        path = _state_seen_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(signature, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        _state_seen_prune(path.parent)
+    except Exception:
+        pass
+
+
+def focus_notice() -> None:
+    """One-release shim: an older session_start.py left pending by `levain update` still
+    calls it, and the AttributeError would drop the whole SessionStart context."""
+    return None
+
+
+def state_line_pending(session_id: str) -> tuple[str | None, str | None]:
+    """The per-prompt state line as (line, pending_signature): the line is shown only when
+    it differs from what this session last saw. Unknown marker (never seeded, or pruned)
+    shows a live line: a repeat is harmless, a swallowed change is not. A line that went
+    away says so once. NON-MUTATING: the caller records the pending signature with
+    state_seen_record() only AFTER the output was delivered, so a failed hook can repeat a
+    line but never lose one. pending is None when there is nothing to record. Unreadable
+    context yields (None, None). Fail-soft: any fault -> (None, None)."""
+    try:
+        if not session_id:
+            return None, None
+        result = state_line()
+        if result is None:
+            return None, None
+        sig, line = result
+        path = _state_seen_path(session_id)
+        prior = _state_seen_read(path)
+        if prior == sig:
+            try:
+                os.utime(path)  # recency = last prompt, so an active session is never pruned
+            except OSError:
+                pass
+            return None, None
+        out = line if sig else (_STATE_CLEARED_LINE if prior else None)
+        return out, sig
     except Exception:
         return None, None
-    if not isinstance(data, dict):
-        return None, None
-    rt = data.get("focus")
-    text = " ".join(rt.split()) if isinstance(rt, str) and rt.split() else None
-    # Enforce the write seam's cap on READ too: a focus over MAX_FOCUS_TEXT_LEN (a hand-
-    # edited / foreign / sensor-app context file the governed edit would refuse) must not
-    # flood primacy model context — the reader is a prompt-construction boundary, not a UI
-    # render the cockpit can visually clamp (codex L3). Over-cap → treat as absent.
-    if text is not None and len(text) > _MAX_FOCUS_TEXT_LEN:
-        text = None
-    ra = data.get("focus_set_at")
-    set_at = ra if isinstance(ra, str) and ra.strip() else None
-    return text, set_at
-
-
-def focus_notice() -> str | None:
-    """The operator's live declared focus ('what I'm on now') at primacy, so the partner
-    orients to the operator's OWN frame — the READ that closes the cockpit focus edit's
-    writer→store→reader loop (0.3.11). Pure-echo operator self-report: no machine
-    interpretation, no deference-risk (you cannot defer to your own input). None when no
-    focus is set. A stale focus (past FOCUS_STALE_AFTER_HOURS) or one whose age can't be
-    established is FLAGGED to re-confirm, never trusted as current (operator-reports-
-    first: a nudge, not a verdict — the honesty floor the cockpit render already applies)."""
-    text, set_at = _read_focus_fields()
-    if not text:
-        return None
-    freshness, age_label = _focus_freshness(set_at)
-    age = f" ({age_label})" if age_label else " (age unknown)"
-    if freshness == "fresh":
-        return (
-            f'[focus] The operator\'s current declared focus{age} — their own words for '
-            f'"what I\'m on now": "{text}". Orient to it; it is their frame for this '
-            f'session, reflected back (not a machine read).'
-        )
-    # stale OR unknown age — never present an old / unverifiable focus as current
-    return (
-        f'[focus] The operator\'s last declared focus{age} — their own words for "what '
-        f'I\'m on now": "{text}". It may be out of date: take it as a prompt to confirm '
-        f'what they\'re on now, not a settled fact.'
-    )
 
 
 def _is_migrate_check(data: object) -> bool:
@@ -955,7 +1025,7 @@ def read_stdin() -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def emit(additional_context: str, event_name: str) -> None:
+def emit(additional_context: str, event_name: str) -> bool:
     """Write hook output in Codex's hook-JSON format. `additionalContext`
     is injected into the model's context at the hook's position; `event_name`
     is the hook event ("SessionStart" / "UserPromptSubmit"), emitted as
@@ -968,7 +1038,10 @@ def emit(additional_context: str, event_name: str) -> None:
     primary harness-coupled seam — a future non-Codex adapter that diverges
     on output format swaps this function. The stdout writes are guarded: if
     the harness has already closed the pipe (a killed-session race), emit()
-    degrades to silence rather than raising."""
+    degrades to silence rather than raising. Returns True only when the output was
+    written and flushed."""
+    if sys.stdout is None:    # fd 1 was closed before the interpreter started: there is nowhere to write
+        return False
     try:
         payload = {
             "hookSpecificOutput": {
@@ -978,5 +1051,18 @@ def emit(additional_context: str, event_name: str) -> None:
         }
         sys.stdout.write(json.dumps(payload))
         sys.stdout.write("\n")
+        sys.stdout.flush()
+        return True
     except (OSError, ValueError):
-        pass
+        # Point fd 1 at devnull so interpreter shutdown cannot retry flushing the broken
+        # buffer (it would print 'Exception ignored' and exit 120). Python's documented
+        # SIGPIPE recipe.
+        try:
+            target = sys.stdout.fileno()
+            fd = os.open(os.devnull, os.O_WRONLY)
+            if fd != target:    # a closed fd 1 is handed back by open itself, and closing it then re-breaks stdout
+                os.dup2(fd, target)
+                os.close(fd)
+        except Exception:
+            pass
+        return False

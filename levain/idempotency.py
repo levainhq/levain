@@ -8,7 +8,7 @@ store is the at-most-once gate an irreversible :class:`~levain.writes.ActionVerb
 a CLIENT-SUPPLIED ``idempotency_key`` is recorded with the request's content fingerprint and
 deduped within a window, so a replay returns the ORIGINAL response WITHOUT re-firing.
 
-It mirrors the vagus efferent gate's at-most-once primitive (``vagus.efferent.pending`` —
+It mirrors the vagus efferent gate's at-most-once primitive (``levain.autonomic.pending`` —
 atomic ``claim()`` + a content-fingerprint integrity seal) but with the inverse state machine:
 the pending store is a propose→resolve QUEUE (``claim`` removes-and-returns, exactly one of N
 resolvers wins); this is a dedup KEYSTORE (a key persists for the window so a later replay still

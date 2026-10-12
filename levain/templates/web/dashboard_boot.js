@@ -30,12 +30,11 @@
   // job finishes — so the sibling write's saved state still lands, just after the job.
   let deferredReload = false;
 
-  // OFF-BOX write token (spore-129). When the substrate is served off-loopback (a Tailscale
-  // mesh write surface) the server REQUIRES the X-Levain-Write-Token header on /edit — the
-  // factor that replaces loopback-is-auth once the surface leaves the machine. The server
-  // signals it via `view.write_token_required` (set in load()); we hold the device's token in
-  // localStorage and attach it. On a loopback (default) surface this stays false and the
-  // localhost-sovereign token-free path is unchanged. (This localStorage entry is the
+  // The write token (spore-129, then K2a). A writable server REQUIRES the X-Levain-Write-Token
+  // header on every write, on loopback too (K2a); off-box it also gates the reads (spore-220).
+  // The server signals it via `view.write_token_required` (set in load()); we hold the token in
+  // localStorage and attach it. The server prints the token at start, with a link carrying it
+  // in the fragment, which the page takes on load. (This localStorage entry is the
   // desktop-browser STOPGAP; flowConnect's native shell later holds the token in the keychain
   // and injects the same header — the server gate underneath is identical.)
   //
@@ -50,15 +49,33 @@
   const WRITE_TOKEN_KEY = "levain_write_token";
   let writeTokenRequired = false;
 
+  // K2a: `levain serve` opens the page with the write token in the URL FRAGMENT (never sent to the server).
+  // Take it, keep it, and strip it from the address bar, leaving any chat_token for the chat panel.
+  (function takeFragmentWriteToken() {
+    try {
+      const params = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+      const tok = params.get("write_token");
+      if (tok === null) return;
+      params.delete("write_token");
+      const rest = params.toString();
+      history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
+      // a token is printable ASCII without spaces (it travels in a request header)
+      if (/^[\x21-\x7e]+$/.test(tok)) window.localStorage.setItem(WRITE_TOKEN_KEY, tok);
+      else console.warn("levain: the write token in the link is not a header-safe string; not stored");
+    } catch (_) { /* no history or storage: the prompt still works */ }
+  })();
+
   // The device-held off-box token from localStorage ("" if none / private mode).
   function storedToken() {
     try { return window.localStorage.getItem(WRITE_TOKEN_KEY) || ""; } catch (_) { return ""; }
   }
-  // Prompt for + persist the off-box token; returns the entered token ("" if cancelled). The
+  // Prompt for + persist the write token; returns the entered token ("" if cancelled). The
   // desktop-browser STOPGAP entry point (flowConnect's native shell injects the same header from
   // the keychain). One token gates BOTH the reads (spore-220) and the writes (spore-129).
+  let tokenDeclined = false;   // this page load: the operator declined the prompt; passive refreshes stay quiet
   function promptForToken() {
-    const tok = (window.prompt("Off-box token (shown on the bridge --write startup line):") || "").trim();
+    const tok = (window.prompt("Write token (printed when this server started: on its startup line, or in the daemon's log):") || "").trim();
+    if (tok) tokenDeclined = false;
     if (tok) { try { window.localStorage.setItem(WRITE_TOKEN_KEY, tok); } catch (_) { /* ignore */ } }
     return tok;
   }
@@ -188,6 +205,13 @@
     return res.json();
   }
 
+  // The read transport for code outside this file (the filter box's store search, a one-panel refetch):
+  // the same function, so the same token handling.
+  // `headers` is the SAME read-header function the reads above use, so the change stream (a fetch read that
+  // cannot go through res.json()) carries the same credential; `reload` is the board's one passive re-read and
+  // resolves true only once a board was drawn (false: deferred by an edit or a load in flight, or it failed).
+  window.LevainCockpitTransport = { readJson: authedReadJson, headers: readHeaders, reload: () => load({ passive: true }) };
+
   // Poll an async job's status → { status, result?, error? }. Rides authedReadJson (spore-220 gates
   // /job.json off-box; token-free on loopback/read-only). Throws on a non-OK (incl. the fail-closed
   // 500 a corrupt job store returns); the in-box poll loop retries a few times, then surfaces it.
@@ -226,25 +250,364 @@
     return window.LevainDashboard.hasUnsavedEdit();
   }
 
+  // DATA SOURCE (cockpit design §7). The page draws from the kernel's cockpit manifest + panel routes
+  // (cockpit_view.js maps them onto the same components) and writes through /cockpit/verb (postVerb
+  // below). `/?source=substrate` draws the legacy /substrate.json page, whose writes post /edit and
+  // /action (a T2 write there is refused: it fires only through the broker).
+  const useManifest = new URLSearchParams(window.location.search).get("source") !== "substrate";
+
+  // ---- MANIFEST WRITES (R1): every affordance on the manifest source posts /cockpit/verb ----
+  //
+  // The page decides no tier. A gesture that may escalate asks the kernel first (a dry run), shows the
+  // tier it would take, and fires only on the operator's second click, with exactly the request it showed.
+  // `live` is the write surface of the view last RENDERED: a write names the row version the operator saw,
+  // so a re-read never moves it under an open form (the kernel's `stale` answer is the backstop).
+  let live = null;
+  let frozen = null;        // the previewed request: {fp0, tier, gesture, intent}
+  let notice = null;        // what the last write said, drawn on its row once the board is rebuilt
+
+  const KEYS_STORE = "levain_cockpit_keys";
+  function readKeys() {
+    try { const o = JSON.parse(window.sessionStorage.getItem(KEYS_STORE) || "{}"); return o && typeof o === "object" ? o : {}; }
+    catch (_) { return {}; }
+  }
+  function writeKeys(o) { try { window.sessionStorage.setItem(KEYS_STORE, JSON.stringify(o)); } catch (_) { /* no storage: no replay */ } }
+
+  // a stable string for a JSON value: keys sorted, so one request always has one fingerprint
+  function canon(v) {
+    if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
+    if (v && typeof v === "object") return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}";
+    return JSON.stringify(v === undefined ? null : v);
+  }
+  function newKey() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") return window.crypto.randomUUID();
+      const a = new Uint8Array(16);
+      window.crypto.getRandomValues(a);
+      return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+    } catch (_) { return "idem-" + Date.now() + "-" + Math.random().toString(16).slice(2); }
+  }
+
+  // POST a body; {net:true} when the outcome is unknown (no answer, or a proxy's non-JSON 5xx), else
+  // {ok, status, data}. An answer from the server is authoritative, whatever it says.
+  async function send(route, body) {
+    let res;
+    try { res = await fetch(route, { method: "POST", headers: writeHeaders(), body: JSON.stringify(body) }); }
+    catch (e) { return { net: true, message: e && e.message ? e.message : String(e) }; }
+    let data = {};
+    let parsed = true;
+    try { data = await res.json(); } catch (_) { parsed = false; }
+    if (!parsed && res.status >= 500) return { net: true, message: "HTTP " + res.status };
+    if (res.status === 403 && writeTokenRequired && /token/i.test((data && data.message) || "")) dropToken();
+    return { ok: res.ok, status: res.status, data: data || {} };
+  }
+
+  const NETWORK_MESSAGE = "no answer: the request may or may not have landed. Re-read the page to see; sending it again lands once only if it carries a key.";
+  // answers after which the page's picture of the row or of the install is stale or unavailable
+  const REREAD = new Set(["needs_intent", "stale", "tier_moved", "gesture_moved", "needs_broker", "standby", "not_built"]);
+
+  // The kernel's answer, drawn on its row the moment it arrives: the full re-read can take seconds, and a
+  // row that says "…" until then hides a landed write. The row is not locked meanwhile: an edit sent
+  // against the old row version is refused "stale" by the kernel.
+  function paintNow(n) {
+    if (!n || !n.key) return;
+    for (const row of document.querySelectorAll("[data-row-key]")) {
+      if (row.dataset.rowKey !== n.key) continue;
+      const host = row.querySelector(".verb-actions") || row;
+      let m = host.querySelector(".edit-msg");
+      if (!m) { m = document.createElement("span"); host.appendChild(m); }
+      m.className = "edit-msg " + n.cls;
+      m.textContent = n.text;
+      return;
+    }
+  }
+
+  function fault(r, what) {
+    const d = r.data || {};
+    const code = d.error || "HTTP " + r.status;
+    const text = d.message || code;
+    if (REREAD.has(code) || r.status === 501) {
+      frozen = null;
+      notice = { key: what.row_id || null, text: what.label + ": " + text + " (re-read)", cls: "err" };
+      paintNow(notice);
+      load({ passive: true });   // a re-read that never discards an open form: it defers while one is dirty
+      return { ok: false, error: code, message: text + " Re-read the page; review and click again." };
+    }
+    return { ok: false, error: code, message: text };
+  }
+
+  function previewText(head, action, tier, gesture, base) {
+    const how = gesture === "sign" ? "waits for a signature" : "fires now, recorded as reported (claims cockpit token)";
+    const from = action.tier && action.tier !== tier ? " (rises from " + action.tier + ")" : "";
+    const cut = (v) => { const t = typeof v === "string" ? v : String(JSON.stringify(v)); return JSON.stringify(t.length > 60 ? t.slice(0, 57) + "..." : t); };
+    const vals = Object.keys(base.params).map((k) => k + " = " + cut(base.params[k])).join(", ") || "no values";
+    return (head.label || base.verb) + " is " + tier + from + ": " + how + ". " + (head.effect ? head.effect + ". " : "")
+      + "Sending " + vals + ". Click again to fire.";
+  }
+
+  async function postVerb(action, params, opts) {
+    opts = opts || {};
+    const head = (live && live.heads && live.heads[action.verb]) || {};
+    const label = head.label || action.verb;
+    // an undefined value is no value: it is not sent, not fingerprinted and not previewed
+    const given = {};
+    for (const k of Object.keys(params || {})) if (params[k] !== undefined) given[k] = params[k];
+    params = given;
+    if (action.gesture === "refused" || action.gesture === "laptop-only") {
+      return { ok: false, error: "gesture", message: label + " is " + action.gesture + " here: it cannot be done from this page." };
+    }
+    const t = action.target || {};
+    const base = { verb: action.verb, panel_id: t.panel_id, params: params || {} };
+    if (typeof t.row_id === "string") { base.row_id = t.row_id; base.row_version = t.row_version; }
+    const pv = opts.panelVersion !== undefined && opts.panelVersion !== null ? opts.panelVersion : t.panel_version;
+    if (typeof pv === "string") base.panel_version = pv;
+    if (head.confirm === true && opts.confirm === true) base.confirm = true;
+    const what = { row_id: base.row_id, label: label };
+    const fp0 = canon(base);
+
+    let tier = "C1", gesture = action.gesture, intent = null;
+    if (frozen && frozen.fp0 === fp0) {
+      tier = frozen.tier; gesture = frozen.gesture; intent = frozen.intent;
+    } else {
+      frozen = null;
+      const mayEscalate = !(action.gesture === "direct" && (!Array.isArray(action.escalates) || action.escalates.length === 0));
+      if (mayEscalate) {
+        const d = await send("/cockpit/verb", Object.assign({}, base, { dry_run: true }));
+        if (d.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };
+        if (!d.ok) return fault(d, what);
+        tier = d.data.tier; gesture = d.data.gesture;
+        if (gesture === "refused" || gesture === "laptop-only") {
+          return { ok: false, error: "gesture", message: label + " is " + tier + " with these values, and its gesture is " + gesture + ": it cannot be done from this page." };
+        }
+        if (tier !== "C1") {
+          intent = gesture === "sign" ? "sign" : "reported";
+          frozen = { fp0: fp0, tier: tier, gesture: gesture, intent: intent };
+          return { ok: false, preview: true, error: "preview", message: previewText(head, action, tier, gesture, base) };
+        }
+      }
+    }
+
+    let env = Object.assign({}, base);
+    if (intent) { env.intent = intent; env.tier_seen = tier; env.gesture_seen = gesture; }
+    // A T2+ fire (or an idempotent verb's) carries one key, minted for this frozen request and kept with
+    // the whole request until the kernel answers, so a lost answer is replayed, never re-decided.
+    let fpKey = null;
+    if (tier !== "C1" || head.idempotent === true) {
+      fpKey = canon([base.verb, base.panel_id, base.row_id || null, base.row_version || base.panel_version || null,
+                     base.params, intent, base.confirm === true]);
+      const keys = readKeys();
+      if (keys[fpKey] && keys[fpKey].envelope) env = keys[fpKey].envelope;
+      else { env.idempotency_key = newKey(); keys[fpKey] = { envelope: env }; writeKeys(keys); }
+    }
+    const r = await send("/cockpit/verb", env);
+    if (r.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };   // key and preview stay
+    frozen = null;
+    if (fpKey) { const keys = readKeys(); delete keys[fpKey]; writeKeys(keys); }
+    if (!r.ok) return fault(r, what);
+    const d = r.data;
+    const state = typeof d.state === "string" && d.state ? d.state : "done";
+    notice = { key: base.row_id || null, text: label + ": " + state + (d.label ? " · " + d.label : ""), cls: state === "COMMITTED" || state === "done" ? "note" : "preview" };
+    paintNow(notice);
+    await afterWrite();
+    return { ok: true, data: d };
+  }
+
+  // reload after a landed write, deferring while an async job polls (as postWrite does)
+  async function afterWrite() {
+    if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()) {
+      deferredReload = true;
+    } else {
+      await load();
+    }
+  }
+
+  // The legacy request kinds the render core still speaks, translated onto cockpit verbs. Only the verb
+  // name, the params and the target are read from the request; everything else the kernel decides.
+  const ROW_KEY = { spore_id: "spore:", episode_id: "episode:", edit_id: "edit:" };
+  const NOT_PARAMS = new Set(["kind", "spore_id", "episode_id", "edit_id", "expect_disposition", "confirm",
+    "panel_version", "source", "heading", "expected_body"]);
+  const VERB_OF_KIND = { state: "section_edit" };
+
+  function panelActionFor(verb, req) {
+    // every capture, a note included, is the Tray's create; the disposition rides in params
+    const want = verb === "spore_seed" ? "tray" : null;
+    for (const pid of Object.keys(live.panels)) {
+      if (want && pid !== want) continue;
+      const a = live.panels[pid].actions.find((x) => x && x.verb === verb);
+      if (a) return a;
+    }
+    return null;
+  }
+
+  async function manifestCommit(req) {
+    if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
+    const verb = Object.prototype.hasOwnProperty.call(VERB_OF_KIND, req.kind) ? VERB_OF_KIND[req.kind] : req.kind;
+    const params = {};
+    for (const k of Object.keys(req)) if (!NOT_PARAMS.has(k)) params[k] = req[k];
+    let action = null;
+    const rk = Object.keys(ROW_KEY).find((k) => Object.prototype.hasOwnProperty.call(req, k));
+    if (rk) {
+      const row = live.rows[ROW_KEY[rk] + req[rk]];
+      action = row ? row.actions.find((a) => a && a.verb === verb) : null;
+    } else {
+      action = panelActionFor(verb, req);
+    }
+    if (!action) return { ok: false, error: "not_offered", message: "the cockpit did not offer " + verb + " here" };
+    return postVerb(action, params, { confirm: req.confirm === true, panelVersion: req.panel_version });
+  }
+
+  // a downstream verb's compose box: found by verb name on the panels that offer it
+  async function manifestAction(verb, params, confirm) {
+    if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
+    const action = panelActionFor(verb, null);
+    if (!action) return { ok: false, error: "not_offered", message: "the cockpit did not offer " + verb + " here" };
+    return postVerb(action, params, { confirm: confirm === true });
+  }
+
+  // cancel a waiting pending: the gesture's intent, no preview, and a key of its own. The whole envelope
+  // is kept by pending id until the kernel answers, so a click after a lost answer replays the same key.
+  async function cancelPending(c) {
+    const slot = "cancel:" + c.pending_id;
+    const keys = readKeys();
+    let body = keys[slot] && keys[slot].envelope;
+    if (!body) {
+      body = { idempotency_key: newKey() };
+      if (c.tier && c.tier !== "C1") body.intent = c.gesture === "sign" ? "sign" : "reported";
+      keys[slot] = { envelope: body };
+      writeKeys(keys);
+    }
+    const route = c.route || "/cockpit/pending/" + encodeURIComponent(c.pending_id) + "/cancel";
+    const r = await send(route, body);
+    if (r.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };   // the envelope stays
+    if (r.status < 500) { const after = readKeys(); delete after[slot]; writeKeys(after); }   // a 5xx is indeterminate: keep it
+    if (!r.ok) return fault(r, { row_id: null, label: "cancel" });
+    const d = r.data;
+    notice = { key: null, text: "cancel: " + (d.state || "done") + (d.label ? " · " + d.label : ""), cls: "note" };
+    await afterWrite();
+    return { ok: true, data: d };
+  }
+
+  // Draw what the last write said on its row (or in the status line when the row is gone). The status
+  // line carries it either way.
+  function showNotice() {
+    if (!notice) return;
+    const n = notice;
+    notice = null;
+    status(n.text);
+    if (!n.key) return;
+    const rows = document.querySelectorAll("[data-row-key]");
+    for (const row of rows) {
+      if (row.dataset.rowKey !== n.key) continue;
+      const host = row.querySelector(".verb-actions") || row;
+      let m = host.querySelector(".edit-msg");
+      if (!m) { m = document.createElement("span"); host.appendChild(m); }
+      m.className = "edit-msg " + n.cls;
+      m.textContent = n.text;
+      return;
+    }
+  }
+
+  // Any edit to a form discards the preview: the operator fires only what they were shown.
+  function discardPreview(ev) {
+    if (!frozen) return;
+    frozen = null;
+    const t = ev && ev.target && ev.target.closest ? ev.target.closest(".verb-form, .tray-dump, .edit-controls, .editor, .state-editor") : null;
+    const m = t ? t.querySelector(".edit-msg.preview") : null;
+    if (m) { m.className = "edit-msg"; m.textContent = ""; }
+  }
+  if (useManifest) {
+    document.addEventListener("input", discardPreview, true);
+    document.addEventListener("change", discardPreview, true);
+  }
+
+  let heldNext = null;
+  async function loadManifestView(passive) {
+    let manifest = await authedReadJson("/cockpit/manifest.json");   // settles the token: panels do not re-prompt
+    // A writable install that wants a token and read the manifest without one (a loopback read needs none)
+    // would draw every action refused. Ask for the token now, then read again as that credential.
+    const cred = manifest && manifest.credential;
+    const wantsToken = !!(manifest && manifest.transport && manifest.transport.write_token_required === true
+      && cred && cred.class === "none");
+    if (wantsToken && !passive && !tokenDeclined) {
+      if (promptForToken()) manifest = await authedReadJson("/cockpit/manifest.json");
+      else { tokenDeclined = true; dropToken(); }
+    }
+    const fetchedAt = Date.now();
+    const ids = Object.keys(manifest.panels);
+    const panels = Object.create(null);
+    // One shared re-auth for the batch: if the token rotated after the manifest read, every panel 403s
+    // together, so the first one prompts (or drops the dead token) and the rest wait on that same answer.
+    let reauth = null;
+    const fetchPanel = (url) => fetch(url, { cache: "no-store", headers: readHeaders() });
+    await Promise.all(ids.map(async (id) => {
+      const url = "/cockpit/panel/" + encodeURIComponent(id) + ".json?profile=full";
+      try {
+        let res = await fetchPanel(url);
+        if (res.status === 403 && await isTokenReject(res.clone())) {
+          // a passive refresh never steals focus with a prompt over an open editor (as the legacy path does)
+          reauth = reauth || Promise.resolve().then(() => {
+            if (passive && editInProgress()) return false;
+            if (passive && tokenDeclined) return false;
+            if (promptForToken()) return true;
+            tokenDeclined = true;
+            dropToken();
+            return false;
+          });
+          if (await reauth) {
+            const usedToken = storedToken();
+            res = await fetchPanel(url);
+            // the replacement token was rejected too: drop it so the next refresh asks again
+            if (res.status === 403 && await isTokenReject(res.clone()) && storedToken() === usedToken) dropToken();   // not a newer token another tab stored
+          }
+        }
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        panels[id] = await res.json();
+      } catch (e) {
+        // keep the reason: the mapper draws this panel as unavailable with it, never as an empty one
+        panels[id] = { error: e && e.message ? e.message : String(e) };
+      }
+    }));
+    // the panels this board was drawn from, each with the head etag it was drawn under: the change stream
+    // resyncs over these ids, and the poll fallback compares the etags
+    heldNext = Object.fromEntries(ids.map((id) => [id, { etag: (manifest.panels[id] || {}).etag || null }]));
+    return window.LevainCockpitView.fromManifest({ manifest: manifest, panels: panels }, { elapsedMs: Date.now() - fetchedAt });
+  }
+
   async function load(opts) {
     const passive = !!(opts && opts.passive);
     if (inflight) {
       // A passive read is droppable (next trigger re-reads); a non-passive save/boot
       // reload must NOT be — latch it to re-run when the in-flight load settles.
       if (!passive) pendingReload = true;
-      return;
+      return false;
     }
     // If the render core didn't load (reorder / serve failure), say so plainly
     // rather than throwing an opaque TypeError after a successful fetch.
     if (!window.LevainDashboard || typeof window.LevainDashboard.render !== "function") {
       status("render core failed to load");
-      return;
+      return false;
     }
     // Pre-fetch fast path: don't even fetch if we already know an edit is open.
-    if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
+    if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
     inflight = true;
     if (btn) btn.disabled = true;
     try {
+      if (useManifest) {
+        const mview = await loadManifestView(passive);
+        if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
+        writeTokenRequired = mview.write_token_required === true;
+        frozen = null;   // a rebuilt board shows no preview, so none may be fired
+        window.LevainDashboard.render(mview, mview.writable
+          ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, onJobsIdle, recall } : { recall });
+        live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };
+        if (heldNext) {    // published once drawn: only then can a panel be refetched in place
+          window.LevainCockpitHeld = heldNext;
+          document.dispatchEvent(new CustomEvent("levain:cockpit-held"));   // the change stream starts, or restarts, on this
+        }
+        status("read " + new Date().toLocaleTimeString());
+        showNotice();
+        return true;
+      }
       let res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
       // OFF-BOX BOOTSTRAP (spore-220): an off-box writable surface gates the substrate READS. On the
       // first load we hold no token yet (and don't yet know one is required — that flag rides INSIDE
@@ -257,7 +620,7 @@
         // below, so a background token-403 can't steal focus from in-progress text (complement L3
         // FIND-1 / the spore-108 "passive never disrupts an edit" invariant). The next explicit
         // boot/save load (passive:false) re-prompts.
-        if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
+        if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
         if (promptForToken()) res = await fetch("/substrate.json", { cache: "no-store", headers: readHeaders() });
         if (res.status === 403) {
           // Still refused after the retry (wrong/rotated token, or the operator cancelled): drop the
@@ -266,7 +629,7 @@
           // so it falls through to the generic read-failed path below with the stored token intact.
           dropToken();
           status("read refused — off-box token missing or invalid");
-          return;
+          return false;
         }
       }
       if (!res.ok) throw new Error("HTTP " + res.status);
@@ -274,9 +637,9 @@
       // Post-fetch race re-check (codex L3 HIGH): a passive load that STARTED clean, then
       // the operator opened/typed an editor WHILE this fetch was in flight — rebuilding
       // now would still discard it. The save path (passive:false) always applies.
-      if (passive && editInProgress()) { status("editing — refresh deferred"); return; }
-      // Track whether THIS surface demands the off-box write token (spore-129) so commit()'s
-      // writeHeaders attaches it. False on a loopback/read-only surface (the default).
+      if (passive && editInProgress()) { status("editing — refresh deferred"); return false; }
+      // Track whether THIS surface demands the write token so commit()'s writeHeaders attaches it.
+      // True on any writable surface (K2a), false on a read-only one.
       writeTokenRequired = view.write_token_required === true;
       // Gate the write transport on the substrate being writable (NO THEATER): a
       // read-only source (no install root → POST /edit 422s) renders with no edit
@@ -286,8 +649,10 @@
       // read-only surface too; the write transports stay gated on `writable` (NO THEATER).
       window.LevainDashboard.render(view, view.writable === false ? { recall } : { commit, commitAction, commitJob, pollJob, onJobsIdle, recall });
       status("read " + new Date().toLocaleTimeString());
+      return true;
     } catch (e) {
       status("read failed: " + (e && e.message ? e.message : e));
+      return false;
     } finally {
       inflight = false;
       if (btn) btn.disabled = false;

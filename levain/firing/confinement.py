@@ -5,13 +5,15 @@ complete CC/Codex REPLACEMENT — a stateful networked shell that works on the o
 not a workspace jail. The file-editor slice (step 6) confined the entity's file hands IN-PROCESS;
 bash cannot be confined that way (a persistent host shell's ``cd ~`` / absolute paths escape any
 Python check), so the shell needs an OS sandbox. This module is that sandbox — SLICE 1: the
-confinement CORE (the policy + the profile + the persistent sandboxed shell), behind a provider seam.
+confinement CORE (the policy + the profile + the stateful sandboxed shell), behind a provider seam.
 
 **The polarity FLIPS (Phill-ratified 2026-07-10).** The step-6 file jail was ``(deny default) →
 allow the workspace`` — a JAIL. A CC replacement inverts it: ``(allow default) → DENY the crown
 jewels``. The OS sandbox stops being a jail and becomes a **structural FLOOR** that keeps the
 (less-trusted, open-model) entity out of the sovereignty crown jewels no matter what it is told to
-do, while it otherwise works like CC on real repos. This inversion also DISSOLVES the hardest part
+do, while it otherwise works like CC on real repos (one stated exception, Linux only: inside bash
+the entries directly in ``$HOME`` are read-only; see step (0) of :func:`_bwrap_plan_impl`). This
+inversion also DISSOLVES the hardest part
 of the old design — a default-DENY profile blocked ``cat``/``python`` from loading their own libs, so
 it needed an empirically-hunted "system allow-set"; a default-ALLOW profile needs NO allow-set at all
 (every tool loads its libs freely), so the profile is JUST the denylist.
@@ -56,7 +58,7 @@ per-command.
 **The provider seam (``canonical_object_model_plus_replaceable_surfaces``, mirroring
 ``levain.daemon.DaemonProvider``).** ONE OS-agnostic :class:`CrownJewelsPolicy` behind a
 :class:`ConfinementProvider` interface (``render_profile`` PURE → the platform's sandbox text;
-``spawn_shell`` I/O → a persistent confined shell). macOS (:class:`SeatbeltProvider`) shipped first;
+``spawn_shell`` I/O → a stateful confined shell). macOS (:class:`SeatbeltProvider`) shipped first;
 Linux (:class:`BwrapProvider`, K4c) shipped second against the same contract; a container backend
 remains a PURE ADDITION — and the macOS denylist IS their requirements spec (macOS-first was the
 de-risk pass, and it held: the contract needed ONE addition, ``available()``, and no reshaping).
@@ -104,7 +106,9 @@ is tabulated above :func:`_bwrap_argv`.
     wrapper) is a later polish, not a floor concern.
   - DAEMONIZED SURVIVOR (apparatus L3 codex): a child that ``setsid``/``nohup``/double-forks into a NEW
     session escapes the shell's process-group teardown (:meth:`SandboxedShell.close`) and outlives the
-    run — the same behavior a normal shell / CC / Codex has. It stays SANDBOX-CONFINED (crown jewels
+    run — the same behavior a normal shell / CC / Codex has (macOS; under bwrap each command's bash is
+    pid 1 of its own pid namespace, and the kernel ends everything in it when bash exits, measured by
+    ``test_linux_a_setsid_child_ends_with_its_command``). It stays SANDBOX-CONFINED (crown jewels
     remain off-limits), so it is not a confinement breach, but it is unattended code with network +
     broad non-jewel authority. ⚠ **The K3 efferent gate does NOT bound this one** — it halts actions
     BEFORE they run, and a setsid survivor is already running. Since K4a ships scheduled seats, the
@@ -221,23 +225,32 @@ is allowed to land).
 """
 from __future__ import annotations
 
+import atexit
+import codecs
+import errno
+import inspect
 import json
+import logging
 import os
 import platform
-import queue
+import re
+import select
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unicodedata
+import urllib.parse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import IO, Literal, NoReturn
+from typing import Any, Callable, Literal, NoReturn
 
 # The efferent gate's accepted settings, imported rather than restated: the config loader and the
 # gate must agree on the vocabulary by construction, not by two lists staying in sync. Both modules
@@ -271,6 +284,8 @@ __all__ = [
 
 # The macOS seatbelt driver. An ABSOLUTE path (never a PATH lookup — a confined child must resolve
 # the sandbox binary deterministically, and this is the OS-shipped location).
+_log = logging.getLogger("levain.firing.confinement")
+
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 
 # The Linux sandbox driver. ABSOLUTE for the same reason as ``SANDBOX_EXEC`` — a confined child must
@@ -285,7 +300,6 @@ SshMode = Literal["agent", "raw"]
 # Backpressure bounds so a runaway producer (``yes``, ``tail -f`` left after a timeout) can't grow the
 # PARENT process's memory without limit (apparatus L3 complement #4). Normal commands never hit these.
 _MAX_OUTPUT_CHARS = 8 * 1024 * 1024   # per-command returned output cap (then truncate + mark)
-_MAX_QUEUE_LINES = 200_000            # reader-queue depth; oldest dropped past this (runaway only)
 
 # The ssh files WRITE-denied in EVERY ssh_mode — the persistence/exec-vector floor (slice 3, Phill-
 # ratified 2026-07-12; expanded from authorized_keys-only after apparatus L1 caught the config/rc gap +
@@ -304,6 +318,16 @@ _MAX_QUEUE_LINES = 200_000            # reader-queue depth; oldest dropped past 
 # limit documented in "Gating"); these are the ssh-specific zero-legit vectors, closed because the
 # module's thesis is no claim>enforcement gap. SURGICAL (literal, not ancestor-expanded — see build_policy).
 _SSH_WRITE_DENIED = ("authorized_keys", "authorized_keys2", "config", "rc")
+
+# The gnupg configuration files WRITE-denied in every host GNUPGHOME the floor knows: the gpg
+# analogue of the ssh ``config`` vector above. The operator's gpg-agent, scdaemon and dirmngr run
+# OUTSIDE the floor, read these files, and start programs they name (``pinentry-program``,
+# ``scdaemon-program``), so bash writing one would choose a program the host runs unconfined.
+# ``gpg.conf``, ``dirmngr.conf`` and ``common.conf`` carry lower-severity options and are denied with
+# them: an entity has no reason to write any of them. UNCONDITIONAL, like ``_SSH_WRITE_DENIED``.
+_GNUPG_CONF_WRITE_DENIED = (
+    "gpg-agent.conf", "scdaemon.conf", "gpg.conf", "dirmngr.conf", "common.conf",
+)
 
 # The entity's OWN store files under ``<entity>/.levain/``, WRITE-denied to its confined hands (read
 # stays allowed). anneal writes these IN THE HOST PROCESS (capture/wrap), never through the sandboxed
@@ -356,7 +380,99 @@ def cred_floor_label(system: str | None = None) -> str:
     return base + (" · the Keychain" if (system or _platform.system()) == "Darwin" else "")
 
 
-_STANDARD_CRED_SUBTREES = ("~/.config/gh",)   # gh OAuth token (hosts.yml) → repo push/admin
+_STANDARD_CRED_SUBTREES = (
+    "~/.config/gh",                 # gh OAuth token (hosts.yml) → repo push/admin
+    # Cloud CLI credential caches (lane P2 item 4). Each holds a live token the CLI writes itself:
+    "~/.aws/sso/cache",             # IAM Identity Center tokens (botocore _SSO_TOKEN_CACHE_DIR)
+    "~/.aws/cli/cache",             # assumed-role temporary credentials (aws-cli assumerole CACHE_DIR);
+                                    # not ~/.aws/cli itself, which holds `alias`
+    "~/.aws/login/cache",           # `aws login` tokens (or $AWS_LOGIN_CACHE_DIRECTORY, below)
+    "~/.aws/boto/cache",            # botocore JSONFileCache (assume-role / SSO credentials)
+    "~/.config/gcloud",             # gcloud's credential databases and ADC (or $CLOUDSDK_CONFIG)
+    "~/.azure",                     # az's MSAL token cache and service principals (or $AZURE_CONFIG_DIR)
+)
+# Credential directories that are a tool's WHOLE home. On Linux an absent one is created (0700,
+# recorded in the placeholder ledger and removed at close if still empty) and masked like every
+# other absent jewel directory, so the shell can neither plant a config there nor read what an
+# operator's `gcloud auth login` writes there mid-session (L2 r1). One whose parent this user cannot
+# write is skipped: the shell cannot create it either. macOS denies them whether or not they exist.
+_PRESENT_ONLY_CRED_DIRS = ("~/.config/gcloud", "~/.azure")
+# The tools' own credential-location overrides (L1 r1), read from the environment when the policy
+# is built: (variable, "dir" | "file", the path(s) its value names). Each is denied IN ADDITION to
+# the default location, which can still hold what was written before the override was set.
+_CRED_OVERRIDES: tuple[tuple[str, str, str], ...] = (
+    ("AWS_LOGIN_CACHE_DIRECTORY", "dir", "{}"),
+    ("CLOUDSDK_CONFIG", "dir", "{}"),
+    ("AZURE_CONFIG_DIR", "dir", "{}"),
+    ("GH_CONFIG_DIR", "dir", "{}"),
+    ("XDG_CONFIG_HOME", "dir", "{}/gh"),
+    ("XDG_CONFIG_HOME", "file", "{}/git/credentials"),
+    ("AWS_SHARED_CREDENTIALS_FILE", "file", "{}"),
+    ("NETRC", "file", "{}"),
+    ("NPM_CONFIG_USERCONFIG", "file", "{}"),
+    ("DOCKER_CONFIG", "file", "{}/config.json"),
+    ("KUBECONFIG", "file", "{list}"),       # a colon-separated list: every entry
+)
+_CRED_DIR_ENV = tuple(v for v, kind, _ in _CRED_OVERRIDES if kind == "dir")
+
+
+def _git_store_files(config: Path) -> list[Path]:
+    """The files a ``credential.helper = store --file <path>`` in git config ``config`` names."""
+    try:
+        text = config.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"\s*helper\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        value = m.group(1).strip()
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            value = value[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            continue
+        if not words or words[0] != "store":
+            continue
+        for k, w in enumerate(words):
+            if w.startswith("--file="):
+                out.append(Path(os.path.expanduser(w[len("--file="):])))
+            elif w == "--file" and k + 1 < len(words):
+                out.append(Path(os.path.expanduser(words[k + 1])))
+    return out
+
+
+def _cred_overrides(environ=None) -> tuple[list[Path], list[Path]]:
+    """``(dirs, files)`` the credential-location overrides in ``environ`` name: absolute paths only (a
+    relative value would be resolved against whatever directory levain was started in). Includes the
+    store files a ``GIT_CONFIG_GLOBAL`` config names."""
+    env = os.environ if environ is None else environ
+    dirs: list[Path] = []
+    files: list[Path] = []
+    for var, kind, form in _CRED_OVERRIDES:
+        value = env.get(var, "")
+        values = value.split(os.pathsep) if form == "{list}" else [value]
+        for v in values:
+            v = os.path.expanduser(v)
+            if not v or not os.path.isabs(v):
+                continue
+            path = Path(v if form == "{list}" else form.format(v))
+            (dirs if kind == "dir" else files).append(path)
+    git_global = os.path.expanduser(env.get("GIT_CONFIG_GLOBAL", ""))
+    if git_global and os.path.isabs(git_global):
+        files += [f for f in _git_store_files(Path(git_global)) if f.is_absolute()]
+    return list(_dedup_paths(dirs)), list(_dedup_paths(files))
+
+
+def _cred_dir_sources() -> list[Path]:
+    """The credential directories that are a tool's whole home, lexical: the defaults and every
+    override (:data:`_CRED_DIR_ENV`)."""
+    home = Path.home()
+    return list(_dedup_paths([home / d[2:] for d in _PRESENT_ONLY_CRED_DIRS] + _cred_overrides()[0]))
+
+
 _STANDARD_CRED_FILES = (
     "~/.aws/credentials",           # aws access key/secret. NOT ~/.aws/config — it holds region /
                                     # profile / SSO the entity legitimately needs; an operator whose
@@ -369,6 +485,68 @@ _STANDARD_CRED_FILES = (
     "~/.docker/config.json",        # registry `auths` when no credsStore helper holds them
     "~/.kube/config",               # cluster credentials (client certs, bearer tokens, exec plugins)
 )
+
+# The tool directories that hold a standard cred file. On Linux each is mounted READ-ONLY with its
+# existing subdirectories bound back read-write (step (2a) of the bwrap plan, the construct the
+# entity's own .levain store uses), so an absent cred file in one needs no mountpoint on the host
+# and a link in one cannot be swapped from inside. A file planted at an absent cred path is a real
+# vector: kubeconfig ``users[].exec`` and docker ``credHelpers`` run a command when the operator
+# next uses the tool. Cost: inside a confined session the entity cannot create or rewrite a top-
+# level file in these directories (``aws configure set``, ``kubectl config use-context``,
+# ``git config --global`` for an XDG git user). macOS denies a path string whether it exists or
+# not, so it needs none of this. $HOME itself is such a view on Linux (step (0) of the bwrap plan),
+# so an absent $HOME-level cred file needs no placeholder either.
+_CRED_TOOL_DIRS = ("~/.kube", "~/.docker", "~/.aws", "~/.config/git")
+
+
+def floor_roots(specs) -> list[Path]:
+    """THE way a list of jewel roots enters the floor, as data: each ``~/rel`` or absolute path at
+    its three spellings (:func:`_spellings`). The standard cred stores, the cloud directories, the
+    credential overrides and the ledger go through it; a new list (browser profiles) is one more
+    tuple passed here, and the plan's absent-path handling (a tool directory read-only, an absent
+    directory created and ledgered, a $HOME-level file absent from the $HOME view, a link refused
+    where it could be swapped) applies to it unchanged."""
+    return [p for spec in specs for p in _spellings(spec)]
+
+
+def _secret_files() -> list[Path]:
+    try:
+        from levain.launch import secret_files
+    except ImportError as exc:   # fail closed: a key file the floor cannot learn of is not left open
+        raise ConfinementError(f"could not learn which secret files to deny ({exc})") from exc
+    return secret_files()
+
+
+def _spellings(spec: str | Path) -> list[Path]:
+    """A jewel path at the three spellings the ssh vectors have used since 2026-08-21: the raw
+    ``Path.home()`` form (the true lexical path), resolved HOME plus the unresolved rest, and the
+    fully resolved target. ``spec`` is ``~/rel`` or an absolute path (then the middle spelling is the
+    resolved parent plus the unresolved final component). Duplicates collapse, so in the ordinary
+    no-symlink case this is one path.
+
+    Why all three: Seatbelt canonicalises a path for data operations, but ``unlink``/``rename``/``ln``
+    act on the LINK and are matched lexically, so under a resolved-only deny ``rm -f <link>`` succeeds
+    and the recreated file is an object nothing names (the ssh finding, see ``build_policy`` (3)). On
+    Linux the lexical spelling is what lets the bwrap plan see that a jewel is a link at all.
+    Use it for every list of home-relative jewels (ssh, the standard cred stores, browser profiles),
+    so the next list cannot repeat the resolved-only miss."""
+    s = str(spec)
+    if s == "~" or s.startswith("~/"):
+        raw = Path.home() / s[2:]
+        candidates = [lambda: Path.home().resolve() / s[2:], raw.resolve]
+    else:
+        raw = Path(s)
+        candidates = [lambda: raw.parent.resolve() / raw.name, raw.resolve]
+    out = [raw]
+    for spell in candidates:
+        # A symlink loop must not crash the policy build (L1 r1). The raw spelling stays denied (on
+        # macOS a literal deny of a path no lookup can finish), and the Linux plan, which resolves
+        # every root again, refuses bash with the reason.
+        try:
+            out.append(spell())
+        except (OSError, RuntimeError):
+            pass
+    return list(_dedup_paths(out))
 
 # CONTAINER / VM DAEMON SOCKETS — folded into the UNIVERSAL floor, default ON (spore-725).
 #
@@ -464,6 +642,37 @@ def _runtime_dirs() -> list[str]:
     return out
 
 
+def _runtime_socket_refusal(rel: str) -> str | None:
+    """Why ``rel`` (a path relative to a user runtime dir) may not come back into bash's view of that
+    dir, or None. The service manager (``systemd/``) and the session bus (``bus``) run what they are
+    asked outside the sandbox, the whole-floor bypass measured 2026-09-30, and dirmngr fetches over
+    the network for whoever connects (the 2026-10-10 rename attack)."""
+    if "\0" in rel:
+        return "holds a NUL byte"
+    parts = Path(rel).parts
+    if not parts or Path(rel).is_absolute() or ".." in parts:
+        return "is not a path inside the runtime dir"
+    if parts[0] == "systemd":
+        return "is the user's service manager, which runs any command outside the sandbox"
+    if parts[0] == "bus":
+        return "is the session bus, which reaches the service manager"
+    if "S.dirmngr" in parts:
+        return "is gnupg's dirmngr, which fetches from the network for whoever connects"
+    return None
+
+
+def check_runtime_sockets(entries, *, where: str) -> tuple[str, ...]:
+    """The ``runtime_sockets`` allowlist as given, or :class:`ConfinementError` naming the first entry
+    the runtime-dir view never binds back (:func:`_runtime_socket_refusal`)."""
+    out: list[str] = []
+    for rel in entries:
+        why = _runtime_socket_refusal(rel) if isinstance(rel, str) else "is not a string"
+        if why is not None:
+            raise ConfinementError(f"{where}: {rel!r} {why}. Remove it — fail-closed.")
+        out.append(rel)
+    return tuple(dict.fromkeys(out))
+
+
 def _expand_socket_source(spec: str) -> list[Path]:
     """One roster entry as the paths it names; empty when it names a runtime dir this host does not
     have — a path still containing ``$`` would deny a file nobody can create, and read as cover."""
@@ -498,12 +707,13 @@ class CrownJewelsPolicy:
     stores + ssh keys) is shared across OSes and is the load-bearing security surface.
 
     Paths are stored ABSOLUTE, and MOSTLY resolved (symlink-followed) so the rendered denies match
-    what the kernel sees. ⚠ ``deny_write_files`` IS THE DELIBERATE EXCEPTION AND THIS SENTENCE USED
-    TO DENY IT (it read "Every path is stored RESOLVED", which my own 2026-08-21 change falsified and
-    codex L3 caught): each ssh vector is stored at up to THREE spellings — raw ``Path.home()``,
-    resolved-HOME, and fully resolved — because resolving alone LOSES the lexical path that sshd
-    honours through ``realpath()``. ``deny_write_dirs`` carries the same exception for the ~/.ssh
-    anchor. See ``build_policy`` (3). ``workspace`` is the shell's starting cwd + a definitely-writable root; it is NOT a
+    what the kernel sees. ⚠ THE EXCEPTIONS ARE DELIBERATE (it once read "Every path is stored
+    RESOLVED", which the 2026-08-21 change falsified and codex L3 caught): each ssh vector in
+    ``deny_write_files``, and each standard cred store in ``deny_files`` / ``deny_read_write``, is
+    stored at up to THREE spellings (:func:`_spellings`) — raw ``Path.home()``, resolved-HOME, and
+    fully resolved — because resolving alone LOSES the lexical path, which link operations match
+    and which sshd honours through ``realpath()``. ``deny_write_dirs`` carries the lexical ancestors
+    too. See ``build_policy`` (3). ``workspace`` is the shell's starting cwd + a definitely-writable root; it is NOT a
     jail (the entity may read/write broadly under default-allow) — it is just where a fresh entity's
     work lands by convention."""
 
@@ -671,6 +881,34 @@ class CrownJewelsPolicy:
     # `deny_write_files`. ⚠ NEW FIELDS GO AT THE END: one inserted earlier shifts every later field
     # for a positional caller (codex, L3 2026-10-02, reproduced; repeated by spore-1308's first cut,
     # L1 2026-10-03). tests/test_floor_project_memory.py freezes the order.
+    ro_tool_dirs: tuple[Path, ...] = ()  # the standard cred files' tool directories
+    # (:data:`_CRED_TOOL_DIRS`, raw ``Path.home()`` spelling), set with ``deny_standard_creds``. Linux
+    # only: the bwrap plan mounts each read-only and binds its existing subdirectories back read-write,
+    # creating an absent one at 0700 first. Seatbelt needs no counterpart (it denies absent paths).
+    cred_dir_sources: tuple[Path, ...] = ()  # the credential directories that are a tool's whole home
+    # (:func:`_cred_dir_sources`: ~/.config/gcloud, ~/.azure, and every directory override), lexical.
+    # Their spellings are in ``deny_read_write``; this tells the Linux plan which absent roots may be
+    # skipped when this user cannot create them. Empty unless ``deny_standard_creds``.
+    trusted_roots: tuple[tuple[Path, Path], ...] = ()  # (as spelled, real path) for the workspace,
+    # the entity dir and $HOME, resolved ONCE here. A symlink above one of them is the operator's,
+    # not the entity's: the file editor's walk (levain.firing.openhands.tools) maps a path under one
+    # to its real spelling and then follows no symlink below it (head ruling 2026-10-07).
+    runtime_sockets: tuple[str, ...] = ()  # the operator's allowlist of sockets bound back into the
+    # Linux runtime-dir view (step (7) of :func:`_bwrap_plan_impl`), each relative to the runtime dir,
+    # checked by :func:`check_runtime_sockets`. Empty: only the gpg agent, keyboxd and the ssh agent come back.
+
+
+def _trusted_roots(entity_dir, workspace) -> tuple[tuple[Path, Path], ...]:
+    """``(as spelled, real)`` for the workspace, the entity dir and $HOME, longest first."""
+    ed = Path(os.path.abspath(os.path.expanduser(str(entity_dir))))
+    ws = (Path(os.path.abspath(os.path.expanduser(str(workspace)))) if workspace is not None
+          else ed / "workspace")
+    out: dict[Path, Path] = {}
+    for lex in (ws, ed, Path(os.path.abspath(os.path.expanduser("~")))):
+        real = lex.resolve()
+        out[lex] = real
+        out[real] = real
+    return tuple(sorted(out.items(), key=lambda kv: len(str(kv[0])), reverse=True))
 
 
 def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
@@ -695,6 +933,10 @@ def _write_deny_ancestors(jewels: list[Path]) -> tuple[Path, ...]:
 
 
 PROJECT_MEMORY_HOME = ".anneal-projects"
+# The autonomic engine's store DIRECTORY (``levain.autonomic.db.default_store_dir``): its binding registry,
+# run journal, SQLite sidecars and effect leases, denied read and write as ONE subtree under the levain
+# home (``$LEVAIN_HOME``, else ``~/.levain``). The database's sidecars live inside it, so bash is not refused.
+AUTONOMIC_STORE_DIR = "autonomic"
 DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
 
 
@@ -970,6 +1212,7 @@ def build_policy(
     # operator who genuinely runs containers from the entity and accepts that.
     allow_container_sockets: bool = False,
     deny_localhost_outbound: bool = False,
+    runtime_sockets: tuple[str, ...] = (),
 ) -> CrownJewelsPolicy:
     """Assemble the crown-jewels floor for the entity at ``entity_dir``.
 
@@ -979,6 +1222,9 @@ def build_policy(
         read the operator's own memory;
       - sibling entities' ``<other>/.levain/`` stores (subtrees) — one entity can't read another's
         memory;
+      - the autonomic engine's store directory ``<levain home>/autonomic`` (``$LEVAIN_HOME``, else
+        ``~/.levain``; subtree, read and write) — the binding registry and run journal that decide
+        what fires, so an entity can neither read nor rewrite its own authority (:data:`AUTONOMIC_STORE_DIR`);
       - ⛔ ALL of ``~/.ssh`` (read+write-denied when ``ssh_mode="agent"``, except ``known_hosts``
         r+w and ``config`` r) — LOCATION-BASED, NOT NAME-BASED. See this module's docstring, which
         is the one home for this fact and carries its provenance (apparatus L2). This bullet used
@@ -993,11 +1239,14 @@ def build_policy(
       - ``~/.ssh/authorized_keys`` (+ ``authorized_keys2``) WRITE — denied in BOTH ssh_modes: planting
         a key is a persistent SSH backdoor with zero legit entity use (in agent-mode the whole ~/.ssh
         subtree already covers it; in raw-mode this is the sole guard). Surgical (literal, not ancestor-
-        expanded), so raw-mode keeps ~/.ssh otherwise writable.
+        expanded), so raw-mode keeps ~/.ssh otherwise writable;
+      - levain's ledger of the Linux floor's session placeholders, ``~/.levain-runtime/floor/``
+        (subtree): it decides what levain deletes from the operator's home.
 
     **``deny_standard_creds=True``:** fold the standard tool-canonical cred stores
-    (:data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES`) into the floor. These are knowable
-    locations (not the false-security guessing the module refuses). This parameter's own default is
+    (:data:`_STANDARD_CRED_SUBTREES` + :data:`_STANDARD_CRED_FILES`) into the floor, each at its three
+    spellings, and name their tool directories (:data:`_CRED_TOOL_DIRS`) for the Linux plan. These
+    are knowable locations (not the false-security guessing the module refuses). This parameter's own default is
     False; the product default comes from :func:`levain.firing.drive.resolve_cred_floor`, which passes
     True in every drive except the interactive REPL unless the entity declares ``false``. Wired from ``confinement.json`` via :meth:`levain.firing.binding.ConversationBinding.create`.
 
@@ -1014,7 +1263,20 @@ def build_policy(
     Every crown jewel's ancestor dirs are additionally write-denied (:func:`_write_deny_ancestors`) to
     close the rename-relocation bypass (apparatus L2). NOTE the entity's OWN ``<entity>/.levain/``
     store is NOT denied — the entity's memory is its own to read/write. Only the operator's memory
-    store and SIBLING stores are the structural crown jewels."""
+    store and SIBLING stores are the structural crown jewels.
+
+    **What the floor confines (its definition, head ruling 2026-10-07).** The floor confines the
+    ENTITY'S SHELL and the entity's file editor. The operator's own unconfined processes (their
+    terminal, their tools, a session they started with the cred floor off) are trusted: running as
+    the operator's user, outside any sandbox, they already hold every crown jewel directly, so
+    nothing the floor does is meant to stand between them and it. This is why the Linux plan binds
+    host paths BY NAME: :func:`_bwrap_plan` classifies each entry it carries into a view ($HOME, a
+    tool directory, the entity's store) and emits a bind of that name, which bwrap resolves when it
+    starts. Between the two only an unconfined process of the same user can swap the source, since
+    inside any confined shell those names sit in read-only views and cannot be renamed, and that
+    process gains nothing by the swap that it does not already have. Under a separate hands user,
+    bwrap runs as that user, so a source reached through a swapped link is still access-checked as
+    the hands user."""
     # ⛔ TYPE-CHECK THE OPT-OUT AT THIS BOUNDARY — IT FAILS **OPEN**, WHICH IS THE ONE
     # DIRECTION A SECURITY FLAG MUST NOT FAIL (codex L3, 2026-09-04; MEASURED HERE).
     # Passing the STRING "false" for this flag — exactly what an env-var-backed or
@@ -1053,6 +1315,7 @@ def build_policy(
     home = Path.home()
 
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
+    subtrees.append((Path(os.environ.get("LEVAIN_HOME") or home / ".levain").expanduser() / AUTONOMIC_STORE_DIR).resolve())
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
     listed_dirs = _trust_listed_stores(home, ed, ws)
@@ -1066,9 +1329,24 @@ def build_policy(
     # (resolved by levain.firing.drive.resolve_cred_floor: True except at the interactive REPL, unless
     # the entity declares ``deny_standard_creds: false`` in confinement.json). They flow through the SAME subtree/file machinery (read+write deny + ancestor
     # write-deny), so no separate rendering path is needed.
+    # Each at all three spellings (:func:`_spellings`): resolved-only left a stow-style
+    # ``~/.kube/config -> ~/dotfiles/kube/config`` link out of the floor, so ``rm`` + recreate of the
+    # link planted a kubeconfig the operator's next kubectl would run (codex L3, 2026-10-07).
+    tool_dirs: list[Path] = []
+    cred_dir_sources: list[Path] = []
     if deny_standard_creds:
-        subtrees.extend(Path(s).expanduser().resolve() for s in _STANDARD_CRED_SUBTREES)
-        files.extend(Path(f).expanduser().resolve() for f in _STANDARD_CRED_FILES)
+        cred_dir_sources = _cred_dir_sources()
+        subtrees.extend(floor_roots([*_STANDARD_CRED_SUBTREES, *cred_dir_sources]))
+        files.extend(floor_roots([*_STANDARD_CRED_FILES, *_cred_overrides()[1]]))
+        tool_dirs = [home / d[2:] for d in _CRED_TOOL_DIRS]
+    # The model API key file levain was given (`--api-key-file`): denied both ways, so the key the
+    # flag keeps off the command line is not left readable to the entity instead (L2 r1).
+    files.extend(floor_roots(_secret_files()))
+    # The ledger of the session-scoped Linux placeholders (:func:`_ledger_enter`) decides what levain
+    # deletes from the operator's home, so the entity may neither read nor write it.
+    # At all three spellings, like every other jewel (L1 r1): a link at ~/.levain-runtime must not
+    # leave the ledger reachable by a name the floor does not hold.
+    subtrees.extend(_spellings("~/.levain-runtime/floor"))
 
     ssh_dir = (home / ".ssh").resolve() if ssh_mode == "agent" else None
 
@@ -1149,14 +1427,24 @@ def build_policy(
     #           target. Denying more endpoints does not fix resolve-first.
     #       (e) HARDLINKS — a pre-existing outside hardlink to a vector: refused at spawn and by the
     #           file editor (see the honest limits above).
-    ssh_home = home / ".ssh"
-    ssh_home_lexical = home.resolve() / ".ssh"      # resolved HOME + un-deref'd .ssh, as ``ssh_anchor``
     deny_write_files_l: list[Path] = []
     for n in _SSH_WRITE_DENIED:
-        # THREE SPELLINGS, and the first one is easy to miss (apparatus L3 codex, 2026-08-21).
-        deny_write_files_l.append(ssh_home / n)               # RAW ``Path.home()`` — the true lexical
-        deny_write_files_l.append(ssh_home_lexical / n)       # resolved HOME + un-deref'd .ssh
-        deny_write_files_l.append((ssh_home / n).resolve())   # the real content target, thru symlinks
+        # THREE SPELLINGS, and the first one is easy to miss (apparatus L3 codex, 2026-08-21): RAW
+        # ``Path.home()`` (the true lexical path), resolved HOME + un-deref'd .ssh, and the real
+        # content target through symlinks. One helper now builds them for every jewel list.
+        deny_write_files_l.extend(_spellings(f"~/.ssh/{n}"))
+    # The gnupg configuration files (_GNUPG_CONF_WRITE_DENIED) in every home _gnupg_homes() names, at
+    # the same spellings and for the same reason as the ssh vectors above. UNCONDITIONAL. A file that
+    # EXISTS renders ``--ro-bind conf conf`` (read OK, write EROFS); an ABSENT one is masked. Neither
+    # breaks legitimate gpg: the host agent reads its conf host-side, and ``gpg --sign`` does not read
+    # these files (measured on Linux 2026-10-12: a confined ``gpg --clearsign`` succeeded with
+    # ``gpg-agent.conf`` unreadable). The home is passed UNRESOLVED so _spellings pins its lexical
+    # ancestors (an intermediate symlink in the path must not be swappable), and the home dir itself is
+    # ancestor-write-denied (``--bind P P``: rename EBUSY, file creation inside still OK, so trustdb and
+    # keyring writes are unaffected).
+    for home in _gnupg_homes():
+        for conf in _GNUPG_CONF_WRITE_DENIED:
+            deny_write_files_l.extend(_spellings(home / conf))
     # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
     # A trust spelling whose own location (final component unresolved) is already denied both ways
@@ -1241,8 +1529,9 @@ def build_policy(
     # on macOS and nothing on Linux. The paths are the RESOLVED ones, which is what SQLite names its
     # sidecars after.
     sidecars: list[Path] = []
+    known_dirs = {*listed_dirs, *_spellings("~/.levain-runtime/floor")}
     for jewel in _dedup(subtrees + files):
-        if jewel in listed_dirs and not jewel.is_file():
+        if jewel in known_dirs and not jewel.is_file():
             continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
         # Not a directory, rather than is a file: a jewel absent when the policy is built can be
         # created as a SQLite store before the shell starts (codex, L3 2026-10-02).
@@ -1325,8 +1614,8 @@ def build_policy(
     # by this anchor and by nothing else."
     # ▶ MEASURED, NOT ARGUED (2026-09-03): ``_write_deny_ancestors`` walks ``jewel.parents`` and does
     # NOT resolve, so the DIRECTORY is produced by the FILES' own ancestors. Both lexical spellings
-    # are in ``all_jewels`` by construction thirty lines up — ``ssh_home / n`` (raw ``Path.home()``)
-    # and ``ssh_home_lexical / n`` (``home.resolve()`` + un-deref'd ``.ssh``) — so their parents are
+    # are in ``all_jewels`` by construction thirty lines up — ``Path.home() / ".ssh" / n`` and
+    # ``home.resolve() / ".ssh" / n``, the first two :func:`_spellings` — so their parents are
     # exactly ``home / ".ssh"`` AND ``home.resolve() / ".ssh"``. The second of those IS
     # ``ssh_anchor``. It is therefore already denied whether or not HOME is itself a symlink, which
     # is the one case the rebuttal's "and by nothing else" needed in order to be true.
@@ -1365,6 +1654,10 @@ def build_policy(
         deny_localhost_outbound=deny_localhost_outbound,
         deny_keychain=deny_standard_creds,
         sqlite_sidecars=sqlite_sidecars_t,
+        ro_tool_dirs=tuple(tool_dirs),
+        cred_dir_sources=tuple(cred_dir_sources),
+        trusted_roots=_trusted_roots(entity_dir, workspace),
+        runtime_sockets=check_runtime_sockets(runtime_sockets, where="runtime_sockets"),
     )
 
 
@@ -1474,7 +1767,7 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     # (spore-1308 follow-on, codex L3 2026-10-03): a store anneal starts trusting after the binding
     # was built is covered from the next spawn on. Raises ConfinementError on an unsafe store.
     listed = _trust_listed_stores(Path.home(), policy.entity_dir, policy.workspace)
-    new_dirs = [d for d in listed if d not in policy.deny_read_write]
+    new_dirs = list(_dedup_paths([d for d in listed if d not in policy.deny_read_write]))
     if new_dirs:
         policy = replace(
             policy,
@@ -1557,6 +1850,106 @@ def _ci_within(path: Path, root: Path) -> bool:
     return p == r or p.startswith(r.rstrip(os.sep) + os.sep)
 
 
+# Paths that are views of a PROCESS rather than files (lane P2 item 2c). The file editor runs inside
+# levain's own process, so on Linux ``/proc/self/mem`` is levain's memory (a process may always read
+# itself), with the carried environment and the model API key in it, and ``/proc/<pid>/environ`` is
+# any same-user process's exec-time environment. ``/dev/fd/N`` and ``/dev/std*`` are levain's own open
+# files on both OSes (an open SQLite store, say). The editor has no reason to touch any of them.
+_PROCESS_VIEW_ROOTS = (Path("/proc"), Path("/dev/fd"))
+_PROCESS_VIEW_FILES = (Path("/dev/stdin"), Path("/dev/stdout"), Path("/dev/stderr"))
+
+
+def _process_view_reason(given: Path | str, resolved: Path) -> str | None:
+    """Why ``given`` (as the caller spelled it, and as it resolves) is a process view, or None. The
+    given spelling matters on Linux: ``/proc/self/fd/N`` resolves to wherever fd N points, which is
+    the file it exposes and may be an ordinary path."""
+    try:
+        spelled = Path(os.path.abspath(os.path.expanduser(str(given))))
+    except (ValueError, OSError, RuntimeError):
+        spelled = resolved
+    roots = list(_PROCESS_VIEW_ROOTS)
+    if platform.system() == "Linux":
+        # Any other procfs on the host is the same view (a chroot's or a container's /proc): the
+        # editor runs in levain's own mount namespace, where step (8) of the bash plan does not reach.
+        try:
+            roots += _extra_procfs_mounts()
+        except OSError as exc:
+            return f"{given}: the mount table could not be read to rule out a process view ({exc}) — refused"
+    for q in (spelled, resolved):
+        if any(_ci_within(q, r) for r in roots) or any(_canon(str(q)) == _canon(str(f))
+                                                       for f in _PROCESS_VIEW_FILES):
+            return (f"{given} is a view of a running process (/proc, /dev/fd, /dev/std*), which "
+                    "would expose levain's own memory, open files and environment — refused")
+    return None
+
+
+def _procfs_devices() -> set[int]:
+    devs: set[int] = set()
+    for mp in [Path("/proc"), *_extra_procfs_mounts()]:
+        try:
+            devs.add(os.stat(mp).st_dev)
+        except OSError:
+            pass
+    return devs
+
+
+def opened_file_path(fd: int) -> str:
+    """The path of the file ``fd`` has open, as the kernel names it: ``/proc/self/fd/<fd>`` on Linux
+    (a process may always read its own), ``F_GETPATH`` on macOS. Raises OSError when there is none
+    (a pipe, a socket) or it cannot be read."""
+    if platform.system() == "Linux":
+        path = os.readlink(f"/proc/self/fd/{fd}")
+        if not path.startswith("/"):   # "pipe:[123]", "socket:[456]", "anon_inode:...": no file
+            raise OSError(f"fd {fd} is not a file ({path})")
+        return path
+    import fcntl
+
+    getpath = getattr(fcntl, "F_GETPATH", None)
+    if getpath is None:
+        raise OSError("this platform cannot name an open file")
+    raw = fcntl.fcntl(fd, getpath, bytes(1024))
+    return os.fsdecode(raw.split(b"\0", 1)[0])
+
+
+def opened_file_reason(policy: CrownJewelsPolicy, fd: int) -> str | None:
+    """Why the file ALREADY OPEN on ``fd`` must not be read or written through the file editor, or
+    None. The editor's path check runs before the editor opens the path, so a link the shell flips in
+    between (to ``/proc/<pid>/environ``, or to any jewel) passed it (L2 r1). This judges the object
+    actually opened, by its device (any procfs) and by the name the kernel gives it, before a byte
+    is read. Fail-closed: a file whose name cannot be learnt is refused."""
+    try:
+        st = os.fstat(fd)
+        if platform.system() == "Linux" and st.st_dev in _procfs_devices():
+            return "the opened file is in a /proc filesystem, a view of a running process"
+        if stat.S_ISDIR(st.st_mode):
+            return None
+        path = opened_file_path(fd)
+    except OSError as exc:
+        return f"the opened file could not be identified ({exc}) — refused (fail-closed)"
+    reason = crown_jewel_reason(policy, path)
+    if reason is not None:
+        return reason
+    # The opened object's own identity, never a second stat of its name: the shell can unlink or
+    # replace that name between the open and this check (codex, L3 r2), and then the name leads to
+    # another file. The jewel walk runs when the object has other names or its name no longer leads
+    # to it; a single-name file still at its name is judged by the name, as above.
+    try:
+        named = os.stat(path)
+        moved = (named.st_dev, named.st_ino) != (st.st_dev, st.st_ino)
+    except (OSError, ValueError):
+        moved = True
+    if st.st_nlink < 2 and not moved:
+        return None
+    try:
+        jewels = _jewel_inodes(policy)
+    except ConfinementError as exc:
+        return f"the opened file could not be checked against the crown jewels: {exc}"
+    hit = jewels.get((st.st_dev, st.st_ino))
+    if hit is not None:
+        return f"the opened file is another name for the crown jewel {hit[1]}, which the floor denies"
+    return None
+
+
 def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | None:
     """Return a human reason if ``path`` is a crown jewel the floor denies, else ``None``.
 
@@ -1580,10 +1973,11 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     SHELL's ssh can record host keys): the file editor has no legitimate need to touch ssh files (that
     is bash's job via ``ssh``), so denying all of ``~/.ssh`` here is fail-closed and avoids a read/write-
     polarity subtlety. Ancestor write-dirs are NOT checked — they exist to block ``mv``-relocation of a
-    jewel, and the file editor has no rename primitive (its commands are ``view``/``create``/
-    ``str_replace``/``insert``/``undo_edit``). Also denies the entity's OWN memory STORE files
-    (``own_memory_files`` — continuity/crystal/db + sidecars): the file editor has no rename primitive
-    and no legit reason to touch the store (the wrap composes it in-process), so it is denied OUTRIGHT
+    jewel, and the file editor never renames an existing file or directory: its only rename is
+    ``insert`` moving its own temp file onto the target, which walks the target's parents by directory
+    fd and refuses a symlink among them (``levain.firing.openhands.tools._floored_move``). Also denies
+    the entity's OWN memory STORE files (``own_memory_files`` — continuity/crystal/db + sidecars): the
+    file editor has no legit reason to touch the store (the wrap composes it in-process), so it is denied OUTRIGHT
     here (read included), while the seatbelt hand still allows bash to READ it — spore-359, so a hand-
     write can't poison the always-loaded memory the wrap alone composes. The rest of ``<entity>/.levain/``
     is NOT a jewel (the entity's memory is its own to read); the firing's ``assert_entity_isolated``
@@ -1605,6 +1999,8 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
     # whose row was in verdicts.jsonl the whole time. Every claim re-verified here by execution.)
     except (ValueError, OSError, RuntimeError) as exc:
         return f"path {path!r} could not be resolved ({exc}) — refused (fail-closed)"
+    if (why := _process_view_reason(path, p)) is not None:
+        return why
     for sub in policy.deny_read_write:
         if _ci_within(p, sub):
             return f"{p} is under the crown-jewel store {sub}"
@@ -1687,9 +2083,17 @@ def crown_jewel_reason(policy: CrownJewelsPolicy, path: Path | str) -> str | Non
             if wf in policy.trust_spellings:
                 return (f"{p} is the derive-trust file — writing it would rebind which repo roots "
                         f"the operator's project memory re-derives against (spore-1308)")
+            # A filename test HERE is cosmetic — the deny already happened by location; this only
+            # picks the human-readable REASON, so it does not reintroduce name-based SECURITY
+            # reasoning (which the module refuses for enforcement, above). It stops a gpg conf being
+            # reported as an "ssh" vector.
+            if wf.name in _GNUPG_CONF_WRITE_DENIED:
+                return (f"{p} is a write-protected gnupg configuration file — the host gpg-agent "
+                        f"starts programs it names")
             return f"{p} is a write-protected ssh persistence/exec vector (authorized_keys/config/rc)"
     for mf in policy.own_memory_files:
-        # The file editor has no rename primitive and no legit reason to touch the entity's own store
+        # The file editor renames nothing but its own temp file, and has no legit reason to touch the
+        # entity's own store
         # (its memory is composed by the host-process wrap, never edited by hand) → denied OUTRIGHT
         # here (read included), same fail-closed stance as the ssh write-files. The SEATBELT hand still
         # allows the READ (bash may `cat` it); denying both hands the WRITE is what closes the poison-
@@ -1760,12 +2164,24 @@ class ConfinementConfig:
     # is the EXACT ``own_memory_files`` class from the sibling dataclass; a new field on a public
     # dataclass goes at the END unless the whole class is made keyword-only in a deliberate break.
     # ``test_confinement_config_field_order_is_append_only`` pins it.
+    hands_user: str | None = None
+    hands_uid: int | None = None
+    hands_workspace: Path | None = None
+    hands_egress_ports: tuple[int, ...] = ()
+    # M2: the dedicated unprivileged user `sudo levain setup-isolation` created for this entity's
+    # bash, its numeric id, and the workspace it created for it outside the operator's home; removed
+    # by its `--undo`. All three or none: absent means not set up. Appended last, per the rule above.
+    runtime_sockets: tuple[str, ...] = ()
+    # The sockets under the user runtime dir that bash on Linux may still reach (``podman/podman.sock``),
+    # Flatpak ``--socket=`` style: every other entry of that dir is absent inside bash (step (7) of
+    # :func:`_bwrap_plan_impl`). Naming a daemon's socket here hands bash that daemon, knowingly.
+    # :func:`check_runtime_sockets` refuses the service manager, the session bus and dirmngr.
 
 
 _CONFINEMENT_CONFIG_NAME = "confinement.json"
 
 
-def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
+def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True) -> ConfinementConfig:
     """Load ``<entity>/.levain/confinement.json`` if present, else the default (universal floor only).
 
     Schema (all fields optional)::
@@ -1776,7 +2192,8 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
          "deny_standard_creds": false,
          "allow_container_sockets": false,
          "allow_localhost_outbound": false,
-         "efferent_gate": "auto"}
+         "efferent_gate": "auto",
+         "runtime_sockets": ["podman/podman.sock"]}
 
     ``~`` is expanded in every path. Unknown keys are IGNORED (forward-compat). A MISSING file returns
     the default (empty declarations, ``ssh_mode="agent"``, ``efferent_gate="auto"``) — the universal
@@ -1873,6 +2290,70 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
             f"deny ON in both ssh_modes (the default)."
         )
 
+    # M2. Absent means not set up. Each value must be one setup-isolation could have written, and
+    # the three come together: anything else (a typo, another account, a hand-edited path) is
+    # refused, not tried.
+    hands_user = data.get("hands_user")
+    hands_uid = data.get("hands_uid")
+    hands_workspace_raw = data.get("hands_workspace")
+    hands_workspace: Path | None = None
+    present = [k for k in ("hands_user", "hands_uid", "hands_workspace") if k in data]
+    if present:
+        from levain.firing.hands import HANDS_USER_RE, WORKSPACE_ROOT, hands_user_name
+
+        redo = (" Run `sudo levain setup-isolation --undo` and set it up again — fail-closed.")
+        if len(present) != 3:
+            raise ConfinementError(
+                f"{base}: hands_user, hands_uid and hands_workspace come together; found only "
+                f"{', '.join(present)}.{redo}"
+            )
+        if not isinstance(hands_user, str) or not HANDS_USER_RE.match(hands_user):
+            raise ConfinementError(
+                f"{base}: hands_user must be the name `levain setup-isolation` recorded, got "
+                f"{hands_user!r}.{redo}"
+            )
+        # bound_hands=False only for setup-isolation itself, so a moved entity can still be undone.
+        if bound_hands and hands_user != hands_user_name(entity_dir):
+            # The name is derived from this entity's path. A record copied from another entity would
+            # share its hands user while locking a different hands.lock (levain.firing.ws_git).
+            raise ConfinementError(
+                f"{base}: hands_user {hands_user} was set up for another entity directory (this one's "
+                f"would be {hands_user_name(entity_dir)}).{redo}")
+        if isinstance(hands_uid, bool) or not isinstance(hands_uid, int) or hands_uid <= 0:
+            raise ConfinementError(f"{base}: hands_uid must be a positive integer, got {hands_uid!r}.{redo}")
+        # Exactly the path setup creates for THIS user: undo (as root) re-groups and re-modes that
+        # tree, so a looser check would let a hand-edited path aim it at another directory.
+        expected = {str(r / hands_user / "workspace") for r in WORKSPACE_ROOT.values()}
+        home = str(Path.home()) + os.sep
+        if (
+            not isinstance(hands_workspace_raw, str)
+            or hands_workspace_raw not in expected
+            or (hands_workspace_raw + os.sep).startswith(home)
+        ):
+            raise ConfinementError(
+                f"{base}: hands_workspace must be the path setup-isolation created for {hands_user} "
+                f"({' or '.join(sorted(expected))}), got {hands_workspace_raw!r}.{redo}"
+            )
+        hands_workspace = Path(hands_workspace_raw)
+    # The loopback TCP ports the hands user's network boundary allows (Linux, P-1 (a)); setup writes
+    # them with the three above and reads them back on a repair run.
+    hands_egress_ports: tuple[int, ...] = ()
+    if "hands_egress_ports" in data:
+        from levain.firing.hands import HandsSetupError, check_egress_ports
+
+        if not present:
+            raise ConfinementError(f"{base}: hands_egress_ports belongs to a hands setup, and there is none — "
+                                   "fail-closed. Remove the key.")
+        try:
+            hands_egress_ports = check_egress_ports(data["hands_egress_ports"])
+        except HandsSetupError as exc:
+            raise ConfinementError(f"{base}: {exc} — fail-closed.") from None
+
+    runtime_sockets = data.get("runtime_sockets", [])
+    if not isinstance(runtime_sockets, list) or not all(isinstance(v, str) for v in runtime_sockets):
+        raise ConfinementError(f"{base}: 'runtime_sockets' must be a list of path strings — fail-closed.")
+    runtime_sockets = check_runtime_sockets(runtime_sockets, where=f"{base}: runtime_sockets")
+
     return ConfinementConfig(
         deny_files=_paths("deny_files"),
         deny_subtrees=_paths("deny_subtrees"),
@@ -1881,59 +2362,683 @@ def load_confinement_config(entity_dir: Path | str) -> ConfinementConfig:
         allow_container_sockets=allow_container_sockets,
         allow_localhost_outbound=allow_localhost_outbound,
         efferent_gate=efferent_gate,
+        hands_user=hands_user,
+        hands_uid=hands_uid,
+        hands_workspace=hands_workspace,
+        hands_egress_ports=hands_egress_ports,
+        runtime_sockets=runtime_sockets,
     )
 
 
-# --- the persistent sandboxed shell (the I/O primitive) --------------------------------------
+# --- the sandboxed shell (the I/O primitive) -------------------------------------------------
 
 @dataclass(frozen=True)
 class ShellResult:
     """One command's result from a :class:`SandboxedShell`. ``output`` merges stdout+stderr (a
-    terminal shows both interleaved); ``exit_code`` is the command's ``$?``. ``timed_out`` is True
-    when the command did not complete within the deadline (``exit_code`` is then ``None``)."""
+    terminal shows both interleaved). ``exit_code`` is the status levain's ``waitpid`` returned for the
+    process it spawned; ``signal`` is set instead when a signal ended it. Under bwrap that process is
+    bwrap, which waits on bash and exits with bash's status, a signal death of bash as 128 + its
+    number, so that arrives in ``exit_code``; a signal levain sends (``interrupt()``) ends bwrap
+    itself, and the command's leaf is killed with it, bash included (``_HANDS_START`` and
+    :meth:`_BwrapShell._signal`; bwrap's ``--die-with-parent`` alone did not, RUN 2026-10-09), and it arrives in ``signal``.
+    ``timed_out`` is True when the
+    command did not finish within the deadline and levain killed its process group (``exit_code`` and
+    ``signal`` are then ``None``)."""
 
     output: str
     exit_code: int | None
     timed_out: bool = False
+    signal: int | None = None
+
+
+# The fixed program each command's bash runs (``bash -c _RUNNER bash``). Everything it is given arrives
+# on stdin, a socket levain holds the other end of, as NUL-terminated DATA: the directory to start in,
+# the shell's home directory (its workspace, used when the first is gone; the process itself starts in
+# ``/``), ``o<OLDPWD>`` or ``-``, the exported variables as ``NAME=value`` fields ended by an empty field, then
+# the command. Each is applied with ``builtin cd`` / ``builtin export`` / an assignment; nothing levain
+# carries is ever sourced or evaluated, only the command itself. A ``__levain_*`` name is never
+# exported (levain never sends one either), so nothing carried can steer the runner's own variables.
+# The socket is then moved to fd ``_STATE_FD`` (87: far from the low fds scripts use for lock files)
+# and stdin becomes /dev/null.
+# The EXIT trap writes back on that fd, and only while it is still a socket (a command that put a
+# file there gets nothing written into it): ``P<pwd -P>``, ``O<OLDPWD>`` when set, ``E<NAME>=<value>``
+# per exported variable, and ``Z``, each NUL-terminated. levain parses that as data (see
+# ``SandboxedShell._carry``) and drops it when the command timed out or waitpid reports a signal. The
+# command (or a background job of it) can write to the fd too; what it writes can only become its own
+# next directory and environment, which ``cd`` and ``export`` already give it.
+# Nothing here reports completion or a status: levain learns both from waitpid.
+# bash 3.2 (macOS /bin/bash): with errexit on and an EXIT trap set, a shell that exits through the
+# errexit path exits 0 and ``$?`` in the trap is already 0 (an unbound variable under ``-u``, ``${x?}``,
+# a syntax error inside ``eval``; bash 5.2 reports them correctly, so the fix applies to bash < 4
+# only). The trap turns that case into exit 1 when ``$?`` is 0, ``-e`` is on and the command neither
+# ran to its end (``__levain_done``) nor called ``exit``. A call of ``exit`` however spelled (``\exit``,
+# ``'exit'``, ``$e``, ``X=1 exit``) reaches the ``exit`` function below, which marks it
+# (``__levain_x``); ``builtin exit`` and ``command exit`` skip functions, so ``BASH_COMMAND`` (read
+# before any command in the trap: ``[[`` and other commands there overwrite it; assignments do not) is
+# matched for those, quotes and backslashes removed.
+# A signal never needs the correction: measured on bash 3.2, a shell a signal ends still dies of that
+# signal when its EXIT trap calls ``exit 1``, and levain discards what the trap wrote. So no signal is
+# trapped (a trapped INT would end the command even when its foreground program handled Ctrl-C), except
+# by bash as pid 1 of a pid namespace (bwrap ``--as-pid-1``): pid 1 ignores a signal it has no handler
+# for, so there HUP/INT/QUIT/TERM are trapped to skip the write-back (``__levain_g``) and exit 128+n.
+# Bash 3.2 is the floor: no mapfile, no ${x@Q}, no associative arrays, no {fd} redirections.
+_STATE_FD = 87
+_RUNNER = r"""IFS= builtin read -r -d '' __levain_w
+IFS= builtin read -r -d '' __levain_h
+IFS= builtin read -r -d '' __levain_o
+__levain_k=' PWD OLDPWD SHLVL _ '
+while IFS= builtin read -r -d '' __levain_e && [[ -n $__levain_e ]]; do
+  case $__levain_e in __levain_*) continue ;; esac
+  __levain_k="$__levain_k${__levain_e%%=*} "
+  builtin export -- "$__levain_e"
+done
+IFS= builtin read -r -d '' __levain_c
+exec 87<&0 </dev/null
+for __levain_n in $(builtin compgen -e); do
+  case $__levain_k in *" $__levain_n "*) ;; *) builtin unset -v -- "$__levain_n" 2>/dev/null ;; esac
+done
+builtin cd -- "$__levain_w" 2>/dev/null || {
+  builtin cd -- "$__levain_h" 2>/dev/null || {
+    builtin printf 'levain: cannot enter %s nor the workspace %s; the command did not run\n' "$__levain_w" "$__levain_h" >&2
+    builtin exit 126
+  }
+  builtin printf 'levain: %s is gone; this command starts in %s\n' "$__levain_w" "$PWD" >&2
+}
+case $__levain_o in o*) OLDPWD=${__levain_o#o} ;; *) builtin unset -v OLDPWD ;; esac
+builtin unset -v __levain_w __levain_h __levain_o __levain_k __levain_e __levain_n \
+  __levain_done __levain_g __levain_x __levain_xs __levain_b __levain_m __levain_s __levain_f
+exit() {
+  __levain_xs=$?
+  __levain_x=1
+  if [[ $# == 0 ]]; then builtin exit "$__levain_xs"; fi
+  builtin exit "$@"
+}
+__levain_exit() {
+  __levain_s=$?
+  __levain_f=$-
+  __levain_m=$BASH_COMMAND
+  { builtin set +euxv; } 2>/dev/null
+  builtin trap '' PIPE
+  IFS=$' \t\n'
+  if [[ -n ${__levain_g-} ]]; then builtin return; fi
+  __levain_b=
+  if [[ $__levain_s == 0 && -z ${__levain_done-} && -z ${__levain_x-} && $__levain_f == *e* && ${BASH_VERSINFO[0]} -lt 4 ]]; then
+    __levain_m=${__levain_m//[\\\'\"]/}
+    case $__levain_m in
+      exit|exit[[:space:]]*|builtin[[:space:]]exit|builtin[[:space:]]exit[[:space:]]*) ;;
+      builtin[[:space:]]--[[:space:]]exit|builtin[[:space:]]--[[:space:]]exit[[:space:]]*) ;;
+      command[[:space:]]exit|command[[:space:]]exit[[:space:]]*) ;;
+      command[[:space:]]--[[:space:]]exit|command[[:space:]]--[[:space:]]exit[[:space:]]*) ;;
+      *) __levain_b=1 ;;
+    esac
+  fi
+  if [[ -S /dev/fd/87 ]]; then
+    {
+      builtin printf 'P%s\0' "$(builtin pwd -P 2>/dev/null)"
+      if [[ -n ${OLDPWD+x} ]]; then builtin printf 'O%s\0' "$OLDPWD"; fi
+      for __levain_n in $(builtin compgen -e); do
+        builtin printf 'E%s=%s\0' "$__levain_n" "${!__levain_n}"
+      done
+      builtin printf 'Z\0'
+    } >&87 2>/dev/null
+  fi
+  if [[ -n $__levain_b ]]; then builtin exit 1; fi
+}
+builtin trap __levain_exit EXIT
+if [[ $$ == 1 ]]; then
+  builtin trap '__levain_g=1; builtin trap - HUP; builtin kill -HUP $$; builtin exit 129' HUP
+  builtin trap '__levain_g=1; builtin trap - INT; builtin kill -INT $$; builtin exit 130' INT
+  builtin trap '__levain_g=1; builtin trap - QUIT; builtin kill -QUIT $$; builtin exit 131' QUIT
+  builtin trap '__levain_g=1; builtin trap - TERM; builtin kill -TERM $$; builtin exit 143' TERM
+fi
+builtin eval "$__levain_c"
+__levain_done=$?
+builtin exit "$__levain_done"
+"""
+
+# The PATH a hands-user bash starts with: system and package-manager directories only, never a
+# directory under the operator's home (which the hands user cannot enter anyway).
+HANDS_PATH = "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+SUDO = "/usr/bin/sudo"
+
+
+@dataclass(frozen=True)
+class HandsIdentity:
+    """The separate, unprivileged OS user an entity's bash runs as (``levain setup-isolation``,
+    :mod:`levain.firing.hands`): its name, uid, home and workspace."""
+
+    user: str
+    uid: int
+    home: str
+    workspace: Path
+    #: Linux: the loopback TCP ports the hands user's network boundary lets out (setup's
+    #: ``--egress-port``), which the launch probes and relays. Used on Linux only.
+    egress_ports: tuple[int, ...] = ()
+
+
+def hands_for(cfg: "ConfinementConfig", mode: str, *, system: str | None = None) -> HandsIdentity | None:
+    """The hands user bash runs as for a session in drive ``mode``, or None (bash runs as the
+    operator). The ONE place this is decided, so the binding, the banner and doctor agree.
+
+    - No hands user set up: None.
+    - The interactive REPL: None, by design (design §8 i, D4): a human reads every turn there.
+    - macOS or Linux, headless or unattended: the hands user. On Linux bwrap runs AS it in an
+      allowlisted view that leaves the operator's home out (:func:`_hands_bwrap_argv`). A setup whose account is gone raises (fail-closed): never a silent
+      fall-back to the operator.
+    - Any other OS: None."""
+    if cfg.hands_user is None or cfg.hands_uid is None or cfg.hands_workspace is None:
+        return None
+    if mode == "interactive":
+        return None
+    if (system or platform.system()) not in ("Darwin", "Linux"):
+        return None
+    import pwd
+
+    redo = ("Set it up again: sudo levain setup-isolation --undo, then sudo levain setup-isolation.")
+    try:
+        entry = pwd.getpwnam(cfg.hands_user)
+    except KeyError:
+        raise ConfinementError(
+            f"the entity's hands user {cfg.hands_user} does not exist — refusing to run bash as you "
+            f"instead (fail-closed). {redo}"
+        ) from None
+    # By uid as well as by name: an account deleted and re-created under the same name is another
+    # account, and the workspace's ownership and ACLs were made for the recorded uid (S2 L1b LOW-3).
+    if entry.pw_uid != cfg.hands_uid:
+        raise ConfinementError(
+            f"the entity's hands user {cfg.hands_user} now has uid {entry.pw_uid}, not the uid "
+            f"{cfg.hands_uid} setup recorded — refusing to run bash as it (fail-closed). {redo}"
+        )
+    return HandsIdentity(cfg.hands_user, cfg.hands_uid, entry.pw_dir, cfg.hands_workspace,
+                         tuple(cfg.hands_egress_ports))
+
+
+def _hands_env(hands: HandsIdentity) -> dict[str, str]:
+    """The whole environment a hands-user bash starts with (``env -i`` drops everything else, sudo's
+    own variables included)."""
+    return {"HOME": hands.home, "PATH": HANDS_PATH, "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+            "TERM": "dumb", "USER": hands.user, "LOGNAME": hands.user}
+
+
+#: Linux: run in front of every sandboxed command levain starts (argv: its role, levain's pid, then the
+#: command): by every hands process, as the hands user, between sudo and what it starts (role ``hands``);
+#: by the operator floor's bwrap, as the operator, inside the command's cgroup leaf (role ``operator``).
+#: The role is passed, never inferred (L3 r2: a guess from ``/proc/<levain>``'s owner is a guess about
+#: procfs). Before it execs the command:
+#: 1. It joins a NEW, empty session keyring (:data:`_START_KEYRING`; on the operator floor too, Phill
+#:    2026-10-09: "yes to both").
+#: 2. It forks a watcher holding pidfds on levain and on itself (the command, once exec'd).
+#:    ``operator``: when either ends, the watcher writes ``cgroup.kill`` of its own leaf, which holds
+#:    only this command, so every process of it goes, one reparented by bwrap's death included, and the
+#:    watcher with them. The kernel's membership answers "what belongs to this command"; no scan.
+#:    ``hands``: the leaf is the operator's and the hands user cannot write it; when levain ends first,
+#:    the command gets SIGTERM, then SIGKILL, then, 3 s on, every process of the hands user. RUN
+#:    2026-10-09 with levain SIGKILLed mid-command: as hands, bwrap's ``--die-with-parent`` binds to sudo,
+#:    which outlives levain, and the command's bash, a ``setsid`` child and both relays kept running; as
+#:    the operator, bwrap died with levain but the namespace's pid 1 and a ``setsid`` child kept running.
+#: Refused before the command starts: levain not an ancestor (a pid reused after levain died), levain
+#: gone by the time its uid is read, a ``hands`` start as levain's own uid (its ``kill(-1)`` would end
+#: the operator's processes), an ``operator`` start as another uid, or outside a leaf this levain made.
+#: ``python3 -I -S`` (no site, no environment); every input is argv data.
+_START_KEYRING = r"""import ctypes, os, select, signal, sys, time
+nr = {"x86_64": 250, "aarch64": 219, "riscv64": 219}.get(os.uname().machine)
+if nr is None:
+    sys.stderr.write("levain: no keyctl syscall number known for %s; refusing to start with the "
+                     "operator's session keyring\n" % os.uname().machine)
+    os._exit(126)
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+if libc.syscall(ctypes.c_long(nr), ctypes.c_long(1), ctypes.c_void_p(None)) < 0:
+    sys.stderr.write("levain: could not join a new session keyring: %s\n" % os.strerror(ctypes.get_errno()))
+    os._exit(126)
+"""
+# The keyring join: the operator's session keyring otherwise crosses sudo (no pam_keyinit in Ubuntu's
+# sudo stack) and bwrap (a user namespace does not detach it): RUN in a VM 2026-10-09, `keyctl print`
+# inside a hands bash printed a key the operator had added to @s. The keyctl syscall number is the
+# architecture's; one not listed refuses.
+
+_START_WATCH = r"""def refuse(why):
+    sys.stderr.write("levain: %s\n" % why)
+    os._exit(126)
+if not hasattr(os, "pidfd_open"):
+    refuse("this python3 (%s) has no os.pidfd_open (3.9 or later and Linux 5.3 or later are needed) to "
+           "end the command with levain; refusing" % sys.version.split()[0])
+role, watch, argv, me = sys.argv[1], int(sys.argv[2]), sys.argv[3:], os.getpid()
+if role not in ("hands", "operator"):
+    refuse("unknown start role %r; refusing" % role)
+def parent(pid):
+    with open("/proc/%d/stat" % pid) as f:
+        return int(f.read().rsplit(")", 1)[1].split()[1])
+try:
+    held = os.pidfd_open(watch)
+    up = os.getppid()
+    while up not in (watch, 0, 1):
+        up = parent(up)
+    if up == watch:
+        with open("/proc/%d/status" % watch) as f:
+            uid = [int(x.split()[1]) for x in f if x.startswith("Uid:")][0]
+except PermissionError as e:
+    refuse("cannot read %s: /proc hides other users' processes here (hidepid), so the command cannot be "
+           "tied to levain; remount /proc without hidepid" % e.filename)
+except OSError as e:
+    refuse("cannot watch levain (pid %d): %s" % (watch, e))
+# The pidfd was taken before the reads: readable now means levain ended, so they may describe another.
+if up != watch or select.select([held], [], [], 0)[0]:
+    refuse("levain (pid %d) is gone; not starting" % watch)
+if role == "hands" and os.getuid() == uid:
+    refuse("a process meant for the entity's own user would run as levain's user (uid %d); refusing" % uid)
+if role == "operator":
+    if os.getuid() != uid:
+        refuse("the operator's sandbox would run as uid %d, not levain's (uid %d); refusing" % (os.getuid(), uid))
+    with open("/proc/self/cgroup") as f:
+        leaf = f.read().strip()
+    head = "0::/user.slice/user-%d.slice/user@%d.service/levain.slice/levain-" % (uid, uid)
+    unit = leaf[len(head):].split("-") if leaf.startswith(head) and "\n" not in leaf else []
+    if len(unit) != 5 or unit[1] != str(watch) or not unit[4].endswith(".scope"):
+        refuse("not in a cgroup leaf levain (pid %d) made (%s); refusing to run without one" % (watch, leaf))
+    kill = "/sys/fs/cgroup" + leaf[len("0::"):] + "/cgroup.kill"
+    try:
+        # Opened now, so the write at the end needs no open that could fail then (codex L3 r3).
+        kfd = os.open(kill, os.O_WRONLY | os.O_CLOEXEC)
+    except OSError as e:
+        refuse("cannot open %s, which ends the command with levain (%s); refusing" % (kill, e))
+mine = os.pidfd_open(me)
+if os.fork() == 0:
+    n = os.open(os.devnull, os.O_RDWR)
+    for f in (0, 1, 2):
+        os.dup2(n, f)
+    ready = select.select([held, mine], [], [])[0]
+    if role == "operator":
+        # Either end: bwrap's --die-with-parent may kill bwrap before levain's pidfd turns readable (RUN
+        # 2026-10-09: 4 of 10), and a command that ended on its own leaves nothing here but this watcher.
+        # Retried; if every write fails, the next levain's crash sweep kills a dead levain's leaves.
+        for _ in range(5):
+            try:
+                os.write(kfd, b"1")
+                break
+            except OSError as e:
+                if e.errno in (2, 19):   # ENOENT, ENODEV: the leaf is already gone
+                    break
+                time.sleep(0.2)
+        os._exit(0)
+    if held not in ready:
+        os._exit(0)
+    for sig, wait in ((signal.SIGTERM, 2), (signal.SIGKILL, None)):
+        try:
+            signal.pidfd_send_signal(mine, sig)
+        except OSError:
+            break
+        if wait and select.select([mine], [], [], wait)[0]:
+            break
+    # With levain gone its session is over, and only one session holds the hands user: everything of
+    # that user goes, grandchildren and the namespace's pid 1 included, once every watcher has had its
+    # own SIGTERM turn above (2 s), so a relay can still tidy its directory (codex L3 r1).
+    time.sleep(3)
+    try:
+        os.kill(-1, signal.SIGKILL)
+    except OSError:
+        pass
+    os._exit(0)
+os.close(held)
+os.close(mine)
+if role == "operator":
+    os.close(kfd)
+os.execv(argv[0], argv)
+"""
+_HANDS_START = _START_KEYRING + _START_WATCH
+
+
+def hands_prefix(hands: HandsIdentity, *, system: str | None = None) -> list[str]:
+    """``sudo -n -u <hands> /usr/bin/env -i <env>``: what goes in front of the sandbox driver. sudo is
+    OUTSIDE the sandbox: the shipped profile refuses to exec a setuid binary (measured in the M1 VM
+    run), so the profile applies to the hands process, which is the point. ``-n``: never prompt.
+    On Linux the start program (:data:`_HANDS_START`, role ``hands``) follows ``env -i``."""
+    argv = [SUDO, "-n", "-u", hands.user, "/usr/bin/env", "-i",
+            *(f"{k}={v}" for k, v in _hands_env(hands).items())]
+    if (system or platform.system()) == "Linux":
+        argv += _start_argv(HANDS_PYTHON, hands=True)
+    return argv
+
+
+def _start_argv(python: str, *, hands: bool) -> list[str]:
+    """:data:`_HANDS_START` run by ``python`` in role ``hands`` or ``operator``, watching this process;
+    the command follows it."""
+    return [python, "-I", "-S", "-c", _HANDS_START, "hands" if hands else "operator", str(os.getpid())]
+
+
+def _require_hands_python() -> None:
+    """Linux: every hands process starts through ``python3`` (the keyring join); refuse by name
+    without it."""
+    if not os.access(HANDS_PYTHON, os.X_OK):
+        raise ConfinementError(
+            f"{HANDS_PYTHON} is missing: every process run as the entity's own user on Linux starts "
+            "through it, to leave your session keyring behind and to end with levain. Install python3 — refusing to run it as "
+            "the entity's own user, or as you instead (fail-closed)."
+        )
+
+
+def _require_hands_sudo(hands: HandsIdentity) -> None:
+    """Fail closed when the operator can no longer run commands as the hands user (the sudoers rule
+    removed, the account retired): bash never falls back to the operator."""
+    from levain.launch import child_env
+
+    try:
+        r = subprocess.run([SUDO, "-n", "-u", hands.user, "/usr/bin/true"], capture_output=True,
+                           stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=30)
+        ok, said = r.returncode == 0, r.stderr.decode("utf-8", "replace").strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        ok, said = False, str(exc)
+    if not ok:
+        raise ConfinementError(
+            f"bash runs as the entity's own user {hands.user} here, but sudo refused to start it "
+            f"({said or 'no reason given'}) — refusing to run bash as you instead (fail-closed). "
+            "Set it up again: sudo levain setup-isolation --undo, then sudo levain setup-isolation."
+        )
+
+
+def _hands_signal(hands: HandsIdentity, pgid: int, sig: int) -> bool:
+    """Signal a hands-user process group. levain (the operator) may not signal another uid's
+    processes, so the signal is sent AS the hands user (the same sudoers rule allows it). False when
+    sudo refused or stalled, or kill found nothing to signal."""
+    from levain.launch import child_env
+
+    try:
+        r = subprocess.run([SUDO, "-n", "-u", hands.user, "/bin/kill", f"-{int(sig)}", "--", f"-{int(pgid)}"],
+                           capture_output=True, stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def sweep_hands_user(user: str, *, uid: int | None, timeout: float = 5.0) -> str | None:
+    """Stop every process of the hands user ``user`` (SIGKILL to all it may signal, sent as it), and
+    verify none of the entity's is left. For a session's start and end: a command can leave its
+    process group (``setsid``), so killing the groups levain started does not reach everything the
+    entity left running. Safe only while one session owns the user
+    (:func:`levain.firing.ws_git.hold_hands_session`). None when none is left, else what is.
+
+    The check is :func:`levain.firing.ws_git.entity_session_live`, the one ws-git uses: on macOS
+    launchd starts (and restarts) per-user system agents for a uid that ran Apple code, and those
+    are not the entity's (S2 L3 r3, codex HIGH). Root and levain's own account are refused. ``uid`` is
+    the hands user's id as setup recorded it: no name lookup runs here, since one can block in NSS
+    with no bound (S2 L3 r5, codex MED); None (not known) is refused."""
+    from levain.firing.ws_git import WsGitError, entity_session_live
+    from levain.launch import child_env
+
+    deadline = time.monotonic() + timeout
+    if uid is None:
+        return f"the id of {user} is not known, so its processes cannot be checked"
+    if uid in (0, os.getuid()):
+        return f"refusing to stop every process of {user} (uid {uid}): it is root or levain's own account"
+    said: str | None = None
+    while True:
+        # Every step, the check's pgrep and ps included, is bounded by what is left of `timeout`, with
+        # no floor, so a stalled one cannot stretch the sweep (S2d codex MED, r3, r4).
+        left = deadline - time.monotonic()
+        if left > 0:
+            try:
+                subprocess.run([SUDO, "-n", "-u", user, "/bin/kill", "-9", "--", "-1"], capture_output=True,
+                               stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=left)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        left = deadline - time.monotonic()
+        if left <= 0:   # what the last check found, or that none could run (S2 L3 r5)
+            return said or (f"the stop of {user}'s processes ran out of its {timeout:g} s before it "
+                            "could check that none is left")
+        try:
+            if not entity_session_live(uid, timeout=left):
+                return None
+            said = f"processes of {user} are still running"
+        except WsGitError as exc:
+            said = str(exc)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return said
+        time.sleep(min(0.2, left))
+
+
+# Names never carried from one command to the next, whatever the entity set them to: each makes a
+# shell (or the dynamic loader) run code or reparse input at startup, or is bash's own bookkeeping.
+_NEVER_CARRIED = frozenset({
+    "BASH_ENV", "ENV", "PROMPT_COMMAND", "SHELLOPTS", "BASHOPTS", "PS4", "IFS", "CDPATH",
+    "GLOBIGNORE", "EXECIGNORE", "POSIXLY_CORRECT", "TMOUT", "PWD", "OLDPWD", "SHLVL", "_",
+})
+# ``BASH_`` covers BASH_FUNC_* (an exported function), BASH_ENV, BASH_XTRACEFD, BASH_LOADABLES_PATH;
+# ``__levain_`` the runner's own variables (the runner refuses them too).
+_NEVER_CARRIED_PREFIXES = ("BASH_", "LD_", "DYLD_", "__levain_")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# The most levain reads back from one command's state channel.
+_MAX_CARRY_BYTES = 4 * 1024 * 1024
+# Finished commands whose output pipe a background job still holds, kept for their later output. Past
+# this many, the oldest pipe's read end is closed (its writer then gets EPIPE), so background jobs
+# cannot use up levain's file descriptors.
+_MAX_LATE = 32
+
+# After a command's bash exits, how long its output pipe may stay open before the result is returned:
+# a background job (``server &``) holds the pipe, and its later output is reported with the next run.
+_DRAIN_GRACE = 0.2
+# A killed group's members get this long after SIGTERM before SIGKILL.
+_KILL_GRACE = 1.0
+# How long a reap waits for a signal still being sent to the leader's group, longer than a hands
+# shell's signal (`_hands_signal`, two sudo runs) takes at its slowest. Past it the leader is left
+# unreaped and its group kept.
+_REAP_WAIT = 30.0
+# The start probe's deadline.
+_START_TIMEOUT = 20.0
+
+
+class _Output:
+    """One command's merged stdout+stderr, read by its own thread until every writer has closed the
+    pipe, or until :meth:`abandon`. Bounded: past ``_MAX_OUTPUT_CHARS`` it keeps a single truncation
+    note and drops the rest."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self._lock = threading.Lock()
+        self._parts: list[str] = []
+        self._kept = 0
+        self._truncated = False
+        self._abandoned = threading.Event()
+        self.eof = threading.Event()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _add(self, text: str) -> None:
+        if not text:
+            return
+        with self._lock:
+            if self._kept < _MAX_OUTPUT_CHARS:
+                room = _MAX_OUTPUT_CHARS - self._kept
+                self._parts.append(text[:room])
+                self._kept += min(len(text), room)
+                if len(text) <= room:
+                    return
+            if not self._truncated:
+                self._parts.append(f"\n[output truncated at {_MAX_OUTPUT_CHARS} chars]\n")
+                self._truncated = True
+
+    def _pump(self) -> None:
+        # poll() with a timeout, not a bare read: the fd is closed only by this thread, so closing it
+        # from another thread can never race a read on a reused fd number.
+        poller = select.poll()
+        poller.register(self._fd, select.POLLIN)
+        try:
+            while not self._abandoned.is_set():
+                try:
+                    if not poller.poll(250):
+                        continue
+                    chunk = os.read(self._fd, 65536)
+                except InterruptedError:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                self._add(self._decoder.decode(chunk))
+            self._add(self._decoder.decode(b"", final=True))
+        finally:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self.eof.set()
+
+    def abandon(self) -> None:
+        """Stop reading and close the read end (within the poll interval); a writer then gets EPIPE."""
+        self._abandoned.set()
+
+    def take(self) -> str:
+        """Everything read since the last ``take`` (the bound counts the whole command's output)."""
+        with self._lock:
+            text, self._parts = "".join(self._parts), []
+        return text
+
+
+class _Carry:
+    """The state channel of one command: levain's end of the socket that is bash's stdin. Reads what
+    the runner's EXIT trap writes back (see ``_RUNNER``) until EOF, :meth:`stop`, or the bound, and
+    keeps the LAST complete frame: the trap writes after everything the command itself wrote. (A
+    background job still holding the state fd can write later; that, too, is only data.)"""
+
+    def __init__(self, sock: socket.socket) -> None:
+        self._sock = sock
+        self._lock = threading.Lock()
+        self._buf = bytearray()
+        self._stopping = threading.Event()
+        self.done = threading.Event()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _take(self, chunk: bytes) -> bool:
+        """Keep ``chunk``; False once over the bound (then nothing carries)."""
+        with self._lock:
+            if len(self._buf) + len(chunk) > _MAX_CARRY_BYTES:
+                self._buf = bytearray()
+                return False
+            self._buf += chunk
+            return True
+
+    def _pump(self) -> None:
+        # poll() with a timeout, never a blocking recv: stop() only sets a flag, and this thread then
+        # reads whatever is already queued (non-blocking) before it closes. A shutdown() from another
+        # thread would wake a blocking recv, but on macOS it also discards the unread queue, the
+        # trap's frame included, when a background job keeps the socket open (S2 L2b L5).
+        poller = select.poll()
+        poller.register(self._sock.fileno(), select.POLLIN)
+        try:
+            while not self._stopping.is_set():
+                try:
+                    if not poller.poll(50):
+                        continue
+                    chunk = self._sock.recv(65536)
+                except InterruptedError:
+                    continue
+                except OSError:
+                    return
+                if not chunk or not self._take(chunk):
+                    return
+            while True:
+                try:
+                    chunk = self._sock.recv(65536, socket.MSG_DONTWAIT)
+                except (BlockingIOError, InterruptedError):
+                    return
+                except OSError:
+                    return
+                if not chunk or not self._take(chunk):
+                    return
+        finally:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self.done.set()
+
+    @property
+    def frame(self) -> bytes | None:
+        """The last ``...\\0Z\\0``-ended frame read, without its ``Z`` field, or None."""
+        with self._lock:
+            buf = bytes(self._buf)
+        end = buf.rfind(b"\0Z\0")
+        if end < 0:
+            return b"" if buf.startswith(b"Z\0") else None
+        start = buf.rfind(b"\0Z\0", 0, end)
+        return buf[start + 3 if start >= 0 else 0: end + 1]
+
+    def send(self, data: bytes) -> None:
+        """Write the runner's input from a thread (a driver that never reads stdin must not block
+        ``run()``), then half-close, so a read of the state fd by the command gets EOF."""
+        sock = self._sock
+
+        def feed() -> None:
+            try:
+                sock.sendall(data)
+                sock.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+        threading.Thread(target=feed, daemon=True).start()
+
+    def stop(self) -> None:
+        """Stop reading: the reader takes what is already queued, then closes the socket (within its
+        poll interval). Everything the trap wrote before bash exited is queued by then. The write side
+        is shut, which ends a feed still blocked on a driver that never read its input."""
+        self._stopping.set()
+        try:
+            self._sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def _never_carried(name: str) -> bool:
+    return (not _ENV_NAME.fullmatch(name) or name in _NEVER_CARRIED
+            or name.startswith(_NEVER_CARRIED_PREFIXES))
 
 
 class SandboxedShell:
-    """A persistent, stateful ``/bin/bash`` running UNDER the platform sandbox.
+    """A ``/bin/bash`` under the platform sandbox, one bash process PER COMMAND.
 
-    ONE bash process reads sequential commands from a PRIVATE FIFO command channel, so cwd / env /
-    shell functions PERSIST across :meth:`run` calls — a real stateful shell, not per-command exec
-    (Phill: real dev work + SSH sessions need state). The sandbox profile fences by PATH at the syscall
-    level, so even after the shell ``cd``\\ s into ``$HOME`` it still cannot read a denied crown jewel
-    (the exact property an in-process fence cannot give a shell).
+    :meth:`run` spawns ``<driver argv> -c <runner> bash`` in a new session, writes its input to its
+    stdin and waits for it. **Completion is levain's ``waitpid`` on that process and the status is its
+    waitpid status** (spore-1385, Phill's ruling): nothing the shell prints is parsed for either, so
+    code the entity runs cannot end a command early or forge its status. The model this replaced ran
+    one bash reading commands from a pipe and took completion and ``$?`` from a line bash printed; bash
+    read that pipe one byte at a time on fd 255, so a builtin in a command could read the status line
+    ahead of bash and print one of its own (reproduced: ``tests/test_shell_oob_status.py``).
 
-    Non-interactive (``bash --noprofile --norc`` reading a FIFO as its script): no PS1, no job control,
-    no prompt noise. The command channel is a FIFO bash OPENS ITSELF (close-on-exec → children can't
-    inherit/read it) and children get ``/dev/null`` stdin (so ``ssh host cmd`` / ``cat`` / a REPL can't
-    hijack the channel — apparatus L1+L3). Per-command completion + exit code are read via an
-    UNGUESSABLE, SPLIT sentinel (``<h1><h2> <$?>``): the joined output matches, but a ``set -x`` /
-    DEBUG-trap trace of the sentinel line shows the halves separated, so a trace can't spoof
-    end-of-command. A reader thread drains stdout into a bounded queue so :meth:`run` can enforce a
-    wall-clock timeout without blocking on a hung command.
+    **What carries from one command to the next, by design: the working directory, ``OLDPWD`` (so
+    ``cd -`` works) and the exported variables.** levain holds them in memory, hands them to the next
+    command's bash as data on its stdin, and reads them back from the command's EXIT trap over the same
+    socket (see ``_RUNNER``). Nothing carried is ever sourced or evaluated, and there is no state file:
+    a file another process could write would run code in this shell. Never carried: names that make a
+    shell or the loader run code at startup (``_NEVER_CARRIED``; ``BASH_*``, ``LD_*``, ``DYLD_*``), and
+    a variable the entity introduced whose name the launch allowlist refuses by rule (credential-shaped,
+    or one of levain's own), see :meth:`_carry`. **Nothing else carries:** unexported variables,
+    functions, aliases, traps, ``set``/``shopt`` options (``set -e`` included), ``umask``, ``ulimit``,
+    the directory stack, ``$?``, ``$!`` and the job table all start fresh in each command, the way they
+    do in a new terminal. A command that timed out, or that waitpid reports as ended by a signal,
+    carries nothing (levain discards what the runner wrote back); the next command then starts from
+    the last one that ended by itself. A command that replaces the EXIT trap
+    (``trap ... EXIT``, ``exec prog``) writes nothing back either, nor one that puts something other
+    than a socket on the state fd (``_STATE_FD``).
 
-    KNOWN v1 LIMITS (documented, not hidden):
-      1. **Single-caller.** :meth:`run` is NOT re-entrant/concurrent (it shares the sentinel counter +
-         the stdout queue); a concurrent call fails FAST with :class:`ConfinementError`. ``close()`` /
-         ``interrupt()`` are the only methods safe from another thread while a ``run()`` is in flight.
-      2. **A NON-TERMINATING timed-out command wedges the shell.** ``timed_out`` leaves the command
-         RUNNING; the sentinel self-heal recovers only when that command EVENTUALLY ends (its late
-         sentinel is drained by the next ``run()``). A command that never returns (``nc -l``, an
-         infinite loop) leaves its sentinel outstanding forever → later ``run()``\\ s time out draining
-         it. Recovery is :meth:`close` + a fresh :meth:`SeatbeltProvider.spawn_shell`; this core does
-         not auto-kill (that policy is the tool's). ``interrupt()`` SIGINTs the group, which a
-         non-interactive bash treats as fatal — so it effectively ends the shell too.
-      3. **Truly interactive programs** (``vim``, an interactive password prompt) need a PTY this
-         core does not provide — the entity is an LLM driving non-interactive dev commands + agent-auth
-         SSH, so a PTY is a later slice if ever needed.
-      4. **A command that leaves the parser mid-statement** (unterminated heredoc/quote, a trailing
-         ``\\``) fuses with the sentinel line → the split-token turns most such cases into a TIMEOUT
-         (detectable) rather than silently-wrong output; the caller resets on timeout.
-      5. A runaway producer left after a timeout has its output BOUNDED (per-command cap + a bounded
-         reader queue that drops oldest); the loss is only under a runaway that will be ``close()``\\ d."""
+    The sandbox profile fences by PATH at the syscall level, so a ``cd`` into ``$HOME`` still cannot
+    read a denied crown jewel.
+
+    - **Output**: one pipe per command, stdout and stderr merged, bounded at ``_MAX_OUTPUT_CHARS``.
+      After waitpid the pipe gets ``_DRAIN_GRACE`` to close; a background job that keeps it open
+      (``server &``) has its later output returned, labelled, with the next result. At most
+      ``_MAX_LATE`` such pipes are kept; past that the oldest is closed and its writer gets EPIPE.
+    - **Timeout**: the command's whole process group is killed (SIGTERM, then SIGKILL) and reaped, and
+      the shell stays usable.
+    - **Background jobs** outlive the command that started them where the sandbox allows it (macOS).
+      Under bwrap the command's bash is pid 1 of its pid namespace, so the namespace, and every
+      background job in it, ends with the command.
+    - **close()** kills every process group this shell started and waits for them to empty.
+    - :meth:`run` is single-caller (a concurrent call fails fast); ``close()`` and ``interrupt()`` are
+      safe from another thread while a ``run()`` is in flight. A command containing a NUL byte is
+      refused (bash could not receive it whole).
+    - No PTY: truly interactive programs (``vim``, a password prompt) see /dev/null on stdin.
+    - A child that leaves the command's session or process group (``setsid``, ``set -m``, a double
+      fork into a new session) escapes the group kill on macOS, as from any shell; it stays under the
+      sandbox profile it inherited."""
 
     def __init__(
         self,
@@ -1945,19 +3050,11 @@ class SandboxedShell:
     ) -> None:
         self._argv = argv
         self._cwd = cwd
-        self._env = env
+        # The env bash STARTS with: levain's, never one the entity shaped (startup-execution names
+        # stripped, so nothing runs before the runner). The entity's exports arrive as data.
+        self._env = {k: v for k, v in env.items() if not _never_carried(k)}
         self._default_timeout = default_timeout
-        # An unguessable per-shell sentinel so no command's own output can spoof end-of-command.
-        # The end-of-command marker. SPLIT into two halves emitted as separate printf args ('%s%s'):
-        # the joined OUTPUT equals `_sentinel` (matched), but bash's own trace of the sentinel line
-        # (`set -x` / `set -v` / a DEBUG trap echoing $BASH_COMMAND) shows the two halves SEPARATED by
-        # whitespace, so a trace can't spoof end-of-command (apparatus L3 consensus — verified live:
-        # unsplit, `set -x` silently corrupted the protocol).
-        sentinel = f"__LEVAIN_SENTINEL_{os.urandom(12).hex()}__"
-        self._sentinel = sentinel
-        self._sent_h1 = sentinel[: len(sentinel) // 2]
-        self._sent_h2 = sentinel[len(sentinel) // 2 :]
-        self._proc: subprocess.Popen[str] | None = None
+        self._leader: _Leader | None = None   # the command running now, if any
         # ⛔ THE POLICY THIS SHELL WAS ACTUALLY CONFINED BY — set by the provider seam, so the
         # caller can cache the EXACT set that got rendered (codex L3 #1, 2026-09-04). Without it the
         # executor refreshed once and `spawn_shell` refreshed AGAIN, discarding the second result:
@@ -1969,352 +3066,501 @@ class SandboxedShell:
         # nothing"; that is true only if the filesystem is identical at both instants, which is
         # precisely what a TOCTOU fix may not assume.
         self.effective_policy: CrownJewelsPolicy | None = None
-        self._cmd_w: IO[str] | None = None   # the FIFO command channel write end (see start())
-        self._fifo_dir: str | None = None    # the tempdir holding the command FIFO (cleaned on close)
-        self._stdout_q: "queue.Queue[str | None]" = queue.Queue(maxsize=_MAX_QUEUE_LINES)
-        self._reader: threading.Thread | None = None
-        self._run_lock = threading.Lock()    # serialize run(); fail-fast on concurrent misuse
+        # The carried state (see the class docstring), applied to each command and replaced by what
+        # a command that ended by itself writes back.
+        self._carried_cwd = str(cwd)
+        self._carried_oldpwd: str | None = None
+        self._carried_env: dict[str, str] = dict(self._env)
+        self._started = False
         self._closed = False
-        # OUTSTANDING sentinels: incremented per command written, decremented per sentinel seen. A
-        # timed-out command leaves its sentinel outstanding (it fires late, when the command finally
-        # ends), so the NEXT run() must first DRAIN the stale sentinel(s) + their late output before
-        # reading its own — otherwise it would return the stale command's result. This makes the shell
-        # SELF-HEAL across a timeout instead of desyncing (the caller can keep using it).
-        self._pending = 0
+        self._probe_carried = False          # did the last command's state frame come back
+        self._run_lock = threading.Lock()    # serialize run(); fail-fast on concurrent misuse
+        self._lock = threading.Lock()        # guards _groups / _late across run() and close()
+        # Process groups this shell started that may still have members (a command's own group while
+        # it runs, a finished command's background jobs after), pgid -> that command's leader, held
+        # unreaped until the group is empty so the number cannot be reused (see `_Leader`).
+        self._groups: dict[int, _Leader] = {}
+        # Finished commands whose pipe a background job still holds: their later output.
+        self._late: list[_Output] = []
 
     # -- lifecycle -----------------------------------------------------------------------------
 
     @property
     def closed(self) -> bool:
-        """True once this shell has been closed — either explicitly (:meth:`close`) or because a
-        command ended it (an ``exit`` gives EOF → :meth:`run` self-closes). A consumer that reuses one
-        shell across commands checks this to RESPAWN a fresh shell after the entity ran ``exit``,
-        rather than handing the next command a dead channel (which would raise ``ConfinementError``)."""
+        """True once :meth:`close` ran. A command never closes the shell: ``exit N`` ends that
+        command's bash with status N and the next command starts from the carried state."""
         return self._closed
 
+    # Whether each command runs in a pid namespace of its own, whose init gone means its group is
+    # empty (:meth:`_group_emptied`). Required on Linux.
+    _own_pid_namespace = False
+
     def start(self) -> "SandboxedShell":
-        """Spawn the sandboxed bash and its stdout reader thread. Returns self (chainable)."""
-        if self._proc is not None:
+        """Prove the driver runs bash, with a probe command that must print a random token and exit 0
+        (a dead or misconfigured sandbox driver fails the spawn here, never as a live-looking shell).
+        Returns self (chainable)."""
+        if self._started:
             return self
-        # The command channel is a FIFO that BASH OPENS ITSELF as its script. Why a FIFO and not an
-        # inherited pipe fd (``pass_fds`` + ``/dev/fd/N``): an inherited fd is visible to bash's
-        # CHILDREN at a known number, so a command can ``os.read(3, …)`` and steal the command stream /
-        # learn the sentinel (apparatus L3 codex HIGH, verified live). A fd bash OPENS is CLOSE-ON-EXEC,
-        # so children never inherit it — the command channel is private from the commands. Children's
-        # stdin is ``/dev/null`` (no stdin hijack — apparatus L1). The fifo lives in an unguessable
-        # mkdtemp dir (a child would have to guess the path to interfere).
-        fifo_dir = tempfile.mkdtemp(prefix="levain-cmd-")
-        fifo = os.path.join(fifo_dir, "cmd")
-        rendezvous = -1
+        if self._closed:
+            raise ConfinementError("shell is closed")
+        self._started = True
         try:
-            os.mkfifo(fifo)
-            self._proc = subprocess.Popen(
-                [*self._argv, fifo],
-                stdin=subprocess.DEVNULL,   # children get /dev/null, NOT the command channel
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,   # merge stderr into stdout (terminal-like)
-                cwd=str(self._cwd),
-                env=self._env,
-                text=True,
-                encoding="utf-8",
-                errors="replace",           # a tool emitting non-UTF-8 bytes (binary `git diff`, a
-                                            # latin-1 tool) must NOT crash the reader thread with a
-                                            # UnicodeDecodeError + brick the shell (apparatus L3 —
-                                            # verified live: strict decode killed the reader).
-                bufsize=1,                  # line-buffered
-                # A NEW session/process group (pgid == the shell's pid), so close()/interrupt() can
-                # signal the WHOLE tree: a persistent shell spawns children (git, python, a timed-out
-                # `sleep`) that a bare terminate() of bash alone would ORPHAN — reparented to init,
-                # still running (verified live: a timed-out `sleep` survived close()). Signaling the
-                # group reaps them; it also makes interrupt() reach a running child.
-                start_new_session=True,
-                # WELD (apparatus L2 HIGH): no INHERITED fd may bypass the profile (seatbelt checks
-                # open(), not read() of an already-open fd). CALLER CONTRACT: no crown-jewel fd may be
-                # open in this process at spawn time. With the FIFO channel there is NO passed fd.
-                close_fds=True,
-            )
-            # Drain bash's stdout from the start so the handshake below can observe its output (incl. a
-            # `sandbox-exec` startup error).
-            self._reader = threading.Thread(target=self._drain_stdout, daemon=True)
-            self._reader.start()
-            # FIFO open dance (apparatus L3 codex round-2). O_RDWR RENDEZVOUS opens without blocking and
-            # provides a reader so (a) bash's own blocking O_RDONLY script-open unblocks and (b) the real
-            # O_WRONLY command channel opens without blocking. Then:
-            #   - HANDSHAKE proves bash actually opened + is reading — else sandbox-exec/bash died at
-            #     startup and spawn must FAIL, not hand back a dead shell (codex R2 #2);
-            #   - close the rendezvous so the parent is WRITER-ONLY → a dead bash gives EPIPE on write,
-            #     not an unbounded block (O_RDWR left the parent a reader → a big write could wedge; codex R2 #3);
-            #   - UNLINK the fifo so a child's ``open($0)`` (bash discloses the script PATH as ``$0``,
-            #     so "unguessable mkdtemp path" was NOT enough) hits ENOENT — the channel is truly
-            #     private from the commands (codex R2 #1). bash keeps reading via its open fd.
-            rendezvous = os.open(fifo, os.O_RDWR)
-            self._cmd_w = os.fdopen(os.open(fifo, os.O_WRONLY), "w")
-            self._handshake()
-            os.close(rendezvous)
-            rendezvous = -1
-            os.unlink(fifo)
-        except BaseException as exc:  # noqa: BLE001 — cleanup must survive Ctrl-C/SystemExit too, else
-            # a cancellation during _handshake() leaks the rendezvous fd + fifo dir (close() can't
-            # reach them: rendezvous is a local, _fifo_dir is unset until success — apparatus L3 codex R3).
-            if rendezvous >= 0:
-                try:
-                    os.close(rendezvous)
-                except OSError:
-                    pass
-                rendezvous = -1
-            self._teardown_failed_start(fifo_dir)
+            token = f"__LEVAIN_READY_{os.urandom(8).hex()}__"
+            r = self._execute(f"printf '%s\\n' '{token}'", _START_TIMEOUT)
+            if not (r.timed_out or r.exit_code != 0 or token not in r.output) and not self._probe_carried:
+                # bash ran, but its state frame never came back: something between levain and bash
+                # replaced the socket on its stdin (a sudoers `log_input` makes it a pipe), and nothing
+                # would carry from one command to the next, silently (S2 L2b L3).
+                raise ConfinementError(
+                    "the shell's state channel did not answer the start probe (is the socket on bash's "
+                    "stdin replaced, e.g. by a sudo log_input setting?) — refusing a shell whose "
+                    "directory and exports would silently not carry."
+                )
+            if r.timed_out or r.exit_code != 0 or token not in r.output:
+                driver = os.path.basename(self._argv[0]) if self._argv else "the sandbox driver"
+                said = " | ".join(x.strip() for x in r.output.splitlines()[-5:] if x.strip())
+                how = "timed out" if r.timed_out else (
+                    f"was killed by signal {r.signal}" if r.signal else f"exited {r.exit_code}"
+                )
+                raise ConfinementError(
+                    f"the shell's start probe {how} — {driver} / bash did not run"
+                    + (f": {said}" if said else ".")
+                )
+        except BaseException as exc:  # noqa: BLE001 — cleanup must survive Ctrl-C/SystemExit too
+            self.close()
             if not isinstance(exc, Exception):
-                raise  # a cancellation (KeyboardInterrupt / SystemExit) propagates UNCHANGED
+                raise
             reason = exc if isinstance(exc, ConfinementError) else (
                 f"could not spawn the sandboxed shell ({exc}); argv={self._argv[:2]}…"
             )
             raise ConfinementError(str(reason)) from exc
-        self._fifo_dir = fifo_dir
         return self
 
-    def _handshake(self, timeout: float = 10.0) -> None:
-        """Prove bash opened the FIFO + is executing commands: send a token, wait for it on stdout.
-        Raise :class:`ConfinementError` if the shell exited / never responded (a dead sandbox driver
-        must fail spawn, not masquerade as a live shell — apparatus L3 codex round-2 #2)."""
-        cmd_w = self._cmd_w
-        assert cmd_w is not None
-        token = f"__LEVAIN_READY_{os.urandom(8).hex()}__"
-        try:
-            cmd_w.write(f"printf '%s\\n' '{token}'\n")
-            cmd_w.flush()
-        except (BrokenPipeError, OSError, ValueError) as exc:
-            raise ConfinementError(f"shell exited before the startup handshake ({exc})") from exc
-        deadline = time.monotonic() + timeout
-        # stderr is merged into stdout, so whatever the driver printed before dying (bwrap's
-        # "Can't remount readonly on ...", say) arrives here; keep it for the error.
-        early: list[str] = []
-        while time.monotonic() < deadline:
-            try:
-                line = self._stdout_q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if line is None:
-                driver = os.path.basename(self._argv[0]) if self._argv else "the sandbox driver"
-                said = " | ".join(x.strip() for x in early[-5:] if x.strip())
-                raise ConfinementError(
-                    f"shell exited during startup — {driver} / bash did not start"
-                    + (f": {said}" if said else ".")
-                )
-            if token in line:
-                return
-            early = [*early[-19:], line]
-        raise ConfinementError("timed out waiting for the shell startup handshake.")
+    # -- the carried state ---------------------------------------------------------------------
 
-    def _teardown_failed_start(self, fifo_dir: str) -> None:
-        """Best-effort cleanup for a start() that raised: close the write end, kill the group, remove
-        the fifo dir. Leaves ``_proc``/``_cmd_w`` None + ``_fifo_dir`` unset so a later close() is a
-        no-op (this path already cleaned up)."""
-        if self._cmd_w is not None:
-            try:
-                self._cmd_w.close()
-            except Exception:  # noqa: BLE001 — teardown must never raise
-                pass
-            self._cmd_w = None
-        if self._proc is not None and self._proc.poll() is None:
-            self._signal_group(signal.SIGKILL)
-        self._proc = None
-        shutil.rmtree(fifo_dir, ignore_errors=True)
+    def _input(self, command: str) -> bytes:
+        """The runner's stdin: the carried state as NUL-terminated data, then the command."""
+        enc = lambda s: s.encode("utf-8", "surrogateescape")   # noqa: E731
+        parts = [enc(self._carried_cwd), enc(str(self._cwd)), b"-" if self._carried_oldpwd is None
+                 else b"o" + enc(self._carried_oldpwd)]
+        parts += [enc(f"{k}={v}") for k, v in self._carried_env.items()]
+        parts += [b"", enc(command)]
+        return b"\0".join(parts) + b"\0"
 
-    def _drain_stdout(self) -> None:
-        """Read stdout line by line into the queue; enqueue ``None`` at EOF (shell exited).
+    def _carry(self, frame: bytes) -> None:
+        """Adopt what a command's EXIT trap wrote back, as data: ``P<cwd>``, ``O<OLDPWD>``,
+        ``E<NAME>=<value>`` fields. A malformed frame carries nothing (the previous state stays).
+        Kept: every name levain started bash with, and any other name except ``_NEVER_CARRIED`` and
+        the ones :func:`levain.launch.refused_by_rule` refuses (credential-shaped, levain's own)."""
+        from levain.launch import refused_by_rule
 
-        Uses ``readline()`` in a loop, NOT ``for line in stdout`` — the iterator protocol read-aheads
-        into an ~8KB buffer and won't yield a line until that buffer fills or EOF, which DEADLOCKS a
-        persistent shell whose output never fills a block and whose stdin stays open (no EOF). Verified
-        live: the iterator form hangs, ``readline()`` streams per line."""
-        # Capture proc/stdout ONCE at entry into locals (apparatus L3 complement #3): close() nulls
-        # self._proc from another thread, so re-reading self._proc.stdout mid-loop could AttributeError.
-        proc = self._proc
-        if proc is None or proc.stdout is None:
-            self._stdout_q.put(None)
+        fields = [f.decode("utf-8", "surrogateescape") for f in frame.split(b"\0")[:-1]]
+        if not fields or not fields[0].startswith("P"):
             return
-        stdout: IO[str] = proc.stdout
+        cwd, oldpwd, env = fields[0][1:], None, {}
+        for f in fields[1:]:
+            if f.startswith("O") and oldpwd is None:
+                oldpwd = f[1:]
+            elif f.startswith("E") and "=" in f:
+                name, value = f[1:].split("=", 1)
+                if _never_carried(name):
+                    continue
+                if name not in self._env and refused_by_rule(name):
+                    continue
+                env[name] = value
+            else:
+                return
+        if cwd:
+            self._carried_cwd = cwd
+        self._carried_oldpwd = oldpwd
+        self._carried_env = env
 
-        def enqueue(item: str | None) -> None:
-            # Non-blocking put that DROPS the oldest line when full, so a runaway producer can't grow
-            # memory AND the reader never blocks (a blocking put(None) at EOF could hang forever if no
-            # consumer is draining). Lossy only under a runaway that will be close()d anyway.
-            try:
-                self._stdout_q.put_nowait(item)
-            except queue.Full:
-                try:
-                    self._stdout_q.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self._stdout_q.put_nowait(item)
-                except queue.Full:
-                    pass
+    # -- one command ---------------------------------------------------------------------------
 
+    def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
+        """The argv for one command's driver, and fds it inherits (closed here after the spawn)."""
+        return [*self._argv, "-c", _RUNNER, "bash"], ()
+
+    def _leader_made(self, leader: _Leader) -> None:
+        """Hook: a command's driver process exists and is watched; nothing of it has run yet."""
+
+    def _after_spawn(self, pgid: int) -> None:
+        """Hook: a command's process group exists and its bash is waiting for its input (the bwrap
+        shell confirms it is in its cgroup leaf). Raising here refuses the command before it can run."""
+
+    def _after_command(self, pgid: int) -> None:
+        """Hook: a command's bash has been reaped and its result is about to be returned."""
+
+    def _spawn(self) -> tuple[_Leader, _Output, _Carry]:
+        # The argv first: it may raise (the bwrap shell refuses there, and records the claim), and
+        # nothing below exists yet to leak (S2 L2b L6).
+        argv, pass_fds = self._spawn_argv()
+        made: list[int] = []
         try:
-            while True:
-                line = stdout.readline()
-                if line == "":  # EOF — the shell exited
-                    break
-                enqueue(line)
+            if platform.system() == "Linux" and not self._own_pid_namespace:
+                raise ConfinementError(
+                    "on Linux a shell must run each command in a pid namespace of its own (bwrap), the "
+                    "only way levain can tell that a command left nothing running — refusing (fail-closed)."
+                )
+            rd, wr = os.pipe()
+            made += (rd, wr)
+            ours, theirs = socket.socketpair()
+        except BaseException:
+            for fd in (*made, *pass_fds):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+        proc: subprocess.Popen[bytes] | None = None
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdin=theirs.fileno(),
+                stdout=wr,
+                stderr=wr,                  # merged, as a terminal shows them
+                # `/`, which every user can enter: the runner then changes to the carried directory,
+                # so the spawning process never needs access to it (a hands-user workspace).
+                cwd="/",
+                env=self._env,
+                # A NEW session, so this command's process group (pgid == its pid) can be signalled
+                # as a whole: its children, and a timed-out command's, would otherwise be orphaned.
+                start_new_session=True,
+                # WELD (apparatus L2 HIGH): no INHERITED fd may bypass the profile (seatbelt checks
+                # open(), not read() of an already-open fd). CALLER CONTRACT: no crown-jewel fd may be
+                # open in this process at spawn time.
+                close_fds=True,
+                pass_fds=pass_fds,
+            )
+            # Watched from here on, never reaped by Popen until its group is empty (see `_Leader`).
+            leader = _Leader(proc)
+            self._leader_made(leader)
+        except BaseException:
+            os.close(rd)
+            ours.close()
+            if proc is not None:   # the watch could not be set up; no input was sent, nothing ran
+                self._signal(proc.pid, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+            raise
         finally:
-            enqueue(None)
+            os.close(wr)
+            theirs.close()
+            for fd in pass_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        out = _Output(rd)
+        carry = _Carry(ours)
+        with self._lock:
+            # Registered under the lock, against a close() that ran meanwhile (S2 L3 r1, codex HIGH):
+            # close() sets `_closed` before it takes its snapshot of the groups, so either it sees
+            # this group and kills it, or this sees `_closed` and kills it here.
+            closed = self._closed
+            if not closed:
+                self._groups[proc.pid] = leader
+        if closed:
+            if not self._kill_group(proc.pid, leader):
+                with self._lock:
+                    self._groups[proc.pid] = leader   # kept for close() to report, never dropped
+                self._note_leftovers()
+            out.abandon()
+            carry.stop()
+            raise ConfinementError("shell is closed")
+        self._leader = leader
+        return leader, out, carry
+
+    def _kill_group(self, pgid: int, leader: _Leader) -> bool:
+        """SIGTERM the group, give it ``_KILL_GRACE``, SIGKILL what is left, and wait for the group
+        to empty; then reap its leader. False when it did not empty, when the SIGKILL was not
+        delivered, or when the reap had to wait too long: the leader stays unreaped (the number stays
+        this group's) and the caller must not report it killed."""
+        self._signal_group(pgid, leader, signal.SIGTERM)
+        leader.wait(_KILL_GRACE)
+        delivered = True
+        if not self._group_emptied(pgid, leader, 0.2):
+            delivered = self._signal_group(pgid, leader, signal.SIGKILL)
+        leader.wait(5.0)
+        # A SIGKILL that may not have landed leaves the group held, whatever it looks like (r5).
+        return (delivered and leader.exited and self._group_emptied(pgid, leader, 5.0)
+                and self._reap(pgid, leader))
+
+    def _signal_group(self, pgid: int, leader: _Leader, sig: int) -> bool:
+        """Signal a group only while its leader is unreaped: the leader is held unreaped for the send
+        (:meth:`_Leader.hold_for_signal`), so a number another thread has just freed is never
+        signalled (S2d codex HIGH). No lock is held across the send, which for a hands shell is sudo,
+        so a slow one never holds up a Ctrl-C or the shell's bookkeeping (S2 L3 r3, r4). True when
+        the signal was delivered, or there was nothing left to deliver it to (see :meth:`_signal`)."""
+        if not leader.hold_for_signal():
+            return True   # reaped: its group was emptied and is not this shell's any more
+        try:
+            return self._signal(pgid, sig)
+        finally:
+            leader.signal_sent()
+
+    def _reap(self, pgid: int, leader: _Leader) -> bool:
+        """Reap a leader whose group is empty, then forget the group. A signal between the two finds
+        the leader reaped and is not sent. False, the group kept, when a signal to it is still being
+        sent after ``_REAP_WAIT``."""
+        if not leader.reap(timeout=_REAP_WAIT):
+            return False
+        with self._lock:
+            if self._groups.get(pgid) is leader:
+                del self._groups[pgid]
+        return True
+
+    @staticmethod
+    def _signal(pgid: int, sig: int) -> bool:
+        """Send ``sig`` to group ``pgid``. True when it was delivered or the group is gone (ESRCH)."""
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _group_emptied(self, pgid: int, leader: _Leader, timeout: float) -> bool:
+        """Whether group ``pgid`` has no live member (polled up to ``timeout``): THE authority every
+        reap of a leader rests on. Here, macOS's: a process table read in one call
+        (:func:`_group_gone`). Linux has no such call and /proc is read one entry at a time, which a
+        member that keeps forking can evade (S2 L3 r3, r4, r5), so a Linux shell must run each command
+        in a cgroup leaf of its own and answer from that (:class:`_BwrapShell`); any other shell is
+        refused there at its spawn."""
+        if platform.system() != "Darwin":
+            return False
+        return _group_gone(pgid, timeout=timeout)
+
+    def _before_command(self) -> None:
+        """What a provider checks before each command, inside :meth:`run`'s single-caller lock and after
+        its closed check; raising refuses the command. Nothing by default."""
+
+    def _prune_groups(self) -> None:
+        """Reap the leader of each group that has emptied (:meth:`_group_emptied`), and forget the
+        group. Only then may its number be reused, and it is no longer signalled."""
+        with self._lock:
+            groups = list(self._groups.items())
+        # Decided outside the lock: `_group_emptied` may run pgrep (S2 L3 r3).
+        for pgid, leader in groups:
+            if leader.reaped or (leader.wait(0) and self._group_emptied(pgid, leader, 0.0)):
+                self._reap(pgid, leader)
+            elif leader.exited:
+                leader.release_watch()
+
+    def _keep_late(self, out: _Output) -> None:
+        with self._lock:
+            self._late.append(out)
+            while len(self._late) > _MAX_LATE:
+                self._late.pop(0).abandon()
+
+    def _late_output(self) -> str:
+        with self._lock:
+            late, still = self._late, []
+            text = []
+            for out in late:
+                t = out.take()
+                if t:
+                    text.append(t)
+                if not out.eof.is_set():
+                    still.append(out)
+            self._late = still
+        joined = "".join(text)
+        if not joined:
+            return ""
+        if not joined.endswith("\n"):
+            joined += "\n"
+        return f"[output from background jobs of earlier commands]\n{joined}[end of background output]\n"
+
+    def _execute(self, command: str, deadline_s: float) -> ShellResult:
+        data = self._input(command)
+        leader, out, carry = self._spawn()
+        pgid = leader.pid
+        timed_out = False
+        try:
+            # bash waits on its stdin until the input arrives, so a refusal here stops the command
+            # before any of it runs.
+            self._after_spawn(pgid)
+            carry.send(data)
+            if not leader.wait(deadline_s):
+                timed_out = True
+                if not self._kill_group(pgid, leader):
+                    # The signals did not land (sudo refused or stalled, say): the command may still
+                    # be running, so it is not reported as killed, and the shell is closed (S2 L1b
+                    # MED-2, L2b L4).
+                    out.abandon()
+                    carry.stop()
+                    self.close()
+                    raise ConfinementError(
+                        "the command timed out and levain could not stop it: its process group is "
+                        "still running. The shell was closed; check for the leftover processes "
+                        f"(process group {pgid})."
+                    )
+        except BaseException:
+            self._kill_group(pgid, leader)
+            carry.stop()
+            if not out.eof.wait(_DRAIN_GRACE):
+                out.abandon()   # a survivor holding the pipe must not keep the reader (S2 L3 r1)
+            raise
+        finally:
+            self._leader = None
+        until = time.monotonic() + _DRAIN_GRACE
+        carry.done.wait(_DRAIN_GRACE)
+        out.eof.wait(max(0.0, until - time.monotonic()))
+        carry.stop()
+        # The reader takes what is queued and closes within its poll interval; the frame is read
+        # only after that, or a background job holding the state fd would leave it half-read
+        # (S2 L3 r1, codex LOW).
+        carry.done.wait(1.0)
+        self._after_command(pgid)
+        text = out.take()
+        if not out.eof.is_set():
+            self._keep_late(out)
+        if timed_out:
+            return ShellResult(output=text, exit_code=None, timed_out=True)
+        rc = leader.status
+        if rc is None:
+            # The leader exited before its watch was set up (its driver failed before the input was
+            # sent), so its status comes from reaping it: the group is stopped and emptied first.
+            if not self._kill_group(pgid, leader):
+                self.close()
+                raise ConfinementError(
+                    "the shell's driver exited at once and levain could not stop what it left "
+                    f"running (process group {pgid}). The shell was closed."
+                )
+            rc = leader.status
+        self._prune_groups()
+        if rc is not None and rc < 0:
+            return ShellResult(output=text, exit_code=None, signal=-rc)
+        frame = carry.frame
+        self._probe_carried = frame is not None
+        if frame is not None:
+            self._carry(frame)
+        return ShellResult(output=text, exit_code=rc)
 
     def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
-        """Run ``command`` in the persistent shell; return its output + exit code.
-
-        Writes the command, then a sentinel echo carrying ``$?``, and reads stdout until the sentinel
-        line appears (or the deadline lapses → ``timed_out``). Because it is ONE long-lived bash, state
-        set by a prior command (cwd, exported vars, functions) is visible here."""
-        # run() is single-caller: it shares _pending + the stdout queue as ONE state machine, so
-        # concurrent calls would corrupt output attribution + the sentinel counter. Fail FAST on
-        # concurrent misuse (apparatus L3 consensus) rather than silently mis-attribute. close() /
-        # interrupt() deliberately do NOT take this lock — they must work cross-thread while a run()
-        # (possibly a long one) is in flight.
+        """Run ``command`` in a fresh bash that starts from the carried state; return its output, and
+        the exit status levain's waitpid reported (or the signal that ended it, or a timeout)."""
+        # Single-caller: a concurrent call would race the carried state and the late-output buffer.
+        # close() / interrupt() deliberately do NOT take this lock.
         if not self._run_lock.acquire(blocking=False):
             raise ConfinementError(
                 "SandboxedShell.run() is single-caller; a command is already running on this shell."
             )
         try:
-            # Local capture: close() may null self._cmd_w from another thread between this check and the
-            # write; the local then fails with ValueError (write on a closed file) → clean refusal, not
-            # an uncaught AttributeError (apparatus L3 consensus).
-            cmd_w = self._cmd_w
-            if self._closed or self._proc is None or cmd_w is None:
+            not_running = "shell is not running (call start() first, and not after close())"
+            if self._closed:
+                raise ConfinementError(not_running)
+            if "\0" in command:
                 raise ConfinementError(
-                    "shell is not running (call start() first, and not after close())"
+                    "refusing a command that contains a NUL byte: bash cannot receive it whole."
                 )
-            deadline_s = self._default_timeout if timeout is None else timeout
-
-            # `command`, then the sentinel printf. The sentinel is SPLIT into two printf args ('%s%s')
-            # whose OUTPUT joins to the token but whose SOURCE (what a `set -x` / DEBUG-trap trace
-            # echoes) shows the halves separated — so a trace can't spoof end-of-command (apparatus L3).
-            payload = (
-                f"{command}\n"
-                f"printf '%s%s %d\\n' '{self._sent_h1}' '{self._sent_h2}' \"$?\"\n"
-            )
-            try:
-                cmd_w.write(payload)
-                cmd_w.flush()
-            except (BrokenPipeError, OSError, ValueError) as exc:
-                raise ConfinementError(
-                    f"sandboxed shell command channel is closed ({exc})"
-                ) from exc
-            self._pending += 1  # this command's sentinel is now outstanding
-
-            deadline = time.monotonic() + deadline_s
-            collected: list[str] = []
-            total = 0
-            truncated = False
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    # My sentinel stays outstanding (it fires when the command finally ends); the NEXT
-                    # run() drains it. Collected so far is this (timed-out) command's partial output.
-                    return ShellResult(output="".join(collected), exit_code=None, timed_out=True)
-                try:
-                    line = self._stdout_q.get(timeout=min(remaining, 0.5))
-                except queue.Empty:
-                    continue
-                if line is None:  # EOF — the shell exited (e.g. the command ran `exit`)
-                    self._pending = 0
-                    self.close()  # reap + release (unlinks the profile for _SeatbeltShell)
-                    return ShellResult(output="".join(collected), exit_code=None, timed_out=False)
-                # Find the sentinel as a SUBSTRING, not a line-prefix: a command whose output has no
-                # trailing newline (``head -c 60``, ``printf`` without ``\n``) concatenates the sentinel
-                # onto its last output line, so a ``startswith`` check would miss it and the shell would
-                # hang (verified live). The sentinel is an unguessable random token, so real command
-                # output cannot spoof it.
-                idx = line.find(self._sentinel)
-                if idx != -1:
-                    self._pending -= 1
-                    if self._pending > 0:
-                        # A STALE sentinel from a prior timed-out command — discard its (now-complete)
-                        # output + keep reading for MY sentinel (self-heal the desync).
-                        collected, total, truncated = [], 0, False
-                        continue
-                    if idx:
-                        collected.append(line[:idx])  # output that shared the sentinel's line
-                    tail = line[idx + len(self._sentinel):].strip()
-                    try:
-                        code = int(tail)
-                    except ValueError:
-                        code = None
-                    return ShellResult(output="".join(collected), exit_code=code, timed_out=False)
-                # Bound the per-command returned output (apparatus L3 complement #4): past the cap, stop
-                # accumulating so a huge/runaway output can't grow the parent heap without limit.
-                if total < _MAX_OUTPUT_CHARS:
-                    collected.append(line)
-                    total += len(line)
-                elif not truncated:
-                    collected.append(f"\n[output truncated at {_MAX_OUTPUT_CHARS} chars]\n")
-                    truncated = True
+            # The provider's checks run before the started refusal, as they did in its own run(), so an
+            # unstarted shell's floor is checked too; whether it was started is read BEFORE them, so a
+            # start() finishing during a long check does not let this command in (codex L3 r6).
+            started = self._started
+            self._before_command()
+            if not started:
+                raise ConfinementError(not_running)
+            self._prune_groups()
+            late = self._late_output()
+            r = self._execute(command, self._default_timeout if timeout is None else timeout)
+            if late:
+                r = replace(r, output=late + r.output)
+            return r
         finally:
-            self._run_lock.release()
+            try:
+                self._run_ended()
+            finally:
+                self._run_lock.release()
 
-    def _signal_group(self, sig: int) -> None:
-        """Send ``sig`` to the shell's whole process GROUP (the shell + every child it spawned).
-        Best-effort — a dead process / a platform without ``killpg`` is a no-op, never a raise."""
-        proc = self._proc
-        if proc is None:
-            return
-        try:
-            os.killpg(os.getpgid(proc.pid), sig)
-        except (ProcessLookupError, OSError, AttributeError):
-            pass
+    def _run_ended(self) -> None:
+        """Hook: :meth:`run` is returning or raising, still holding its single-caller lock, so nothing it
+        does here can be raced by another run(). Nothing by default."""
 
     def interrupt(self) -> None:
-        """Best-effort SIGINT to the shell's process GROUP (Ctrl-C a hung command AND its children).
-        Never raises. Signals the group, not just bash, because a running child (``sleep``, a build)
-        is the process actually blocking — bash is asleep waiting on it."""
-        if self._proc is None or self._proc.poll() is not None:
-            return
-        self._signal_group(signal.SIGINT)
+        """Best-effort SIGINT to the running command's process GROUP (Ctrl-C it and its children).
+        On Linux every signal levain sends a command kills it (:meth:`_BwrapShell._signal`), so there
+        Ctrl-C ends the command, as bwrap's parent-death kill did before. Never raises."""
+        leader = self._leader
+        # An exited leader is unreaped or gone; neither is Ctrl-C'd.
+        if leader is not None and not leader.exited:
+            self._signal_group(leader.pid, leader, signal.SIGINT)
 
     def close(self) -> None:
-        """Terminate the shell + its process GROUP, then release resources. Idempotent, never raises.
-        Signals the group (SIGTERM → SIGKILL) so a timed-out / backgrounded child in the shell's pgid
-        is reaped, not orphaned to init.
-
-        LIMIT (apparatus L3 codex, welded not hidden): a child that DAEMONIZES into a NEW session/pgid
-        (``setsid`` / ``nohup`` / a double-fork) escapes ``killpg`` and SURVIVES close — the same
-        behavior a normal shell (and CC/Codex) has. The survivor stays SANDBOX-CONFINED (the seatbelt
-        is inherited, so crown jewels remain off-limits), but it is unattended code with network + broad
-        non-jewel authority after the operator thinks the run ended. Reaping arbitrary setsid escapees
-        is racy and out of scope here; the crown-jewels floor bounds it, and the per-domain network
-        policy (``spore-417``) is the real answer. ⚠ Since K4a ships scheduled seats, do NOT read the
-        old "human-in-the-loop v1 posture" as covering this — an unattended seat has no human, and the
-        K3 gate cannot help because the survivor is ALREADY running."""
+        """Kill every process group this shell started (SIGTERM, then SIGKILL), wait for each to
+        empty, and reap its leader. A group that does not empty is KEPT, leader unreaped, and named
+        by :attr:`unemptied_groups`; calling close() again retries it. Never raises."""
         self._closed = True
-        proc = self._proc
-        if self._cmd_w is not None:
-            try:
-                self._cmd_w.close()  # EOF on bash's script → it exits gracefully
-            except Exception:  # noqa: BLE001 — already-closed / teardown must never raise
-                pass
-            self._cmd_w = None
-        try:
-            if proc is not None and proc.poll() is None:
-                self._signal_group(signal.SIGTERM)
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._signal_group(signal.SIGKILL)
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
-        finally:
-            self._proc = None
-            if self._fifo_dir is not None:
-                shutil.rmtree(self._fifo_dir, ignore_errors=True)  # always remove the command FIFO
-                self._fifo_dir = None
+        # Reap what already emptied: those are not signalled.
+        self._prune_groups()
+        with self._lock:
+            groups = list(self._groups.items())
+            late, self._late = self._late, []
+        for out in late:
+            out.abandon()
+        # Each leader is still unreaped, so each number is still this shell's group (see `_Leader`).
+        for pgid, leader in groups:
+            self._signal_group(pgid, leader, signal.SIGTERM)
+        deadline = time.monotonic() + _KILL_GRACE
+        undelivered: set[int] = set()
+        for pgid, leader in groups:
+            if not self._group_emptied(pgid, leader, max(0.0, deadline - time.monotonic())):
+                if not self._signal_group(pgid, leader, signal.SIGKILL):
+                    undelivered.add(pgid)   # kept, whatever it looks like (r5)
+        for pgid, leader in groups:
+            leader.wait(5.0)
+            emptied = leader.reaped or (pgid not in undelivered and leader.exited
+                                        and self._group_emptied(pgid, leader, 5.0))
+            if not (emptied and self._reap(pgid, leader)):
+                # close() never raises; a group it could not empty is said, not hidden, and the
+                # session keeps the workspace lock while it lives (S2 L3 r2, codex HIGH).
+                _log.warning("levain: the shell's process group %d is still running after close()", pgid)
+        self._note_leftovers()
+
+    @property
+    def unemptied_groups(self) -> tuple[int, ...]:
+        """After :meth:`close`: the process groups it could not empty (their leaders still held)."""
+        with self._lock:
+            return tuple(sorted(self._groups)) if self._closed else ()
+
+    @property
+    def hands_user(self) -> str | None:
+        """The account this shell's commands run as, when it is not levain's own."""
+        return None
+
+    def _note_leftovers(self) -> None:
+        with _UNEMPTIED_LOCK:
+            if self.unemptied_groups:
+                _UNEMPTIED_SHELLS.add(self)
+            else:
+                _UNEMPTIED_SHELLS.discard(self)
 
     def __enter__(self) -> "SandboxedShell":
         return self.start()
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+# Closed shells holding a group they could not empty, kept (strongly: each holds its groups' unreaped
+# leaders) until a retry empties them. A session asks before it lets go of its workspace lock.
+_UNEMPTIED_SHELLS: "set[SandboxedShell]" = set()
+_UNEMPTIED_LOCK = threading.Lock()
+
+
+def unemptied_shell_groups(hands_user: str) -> list[int]:
+    """Process groups of closed shells running as ``hands_user`` that are still not empty, after one
+    more close() of each (which kills and reaps what it can now)."""
+    with _UNEMPTIED_LOCK:
+        shells = [s for s in _UNEMPTIED_SHELLS if s.hands_user == hands_user]
+    left: list[int] = []
+    for s in shells:
+        s.close()
+        left += s.unemptied_groups
+    return left
 
 
 # --- the provider seam (mirrors levain.daemon.DaemonProvider) --------------------------------
@@ -2367,9 +3613,12 @@ class ConfinementProvider(ABC):
         *,
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
+        hands: HandsIdentity | None = None,
     ) -> SandboxedShell:
-        """Start a persistent shell confined by ``policy``. The returned :class:`SandboxedShell` is
+        """Start a stateful shell confined by ``policy``. The returned :class:`SandboxedShell` is
         already ``start()``\\ ed and carries the policy it was confined by in ``effective_policy``.
+        With ``hands`` (see :func:`hands_for`), bash runs as that user; a provider that cannot do
+        that refuses, never runs bash as the operator instead.
 
         ⛔⛔ **THE CALLER REFRESHES THE SOCKET FLOOR, NOT THIS METHOD — AND A METACLASS GUARD THAT
         TRIED TO ENFORCE THE OPPOSITE WAS DELETED AFTER FIVE VERSIONS AND SEVEN BYPASSES**
@@ -2435,8 +3684,22 @@ class ConfinementProvider(ABC):
             refreshed = refresh_socket_denies(policy)
         except Exception as exc:
             raise FloorRefreshError(str(exc)) from exc
+        # Against the WHOLE policy, a hands launch's too: a jewel outside the view may have its other name
+        # inside it, and no check can tell where that name is (codex + complement L3 r5; Phill 10-03:
+        # refuse bash when ANY jewel inode has st_nlink > 1). The view's narrowing starts after this.
         _refuse_multiply_linked_jewels(refreshed)
-        shell = self._spawn_shell_impl(refreshed, env=env, default_timeout=default_timeout)
+        # `hands` is passed only when set, so a provider written before it existed still works for
+        # every operator-uid shell, and refuses a hands one. Decided from the signature, never from a
+        # TypeError, which a hands-capable provider can raise for any other reason (S2 L1b LOW-5).
+        if hands is not None and not _accepts_hands(self._spawn_shell_impl):
+            raise ConfinementError(
+                f"{type(self).__name__} cannot run bash as the entity's own user — refusing to run "
+                "it as you instead (fail-closed)."
+            )
+        shell = self._spawn_shell_impl(
+            refreshed, env=env, default_timeout=default_timeout,
+            **({"hands": hands} if hands is not None else {}),
+        )
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
         # only MOVED the crash to the caller's `.run`, as an AttributeError that `__call__` does not
         # convert into an in-band refusal.
@@ -2456,9 +3719,39 @@ class ConfinementProvider(ABC):
         *,
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
+        hands: HandsIdentity | None = None,
     ) -> SandboxedShell:
         """Platform half of :meth:`spawn_shell`. ``policy`` arrives with its socket connect arm
         ALREADY re-resolved for this spawn — render it as given; do not re-derive it here."""
+
+    def hands_file(self, policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, path: str,
+                   data: bytes = b"", *, timeout: float = 60.0) -> bytes:
+        """Run one file operation AS the hands user, under this provider's floor, inside the hands
+        workspace: the file editor's reads and writes for an entity whose bash runs as that user (the
+        editor never touches a file with the operator's rights there). ``op`` is ``read`` (returns
+        the file's bytes), ``stat``, ``list`` (see :data:`_HANDS_FILE_HELPER` for their output) or
+        ``write`` (``data`` replaces the file). Raises :class:`FileNotFoundError` for a missing path,
+        :class:`HandsFileRefused` with the reason for a refusal, :class:`OSError` when the helper
+        could not run; a provider that cannot run as another user raises :class:`ConfinementError`."""
+        raise ConfinementError(
+            f"{type(self).__name__} cannot use files as the entity's own user — refusing to use them as "
+            "you instead (fail-closed)."
+        )
+
+    def hands_write(self, policy: CrownJewelsPolicy, hands: HandsIdentity, path: str, data: bytes,
+                    *, timeout: float = 120.0) -> None:
+        """Write ``data`` to ``path`` as the hands user (:meth:`hands_file` ``write``)."""
+        self.hands_file(policy, hands, "write", path, data, timeout=timeout)
+
+
+def _accepts_hands(fn: Any) -> bool:
+    """Whether ``fn`` takes a ``hands`` keyword (named, or through ``**kwargs``)."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "hands" and p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD)
+               or p.kind is p.VAR_KEYWORD for p in params)
 
 
 def _reject_control_chars(value: str) -> None:
@@ -2685,14 +3978,15 @@ class SeatbeltProvider(ConfinementProvider):
             # own path would be misfiled, and name-based reasoning about security-relevant paths
             # is the thing this module refuses.
             _sockets = set(policy.socket_spellings) or set(policy.deny_sockets)
-            _ssh_vectors = [f for f in policy.deny_write_files if f not in _sockets]
+            _exec_vectors = [f for f in policy.deny_write_files if f not in _sockets]
             _socket_files = [f for f in policy.deny_write_files if f in _sockets]
-            if _ssh_vectors:
-                lines.append(";; ssh persistence/exec vectors (authorized_keys*, config, rc) — ALWAYS write-")
-                lines.append(";; denied (both ssh_modes): a planted key / ProxyCommand config / rc is code the")
-                lines.append(";; operator or sshd runs later — a persistent backdoor, zero legit entity use.")
+            if _exec_vectors:
+                lines.append(";; ssh + gpg persistence/exec vectors (ssh authorized_keys*, config, rc;")
+                lines.append(";; gpg-agent.conf/scdaemon.conf/gpg.conf/dirmngr.conf/common.conf) — ALWAYS write-")
+                lines.append(";; denied: a planted key / ProxyCommand config / rc / pinentry-program is code the")
+                lines.append(";; operator, sshd or the host gpg-agent runs later — a backdoor, zero legit entity use.")
                 lines.append("(deny file-write*")
-                for f in _ssh_vectors:
+                for f in _exec_vectors:
                     lines.append(f'    (literal "{_sbpl_string(str(f))}")')
                 lines.append(")")
                 lines.append("")
@@ -2732,6 +4026,7 @@ class SeatbeltProvider(ConfinementProvider):
         *,
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
+        hands: HandsIdentity | None = None,
     ) -> SandboxedShell:
         if not sandbox_exec_available():
             raise ConfinementError(
@@ -2739,18 +4034,26 @@ class SeatbeltProvider(ConfinementProvider):
                 "Refusing to grant bash hands without the sandbox (fail-closed)."
             )
         profile_text = self.render_profile(policy)
-        # A temp profile file for the shell's lifetime — `sandbox-exec -f` reads it before the sandbox
-        # applies, so it need not be inside the allow-set. The SandboxedShell owns unlink on close.
-        fd, profile_path = tempfile.mkstemp(prefix="levain-seatbelt-", suffix=".sb")
-        try:
-            with os.fdopen(fd, "w") as fh:
-                fh.write(profile_text)
-        except OSError as exc:
-            os.unlink(profile_path)
-            raise ConfinementError(f"could not write the seatbelt profile ({exc})") from exc
-
+        _refuse_kernel_mask_rules(profile_text)
+        if hands is not None:
+            # The floor is rendered for the hands workspace (the binding fenced it there), and the
+            # profile is applied to the hands process: sudo -> env -i -> sandbox driver -> bash.
+            _require_hands_sudo(hands)
+            hands_shell = _HandsSeatbeltShell(
+                hands=hands,
+                argv=[*hands_prefix(hands), SANDBOX_EXEC, "-p", profile_text,
+                      "/bin/bash", "--noprofile", "--norc"],
+                cwd=hands.workspace,
+                env=_hands_env(hands),
+                default_timeout=default_timeout,
+            )
+            return hands_shell.start()
+        # The profile goes on argv as TEXT (`-p`), never as a file. Each command is its own driver
+        # process, so a profile file would be read again at every command, and the file (owned by this
+        # uid, in its temp dir, outside every deny) could be rewritten by the entity between two
+        # commands to drop every deny (S2 L2 C1). The text lives only in this process's memory.
         argv = [
-            SANDBOX_EXEC, "-f", profile_path,
+            SANDBOX_EXEC, "-p", profile_text,
             "/bin/bash", "--noprofile", "--norc",
         ]
         # A fresh entity's cwd is its workspace; ensure it exists (the shell's Popen(cwd=) needs a real
@@ -2761,15 +4064,295 @@ class SeatbeltProvider(ConfinementProvider):
             cwd=policy.workspace,
             env=env if env is not None else _default_shell_env(),
             default_timeout=default_timeout,
-            profile_path=Path(profile_path),
         )
-        try:
-            return shell.start()
-        except Exception:
-            # start() raised (a bad spawn) → the profile file would otherwise leak (close() is never
-            # reached). shell.close() unlinks it even though _proc is None (apparatus L1 #4a).
-            shell.close()
-            raise
+        return shell.start()
+
+    def hands_file(self, policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, path: str,
+                   data: bytes = b"", *, timeout: float = 60.0) -> bytes:
+        return _seatbelt_hands_file(self, policy, hands, op, path, data, timeout)
+
+
+class HandsFileRefused(PermissionError):
+    """The hands file helper refused an operation (outside the workspace, a symlink, not a regular
+    file, too large, permission denied); the message is its reason."""
+
+
+# The largest file the editor reads through the hands helper.
+_HANDS_READ_LIMIT = 64 * 1024 * 1024
+# The most entries the editor lists in one directory (the helper reads no further than one past it).
+_HANDS_LIST_MAX = 100_000
+HANDS_ZSH = "/bin/zsh"
+
+# The file editor's hands for an entity whose bash runs as its own user: ONE fixed zsh program, run as
+# that user (sudo -n -u, env -i, no terminal) under the same sandbox profile as its bash, so every read
+# and write is made with that user's rights and the floor's, never the operator's. zsh because it
+# ships with every macOS and its zsh/system module opens with O_NOFOLLOW and O_NONBLOCK, which no
+# stock shell utility can. Its input is data only: the operation, the workspace, the path, the size
+# limit and the workspace's identity are arguments, a written file's content is stdin; nothing given
+# to it is evaluated.
+# Confinement (S2 L3 r1, codex HIGH + glm MED): the workspace must not be a symlink and must still be
+# the directory levain recorded (device:inode, $5), and the helper ENTERS it. The path, lexically
+# inside the workspace, is then walked one directory at a time with cd, refusing a symlink component
+# and checking after every step that the physical working directory (getcwd) is still the workspace
+# or under it, so a component swapped for a link between the check and the cd is caught. Everything
+# after the walk is relative to the directory the helper is IN, which a later rename cannot move it
+# out of. The last component is never followed: a symlink there is refused, or, for a write,
+# replaced. That bounds where the editor looks; what it may touch is the kernel's to say, by the
+# hands user's rights and the profile.
+#   read   the regular file's bytes on stdout, at most limit+1 of them (levain refuses more); a FIFO,
+#          device or directory is refused, not opened for long (O_NONBLOCK)
+#   stat   lstat as "mode ino dev nlink uid gid size atime mtime ctime"
+#   list   the directory's entries, then each non-hidden real subdirectory's non-hidden entries, as
+#          NUL-terminated pairs "<l|d|f|o>" "<name or sub/name>", at most limit+1 bytes
+#   write  stdin into a new file beside the target (O_CREAT|O_EXCL|O_NOFOLLOW), given the target's
+#          permissions (0644 when new), then renamed over it: atomic, and a link or FIFO at the
+#          target is replaced, never written through
+# Exit 0 done, 2 no such path, 3 refused (the reason on stderr); anything else is a failure. /etc/zshenv,
+# root's own file, is the one startup file `zsh -f` still reads. The descriptors are fixed numbers
+# (5, 6): zsh 5.9 can report a wrong number for ``sysopen -u var`` after a redirected command (seen on
+# macOS: the variable said 13, the file was open on 11).
+_HANDS_FILE_HELPER = r"""emulate -R zsh
+zmodload zsh/system zsh/stat 2>/dev/null || { print -ru2 -- 'zsh modules are unavailable'; exit 70 }
+refuse() { print -rnu2 -- "$1"; exit 3 }
+op=$1 ws=$2 p=$3 lim=$4 wsid=$5 cap=$6
+[[ $ws == /* && $p == /* ]] || refuse "not an absolute path: $p"
+[[ -L $ws ]] && refuse "the workspace $ws is a symlink"
+zstat -L -H st -- $ws 2>/dev/null || refuse "the workspace $ws is gone"
+[[ "$st[device]:$st[inode]" == $wsid ]] || refuse "the workspace $ws is not the directory levain recorded"
+builtin cd -q -- $ws 2>/dev/null || refuse "cannot enter the workspace $ws"
+zstat -L -H st -- . 2>/dev/null && [[ "$st[device]:$st[inode]" == $wsid ]] || refuse "the workspace $ws changed while it was entered"
+wsr=$(builtin pwd -P)
+inside() { local here; here=$(builtin pwd -P); [[ $here == $wsr || $here == $wsr/* ]] }
+absent() { [[ -e $1 || -L $1 ]] || exit 2 }
+enter() {
+  [[ -L ./$1 ]] && refuse "$3 runs through a symlink; the editor does not follow links for an entity with its own user"
+  [[ -d ./$1 ]] || { absent ./$1; refuse "$3: a component is not a directory" }
+  builtin cd -q -- ./$1 2>/dev/null || refuse "cannot enter a directory of $3: permission denied"
+  inside || refuse "$3 left the workspace while it was walked"
+}
+p=${p:a}
+wsa=${ws:a}
+if [[ $p == $wsa ]]; then
+  parts=()
+elif [[ $p == $wsa/* ]]; then
+  parts=(${(s:/:)${p#$wsa/}})
+else
+  refuse "$3 is outside the workspace $ws"
+fi
+n=
+if (( $#parts )); then
+  n=$parts[-1]
+  for c in $parts[1,-2]; do enter $c x $3; done
+fi
+kind() {
+  if [[ -L $1 ]]; then REPLY=l; elif [[ -d $1 ]]; then REPLY=d; elif [[ -f $1 ]]; then REPLY=f; else REPLY=o; fi
+}
+case $op in
+  stat)
+    t=${n:-.}
+    zstat -L -H st -- ./$t 2>/dev/null || { absent ./$t; refuse "cannot stat $3: permission denied" }
+    print -rn -- "$st[mode] $st[inode] $st[device] $st[nlink] $st[uid] $st[gid] $st[size] $st[atime] $st[mtime] $st[ctime]"
+    ;;
+  read)
+    [[ -n $n ]] || refuse "$3 is a directory"
+    if ! sysopen -r -o nofollow,nonblock -u 5 -- ./$n 2>/dev/null; then
+      absent ./$n
+      [[ -L ./$n ]] && refuse "$3 is a symlink; the editor does not follow links for an entity with its own user"
+      refuse "cannot open $3: permission denied"
+    fi
+    zstat -f 5 -H st 2>/dev/null || refuse "cannot stat $3"
+    (( (st[mode] & 8#170000) == 8#100000 )) || refuse "$3 is not a regular file"
+    (( st[size] <= lim )) || refuse "$3 is larger than $lim bytes"
+    /usr/bin/head -c $(( lim + 1 )) <&5
+    ;;
+  list)
+    [[ -n $n ]] && enter $n x $3
+    [[ -r . && -x . ]] || refuse "cannot list $3: permission denied"
+    setopt null_glob glob_dots
+    # (Y): the glob stops reading the directory after cap+1 matches, so a huge one costs no more.
+    es=( ./*(Y$(( cap + 1 ))) )
+    (( $#es > cap )) && refuse "$3 has more than $cap entries; not listed"
+    {
+      for e in ${(o)es}; do
+        kind $e
+        print -rn -- "$REPLY"$'\0'"${e:t}"$'\0'
+        if [[ $REPLY == d && ${e:t} != .* ]]; then
+          (
+            builtin cd -q -- $e 2>/dev/null && inside || exit 0
+            cs=( ./[^.]*(Y$(( cap + 1 ))) )
+            (( $#cs > cap )) && refuse "$3/${e:t} has more than $cap entries; not listed"
+            for c in ${(o)cs}; do
+              kind $c
+              print -rn -- "$REPLY"$'\0'"${e:t}/${c:t}"$'\0'
+            done
+          ) || exit $?
+        fi
+      done
+    } | /usr/bin/head -c $(( lim + 1 ))
+    if (( pipestatus[1] == 3 )); then exit 3; fi
+    ;;
+  write)
+    [[ -n $n ]] || refuse "$3 is a directory"
+    [[ -d ./$n && ! -L ./$n ]] && refuse "$3 is a directory"
+    mode=644
+    if [[ -f ./$n && ! -L ./$n ]] && zstat -L -H st -- ./$n 2>/dev/null; then
+      mode=$(( [##8] st[mode] & 8#7777 ))
+    fi
+    t=./.$n.levain-$$-$RANDOM
+    sysopen -w -o create,excl,nofollow -m 600 -u 6 -- $t 2>/dev/null || refuse "cannot write in the directory of $3: permission denied"
+    if ! /bin/cat >&6; then exec 6>&-; /bin/rm -f -- $t; refuse "writing $3 failed"; fi
+    exec 6>&-
+    if ! /bin/chmod $mode $t || ! /bin/mv -f -- $t ./$n; then /bin/rm -f -- $t; refuse "could not replace $3"; fi
+    ;;
+  *) refuse "unknown operation $op" ;;
+esac
+"""
+_HANDS_FILE_OPS = ("read", "stat", "list", "write")
+
+
+def _hands_file_argv(driver: list[str], hands: HandsIdentity, op: str, path: str, ws_id: str) -> list[str]:
+    """The helper as the hands user under ``driver``, the platform's sandbox argv (the Seatbelt driver
+    with its profile, or a hands launch's bwrap argv): the same program and arguments on both."""
+    return [*hands_prefix(hands), *driver,
+            HANDS_ZSH, "-f", "-c", _HANDS_FILE_HELPER, "zsh", op, str(hands.workspace), path,
+            str(_HANDS_READ_LIMIT), ws_id, str(_HANDS_LIST_MAX)]
+
+
+def _workspace_id(hands: HandsIdentity) -> str:
+    """``device:inode`` of the hands workspace as levain sees it now; refuses a symlink there."""
+    st = os.lstat(hands.workspace)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise HandsFileRefused(f"the hands workspace {hands.workspace} is not a directory (a symlink?)")
+    return f"{st.st_dev}:{st.st_ino}"
+
+
+def _stop_hands_group(hands: HandsIdentity, proc: subprocess.Popen[bytes]) -> bool:
+    """SIGKILL a hands helper's whole session group: its members as the hands user, sudo (the leader,
+    the operator's real uid) as levain. True once the group is gone and sudo reaped."""
+    _hands_signal(hands, proc.pid, signal.SIGKILL)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    return _group_gone(proc.pid, timeout=5.0) and proc.poll() is not None
+
+
+def _run_hands_helper(argv: list[str], hands: HandsIdentity, data: bytes, timeout: float,
+                      what: str = "the editor's file operation",
+                      on_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
+                      cancelled: Callable[[], bool] | None = None,
+                      ) -> subprocess.CompletedProcess[bytes]:
+    """Run the helper in a new session (no controlling terminal) and, on a timeout or any error,
+    kill its WHOLE group, not only sudo: ``subprocess.run`` kills just the child it started (S2 L3 r1,
+    codex + glm). ``on_start`` is given the process first; if it raises, the group is killed too.
+    ``cancelled`` is asked every 0.2 s; once it says so the group is killed and OSError raised. Only
+    this thread ever signals or reaps the helper (L3 r3, r4: another thread signalling it could reach a
+    reused pid)."""
+    from levain.launch import child_env
+
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            cwd="/", env=child_env(), start_new_session=True)
+    stopped = False
+    try:
+        if on_start is not None:
+            on_start(proc)
+        if cancelled is None:
+            out, err = proc.communicate(data, timeout=timeout)
+        else:
+            deadline, sent = time.monotonic() + timeout, data
+            while True:
+                try:
+                    out, err = proc.communicate(sent, timeout=max(0.0, min(0.2, deadline - time.monotonic())))
+                    break
+                except subprocess.TimeoutExpired:
+                    sent = None   # retried without input: "Cannot send input after starting communication"
+                    if time.monotonic() >= deadline:
+                        raise
+                    if cancelled():
+                        stopped = True
+                        gone = _stop_hands_group(hands, proc)
+                        raise OSError(f"{what} as {hands.user} was cancelled"
+                                      + ("" if gone else f"; its process group {proc.pid} could not be stopped"))
+    except subprocess.TimeoutExpired:
+        gone = _stop_hands_group(hands, proc)
+        raise OSError(f"{what} as {hands.user} timed out"
+                      + ("" if gone else f"; its process group {proc.pid} could not be stopped")) from None
+    except BaseException:
+        if not stopped:
+            _stop_hands_group(hands, proc)
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
+def _hands_file_op(hands: HandsIdentity, op: str, path: str, data: bytes, timeout: float,
+                   driver: Callable[[], list[str]]) -> bytes:
+    """One editor operation through the helper, on every platform: ``driver()`` gives the sandbox argv
+    the helper runs under (asked after the operation and the workspace are checked), and the helper's
+    exit status becomes the result or the exception :meth:`ConfinementProvider.hands_file` documents."""
+    if op not in _HANDS_FILE_OPS:
+        raise ValueError(f"unknown hands file operation {op!r}")
+    try:
+        ws_id = _workspace_id(hands)
+    except FileNotFoundError:
+        raise HandsFileRefused(f"the hands workspace {hands.workspace} is gone") from None
+    argv = _hands_file_argv(driver(), hands, op, path, ws_id)
+    # stdin is the content for a write and empty otherwise.
+    r = _run_hands_helper(argv, hands, data if op == "write" else b"", timeout)
+    said = r.stderr.decode("utf-8", "replace").strip()
+    if r.returncode == 0:
+        if op in ("read", "list") and len(r.stdout) > _HANDS_READ_LIMIT:
+            raise HandsFileRefused(f"{path}: more than {_HANDS_READ_LIMIT} bytes; not read")
+        return r.stdout
+    if r.returncode == 2:
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
+    if r.returncode == 3:
+        raise HandsFileRefused(said or f"{hands.user} may not {op} {path}")
+    raise OSError(f"{hands.user} could not {op} {path} (status {r.returncode}): "
+                  + (said.splitlines()[-1] if said else "no reason given"))
+
+
+def _seatbelt_hands_file(provider: "SeatbeltProvider", policy: CrownJewelsPolicy, hands: HandsIdentity,
+                         op: str, path: str, data: bytes, timeout: float) -> bytes:
+    def driver() -> list[str]:
+        text = provider.render_profile(policy)
+        _refuse_kernel_mask_rules(text)
+        return [SANDBOX_EXEC, "-p", text]
+
+    return _hands_file_op(hands, op, path, data, timeout, driver)
+
+
+def _bwrap_hands_file(policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, path: str, data: bytes,
+                      timeout: float) -> bytes:
+    """The editor on Linux: the same helper under the bwrap argv a hands shell runs under, from the
+    same planner and transform. The launch probes and the listener sweep are not run for it: the helper
+    is a fixed program that opens files and never a socket, and a bwrap that cannot build the
+    namespaces fails the operation (fail-closed)."""
+    if not os.access(HANDS_ZSH, os.X_OK):
+        raise ConfinementError(
+            f"{HANDS_ZSH} is missing: install zsh (the editor's hands use it) — refusing to use the "
+            "entity's files as you instead (fail-closed)."
+        )
+    _require_hands_python()
+
+    def driver() -> list[str]:
+        argv, _ = _bwrap_plan(_hands_policy(policy, hands))
+        argv = _hands_bwrap_argv(argv, hands)
+        missing = _hands_argv_unmade(argv)
+        if missing is not None:
+            # A shell creates such a placeholder under its ledger claim and removes it once no shell
+            # needs it. The editor takes no claim, so it refuses rather than let bwrap create the
+            # path on the host and leave it behind.
+            raise ConfinementError(
+                f"the floor mounts over {missing}, which does not exist; only a running shell creates it "
+                "— refusing to use the entity's files (fail-closed). Run a command in the shell, then retry."
+            )
+        return argv
+
+    return _hands_file_op(hands, op, path, data, timeout, driver)
 
 
 def _default_shell_env() -> dict[str, str]:
@@ -2801,38 +4384,53 @@ def _default_shell_env() -> dict[str, str]:
 
 
 class _SeatbeltShell(SandboxedShell):
-    """A :class:`SandboxedShell` that also unlinks its seatbelt profile file on close. Kept private —
-    callers get a :class:`SandboxedShell` from :meth:`SeatbeltProvider.spawn_shell`."""
+    """A :class:`SandboxedShell` that re-runs the kernel-mask refusal, before every command, on the
+    profile text it is about to hand the driver's ``-p``. Kept private — callers get a
+    :class:`SandboxedShell` from :meth:`SeatbeltProvider.spawn_shell`."""
 
-    def __init__(
-        self,
-        *,
-        profile_path: Path,
-        argv: list[str],
-        cwd: Path,
-        env: dict[str, str],
-        default_timeout: float = 120.0,
-    ) -> None:
-        # Explicit params forwarded to super (NOT **kwargs: object, which would erase the signature so
-        # mypy couldn't catch a wrong/renamed kwarg — apparatus L1 #9).
+    def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
+        argv, fds = super()._spawn_argv()
+        # The exact argv element the driver will read.
+        _refuse_kernel_mask_rules(argv[argv.index(SANDBOX_EXEC) + 2])
+        return argv, fds
+
+
+class _HandsSeatbeltShell(_SeatbeltShell):
+    """A seatbelt shell whose bash runs as the entity's hands user (``sudo -n -u``, outside the
+    sandbox driver). levain cannot signal another uid's processes, so every signal (timeout, close,
+    interrupt) is sent as the hands user; checking that a group is empty still works from levain
+    (``killpg(pgid, 0)`` answers EPERM while a member lives)."""
+
+    def __init__(self, *, hands: HandsIdentity, argv: list[str], cwd: Path, env: dict[str, str],
+                 default_timeout: float = 120.0) -> None:
         super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
-        self._profile_path = profile_path
+        self.hands = hands
 
-    def close(self) -> None:
-        # ⛔ `finally`, NOT sequential (complement L3 LOW, 2026-09-04). This unlink is ADDITIVE
-        # cleanup that only this subclass knows about, and `super().close()` above it can raise —
-        # at which point the temp SBPL profile leaked, one per rejected or failed shell. Nothing
-        # upstream can compensate: a caller falling back to `SandboxedShell.close` runs the BASE
-        # teardown, which has never heard of this file.
-        # ⚡ The general form: a subclass's own additive cleanup has to be robust to its parent's
-        # failure, because no generic fallback can know what the subclass added.
-        try:
-            super().close()
-        finally:
+    @property
+    def hands_user(self) -> str | None:
+        return self.hands.user
+
+    def _signal(self, pgid: int, sig: int) -> bool:   # type: ignore[override]
+        # The group's members run as the hands user, except sudo, the group leader, whose REAL uid is
+        # the operator's: only levain can signal it, and only the hands user the rest. A command that
+        # stops itself (`kill -STOP $$`) stops sudo too, so after the signal both get SIGCONT, or a
+        # stopped sudo would outlive the timeout, close() and levain (S2 L2b M2).
+        delivered = _hands_signal(self.hands, pgid, sig)
+        if sig != signal.SIGCONT:
+            _hands_signal(self.hands, pgid, signal.SIGCONT)
+        gone = False
+        for s_ in (sig, signal.SIGCONT):
             try:
-                self._profile_path.unlink()
+                os.killpg(pgid, s_)
+            except ProcessLookupError:
+                gone = True
             except OSError:
                 pass
+        # Three answers (S2 L3 r6): delivered (the hands user's kill said so), confirmed gone, or
+        # unconfirmed. A kill that found nothing left exits non-zero like a refused or stalled sudo,
+        # so "gone" is confirmed apart from it: ESRCH, or, since ESRCH cannot come while the leader is
+        # held unreaped, macOS's one-call process table showing no live member (`_group_live`).
+        return delivered or gone or not _group_live(pgid)
 
 
 # --- Linux: bwrap (mount-namespace) provider -------------------------------------------------
@@ -2965,7 +4563,7 @@ def _jewel_inodes(policy: CrownJewelsPolicy) -> dict[tuple[int, int], tuple[int,
 
     The jewels are the named ones (followed through symlinks) plus every entry under the hidden
     subtrees and the ssh dir (walked without following symlinks), and on Linux the session bus and
-    the systemd manager socket bwrap step (7) masks. An absent jewel is skipped: there is no file to
+    the systemd manager socket bwrap step (7) hides. An absent jewel is skipped: there is no file to
     have other names.
 
     ⛔ A jewel this user cannot stat or list raises :class:`ConfinementError` ("could not check"),
@@ -3143,21 +4741,66 @@ def _reachable(p: Path) -> bool:
         return False
 
 
-def _bwrap_file_target(f: Path) -> Path:
+def _host_spelling(p: Path) -> Path:
+    """``p`` with its parent resolved. A mount destination is spelled this way: bwrap resolves a
+    destination inside its new root, where an absolute link in a parent (``~/.config`` pointing
+    elsewhere) does not lead where it leads on the host, so a mount spelled through one cannot land."""
+    return p.parent.resolve() / p.name
+
+
+def _home_read_only_root() -> Path | None:
+    """The real ``$HOME`` the bwrap plan binds read-only (step (0) of :func:`_bwrap_plan_impl`), or
+    None when it binds none ($HOME unresolvable, the filesystem root, or not a directory)."""
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        return None
+    if home == Path(home.anchor) or not home.is_dir():
+        return None
+    return home
+
+
+def _bwrap_file_target(f: Path, frozen: tuple[Path, ...] = ()) -> Path:
     """Where a mount for the protected FILE ``f`` must land. A mount cannot land on a symlink (bwrap
     aborts; measured 2026-09-30 with a stow-style ~/.ssh/config). A link this user can replace is
     REFUSED, because masking its target leaves the link free to be swapped for a planted file; one
-    they cannot replace is masked at its real path."""
+    they cannot replace, or one in a directory of ``frozen`` (mounted read-only by the plan, so the
+    link cannot be replaced from inside), is masked at its real path."""
     if not f.is_symlink():
-        return f
+        return _host_spelling(f)
+    _refuse_replaceable_link(f, frozen)
+    return _link_target(f)
+
+
+def _link_target(f: Path) -> Path:
+    """The real path of the link ``f``, refusing one that leads nowhere. ``resolve()`` alone returns
+    a loop's own path on Python 3.13 (it raised on 3.12), and a mask aimed there, or at a dangling
+    link's absent target, would make bwrap abort or create the target on the host."""
+    try:
+        return f.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ConfinementError(
+            f"{f} is a symlink that leads nowhere (dangling, or a loop). The Linux floor masks a "
+            "link at its target, and this one has none. Refusing to grant bash hands (fail-closed). "
+            "Remove or fix the link."
+        ) from None
+
+
+def _refuse_replaceable_link(f: Path, frozen: tuple[Path, ...] = ()) -> None:
+    """Refuse bash when the jewel spelling ``f`` is a symlink in a directory this user can write,
+    unless that directory is one of ``frozen``: the plan mounts it read-only, so inside bash the link
+    can be neither removed nor replaced (``$HOME`` itself, step (0); a store or tool directory)."""
+    if f.parent.resolve() in frozen:
+        return
     if os.access(f.parent, os.W_OK):
         raise ConfinementError(
             f"{f} is a symlink in a directory this user can write. The Linux floor protects files "
             "with mounts, and a mount cannot cover a symlink, so the link could be replaced by a "
             "planted file. Refusing to grant bash hands (fail-closed). Replace the symlink with the "
-            "real file to use bash."
+            "real file to use bash (for a standard credential store, setting "
+            "\"deny_standard_creds\": false in .levain/confinement.json also does it). A link "
+            "directly in a home directory bash sees read-only (the usual case) is accepted."
         )
-    return f.resolve()
 
 
 _MASK_OPS = ("--bind", "--ro-bind", "--bind-try", "--ro-bind-try")
@@ -3190,6 +4833,35 @@ def _refuse_bind_after_mask(argv: list[str]) -> None:
             )
 
 
+def _unescape_mountinfo(field: str) -> str:
+    """mountinfo octal-escapes space, tab, newline and backslash as ``\\ooo`` (proc_pid_mountinfo(5))."""
+    import re
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
+def _extra_procfs_mounts(mountinfo: str = "/proc/self/mountinfo") -> list[Path]:
+    """Every ``proc`` filesystem mounted outside ``/proc`` on this host, from ``mountinfo``. Empty
+    where the file does not exist (macOS). An unreadable or malformed table raises OSError, which
+    :func:`_bwrap_plan` turns into a refusal: a procfs it could not look for is not known absent."""
+    try:
+        text = Path(mountinfo).read_text(encoding="utf-8", errors="surrogateescape")
+    except FileNotFoundError:
+        return []
+    out: list[Path] = []
+    for line in text.splitlines():
+        pre, sep, post = line.partition(" - ")
+        fields = pre.split(" ")
+        if not sep or len(fields) < 5 or not post:
+            raise OSError(f"unreadable mount table line in {mountinfo}: {line!r}")
+        if post.split(" ")[0] != "proc":
+            continue
+        mp = Path(_unescape_mountinfo(fields[4]))
+        if mp == Path("/proc") or mp.is_relative_to("/proc"):
+            continue
+        out.append(mp)
+    return list(_dedup_paths(out))
+
+
 def _bwrap_argv(policy: CrownJewelsPolicy) -> list[str]:
     """The bwrap argv alone — :func:`_bwrap_plan` without the directories to create first."""
     return _bwrap_plan(policy)[0]
@@ -3212,6 +4884,336 @@ def _bwrap_plan(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         ) from exc
 
 
+#: Step (7b) of :func:`_bwrap_plan_impl`: directories of daemons that resolve or fetch a name on
+#: the network for whoever connects (the system D-Bus, which carries systemd-resolved and avahi;
+#: resolved's varlink; nscd; avahi's own socket; tailscaled's LocalAPI, a deputy where the host made
+#: this user its operator [traced, not run]), hidden whole; and the deputy sockets that sit in the
+#: shared /run itself (snapd), masked. R1 measured the resolver rows (levain
+#: project_memory/1009-s2-linux/R1_RESULT.md); the abstract-socket row is closed by --unshare-net.
+_NETWORK_DEPUTY_DIRS = ("/run/dbus", "/run/systemd/resolve", "/run/nscd", "/run/avahi-daemon",
+                        "/run/tailscale")
+_NETWORK_DEPUTY_SOCKETS = ("/run/snapd.socket", "/run/snapd-snap.socket")
+
+
+_PROC_NET_UNIX = "/proc/net/unix"
+_ON_LINUX = sys.platform.startswith("linux")
+# One row of /proc/net/unix: Num RefCount Protocol Flags Type St Inode [Path].
+_UNIX_ROW = re.compile(r"[0-9a-fA-F]+: [0-9a-fA-F]{8} [0-9a-fA-F]{8} [0-9a-fA-F]{8} "
+                       r"[0-9a-fA-F]{4} [0-9a-fA-F]{2} +[0-9]+(?: (.*))?")
+
+
+def _bound_unix_socket_paths() -> list[str]:
+    """Every filesystem path a unix socket is bound to in levain's network namespace, as the kernel
+    lists it in ``/proc/net/unix`` (abstract names, ``@...``, have no path and are skipped). Linux
+    only: bwrap runs nowhere else, so elsewhere this is empty. Raises :class:`ConfinementError` when
+    the list cannot be read or a row does not have the kernel's shape (a bound path containing a
+    newline splits its row, and its socket would otherwise go unseen), because the offline floor
+    cannot then know which sockets to hide. Sockets of other network namespaces are not listed, and
+    no unprivileged process can list them."""
+    if not _ON_LINUX:
+        return []
+    try:
+        with open(_PROC_NET_UNIX, encoding="utf-8", errors="surrogateescape", newline="\n") as fh:
+            lines = fh.read().split("\n")
+    except OSError as e:
+        raise ConfinementError(
+            f"cannot read {_PROC_NET_UNIX} ({e.strerror or e}), so the floor cannot find the "
+            "daemon sockets to hide from bash without network (fail-closed).") from None
+    if lines and lines[-1] == "":
+        lines.pop()
+    if not lines or not lines[0].startswith("Num "):
+        raise ConfinementError(f"{_PROC_NET_UNIX} has no header row (fail-closed).")
+    out: list[str] = []
+    for line in lines[1:]:
+        m = _UNIX_ROW.fullmatch(line)
+        if m is None:
+            raise ConfinementError(
+                f"{_PROC_NET_UNIX} has a row the floor cannot read ({line[:80]!r}): a socket path "
+                "with a newline in it, say. Bash without network is refused (fail-closed).")
+        if m.group(1) and not m.group(1).startswith("@"):
+            out.append(m.group(1))
+    return out
+
+
+def _gnupg_homes() -> list[Path]:
+    """Every GNUPGHOME whose configuration a host gpg process reads, taken from where gpg looks for its
+    homedir, never from what is running now (an agent the operator starts after the shell launched
+    reads the same files).
+      - ``~/.gnupg`` (the default);
+      - ``$GNUPGHOME`` from levain's OWN environment when it is an ABSOLUTE path.
+    A home that does not exist YET is returned too: gpg creates it on its first run and then reads
+    its configuration, so the denies must already cover it (macOS denies the path string; on Linux
+    the absent home is created 0700 and pinned before bwrap runs and recorded in the placeholder
+    ledger, see step (1) of ``_bwrap_plan``). A path that exists and is not a directory is skipped:
+    nothing can be placed beneath it. Homes come only from these
+    trusted sources: never from a socket's parent directory (a redirected socketdir is not a home) and
+    never from running the operator's shell (shell startup files are writable by the entity).
+
+    Returned UNRESOLVED so the caller's :func:`_spellings` pins the LEXICAL ancestors too: an
+    intermediate symlink in a homedir path must not be swappable. Duplicates collapse. Any OS; empty
+    on a box with no gnupg."""
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path.home() / ".gnupg")   # the default home
+    except RuntimeError:
+        pass  # no home directory for this user
+    gnupghome = os.environ.get("GNUPGHOME")
+    if gnupghome and os.path.isabs(gnupghome):
+        # ABSOLUTE only: a relative $GNUPGHOME would resolve against levain's cwd, which the sandbox
+        # and gpg need not share, so it would name the wrong path.
+        candidates.append(Path(gnupghome))
+    out: list[Path] = []
+    for h in candidates:
+        if os.path.lexists(h) and not os.path.isdir(h):
+            continue  # a file where the home would be: gpg cannot use it, nothing lives under it
+        out.append(h)
+    return list(dict.fromkeys(out))
+
+
+def _dirmngr_sockets() -> list[Path]:
+    """The operator's gnupg dirmngr sockets the offline bash could reach. dirmngr is socket-activated
+    by the user's service manager (or left running by an earlier gpg), so a connect reaches it OUTSIDE
+    bash's network namespace, and it fetches (WKD, keyservers) and resolves names the client chooses.
+
+    Two sources, unioned: every socket named ``S.dirmngr`` the kernel lists as bound in levain's network
+    namespace (:func:`_bound_unix_socket_paths`),
+    which covers any GNUPGHOME, including one bash sets for itself later (codex L3 r6: guessing from
+    levain's own GNUPGHOME missed that); and the default places (``<runtime>/gnupg``, its ``d.*``
+    subdirectories, ``~/.gnupg``), so a socket file present at spawn with no listener is hidden as
+    before. A dirmngr first bound after spawn is not hidden: the residual the call site states.
+
+    These are masks BY PATH, and the operator-floor bash runs as the operator, so it can rename any of
+    the operator's directories: one session moves the directory holding a live dirmngr socket, and the
+    next reaches it at its new name, where neither source finds it (REPRODUCED 2026-10-10 on argushub,
+    63 packets on port 53 carrying a fresh name).
+    No path mask closes that. Under a user runtime dir, where gnupg puts its sockets whenever
+    ``/run/user/<uid>`` exists, the runtime-dir view (step (7) of :func:`_bwrap_plan_impl`) does, and
+    the masks here are dropped for those paths. A dirmngr socket in a GNUPGHOME outside every runtime
+    dir (one started where ``/run/user/<uid>`` was absent) gets a view of its GNUPGHOME the same way
+    (:func:`_gnupg_home_views`); one in ``$HOME``, a directory directly in it (``~/.gnupg``) or
+    ``/tmp`` keeps its mask, since bash can rename none of those."""
+    found: list[Path] = []
+    for s in _bound_unix_socket_paths():
+        if Path(s).name != "S.dirmngr":
+            continue
+        if not s.startswith("/"):
+            raise ConfinementError(
+                f"a dirmngr socket is bound at the relative path {s!r}, which the floor cannot "
+                "place, so it cannot hide it from bash without network (fail-closed).")
+        try:
+            found.append(_host_spelling(Path(s)))  # bound through a linked parent: masked where it lands
+        except (OSError, RuntimeError, ValueError) as e:
+            raise ConfinementError(
+                f"cannot resolve the dirmngr socket path {s!r} ({e}), so the floor cannot hide it "
+                "from bash without network (fail-closed).") from None
+    roots = [Path(r) / "gnupg" for r in _runtime_dirs()]
+    try:
+        roots.append(Path.home() / ".gnupg")
+    except RuntimeError:
+        pass  # no home directory for this user: nothing there to hide
+    for g in roots:
+        try:
+            if not g.is_dir():
+                continue
+            found += [g / "S.dirmngr", *sorted(g.glob("d.*/S.dirmngr"))]
+        except OSError:
+            continue  # another user's runtime dir: out of the entity's reach too
+    return list(dict.fromkeys(f for f in found if _reachable(f) and f.exists()))
+
+
+#: The ``gpgconf --list-dirs`` names of the gnupg sockets bash gets back: the agent's own and its ssh
+#: one, and keyboxd's (GnuPG 2.4 ``use-keyboxd``: the public keyring as a local daemon). NOT the agent's
+#: ``.extra`` and ``.browser`` sockets (meant for forwarding to another host) nor dirmngr's.
+_GPG_SOCKET_DIRS = ("agent-socket", "agent-ssh-socket", "keyboxd-socket")
+
+
+def _gpg_sockets() -> list[Path]:
+    """The operator's gnupg sockets named in :data:`_GPG_SOCKET_DIRS`, as ``gpgconf`` names them for this
+    process's GNUPGHOME, the default one or not. All of ``--list-dirs`` is read and the names picked out,
+    so a gnupg without keyboxd (before 2.3) is never asked for a name it does not have. Empty when
+    gpgconf is missing or fails: gpg inside bash then finds no agent, a degrade rather than an exposure."""
+    from levain.launch import child_env
+
+    exe = shutil.which("gpgconf")
+    if exe is None:
+        return []
+    try:
+        done = subprocess.run([exe, "--list-dirs"],
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/",
+                              env=child_env("GNUPGHOME"), timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if done.returncode != 0:
+        return []
+    out: list[Path] = []
+    for line in done.stdout.splitlines():
+        name, _, value = line.partition(":")
+        value = urllib.parse.unquote(value)   # gpgconf percent-escapes its values (":" is %3a)
+        if name in _GPG_SOCKET_DIRS and value.startswith("/"):
+            out.append(Path(value))
+    return out
+
+
+#: The sockets a view of a GNUPGHOME (:func:`_gnupg_home_views`) binds back, by name.
+_GNUPG_HOME_SOCKETS = frozenset({"S.gpg-agent", "S.gpg-agent.ssh", "S.keyboxd"})
+
+
+def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path],
+                      dirmngr: list[Path]) -> tuple[list[Path], list[Path]]:
+    """The GNUPGHOMEs that hold a dirmngr socket outside every runtime dir, as ``(views, pins)``, for bash
+    without network only (dirmngr is a network deputy only there). gnupg keeps its sockets in GNUPGHOME
+    when it finds no ``/run/user/<uid>``, and a dirmngr started then (a cron job, a login with no user
+    manager, before linger) is still there when the operator runs levain. Masked by path it was moved:
+    one session renamed the GNUPGHOME, or its parent, and the next reached dirmngr at its new name
+    (RUN on argushub 2026-10-12, 60 packets on port 53 carrying a fresh name, both renames).
+
+    Each such directory is a view like a runtime dir's, and its ancestors (``pins``) are pinned so it
+    cannot be moved from above. A directory that is ``/``, ``/run``, ``/var/run``, ``/tmp``,
+    ``/var/tmp`` or ``$HOME``, or one directly in ``$HOME`` (``~/.gnupg``: step (0)'s view of $HOME
+    makes it a mountpoint), is left to the mask: bash cannot rename it or anything above it. One
+    another user owns keeps the mask too: its files are not the operator's to bind back. A directory that holds the workspace, the entity or ``$HOME`` is
+    refused: a view would hide them. ``dirmngr`` is the plan's one reading of :func:`_dirmngr_sockets`,
+    which its masks use too: read twice, a dirmngr that appeared between the readings got a mask only."""
+    if not policy.deny_localhost_outbound:
+        return [], []
+    shared = {Path(p).resolve() for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp")}
+    home = Path.home().resolve()
+    shared.add(home)
+    views: list[Path] = []
+    for f in dirmngr:
+        g = f.resolve().parent
+        if (g in shared or g.parent == home or g in views
+                or any(g == r or g.is_relative_to(r) for r in runtime_roots)):
+            continue
+        try:
+            owner = os.stat(g).st_uid
+        except OSError:
+            continue   # gone since the socket was listed: nothing is left there to hide
+        if owner != os.geteuid():
+            continue   # another user's home: its files are not the operator's to bind back; the mask stays
+        for held in (policy.workspace.resolve(), policy.entity_dir.resolve(), home):
+            if held == g or held.is_relative_to(g):
+                raise ConfinementError(
+                    f"a gnupg dirmngr socket is in {g}, which holds {held}. Bash without network gets a "
+                    "view of that directory without dirmngr, and the view would hide the workspace too. "
+                    "Refusing to grant bash hands (fail-closed). Stop that dirmngr (`gpgconf --homedir "
+                    f"{g} --kill dirmngr`) or move that GNUPGHOME.")
+        views.append(g)
+    views = [g for g in views if not any(g != o and g.is_relative_to(o) for o in views)]
+    pins = sorted({a for g in views for a in g.parents if str(a) != a.anchor})
+    return views, pins
+
+
+def _runtime_view(policy: CrownJewelsPolicy,
+                  dirmngr: list[Path] | None = None) -> tuple[list[str], list[Path], list[Path]]:
+    """Step (7) of :func:`_bwrap_plan_impl` as ``(ops, view_roots, pins)``: each user runtime dir this
+    user owns (:func:`_runtime_dirs`, resolved) becomes a fresh 0700 tmpfs, and only socket FILES come
+    back into it: gnupg's (:func:`_gpg_sockets`), ``$SSH_AUTH_SOCK``, and the entity's
+    ``runtime_sockets``, each kept only when it resolves under that dir, is a socket now, and is not one
+    :func:`_runtime_socket_refusal` names. A name among those that is a link in the dir comes back as
+    the same link, beside the socket it resolves to. The tmpfs and the parent directories the sockets need are
+    made at 0700: with them at 0755, gpg-connect-agent answered "no gpg-agent running in this session"
+    through the bound-back socket, and at 0700 it reached the agent (RUN on argushub 2026-10-12, gnupg
+    2.4.4, bubblewrap 0.9.0). The view stays writable, so an agent a tool starts inside bash can make
+    its socket there; it is gone with the shell. A runtime dir that holds the workspace, the entity or
+    ``$HOME`` (``XDG_RUNTIME_DIR`` pointed at one of the operator's directories) is refused: its view
+    would hide them. Each dir's ancestors go back as ``pins``.
+
+    Each GNUPGHOME of :func:`_gnupg_home_views` is a view too, whose ancestors go back as ``pins``. Its
+    sockets in :data:`_GNUPG_HOME_SOCKETS` and its files come back, the files writable: with the trustdb
+    read-only, ``gpg --list-keys`` died "failed to append a record" on its trustdb check (RUN on
+    argushub 2026-10-12). Its directories do not come back (``private-keys-v1.d`` is the agent's,
+    ``public-keys.d`` keyboxd's); links come back as the same links. The costs: gpg inside bash cannot
+    replace a file there (an ``--import`` into a ``pubring.kbx`` keyring renames it, and gets EBUSY),
+    and its lock files land in the view, so a gpg on the host writing the trustdb at the same moment
+    does not see the lock."""
+    roots: list[Path] = []
+    for r in _runtime_dirs():
+        rd = Path(r)
+        try:
+            st = os.stat(rd)
+            real = rd.resolve()
+        except (OSError, RuntimeError):
+            continue   # absent, or another user's: nothing of it is reachable to hide
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or real in roots:
+            continue
+        roots.append(real)
+    roots = [r for r in roots if not any(r != o and r.is_relative_to(o) for o in roots)]   # the outer view covers it
+    for root in roots:
+        for held in (policy.workspace.resolve(), policy.entity_dir.resolve(), Path.home().resolve()):
+            if held == root or held.is_relative_to(root):
+                raise ConfinementError(
+                    f"the user runtime dir {root} holds {held}. Bash gets a view of that directory "
+                    "holding only its agent sockets, and the view would hide that too. Refusing "
+                    "to grant bash hands (fail-closed). Point XDG_RUNTIME_DIR at a directory of its own.")
+    if dirmngr is None:
+        dirmngr = _dirmngr_sockets() if policy.deny_localhost_outbound else []
+    homes, pins = _gnupg_home_views(policy, roots, dirmngr)
+    # A runtime dir is pinned from above like a GNUPGHOME view: under a directory bash can rename
+    # (``XDG_RUNTIME_DIR=~/.cache/xdg``), renaming that parent carried the host's dir, dirmngr included,
+    # to a name the next session has no view of (complement L3 r1). /run/user/<uid>'s parents are
+    # root's; their self-binds are pins like any other present ancestor.
+    pins = sorted({*pins, *(a for r in roots for a in r.parents if str(a) != a.anchor)})
+    wanted = list(_gpg_sockets()) if roots else []
+    auth_sock = os.environ.get("SSH_AUTH_SOCK", "")
+    if auth_sock.startswith("/"):
+        wanted.append(Path(auth_sock))
+    wanted += [rt / rel for rt in roots for rel in policy.runtime_sockets]
+    ops: list[str] = []
+    for root in roots:
+        keep: list[Path] = []
+        links: dict[Path, str] = {}   # a wanted name that is a link to a kept socket -> its link value
+        for s in wanted:
+            try:
+                real = s.resolve()
+                is_sock = stat.S_ISSOCK(os.stat(real).st_mode)
+                lexical = s.parent.resolve() / s.name
+                value = os.readlink(lexical) if lexical != real and os.path.islink(lexical) else None
+            except (OSError, RuntimeError):
+                continue
+            if not is_sock or real == root or not real.is_relative_to(root):
+                continue
+            if _runtime_socket_refusal(str(real.relative_to(root))) is not None:
+                continue   # a link in the allowlist pointing at a refused socket
+            keep.append(real)
+            if (value is not None and lexical.is_relative_to(root)
+                    and _runtime_socket_refusal(str(lexical.relative_to(root))) is None):
+                # The name the operator gave ($SSH_AUTH_SOCK, a runtime_sockets entry) is a link: it
+                # comes back as the same link, or a variable naming it would point at nothing (codex
+                # L3 r1). A chain of links comes back as one, to the socket itself.
+                one_hop = os.path.normpath(os.path.join(lexical.parent, value)) == str(real)
+                links[lexical] = value if one_hop else str(real)
+        keep = list(dict.fromkeys(keep))
+        ops += ["--perms", "0700", "--tmpfs", str(root)]
+        dirs = sorted({str(a) for s in (*keep, *links) for a in s.parents if a != root and a.is_relative_to(root)})
+        for d in dirs:
+            ops += ["--perms", "0700", "--dir", d]
+        for s in keep:
+            # A read-only bind would not stop connect(), so it buys nothing over a plain one.
+            ops += ["--bind", str(s), str(s)]
+        for link, value in links.items():
+            ops += ["--symlink", value, str(link)]
+    for g in homes:
+        ops += ["--perms", "0700", "--tmpfs", str(g)]
+        try:
+            children = [(c, os.lstat(c)) for c in sorted(g.iterdir(), key=lambda p: p.name)]
+        except OSError as exc:
+            raise ConfinementError(
+                f"could not list the gnupg home {g}, which holds a dirmngr socket ({exc}). Refusing to grant "
+                "bash hands (fail-closed).") from None
+        for child, st in children:
+            if stat.S_ISLNK(st.st_mode):
+                ops += ["--symlink", os.readlink(child), str(child)]
+            elif child.name.startswith("S.") and child.name not in _GNUPG_HOME_SOCKETS:
+                continue   # dirmngr's, the agent's forwarding sockets, or one of those names as a file
+            elif stat.S_ISSOCK(st.st_mode):
+                if child.name in _GNUPG_HOME_SOCKETS:   # a socket by any other name stays out
+                    ops += ["--bind", str(child), str(child)]
+            elif stat.S_ISREG(st.st_mode):
+                ops += ["--bind", str(child), str(child)]
+    return ops, roots + homes, pins
+
+
 def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     """THE single source of the bwrap invocation, as ``(argv, dirs_to_create_first)``. :meth:`BwrapProvider.render_profile` renders this
     list as text and :meth:`BwrapProvider.spawn_shell` executes it — deliberately ONE computation
@@ -3220,7 +5222,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
 
     Pure: no I/O EXCEPT ``Path.exists`` probes, which decide between the self-bind and the
     ``/dev/null`` form for a write-denied file, and a 16-byte header read of file-shaped jewels
-    (:func:`_refuse_plantable_sqlite_jewels`). Reads, never a mutation."""
+    (:func:`_refuse_plantable_sqlite_jewels`), and, for bash without network, the kernel's list of bound
+    unix sockets (:func:`_bound_unix_socket_paths`, which refuses when it cannot be read). Reads, never
+    a mutation, except one: ``gpgconf --list-dirs`` (:func:`_gpg_sockets`) creates gnupg's socket
+    directory under the runtime dir for a non-default GNUPGHOME, as any gpg command run there does
+    (RUN on argushub 2026-10-12, gnupg 2.4.4)."""
     _refuse_plantable_sqlite_jewels(policy)
     argv: list[str] = [
         BWRAP,
@@ -3232,9 +5238,31 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # redirections a test might be relying on.
         "--proc", "/proc",
         "--dev", "/dev",
-        # The sandbox dies with the levain process that owns it. Complements — never replaces —
-        # SandboxedShell.close()'s process-group teardown.
+        # bwrap dies with the levain thread that started it. Its pid 1 does not follow it: the start
+        # program's watcher (``_HANDS_START``) kills the command's leaf, which does. Complements, never replaces,
+        # SandboxedShell.close()'s process-group and leaf teardown.
         "--die-with-parent",
+        # A new PID namespace (lane P2 item 2c), so the ``--proc /proc`` above shows only the
+        # sandbox's own processes: "A /proc filesystem shows (in the /proc/pid directories) only
+        # processes visible in the PID namespace of the process that performed the mount"
+        # (pid_namespaces(7)). Without it, bash read ``/proc/<pid>/environ`` and ``cmdline`` of levain
+        # and of every other process of this user, which is where their secrets live. Costs: bash
+        # cannot see or signal host processes (``ps``, ``kill`` of a server started outside). bash is
+        # that namespace's pid 1 (``--as-pid-1``, added in `spawn_shell`) and runs in a session of its
+        # own (``--new-session``), so it is NOT in the process group ``_signal_group`` signals: a
+        # signal there reaches bwrap, and bash dies when bwrap does: the start program's watcher kills the
+        # command's leaf when bwrap ends (``_HANDS_START``), a pid 1 that outlived it included, which
+        # ``--die-with-parent`` above did not do (RUN 2026-10-09); levain's own kill is that leaf's too.
+        # When bash, pid 1, exits, the kernel kills the rest of the namespace (pid_namespaces(7)).
+        "--unshare-pid",
+        # A cgroup namespace rooted at the command's own leaf: without it bash, which runs as the
+        # operator, could move itself into any other cgroup the operator owns and out of the leaf levain
+        # kills (RUN on argushub 2026-10-09: ESCAPED without, refused with; 1009-13_S2/DESIGN.md P4).
+        "--unshare-cgroup",
+        # cgroupfs read-only inside: `cgroup.kill` and `cgroup.freeze` check only file permission, not
+        # the cgroup namespace, so bash (the operator's uid) could otherwise stop or freeze any cgroup
+        # the operator owns, another command's leaf or the operator's own services included.
+        "--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup",
     ]
     if policy.deny_localhost_outbound:
         # spore-755 on Linux (option B, see LINUX_LOCALHOST_REFUSAL's comment): a new, empty network
@@ -3262,6 +5290,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # identity check between the plan and bwrap instead; five review rounds each found a different
     # way past it.
     masks: list[str] = []
+    # $HOME as step (0) binds it read-only. A link directly in it cannot be removed or replaced from
+    # inside bash, so it is masked at its target instead of refused (desk ruling 2026-10-07, after
+    # the CI live job showed $HOME's top level read-only). Deeper links keep the refusal.
+    home_ro = _home_read_only_root()
+    frozen_home: tuple[Path, ...] = (home_ro,) if home_ro is not None else ()
 
     # (2a) THE ENTITY'S OWN STORE DIR (``.levain``) IS MOUNTED READ-ONLY, and every existing ordinary
     # entry in it is bound back read-write. The confined shell can then CREATE nothing at the top of
@@ -3272,9 +5305,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # that the HOST's own readers then failed on — anneal cannot open a 0444 memory.db ("attempt to
     # write a readonly database"), and an absent confinement.json (what ``init`` produces) came back
     # as empty JSON that the next session's ``load_confinement_config`` refuses.
-    # ⛔ IT COMES FIRST IN THE BODY, before the jewel tmpfs of step (2): a bind takes its source from
-    # the real host tree, so emitted after a tmpfs at or under .levain it re-exposed that jewel
-    # (complement + codex, L3 r1). Emitted first, any deny inside .levain lands on top of it.
+    # ⛔ IT COMES BEFORE the jewel tmpfs of step (2): a bind takes its source from the real host
+    # tree, so emitted after a tmpfs at or under .levain it re-exposed that jewel (complement +
+    # codex, L3 r1). Emitted before them, any deny inside .levain lands on top of it. It comes AFTER
+    # the tool-directory views below: an entity inside a tool directory (~/.kube/project) sits under
+    # a child the view binds back read-write, and that bind emitted later covered this read-only
+    # one (codex, L3 r3).
     # ⚖ STRICTER THAN macOS, STATED: on macOS the confined shell may create new files in .levain
     # other than the denied literals and edit the ones it may write; here it may do neither for a
     # top-level file. Its subdirectories stay writable.
@@ -3282,6 +5318,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     if policy.config_file is not None:
         protected.add(policy.config_file)
     ro_store_dirs: list[Path] = []
+    store_argv: list[str] = []
     for d in sorted({p.parent for p in protected}, key=lambda p: str(p)):
         if d.is_symlink() or not d.is_dir():
             # `levain run` refuses an entity with no .levain/ before it gets here; anything else
@@ -3291,7 +5328,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 f"the entity store {d} is missing or a symlink — refusing to grant bash hands "
                 "(fail-closed)."
             )
-        argv += ["--ro-bind", str(d), str(d)]
+        store_argv += ["--ro-bind", str(d), str(d)]
         ro_store_dirs.append(d)
         # Only DIRECTORIES come back read-write. A per-FILE bind pins the file's inode, so a host
         # write by rename (anneal and levain write that way) would leave the shell reading and
@@ -3303,22 +5340,97 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # This is the opposite case: an ordinary subdirectory the host removed between planning
             # and spawn should cost that subdirectory, not the whole shell. It stays pinned by inode
             # for the shell's life, so a host-side replacement of it is not seen (complement, r2).
-            argv += ["--bind-try", str(child), str(child)]
+            store_argv += ["--bind-try", str(child), str(child)]
+    entity_store_dirs = list(ro_store_dirs)
 
-    def _absent_in_ro_store(f: Path) -> bool:
+    def _nearest_existing(q: Path) -> Path:
+        q = q.parent.resolve() / q.name
+        while not os.path.lexists(q) and q != q.parent:
+            q = q.parent
+        return q
+
+    # The standard cred files' TOOL directories (lane P2, items 5 and 6) get a VIEW, not the host
+    # directory: a read-only tmpfs holding the real directory's existing entries except the cred
+    # names. Subdirectories come back read-write, files read-only, links as the same links. A cred
+    # file absent at spawn then needs no mountpoint, so no 0444 stub lands on the host, and it stays
+    # absent inside bash even when the operator's tool creates it on the host mid-session: the host
+    # directory is not what bash sees (desk ruling 2026-10-07; a read-only bind of the host directory
+    # showed such a file). bash cannot create one either, the tmpfs being read-only. A
+    # cred file that is a link is masked at its target (step 4); any other link is recreated as the
+    # same link, which cannot be replaced from inside. The cost: an entry the
+    # host adds or replaces at the top of a tool directory after spawn is not seen (a per-file bind
+    # pins the inode). An absent tool directory is created first (0700, by the provider: step (1)
+    # puts it in ``create_first``) and recorded in the placeholder ledger, which removes it at close
+    # if it is still empty. The ops are bwrap(1)'s --tmpfs, --bind-try, --ro-bind-try, --symlink and
+    # --remount-ro. A mountpoint inside the view is made in the tmpfs, except under a subdirectory
+    # bound back from the host (a "window", ~/.aws/sso): there it is on the host, so it is prepared,
+    # ledgered and watched like any other (:func:`_mount_plan_paths`; codex, L3 r3).
+    # The names a view (a tool directory, or $HOME in step (0)) leaves out. A denied socket is one:
+    # absent from the view, it stays unreachable across a daemon restart too.
+    secret_names = {_host_spelling(p) for p in (*policy.deny_files, *policy.deny_read_write,
+                                               *policy.deny_write_files, *policy.sqlite_sidecars,
+                                               *policy.deny_sockets)}
+    tool_views: list[Path] = []
+    tool_windows: list[Path] = []
+    for t in sorted(policy.ro_tool_dirs, key=lambda p: str(p)):
+        real = t.parent.resolve() / t.name
+        if real.is_symlink():
+            _refuse_replaceable_link(real, (*frozen_home, *entity_store_dirs))
+            real = _link_target(real)
+        if os.path.lexists(real) and not real.is_dir():
+            continue   # a file where the tool's directory should be: nothing can live under it
+        if real in ro_store_dirs:
+            continue
+        if not os.path.lexists(real) and _nearest_existing(real) in frozen_home:
+            continue   # absent, and not creatable in step (0)'s $HOME view: nothing to show or hide
+        argv += ["--tmpfs", str(real)]
+        remount_ro.append(str(real))
+        ro_store_dirs.append(real)
+        tool_views.append(real)
+        if not real.is_dir():
+            continue
+        for child in sorted(real.iterdir(), key=lambda p: p.name):
+            if child in secret_names:
+                continue
+            if child.is_symlink():
+                argv += ["--symlink", os.readlink(child), str(child)]
+            elif child.is_dir():
+                argv += ["--bind-try", str(child), str(child)]
+                tool_windows.append(child)
+            else:
+                argv += ["--ro-bind-try", str(child), str(child)]
+    argv += store_argv
+    # $HOME is a read-only view too (step (0)): an absent path directly in it needs no mount.
+    ro_store_dirs += list(frozen_home)
+
+    view_roots = {*tool_views, *frozen_home}
+
+    def _left_out_of_a_view(f: Path) -> bool:
+        # A credential name directly in a view ($HOME, a tool directory) is not carried into it, so
+        # inside bash it is ABSENT, not an empty file: no mask (head ruling 2026-10-07). A link there
+        # still has its target masked, through the target's own spelling.
+        h = _host_spelling(f)
+        return h.parent in view_roots and h in secret_names and not f.is_symlink()
+
+    def _absent_in_ro_store(f: Path, dirs: list[Path] | None = None) -> bool:
         # Nothing to hide and nothing the shell can create: no mount, so no host stub. Decided by
         # the NEAREST EXISTING ancestor, not the parent: an absent `.levain/vault` (or a path
         # deeper under an absent dir) cannot be created from inside a read-only store dir, and
         # mounting it made bwrap mkdir inside that read-only mount, so bash never started
         # (Diogenes LOW 2026-10-02, run in the Linux container). An existing subdirectory is bound
         # back read-write in (2a), so a path under one is still mounted. ⚠ SPAWN-TIME, like step
-        # (6): a path the HOST creates there after spawn is visible through the read-only bind.
+        # (6): in the entity's store a path the HOST creates after spawn is visible through the
+        # read-only bind (a tool directory is a tmpfs view, where it is not).
+        # A read-only tool directory may not exist yet (the provider creates it just before
+        # bwrap), so the walk stops at one whether or not it exists. Compared at the real parent,
+        # because the read-only mounts are spelled that way.
+        dirs = ro_store_dirs if dirs is None else dirs
         if f.exists():
             return False
-        anc = f.parent
-        while not anc.exists() and anc != anc.parent:
+        anc = f.parent.resolve()
+        while anc not in dirs and not anc.exists() and anc != anc.parent:
             anc = anc.parent
-        return anc in ro_store_dirs
+        return anc in dirs
 
     # (2) CROWN-JEWEL SUBTREES — hidden AND honest about refusing writes.
     # Parent-first, and a root already inside another is dropped: a parent tmpfs emitted after its
@@ -3335,7 +5447,25 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     masked_both: list[str] = []
     nested_in_ssh: list[Path] = []
     ssh_dir = policy.ssh_dir
+    cred_dir_spellings = set(floor_roots(policy.cred_dir_sources))
     for sub in sorted(policy.deny_read_write, key=lambda p: str(p)):
+        # A subtree root spelled lexically (:func:`_spellings`) may be a link, and bwrap refuses to
+        # mount on one (it resolves the path and aborts; measured 2026-09-30). Its resolved spelling is
+        # in the policy too and gets the tmpfs; the link itself is safe only where it cannot be
+        # replaced from inside, so a link this user can write the directory of refuses bash, as a
+        # cred FILE link does, unless that directory is $HOME itself (read-only in bash, step 0). Any other root is mounted at its real parent.
+        real = sub.parent.resolve() / sub.name
+        if real.is_symlink():
+            _refuse_replaceable_link(real, (*frozen_home, *ro_store_dirs))
+            # Skipped only because its target is mounted under its own spelling, which is checked
+            # here rather than assumed (L2 r1): a list that added a link root alone is refused.
+            if real.resolve() not in policy.deny_read_write:
+                raise ConfinementError(
+                    f"{real} is a symlink to {real.resolve()}, which the floor does not name, so the "
+                    "Linux plan cannot cover it. Refusing to grant bash hands (fail-closed)."
+                )
+            continue
+        sub = real
         if any(sub == r or sub.is_relative_to(r) for r in tmpfs_roots):
             continue
         # A root STRICTLY inside the ssh dir cannot be mounted here: step (3)'s ssh tmpfs, emitted
@@ -3346,14 +5476,21 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         if ssh_dir is not None and sub != ssh_dir and sub.is_relative_to(ssh_dir):
             nested_in_ssh.append(sub)   # mounted after step (3)'s ssh tmpfs, see there
             continue
-        if not sub.exists() and not _absent_in_ro_store(sub) and not _mountpoint_creatable(sub):
+        # An absent root under a TOOL directory is mounted all the same, inside that directory's
+        # tmpfs view, so nothing is created on the host: what the operator's tool writes there
+        # mid-session must stay unreadable (the aws caches, research §4; L2 r1), and in the view it
+        # is not even present. Only the entity's own store dirs skip absent roots.
+        absent_in_store = _absent_in_ro_store(sub, [*entity_store_dirs, *frozen_home])
+        if not sub.exists() and not absent_in_store and not _mountpoint_creatable(sub):
+            if sub in cred_dir_spellings:
+                continue   # a tool's home this user cannot create: the shell cannot create it either
             raise ConfinementError(
                 f"{sub} is a crown-jewel directory that does not exist, and bwrap cannot create it to "
                 "cover it (its nearest existing parent is not writable). If an anneal trust file lists "
                 "a store there that no longer exists, remove that entry. Refusing to grant bash hands "
                 "(fail-closed)."
             )
-        if _absent_in_ro_store(sub):
+        if absent_in_store:
             continue
         if sub.exists() and not sub.is_dir():
             # A subtree root that is a FILE (argushub's ~/.anneal-memory is a SQLite file, measured
@@ -3428,7 +5565,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         # "SELECTS THE FORM rather than skipping the path" and points at the write-only block "for
         # why it is applied rather than skipping outright". It described step (5) while step (4),
         # its other call site, did the opposite. The helper was right; one caller was not.
-        if _absent_in_ro_store(f):
+        if _absent_in_ro_store(f) or _left_out_of_a_view(f):
             continue
         if f in policy.sqlite_sidecars and not f.exists():
             # A sidecar absent at spawn is not mounted: its mountpoint would be a 0444 stub that
@@ -3438,7 +5575,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             continue
         # Under a jewel tmpfs the mount lands in the ephemeral tmpfs, where a host symlink at that
         # path is not visible; only a path on the host tree needs the symlink check (glm, L3 b).
-        dest = str(f if _shadowed_by(f, roots) else _bwrap_file_target(f))
+        if _shadowed_by(f, roots):
+            dest = str(f)
+        else:
+            # A link in a read-only store or tool dir, or directly in $HOME: masked at its target.
+            dest = str(_bwrap_file_target(f, (*frozen_home, *ro_store_dirs)))
         masks.append(dest)
         masked_both.append(dest)
 
@@ -3460,7 +5601,10 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # through, which a control run confirmed it does.
     # The entity's own store files never reach the missing-file branch: an absent one is covered by
     # the read-only store dir in step (2a), because the stub this branch would leave broke the
-    # host's own store when it was tried there (measured 2026-09-30).
+    # host's own store when it was tried there (measured 2026-09-30). The same holds for a cred
+    # file in a tool directory (step 2a); a $HOME-level cred file's stub from step (4) lasts only
+    # for the session (:func:`_ledger_enter`), as does every stub this step creates: the provider
+    # records whatever it creates in the placeholder ledger, which removes it once no session needs it.
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)
     # Targets steps (2) and (4) already mask, as those steps EMITTED them (codex, L3 r2: a second
     # resolve of the policy paths can observe a symlink retargeted after step (4) ran). EXACT
@@ -3469,7 +5613,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # a distinct, write-only file on a case-sensitive volume (0.5.4 known open issue).
     denied_both_targets = set(masked_both)
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
-        if _absent_in_ro_store(f):
+        if _absent_in_ro_store(f) or _left_out_of_a_view(f):
             continue
         if f in deny_both or f in file_roots:
             # Step (4) (or step (2), for a subtree root that is a file) already denies it BOTH ways. A self-bind here would take its source from the
@@ -3504,7 +5648,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
                 "its target. Refusing to grant bash hands (fail-closed). Remove or fix the link."
             )
         elif f.exists():
-            target = _bwrap_file_target(f)
+            target = _bwrap_file_target(f, frozen_home)
             if _shadowed_by(target, roots) or str(target) in denied_both_targets:
                 # The spelling is outside every hidden subtree but its TARGET is inside one: a
                 # self-bind takes its source from the host tree, so it would put the hidden file
@@ -3517,7 +5661,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             else:
                 argv += ["--ro-bind", str(target), str(target)]
         else:
-            masks.append(str(f))
+            masks.append(str(_host_spelling(f)))
 
     # (6) CONTAINER-DAEMON SOCKETS (spore-725) — THE CONNECT ARM, MEASURED 2026-09-30 on a Linux
     # kernel (6.12, bubblewrap 0.9.0, in Docker with the namespace restrictions relaxed):
@@ -3531,30 +5675,43 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     #                               a daemon restart, because the new socket lands in the host dir
     #                               the sandbox cannot see. Measured.
     # So the directory form is used wherever the socket lives in a directory the daemon owns, and
-    # the file form only where the parent is shared by everything (/run, $XDG_RUNTIME_DIR) and
-    # hiding it would break the host. Paths are the RESOLVED targets, which is what connect() uses.
+    # the file form only where the parent is shared by everything (/run, /tmp, $HOME) and hiding it
+    # would break the host. A user runtime dir is neither: it is step (7)'s view. Paths are the
+    # RESOLVED targets, which is what connect() uses.
     # A daemon dir that is absent but creatable by this user (its parent exists and is writable)
     # is still mounted — bwrap creates it empty — because the user-level daemons
     # (``systemctl --user start podman.socket``) can be STARTED FROM INSIDE THE SANDBOX, and a
     # dir that is not hidden at spawn would then show the socket. An absent dir under a parent the
     # user cannot write belongs to a root daemon this user cannot start, and is skipped.
-    # ⚠ RESIDUAL, STATED: a socket in a SHARED dir (rootful /run/docker.sock, rootless
-    # $XDG_RUNTIME_DIR/docker.sock) is covered only while its inode lives. A restart re-exposes it
-    # for the rest of that shell, and a rootless daemon absent at spawn can be started afterwards.
-    # Both run through the user's service manager, which is outside this namespace.
-    # That manager is itself the sharper bypass, and step (7) hides it: the entity cannot ask it to
-    # start or restart anything.
-    # Compared RESOLVED, because the socket targets are: a symlinked runtime dir or HOME compared
-    # lexically would get the directory form, a read-only tmpfs over the whole runtime dir (L1 + L2).
+    # ⚠ RESIDUAL, STATED: a socket in a SHARED dir (rootful /run/docker.sock) is covered only while
+    # its inode lives: a restart re-exposes it for the rest of that shell. A rootless daemon's socket
+    # is under a user runtime dir, which is step (7)'s: absent from that dir's view, before and after
+    # a restart, unless the entity's ``runtime_sockets`` brings it back, so no form here. Step (7)
+    # also hides the user's service manager, the sharper bypass: the entity cannot ask it to start
+    # or restart anything.
+    # Compared RESOLVED, because the socket targets are: a symlinked HOME compared lexically would
+    # get the directory form, a read-only tmpfs over the whole of it (L1 + L2).
+    # Read ONCE: the views and the masks of step (7b) must see the same dirmngr sockets.
+    dirmngr = _dirmngr_sockets() if policy.deny_localhost_outbound else []
+    runtime_ops, runtime_roots, view_pins = _runtime_view(policy, dirmngr)
+    for r in runtime_roots:
+        for t in tool_views:
+            if r == t or r.is_relative_to(t):
+                # The tool directory's view is placed after it, so would cover it, and bind the host
+                # directory back as one of its subdirectories, dirmngr included.
+                raise ConfinementError(
+                    f"{r}, which bash gets as a view without dirmngr, is inside the tool directory {t}, "
+                    "whose own view would put the host's back. Refusing to grant bash hands "
+                    "(fail-closed). Stop the dirmngr there, or move that directory out of it.")
     shared = {Path(p).resolve() for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp")}
     shared.add(Path.home().resolve())
-    for runtime in _runtime_dirs():
-        shared.add(Path(runtime).resolve())
     hidden_dirs: list[Path] = []
     for s in sorted(policy.deny_sockets, key=lambda p: str(p)):
         parent = s.parent
         if not _reachable(parent):
             continue   # another user's runtime dir: this user (and so the entity) cannot reach it
+        if any(parent.resolve() == r or parent.resolve().is_relative_to(r) for r in runtime_roots):
+            continue
         if parent.resolve() in shared:
             if s.exists():
                 masks.append(str(s))
@@ -3566,32 +5723,76 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             remount_ro.append(str(parent))
             hidden_dirs.append(parent)
 
-    # (7) THE USER'S SERVICE MANAGER AND SESSION BUS (spore-1244), MEASURED 2026-09-30 in a
-    # systemd-as-PID-1 container with a real `systemd --user` (systemd 255, linger on), driving the
-    # real provider: with neither hidden, `systemd-run --user --pipe --wait cat <jewel>` from INSIDE
-    # the confined shell printed the jewel — the manager runs the command outside this namespace, a
-    # whole-floor bypass. With `$XDG_RUNTIME_DIR/systemd` hidden and `$XDG_RUNTIME_DIR/bus` masked,
-    # both `systemd-run --user` and `systemctl --user` get "Failed to connect to bus". The same
-    # class as the container sockets above (an unsandboxed daemon's socket), so it is denied by
-    # default the same way. The cost: the shell has no `systemctl --user` and no session D-Bus.
-    # ⚠ A bus started AFTER the shell, or a D-Bus on an abstract socket (older distros), is not
-    # covered — the manager that could start one is unreachable from inside, so the entity cannot.
-    for r in _runtime_dirs():
-        rd = Path(r)
-        if not _reachable(rd):
+    # (7) EACH USER RUNTIME DIR IS A VIEW (:func:`_runtime_view`; its ops are placed after the pins,
+    # below). A fresh tmpfs over the dir, and only socket FILES bound back into it: the gpg agent,
+    # keyboxd, the ssh agent and the entity's ``runtime_sockets``. Never a directory: a bound directory would carry
+    # every socket beside the one wanted, and stay renameable. That closes three things at once:
+    #   · the user's service manager and session bus (spore-1244, MEASURED 2026-09-30, systemd 255):
+    #     reachable, `systemd-run --user --pipe --wait cat <jewel>` from inside bash printed the
+    #     jewel; hidden, it is "Failed to connect to bus";
+    #   · gnupg's dirmngr, which fetches what a client asks for over the network. A mask by path did
+    #     not hold: one session renamed the operator's directory holding S.dirmngr and the next reached
+    #     the socket at its new name (argushub 2026-10-10, 63 packets on port 53 carrying a fresh name).
+    #     Inside the view that rename moves only tmpfs content;
+    #   · every other daemon socket in the dir, present or started later, which a roster would miss.
+    # A GNUPGHOME holding a live dirmngr outside every runtime dir is a view too, for bash without
+    # network (:func:`_gnupg_home_views`), with its parents pinned: renaming it or its parent moved
+    # dirmngr past the mask (argushub 2026-10-12, 60 packets each). A view inside a tool directory's
+    # view (``~/.kube/gnupg``) is refused where :func:`_runtime_view` is called.
+    # ⚠ A D-Bus on an abstract socket (older distros) is not in any directory: it is closed only where
+    # bash has no network (``--unshare-net``).
+    # The cost: inside bash the runtime dir holds only those sockets. A bound-back socket keeps its
+    # inode, so an agent restarted on the host is unreachable for the rest of that shell.
+    # (7b) THE HOST'S NETWORK DEPUTIES, WHENEVER BASH HAS NO IP NETWORK. ``--unshare-net``
+    # removes bash's own sockets from the network, but a root daemon reached over a unix socket
+    # resolves (and so sends on the wire) whatever name bash hands it, and the name can carry data
+    # out. MEASURED 2026-10-10 on argushub (Ubuntu, systemd-resolved) with the 0.7.0 wheel: in the
+    # operator-floor bash, `resolvectl query` of a fresh name over the system bus answered "Data
+    # from: network". The same day, the operator's own gnupg dirmngr resolved a name bash handed it
+    # in a WKD request (63 packets carrying it on port 53, 0.7.1.dev0 before this mask). The hands
+    # view never sees them (its /run is empty and its uid is not the operator's; R1, 2026-10-09:
+    # D-Bus, varlink, avahi, snapd and nscd closed). So each such daemon's own directory gets a
+    # read-only tmpfs (the form that holds across a daemon restart while the directory persists,
+    # step (6)), and a socket in a directory shared with other sockets gets the file mask (gpg-agent
+    # beside dirmngr keeps working). Cost: in offline bash, `systemctl` and `busctl` on the system
+    # bus, `resolvectl`, `snap`, `tailscale` and gpg's network commands are gone, and
+    # /etc/resolv.conf may point at nothing. A daemon whose socket or directory is absent at spawn,
+    # or that recreates its socket, is not hidden from then on: the residual step (6) states.
+    if policy.deny_localhost_outbound:
+        # Those in a view (step (7)) are absent from it; one in $HOME or /tmp itself still needs the mask.
+        masks += [str(f) for f in dirmngr
+                  if not any(f.resolve().is_relative_to(r) for r in runtime_roots)]
+        for d in _NETWORK_DEPUTY_DIRS:
+            real = Path(d).resolve()
+            if not _reachable(real) or not real.is_dir() or real in hidden_dirs:
+                continue
+            argv += ["--tmpfs", str(real)]
+            remount_ro.append(str(real))
+            hidden_dirs.append(real)
+        for f in _NETWORK_DEPUTY_SOCKETS:
+            real = Path(f).resolve()
+            if _reachable(real) and real.exists():
+                masks.append(str(real))
+
+    # (8) ANY OTHER procfs MOUNT. ``--bind / /`` is recursive, so a procfs mounted elsewhere on the
+    # host (a container runtime's, a chroot's) would still show the host's processes after
+    # ``--unshare-pid``. Each is hidden by a read-only tmpfs. Read from this process's own
+    # /proc/self/mountinfo, which is the host mount namespace bwrap copies.
+    for mp in _extra_procfs_mounts():
+        if not _reachable(mp) or _shadowed_by(mp, tuple(tmpfs_roots)):
             continue
-        sysd = rd / "systemd"
-        if _reachable(sysd) and (sysd.is_dir() or (rd.is_dir() and os.access(rd, os.W_OK))):
-            argv += ["--tmpfs", str(sysd)]
-            remount_ro.append(str(sysd))
-        bus = rd / "bus"
-        if _reachable(bus) and bus.exists():
-            masks.append(str(bus))
+        if not mp.is_dir():
+            masks.append(str(mp))   # a bind of one procfs FILE: a tmpfs cannot cover a file (L2 r1)
+            continue
+        argv += ["--tmpfs", str(mp)]
+        remount_ro.append(str(mp))
 
     # The masks close the body (the masks-last rule above). They are appended BEFORE step (1), which
     # pins every directory the body makes bwrap create, so a mask's absent parent is pinned too
     # ("test_bwrap_creates_and_pins_an_absent_ssh_dir_before_planting_anything_in_it" fails if not).
-    for m in masks:
+    # One mask per destination: a link and its target are both in the policy (:func:`_spellings`)
+    # and can name the same file.
+    for m in dict.fromkeys(masks):
         argv += ["--ro-bind", "/dev/null", m]
 
     # (1) ANCESTOR DIRS, EMITTED FIRST. Parent-before-child is a HARD ordering requirement (bwrap
@@ -3601,13 +5802,15 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # finding below. Three cases, all measured or reviewed on 2026-09-30:
     #   · PRESENT: pinned at its RESOLVED path. A mount cannot land on a symlink, so /var/run (a
     #     symlink to /run) aborted bwrap until it was resolved.
-    #   · A SYMLINK THIS USER CAN REPLACE (its parent is writable): REFUSED. Pinning the target leaves
+    #   · A SYMLINK THIS USER CAN REPLACE (its parent is writable, and not $HOME, which step (0)
+    #     makes read-only inside bash): REFUSED. Pinning the target leaves
     #     the link itself free to be swapped for a real directory holding a planted file, and macOS
     #     covers that link by name while a mount cannot. Fail closed, as bwrap itself used to.
     #   · ABSENT: pinned only if the body will CREATE something under it — then it is created here
     #     first (by the provider on the host, 0700, just before bwrap runs: bwrap resolves a bind's
     #     SOURCE before it applies ``--dir``, so it cannot pin a directory it creates itself —
-    #     measured) and pinned, because an unpinned directory that bwrap creates on the
+    #     measured; recorded in the placeholder ledger, which removes it at close if it is still
+    #     empty) and pinned, because an unpinned directory that bwrap creates on the
     #     host can be renamed away and replaced with a planted one (L1 + L2 review: raw mode with no
     #     ~/.ssh, plant ``authorized_keys``). An absent ancestor nothing will be created under holds
     #     nothing and is skipped — a self-bind of a missing source aborts bwrap, which is how the
@@ -3619,36 +5822,401 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         elif op in ("--tmpfs", "--dir"):
             created.append(argv[k + 1])
     pins: list[tuple[str, bool]] = []   # (path, needs creating)
-    for d in sorted(policy.deny_write_dirs, key=lambda p: str(p)):
+    # A GNUPGHOME's view (step (7)) is pinned from above like a jewel: its parents are its ancestors.
+    for d in sorted({*policy.deny_write_dirs, *view_pins}, key=lambda p: str(p)):
         if d.is_symlink():
-            if os.access(d.parent, os.W_OK):
+            # A link directly in $HOME is frozen by step (0)'s read-only bind: pin its target.
+            if os.access(d.parent, os.W_OK) and d.parent.resolve() not in frozen_home:
                 raise ConfinementError(
                     f"{d} is a symlink in a directory this user can write. The Linux floor pins a "
                     "jewel's parent directories with mounts, and a mount cannot pin a symlink, so "
                     "the link could be swapped for a planted directory. Refusing to grant bash "
                     "hands (fail-closed). Replace the symlink with the real directory to use bash."
                 )
-            entry = (str(d.resolve()), False)
+            entry = (str(_link_target(d)), False)
         elif d.is_dir():
             entry = (str(d.resolve()), False)
-        elif any(c == str(d) or c.startswith(str(d) + "/") for c in created):
-            entry = (str(d), True)
+        elif any(c == str(_host_spelling(d)) or c.startswith(str(_host_spelling(d)) + "/")
+                 for c in created):
+            entry = (str(_host_spelling(d)), True)
         else:
+            continue
+        e = Path(entry[0])
+        if (any(e != v and e.is_relative_to(v) for v in tool_views)
+                and not any(e != w and e.is_relative_to(w) for w in tool_windows)):
+            # In a tool directory's view and not below a window into the host: the view is read-only
+            # and each window is itself a mountpoint, so nothing here can be renamed, and a pin would
+            # only create a directory on the host for nothing. Below a window it is pinned as usual
+            # (complement, L3 r3).
+            continue
+        if any(e == r or e.is_relative_to(r) for r in runtime_roots):
+            # In a runtime dir's or a GNUPGHOME's view (step (7)): its tmpfs is itself a mountpoint and
+            # nothing under it is the host's, so a pin there would bind a host directory back into it.
             continue
         if entry[0] not in [p for p, _ in pins]:
             pins.append(entry)
+    # (0) $HOME's OWN ENTRIES ARE READ-ONLY (desk ruling 2026-10-07, option (c)), AS A VIEW (head
+    # ruling, same day, (b)). $HOME is a read-only tmpfs holding its existing entries except the
+    # credential names: each subdirectory bound back read-write, each file read-only, each link as
+    # the same link. Inside bash nothing can be created, removed, renamed or swapped directly in
+    # $HOME, while everything below a subdirectory (the workspace, a repo, ~/.cache) is as writable
+    # as before; every link at the top level (a dotfile manager's ~/.config, ~/.netrc) is
+    # unswappable from inside. And a credential file at the top level (~/.netrc, ~/.npmrc, ...) that
+    # the operator's tool creates on the host mid-session lands in the host directory, which bash
+    # never sees, not even in a command already running; an absent one needs no placeholder. It goes
+    # after the pins of $HOME's own ancestors and BEFORE every deeper mount: a later tmpfs on $HOME
+    # would hide the mounts beneath it, and the deeper pins and the body land on top of it. $HOME's
+    # own pin is dropped: the tmpfs is itself a mountpoint, so $HOME still cannot be renamed.
+    # Costs: a tool that creates a NEW top-level file or directory in $HOME (a first ~/.npm, say)
+    # fails inside bash; a top-level file the host replaces after spawn is not seen (a per-file bind
+    # pins the inode).
+    home_ops: list[str] = []
+    home_real = home_ro
+    if home_real is not None and policy.workspace.resolve() == home_real:
+        raise ConfinementError(
+            f"the workspace is {home_real} itself, whose own entries are read-only inside bash on "
+            "Linux, so the entity could not write at its workspace root. Refusing to grant bash "
+            "hands (fail-closed). Use a subdirectory of your home as the workspace."
+        )
+    if home_real is not None:
+        home_ops = ["--tmpfs", str(home_real)]
+        for child in sorted(home_real.iterdir(), key=lambda p: p.name):
+            if child in secret_names:
+                continue
+            if child.is_symlink():
+                home_ops += ["--symlink", os.readlink(child), str(child)]
+            elif child.is_dir():
+                # Not `-try`: a subdirectory removed between the plan and the spawn aborts bwrap (a
+                # refusal; the next spawn plans again) rather than starting with it silently missing.
+                home_ops += ["--bind", str(child), str(child)]
+            else:
+                home_ops += ["--ro-bind-try", str(child), str(child)]
+    outer: list[str] = []
     ancestors: list[str] = []
     create_first: list[str] = []
     for path, create in sorted(pins):
         if create:
             create_first.append(path)
-        ancestors += ["--bind", path, path]
+        if home_ops and Path(path) == home_real:
+            continue
+        if home_ops and home_real.is_relative_to(path):
+            outer += ["--bind", path, path]
+        else:
+            ancestors += ["--bind", path, path]
 
-    out = head + ancestors + argv
+    # The runtime views after every pin (an ancestor's bind would cover a view) and before the body.
+    out = head + outer + home_ops + ancestors + runtime_ops + argv
     for r in remount_ro:
         out += ["--remount-ro", r]
+    if home_ops:
+        out += ["--remount-ro", str(home_real)]
     _refuse_bind_after_mask(out)
     return out, create_first
+
+
+#: The ops :func:`bwrap_available` adds so that a bubblewrap older than 0.5.0, which has no ``--perms``,
+#: reads unavailable rather than failing every shell.
+_BWRAP_PERMS_PROBE = ("--perms", "0700", "--tmpfs", "/tmp")
+
+
+def _bwrap_lacks_perms() -> bool:
+    """True when bwrap starts WITHOUT ``--perms`` and, WITH it, fails naming the option: a bubblewrap
+    older than 0.5.0. A failure that does not name ``--perms`` (an LSM refusing the tmpfs) is another
+    cause and is left to the other diagnoses."""
+    def run(*extra: str) -> subprocess.CompletedProcess | None:
+        try:
+            return subprocess.run(
+                [BWRAP, "--bind", "/", "/", *extra, "--proc", "/proc", "--dev", "/dev", "--unshare-pid",
+                 "/bin/true"],
+                capture_output=True, timeout=10, env=_probe_env(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    plain = run()
+    if plain is None or plain.returncode != 0:
+        return False
+    with_perms = run(*_BWRAP_PERMS_PROBE)
+    return with_perms is not None and with_perms.returncode != 0 and b"--perms" in with_perms.stderr
+
+
+def _bwrap_runs_without_a_pid_namespace() -> bool:
+    """True when bwrap starts WITHOUT ``--unshare-pid`` and fails WITH it, which pins a refusal on the
+    PID namespace rather than on user namespaces in general. Both probes run here, so the answer
+    never rests on another check's result."""
+    def runs(*extra: str) -> bool:
+        try:
+            proc = subprocess.run(
+                [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", *extra, "/bin/true"],
+                capture_output=True, timeout=10, env=_probe_env(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0
+
+    return runs() and not runs("--unshare-pid")
+
+
+def _probe_env() -> dict[str, str]:
+    from levain.launch import child_env   # stdlib-only, so this module stays a dependency leaf
+
+    return child_env()
+
+
+# --- one cgroup v2 leaf per command (S2, Phill 2026-10-09: "yes sorry, that is correct: A'") --------
+# Every process of a Linux command lives in ONE cgroup v2 leaf levain names before the command runs: a
+# transient scope of the operator's own systemd user manager (``systemd-run --user --scope``), which
+# systemd delegates to the operator. kill = write ``1`` to its ``cgroup.kill``; gone = its
+# ``cgroup.events`` says ``populated 0``, or the leaf is absent (the kernel refuses to remove a populated
+# cgroup, and systemd removes an empty scope). No pid is needed for either. Why a user scope and not a
+# unit setup installs: a process may be moved between cgroups only by a writer of the COMMON
+# ANCESTOR's ``cgroup.procs``, which for the operator's session and any delegated unit is root's (RUN on
+# argushub 2026-10-09, project_memory/1009-13_S2/DESIGN.md P1); the user manager does the move for us.
+SYSTEMD_RUN = "/usr/bin/systemd-run"
+_CGROUP_ROOT = Path("/sys/fs/cgroup")
+_LEVAIN_SLICE = "levain.slice"
+_CGROUP_KILL_KERNEL = (5, 14)   # cgroup.kill first shipped in 5.14
+_LINGER_REMEDY = ("run `sudo levain setup-isolation` (it enables linger for you, so your systemd user "
+                  "manager runs without a login session), or `sudo loginctl enable-linger $USER`")
+
+
+def _user_manager_rel(uid: int) -> str:
+    return f"user.slice/user-{uid}.slice/user@{uid}.service"
+
+
+def _leaf_rel(uid: int, unit: str) -> str:
+    """The leaf of transient scope ``unit``, relative to the cgroup root (layout RUN on systemd 255)."""
+    return f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/{unit}.scope"
+
+
+# A leaf's unit names the levain process that made it (pid namespace, pid and kernel start time), so a
+# sweep can tell a crashed levain's leaf from a live one's without any other record. A pid names a
+# process only inside its own pid namespace, so leaves are made, and swept, only from the host's initial
+# one (PROC_PID_INIT_INO, include/linux/proc_ns.h); a levain in a nested namespace is refused by name,
+# since its leaves would outlive it with no sweep able to judge them (L3 r10, r11). The namespace stays
+# in the name so the sweep judges only names it can read, whatever made them; a name without it is
+# never judged (L3 r12).
+# Bounded, canonical fields (no leading zero): a tag is read back from the ledger, an unbounded digit run
+# would not convert (L3 r14), and a padded number would not compare equal to /proc's (L3 r18).
+_N = r"(?:0|[1-9][0-9]{0,19})"
+_LEAF_UNIT = re.compile(rf"levain-({_N})-({_N})-({_N})-[0-9a-f]{{12}}-{_N}\.scope")
+_INIT_PIDNS = "4026531836"
+_PID_MAX_LIMIT = 4194304   # PID_MAX_LIMIT on 64-bit Linux (include/linux/threads.h); pids stay below it
+
+
+def _leaf_unit(token: str, n: int) -> str | None:
+    """The unit name of this levain's leaf number ``n``; None when this levain must not make one (not
+    in the initial pid namespace) or /proc cannot say who it is."""
+    started = _proc_start_time(os.getpid())
+    if started is None or _pidns() != _INIT_PIDNS:
+        return None
+    return f"levain-{_INIT_PIDNS}-{os.getpid()}-{started}-{token}-{n}"
+
+
+def _leaf_orphaned(rel: str, uid: int) -> bool:
+    """Whether leaf ``rel`` of ``uid`` may be killed as a crashed levain's: a levain leaf name from the
+    initial pid namespace, read from that namespace, whose maker (its pid and start time) is gone. The
+    crash sweep and the claim path both ask only this, so they cannot disagree about a leaf (L3 r13, r14)."""
+    head = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/"
+    m = _LEAF_UNIT.fullmatch(rel[len(head):]) if rel.startswith(head) else None
+    if m is None or m.group(1) != _INIT_PIDNS or _pidns() != _INIT_PIDNS:
+        return False
+    # Gone means the kernel says so: no such process, a zombie, or a later start time. A read that fails
+    # any other way, or a stat line too short to read, is not knowing, and an unknown maker keeps its
+    # leaf (L3 r15: an EMFILE here killed a live levain's command).
+    pid = int(m.group(2))
+    if not 1 <= pid < _PID_MAX_LIMIT:
+        return False   # no levain has that pid: not a name to judge (L3 r17: kill(0) is our own group)
+    try:
+        fields = _stat_fields(pid)
+    except (FileNotFoundError, ProcessLookupError):
+        try:
+            os.kill(pid, 0)   # a /proc that hides processes (hidepid) also says ENOENT (L3 r16)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            pass
+        return False
+    except OSError:
+        return False
+    if len(fields) < 20:
+        return False
+    return fields[0] in (b"Z", b"X", b"x") or fields[19] != m.group(3).encode()
+
+
+def _stat_fields(pid: int) -> list[bytes]:
+    """The fields of ``/proc/<pid>/stat`` after the command name, as bytes: a process sets its own
+    name, and one that does not decode must not stop a sweep (L3 r16)."""
+    return Path(f"/proc/{pid}/stat").read_bytes().rsplit(b")", 1)[-1].split()
+
+
+def sweep_dead_leaves() -> list[str]:
+    """Kill every leaf whose levain is gone (its pid absent, or now another process's), and return the
+    ones still populated afterwards. A crashed levain's sandbox can outlive it: bwrap's PDEATHSIG misses a
+    namespace init cloned before it is armed (bubblewrap #633, #700; reproduced by the S2 proving run)."""
+    uid = os.getuid()
+    base = _CGROUP_ROOT / _user_manager_rel(uid) / _LEVAIN_SLICE
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return []
+    left: list[str] = []
+    killed: list[str] = []
+    for name in names:
+        rel = f"{_user_manager_rel(uid)}/{_LEVAIN_SLICE}/{name}"
+        if not _leaf_orphaned(rel, uid):
+            continue
+        (killed if _leaf_kill(rel) else left).append(rel)
+    # Every leaf is killed first, then all are awaited against ONE deadline: the sweep runs at every
+    # CLI start, so a wait per leaf would add up (L3 r10).
+    deadline = time.monotonic() + 5.0
+    for rel in killed:
+        if not _leaf_gone(rel, timeout=max(0.0, deadline - time.monotonic())):
+            left.append(rel)
+    return left
+
+
+def _cgroup_problem(*, release: str | None = None, osrelease: str | None = None, mounts: str | None = None,
+                    container: bool | None = None, pidns: str | None = None, uid: int | None = None,
+                    root: Path = _CGROUP_ROOT) -> tuple[str, str | None] | None:
+    """Why a Linux command cannot get a cgroup leaf here, as (reason, remedy), or None. Each refusal is
+    by name; there is no fallback that runs a command without its leaf. The inputs default to this
+    host's; they are parameters so each refusal is testable off Linux."""
+    if osrelease is None:
+        try:
+            osrelease = Path("/proc/sys/kernel/osrelease").read_text()
+        except OSError:
+            osrelease = ""
+    if "microsoft" in osrelease.lower() or "wsl" in osrelease.lower():
+        return ("this is WSL2, which levain's Linux floor does not support yet (its cgroup setup is "
+                "not measured)", "run levain on a Linux host")
+    if container is None:
+        container = any(os.path.exists(f) for f in ("/.dockerenv", "/run/.containerenv",
+                                                     "/run/systemd/container"))
+    if container:
+        return ("this is a container, which levain's Linux floor does not support yet (cgroup "
+                "delegation into it is not measured)", "run levain on the host")
+    pidns = _pidns() if pidns is None else pidns
+    if pidns == "-":
+        return ("levain cannot read its pid namespace from /proc/self/ns/pid, so a crashed levain's "
+                "command scopes could not be told from a live one's", "run levain with /proc mounted")
+    if pidns != _INIT_PIDNS:
+        return ("levain is running in a nested pid namespace, where a crashed levain's command scopes "
+                "could not be told from a live one's", "run levain in the host's pid namespace")
+    m = re.match(r"(\d+)\.(\d+)", release if release is not None else os.uname().release)
+    if not m or (int(m.group(1)), int(m.group(2))) < _CGROUP_KILL_KERNEL:
+        return (f"Linux {release if release is not None else os.uname().release} has no cgroup.kill "
+                "(it needs 5.14 or later), which is how levain stops every process of a command",
+                "upgrade the kernel")
+    if mounts is None:
+        try:
+            mounts = Path("/proc/self/mounts").read_text()
+        except OSError:
+            mounts = ""
+    fields = [ln.split() for ln in mounts.splitlines()]
+    v2 = [f for f in fields if len(f) > 3 and f[1] == str(root) and f[2] == "cgroup2"]
+    legacy = any(len(f) > 2 and f[2] == "cgroup" for f in fields)
+    if not v2 or legacy:
+        return (f"cgroups here are not the unified v2 hierarchy at {root} (v1 or hybrid), which "
+                "levain needs to account for every process of a command",
+                "boot with the unified cgroup hierarchy (`systemd.unified_cgroup_hierarchy=1`)")
+    # Without `nsdelegate` a cgroup namespace is not a delegation boundary, and a command could move
+    # itself out of its leaf despite `--unshare-cgroup` (kernel cgroup-v2.rst, "nsdelegate").
+    if "nsdelegate" not in v2[-1][3].split(","):
+        return (f"cgroup2 at {root} is mounted without `nsdelegate`, so a command could leave its "
+                "cgroup", "mount cgroup2 with `nsdelegate` (systemd does this by default)")
+    if not (os.path.isfile(SYSTEMD_RUN) and os.access(SYSTEMD_RUN, os.X_OK)):
+        return (f"{SYSTEMD_RUN} is missing: levain puts each command in a systemd user scope",
+                "use a systemd host")
+    uid = os.getuid() if uid is None else uid
+    mgr = root / _user_manager_rel(uid)
+    try:
+        st = os.lstat(mgr)
+        ok = stat.S_ISDIR(st.st_mode) and st.st_uid == uid
+    except OSError:
+        ok = False
+    if not ok:
+        return (f"your systemd user manager is not running ({mgr} is absent or not yours)", _LINGER_REMEDY)
+    if root == _CGROUP_ROOT and not os.path.exists(f"/run/user/{uid}/bus"):
+        return (f"your systemd user manager has no bus at /run/user/{uid}/bus yet, which "
+                "`systemd-run --user` needs", _LINGER_REMEDY)
+    return None
+
+
+def _leaf_chain_problem() -> str | None:
+    """Run the launch chain every command uses, minus the floor's mounts: a transient user scope
+    around ``bwrap --unshare-pid --unshare-cgroup`` with cgroupfs read-only. None when it ran, else what
+    it said. Static checks cannot see an LSM, a seccomp profile or a user manager that refuses (L3 r9)."""
+    unit = _leaf_unit(os.urandom(6).hex(), 0)
+    if unit is None:
+        return "levain cannot read its own start time from /proc, or is not in the host's pid namespace"
+    rel = _leaf_rel(os.getuid(), unit)
+    argv = ["/usr/bin/env", f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}", SYSTEMD_RUN, "--user", "--scope",
+            "--quiet", "--collect", f"--slice={_LEVAIN_SLICE}", f"--unit={unit}", "--",
+            BWRAP, "--die-with-parent", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+            "--unshare-pid", "--unshare-cgroup", "--ro-bind", "/sys/fs/cgroup", "/sys/fs/cgroup",
+            "/bin/true"]
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, env=_probe_env())
+    except OSError as exc:
+        return str(exc)
+    try:
+        _, err = proc.communicate(timeout=20)
+    except subprocess.SubprocessError:
+        # Killing systemd-run alone would leave a stalled bwrap in its scope, owned by this live levain,
+        # so no sweep would ever reap it (L3 r10): kill the scope too and wait for it to empty.
+        proc.kill()
+        _leaf_kill(rel)
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.SubprocessError:
+            pass
+        if _leaf_gone(rel, timeout=5.0):
+            return "the launch probe did not finish within 20 s"
+        return f"the launch probe did not finish within 20 s, and its scope {rel} could not be emptied"
+    if proc.returncode == 0:
+        return None
+    said = err.decode("utf-8", "replace").strip().splitlines()
+    return said[-1] if said else f"exit {proc.returncode}"
+
+
+def _leaf_populated(rel: str) -> bool | None:
+    """True or False from the leaf's ``cgroup.events``; None when the leaf is absent (removed)."""
+    try:
+        text = (_CGROUP_ROOT / rel / "cgroup.events").read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ENODEV:   # removed while open
+            return None
+        return True   # cannot tell: not gone
+    for line in text.splitlines():
+        if line.startswith("populated "):
+            return line.split()[1] != "0"
+    return True
+
+
+def _leaf_kill(rel: str) -> bool:
+    """SIGKILL every process in the leaf and its descendants (``cgroup.kill``). True when written, or
+    the leaf is absent; False when the write failed."""
+    try:
+        (_CGROUP_ROOT / rel / "cgroup.kill").write_text("1")
+    except FileNotFoundError:
+        return not (_CGROUP_ROOT / rel).exists()   # the leaf is gone; a leaf with no cgroup.kill is not
+    except OSError as exc:
+        return exc.errno == errno.ENODEV
+    return True
+
+
+def _leaf_gone(rel: str, *, timeout: float) -> bool:
+    """True once the leaf has no live process (polled up to ``timeout``)."""
+    deadline = time.monotonic() + timeout
+    while _leaf_populated(rel) is True:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
 
 
 def bwrap_available() -> bool:
@@ -3664,14 +6232,20 @@ def bwrap_available() -> bool:
 
     Deliberately NOT cached. It is one ``bwrap --bind / / /bin/true`` (single-digit milliseconds), and
     a cached answer would survive an operator loading an AppArmor profile or flipping the sysctl —
-    reporting "no confinement" for the life of the process on a box that has just become capable."""
+    reporting "no confinement" for the life of the process on a box that has just become capable.
+
+    It makes a tmpfs with ``--perms``, as every runtime view does (step (7) of :func:`_bwrap_plan_impl`):
+    bubblewrap has the option from 0.5.0, and a 0.4.x (Ubuntu 20.04, Debian 11) passed a probe without
+    it, then failed every shell "Unknown option --perms" (codex L3 r1)."""
     if not (os.path.isfile(BWRAP) and os.access(BWRAP, os.X_OK)):
         return False
     try:
         proc = subprocess.run(
-            [BWRAP, "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "/bin/true"],
+            [BWRAP, "--bind", "/", "/", *_BWRAP_PERMS_PROBE, "--proc", "/proc", "--dev", "/dev",
+             "--unshare-pid", "/bin/true"],
             capture_output=True,
             timeout=10,
+            env=_probe_env(),
         )
     except (OSError, subprocess.SubprocessError):
         # Cannot even attempt it -> not available. FAIL CLOSED; never let an exception here read as
@@ -3693,9 +6267,10 @@ def bwrap_netns_available() -> bool:
     try:
         proc = subprocess.run(
             [BWRAP, "--unshare-net", "--bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
-             "/bin/true"],
+             "--unshare-pid", "/bin/true"],
             capture_output=True,
             timeout=10,
+            env=_probe_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -3731,7 +6306,8 @@ NETNS_REFUSAL = (
 #: twice; the ControlMaster class is spore-1005).
 OFFLINE_RESIDUAL = (
     "bash keeps only its own isolated loopback. NOT blocked: a unix socket at a file path the floor "
-    "does not deny (an ssh ControlMaster or a proxy socket in /tmp, D-Bus, X11), which can reach "
+    "does not deny (an ssh ControlMaster or a proxy socket in /tmp, X11, a daemon that fetches "
+    "on request other than the ones the floor hides), which can reach "
     "this host's services and so bypass the block (spore-1005); and inside a VM, AF_VSOCK to the "
     "hypervisor"
 )
@@ -3812,9 +6388,11 @@ def _mount_plan_paths(
     self-bind comes first; its source exists, so nothing is created). A path strictly inside a tmpfs
     root is left out of both, by EXACT containment: the tmpfs hides the
     host tree there, and a case-folded match would drop a distinct path on a case-sensitive filesystem
-    (L3 2026-10-03)."""
+    (L3 2026-10-03). Unless it is strictly inside a host directory self-bound into that tmpfs after it
+    (a tool view's window): below one the host tree is back (L3 r3)."""
     mounted: dict[str, str | None] = {}
     tmpfs: list[Path] = []
+    windows: list[Path] = []   # host directories bound back inside a tmpfs: host-backed again below
     i = 0
     while i < len(argv):
         op = argv[i]
@@ -3827,15 +6405,27 @@ def _mount_plan_paths(
             if dst != "/":
                 kind = "file" if src == "/dev/null" else None   # /dev/null always exists (codex L3 r5)
                 mounted.setdefault(dst, kind)
+                pd = Path(dst)
+                if (src == dst and any(pd != t and pd.is_relative_to(t) for t in tmpfs)
+                        and os.path.isdir(dst)):
+                    windows.append(pd)
             i += 3
-        elif op in ("--proc", "--dev", "--remount-ro", "--dir"):
+        elif op in ("--proc", "--dev", "--remount-ro", "--dir", "--perms"):
             i += 2
+        elif op == "--symlink":   # a link made in a tmpfs view (a tool directory): nothing on the host
+            i += 3
         else:
             i += 1
 
     def hidden(q: str) -> bool:
+        # Strictly inside a tmpfs, and not strictly inside a host directory bound back into it (a
+        # tool view's ~/.aws/sso: what lies below it is the host's again; codex, L3 r3).
+        # The NEAREST covering mount decides, so a tmpfs or mask nested inside a window is hidden
+        # again (L1 r3: ~/.aws/sso/cache's contents under the ~/.aws/sso window).
         pq = Path(q)
-        return any(pq != r and pq.is_relative_to(r) for r in tmpfs)
+        covers = [(len(r.parts), 1) for r in tmpfs if pq != r and pq.is_relative_to(r)]
+        covers += [(len(w.parts), 0) for w in windows if pq != w and pq.is_relative_to(w)]
+        return bool(covers) and max(covers)[1] == 1
 
     mounted = {q: k for q, k in mounted.items() if not hidden(q)}
     unmounted = [q for q in _named_jewel_paths(policy) if q not in mounted and not hidden(q)]
@@ -3860,29 +6450,1172 @@ def _named_jewel_paths(policy: CrownJewelsPolicy) -> list[str]:
     return list(dict.fromkeys(spelled(Path(p)) for p in named))
 
 
-def _prepare_mountpoints(mounted: dict[str, str | None]) -> None:
+def _prepare_mountpoints(mounted: dict[str, str | None],
+                         created: list[tuple[str, str]] | None = None) -> list[tuple[str, str]]:
     """Create every absent host mountpoint before bwrap runs, so the manifest can be recorded before
     the start and nothing is adopted afterwards. bwrap would create the same things (an empty 0444
     file for a ``/dev/null`` bind, a directory for a tmpfs); creating them here first means the object
     it mounts over is the one recorded. An exclusive create that loses a race keeps whatever is there,
-    which is still recorded before bwrap mounts over it."""
+    which is still recorded before bwrap mounts over it. Returns every object THIS call created,
+    parents included, as ``(path, "file" | "dir")``: the ledger owns exactly those (its own
+    successful ``mkdir`` or ``O_EXCL`` create, never a path merely seen absent), and removes them
+    once no session needs them. Each is appended to ``created`` (the caller's list, when given) as it
+    is made, so a failure part-way still leaves the caller holding what was already created."""
+    if created is None:
+        created = []
+
+    def mkdir(a: Path) -> None:
+        try:
+            a.mkdir(mode=0o700)   # each level 0700: mkdir(parents=True) gives the umask (glm L3 r5)
+        except FileExistsError:
+            return                # someone else's (or a racing spawn's): not levain's to remove
+        created.append((str(a), "dir"))
+
     for q, kind in mounted.items():
         p = Path(q)
         if kind is None or os.path.lexists(p):
             continue
         # bwrap would create missing parents too; without them a jewel under an absent directory
         # (~/.config/gh/hosts.yml on a host with no ~/.config/gh) refused bash (complement L3 r4).
-        missing = [a for a in reversed(p.parents) if not os.path.lexists(a)]
-        for a in missing:   # each level 0700: mkdir(parents=True) gives intermediates the umask (glm L3 r5)
-            a.mkdir(mode=0o700, exist_ok=True)
+        for a in [a for a in reversed(p.parents) if not os.path.lexists(a)]:
+            mkdir(a)
         if kind == "dir":
-            p.mkdir(mode=0o700, exist_ok=True)
+            mkdir(p)
         else:
             try:
-                os.close(os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY
-                                 | getattr(os, "O_NOFOLLOW", 0), 0o444))
+                fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                             0o444)
+            except FileExistsError:
+                continue
+            try:
+                os.fchmod(fd, 0o444)   # exactly 0444 whatever the umask: the ledger checks the mode
+            except OSError:
+                # Not the 0444 file the ledger knows how to remove (under umask 077 it is 0400), so it
+                # is removed now, while this call still holds it and knows it is the one it made.
+                try:
+                    st, lst = os.fstat(fd), os.lstat(p)
+                    if (st.st_dev, st.st_ino) == (lst.st_dev, lst.st_ino):
+                        os.unlink(p)
+                finally:
+                    os.close(fd)
+                raise
+            os.close(fd)
+            created.append((q, "file"))
+    return created
+
+
+# --- the session-scoped placeholder ledger (Linux) -----------------------------------------------
+#
+# A mount needs a mountpoint, so an absent jewel under a writable directory (a cred directory under
+# an existing ~/.config, say) is masked over a placeholder the provider creates. Skipping it would let
+# the shell PLANT the file, so the placeholder stays, but only while a session needs it: before this
+# ledger such placeholders were left on the host for good, and ``npm login`` / ``docker login`` then
+# failed on a 0444 file. (A $HOME-level cred file needs none since $HOME became a view, step (0).)
+# ⛔ Never unlinked while a session might rely on it. Since Linux 3.18 a host-side unlink of a
+# file that is a mountpoint in ANOTHER mount namespace succeeds and lazily DETACHES that mount
+# (torvalds/linux 8ed936b, "vfs: Lazily remove mounts on unlinked files and directories"), which
+# would let a live shell create the file. So each object carries the claims of the shells that mask
+# it, and is removed only when none is left: at close, at levain exit, and by the sweep that runs
+# before every Linux spawn, at levain's launch and in ``levain doctor`` (a crash or SIGKILL leaves
+# claims whose process is gone).
+# ⛔ Removed only while it is still the object created: same device and inode, and for a file still
+# empty and 0444, for a directory still empty. An operator's ``npm login`` that replaced it by rename
+# leaves a different inode, which this keeps (and the replacement closed the live shell, through the
+# manifest check in :class:`_BwrapShell`).
+# The ledger directory is a crown jewel (``build_policy``), so the entity can neither read it nor
+# forge a claim. Directories the provider creates to pin them (an absent ~/.kube, say) are recorded
+# the same way.
+
+_LEDGER_NAME = "placeholders.json"
+
+
+def _ledger_dir() -> Path:
+    return Path.home() / ".levain-runtime" / "floor"
+
+
+def _ledger_dir_problem(create: bool) -> str | None:
+    """Why the ledger directory cannot be trusted, or None. It must be a real directory (no link at
+    ``~/.levain-runtime`` or at ``floor``), owned by this user, and ``floor`` must be 0700: a link there
+    could point the ledger at a file someone else wrote, and the ledger decides what levain deletes.
+    With ``create``, absent levels are made 0700 first."""
+    d = _ledger_dir()
+    for level in (d.parent, d):
+        if create and not os.path.lexists(level):
+            try:
+                level.mkdir(mode=0o700)
             except FileExistsError:
                 pass
+            except OSError as exc:
+                return f"cannot create {level} ({exc})"
+        try:
+            st = os.lstat(level)
+        except FileNotFoundError:
+            return f"{level} does not exist"
+        except OSError as exc:
+            return f"cannot inspect {level} ({exc})"
+        if not stat.S_ISDIR(st.st_mode):
+            return f"{level} is not a directory (a link or a file)"
+        if st.st_uid != os.geteuid():
+            return f"{level} is owned by another user"
+    if stat.S_IMODE(os.lstat(d).st_mode) != 0o700:
+        return f"{d} is not mode 0700"
+    return None
+
+
+def _proc_start_time(pid: int) -> str | None:
+    """The kernel's start time of ``pid`` (Linux, field 22 of /proc/<pid>/stat), or None elsewhere or
+    when unreadable. Part of a claim, so a reused pid does not keep a dead session's claim alive."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    return data.rsplit(")", 1)[-1].split()[19]
+
+
+def _pidns() -> str:
+    try:
+        return str(os.stat("/proc/self/ns/pid").st_ino)
+    except OSError:
+        return "-"
+
+
+def _new_claim() -> str:
+    """``pid:starttime:pidns:token``. A claim made in another pid namespace (a container sharing this
+    home) cannot be judged from here, so :func:`_claim_alive` keeps it."""
+    pid = os.getpid()
+    return f"{pid}:{_proc_start_time(pid) or '-'}:{_pidns()}:{os.urandom(6).hex()}"
+
+
+def _claim_alive(claim: str) -> bool:
+    parts = claim.split(":")
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    if len(parts) >= 4 and parts[2] != _pidns():
+        return True   # made in another pid namespace: not ours to judge, so kept
+    try:
+        os.kill(pid, 0)
+        owner = True
+    except ProcessLookupError:
+        owner = False
+    except PermissionError:
+        # Another user's process holds the pid. Its start time, where /proc shows it, tells levain
+        # itself from a reuse (L3 r10); unreadable or unrecorded, the claim is kept.
+        now = _proc_start_time(pid)
+        if now is None or len(parts) < 4 or parts[1] == "-" or now == parts[1]:
+            return True
+        owner = False
+    except OSError:
+        owner = False
+    if owner and len(parts) >= 4 and parts[1] != "-":
+        now = _proc_start_time(pid)
+        owner = now is None or now == parts[1]   # a later start: the pid was reused
+    if owner:
+        return True
+    # levain is gone (dead, or its pid now another process's), but its sandbox may not be: bwrap's
+    # PDEATHSIG does not reach a namespace init cloned before it is armed (bubblewrap #633, #700). The
+    # tag says what the claim covers, and each kind is judged on its own (L3 r9: a reused pid dropped
+    # the claim without looking at the leaf).
+    tag = parts[4] if len(parts) >= 5 else ""
+    if tag.startswith("c"):
+        # The leaf of the command it covers, tagged before that command was spawned: kill it, and keep
+        # the claim while it is populated (the next sweep looks again; no wait under the ledger lock).
+        rel = tag[1:]
+        if not _leaf_orphaned(rel, os.getuid()):
+            return True   # not ours to judge, or its maker is alive: kept
+        _leaf_kill(rel)
+        return not _leaf_gone(rel, timeout=0.5)
+    if tag.startswith("b"):
+        # The previous build's tag: the command's bash, pid 1 of its namespace, by pid and kernel start
+        # time; a zombie pid 1 means its namespace is already empty.
+        pid_s, _, start = tag[1:].partition("@")
+        try:
+            data = Path(f"/proc/{int(pid_s)}/stat").read_text()
+        except (ValueError, OSError):
+            return False
+        fields = data.rsplit(")", 1)[-1].split()
+        if len(fields) < 20 or fields[0] in ("Z", "X", "x"):
+            return False
+        return start in ("", "-") or fields[19] == start
+    if tag.startswith("g"):
+        # An earlier build's tag names the command's process group. killpg(0) is levain's own group and
+        # 1 is init's: neither is a command's, so neither keeps a claim.
+        try:
+            if int(tag[1:]) <= 1:
+                return False
+            os.killpg(int(tag[1:]), 0)
+            return True
+        except (ValueError, ProcessLookupError):
+            return False
+        except PermissionError:
+            return True
+    return False
+
+
+def _object_unchanged(entry: dict) -> bool:
+    try:
+        st = os.lstat(entry["path"])
+    except OSError:
+        return False
+    if (st.st_dev, st.st_ino) != (entry.get("dev"), entry.get("ino")):
+        return False
+    if entry.get("kind") == "dir":
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        try:
+            return not os.listdir(entry["path"])
+        except OSError:
+            return False
+    return stat.S_ISREG(st.st_mode) and st.st_size == 0 and stat.S_IMODE(st.st_mode) == 0o444
+
+
+def _identity_matches(entry: dict) -> bool:
+    try:
+        st = os.lstat(entry["path"])
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == (entry.get("dev"), entry.get("ino"))
+
+
+class _LedgerTxn:
+    """One transaction on the ledger, under its exclusive lock: everything a spawn does to the objects
+    it relies on (sweep, plan, create, record, claim) happens inside one, so another session's release
+    or sweep cannot remove an object between this spawn deciding to use it and claiming it (L1 r1).
+    On exit, every entry no live claim holds is dropped, and its object removed when it is still the
+    one levain made. ``ok`` is False when the ledger cannot be trusted or read; then nothing is
+    recorded and nothing removed, which leaves objects where they are rather than guessing."""
+
+    def __init__(self) -> None:
+        self.ok = False
+        self.problem: str | None = None
+        self.entries: list[dict] = []
+        self.removed: list[str] = []
+        self.rollback: set[str] = set()   # objects to remove at once if this commit fails
+        self._lock = None
+
+    def __enter__(self) -> "_LedgerTxn":
+        import fcntl
+
+        self.problem = _ledger_dir_problem(create=True)
+        if self.problem is not None:
+            return self
+        d = _ledger_dir()
+        try:
+            self._lock = open(d / (_LEDGER_NAME + ".lock"), "a")
+            fcntl.flock(self._lock, fcntl.LOCK_EX)
+            try:
+                data = json.loads((d / _LEDGER_NAME).read_text(encoding="utf-8"))
+                entries = data["entries"]
+            except FileNotFoundError:
+                entries = []
+            if not isinstance(entries, list):
+                raise ValueError("entries is not a list")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.problem = f"the ledger {d / _LEDGER_NAME} cannot be read ({exc})"
+            return self
+        self.entries = [e for e in entries if isinstance(e, dict) and isinstance(e.get("path"), str)]
+        for e in self.entries:
+            e["claims"] = [c for c in e.get("claims", []) if isinstance(c, str)]
+        self.ok = True
+        return self
+
+    def sweep(self) -> None:
+        """Drop the claims of processes that no longer exist."""
+        for e in self.entries:
+            e["claims"] = [c for c in e["claims"] if _claim_alive(c)]
+
+    def record(self, created: list[tuple[str, str]]) -> None:
+        """Record objects levain itself just created (its own successful ``mkdir`` or ``O_EXCL``
+        create, never "absent when looked at"), with their identity, unclaimed."""
+        for path, kind in created:
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            self.entries = [e for e in self.entries if e["path"] != path]
+            self.entries.append({"path": path, "kind": kind, "dev": st.st_dev, "ino": st.st_ino,
+                                 "claims": []})
+
+    def claim(self, paths: set[str], claim: str) -> None:
+        """Add ``claim`` to every entry at one of ``paths`` whose object is still the one recorded."""
+        for e in self.entries:
+            if e["path"] in paths and _identity_matches(e):
+                e["claims"].append(claim)
+
+    def retag(self, old: str, new: str) -> None:
+        for e in self.entries:
+            e["claims"] = [new if c == old else c for c in e["claims"]]
+
+    def drop(self, claim: str) -> None:
+        for e in self.entries:
+            e["claims"] = [c for c in e["claims"] if c != claim]
+
+    def __exit__(self, *exc: object) -> None:
+        try:
+            if not self.ok:
+                return
+            kept: list[dict] = []
+            # Children before parents, so a created ~/.config/git goes before a created ~/.config.
+            for e in sorted(self.entries, key=lambda e: len(e["path"]), reverse=True):
+                if e["claims"]:
+                    kept.append(e)
+                    continue
+                if _object_unchanged(e):
+                    try:
+                        if e.get("kind") == "dir":
+                            os.rmdir(e["path"])
+                        else:
+                            os.unlink(e["path"])
+                        self.removed.append(e["path"])
+                    except OSError:
+                        kept.append(e)   # still there: try again next time
+                elif e.get("kind") == "dir" and _identity_matches(e):
+                    # Still levain's directory, only not empty yet (another session's object inside
+                    # it, say): kept, so it goes once that is gone (L3 r1).
+                    kept.append(e)
+                # else: it is no longer the object levain made (the operator's now); forget it
+            path = _ledger_dir() / _LEDGER_NAME
+            tmp = path.with_name(path.name + ".tmp")
+            try:
+                tmp.write_text(json.dumps({"entries": sorted(kept, key=lambda e: e["path"])}, indent=1),
+                               encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError as exc:
+                self.problem = f"the ledger {path} cannot be written ({exc})"
+                # What this transaction's spawn made is in no ledger on disk and no shell will use
+                # it: removed now, still under the lock, if it is still the object made (L3 r3).
+                for e in sorted(self.entries, key=lambda e: len(e["path"]), reverse=True):
+                    if e["path"] in self.rollback and _object_unchanged(e):
+                        try:
+                            os.rmdir(e["path"]) if e.get("kind") == "dir" else os.unlink(e["path"])
+                        except OSError:
+                            pass
+        finally:
+            if self._lock is not None:
+                self._lock.close()   # releases the flock
+
+
+def _ledger_enter(created: list[tuple[str, str]], mounted: set[str], claim: str) -> None:
+    """Record ``created`` and claim every entry at a path in ``mounted`` (one transaction)."""
+    with _LedgerTxn() as txn:
+        if txn.ok:
+            txn.record(created)
+            txn.claim(mounted, claim)
+
+
+def _ledger_release(claim: str) -> list[str] | None:
+    """Drop ``claim`` and remove what no session holds any more; the paths removed, or None when the
+    ledger could not be used and the claim was NOT dropped (the caller keeps it, to try again). Called
+    only once the claiming shell's namespace is gone (:meth:`_BwrapShell.close`)."""
+    with _LedgerTxn() as txn:
+        if txn.ok:
+            txn.drop(claim)
+    # Confirmed only once the ledger was read AND its commit written: a commit that failed leaves `ok` set
+    # and only records `problem` (L3 r11, RUN on w27: a .tmp that could not be written counted as
+    # released, and the claim stayed in the ledger with nothing left to release it).
+    return txn.removed if txn.ok and txn.problem is None else None
+
+
+def sweep_floor_placeholders() -> list[str]:
+    """Drop the claims of processes that no longer exist and remove the objects nobody holds. Run
+    inside every Linux spawn's own transaction, at launch (:mod:`levain.launch`) and by
+    ``levain doctor``. Returns the paths removed. A crashed levain's cgroup leaves are killed first, so
+    the claims that name them are judged on leaves that are emptying (L3 r9)."""
+    if platform.system() == "Linux":
+        sweep_dead_leaves()
+    if not (_ledger_dir() / _LEDGER_NAME).exists():
+        return []
+    with _LedgerTxn() as txn:
+        if txn.ok:
+            txn.sweep()
+    return txn.removed
+
+
+def ledger_problem() -> str | None:
+    """Why the placeholder ledger cannot be used, or None (for ``levain doctor``: a ledger levain
+    cannot read or trust leaves every placeholder on disk, so it must be said, not swallowed)."""
+    d = _ledger_dir()
+    if not os.path.lexists(d) and not os.path.lexists(d.parent):
+        return None   # never used on this host
+    with _LedgerTxn() as txn:
+        pass
+    return txn.problem
+
+
+def live_floor_placeholders() -> list[Path]:
+    """The placeholder FILES a live session holds on this host right now (for the banner)."""
+    try:
+        entries = json.loads((_ledger_dir() / _LEDGER_NAME).read_text(encoding="utf-8"))["entries"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    return [Path(e["path"]) for e in entries
+            if isinstance(e, dict) and e.get("kind") == "file"
+            and any(isinstance(c, str) and _claim_alive(c) for c in e.get("claims", []))]
+
+
+# Every Linux shell until its claim is confirmed released (`_BwrapShell.close`). Held strongly: a shell its
+# caller dropped with its claim unreleased is still closed, and the claim released, at exit (codex L3 r10,
+# RUN on w26: from a WeakSet it was collected and its claim outlived levain).
+_LIVE_BWRAP_SHELLS: "set[_BwrapShell]" = set()
+
+
+@atexit.register
+def _close_live_shells() -> None:
+    """At levain's exit, close every Linux shell still open, so each releases its placeholders the
+    normal way, after its namespace is gone. Releasing a claim while its shell lived would let the
+    release unlink a placeholder still mounted in that shell, which detaches the mount."""
+    for shell in list(_LIVE_BWRAP_SHELLS):
+        try:
+            shell.close()
+        except Exception:  # noqa: BLE001 — exit must go on
+            pass
+
+
+def _group_live(pgid: int) -> bool:
+    """Whether process group ``pgid`` has a member that is not a zombie. The shell keeps each group's
+    leader unreaped while its group lives (:class:`_Leader`), so a zombie must not count.
+
+    macOS only: elsewhere a group that ``killpg`` still finds is called live, since Linux has no one-call
+    process table to tell its members from a zombie leader (see :meth:`SandboxedShell._group_emptied`)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass   # a zombie (macOS answers EPERM for one, measured), or a member of another uid
+    else:
+        if platform.system() == "Darwin":
+            return True   # macOS signals no zombie, so a success is a live member (measured)
+    if platform.system() != "Darwin":
+        return True
+    # macOS (and other BSDs): pgrep lists no zombie (measured), and lists every user's processes.
+    from levain.launch import child_env
+
+    try:
+        r = subprocess.run(["/usr/bin/pgrep", "-g", str(int(pgid))], capture_output=True,
+                           stdin=subprocess.DEVNULL, cwd="/", env=child_env(), timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return True   # cannot tell: not gone
+    return r.returncode != 1
+
+
+def _group_gone(pgid: int, *, timeout: float) -> bool:
+    """True once no live process is left in process group ``pgid`` (polled until ``timeout``)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if not _group_live(pgid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+_NOTE_EXITSTATUS = 0x04000000   # <sys/event.h>: NOTE_EXIT's data carries the wait status
+
+
+class _Leader:
+    """A command's driver process, the leader of its process group, watched WITHOUT being reaped.
+
+    A pid is not reused until its process is reaped, and a process group's id is its leader's pid
+    (POSIX.1-2024 Base Definitions 4.17), so while the leader stays an unreaped zombie no new process
+    group can take its number and a signal to it can reach only this command's processes. The shell
+    reaps the leader only once its group has no live member (S2 L3 r2, codex HIGH: a background job's
+    group was kept by number after its leader was reaped, and could be recycled under a later kill).
+
+    The exit status is read without reaping: ``waitid(WNOWAIT)`` where Python has it (Linux; CPython
+    leaves it out on macOS), else a kqueue ``NOTE_EXIT | NOTE_EXITSTATUS`` registered right after the
+    spawn. A leader that exited before that registration (its driver failed before the command's input
+    was sent) has its status read when it is reaped."""
+
+    def __init__(self, proc: subprocess.Popen[bytes]) -> None:
+        self.proc = proc
+        self.pid = proc.pid
+        self.status: int | None = None   # Popen.returncode-style, once seen exited
+        self.exited = False
+        self.reaped = False
+        self._reap_lock = threading.Lock()
+        # Signals being sent to the group right now (outside the lock: a hands signal is sudo). The
+        # leader is not reaped while any is out, so the number they name stays this group's.
+        self._signalling = 0
+        self._signals_done = threading.Condition(self._reap_lock)
+        self._kq: Any = None
+        self._pidfd: int | None = None
+        if hasattr(os, "waitid"):
+            try:
+                self._pidfd = os.pidfd_open(self.pid)   # type: ignore[attr-defined]
+            except (AttributeError, OSError):
+                self._pidfd = None
+            return
+        kq = select.kqueue()
+        ev = select.kevent(self.pid, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD,
+                           fflags=select.KQ_NOTE_EXIT | _NOTE_EXITSTATUS)
+        try:
+            got = kq.control([ev], 1, 0)
+        except OSError as exc:
+            kq.close()
+            if exc.errno != errno.ESRCH:
+                raise
+            self.exited = True   # ESRCH: it exited before the watch was set
+            return
+        errs = [e.data for e in got if e.flags & select.KQ_EV_ERROR]
+        if errs:
+            kq.close()
+            if any(d != errno.ESRCH for d in errs):
+                # Only ESRCH means "already exited"; anything else is a watch that could not be set,
+                # and a running command must not be read as a finished one (S2 L3 r3).
+                raise OSError(errs[0], f"cannot watch the shell's process: {os.strerror(errs[0])}")
+            self.exited = True
+            return
+        self._kq = kq
+        self._take(got)
+
+    def _take(self, events: list[Any]) -> None:
+        for e in events:
+            if e.filter == select.KQ_FILTER_PROC and e.fflags & select.KQ_NOTE_EXIT:
+                # The status first: a waiter on another thread that sees `exited` reads it (r3).
+                self.status = os.waitstatus_to_exitcode(e.data)
+                self.exited = True
+
+    def wait(self, timeout: float) -> bool:
+        """True once the leader has exited (it stays unreaped), polled up to ``timeout`` seconds.
+
+        Safe from two threads at once (run() and a close() from another thread): the kqueue reports
+        the exit to one of them, so each blocks in short slices and rechecks what the other saw, and
+        a watch the other thread released by reaping the leader ends the wait instead of raising."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if self.exited:
+                return True
+            left = max(0.0, deadline - time.monotonic())
+            step = min(left, 0.05)
+            kq, pidfd = self._kq, self._pidfd
+            try:
+                if kq is not None:
+                    self._take(kq.control(None, 1, step))
+                elif hasattr(os, "waitid"):
+                    r = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)  # type: ignore[attr-defined]
+                    if r is not None and r.si_pid == self.pid:
+                        self.status = (r.si_status if r.si_code == os.CLD_EXITED  # type: ignore[attr-defined]
+                                       else -r.si_status)
+                        self.exited = True
+                    elif step > 0:
+                        if pidfd is not None:
+                            select.select([pidfd], [], [], step)
+                        else:
+                            time.sleep(step)
+                elif step > 0:
+                    time.sleep(step)   # the watch is gone: another thread reaped the leader
+            except (ChildProcessError, OSError, ValueError):
+                # Another thread's reap() may be between the kernel's reap and its flags: it holds
+                # the reap lock across both, so taking it once settles which this was.
+                with self._reap_lock:
+                    pass
+                if not (self.reaped or self.exited):
+                    raise
+            if self.exited:
+                return True
+            if left <= 0:
+                return False
+
+    def hold_for_signal(self) -> bool:
+        """Keep the leader unreaped while the caller signals its group, outside the reap lock; False
+        when it is already reaped (its number may be another group's now: send nothing). Every True
+        is followed by :meth:`signal_sent`."""
+        with self._reap_lock:
+            if self.reaped:
+                return False
+            self._signalling += 1
+            return True
+
+    def signal_sent(self) -> None:
+        with self._reap_lock:
+            self._signalling -= 1
+            self._signals_done.notify_all()
+
+    def reap(self, timeout: float | None = None) -> bool:
+        """Reap the leader (only once its group has no live member) and free the watch. Waits for any
+        signal still being sent to the group (S2 L3 r4), up to ``timeout``: False, still unreaped,
+        when one is still out then (r5)."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._reap_lock:
+            while self._signalling:
+                left = None if deadline is None else deadline - time.monotonic()
+                if left is not None and left <= 0:
+                    return False
+                self._signals_done.wait(left)
+            if self.reaped:
+                return True
+            self.proc.wait()
+            if self.status is None:
+                self.status = self.proc.returncode
+            self.exited = True
+            self.reaped = True
+            self._release()
+            return True
+
+    def release_watch(self) -> None:
+        """Free the watch of a leader seen exited and kept unreaped (its group still held): its exit is
+        known, so the watch is not needed again, and a held leader would otherwise keep an fd."""
+        with self._reap_lock:
+            if self.exited:
+                self._release()
+
+    def _release(self) -> None:
+        if self._kq is not None:
+            self._kq.close()
+            self._kq = None
+        if self._pidfd is not None:
+            try:
+                os.close(self._pidfd)
+            except OSError:
+                pass
+            self._pidfd = None
+
+
+# --- the Linux hands launch (S2-linux) ------------------------------------------------------------
+# bwrap runs AS the hands user, in an ALLOWLISTED view (Phill's ruling (A), 2026-10-09): the sandbox
+# root is bwrap's own empty tmpfs, and only the trees bash needs are mounted into it. Read-only: /usr
+# (and the merged-/usr links /bin, /sbin, /lib*), /etc and /opt. Writable: the hands workspace and the
+# hands home. Fresh and empty: /tmp, /var/tmp, /run, and bwrap's own /dev and /proc. The host's root is
+# never bound, so the operator's home, the entity directory, /srv, /mnt, /media, /var/lib, daemon
+# sockets under /run and container volumes are not in the view at all: no list of what to hide and no
+# matching of socket names. Of the floor's plan, only ops whose target lies in a host tree of the view
+# are kept (a mask over a jewel in /etc, say); everything else it hides is already absent. The network
+# namespace is always new (abstract unix sockets, the host's loopback), the IPC namespace is new, and
+# the user namespace is new with ``--disable-userns``, so no nested one can be made inside (ENOSPC).
+# Linux hands is therefore stricter than macOS hands, which stays default-allow under Seatbelt.
+
+#: Host trees in a hands view, read-only (absent ones are skipped).
+_HANDS_VIEW_RO = ("/usr", "/etc", "/opt")
+#: The merged-/usr links: a symlink here becomes the same symlink in the view, a real directory (an
+#: unmerged host) is a read-only tree like those above (:func:`_hands_view_trees`).
+_HANDS_VIEW_LINKS = ("/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32")
+#: Fresh, empty and writable in a hands view.
+_HANDS_VIEW_TMP = ("/tmp", "/var/tmp", "/run")
+#: Ops of the floor's plan and the number of arguments each takes. An op not named here is refused by
+#: the transform, so a new op in the plan cannot pass through it unexamined.
+_BWRAP_OP_ARITY = {
+    "--bind": 2, "--ro-bind": 2, "--bind-try": 2, "--ro-bind-try": 2, "--symlink": 2,
+    "--tmpfs": 1, "--remount-ro": 1, "--dir": 1, "--proc": 1, "--dev": 1, "--perms": 1,
+    "--die-with-parent": 0, "--unshare-pid": 0, "--unshare-cgroup": 0, "--unshare-net": 0,
+}
+
+
+_HANDS_VIEW_FLAGS = ("--unshare-user", "--disable-userns", "--unshare-ipc", "--unshare-net", "--unshare-pid",
+                     "--unshare-cgroup", "--die-with-parent")
+
+
+def _hands_view_trees(hands: HandsIdentity) -> tuple[list[str], list[str]]:
+    """``(read_only, writable)``: the host trees a hands view binds, read-only ones that exist here and
+    the hands workspace and home."""
+    ro = [t for t in (*_HANDS_VIEW_RO, *_HANDS_VIEW_LINKS) if os.path.isdir(t) and not os.path.islink(t)]
+    home = os.path.realpath(hands.home)
+    if any(t == home or t.startswith(home.rstrip("/") + "/") for t in ("/", *ro)):
+        raise ConfinementError(f"the hands user's home is {hands.home}, which would put {home} of the host "
+                               "in its view, writable — refusing (fail-closed). Set the entity up again: sudo "
+                               "levain setup-isolation --undo, then sudo levain setup-isolation.")
+    return ro, [str(hands.workspace), home]
+
+
+def _in_hands_view(path: str | Path, hands: HandsIdentity) -> bool:
+    """Whether ``path`` lies in a host tree of the hands view, so bash run as the hands user can see it."""
+    ro, rw = _hands_view_trees(hands)
+    p = Path(os.path.normpath(path))
+    return any(p == Path(t) or p.is_relative_to(t) for t in (*ro, *rw))
+
+
+#: The policy's jewel paths a hands launch narrows to its view: each names a host path the hands user
+#: would have to reach, so one outside the view is moot. `_HANDS_POLICY_KEPT` holds every other path
+#: field, each a SOURCE or a classification whose entry may feed something inside the view; a test
+#: fails while a path field is in neither, so a new one gets a decision.
+_HANDS_POLICY_NARROWED = ("deny_read_write", "deny_files", "deny_write_dirs", "deny_write_files", "deny_sockets",
+                          "socket_spellings", "own_memory_files", "sqlite_sidecars", "trust_spellings",
+                          "ssh_dir", "config_file")
+_HANDS_POLICY_KEPT = ("entity_dir", "workspace", "socket_sources", "ro_tool_dirs", "cred_dir_sources",
+                      "trusted_roots")
+
+
+def _hands_policy(policy: CrownJewelsPolicy, hands: HandsIdentity) -> CrownJewelsPolicy:
+    """The floor's policy with only the jewels a hands view contains: what a hands launch checks, plans
+    from, rechecks and edits under. A jewel outside the view is unreachable by the hands user, so a
+    refusal over it refused for nothing (RUN 2026-10-09: a SQLite file refused every hands launch). NOT
+    used for the hardlink rule, which keeps the whole policy: an outside jewel's other name may be inside."""
+    changes: dict[str, object] = {}
+    for name in _HANDS_POLICY_NARROWED:
+        v = getattr(policy, name)
+        if isinstance(v, tuple):
+            changes[name] = tuple(p for p in v if _in_hands_view(p, hands))
+        elif v is not None and not _in_hands_view(v, hands):
+            changes[name] = None
+    return replace(policy, **changes)
+
+
+def _hands_bwrap_argv(argv: list[str], hands: HandsIdentity) -> list[str]:
+    """The floor's bwrap ``argv`` (``_bwrap_plan``'s, without the command) turned into a hands launch's
+    allowlisted view: the view's own mounts first, then every op of the floor's plan whose target lies
+    in a host tree of the view, in the plan's order; every other op is dropped. Reads only the host's
+    link layout and which view trees exist."""
+    if not argv or argv[0] != BWRAP:
+        raise ConfinementError("internal: the hands launch was given a plan that is not bwrap's — refusing "
+                               "(fail-closed).")
+    ro, rw = _hands_view_trees(hands)
+    trees = [Path(t) for t in (*ro, *rw)]
+    out = [argv[0], *_HANDS_VIEW_FLAGS]
+    for t in ro:
+        out += ["--ro-bind", t, t]
+    for link in _HANDS_VIEW_LINKS:
+        if os.path.islink(link):
+            out += ["--symlink", os.readlink(link), link]
+    out += ["--proc", "/proc", "--dev", "/dev"]
+    for t in _HANDS_VIEW_TMP:
+        out += ["--tmpfs", t]
+    for t in rw:
+        out += ["--bind", t, t]
+    i = 1
+    while i < len(argv):
+        op = argv[i]
+        n = _BWRAP_OP_ARITY.get(op)
+        if n is None or i + n >= len(argv):
+            raise ConfinementError(f"internal: the floor's plan has {op!r}, which the hands launch does not "
+                                   "know how to place — refusing (fail-closed).")
+        args = argv[i + 1:i + 1 + n]
+        i += 1 + n
+        if n and any(Path(args[-1]) == t or Path(args[-1]).is_relative_to(t) for t in trees):
+            out += [op, *args]
+    return out
+
+
+def _hands_ns_problem(hands: HandsIdentity, timeout: float = 30.0) -> str | None:
+    """Can bwrap build a hands launch's namespaces AS the hands user here? None when it can, else what
+    it said. Ubuntu 23.10+ with ``kernel.apparmor_restrict_unprivileged_userns=1`` refuses it until the
+    bwrap-userns-restrict profile is installed (RUN 2026-10-09)."""
+
+    # The bare view the launch builds (glm L3 r1: a probe over `--bind / /` could pass where the view fails).
+    argv = [*hands_prefix(hands), *_hands_bwrap_argv([BWRAP], hands), "/bin/true"]
+    try:
+        r = _run_hands_helper(argv, hands, b"", timeout, "the namespace probe")
+    except OSError as exc:
+        return f"bwrap could not be run as {hands.user} ({exc})"
+    if r.returncode == 0:
+        return None
+    said = r.stderr.decode("utf-8", "replace").strip().splitlines()
+    if said and said[-1].startswith("levain: "):   # the start program refused, before bwrap ran
+        return said[-1][len("levain: "):]
+    # The probe builds the whole view, so a missing bind source fails here too: bwrap's own words lead
+    # (complement L3 r2), and the AppArmor remedy is offered for the namespace case only.
+    return (f"bwrap cannot start the hands view as {hands.user} ({said[-1] if said else 'no reason given'}). "
+            "If that is about namespaces or uid_map: on Ubuntu 23.10+ install the bwrap-userns-restrict AppArmor profile: sudo install -m 0644 "
+            "/usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/ && sudo apparmor_parser "
+            "-r /etc/apparmor.d/bwrap-userns-restrict (from the apparmor-profiles package); bubblewrap 0.8 or "
+            "later is needed for --disable-userns")
+
+
+def _hands_argv_unmade(argv: list[str]) -> str | None:
+    """The first mount target of a hands bwrap ``argv`` that is not on the host, or None. bwrap would
+    create such a target itself: on the host when it lies under one of the view's host trees, in the
+    view only when it lies in a tmpfs mounted earlier in the argv; a ``-try`` bind with no source is
+    skipped by bwrap. Conservative: a target in neither is reported too."""
+    views: list[Path] = []
+    i = 1
+    while i < len(argv):
+        op = argv[i]
+        n = _BWRAP_OP_ARITY.get(op, 0)
+        args = argv[i + 1:i + 1 + n]
+        i += 1 + n
+        if not n or op in ("--symlink", "--dir"):
+            continue
+        dst = Path(args[-1])
+        if op in ("--bind-try", "--ro-bind-try") and not os.path.lexists(args[0]):
+            continue
+        if not any(dst.is_relative_to(v) and dst != v for v in views) and not os.path.lexists(dst):
+            return str(dst)
+        if op == "--tmpfs":
+            views.append(dst)
+    return None
+
+
+# --- the proxy relays (criterion 1) ---------------------------------------------------------------
+# A hands launch's network namespace has no route to the host's loopback, where the entity's proxy
+# listens. Two relays carry exactly the recorded egress ports across, and add no authority: the host
+# side runs AS the hands user in the host's network namespace, so its TCP connects to 127.0.0.1:<port>
+# are the hands user's and the nftables table still decides which ports get out; the namespace side
+# runs inside each command's sandbox. They meet on pathname unix sockets in a fresh 0700 directory
+# under the hands user's own home, which the hands view binds read-write. ONE fixed program for both, run with
+# ``python3 -I -S`` (stdlib only, no site, no environment): every input is argv data, nothing is
+# evaluated, and it connects to nothing but 127.0.0.1:<port> or <dir>/<port>.sock.
+#   out <dir> <port>...   bind <dir>/<port>.sock (0600) for each port, relay each connection to
+#                         127.0.0.1:<port>; print "ready" once every socket listens; on SIGTERM remove
+#                         the sockets (through the directory's fd from mkdir, so a directory swapped
+#                         for a symlink meanwhile is not followed) and the directory (levain cannot)
+#   in <dir> <port>... -- <argv>
+#                         listen on 127.0.0.1:<port> for each port, fork the relay to <dir>/<port>.sock,
+#                         then exec <argv> (the command's bash) in its own place: bash stays pid 1 of
+#                         the command's pid namespace and the relay, its child, dies with it. Every
+#                         socket listens before bash exists, so a connection is queued, never refused,
+#                         and the relay is in no job table of bash (``wait`` does not wait for it).
+HANDS_PYTHON = "/usr/bin/python3"
+_HANDS_RELAY_PREFIX = ".levain-relay-"
+_HANDS_RELAY_READY_TIMEOUT = 10.0
+_HANDS_RELAY = r"""import os, signal, socket, sys, threading, time
+def pump(a, b):
+    try:
+        while True:
+            d = a.recv(65536)
+            if not d:
+                break
+            b.sendall(d)
+    except OSError:
+        for s in (a, b):
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        return
+    try:
+        b.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+def pair(c, connect):
+    try:
+        t = connect()
+    except OSError:
+        c.close()
+        return
+    th = threading.Thread(target=pump, args=(c, t), daemon=True)
+    th.start()
+    pump(t, c)
+    th.join()
+    c.close()
+    t.close()
+slots = threading.BoundedSemaphore(64)
+def held(c, connect):
+    try:
+        pair(c, connect)
+    finally:
+        slots.release()
+def serve(ls, connect):
+    while True:
+        try:
+            c = ls.accept()[0]
+        except OSError:
+            time.sleep(0.05)
+            continue
+        if not slots.acquire(blocking=False):
+            c.close()
+            continue
+        threading.Thread(target=held, args=(c, connect), daemon=True).start()
+def tcp(port):
+    return lambda: socket.create_connection(("127.0.0.1", port))
+def unix(path):
+    def connect():
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(path)
+        except OSError:
+            s.close()
+            raise
+        return s
+    return connect
+def ports(args):
+    for a in args:
+        if not (a.isascii() and a.isdigit() and 0 < int(a) < 65536):
+            raise ValueError("not a port: %r" % a)
+    return [int(a) for a in args]
+def run(listeners):
+    for s, connect in listeners:
+        threading.Thread(target=serve, args=(s, connect), daemon=True).start()
+    while True:
+        signal.pause()
+mode, d = sys.argv[1], sys.argv[2]
+if mode == "out":
+    made = []
+    mine = []
+    def tidy():
+        for name in made:
+            try:
+                os.unlink(name, dir_fd=mine[0])
+            except OSError:
+                pass
+        if mine:
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+    def stop(*_):
+        tidy()
+        os._exit(0)
+    signal.signal(signal.SIGTERM, stop)
+    os.umask(0o077)
+    def maker_gone(name):
+        parts = name[len(".levain-relay-"):].split("-")
+        if len(parts) != 3 or not (parts[0].isascii() and parts[0].isdigit()) or len(parts[0]) > 7:
+            return False   # no maker in the name: cannot tell, kept (L3 r4)
+        try:
+            with open("/proc/%s/stat" % parts[0]) as f:
+                return f.read().rsplit(")", 1)[1].split()[19] != parts[1]
+        except FileNotFoundError:
+            try:
+                os.kill(int(parts[0]), 0)   # hidepid hides it from /proc, not from kill(2)
+            except ProcessLookupError:
+                return True
+            except (OSError, OverflowError, ValueError):
+                pass
+            return False
+        except (OSError, IndexError):
+            return False   # cannot tell: kept
+    def sweep(home):
+        # A relay killed outright (not by its SIGTERM) leaves its directory; only its maker's other
+        # shells may still use one whose maker lives.
+        for name in os.listdir(home):
+            if name.startswith(".levain-relay-") and name != os.path.basename(d) and maker_gone(name):
+                try:
+                    fd = os.open(os.path.join(home, name), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                except OSError:
+                    continue
+                try:
+                    for e in os.listdir(fd):
+                        if e.endswith(".sock"):
+                            try:
+                                os.unlink(e, dir_fd=fd)
+                            except OSError:
+                                pass
+                finally:
+                    os.close(fd)
+                try:
+                    os.rmdir(os.path.join(home, name))
+                except OSError:
+                    pass
+    try:
+        listeners = []
+        want = ports(sys.argv[3:])
+        try:
+            sweep(os.path.dirname(d))
+        except OSError:
+            pass
+        os.mkdir(d, 0o700)
+        try:
+            mine.append(os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+        except OSError:
+            os.rmdir(d)
+            raise
+        for port in want:
+            p = os.path.join(d, "%d.sock" % port)
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.bind(p)
+            made.append("%d.sock" % port)
+            os.chmod(p, 0o600)
+            s.listen(64)
+            listeners.append((s, tcp(port)))
+    except Exception as e:
+        sys.stderr.write("levain relay: %s\n" % e)
+        sys.stderr.flush()
+        tidy()
+        os._exit(1)
+    sys.stdout.write("ready\n")
+    sys.stdout.flush()
+    n = os.open(os.devnull, os.O_RDWR)
+    os.dup2(n, 1)
+    os.dup2(n, 2)
+    run(listeners)
+elif mode == "in":
+    i = sys.argv.index("--")
+    try:
+        listeners = []
+        for port in ports(sys.argv[3:i]):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("127.0.0.1", port))
+            s.listen(64)
+            listeners.append((s, unix(os.path.join(d, "%d.sock" % port))))
+    except Exception as e:
+        sys.stderr.write("levain relay: cannot listen inside the sandbox: %s\n" % e)
+        sys.stderr.flush()
+        os._exit(126)
+    if os.fork() == 0:
+        n = os.open(os.devnull, os.O_RDWR)
+        for f in (0, 1, 2):
+            os.dup2(n, f)
+        run(listeners)
+    for s, _ in listeners:
+        s.close()
+    os.execv(sys.argv[i + 1], sys.argv[i + 1:])
+else:
+    sys.stderr.write("levain relay: unknown mode %r\n" % mode)
+    os._exit(2)
+"""
+
+
+def _hands_relay_dir(hands: HandsIdentity) -> str:
+    """A fresh directory name for one shell's relay sockets, under the hands user's home. It names the
+    levain that made it (pid and kernel start time), so a later relay can tell a dead levain's directory,
+    left by a relay killed outright, from a live one's and remove it (see ``_HANDS_RELAY``)."""
+    started = _proc_start_time(os.getpid())
+    if started is None:
+        raise ConfinementError("levain cannot read its own start time from /proc — refusing to start the "
+                               "entity's proxy relay (fail-closed).")
+    return os.path.join(os.path.realpath(hands.home),
+                        f"{_HANDS_RELAY_PREFIX}{os.getpid()}-{started}-{os.urandom(8).hex()}")
+
+
+def _hands_relay_in(hands: HandsIdentity, sockdir: str) -> list[str]:
+    """What goes in front of each command's bash in a hands launch with egress ports."""
+    return [HANDS_PYTHON, "-I", "-S", "-c", _HANDS_RELAY, "in", sockdir,
+            *(str(p) for p in hands.egress_ports), "--"]
+
+
+class _HandsRelay:
+    """The host side of one hands shell's relays: a process group led by sudo, the relay in it running
+    as the hands user. :meth:`stop` is idempotent."""
+
+    def __init__(self, hands: HandsIdentity, proc: subprocess.Popen[bytes], sockdir: str) -> None:
+        self.hands, self.proc, self.sockdir = hands, proc, sockdir
+        self._gone: bool | None = None
+
+    def stop(self) -> bool:
+        """SIGTERM as the hands user first, so the relay removes its sockets and directory; then the
+        whole group killed and sudo reaped. True once nothing of it is left; a stop that left something
+        is tried again by the next call (codex L3 r1)."""
+        if self._gone:
+            return True
+        _hands_signal(self.hands, self.proc.pid, signal.SIGTERM)
+        try:
+            self.proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        self._gone = _stop_hands_group(self.hands, self.proc)
+        return self._gone
+
+
+def _start_hands_relay(hands: HandsIdentity, sockdir: str) -> _HandsRelay:
+    """Start the host side of the relays and wait (bounded) for its ready line; refuse by name when it
+    does not come. Nothing of a refused start is left running."""
+    from levain.launch import child_env
+
+    argv = [*hands_prefix(hands), HANDS_PYTHON, "-I", "-S", "-c", _HANDS_RELAY, "out", sockdir,
+            *(str(p) for p in hands.egress_ports)]
+    refuse = " — refusing to run bash as the entity's own user, or as you instead (fail-closed)."
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                cwd="/", env=child_env(), start_new_session=True)
+    except OSError as exc:
+        raise ConfinementError(f"the proxy relay could not be started as {hands.user} ({exc}){refuse}") from exc
+    relay = _HandsRelay(hands, proc, sockdir)
+    try:
+        got = b""
+        deadline = time.monotonic() + _HANDS_RELAY_READY_TIMEOUT
+        fd = proc.stdout.fileno()   # type: ignore[union-attr]
+        while b"\n" not in got:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                break
+            chunk = os.read(fd, 64)
+            if not chunk:
+                break
+            got += chunk
+        if got == b"ready\n":
+            for f in (proc.stdout, proc.stderr):
+                f.close()   # type: ignore[union-attr]
+            proc.stdout = proc.stderr = None
+            return relay
+        said = ""
+        if proc.poll() is not None:
+            said = proc.stderr.read().decode("utf-8", "replace").strip()   # type: ignore[union-attr]
+        raise ConfinementError(
+            f"the proxy relay for the entity's egress ports {list(hands.egress_ports)}, run as {hands.user}, "
+            f"did not start ({said.splitlines()[-1] if said else f'no ready line within {_HANDS_RELAY_READY_TIMEOUT:g} s'})"
+            + refuse
+        )
+    except OSError as exc:
+        relay.stop()
+        raise ConfinementError(f"the proxy relay run as {hands.user} could not be read ({exc}){refuse}") from exc
+    except BaseException:
+        relay.stop()
+        raise
+    finally:
+        for f in (proc.stdout, proc.stderr):
+            if f is not None:
+                f.close()
+
+
+# --- pathname listeners (criterion 2) -------------------------------------------------------------
+# A unix socket or FIFO the hands user may write is a deputy the network namespace does not cut. The
+# view holds no host tree but /usr, /etc and /opt read-only (and the hands user's own), so those are
+# what is walked.
+#: The walk, as the hands user inside its own view: every socket it may write, FIFO it may read or
+#: write, and directory it may search but not list (RUN 2026-10-09: none on a stock Ubuntu 24.04) in
+#: the view's read-only host trees. bash cannot reach any other host file, and the view's writable trees are the
+#: hands user's own.
+_HANDS_FIND = "/usr/bin/find"
+_HANDS_WALK_TIMEOUT = 120.0
+
+
+def _hands_listener_problem(hands: HandsIdentity) -> str | None:
+    """What :func:`_hands_walk` found, named with the remedy, or why it could not walk; None when it
+    found nothing."""
+    try:
+        found = _hands_walk(hands)
+    except OSError as exc:
+        return f"levain could not walk, as {hands.user}, the host files its bash would see ({exc})"
+    return _hands_reach_text(hands, found) if found else None
+
+
+def _hands_reach_text(hands: HandsIdentity, found: list[str]) -> str:
+    more = f" and {len(found) - 3} more" if len(found) > 3 else ""
+    return (f"{hands.user} can reach {', '.join(found[:3])}{more}, which bash run as it sees (a socket it "
+            "may write, a FIFO it may read or write, or a directory it may search but not list, where such "
+            "a file could be): tighten the mode so the entity's user cannot")
+
+
+def _hands_walk(hands: HandsIdentity,
+                on_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
+                cancelled: Callable[[], bool] | None = None) -> list[str]:
+    """Every unix socket or FIFO in the read-only host trees of a hands view that the hands user may
+    write (and every directory there it may search but not list). Asked of the kernel as the hands
+    user inside the view with none of the floor's masks (they only hide; so this sees at least what
+    bash will), by ``find -writable``, which is access(2): modes, ACLs and every ancestor's search bit.
+    OSError when the walk could not be done; ``on_start`` and ``cancelled`` as for :func:`_run_hands_helper`."""
+
+    ro, _ = _hands_view_trees(hands)
+    if not ro:
+        return []
+    argv = [*hands_prefix(hands), *_hands_bwrap_argv([BWRAP], hands), "/usr/bin/env", "LC_ALL=C", _HANDS_FIND,
+            *ro, "(", "(", "-type", "s", "-writable", ")", "-o", "(", "-type", "p", "(", "-writable", "-o",
+            "-readable", ")", ")", "-o", "(", "-type", "d", "-executable", "!", "-readable", ")", ")", "-print0"]
+    # The whole OR in one pair of parentheses: -print0 binds by -a, tighter than -o, so without it only
+    # the last branch printed (RUN 2026-10-09: a 0777 socket under /opt walked as None).
+    r = _run_hands_helper(argv, hands, b"", _HANDS_WALK_TIMEOUT, "the walk", on_start=on_start,
+                          cancelled=cancelled)
+    found = [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
+    said = [x for x in r.stderr.decode("utf-8", "replace").splitlines() if x.strip()]
+    # find exits 1 when a directory cannot be listed and walks the rest. Only that is let through, for
+    # a directory the hands user can neither list nor search (nothing in it is reachable): one it can
+    # search but not list is itself a hit above, since a socket in it is reachable by a known name.
+    # Anything else (bwrap or find failing to start) refuses.
+    unlisted = [x for x in said if x.startswith(f"{_HANDS_FIND}: ") and x.endswith(": Permission denied")]
+    if r.returncode != 0 and (not said or len(unlisted) != len(said)):
+        raise OSError(said[-1] if said else f"status {r.returncode}")
+    return found
+
+
+def _hands_launch_problem(hands: HandsIdentity) -> str | None:
+    """What stops a Linux hands launch, checked before any of its processes starts (Phill's ruling (A):
+    probe at every hands launch). None when nothing does."""
+    from levain.firing.hands import HandsSetupError, egress_boundary_problem, hands_net_group, net_group_problem
+
+    try:
+        net_group = hands_net_group(hands.user)
+    except HandsSetupError as exc:
+        return str(exc)
+    problem = net_group_problem(hands.user)
+    if problem is not None:
+        return f"the entity's network boundary is open: {problem}"
+    problem = egress_boundary_problem(hands.user, hands.egress_ports, net_group=net_group)
+    if problem is not None:
+        return f"the entity's network boundary does not hold: {problem}"
+    return _hands_ns_problem(hands)
 
 
 class _BwrapShell(SandboxedShell):
@@ -3906,10 +7639,11 @@ class _BwrapShell(SandboxedShell):
     The manifest is recorded once, before bwrap runs, after the provider has created every absent
     host mountpoint itself (:func:`_prepare_mountpoints`), so nothing is adopted after the start. It
     covers every mounted path and every jewel the plan leaves unmounted (:func:`_mount_plan_paths`).
-    NOT covered: a command already running when something changes, or one backgrounded earlier, keeps
-    its access for as long as it runs; so does a command whose path changes between this check and
-    its start; a ``setsid`` child survives the group kill (the module's known slice-2 limit); a store
-    with no recognisable header (SQLCipher) is never classified as a database."""
+    NOT covered: a command already running when something changes keeps its access for as long as it
+    runs; so does a command whose path changes between this check and its start; a store with no
+    recognisable header (SQLCipher) is never classified as a database. Each command is its own bwrap
+    whose bash is pid 1 of its pid namespace, so nothing a command starts (a background job, a
+    ``setsid`` child) outlives it to hold access past the next check."""
 
     def __init__(
         self,
@@ -3924,6 +7658,313 @@ class _BwrapShell(SandboxedShell):
         super().__init__(argv=argv, cwd=cwd, env=env, default_timeout=default_timeout)
         self._jewel_policy = policy
         self._manifest = dict(manifest)   # recorded before the start; never updated
+        self._ledger_claim: str | None = None   # this shell's claim on the placeholder ledger
+        self._claim_base: str | None = None     # the claim before a command's bash is added to it
+        # Each command's cgroup leaf by its process group (see `_leaf_rel`), bound to the leader OBJECT
+        # so a later group that reuses the number is never judged by an earlier one's leaf; deleted
+        # when that leader is reaped. The leaf, not a pid, answers "may anything of it still run".
+        self._leaves: dict[int, tuple[_Leader, str]] = {}
+        self._pending_leaf: str | None = None   # named for the spawn in progress, before its leader exists
+        # EVERY leaf named for a spawn, from the moment it is named until it is confirmed empty with its
+        # driver exited: leaf -> its driver, None while none exists yet. Nothing in between is untracked,
+        # so the claim is never released, nor retagged away, while any of them may hold a sandbox.
+        self._named: dict[str, _Leader | None] = {}
+        self._unit_token = os.urandom(6).hex()
+        self._units = 0
+        self._relay: _HandsRelay | None = None   # a hands launch's host-side proxy relay, if any
+        self._hands: HandsIdentity | None = None   # a hands launch's user, whose files are repaired
+        self._command_since = 0.0
+        # Clear from a run()'s admission (`_before_command`, under `_lock`, refused once closed) until its
+        # command's group is registered or the run is refused. close() waits for it, so it never settles
+        # or releases the claim while a spawn is being prepared (codex L3 r6, RUN on w22: the claim was
+        # released and a sandbox then spawned without one). Admission under the close lock, and close
+        # draining what was admitted, as concurrent.futures and net/http's Server.Shutdown do.
+        self._preflight_done = threading.Event()
+        self._preflight_done.set()
+        self._preflight_thread: int | None = None   # the run thread that holds it
+
+    def start(self) -> "SandboxedShell":
+        super().start()
+        self._probed = True
+        return self
+
+    # Each command runs in a pid namespace of its own (``--unshare-pid --as-pid-1``), inside its leaf.
+    _own_pid_namespace = True
+    _probed = False   # start()'s own command has run: it changes no file, so nothing to repair
+
+    def _group_emptied(self, pgid: int, leader: _Leader, timeout: float) -> bool:
+        """Empty once the command's driver (the leader) has exited and its leaf has no live process.
+        Only THIS leader's leaf counts."""
+        deadline = time.monotonic() + timeout
+        if not leader.wait(timeout):
+            return False
+        rec = self._leaves.get(pgid)
+        if rec is None or rec[0] is not leader:
+            return False
+        return _leaf_gone(rec[1], timeout=max(0.0, deadline - time.monotonic()))
+
+    def _signal(self, pgid: int, sig: int) -> bool:   # type: ignore[override]
+        """Every signal levain sends a Linux command stops it: SIGKILL to the driver (levain's own
+        unreaped child, so the number is still it), then ``cgroup.kill`` on its leaf. The driver first:
+        until ``systemd-run`` has moved it into the leaf it is outside it, and dead it cannot exec the
+        sandbox afterwards. True when the leaf kill was written or the leaf is absent."""
+        rec = self._leaves.get(pgid)
+        leaf = rec[1] if rec is not None else self._pending_leaf
+        try:
+            os.kill(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return False
+        return leaf is None or _leaf_kill(leaf)
+
+    def _kill_group(self, pgid: int, leader: _Leader) -> bool:
+        """Kill the command (driver and leaf), wait for the leaf to empty, then reap the driver. False,
+        the group kept, when the kill was not written or the leaf did not empty in time."""
+        delivered = self._signal_group(pgid, leader, signal.SIGKILL)
+        leader.wait(5.0)
+        return (delivered and leader.exited and self._group_emptied(pgid, leader, 5.0)
+                and self._reap(pgid, leader))
+
+    def _reap(self, pgid: int, leader: _Leader) -> bool:
+        if not super()._reap(pgid, leader):
+            return False
+        with self._lock:
+            rec = self._leaves.get(pgid)
+            if rec is not None and rec[0] is leader:
+                del self._leaves[pgid]
+                self._named.pop(rec[1], None)   # reaped only once its leaf was confirmed empty
+        return True
+
+    def _settled(self) -> bool:
+        """Every named leaf is empty and its driver has exited (a leaf with no driver yet is not)."""
+        with self._lock:
+            named = list(self._named.items())
+        for leaf, leader in named:
+            if leader is None or not leader.wait(0) or not _leaf_gone(leaf, timeout=5.0):
+                return False
+            with self._lock:
+                if self._named.get(leaf) is leader:
+                    del self._named[leaf]
+        return True
+
+    def _run_ended(self) -> None:
+        # A run refused before its spawn; a no-op once `_spawn` ended it. Inside run()'s single-caller lock,
+        # so a run() re-entered on this thread (a signal handler, say) is refused by that lock before it
+        # touches the preflight (L3 r7-r9: a guard for it here deadlocked on `_lock`, reproduced).
+        self._end_preflight()
+
+    def _end_preflight(self) -> None:
+        """End the run thread's preflight (see `_preflight_done`); a no-op on any other thread, so
+        start()'s own spawn never ends a run's."""
+        with self._lock:
+            if self._preflight_thread != threading.get_ident():
+                return
+            self._preflight_thread = None
+            self._preflight_done.set()
+
+    def _spawn(self) -> tuple[_Leader, _Output, _Carry]:
+        try:
+            return super()._spawn()   # its group is registered, or killed as closed, before it returns
+        except BaseException:
+            # A spawn that failed before its driver was recorded (Popen raised, or the watch could not
+            # be set up and the driver was killed): kill whatever reached its leaf, and stop tracking
+            # it only once it is empty.
+            with self._lock:
+                leaf, self._pending_leaf = self._pending_leaf, None
+            if leaf is not None and self._named.get(leaf, False) is None:
+                _leaf_kill(leaf)
+                if _leaf_gone(leaf, timeout=5.0):
+                    with self._lock:
+                        if self._named.get(leaf, False) is None:
+                            del self._named[leaf]
+            raise
+        finally:
+            # After the failed spawn's leaf is dealt with: close() settles only what this left behind.
+            self._end_preflight()
+
+    def _leader_made(self, leader: _Leader) -> None:
+        with self._lock:
+            leaf, self._pending_leaf = self._pending_leaf, None
+            if leaf is not None:
+                self._leaves[leader.pid] = (leader, leaf)
+                self._named[leaf] = leader
+
+    def close(self) -> None:
+        # The claim is released only once every leaf is EMPTY, never while any process of a sandbox
+        # lives: a host-side unlink of a placeholder still mounted in a live namespace detaches that
+        # mount (Linux 3.18+, 8ed936b), and the shell could then plant the file (L1 + L2 r1). A leaf
+        # that does not empty keeps the claim; once this levain is gone, the next Linux spawn's
+        # `sweep_dead_leaves` kills the leaf and the ledger sweep then drops the claim. Released in
+        # `finally`, whatever the base teardown did.
+        # No run() is admitted once this is set. One already admitted belongs to the run thread, which alone
+        # signals and reaps its walk (L3 r3: a second thread signalling it could reach a reused pid): the
+        # walk sees this within 0.2 s, and the run ends its preflight refused or with its group registered,
+        # which `_spawn` then kills. close() waits for that (L3 r4, r6), except on the run thread itself,
+        # which closes the shell when it refuses a command.
+        with self._lock:
+            self._closed = True
+            own = self._preflight_thread == threading.get_ident()
+        # Longer than the walk's own bound plus its group stop. A preflight still outstanding after it (a
+        # check stuck on a hung mount) may yet spawn, so the claim is KEPT, as for a leaf that does not
+        # empty (codex + glm + complement L3 r7, RUN on w23: the claim was released and a spawn followed).
+        drained = own or self._preflight_done.wait(_HANDS_WALK_TIMEOUT + 30)
+        if not drained:
+            _log.warning("levain: a command being prepared on the shell did not stop after close(); the "
+                         "shell keeps its claim on the floor's files: call close() again once it has")
+        try:
+            super().close()
+        finally:
+            if self._relay is not None:
+                self._relay.stop()   # after the commands: nothing inside is left to use it
+            # The shell lets go of its claim, and of its registration, only when it releases the claim.
+            # Until then (a preflight still outstanding, a group that did not empty, a leaf not settled)
+            # it keeps both: a spawn the preflight still makes is retagged onto the claim, and a later
+            # close(), or the exit hook's, releases it (L3 r8, RUN on w24: a claim taken off the shell left
+            # the late spawn's leaf untagged; codex L3 r9: the same after a group that did not empty).
+            # With no claim there is nothing to settle for (complement L3 r10: up to 5 s per leaf, and an
+            # OSError out of a close() that never raises); a settle that errs is not settled.
+            try:
+                settled = self._ledger_claim is None or self._settled()
+            except OSError:
+                settled = False
+            # A claim belongs to this shell until its release is CONFIRMED: a ledger that could not be
+            # written leaves it here for the next close() or the exit hook's (codex L3 r10, RUN on w26:
+            # dropped from the shell first, it stayed in the ledger with nothing left to release it).
+            if drained and not self.unemptied_groups and settled:
+                claim = self._ledger_claim
+                if claim is None or _ledger_release(claim) is not None:
+                    self._ledger_claim = None
+                    _LIVE_BWRAP_SHELLS.discard(self)
+                else:
+                    _log.warning("levain: the placeholder ledger could not be written; the shell keeps its "
+                                 "claim, and a later close() or levain's exit releases it")
+
+    def _spawn_argv(self) -> tuple[list[str], tuple[int, ...]]:
+        self._command_since = time.time()
+        # One command at a time on the claim: it names one leaf, so an earlier one still populated
+        # refuses this command (a retag would stop the claim covering it).
+        if not self._settled():
+            raise ConfinementError(
+                "an earlier command's sandbox could not be stopped — refusing to run the command "
+                "(fail-closed): the shell's claim must keep covering it, so close this shell."
+            )
+        problem = _cgroup_problem()
+        if problem is not None:
+            raise ConfinementError(f"{problem[0]} — refusing to run the command (fail-closed)."
+                                   + (f" To fix: {problem[1]}." if problem[1] else ""))
+        argv, pass_fds = super()._spawn_argv()
+        unit = _leaf_unit(self._unit_token, self._units + 1)
+        if unit is None:
+            # The unit name carries it, so a crash sweep can tell this levain's leaves from a live one's.
+            raise ConfinementError("levain cannot read its own start time from /proc, or is not in the "
+                                   "host's pid namespace — refusing to run the command (fail-closed): a "
+                                   "crash could not be told from a live levain.")
+        self._units += 1
+        leaf = _leaf_rel(os.getuid(), unit)
+        # The claim names the leaf BEFORE anything is spawned in it: after a levain crash at any later
+        # point the sweep finds the leaf, kills it, and keeps the claim until it is empty.
+        claim = self._ledger_claim
+        if claim is not None and self._claim_base is not None:
+            tagged = f"{self._claim_base}:c{leaf}"
+            with _LedgerTxn() as txn:
+                if txn.ok:
+                    txn.retag(claim, tagged)
+            if not txn.ok or txn.problem is not None:
+                raise ConfinementError(
+                    f"{txn.problem} — refusing to run the command (fail-closed): the shell's claim on "
+                    "the floor's files could not be recorded."
+                )
+            self._ledger_claim = tagged
+        with self._lock:
+            self._pending_leaf = leaf
+            self._named[leaf] = None
+        # systemd-run finds the user manager through XDG_RUNTIME_DIR; bash does not get it unless the
+        # caller gave it, so a second env drops it again after the move.
+        scope = [SYSTEMD_RUN, "--user", "--scope", "--quiet", "--collect", f"--slice={_LEVAIN_SLICE}",
+                 f"--unit={unit}", "--"]
+        if "XDG_RUNTIME_DIR" not in self._env:
+            scope = ["/usr/bin/env", f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}", *scope,
+                     "/usr/bin/env", "-u", "XDG_RUNTIME_DIR"]
+        return scope + argv, pass_fds
+
+    def _after_spawn(self, pgid: int) -> None:
+        # bash is blocked reading its input, so nothing of the command has run yet. Before it may run,
+        # its driver must be IN its leaf: systemd-run moves itself there and then execs bwrap, so
+        # everything the command ever starts is a descendant of a member.
+        with self._lock:
+            rec = self._leaves.get(pgid)
+        if rec is None:
+            raise ConfinementError(
+                "the command's process group is no longer tracked by this shell — refusing to run the "
+                "command (fail-closed)."
+            )
+        leader, leaf = rec
+        want = f"0::/{leaf}"
+        unit = leaf.rsplit("/", 1)[-1]
+        deadline = time.monotonic() + _START_TIMEOUT
+        while True:
+            try:
+                now = Path(f"/proc/{pgid}/cgroup").read_text().strip()
+            except OSError:
+                now = ""
+            if now == want:
+                return
+            if now.startswith("0::/") and now.endswith(f"/{unit}"):
+                # Its own scope (the unit name is unique) under a layout `_leaf_rel` did not predict:
+                # kill and wait on the path it is really in, then refuse.
+                seen = now[len("0::/"):]
+                with self._lock:
+                    self._leaves[pgid] = (leader, seen)
+                    self._named.pop(leaf, None)
+                    self._named[seen] = leader
+                raise ConfinementError(
+                    f"the command's cgroup is {seen}, not {leaf} as levain expects for this systemd — "
+                    "refusing to run the command (fail-closed)."
+                )
+            if leader.wait(0) or time.monotonic() >= deadline:
+                raise ConfinementError(
+                    "the command's sandbox did not start in its cgroup (systemd-run --user failed or "
+                    "stalled; `levain doctor` checks it) — refusing to run the command (fail-closed)."
+                )
+            time.sleep(0.01)
+
+    def _after_command(self, pgid: int) -> None:
+        # The command's bash was pid 1 of its namespace, so the kernel is killing everything left in
+        # it, but only once pid 1 has died: when bwrap alone died (an OOM kill, a root SIGKILL), pid 1
+        # and a setsid child outlived run()'s return (RUN 2026-10-09, codex L3 r3). Whatever is still in a
+        # finished command's leaf outlived it, so the leaf is killed; a leaf that does not empty is still
+        # named, and `_settled` refuses the next command over it.
+        with self._lock:
+            rec = self._leaves.get(pgid)
+        if rec is not None:
+            _leaf_kill(rec[1])
+            _leaf_gone(rec[1], timeout=5.0)
+        if self._hands is not None and self._probed:
+            self._repair_masks()
+
+    @property
+    def hands_user(self) -> str | None:
+        # So teardown counts a hands shell's unemptied groups as that user's (codex L3 r1).
+        return self._hands.user if self._hands is not None else None
+
+    def _repair_masks(self) -> None:
+        """A hands command's chmod 600, or a file it created 0600, leaves an ACL mask of --- that hides
+        the file from the operator (RUN in a VM 2026-10-09); restore it on what changed since the
+        command started. A failure is logged, not raised: the command already ran."""
+        from levain.firing.ws_git import mask_repair_argv
+
+        hands = self._hands
+        if hands is None:
+            return
+        argv = mask_repair_argv(hands, since=self._command_since - 2)
+        try:
+            r = _run_hands_helper(argv, hands, b"", 60, "restoring your read access")
+            if r.returncode != 0:
+                _log.warning("restoring your read access to files the entity's command changed failed: %s",
+                             r.stderr.decode("utf-8", "replace").strip()[-300:])
+        except OSError as exc:
+            _log.warning("restoring your read access to files the entity's command changed failed: %s", exc)
 
     def _recheck(self) -> None:
         _refuse_plantable_sqlite_jewels(self._jewel_policy)
@@ -3935,9 +7976,30 @@ class _BwrapShell(SandboxedShell):
                     "the floor no longer covers what is on disk there."
                 )
 
-    def run(self, command: str, *, timeout: float | None = None) -> ShellResult:
-        if self.closed:
-            return super().run(command, timeout=timeout)   # the base refusal names the real reason
+    def _before_command(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise ConfinementError("the shell was closed; the command was not run")
+            self._preflight_done.clear()
+            self._preflight_thread = threading.get_ident()
+        hands = self._hands
+        if hands is not None:
+            # The walk again before every command (Phill 2026-10-09, "yes to both"): a socket or FIFO
+            # made since the last one (RUN: a root listener planted mid-shell was CONNECTED) refuses
+            # this command. What is made DURING a command is not seen; that is the README's residue.
+            # A walk that could not be done says nothing about the host: that command is refused and the
+            # shell stays (complement L3 r2). None starts once the shell is closed (codex L3 r2); one
+            # running when it closes is stopped by this thread, its owner, and close() waits for that.
+            try:
+                found = _hands_walk(hands, self._refuse_once_closed, lambda: self._closed)
+            except OSError as exc:
+                raise ConfinementError(
+                    f"levain could not walk, as {hands.user}, the host files its bash would see ({exc}) — "
+                    "the command was not run (fail-closed).") from exc
+            if found:
+                self.close()
+                raise ConfinementError(f"{_hands_reach_text(hands, found)} — the shell was closed and the "
+                                       "command was not run (fail-closed).")
         try:
             self._recheck()
         except (OSError, RuntimeError) as exc:   # RuntimeError includes ConfinementError
@@ -3948,7 +8010,11 @@ class _BwrapShell(SandboxedShell):
                 f"a crown jewel changed since this shell started, or could not be re-checked, so "
                 f"the shell was closed and the command was not run. {exc}"
             ) from exc
-        return super().run(command, timeout=timeout)
+
+    def _refuse_once_closed(self, proc: subprocess.Popen[bytes]) -> None:
+        with self._lock:
+            if self._closed:
+                raise ConfinementError("the shell was closed; the command was not run")
 
 
 class BwrapProvider(ConfinementProvider):
@@ -3972,12 +8038,15 @@ class BwrapProvider(ConfinementProvider):
     message a human reads will say "No such file or directory", and anything matching on EPERM to
     detect a denial will not fire.
 
-    ⚠ NOT CLAIMED, BECAUSE NOT MEASURED: whether ``--unshare-pid`` would close the DAEMONIZED
-    SURVIVOR limit the module docstring documents as open on macOS. It plausibly would (a pid
-    namespace reaps its children when its init exits), it is one flag, and it is deliberately NOT
-    built here — K4c is PARITY, and the one attempt to measure it was invalidated by a container
-    artifact (procfs cannot be mounted under Docker's default caps). It needs a real Linux host
-    before it is either claimed or shipped."""
+    ``--unshare-pid`` IS NOW BUILT (lane P2 item 2c, 2026-10-07), for a different reason than the one
+    this paragraph once weighed it for: without it the sandbox's procfs showed every process of this
+    user, so bash could read ``/proc/<pid>/environ`` of levain and the rest. pid_namespaces(7): the
+    new procfs shows only the namespace's processes (asserted live by
+    ``test_linux_live_bash_sees_no_host_process``, which the CI workflow's live job runs), and "If
+    the "init" process of a PID namespace terminates, the kernel terminates all of the processes in
+    the namespace via a SIGKILL signal". Each command now runs as its own bwrap with bash as that
+    pid 1 (``--as-pid-1``), so a ``setsid`` child ends with its command
+    (``test_linux_a_setsid_child_ends_with_its_command`` measures it)."""
 
     #: Enforced by ``--unshare-net`` (no IP network in bash), not by a per-destination rule; what it
     #: does not close is ``OFFLINE_RESIDUAL``.
@@ -3985,40 +8054,16 @@ class BwrapProvider(ConfinementProvider):
     localhost_deny_removes_network = True
 
     def available(self) -> bool:
-        return bwrap_available()
+        return _cgroup_problem() is None and bwrap_available() and _leaf_chain_problem() is None
 
     def localhost_deny_ready(self) -> bool:
         return bwrap_netns_available()
 
-    def render_profile(self, policy: CrownJewelsPolicy) -> str:
-        """The bwrap invocation as shell-quoted text.
-
-        bwrap has no profile FILE — the policy IS the argv — so "render the platform's native
-        sandbox profile text" is honoured by rendering the exact command. Quoted with
-        :func:`shlex.join` so the rendered form is both diffable in a test and pasteable into a
-        terminal to reproduce a floor by hand, which is how an equivalence claim gets re-checked
-        later by someone who does not trust this docstring."""
-        argv, create_first = _bwrap_plan(policy)
-        mkdir = f"mkdir -m 700 {shlex.join(create_first)} && " if create_first else ""
-        return mkdir + shlex.join(argv) + "\n"
-
-    def _spawn_shell_impl(
-        self,
-        policy: CrownJewelsPolicy,
-        *,
-        env: dict[str, str] | None = None,
-        default_timeout: float = 120.0,
-    ) -> SandboxedShell:
-        if not bwrap_available():
-            raise ConfinementError(
-                f"{BWRAP} cannot establish a namespace on this host — refusing to grant bash hands "
-                "without a confinement floor (fail-closed). The usual cause on Ubuntu 23.10+ is "
-                "`kernel.apparmor_restrict_unprivileged_userns=1`, which blocks unprivileged user "
-                "namespaces for unconfined programs; an AppArmor profile granting `userns` to "
-                f"{BWRAP} is the narrow fix. Note that `bwrap` being INSTALLED and "
-                "`kernel.unprivileged_userns_clone=1` can BOTH be true on a host where this still "
-                "fails — which is why this is probed by running bwrap, not by reading either."
-            )
+    def _prepare(self, policy: CrownJewelsPolicy, made: list[tuple[str, str]],
+                 hands: HandsIdentity | None = None, relay_dir: str | None = None):
+        """Plan the floor and put on the host what it needs, inside the caller's ledger transaction:
+        ``(argv, create_first, mounted, unmounted, manifest)``. Every object it creates is appended to
+        ``made`` as it goes, so a refusal part-way still hands the ledger everything made."""
         # The named jewels' state BEFORE the plan reads the disk: a path that changes between the plan
         # and the manifest (an absent root created as a directory, say) would be recorded in its new
         # state, unmounted and never "changed" again, so the spawn refuses instead (codex L3 r4).
@@ -4029,26 +8074,49 @@ class BwrapProvider(ConfinementProvider):
                 f"could not inspect the floor's jewels ({exc}) — refusing to grant bash hands "
                 "(fail-closed)."
             ) from exc
+        # The workspace exists BEFORE the plan reads $HOME: one directly in $HOME made later would
+        # be missing from the step (0) view (codex, closing pass). Not a jail — reach is
+        # default-allowed; Popen needs it to exist.
+        policy.workspace.mkdir(parents=True, exist_ok=True)
         argv, create_first = _bwrap_plan(policy)
         mounted, unmounted = _mount_plan_paths(argv, policy)
+        if hands is not None:
+            # The policy was narrowed to the view's jewels before this plan (`_spawn_bwrap`); what bwrap
+            # executes is the view.
+            argv = _hands_bwrap_argv(argv, hands)
         # `-p` (privileged mode): bash neither imports exported functions nor reads SHELLOPTS,
         # BASHOPTS, ENV or BASH_ENV, so nothing from the env runs before the first recheck (codex L3 r6).
-        argv = argv + ["/bin/bash", "--noprofile", "--norc", "-p"]
+        # `--as-pid-1`: bash itself is pid 1 of the namespace and the bwrap process levain waits on
+        # is its parent, so the status levain reads is bash's own waitpid status. Without it bwrap's
+        # reaper is pid 1 and passes bash's status on through an eventfd the reaper holds; the reaper
+        # runs as bash's user and stays dumpable (bubblewrap.c: do_init, monitor_child), so code in the
+        # sandbox that could take that fd from it (ptrace, or pidfd_getfd where Yama allows) could
+        # write a status of its choosing (spore-1385). With bash as pid 1 there is no such channel.
+        # `--new-session`: bash calls setsid(), so it and everything it starts are in a process group
+        # of their own, apart from the bwrap process levain waits on. Without it a `kill 0` inside the
+        # sandbox reached bwrap too (a group signal crosses pid namespaces), so a command could stop or
+        # kill the process that reports its status (S2 L2 M5).
+        # A hands launch with egress ports starts each command's bash through the namespace side of the
+        # proxy relays, which execs it (see `_HANDS_RELAY`): bash is still pid 1.
+        relay_in = _hands_relay_in(hands, relay_dir) if hands is not None and relay_dir is not None else []
+        argv = argv + ["--new-session", "--as-pid-1", *relay_in, "/bin/bash", "--noprofile", "--norc", "-p"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
+        # Each one this process made is levain's, recorded in the placeholder ledger and removed once
+        # no session needs it; one that appeared meanwhile is someone else's and is left alone.
         for d in create_first:
             try:
-                Path(d).mkdir(mode=0o700, exist_ok=True)
+                Path(d).mkdir(mode=0o700)
+                made.append((d, "dir"))
+            except FileExistsError:
+                pass
             except OSError as exc:
                 raise ConfinementError(
                     f"could not create {d} to pin it before sandboxing ({exc}) — refusing to grant "
                     "bash hands (fail-closed)."
                 ) from exc
-        # Same convenience as the seatbelt path: a fresh entity's cwd is its workspace, and Popen
-        # needs it to exist. Not a jail — reach is default-allowed.
-        policy.workspace.mkdir(parents=True, exist_ok=True)
         try:
-            _prepare_mountpoints(mounted)
+            _prepare_mountpoints(mounted, made)
             manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
         except (OSError, RuntimeError) as exc:
             raise ConfinementError(
@@ -4061,6 +8129,106 @@ class BwrapProvider(ConfinementProvider):
                 f"{moved[0]} changed while the floor was being planned, so the plan may not cover it "
                 "— refusing to grant bash hands (fail-closed). Try again."
             )
+        if hands is not None:
+            # Only what the hands view shows is watched: a jewel outside it (the operator editing
+            # ~/.ssh/config, say) is absent from bash's view and must not close the shell.
+            manifest = {q: v for q, v in manifest.items() if _in_hands_view(q, hands)}
+        return argv, create_first, mounted, unmounted, manifest
+
+    def render_profile(self, policy: CrownJewelsPolicy) -> str:
+        """The bwrap invocation as shell-quoted text.
+
+        bwrap has no profile FILE — the policy IS the argv — so "render the platform's native
+        sandbox profile text" is honoured by rendering the exact command. Quoted with
+        :func:`shlex.join` so the rendered form is both diffable in a test and pasteable into a
+        terminal to reproduce a floor by hand, which is how an equivalence claim gets re-checked
+        later by someone who does not trust this docstring. It is the OPERATOR floor's command: for a
+        hands entity bwrap runs the allowlisted view :func:`_hands_bwrap_argv` makes from it."""
+        argv, create_first = _bwrap_plan(policy)
+        mkdir = f"mkdir -m 700 {shlex.join(create_first)} && " if create_first else ""
+        return mkdir + shlex.join(argv) + "\n"
+
+    def hands_file(self, policy: CrownJewelsPolicy, hands: HandsIdentity, op: str, path: str,
+                   data: bytes = b"", *, timeout: float = 60.0) -> bytes:
+        return _bwrap_hands_file(policy, hands, op, path, data, timeout)
+
+    def _spawn_shell_impl(
+        self,
+        policy: CrownJewelsPolicy,
+        *,
+        env: dict[str, str] | None = None,
+        default_timeout: float = 120.0,
+        hands: HandsIdentity | None = None,
+    ) -> SandboxedShell:
+        relay_dir: str | None = None
+        if hands is not None:
+            _require_hands_python()
+            _require_hands_sudo(hands)
+            problem = _hands_launch_problem(hands) or _hands_listener_problem(hands)
+            if problem is not None:
+                raise ConfinementError(f"{problem} — refusing to run bash as the entity's own user, or as "
+                                       "you instead (fail-closed).")
+            if hands.egress_ports:
+                relay_dir = _hands_relay_dir(hands)
+        if not bwrap_available():
+            d = diagnose_confinement("Linux")
+            raise ConfinementError(
+                f"{BWRAP} cannot establish the floor's namespaces on this host — refusing to grant "
+                f"bash hands without a confinement floor (fail-closed). {d.reason}."
+                + (f" To fix: {d.remedy}." if d.remedy else "")
+                + " The usual cause on Ubuntu 23.10+ is `kernel.apparmor_restrict_unprivileged_userns=1`; "
+                "`bwrap` being installed and `kernel.unprivileged_userns_clone=1` can both be true on "
+                "a host where this still fails, which is why it is probed by running bwrap."
+            )
+        # Started once per shell, after the sweep above (its sockets are not swept) and before the start
+        # probe; from the shell's construction on, the shell owns it and its close stops it.
+        relay = _start_hands_relay(hands, relay_dir) if hands is not None and relay_dir else None
+        try:
+            return self._spawn_bwrap(policy, env, default_timeout, hands, relay)
+        except BaseException:
+            if relay is not None:
+                relay.stop()
+            raise
+
+    def _spawn_bwrap(self, policy: CrownJewelsPolicy, env: dict[str, str] | None, default_timeout: float,
+                     hands: HandsIdentity | None, relay: _HandsRelay | None) -> SandboxedShell:
+        if hands is not None:
+            # Planned, claimed and rechecked under the view's jewels only; the hardlink rule ran over the
+            # whole policy before this (`spawn_shell`).
+            policy = _hands_policy(policy, hands)
+        # A crashed levain's leaves first, so the ledger sweep below finds their claims empty.
+        sweep_dead_leaves()
+        # ONE ledger transaction from the sweep to the claim (L1 r1): another session's release or sweep
+        # cannot remove an object this plan relies on between the plan and the claim. The sweep runs
+        # FIRST, so a crashed session's objects are either gone before the plan looks or claimed by it.
+        claim = _new_claim()
+        made: list[tuple[str, str]] = []
+        with _LedgerTxn() as txn:
+            if not txn.ok:
+                # Without a ledger this shell's claims cannot reach the disk, and another session
+                # that can read it later would remove what this shell's masks stand on (codex, L3 r3).
+                raise ConfinementError(
+                    f"{txn.problem} — refusing to grant bash hands (fail-closed): the floor's "
+                    "placeholder ledger is needed to keep its files in place for this shell."
+                )
+            txn.sweep()
+            try:
+                argv, create_first, mounted, unmounted, manifest = self._prepare(
+                    policy, made, hands, relay.sockdir if relay is not None else None)
+            finally:
+                # Recorded even on a refusal: unclaimed, it is removed as the transaction ends.
+                txn.record(made)
+                txn.rollback = {p for p, _ in made}
+            # Everything this spawn made is claimed too, parents included (an absent ~/.config
+            # made for ~/.config/gh): unclaimed and non-empty, it would otherwise be forgotten.
+            txn.claim({*mounted, *create_first, *(p for p, _ in made)}, claim)
+        if txn.problem is not None:
+            # The claim never reached the disk, so another session's close could remove a placeholder
+            # this shell's mask would stand on, and the shell could then plant it (codex, L3 r2).
+            raise ConfinementError(
+                f"{txn.problem} — refusing to grant bash hands (fail-closed): without its claim on "
+                "disk, another session could remove a file this shell's floor relies on."
+            )
         # Startup-execution controls stripped as well as ignored by `-p`: bash would source, import or
         # expand these before the first per-command check, so a jewel that appeared after the manifest
         # could be read before anything looked (codex L3 r5, r6).
@@ -4068,15 +8236,29 @@ class BwrapProvider(ConfinementProvider):
             k: v for k, v in (env if env is not None else _default_shell_env()).items()
             if k not in _STARTUP_EXEC_VARS and not k.startswith("BASH_FUNC_")
         }
+        if hands is not None:
+            # sudo OUTSIDE bwrap, as on macOS; bash starts from the hands user's environment alone.
+            argv = [*hands_prefix(hands), *argv]
+            shell_env = _hands_env(hands)
+        else:
+            # The command ends when levain does (see _HANDS_START, role operator: its leaf is killed):
+            # bwrap's --die-with-parent alone left a setsid child and the namespace's pid 1 running.
+            argv = [*_start_argv(sys.executable, hands=False), *argv]
         shell = _BwrapShell(
-            policy=policy,
+            policy=policy,   # a hands launch's is already the view's (`_spawn_bwrap`)
             manifest=manifest,
             argv=argv,
             cwd=policy.workspace,
             env=shell_env,
             default_timeout=default_timeout,
         )
+        shell._ledger_claim = claim
+        shell._claim_base = claim
+        shell._relay = relay
+        shell._hands = hands
+        _LIVE_BWRAP_SHELLS.add(shell)
         try:
+            # Each command, the start probe included, tags the claim with its process group.
             shell.start()
             shell._recheck()   # whatever changed during the start closes it before any command
         except ConfinementError:   # a RuntimeError subclass: the recheck's own refusal, unchanged
@@ -4094,6 +8276,25 @@ class BwrapProvider(ConfinementProvider):
             shell.close()   # never orphan a started shell (glm L3 r2)
             raise
         return shell
+
+
+def _refuse_kernel_mask_rules(profile_text: str) -> None:
+    """Refuse, before any exec, a Seatbelt profile that would make XNU build a syscall mask.
+
+    A malformed one kernel-panicked a host on 2026-10-07 (a hand-written experiment, not levain's
+    profile). levain calls ``sandbox-exec`` by absolute path, so no PATH shim on the host sees its
+    profiles; this check is levain's own, at its only exec point, on every machine. The token set
+    and the computed-operation forms live in :mod:`levain.firing.seatbelt_guard`.
+    """
+    from levain.firing.seatbelt_guard import scan
+
+    hits = scan(profile_text)
+    if hits:
+        raise ConfinementError(
+            "refusing to start the macOS confinement floor: the Seatbelt profile contains "
+            f"{', '.join(hits)}, which makes the kernel build a syscall mask (a malformed one "
+            "panicked a Mac on 2026-10-07). levain never emits these; this profile was altered."
+        )
 
 
 def sandbox_exec_available() -> bool:
@@ -4240,9 +8441,37 @@ def diagnose_confinement(system: str | None = None) -> ConfinementDiagnosis:
             "install it (`sudo apt install bubblewrap`, `sudo dnf install bubblewrap`, "
             "`sudo pacman -S bubblewrap`)",
         )
-    if provider.available():
+    problem = _cgroup_problem()
+    if problem is not None:
+        return ConfinementDiagnosis(False, "bwrap (Linux mount namespace)", problem[0], problem[1])
+    if bwrap_available():
+        # This is everything `BwrapProvider.available()` checks; asking it again would run the
+        # launch probe a second time (L3 r10).
+        said = _leaf_chain_problem()
+        if said is not None:
+            return ConfinementDiagnosis(
+                False, "bwrap (Linux mount namespace)",
+                f"a command cannot start in its own cgroup scope here ({said})", _LINGER_REMEDY)
         return ConfinementDiagnosis(True, "bwrap (Linux mount namespace)",
                                     "Linux bwrap floor active", None)
+    if _bwrap_lacks_perms():
+        return ConfinementDiagnosis(
+            False, "bwrap (Linux mount namespace)",
+            f"the bubblewrap at {BWRAP} has no --perms option: Levain needs bubblewrap 0.5.0 or later",
+            "install bubblewrap 0.5.0 or later",
+        )
+    if _bwrap_runs_without_a_pid_namespace():
+        # The floor needs `--unshare-pid` (so bash cannot read other processes' environments), and
+        # a new PID namespace needs a fresh /proc mount, which the kernel refuses where /proc has
+        # masked or covered paths: the default inside Docker and podman (L2 r1, from bubblewrap.c).
+        # Never dropped to make bash start: fail closed, with the cause and the fix.
+        return ConfinementDiagnosis(
+            False, "bwrap (Linux mount namespace)",
+            "bwrap runs here, but cannot give bash its own PID namespace: a fresh /proc cannot be "
+            "mounted (usually because this is a container whose /proc has masked paths)",
+            "run levain on the host, or start the container with an unmasked /proc (Docker and "
+            "podman: `--security-opt systempaths=unconfined`)",
+        )
     if _apparmor_restricts_userns():
         return ConfinementDiagnosis(
             False, "bwrap (Linux mount namespace)",

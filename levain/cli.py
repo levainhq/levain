@@ -1,6 +1,7 @@
 """Levain CLI — `levain init`, `levain doctor`, `levain verify-hooks`.
 
-The entry point declared by `pyproject.toml` ([project.scripts] levain).
+The CLI that `levain.launch.main` (the entry point declared by `pyproject.toml`, [project.scripts]
+levain) hands over to.
 Subcommand handlers live in sibling modules; this file is dispatch only.
 Lazy imports keep `levain --help` fast and isolate import errors per command.
 """
@@ -9,7 +10,10 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import stat
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from levain import __version__
@@ -294,35 +298,93 @@ def main(argv: list[str] | None = None) -> int:
             "(the mode a cockpit over a store with no governed write target uses)."
         ),
     )
-    tui_p.set_defaults(func=_cmd_tui)
-
-    focus_p = subparsers.add_parser(
-        "focus",
-        help="Set / show the operator's live focus — what you're working on now.",
-        description=(
-            "The operator's live, self-authored attention context — 'what I'm on "
-            "right now' — that every session reads to orient (it travels across "
-            "sessions, like the rest of the substrate). With TEXT, sets it; with no "
-            "argument, shows the current focus + its freshness; --clear unsets it. "
-            "Stored in the install's .levain/context.json and read into the "
-            "dashboard / TUI / web cockpit. (A sensor app may write the same "
-            "three-key contract into its own context file instead.)"
+    tui_p.add_argument(
+        "--manifest",
+        action="store_true",
+        help=(
+            "Render the shared cockpit manifest (the kernel's panels, order and groups) "
+            "instead of the substrate view. Read-only."
         ),
     )
-    focus_p.add_argument(
-        "text", nargs="?", default=None,
-        help="The focus to set (omit to show the current one).",
+    tui_p.set_defaults(func=_cmd_tui)
+
+    state_p = subparsers.add_parser(
+        "state",
+        help="Set / show your freeform state line — what's going on right now.",
+        description=(
+            "An optional, freeform line in your own words ('wiped, keep it light', "
+            "'on the billing refactor') that every session reads at start and the "
+            "cockpit shows, verbatim with its age. "
+            "It is never parsed, scored or used to limit what the partner does; you are "
+            "the authority on your own state. With TEXT, sets it; with no argument, shows "
+            "it; --clear removes it. It expires after 12 hours: a stale state is dropped, "
+            "not shown. Stored in .levain/context.json."
+        ),
     )
-    focus_p.add_argument(
+    state_p.add_argument(
+        "text", nargs="?", default=None,
+        help="The state to set (omit to show the current one).",
+    )
+    state_p.add_argument(
         "--path", type=Path, default=Path.cwd(),
         help="Install directory (default: cwd).",
     )
-    focus_p.add_argument("--clear", action="store_true", help="Unset the focus.")
-    focus_p.add_argument(
+    state_p.add_argument("--clear", action="store_true", help="Remove the state.")
+    state_p.add_argument(
         "--source", default="cli",
         help="Provenance tag for who set it (default: cli).",
     )
-    focus_p.set_defaults(func=_cmd_focus)
+    state_p.set_defaults(func=_cmd_state)
+
+    ck_p = subparsers.add_parser(
+        "cockpit",
+        help="Enroll, revoke and list the cockpit's signing keys (a reported install).",
+        description=(
+            "The keys that sign the cockpit's T2/T3 writes, held as links in the signed authority log. "
+            "`enroll` adds an OpenSSH public key (class laptop-presence signs T2 and T3, display-phone "
+            "T2) by a link a laptop-presence key signs; `revoke` retires one by a link a key of at least "
+            "its class signs (the last laptop-presence key only with --compromised-since); `keys` lists "
+            "them. Each signing key is passed as --signing-key and may ask for a touch. The log's first "
+            "link is `levain cockpit ledger init`'s. A governed install's keys are written by the root "
+            "installer, so these refuse it."
+        ),
+    )
+    ck_sub = ck_p.add_subparsers(dest="cockpit_cmd", required=True)
+
+    def _ck_common(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--path", type=Path, default=Path.cwd(),
+                        help="Install directory (default: cwd); the journal is its ledger's cockpit/.")
+        sp.add_argument("--data-root", type=Path, default=None, dest="data_root",
+                        help="The cockpit data root itself (an embedder's, e.g. flow's state/bridge/cockpit).")
+
+    ck_enroll = ck_sub.add_parser("enroll", help="Enroll an OpenSSH public key.")
+    ck_enroll.add_argument("key", type=Path, help="The public key file (e.g. ~/.ssh/id_ed25519.pub).")
+    ck_enroll.add_argument("--class", dest="key_class", default="laptop-presence",
+                           choices=("laptop-presence", "display-phone", "presence"),
+                           help="What the key may sign (default: laptop-presence): laptop-presence "
+                                "signs T2 and T3, display-phone T2, presence nothing yet.")
+    ck_enroll.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                           help="The enrolled laptop-presence key that signs this enrolment (its private "
+                                "key file, or the .pub of a key an agent holds).")
+    _ck_common(ck_enroll)
+    ck_enroll.set_defaults(func=_cmd_cockpit_enroll)
+    ck_revoke = ck_sub.add_parser("revoke", help="Revoke an enrolled key.")
+    ck_revoke.add_argument("ref", help="The key's fingerprint (SHA256:...) or principal.")
+    ck_revoke.add_argument("--compromised-since", dest="compromised_since", type=int, default=None,
+                           help="The authority seq (as `levain cockpit keys` lists) from which the key "
+                                "may have been in other hands; its fires decided at or after that seq read "
+                                "\"signed by a revoked key\", and the last laptop-presence key can be revoked "
+                                "with it. The seq is a position in the authority log, which moves only when "
+                                "a link is appended (an enrol, a revoke, a policy change), so it marks every "
+                                "fire since the log's head reached it, not a point in time.")
+    ck_revoke.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                           help="An enrolled key of at least the revoked key's class that signs this "
+                                "revocation (its private key file, or the .pub of a key an agent holds).")
+    _ck_common(ck_revoke)
+    ck_revoke.set_defaults(func=_cmd_cockpit_revoke)
+    ck_keys = ck_sub.add_parser("keys", help="List enrolled keys.")
+    _ck_common(ck_keys)
+    ck_keys.set_defaults(func=_cmd_cockpit_keys)
 
     run_p = subparsers.add_parser(
         "run",
@@ -334,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
             "carries its OWN memory, and NEVER touches this laptop's flow store "
             "(the sovereignty guard fail-closes before the first turn). It has "
             "confined HANDS — a file editor plus (where an OS sandbox exists) a "
-            "persistent bash — both fenced to a crown-jewels floor: they work on "
+            "stateful bash — both fenced to a crown-jewels floor: they work on "
             "your real repos while ~/.anneal-memory/, sibling stores, and ~/.ssh "
             "key material stay off-limits (--no-tools for a pure conversational "
             "partner). Multi-line input is ONE message: a pasted block is kept "
@@ -367,6 +429,15 @@ def main(argv: list[str] | None = None) -> int:
         default="http://localhost:11434",
         dest="base_url",
         help="The model endpoint (default: http://localhost:11434, local Ollama).",
+    )
+    run_p.add_argument(
+        "--api-key-file",
+        default=None,
+        dest="api_key_file",
+        metavar="PATH",
+        help="Read the endpoint's API key from PATH (refused if other users can read or write it, or if it is a symlink). "
+             "Or set LEVAIN_API_KEY. Either keeps the key off the command line, where other "
+             "processes can read it; the file is also denied to the entity's own hands.",
     )
     run_p.add_argument(
         "--api-key",
@@ -518,6 +589,15 @@ def main(argv: list[str] | None = None) -> int:
         help="The compose-model endpoint (default: http://localhost:11434, local Ollama).",
     )
     wrap_p.add_argument(
+        "--api-key-file",
+        default=None,
+        dest="api_key_file",
+        metavar="PATH",
+        help="Read the endpoint's API key from PATH (refused if other users can read or write it, or if it is a symlink). "
+             "Or set LEVAIN_API_KEY. Either keeps the key off the command line, where other "
+             "processes can read it; the file is also denied to the entity's own hands.",
+    )
+    wrap_p.add_argument(
         "--api-key",
         default=None,
         dest="api_key",
@@ -588,7 +668,8 @@ def main(argv: list[str] | None = None) -> int:
             "default — it binds a socket, so read-only is the safe default (unlike "
             "`levain tui`, a local terminal, which defaults writable); pass --write for "
             "the GOVERNED WRITABLE cockpit (operate State / spores / Tray-Keep through "
-            "the same governed seam `levain tui` uses, under localhost-sovereign auth). "
+            "the same governed seam `levain tui` uses; every write needs the write token "
+            "the server prints at start). "
             "This is the sovereign v2 control surface; the in-host `serve-app` MCP App "
             "is the parked alternative."
         ),
@@ -626,10 +707,23 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Serve the GOVERNED WRITABLE cockpit instead of a read-only glance — "
             "enables State / spore touch/descend/ascend / Tray-Keep / episode-tombstone "
-            "edits through the governed write seam. Loopback-sovereign (the localhost "
-            "bind + Host/CSRF guards are the auth; no token) and loopback-ONLY — there "
+            "edits through the governed write seam. Every write needs the write token "
+            "this server prints at start, with a link that carries it (loopback too: "
+            "127.0.0.1 is reachable by every local user). Loopback-ONLY — there "
             "is no off-box writable serve (an install's seed/config is operator-private). "
             "Default is read-only."
+        ),
+    )
+    web_p.add_argument(
+        "--install-class",
+        choices=["reported"],
+        default=None,
+        dest="install_class",
+        help=(
+            "Declare this install's class for the cockpit broker (T2/T3 writes). `reported` is "
+            "the only class declared here: a write fired on the surface token is labelled "
+            "'claims cockpit token', and signatures read 'signed · reported'. With no declaration "
+            "and no governed marker, T2/T3 writes answer 'run the installer'."
         ),
     )
     web_p.add_argument(
@@ -656,6 +750,15 @@ def main(argv: list[str] | None = None) -> int:
         default="http://localhost:11434",
         dest="base_url",
         help="With --chat: the model endpoint (default: http://localhost:11434, local Ollama).",
+    )
+    web_p.add_argument(
+        "--api-key-file",
+        default=None,
+        dest="api_key_file",
+        metavar="PATH",
+        help="With --chat: Read the endpoint's API key from PATH (refused if other users can read or write it, or if it is a symlink). "
+             "Or set LEVAIN_API_KEY. Either keeps the key off the command line, where other "
+             "processes can read it; the file is also denied to the entity's own hands.",
     )
     web_p.add_argument(
         "--api-key",
@@ -965,11 +1068,126 @@ def main(argv: list[str] | None = None) -> int:
     )
     adopt_p.set_defaults(func=_cmd_adopt_answers)
 
+    iso_p = subparsers.add_parser(
+        "setup-isolation",
+        help="Create a dedicated unprivileged user for an entity's bash (one-time, needs sudo).",
+        description=(
+            "Create a dedicated user for this entity's bash, with no password and no login shell, "
+            "a workspace of its own outside your home directory (/Users/Shared/levain on macOS, "
+            "/var/lib/levain on Linux) that you can read and that you change through the entity "
+            "(or ws-git, ws-put and ws-adopt), an ssh key of its own, and one sudoers rule that "
+            "lets your account start commands as that user. A process running as that user cannot "
+            "read the environment of your processes or files only you can read. On macOS, headless "
+            "chat turns, --task runs and scheduled seats then execute bash as that user, and the file "
+            "editor writes as it; the interactive `levain run` REPL keeps using your account. Needs "
+            "root once: run it with sudo. --undo removes what it created."
+        ),
+    )
+    iso_p.add_argument(
+        "--path",
+        type=Path,
+        default=Path.cwd(),
+        help="Entity directory (default: cwd).",
+    )
+    iso_p.add_argument(
+        "--undo",
+        action="store_true",
+        help=(
+            "Retire the user (its account stays, disabled: no login, no password, no home, so its id "
+            "is never given to another account) and remove its ssh key, its sudoers rule and the "
+            "workspace permissions. Files it created keep its retired id as owner and become readable by "
+            "your group (never yours, never root's: a git that owned them would trust a repository "
+            "it filled); the workspace is removed only if empty."
+        ),
+    )
+    iso_p.add_argument(
+        "--reenable",
+        action="store_true",
+        help=(
+            "Give this entity its hands back after an --undo: the retired hands user (undo keeps the "
+            "account, disabled, so its id is never reused) is brought back with the same id."
+        ),
+    )
+    iso_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Print every step and change nothing (does not need sudo).",
+    )
+    iso_p.add_argument(
+        "--egress-port",
+        action="append",
+        type=int,
+        dest="egress_ports",
+        metavar="PORT",
+        help=(
+            "Linux: a loopback TCP port the hands user may connect to (its model proxy); repeat for more. "
+            "Every other connection the hands user opens is refused (an nftables rule on its uid). "
+            "Omitted, a setup allows none and a repair run keeps what is recorded."
+        ),
+    )
+    iso_p.set_defaults(func=_cmd_setup_isolation)
+
+    wsg_p = subparsers.add_parser(
+        "ws-git",
+        help="Run git in the entity's workspace as the entity's user, with hooks and the like off.",
+        description=(
+            "Every repository in the workspace `levain setup-isolation` created belongs to the "
+            "entity's user, and your own git refuses them. This runs git as that user, without "
+            "hooks or any program a repository's config could name, and refuses a repository "
+            "whose config sets anything beyond remotes, branches and core basics. It waits for "
+            "the entity: while anything runs as the entity's user, it refuses."
+        ),
+    )
+    wsg_p.add_argument("--path", type=Path, default=Path.cwd(), help="Entity directory (default: cwd).")
+    wsg_p.add_argument("-C", dest="repo", type=Path, default=Path.cwd(),
+                       help="Repository inside the workspace (default: cwd).")
+    wsg_p.add_argument("git_args", nargs=argparse.REMAINDER, help="Arguments for git, e.g. status, log -5.")
+    wsg_p.set_defaults(func=_cmd_ws_git)
+
+    wsa_p = subparsers.add_parser(
+        "ws-adopt",
+        help="Import one of your repositories into the entity's workspace, owned by the entity's user.",
+        description=(
+            "Copies a repository of yours, from where it is, into the entity's workspace as a new "
+            "repository that belongs to the entity's user. Every branch and tag comes across, and "
+            "the branch list is checked against yours; remotes with an https or ssh URL are kept. "
+            "Hooks are not copied. Your repository is not moved or changed; uncommitted changes "
+            "and stashes stay only there."
+        ),
+    )
+    wsa_p.add_argument("--path", type=Path, default=Path.cwd(), help="Entity directory (default: cwd).")
+    wsa_p.add_argument("repo", type=Path, help="Your repository (outside the workspace).")
+    wsa_p.add_argument("--as", dest="name", default=None,
+                       help="Its folder name in the workspace (default: the repository's folder name).")
+    wsa_p.set_defaults(func=_cmd_ws_adopt)
+
+    wsp_p = subparsers.add_parser(
+        "ws-put",
+        help="Copy one file of yours into the entity's workspace, written by the entity's user.",
+        description=(
+            "Copies a regular file into the entity's workspace as plain data: the entity's user "
+            "writes it, never as a program (mode 0644), and a link anywhere on the way stops the "
+            "copy instead of redirecting it. Missing folders are created. Nothing in the workspace "
+            "is run."
+        ),
+    )
+    wsp_p.add_argument("--path", type=Path, default=Path.cwd(), help="Entity directory (default: cwd).")
+    wsp_p.add_argument("src", type=Path, help="Your file.")
+    wsp_p.add_argument("dest", help="Where it goes: a path inside the workspace, or relative to it.")
+    wsp_p.set_defaults(func=_cmd_ws_put)
+
     from levain.team.cli import register as _register_team
 
     _register_team(subparsers)
 
     args = parser.parse_args(argv)
+    from levain.launch import api_key_lifted
+
+    if api_key_lifted() and not hasattr(args, "api_key"):
+        # The re-exec lifts --api-key before argparse sees it; a command without that option would
+        # otherwise drop the key silently instead of rejecting it (L3 r2).
+        parser.error("unrecognized arguments: --api-key")
     return args.func(args)
 
 
@@ -1057,18 +1275,62 @@ def _cmd_dashboard(args: argparse.Namespace) -> int:
 def _cmd_tui(args: argparse.Namespace) -> int:
     from levain.tui import run_tui
 
-    return run_tui(path=args.path, read_only=args.read_only)
+    return run_tui(path=args.path, read_only=args.read_only, manifest=args.manifest)
 
 
-def _cmd_focus(args: argparse.Namespace) -> int:
-    from levain.dashboard import run_focus
+def _cmd_state(args: argparse.Namespace) -> int:
+    from levain.dashboard import run_state
 
-    return run_focus(
+    return run_state(
         path=args.path, text=args.text, source=args.source, clear=args.clear
     )
 
 
+def _resolve_api_key(args: argparse.Namespace) -> bool:
+    """Settle ``args.api_key`` from, in order: ``--api-key`` (in-process callers; the console entry
+    lifts it out of the command line, see :mod:`levain.launch`), the value so lifted,
+    ``--api-key-file``, then ``LEVAIN_API_KEY`` (removed from the environment once read, so no child
+    inherits it). False, with the reason printed, when the key cannot be used."""
+    from levain.launch import API_KEY_ENV, add_secret_file, take_lifted_api_key
+
+    given = getattr(args, "api_key", None) or take_lifted_api_key()
+    path = getattr(args, "api_key_file", None)
+    env_key = os.environ.pop(API_KEY_ENV, None)
+    if given is not None and path is not None:
+        print("levain: give the API key once: --api-key or --api-key-file, not both.", file=sys.stderr)
+        return False
+    if path is not None:
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError("not a regular file")
+                if st.st_mode & 0o077:
+                    print(f"levain: {path} is readable or writable by other users "
+                          f"(mode {stat.S_IMODE(st.st_mode):o}); run `chmod 600 {path}`. The key was "
+                          "not used.", file=sys.stderr)
+                    return False
+                with os.fdopen(fd, encoding="utf-8") as fh:
+                    fd = -1
+                    given = fh.read().strip()
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"levain: could not read the API key file {path}: {exc}", file=sys.stderr)
+            return False
+        if not given:
+            print(f"levain: the API key file {path} is empty.", file=sys.stderr)
+            return False
+        add_secret_file(path)   # the floor denies it to the entity, both ways
+    args.api_key = given if given is not None else env_key
+    return True
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
+    if not _resolve_api_key(args):
+        return 2
     # Two drivers over ONE session (the K1 seam, `levain.session`): `--task` is the
     # non-interactive runner (one spec, exit-when-done, an exit code a caller can branch on);
     # without it, the interactive REPL. `--quiet`/`--max-iterations` only shape a task run.
@@ -1246,6 +1508,9 @@ def _resolve_unattended_consolidate_bound(
 def _cmd_wrap(args: argparse.Namespace) -> int:
     from levain.wrap import wrap_entity
 
+    if not _resolve_api_key(args):
+        return 2
+
     max_seconds = getattr(args, "max_seconds", None)
     if _reject_bad_max_seconds(max_seconds, command="wrap"):
         return 2
@@ -1273,8 +1538,104 @@ def _cmd_wrap(args: argparse.Namespace) -> int:
     )
 
 
+def _cockpit_root(args: argparse.Namespace) -> Path:
+    """The broker's data root: ``--data-root``, else the one ``levain serve --write`` uses for
+    ``--path`` (its write scope's ledger root's ``cockpit/``)."""
+    if args.data_root is not None:
+        return args.data_root
+    from levain.dashboard import _resolve_source
+
+    scope = _resolve_source(args.path).write_scope
+    if scope is None:
+        raise SystemExit(f"{args.path} has no writable install; pass --data-root")
+    return scope.ledger_root / "cockpit"
+
+
+_KEY_FILE_MAX = 16 * 1024
+
+
+def _cockpit_refusals() -> tuple[type[BaseException], ...]:
+    """What a key command answers as a refusal, never a traceback: its own refusals, the authority
+    log's (a refused link, an unusable log, the verifier), an unreadable file, and the journal's (busy
+    while the broker writes, not a cockpit journal, corrupt)."""
+    import sqlite3
+
+    from levain.authority import AuthorityError
+    from levain.cockpit.firejournal import CockpitFormatError
+    from levain.cockpit.keys import KeyError_
+
+    return (KeyError_, AuthorityError, OSError, UnicodeDecodeError, sqlite3.Error, CockpitFormatError)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _cmd_cockpit_enroll(args: argparse.Namespace) -> int:
+    from levain.cockpit.keys import KeyError_, enroll, ssh_signer
+
+    try:
+        with args.key.expanduser().open("rb") as fh:
+            raw = fh.read(_KEY_FILE_MAX + 1)
+        if len(raw) > _KEY_FILE_MAX:
+            raise KeyError_(f"{args.key} is larger than a public key file ({_KEY_FILE_MAX} bytes)")
+        signer_fp, sign = ssh_signer(args.signing_key)
+        row, created, warning = enroll(_cockpit_root(args), raw.decode("utf-8"), args.key_class,
+                                       signer_fp=signer_fp, sign=sign, clock=_utc_now)
+    except _cockpit_refusals() as exc:
+        print(f"enroll refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"{'enrolled' if created else 'already enrolled'}: {row.fingerprint} as {row.key_class} "
+          f"at seq {row.enrolled_seq} (principal {row.principal})")
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _cmd_cockpit_revoke(args: argparse.Namespace) -> int:
+    from levain.cockpit.keys import revoke, ssh_signer
+
+    try:
+        signer_fp, sign = ssh_signer(args.signing_key)
+        row, warning = revoke(_cockpit_root(args), args.ref, signer_fp=signer_fp, sign=sign, clock=_utc_now,
+                              compromised_since=args.compromised_since)
+    except _cockpit_refusals() as exc:
+        print(f"revoke refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"revoked: {row.fingerprint} at seq {row.revoked_seq}"
+          + (f" (compromised since seq {row.compromised_since})" if row.compromised_since else ""))
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
+    from levain.cockpit.keys import keys
+
+    try:
+        rows, note = keys(_cockpit_root(args), now=_utc_now())
+    except _cockpit_refusals() as exc:
+        print(f"keys: {exc}", file=sys.stderr)
+        return 1
+    if note:
+        print(note)
+    if not rows:
+        print("no keys enrolled")
+    for r in rows:
+        state = f"revoked at seq {r.revoked_seq}" if r.revoked_seq is not None else "active"
+        if r.compromised_since is not None:
+            state += f", compromised since seq {r.compromised_since}"
+        print(f"{r.fingerprint}  {r.key_class:<16} {state:<44} enrolled at seq {r.enrolled_seq}"
+              + (f" ({r.enrolled_at})" if r.enrolled_at else "")
+              + (f", first enrolled {r.legacy_enrolled_at}" if r.legacy_enrolled_at else ""))
+    return 0
+
+
 def _cmd_serve(args: argparse.Namespace) -> int:
     from levain.web_server import run_web_server
+
+    if not _resolve_api_key(args):
+        return 2
 
     return run_web_server(
         path=args.path,
@@ -1288,6 +1649,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         api_key=args.api_key,
         max_iterations=args.max_iterations,
         turn_seconds=args.turn_seconds,
+        install_class=args.install_class,
     )
 
 
@@ -1333,6 +1695,7 @@ def _cmd_daemon_install(args: argparse.Namespace) -> int:
         return 1
     print(result)
     print(f"\n  serves http://127.0.0.1:{args.port}  (loopback, governed-writable)")
+    print(f"  write token + unlocked link: the latest start's lines in {spec.stdout_log}")
     print(f"\n⚠ {daemon.THREAT_MODEL_NOTE}")
     return 0
 
@@ -1772,6 +2135,33 @@ def _cmd_adopt_answers(args: argparse.Namespace) -> int:
     return run_adopt_answers(args.path, dry_run=args.dry_run)
 
 
+def _cmd_setup_isolation(args: argparse.Namespace) -> int:
+    from levain.firing.hands import cmd_setup_isolation
+
+    ports = tuple(args.egress_ports) if args.egress_ports is not None else None
+    return cmd_setup_isolation(args.path, undo=args.undo, dry_run=args.dry_run, reenable=args.reenable,
+                               egress_ports=ports)
+
+
+def _cmd_ws_git(args: argparse.Namespace) -> int:
+    from levain.firing.ws_git import cmd_ws_git
+
+    git_args = args.git_args[1:] if args.git_args[:1] == ["--"] else args.git_args
+    return cmd_ws_git(args.path, args.repo, git_args)
+
+
+def _cmd_ws_adopt(args: argparse.Namespace) -> int:
+    from levain.firing.ws_git import cmd_ws_adopt
+
+    return cmd_ws_adopt(args.path, args.repo, args.name)
+
+
+def _cmd_ws_put(args: argparse.Namespace) -> int:
+    from levain.firing.ws_git import cmd_ws_put
+
+    return cmd_ws_put(args.path, args.src, args.dest)
+
+
 def _cmd_daemon_restart(args: argparse.Namespace) -> int:
     from levain import daemon
 
@@ -1787,4 +2177,7 @@ def _cmd_daemon_restart(args: argparse.Namespace) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Through the console entry, so `python -m levain.cli` gets the launch re-exec too.
+    from levain.launch import main as _launch_main
+
+    sys.exit(_launch_main())

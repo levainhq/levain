@@ -14,19 +14,16 @@
 # the venv and build output out of it), then run the whole suite:
 #
 #   docker build -f tests/linux/Dockerfile -t levain-linux .
-#   docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
-#       --security-opt systempaths=unconfined levain-linux
+#   docker run --rm levain-linux
 #
-# ⛔ THE THREE --security-opt FLAGS ARE THE DIFFERENCE BETWEEN TESTING THE FLOOR AND SKIPPING IT.
-# Docker's default seccomp profile refuses the unprivileged user namespace `bwrap` needs, and its
-# masked /proc paths refuse a fresh procfs mount. Without the flags `bwrap_available()` is False and
-# every `linux_live` test would SKIP — a green run that never touched the floor. So this image sets
-# `LEVAIN_REQUIRE_LINUX_LIVE=1`, which turns that skip into a FAILURE: run it without the flags and
-# it goes red, saying why. The flags relax the CONTAINER, not the floor under test.
-#
-# ⚠ A CONTAINER IS STILL NOT A HOST. It proves the namespace mechanics on a real Linux kernel; it does
-# not prove an Ubuntu host's AppArmor posture or a real `systemd --user` session with linger. Those
-# need a real machine.
+# ⛔ THIS IMAGE NO LONGER RUNS THE FLOOR, AND MUST NOT BE MADE TO. Since the cgroup v2 frame (S2,
+# 2026-10-09) levain refuses a container BY NAME: each command needs its own scope from a host's
+# systemd user manager, and delegation into a container is not measured. The image used to require
+# the live floor (`LEVAIN_REQUIRE_LINUX_LIVE=1`), which made it red on every run, so it now sets
+# `LEVAIN_EXPECT_CONTAINER_REFUSAL=1` and a green run means the refusal holds
+# (`test_the_linux_image_is_refused_as_a_container_by_name`). Run it WITHOUT Docker's --security-opt
+# relaxations: with them bwrap starts, the `linux_live` tests stop skipping, and each one fails on
+# the container refusal. The live floor runs on a host: the CI `linux-live` job's VM, or argushub.
 FROM ubuntu:24.04
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends \
@@ -42,7 +39,7 @@ WORKDIR /home/entity/levain
 # the header works as written; an environment gap that surfaces as a unit-verification failure is
 # the kind of false red that teaches people to ignore a suite.
 ENV XDG_RUNTIME_DIR=/tmp/xdg \
-    LEVAIN_REQUIRE_LINUX_LIVE=1
+    LEVAIN_EXPECT_CONTAINER_REFUSAL=1
 RUN mkdir -p /tmp/xdg && python3 -m venv /home/entity/venv
 COPY --chown=entity pyproject.toml README.md LICENSE NOTICE MANIFEST.in ./
 COPY --chown=entity levain ./levain

@@ -66,6 +66,7 @@ from levain.firing.confinement import (
     _STANDARD_CRED_SUBTREES,
     ConfinementError,
     confinement_supported,
+    hands_for,
     load_confinement_config,
     resolve_localhost_deny,
 )
@@ -83,6 +84,7 @@ from levain.firing.gate import (
     resolve_gate_mode,
 )
 from levain.firing.binding import BindingError, ConversationBinding, mark_entity_process
+from levain.firing.ws_git import WsGitError, hold_hands_session, hold_session_lock
 from levain.firing.isolation import (
     ENTITY_STORE_SUBDIR,
     IsolationError,
@@ -214,6 +216,30 @@ class SessionStartError(Exception):
         self.code = code
 
 
+def _stop_hands_user(user: str, uid: int | None) -> str | None:
+    """At the end of a session whose bash ran as ``user``: stop every process of that user (a command
+    can leave its process group with ``setsid``), then empty and reap the groups the shells could not
+    empty. None when nothing is left; else what is, which is also logged, and the caller keeps its
+    workspace locks."""
+    from levain.firing.confinement import sweep_hands_user, unemptied_shell_groups
+
+    try:
+        swept = sweep_hands_user(user, uid=uid)
+        groups = unemptied_shell_groups(user)
+    except BaseException as exc:  # noqa: BLE001 — a TurnTimeout too: teardown must not raise (S2d codex)
+        swept, groups = f"the stop was interrupted ({type(exc).__name__})", []
+    said = "; ".join(x for x in (swept, f"process groups {groups} not empty" if groups else None) if x)
+    if not said:
+        return None
+    try:
+        logging.getLogger("levain.session").warning(
+            "levain: could not stop every process of %s (%s); the workspace stays locked for ws-git "
+            "until this process ends", user, said)
+    except BaseException:  # noqa: BLE001 — a raising log handler must not undo the answer
+        pass
+    return said
+
+
 @dataclass(frozen=True)
 class TurnResult:
     """What the harness observed about one completed turn.
@@ -335,6 +361,22 @@ def _apply_drive_policy(cfg: Any, mode: DriveMode) -> bool:
     return resolve_cred_floor(
         cfg.deny_standard_creds if cfg is not None else None, mode=mode
     )
+
+
+def _check_hands_workspace(workspace: Path) -> None:
+    """The hands user's workspace is the path setup recorded (``load_confinement_config`` checked it
+    is under the workspace root and outside the operator's home): it must be a real directory, not a
+    link, so the floor and the conversation name the directory that is there."""
+    try:
+        st = os.lstat(workspace)
+    except OSError as exc:
+        raise IsolationError(f"the entity's workspace {workspace} is not there ({exc}); set the "
+                             "entity's user up again: sudo levain setup-isolation") from exc
+    import stat as _stat
+
+    if not _stat.S_ISDIR(st.st_mode) or Path(os.path.realpath(workspace)) != Path(workspace):
+        raise IsolationError(f"the entity's workspace {workspace} is not a plain directory (a link?) "
+                             "— refusing (fail-closed).")
 
 
 def require_openhands_entity(entity_dir: Path) -> str | None:
@@ -653,6 +695,23 @@ class EntitySession:
     # be unanswered, and every turn method's `run()` would execute them, so the session refuses
     # every further turn instead of trusting each driver to stop.
     _refusal_unconfirmed: bool = field(default=False, init=False, repr=False, compare=False)
+    # A hands entity's session holds the hands lock SHARED for its whole life, so `levain ws-git` and
+    # `ws-adopt` (which take it exclusive) never run while it is open (levain.firing.ws_git).
+    hands_lock_fd: int | None = field(default=None, repr=False, compare=False)
+    # A session whose bash runs as the hands user also holds that entity's one-session lock,
+    # exclusive (`hold_hands_session`): its end stops every process of the hands user.
+    hands_session_fd: int | None = field(default=None, repr=False, compare=False)
+    left_running: str | None = field(default=None, init=False, compare=False)
+    """Set by :meth:`close` when something of the hands user could not be stopped; the workspace
+    lock is then kept until this process ends."""
+    hands_user: str | None = None
+    """The separate user this session's bash runs as (and its file editor writes as), or None when
+    bash runs as the operator (no setup, the interactive REPL, or Linux): the banner says which."""
+    hands_uid: int | None = None
+    """That user's id as setup recorded it, for the stop at the session's end (no name lookup)."""
+    _close_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     # -- construction --------------------------------------------------------
 
@@ -782,6 +841,8 @@ class EntitySession:
         # under-declares the concrete `send_message` / `state` surface.
         conversation: Any = None
         started = False
+        hands_lock_fd: int | None = None
+        hands_session_fd: int | None = None
         try:
             llm = LLM(usage_id="levain-run", **resolve_llm_kwargs(model, base_url, api_key))
             # Fail CLOSED if support cannot be determined: an undetermined sandbox means NO
@@ -797,6 +858,9 @@ class EntitySession:
             # read the floor-shaping fields so an honesty-floor banner reflects the ACTUAL
             # floor (a static "~/.ssh protected" line would LIE under ssh_mode="raw").
             cfg = load_confinement_config(entity_dir) if with_tools else None
+            # Only a session with tools can act in the workspace, so only it needs the hands lock.
+            if cfg is not None and cfg.hands_user is not None:
+                hands_lock_fd = hold_session_lock(entity_dir)
             ssh_mode = cfg.ssh_mode if cfg is not None else "agent"
             # NOT drive-resolved (spore-725): a live daemon socket is a total bypass whether or
             # not a human is watching, so there is no mode that should soften it.
@@ -813,16 +877,30 @@ class EntitySession:
             # against it (complement L3). That floor and conversation name the same directory comes
             # from the reassignment below, not from this order.
             guard_entity(entity_dir)
-            workspace = entity_dir / WORKSPACE_SUBDIR
-            assert_workspace_isolated(workspace, entity_dir=entity_dir)
-            workspace.mkdir(parents=True, exist_ok=True)
-            assert_workspace_isolated(workspace, entity_dir=entity_dir)
+            # Bash runs as the entity's own user outside the interactive REPL, when one is set up
+            # (`hands_for` is the one place that decides). Its workspace is the one setup made and
+            # recorded, outside the entity dir, owned by that user: the floor is fenced around it.
+            hands_id = hands_for(cfg, mode) if cfg is not None else None
+            if hands_id is not None:
+                hands_session_fd = hold_hands_session(entity_dir)
+                # Nothing of the hands user may outlive an earlier session into this one (a setsid
+                # process of a levain that was killed before its end ran, S2d codex): stop it first.
+                if (stale := _stop_hands_user(hands_id.user, hands_id.uid)) is not None:
+                    raise WsGitError(f"processes of the entity's user from an earlier session could not "
+                                     f"be stopped ({stale}); refusing to start")
+                workspace = hands_id.workspace
+                _check_hands_workspace(workspace)
+            else:
+                workspace = entity_dir / WORKSPACE_SUBDIR
+                assert_workspace_isolated(workspace, entity_dir=entity_dir)
+                workspace.mkdir(parents=True, exist_ok=True)
+                assert_workspace_isolated(workspace, entity_dir=entity_dir)
             # spore-438: THIS conversation's entity + drive mode + floor, resolved ONCE from the
             # config read above and carried into both hands as data (the tool spec), which are
             # built from it below before open returns. Another session's binding is another object.
             conv_binding = (
                 ConversationBinding.create(
-                    entity_dir, mode=mode, workspace=workspace, config=cfg
+                    entity_dir, mode=mode, workspace=workspace, config=cfg, hands=hands_id
                 )
                 if cfg is not None
                 else None
@@ -835,7 +913,10 @@ class EntitySession:
             workspace = (
                 conv_binding.floor.workspace if conv_binding is not None else workspace.resolve()
             )
-            assert_workspace_isolated(workspace, entity_dir=entity_dir)
+            if hands_id is not None:
+                _check_hands_workspace(workspace)
+            else:
+                assert_workspace_isolated(workspace, entity_dir=entity_dir)
             entity_tools = (
                 build_entity_tools(conv_binding, with_bash=bash_ok)
                 if conv_binding is not None
@@ -921,6 +1002,8 @@ class EntitySession:
                 f"the confinement config is invalid — fix it and retry:\n  {exc}\n"
                 f"  ({entity_dir / ENTITY_STORE_SUBDIR / 'confinement.json'})"
             ) from exc
+        except WsGitError as exc:
+            raise SessionStartError(f"refusing to start: {exc}") from exc
         except Exception as exc:  # noqa: BLE001 — a bad model/endpoint config is a usage error
             raise SessionStartError(
                 f"could not start the entity ({exc}).\n"
@@ -930,13 +1013,23 @@ class EntitySession:
             # A start that failed AFTER the conversation was built must not abandon it: the SDK
             # registers each conversation's close() with atexit, so a refused open would otherwise
             # live until process exit (L3 2026-10-02, three seats). Best-effort; the start error wins.
+            torn_down = True
             if not started and conversation is not None:
                 try:
                     conversation.close()
-                except Exception:  # noqa: BLE001
+                except BaseException:  # noqa: BLE001 — a TurnTimeout too: the start error wins
+                    torn_down = False
                     logging.getLogger("levain.session").warning(
                         "closing a conversation from a failed start raised", exc_info=True
                     )
+            # After the conversation, and only if it closed and nothing of the hands user is left: a
+            # shell or process still alive must keep ws-git out.
+            if not started and hands_session_fd is not None and hands_id is not None:
+                torn_down = _stop_hands_user(hands_id.user, hands_id.uid) is None and torn_down
+            if not started and torn_down:
+                for lock in (hands_session_fd, hands_lock_fd):
+                    if lock is not None:
+                        os.close(lock)
 
         return cls(
             entity_dir=entity_dir,
@@ -952,6 +1045,10 @@ class EntitySession:
             gate_mode=gate_mode,
             bash_refusal=bash_refusal if with_tools else None,
             bash_offline=with_tools and bash_ok and bash_offline,
+            hands_lock_fd=hands_lock_fd,
+            hands_session_fd=hands_session_fd,
+            hands_user=hands_id.user if (with_tools and hands_id is not None) else None,
+            hands_uid=hands_id.uid if (with_tools and hands_id is not None) else None,
         )
 
     # -- the one operation ---------------------------------------------------
@@ -1526,19 +1623,43 @@ class EntitySession:
         process down.
 
         Never raising is not the same as succeeding: a ``conversation.close()`` that raised did not
-        release the shell, and that is recorded in :attr:`release_error` (codex L3 r5 on the chat
-        driver, run: the driver reported a release that had failed)."""
-        if self._closed:
-            return
-        self._closed = True
+        release the shell, and a hands-user process that could not be stopped was not released
+        either; either is recorded in :attr:`release_error`, which the chat driver reports (codex
+        L3 r5 on the chat driver, run: the driver reported a release that had failed)."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        torn_down = False
         try:
             self.conversation.close()
+            torn_down = True
         except BaseException as exc:  # noqa: BLE001 — teardown must never raise; see the docstring
             try:
                 text = f"{type(exc).__name__}: {exc}"
             except BaseException:  # noqa: BLE001 — an exception whose text cannot be read
                 text = "the conversation's close raised"
             self.release_error = text
+        finally:
+            # After the conversation (and its shell), and only once nothing of the hands user is left
+            # running: ws-git may run once nothing of this session can still act in the workspace. A
+            # teardown that failed, or a process that could not be stopped, keeps the locks until
+            # this process ends, which releases them (S2 L3 r2, codex HIGH).
+            # The stop runs whether or not the teardown did: a setsid child is not reached by the
+            # conversation's close, and must not outlive a session whose close failed (S2 L3 r3).
+            if self.hands_session_fd is not None and self.hands_user is not None:
+                self.left_running = _stop_hands_user(self.hands_user, self.hands_uid)
+                torn_down = torn_down and self.left_running is None
+                if self.left_running is not None and self.release_error is None:
+                    self.release_error = f"hands user left running: {self.left_running}"
+            for name in ("hands_session_fd", "hands_lock_fd"):
+                fd = getattr(self, name)
+                if fd is not None and torn_down:
+                    setattr(self, name, None)
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     @property
     def closed(self) -> bool:

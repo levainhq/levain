@@ -41,16 +41,21 @@
     const p = el("div", "panel" + (span2 ? " span2" : ""));
     p.dataset.zone = entry.zone || "";
     p.dataset.editClass = entry.edit_class || "";
+    if (entry.modes) p.dataset.modes = entry.modes;   // which of the Morning / Board / Build modes show this panel
     const head = el("div", "phead");
     head.appendChild(el("h2", null, entry.title));
     if (entry.edit_class) {
       head.appendChild(el("span", "chip chip-" + entry.edit_class, entry.edit_class));
     }
     if (entry.source) head.appendChild(el("span", "src", entry.source));
+    if (entry.fresh) head.appendChild(el("span", "src fresh", entry.fresh));   // manifest source: when the kernel last read it
     // dense kinds get a ⤢ control in the header → a focused, full-screen re-render
     // (Slice 2). Only the long modules (CLAMP_KINDS) — health/graph stay natural-height.
     if (entry.kind && CLAMP_KINDS.has(entry.kind)) head.appendChild(buildExpandBtn(entry));
     p.appendChild(head);
+    // A manifest source's status lines (stale / partial / held back / the provider's note), drawn
+    // under the header so a degraded panel never reads as a healthy one.
+    for (const b of entry.banner || []) p.appendChild(el("div", "ext-note" + (b.tone === "stale" ? " stale" : ""), b.text));
     return p;
   };
   const kv = (parent, k, v) => {
@@ -82,6 +87,8 @@
   // NO board reload — the result lands in the box, not a rebuild) and returns a job HANDLE;
   // `pollJob` reads GET /job.json for the terminal result. Both null on a read-only port.
   let commitJob = null;
+  // Cancel a waiting pending (the manifest source only): `cancelPending(cancel) → Promise<{ok}|{ok:false,...}>`.
+  let cancelPending = null;
   let pollJob = null;
   // The episode-search READ transport (GET /recall.json), injected by the boot layer so the core
   // stays token-agnostic — the boot layer attaches the off-box token (spore-220 gates /recall.json
@@ -121,53 +128,92 @@
   // re-renders (a verb fires → the board rebuilds → you stay in your filter) and into the
   // focus modal. Empty = show all. Matches spore text OR spore-id.
   let openLoopsQuery = "";
+  const sporeQueries = Object.create(null);  // Tray / Keep filter queries, keyed by panel kind
+  // The Tray's chosen view ("" = the kernel's own order, else a view id) and the Episodes agent filter
+  // ("" = all). Both are display choices that survive a refresh re-render in the same page.
+  let trayView = "";
+  let episodeAgent = "";
   // The scroll position to re-apply after a modal refresh-rebuild. For the episode
   // panel the result list arrives async (a /recall.json fetch), so buildModal's
   // synchronous restore clamps to 0 — the episode renderer re-applies this once its
   // rows land. null = don't restore (cleared on a fresh user search → resets to top).
   let modalRestoreScroll = null;
 
-  // The masthead focus line. `focus` is the view.focus payload (or null/undefined).
-  //   null/absent        → no live-context source → hide the line entirely.
-  //   {text: null}       → a source exists but no focus is set → "no focus set".
-  //   {text, age_label}  → the focus + its freshness; a stale focus dims + nudges.
-  // textContent throughout (the operator authored the string, but the cockpit never
-  // routes operator text through innerHTML — consistent with the rest of the app).
-  function renderFocus(focus) {
-    const fEl = document.getElementById("focus");
-    if (!fEl) return;
-    // Skip a rebuild while an edit is OPEN, so a background/passive render (a job poll)
-    // can't nuke the half-typed focus — EXCEPT the authoritative SAVE render (marked
-    // data-saving="1" by doSave), which MUST rebuild to replace the editor with the just-
-    // committed focus. Without that exception the guard fires on the save reload too and
-    // the editor strands frozen on "saving…" forever (codex/complement/nemotron L3, all
-    // three; deterministic). Passive reloads ALSO defer at the load() level via
-    // hasUnsavedEdit(".focus-editor") — this guard is the belt to that suspenders.
-    const openEditor = fEl.querySelector(".focus-editor");
-    if (openEditor && openEditor.dataset.saving !== "1") return;
-    fEl.replaceChildren();
-    fEl.classList.remove("unset", "stale");
-    if (!focus) { fEl.hidden = true; return; }  // no live-context source → no line, no affordance
-    fEl.hidden = false;
-    if (!focus.text) {
-      fEl.classList.add("unset");
-      fEl.appendChild(el("span", "ftext", "no focus set"));
-    } else {
-      fEl.appendChild(el("span", "ftext", focus.text));
-      if (focus.freshness === "unknown") {
-        // age can't be established (missing/unparseable/future stamp) — say so, dimmed;
-        // unknown ≠ fresh, so it must NOT render like a current focus.
-        fEl.appendChild(el("span", "fage", "· age unknown"));
-        fEl.classList.add("stale");
-      } else if (focus.age_label) {
-        fEl.appendChild(el("span", "fage",
-          focus.age_label + (focus.stale ? " · still live?" : "")));
-        if (focus.stale) fEl.classList.add("stale");
+  // The starter jar (masthead): rise level = today's episodes against the entity's own typical
+  // day (view.jar, counts from its store); a typical day sits at the dashed mark. A bubble
+  // rises for each episode that arrived since the LAST render of the same day, so a bubble is
+  // a true new episode, never decoration. status != "ok" -> an empty jar with its reason.
+  let jarLastToday = null, jarLastDay = null;
+  function renderJar(jar) {
+    const j = document.getElementById("jar");
+    if (!j) return;
+    j.replaceChildren();
+    if (!jar) { j.hidden = true; jarLastToday = jarLastDay = null; return; }  // baseline resets while hidden
+    j.hidden = false;
+    j.classList.toggle("empty", jar.status !== "ok");
+    const NS = "http://www.w3.org/2000/svg";
+    const mk = (tag, attrs) => {
+      const n = document.createElementNS(NS, tag);
+      for (const k of Object.keys(attrs)) n.setAttribute(k, attrs[k]);
+      return n;
+    };
+    const svg = mk("svg", { viewBox: "0 0 26 34", role: "img", "aria-label": "starter jar: " + jar.label });
+    const clip = mk("clipPath", { id: "jar-clip" });
+    clip.appendChild(mk("path", { d: "M5 8 H21 V28 Q21 32 17 32 H9 Q5 32 5 28 Z" }));
+    svg.appendChild(clip);
+    const top = 10, h = 22;  // the inside of the jar
+    const fillH = Math.max(0, Math.min(1, jar.level || 0)) * h;
+    svg.appendChild(mk("rect", { class: "jar-fill", "clip-path": "url(#jar-clip)", x: 5,
+      y: top + h - fillH, width: 16, height: fillH }));
+    svg.appendChild(mk("line", { class: "jar-mark", x1: 4, x2: 22, y1: top + h / 2, y2: top + h / 2 }));
+    svg.appendChild(mk("path", { class: "jar-glass", d: "M8 4 H18 V8 H21 V28 Q21 32 17 32 H9 Q5 32 5 28 V8 H8 Z" }));
+    // bubbles: one per newly arrived episode (cap 5), only on a same-day rise
+    const grew = jar.today != null && jarLastToday != null && jar.day === jarLastDay && jar.today > jarLastToday;
+    if (grew && jar.status === "ok") {
+      const n = Math.min(5, jar.today - jarLastToday);
+      for (let i = 0; i < n; i++) {
+        const b = mk("circle", { class: "jar-bubble", cx: 9 + i * 2.5, cy: top + h - fillH + 2, r: 1.4 });
+        b.style.animationDelay = (i * 0.25) + "s";
+        b.addEventListener("animationend", () => b.remove());
+        svg.appendChild(b);
       }
     }
-    // Class-A inline edit affordance (commit-gated) — set/edit "what I'm on now" IN the
-    // cockpit, not only via `levain focus` / the app. A read-only port shows none (NO THEATER).
-    wireFocusEdit(fEl, focus);
+    jarLastToday = jar.today == null ? null : jar.today;
+    jarLastDay = jar.day || null;
+    j.appendChild(svg);
+    j.appendChild(el("span", "jar-label", jar.status === "ok" ? jar.label : jar.label + " (empty)"));
+  }
+
+  // The masthead state line: the optional freeform "what's going on" line.
+  // `state` is view.state ({text:null} when unset OR expired: the server already dropped
+  // an expired one, so nothing here re-derives age). Verbatim text via textContent, age
+  // beside it, never interpreted. null/absent -> no live-context source -> hidden.
+  function renderState(state) {
+    const sEl = document.getElementById("state");
+    if (!sEl) return;
+    const openEditor = sEl.querySelector(".state-editor");
+    if (openEditor && openEditor.dataset.saving !== "1") return;
+    sEl.replaceChildren();
+    sEl.classList.remove("unset");
+    if (!state) { sEl.hidden = true; return; }
+    sEl.hidden = false;
+    if (!state.text) {
+      sEl.classList.add("unset");
+      sEl.appendChild(el("span", "ftext", "no state set"));
+    } else {
+      sEl.appendChild(el("span", "ftext", state.text));
+      if (state.age_label) sEl.appendChild(el("span", "fage", state.age_label));
+    }
+    if (!commit || state.can_edit === false) return;
+    const has = !!(state && state.text);
+    const btn = el("button", "state-edit", has ? "edit" : "set");
+    btn.type = "button";
+    btn.title = has ? "edit your state" : "set your state";
+    btn.setAttribute("aria-label", has ? "edit state" : "set state");
+    btn.addEventListener("click", () => enterStateEdit(sEl, state, btn, {
+      kind: "operator_state", placeholder: "what's going on, in your words; blank to clear",
+    }));
+    sEl.appendChild(btn);
   }
 
   // ---------------------------------------------------------------- render ----
@@ -177,12 +223,15 @@
     commit = opts && typeof opts.commit === "function" ? opts.commit : null;
     commitAction = opts && typeof opts.commitAction === "function" ? opts.commitAction : null;
     commitJob = opts && typeof opts.commitJob === "function" ? opts.commitJob : null;
+    cancelPending = opts && typeof opts.cancelPending === "function" ? opts.cancelPending : null;
     pollJob = opts && typeof opts.pollJob === "function" ? opts.pollJob : null;
     onJobsIdle = opts && typeof opts.onJobsIdle === "function" ? opts.onJobsIdle : null;
     recall = opts && typeof opts.recall === "function" ? opts.recall : null;
 
     const board = document.getElementById("board");
     if (!board) return;
+    // the typed panels about to be dropped end their timers and mounts first
+    if (window.LevainCockpitKinds && window.LevainCockpitKinds.reset) window.LevainCockpitKinds.reset();
     board.replaceChildren();
 
     const entityEl = document.getElementById("entity");
@@ -193,14 +242,17 @@
       return;
     }
     const paths = view.paths || {};
-    if (storeEl) storeEl.textContent = paths.episodic_db || "(store path unknown)";
+    if (storeEl) {
+      storeEl.textContent = paths.episodic_db || "(store path unknown)";
+      storeEl.hidden = !!paths.omitted;   // a manifest source carries no store path: no line, not a false "unknown"
+    }
     if (entityEl) {
       const stem = (paths.episodic_db ? String(paths.episodic_db).split("/").pop() : "") || "substrate";
       // A rename editor open in the masthead (spore-280 — the pre-existing twin of the 247
-      // focus stranding). Unlike renderFocus (which replaceChildren-rebuilds #focus and so
+      // state-line stranding). Unlike renderState (which replaceChildren-rebuilds #state and so
       // tears its editor down for free), the entity name toggles #entity's display + hangs a
       // sibling .name-editor on .unit — so the teardown must be EXPLICIT here or a successful
-      // rename strands the editor frozen with #entity hidden behind it. Mirrors renderFocus's
+      // rename strands the editor frozen with #entity hidden behind it. Mirrors renderState's
       // data-saving exception: a passive render that slipped past the hasUnsavedEdit gate must
       // NOT tear a still-being-typed editor down (that drops the half-typed name) — skip the
       // rebuild and leave it intact. The authoritative SAVE render marks the editor
@@ -241,12 +293,11 @@
       const md = document.querySelector(".brand .model");
       if (md) md.textContent = view.brand_model;
     }
-    // The operator's live focus — their OWN declared "what I'm on", reflected back
-    // (pure-echo: no machine interpretation, so no "does this match?" loop-close
-    // needed — it IS their read). Hidden when there's no live-context source; "no
-    // focus set" when present-but-empty; freshness-stamped, a stale focus flagged so
-    // the operator can re-confirm (operator-reports-first — a nudge, not a verdict).
-    renderFocus(view.focus);
+    // The operator's state line: their OWN words, reflected back verbatim (no machine
+    // interpretation). Hidden when there is no live-context source; "no state set"
+    // when present-but-empty; an expired line arrives already dropped by the server.
+    renderState(view.state);
+    renderJar(view.jar);
     // Drive the living-rings vital-signs from substrate health: write-path LIVE →
     // steady phosphor heartbeat; DARK → slow, dim-red. The background IS the pulse.
     // (view.scope stays a data-only seam — the UI surfaces it when team scope is
@@ -269,7 +320,7 @@
         board.appendChild(sep);
         lastZone = entry.zone;
       }
-      const node = renderPanel(entry, view);
+      const node = renderPanelSafe(entry, view);
       if (node) {
         if (CLAMP_KINDS.has(entry.kind)) node.setAttribute("data-clamp", "");
         board.appendChild(node);
@@ -357,9 +408,12 @@
   }
 
   function finalizePanels(board) {
-    for (const p of board.querySelectorAll(".panel")) {
+    for (const p of board.querySelectorAll(".panel")) finalizePanel(p);
+  }
+  function finalizePanel(p) {
+    {
       const phead = p.querySelector(".phead");
-      if (!phead) continue;
+      if (!phead) return;
       const body = el("div", "pbody");
       while (phead.nextSibling) body.appendChild(phead.nextSibling);
       p.appendChild(body);
@@ -382,6 +436,20 @@
   // Dispatch a single manifest entry to its renderer. Singleton kinds read their
   // data from the matching view field; indexed kinds (config/section) use `ref`.
   // `opts` (modal context) is forwarded to the kinds that vary in the focus modal.
+  // One panel whose data a renderer cannot draw is an unavailable panel, never a blank board or a
+  // stale modal: the board and the focus modal both draw through this.
+  function renderPanelSafe(entry, view, opts) {
+    try { return renderPanel(entry, view, opts); } catch (e) {
+      const node = el("div", "panel");
+      node.dataset.zone = entry.zone || "";
+      node.dataset.editClass = entry.edit_class || "";
+      const name = [entry.title, entry.id].find((v) => typeof v === "string" && v) || "panel";
+      node.appendChild(el("div", "phead", name));
+      node.appendChild(el("p", "err", "unavailable — could not be drawn (" + (e && e.message ? e.message : "bad data") + ")"));
+      return node;
+    }
+  }
+
   function renderPanel(entry, view, opts) {
     switch (entry.kind) {
       case "health": return renderHealth(entry, view);
@@ -395,7 +463,7 @@
       case "section": return renderSection(entry, (view.sections || [])[entry.ref]);
       case "config": return renderConfig(entry, (view.config_docs || [])[entry.ref]);
       case "edits": return renderEdits(entry, view);
-      case "external": return renderExternal(entry, view);
+      case "external": return renderExternal(entry, view, opts);
       default: return null;
     }
   }
@@ -416,12 +484,18 @@
     head.appendChild(vWrap);
     p.appendChild(head);
 
-    kv(p, "Hebbian links", `${fmt(h.total_links)} (avg ${num(h.avg_strength).toFixed(2)}, max ${num(h.max_strength).toFixed(2)})`);
-    kv(p, "density", `${num(h.density).toFixed(3)} · local ${num(h.local_density).toFixed(3)}`);
+    // a manifest source may not carry every figure: show only what was sent, never a made-up 0.00
+    kv(p, "Hebbian links", `${fmt(h.total_links)} (avg ${num(h.avg_strength).toFixed(2)}` + (h.max_strength != null ? `, max ${num(h.max_strength).toFixed(2)}` : "") + ")");
+    kv(p, "density", `${num(h.density).toFixed(3)}` + (h.local_density != null ? ` · local ${num(h.local_density).toFixed(3)}` : ""));
     kv(p, "graduations", `${fmt(h.graduations_validated_total)} validated / ${fmt(h.graduations_demoted_total)} demoted`);
     kv(p, "episodes", `${fmt(h.total_episodes)} (${fmt(h.episodes_since_wrap)} since wrap)`);
-    const last = h.last_wrap_at ? datePart(h.last_wrap_at) : "never";
-    kv(p, "continuity", `${h.continuity_chars != null ? fmt(h.continuity_chars) + " chars" : "not yet created"} · ${fmt(h.total_wraps)} wraps · last ${last}`);
+    if (h.wrap_history_unavailable) {
+      // the wraps panel could not be read: say so, never "never" (a manifest source)
+      kv(p, "continuity", `${fmt(h.total_wraps)} wraps · history unavailable`);
+    } else {
+      const last = h.last_wrap_at ? datePart(h.last_wrap_at) : "never";
+      kv(p, "continuity", `${h.continuity_chars != null ? fmt(h.continuity_chars) + " chars" : "not yet created"} · ${fmt(h.total_wraps)} wraps · last ${last}`);
+    }
     if (h.tombstones) kv(p, "tombstones", fmt(h.tombstones));
     if (h.wrap_in_progress) p.appendChild(el("p", "note", "⚠ wrap in progress — snapshot may be momentarily inconsistent"));
     return p;
@@ -607,6 +681,7 @@
   // turns on the governed dump/sort/park verbs — edit_class "" → isVerbPanel false → none).
   function sporeRow(s, verbs, badgeField, panelKind) {
     const row = el("div", "row");
+    if (s.row_id) row.dataset.rowKey = s.row_id;   // where a transport notice lands after the board is rebuilt
     // the spore id is the common reference handle (how flow tracks + you name it,
     // e.g. "compost spore-049") — show it leading so the row is addressable; the TUI
     // shows the same id trailing (tui.render_panel_lines).
@@ -620,9 +695,49 @@
     if (badge) row.appendChild(el("span", "tier", `[${badge}]`));
     appendClause(row, s.text);  // FULL text + per-item expand (no truncation, no edit data-loss)
     if (s.next) row.appendChild(el("span", "muted", "→ " + s.next));
+    if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
     if (verbs && s.id) row.appendChild(buildSporeVerbs(s, panelKind));
     return row;
   }
+
+  // The filter bar the spore panels share (Open Loops / Tray / Keep): CLIENT-side over the
+  // loaded list, text (case-insensitive substring) OR spore-id. The query persists per panel
+  // kind in `sporeQueries`, so a verb that rebuilds the board leaves you in your filter.
+  // FILTER-EXTRACT-START (a node test lifts this block)
+  // opts (optional): controls(bar, redraw) adds in-panel controls to the bar; pick(list) returns the
+  // rows to filter (a view's own order), re-read on every redraw.
+  function mountSporeFilter(p, all, noun, kind, drawRows, opts) {
+    const bar = el("div", "ep-search");
+    const input = el("input", "ep-search-input");
+    input.type = "search";
+    input.placeholder = "filter " + noun + " by text or spore-id…";
+    input.setAttribute("aria-label", "filter " + kind + " by text or spore id");
+    const status = el("span", "ep-search-status", "");
+    bar.append(input, status);
+    p.appendChild(bar);
+    const results = el("div", "sp-results");
+    p.appendChild(results);
+    const render = (raw) => {
+      const q = raw.trim().toLowerCase();
+      const base = opts && opts.pick ? opts.pick(all) : all;
+      const rows = q
+        ? base.filter((s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
+                            String(s.id || "").toLowerCase().includes(q))
+        : base;
+      results.replaceChildren();
+      if (rows.length === 0) results.appendChild(el("p", "empty", "no " + noun + " match “" + raw.trim() + "”"));
+      else drawRows(rows, results);
+      status.textContent = q ? (rows.length + (rows.length === 1 ? " match" : " matches") + " · ⌫ to clear") : "";
+      const b = results.closest(".pbody"); if (b) measureOverflow(b);
+      measureClauses(results);
+    };
+    input.addEventListener("input", () => { sporeQueries[kind] = input.value; render(input.value); });
+    if (opts && opts.controls) opts.controls(bar, () => render(input.value));
+    if (sporeQueries[kind]) input.value = sporeQueries[kind];
+    render(input.value);
+  }
+
+  // FILTER-EXTRACT-END
 
   // The three spore projections share one renderer — same read/verb contract, different
   // source list + badge axis + empty copy. All three read their fault from the single
@@ -637,7 +752,40 @@
     if (err) { p.appendChild(el("p", "err", "unavailable — " + err)); return p; }
     if (!list || list.length === 0) { p.appendChild(el("p", "empty", emptyMsg)); return p; }
     const verbs = isVerbPanel(entry);
-    for (const s of list) p.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
+    // the Tray's views: the kernel names each ordering and sends the row ids in it; this only picks one
+    const views = entry.kind === "tray" && Array.isArray(view.tray_views) && view.tray_view_rows ? view.tray_views : [];
+    const viewOf = () => (views.some((v) => v.id === trayView) ? trayView : "");
+    const opts = views.length ? {
+      controls: (bar, redraw) => {
+        const sel = el("select", "tray-dump-type");
+        sel.setAttribute("aria-label", "Tray order");
+        sel.appendChild(Object.assign(el("option", null, "Tray order"), { value: "" }));
+        for (const v of views) sel.appendChild(Object.assign(el("option", null, v.title), { value: v.id }));
+        sel.value = viewOf();
+        sel.addEventListener("change", () => { trayView = sel.value; redraw(); });
+        bar.appendChild(sel);
+      },
+      pick: (all) => {
+        const ids = viewOf() ? view.tray_view_rows[viewOf()] : null;
+        if (!Array.isArray(ids)) return all;
+        const byId = new Map(all.map((s) => [s.id, Object.assign({}, s, { age_shown: true })]));
+        // a row the view did not name still shows, after the named ones
+        const named = new Set(ids);
+        return ids.filter((id) => byId.has(id)).map((id) => byId.get(id))
+          .concat(all.filter((s) => !named.has(s.id)).map((s) => byId.get(s.id)));
+      },
+    } : undefined;
+    mountSporeFilter(p, list, "items", entry.kind, (rows, results) => {
+      let lastGroup = null;
+      for (const s of rows) {
+        // a manifest source brings the kernel's own bands (Today / Overdue / Also pending), in its order;
+        // a chosen view is ungrouped
+        const g = s.group || null;
+        if (s.group_title && g !== lastGroup && !viewOf()) results.appendChild(el("div", "grp-head", s.group_title));
+        lastGroup = g;
+        results.appendChild(sporeRow(s, verbs, badgeField, entry.kind));
+      }
+    }, opts);
     return p;
   }
 
@@ -664,7 +812,7 @@
     const render = (raw) => {
       const q = raw.trim().toLowerCase();
       const rows = q
-        ? all.filter((s) => (s.text || "").toLowerCase().includes(q) ||
+        ? all.filter((s) => String(s.text == null ? "" : s.text).toLowerCase().includes(q) ||
                             String(s.id || "").toLowerCase().includes(q))
         : all;
       results.replaceChildren();
@@ -723,15 +871,19 @@
   // hits (spore-107), so they render identically. `verbs` carries the panel's verb
   // affordance (the tombstone), which works on search rows too: `commit` is the
   // module-level closure, available to dynamically-added rows.
-  function episodeRow(e, verbs) {
-    const row = el("div", "row");
+  function episodeRow(e, verbs, showAgent) {
+    const row = el("div", "row" + (e.emphasis === "dim" ? " ext-dim" : ""));
+    if (e.row_id) row.dataset.rowKey = e.row_id;
+    if (showAgent && e.agent) row.appendChild(el("span", "tier", `[${e.agent}]`));
     if (e.type) row.appendChild(el("span", "etype", e.type));
     appendClause(row, e.content);  // FULL content + per-item expand (no truncation)
     if (Array.isArray(e.tags) && e.tags.length) {
       row.appendChild(el("span", "tags", "#" + e.tags.slice(0, 5).join(" #")));
     }
     row.appendChild(el("span", "muted", datePart(e.timestamp)));
-    if (verbs && e.id) row.appendChild(buildEpisodeVerbs(e));
+    // a row that lists its actions offers only those; a row without the field (the legacy path) keeps the panel's
+    const offers = !Array.isArray(e.actions) || e.actions.some((a) => a && a.verb === "episode_tombstone");
+    if (verbs && e.id && offers) row.appendChild(buildEpisodeVerbs(e));
     return row;
   }
 
@@ -776,16 +928,40 @@
         if (sc) { sc.scrollTop = modalRestoreScroll; modalRestoreScroll = null; }
       }
     };
+    const agents = [];
+    for (const e of list) if (e.agent && !agents.includes(e.agent)) agents.push(e.agent);
+    const multi = agents.length > 1;
+    // the choice outlives a refresh in which that agent is absent: it shows as All, and applies again on return
+    const agentNow = () => (agents.includes(episodeAgent) ? episodeAgent : "");
+    let agentSel = null;
+    const syncAgent = () => {
+      if (!agentSel) return;
+      const searching = !!input.value.trim();
+      agentSel.disabled = searching;
+      agentSel.title = searching ? "the agent filter applies to the recent list, not to keyword search results" : "";
+    };
     const renderRows = (rows) => {
       results.replaceChildren();
-      for (const e of rows) results.appendChild(episodeRow(e, verbs));
+      for (const e of rows) results.appendChild(episodeRow(e, verbs, multi));
     };
     const showRecent = () => {
       status.textContent = "";
+      const shown = agentNow() ? list.filter((e) => e.agent === agentNow()) : list;
       if (list.length === 0) results.replaceChildren(el("p", "empty", "no episodes yet"));
-      else renderRows(list);
+      else renderRows(shown);
       reMeasure();
     };
+    if (multi) {
+      const sel = el("select", "tray-dump-type");
+      sel.setAttribute("aria-label", "filter episodes by agent");
+      sel.appendChild(Object.assign(el("option", null, "All agents"), { value: "" }));
+      for (const a of agents) sel.appendChild(Object.assign(el("option", null, a), { value: a }));
+      sel.value = agentNow();
+      // a keyword search shows the store's own matches; the filter applies to the recent list
+      sel.addEventListener("change", () => { episodeAgent = sel.value; if (!input.value.trim()) showRecent(); });
+      agentSel = sel;
+      bar.appendChild(sel);
+    }
 
     // Latest-query-wins: a slow earlier response must not clobber a newer one.
     let seq = 0;
@@ -840,9 +1016,9 @@
     // Emptying the box (backspace or the native search-clear ×) restores recent at once.
     // Any edit invalidates an in-flight search (seq++), so a late response never renders
     // under a changed box (codex L3); emptying also restores the recent list.
-    input.addEventListener("input", () => { seq++; capture(); if (!input.value.trim()) showRecent(); });
+    input.addEventListener("input", () => { seq++; capture(); syncAgent(); if (!input.value.trim()) showRecent(); });
 
-    if (modal && modalEpisodeQuery) { input.value = modalEpisodeQuery; search(modalEpisodeQuery); }
+    if (modal && modalEpisodeQuery) { input.value = modalEpisodeQuery; syncAgent(); search(modalEpisodeQuery); }
     else showRecent();
     return p;
   }
@@ -1267,8 +1443,7 @@
         new_body: ta.value,
       });
       if (res && res.ok) return;  // shim re-fetched + re-rendered → this DOM is gone
-      msg.className = "edit-msg err";
-      msg.textContent = (res && (res.message || res.error)) || "save failed";
+      showFail(msg, res, "save failed");
       save.disabled = false; cancel.disabled = false;
     });
   }
@@ -1278,19 +1453,52 @@
   // verbs (never raw writes). A metal button per row; destructive verbs open a small
   // confirm/kind form that sends confirm:true (the server requires it regardless).
 
+  // The cockpit verb each spore button fires. On a manifest row (one that lists its `actions`) a button
+  // is kept only when the kernel offered that verb on the row, and is disabled, with the gesture as its
+  // title, when the gesture is one a browser cannot perform. A legacy row lists none and is untouched.
+  const BUTTON_VERB = { touch: "spore_touch", edit: "spore_update", reclassify: "spore_update", park: "spore_update",
+    reactivate: "spore_update", schedule: "spore_surface_at", metabolize: "spore_set_disposition",
+    "→ tray": "spore_set_disposition", activate: "spore_set_disposition", "remind me": "spore_set_disposition",
+    dismiss: "spore_descend", remove: "spore_descend", compost: "spore_descend", promote: "spore_ascend",
+    tombstone: "episode_tombstone" };
+
   function verbBtn(label, title, onClick) {
     const b = el("button", "verb-btn", label);
     b.type = "button";
     if (title) b.title = title;
+    if (Object.prototype.hasOwnProperty.call(BUTTON_VERB, label)) b.dataset.verb = BUTTON_VERB[label];
     b.addEventListener("click", onClick);
     return b;
+  }
+
+  function gateByActions(wrap, actions) {
+    if (!Array.isArray(actions)) return wrap;
+    for (const b of Array.prototype.slice.call(wrap.querySelectorAll(".verb-btn[data-verb]"))) {
+      const a = actions.find((x) => x && x.verb === b.dataset.verb);
+      if (!a) { b.remove(); continue; }
+      if (a.gesture === "refused" || a.gesture === "laptop-only") { b.disabled = true; b.title = a.gesture; }
+    }
+    return wrap;
+  }
+
+  // A failed (or previewed) answer in a message span. A preview is not an error: it asks for a second click.
+  function showFail(msg, res, fallback) {
+    msg.className = "edit-msg " + (res && res.preview ? "preview" : "err");
+    msg.textContent = (res && (res.message || res.error)) || fallback;
   }
 
   function verbErr(wrap, res) {
     let m = wrap.querySelector(".edit-msg");
     if (!m) { m = el("span", "edit-msg", ""); wrap.appendChild(m); }
-    m.className = "edit-msg err";
-    m.textContent = (res && (res.message || res.error)) || "failed";
+    showFail(m, res, "failed");
+  }
+
+  // A row whose text the page shows altered (hidden characters) offers no inline text edit: saving the
+  // shown text would write the sanitiser's marker over the real characters.
+  function editBtn(wrap, s) {
+    const b = verbBtn("edit", "refine the text", () => openTextEdit(wrap, s));
+    if (s.text_locked) { b.disabled = true; b.title = s.text_locked; }
+    return b;
   }
 
   function buildSporeVerbs(s, panelKind) {
@@ -1299,7 +1507,7 @@
     // A TRAY item (the forming workbench): edit + reclassify (plastic WHILE forming) are
     // first-class — the item isn't ready for the lifecycle verbs yet. Then the route levers.
     if (panelKind === "tray") {
-      wrap.appendChild(verbBtn("edit", "refine the text", () => openTextEdit(wrap, s)));
+      wrap.appendChild(editBtn(wrap, s));
       wrap.appendChild(verbBtn("reclassify", "change the type — it's still forming", () =>
         openReclassify(wrap, s)));
       // metabolize — promote into cognition as a live loop (Tray->loop is never the
@@ -1316,14 +1524,14 @@
         wrap.appendChild(verbBtn("dismiss", "compost this inbox item", () =>
           openResolveForm(wrap, "spore_descend", "dismiss", s, s.descend_kinds, false)));
       }
-      return wrap;
+      return gateByActions(wrap, s.actions);
     }
 
     // KEEP — durable reference, NOT loop-lifecycle. Always editable. A NOTE gets the promote
     // lifecycle (→ tray / activate / remind me); a pinned-dormant LOOP reactivates (un-park).
     // Both end with remove.
     if (panelKind === "keep") {
-      wrap.appendChild(verbBtn("edit", "refine the text", () => openTextEdit(wrap, s)));
+      wrap.appendChild(editBtn(wrap, s));
       if (s.disposition === "note") {
         // The KEEP-NOTE PROMOTE lifecycle (2026-06-23): a deferred someday/maybe note re-enters
         // the flow without delete+recreate (lineage preserved). A pure reference note simply
@@ -1366,7 +1574,7 @@
       if (Array.isArray(s.descend_kinds) && s.descend_kinds.length) {
         wrap.appendChild(verbBtn("remove", "delete this from Keep", () => openRemoveConfirm(wrap, s)));
       }
-      return wrap;
+      return gateByActions(wrap, s.actions);
     }
 
     // OPEN LOOPS — the entity's live cognition: the lifecycle verbs (+ edit + schedule).
@@ -1377,7 +1585,7 @@
       b.disabled = false;
       verbErr(wrap, res);
     }));
-    wrap.appendChild(verbBtn("edit", "refine the text", () => openTextEdit(wrap, s)));
+    wrap.appendChild(editBtn(wrap, s));
     wrap.appendChild(verbBtn("schedule", "resurface on a future date", () => openSurfaceForm(wrap, s)));
     // park — pin to Keep: hide from active cognition but the loop stays OPEN (exempt from the
     // dormancy→compost prompt), resurfaceable. The exact inverse of Keep's "reactivate"; a tier
@@ -1403,7 +1611,7 @@
       wrap.appendChild(verbBtn("promote", "transmute into memory / project", () =>
         openResolveForm(wrap, "spore_ascend", "promote", s, s.ascend_kinds, true)));
     }
-    return wrap;
+    return gateByActions(wrap, s.actions);
   }
 
   // The schedule form: a date input + confirm -> spore_surface_at (clear = explicit empty).
@@ -1437,7 +1645,7 @@
       msg.className = "edit-msg busy"; msg.textContent = "…";
       const res = await commit({ kind: "spore_surface_at", spore_id: s.id, surface_at: value });
       if (res && res.ok) return;  // re-rendered
-      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
       go.disabled = false; clearBtn.disabled = false; cancel.disabled = false;
     };
     go.addEventListener("click", () => {
@@ -1479,13 +1687,21 @@
       msg.className = "edit-msg busy"; msg.textContent = "…";
       const res = await commit(req);
       if (res && res.ok) return;  // re-rendered
-      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
       go.disabled = false; cancel.disabled = false;
     });
   }
 
-  // Inline text edit — the forming-workbench refine (spore_update{text}). Any spore.
+  // Inline text edit — the forming-workbench refine (spore_update{text}). Any spore. When the kernel offers
+  // `domain` on this row's edit, the form carries a domain input too (prefilled from the row): domain is
+  // sent only when it differs from what was shown, and as "" only when the operator clears a domain on
+  // purpose. A text-only edit keeps the same request.
+  function offersDomain(s) {
+    const a = Array.isArray(s.actions) ? s.actions.find((x) => x && x.verb === "spore_update") : null;
+    return !!a && Array.isArray(a.escalates) && a.escalates.some((x) => x && x.param === "domain");
+  }
   function openTextEdit(host, s) {
+    const withDomain = offersDomain(s);
     openRowForm(host, () => {
       const ta = el("textarea", "verb-edit-ta");
       ta.value = s.text || "";  // FULL canonical text — the wire no longer truncates, so edit
@@ -1495,14 +1711,27 @@
       const lines = ta.value.split("\n").length;
       ta.rows = Math.min(16, Math.max(3, lines, Math.ceil(ta.value.length / 56)));
       ta.dataset.orig = ta.value;  // dirty baseline for hasUnsavedEdit (spore-108)
-      return { nodes: [ta], focus: ta, ta };
+      if (!withDomain) return { nodes: [ta], focus: ta, ta };
+      const dom = el("input", "verb-domain");
+      dom.type = "text"; dom.maxLength = 64; dom.placeholder = "domain";
+      dom.setAttribute("aria-label", "domain");
+      dom.value = s.domain || "";
+      dom.dataset.orig = dom.value;
+      return { nodes: [ta, dom], focus: ta, ta, dom };
     }, (f, msg) => {
       // Save the value VERBATIM — only trim for the empty-CHECK. trimming the saved text
       // would silently strip a spore's structural leading/trailing newlines on its first
       // edit (the small sibling of the truncation data-loss this slice fixes) [complement L3].
       const text = f.ta.value;
       if (!text.trim()) { msg.className = "edit-msg err"; msg.textContent = "text can't be empty"; return null; }
-      return { kind: "spore_update", spore_id: s.id, text };
+      if (!f.dom) return { kind: "spore_update", spore_id: s.id, text };
+      const req = { kind: "spore_update", spore_id: s.id };
+      const textChanged = text !== (s.text || "");
+      const domChanged = f.dom.value.trim() !== (s.domain || "");
+      if (!textChanged && !domChanged) { msg.className = "edit-msg err"; msg.textContent = "nothing changed"; return null; }
+      if (textChanged) req.text = text;
+      if (domChanged) req.domain = f.dom.value.trim();   // "" only when a non-empty domain was cleared
+      return req;
     }, "save", false);
   }
 
@@ -1582,7 +1811,7 @@
       const res = await commit(buildReq(text, sel && sel.value));
       if (res && res.ok) return;  // re-rendered → fresh panel carrying the new item
       go.disabled = false;
-      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
     };
     go.addEventListener("click", submit);
     // Cmd/Ctrl+Enter submits; plain Enter newlines (a capture may be multi-line).
@@ -1667,7 +1896,7 @@
       msg.className = "edit-msg busy"; msg.textContent = "…";
       const res = await commit(req);
       if (res && res.ok) return;  // re-rendered
-      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
       go.disabled = false; cancel.disabled = false;
     });
   }
@@ -1676,7 +1905,7 @@
     const wrap = el("span", "verb-actions");
     wrap.appendChild(verbBtn("tombstone", "delete this input — the consolidate re-derives without it", () =>
       openTombstoneConfirm(wrap, e)));
-    return wrap;
+    return gateByActions(wrap, e.actions);
   }
 
   function openTombstoneConfirm(host, e) {
@@ -1706,7 +1935,7 @@
       msg.className = "edit-msg busy"; msg.textContent = "…";
       const res = await commit({ kind: "episode_tombstone", episode_id: e.id, confirm: true });
       if (res && res.ok) return;  // re-rendered
-      msg.className = "edit-msg err"; msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
       go.disabled = false; cancel.disabled = false;
     });
   }
@@ -1903,8 +2132,7 @@
 
     const failed = (res) => {
       setDisabled(false);
-      msg.className = "edit-msg err";
-      msg.textContent = (res && (res.message || res.error)) || "failed";
+      showFail(msg, res, "failed");
     };
 
     // ── async-job (spec.job) result area + poll loop ──
@@ -2019,7 +2247,23 @@
     return box;
   }
 
-  function renderExternal(entry, view) {
+  // A waiting pending's cancel: posted with the gesture's intent and no preview. A gesture a browser
+  // cannot perform is disabled with the gesture as its title.
+  function buildPendingCancel(c) {
+    const wrap = el("span", "verb-actions");
+    const b = verbBtn("cancel", "cancel this waiting request", async () => {
+      b.disabled = true;
+      const res = await cancelPending(c);
+      if (res && res.ok) return;  // re-rendered
+      b.disabled = false;
+      verbErr(wrap, res);
+    });
+    if (c.gesture === "refused" || c.gesture === "laptop-only") { b.disabled = true; b.title = c.gesture; }
+    wrap.appendChild(b);
+    return wrap;
+  }
+
+  function renderExternal(entry, view, opts) {
     const p = panel(entry);
     const data = (view.extra_panels || {})[entry.id] || {};
     if (data.error) {
@@ -2048,19 +2292,30 @@
       else { p.appendChild(renderMarkdown(md)); }
       return p;
     }
+    // A typed panel of the v2 kinds draws itself (cockpit_view.js); the row engine stays here, so a pending's
+    // cancel and the per-item expand are the same code whichever component asks for rows.
+    if (data.typed && window.LevainCockpitKinds) {
+      window.LevainCockpitKinds.fill(p, data, { rows: appendExternalLines, modal: !!(opts && opts.modal), entry: entry });
+      return p;
+    }
     const lines = Array.isArray(data.lines) ? data.lines : [];
     if (lines.length === 0) {
       p.appendChild(el("p", "empty", data.empty || "nothing here"));
       return p;
     }
+    appendExternalLines(p, lines);
+    return p;
+  }
+
+  function appendExternalLines(host, lines) {
     for (const ln of lines) {
       const o = ln && typeof ln === "object" ? ln : {};
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.meta) row.appendChild(el("span", "ext-meta", String(o.meta)));
       appendClause(row, o.text != null ? String(o.text) : "");  // per-item expand, like episodes
-      p.appendChild(row);
+      if (o.cancel && cancelPending) row.appendChild(buildPendingCancel(o.cancel));
+      host.appendChild(row);
     }
-    return p;
   }
 
   function renderEdits(entry, view) {
@@ -2075,7 +2330,10 @@
       row.appendChild(el("span", "edit-act" + (isUndo ? " undo" : ""), isUndo ? "undo" : (e.action || "edit")));
       const label = String(e.source || "") + (e.heading ? " · " + e.heading : "");
       row.appendChild(el("span", "clause", label));
-      if (commit && !isUndo && e.id && e.undoable !== false && !claimed.has(e.source)) {
+      // a manifest row lists its actions: undo shows only where the kernel offered it (a legacy row lists none)
+      const undoOffered = !Array.isArray(e.actions) || e.actions.some((a) => a && a.verb === "undo"
+        && a.gesture !== "refused" && a.gesture !== "laptop-only");
+      if (commit && undoOffered && !isUndo && e.id && e.undoable !== false && !claimed.has(e.source)) {
         const u = el("button", "undo-btn", "undo");
         u.type = "button";
         u.addEventListener("click", async () => {
@@ -2095,8 +2353,13 @@
   }
 
   // The masthead "Unit" name is a Class-A input too — a commit-gated rename.
+  // A manifest view lists the verbs it offered; the rename shows only where the kernel offered it.
+  function verbOffered(view, verb) {
+    return !view || !view.offered_verbs || view.offered_verbs[verb] === true;
+  }
+
   function wireEntityName(entityEl, view) {
-    if (!commit) return;
+    if (!commit || !verbOffered(view, "entity_name")) return;
     const unit = entityEl.parentElement;
     if (!unit || unit.querySelector(".name-edit") || unit.querySelector(".name-editor")) return;
     const btn = el("button", "name-edit", "rename");
@@ -2132,7 +2395,7 @@
       msg.className = "edit-msg busy"; msg.textContent = "saving…";
       // Mark the editor "saving" so the SUCCESS reload's render() tears it down + restores the
       // entity line to the committed name, instead of the (passive-defer) guard leaving it
-      // stranded frozen on "saving…" (spore-280 — the twin of the 247 focus stranding). A
+      // stranded frozen on "saving…" (spore-280 — the twin of the 247 state-line stranding). A
       // passive reload defers via hasUnsavedEdit(".name-editor"); only this save's passive:false
       // reload rebuilds #entity.
       editor.dataset.saving = "1";
@@ -2142,8 +2405,7 @@
       const res = await commit({ kind: "entity_name", value: input.value });
       if (res && res.ok) return;  // reloaded — the save render tore this editor down
       delete editor.dataset.saving;  // save FAILED: re-arm the guard so passive reloads defer again
-      msg.className = "edit-msg err";
-      msg.textContent = (res && (res.message || res.error)) || "save failed";
+      showFail(msg, res, "save failed");
       save.disabled = false; cancel.disabled = false;
     };
     cancel.addEventListener("click", restore);
@@ -2154,28 +2416,18 @@
     });
   }
 
-  // The masthead focus line's Class-A inline edit (commit-gated). The operator sets
-  // "what I'm on now" IN the cockpit — a SECOND set-path alongside `levain focus` / the
-  // companion app (last-writer-wins). Mirrors wireEntityName: a small control swaps the
-  // line for an input; save → POST /edit {kind:"focus"}; a blank value CLEARS it. A
+  // The masthead state line's Class-A inline edit (commit-gated). The operator sets
+  // "what's going on" IN the cockpit, a second set-path alongside `levain state`
+  // (version-bound: see doSave). Mirrors wireEntityName: a small control swaps the line for an
+  // input; save -> POST /edit {kind:"operator_state"}; a blank value CLEARS it. A
   // read-only port (no commit) shows no affordance.
-  function wireFocusEdit(fEl, focus) {
-    if (!commit) return;
-    const has = !!(focus && focus.text);
-    const btn = el("button", "focus-edit", has ? "edit" : "set");
-    btn.type = "button";
-    btn.title = has ? "edit your focus" : "set your focus";
-    btn.setAttribute("aria-label", has ? "edit focus" : "set focus");
-    btn.addEventListener("click", () => enterFocusEdit(fEl, focus, btn));
-    fEl.appendChild(btn);
-  }
-
-  function enterFocusEdit(fEl, focus, btn) {
-    const current = (focus && focus.text) || "";
-    const editor = el("div", "focus-editor");
-    const input = el("input", "focus-input");
+  function enterStateEdit(fEl, state, btn, opts) {
+    const kind = (opts && opts.kind) || "operator_state";
+    const current = (state && state.text) || "";
+    const editor = el("div", "state-editor");
+    const input = el("input", "state-input");
     input.type = "text"; input.value = current; input.maxLength = 500;
-    input.placeholder = "what you're on now — blank to clear";
+    input.placeholder = (opts && opts.placeholder) || "what's going on, in your words; blank to clear";
     const save = el("button", "edit-save", "save");
     const cancel = el("button", "edit-cancel", "cancel");
     save.type = "button"; cancel.type = "button";
@@ -2194,20 +2446,20 @@
     const doSave = async () => {
       save.disabled = true; cancel.disabled = true;
       msg.className = "edit-msg busy"; msg.textContent = "saving…";
-      // Mark the editor "saving" so the SUCCESS reload's renderFocus rebuilds PAST the
-      // in-progress guard (replacing this editor with the committed focus) instead of
+      // Mark the editor "saving" so the SUCCESS reload's renderState rebuilds PAST the
+      // in-progress guard (replacing this editor with the committed line) instead of
       // bailing and stranding it frozen on "saving…" (the L1 + codex/complement/nemotron
       // L3 HIGH, reproduced end-to-end).
       editor.dataset.saving = "1";
-      // No `expected`/optimistic lock: focus is live-state, last-writer-wins (a foreign
-      // sensor writer may have touched the file — an optimistic lock would false-409). A
-      // blank value clears (the server reads an empty focus as unset). `source` is omitted
-      // → the server stamps "web" (the honest HTTP default; a client shouldn't self-declare).
-      const res = await commit({ kind: "focus", text: input.value });
-      if (res && res.ok) return;  // reloaded — the save render rebuilt #focus, removing this editor
+      // The write names the version of the line it was rendered with (state.version, a hash of
+      // the stored state keys only, so a sensor writing other keys of the file does not
+      // stale it); a line changed since render is refused 409 and its message shows. A blank
+      // value clears (the server reads an empty line as unset). `source` is omitted → the
+      // server stamps it from the credential (a client never self-declares).
+      const res = await commit({ kind, text: input.value, panel_version: state && state.version });
+      if (res && res.ok) return;  // reloaded — the save render rebuilt #state, removing this editor
       delete editor.dataset.saving;  // save FAILED: re-arm the guard so passive reloads defer again
-      msg.className = "edit-msg err";
-      msg.textContent = (res && (res.message || res.error)) || "save failed";
+      showFail(msg, res, "save failed");
       save.disabled = false; cancel.disabled = false;
     };
     cancel.addEventListener("click", restore);
@@ -2283,7 +2535,7 @@
   // body, so editing works in-place exactly as the grid does. NOT clamped — the
   // .modal-body is the scroll container, so the content reads at full height.
   function modalContent(entry, view) {
-    const p = renderPanel(entry, view, { modal: true });
+    const p = renderPanelSafe(entry, view, { modal: true });
     if (!p) return null;
     const host = el("div", "modal-panel");
     const phead = p.querySelector(".phead");
@@ -2367,6 +2619,7 @@
     const wasSearchFocused = !!oldSearch && oldSearch === document.activeElement;
     const hadModalFocus = overlay.contains(document.activeElement);
     overlay.replaceChildren(box);
+    pruneModalKinds();  // the typed panels the old modal body held end with it
     measureClauses(box);  // reveal per-item expand toggles inside the focus modal too
     mbody.scrollTop = prevScroll;
     const newSearch = wasSearchFocused ? mbody.querySelector(".ep-search-input") : null;
@@ -2381,9 +2634,16 @@
     buildModal(entry);
   }
 
+  // A typed panel drawn into the focus modal lives exactly while its body is on the page.
+  function pruneModalKinds() {
+    const K = window.LevainCockpitKinds;
+    if (K && typeof K.pruneModal === "function") K.pruneModal();
+  }
+
   function closeModal() {
     const overlay = document.getElementById("levain-modal");
     if (overlay) overlay.remove();
+    pruneModalKinds();
     document.body.classList.remove("modal-open");
     modalKey = null;
     const rf = modalReturnFocus;
@@ -2445,6 +2705,18 @@
 
   wireTabs();
 
+  // Number keys switch the zone tab (1 All, 2 Identity, 3 Operate, 4 Mind) unless typing in a field.
+  document.addEventListener("keydown", (ev) => {
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    const t = ev.target;
+    if (ev.defaultPrevented || modalKey) return;   // not behind an open overlay
+    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+    const idx = "1234".indexOf(ev.key);
+    if (idx < 0 || ev.key.length !== 1) return;
+    const tabs = document.querySelectorAll(".tab");
+    if (tabs[idx]) tabs[idx].click();
+  });
+
   // Is the operator mid-edit/capture with text that an involuntary re-render would
   // discard? (spore-108) render() rebuilds the whole #board (+ modal) via
   // replaceChildren, so a visibilitychange / refresh-button re-read fired while a
@@ -2465,7 +2737,7 @@
   //   (the masthead rename `.name-editor` USED to be excluded here — it survives a board
   //   rebuild since it lives outside `#board` — but render() now TEARS a data-saving editor
   //   down to close the rename, so a passive reload firing mid-save could strip it early and
-  //   flash the OLD name; it is gated below with `.focus-editor`, spore-280.)
+  //   flash the OLD name; it is gated below with `.state-editor`, spore-280.)
   // Fails SAFE: a missing `data-orig` reads as dirty → defers a harmless passive re-read
   // rather than risking data loss (the boot shim's editInProgress fails closed the same way).
   function hasUnsavedEdit() {
@@ -2473,11 +2745,11 @@
     // discard the polling box + its pending result mid-consult (the job keeps running server-side,
     // but the operator loses the handle). Defer the rebuild until the poll terminates.
     if (_activeJobs.size > 0) return true;
-    // An open masthead focus editor is unsaved work — a passive reload must defer (not
-    // rebuild #focus out from under the half-typed input). The authoritative SAVE reload
+    // An open masthead state editor is unsaved work — a passive reload must defer (not
+    // rebuild #state out from under the half-typed input). The authoritative SAVE reload
     // is passive:false, so it is NOT gated here and still refreshes (see load() in the boot
-    // layer + the renderFocus data-saving exception).
-    if (document.querySelector(".focus-editor")) return true;
+    // layer + the renderState data-saving exception).
+    if (document.querySelector(".state-editor")) return true;
     // An open masthead RENAME editor is unsaved work too, and for the same reason render()
     // now tears a saving one down: a passive reload must defer or it could strip the editor
     // mid-save and flash the old name (or drop the half-typed one). The authoritative SAVE
@@ -2495,5 +2767,5 @@
   // Export the entry points onto a namespace the surface shim calls. `jobsActive` lets the boot
   // layer DEFER a board reload while an async job is polling (a reload would detach the live result
   // box) — flushed via the injected onJobsIdle when the last job finishes (L3 codex MED).
-  window.LevainDashboard = { render, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0 };
+  window.LevainDashboard = { render, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0 };
 })();

@@ -129,13 +129,9 @@ MAX_IDEMPOTENCY_KEY_LEN = 200
 # paragraph. Bound the captured text so a runaway request can't persist an arbitrarily
 # large spore (the server caps the request body too — this is the data-layer backstop).
 MAX_SPORE_TEXT_BYTES = 8 * 1024
-# A focus is a single-line "what I'm on now", rendered on the cockpit masthead — bound it
-# so a runaway request can't persist a novel-length focus (the server body cap is the
-# outer backstop). Measured AFTER whitespace-collapse, the shape `write_focus` stores.
-MAX_FOCUS_TEXT_LEN = 500
-# Provenance for a focus set: who authored it. A small allowlist — anything else (a
+# Provenance for an operator-context (state line) set: who authored it. A small allowlist — anything else (a
 # spoofed HTTP value) falls back to the honest default for the only HTTP caller ("web").
-_FOCUS_SOURCE_ALLOWLIST = frozenset({"web", "tui", "cli", "app"})
+_CONTEXT_SOURCE_ALLOWLIST = frozenset({"web", "tui", "cli", "app"})
 # Strict YYYY-MM-DD shape — anchored \d so a space-padded "2026-06- 1" (which len==10 +
 # datetime.strptime would wrongly accept) is rejected; a real-date check follows.
 _ISO_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
@@ -182,18 +178,18 @@ class WriteScope:
       non-install substrate) → those kinds are refused; State + the Class-B verbs do
       not need it.
     - ``context_json`` — OPTIONAL. The operator's live-context contract
-      (``{focus, focus_set_at, focus_source}``) — the WRITE-peer of the read path's
+      (``{state, state_set_at, state_source}``) — the WRITE-peer of the read path's
       ``SubstrateSource.context_json`` (the same path, mirrored read/write like
-      ``anneal`` is). Locates the target for the Class-A ``focus`` edit (operator
-      live-state, last-writer-wins — no lock/backup/undo, distinct from the
+      ``anneal`` is). Locates the target for the Class-A ``operator_state`` edit
+      (operator live-state, last-writer-wins — no backup/undo, distinct from the
       consolidated-cognition State edit). ``None`` (a substrate with no live-context
-      file, or a read-only source) → the ``focus`` kind is refused. TRUSTED (never
+      file, or a read-only source) → the ``operator_state`` kind is refused. TRUSTED (never
       request-supplied). NB in flow's N-of-1 case this points at the sensor-written
-      SUPERSET (``state/context_state.json``), a foreign-multi-writer file — so the focus
+      SUPERSET (``state/context_state.json``), a foreign-multi-writer file — so the state
       write is a lost-update race with the sensor drains (``os.replace`` prevents a torn
-      read, but a concurrent whole-object writer can revert a just-set focus, which —
+      read, but a concurrent whole-object writer can revert a just-set line, which —
       unlike a resampled sensor key — does NOT self-heal). Accepted low-stakes; the full
-      rationale + the proper-fix pointer live in ``dashboard.write_focus``'s CONCURRENCY note.
+      rationale lives in ``dashboard.write_state``'s docstring.
 
     ``from_install_root`` reproduces the pre-WriteScope BEHAVIOR (store paths by the
     ``.levain/memory.db`` convention, ledger physical location at ``.levain/``, undo
@@ -232,10 +228,12 @@ class EditError(Exception):
     """A write was refused. ``http_status`` is the code the server maps it to;
     ``code`` is a stable machine token the frontend can branch on."""
 
-    def __init__(self, code: str, http_status: int, message: str) -> None:
+    def __init__(self, code: str, http_status: int, message: str,
+                 extra: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.http_status = http_status
+        self.extra = dict(extra or {})   # receipt fields beside error + message
 
 
 @dataclass(frozen=True)
@@ -294,13 +292,26 @@ class ActionVerb:
       from launching a DUPLICATE expensive job). The handler runs in the worker, so its input
       validation surfaces via poll as a ``failed`` job (the frontend validates required fields
       client-side before the propose — server-side validation is defense-in-depth).
-    - ``label`` — a short human label for the audit trail + the operator affordance."""
+    - ``label`` — a short human label for the audit trail + the operator affordance.
+    - ``fields`` — the param names the verb takes. Declared, the cockpit allowlist refuses any other
+      param and the manifest publishes them for the page's compose box; ``None`` leaves the handler
+      to validate its own params."""
 
     handler: Callable[[dict[str, Any]], dict[str, Any]]
     confirm_required: bool = True
     idempotent: bool = False
     job: bool = False
     label: str = ""
+    fields: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        f = self.fields
+        if f is None:
+            return
+        # a bare string, or the one-tuple ("message") written without its comma, would publish letters
+        if (not isinstance(f, tuple) or not all(isinstance(x, str) and x for x in f)
+                or len(set(f)) != len(f)):
+            raise ValueError(f"ActionVerb.fields must be None or a tuple of unique non-empty strings, got {f!r}")
 
 
 @contextmanager
@@ -629,7 +640,8 @@ def _require_install_root(scope: WriteScope, kind_label: str) -> Path:
     return scope.install_root
 
 
-def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None) -> dict[str, Any]:
+def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None,
+               expected_version: str | None = None) -> dict[str, Any]:
     """Apply one governed edit described by ``req`` (an untrusted JSON dict) against
     ``scope`` (the explicit write surface). Returns a result dict on success; raises
     ``EditError`` (carrying an HTTP status) on refusal.
@@ -637,9 +649,9 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
     Kinds: ``config`` (a world.md section or a whole posture/recency file) +
     ``entity_name`` (the .levain/config.json name) — Class-A seed/config, require a
     ``scope.install_root``; ``state`` (the neocortex ``State`` section, Class A, targets
-    ``scope.anneal.continuity_md``); ``focus`` (the operator's live-context focus, Class A,
-    targets ``scope.context_json`` — live-state, last-writer-wins, no lock/backup/undo,
-    distinct from the consolidated-cognition State edit); the Class-B verbs (``spore_touch`` /
+    ``scope.anneal.continuity_md``); ``operator_state`` (the operator's freeform expiring
+    state line, Class A, targets ``scope.context_json`` — live-state, last-writer-wins, no
+    backup/undo; named ``operator_state`` because ``state`` is the neocortex edit above); the Class-B verbs (``spore_touch`` /
     ``spore_descend`` / ``spore_ascend`` / ``episode_tombstone``, off ``scope.anneal``);
     the Slice-3b Tray operator-I/O kinds (``spore_seed`` capture / ``spore_set_disposition``
     re-route / ``spore_surface_at`` schedule, off ``scope.anneal`` — non-destructive);
@@ -647,6 +659,13 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
     if not isinstance(req, dict):
         raise EditError("bad_request", 400, "request must be a JSON object")
     kind = req.get("kind")
+    # a spore kind's row version, compared by anneal inside its write transaction (the cockpit
+    # passes the Row.version it read); None keeps a caller's write unguarded, as before
+    if expected_version is not None and (type(expected_version) is not str or not expected_version):
+        raise EditError("bad_request", 400, "expected_version must be a non-empty string")
+    guard = _VersionGuard(expected_version)
+    if expected_version is not None and not str(kind).startswith("spore_"):
+        raise EditError("bad_request", 400, f"expected_version binds a spore write, not {kind!r}")
     # Serialize the entire mutation (read→check→backup→audit→write) across the
     # server's request threads — this is what makes single-writer true (L1 HIGH).
     with _WRITE_LOCK:
@@ -654,24 +673,26 @@ def apply_edit(scope: WriteScope, req: dict[str, Any], *, now: str | None = None
             return _apply_config_edit(scope, req, now)
         if kind == "state":
             return _apply_state_edit(scope, req, now)
-        if kind == "focus":
-            return _apply_focus_edit(scope, req, now)
+        if kind == "operator_state":
+            return _apply_operator_state_edit(scope, req, now)
         if kind == "entity_name":
             return _apply_entity_name(scope, req, now)
         if kind == "spore_touch":
-            return _apply_spore_verb(scope, req, now, "touch")
+            return _apply_spore_verb(scope, req, now, "touch", guard)
         if kind == "spore_descend":
-            return _apply_spore_verb(scope, req, now, "descend")
+            return _apply_spore_verb(scope, req, now, "descend", guard)
         if kind == "spore_ascend":
-            return _apply_spore_verb(scope, req, now, "ascend")
+            return _apply_spore_verb(scope, req, now, "ascend", guard)
         if kind == "spore_seed":
+            if expected_version is not None:
+                raise EditError("bad_request", 400, "a new spore has no version to bind")
             return _apply_spore_seed(scope, req, now)
         if kind == "spore_set_disposition":
-            return _apply_spore_set_disposition(scope, req, now)
+            return _apply_spore_set_disposition(scope, req, now, guard)
         if kind == "spore_surface_at":
-            return _apply_spore_surface_at(scope, req, now)
+            return _apply_spore_surface_at(scope, req, now, guard)
         if kind == "spore_update":
-            return _apply_spore_update(scope, req, now)
+            return _apply_spore_update(scope, req, now, guard)
         if kind == "episode_tombstone":
             return _apply_episode_tombstone(scope, req, now)
         if kind == "undo":
@@ -729,13 +750,16 @@ def _best_effort_action_audit(ledger_root: Path, record: dict[str, Any]) -> None
 
 def apply_action(scope: WriteScope, registry: dict[str, "ActionVerb"],
                  req: dict[str, Any], *, now: str | None = None,
-                 job_runtime: "JobRuntime | None" = None) -> dict[str, Any]:
+                 job_runtime: "JobRuntime | None" = None,
+                 bind: dict[str, Any] | None = None) -> dict[str, Any]:
     """Dispatch ONE governed operator action described by ``req`` against a registered verb.
     The kernel GOVERNS (validate → confirm-gate → execute → audit-receipt); the verb's
     ``handler`` does the domain work. Returns a result dict; raises ``EditError`` (HTTP-
     mapped, so the server's existing ``except EditError`` handles it) on refusal or failure.
 
     ``req``: ``{"verb": str, "params": dict?, "confirm": bool?, "idempotency_key": str?}``.
+    ``bind``: what the request targets beyond its params (a cockpit verb's ``panel_id``); it is part
+    of the idempotency fingerprint, so one key sent to two targets is a reused key, not a replay.
     Unknown verb → 404; a ``confirm_required`` verb without ``confirm: true`` → 409 (NO execution,
     NO audit — nothing happened); a handler that raises → the attempt is AUDITED (outcome "error")
     then surfaced as 502 (the receipt binds to what actually happened — NO-THEATER; a rendered
@@ -784,7 +808,7 @@ def apply_action(scope: WriteScope, registry: dict[str, "ActionVerb"],
     idem_store: "IdempotencyStore | None" = None
     idem_key: str | None = None
     if spec.idempotent:
-        replay, idem_store, idem_key = _idempotency_claim(scope, verb, spec, params, req, now_iso)
+        replay, idem_store, idem_key = _idempotency_claim(scope, verb, spec, params, req, now_iso, bind)
         if replay is not None:
             return replay
 
@@ -945,7 +969,7 @@ def _dispatch_job(
 
 def _idempotency_claim(
     scope: WriteScope, verb: str, spec: "ActionVerb", params: dict[str, Any],
-    req: dict[str, Any], now_iso: str,
+    req: dict[str, Any], now_iso: str, bind: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, "IdempotencyStore | None", str | None]:
     """Run the at-most-once gate for an idempotent verb. Returns ``(replay_response, store, key)``:
     a non-None ``replay_response`` ⇒ RETURN it immediately (a deduped retry — no re-fire);
@@ -966,7 +990,10 @@ def _idempotency_claim(
                         f"'idempotency_key' exceeds {MAX_IDEMPOTENCY_KEY_LEN} characters")
     store = IdempotencyStore(scope.ledger_root / "idempotency.json")
     try:
-        fingerprint = request_fingerprint(verb, params)
+        # a bound request is fingerprinted under "cockpit:<verb>", a name no registered verb can
+        # have (the registry refuses ':'), so it never equals an unbound request's fingerprint
+        fingerprint = request_fingerprint(verb, params) if bind is None else \
+            request_fingerprint("cockpit:" + verb, {"params": params, "bind": bind})
     except ValueError as exc:
         # params that can't be canonically fingerprinted (non-string dict key / non-finite float —
         # L3 codex LOW). Unreachable via HTTP (JSON keys are strings); a clean 400 for the API path.
@@ -1066,48 +1093,41 @@ def _apply_config_edit(scope: WriteScope, req: dict[str, Any], now: str | None) 
     )
 
 
-def _apply_focus_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
-    """Set (or clear) the operator's live focus — the Class-A ``focus`` edit kind.
-
-    Distinct from the ``state`` edit (consolidated-cognition, the consolidate's
-    single-writer territory, lock + backup + undo): focus is OPERATOR LIVE-STATE
-    (last-writer-wins, no deference-risk, no machine interpretation — the cleanest
-    Class-A input), so it needs NEITHER the continuity lock NOR a backup/undo. The set
-    IS the record (``write_focus`` stamps ``focus_set_at`` + ``focus_source``); a blank
-    ``text`` (or an omitted one) CLEARS it (``dashboard._read_focus`` reads an empty
-    focus as unset). Runs under the shared ``_WRITE_LOCK`` (serializes cockpit
-    focus-writes against each other + sibling edits); ``write_focus`` is merge-preserving
-    + atomic, so a FOREIGN sensor writer of the same superset file is handled by that
-    file's established last-writer-wins contract, not serialized here.
-
-    Refuses 422 ``no_focus_target`` when the scope carries no ``context_json`` — a
-    read-only source, or a substrate with no live-context file, has no writable focus.
-    (``now`` is unused — ``write_focus`` self-stamps a tz-aware time, as the CLI does.)"""
+def _apply_operator_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None,
+                               check: "Callable[[], None] | None" = None) -> dict[str, Any]:
+    """Set (or clear) the operator's freeform state line, the ``operator_state`` kind:
+    live-state in ``scope.context_json`` (``write_state``'s lock, no continuity lock or backup;
+    ``check`` is the cockpit's version compare, run under that lock),
+    bounded by ``dashboard.STATE_MAX_TEXT_LEN`` with an allowlisted provenance tag. The text is stored verbatim apart from whitespace collapse and
+    is never interpreted. Refuses 422 ``no_state_target`` without a ``context_json``."""
     ctx = scope.context_json
     if ctx is None:
         raise EditError(
-            "no_focus_target", 422,
-            "this substrate has no writable operator-context (focus); nothing to set",
+            "no_state_target", 422,
+            "this substrate has no writable operator-context (state); nothing to set",
         )
     text = req.get("text")
     if text is None:
-        text = ""  # an omitted 'text' is an explicit clear (blank reads back as unset)
+        text = ""
     if not isinstance(text, str):
-        raise EditError("bad_focus", 400, "focus 'text' must be a string")
-    # Cap the whitespace-collapsed length — the exact shape `write_focus` will store
-    # (it collapses internal whitespace on write; measure the same thing).
+        raise EditError("bad_state", 400, "state 'text' must be a string")
     collapsed = " ".join(text.split())
-    if len(collapsed) > MAX_FOCUS_TEXT_LEN:
-        raise EditError("focus_too_long", 422, f"focus exceeds {MAX_FOCUS_TEXT_LEN} chars")
-    # Provenance: the TUI passes source="tui"; the web is the only HTTP caller, so a
-    # spoofed non-allowlisted source over HTTP falls back to the honest "web" (harmless —
-    # it's the operator's own self-report either way).
+    from levain.dashboard import STATE_MAX_TEXT_LEN
+    if len(collapsed) > STATE_MAX_TEXT_LEN:
+        raise EditError("state_too_long", 422, f"state exceeds {STATE_MAX_TEXT_LEN} chars")
     raw_source = req.get("source")
-    source = raw_source if raw_source in _FOCUS_SOURCE_ALLOWLIST else "web"
-    from levain.dashboard import write_focus  # lazy: avoid the writes↔dashboard import cycle
+    source = raw_source if isinstance(raw_source, str) and raw_source in _CONTEXT_SOURCE_ALLOWLIST else "web"
+    # The bound is the kernel's (dashboard.STATE_MAX_TEXT_LEN), so the governed edit, the CLI
+    # write and every reader agree; imported lazily to avoid the writes↔dashboard cycle.
+    from levain.dashboard import StateLockUnavailable, write_state
 
-    write_focus(ctx, collapsed, source=source)
-    return {"ok": True, "kind": "focus", "cleared": collapsed == ""}
+    try:
+        write_state(ctx, collapsed, source=source, check=check)
+    except StateLockUnavailable as exc:
+        raise EditError("lock_unavailable", 501, str(exc)) from exc
+    except OSError as exc:      # the lock file or the write itself: retryable, never a bare 500
+        raise EditError("store_unavailable", 503, f"state file unavailable: {exc}") from exc
+    return {"ok": True, "kind": "operator_state", "cleared": collapsed == ""}
 
 
 def _apply_state_edit(scope: WriteScope, req: dict[str, Any], now: str | None) -> dict[str, Any]:
@@ -1345,9 +1365,69 @@ def _normalize_expect_disposition(value: Any) -> str | None:
     return value
 
 
+class _VersionGuard:
+    """A spore write bound to the row version the caller read (design §4.4). anneal recomputes the
+    version inside its write transaction with ``version_of`` (the cockpit's own row version,
+    ``cockpit.providers.spore_row_version``) and refuses on a mismatch; ``found`` records what it
+    computed, so the refusal is reported as the stale write it is (409), never a generic failure."""
+
+    def __init__(self, expected: str | None) -> None:
+        self.expected = expected
+        self.found: str | None = None
+        self.error: str | None = None
+        if expected is not None:
+            # resolved before any store lock is taken, so the callback anneal runs under its lock
+            # imports nothing
+            from anneal_memory.spores import SporeError
+            from levain.cockpit.providers import spore_row_version   # lazy: the cockpit imports this module
+            self._version = spore_row_version
+            self._refuse = SporeError
+
+    def version_of(self, spore: dict[str, Any]) -> str:
+        if self.expected is None:
+            raise RuntimeError("version_of on an unguarded write: there is no version to compare")
+        try:
+            self.found = self._version(spore)
+        except (MemoryError, RecursionError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - a stored row the kernel cannot read matches no version it
+            # rendered; the import is resolved in __init__, so this is the row, never the environment.
+            # It RAISES: there is no return value a caller's expected_version could equal, and anneal
+            # saves nothing when its transaction body raises.
+            self.error = f"{type(exc).__name__}: {exc}"
+            raise self._refuse(f"the stored spore could not be versioned ({self.error})") from exc
+        return self.found
+
+
+def _guard_kwargs(guard: "_VersionGuard | None") -> dict[str, Any]:
+    if guard is None or guard.expected is None:
+        return {}
+    return {"expected_version": guard.expected, "version_of": guard.version_of}
+
+
+def _spore_refusal(guard: "_VersionGuard | None", exc: Exception, store: Any = None,
+                   spore_id: str | None = None) -> EditError:
+    """A refused guarded spore write. Stale (409) when anneal's recompute differed, or when the
+    spore the caller read is no longer open (resolved or removed in the window: anneal refuses that
+    before it computes a version, so it is read back here, never matched by message)."""
+    if guard is not None and guard.expected is not None:
+        if guard.error is not None:
+            return EditError("stale", 409, f"the stored item could not be versioned ({guard.error}); re-read it")
+        if guard.found not in (None, guard.expected):
+            return EditError("stale", 409, "the item changed since it was read; re-read it and retry")
+        if guard.found is None and store is not None and spore_id is not None:
+            try:
+                cur = store.get(spore_id)
+            except Exception:  # noqa: BLE001 - the original refusal stands
+                cur = {}
+            if cur is None or cur.get("status") == "resolved":
+                return EditError("stale", 409, "the item was resolved or removed since it was read")
+    return EditError("verb_failed", 422, str(exc))
+
+
 def _apply_spore_verb(
     scope: WriteScope, req: dict[str, Any], now: str | None,
-    verb: Literal["touch", "descend", "ascend"],
+    verb: Literal["touch", "descend", "ascend"], guard: "_VersionGuard | None" = None,
 ) -> dict[str, Any]:
     """A Class-B spore lifecycle verb: ``touch`` (engage — non-destructive),
     ``descend`` (compost downward) or ``ascend`` (transmute upward). The two
@@ -1419,7 +1499,7 @@ def _apply_spore_verb(
         ascend_expect = cast("str | None", current.get("disposition")) if current is not None else None
     try:
         if verb == "touch":
-            store.touch(spore_id)
+            store.touch(spore_id, **_guard_kwargs(guard))
         elif verb == "descend":
             assert spore_kind is not None  # set in the descend validation branch above
             # CAS the operator's render-time SNAPSHOT disposition (the resolve FACE — Keep
@@ -1431,16 +1511,17 @@ def _apply_spore_verb(
             descend_kwargs: dict[str, Any] = {"kind": spore_kind}
             if descend_has_snapshot:
                 descend_kwargs["expect_disposition"] = descend_expect
-            store.descend(spore_id, **descend_kwargs)
+            store.descend(spore_id, **descend_kwargs, **_guard_kwargs(guard))
         else:  # ascend
             assert spore_kind is not None and ref is not None  # set in the ascend branch
             # expect_disposition = the (non-note) value we just read → fail-closed if a
             # concurrent writer flipped it to a note (or anything else) before this resolve.
-            store.ascend(spore_id, kind=spore_kind, ref=ref, expect_disposition=ascend_expect)
+            store.ascend(spore_id, kind=spore_kind, ref=ref, expect_disposition=ascend_expect,
+                         **_guard_kwargs(guard))
     except ValueError as exc:  # bad kind for the spore's type (anneal arg validation)
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / already resolved / store drift
-        raise EditError("verb_failed", 422, str(exc)) from exc
+        raise _spore_refusal(guard, exc, store, spore_id) from exc
     except OSError as exc:  # raw IO from SporeStore._transaction (ENOLCK on a lock-less
         # FS, permission, fsync/replace) — not wrapped by anneal; map to a clean
         # retryable 503 instead of leaking a generic internal 500 [codex L3 MED].
@@ -1541,7 +1622,7 @@ def _apply_spore_seed(
 
 
 def _apply_spore_set_disposition(
-    scope: WriteScope, req: dict[str, Any], now: str | None
+    scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
     """Re-route an OPEN spore across the operator-I/O classes (the AI's triage verb, AND the
     Keep-note promote). ``disposition`` ∈ loop / seed / handoff / agenda / note: ``loop``
@@ -1670,11 +1751,11 @@ def _apply_spore_set_disposition(
         # re-reads and the confirm decision is re-made on fresh state. The disposition + the
         # optional surface_at land in ONE store.update (one transaction, one CAS) — the promote
         # and its schedule never half-apply.
-        store.update(spore_id, **update_kwargs)
+        store.update(spore_id, **update_kwargs, **_guard_kwargs(guard))
     except ValueError as exc:  # anneal arg validation
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / already resolved / store drift / CAS mismatch
-        raise EditError("verb_failed", 422, str(exc)) from exc
+        raise _spore_refusal(guard, exc, store, spore_id) from exc
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
 
@@ -1713,7 +1794,7 @@ def _validate_surface_at(value: Any) -> str | None:
 
 
 def _apply_spore_surface_at(
-    scope: WriteScope, req: dict[str, Any], now: str | None
+    scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
     """Schedule WHEN a spore re-surfaces — the operator-input twin of a spore's ``next:``
     alarm: author now, time the surfacing for a future session-open. ``surface_at`` is
@@ -1733,11 +1814,11 @@ def _apply_spore_surface_at(
         raise EditError("not_found", 404, "no spore store yet — the entity has no open loops")
     store = SporeStore(paths.spores_json)
     try:
-        store.update(spore_id, next=surface_at or None)  # anneal re-validates the date
+        store.update(spore_id, next=surface_at or None, **_guard_kwargs(guard))  # anneal re-validates the date
     except ValueError as exc:
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:
-        raise EditError("verb_failed", 422, str(exc)) from exc
+        raise _spore_refusal(guard, exc, store, spore_id) from exc
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
 
@@ -1750,7 +1831,7 @@ def _apply_spore_surface_at(
 
 
 def _apply_spore_update(
-    scope: WriteScope, req: dict[str, Any], now: str | None
+    scope: WriteScope, req: dict[str, Any], now: str | None, guard: "_VersionGuard | None" = None
 ) -> dict[str, Any]:
     """A governed metadata edit of an OPEN spore — the operator's forming-workbench levers:
     edit ``text`` (refine in place), reclassify ``type`` (ONLY while forming — a Tray item;
@@ -1770,6 +1851,10 @@ def _apply_spore_update(
     )
 
     spore_id = _require_str(req, "spore_id")
+    if "domain" in req:
+        # this write has no domain field; dropping it would report a partial edit as ok. A cockpit
+        # domain edit is T2 and lands through the broker's effect instead
+        raise EditError("bad_verb_arg", 422, "spore_update here does not take domain")
     has_text, has_type, has_tier = "text" in req, "type" in req, "tier" in req
     if not (has_text or has_type or has_tier):
         raise EditError("bad_verb_arg", 422,
@@ -1848,11 +1933,11 @@ def _apply_spore_update(
     elif has_tier and client_snapshot_present:
         kwargs["expect_disposition"] = client_snapshot
     try:
-        store.update(spore_id, **kwargs)
+        store.update(spore_id, **kwargs, **_guard_kwargs(guard))
     except ValueError as exc:  # anneal arg validation
         raise EditError("bad_verb_arg", 422, str(exc)) from exc
     except SporeError as exc:  # unknown id / resolved / drift / CAS mismatch
-        raise EditError("verb_failed", 422, str(exc)) from exc
+        raise _spore_refusal(guard, exc, store, spore_id) from exc
     except OSError as exc:
         raise EditError("store_unavailable", 503, f"spore store unavailable: {exc}") from exc
 

@@ -2388,7 +2388,7 @@ def test_a_harness_that_ends_during_an_approve_runs_nothing(tmp_path):
     assert host.session_status(sid)["state"] == "broken"
 
 
-def test_entity_session_close_records_a_failed_release_and_never_raises():
+def test_entity_session_close_records_a_failed_release_and_never_raises(tmp_path):
     """codex r5 HIGH (RAN): EntitySession.close swallowed a failed conversation close, so a release that
     had failed read as done. It still never raises; the failure is recorded."""
     from levain.session import EntitySession
@@ -2397,10 +2397,8 @@ def test_entity_session_close_records_a_failed_release_and_never_raises():
         def close(self):
             raise RuntimeError("the shell would not stop")
 
-    s = object.__new__(EntitySession)
-    object.__setattr__(s, "_closed", False)
-    object.__setattr__(s, "release_error", None)
-    object.__setattr__(s, "conversation", Conv())
+    s = EntitySession(entity_dir=tmp_path, binding=None, conversation=Conv(), workspace=tmp_path,
+                      model_label="m", with_tools=True, bash_ok=True)
     s.close()
     assert s.release_error == "RuntimeError: the shell would not stop"
 

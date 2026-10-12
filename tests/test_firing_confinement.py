@@ -122,14 +122,14 @@ def test_build_policy_does_not_guess_cred_files(tmp_path: Path, monkeypatch) -> 
     """REGRESSION (L4-live 2026-07-11): a generic, operator-neutral module must NOT invent a cred
     path like ``~/.env.flow`` — that is FALSE SECURITY (it "protects" a path the secret isn't at
     while missing the real one). With no ``deny_files`` passed, no credential file is denied. The
-    only entries are the SQLite sidecar names of the universal stores (``~/.anneal-memory`` and
-    ``~/.anneal-projects``, absent here), which are derived, not guessed."""
+    only entries are the SQLite sidecar names of the universal stores (``~/.anneal-memory``,
+    ``~/.anneal-projects`` and ``~/.levain/autonomic``, absent here), which are derived, not guessed."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("ANNEAL_MEMORY_DERIVE_TRUST", raising=False)
     policy = build_policy(_entity(tmp_path))
     assert set(policy.deny_files) == set(policy.sqlite_sidecars)
     assert {p.name for p in policy.sqlite_sidecars} == {
-        f"{store}{suffix}" for store in (".anneal-memory", ".anneal-projects")
+        f"{store}{suffix}" for store in (".anneal-memory", ".anneal-projects", "autonomic")
         for suffix in ("-wal", "-shm", "-journal")}
 
 
@@ -356,8 +356,8 @@ def test_live_real_tool_runs_under_default_allow(tmp_path: Path) -> None:
 
 @live
 def test_live_state_persists_across_commands(tmp_path: Path) -> None:
-    """ONE long-lived shell: an export in one command is visible in the next (real stateful shell,
-    not per-command exec)."""
+    """A stateful shell: an export in one command is visible in the next (each command's bash
+    starts from the state the previous one saved)."""
     with select_provider().spawn_shell(build_policy(_entity(tmp_path))) as sh:
         assert sh.run("export FOO=bar", timeout=10).exit_code == 0
         r = sh.run("echo val=$FOO", timeout=10)
@@ -373,9 +373,8 @@ def test_live_exit_codes_propagate(tmp_path: Path) -> None:
 
 @live
 def test_live_output_without_trailing_newline(tmp_path: Path) -> None:
-    """REGRESSION for the sentinel-substring fix: a command whose output has NO trailing newline
-    (``printf`` w/o ``\\n``) once concatenated the sentinel onto the last line and hung the shell.
-    Now the sentinel is matched as a substring, so this returns cleanly."""
+    """REGRESSION: a command whose output has NO trailing newline (``printf`` w/o ``\\n``) once
+    hung the shell. Output is read in raw chunks and completion is waitpid, so it returns whole."""
     with select_provider().spawn_shell(build_policy(_entity(tmp_path))) as sh:
         r = sh.run("printf abc", timeout=10)
         assert r.exit_code == 0 and r.timed_out is False
@@ -403,24 +402,24 @@ def test_live_crown_jewel_denied_even_after_cwd_wanders(tmp_path: Path, monkeypa
 
 @live
 def test_live_set_x_does_not_corrupt_protocol(tmp_path: Path) -> None:
-    """REGRESSION (apparatus L3 consensus, verified live): ``set -x`` echoes the sentinel ``printf``
-    line into the merged stream; with a naive token that trace was read as end-of-command and silently
-    corrupted every later result. The SPLIT token makes the trace un-matchable, so the protocol holds:
-    exit codes stay correct and later commands run normally even with xtrace on."""
+    """REGRESSION (apparatus L3 consensus, verified live): ``set -x`` once traced levain's own status
+    line into the stream and corrupted every later result. Status is now waitpid's, and xtrace
+    (which persists in the saved state) must neither change it nor trace levain's state save."""
     with select_provider().spawn_shell(build_policy(_entity(tmp_path))) as sh:
         assert sh.run("set -x", timeout=8).exit_code == 0
         r = sh.run("false", timeout=8)          # xtrace ON — exit code must still be the REAL one
         assert r.exit_code == 1
         r2 = sh.run("echo traced_ok", timeout=8)
         assert r2.exit_code == 0 and "traced_ok" in r2.output
+        assert "__levain" not in r.output + r2.output
 
 
 @live
 def test_live_command_channel_private_from_children(tmp_path: Path) -> None:
-    """REGRESSION (apparatus L3 codex round-1+2, verified live): a child must NOT be able to read the
-    command channel. Two vectors, both closed: (a) an inherited fd (``/dev/fd/N``) — the FIFO bash
-    opens is close-on-exec so children don't inherit it; (b) the FIFO PATH via bash's ``$0`` — the fifo
-    is UNLINKED after the startup handshake, so ``open($0)`` hits ENOENT."""
+    """REGRESSION (apparatus L3 codex round-1+2, verified live): a child must NOT be able to read
+    levain's channel to the shell. The command text now reaches bash on stdin, which is /dev/null
+    before the command runs, and no other descriptor is passed: (a) no fd 3..9 is readable; (b) ``$0``
+    names no file at all."""
     with select_provider().spawn_shell(build_policy(_entity(tmp_path))) as sh:
         # (a) inherited-fd probe: read any fd 3..9 — must find no readable channel
         fd_probe = (
@@ -430,19 +429,18 @@ def test_live_command_channel_private_from_children(tmp_path: Path) -> None:
         )
         r = sh.run(fd_probe, timeout=15)
         assert "STOLE" not in r.output and "probe_done" in r.output
-        # (b) $0-path probe: bash discloses the script path as $0; opening it must fail (unlinked).
-        # If the attack SUCCEEDED, open() returns → exit 0; unlinked → FileNotFoundError → nonzero.
-        r0 = sh.run('python3 -c "import sys; open(sys.argv[1])" "$0" 2>&1', timeout=10)
-        assert r0.exit_code != 0 and "FileNotFoundError" in r0.output
+        # (b) $0 is the plain name `bash -c` was given, not a path to the channel.
+        assert sh.run('echo "$0"', timeout=8).output.strip() == "bash"
+        assert sh.run("cat; echo rc=$?", timeout=8).output.strip() == "rc=0"
         # the shell itself is still perfectly usable afterward:
         assert sh.run("echo ok", timeout=8).output.strip() == "ok"
 
 
 def test_spawn_raises_when_shell_never_reads_the_channel(tmp_path: Path) -> None:
-    """REGRESSION (apparatus L3 codex round-2 #2): if the shell process dies / never reads the command
-    channel at startup, spawn must FAIL CLOSED — a dead driver must not masquerade as a live shell.
-    Hermetic (no sandbox): ``/usr/bin/true`` exits immediately without reading the fifo, so the startup
-    handshake gets EOF and raises."""
+    """REGRESSION (apparatus L3 codex round-2 #2): if the shell process dies / never runs the command
+    at startup, spawn must FAIL CLOSED — a dead driver must not masquerade as a live shell.
+    Hermetic (no sandbox): ``/usr/bin/true`` exits 0 without running the start probe, so the probe's
+    token never appears and start raises."""
     from levain.firing.confinement import SandboxedShell
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -455,7 +453,7 @@ def test_spawn_raises_when_shell_never_reads_the_channel(tmp_path: Path) -> None
 @live
 def test_live_concurrent_run_fails_fast(tmp_path: Path) -> None:
     """REGRESSION (apparatus L3 consensus): ``run()`` is single-caller; a concurrent call must fail
-    FAST rather than silently corrupt ``_pending`` + output attribution."""
+    FAST rather than race the saved state and the late-output buffer."""
     import threading as _th
     sh = select_provider().spawn_shell(build_policy(_entity(tmp_path)))
     started = _th.Event()
@@ -645,12 +643,11 @@ def test_live_timeout_leaves_result_flagged(tmp_path: Path) -> None:
 
 @live
 def test_live_shell_self_heals_after_timeout(tmp_path: Path) -> None:
-    """REGRESSION: a timed-out command's sentinel fires LATE; without pending-sentinel draining, the
-    next run() would consume the STALE sentinel and return the wrong result. The next command must
-    resync and return ITS OWN output/exit."""
+    """REGRESSION: after a timeout the next run() once read the timed-out command's late result. The
+    timed-out command is now killed with its group, and the next command returns ITS OWN output/exit."""
     with select_provider().spawn_shell(build_policy(_entity(tmp_path))) as sh:
         assert sh.run("sleep 2 && echo late", timeout=1).timed_out is True
-        # the sleep is still running; the next command must not pick up the stale sentinel:
+        # the timed-out command must leave nothing behind for the next result:
         r = sh.run("echo fresh_result", timeout=8)
         assert r.timed_out is False
         assert r.exit_code == 0
@@ -659,12 +656,12 @@ def test_live_shell_self_heals_after_timeout(tmp_path: Path) -> None:
 
 @live
 def test_live_close_reaps_child_processes(tmp_path: Path) -> None:
-    """REGRESSION (verified live 2026-07-11): a persistent shell spawns children; a bare terminate()
-    of bash alone ORPHANED a timed-out ``sleep`` (reparented to init, still running). close() now
-    signals the whole process GROUP, so the child is reaped."""
+    """REGRESSION (verified live 2026-07-11): a bare terminate() of bash alone ORPHANED its ``sleep``
+    child (reparented to init, still running). close() signals every process GROUP the shell started,
+    so a background job that outlived its command is reaped."""
     dur = "18237"  # a unique sleep duration = the marker for pgrep
     sh = select_provider().spawn_shell(build_policy(_entity(tmp_path)))
-    assert sh.run(f"sleep {dur}", timeout=1).timed_out is True
+    assert sh.run(f"sleep {dur} > /dev/null 2>&1 &", timeout=5).exit_code == 0
     before = subprocess.run(["pgrep", "-f", f"sleep {dur}"], capture_output=True, text=True)
     assert before.stdout.split(), "the sleep child should be running before close()"
     sh.close()
@@ -680,12 +677,13 @@ def test_live_close_reaps_child_processes(tmp_path: Path) -> None:
 
 
 @live
-def test_live_close_unlinks_profile_and_is_idempotent(tmp_path: Path) -> None:
+def test_live_close_is_idempotent_and_leaves_no_profile_file(tmp_path: Path) -> None:
+    """The profile goes on the driver's argv as text (S2 L2 C1), so there is no file to leak or to
+    rewrite between two commands."""
     sh = select_provider().spawn_shell(build_policy(_entity(tmp_path)))
-    profile = sh._profile_path  # type: ignore[attr-defined]
-    assert profile.exists()
+    if platform.system() == "Darwin":
+        assert "-f" not in sh._argv and "-p" in sh._argv  # type: ignore[attr-defined]
     sh.close()
-    assert not profile.exists()  # the temp seatbelt profile is cleaned up
     sh.close()  # idempotent — no raise
 
 
@@ -1021,7 +1019,7 @@ def test_build_policy_default_does_not_deny_standard_creds(tmp_path: Path, monke
     assert (tmp_path / ".aws" / "credentials").resolve() not in policy.deny_files
 
 
-_VECTOR_MARKER = ";; ssh persistence/exec vectors"
+_VECTOR_MARKER = ";; ssh + gpg persistence/exec vectors"
 
 
 def test_render_profile_ssh_exec_vector_block_is_write_only(tmp_path: Path, monkeypatch) -> None:
@@ -1255,14 +1253,15 @@ def test_sandboxed_shell_closed_reflects_lifecycle(tmp_path: Path, monkeypatch) 
 
 
 @live
-def test_sandboxed_shell_closed_after_a_command_runs_exit(tmp_path: Path, monkeypatch) -> None:
-    # A command that ends the shell (`exit`) closes it → `.closed` becomes True (the signal the bash
-    # executor uses to respawn a fresh shell for the next command).
+def test_sandboxed_shell_stays_open_after_a_command_runs_exit(tmp_path: Path, monkeypatch) -> None:
+    # `exit N` ends that command's bash only: its status is N (levain's waitpid) and the shell stays
+    # open for the next command.
     monkeypatch.setenv("HOME", str(tmp_path))
     shell = SeatbeltProvider().spawn_shell(build_policy(_entity(tmp_path)))
     try:
-        shell.run("exit 0")
-        assert shell.closed is True
+        assert shell.run("exit 4").exit_code == 4
+        assert shell.closed is False
+        assert shell.run("echo again").output.strip() == "again"
     finally:
         shell.close()
 
@@ -1920,6 +1919,179 @@ def test_bwrap_enforces_the_localhost_deny_by_removing_the_network(tmp_path, mon
     assert "--unshare-net" in on and "--unshare-net" not in off
 
 
+def test_offline_bash_cannot_reach_the_hosts_resolver_deputies(tmp_path, monkeypatch) -> None:
+    """MEASURED 2026-10-10 on argushub with 0.7.0: in the operator-floor (offline) bash, `resolvectl
+    query` of a fresh name over the system D-Bus was answered from the network. Each resolver
+    daemon's directory gets a read-only tmpfs and a deputy socket in the shared /run a mask; a
+    networked bash (the operator's opt-out) can resolve directly, so nothing is hidden there."""
+    from levain.firing import confinement as _conf
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home" / ".gnupg").mkdir(parents=True)
+    (tmp_path / "home" / ".gnupg" / "S.dirmngr").touch()
+    (tmp_path / "home" / ".gnupg" / "S.gpg-agent").touch()
+    run = tmp_path / "run"
+    (run / "dbus").mkdir(parents=True)
+    (run / "dbus" / "system_bus_socket").touch()
+    (run / "snapd.socket").touch()
+    monkeypatch.setattr(_conf, "_NETWORK_DEPUTY_DIRS", (str(run / "dbus"), str(run / "absent")))
+    monkeypatch.setattr(_conf, "_NETWORK_DEPUTY_SOCKETS",
+                        (str(run / "snapd.socket"), str(run / "snapd-snap.socket")))
+    on = _bwrap_argv(build_policy(_entity(tmp_path, "on"), deny_localhost_outbound=True))
+    off = _bwrap_argv(build_policy(_entity(tmp_path, "off"), deny_localhost_outbound=False))
+    dbus, snapd = str((run / "dbus").resolve()), str((run / "snapd.socket").resolve())
+    assert _tmpfs_then_ro(on, dbus)
+    assert any(on[k:k + 3] == ["--ro-bind", "/dev/null", snapd] for k in range(len(on)))
+    assert str(run / "absent") not in " ".join(on)  # a mount on an absent root dir aborts bwrap
+    dirmngr = str((tmp_path / "home" / ".gnupg").resolve() / "S.dirmngr")
+    assert any(on[k:k + 3] == ["--ro-bind", "/dev/null", dirmngr] for k in range(len(on)))
+    # signing through gpg-agent keeps working: no agent socket is masked
+    assert not any(on[k:k + 2] == ["--ro-bind", "/dev/null"] and "S.gpg-agent" in on[k + 2]
+                   for k in range(len(on) - 2))
+    assert dbus not in off and snapd not in off and dirmngr not in off
+
+
+# Literal, not the module constant: a red on the parent must be the absent PROPERTY (the conf is not
+# write-denied), not an AttributeError on a new symbol (spore-938).
+_GNUPG_CONFS = ("gpg-agent.conf", "scdaemon.conf", "gpg.conf", "dirmngr.conf", "common.conf")
+
+
+def test_gnupg_conf_write_deny_covers_the_default_home(tmp_path, monkeypatch) -> None:
+    """Bash must not write the operator's gnupg configuration files; the host agent starts programs
+    they name. The deny is UNCONDITIONAL, not gated on ``deny_localhost_outbound``."""
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".gnupg").mkdir()
+    policy = build_policy(_entity(tmp_path))                 # DEFAULT deny_localhost_outbound=False
+    denied = set(policy.deny_write_files)
+    for conf in _GNUPG_CONFS:
+        assert (tmp_path / ".gnupg" / conf).resolve() in denied, f"{conf} not write-denied in ~/.gnupg"
+
+
+def test_gnupg_conf_write_deny_covers_an_absolute_gnupghome(tmp_path, monkeypatch) -> None:
+    """A ``$GNUPGHOME`` from levain's own environment gets the same denies. A RELATIVE one is not
+    used (it would resolve against levain's cwd, not the sandbox's)."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    env_home = tmp_path / "env-gnupg"
+    env_home.mkdir()
+    monkeypatch.setenv("GNUPGHOME", str(env_home))
+    policy = build_policy(_entity(tmp_path))
+    denied = set(policy.deny_write_files)
+    for conf in _GNUPG_CONFS:
+        assert (env_home / conf).resolve() in denied, f"{conf} not denied in $GNUPGHOME"
+
+
+def test_gnupg_conf_deny_pins_a_lexical_ancestor_symlink(tmp_path, monkeypatch) -> None:
+    """A symlink in the home's path cannot be swapped to move the denies: the home is passed to
+    ``_spellings`` UNRESOLVED, so the symlink itself is write-deny-pinned, not only its target."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    real = tmp_path / "real-gnupg"
+    real.mkdir()
+    link = tmp_path / "current"           # intermediate symlink the shell could retarget
+    link.symlink_to(real)
+    monkeypatch.setenv("GNUPGHOME", str(link))
+    policy = build_policy(_entity(tmp_path))
+    write_dirs = {str(d) for d in policy.deny_write_dirs}
+    assert str(link) in write_dirs, "the lexical symlink ancestor is not write-deny-pinned"
+
+
+def test_gnupg_conf_write_deny_covers_an_absent_default_home(tmp_path, monkeypatch) -> None:
+    """gpg creates ~/.gnupg on its first run and then reads its configuration, so a home that does
+    not exist yet must already be covered."""
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    policy = build_policy(_entity(tmp_path))
+    denied = set(policy.deny_write_files)
+    for conf in _GNUPG_CONFS:
+        assert (tmp_path / ".gnupg" / conf).resolve() in denied, f"{conf} not denied in an absent ~/.gnupg"
+
+
+def test_gnupg_conf_write_deny_covers_an_absent_absolute_gnupghome(tmp_path, monkeypatch) -> None:
+    """An absolute $GNUPGHOME from levain's own environment that does not exist yet is covered too."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    env_home = tmp_path / "later-gnupg"
+    monkeypatch.setenv("GNUPGHOME", str(env_home))
+    policy = build_policy(_entity(tmp_path))
+    denied = set(policy.deny_write_files)
+    for conf in _GNUPG_CONFS:
+        assert (env_home / conf).resolve() in denied, f"{conf} not denied in an absent $GNUPGHOME"
+
+
+def test_gnupg_home_that_is_a_file_is_not_a_home(tmp_path, monkeypatch) -> None:
+    """A file where the home would be cannot hold configuration: no deny is planned beneath it."""
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".gnupg").write_text("")
+    policy = build_policy(_entity(tmp_path))
+    assert not any(str(f).startswith(str((tmp_path / ".gnupg").resolve()) + "/")
+                   for f in policy.deny_write_files)
+
+
+def test_seatbelt_denies_writes_to_the_confs_of_an_absent_gnupg_home(tmp_path, monkeypatch) -> None:
+    """macOS denies the path string, so the confs of a home that does not exist yet are in the
+    profile's write-deny block."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    env_home = tmp_path / "later-gnupg"
+    monkeypatch.setenv("GNUPGHOME", str(env_home))
+    profile = SeatbeltProvider().render_profile(build_policy(_entity(tmp_path)))
+    block = profile[profile.index(_VECTOR_MARKER):]
+    block = block[:block.index("\n)\n")]
+    for conf in _GNUPG_CONFS:
+        assert f'(literal "{(env_home / conf).resolve()}")' in block, f"{conf} not in the write-deny block"
+
+
+def test_bwrap_masks_the_confs_of_an_absent_gnupghome_and_creates_its_pin(tmp_path, monkeypatch) -> None:
+    """On Linux a home that does not exist yet is created 0700 by the provider and pinned before
+    bwrap runs (so it cannot be renamed and replaced), and each conf in it is masked read-only."""
+    from levain.firing.confinement import _bwrap_plan
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    env_home = tmp_path / "later-gnupg"
+    monkeypatch.setenv("GNUPGHOME", str(env_home))
+    argv, create_first = _bwrap_plan(build_policy(_entity(tmp_path)))
+    home = str(env_home.resolve())
+    assert home in create_first, "the absent home is not created and pinned before bwrap"
+    triples = [argv[k:k + 3] for k in range(len(argv))]
+    assert ["--bind", home, home] in triples, "the absent home is not pinned"
+    for conf in _GNUPG_CONFS:
+        assert ["--ro-bind", "/dev/null", f"{home}/{conf}"] in triples, f"{conf} not masked"
+
+
+def test_bwrap_masks_an_absent_conf_in_an_existing_gnupg_home(tmp_path, monkeypatch) -> None:
+    """In a home that exists, a conf that does not is masked read-only (it cannot be created)."""
+    from levain.firing.confinement import _bwrap_plan
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    env_home = tmp_path / "gnupg"
+    env_home.mkdir()
+    (env_home / "gpg.conf").write_text("")
+    monkeypatch.setenv("GNUPGHOME", str(env_home))
+    argv, _ = _bwrap_plan(build_policy(_entity(tmp_path)))
+    triples = [argv[k:k + 3] for k in range(len(argv))]
+    home = str(env_home.resolve())
+    assert ["--ro-bind", "/dev/null", f"{home}/gpg-agent.conf"] in triples
+    assert ["--ro-bind", f"{home}/gpg.conf", f"{home}/gpg.conf"] in triples
+
+
+def test_bwrap_absent_default_gnupg_home_needs_no_mount_under_the_read_only_home_view(
+    tmp_path, monkeypatch
+) -> None:
+    """$HOME is a read-only view inside bash on Linux, so bash cannot create ~/.gnupg: the confs of
+    an absent default home need no mount, and the plan creates nothing on the host for them."""
+    from levain.firing.confinement import _bwrap_plan
+
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    argv, create_first = _bwrap_plan(build_policy(_entity(tmp_path)))
+    gnupg = str((tmp_path / ".gnupg").resolve())
+    home = str(tmp_path.resolve())
+    assert ["--remount-ro", home] in [argv[k:k + 2] for k in range(len(argv))], "no read-only $HOME view"
+    assert not any(d == gnupg or d.startswith(gnupg + "/") for d in create_first)
+    assert not any(a == gnupg or a.startswith(gnupg + "/") for a in argv), "a mount under the absent home"
+
+
 def _tmpfs_then_ro(argv: list[str], d: str) -> bool:
     """A read-only tmpfs over ``d``: mounted, then remounted read-only LATER (remounts are deferred to
     the end of the argv so mountpoints inside the tmpfs can still be created)."""
@@ -1961,9 +2133,13 @@ def test_bwrap_uses_a_dev_null_mount_for_a_socket_in_a_shared_dir(tmp_path, monk
     sock.touch()
     argv = _bwrap_argv(_bwrap_socket_policy(tmp_path, monkeypatch, sock))
     assert ["--ro-bind", "/dev/null", str(sock.resolve())] in [argv[k:k + 3] for k in range(len(argv))]
-    assert "--tmpfs" not in argv or str(tmp_path.resolve()) not in [
-        argv[k + 1] for k, a in enumerate(argv) if a == "--tmpfs"
-    ]
+    # $HOME's only tmpfs is step (0)'s view, which carries its entries; the socket is left out of it
+    # (a denied name) and masked there, never hidden by a read-only tmpfs over its directory.
+    h = str(tmp_path.resolve())
+    assert ["--ro-bind-try", str(sock.resolve()), str(sock.resolve())] not in [
+        argv[k:k + 3] for k in range(len(argv))]
+    assert [h] == [argv[k + 1] for k, a in enumerate(argv) if a == "--remount-ro" and argv[k + 1] == h]
+    assert argv[-2:] == ["--remount-ro", h], "the view is made read-only last"
 
 
 def test_bwrap_absent_daemon_dirs_cost_nothing_and_mount_nothing(tmp_path, monkeypatch) -> None:
@@ -2192,29 +2368,20 @@ def test_spawn_shell_refreshes_so_every_consumer_gets_it_not_just_one_call_site(
     )
 
 
-def test_a_seatbelt_shell_unlinks_its_profile_even_if_the_base_close_raises(tmp_path) -> None:
-    """⛔ complement L3 LOW. `_SeatbeltShell.close` ran `super().close()` and THEN unlinked its temp
-    SBPL profile, so a raising base teardown leaked one profile file per failed shell — and nothing
-    upstream can compensate, because a generic fallback has never heard of that file.
-    ⚡ The general form: a subclass's ADDITIVE cleanup must be robust to its parent's failure."""
-    from levain.firing.confinement import SandboxedShell, _SeatbeltShell
+def test_a_seatbelt_shell_rescans_its_profile_text_before_every_spawn(tmp_path, monkeypatch) -> None:
+    """The kernel-mask refusal runs on the exact ``-p`` argv element before each command's spawn, not
+    only when the provider rendered it: nothing reaches Popen with a mask rule in it. The text here is
+    never executed; the scan refuses first."""
+    from levain.firing import confinement
+    from levain.firing.confinement import _SeatbeltShell
 
-    prof = tmp_path / "levain-seatbelt-test.sb"
-    prof.write_text("(version 1)")
-    sh = _SeatbeltShell(argv=["/bin/true"], cwd=tmp_path, env={}, profile_path=prof)
-
-    def _boom(self):
-        raise OSError("base teardown failed")
-
-    original = SandboxedShell.close
-    try:
-        SandboxedShell.close = _boom  # type: ignore[method-assign]
-        with pytest.raises(OSError):
-            sh.close()
-    finally:
-        SandboxedShell.close = original  # type: ignore[method-assign]
-
-    assert not prof.exists(), "the temp seatbelt profile leaked when the base close raised"
+    spawned: list = []
+    monkeypatch.setattr(confinement.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    bad = "(version 1)\n(allow default)\n(deny " + "syscall" + "-unix)\n"
+    sh = _SeatbeltShell(argv=[confinement.SANDBOX_EXEC, "-p", bad, "/bin/bash"], cwd=tmp_path, env={})
+    with pytest.raises(confinement.ConfinementError, match="syscall mask"):
+        sh.start()
+    assert spawned == []
 
 
 # =============================================================================================
@@ -2457,6 +2624,9 @@ def test_bwrap_subtrees_are_tmpfs_AND_remount_ro(tmp_path, monkeypatch) -> None:
     the refusal honest (EROFS). Both measured; the pairing is the contract."""
     policy = _lin_policy(tmp_path, monkeypatch)
     assert policy.deny_read_write, "fixture must produce at least one crown-jewel subtree"
+    # Existing subtrees: an absent one directly in $HOME is simply absent from step (0)'s view.
+    for sub in policy.deny_read_write:
+        sub.mkdir(parents=True, exist_ok=True)
     argv = _bwrap_argv(policy)
     for sub in policy.deny_read_write:
         assert ("--tmpfs", str(sub)) in _pairs(argv, "--tmpfs")
@@ -2472,6 +2642,10 @@ def test_bwrap_every_tmpfs_is_remounted_ro_except_the_ssh_dir(tmp_path, monkeypa
     tmpfs = {t for _, t in _pairs(argv, "--tmpfs")}
     ro = {t for _, t in _pairs(argv, "--remount-ro")}
     exempt = {str(policy.ssh_dir)} if policy.ssh_dir is not None else set()
+    # The runtime-dir views (step (7)) are the other: a tool that starts its own agent inside bash
+    # makes its socket there.
+    from levain.firing.confinement import _runtime_view
+    exempt |= {str(r) for r in _runtime_view(policy)[1]}
     assert tmpfs - ro == exempt
 
 
@@ -2490,9 +2664,17 @@ def test_bwrap_ancestor_dirs_are_self_bound_parents_before_children(tmp_path, mo
     policy = _lin_policy(tmp_path, monkeypatch)
     assert policy.deny_write_dirs, "fixture must produce ancestor dirs"
     argv = _bwrap_argv(policy)
-    self_binds = [(s, d) for s, d in _triples(argv, "--bind") if s == d]
-    bound = [d for _, d in self_binds]
+    # $HOME is pinned by its own view (step (0)'s tmpfs), not by a second self-bind.
+    # A runtime dir is pinned by its view (step (7)'s tmpfs), and nothing under it is the host's.
+    from levain.firing.confinement import _runtime_view
+    views = [str(r) for r in _runtime_view(policy)[1]]
+    home = str(Path.home().resolve())
+    bound = [argv[k + 2] if a == "--bind" else argv[k + 1] for k, a in enumerate(argv[:-2])
+             if (a == "--bind" and argv[k + 1] == argv[k + 2])
+             or (a == "--tmpfs" and argv[k + 1] in (home, *views))]
     for anc in policy.deny_write_dirs:
+        if any(anc.resolve().is_relative_to(v) and str(anc.resolve()) != v for v in views):
+            continue
         # Pinned when it exists (at its RESOLVED path: a mount cannot land on a symlink, /var/run,
         # macOS's /var) or when the argv will CREATE something under it; an absent ancestor nothing
         # lands under is skipped (self-binding a missing source aborted bwrap, 2026-09-30).
@@ -2509,12 +2691,16 @@ def test_bwrap_cred_files_and_config_deny_both_directions(tmp_path, monkeypatch)
     """``--ro-bind /dev/null`` denies READ (EACCES) as well as write — the closest analogue of macOS's
     ``(deny file-read* file-write* (literal ...))``. Measured to hold with AND without ``--dev``, so
     it does not depend on the device tree."""
-    secret = tmp_path / "secret.env"
+    (tmp_path / "creds").mkdir()
+    secret = tmp_path / "creds" / "secret.env"     # below a subdirectory of $HOME: on the host tree
     secret.write_text("TOKEN")
-    policy = _lin_policy(tmp_path, monkeypatch, deny_files=(secret,))
+    top = tmp_path / "top.env"                      # directly in $HOME: left out of the step (0) view
+    top.write_text("TOKEN")
+    policy = _lin_policy(tmp_path, monkeypatch, deny_files=(secret, top))
     argv = _bwrap_argv(policy)
     devnull_targets = [d for s, d in _triples(argv, "--ro-bind") if s == "/dev/null"]
     assert str(secret.resolve()) in devnull_targets
+    assert str(top.resolve()) not in argv, "absent inside bash, not an empty file"
     if policy.config_file is not None:
         # An ABSENT config gets no mount (a /dev/null mountpoint would leave an empty JSON stub the
         # next session refuses); the read-only store dir is what stops the shell creating it.
@@ -2532,30 +2718,37 @@ def _store_policy(tmp_path, monkeypatch):
     return build_policy(ent), lv
 
 
-def test_bwrap_creates_and_pins_an_absent_ssh_dir_before_planting_anything_in_it(tmp_path, monkeypatch) -> None:
-    """L1 H1 / L2 (2026-09-30): raw mode with no ~/.ssh. The argv makes bwrap CREATE ~/.ssh to hold
-    the vector mounts; unpinned, the entity could rename it away, make a fresh one and plant
-    ``authorized_keys`` on the host. It must be created and pinned BEFORE any mount inside it."""
+def test_bwrap_an_absent_ssh_dir_needs_nothing_in_the_home_view(tmp_path, monkeypatch) -> None:
+    """L1 H1 / L2 (2026-09-30): raw mode with no ~/.ssh. The argv used to make bwrap CREATE ~/.ssh
+    to hold the vector mounts, pinned so it could not be renamed away and replaced with a planted
+    ``authorized_keys``. In step (0)'s read-only $HOME view an absent ~/.ssh cannot be created at
+    all, so nothing is created on the host and nothing is mounted under it (ruling 2026-10-07)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     assert not (tmp_path / ".ssh").exists()
     from levain.firing.confinement import _bwrap_plan
 
     argv, create_first = _bwrap_plan(build_policy(_entity(tmp_path), ssh_mode="raw"))
     ssh = str(tmp_path / ".ssh")
-    assert ssh in create_first, "bwrap cannot pin a dir it creates; the provider must create it first"
-    i_pin = [argv[k:k + 3] for k in range(len(argv))].index(["--bind", ssh, ssh])
-    inside = [k for k, a in enumerate(argv) if a.startswith(ssh + "/")]
-    assert inside and min(inside) > i_pin, "a mount inside ~/.ssh landed before ~/.ssh was pinned"
+    assert ssh not in create_first
+    assert not [a for a in argv if a == ssh or a.startswith(ssh + "/")]
+    assert argv[-2:] == ["--remount-ro", str(tmp_path.resolve())]
 
 
-def test_bwrap_refuses_a_replaceable_symlinked_jewel_ancestor(tmp_path, monkeypatch) -> None:
-    """A mount cannot pin a symlink; pinning its target leaves the link swappable. Fail closed."""
+def test_bwrap_pins_a_home_level_symlinked_jewel_ancestor_at_its_target(tmp_path, monkeypatch) -> None:
+    """A mount cannot pin a symlink. A link directly in $HOME cannot be swapped from inside bash
+    ($HOME's top level is read-only there, ruling 2026-10-07), so its target is pinned instead; a
+    deeper link still refuses (test_bwrap_refuses_a_replaceable_symlinked_protected_file)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     real = tmp_path / "dotfiles-ssh"
     real.mkdir()
     (tmp_path / ".ssh").symlink_to(real)
-    with pytest.raises(ConfinementError, match="symlink"):
-        _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw"))
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), ssh_mode="raw"))
+    assert ["--bind", str(real.resolve()), str(real.resolve())] in [argv[k:k + 3] for k in range(len(argv))]
+    # In the view the link is recreated as the same link; nothing is mounted at or through it.
+    link = str(tmp_path / ".ssh")
+    assert ["--symlink", str(real), link] in [argv[k:k + 3] for k in range(len(argv))]
+    assert argv.count(link) == 1
+    assert not any(a.startswith(link + "/") for a in argv)
 
 
 def test_bwrap_refuses_a_replaceable_symlinked_protected_file(tmp_path, monkeypatch) -> None:
@@ -2632,6 +2825,8 @@ def test_bwrap_distinct_roots_differing_only_in_case_both_keep_their_tmpfs(tmp_p
     swallowed the distinct /x/secret/inner and left it readable. Containment must be exact."""
     monkeypatch.setenv("HOME", str(tmp_path))
     a, b = tmp_path / "Secret", tmp_path / "secret" / "inner"
+    a.mkdir()
+    b.mkdir(parents=True)
     argv = _bwrap_argv(build_policy(_entity(tmp_path), extra_deny_read_write=(a, b)))
     tmpfs = [argv[k + 1] for k, x in enumerate(argv) if x == "--tmpfs"]
     assert str(a) in tmpfs and str(b) in tmpfs
@@ -2695,7 +2890,10 @@ def test_bwrap_blocks_planting_a_vector_that_does_not_exist_yet(tmp_path, monkey
     ssh.mkdir()
     policy = build_policy(_entity(tmp_path), ssh_mode="raw")
     sockets = set(policy.socket_spellings) | set(policy.deny_sockets)  # step (6) owns those
-    missing = [p for p in policy.deny_write_files if not p.exists() and p not in sockets]
+    # A missing vector whose directory exists: one under an absent directory in $HOME's read-only
+    # view needs no mount (bash cannot create the directory; see the absent-gnupg-home test).
+    missing = [p for p in policy.deny_write_files
+               if not p.exists() and p.parent.exists() and p not in sockets]
     assert missing, "fixture must produce at least one not-yet-existing ssh vector"
     argv = _bwrap_argv(policy)
     devnull_targets = [d for s, d in _triples(argv, "--ro-bind") if s == "/dev/null"]
@@ -2866,16 +3064,30 @@ linux_live = pytest.mark.skipif(
 def test_linux_live_cannot_skip_where_it_is_required() -> None:
     """The `linux_live` tests SKIP wherever bwrap cannot run, which is right on a laptop and wrong in
     the image built to run them: there a skip is a green suite that never touched the floor.
-    `tests/linux/Dockerfile` sets ``LEVAIN_REQUIRE_LINUX_LIVE=1``, so in that image a refused
-    namespace FAILS here instead of skipping eight tests quietly."""
+    The CI `linux-live` job sets ``LEVAIN_REQUIRE_LINUX_LIVE=1``, so there a refused namespace FAILS
+    here instead of skipping the live tests quietly."""
     if os.environ.get("LEVAIN_REQUIRE_LINUX_LIVE") != "1":
-        pytest.skip("only enforced where LEVAIN_REQUIRE_LINUX_LIVE=1 (the Linux test image)")
+        pytest.skip("only enforced where LEVAIN_REQUIRE_LINUX_LIVE=1 (the CI linux-live job)")
     assert platform.system() == "Linux" and bwrap_available(), (
         "LEVAIN_REQUIRE_LINUX_LIVE=1 but bwrap cannot establish a namespace here, so every "
-        "linux_live test would skip. In Docker, run with --security-opt seccomp=unconfined "
-        "--security-opt apparmor=unconfined --security-opt systempaths=unconfined "
-        "(see tests/linux/Dockerfile)."
+        "linux_live test would skip. On an Ubuntu host: "
+        "`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`."
     )
+
+
+def test_the_linux_image_is_refused_as_a_container_by_name() -> None:
+    """`tests/linux/Dockerfile` is a container, which the cgroup frame refuses by name (no fallback).
+    The image used to require the live floor, so it went red on every run, and a suite that is red by
+    design teaches its reader to ignore the run that is red for a reason. It now sets
+    ``LEVAIN_EXPECT_CONTAINER_REFUSAL=1``, and green there means the refusal holds. The live floor is
+    run on a host (the CI `linux-live` job's VM, or argushub)."""
+    if os.environ.get("LEVAIN_EXPECT_CONTAINER_REFUSAL") != "1":
+        pytest.skip("only in the Linux test image (LEVAIN_EXPECT_CONTAINER_REFUSAL=1)")
+    from levain.firing.confinement import diagnose_confinement
+    d = diagnose_confinement()
+    assert platform.system() == "Linux" and not d.supported, d
+    assert "container" in d.reason, d
+    assert not confinement_supported()
 
 
 @pytest.fixture()
@@ -3176,6 +3388,7 @@ def test_diagnose_linux_apparmor_names_the_cause_and_the_official_profile(monkey
     do is map root into one (no capabilities in the stacked child profile), which is what a nested
     bwrap, rootless docker/podman, flatpak and browser sandboxes all need. The remedy text says the
     accurate thing, so this asserts the accurate thing."""
+    monkeypatch.setattr("levain.firing.confinement._cgroup_problem", lambda: None)
     monkeypatch.setattr("levain.firing.confinement.os.path.isfile", lambda p: True)
     monkeypatch.setattr("levain.firing.confinement.os.access", lambda p, m: True)
     monkeypatch.setattr("levain.firing.confinement.bwrap_available", lambda: False)
@@ -3191,6 +3404,7 @@ def test_diagnose_linux_apparmor_names_the_cause_and_the_official_profile(monkey
 def test_diagnose_linux_namespace_denied_without_apparmor_is_a_different_sentence(monkeypatch) -> None:
     """Not every namespace refusal is AppArmor (a container's seccomp does it too, which is how the
     Linux branches were exercised). A remedy naming the wrong cause is worse than a generic one."""
+    monkeypatch.setattr("levain.firing.confinement._cgroup_problem", lambda: None)
     monkeypatch.setattr("levain.firing.confinement.os.path.isfile", lambda p: True)
     monkeypatch.setattr("levain.firing.confinement.os.access", lambda p, m: True)
     monkeypatch.setattr("levain.firing.confinement.bwrap_available", lambda: False)
@@ -3442,3 +3656,55 @@ def test_cred_floor_label_names_the_keychain_on_macos_only() -> None:
 
     assert cred_floor_label("Darwin").endswith("· the Keychain")
     assert "Keychain" not in cred_floor_label("Linux")
+
+
+def test_offline_bash_masks_every_dirmngr_the_kernel_lists(tmp_path, monkeypatch) -> None:
+    """codex L3 r6 HIGH: a host dirmngr already listening under a GNUPGHOME levain never saw (bash can
+    `export GNUPGHOME=...` itself) was left reachable. The kernel's bound-socket list is the source."""
+    from levain.firing import confinement as _conf
+
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    elsewhere = tmp_path / "srv" / "keyring"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "S.dirmngr").touch()
+    (elsewhere / "S.gpg-agent").touch()
+    linked = tmp_path / "linked-keyring"
+    linked.symlink_to(elsewhere)  # complement L3 r7: a bound path may go through a linked parent
+    monkeypatch.setattr(_conf, "_bound_unix_socket_paths",
+                        lambda: [str(linked / "S.dirmngr"), str(elsewhere / "S.gpg-agent")])
+    on = _bwrap_argv(build_policy(_entity(tmp_path, "on"), deny_localhost_outbound=True))
+    # Hidden by a view of its directory, not a mask a rename escapes (dirmngr A-1b, RUN 2026-10-12):
+    # nothing named S.dirmngr comes back into it, and the agent's socket does.
+    keyring = str(elsewhere.resolve())
+    assert ["--perms", "0700", "--tmpfs", keyring] in [on[k:k + 4] for k in range(len(on))]
+    assert not [on[k:k + 3] for k in range(len(on)) if on[k].endswith("bind")
+                and on[k + 2] == keyring + "/S.dirmngr"]
+    assert ["--bind", keyring + "/S.gpg-agent", keyring + "/S.gpg-agent"] in [on[k:k + 3] for k in range(len(on))]
+
+
+def test_offline_bash_is_refused_when_the_kernel_socket_list_cannot_be_read(
+        tmp_path, monkeypatch) -> None:
+    from levain.firing import confinement as _conf
+
+    monkeypatch.setattr(_conf, "_ON_LINUX", True)
+    monkeypatch.setattr(_conf, "_PROC_NET_UNIX", str(tmp_path / "absent"))
+    with pytest.raises(_conf.ConfinementError, match="cannot read"):
+        _conf._bound_unix_socket_paths()
+    listing = tmp_path / "unix"
+    listing.write_text(
+        "Num       RefCount Protocol Flags    Type St Inode Path\n"
+        "0000000000000000: 00000002 00000000 00010000 0001 01  9621 /run/user/1000/gnupg/S.dirmngr\n"
+        "0000000000000000: 00000002 00000000 00010000 0001 01  9622 @abstract\n"
+        "0000000000000000: 00000003 00000000 00000000 0001 03  9623\n"
+        "0000000000000000: 00000002 00000000 00010000 0001 01  9624 /tmp/a b/S.dirmngr\n")
+    monkeypatch.setattr(_conf, "_PROC_NET_UNIX", str(listing))
+    assert _conf._bound_unix_socket_paths() == ["/run/user/1000/gnupg/S.dirmngr", "/tmp/a b/S.dirmngr"]
+    # a bound path with a newline splits its row: refused, never read as two rows
+    listing.write_text(listing.read_text().replace("/tmp/a b/", "/tmp/a\nb/"))
+    with pytest.raises(_conf.ConfinementError, match="cannot read"):
+        _conf._bound_unix_socket_paths()
+    listing.write_text("garbage\n")
+    with pytest.raises(_conf.ConfinementError, match="no header"):
+        _conf._bound_unix_socket_paths()

@@ -200,14 +200,16 @@ def test_live_confined_shell_cannot_touch_project_memory(home: Path) -> None:
 @live
 def test_live_confined_shell_cannot_replace_an_env_trust_file(home: Path, monkeypatch) -> None:
     """Only the file literal protects it here, so a write, a replace-by-rename onto it and an unlink
-    must all be refused while the shell still writes beside it."""
-    trust = home / "derive-trust.json"
+    must all be refused while the shell still writes beside it. (In a subdirectory of $HOME: on Linux
+    $HOME's own entries are read-only inside bash, so "beside" at the top level is refused too.)"""
+    (home / "cfg").mkdir()
+    trust = home / "cfg" / "derive-trust.json"
     trust.write_text("ORIGINAL")
     monkeypatch.setenv(DERIVE_TRUST_ENV, str(trust))
     with select_provider().spawn_shell(build_policy(_entity(home))) as sh:
-        _ok(sh, f"echo x > '{home}/beside'")
+        _ok(sh, f"echo x > '{home}/cfg/beside'")
         _refused(sh, f"echo PLANTED > '{trust}'")
-        _refused(sh, f"mv -f '{home}/beside' '{trust}'")
+        _refused(sh, f"mv -f '{home}/cfg/beside' '{trust}'")
         _refused(sh, f"rm -f '{trust}'")
     assert trust.read_text() == "ORIGINAL"
 
@@ -241,17 +243,14 @@ def test_live_a_symlinked_store_cannot_be_swapped_for_a_planted_tree(
     home: Path, tmp_path: Path, store: str
 ) -> None:
     """L2 MED (run on macOS before the fix: rm of the link, then a planted trust file and continuity).
-    macOS refuses the unlink; Linux refuses to start bash while the store is a symlink."""
+    Both platforms refuse the unlink and the rename: macOS by its rule on the link, Linux because
+    $HOME's own entries are read-only inside bash (ruling 2026-10-07; it refused bash before)."""
     real = _project_home(tmp_path / f"real{store}")
     link = home / store
     link.symlink_to(real)
     policy = build_policy(_entity(home))
-    if _LINUX:
-        with pytest.raises(ConfinementError, match="symlink"):
-            select_provider().spawn_shell(policy)
-        return
     with select_provider().spawn_shell(policy) as sh:
-        _ok(sh, f"touch '{home}/control'")
+        _ok(sh, f"touch '{policy.workspace}/control'")
         _refused(sh, f"rm '{link}'")
         _refused(sh, f"mv '{link}' '{home}/moved'")
     assert link.is_symlink() and (real / "derive-trust.json").exists()
@@ -822,8 +821,8 @@ def test_a_jewel_retargeted_after_its_mask_does_not_unmask_the_write_only_target
     real_resolve = Path.resolve
     masked = []
 
-    def target(f):
-        out = real_target(f)
+    def target(f, *rest):
+        out = real_target(f, *rest)
         if f == jewel:
             masked.append(out)
         return out

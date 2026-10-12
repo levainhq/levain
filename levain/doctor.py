@@ -44,6 +44,7 @@ def _supports_color() -> bool:
 _COLOR = _supports_color()
 _OK = "\033[32m✓\033[0m" if _COLOR else "[OK]"
 _FAIL = "\033[31m✗\033[0m" if _COLOR else "[FAIL]"
+_WARN = "\033[33m!\033[0m" if _COLOR else "[WARN]"
 
 
 EXIT_HEALTHY = 0
@@ -77,12 +78,15 @@ class CheckResult:
     # Meaningful only when ``ok`` is False: the failure is a post-upgrade step still
     # pending, not a broken install. It changes the exit code, never the badge.
     upgrade_pending: bool = False
+    # Meaningful only when ``ok`` is True: a working install with an exposure the operator should
+    # act on. It changes the badge and prints the hint, never the exit code.
+    warn: bool = False
 
 
 def _emit(r: CheckResult) -> None:
-    badge = _OK if r.ok else _FAIL
+    badge = _FAIL if not r.ok else (_WARN if r.warn else _OK)
     print(f"  {badge} {r.name}: {r.detail}")
-    if not r.ok and r.hint:
+    if (not r.ok or r.warn) and r.hint:
         print(f"      → {r.hint}")
 
 
@@ -113,6 +117,9 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     core.extend(_check_recorded_answers(install))
     core.extend(_check_runtime(install))
     core.extend(_check_confinement(install))
+    if hookless:
+        core.extend(_check_hands_isolation(install))
+    core.extend(_check_floor_placeholders())
     core.extend(_check_store(install))
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
@@ -173,7 +180,8 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     elif verify_rc != 0:
         print("Static checks passed but live-fire verify-hooks FAILED.")
     else:
-        print("All checks passed.")
+        warned = [r for r in all_results if r.ok and r.warn]
+        print("All checks passed." + (f" ({len(warned)} warning(s) above.)" if warned else ""))
     if pending and not broken and verify_rc == 0:
         print(
             f"  Every failure above is a post-upgrade step not yet applied "
@@ -794,7 +802,10 @@ def _probe(cmd: list[str], timeout: float = 5.0) -> tuple[bool, str]:
     happens to invoke a Levain-aware tool isn't silenced by a parent shell
     that set the var for an unrelated reason.
     """
-    env = {k: v for k, v in os.environ.items() if k != "LEVAIN_HOOK_SUPPRESS"}
+    from levain.launch import child_env
+
+    env = child_env()
+    env.pop("LEVAIN_HOOK_SUPPRESS", None)
     try:
         r = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, env=env
@@ -876,6 +887,164 @@ def _check_confinement(install: Path) -> list[CheckResult]:
     if d.remedy:
         detail += f"\n      → to enable the bash hand: {d.remedy}"
     return [CheckResult("confinement floor", True, detail)]
+
+
+def _check_hands_isolation(install: Path) -> list[CheckResult]:
+    """Is this entity's bash run as its own unprivileged user outside the interactive REPL (M2)?
+
+    Not set up is a WARNING, loud but not a failure: the entity works, but its bash runs as the
+    operator, so it can read the argv and environment of every process the operator runs. A
+    recorded user that cannot be started (deleted, or its sudoers rule gone) is a FAILURE."""
+    name = "hands isolation"
+    try:
+        from levain.firing.confinement import load_confinement_config
+        from levain.firing.hands import host_os
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult(name, True, f"not determinable ({exc})")]
+    try:
+        host_os()
+    except Exception:  # noqa: BLE001 — no setup exists for this OS; nothing to warn about
+        return []
+    try:
+        cfg = load_confinement_config(install)
+    except Exception:  # noqa: BLE001 — _check_confinement already FAILs a broken config
+        return []
+    if cfg.hands_user is None:
+        return [CheckResult(
+            name, True,
+            "NOT SET UP. Headless chat and unattended runs execute bash as YOU, so the entity can "
+            "read the environment and command line of every process you run (tokens included).",
+            hint=f"sudo levain setup-isolation --path {shlex.quote(str(install))}",
+            warn=True,
+        )]
+    import pwd
+
+    redo = f"sudo levain setup-isolation --undo --path {shlex.quote(str(install))}, then set it up again"
+    try:
+        entry = pwd.getpwnam(cfg.hands_user)
+    except KeyError:
+        return [CheckResult(name, False, f"hands user {cfg.hands_user} does not exist", hint=redo)]
+    if entry.pw_uid != cfg.hands_uid:
+        # an OS update can take an id for a system account (macOS 15 did, for 301-304)
+        return [CheckResult(name, False, f"hands user {cfg.hands_user} now has id {entry.pw_uid}, not the "
+                            f"recorded {cfg.hands_uid}", hint=redo)]
+    # No stat of the sudoers drop-in: /etc/sudoers.d is root-only on Linux (measured in CI), so the
+    # operator cannot see it. Writing to the workspace AS the hands user tests the rule, the account
+    # and its ownership of the workspace in one step.
+    ok, out = _probe(["sudo", "-n", "-u", cfg.hands_user, "/bin/test", "-w", str(cfg.hands_workspace)])
+    if not ok:
+        return [CheckResult(name, False, f"{cfg.hands_user} cannot write its workspace "
+                            f"{cfg.hands_workspace} ({out or 'refused'})", hint=redo)]
+    from levain.firing.hands import egress_boundary_problem, egress_drift_problem, hands_net_group, net_group_problem
+
+    if host_os() == "linux" and (
+            problem := net_group_problem(cfg.hands_user)
+            or egress_drift_problem(cfg.hands_user, cfg.hands_uid, cfg.hands_egress_ports)
+            or egress_boundary_problem(cfg.hands_user, cfg.hands_egress_ports,
+                                       net_group=hands_net_group(cfg.hands_user))):
+        # A behaviour probe, not a ruleset read: listing nftables needs root (P-1 (a)).
+        return [CheckResult(name, False, f"network boundary: {problem}",
+                            hint=f"sudo levain setup-isolation --path {shlex.quote(str(install))} (a repair run "
+                                 "loads it again)")]
+    from levain.firing.confinement import HANDS_PYTHON, HANDS_ZSH
+
+    if host_os() == "linux" and not os.access(HANDS_PYTHON, os.X_OK):
+        return [CheckResult(name, False, f"{HANDS_PYTHON} is missing: every process run as {cfg.hands_user} "
+                            "starts through it, so bash and the file editor refuse",
+                            hint="install python3")]
+    from levain.firing.hands import WORKSPACE_ROOT
+    from levain.firing.ws_git import bare_repository_explicit, foreign_entries, wildcard_safe_directory
+
+    extra: list[CheckResult] = []
+    if host_os() == "linux" and not os.access(HANDS_ZSH, os.X_OK):
+        extra.append(CheckResult("hands file editor", True,
+                                 f"{HANDS_ZSH} is missing: the file editor refuses as {cfg.hands_user}",
+                                 hint="install zsh", warn=True))
+    wildcard = wildcard_safe_directory(tuple(WORKSPACE_ROOT.values()))
+    if wildcard:
+        extra.append(CheckResult(
+            "git trust", True,
+            "your git trusts EVERY repository, or every one in the entity's workspace (safe.directory in "
+            + ", ".join(wildcard) + "). That switches off the check that keeps your git from running code "
+            "the entity writes into a repository in its workspace.",
+            hint="remove that safe.directory line, or narrow it to paths outside the entity's workspace",
+            warn=True,
+        ))
+    if not bare_repository_explicit():
+        extra.append(CheckResult(
+            "git bare repositories", True,
+            "your git will use a bare repository it finds in a folder by itself (safe.bareRepository is not "
+            "explicit). Nothing in the entity's workspace is yours, so there is no folder of yours it could "
+            "plant one in, but with this setting your git never picks one up unasked.",
+            hint="git config --global safe.bareRepository explicit",
+            warn=True,
+        ))
+    from levain.firing.ws_git import Hands, WsGitError
+
+    try:
+        foreign = foreign_entries(Hands(cfg.hands_user, cfg.hands_uid, entry.pw_dir, cfg.hands_workspace))
+    except (WsGitError, OSError) as exc:
+        return [CheckResult(name, False, str(exc), hint=redo), *extra]
+    if foreign:
+        return [CheckResult(
+            name, False,
+            f"{len(foreign)} entr(y/ies) in the workspace do not belong to the entity's user, or are writable by "
+            "you: " + ", ".join(str(g) for g in foreign[:3]) + ". Everything there must "
+            "be the entity's and read-only to you: a folder of yours that the entity can write is one it can "
+            "turn into a repository your git trusts and runs code from, as you.",
+            hint="remove what is yours with `sudo rm -r`, take write away from you (`sudo chmod o-w`, or the "
+                 "ACL entry that grants it), or set the entity up again; import a repository with `levain ws-adopt`",
+        ), *extra]
+    from levain.firing.confinement import hands_for
+
+    try:
+        separated = hands_for(cfg, "headless") is not None
+    except Exception:  # noqa: BLE001 — the account check above already passed
+        separated = False
+    if not separated:
+        return [CheckResult(
+            name, True,
+            f"hands user {cfg.hands_user} is set up (workspace {cfg.hands_workspace}), but on this OS "
+            "levain still runs the entity's bash as you",
+            hint="running bash as the entity's own user is built for macOS and Linux",
+            warn=True,
+        ), *extra]
+    return [CheckResult(
+        name, True,
+        f"hands user {cfg.hands_user} is set up: headless chat, --task and seats run the entity's bash "
+        f"as it, in {cfg.hands_workspace}; the interactive REPL runs bash as you, since you read every turn",
+    ), *extra]
+def _check_floor_placeholders() -> list[CheckResult]:
+    """Sweep the Linux floor's session placeholders (an absent ``~/.netrc`` the bash floor masks over
+    an empty 0444 file while a session runs): remove the ones whose session is gone, which a crash
+    or SIGKILL leaves behind, and name the ones a live session still holds. Silent where there are
+    none, which is every macOS host."""
+    try:
+        from levain.firing.confinement import (
+            ledger_problem,
+            live_floor_placeholders,
+            sweep_floor_placeholders,
+        )
+        problem = ledger_problem()
+        if problem is not None:
+            return [CheckResult(
+                "floor placeholders", False,
+                f"{problem}: levain cannot tell which placeholders are its own, so it removes none",
+                hint="move the file or link aside; levain makes a fresh ledger at the next bash start",
+            )]
+        removed = sweep_floor_placeholders()
+        live = live_floor_placeholders()
+    except Exception as exc:  # noqa: BLE001 — never let the sweep break the whole doctor run
+        return [CheckResult("floor placeholders", True, f"not determinable ({exc})")]
+    if not removed and not live:
+        return []
+    parts = []
+    if removed:
+        parts.append("removed, their session gone: " + ", ".join(removed))
+    if live:
+        parts.append("held by a running session (removed when it ends): "
+                     + ", ".join(str(p) for p in live))
+    return [CheckResult("floor placeholders", True, "; ".join(parts))]
 
 
 def _check_store(install: Path) -> list[CheckResult]:

@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
+from ..launch import child_env
 from . import canon as C
 from . import entry as E
 from . import index as I
@@ -16,7 +18,7 @@ from . import roles as R
 from . import wire as W
 from .export import export_stream
 from .hook import decide
-from .transport import GitLedger, Repo, TeamError
+from .transport import _NO_HOOKS, GitLedger, InitIncomplete, JoinIncomplete, Repo, TeamError, ledger_env
 
 
 def _repo(args) -> Repo:
@@ -61,41 +63,108 @@ def _repo_paths(repo: Repo, paths: list[str]) -> list[str]:
     return out
 
 
-def _members(values: list[str] | None) -> dict[str, str]:
-    out = {}
+def _members(values: list[str] | None) -> tuple[dict[str, str], dict[str, str]]:
+    """``handle=email[=public key line or .pub file]`` -> (handle->email, handle->key line)."""
+    out, keys = {}, {}
     for v in values or []:
         if "=" not in v:
-            raise TeamError(f"--member takes handle=email, got {v!r}")
-        h, mail = v.split("=", 1)
-        out[h.strip()] = mail.strip()
-    return out
+            raise TeamError(f"--member takes handle=email[=pubkey], got {v!r}")
+        parts = v.split("=", 2)
+        out[parts[0].strip()] = parts[1].strip()
+        if len(parts) == 3 and parts[2].strip():
+            from .cli_tenure import _key_line
+            keys[parts[0].strip()] = _key_line(parts[2].strip())
+    return out, keys
 
 
 def cmd_init(args) -> int:
     repo = _repo(args)
     gl = GitLedger(repo)
-    members = _members(args.member)
-    team = R.Team(project=args.project or repo.toplevel.name, owner=args.owner, members=members,
-                  client_owners=_split(args.client_owner), mode=args.mode, fetch_interval=args.fetch_interval)
-    print(gl.init(team, remote=args.remote, push=not args.no_push))
-    if args.anneal_db:
-        gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
-    if args.pack:
-        written = P.seed(gl, Path(args.pack), push=not args.no_push)
-        print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
-    if not args.no_install:
-        _install_all(repo)
+    incomplete = None
+    try:
+        members, keys = _members(args.member)
+        team = R.Team(project=args.project or repo.toplevel.name, owner=args.owner, members=members,
+                      client_owners=_split(args.client_owner), mode=args.mode, fetch_interval=args.fetch_interval)
+        try:
+            anneal_db = str(Path(args.anneal_db).expanduser().resolve()) if args.anneal_db else None
+        except (OSError, RuntimeError) as exc:      # a loop or an unreadable path: a refusal, never a raw trace
+            raise TeamError(f"--anneal-db {args.anneal_db!r} cannot be resolved ({exc}); nothing was changed") from None
+        print(gl.init(team, member_keys=keys, remote=args.remote, push=not args.no_push,
+                      signing_key=args.signing_key, replace_legacy=args.replace_legacy, anneal_db=anneal_db))
+    except InitIncomplete as exc:
+        incomplete = exc        # initialised, the push not completed: the setup below runs only if it was published
+    try:
+        if incomplete is None:
+            if args.pack:
+                written = P.seed(gl, Path(args.pack), push=not args.no_push)
+                print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
+            if not args.no_install:
+                _install_all(repo)
+        elif not incomplete.confirmed:
+            # the remote was not seen to hold this ledger, so nothing is set up on it: it may yet be dropped for
+            # another (code L3 r15 codex 2, r16 codex 1, r17 codex 1 + 2); the join that adopts another installs
+            # a pack is seeded only into THIS ledger once a sync publishes it, never into another team's after a join
+            # (r19 complement 3); the join that adopts another installs, so install is named only for the sync path
+            todo = ([f"`levain team pack-sync {shlex.quote(args.pack)}`"] if args.pack else []) + \
+                ([] if args.no_install else ["`levain team install`"])
+            if todo and incomplete.outcome in ("pending", "unknown"):
+                incomplete = InitIncomplete(f"{incomplete}; the clone was NOT set up: once a sync succeeds, run "
+                                            + " and ".join(todo), outcome=incomplete.outcome)
+            elif args.pack and incomplete.outcome == "lost":
+                incomplete = InitIncomplete(f"{incomplete}; the pack {args.pack} was NOT seeded (this ledger is never "
+                                            "published)", outcome="lost")
+        else:
+            # published, only the bookkeeping sync is pending: the ledger is ours, so the setup runs, the seed locally
+            if args.pack:
+                try:
+                    written = P.seed(gl, Path(args.pack), push=False)
+                    print(f"seeded {len(written)} pack rule entr{'y' if len(written) == 1 else 'ies'} from {args.pack}")
+                except (TeamError, E.EntryError, R.RolesError, ValueError, OSError) as exc:
+                    incomplete = InitIncomplete(f"{incomplete}; the pack was NOT seeded ({exc}): after the sync, run "
+                                                f"`levain team pack-sync {shlex.quote(args.pack)}`",
+                                                outcome=incomplete.outcome)
+            if not args.no_install:
+                _install_all(repo)
+    except Exception as exc:
+        if incomplete is not None:
+            # both pending items are named: this CLI never shows a chained cause (code L3 r14 codex 3)
+            raise InitIncomplete(f"{incomplete}; then the clone's setup failed ({exc}): fix it, then run "
+                                 "`levain team install`", outcome=incomplete.outcome) from exc
+        raise
+    if incomplete is not None:
+        raise incomplete
     return 0
 
 
 def cmd_join(args) -> int:
     repo = _repo(args)
     gl = GitLedger(repo)
-    print(gl.join(remote=args.remote, new_device=args.new_device))
-    if args.anneal_db:
-        gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
-    if not args.no_install:
-        _install_all(repo)
+    accepted = {}
+    for v in args.accept_merge or []:
+        sha, _, n = v.partition(":")
+        if not n.isdigit():
+            raise TeamError(f"--accept-merge takes SHA:PARENT, got {v!r}: name the parent the owner chose (a trust "
+                            "decision, never a default)")
+        accepted[sha] = int(n)
+    incomplete = None
+    try:
+        print(gl.join(remote=args.remote, new_device=args.new_device, root=args.root, signing_key=args.signing_key,
+                      accept_merges=accepted))
+    except JoinIncomplete as exc:
+        incomplete = exc        # joined: the clone's own setup below still runs, then the command fails
+    try:
+        if args.anneal_db:
+            gl.save_state(anneal_db=str(Path(args.anneal_db).expanduser().resolve()))
+        if not args.no_install:
+            _install_all(repo)
+    except Exception as exc:
+        # the pending-steps message is the one a person must read: a setup failure is chained to it, never in its
+        # place (code L3 r5 complement 7)
+        if incomplete is not None:
+            raise incomplete from exc
+        raise
+    if incomplete is not None:
+        raise incomplete
     return 0
 
 
@@ -103,8 +172,10 @@ def _actor(gl: GitLedger) -> tuple[R.Team, str]:
     team = gl.team()
     handle = gl.handle(team)
     if handle is None:
-        raise TeamError(f"your git user.email ({gl.email() or 'unset'}) is not a member of {team.project}; "
-                        f"ask {team.owner} to run `levain team member add <handle> <email>`")
+        raise TeamError(f"this machine's signing key is not a member's key in force in {team.project}: from one of "
+                        "your machines whose key is in force, run `levain team key add <your handle> <this machine's "
+                        f"public key>`; if you have none yet, {team.owner} proposes your first key (`levain team key add "
+                        "<your handle> <your public key>`); then `levain team sync` here")
     return team, handle
 
 
@@ -180,6 +251,9 @@ def cmd_status(args) -> int:
                          ensure_ascii=False))
         return 0
     print(f"{team.project}: owner {team.owner}, you are {handle or 'NOT a member'}, mode {team.mode}")
+    from .cli_tenure import status_lines
+    for line in status_lines(gl):
+        print(line)
     print(C.staleness(canon_text, state))
     if ledger.problems:
         print(f"{len(ledger.problems)} integrity problem(s): run `levain team verify`")
@@ -235,8 +309,11 @@ def cmd_consolidate(args) -> int:
 def cmd_export(args) -> int:
     gl = GitLedger(_repo(args))
     gl.require_joined()
-    ledger = gl.ledger()
-    sys.stdout.writelines(export_stream(ledger, in_force=args.in_force))
+    if args.in_force:
+        sys.stdout.writelines(export_stream(gl.ledger(), in_force=True))
+        return 0
+    from .export import export_v3
+    sys.stdout.writelines(export_v3(gl))   # contract v3, strict profile (seam doc §3a item 3)
     return 0
 
 
@@ -274,8 +351,24 @@ def cmd_member_add(args) -> int:
     team, handle = _actor(gl)
     if handle != team.owner:
         raise TeamError(f"only the owner ({team.owner}) changes membership")
-    print(gl.update_team(lambda t: t.members.__setitem__(args.handle, args.email),
-                         f"levain team: add member {args.handle}", push=not args.no_push))
+    from .cli_tenure import _key_line
+    line = _key_line(args.key) if args.key else None
+    d = gl.derivation()
+    if d.retired(args.handle):
+        raise TeamError(f"{args.handle} was a member of this ledger and was removed; a handle is never re-used, so "
+                        "invite them under a new handle")
+    if line and args.handle in d.ever_keyed:
+        raise TeamError(f"{args.handle} already has had a key in force, so only {args.handle} proposes their keys "
+                        f"(`levain team key add {args.handle} <public key>` from a machine whose key is in force)")
+
+    def add(t, ten) -> None:
+        t.members[args.handle] = args.email
+        if line:
+            ten.pending_keys.setdefault(args.handle, []).append(line)
+    print(gl.update_counted(add, f"levain team: add member {args.handle}", push=not args.no_push))
+    if not line:
+        print(f"{args.handle} has no key yet: their lines are not enforced until `levain team key add {args.handle} "
+              "<their public key>` (the owner may propose a member's first key) and their machine confirms it")
     return 0
 
 
@@ -313,8 +406,8 @@ def cmd_doctor(args) -> int:
         rows.append((not err, f"remote {gl.remote}: last fetch "
                      + (I.age(_iso(st.get('last_fetch_ok'))) if st.get("last_fetch_ok") else "never")
                      + (f"; last error: {err}" if err else "")))
-        ahead = subprocess.run(["git", "log", "--format=%s", f"refs/remotes/{gl.remote}/levain-ledger..HEAD"],
-                               cwd=gl.wt, capture_output=True, text=True)
+        ahead = subprocess.run(["git", *_NO_HOOKS, "log", "--format=%s", f"refs/remotes/{gl.remote}/{gl.branch}..HEAD"],
+                               cwd=gl.wt, capture_output=True, text=True, env=ledger_env())
         subjects = ahead.stdout.splitlines() if ahead.returncode == 0 else ["?"]
         real = [s for s in subjects if not s.startswith("levain team: ack ")]
         rows.append((not real, f"{len(subjects)} local ledger commit(s) not pushed"
@@ -351,7 +444,7 @@ def _hook_import_check(repo: Repo) -> tuple[bool, str]:
     except (OSError, ValueError, KeyError, IndexError, TypeError):
         return False, "cannot read the wired PreToolUse command"
     cp = subprocess.run([py, "-P", "-c", "import levain.team.hook"], capture_output=True, text=True,
-                        cwd=str(repo.toplevel), timeout=30)
+                        cwd=str(repo.toplevel), timeout=30, env=child_env())
     if cp.returncode != 0:
         return False, f"the wired interpreter cannot import levain.team.hook: {cp.stderr.strip()[-200:]}"
     return True, "the wired interpreter imports levain.team.hook"
@@ -376,7 +469,7 @@ def _anneal_row(gl: GitLedger) -> tuple[bool, str]:
 def register(subparsers) -> None:
     team_p = subparsers.add_parser(
         "team", help="Share one project's decisions across a team of engineers (git ledger + edit-time hook).",
-        description="Team context: an append-only, hash-chained decision ledger on a `levain-ledger` branch of "
+        description="Team context: an append-only, hash-chained decision ledger on a `levain-team-ledger` branch of "
                     "the project's repo, a Claude Code PreToolUse hook that shows a recorded decision at the "
                     "edit it governs, and an owner-generated PROJECT.md canon.")
     sub = team_p.add_subparsers(dest="team_command", metavar="<team command>", required=True)
@@ -390,8 +483,12 @@ def register(subparsers) -> None:
     p = add("init", cmd_init, "Create the team ledger in this repository (first engineer; becomes the remote branch).")
     p.add_argument("--project")
     p.add_argument("--owner", required=True, help="handle of the canon owner (must be a --member)")
-    p.add_argument("--member", action="append", required=True, metavar="HANDLE=EMAIL",
-                   help="repeatable; the email is matched against each engineer's git user.email")
+    p.add_argument("--member", action="append", required=True, metavar="HANDLE=EMAIL[=PUBKEY]",
+                   help="repeatable; PUBKEY (a .pub file or key line) is the member's signing key, pending until "
+                        "their machine confirms it at join")
+    p.add_argument("--signing-key", help="your ssh public key file (in ssh-agent, or without a passphrase)")
+    p.add_argument("--replace-legacy", action="store_true",
+                   help="create a strict ledger beside a 0.6.x levain-ledger (which is never read or converted)")
     p.add_argument("--client-owner", action="append", metavar="NAME",
                    help="names allowed as client:<NAME> owners (repeatable or comma-separated)")
     p.add_argument("--mode", default="ask-once", choices=E.MODES)
@@ -404,6 +501,10 @@ def register(subparsers) -> None:
 
     p = add("join", cmd_join, "Join this clone to the team ledger already on the remote.")
     p.add_argument("--remote")
+    p.add_argument("--root", help="the genesis of the ledger to trust (required when the remote has several)")
+    p.add_argument("--signing-key", help="your ssh public key file (in ssh-agent, or without a passphrase)")
+    p.add_argument("--accept-merge", action="append", metavar="SHA:PARENT",
+                   help="pin through a merge the owner named, following that parent")
     p.add_argument("--new-device", action="store_true",
                    help="give this clone its own device id (after copying a .git directory from another machine)")
     p.add_argument("--anneal-db")
@@ -471,20 +572,38 @@ def register(subparsers) -> None:
     ma = msub.add_parser("add", help="add a member")
     ma.add_argument("handle")
     ma.add_argument("email")
+    ma.add_argument("--key", help="their signing public key (a .pub file or key line); pending until they confirm")
     ma.add_argument("--repo")
     ma.add_argument("--no-push", action="store_true")
     ma.set_defaults(func=_guarded(cmd_member_add))
+    from . import cli_tenure
+    mr = msub.add_parser("remove", help="remove a member")
+    mr.add_argument("handle")
+    mr.add_argument("--repo")
+    mr.add_argument("--no-push", action="store_true")
+    mr.set_defaults(func=_guarded(lambda a: cli_tenure.cmd_member_remove(GitLedger(_repo(a)), a)))
+    cli_tenure.register(sub, add)
 
     p = add("pack-sync", cmd_pack_sync, "Owner only: seed or upgrade a pack's judgment.toml rules into the ledger.")
     p.add_argument("pack_dir")
     p.add_argument("--no-push", action="store_true")
 
 
+# commands that change no ledger, pin or trust state run outside the op, so they never queue behind a slow sync (code
+# L3 r7 complement 2): `view` (a server; its writes take the op), `status`/`verify`/`doctor` (read), `install` (writes
+# .claude settings only)
+_OUTSIDE_OP = {"view", "status", "verify", "doctor", "install"}
+
+
 def _guarded(func):
     def call(args) -> int:
         from .transport import WARNINGS
         try:
-            return func(args)
+            if getattr(args, "team_command", None) in _OUTSIDE_OP:
+                return func(args)      # read-only, or a server whose writes take the op themselves
+            # every other team command is ONE operation on the clone, start to finish (code L3 r6: git's frame)
+            with GitLedger(_repo(args)).op():
+                return func(args)
         except (TeamError, E.EntryError, R.RolesError, ValueError, OSError) as exc:
             print(f"levain team: {exc}", file=sys.stderr)
             return 2

@@ -33,6 +33,7 @@ import subprocess
 import tempfile
 from dataclasses import replace
 
+from levain.cockpit.engine import Cockpit
 from levain.dashboard import CLASS_A, CLASS_B, CLASS_C, SubstrateSource, SubstrateView
 from levain.tui import (
     ZONES,
@@ -75,6 +76,7 @@ def main_loop(
     view: SubstrateView,
     *,
     read_only: bool = False,
+    cockpit: "Cockpit | None" = None,
 ) -> int:
     """Run the curses event loop under ``curses.wrapper`` (which guarantees the
     terminal is restored on any exit). The first view is built by the caller,
@@ -83,8 +85,68 @@ def main_loop(
     The write target is ``source.write_scope`` (the explicit governed write surface).
     ``read_only`` forces the inspect-only variant; a source with ``write_scope is None``
     is read-only too. Either way ``_active_verbs`` advertises + dispatches nothing and
-    ``_apply`` refuses (the un-bypassable chokepoint) — a pure inspection surface."""
+    ``_apply`` refuses (the un-bypassable chokepoint) — a pure inspection surface.
+
+    ``cockpit`` (R2) renders the shared cockpit MANIFEST instead of the substrate view: the
+    kernel's panels, order and groups, read-only (verbs are K2a/K2b)."""
+    if cockpit is not None:
+        return curses.wrapper(_manifest_loop, cockpit)
     return curses.wrapper(_loop, source, view, read_only)
+
+
+_MANIFEST_ATTRS = {
+    "head": lambda c: c.A_BOLD, "panel": lambda c: c.A_BOLD | c.A_UNDERLINE, "group": lambda c: c.A_BOLD,
+    "row": lambda c: c.A_NORMAL, "note": lambda c: c.A_DIM, "dim": lambda c: c.A_DIM,
+    "error": lambda c: c.A_REVERSE | c.A_BOLD, "stale": lambda c: c.A_STANDOUT, "partial": lambda c: c.A_STANDOUT,
+}
+
+
+def _manifest_loop(stdscr: "curses.window", cockpit: "Cockpit") -> int:
+    """The manifest viewer: j/k/arrows/PgUp/PgDn scroll, r re-reads now, q quits. It re-reads every
+    couple of seconds (a getch timeout) so a status change shows without a keypress; scrolling only
+    re-slices the lines already read. A read that raises keeps the last good lines under a banner."""
+    from levain.cockpit.text import render_lines, snapshot, visible
+
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.timeout(2000)
+    top = 0
+    lines: list[tuple[str, str]] = []
+    banner = ""
+    reread = True
+    while True:
+        h, w = stdscr.getmaxyx()
+        if reread:
+            try:
+                lines = render_lines(snapshot(cockpit), max(20, w - 1))
+                banner = ""
+            except Exception as exc:  # noqa: BLE001 - keep the last good screen, say the read failed
+                banner = visible(f"READ FAILED: {type(exc).__name__}: {exc}")
+            reread = False
+        body = max(1, h - 2)
+        top = max(0, min(top, max(0, len(lines) - body)))
+        stdscr.erase()
+        for i, (style, text) in enumerate(lines[top:top + body]):
+            _safe_addstr(stdscr, i, 0, text, _MANIFEST_ATTRS.get(style, lambda c: c.A_NORMAL)(curses))
+        foot = banner or "j/k scroll · PgUp/PgDn · r refresh · q quit  (read-only manifest view)"
+        _safe_addstr(stdscr, h - 1, 0, foot[: w - 1], curses.A_REVERSE if banner else curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (ord("q"), 27):
+            return 0
+        if ch in (-1, ord("r")):
+            reread = True
+        elif ch == curses.KEY_RESIZE:
+            curses.update_lines_cols()
+            reread = True
+        elif ch in (ord("j"), curses.KEY_DOWN):
+            top += 1
+        elif ch in (ord("k"), curses.KEY_UP):
+            top -= 1
+        elif ch == curses.KEY_NPAGE:
+            top += body
+        elif ch == curses.KEY_PPAGE:
+            top -= body
 
 
 def _loop(
@@ -144,10 +206,9 @@ def _loop(
             model = move_in_panel(model, +10_000)
         elif ch == ord("r"):
             model = _rebuild(model, source, "refreshed")
-        elif ch == ord("f") and not model.read_only:
-            # Global write: set/edit the masthead focus (not a row-scoped verb — focus
-            # isn't a selectable panel). Read-only cockpit → 'f' falls through to a no-op.
-            model = _edit_focus(stdscr, model, source)
+        elif ch == ord("S") and not model.read_only:
+            # Global write: set/edit the freeform state line (shift-S: lowercase s is a verb key).
+            model = _edit_state(stdscr, model, source)
         else:
             # Verb keys — fire only if the SELECTED panel+row affords that verb
             # (the same set the footer advertised). An unbound key does nothing.
@@ -216,6 +277,26 @@ def _rebuild(model: TuiModel, source: SubstrateSource, status: str) -> TuiModel:
         return with_view(model, source.build(), status=status)
     except Exception as exc:  # noqa: BLE001 — UI liveness: never crash on a rebuild
         return replace(model, status=f"⚠ view refresh failed ({exc}) — showing last view")
+
+
+def _edit_state(
+    stdscr: "curses.window", model: TuiModel, source: SubstrateSource,
+) -> TuiModel:
+    """Set / edit the operator's freeform state line ('S'): a GLOBAL write, not a
+    row-scoped verb (the line isn't a selectable panel). Opens ``$EDITOR`` seeded with the
+    current line; an empty buffer clears it; routed through the governed ``apply_edit``
+    seam (``kind='operator_state'``). The text is the operator's own words, stored verbatim."""
+    view = model.view
+    state = getattr(view, "state", None) if view is not None else None
+    current = state.text if (state is not None and state.text) else ""
+    edited = _edit_via_editor(stdscr, current)
+    if edited is None:
+        return replace(model, status="⚠ state unchanged — $EDITOR is missing or exited non-zero")
+    new = " ".join(edited.split())
+    if new == current:
+        return replace(model, status="state — no change")
+    ok = "state cleared" if new == "" else "state set"
+    return _apply(model, source, {"kind": "operator_state", "text": new, "source": "tui"}, ok)
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +674,9 @@ def _edit_via_editor(stdscr: "curses.window", initial_text: str) -> str | None:
         curses.endwin()  # hand the terminal to the editor
         rc = 1
         try:
-            rc = subprocess.call(shlex.split(editor) + [tmp])
+            from levain.launch import child_env
+
+            rc = subprocess.call(shlex.split(editor) + [tmp], env=child_env(prefixes=("VIM", "NVIM")))
         except (OSError, ValueError):  # missing editor / unbalanced quotes in $EDITOR
             return None
         finally:
@@ -612,29 +695,6 @@ def _edit_via_editor(stdscr: "curses.window", initial_text: str) -> str | None:
             os.unlink(tmp)
         except OSError:
             pass
-
-
-def _edit_focus(
-    stdscr: "curses.window", model: TuiModel, source: SubstrateSource,
-) -> TuiModel:
-    """Set / edit the operator's live focus — the masthead 'what I'm on now'. A GLOBAL
-    write ('f'), NOT a row-scoped verb: focus isn't a selectable panel, so it can't ride
-    ``_active_verbs``. Opens ``$EDITOR`` seeded with the current focus (the TUI's edit
-    idiom); an empty buffer CLEARS it (distinct from an editor crash → ``None`` → no-op).
-    Live-state, last-writer-wins — routed through the same governed ``apply_edit`` seam
-    (``kind='focus'``) every write funnels through. The 'f' keybind is gated on
-    ``not model.read_only``; ``_apply`` is the un-bypassable read-only backstop."""
-    view = model.view
-    focus = getattr(view, "focus", None) if view is not None else None
-    current = focus.text if (focus is not None and focus.text) else ""
-    edited = _edit_via_editor(stdscr, current)
-    if edited is None:
-        return replace(model, status="⚠ focus unchanged — $EDITOR is missing or exited non-zero")
-    new = " ".join(edited.split())  # single line (write_focus collapses on write too)
-    if new == current:
-        return replace(model, status="focus — no change")
-    ok = "focus cleared" if new == "" else "focus set"
-    return _apply(model, source, {"kind": "focus", "text": new, "source": "tui"}, ok)
 
 
 # ---------------------------------------------------------------------------
@@ -664,8 +724,8 @@ def _safe_addstr(stdscr: "curses.window", y: int, x: int, text: str, attr: int =
     s = text[:avail]
     try:
         stdscr.addstr(y, x, s, attr)
-    except curses.error:
-        pass  # last-cell write; harmless
+    except (curses.error, UnicodeError):
+        pass  # last-cell write, or a string the terminal encoding cannot carry; harmless
 
 
 def _paint(stdscr: "curses.window", model: TuiModel) -> TuiModel:
@@ -692,25 +752,19 @@ def _paint(stdscr: "curses.window", model: TuiModel) -> TuiModel:
         attr = curses.A_REVERSE if i == model.zone_idx else curses.A_NORMAL
         _safe_addstr(stdscr, 1, x, tab, attr)
         x += len(tab) + 1
-    # Rule row (row 2) — overlay the operator's live focus on the separator: their
-    # OWN declared frame (pure-echo), freshness-tagged. NO-THEATER: a stale focus
-    # dims + carries a "?" re-confirm nudge; no live-context source → a plain rule.
+    # Rule row (row 2): the operator's state line rides the separator, verbatim with its
+    # age. An expired line is already dropped by the reader; no live-context source → a
+    # plain rule.
     _safe_addstr(stdscr, 2, 0, "─" * w, curses.A_DIM)
-    focus = view.focus
-    if focus is not None and w > 12:
-        if focus.text and focus.freshness == "unknown":
-            # age can't be established — say so, dimmed (unknown ≠ fresh).
-            tag = f" ⊙ {focus.text} · age unknown "
-            f_attr = curses.A_DIM
-        elif focus.text:
-            age = focus.age_label.replace("set ", "") if focus.age_label else ""
-            suffix = f" · {age}{' ?' if focus.stale else ''}" if age else ""
-            tag = f" ⊙ {focus.text}{suffix} "
-            f_attr = curses.A_DIM if focus.stale else curses.A_NORMAL
+    st = view.state
+    if st is not None and w > 12:
+        avail = max(w - 4, 0)
+        if st.text:
+            age = st.age_label.replace("set ", "")
+            tag = f" ⊙ {st.text} · {age} " if age else f" ⊙ {st.text} "
+            _safe_addstr(stdscr, 2, 2, tag[:avail])
         else:
-            tag = " ⊙ no focus set "
-            f_attr = curses.A_DIM
-        _safe_addstr(stdscr, 2, 2, tag[: w - 4], f_attr)
+            _safe_addstr(stdscr, 2, 2, " ⊙ no state set "[:avail], curses.A_DIM)
 
     left_w = min(_LEFT_W, w // 3)
     body_top, body_bottom = 3, h - 3  # inclusive rows for the body
@@ -806,7 +860,7 @@ _HELP_LINES = [
     "    j / k          move (select item in a list panel, else scroll)",
     "    PgDn / PgUp    page · g / G  first / last (or top / bottom)",
     "    r              refresh (rebuild the substrate view)",
-    "    f              set / edit your focus — 'what I'm on now' (writable cockpit)",
+    "    S              set / edit your state — what's going on, in your words (expires in 12 h)",
     "    q / Esc        quit · ?  this help (any key dismisses)",
     "",
     "  verbs (only where the SELECTED panel + row affords them)",

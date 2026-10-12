@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# End-to-end `levain setup-isolation` on a throwaway CI runner (Linux and macOS): set up, check what
+# the hands user can and cannot reach, undo (with a hands process still running), check that
+# everything is gone, then set up again to check the id is not reused. Runs as the runner account,
+# which has passwordless sudo; never run it on a machine you care about.
+set -uo pipefail
+
+LEVAIN="$(command -v levain)"
+PY="$(command -v python3)"
+E="$HOME/levain-iso/coyote"   # under the operator's home: the case the recorded workspace exists for
+FAILS=0
+pass() { echo "OK   $*"; }
+fail() { echo "FAIL $*"; FAILS=$((FAILS + 1)); }
+info() { echo "INFO $*"; }
+check() { local what="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$what"; else fail "$what"; fi; }
+refused() { local what="$1"; shift; if "$@" >/dev/null 2>&1; then fail "$what (was allowed)"; else pass "$what (refused)"; fi; }
+cfgval() { "$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))' "$E/.levain/confinement.json" "$1"; }
+as_hands() { (cd / && sudo -n -u "$H" env -i "HOME=$HHOME" PATH=/usr/bin:/bin "$@"); }   # from /: the runner's cwd is closed to it
+setup() { sudo -E env "PATH=$PATH" "$LEVAIN" setup-isolation --path "$E" "$@"; }
+
+echo "== init a scratch OpenHands entity under \$HOME"
+mkdir -p "$(dirname "$E")"
+"$LEVAIN" init --adapter openhands --answers-template 2>/dev/null \
+  | "$PY" -c 'import json,sys; d=json.load(sys.stdin); d.update(OPERATOR_NAME="CI", ENTITY_NAME="coyote"); print(json.dumps(d))' \
+  > /tmp/levain-iso-answers.json
+"$LEVAIN" init --adapter openhands --path "$E" --answers /tmp/levain-iso-answers.json >/dev/null || { echo "init failed"; exit 1; }
+git config --global user.name "CI Operator"; git config --global user.email ci-operator@invalid
+SSHD_DROPINS=0; grep -qiE '^\s*include\s+/etc/ssh/sshd_config.d' /etc/ssh/sshd_config 2>/dev/null && SSHD_DROPINS=1
+if [ "$(uname)" = Darwin ]; then CRON_DENY=/usr/lib/cron/cron.deny; else CRON_DENY=/etc/cron.deny; fi
+
+echo "== dry run needs no root and changes nothing"
+check "dry run" "$LEVAIN" setup-isolation --path "$E" --dry-run
+refused "non-root setup" "$LEVAIN" setup-isolation --path "$E"
+check "doctor warns before setup" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'NOT SET UP'"
+
+echo "== setup"
+OP_SAFE_BEFORE="$(git config --global --get-all safe.directory 2>/dev/null | sort)"
+info "safe.directory entries the operator already has: $(git config --show-origin --get-all safe.directory 2>/dev/null | tr '\n' ' ')"
+setup || { echo "setup failed"; exit 1; }
+if [ "$(git config --global --get-all safe.directory 2>/dev/null | sort)" = "$OP_SAFE_BEFORE" ]; then pass "setup added no safe.directory entry for the operator"; else fail "setup changed the operator's safe.directory"; fi
+H="$(cfgval hands_user)"; HID="$(cfgval hands_uid)"; WS="$(cfgval hands_workspace)"; HHOME="$(eval echo ~"$H")"
+ME="$(id -un)"
+echo "hands user: $H (id $HID), workspace: $WS"
+case "$WS" in "$HOME"/*) fail "workspace is under the operator's home";; *) pass "workspace is outside the operator's home";; esac
+check "hands user has the recorded id" test "$(id -u "$H")" = "$HID"
+if id -nG "$H" | tr ' ' '\n' | grep -qxE 'staff|admin|sudo|wheel|users|docker'; then fail "hands user is in a privileged or shared group: $(id -nG "$H")"; else pass "hands user groups: $(id -nG "$H")"; fi
+check "operator can run as hands" sudo -n -u "$H" /usr/bin/true
+refused "hands can sudo" sudo -n -u "$H" sudo -n /usr/bin/true
+check "doctor: set up, and says bash does not use it yet" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'is set up'"
+if [ "$SSHD_DROPINS" = 1 ]; then check "sshd drop-in denies the hands user" sudo grep -qx "DenyUsers $H" "/etc/ssh/sshd_config.d/levain-$H.conf"; else info "sshd here does not read sshd_config.d"; fi
+if [ -e "$CRON_DENY" ]; then check "hands user is in $CRON_DENY" grep -qx "$H" "$CRON_DENY"; else info "no $CRON_DENY on this system"; fi
+
+echo "== the entity's own ssh key"
+check "hands key exists and is the hands user's" sudo -n -u "$H" test -O "$HHOME/.ssh/id_ed25519"
+refused "operator reads the hands key without sudo" /bin/cat "$HHOME/.ssh/id_ed25519"
+check "hands can sign with its key" as_hands bash -c "cd /tmp && echo p > /tmp/levain-iso-payload-\$\$ && ssh-keygen -Y sign -f '$HHOME/.ssh/id_ed25519' -n levain /tmp/levain-iso-payload-\$\$"
+
+echo "== the uid gate"
+SECRET="$HOME/levain-iso-secret"; echo x > "$SECRET"; chmod 600 "$SECRET"
+refused "hands reads the operator's 0600 file" sudo -n -u "$H" /bin/cat "$SECRET"
+refused "hands lists the operator's home" sudo -n -u "$H" /bin/ls "$HOME"
+refused "hands reads the entity's own store under the operator's home" sudo -n -u "$H" /bin/ls "$E/.levain"
+CANARY="LEVAIN_ISO_CANARY=$("$PY" -c 'import secrets; print(secrets.token_hex(16))')"
+env "$CANARY" sleep 300 & CPID=$!
+sleep 1
+if [ -r /proc/self/environ ]; then
+  refused "hands reads the operator's /proc/PID/environ" sudo -n -u "$H" /bin/cat "/proc/$CPID/environ"
+  if sudo -n -u "$H" /bin/cat "/proc/$CPID/cmdline" >/dev/null 2>&1; then
+    info "hands can read the operator's /proc/PID/cmdline (world-readable on Linux unless /proc is mounted hidepid)"
+  fi
+else
+  RD="$(mktemp /tmp/levain-iso-read-XXXXXX.py)"; chmod 644 "$RD"
+  cat > "$RD" <<'PYEOF'
+import ctypes, ctypes.util, sys
+libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+mib = (ctypes.c_int * 3)(1, 49, int(sys.argv[1]))  # CTL_KERN, KERN_PROCARGS2
+size = ctypes.c_size_t(1 << 20); buf = ctypes.create_string_buffer(size.value)
+sys.exit(0 if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) == 0 else 1)
+PYEOF
+  check "operator reads its own process's KERN_PROCARGS2 (control)" /usr/bin/python3 "$RD" "$CPID"
+  refused "hands reads the operator's KERN_PROCARGS2" sudo -n -u "$H" /usr/bin/python3 "$RD" "$CPID"
+
+  echo "== the entity's bash runs as the hands user (M2 S2 slice 2), through levain's own spawn"
+  SH="$(mktemp /tmp/levain-iso-shell-XXXXXX.py)"; chmod 644 "$SH"
+  cat > "$SH" <<'PYEOF'
+import os, sys
+from pathlib import Path
+from levain.firing.confinement import build_policy, hands_for, load_confinement_config, select_provider
+e, cpid, rd = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+cfg = load_confinement_config(e)
+hands = hands_for(cfg, "headless")
+assert hands is not None, "no hands user for a headless session"
+assert hands_for(cfg, "interactive") is None, "the REPL must keep the operator's account"
+policy = build_policy(e, workspace=hands.workspace)
+provider = select_provider()
+with provider.spawn_shell(policy, hands=hands) as sh:
+    def run(cmd, **kw):
+        r = sh.run(cmd, **kw)
+        print(f"  $ {cmd} -> {r.exit_code} {r.output.strip()[:200]!r}")
+        return r
+    assert run("id -un", timeout=30).output.strip() == hands.user
+    assert run("pwd", timeout=30).output.strip() == str(hands.workspace)
+    assert run(f"/usr/bin/python3 {rd} {cpid}", timeout=30).exit_code != 0, "read the operator's KERN_PROCARGS2"
+    assert run(f"ls {Path.home()}", timeout=30).exit_code != 0, "listed the operator's home"
+    assert run("export KEEP=1; cd /tmp", timeout=30).exit_code == 0
+    assert run('echo "$KEEP $PWD"', timeout=30).output.strip() in ("1 /tmp", "1 /private/tmp")
+    assert run("sleep 611 & sleep 612", timeout=2).timed_out
+    assert run("ssh-add -l", timeout=30).exit_code not in (None, 0), "the hands shell reached an ssh-agent"
+    assert run("test -r ~/.ssh/id_ed25519", timeout=30).exit_code == 0, "the entity cannot read its own key"
+provider.hands_write(policy, hands, str(hands.workspace / "from-editor"), b"edited\n")
+st = os.stat(hands.workspace / "from-editor")
+assert st.st_uid == hands.uid, f"the editor's write is owned by {st.st_uid}, not the hands user"
+print("ok")
+PYEOF
+  if "$PY" "$SH" "$E" "$CPID" "$RD"; then pass "a headless shell runs as the hands user and reaches neither the operator's process args nor home; the editor writes as it"; else fail "the hands-user shell"; fi
+  sleep 1
+  refused "a timed-out hands command left a process running" pgrep -u "$HID" -f "sleep 61[12]"
+fi
+kill "$CPID" 2>/dev/null
+
+echo "== workspace: the entity's; the operator reads it (ruling A)"
+check "the workspace belongs to the hands user" test "$(stat -c %u "$WS" 2>/dev/null || stat -f %u "$WS")" = "$HID"
+if [ -n "$(sudo find "$WS" ! -user "$HID" -print -quit)" ]; then fail "setup left something in the workspace that is not the hands user's"; else pass "setup left nothing in the workspace that is not the hands user's"; fi
+check "hands creates a file" as_hands bash -c "cd '$WS' && echo h > from-hands"
+check "operator reads it" /bin/cat "$WS/from-hands"
+check "operator lists the workspace" /bin/ls "$WS"
+refused "operator appends to it" bash -c "echo o >> '$WS/from-hands'"
+refused "operator creates a file" bash -c "echo o > '$WS/from-op'"
+refused "operator creates a folder" mkdir "$WS/op-folder"
+refused "operator renames the entity's file" mv "$WS/from-hands" "$WS/renamed"
+refused "operator deletes the entity's file" rm -f "$WS/from-hands"
+check "hands creates a folder" as_hands mkdir "$WS/hands-folder"
+refused "operator creates a file in the entity's folder" bash -c "echo o > '$WS/hands-folder/x'"
+HPY="$("$PY" -c 'import os,sys; print(os.path.realpath(sys.executable))')"   # the interpreter ws-put finds
+check "hands writes a 0600 file atomically" as_hands "$HPY" -c "import os,tempfile; fd,p=tempfile.mkstemp(dir='$WS'); os.write(fd,b'x'); os.close(fd); os.replace(p,'$WS/atomic-0600')"
+info "its permissions: $(ls -le "$WS/atomic-0600" 2>&1 | tr '\n' ' ')$(getfacl -p "$WS/atomic-0600" 2>/dev/null | tr '\n' ' ')"
+if /bin/cat "$WS/atomic-0600" >/dev/null 2>&1; then pass "operator reads a 0600 file the hands wrote atomically"; else
+  info "operator cannot read a 0600 file the hands wrote atomically (Linux: the ACL mask follows the file mode)"
+  "$PY" -c 'import json,subprocess,sys; from levain.firing import ws_git; h=ws_git.load_hands(sys.argv[1]); sys.exit(subprocess.run(ws_git.mask_repair_argv(h)).returncode)' "$E" >/dev/null 2>&1
+  check "after the mask repair the operator reads it" /bin/cat "$WS/atomic-0600"
+fi
+
+echo "== ws-put: a file of the operator's, written by the entity's user as data"
+printf '#!/bin/sh\necho hi\n' > /tmp/levain-iso-put.sh; chmod 755 /tmp/levain-iso-put.sh
+check "ws-put into a new folder" "$LEVAIN" ws-put --path "$E" /tmp/levain-iso-put.sh notes/run.sh
+check "it belongs to the hands user" test "$(stat -c %u "$WS/notes/run.sh" 2>/dev/null || stat -f %u "$WS/notes/run.sh")" = "$HID"
+check "it is not executable" test "$(stat -c %a "$WS/notes/run.sh" 2>/dev/null || stat -f %Lp "$WS/notes/run.sh")" = 644
+OUT=/tmp/levain-iso-out; rm -rf "$OUT"; mkdir -m 777 "$OUT"
+as_hands ln -s "$OUT" "$WS/lnk"
+refused "ws-put through a symlinked folder" "$LEVAIN" ws-put --path "$E" /tmp/levain-iso-put.sh lnk/x
+check "nothing was written through it" test -z "$(ls -A "$OUT")"
+refused "ws-put out of the workspace" "$LEVAIN" ws-put --path "$E" /tmp/levain-iso-put.sh ../escaped
+as_hands bash -c "echo planted > '$WS/planted.txt'"
+refused "ws-put of a file inside the workspace" "$LEVAIN" ws-put --path "$E" "$WS/planted.txt" copied
+check "control: the same file outside the workspace is copied" bash -c "cp '$WS/planted.txt' /tmp/levain-iso-mine.txt && '$LEVAIN' ws-put --path '$E' /tmp/levain-iso-mine.txt copied"
+as_hands ln -s "$SECRET" /tmp/levain-iso-bait
+refused "ws-put of a link the entity left in /tmp, pointing at a file of yours" "$LEVAIN" ws-put --path "$E" /tmp/levain-iso-bait stolen
+check "nothing of yours landed" test ! -e "$WS/stolen"
+rm -f /tmp/levain-iso-bait /tmp/levain-iso-mine.txt
+echo "== git: every repository is the hands user's (H)"
+CANARY_LOG=/tmp/levain-iso-canary; : > "$CANARY_LOG"; chmod 666 "$CANARY_LOG"
+PLANT="/usr/bin/id -un >> $CANARY_LOG"
+printf '[user]\n\tname = CI Operator\n\temail = ci-operator@invalid\n' > /tmp/levain-iso-clean-gitconfig
+opgit() { env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/tmp/levain-iso-clean-gitconfig git "$@"; }
+export -f opgit
+check "hands creates and commits a repository" as_hands bash -c "cd '$WS' && git init -q repo-h && cd repo-h && echo a > a && git add a && git commit -q -m one"
+check "hands commits again, branches and runs gc" as_hands bash -c "cd '$WS/repo-h' && echo b > b && git add b && git commit -q -m two && git checkout -q -b side && git gc -q"
+check "the entity's commit carries the operator's git identity" as_hands bash -c "cd '$WS/repo-h' && test \"\$(git log -1 --format=%ae)\" = ci-operator@invalid"
+as_hands bash -c "cd '$WS/repo-h' && for h in pre-commit post-checkout post-commit; do printf '#!/bin/sh\n$PLANT\n' > .git/hooks/\$h; chmod +x .git/hooks/\$h; done"
+info "processes of the hands user now: $(ps -U "$HID" -o pid=,ppid=,comm= 2>&1 | tr '\n' ';')"
+refused "operator git reads a repository the hands user owns" opgit -C "$WS/repo-h" status --short
+refused "operator git log in it" opgit -C "$WS/repo-h" log -1
+check "ws-git status works on the hands repository" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-h" status --short
+check "ws-git log works" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-h" log -1 --oneline
+check "ws-git checkout (would fire post-checkout) works" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-h" checkout -q -
+as_hands bash -c "cd '$WS' && git init -q repo-p && cd repo-p && git config core.fsmonitor '$PLANT' && git config alias.st '!$PLANT'"
+refused "ws-git on a repository whose config names a program" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-p" status
+as_hands bash -c "cd '$WS' && git init -q repo-i && cd repo-i && printf '[core]\n\tfsmonitor = $PLANT\n' > /tmp/levain-iso-evil.cfg && git config include.path /tmp/levain-iso-evil.cfg"
+refused "ws-git on a repository that includes another config" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-i" status
+opgit -C "$WS/repo-h" status >/dev/null 2>&1; opgit -C "$WS/repo-p" status >/dev/null 2>&1
+
+echo "== the bare-repository attack: no folder of the operator's to plant one in"
+as_hands bash -c "cd '$WS' && git init -q --bare plant && git --git-dir=plant config core.fsmonitor '$PLANT'"
+as_hands bash -c "mkdir -p '$WS/proj' && cd '$WS/proj' && git init -q --bare .git && git --git-dir=.git config core.fsmonitor '$PLANT' && git --git-dir=.git config core.bare false"
+refused "operator git inside a planted bare repository" bash -c "cd '$WS/plant' && opgit status"
+refused "operator git in a folder whose .git is a planted repository (the rename variant)" opgit -C "$WS/proj" status
+git init -q --bare /tmp/levain-iso-opbare
+check "control: operator git uses a bare repository of its own, found by discovery" bash -c "cd /tmp/levain-iso-opbare && opgit rev-parse --git-dir"
+refused "with safe.bareRepository=explicit it does not" bash -c "cd /tmp/levain-iso-opbare && opgit -c safe.bareRepository=explicit rev-parse --git-dir"
+rm -rf /tmp/levain-iso-opbare
+if [ -n "$(sudo find "$WS" ! -user "$HID" -print -quit)" ]; then fail "something in the workspace is not the hands user's"; else pass "still nothing in the workspace that is not the hands user's"; fi
+if grep -qx "$ME" "$CANARY_LOG"; then fail "entity-planted code ran as the operator"; else pass "no entity-planted code ran as the operator"; fi
+if grep -qx "$H" "$CANARY_LOG"; then info "planted code ran as the hands user under ws-git"; else pass "no planted code ran at all under ws-git"; fi
+check "doctor warns that the runner's git trusts every repository" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'EVERY repository'"
+check "doctor warns while safe.bareRepository is not explicit" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'safe.bareRepository is not'"
+printf '[safe]\n\tbareRepository = explicit\n' > /tmp/levain-iso-explicit-gitconfig
+if GIT_CONFIG_GLOBAL=/tmp/levain-iso-explicit-gitconfig "$LEVAIN" doctor --path "$E" | grep -q 'safe.bareRepository is not'; then fail "doctor warns although it is explicit"; else pass "doctor does not warn once it is explicit"; fi
+
+echo "== the entity opens a folder up to the operator: doctor fails"
+# macOS: the mode bits decide what the operator's read-only ACL entry leaves open. Linux: a named
+# ACL entry wins over the other bits, so the entity has to grant the operator by name.
+if [ "$(uname)" = Darwin ]; then as_hands chmod 777 "$WS/hands-folder"; else as_hands setfacl -m "u:$ME:rwx" "$WS/hands-folder"; fi
+check "the operator can now create a folder there" mkdir "$WS/hands-folder/by-op"
+check "doctor names what the operator can write, and what it owns" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'writable by'"
+rmdir "$WS/hands-folder/by-op"
+if [ "$(uname)" = Darwin ]; then as_hands chmod 755 "$WS/hands-folder"; else as_hands setfacl -m "u:$ME:rx" "$WS/hands-folder"; fi
+if "$LEVAIN" doctor --path "$E" | grep -q 'do not belong to the entity'; then fail "doctor still reports it once closed"; else pass "doctor no longer reports it once closed"; fi
+
+echo "== a folder force-created as the operator: doctor fails"
+sudo mkdir "$WS/forced" && sudo chown "$(id -u)" "$WS/forced"
+refused "doctor passes with it there" "$LEVAIN" doctor --path "$E"
+check "doctor names it" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'do not belong to the entity'"
+sudo rmdir "$WS/forced"
+if "$LEVAIN" doctor --path "$E" | grep -q 'do not belong to the entity'; then fail "doctor still reports it"; else pass "doctor no longer reports it"; fi
+
+echo "== ws-git waits while the entity's user runs anything"
+sudo -n -u "$H" /bin/sleep 120 >/dev/null 2>&1 &
+sleep 1
+refused "ws-git while a hands process runs" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-h" status --short
+check "and it says why" bash -c "\"$LEVAIN\" ws-git --path \"$E\" -C \"$WS/repo-h\" status | grep -q 'processes running'"
+check "ws-adopt refuses too" bash -c "\"$LEVAIN\" ws-adopt --path \"$E\" \"$HOME\" --as never | grep -q 'processes running'"
+sudo -n -u "$H" /usr/bin/pkill -U "$HID" sleep; sleep 1
+check "ws-git once it stopped" "$LEVAIN" ws-git --path "$E" -C "$WS/repo-h" status --short
+
+echo "== ws-adopt imports a repository of the operator's, from where it is"
+MINE="$HOME/levain-iso-mine"; rm -rf "$MINE"
+git init -q "$MINE" && git -C "$MINE" checkout -q -b main && echo m > "$MINE/m" && git -C "$MINE" add m && git -C "$MINE" commit -q -m one
+git -C "$MINE" checkout -q -b side && echo s > "$MINE/s" && git -C "$MINE" add s && git -C "$MINE" commit -q -m two
+git -C "$MINE" checkout -q -b feature/x && git -C "$MINE" commit -q --allow-empty -m three && git -C "$MINE" checkout -q main && git -C "$MINE" tag v1
+BEFORE="$(git -C "$MINE" for-each-ref)"
+check "ws-adopt imports it" "$LEVAIN" ws-adopt --path "$E" "$MINE"
+check "the import belongs to the hands user" test "$(stat -c %u "$WS/levain-iso-mine/.git" 2>/dev/null || stat -f %u "$WS/levain-iso-mine/.git")" = "$HID"
+check "every branch and tag came across" bash -c "test \"\$(git -C '$MINE' for-each-ref --format='%(refname) %(objectname)' refs/heads refs/tags)\" = \"\$('$LEVAIN' ws-git --path '$E' -C '$WS/levain-iso-mine' for-each-ref --format='%(refname) %(objectname)' refs/heads refs/tags)\""
+check "the original is where it was, unchanged" test "$(git -C "$MINE" for-each-ref)" = "$BEFORE"
+refused "operator git reads the import" opgit -C "$WS/levain-iso-mine" status --short
+check "the entity commits in it" as_hands bash -c "cd '$WS/levain-iso-mine' && echo e > e && git add e && git commit -q -m entity"
+refused "ws-adopt of a repository inside the workspace" "$LEVAIN" ws-adopt --path "$E" "$WS/repo-h" --as again
+rm -rf "$MINE"
+
+echo "== undo, with a hands process still running"
+BAIT="$HOME/levain-iso-bait"; echo b > "$BAIT"; chmod 600 "$BAIT"
+as_hands ln -s "$BAIT" "$WS/to-bait"          # undo runs chmod as root: it must not follow this
+sudo -n -u "$H" /bin/sleep 600 >/dev/null 2>&1 &
+sleep 1
+SUDOERS="/etc/sudoers.d/levain-$H"
+setup --undo || fail "undo exited nonzero"
+check "the hands user stays, as a tombstone holding its id" test "$(id -u "$H" 2>/dev/null)" = "$HID"
+if [ "$(uname)" = Darwin ]; then
+  check "it is marked retired" bash -c "dscl . -read '/Users/$H' RealName | grep -q retired"
+  check "it is disabled for login" bash -c "sudo dscl . -read '/Users/$H' AuthenticationAuthority | grep -q DisabledUser"   # root-readable only
+  check "its shell is /usr/bin/false" bash -c "dscl . -read '/Users/$H' UserShell | grep -q /usr/bin/false"
+else
+  check "it is marked retired" bash -c "getent passwd '$H' | cut -d: -f5 | grep -q retired"
+  check "its password is locked" bash -c "sudo passwd -S '$H' | awk '{print \$2}' | grep -qx L"
+  check "it is expired" bash -c "sudo chage -l '$H' | grep -i 'account expires' | grep -vq never"
+  refused "root's su to it with an explicit shell (expired)" sudo su -s /bin/sh "$H" -c /bin/true
+fi
+# The operator's own `sudo -u` cannot be probed here: the runner account may run anything as anyone.
+# What the rule granted is gone, which is what that would show:
+refused "its sudoers rule is gone" sudo test -e "/etc/sudoers.d/levain-$H"
+refused "root's su to it" sudo su "$H" -c /usr/bin/true
+check "its home and ssh key are gone" bash -c "! sudo test -e '$HHOME/.ssh/id_ed25519'"
+refused "a hands process survived" pgrep -U "$HID"
+refused "sudoers drop-in still exists" sudo test -e "$SUDOERS"
+refused "sshd drop-in still exists" sudo test -e "/etc/ssh/sshd_config.d/levain-$H.conf"
+if [ -e "$CRON_DENY" ]; then refused "hands user still in $CRON_DENY" grep -qx "$H" "$CRON_DENY"; fi
+if [ -n "$(cfgval hands_user)$(cfgval hands_uid)$(cfgval hands_workspace)" ]; then fail "hands keys still recorded"; else pass "hands keys removed from confinement.json"; fi
+check "the non-empty workspace is kept" test -d "$WS"
+OPGID="$(id -g)"
+check "the files the hands created keep the retired id as owner (never the operator's, never root's)" test "$(stat -c %u "$WS/from-hands" 2>/dev/null || stat -f %u "$WS/from-hands")" = "$HID"
+check "and have the operator's group" test "$(stat -c %g "$WS/from-hands" 2>/dev/null || stat -f %g "$WS/from-hands")" = "$OPGID"
+check "and the operator can read them" /bin/cat "$WS/from-hands"
+if [ -n "$(sudo find "$WS" \( -user 0 -o -user "$ME" \) -print -quit 2>/dev/null)" ]; then fail "undo gave something in the workspace to root or the operator"; else pass "nothing in the workspace is root's or the operator's"; fi
+check "operator still reads the workspace after undo" /bin/ls "$WS"
+check "undo did not change what an entity link points at" test "$(stat -c %a "$BAIT" 2>/dev/null || stat -f %Lp "$BAIT")" = 600
+rm -f "$BAIT"
+check "the entity's repository keeps the retired id as owner" test "$(stat -c %u "$WS/repo-h/.git" 2>/dev/null || stat -f %u "$WS/repo-h/.git")" = "$HID"
+refused "operator git reads the entity's repository after undo" opgit -C "$WS/repo-h" status --short
+refused "sudo git reads it after undo (git checks SUDO_UID, the operator)" sudo env GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$WS/repo-h" status --short
+refused "root's own git reads it after undo" sudo env -u SUDO_UID GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git -C "$WS/repo-h" status --short
+check "operator can clone it to keep the work" bash -c "opgit -c safe.directory='$WS/repo-h' -c core.hooksPath=/dev/null clone -q --no-local '$WS/repo-h' /tmp/levain-iso-kept && test -e /tmp/levain-iso-kept/a"
+if grep -qx "$ME" "$CANARY_LOG"; then fail "entity-planted code ran as the operator after undo"; else pass "no entity-planted code ran as the operator after undo"; fi
+if [ "$(uname)" = Darwin ]; then
+  if ls -leR "$(dirname "$WS")" 2>/dev/null | grep -qE '^ [0-9]+: '; then fail "ACL entries left in the workspace"; else pass "no ACL entries left in the workspace"; fi
+else
+  if getfacl -Rp "$(dirname "$WS")" 2>/dev/null | grep -qE '^(default:)?user:[^:]+:'; then fail "ACL entries left in the workspace"; else pass "no ACL entries left in the workspace"; fi
+fi
+
+echo "== setup again: refused while the tombstone stands, then re-enabled with the same id"
+sudo rm -rf "$(dirname "$WS")"
+if setup >/tmp/levain-iso-again.log 2>&1; then fail "a plain setup over the tombstone was allowed"; else pass "a plain setup over the tombstone is refused"; fi
+check "and it points at --reenable" grep -q -- "--reenable" /tmp/levain-iso-again.log
+setup --reenable >/dev/null || fail "setup --reenable failed"
+HID2="$(cfgval hands_uid)"
+if [ "$HID2" = "$HID" ]; then pass "re-enabled with the same id $HID"; else fail "re-enabled with id '$HID2', not $HID"; fi
+check "it can run again" sudo -n -u "$H" /usr/bin/true
+check "doctor sees it set up" bash -c "\"$LEVAIN\" doctor --path \"$E\" | grep -q 'is set up'"
+setup --undo >/dev/null || fail "second undo failed"
+check "a tombstone again, same id" test "$(id -u "$H" 2>/dev/null)" = "$HID"
+check "operator still has sudo" sudo -n /usr/bin/true
+rm -f "$SECRET"
+
+echo "== $FAILS failure(s)"
+exit "$FAILS"

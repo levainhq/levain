@@ -16,10 +16,11 @@ LOAD-BEARING INVARIANT — per-user, NO admin/root. A launchd *user* agent
 ``schtasks`` task WITHOUT ``/RU SYSTEM`` — never a system LaunchDaemon / service. This keeps the
 install sovereign + sudo-free, and is exactly what rejects the Windows-*Service* path.
 
-THREAT-MODEL (M2): always-on means a 24/7 token-free loopback-LOCAL write window — any *local*
-process can POST to the cockpit. That is the same posture as any localhost dev server;
-browser/cross-origin attacks stay kernel-blocked (Host allowlist + CSRF + the loopback bind).
-Off-box (``--host <mesh>``) is deliberately NOT daemonized here — an install-bearing serve is
+THREAT-MODEL (M2, K2a): always-on means a 24/7 loopback-LOCAL cockpit. Every write needs the
+serve's write token, on loopback too, because 127.0.0.1 is reachable by every local uid. The serve
+mints a fresh token on each start and prints it, with the unlocked link, to stdout, which is the
+unit's log (created owner-only by ``_private_logs``). Browser/cross-origin attacks stay blocked
+(Host allowlist + CSRF + the loopback bind). Off-box (``--host <mesh>``) is deliberately NOT daemonized here — an install-bearing serve is
 loopback-only by construction (its seed/config is operator-private).
 """
 
@@ -421,7 +422,9 @@ class DaemonProvider(ABC):
 
 
 def _run(cmd: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    from levain.launch import child_env
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=child_env())
     if check and proc.returncode != 0:
         msg = (proc.stderr or proc.stdout or "").strip()
         raise DaemonError(f"`{' '.join(cmd)}` failed (rc={proc.returncode}): {msg}")
@@ -437,6 +440,34 @@ def _refuse_root() -> None:
         raise DaemonError(
             "refusing to run as root / via sudo — the Levain daemon is a per-user agent and "
             "needs no admin. Re-run as your normal user, without sudo.")
+
+
+def _private_logs(spec: "DaemonSpec") -> None:
+    """Keep the unit's logs owner-only: a writable serve prints its per-launch write token to
+    stdout, which is this log.
+
+    systemd's ``append:`` creates a missing log 0664 in a 0775 directory (measured on Ubuntu 24.04,
+    2026-10-11), readable by any local user who can traverse the operator's home, the party the
+    write token keeps out. So levain's own Linux log directory is made 0700, which also covers a
+    log deleted, rotated or recreated after install, and each log is created or narrowed to 0600.
+    macOS's default, ``~/Library/Logs``, is shared with other apps and is left alone: ``~/Library``
+    is owner-only by default."""
+    own_dir = platform.system() != "Darwin" and spec.stdout_log.parent == _default_log_dir().expanduser().resolve()
+    path = spec.stdout_log.parent
+    try:
+        for path in dict.fromkeys((spec.stdout_log.parent, spec.stderr_log.parent)):
+            path.mkdir(parents=True, exist_ok=True)
+        if own_dir:
+            path = spec.stdout_log.parent
+            os.chmod(path, 0o700)
+        for path in (spec.stdout_log, spec.stderr_log):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+    except OSError as exc:
+        raise DaemonError(f"cannot make {path} owner-only: {exc}. Nothing was installed.") from exc
 
 
 # --- macOS: launchd USER agent ---------------------------------------------------------------
@@ -515,8 +546,7 @@ class LaunchdProvider(DaemonProvider):
     def install(self, spec: DaemonSpec) -> str:
         _refuse_root()
         self.UNIT_DIR.mkdir(parents=True, exist_ok=True)
-        spec.stdout_log.parent.mkdir(parents=True, exist_ok=True)
-        spec.stderr_log.parent.mkdir(parents=True, exist_ok=True)
+        _private_logs(spec)
         plist_path = self._plist_path(spec.label)
         domain = self._domain()
         # TRANSACTIONAL + ATOMIC (the install-honesty floor): a failed bootstrap must neither DESTROY a
@@ -964,8 +994,7 @@ class SystemdUserProvider(DaemonProvider):
                 "(StandardOutput=append:). Nothing was written."
             )
         self.UNIT_DIR.mkdir(parents=True, exist_ok=True)
-        spec.stdout_log.parent.mkdir(parents=True, exist_ok=True)
-        spec.stderr_log.parent.mkdir(parents=True, exist_ok=True)
+        _private_logs(spec)
 
         service_path = self._service_path(spec.label)
         timer_path = self._timer_path(spec.label)
@@ -1223,8 +1252,10 @@ def select_provider(system: str | None = None) -> DaemonProvider:
 
 
 THREAT_MODEL_NOTE = (
-    "An always-on serve is a 24/7 loopback-LOCAL write window: any LOCAL process on this "
-    "machine can write to the cockpit (no token — the localhost bind + Host/CSRF guards are "
-    "the auth, same as any localhost dev server). Cross-origin/browser attacks stay blocked. "
-    "Off-box (--host <mesh>) is NOT daemonized — an install-bearing serve is loopback-only."
+    "An always-on serve is a 24/7 loopback-LOCAL cockpit. Every write needs its write token, on "
+    "loopback too. The token changes each time the daemon starts and is printed only to the "
+    "daemon's log (owner-only) with an `open the cockpit, unlocked:` link: open the link from "
+    "the latest start (after a login or a restart the page asks again). Cross-origin/browser "
+    "attacks stay blocked. Off-box (--host <mesh>) is NOT daemonized: an install-bearing serve is "
+    "loopback-only."
 )

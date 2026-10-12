@@ -4,8 +4,9 @@
 // build_field_plan projection) using createElement/textContent ONLY — no
 // innerHTML, so the page's CSP can be `script-src 'self'; style-src 'self'`
 // with no inline exception and no injection sink. On submit it POSTs
-// {adapter, answers} to /init (same-origin fetch, application/json — exactly
-// what the server's write/auth boundary requires) and renders the result.
+// {adapter, answers} to /init (same-origin fetch, application/json, and the
+// run's write token in X-Levain-Write-Token — exactly what the server's
+// write/auth boundary requires) and renders the result.
 
 (function () {
   "use strict";
@@ -35,6 +36,23 @@
   var submitNote = document.getElementById("submit-note");
   var resultEl = document.getElementById("result");
   var formEl = document.getElementById("init-form");
+
+  // The write token: `levain init --web` opens this page with it in the URL FRAGMENT (never sent to
+  // the server). Take it and strip it from the address bar; it lives only in this page, so a reload
+  // or a link opened without it asks for the token the command printed.
+  var writeToken = (function takeFragmentToken() {
+    try {
+      var params = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+      var tok = params.get("write_token");
+      if (tok === null) return "";
+      params.delete("write_token");
+      var rest = params.toString();
+      try {
+        history.replaceState(null, "", location.pathname + location.search + (rest ? "#" + rest : ""));
+      } catch (_) { /* no history API: the token still works for this page */ }
+      return /^[\x21-\x7e]+$/.test(tok) ? tok : "";
+    } catch (_) { return ""; }
+  })();
 
   var plan = null;         // the loaded /init-plan.json
   var fieldControls = [];  // [{slot, style, getEl}] for collectAnswers
@@ -313,13 +331,27 @@
     submitBtn.disabled = true;
     setNote("installing…", false);
     try {
-      var res = await fetch("/init", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ adapter: adapter, answers: collectAnswers() }),
-      });
-      var data = {};
-      try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
+      var body = JSON.stringify({ adapter: adapter, answers: collectAnswers() });
+      var res, data;
+      for (var attempt = 0; attempt < 2; attempt++) {
+        if (!writeToken) {
+          var typed = window.prompt("The write token `levain init --web` printed in your terminal:");
+          if (typed === null) { setNote("not installed: the write token is needed", true); return; }
+          writeToken = typed.trim();
+          // a token travels in a request header: printable ASCII without spaces, as the link's is
+          if (!/^[\x21-\x7e]+$/.test(writeToken)) { writeToken = ""; continue; }
+        }
+        res = await fetch("/init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Levain-Write-Token": writeToken },
+          body: body,
+        });
+        data = {};
+        try { data = await res.json(); } catch (_) { /* tolerate a non-JSON body */ }
+        if (res.status !== 403 || data.error !== "credential_required") break;
+        writeToken = "";      // a wrong or missing token: ask once more
+      }
+      if (!res) { setNote("not installed: that is not a write token", true); return; }
       if (res.ok) {
         renderResult(data);
         setNote(data.ok ? "done" : "partial — see below", !data.ok);

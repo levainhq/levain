@@ -66,6 +66,7 @@ def _server(kind: str, tmp_path: Path):
         httpd = make_docs_server(tmp_path, port=0)
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
+    _TOKEN[kind] = getattr(httpd, "write_token", None)
     try:
         yield httpd.server_address[1]
     finally:
@@ -119,6 +120,7 @@ def test_each_security_header_appears_once_on_a_normal_response(tmp_path, kind):
 
 
 WRITE_ROUTES = {"serve": "/edit", "init": "/init"}
+_TOKEN: dict[str, str | None] = {}
 
 
 def _raw_post(port: int, path: str, headers: dict, body: bytes = b""):
@@ -164,8 +166,36 @@ def test_every_write_server_runs_the_shared_write_preamble(tmp_path, kind, heade
         with _server(kind, tmp_path) as port:
             # No body: a refused request's unread bytes can make the kernel reset the socket before
             # the response is read (complement L3).
-            got, resp_headers, _ = _raw_post(port, WRITE_ROUTES[kind], headers)
+            # init's write token is checked right after the origin checks (K2a's order); send it so the
+            # later refusals are reached. The bad-host and cross-site cases refuse before it is read.
+            tok = {"X-Levain-Write-Token": _TOKEN[kind]} if kind == "init" else {}
+            got, resp_headers, _ = _raw_post(port, WRITE_ROUTES[kind], {**tok, **headers})
     finally:
         sys.set_int_max_str_digits(old_limit)
     assert got == status, f"{kind}: {headers} -> {got}"
     assert resp_headers.get("Connection") == "close"
+
+
+def test_verbose_access_log_never_carries_a_search_query(monkeypatch, capsys) -> None:
+    from levain.http_guards import GuardedHandler
+
+    monkeypatch.setenv("LEVAIN_SERVE_VERBOSE", "1")
+    h = GuardedHandler.__new__(GuardedHandler)
+    h.client_address = ("127.0.0.1", 1)
+    h.requestline = "GET /cockpit/panel/episodes.json?limit=5&q=secret%20words HTTP/1.1"
+    h.log_request(200)
+    err = capsys.readouterr().err
+    assert "secret" not in err and "q=-" in err and "limit=5" in err
+
+
+def test_verbose_access_log_redacts_q_by_its_decoded_name_and_on_the_error_path(monkeypatch, capsys) -> None:
+    from levain.http_guards import GuardedHandler
+
+    monkeypatch.setenv("LEVAIN_SERVE_VERBOSE", "1")
+    h = GuardedHandler.__new__(GuardedHandler)
+    h.client_address = ("127.0.0.1", 1)
+    h.requestline = "GET /cockpit/panel/p.json?%71=secret&limit=5&q%3D=kept HTTP/1.1"
+    h.log_request(200)
+    h.log_error("code %d, message %s", 400, "Bad request syntax ('GET /x?a=1&q=hidden HTTP/1.1')")
+    err = capsys.readouterr().err
+    assert "secret" not in err and "hidden" not in err and "%71=-" in err and "limit=5" in err and "a=1" in err

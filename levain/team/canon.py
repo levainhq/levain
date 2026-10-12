@@ -55,7 +55,7 @@ def render(team: R.Team, ledger: I.Ledger, *, tree: str, by: str, ts: str) -> st
         f"# {team.project}: project canon",
         "",
         f"generated {ts} by {by} from ledger {tree} ({_count(ledger)} entries); do not hand-edit.",
-        f"The ledger (branch `levain-ledger`, `ledger/`) is the source of truth; this file is derived from it.",
+        f"The ledger (branch `levain-team-ledger`, `ledger/`) is the source of truth; this file is derived from it.",
         f"Owner: {team.owner} · members: {', '.join(team.members)} · default mode: {team.mode}",
         "",
     ]

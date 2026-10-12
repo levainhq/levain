@@ -763,6 +763,8 @@ def _print_banner(
     allow_container_sockets: bool = False,
     bash_note: str | None = None,
     bash_offline: bool = False,
+    hands_user: str | None = None,
+    workspace: Path | None = None,
 ) -> None:
     """The session header — and the HONESTY FLOOR: show the operator exactly which stores this
     entity reads/writes, what hands it has, AND what the crown-jewels floor keeps off-limits, so
@@ -783,12 +785,18 @@ def _print_banner(
     print(f"  model:     {model}")
     print(f"  memory:    {binding.episodic_path}")
     print(f"             {binding.crystal_path}")
-    print(f"  workspace: {entity_dir / WORKSPACE_SUBDIR}")
+    print(f"  workspace: {workspace if workspace is not None else entity_dir / WORKSPACE_SUBDIR}")
     if not with_tools:
         print("  tools:     none (conversational partner; --no-tools)")
     else:
         hands = "file_editor + terminal (bash)" if bash_ok else "file_editor"
         print(f"  tools:     {hands} — confined to the crown-jewels floor")
+        if hands_user is not None:
+            # M2 S2: the entity's own OS user, so the kernel keeps it out of your processes'
+            # environments and your files, beneath the floor.
+            print(f"             bash runs as the entity's own user {hands_user} (the file editor")
+            print("             reads and writes as it too, in its workspace only): it cannot read")
+            print("             your processes or your home")
         if bash_ok and bash_offline:
             # The residual is the shared OFFLINE_RESIDUAL that doctor prints too (codex, L3 on B).
             print("             ⚠ bash has no IP network: on Linux, blocking connections back to this")
@@ -810,7 +818,11 @@ def _print_banner(
                 print("             run `levain doctor` for the full confinement diagnosis")
         print("  floor:     DENIES ~/.anneal-memory/ (flow store) · sibling entity stores ·")
         print("             operator creds + the confinement config (.levain/confinement.json)")
-        if ssh_mode == "agent":
+        if hands_user is not None:
+            # M2 S3 (slice 4): the ssh-agent refuses another uid, and levain does not pass its socket.
+            print("             ~/.ssh: not reachable; the entity's ssh uses its own key")
+            print(f"               (~{hands_user}/.ssh/id_ed25519); your ssh-agent is not passed to it")
+        elif ssh_mode == "agent":
             print("             ~/.ssh key material (agent-auth only — keys usable, not readable)")
         else:
             print("             ⚠ ~/.ssh NOT confined (ssh_mode=raw — raw key reads ALLOWED;")
@@ -916,6 +928,9 @@ def _banner_for(
         gate_mode=session.gate_mode, max_seconds=max_seconds, bash_note=bash_note,
         allow_container_sockets=session.allow_container_sockets,
         bash_offline=getattr(session, "bash_offline", False),
+        hands_user=getattr(session, "hands_user", None),
+        workspace=(getattr(session, "workspace", None)
+                   if getattr(session, "hands_user", None) else None),
     )
 
 

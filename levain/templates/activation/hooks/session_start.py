@@ -104,16 +104,27 @@ def main() -> int:
         if identity:
             sections.append(identity)
 
-        # 2c. Live focus — the operator's declared "what I'm on now", surfaced at
-        #     primacy so the partner orients to their frame. The cockpit/CLI SET the
-        #     focus (.levain/context.json); this is the READ that makes the partner
-        #     SEE it (was write-only into the render — a set focus never reached the
-        #     session). Always-fire like posture (it's every-session orienting
-        #     context); self-silent when no focus is set, and freshness-flagged so a
-        #     stale one prompts a re-confirm rather than being trusted as current.
-        focus = hook.focus_notice()
-        if focus:
-            sections.append(focus)
+        # 2c. The operator's freeform state line (verbatim, with age, dropped once older than _STATE_EXPIRES_AFTER_HOURS).
+        #     Seeds the per-session "seen" marker with what it showed (also when nothing was
+        #     live, and on every `source`, compact included), so the per-prompt hook speaks
+        #     only on a change. The marker is written only after emit() succeeded. Its own
+        #     try: a fault here drops only this section.
+        session_id = payload.get("session_id")
+        pending_sig = None
+        try:
+            if hasattr(hook, "state_line"):
+                line = hook.state_line()
+                if line is not None:
+                    if line[1]:
+                        sections.append(line[1])
+                    pending_sig = line[0]
+            else:
+                # A pack's older helper without state_line: the plain reader still shows the line.
+                legacy = hook.state_notice()
+                if legacy:
+                    sections.append(legacy)
+        except Exception:
+            pass
 
         # 3. Layer D — start-catch. Fires only on a genuinely fresh session;
         #    on `resume`/`compact` the unwrapped count reflects ongoing work.
@@ -121,51 +132,67 @@ def main() -> int:
         #    is Claude Code's SessionStart payload — a harness-coupling point a
         #    non-Claude-Code adapter must re-verify (see _levain_hook docstring).
         if payload.get("source") in ("startup", "clear"):
+            # Each section below has its own try: one raising never discards the rest.
             # wrap_state, not episodes_since_wrap: a wrap left open by the
             # session that just ended is EXACTLY the state a fresh session
             # opens into, and telling it to run prepare_wrap sends it at the
             # one call that cannot succeed (Alex De Groodt, 2026-08-04).
-            state = _wrap_state_compat(hook)
-            if state is not None:
-                n, wrap_in_progress = state
-                if wrap_in_progress and hasattr(hook, "format_wrap_blocked"):
-                    sections.append(hook.format_wrap_blocked(fresh_session=True))
-                elif n > 0:
-                    sections.append(
-                        f"[wrap check] {n} episode(s) recorded since the last "
-                        f"wrap. If your last session did real work, run the wrap "
-                        f"sequence (prepare_wrap -> compress -> save_continuity) "
-                        f"to consolidate it — unwrapped episodes never compound "
-                        f"into continuity. They are not lost: prepare_wrap still "
-                        f"sees them."
-                    )
+            try:
+                state = _wrap_state_compat(hook)
+                if state is not None:
+                    n, wrap_in_progress = state
+                    if wrap_in_progress and hasattr(hook, "format_wrap_blocked"):
+                        sections.append(hook.format_wrap_blocked(fresh_session=True))
+                    elif n > 0:
+                        sections.append(
+                            f"[wrap check] {n} episode(s) recorded since the last "
+                            f"wrap. If your last session did real work, run the wrap "
+                            f"sequence (prepare_wrap -> compress -> save_continuity) "
+                            f"to consolidate it — unwrapped episodes never compound "
+                            f"into continuity. They are not lost: prepare_wrap still "
+                            f"sees them."
+                        )
+            except Exception:
+                pass
 
-            # Time-based spore germination — open loops that have gone dormant
-            # or whose `next` date has arrived, surfaced once on a fresh session
-            # so nothing rots silently. Growing/resting/parked stay out of the
-            # way. Fires only on a fresh session (with the wrap-check), not on
-            # resume/compact mid-flow.
-            due = hook.due_dormant_spores(hook.open_spores())
-            if due:
-                sections.append(hook.format_due_spores(due))
+            try:
+                # Time-based spore germination — open loops that have gone dormant
+                # or whose `next` date has arrived, surfaced once on a fresh session
+                # so nothing rots silently. Growing/resting/parked stay out of the
+                # way. Fires only on a fresh session (with the wrap-check), not on
+                # resume/compact mid-flow.
+                due = hook.due_dormant_spores(hook.open_spores())
+                if due:
+                    sections.append(hook.format_due_spores(due))
+            except Exception:
+                pass
 
-            # Compatibility drift — a once-per-fresh-session nudge if the version
-            # SET fell out of sync (anneal changed underneath the install, or
-            # unreviewed migration proposals exist). Cheap + fail-silent; the
-            # authoritative multi-axis verify is `levain doctor`.
-            drift = hook.compat_drift()
-            if drift:
-                sections.append(drift)
+            try:
+                # Compatibility drift — a once-per-fresh-session nudge if the version
+                # SET fell out of sync (anneal changed underneath the install, or
+                # unreviewed migration proposals exist). Cheap + fail-silent; the
+                # authoritative multi-axis verify is `levain doctor`.
+                drift = hook.compat_drift()
+                if drift:
+                    sections.append(drift)
+            except Exception:
+                pass
 
-            # Pack drift — a pulled pack SOURCE changed since this install was
-            # composed. Same fail-silent nudge toward `levain update`, for the
-            # DOWNSTREAM pack axis (the operator's doctrine, not the engine).
-            pack = hook.pack_drift()
-            if pack:
-                sections.append(pack)
+            try:
+                # Pack drift — a pulled pack SOURCE changed since this install was
+                # composed. Same fail-silent nudge toward `levain update`, for the
+                # DOWNSTREAM pack axis (the operator's doctrine, not the engine).
+                pack = hook.pack_drift()
+                if pack:
+                    sections.append(pack)
+            except Exception:
+                pass
 
+        delivered = True
         if sections:
-            hook.emit("\n\n".join(sections), "SessionStart")
+            delivered = hook.emit("\n\n".join(sections), "SessionStart") is True
+        if delivered and pending_sig is not None and isinstance(session_id, str) and session_id:
+            hook.state_seen_record(session_id, pending_sig)
     except Exception:
         # Structural fail-open: no error escapes a harness entry point.
         pass

@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
+import shlex
 from pathlib import Path
 
 import pytest
@@ -200,15 +203,18 @@ def test_codex_global_files_of_another_install_are_left_alone(make_install, tmp_
     before = hooks.read_text(), config.read_text()
     assert str(other) in before[0]
     r, out = _refresh(install)
+    # hooks.json is not what levain wrote for THIS install, and this levain renders the same
+    # as it did: kept as it is. Had the package moved, _refresh_decision would stage it.
     assert not r.review and (hooks.read_text(), config.read_text()) == before
-    assert "belongs to another install" in out and "another store" in out
+    assert "another store" in out
 
 
 def test_codex_global_files_of_this_install_are_refreshed(make_install, tmp_path):
     install = make_install("codex")
     hooks = tmp_path / "codex-home" / "hooks.json"
     current = hooks.read_text()
-    older = current.replace("activation", "activation-old")
+    older = current.replace('"timeout": 30', '"timeout": 31')   # still this install's shape
+    assert older != current
     hooks.write_text(older)
     receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
     data = json.loads(receipt.read_text())
@@ -218,6 +224,65 @@ def test_codex_global_files_of_this_install_are_refreshed(make_install, tmp_path
     r, _out = _refresh(install)
     assert str(hooks) in r.refreshed and hooks.read_text() == current
     assert list(hooks.parent.glob("hooks.json.bak.*"))
+
+
+def _codex_r7_shape(shape: str, current: str, tmp_path: Path) -> str:
+    """hooks.json texts from spore-866 L3 r7's findings against the deleted text predicate,
+    and a legacy install's own render from another interpreter. On 3d6152a the echo,
+    symlink and legacy texts were overwritten; nan_constant was already refused there and
+    stays as a regression pin."""
+    data = json.loads(current)
+    cmd = data["hooks"]["SessionStart"][0]["hooks"][0]
+    script = shlex.split(cmd["command"])[1]
+    if shape == "nan_constant":        # a JSON constant json.loads accepts
+        cmd["timeout"] = float("nan")
+    elif shape == "echo_exact_script":  # the exact generated command, run by something else
+        cmd["command"] = "/bin/echo " + cmd["command"]
+    elif shape == "symlink_dotdot":    # normpath collapses `link/..`; the kernel follows link
+        (tmp_path / "far" / "away").mkdir(parents=True)
+        (tmp_path / "link").symlink_to(tmp_path / "far" / "away")
+        rel = Path(script).relative_to(tmp_path)
+        cmd["command"] = cmd["command"].replace(script, f"{tmp_path}/link/../{rel}")
+    else:                              # "legacy": levain's render, another interpreter
+        cmd["command"] = cmd["command"].replace(shlex.split(cmd["command"])[0],
+                                                "/usr/old/bin/python3", 1)
+    return json.dumps(data, indent=2)
+
+
+@pytest.mark.parametrize("shape", ["nan_constant", "echo_exact_script", "symlink_dotdot",
+                                   "legacy"])
+def test_codex_hooks_not_recorded_for_this_install_are_staged(
+        make_install, tmp_path, monkeypatch, shape):
+    # Phill 2026-10-10, "go with B": the adapter receipt alone decides. With no record of
+    # levain writing hooks.json (an install from before 0.5.0, or a lost receipt), any bytes
+    # go to pending, untouched. MUTATION (2026-10-10): on 3d6152a's install.py the echo,
+    # symlink and legacy cases were overwritten.
+    import levain.install as inst_mod
+
+    install = make_install("codex")
+    hooks = tmp_path / "codex-home" / "hooks.json"
+    current = hooks.read_text()
+    text = _codex_r7_shape(shape, current, tmp_path)
+    assert text != current
+    hooks.write_text(text)
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
+    data = json.loads(receipt.read_text())
+    del data["files"]["codex-home/hooks.json"]
+    receipt.write_text(json.dumps(data))
+    r, out = _refresh(install)
+    assert hooks.read_text() == text and "codex-home/hooks.json" in r.review
+    staged = install.joinpath(".levain", "pending", "codex-home", "hooks.json")
+    assert staged.read_text() == current
+    assert not list(hooks.parent.glob("hooks.json.bak.*"))
+    r, out = _refresh(install)                        # once, then quiet
+    assert hooks.read_text() == text and not r.review and "hooks.json" not in out
+    hooks.write_text(staged.read_text())              # the operator accepts levain's version
+    r, out = _refresh(install)
+    assert not r.review and not r.refreshed
+    moved = current + "\n"                           # the next release refreshes it
+    monkeypatch.setattr(inst_mod, "_codex_hooks_json", lambda *a: moved)
+    r, out = _refresh(install)
+    assert str(hooks) in r.refreshed and hooks.read_text() == moved
 
 
 def test_an_openhands_entity_has_nothing_to_refresh(make_install):
@@ -708,3 +773,233 @@ def test_ack_is_skipped_on_a_run_that_refreshes_the_carrier(tmp_path, capsys, mo
     assert carrier.read_text() == current
     assert _migrate_state(install).migrate_acked == before.migrate_acked
     assert "--ack SKIPPED" in out and "refreshed" in out
+
+
+def test_an_interrupted_codex_hooks_write_leaves_the_old_file(tmp_path, monkeypatch):
+    # Reproduced 2026-10-10 on a4b2bef: ENOSPC during the write left NO hooks.json (it was
+    # unlinked first), only its backup. Now it is written beside it and renamed over it.
+    import errno
+    import os
+
+    from levain.install import _write_codex_hooks
+
+    hooks = tmp_path / "hooks.json"
+    hooks.write_text('{"old": true}\n')
+
+    def full(*_a):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "fsync", full)
+    with pytest.raises(OSError):
+        _write_codex_hooks(hooks, '{"new": true}\n', lambda _s: None)
+    assert hooks.read_text() == '{"old": true}\n'
+    assert sorted(p.name.split(".bak.")[0] for p in tmp_path.iterdir()) == ["hooks.json",
+                                                                           "hooks.json"]
+    monkeypatch.undo()
+    _write_codex_hooks(hooks, '{"new": true}\n', lambda _s: None)
+    assert hooks.read_text() == '{"new": true}\n'
+    # codex L3 r2, reproduced: a NEW file was forced to 0644 under umask 077.
+    fresh = tmp_path / "new" / "hooks.json"
+    fresh.parent.mkdir()
+    old_umask = os.umask(0o077)
+    try:
+        _write_codex_hooks(fresh, "{}", lambda _s: None)
+    finally:
+        os.umask(old_umask)
+    assert fresh.stat().st_mode & 0o077 == 0
+
+
+def test_init_over_a_dangling_hooks_json_symlink_writes_the_file(make_install, tmp_path):
+    # glm L3 r3 HIGH 2026-10-10, reproduced through `levain init`: the backup followed the
+    # missing link and raised FileNotFoundError after config.toml was already written.
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    hooks = codex_home / "hooks.json"
+    hooks.symlink_to(tmp_path / "nowhere" / "hooks.json")
+    install = make_install("codex")  # asserts init exits 0
+    assert hooks.is_file() and not hooks.is_symlink()
+    assert str(install) in hooks.read_text()
+    (bak,) = codex_home.glob("hooks.json.bak.*")
+    assert bak.is_symlink() and os.readlink(bak) == str(tmp_path / "nowhere" / "hooks.json")
+
+
+def test_an_adopted_staged_copy_is_removed(make_install, tmp_path):
+    # Reproduced 2026-10-10 through `levain update`: the pending copy outlived its adoption,
+    # so copying it over later downgraded the file and the next update called that "keep".
+    install = make_install("codex")
+    hooks = tmp_path / "codex-home" / "hooks.json"
+    current = hooks.read_text()
+    hooks.write_text(current.replace('"timeout": 30', '"timeout": 45'))  # an operator edit
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
+    data = json.loads(receipt.read_text())
+    data["files"]["codex-home/hooks.json"] = _sha(b"an older release's render")
+    receipt.write_text(json.dumps(data))
+    staged = install / ".levain" / "pending" / "codex-home" / "hooks.json"
+    r, _out = _refresh(install)
+    assert staged.read_text() == current and r.review
+    hooks.write_text(staged.read_text())  # the operator adopts it
+    r, out = _refresh(install)
+    assert not r.review and not staged.exists() and "settled and removed" in out
+
+
+@pytest.mark.parametrize("through_link", [False, True])
+def test_a_refreshed_hooks_json_keeps_its_mode(make_install, tmp_path, through_link):
+    # complement L3 r3 LOW: deleting the fchmod branch left the suite green.
+    install = make_install("codex")
+    hooks = tmp_path / "codex-home" / "hooks.json"
+    current = hooks.read_text()
+    older = current.replace('"timeout": 30', '"timeout": 31')
+    real = hooks
+    if through_link:
+        real = tmp_path / "dotfiles" / "hooks.json"
+        real.parent.mkdir()
+        hooks.unlink()
+        hooks.symlink_to(real)
+    real.write_text(older)
+    real.chmod(0o640)
+    receipt = install.joinpath(*ADAPTER_RECEIPT_REL)
+    data = json.loads(receipt.read_text())
+    data["files"]["codex-home/hooks.json"] = _sha(older.encode())
+    receipt.write_text(json.dumps(data))
+    r, _out = _refresh(install)
+    assert str(hooks) in r.refreshed and hooks.read_text() == current
+    assert stat.S_IMODE(hooks.stat().st_mode) == 0o640
+
+
+def test_codex_home_is_one_writer_across_installs(make_install, tmp_path, capsys):
+    # codex L3 r2 HIGH 2026-10-10, reproduced through the CLI on 0.7.0: two installs'
+    # inits interleaved, leaving config.toml on one store and hooks.json on the other.
+    import fcntl
+
+    from levain.install import CODEX_HOME_LOCK_NAME
+    from levain.update import run_update
+    from tests.test_init_answers import _filled
+
+    first = make_install("codex", name="first")
+    codex_home = tmp_path / "codex-home"
+    before = {p.name: p.read_bytes() for p in codex_home.iterdir() if p.is_file()}
+    af = tmp_path / "second-answers.json"
+    af.write_text(json.dumps(_filled(capsys)), encoding="utf-8")
+    fd = os.open(codex_home / CODEX_HOME_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # another install's init, mid-write
+    lines: list[str] = []
+    try:
+        assert run_init(tmp_path / "second", "codex", force=False, answers_file=af) == 1
+        assert run_update(first, no_pip=True, emit=lines.append) == 1
+    finally:
+        os.close(fd)
+    assert "writing " + str(codex_home) in capsys.readouterr().out
+    assert any(str(codex_home) in ln for ln in lines)
+    assert {p.name: p.read_bytes() for p in codex_home.iterdir() if p.is_file()} == before
+    assert not (tmp_path / "second" / "seed").exists()
+
+
+@pytest.mark.parametrize("env", [None, ("LEVAIN_CODEX_HOME_UNLOCKED", "true"),
+                                 ("LEVAIN_CODEX_HOME_UNLOCKED", "1"), ("LEVAIN_UNLOCKED", "1")])
+def test_codex_home_fails_closed_where_it_cannot_be_locked(
+        make_install, tmp_path, capsys, monkeypatch, env):
+    # Phill 2026-10-10, option B, then 10-11 frame A (one protocol for both locks): where flock
+    # answers "not supported" (some SMB/NFS homes), codex init and update refuse before writing,
+    # unless LEVAIN_UNLOCKED is exactly "1". The 0.7.1 name LEVAIN_CODEX_HOME_UNLOCKED still
+    # unlocks the CODEX_HOME lock, but the install lock is taken first and refuses without
+    # LEVAIN_UNLOCKED, so the alias alone writes nothing.
+    import errno
+    import fcntl
+
+    from levain.install import CODEX_HOME_UNLOCKED_ENV, UNLOCKED_ENV
+    from levain.update import run_update
+    from tests.test_init_answers import _filled
+
+    first = make_install("codex", name="first")
+    codex_home = tmp_path / "codex-home"
+    before = {p.name: p.read_bytes() for p in codex_home.iterdir() if p.is_file()}
+    af = tmp_path / "second-answers.json"
+    af.write_text(json.dumps(_filled(capsys)), encoding="utf-8")
+    for name in (CODEX_HOME_UNLOCKED_ENV, UNLOCKED_ENV):
+        monkeypatch.delenv(name, raising=False)
+    if env is not None:
+        monkeypatch.setenv(*env)
+
+    def no_locks(_fd, _op):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(fcntl, "flock", no_locks)
+    lines: list[str] = []
+    init_rc = run_init(tmp_path / "second", "codex", force=False, answers_file=af)
+    update_rc = run_update(first, no_pip=True, emit=lines.append)
+    out = capsys.readouterr()
+    if env == (UNLOCKED_ENV, "1"):
+        assert (init_rc, update_rc) == (0, 0)
+        assert (tmp_path / "second" / "seed").exists()
+        assert "cannot lock" in out.err
+        return
+    assert (init_rc, update_rc) == (1, 1)
+    assert f"{UNLOCKED_ENV}=1" in out.out
+    assert any(f"{UNLOCKED_ENV}=1" in ln for ln in lines)
+    assert {p.name: p.read_bytes() for p in codex_home.iterdir() if p.is_file()} == before
+    assert not (tmp_path / "second" / "seed").exists()
+
+
+def test_codex_home_lock_fails_closed_without_fcntl(tmp_path, monkeypatch, capsys):
+    # Windows has no fcntl: same refusal, same override. With only the alias set, the note must not
+    # name LEVAIN_UNLOCKED, which is unset (L3 r1 LOW).
+    from levain.install import CODEX_HOME_UNLOCKED_ENV, CodexHomeUnlockable, codex_home_lock
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "fcntl", None)  # `import fcntl` raises ImportError
+    monkeypatch.delenv(CODEX_HOME_UNLOCKED_ENV, raising=False)
+    with pytest.raises(CodexHomeUnlockable, match="no flock"):
+        with codex_home_lock(tmp_path):
+            pass
+    monkeypatch.setenv(CODEX_HOME_UNLOCKED_ENV, "1")
+    monkeypatch.delenv("LEVAIN_UNLOCKED", raising=False)
+    with codex_home_lock(tmp_path):
+        pass
+    err = capsys.readouterr().err
+    assert "unlocked override" in err and "LEVAIN_UNLOCKED" not in err
+
+
+def _pair_failing_hooks(tmp_path, monkeypatch, meddle):
+    """Run _write_codex_pair on a codex home holding a config.toml, with the hooks.json write
+    replaced by ``meddle(config, kept)`` and then a failure. Returns (config, notes)."""
+    from levain import install as _inst
+
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    config = home / "config.toml"
+    config.write_text('[mcp_servers.anneal_memory]\ncommand = "old"\nargs = ["--db", "/old"]\n')
+
+    def failing_hooks(_hooks, _text, _emit):
+        kept = next(home.glob(".config.toml.levain-prior.*"))
+        meddle(config, kept)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(_inst, "_write_codex_hooks", failing_hooks)
+    notes: list[str] = []
+    fragment = '[mcp_servers.anneal_memory]\ncommand = "new"\nargs = ["--db", "/new"]\n'
+    with pytest.raises(OSError, match="disk full"):
+        _inst._write_codex_pair(home, fragment, "{}", notes.append)
+    return config, notes
+
+
+def test_codex_pair_undo_never_deletes_the_original_a_link_now_leads_to(tmp_path, monkeypatch):
+    # codex L3 r6 MED: config.toml swapped for a link to the kept original between the merge and
+    # the undo; the undo read the original's inode through the link, called it "nothing to undo"
+    # and deleted the kept file, leaving config.toml dangling.
+    def link_to_kept(config, kept):
+        config.unlink()
+        config.symlink_to(kept)
+
+    config, notes = _pair_failing_hooks(tmp_path, monkeypatch, link_to_kept)
+    assert config.resolve().is_file() and "/old" in config.read_text()
+    assert any("could not be confirmed" in n for n in notes)
+
+
+def test_codex_pair_undo_names_a_config_removed_meanwhile(tmp_path, monkeypatch):
+    # glm L3 r6 MED: a config.toml removed while levain ran was reported as "left as it is".
+    config, notes = _pair_failing_hooks(tmp_path, monkeypatch, lambda c, _k: c.unlink())
+    assert not config.exists()
+    kept = list(config.parent.glob(".config.toml.levain-prior.*"))
+    assert len(kept) == 1 and "/old" in kept[0].read_text()
+    assert any("was removed by something else" in n and str(kept[0]) in n for n in notes)

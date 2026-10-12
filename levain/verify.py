@@ -230,7 +230,10 @@ def _invoke(
     (the same one the harness will actually use), not necessarily the one
     running `levain verify-hooks`.
     """
-    env = {k: v for k, v in os.environ.items() if k != "LEVAIN_HOOK_SUPPRESS"}
+    from levain.launch import child_env
+
+    env = child_env()
+    env.pop("LEVAIN_HOOK_SUPPRESS", None)
 
     try:
         result = subprocess.run(

@@ -36,22 +36,109 @@ if [ -z "$PY" ]; then
     exit 1
 fi
 
-out="$(mktemp)"
-if ! "$PY" -m pytest tests/test_manifest.py -q -p no:cacheprovider \
-        -k "ReleaseStampIsNotAPublishedVersion" >"$out" 2>&1; then
+# THE SUBJECT IS WHAT THE PUSH PUBLISHES, NOT THIS CHECKOUT'S HEAD (2026-10-11,
+# reproduced): reading HEAD refused correct pushes made from a checkout parked
+# on an older branch, every branch delete, and the release tag itself, and let a
+# released-stamp commit through from a clean main. git writes one
+# "<local ref> <local sha> <remote ref> <remote sha>" line per ref on stdin; an
+# all-zero local sha is a delete, which publishes nothing.
+#
+# What is checked is every commit the push makes newly reachable on the
+# destination: what neither the destination's advertised refs nor the ref's
+# old tip already reach (with nothing advertised, the whole history, as git's
+# own templates/hooks--pre-push.sample walks a new branch). "Already on the
+# remote" is what the DESTINATION advertises (`git ls-remote` on the location
+# git passes as $2, githooks(5)), never local remote-tracking refs, which go
+# stale. The release record is the destination's tags plus the tags this push
+# sets, never the local tags: a release tag lands after main is pushed, so a
+# clone can hold the release commit without its tag. A release-tag push also
+# checks the destination's commits past the tag's target.
+push=""; out=""; adv=""
+trap 'rm -f "$push" "$out" "$adv"' EXIT
+trap 'exit 1' HUP INT TERM
+push="$(mktemp)" && out="$(mktemp)" && adv="$(mktemp)" || exit 1
+
+lines=""
+while read -r lref lsha rref rsha || [ -n "${lref:-}" ]; do
+    [ -z "${lsha:-}" ] && continue
+    [ -z "${lsha//0/}" ] && continue   # all zeros (sha1 or sha256): a delete
+    if ! c="$(git rev-parse --verify -q "${lsha}^{commit}")"; then
+        # A tag on a tree or blob carries no stamp; a release tag must be a commit.
+        case "${rref:-}" in refs/tags/v*) ;; *) continue ;; esac
+        echo "pre-push: release tag ${rref} names $lsha, which is not a commit." >&2
+        echo "          Push deliberately with --no-verify if this is intended." >&2
+        exit 1
+    fi
+    lines="$lines$lref $lsha $rref ${rsha:-0}
+"
+done
+[ -z "$lines" ] && exit 0   # deletes only
+
+dest="${2:-${1:-origin}}"
+if ! git ls-remote "$dest" >"$adv"; then
+    echo "pre-push: could not read what $dest advertises; the gate cannot check this push." >&2
+    echo "          Push deliberately with --no-verify if this is intended." >&2
+    exit 1
+fi
+grep -E $'\trefs/tags/v' "$adv" | sed 's/^/R /' >>"$push"
+# The destination's commits that this clone holds bound every walk.
+have="$(cut -f1 "$adv" | sort -u | git cat-file --batch-check='%(objectname) %(objecttype)' \
+        | awk '$2 == "commit" {print $1}')"
+
+while read -r lref lsha rref rsha; do
+    [ -z "${lsha:-}" ] && continue
+    c="$(git rev-parse --verify -q "${lsha}^{commit}")" || exit 1
+    echo "T $c" >>"$push"
+    # What this push makes newly reachable: commits no advertised ref (and not
+    # the ref's own old tip) already reaches. `--not` does not reach revisions
+    # read from --stdin, so each exclusion is `^sha`; none (a fresh
+    # destination) walks the whole history.
+    excl="$have"
+    if [ -n "${rsha//0/}" ] && git cat-file -e "${rsha}^{commit}" 2>/dev/null; then
+        excl="$excl $rsha"
+    fi
+    new="$( { [ -z "${excl// /}" ] || printf '^%s\n' $excl; } | git rev-list --stdin "$c")" \
+        || { echo "pre-push: could not list the commits this push publishes." >&2; exit 1; }
+    [ -n "$new" ] && printf 'C %s\n' $new >>"$push"
+    case "$rref" in refs/tags/v*)
+        echo "P ${rref#refs/tags/} $c" >>"$push"
+        # A release tag also judges what the destination already holds past
+        # its commit: a non-bumped descendant pushed before the tag existed.
+        # That walk can only see branch tips this clone holds, so a missing
+        # one refuses rather than passing unseen.
+        missing="$(grep -E $'\trefs/heads/' "$adv" | cut -f1 \
+                   | git cat-file --batch-check='%(objectname) %(objecttype)' | awk '$2 == "missing" {print $1}')"
+        if [ -n "$missing" ]; then
+            echo "pre-push: $dest has branch commits this clone lacks, so ${rref} cannot be checked" >&2
+            echo "          against them. Run: git fetch ${1:-origin}   then push the tag again." >&2
+            exit 1
+        fi
+        if [ -n "$have" ]; then
+            desc="$(printf '%s\n' $have | git rev-list --stdin --ancestry-path "^$c")" \
+                || { echo "pre-push: could not list what follows $rref." >&2; exit 1; }
+            [ -n "$desc" ] && printf 'C %s\n' $desc >>"$push"
+        fi ;;
+    esac
+done <<EOF_LINES
+$lines
+EOF_LINES
+grep -q '^C ' "$push" || exit 0   # nothing newly published: tips the destination holds
+
+test_id="tests/test_manifest.py::TestReleaseStampIsNotAPublishedVersion::test_the_committed_stamp_of_each_pushed_commit_is_not_released"
+if ! LEVAIN_PUSH_FILE="$push" "$PY" -m pytest "$test_id" -q -rs -p no:cacheprovider >"$out" 2>&1 \
+        || grep -qE '^SKIPPED |[0-9]+ skipped in ' "$out"; then
     echo >&2
-    echo "⛔ pre-push BLOCKED — the release-stamp gate failed:" >&2
+    echo "⛔ pre-push BLOCKED — the release-stamp gate failed or could not run:" >&2
     echo >&2
-    sed -n '/FAILED\|AssertionError\|Error/p' "$out" | head -8 >&2
+    sed -n '/FAILED\|AssertionError\|Error\|SKIPPED/p' "$out" | head -8 >&2
+    grep -q 'FAILED\|AssertionError\|Error\|SKIPPED' "$out" || tail -5 "$out" >&2
     echo >&2
-    echo "   HEAD is stamped at an already-released version, or the two stamps" >&2
-    echo "   disagree. Bump BOTH (pyproject.toml, levain/__init__.py) to the next" >&2
+    echo "   A pushed commit is stamped at an already-released version, or its two" >&2
+    echo "   stamps disagree. Bump BOTH (pyproject.toml, levain/__init__.py) to the next" >&2
     echo "   .devN — or, if this IS the release commit, make the stamp bump and" >&2
     echo "   the tag the SAME commit. See spore-710 and CHANGELOG 'Versioning'." >&2
     echo >&2
     echo "   To push anyway: git push --no-verify" >&2
-    rm -f "$out"
     exit 1
 fi
-rm -f "$out"
 exit 0

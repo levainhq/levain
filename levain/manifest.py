@@ -70,7 +70,7 @@ from levain import __version__
 # bumped in lockstep with the pyproject dependency floor at each release. The
 # pip-pin consistency check (:func:`pip_floor_verdict`) flags it if the two ever
 # drift, which is the release-gate that keeps the manifest honest.
-KNOWN_GOOD_ANNEAL = "0.9.39"
+KNOWN_GOOD_ANNEAL = "0.9.43"
 
 # The anneal store section-schema a partnership entity runs on (anneal
 # AM-INITSCHEMA). A store left on the default silently runs the 4-section ops
@@ -371,9 +371,11 @@ def _run_anneal_json(
     ]
     for cmd in candidates:
         try:
+            from levain.launch import child_env
+
             result = subprocess.run(
                 cmd, capture_output=True, text=True,
-                errors="replace", timeout=timeout,
+                errors="replace", timeout=timeout, env=child_env(),
             )
         except subprocess.TimeoutExpired:
             return None
