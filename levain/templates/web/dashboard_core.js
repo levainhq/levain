@@ -574,6 +574,7 @@
     // no brief entries and no state worth showing: no card (an operator who can set the state keeps the card for its set button)
     const st = view.state;
     region.hidden = !entries.length && !(st && (st.text || (commit && st.can_edit !== false)));
+    const hb = document.getElementById("ck-h-brief"); if (hb) hb.hidden = region.hidden;   // page chrome: the section's header follows its region
   }
 
   function renderWidgets(view, byId) {
@@ -593,6 +594,7 @@
     }
     region.replaceChildren(...cards);
     region.hidden = !entries.length;
+    const hw = document.getElementById("ck-h-widgets"); if (hw) hw.hidden = region.hidden;
     region.style.setProperty("--ck-n", String(Math.max(1, entries.length)));
   }
 
@@ -608,6 +610,7 @@
   }
 
   // a zone's cards, in the kernel's order, packed into rows of CK_COLUMNS; a row is as tall as its tallest card
+  const ZONE_GLOSS = { operate: "what is waiting, what is moving" };
   function renderZone(zone, view, byId, board) {
     const cards = [];
     for (const c of zone.cards) {
@@ -617,7 +620,11 @@
     if (!cards.length) return;
     const sec = el("section", "ck-zone");
     sec.dataset.zone = zone.id;
-    sec.appendChild(el("div", "zone-title", zone.title));
+    // the title is the manifest's; the one-line gloss beside it is page chrome (a zone the page has no gloss for gets none)
+    const head = el("div", "zone-head");
+    head.appendChild(el("div", "zone-title", zone.title));
+    if (ZONE_GLOSS[zone.id]) head.appendChild(el("span", "zone-gloss", ZONE_GLOSS[zone.id]));
+    sec.appendChild(head);
     const grid = el("div", "ck-zgrid");
     grid.dataset.ckRegion = "zone";
     grid.dataset.ckZone = zone.id;

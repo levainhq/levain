@@ -156,7 +156,7 @@
     }
 
     function setToggle() {
-      toggle.textContent = ambientOn ? 'Ambient: on' : 'Ambient: paused';
+      toggle.textContent = ambientOn ? 'Ambient on' : 'Ambient paused';
       toggle.setAttribute('aria-pressed', ambientOn ? 'true' : 'false');
       toggle.setAttribute('aria-label', 'Ambient motion, currently ' + (ambientOn ? 'on' : 'paused'));
     }
@@ -247,7 +247,7 @@
         var a = Math.max(0.35, 1 - ((now - e.t) / 3600000) / (opts.windowHours * 1.15));
         if (e.kind === 'commit') { g.globalAlpha = a; g.fillStyle = P.contrast; g.beginPath(); g.arc(x, y, 1.3 + hash01(e.t) * 0.9, 0, 7); g.fill(); }
         else if (e.kind === 'review') { g.globalAlpha = e.ok ? a * 0.8 : 1; g.strokeStyle = e.ok ? P.label : P.accent; g.lineWidth = e.ok ? 1 : 1.5; g.beginPath(); g.arc(x, y, e.ok ? 2.6 : 3.2, 0, 7); g.stroke(); }
-        else if (e.kind === 'decision') { g.globalAlpha = 1; g.fillStyle = P.accent; g.beginPath(); g.moveTo(x, y - 4); g.lineTo(x + 4, y); g.lineTo(x, y + 4); g.lineTo(x - 4, y); g.closePath(); g.fill(); }
+        else if (e.kind === 'decision') { g.globalAlpha = 1; g.fillStyle = P.contrast; g.beginPath(); g.moveTo(x, y - 4); g.lineTo(x + 4, y); g.lineTo(x, y + 4); g.lineTo(x - 4, y); g.closePath(); g.fill(); }
         else { g.globalAlpha = a * 0.55; g.fillStyle = P.contrast; g.fillRect(x, y, 1.4, 1.4); }
         g.globalAlpha = 1;
         hits.push({ e: e, x: x, y: y });
