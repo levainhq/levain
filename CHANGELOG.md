@@ -4,6 +4,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [Unreleased]
+
+### Removed
+
+- **`ChainExecutor.gate`.** The executor now holds a `GateHandle`, exposed as `ChainExecutor.handle`; read the gate with `handle.current()`, once per admission. A gate kept across a policy swap goes stale, so the executor no longer hands one out.
+
 ## [0.9.0] — 2026-10-12
 
 Two things ship together: the signed team tier (team ledgers signed by SSH keys, the team replayed from signed history) and the live cockpit (eleven panel kinds, a page that redraws only what changed, an ambient sky).
