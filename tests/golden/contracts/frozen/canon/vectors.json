@@ -139,7 +139,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a317d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -164,7 +180,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a317d",
     "log_kind": "team",
-    "at": "verify"
+    "at": "verify",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -189,7 +221,23 @@
    "input": {
     "data_hex": "7b2276223a312c226c656166223a226c696e65227d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -214,7 +262,23 @@
    "input": {
     "data_hex": "7b226c656166223a20226c696e65222c2276223a317d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -239,7 +303,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a225c7530306539227d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -264,7 +344,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a2d307d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -289,7 +385,23 @@
    "input": {
     "data_hex": "efbbbf7b226c656166223a226c696e65222c2276223a317d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -314,7 +426,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a317d0a",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -339,7 +467,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a22c3a9227d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -364,7 +508,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a307d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -389,7 +549,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a312e307d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -414,7 +590,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a3165327d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -439,7 +631,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a4e614e7d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -464,7 +672,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a2d496e66696e6974797d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -489,7 +713,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c226c656166223a226c696e65222c2276223a317d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -514,7 +754,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a225c7564383030227d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -539,7 +795,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a22eda080227d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -564,7 +836,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a22ff227d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -589,7 +877,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a393030373139393235343734303939327d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -614,7 +918,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a2d393030373139393235343734303939327d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -639,7 +959,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a393030373139393235343734303939317d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -664,7 +1000,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a5b5b5b5d5d5d7d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -689,7 +1041,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d7d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -714,7 +1082,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d7d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -739,7 +1123,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d7d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -764,7 +1164,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a225b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b227d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -789,7 +1205,23 @@
    "input": {
     "data_hex": "7b226c656166223a226e6f7065222c2276223a317d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -814,7 +1246,23 @@
    "input": {
     "data_hex": "7b226c656166223a226e6f7065222c2276223a317d",
     "log_kind": "team",
-    "at": "verify"
+    "at": "verify",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -839,7 +1287,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a327d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -864,7 +1328,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a327d",
     "log_kind": "team",
-    "at": "verify"
+    "at": "verify",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -889,7 +1369,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a317d",
     "log_kind": "fleet",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -914,7 +1410,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a317d",
     "log_kind": "receipt",
-    "at": "verify"
+    "at": "verify",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -939,7 +1451,23 @@
    "input": {
     "data_hex": "7b226c656166223a22726563656970745f636865636b706f696e74222c2276223a317d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -964,7 +1492,23 @@
    "input": {
     "data_hex": "5b315d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -989,7 +1533,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65227d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -1014,7 +1574,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a747275657d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -1039,7 +1615,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a2231227d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -1064,7 +1656,23 @@
    "input": {
     "data_hex": "7b226c656166223a226c696e65222c2276223a2d317d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -1089,7 +1697,23 @@
    "input": {
     "data_hex": "7b226c656166223a22222c2276223a317d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -1114,7 +1738,23 @@
    "input": {
     "data_hex": "7b226c656166223a312c2276223a317d",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {
@@ -1139,7 +1779,23 @@
    "input": {
     "data_hex": "",
     "log_kind": "team",
-    "at": "ingest"
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
    },
    "expect": {
     "levain": {

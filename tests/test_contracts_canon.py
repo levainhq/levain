@@ -20,7 +20,8 @@ def test_vector(v):
         # the team writer emits the same bytes for an object without "hash"
         assert E.canonical(i["value"]).encode("utf-8").hex() == want["bytes_hex"]
     elif v["op"] == "leaf":
-        assert C.classify_leaf(h(i["data_hex"]), i["log_kind"], at=i["at"]) == want["verdict"]
+        reg = {(e["leaf"], e["v"]): frozenset(e["log_kinds"]) for e in i["registry"]}
+        assert C.classify_leaf(h(i["data_hex"]), i["log_kind"], at=i["at"], registry=reg) == want["verdict"]
     elif v["op"] == "chain_hash":
         assert C.chain_hash(i["prev"], i["entry"]) == want["hash"]
         assert C.canonical({k: x for k, x in i["entry"].items() if k != "hash"}) == want["canonical"]
@@ -55,6 +56,16 @@ def test_unknown_log_kind_and_bad_mode():
     assert C.classify_leaf(b'{"leaf":"line","v":1}', "galaxy", at="ingest") == C.REFUSE
     with pytest.raises(ValueError):
         C.classify_leaf(b'{"leaf":"line","v":1}', "team", at="later")
+
+
+def test_the_shipped_registry_is_empty_until_s1b_lands_each_validator():
+    """HEAD_RULINGS #7: a type registered without its field validator would pass on framing alone."""
+    assert C.REGISTRY == {}
+    ok = b'{"leaf":"line","v":1}'
+    assert C.classify_leaf(ok, "team", at="ingest") == C.REFUSE
+    assert C.classify_leaf(ok, "team", at="verify") == C.UNVERIFIABLE
+    with pytest.raises(C.UnknownLeafError):
+        C.check_leaf(ok, "team")
 
 
 def test_registry_is_exact_pairs_with_known_log_kinds():

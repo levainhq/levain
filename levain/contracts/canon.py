@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import Mapping
 
 from . import ContractError
 from .grammar import JSON_INT_MAX, check_int
@@ -27,10 +28,9 @@ LOG_KINDS = ("team", "fleet", "receipt")
 
 # The one global registry: (leaf, v) -> the log kinds that accept it. A leaf name has one meaning across every
 # log; a new v is a new entry and an old (leaf, v) stays verifiable forever. Provisional shapes are never here.
-REGISTRY: dict[tuple[str, int], frozenset[str]] = {
-    ("line", 1): frozenset({"team"}),                  # F9
-    ("receipt_checkpoint", 1): frozenset({"team"}),    # F10
-}
+# A type is registered in the same commit as its field validator, never before: an entry without one would pass
+# on framing alone. Empty until S1-b lands F9 ("line", 1) and F10 ("receipt_checkpoint", 1).
+REGISTRY: dict[tuple[str, int], frozenset[str]] = {}
 
 ACCEPT, REFUSE, UNVERIFIABLE = "accept", "refuse", "unverifiable"
 
@@ -141,10 +141,11 @@ def parse(d: bytes) -> object:
         raise ContractError(f"leaf data does not parse: {type(e).__name__}") from None
 
 
-def check_leaf(d: bytes, log_kind: str) -> dict:
+def check_leaf(d: bytes, log_kind: str, *,
+               registry: Mapping[tuple[str, int], frozenset[str]] | None = None) -> dict:
     """Ingest-time framing check: canonical bytes, a registered ``(leaf, v)``, accepted on ``log_kind``.
 
-    Returns the parsed leaf object. Raises ``UnknownLeafError`` for an unregistered ``(leaf, v)`` and
+    ``registry`` replaces ``REGISTRY`` (the framing goldens inject a test registry). Returns the parsed leaf object. Raises ``UnknownLeafError`` for an unregistered ``(leaf, v)`` and
     ``ContractError`` for every other refusal. The leaf type's own field rules are its module's (F9, F10).
     """
     try:
@@ -159,7 +160,7 @@ def check_leaf(d: bytes, log_kind: str) -> dict:
         if not isinstance(leaf, str) or not leaf:
             raise ContractError('a leaf carries a non-empty string "leaf"')
         check_int(v, JSON_INT_MAX)
-        kinds = REGISTRY.get((leaf, v))
+        kinds = (REGISTRY if registry is None else registry).get((leaf, v))
         if kinds is None:
             raise UnknownLeafError(f"unknown leaf type ({leaf!r}, {v})")
         if log_kind not in kinds:
@@ -171,7 +172,8 @@ def check_leaf(d: bytes, log_kind: str) -> dict:
         raise ContractError(f"leaf validation failed: {type(e).__name__}") from None
 
 
-def classify_leaf(d: bytes, log_kind: str, *, at: str) -> str:
+def classify_leaf(d: bytes, log_kind: str, *, at: str,
+                  registry: Mapping[tuple[str, int], frozenset[str]] | None = None) -> str:
     """``ACCEPT``, ``REFUSE`` or ``UNVERIFIABLE`` for leaf framing; ``at`` is ``"ingest"`` or ``"verify"``.
 
     An unknown ``(leaf, v)`` is REFUSE at ingest and UNVERIFIABLE at verify, never tampering.
@@ -179,7 +181,7 @@ def classify_leaf(d: bytes, log_kind: str, *, at: str) -> str:
     if at not in ("ingest", "verify"):
         raise ValueError("at is 'ingest' or 'verify'")
     try:
-        check_leaf(d, log_kind)
+        check_leaf(d, log_kind, registry=registry)
     except UnknownLeafError:
         return REFUSE if at == "ingest" else UNVERIFIABLE
     except ContractError:

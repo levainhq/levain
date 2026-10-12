@@ -43,8 +43,15 @@ canon("nesting-and-literals", {"f": False, "e": True, "c": [1, [2, {"d": None}]]
       '{"a":[],"b":{},"c":[1,[2,{"d":null}]],"e":true,"f":false}')
 
 
+# The framing goldens run against this injected TEST registry, never levain's own: in S1-a the shipped
+# REGISTRY is empty, and S1-b registers each leaf type in the same commit as its field validator (HEAD_RULINGS #7).
+TEST_REGISTRY = [{"leaf": "line", "v": 1, "log_kinds": ["team"]},
+                 {"leaf": "receipt_checkpoint", "v": 1, "log_kinds": ["team"]}]
+
+
 def leaf(vid, data: bytes, at, verdict, authority, log="team"):
-    V.append(vector(f"leaf-{vid}", "no_upstream", "leaf", {"data_hex": data.hex(), "log_kind": log, "at": at},
+    V.append(vector(f"leaf-{vid}", "no_upstream", "leaf",
+                    {"data_hex": data.hex(), "log_kind": log, "at": at, "registry": TEST_REGISTRY},
                     {"verdict": verdict}, authority, None))
 
 
