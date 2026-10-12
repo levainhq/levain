@@ -576,14 +576,19 @@ def test_codex_flags_after_the_script_do_not_count():
 def test_codex_mcp_server_rules(ent):
     roots = (Path(os.path.realpath(ent)),)
     py = "/usr/bin/python3"
-    assert hg.check_codex_code_paths({}, {"m": {"command": py, "args": ["-I", "server.py"]}}, roots)
-    assert hg.check_codex_code_paths({}, {"m": {"command": py, "args": ["-I", "/opt/s.py"],
-                                                "env": {"PYTHONPATH": str(ent)}}}, roots)
     db = str(ent / ".levain" / "memory.db")
-    assert hg.check_codex_code_paths({}, {"m": {"command": py, "args": ["-I", "/opt/s.py", "--db", db]}}, roots) == []
+    assert hg.check_codex_code_paths({}, {"m": {"command": py, "args": ["-I", "server.py", "--db", db]}}, roots,
+                                     expected_db=db)
+    assert hg.check_codex_code_paths({}, {"m": {"command": py, "args": ["-I", "/opt/s.py", "--db", db],
+                                                "env": {"PYTHONPATH": str(ent)}}}, roots, expected_db=db)
+    assert hg.check_codex_code_paths({}, {"m": {"command": py, "args": ["-I", "/opt/s.py", "--db", db]}}, roots,
+                                     expected_db=db) == []
+    # without the entity's store an MCP server cannot be vetted at all (chat L3 r1, H2)
+    assert hg.check_codex_code_paths({}, {"m": {"command": py, "args": ["-I", "/opt/s.py", "--db", db]}}, roots)
     # L3 r1, codex 4: the --db exemption is by position, not by value
     evil = str(ent / "evil.py")
-    assert hg.check_codex_code_paths({}, {"m": {"command": py, "args": ["-I", evil, "--db", evil]}}, roots)
+    assert hg.check_codex_code_paths({}, {"m": {"command": py, "args": ["-I", evil, "--db", evil]}}, roots,
+                                     expected_db=evil)
 
 
 def test_codex_spawn_env():
@@ -726,3 +731,55 @@ def test_pin_file_that_is_not_an_object_refuses(ent, tmp_path):
     (state / "hook_pin.json").write_text("[]")
     with pytest.raises(hg.HostRefusal, match="unreadable"):
         hg.check_or_record_pin(ent, state)
+
+
+# ---------------------------------------------------------------------------- chat L3 r1, H2
+
+
+_OTHER_DB = "/other-entity/.levain/memory.db"
+
+
+@pytest.mark.parametrize("tail", [
+    ["--db", _OTHER_DB],                       # another entity's store
+    [],                                        # no --db at all
+    ["--db", "{db}", "--db", _OTHER_DB],       # a duplicate: argparse keeps the last
+    ["--db", "{db}", "--db", "{db}"],          # a duplicate, even of the right path
+    ["--d", _OTHER_DB],                        # argparse abbreviation of --db
+    ["--db=" + _OTHER_DB],                     # the = spelling
+    ["--db"],                                  # no value
+])
+def test_codex_mcp_db_must_be_exactly_this_entitys_store(ent, tail):
+    # codex HIGH: every value after --db was removed before vetting, so any store passed
+    roots = (Path(os.path.realpath(ent)),)
+    db = str(Path(os.path.realpath(ent)) / ".levain" / "memory.db")
+    args = ["-I", "/opt/s.py", *[t.replace("{db}", db) for t in tail]]
+    probs = hg.check_codex_code_paths({}, {"m": {"command": "/usr/bin/python3", "args": args}}, roots,
+                                      expected_db=db)
+    assert any("--db" in p for p in probs), probs
+
+
+def test_codex_mcp_db_compares_resolved_paths(ent, tmp_path):
+    real = Path(os.path.realpath(ent))
+    link = tmp_path / "entlink"
+    os.symlink(real, link)
+    probs = hg.check_codex_code_paths({}, {"m": {"command": "/usr/bin/python3",
+                                                 "args": ["-I", "/opt/s.py", "--db", str(link / ".levain" / "memory.db")]}},
+                                      (real,), expected_db=real / ".levain" / "memory.db")
+    assert probs == []
+
+
+@pytest.mark.parametrize("tail", [
+    ["--db", _OTHER_DB, "serve"],
+    ["serve"],
+    ["--db", "{db}", "--db", "{db}", "serve"],
+    ["--d", _OTHER_DB, "serve"],
+    ["--db=" + _OTHER_DB, "serve"],
+])
+def test_cc_mcp_db_must_be_exactly_this_entitys_store(ent, tail):
+    real = Path(os.path.realpath(ent))
+    cfg = hg.cc_mcp_config(ent, sys.executable)
+    db = str(real / ".levain" / "memory.db")
+    cfg["mcpServers"]["anneal_memory"]["args"] = ["-P", "-m", "anneal_memory",
+                                                  *[t.replace("{db}", db) for t in tail]]
+    probs = hg._check_mcp(cfg, real, (real,))
+    assert any("--db" in p for p in probs), probs

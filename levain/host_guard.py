@@ -441,14 +441,36 @@ def _check_mcp(cfg: Mapping[str, Any], entity: Path, roots: Sequence[Path]) -> l
     args = list(server.get("args", []))
     if not args or args[0] not in ("-P", "-I"):
         problems.append(f"the MCP server does not start isolated from its cwd (-P or -I first): {args!r}")
-    db = str(entity / ".levain" / "memory.db")
+    db_problems, at = _db_arg(args, entity / ".levain" / "memory.db", "the MCP server")
+    problems += db_problems
     for i, a in enumerate(args):
-        if i > 0 and args[i - 1] == "--db":
-            if a != db:
-                problems.append(f"the MCP server's --db is {a!r}, expected {db!r}")
-        elif isinstance(a, str) and "/" in a:
+        if i != at and isinstance(a, str) and "/" in a:
             problems += _outside(a, roots, "an MCP server argument")
     return problems
+
+
+def _is_db_flag(a: Any) -> bool:
+    """``--db``, its ``--db=`` spelling, or an abbreviation of it (``--d``), which an argparse
+    parser with the default allow_abbrev reads as ``--db``."""
+    if not isinstance(a, str):
+        return False
+    name = a.split("=", 1)[0]
+    return len(name) >= 3 and "--db".startswith(name)
+
+
+def _db_arg(args: Sequence[Any], expected: str | os.PathLike[str], what: str) -> tuple[list[str], int | None]:
+    """The MCP server's store, read from the ORIGINAL argv (chat L3 r1, codex H2): exactly one
+    ``--db`` flag, spelled ``--db <path>``, whose path resolves to ``expected``. Returns the
+    problems and the index of the vetted path, so the caller skips only that one word."""
+    at = [i for i, a in enumerate(args) if _is_db_flag(a)]
+    if len(at) != 1:
+        return [f"{what} must name --db exactly once, found {len(at)}: {list(args)!r}"], None
+    i = at[0]
+    if args[i] != "--db" or i + 1 >= len(args) or not isinstance(args[i + 1], str):
+        return [f"{what} must pass its store as `--db <path>`: {list(args)!r}"], None
+    if _real(args[i + 1]) != _real(expected):
+        return [f"{what}'s --db is {args[i + 1]!r}, expected {os.fspath(expected)!r}"], None
+    return [], i + 1
 
 
 _LOOSENING_TRUE = (("allowUnsandboxedCommands",), ("enableWeakerNestedSandbox",),
@@ -776,13 +798,16 @@ _SHELL_META = re.compile(r"[;&|<>`$(){}\n]")
 
 
 def check_codex_code_paths(hooks_json: Mapping[str, Any], mcp_servers: Mapping[str, Any],
-                           roots: Sequence[Path]) -> list[str]:
+                           roots: Sequence[Path], *,
+                           expected_db: str | os.PathLike[str] | None = None) -> list[str]:
     """Code a Codex entity runs outside its sandbox (hooks, MCP servers) must be an exact argv:
     an interpreter outside every writable root, its isolating flags BEFORE the script (a flag
     after the script is the script's argument, L1 r1 #5b), a script outside the writable roots,
     no shell composition, no relative path. MCP servers get the same rule, may not carry env or
-    cwd keys (L1 r1 #5c), and only the single value right after `--db` is exempt, by POSITION
-    (L3 r1, codex 4: removing it by value also removed an identical script argument). Today's
+    cwd keys (L1 r1 #5c), and must name `--db` exactly once with ``expected_db`` (this entity's
+    own store, compared resolved) as its value; only that one word is then exempt, by POSITION
+    (L3 r1, codex 4: removing it by value also removed an identical script argument; chat L3 r1,
+    codex H2: removing every value after any `--db` let another entity's store through). Today's
     Codex install puts its hooks under the entity's own writable root, so this refuses it by
     design (plan D6: S4/S5 move them)."""
     problems: list[str] = []
@@ -795,7 +820,13 @@ def check_codex_code_paths(hooks_json: Mapping[str, Any], mcp_servers: Mapping[s
         if extra:
             problems.append(f"Codex MCP server {name!r} carries keys hosting cannot vet: {sorted(extra)}")
         args = [str(a) for a in server.get("args", [])]
-        kept = [a for i, a in enumerate(args) if not (i > 0 and args[i - 1] == "--db")]
+        if expected_db is None:
+            problems.append(f"Codex MCP server {name!r} cannot be vetted without this entity's store path")
+            at = None
+        else:
+            db_problems, at = _db_arg(args, expected_db, f"Codex MCP server {name!r}")
+            problems += db_problems
+        kept = [a for i, a in enumerate(args) if i != at]
         argv = [str(server.get("command", ""))] + kept
         problems += _vet_codex_argv(shlex.join(argv), roots, f"Codex MCP server {name!r}", ("-I",))
     return problems
@@ -869,8 +900,8 @@ _CODEX_FORWARD = {
 
 def _vet_codex_argv(cmd: str, roots: Sequence[Path], what: str, flags: tuple[str, ...]) -> list[str]:
     """A strict grammar, not a scan: interpreter, then only argument-free isolating flags, then
-    exactly one absolute script outside the roots, then plain arguments (MCP `--db <path>` pairs
-    have already been removed by position). A flag that takes a value (`-X`, `-W`, `-m`, `-c`,
+    exactly one absolute script outside the roots, then plain arguments (an MCP server's vetted
+    `--db` path has already been removed by position; the `--db` flag itself stays). A flag that takes a value (`-X`, `-W`, `-m`, `-c`,
     `--anything`) refuses, because it can swallow the next word and turn a vetted-looking argument
     into the real script (L3 r2, complement 1: `-I -X --db /ent/evil.py`)."""
     if _SHELL_META.search(cmd):
