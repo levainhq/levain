@@ -566,10 +566,16 @@ class CockpitDB:
     ``BEGIN IMMEDIATE`` transaction. ``data_root`` must exist: the broker's start sequence checks and
     owns it (§4.2, §6), so this never creates it."""
 
-    def __init__(self, data_root: Path | str) -> None:
+    def __init__(self, data_root: Path | str, *, install_class: str | None = None, owns_lock: bool = False) -> None:
+        """``install_class`` is the class this opener serves (None: it migrates nothing) and
+        ``owns_lock`` says it already holds ``<data_root>/cockpit.lock`` (the broker, from its start
+        sequence). Both matter only to a ``levain-cockpit/2`` journal's one-way migration
+        (:meth:`_ensure_schema`)."""
         self.data_root = Path(data_root)
         self.path = self.data_root / DB_NAME
         self._ready = False
+        self._install_class = install_class
+        self._owns_lock = owns_lock
 
     # -- connection -----------------------------------------------------------------------------
 
@@ -590,8 +596,20 @@ class CockpitDB:
             raise
         return conn
 
-    @staticmethod
-    def _ensure_schema(conn: sqlite3.Connection) -> None:
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        """Create or check the schema. A ``levain-cockpit/2`` journal migrates to /3 (one way) only
+        when, before anything is written, its stored install class is this opener's (an unset one only
+        for the lock's owner, which sets it next), and only under ``cockpit.lock``: held by the broker
+        already, else taken here non-blocking for the migrating transaction, so a server still running
+        (an old ``levain serve``) refuses the migration rather than losing its journal under it."""
+        lock_fds: list[int] = []        # the lock this opener took, held until the migration commits
+        try:
+            self._ensure_schema_txn(conn, lock_fds)
+        finally:
+            for fd in lock_fds:
+                os.close(fd)
+
+    def _ensure_schema_txn(self, conn: sqlite3.Connection, lock_fds: list[int]) -> None:
         with _txn(conn):
             tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
             marked = "meta" in tables and conn.execute(
@@ -605,6 +623,13 @@ class CockpitDB:
             if row is not None and row[0] != STORE_FORMAT and not migrate:
                 raise CockpitFormatError(f"journal format {row[0]!r} is not {STORE_FORMAT!r}")
             if migrate:
+                stored = _meta(conn, "install_class")
+                if self._install_class is None \
+                        or (stored != self._install_class and not (stored is None and self._owns_lock)):
+                    raise CockpitFormatError(f"this {_MIGRATES_FROM} journal's install class is {stored!r}, "
+                                             f"not {self._install_class!r}: it is not migrated here")
+                if not self._owns_lock:
+                    lock_fds.append(_take_store_lock(self.data_root))
                 _migrate_to_3(conn)
             for stmt in _SCHEMA:
                 conn.execute(stmt)
@@ -1309,6 +1334,28 @@ def _head_of(authority: AuthoritySnapshot | None) -> tuple[int, str]:
 def _authority_head(conn: sqlite3.Connection) -> tuple[int, str]:
     row = conn.execute("SELECT seq, hash FROM authority_log ORDER BY seq DESC LIMIT 1").fetchone()
     return (0, "") if row is None else (row[0], row[1])
+
+
+def _take_store_lock(data_root: Path) -> int:
+    """The exclusive non-blocking ``flock`` on ``<data_root>/cockpit.lock`` a live broker holds for its
+    whole active life (``levain.cockpit.broker.LOCK_NAME``); the fd, which the caller closes. Held
+    elsewhere, a /2 journal's migration is refused, naming the server."""
+    import fcntl
+
+    from levain.cockpit.broker import LOCK_NAME
+    lock = data_root / LOCK_NAME
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise CockpitFormatError(f"this journal is {_MIGRATES_FROM} and a cockpit server holds {lock}: stop "
+                                 "`levain serve`, upgrade it, and restart it (the restarted server migrates "
+                                 "the journal)") from None
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 def _migrate_to_3(conn: sqlite3.Connection) -> None:
