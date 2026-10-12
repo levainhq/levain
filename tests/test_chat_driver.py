@@ -47,11 +47,16 @@ class _Out:
 
     @property
     def ok(self) -> bool:
-        return self.error is None and not self.gated and not self.timed_out and bool(self.reply)
+        return (self.error is None and not self.gated and not self.timed_out and bool(self.reply)
+                and not self.unreadable_call)
 
     @property
     def exit_code(self) -> int:
-        return 0 if self.ok else 3
+        if self.ok:
+            return 0
+        if self.error is None and not self.gated and not self.timed_out and self.reply and self.unreadable_call:
+            return 7
+        return 3
 
 
 _HELD = PendingEfferent("terminal", "rm x", "bash fans in", full='{"command": "rm x"}')
@@ -534,7 +539,7 @@ def test_the_outcome_is_read_once_and_the_snapshot_is_what_gets_recorded():
     reads: list[str] = []
 
     class Flip:
-        reply, tool_activity, error, nudged, timed_out, ok, exit_code = "r", [], None, False, False, False, 0
+        reply, tool_activity, error, nudged, timed_out, ok, exit_code = "r", [], None, False, False, False, 4
         held_digest = "d1"
         pending = (_HELD,)
 
@@ -2649,3 +2654,66 @@ def test_an_expired_idem_key_pins_nothing(tmp_path, monkeypatch):
         host.close(sid)
     with pytest.raises(ChatError):
         host.session_status(first["session_id"])    # pruned, as any ended session past the cap
+
+
+# ---------------------------------------------------------------------------- chat L3 r1, M5
+
+
+def _snap(**kw):
+    base = dict(reply="r", tool_activity=(), error=None, nudged=False, gated=False, timed_out=False,
+                pending=(), held_digest=None, unreadable_call=False, ok=True, exit_code=0)
+    base.update(kw)
+    return TurnSnapshot(**base)
+
+
+@pytest.mark.parametrize("kw", [
+    dict(error="boom"),
+    dict(gated=True, pending=(PendingApproval("terminal", "rm x", '{"command": "rm x"}', "r", True),),
+         held_digest="d"),
+    dict(timed_out=True, error="timed out"),
+    dict(unreadable_call=True),
+    dict(reply=None),
+    dict(reply=""),
+])
+def test_a_snapshot_cannot_claim_ok_over_an_outcome_that_is_not_one(kw):
+    # codex MED-5: ok=True with an unreadable call (or an error, a hold, a timeout, no reply) was accepted
+    with pytest.raises(DriverContractError, match="ok"):
+        _snap(**kw)
+
+
+def test_a_snapshot_exit_code_agrees_with_ok():
+    with pytest.raises(DriverContractError, match="exit_code"):
+        _snap(exit_code=3)                                   # ok, but a failure code
+    with pytest.raises(DriverContractError, match="exit_code"):
+        _snap(ok=False, reply=None, exit_code=0)             # not ok, but success
+
+
+def test_an_unreadable_call_carries_exit_7():
+    from levain import session as s
+    assert _snap(ok=False, unreadable_call=True, exit_code=s.EXIT_UNREADABLE_CALL).exit_code == 7
+    with pytest.raises(DriverContractError, match="exit_code"):
+        _snap(ok=False, unreadable_call=True, exit_code=s.EXIT_NO_REPLY)
+    with pytest.raises(DriverContractError, match="exit_code"):
+        _snap(ok=False, reply=None, exit_code=s.EXIT_UNREADABLE_CALL)   # 7 without an unreadable call
+    # Session's order puts an error before the unreadable check, so an errored one is not 7
+    assert _snap(ok=False, unreadable_call=True, error="x", exit_code=s.EXIT_TURN_FAILED).exit_code == 3
+
+
+def test_the_snapshot_codes_are_sessions():
+    from levain import chat_driver as cd
+    from levain import session as s
+    assert (cd._EXIT_OK, cd._EXIT_UNREADABLE_CALL) == (s.EXIT_OK, s.EXIT_UNREADABLE_CALL)
+
+
+def test_every_real_turn_result_makes_a_snapshot():
+    # The rule is session's own classification: no TurnResult the session can build is refused
+    import itertools
+    from levain.session import TurnResult
+    for reply, error, gated, timed_out, unreadable in itertools.product(
+            (None, "", "r"), (None, "e"), (False, True), (False, True), (False, True)):
+        if timed_out and error is None:
+            continue
+        r = TurnResult(reply=reply, error=error, gated=gated, timed_out=timed_out, unreadable_call=unreadable,
+                       pending=(_HELD,) if gated else (), held_digest="d" if gated else None)
+        snap = read_outcome(r)
+        assert (snap.ok, snap.exit_code) == (r.ok, r.exit_code)

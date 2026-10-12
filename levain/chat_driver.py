@@ -26,6 +26,10 @@ snapshot that breaks one cannot exist):
   that runs an action while reporting nothing held cannot be told apart from one that did not run it,
   so what is checked here is the half the host can see: the consent row is never empty when the
   driver says it halted, and a halt is never silent.
+* ``ok`` and ``exit_code`` never contradict the outcome they come with: ``ok`` only for a completed,
+  ungated turn whose reply is readable, ``exit_code`` 0 exactly when ``ok``, and 7 exactly when an
+  otherwise-completed turn's reply is an unreadable call (:attr:`levain.session.TurnResult.exit_code`).
+  A client that read ``ok`` alone would otherwise show a call that never ran as the entity's answer.
 * A halted turn carries ``held_digest``, a string naming those exact bytes, and the driver's
   :meth:`~HarnessDriver.held_digest` reads the same thing again later. The host binds an approval to
   it and refuses an approve when the two differ or either is missing, so a driver with no digest has a
@@ -210,6 +214,12 @@ class PendingApproval:
             raise DriverContractError("a held action's `recognized` is not a bool")
 
 
+# levain.session's EXIT_OK and EXIT_UNREADABLE_CALL, mirrored so this module stays harness-agnostic
+# (it imports no session code); test_the_snapshot_codes_are_sessions pins them equal.
+_EXIT_OK = 0
+_EXIT_UNREADABLE_CALL = 7
+
+
 @dataclass(frozen=True)
 class TurnSnapshot:
     """A turn's outcome, built ONCE by the driver and immutable: the one terminal record of a turn (ACP's
@@ -217,7 +227,9 @@ class TurnSnapshot:
     checked here, at construction, so a snapshot that exists keeps them; the host serialises this same
     object, and nothing of the outcome is read a second time (the live :meth:`~HarnessDriver.held_digest`
     is re-read at approve on purpose, to compare with the one recorded here). ``ok`` and ``exit_code`` are the harness's
-    own classification, carried, not re-derived."""
+    own classification, carried, not re-derived, but never contradicting the outcome: ``ok`` only for a completed,
+    ungated turn with a readable reply, exit 0 exactly when ``ok``, and exit 7 exactly when an otherwise-completed
+    turn's reply is an unreadable call (:attr:`levain.session.TurnResult.exit_code`'s order; chat L3 r1, codex M5)."""
 
     reply: str | None
     tool_activity: tuple[str, ...]
@@ -257,6 +269,16 @@ class TurnSnapshot:
             raise DriverContractError(
                 "the outcome is timed out but carries no error: a stopped turn did not complete, and an "
                 "outcome without an error would leave the session open for another turn")
+        completed = self.error is None and not self.gated and not self.timed_out and bool(self.reply)
+        if self.ok and not (completed and not self.unreadable_call):
+            raise DriverContractError(
+                "the outcome claims `ok` but it failed, halted, timed out, has no reply or its reply is an "
+                "unreadable call: a client would show it as the entity's answer")
+        if (self.exit_code == _EXIT_OK) != self.ok:
+            raise DriverContractError(f"the outcome's `exit_code` {self.exit_code} disagrees with `ok` {self.ok}")
+        if (self.exit_code == _EXIT_UNREADABLE_CALL) != (completed and self.unreadable_call):
+            raise DriverContractError(
+                f"the outcome's `exit_code` {self.exit_code} disagrees with `unreadable_call` {self.unreadable_call}")
         if self.error is not None:
             return      # failed: the host decides nothing on it (module docstring); its rows were checked
         if self.gated and not self.pending:
