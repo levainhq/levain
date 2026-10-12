@@ -1,27 +1,53 @@
 // Drives driver.html in headless Chrome over CDP: real frames, real time. Prints the page's RESULT line,
 // and saves screenshots when asked.   node run_cdp.mjs <chrome> <outdir|-> 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const [chrome, outdir = '-'] = process.argv.slice(2);
 const here = dirname(fileURLToPath(import.meta.url));
-const port = 9300 + Math.floor(Math.random() * 500);
 const profile = mkdtempSync(join(tmpdir(), 'sky-cdp-'));
 const proc = spawn(chrome, ['--headless=new', '--disable-gpu', '--hide-scrollbars', '--allow-file-access-from-files',
-  `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, '--window-size=1180,700', 'about:blank'], { stdio: 'ignore' });
+  '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--window-size=1180,700', 'about:blank'], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Chrome picks a free port itself (port 0) and writes it to <profile>/DevToolsActivePort, the way Puppeteer finds
+// it: a guessed port could collide with another Chrome on the runner, which CI hit as "no chrome target".
+let exited = null;
+let onExit = () => {};
+const died = (why) => { exited = exited ?? why; onExit(new Error(`chrome died: ${exited}`)); };
+proc.on('exit', (code, signal) => died(`chrome exited (code ${code}, signal ${signal})`));
+proc.on('error', (e) => died(`chrome could not start (${e.message})`));
+// every later await races Chrome's death, so a crash mid-run fails with its cause instead of hanging
+const orDeath = (p) => exited ? Promise.reject(new Error(`chrome died: ${exited}`))
+  : Promise.race([p, new Promise((_, rej) => { const prev = onExit; onExit = (e) => { prev(e); rej(e); }; })]);
+let port = null;
+async function devtoolsPort() {
+  for (let i = 0; i < 150; i++) {
+    if (exited) throw new Error(`no chrome target: ${exited}`);
+    try { const p = parseInt(readFileSync(join(profile, 'DevToolsActivePort'), 'utf8').split('\n')[0], 10); if (p > 0) return p; } catch {}
+    await sleep(200);
+  }
+  throw new Error('no chrome target: DevToolsActivePort never appeared in 30 s');
+}
 async function targets() {
-  for (let i = 0; i < 50; i++) { try { const r = await fetch(`http://127.0.0.1:${port}/json`); const t = (await r.json()).find((x) => x.type === 'page'); if (t) return t; } catch {} await sleep(200); }
-  throw new Error('no chrome target');
+  port = port ?? await devtoolsPort();
+  for (let i = 0; i < 150; i++) {
+    if (exited) throw new Error(`no chrome target: ${exited}`);
+    try { const r = await fetch(`http://127.0.0.1:${port}/json`); const t = (await r.json()).find((x) => x.type === 'page'); if (t) return t; } catch {}
+    await sleep(200);
+  }
+  throw new Error(`no chrome target on port ${port} in 30 s`);
 }
 async function session(wsUrl) {
-  const ws = new WebSocket(wsUrl); await new Promise((r) => (ws.onopen = r));
+  const ws = new WebSocket(wsUrl);
   let id = 0; const pend = new Map();
-  ws.onmessage = (m) => { const d = JSON.parse(m.data); if (d.id && pend.has(d.id)) { pend.get(d.id)(d); pend.delete(d.id); } };
-  return { send: (method, params = {}) => new Promise((r) => { const i = ++id; pend.set(i, r); ws.send(JSON.stringify({ id: i, method, params })); }), close: () => ws.close() };
+  let closed = null;
+  ws.onclose = () => { closed = new Error('the DevTools socket closed'); for (const [, [, rej]] of pend) rej(closed); pend.clear(); };
+  await orDeath(new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('the DevTools socket did not open')); }));
+  ws.onmessage = (m) => { const d = JSON.parse(m.data); if (d.id && pend.has(d.id)) { pend.get(d.id)[0](d); pend.delete(d.id); } };
+  return { send: (method, params = {}) => orDeath(new Promise((res, rej) => { if (closed) return rej(closed); const i = ++id; pend.set(i, [res, rej]); ws.send(JSON.stringify({ id: i, method, params })); })), close: () => ws.close() };
 }
 async function run(query, shotName, midShot) {
   const t = await targets(); const s = await session(t.webSocketDebuggerUrl);
@@ -39,4 +65,11 @@ try {
   console.log('multi', await run('', outdir === '-' ? null : 'ck3_sky.png', outdir === '-' ? null : 'ck3_sky_midflight.png'));
   console.log('single', await run('?single=repo-alpha', outdir === '-' ? null : 'ck3_sky_single_repo.png'));
   console.log('hidden', await run('?hidden=1', null));
-} finally { proc.kill(); }
+} finally {
+  if (!exited) {
+    let timer; const gone = new Promise((r) => proc.once('exit', r));
+    proc.kill(); await Promise.race([gone, new Promise((r) => { timer = setTimeout(r, 5000); })]); clearTimeout(timer);
+  }
+  // cleanup must never fail a run or replace its error: Chrome's helpers can still hold the profile briefly
+  try { rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }); } catch {}
+}

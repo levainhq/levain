@@ -2155,8 +2155,8 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
         # carried one RESOLVED line (the gate) directly above one STATIC line (the floor),
         # answering the same operator question — and THAT ASYMMETRY WAS THE BUG.
         # DERIVED from the spec, never hardcoded: build_seat_spec emits --unattended today. Since
-        # 2026-10-07 headless and unattended resolve the same cred floor, so the derivation matters
-        # only if a later policy splits them again (glm L3 LOW: a claim outliving its enforcement).
+        # 2026-10-12 every drive resolves the same cred floor, so the derivation matters only if a
+        # later policy splits them again (glm L3 LOW: a claim outliving its enforcement).
         # ⚠ NOT COVERED BY A TEST, deliberately: `build_seat_spec` always emits `--unattended`, so
         # hardcoding it here is presently INDISTINGUISHABLE from deriving it, and a mutation of
         # this line survives the suite. Recorded rather than papered over with a test that fakes a
@@ -2246,12 +2246,12 @@ def _cmd_daemon_install_seat(args: argparse.Namespace) -> int:
     print()
     if cred_floor is True:
         why = ("pinned by deny_standard_creds: true" if cred_declared is True
-               else "the default for an unattended seat")
+               else "the default")
         print(f"  cred floor: {cred_floor_label()} are DENIED ({why}).")
     elif cred_floor is False:
         print(
             f"  ⚠ cred floor: {cred_floor_label()} are READABLE by this\n"
-            "    seat — deny_standard_creds is explicitly false, so the unattended default is\n"
+            "    seat — deny_standard_creds is explicitly false, so the default is\n"
             "    OVERRIDDEN. It can read those credentials with nobody watching; the gate stops\n"
             "    it SENDING them anywhere, but not reading them into memory that persists."
         )
