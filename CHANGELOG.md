@@ -10,6 +10,10 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 - **`GateHandle`** (`levain.autonomic.handle`). A process holds one handle over its current `EfferentGate`. `swap(manifest, binding_catalog, aggregate)` builds a new gate on a frozen copy of the catalog and publishes it in one step; pending holds, receipts and the journal carry across. `FireDispatcher` and `ChainExecutor` read the handle once per admission, so an admission in flight completes on the gate it started with.
 
+### Changed
+
+- **The cockpit schema is `levain.cockpit/2`.** The `/1` kinds `triage-list`, `metric`, `visual` and `prose` are accepted as aliases of `list`, `status-dots`, `ambient` and `brief`, and the manifest and every panel carry the new names. Field names are kept, and v2 validates them strictly: a metric needs a non-empty label and a value that is a finite number or a string, prose markdown must be a string, and every prose line must be an object with a string text. A provider whose `/1` value was looser is refused until it sends well-formed values.
+
 ### Removed
 
 - **`ChainExecutor.gate`.** The executor now holds a `GateHandle`, exposed as `ChainExecutor.handle`; read the gate with `handle.current()`, once per admission. A gate kept across a policy swap goes stale, so the executor no longer hands one out.
