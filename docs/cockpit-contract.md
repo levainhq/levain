@@ -64,22 +64,24 @@ The manifest's `regions`:
 ```
 "regions": {
   "hero": [ids], "brief": [ids], "widgets": [ids],
-  "header": [hero ids..., brief ids...],
+  "header": [hero ids..., brief ids..., widget ids...],
   "zones": [{"id", "title", "grid": 3, "panels": [ids],
              "cards": [{"panels": [ids], "size", "span", "tabs": title|null}]}]
 }
 ```
 
-`header` is **compat**: what a renderer that predates the hero reads, derived and never declared. A zone's `panels`
-is the flat list as before; `cards` is the layout over the same ids, in panel order. `now` leads `operate` as a card
+`header` is **compat**: what a renderer that predates the hero reads (hero, brief, then widgets, so a widget is drawn
+by the old page's header-extra path rather than lost), derived and never declared. A zone's `panels` is the flat list
+as before, in rank order; `cards` is the layout over the same ids and is authoritative (the two differ when tab members
+are not rank-contiguous). `now` leads `operate` as a card
 of its own (size `medium`, span 1, no tabs). Regions are content: they are hashed into the manifest etag.
 
 **Reading tokens.** `value.symbol` is optional and one of `clear`, `clear-night`, `partly-cloudy`,
 `partly-cloudy-night`, `cloudy`, `fog`, `drizzle`, `rain`, `heavy-rain`, `thunderstorm`, `snow`, `sleet`, `wind`,
 `haze` (`READING_SYMBOLS`); a provider maps its own source vocabulary onto the set, and an unknown token is refused.
 A sub-reading's `band` stays any string, and the contract names the lowercase tokens `good`, `moderate`,
-`unhealthy-sensitive`, `unhealthy`, `very-unhealthy`, `hazardous` (`READING_BANDS`): a renderer compares
-case-insensitively, `good` is calm, the rest are hot, and any other token renders neutral. A sub-reading's `detail`
+`unhealthy-sensitive`, `unhealthy`, `very-unhealthy`, `hazardous` (`READING_BANDS`): a KE1 renderer
+lowercases the token before comparing, `good` is calm, the rest are hot, and any other token renders neutral. A sub-reading's `detail`
 is a free string (for instance the measuring source).
 
 ## Aliases and `levain.cockpit/1` providers

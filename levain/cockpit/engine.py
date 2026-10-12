@@ -218,13 +218,17 @@ class ProviderSpec:
             self.legacy_region = HEADER
             self.region = HERO if self.kind in HERO_KINDS else (BRIEF if self.kind in BRIEF_KINDS else "operate")
 
-    def with_verbs(self, verbs: tuple[str, ...]) -> "ProviderSpec":
-        """A copy offering ``verbs``. ``replace`` re-runs ``__post_init__`` on the already-normalised
-        kind, so the declared name is carried across explicitly."""
-        out = dataclasses.replace(self, verbs=verbs)
+    def replaced(self, **changes: Any) -> "ProviderSpec":
+        """A copy with ``changes``. ``replace`` re-runs ``__post_init__`` on the already-normalised kind and
+        region, so the declared names (the init=False fields) are carried across explicitly, here and nowhere else."""
+        out = dataclasses.replace(self, **changes)
         out.legacy_kind = self.legacy_kind
         out.legacy_region = self.legacy_region
         return out
+
+    def with_verbs(self, verbs: tuple[str, ...]) -> "ProviderSpec":
+        """A copy offering ``verbs``."""
+        return self.replaced(verbs=verbs)
 
 
 def _label_note(note: str | None, labels: "LabelSnapshot | None") -> str | None:
@@ -492,8 +496,16 @@ class Cockpit:
             if DECISIONS_ID in self._specs and self._specs[DECISIONS_ID] is not self._dec.spec:
                 raise CockpitRegistrationError(
                     "panel 'decisions' is registered by a downstream: attach its source instead of registering it")
+            # transactional: a placement the registry refuses must leave the previous panel and source intact
+            before = (self._dec.source, self._dec.spec, self._specs, self._state, dict(self._rowsets))
             self._dec.source = spec
-            self._install_decisions_locked()
+            try:
+                self._install_decisions_locked()
+            except BaseException:
+                self._dec.source, self._dec.spec, self._specs, self._state, rowsets = before
+                self._rowsets.clear()
+                self._rowsets.update(rowsets)
+                raise
 
     def attach_decision_rows(self, fn: Callable[[datetime], Any]) -> None:
         """The broker's reader of its own decisions rows: ``fn(now)`` returns ``DecisionRows``, None
@@ -510,6 +522,8 @@ class Cockpit:
         spec = ProviderSpec(
             DECISIONS_ID, "triage-list", src.title if src else "Decisions waiting", "gate", _composed,
             region=src.region if src else "operate", rank=src.rank if src else -1,
+            face=src.face if src else "", size=src.size if src else "medium",
+            span=src.span if src else 1, tabs=src.tabs if src else "",
             refresh_every_s=src.refresh_every_s if src else None,
             stale_after_s=src.stale_after_s if src else 900.0, timeout_s=src.timeout_s if src else 10.0,
             order=DECISION_ORDER, facets=KERNEL_DECISION_FACETS | (src.facets if src else frozenset()),
@@ -709,9 +723,7 @@ class Cockpit:
             if any(o.region == HERO and o.kind == kind for o in self._specs.values()):
                 if spec.legacy_region != HEADER:
                     raise CockpitRegistrationError(f"{sid}: the hero holds at most one {kind}")
-                moved = dataclasses.replace(spec, region="operate")
-                moved.legacy_region = spec.legacy_region
-                return moved
+                return spec.replaced(region="operate")
         elif region == BRIEF:
             if kind not in BRIEF_KINDS:
                 raise CockpitRegistrationError(f"{sid}: the brief holds a line or a brief, not a {kind!r}")
@@ -1251,7 +1263,8 @@ class Cockpit:
 
     # --- heads, panels, the now view --------------------------------------------------
     def _etag_of(self, snap: _Snap, groups: list[dict[str, Any]] | None, cred: str, today: date,
-                 views: tuple[tuple[str, str, str], ...] = (), labels: LabelSnapshot | None = None) -> str:
+                 views: tuple[tuple[str, str, str], ...] = (), labels: LabelSnapshot | None = None,
+                 face: str = "") -> str:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
@@ -1261,6 +1274,8 @@ class Cockpit:
                      "verbs": self._verb_rev(),
                      # a panel's views shape view_rows: a kernel that adds or reorders one is not a 304
                      **({"views": [list(v) for v in views]} if views else {}),
+                     # the face is drawn from the head, so changing it is not a 304
+                     **({"face": face} if face else {}),
                      # K2b-3b §0.3: provenance is applied at render, so the journal's revision (and a
                      # snapshot's error) is content; with no labeller there is neither
                      **({"labels": [list(labels.revision) if labels.revision is not None else None, labels.error]}
@@ -1302,7 +1317,7 @@ class Cockpit:
             "filtered": snap.filtered, "skipped": snap.skipped,
             "as_of": snap.as_of, "stale_after_s": spec.stale_after_s,
             "refresh_every_s": spec.refresh_every_s,
-            "etag": self._etag_of(snap, groups, cred, today, spec.views, labelled),
+            "etag": self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face),
             "error": snap.error, "note": note, "empty": spec.empty if snap.empty is None else snap.empty,
             "order": spec.order, "groups": groups,
             "views": [{"id": i, "title": t, "order": o} for i, t, o in spec.views] or None,
@@ -1538,8 +1553,10 @@ class Cockpit:
     @staticmethod
     def _regions(specs: list[ProviderSpec]) -> dict[str, Any]:
         """The manifest's ``regions``. ``specs`` arrives in drawing order. ``header`` is COMPAT: what a renderer
-        that predates hero and brief reads (the hero, then the brief), derived and never declared. A zone's
-        flat ``panels`` list is likewise kept beside its ``cards``."""
+        that predates hero and brief reads (the hero, the brief, then the widgets, so none disappears: the old
+        page draws an unknown header id into Operate), derived and never declared. A zone's flat ``panels``
+        list is likewise kept beside its ``cards``; ``cards`` is authoritative for layout, and the flat list
+        follows rank order, which differs from card order when tab members are not rank-contiguous."""
         hero = [s.id for s in specs if s.region == HERO and s.kind == "reading"] + \
                [s.id for s in specs if s.region == HERO and s.kind != "reading"]
         brief = [s.id for s in specs if s.region == BRIEF]
@@ -1560,8 +1577,9 @@ class Cockpit:
             zones.append({"id": zid, "title": zt, "grid": ZONE_GRID,
                           "panels": ([NOW_ID] if zid == "operate" else []) + [s.id for s in members],
                           "cards": cards})
-        return {"hero": hero, "brief": brief, "widgets": [s.id for s in specs if s.region == WIDGETS],
-                "header": hero + brief, "zones": zones}
+        widgets = [s.id for s in specs if s.region == WIDGETS]
+        return {"hero": hero, "brief": brief, "widgets": widgets,
+                "header": hero + brief + widgets, "zones": zones}
 
     def freshness(self) -> dict[str, dict[str, Any]]:
         """``{panel_id: {as_of, status}}`` for every registered panel, ``now`` included (design §3.4).

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from levain.cockpit import Cockpit, CockpitRegistrationError, ProviderSpec, Read
+from levain.cockpit import Cockpit, CockpitRegistrationError, ProviderSpec, Read, RowIn
 from levain.cockpit.engine import READING_BANDS, READING_SYMBOLS, NOW_ID
 
 CRED = {"class": "none", "device_class": None}
@@ -249,3 +249,94 @@ class TestReadingTokens:
             sub=[{"label": "AQI", "value": 42, "detail": 7}]), region="hero"))
         out = ck.panel("w")
         assert out["status"] == "error" and "detail" in out["error"]
+
+
+# --- L3 round 1 fixes --------------------------------------------------------------------------------
+
+
+def _dec_source(**kw):
+    kw.setdefault("region", "operate")
+    return ProviderSpec("decisions", "triage-list", "Decisions waiting", "gate", _rows,
+                        rank=-1, order="time.desc", facets=frozenset({"at"}), version_fields=("id",), **kw)
+
+
+class TestAttachedDecisionLayout:
+    def test_attach_into_widgets_with_a_count_face_registers(self):
+        ck = _ck()
+        ck.attach_decision_source(_dec_source(region="widgets", face="count"))
+        s = ck._specs["decisions"]
+        assert (s.region, s.face) == ("widgets", "count")
+        assert _regions(ck)["widgets"] == ["decisions"]
+
+    def test_attach_carries_size_span_and_tabs(self):
+        ck = _ck()
+        ck.attach_decision_source(_dec_source(region="mind", size="tall", span=2, tabs="Gates"))
+        s = ck._specs["decisions"]
+        assert (s.size, s.span, s.tabs) == ("tall", 2, "Gates")
+
+    def test_a_refused_attach_leaves_the_previous_state_and_a_retry_works(self):
+        ck = _ck()
+        ck.attach_decision_rows(lambda now: None)       # the kernel's own panel is installed
+        before = ck._specs["decisions"]
+        with pytest.raises(CockpitRegistrationError):
+            ck.attach_decision_source(_dec_source(region="widgets"))   # a list in widgets without a count face
+        assert ck._dec.source is None and ck._specs["decisions"] is before and ck._dec.spec is before
+        ck.attach_decision_source(_dec_source(region="widgets", face="count"))
+        assert ck._specs["decisions"].region == "widgets"
+
+
+class TestSpillKeepsTheDeclaredKind:
+    def test_two_legacy_visual_header_panels_both_read_ok(self):
+        ck = _ck()
+        v = lambda ctx: Read(value={"visual": "sky", "text": ["clear"]})  # noqa: E731
+        for pid in ("v1", "v2"):
+            ck.register(ProviderSpec(pid, "visual", pid, "gauge", v, region="header"))
+        assert (ck._specs["v2"].region, ck._specs["v2"].legacy_kind) == ("operate", "visual")
+        assert ck.panel("v1")["status"] == "ok" and ck.panel("v2")["status"] == "ok"
+
+
+class TestFaceMovesTheEtag:
+    def test_face_is_in_the_panel_and_manifest_etag(self):
+        a, b = _ck(), _ck()
+        a.register(_spec("x", "list", "widgets", face="count"))
+        b.register(_spec("x", "list", "operate"))
+        assert a.panel("x")["etag"] != b.panel("x")["etag"]
+
+    def test_if_none_match_with_the_old_face_is_not_a_304(self):
+        from tests.test_cockpit_k1 import _http, _install, _serve
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            _root, src = _install(Path(d))
+            old, new = _ck(), _ck()
+            old.register(_spec("x", "list", "operate"))
+            new.register(_spec("x", "list", "operate", face="count"))
+            with _serve(src, cockpit=old) as (base, _h):
+                st, hdr, _ = _http(f"{base}/cockpit/panel/x.json")
+                assert st == 200
+                etag = hdr["ETag"]
+            with _serve(src, cockpit=new) as (base, _h):
+                assert _http(f"{base}/cockpit/panel/x.json", {"If-None-Match": etag})[0] == 200
+
+
+class TestCompatHeaderKeepsWidgets:
+    def test_header_is_hero_brief_then_widgets(self):
+        ck = _ck()
+        ck.register(_spec("w", "reading", "hero"))
+        ck.register(_spec("b", "line", "brief"))
+        ck.register(_spec("c", "list", "widgets", face="count"))
+        assert _regions(ck)["header"] == ["w", "b", "c"]
+
+
+class TestCountFaceText:
+    def test_a_count_face_prints_the_count_not_the_rows(self):
+        from levain.cockpit.text import _panel_lines
+        ck = _ck()
+        ck.register(ProviderSpec("c", "list", "C", "gauge",
+                                 lambda ctx: Read(rows=(RowIn("r1", "SECRETROW", {"at": "1"}, stored={"id": "r1"}),)),
+                                 region="widgets", face="count", order="time.desc",
+                                 facets=frozenset({"at"}), version_fields=("id",)))
+        m = ck.manifest(CRED)
+        lines = _panel_lines(m["panels"]["c"], ck.panel("c"), NOW, 80, 12)
+        text = "\n".join(t for _s, t in lines)
+        assert "SECRETROW" not in text and "  1" in text

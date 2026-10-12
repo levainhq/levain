@@ -115,6 +115,8 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
     kind = ALIASES.get(head["kind"], head["kind"])      # a levain.cockpit/1 kernel's names degrade too
     if panel.get("next") and panel.get("rows") is None and panel.get("value") is None:
         out.append((DIM, _fit(f"  (summary only — open {visible(panel['next'])} for the content)", width)))
+    elif kind in ROW_ENGINE_KINDS and head.get("face") == "count":
+        out.append(_row(f"  {head['count'] if head.get('count') is not None else '?'}", width))
     elif kind in ROW_ENGINE_KINDS:
         out.extend(_rows(head, panel, width, top_n))
     else:
