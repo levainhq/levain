@@ -684,3 +684,10 @@ def test_l1_ctrl_c_during_a_signing_touch_says_where_the_log_is(v2, monkeypatch,
     assert rc == 1 and err.startswith("ledger init cancelled") and err.count("\n") == 1
     assert "the log is at seq 2; the store stays uninitialised; re-run to resume" in err
     assert len(_log(root)) == 2 and _uninitialised(root)
+
+
+def test_l2_no_stdin_at_all_is_the_not_a_terminal_refusal(v2, monkeypatch, capsys):
+    root, k = v2
+    monkeypatch.setattr(sys, "stdin", None)
+    assert _cli("--signing-key", str(k["A"].path), "--data-root", str(root)) == 1
+    assert "stdin is not a terminal" in capsys.readouterr().err

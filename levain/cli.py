@@ -1704,7 +1704,7 @@ def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
                   "(new: the genesis)")
         if args.confirm or args.drop_unlisted:
             confirmed, drop = set(args.confirm), args.drop_unlisted
-        elif sys.stdin.isatty():
+        elif sys.stdin is not None and sys.stdin.isatty():
             confirmed, drop = set(), True
             asks = [signer_fp] + [r.fingerprint for r in plan.rows
                                   if r.problem is None and r.fingerprint != signer_fp]
