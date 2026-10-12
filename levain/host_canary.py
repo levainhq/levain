@@ -19,12 +19,12 @@ harness's own sandbox must refuse.
 
 from __future__ import annotations
 
-import collections
 import contextlib
 import functools
 import json
 import os
 import secrets
+import selectors
 import shlex
 import shutil
 import socket
@@ -324,10 +324,15 @@ class _Listener:
 # ---------------------------------------------------------------------------- the run
 
 
-# The most stderr lines a canary keeps from claude (chat L3 r1, codex M4: it kept them all).
-_STDERR_TAIL_LINES = 200
+# The most stderr BYTES a canary keeps from claude (chat L3 r1, codex M4: it kept them all; verify
+# r3: a line cap still kept one newline-free write whole).
+_STDERR_TAIL_BYTES = 64 * 1024
 
-# How long the host waits for the stderr drain to see EOF once the process group is dead.
+# The drain reads raw chunks of this size, and wakes at least this often to check its stop event.
+_DRAIN_CHUNK_BYTES = 64 * 1024
+_DRAIN_POLL_SECONDS = 0.05
+
+# How long the host lets the drain reach EOF once the process group is dead, before it stops it.
 _DRAIN_JOIN_SECONDS = 1.0
 
 
@@ -341,8 +346,10 @@ class _Turn:
     hook_context: dict[str, int] = field(default_factory=dict)
     result: dict[str, Any] | None = None
     timed_out: bool = False
-    stderr_tail: collections.deque[str] = field(
-        default_factory=lambda: collections.deque(maxlen=_STDERR_TAIL_LINES))
+    stderr_tail: bytearray = field(default_factory=bytearray)
+
+    def stderr_text(self) -> str:
+        return self.stderr_tail.decode("utf-8", errors="replace")
 
 
 def _result_text(content: Any) -> str:
@@ -365,12 +372,31 @@ def _additional_context(m: dict[str, Any]) -> int:
     return 0
 
 
-def _drain(stream: Any, tail: collections.deque[str]) -> None:
+def _drain(fd: int, tail: bytearray, stop: threading.Event) -> None:
+    """Read raw bytes from a nonblocking ``fd`` until EOF or ``stop``, keeping only the last
+    _STDERR_TAIL_BYTES. It never blocks in read, so a descendant that escaped the process group and
+    still holds the pipe cannot pin it: cleanup sets ``stop`` and the thread returns within one
+    poll (verify r3, codex MED; closes known edge M4)."""
+    sel = selectors.DefaultSelector()
     try:
-        for line in stream:
-            tail.append(line)
+        os.set_blocking(fd, False)
+        sel.register(fd, selectors.EVENT_READ)
+        while not stop.is_set():
+            if not sel.select(_DRAIN_POLL_SECONDS):
+                continue
+            try:
+                chunk = os.read(fd, _DRAIN_CHUNK_BYTES)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                return
+            tail.extend(chunk)
+            if len(tail) > _STDERR_TAIL_BYTES:
+                del tail[:len(tail) - _STDERR_TAIL_BYTES]
     except (OSError, ValueError):
         pass
+    finally:
+        sel.close()
 
 
 def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, timeout: float,
@@ -390,6 +416,7 @@ def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, time
         raise
     timer: threading.Timer | None = None
     drain: threading.Thread | None = None
+    stop_drain = threading.Event()
 
     def kill_group() -> None:
         # The probe's python is claude's grandchild; killing claude alone could leave it running
@@ -407,7 +434,8 @@ def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, time
         stdin, stdout, stderr = proc.stdin, proc.stdout, proc.stderr
         if stdin is None or stdout is None or stderr is None:
             raise OSError("claude started without its pipes")
-        t = threading.Thread(target=_drain, args=(stderr, turn.stderr_tail), daemon=True)
+        t = threading.Thread(target=_drain, args=(stderr.fileno(), turn.stderr_tail, stop_drain),
+                             name="levain-canary-stderr", daemon=True)
         t.start()
         drain = t  # bound only once started: joining an unstarted thread raises in the finally
         timer = threading.Timer(timeout, on_timeout)
@@ -422,13 +450,14 @@ def _drive(argv: list[str], *, cwd: Path, env: dict[str, str], prompt: str, time
         # so the pgid cannot have been reused by an unrelated process (L3 r2, codex 8).
         kill_group()
         proc.wait()
+        # The drain gets a grace period to read to EOF, then is stopped: a descendant that left the
+        # group may hold stderr open forever, and the drain only ever waits in a bounded select, so
+        # it returns within one poll. Only then is the fd closed under it (verify r3, codex MED).
         if drain is not None:
             drain.join(_DRAIN_JOIN_SECONDS)
-        # A drain still alive is blocked in read on a stderr some descendant that left the group still
-        # holds, and close() on that buffered reader would wait on the same lock forever. It is left
-        # open; the daemon thread and the pipe go with the process (verify r2, complement LOW).
-        stderr_busy = drain is not None and drain.is_alive()
-        for pipe in (proc.stdin, proc.stdout, None if stderr_busy else proc.stderr):
+            stop_drain.set()
+            drain.join(_DRAIN_JOIN_SECONDS)
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
             if pipe is not None:
                 try:
                     pipe.close()

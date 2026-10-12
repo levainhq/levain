@@ -104,11 +104,17 @@ def test_a_descendant_holding_stderr_does_not_hang_the_cleanup(tmp_path):
     factory, started = _child(code)
     done: list = []
     t = threading.Thread(target=lambda: done.append(_drive(factory, tmp_path)), daemon=True)
+    before = set(threading.enumerate())
     try:
         t.start()
         t.join(15)
         assert done, "the canary's cleanup hung on a stderr a surviving descendant still holds"
         assert all(_dead(p) for p in started)
+        # verify r3, codex MED: the blocked drain was left alive holding the fd; now it is stopped
+        # and every pipe is closed, so an escaped descendant costs nothing after cleanup
+        (p,) = started
+        assert p.stderr.closed and p.stdout.closed and p.stdin.closed
+        assert [th for th in threading.enumerate() if th not in before and th is not t] == []
     finally:
         if pidfile.exists():
             try:
@@ -122,7 +128,7 @@ def test_a_descendant_holding_stderr_does_not_hang_the_cleanup(tmp_path):
 
 def test_stderr_is_kept_only_as_a_bounded_tail(tmp_path):
     # codex MED-4: every stderr line was kept in a list nobody read
-    n = hc._STDERR_TAIL_LINES * 5
+    n = 50_000
     code = ("import json, sys, time\n"
             f"for i in range({n}): sys.stderr.write('e%d\\n' % i)\n"
             "sys.stderr.flush()\n"
@@ -130,8 +136,21 @@ def test_stderr_is_kept_only_as_a_bounded_tail(tmp_path):
             "time.sleep(60)\n")
     factory, _ = _child(code)
     turn = _drive(factory, tmp_path)
-    assert len(turn.stderr_tail) == hc._STDERR_TAIL_LINES
-    assert turn.stderr_tail[-1] == f"e{n - 1}\n"
+    assert len(turn.stderr_tail) <= hc._STDERR_TAIL_BYTES
+    assert turn.stderr_text().endswith(f"e{n - 1}\n")
+
+
+def test_one_newline_free_stderr_write_keeps_only_the_capped_tail(tmp_path):
+    # verify r3, codex MED / known edge M4: a line-iterating drain kept a single newline-free write
+    # whole; the byte drain keeps at most _STDERR_TAIL_BYTES of it
+    code = ("import json, sys, time\n"
+            "sys.stderr.buffer.write(b'x' * (10 * 1024 * 1024) + b'\\xffEND'); sys.stderr.flush()\n"
+            "print(json.dumps({'type': 'result'})); sys.stdout.flush()\n"
+            "time.sleep(60)\n")
+    factory, _ = _child(code)
+    turn = _drive(factory, tmp_path)
+    assert 0 < len(turn.stderr_tail) <= hc._STDERR_TAIL_BYTES
+    assert turn.stderr_text().endswith("\ufffdEND")  # decoded with errors="replace"
 
 
 # ---------------------------------------------------------------------------- H1 / LOW-5, the probe
