@@ -532,7 +532,9 @@ def create_touch_id(key_dir: Path | None = None, label: str | None = None, *,
 
 
 def _fetch_references(tmp: Path, *, ssh_keygen: Path | str, provider: str) -> list[tuple[Path, str]]:
-    """Every reference key ``ssh-keygen -K -w <provider>`` downloads, as ``(file, normal public key)``.
+    """Every reference key ``ssh-keygen -K -w <provider>`` downloads, as ``(file, normal public key)``, each
+    key once. Every ``*_sk_rk.pub`` a run leaves is kept (an ed25519 resident key lands in ``id_ed25519_sk_rk``
+    beside the ecdsa one); the caller's public-key match picks, and refuses on none or several.
 
     ``-K`` names each file ``id_ecdsa_sk_rk`` and asks ``Overwrite (y/n)?`` (on stdin) before the second;
     an answer it cannot read ends the run. Its first stdin line is read as the authenticator PIN (stdin is
@@ -540,6 +542,7 @@ def _fetch_references(tmp: Path, *, ssh_keygen: Path | str, provider: str) -> li
     directory k answers k overwrites and stops, leaving the (k+1)-th key; the walk ends when a run exits 0
     (it reached the last key). Measured on macOS 26.6.2 with two identities; no touch is asked."""
     out: list[tuple[Path, str]] = []
+    seen: set[str] = set()
     for k in range(_MAX_FETCH):
         sub = tmp / f"k{k}"
         sub.mkdir(mode=0o700)
@@ -549,17 +552,20 @@ def _fetch_references(tmp: Path, *, ssh_keygen: Path | str, provider: str) -> li
                                 start_new_session=True, env=dict(_VERIFY_ENV))
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise KeyError_(f"ssh-keygen -K could not run ({type(exc).__name__})") from None
-        pubs = sorted(sub.glob("*.pub"))
+        pubs = sorted(sub.glob("*_sk_rk.pub"))
         said = (cp.stdout + cp.stderr).decode("utf-8", "replace")
-        if len(pubs) != 1:
-            if k and not pubs:
+        if not pubs:
+            if k:
                 break
-            raise KeyError_(f"ssh-keygen -K left {len(pubs)} reference keys (exit {cp.returncode}): {said.strip()[:200]}")
-        try:
-            normal = normalise_public_key(pubs[0].read_text("ascii"))
-        except (OSError, UnicodeDecodeError) as exc:
-            raise KeyError_(f"cannot read the fetched public key ({type(exc).__name__})") from None
-        out.append((pubs[0].with_name(pubs[0].name[:-4]), normal))
+            raise KeyError_(f"ssh-keygen -K left no reference key (exit {cp.returncode}): {said.strip()[:200]}")
+        for pub_file in pubs:
+            try:
+                normal = normalise_public_key(pub_file.read_text("ascii"))
+            except (OSError, UnicodeDecodeError) as exc:
+                raise KeyError_(f"cannot read the fetched public key ({type(exc).__name__})") from None
+            if normal not in seen:
+                seen.add(normal)
+                out.append((pub_file.with_name(pub_file.name[:-4]), normal))
         if cp.returncode == 0:
             return out
         if "already exists" not in said:

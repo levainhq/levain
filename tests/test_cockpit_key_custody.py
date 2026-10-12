@@ -114,6 +114,10 @@ open(state + ".log", "a").write("ssh-keygen " + " ".join(args) + "\n")
 sys.stderr.write("Enter PIN for authenticator: You may need to touch your authenticator to authorize key download.\n")
 sys.stdin.readline()                       # the PIN line
 rows = [r for r in db["identities"] if not db.get("hide_new") or r["label"] != db["hide_new"]]
+if db.get("ed25519"):                      # a FIDO ed25519 resident key: its own file name, no prompt
+    open("id_ed25519_sk_rk", "w").write("reference ed25519\n")
+    open("id_ed25519_sk_rk.pub", "w").write(db["ed25519"] + " ssh:\n")
+    sys.stderr.write("Saved ED25519-SK key to id_ed25519_sk_rk\n")
 for n, r in enumerate(rows):
     if n:
         print("id_ecdsa_sk_rk already exists.")
@@ -296,6 +300,27 @@ def test_mkdtemp_failing_after_create_deletes_ours(tmp_path, monkeypatch, provid
     with pytest.raises(KeyError_, match="PermissionError.*the identity was deleted"):
         mac.create(tmp_path / "keys")
     assert [i["label"] for i in mac.load()["identities"]] == ["other-0"]
+
+
+def test_the_fetch_keeps_every_reference_and_the_matcher_picks(tmp_path, monkeypatch, provider_present):
+    """glm MED (L3 r1): a -K run leaving an ecdsa and an ed25519 reference refused outright. Every
+    ``*_sk_rk.pub`` is collected; the public-key matcher picks the new identity's."""
+    mac = Mac(tmp_path, monkeypatch)
+    blob = _s(b"sk-ssh-ed25519@openssh.com") + _s(b"\x07" * 32) + _s(b"ssh:")
+    mac.db["ed25519"] = "sk-ssh-ed25519@openssh.com " + base64.b64encode(blob).decode()
+    mac.save()
+    made = mac.create(tmp_path / "keys")
+    assert made.public_key == mac.new[0]["pub"] and made.ctk_hash == mac.new[0]["hash"]
+    assert "delete-ctk-identity" not in mac.log()
+    refs = custody._fetch_references(_fresh(tmp_path / "walk"), ssh_keygen=mac.ssh_keygen,
+                                     provider=custody.APPLE_PROVIDER)
+    assert sorted(n.split()[0] for _, n in refs) == ["sk-ecdsa-sha2-nistp256@openssh.com"] * 2 + [
+        "sk-ssh-ed25519@openssh.com"]                 # other-0, ours, and the ed25519 key, once each
+
+
+def _fresh(d: Path) -> Path:
+    d.mkdir(mode=0o700)
+    return d
 
 
 def test_touch_id_create_refuses_a_label_already_in_use_before_creating(tmp_path, monkeypatch, provider_present):
