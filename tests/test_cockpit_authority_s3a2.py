@@ -412,6 +412,15 @@ def test_one_request_captures_once(broker, spores, keydir, monkeypatch):
 
 # --- structural fences ----------------------------------------------------------------------------
 
+def _dotted(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        head = _dotted(node.value)
+        return None if head is None else f"{head}.{node.attr}"
+    return None
+
+
 def _calls(tree: ast.AST, module_aliases: set[str], name_aliases: set[str], attr: str) -> list[ast.Call]:
     out = []
     for node in ast.walk(tree):
@@ -419,28 +428,45 @@ def _calls(tree: ast.AST, module_aliases: set[str], name_aliases: set[str], attr
             f = node.func
             if isinstance(f, ast.Name) and f.id in name_aliases:
                 out.append(node)
-            elif isinstance(f, ast.Attribute) and f.attr == attr and isinstance(f.value, ast.Name) \
-                    and f.value.id in module_aliases:
+            elif isinstance(f, ast.Attribute) and f.attr == attr and _dotted(f.value) in module_aliases:
                 out.append(node)
     return out
 
 
-def _uses(path: Path, names: tuple[str, ...]) -> list[tuple[str, str, int]]:
-    """Calls in ``path`` of any of ``names`` from ``levain.authority``, as (name, enclosing function,
-    line). A module alias is ``import levain.authority as X`` / ``from levain import authority as X``."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    modules: set[str] = set()
-    imported: dict[str, str] = {}
+def _module_aliases(tree: ast.AST, module: str) -> set[str]:
+    """Every dotted name ``module`` is reachable as: ``import a.b.c [as X]``, ``import a.b as X``
+    (``X.c``), a bare ``import a...`` (``a.b.c``), ``from a.b import c [as X]``, ``from a import b``
+    (``b.c``)."""
+    out: set[str] = set()
+
+    def bind(full: str, local: str) -> None:
+        if module == full or module.startswith(full + "."):
+            out.add(local + module[len(full):])
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
-                if a.name == "levain.authority" and a.asname:
-                    modules.add(a.asname)
-        elif isinstance(node, ast.ImportFrom):
-            if node.module == "levain":
-                modules.update(a.asname or a.name for a in node.names if a.name == "authority")
-            elif node.module == "levain.authority":
-                imported.update({a.asname or a.name: a.name for a in node.names if a.name in names})
+                if a.asname:
+                    bind(a.name, a.asname)
+                elif a.name.split(".")[0] == module.split(".")[0]:
+                    out.add(module)            # a bare import binds the top package, and the dotted path
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for a in node.names:
+                bind(f"{node.module}.{a.name}", a.asname or a.name)
+    return out
+
+
+def _uses(path: Path, names: tuple[str, ...], module: str = "levain.authority") -> list[tuple[str, str, int]]:
+    """Calls in ``path`` of any of ``names`` from ``module``, as (name, enclosing function, line),
+    through a from-import of the name or any alias of the module (:func:`_module_aliases`)."""
+    return _uses_in(ast.parse(path.read_text(encoding="utf-8")), names, module)
+
+
+def _uses_in(tree: ast.AST, names: tuple[str, ...], module: str) -> list[tuple[str, str, int]]:
+    modules = _module_aliases(tree, module)
+    imported: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == module and not node.level:
+            imported.update({a.asname or a.name: a.name for a in node.names if a.name in names})
     parents: dict[ast.AST, ast.AST] = {}
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
@@ -457,6 +483,16 @@ def _uses(path: Path, names: tuple[str, ...]) -> list[tuple[str, str, int]]:
                     break
             found.append((name, fn, call.lineno))
     return found
+
+
+def _key_act_callers(tree: ast.AST) -> bool:
+    """Whether ``tree`` reaches ``levain.cockpit.keys``' enroll or revoke: a from-import of either, or
+    a call through any alias of the module."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "levain.cockpit.keys" \
+                and {a.name for a in node.names} & {"enroll", "revoke"}:
+            return True
+    return bool(_uses_in(tree, ("enroll", "revoke"), "levain.cockpit.keys"))
 
 
 def test_no_snapshot_is_built_outside_capture_and_append():
@@ -491,14 +527,22 @@ def test_every_appender_is_the_short_lived_cli_path():
         for name, fn, _line in _uses(path, ("append", "sign_and_append", "prepare")):
             appenders.append((str(path.relative_to(LEVAIN)), fn, name))
     assert appenders == [("cockpit/keys.py", "_append", "sign_and_append")]
-    callers = []
-    for path in sorted(LEVAIN.rglob("*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and node.module == "levain.cockpit.keys":
-                if {a.name for a in node.names} & {"enroll", "revoke"}:
-                    callers.append(str(path.relative_to(LEVAIN)))
-    assert sorted(set(callers)) == ["cli.py"]
+    callers = [str(path.relative_to(LEVAIN)) for path in sorted(LEVAIN.rglob("*.py"))
+               if _key_act_callers(ast.parse(path.read_text(encoding="utf-8")))]
+    assert callers == ["cli.py"]
+
+
+def test_the_fences_see_a_nested_module_call_and_a_module_import_of_keys():
+    # each source is one the first scan (an asname-only module alias, a from-import of the act) missed
+    nested = ast.parse("import levain.authority\ndef reader(conn):\n    return levain.authority.snapshot(conn)\n")
+    assert _uses_in(nested, ("snapshot",), "levain.authority") == [("snapshot", "reader", 3)]
+    package = ast.parse("import levain.cockpit\ndef r(c):\n    return levain.authority._replay(c)\n")
+    assert _uses_in(package, ("_replay",), "levain.authority") == [("_replay", "r", 3)]
+    via_module = ast.parse("from levain.cockpit import keys\ndef act(root):\n    keys.enroll(root, 'k')\n")
+    assert _key_act_callers(via_module)
+    via_alias = ast.parse("import levain.cockpit.keys as k\nk.revoke('r', 'x')\n")
+    assert _key_act_callers(via_alias)
+    assert not _key_act_callers(ast.parse("from levain.cockpit import keys\nkeys.keys('r')\n"))
 
 
 # --- MUST (b): fingerprint_of over an fd, a timeout is VerifierUnavailable ------------------------------
