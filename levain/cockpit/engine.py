@@ -1360,7 +1360,7 @@ class Cockpit:
         searchable = spec.window is not None or (count or 0) > SEARCH_THRESHOLD
         return {
             "search": {"fields": list(search_fields_of(spec)), "scope": spec.search_scope,
-                       "default_visible": spec.search_default_visible, "hook": spec.search is not None},
+                       "default_visible": roster_visible(spec), "hook": spec.search is not None},
             "searchable": searchable, "window": spec.window,
         }
 
@@ -2221,13 +2221,106 @@ def _v_roster(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         # null is the honest "no data": a digest is never a faked zero
         if r.get("digest") is not None and not isinstance(r["digest"], dict):
             raise _bad(spec, f"{w}.digest", "must be an object or null (null means no data)")
+        if isinstance(r.get("digest"), dict) and r["digest"].get("last_wrap_at") is not None and not _is_iso(r["digest"]["last_wrap_at"]):
+            raise _bad(spec, f"{w}.digest.last_wrap_at", "must be null or an ISO-8601 timestamp")
         lc = r.get("last_call")
         if lc is not None and not (isinstance(lc, dict) and _is_iso(lc.get("at")) and lc.get("outcome") in EVENT_OUTCOMES):
             raise _bad(spec, f"{w}.last_call", f"must be null or {{at (ISO-8601), outcome (one of {list(EVENT_OUTCOMES)})}}")
-    shown = [{**r, "silence_is_signal": (r["silence_is_signal"] if r.get("silence_is_signal") is not None
-                                         else r["cadence"] == "resident")}
-             for r in rows if r["lifecycle"] != "retired"]      # retired members do not render
+    now = datetime.now(timezone.utc)
+    shown = []
+    for r in rows:
+        if r["lifecycle"] == "retired":
+            continue                                            # retired members do not render
+        r = {**r, "silence_is_signal": (r["silence_is_signal"] if r.get("silence_is_signal") is not None
+                                        else r["cadence"] == "resident")}
+        r["fleet_group"] = fleet_group(r)
+        r["health"] = roster_health(r, now)
+        shown.append(r)
     return {**v, "rows": shown, "retired_hidden": len(rows) - len(shown)}
+
+
+_WRAP_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def _wrap_every_s(text: Any) -> float | None:
+    """'1d' / '12h' / '2w' in seconds; anything else is no schedule (never a guess)."""
+    if not isinstance(text, str) or len(text) < 2 or text[-1] not in _WRAP_UNITS or not text[:-1].isdigit():
+        return None
+    return int(text[:-1]) * _WRAP_UNITS[text[-1]]
+
+
+ROSTER_VISIBLE = 40
+
+
+def roster_visible(spec: "ProviderSpec") -> int:
+    """A roster is a bounded set drawn in groups (the roundtable folds to one line), so it is not cut at the
+    list default of 10 unless its contributor declared a window of its own."""
+    d = spec.search_default_visible
+    return ROSTER_VISIBLE if spec.kind == "roster" and d == 10 else d
+
+
+def fleet_group(row: dict[str, Any]) -> str:
+    """Where a roster row is drawn: the roundtable's seats fold into one group, whatever their cadence."""
+    if row.get("group") == "roundtable":
+        return "roundtable"
+    return "resident" if row.get("cadence") == "resident" else "on_call"
+
+
+def _kb(n: float) -> str:
+    return f"{n / 1e6:.1f} MB" if n > 1e6 else f"{round(n / 1e3)} kB"
+
+
+def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """Health PER KIND, the one place the fleet rules live. ``tone`` is ok | alarm | neutral | unknown;
+    only a RESIDENT member whose silence is a signal can be ``alarm``. An on-call member (and a member the
+    contributor says silence means nothing for) is described by its last call as a neutral fact, its
+    memory as a plain fact; wrap age is an alarm only against ``wrap_every``, only for resident + stateful.
+    The wrap age is read at validation time, so it is as fresh as the snapshot it rides."""
+    dg = row.get("digest") if isinstance(row.get("digest"), dict) else None
+    lc = row.get("last_call") if isinstance(row.get("last_call"), dict) else None
+    stateful = row.get("memory") == "stateful"
+    if stateful:
+        sb = dg.get("store_bytes") if dg else None
+        mem = "memory" + (f" {_kb(sb)}" if isinstance(sb, (int, float)) and not isinstance(sb, bool) and sb else "")
+    else:
+        mem = "stateless"
+    out: dict[str, Any] = {"tone": "neutral", "text": "", "at": None, "memory": mem}
+    if row.get("cadence") == "on_call" or not row.get("silence_is_signal"):
+        if lc:
+            out["text"] = "last call failed" if lc.get("outcome") == "failed" else "answered"
+            out["at"] = lc.get("at")
+        elif row.get("cadence") == "on_call":
+            out["text"] = "not called yet"
+        else:
+            out["text"] = "no signal expected"
+        return out                                              # never an alarm: a neutral fact
+    if dg is None:
+        return {**out, "tone": "unknown", "text": "no data"}
+    if dg.get("available") is False:
+        return {**out, "tone": "alarm", "text": "write path unavailable"}
+    eps = dg.get("episodes_24h")
+    parts: list[str] = []
+    tone = "ok"
+    if not stateful:
+        parts.append("running")
+    elif isinstance(eps, bool) or not isinstance(eps, (int, float)):
+        tone = "unknown"
+        parts.append("episodes unknown")
+    elif eps == 0:
+        tone = "alarm"
+        parts.append("no episodes in 24 h, it should be writing")
+    else:
+        parts.append(f"{int(eps)} episodes in 24 h")
+    every = _wrap_every_s(row.get("wrap_every")) if stateful else None
+    if every is not None:
+        lw = dg.get("last_wrap_at")
+        if _is_iso(lw) and (now - _parse_iso(lw)).total_seconds() > every:
+            tone = "alarm"
+            parts.append(f"last wrap overdue (due every {row['wrap_every']})")
+        else:
+            parts.append(f"wraps every {row['wrap_every']}")
+    out["tone"], out["text"] = tone, " · ".join(parts)
+    return out
 
 
 def _v_form(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
