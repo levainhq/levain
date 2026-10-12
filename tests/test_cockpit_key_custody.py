@@ -631,6 +631,19 @@ def test_a_touch_id_signature_the_key_did_not_make_reads_as_no_presence_not_a_ba
     assert "does not verify" not in msg
 
 
+def test_a_hand_made_touch_id_key_with_no_sidecar_is_named_by_its_provider(tmp_path, monkeypatch):
+    # L3 r1 (codex MED): a hand-made Secure Enclave key signs through SSH_SK_PROVIDER with no sidecar
+    import levain.cockpit.keys as keys_mod
+    from levain.cockpit.custody import APPLE_PROVIDER
+    k, other = RealKey(tmp_path, "k"), RealKey(tmp_path, "other")
+    monkeypatch.setenv("SSH_SK_PROVIDER", APPLE_PROVIDER)
+    _, sign = keys_mod.ssh_signer(k.path)
+    _signs_with(monkeypatch, other)
+    with pytest.raises(KeyError_) as err:
+        sign(b"m")
+    assert "Touch ID" in str(err.value) and "cancelled" in str(err.value)
+
+
 def test_any_key_whose_signature_is_not_its_own_is_refused_at_signing(tmp_path, monkeypatch):
     import levain.cockpit.keys as keys_mod
     k, other = RealKey(tmp_path, "k"), RealKey(tmp_path, "other")

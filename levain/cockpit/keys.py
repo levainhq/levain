@@ -591,7 +591,7 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -
     provider, which ``sign`` sets as ``SSH_SK_PROVIDER`` itself; an ``SSH_SK_PROVIDER`` in the environment
     still wins. A passphrase key (its sidecar says so, or its file is encrypted) is always signed from the
     file with no agent, so ssh-keygen asks the passphrase for every signature and nothing caches it."""
-    from levain.cockpit.custody import PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
+    from levain.cockpit.custody import APPLE_PROVIDER, PASSPHRASE, TOUCH_ID, is_encrypted_file, read_sidecar
     key_path = Path(key_path).expanduser()
     public_key = signing_public_key(key_path)
     fp = fingerprint_of(public_key, ssh_keygen=ssh_keygen)
@@ -626,7 +626,9 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -
         # the log's replay it would read as a bad signature, which is a different failure.
         if not _authority.verify_link_sig(message, signature, public_key=public_key, fingerprint=fp,
                                           ssh_keygen=ssh_keygen):
-            if touch_id:
+            # a Touch ID key is one its sidecar says is, or one signed through the Secure Enclave provider
+            # (a hand-made key enrolled with --custody touch-id has no sidecar)
+            if touch_id or env.get("SSH_SK_PROVIDER") == APPLE_PROVIDER:
                 raise KeyError_(f"Touch ID was cancelled or did not complete: no signature was made with {fp}, "
                                 "so nothing was signed")
             raise KeyError_(f"ssh-keygen returned no valid signature by {fp} ({key_path}), so nothing was signed")
