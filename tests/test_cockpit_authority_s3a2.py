@@ -622,13 +622,14 @@ def _uses_in(tree: ast.AST, names: tuple[str, ...], module: str) -> list[tuple[s
 
 
 def _key_act_callers(tree: ast.AST) -> bool:
-    """Whether ``tree`` reaches ``levain.cockpit.keys``' enroll or revoke: a from-import of either, or
-    a call through any alias of the module."""
+    """Whether ``tree`` reaches ``levain.cockpit.keys``' enroll, revoke or ledger_init: a from-import of
+    any, or a call through any alias of the module."""
+    acts = ("enroll", "revoke", "ledger_init")
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "levain.cockpit.keys" \
-                and {a.name for a in node.names} & {"enroll", "revoke"}:
+                and {a.name for a in node.names} & set(acts):
             return True
-    return bool(_uses_in(tree, ("enroll", "revoke"), "levain.cockpit.keys"))
+    return bool(_uses_in(tree, acts, "levain.cockpit.keys"))
 
 
 def test_no_snapshot_is_built_outside_capture_and_append():
@@ -678,6 +679,7 @@ def test_the_fences_see_a_nested_module_call_and_a_module_import_of_keys():
     assert _key_act_callers(via_module)
     via_alias = ast.parse("import levain.cockpit.keys as k\nk.revoke('r', 'x')\n")
     assert _key_act_callers(via_alias)
+    assert _key_act_callers(ast.parse("from levain.cockpit.keys import ledger_init\n"))
     assert not _key_act_callers(ast.parse("from levain.cockpit import keys\nkeys.keys('r')\n"))
 
 

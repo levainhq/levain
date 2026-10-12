@@ -622,12 +622,9 @@ def _drive_task(
             # No human is driving. With `efferent_gate: "auto"` BOTH modes below resolve GATED —
             # the fan-in a watching operator supplies at the REPL has to come from the gate here.
             #
-            # The two are NOT interchangeable for the crown-jewels CRED floor, which is the whole
-            # reason this is a three-valued mode rather than the old `human_present` bool:
-            # `headless` is a human who typed this and will read the output (they may legitimately
-            # need `gh`), while `unattended` is a scheduler with nobody in the loop at all, where a
-            # silent credential read can compound into always-loaded memory. See
-            # `levain.firing.drive`.
+            # `unattended` records that a scheduler, not a person, invoked the run. No policy splits
+            # the two today: the crown-jewels CRED floor denies the standard stores in every drive
+            # (the REPL too since 2026-10-12). See `levain.firing.drive`.
             mode="unattended" if unattended else "headless",
         )
     except SessionStartError as exc:

@@ -3,8 +3,13 @@
 Who may sign is a verified replay of the signed authority log (``levain.authority``, trust-tiering
 DESIGN §3), never a table a writer can edit: an enrol or a revoke is a LINK, signed by a key the log
 already holds (an enrol by a laptop-presence key; a revoke by a key of at least the revoked key's class),
-judged by the replay at its predecessor. The first link (the genesis) is ``levain cockpit ledger init``'s,
-so an empty log refuses here, naming it.
+judged by the replay at its predecessor. The first link (the genesis) is ``levain cockpit ledger init``'s
+(:func:`ledger_init`), so an empty log refuses here, naming it.
+
+``ledger init`` on a store the /2 -> /3 migration marked uninitialised re-enrols the confirmed
+``legacy_keys`` rows as links, each its own transaction, the marker still set. Only a last transaction,
+which finds the log's head where the last link left it, drops ``legacy_keys`` and clears the marker, so a
+run cut off between links leaves a store that still refuses every signed act and that a re-run resumes.
 
 A governed install's keys are written only by slice G's root helper, so every act here refuses a data
 root a governed marker names, or a journal started under any class but ``reported``.
@@ -21,23 +26,26 @@ import binascii
 import hashlib
 import os
 import re
+import sqlite3
 import struct
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from levain.authority import (NAMESPACE, AuthorityError, AuthorityKey, AuthoritySnapshot, VerifierUnavailable,
-                              _pipe_reading, anchor_path, sign_and_append)
+from levain import authority as _authority
+from levain.authority import (LAPTOP, NAMESPACE, AnchorError, AuthorityError, AuthorityKey, AuthoritySnapshot,
+                              VerifierUnavailable, _pipe_reading, anchor_path, sign_and_append)
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN
 from levain.cockpit.authority import RequestAuthority
-from levain.cockpit.firejournal import _CLASS_RANK, DB_NAME, CockpitDB, _meta
+from levain.cockpit.firejournal import _CLASS_RANK, DB_NAME, UNINITIALISED, CockpitDB, _meta
 from levain.cockpit.install import REPORTED, marker_path, marker_present, marker_unreadable
 
-__all__ = ["KEY_CLASSES", "KeyError_", "KeyRow", "Signer", "enroll", "keys", "fingerprint_of",
-           "normalise_public_key", "principal_of", "revoke", "ssh_signer"]
+__all__ = ["KEY_CLASSES", "InitPlan", "InitResult", "KeyError_", "KeyRow", "LegacyRow", "Signer", "enroll", "keys",
+           "fingerprint_of", "init_plan", "ledger_init", "normalise_public_key", "principal_of", "revoke",
+           "signing_public_key", "ssh_signer"]
 
 KEY_CLASSES = tuple(sorted(_CLASS_RANK, key=_CLASS_RANK.__getitem__))
 # the key types ssh-keygen -Y signs with (sk- = FIDO / Secure Enclave via a security key provider)
@@ -252,6 +260,276 @@ def keys(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAU
     return [_row(k) for k in rows], auth.authority_error
 
 
+# ---------------------------------------------------------------------------------------------------
+# `levain cockpit ledger init` (DESIGN §3.2 genesis, §3.7)
+
+
+@dataclass(frozen=True)
+class LegacyRow:
+    """A ``legacy_keys`` row the /2 -> /3 migration kept, as ``ledger init`` lists it."""
+    fingerprint: str
+    key_class: str
+    key_type: str
+    enrolled_at: str | None
+    revoked: bool
+    compromised: bool                # /2 recorded a compromised_since time for it
+    public_key: str | None           # its normal form; None when the row's key cannot be read
+    problem: str | None              # why it cannot be re-enrolled (listed and skipped); None when it can
+    in_log: KeyRow | None = None     # what an earlier, interrupted init already appended for it
+
+
+@dataclass(frozen=True)
+class InitPlan:
+    """What ``ledger init`` finds: a fresh store (no migration marker, an empty log) or a migrated one,
+    its log's head (0 when empty) and genesis key, the legacy rows in enrol order, and every key the log
+    already holds (an interrupted init's), in enrol order, the genesis first."""
+    migrated: bool
+    seq: int
+    genesis: str | None
+    rows: tuple[LegacyRow, ...]
+    log_keys: tuple[KeyRow, ...] = ()
+
+
+@dataclass(frozen=True)
+class InitResult:
+    links: tuple[str, ...]           # each link this run appended, as "seq N: what"
+    kept: tuple[str, ...]            # legacy fingerprints now in the log (revoked ones included)
+    dropped: tuple[str, ...]         # legacy fingerprints not confirmed
+    skipped: tuple[str, ...]         # legacy fingerprints that cannot be re-enrolled
+    seq: int
+    store_id: str
+    warning: str | None              # the anchor is behind the log's head (the log stands)
+
+
+def _legacy_row(raw: Any, state: AuthoritySnapshot | None, ssh_keygen: Path | str) -> LegacyRow:
+    fp, pub, cls, enrolled_at, revoked_at, compromised = (raw[0], raw[1], raw[2], raw[3], raw[4], raw[5])
+    fp = str(fp)
+    words = pub.split() if isinstance(pub, str) else []
+    key_type = words[0] if words else "?"
+    normal: str | None = None
+    problem: str | None = None
+    if cls not in _CLASS_RANK:
+        problem = f"unknown class {cls!r}"
+    else:
+        try:
+            normal = normalise_public_key(pub if isinstance(pub, str) else "")
+            if fingerprint_of(normal, ssh_keygen=ssh_keygen) != fp:
+                problem = "its public key's fingerprint is not the row's"
+        except KeyError_ as exc:
+            normal, problem = None, f"its public key cannot be read ({exc})"
+        # read through the module at call time: the class floor is authority's, never a copy here
+        if problem is None and cls == LAPTOP and key_type not in _authority._LAPTOP_KEY_TYPES:
+            problem = (f"key type {key_type} is not eligible for {LAPTOP} (one of "
+                       f"{', '.join(sorted(_authority._LAPTOP_KEY_TYPES))})")
+    held = None if state is None else state.key(fp)
+    return LegacyRow(fp, str(cls), key_type, enrolled_at if isinstance(enrolled_at, str) else None,
+                     revoked_at is not None, compromised is not None, normal, problem,
+                     None if held is None else _row(held))
+
+
+def _init_state(db: CockpitDB, now: datetime,
+                ssh_keygen: Path | str) -> tuple[InitPlan, AuthoritySnapshot | None]:
+    with db.read() as conn:
+        # capture first: it reads the anchor before the transaction's first SELECT pins the snapshot
+        auth = RequestAuthority.capture(conn, now=now, anchor=anchor_path(db.data_root), source=str(db.path),
+                                        ssh_keygen=ssh_keygen)
+        _check_reported(conn)
+        marker = _meta(conn, UNINITIALISED)
+        has_legacy = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                                  "AND name = 'legacy_keys'").fetchone() is not None
+        legacy = conn.execute("SELECT fingerprint, public_key, class, enrolled_at, revoked_at, compromised_since "
+                              "FROM legacy_keys ORDER BY enrolled_at, fingerprint").fetchall() if has_legacy else []
+    if auth.authority is None and not auth.log_empty:
+        raise KeyError_(str(auth.authority_error))
+    state = auth.authority
+    if marker is None:
+        if state is not None:
+            raise KeyError_(f"the authority log is already initialised (head at seq {state.seq}); "
+                            "`levain cockpit enroll` adds a key")
+        if has_legacy:
+            raise KeyError_("this store holds legacy_keys but no migration marker; `ledger init` does not "
+                            "recognise it")
+    rows = tuple(_legacy_row(r, state, ssh_keygen) for r in legacy)
+    genesis = None if state is None else next(
+        (k.fingerprint for k in state.keys.values() if k.enrolled_seq == 1), None)
+    held = () if state is None else tuple(_row(k) for k in sorted(state.keys.values(),
+                                                                   key=lambda k: k.enrolled_seq))
+    return InitPlan(marker is not None, 0 if state is None else state.seq, genesis, rows, held), state
+
+
+def init_plan(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+              marker_directory: Path | None = None) -> InitPlan:
+    """What ``ledger init`` would work from, for the operator to confirm row by row; refuses a store that
+    is already initialised. Opening a /2 journal here migrates it (as every key command does)."""
+    db = _journal(data_root, marker_directory=marker_directory)
+    return _init_state(db, now, ssh_keygen)[0]
+
+
+def ledger_init(data_root: Path | str, *, signer_public_key: str, signer_fp: str, sign: Signer,
+                clock: Callable[[], datetime], confirmed: Collection[str], drop_unlisted: bool = False,
+                ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN, marker_directory: Path | None = None) -> InitResult:
+    """Initialise the authority log, every link signed by ``signer_fp`` (a laptop-presence key: a
+    touch-required one asks once per link).
+
+    A fresh store (no migration marker, an empty log) gets one link, the genesis: ``signer_fp``
+    enrolled as laptop-presence, signed by itself (the trust on first use of DESIGN §3.2). A migrated
+    store gets the same genesis (carrying ``legacy_enrolled_at`` when the signing key is a legacy row),
+    then, per confirmed legacy row in enrol order, an ``enrol`` (carrying ``legacy_enrolled_at``) and,
+    for a row /2 revoked, a ``revoke_key``. A revoked row /2 marked compromised is revoked with
+    ``compromised_since`` at its own enrol seq: its /2-era fires carry no authority seq, so any
+    ``compromised_since`` reads them "signed by a revoked key".
+
+    Every key enrolled is confirmed, the signing key included (it is in ``confirmed``). A row that
+    cannot be re-enrolled is skipped; confirming one refuses. An eligible row not confirmed is dropped
+    only with ``drop_unlisted``, else this refuses naming them. Each link is its own transaction and
+    the migration marker stays set while they land, so a run cut off between links leaves a store that
+    still refuses every signed act; a re-run resumes from the log. A resume confirms the log's genesis
+    too (whatever key wrote it), else refuses naming it; an earlier run's key that is no longer confirmed
+    is revoked with ``compromised_since`` at its own enrol seq, so its seq-less /2-era fires read
+    "signed by a revoked key", the nearest the log can say to a dropped key's "unverified"; one that run
+    already revoked without a compromise refuses unless confirmed, as no link can make it compromised. A refusal
+    after a link landed says where the log stands. Only the last transaction, which finds the log's head where the last
+    link left it, drops ``legacy_keys`` and clears the marker."""
+    db = _journal(data_root, marker_directory=marker_directory)
+    plan, state = _init_state(db, _now(clock), ssh_keygen)
+    signer_key = normalise_public_key(signer_public_key)
+    if fingerprint_of(signer_key, ssh_keygen=ssh_keygen) != signer_fp:
+        raise KeyError_("the signing key's public half is not the key that signs")
+    confirmed = set(confirmed)
+    by_fp = {r.fingerprint: r for r in plan.rows}
+    unknown = sorted(confirmed - set(by_fp) - {signer_fp} - ({plan.genesis} if plan.genesis else set()))
+    if unknown:
+        raise KeyError_(f"no legacy key {', '.join(unknown)} to confirm")
+    if signer_fp not in confirmed:
+        raise KeyError_(f"the signing key {signer_fp} is not confirmed; every key init enrols is confirmed, "
+                        "the signing key included")
+    mine = by_fp.get(signer_fp)
+    if mine is not None:
+        if mine.key_class != LAPTOP:
+            raise KeyError_(f"the signing key is a legacy {mine.key_class} key; init signs with a {LAPTOP} key")
+        if mine.revoked:
+            raise KeyError_("the signing key was revoked before the migration; a revoked key stays revoked")
+    bad = [r for r in plan.rows if r.fingerprint in confirmed and r.problem is not None]
+    if bad:
+        raise KeyError_("; ".join(f"{r.fingerprint} cannot be re-enrolled: {r.problem}" for r in bad))
+    unlisted = [r.fingerprint for r in plan.rows
+                if r.problem is None and r.fingerprint not in confirmed and r.fingerprint != signer_fp]
+    if unlisted and not drop_unlisted:
+        raise KeyError_(f"not confirmed: {', '.join(unlisted)}; confirm each one to keep, or pass "
+                        "--drop-unlisted to drop the rest")
+    if state is not None:
+        signer = state.key(signer_fp)
+        if signer is None or not signer.active or signer.key_class != LAPTOP:
+            raise KeyError_(f"an earlier ledger init began this log (genesis {plan.genesis}, head at seq "
+                            f"{state.seq}); sign with an unrevoked {LAPTOP} key it enrolled")
+        if plan.genesis not in confirmed:
+            raise KeyError_(f"the log's genesis {plan.genesis} (seq 1, written by an earlier, interrupted init) "
+                            "is not confirmed; a resume cannot drop the genesis: confirm it (it stays a "
+                            f"{LAPTOP} key) to resume this log")
+        foreign = sorted(k.fingerprint for k in state.keys.values()
+                         if k.fingerprint not in by_fp and k.enrolled_seq != 1)
+        if foreign:
+            raise KeyError_(f"the log holds {', '.join(foreign)}, which no legacy row names; this is not an "
+                            "interrupted init")
+        gone = [r.fingerprint for r in plan.rows if r.fingerprint in confirmed and r.in_log is not None
+                and r.in_log.revoked_seq is not None and not r.revoked]
+        if gone:
+            raise KeyError_(f"{', '.join(gone)} was revoked by an earlier, interrupted init (dropped there); "
+                            "a revoked key stays revoked: leave it unconfirmed")
+        # no op turns a plain revocation compromised, so dropping such a key would report "dropped" (its
+        # /2-era fires unverified) while the log keeps them "signed by a revoked key"
+        plain = [r.fingerprint for r in plan.rows if r.fingerprint not in confirmed and r.in_log is not None
+                 and r.in_log.revoked_seq is not None and r.in_log.compromised_since is None]
+        if plain:
+            raise KeyError_("; ".join(f"{fp} is already in this log, revoked by the interrupted run; confirm it to "
+                                      "keep that record (its earlier acts read as signed by a revoked key)"
+                                      for fp in plain))
+
+    links: list[str] = []
+    warning: str | None = None
+
+    landed = plan.seq                         # the log's head as this run last saw it land
+
+    def put(op: dict[str, Any], what: str) -> AuthoritySnapshot:
+        nonlocal warning, landed
+        try:
+            new = _append(db, op, signer_fp=signer_fp, sign=sign, clock=clock, ssh_keygen=ssh_keygen)
+        except (KeyError_, AuthorityError, sqlite3.Error, OSError) as exc:    # what the CLI answers as a refusal
+            if not landed:
+                raise
+            raise KeyError_(f"{exc}; the log is at seq {landed}; the store stays uninitialised; re-run to "
+                            "resume") from exc
+        landed = new.seq
+        warning = new.anchor_warning          # a later advance that lands supersedes an earlier miss
+        links.append(f"seq {new.seq}: {what}")
+        return new
+
+    def enrol_op(fp: str, public_key: str, cls: str, legacy_at: str | None) -> dict[str, Any]:
+        op: dict[str, Any] = {"op": "enrol", "fingerprint": fp, "public_key": public_key, "class": cls}
+        if legacy_at is not None:
+            op["legacy_enrolled_at"] = legacy_at
+        return op
+
+    if state is None:
+        state = put(enrol_op(signer_fp, signer_key, LAPTOP, None if mine is None else mine.enrolled_at),
+                    f"enrol {signer_fp} as {LAPTOP} (the genesis, signed by itself)")
+    kept, dropped, skipped = [], [], []
+    for r in plan.rows:
+        if r.fingerprint == signer_fp:
+            kept.append(r.fingerprint)
+            continue
+        if r.problem is not None:
+            skipped.append(r.fingerprint)
+            continue
+        have = state.key(r.fingerprint)
+        if r.fingerprint not in confirmed:
+            if have is not None and have.active:
+                # a dropped key's /2-era fires would read UNVERIFIED (no key); the log's nearest is a
+                # compromise from its own enrol, which reads those seq-less fires REVOKED (O3)
+                state = put({"op": "revoke_key", "fingerprint": r.fingerprint,
+                             "compromised_since": have.enrolled_seq},
+                            f"revoke {r.fingerprint} (an interrupted init enrolled it; now dropped, "
+                            "compromised from its enrol)")
+            dropped.append(r.fingerprint)
+            continue
+        if have is None:
+            assert r.public_key is not None
+            state = put(enrol_op(r.fingerprint, r.public_key, r.key_class, r.enrolled_at),
+                        f"enrol {r.fingerprint} as {r.key_class}")
+            have = state.key(r.fingerprint)
+            assert have is not None
+        if r.revoked and have.active:
+            op: dict[str, Any] = {"op": "revoke_key", "fingerprint": r.fingerprint}
+            if r.compromised:
+                op["compromised_since"] = have.enrolled_seq
+            state = put(op, f"revoke {r.fingerprint} (revoked before the migration"
+                            + (", compromised)" if r.compromised else ")"))
+        kept.append(r.fingerprint)
+
+    if plan.migrated:
+        for fp in kept:
+            k = state.key(fp)
+            if k is None or k.active == by_fp[fp].revoked:
+                raise KeyError_(f"{fp} is not in the log as its legacy row says; run `ledger init` again")
+        # the anchor reaches the final head before the marker clears, even when this run appended nothing
+        # (a resume after a link whose advance failed); this result says so when it cannot, superseding
+        # what any link here reported
+        try:
+            _authority.advance_anchor(anchor_path(db.data_root), state)
+            warning = None
+        except (AnchorError, OSError) as exc:
+            warning = f"the log is at seq {state.seq}; the anchor is behind ({exc})"
+        with db.write() as conn:
+            if _meta(conn, UNINITIALISED) is None:
+                raise KeyError_("another `ledger init` finished this store while this one ran")
+            head = conn.execute("SELECT seq, hash FROM authority_log ORDER BY seq DESC LIMIT 1").fetchone()
+            if head is None or (head[0], head[1]) != (state.seq, state.head_hash):
+                raise KeyError_(f"the authority log moved past seq {state.seq} while init ran; run it again")
+            conn.execute("DROP TABLE IF EXISTS legacy_keys")
+            conn.execute("DELETE FROM meta WHERE key = ?", (UNINITIALISED,))
+    return InitResult(tuple(links), tuple(kept), tuple(dropped), tuple(skipped), state.seq, state.store_id, warning)
+
+
 def _now(clock: Callable[[], datetime]) -> datetime:
     now = clock()
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
@@ -263,12 +541,9 @@ _SIGN_TIMEOUT = 120.0          # a touch-required key waits on a person
 _PUBLIC_KEY_MAX = 16 * 1024
 
 
-def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> tuple[str, Signer]:
-    """``(fingerprint, sign)`` for the signing key at ``key_path``: a private key (or an agent-held
-    key's public half) that ``ssh-keygen -Y sign -f`` accepts, its public half read from ``<path>.pub``
-    (or ``key_path`` itself when it is the ``.pub``). ``sign`` runs ``ssh-keygen -Y sign`` in the
-    authority namespace with the terminal's stderr, so a touch-required key's prompt reaches the
-    operator."""
+def signing_public_key(key_path: Path) -> str:
+    """The normal form (``<type> <base64>``) of the signing key's public half: ``<path>.pub``, or
+    ``key_path`` itself when it is the ``.pub``."""
     key_path = Path(key_path).expanduser()
     pub = key_path if key_path.suffix == ".pub" else key_path.with_name(key_path.name + ".pub")
     try:
@@ -282,7 +557,17 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -
         text = raw.decode("ascii")
     except UnicodeDecodeError:
         raise KeyError_(f"{pub} is not a public key file") from None
-    fp = fingerprint_of(normalise_public_key(text), ssh_keygen=ssh_keygen)
+    return normalise_public_key(text)
+
+
+def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -> tuple[str, Signer]:
+    """``(fingerprint, sign)`` for the signing key at ``key_path``: a private key (or an agent-held
+    key's public half) that ``ssh-keygen -Y sign -f`` accepts, its public half read from ``<path>.pub``
+    (or ``key_path`` itself when it is the ``.pub``). ``sign`` runs ``ssh-keygen -Y sign`` in the
+    authority namespace with the terminal's stderr, so a touch-required key's prompt reaches the
+    operator."""
+    key_path = Path(key_path).expanduser()
+    fp = fingerprint_of(signing_public_key(key_path), ssh_keygen=ssh_keygen)
 
     def sign(message: bytes) -> str:
         from levain.launch import child_env

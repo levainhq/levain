@@ -3566,12 +3566,14 @@ def test_bwrap_a_file_subtree_root_is_not_rebound_readable_by_the_write_floor(tm
 
 
 @pytest.mark.parametrize("mode,setting,expected", [
-    ("interactive", None, False), ("headless", None, True), ("unattended", None, True),
+    ("interactive", None, True), ("headless", None, True), ("unattended", None, True),
     ("unattended", False, False),   # the per-entity opt-out keeps the Keychain for that seat
     ("interactive", True, True),    # and an operator can pin it on while driving
+    ("interactive", False, False),  # the opt-in is the only way the REPL reaches it (N7)
 ])
 def test_seatbelt_keychain_rule_follows_the_cred_floor(tmp_path, mode, setting, expected) -> None:
-    """spore-1245, ruled by Phill 2026-10-01 (deny for autonomous ops, not while a human drives).
+    """spore-1245, ruled by Phill 2026-10-01 (deny for autonomous ops, not while a human drives;
+    since N7, 2026-10-12, denied at the REPL too unless the entity opts in).
     Measured before the rule: from inside the confined shell `security find-generic-password -w`
     and `git credential-osxkeychain get` read secrets. Measured after, on the real provider:
     interactive/headless read, unattended refused (rc 44, helper empty), https unaffected. Since
@@ -3587,7 +3589,7 @@ def test_seatbelt_keychain_rule_follows_the_cred_floor(tmp_path, mode, setting, 
         assert (f'(deny mach-lookup (global-name "{svc}"))' in profile) is expected
 
 
-@pytest.mark.parametrize("mode,expected", [("interactive", False), ("unattended", True)])
+@pytest.mark.parametrize("mode,expected", [("interactive", True), ("unattended", True)])
 def test_the_tools_path_policy_carries_the_keychain_deny_too(tmp_path, monkeypatch, mode, expected):
     """complement L3: the hands' floor (resolved once into the conversation's binding, then carried to
     both hands as data) is where the two enforcers once disagreed."""

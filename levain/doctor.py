@@ -121,6 +121,7 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
         core.extend(_check_hands_isolation(install))
     core.extend(_check_floor_placeholders())
     core.extend(_check_store(install))
+    core.extend(_check_cockpit_authority(install))
     core.extend(_check_continuity_headroom(install))
     core.extend(_check_compat_set(install))
     for r in core:
@@ -1088,6 +1089,68 @@ def _check_store(install: Path) -> list[CheckResult]:
         ]
     label = f"reachable ({len(tables)} table(s): {', '.join(tables[:3])}{'…' if len(tables) > 3 else ''})"
     return [CheckResult(".levain/memory.db", True, label)]
+
+
+def _check_cockpit_authority(install: Path) -> list[CheckResult]:
+    """The cockpit's signing keys (trust-tiering DESIGN §3.9), read from ``<install>/.levain/cockpit``.
+    A WARNING, never a failure, while exactly one unrevoked laptop-presence key is enrolled: losing it
+    leaves nothing that can enrol a successor. No row at all without a cockpit journal. The journal is
+    opened read-only (SQLite may add its WAL side files beside it): a ``levain-cockpit/2`` journal is
+    reported, not migrated, and no schema is created; any other format but /3 fails. It reads
+    ``<install>/.levain/cockpit`` only: a store at another data root (an embedder's) gets no row."""
+    from datetime import datetime, timezone
+
+    from levain.authority import LAPTOP, anchor_path
+    from levain.cockpit.authority import RequestAuthority
+    from levain.cockpit.firejournal import _MIGRATES_FROM, DB_NAME, STORE_FORMAT
+
+    root = install / ".levain" / "cockpit"
+    journal = root / DB_NAME
+    name = "cockpit authority"
+    if not journal.is_file():
+        return []
+    try:
+        conn = sqlite3.connect(f"file:{journal}?mode=ro", uri=True, timeout=2, isolation_level=None)
+        try:
+            fmt = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
+            found = None if fmt is None else fmt[0]
+            if found == _MIGRATES_FROM:
+                return [CheckResult(name, True, f"journal format {found!r}; the next "
+                                                "`levain cockpit keys` (or a restarted `levain serve "
+                                                "--write`) upgrades it")]
+            if found != STORE_FORMAT:                 # missing, unknown or newer: the journal refuses it too
+                return [CheckResult(name, False, f"unsupported journal format {found!r}; this levain reads "
+                                                 f"{STORE_FORMAT} and migrates {_MIGRATES_FROM}")]
+            conn.execute("BEGIN")
+            auth = RequestAuthority.capture(conn, now=datetime.now(timezone.utc), anchor=anchor_path(root),
+                                            source=str(journal))
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        return [CheckResult(name, True, f"the journal cannot be read ({exc})", warn=True)]
+    if auth.authority is None:
+        if auth.log_empty:
+            return [CheckResult(name, True, str(auth.authority_error))]
+        return [CheckResult(name, True, str(auth.authority_error), warn=True)]
+    if auth.authority_error is not None:              # a migrated store, its keys not yet re-enrolled
+        return [CheckResult(name, True, auth.authority_error)]
+    laptops = [k.fingerprint for k in auth.authority.active_keys() if k.key_class == LAPTOP]
+    # re-genesis (§3.9) is S3a-2b-2's, not this build's: name it as missing, never as a command to run
+    recovery = ("recovery after losing it, `levain cockpit ledger re-genesis` (a new authority log, every grant "
+                "void), is not in this build")
+    if len(laptops) == 1:
+        return [CheckResult(
+            name, True, f"one {LAPTOP} key is enrolled ({laptops[0]})",
+            f"Enrol a second {LAPTOP} key now: `levain cockpit enroll <key.pub> --signing-key <the enrolled key>`; "
+            f"{recovery}.",
+            warn=True)]
+    if not laptops:
+        return [CheckResult(name, True, f"no unrevoked {LAPTOP} key: nothing can enrol a key or sign a T3 act",
+                            "Recovery, `levain cockpit ledger re-genesis` (a new authority log, every grant void), "
+                            "is not in this build.",
+                            warn=True)]
+    return [CheckResult(name, True, f"{len(laptops)} {LAPTOP} keys enrolled (head at seq {auth.authority.seq})")]
 
 
 def _check_continuity_headroom(install: Path) -> list[CheckResult]:
