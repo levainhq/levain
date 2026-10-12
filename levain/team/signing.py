@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import hashlib
 import json
 import os
 import re
@@ -33,6 +32,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..contracts.keys import fp_of_blob
 from ..launch import child_env
 from .transport import _NO_HOOKS, ledger_env
 
@@ -118,7 +118,7 @@ def fingerprint(pubkey_line: str) -> str:
     except (ValueError, TypeError):
         raise SigningError("the key's base64 does not decode") from None
     _check_blob(declared, blob)
-    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii").rstrip("=")
+    return fp_of_blob(blob)
 
 
 # ---- commit objects ---------------------------------------------------------------------------------------

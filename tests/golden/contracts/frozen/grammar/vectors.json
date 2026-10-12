@@ -1,0 +1,856 @@
+{
+ "item": "§1.1",
+ "generator": "gen.py",
+ "vectors": [
+  {
+   "id": "decimal-zero",
+   "kind": "spec",
+   "op": "decimal",
+   "input": {
+    "text": "0"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "value": 0
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-one",
+   "kind": "spec",
+   "op": "decimal",
+   "input": {
+    "text": "1"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "value": 1
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-max-note",
+   "kind": "spec",
+   "op": "decimal",
+   "input": {
+    "text": "9223372036854775807"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "value": 9223372036854775807
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-leading-zero",
+   "kind": "upstream_lax",
+   "op": "decimal",
+   "input": {
+    "text": "01"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-double-zero",
+   "kind": "upstream_lax",
+   "op": "decimal",
+   "input": {
+    "text": "00"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-plus-sign",
+   "kind": "spec",
+   "op": "decimal",
+   "input": {
+    "text": "+1"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-leading-space",
+   "kind": "spec",
+   "op": "decimal",
+   "input": {
+    "text": " 1"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-underscore",
+   "kind": "spec",
+   "op": "decimal",
+   "input": {
+    "text": "1_0"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-fullwidth-digits",
+   "kind": "spec",
+   "op": "decimal",
+   "input": {
+    "text": "１２"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-negative",
+   "kind": "spec",
+   "op": "decimal",
+   "input": {
+    "text": "-1"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-empty",
+   "kind": "spec",
+   "op": "decimal",
+   "input": {
+    "text": ""
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-trailing-newline",
+   "kind": "spec",
+   "op": "decimal",
+   "input": {
+    "text": "1\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-checkpoint@v1.1.0",
+    "clause": "A non-negative integer encoded as an ASCII decimal is a string containing the base-10 representation of the integer with no extra leading zeros. Zero is encoded as `0`, not the empty string."
+   }
+  },
+  {
+   "id": "decimal-above-note-max",
+   "kind": "levain_profile",
+   "op": "decimal",
+   "input": {
+    "text": "9223372036854775808"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "sizes, indices and timestamps in note text are 0 <= x <= 2^63-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "RFC 9162 serialises uint64 and Go's tlog uses int64; 2^63-1 is representable by both"
+    }
+   }
+  },
+  {
+   "id": "decimal-above-uint64",
+   "kind": "spec",
+   "op": "decimal",
+   "input": {
+    "text": "18446744073709551616"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "strconv.ParseUint",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §4.9 (https://www.rfc-editor.org/rfc/rfc9162)",
+    "clause": "TreeHeadSignature: uint64 tree_size"
+   }
+  },
+  {
+   "id": "b64-one-byte",
+   "kind": "spec",
+   "op": "b64",
+   "input": {
+    "text": "AQ=="
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "bytes": "01"
+    },
+    "upstream": {
+     "implementation": "encoding/base64.StdEncoding",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "Encoders MUST generate canonical base64 according to RFC 4648, Section 3.5, and decoders MUST reject non-canonical encodings."
+   }
+  },
+  {
+   "id": "b64-three-bytes",
+   "kind": "spec",
+   "op": "b64",
+   "input": {
+    "text": "AAAA"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "bytes": "000000"
+    },
+    "upstream": {
+     "implementation": "encoding/base64.StdEncoding",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "Encoders MUST generate canonical base64 according to RFC 4648, Section 3.5, and decoders MUST reject non-canonical encodings."
+   }
+  },
+  {
+   "id": "b64-empty",
+   "kind": "spec",
+   "op": "b64",
+   "input": {
+    "text": ""
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "bytes": ""
+    },
+    "upstream": {
+     "implementation": "encoding/base64.StdEncoding",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "Encoders MUST generate canonical base64 according to RFC 4648, Section 3.5, and decoders MUST reject non-canonical encodings."
+   }
+  },
+  {
+   "id": "b64-nonzero-pad-bits",
+   "kind": "upstream_lax",
+   "op": "b64",
+   "input": {
+    "text": "AB=="
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "encoding/base64.StdEncoding",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "Encoders MUST generate canonical base64 according to RFC 4648, Section 3.5, and decoders MUST reject non-canonical encodings."
+   }
+  },
+  {
+   "id": "b64-embedded-newline",
+   "kind": "upstream_lax",
+   "op": "b64",
+   "input": {
+    "text": "AA\nAA=="
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "encoding/base64.StdEncoding",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "Encoders MUST generate canonical base64 according to RFC 4648, Section 3.5, and decoders MUST reject non-canonical encodings."
+   }
+  },
+  {
+   "id": "b64-embedded-cr",
+   "kind": "upstream_lax",
+   "op": "b64",
+   "input": {
+    "text": "AA\rAA=="
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "encoding/base64.StdEncoding",
+     "version": "go1.27.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "Encoders MUST generate canonical base64 according to RFC 4648, Section 3.5, and decoders MUST reject non-canonical encodings."
+   }
+  },
+  {
+   "id": "b64-unpadded",
+   "kind": "spec",
+   "op": "b64",
+   "input": {
+    "text": "AAA"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "encoding/base64.StdEncoding",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "Encoders MUST generate canonical base64 according to RFC 4648, Section 3.5, and decoders MUST reject non-canonical encodings."
+   }
+  },
+  {
+   "id": "b64-url-alphabet",
+   "kind": "spec",
+   "op": "b64",
+   "input": {
+    "text": "-_8="
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "encoding/base64.StdEncoding",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "Encoders MUST generate canonical base64 according to RFC 4648, Section 3.5, and decoders MUST reject non-canonical encodings."
+   }
+  },
+  {
+   "id": "b64-pad-in-middle",
+   "kind": "spec",
+   "op": "b64",
+   "input": {
+    "text": "AA==AA=="
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "encoding/base64.StdEncoding",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "Encoders MUST generate canonical base64 according to RFC 4648, Section 3.5, and decoders MUST reject non-canonical encodings."
+   }
+  },
+  {
+   "id": "b64-space",
+   "kind": "spec",
+   "op": "b64",
+   "input": {
+    "text": "AA AA==="
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "encoding/base64.StdEncoding",
+     "version": "go1.27.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "Encoders MUST generate canonical base64 according to RFC 4648, Section 3.5, and decoders MUST reject non-canonical encodings."
+   }
+  },
+  {
+   "id": "int-note-max",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": 9223372036854775807,
+    "domain": "note"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "sizes, indices and timestamps in note text are 0 <= x <= 2^63-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "RFC 9162 serialises uint64 and Go's tlog uses int64; 2^63-1 is representable by both"
+    }
+   }
+  },
+  {
+   "id": "int-note-above-max",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": 9223372036854775808,
+    "domain": "note"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "sizes, indices and timestamps in note text are 0 <= x <= 2^63-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "RFC 9162 serialises uint64 and Go's tlog uses int64; 2^63-1 is representable by both"
+    }
+   }
+  },
+  {
+   "id": "int-json-max",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": 9007199254740991,
+    "domain": "json"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1 / F8",
+    "clause": "integers inside a JSON leaf are 0 <= x <= 2^53-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the largest integer an IEEE double holds exactly, so every JSON reader agrees"
+    }
+   }
+  },
+  {
+   "id": "int-json-above-max",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": 9007199254740992,
+    "domain": "json"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1 / F8",
+    "clause": "integers inside a JSON leaf are 0 <= x <= 2^53-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the largest integer an IEEE double holds exactly, so every JSON reader agrees"
+    }
+   }
+  },
+  {
+   "id": "int-zero",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": 0,
+    "domain": "note"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "sizes, indices and timestamps in note text are 0 <= x <= 2^63-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "RFC 9162 serialises uint64 and Go's tlog uses int64; 2^63-1 is representable by both"
+    }
+   }
+  },
+  {
+   "id": "int-negative-note",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": -1,
+    "domain": "note"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "sizes, indices and timestamps in note text are 0 <= x <= 2^63-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "RFC 9162 serialises uint64 and Go's tlog uses int64; 2^63-1 is representable by both"
+    }
+   }
+  },
+  {
+   "id": "int-negative-json",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": -1,
+    "domain": "json"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1 / F8",
+    "clause": "integers inside a JSON leaf are 0 <= x <= 2^53-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the largest integer an IEEE double holds exactly, so every JSON reader agrees"
+    }
+   }
+  },
+  {
+   "id": "int-true-note",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": true,
+    "domain": "note"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "an integer in a frozen structure is type(x) is int, so True is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a JSON or Python boolean is not a size"
+    }
+   }
+  },
+  {
+   "id": "int-true-json",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": true,
+    "domain": "json"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "an integer in a frozen structure is type(x) is int, so True is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a JSON or Python boolean is not a size"
+    }
+   }
+  },
+  {
+   "id": "int-false-note",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": false,
+    "domain": "note"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "an integer in a frozen structure is type(x) is int, so True is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a JSON or Python boolean is not a size"
+    }
+   }
+  },
+  {
+   "id": "int-float-note",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": 1.0,
+    "domain": "note"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "an integer in a frozen structure is type(x) is int, so True is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a JSON or Python boolean is not a size"
+    }
+   }
+  },
+  {
+   "id": "int-string-note",
+   "kind": "no_upstream",
+   "op": "int",
+   "input": {
+    "value": "1",
+    "domain": "note"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "an integer in a frozen structure is type(x) is int, so True is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a JSON or Python boolean is not a size"
+    }
+   }
+  }
+ ]
+}

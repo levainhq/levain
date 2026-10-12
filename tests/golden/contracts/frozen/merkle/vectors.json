@@ -1,0 +1,3369 @@
+{
+ "item": "F1",
+ "generator": "gen.py",
+ "spec_urls": [
+  "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162)",
+  "https://www.rfc-editor.org/rfc/rfc6962",
+  "C2SP tlog-witness@v1.1.0"
+ ],
+ "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+ "vectors": [
+  {
+   "id": "root-0",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 0
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-1",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 1
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-2",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 2
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-3",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 3
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-4",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 4
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-5",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 5
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-6",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 6
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "56c4c4023c9be921f7cee7d8e542d02eea9607b839cc2e4f53d5d6269ff90561"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-7",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 7
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-8",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 8
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-15",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 15
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "78723fcdb95178703ad16ad8e80151776793aa49f8d1adff2af755c06e71868b"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-16",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 16
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "dd6f904d6949deb42802552ae4000d015dd23f983a47c8a098e890135ecd8c1e"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-17",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 17
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "669f883ae2f6a0ad72fd0d1a54018e04b1cb403cb4af4ea418003f24ae6601e5"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-255",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 255
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "4519e026d097e8e86a3ec919249c17c78a40e403d5a8f02a60c5e6def78613ab"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-256",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 256
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "ee716fc883e642c64c08cbceef64cc0cfb90d4636c364ff373e7c00f9af76868"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-257",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 257
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "7b86303cef9c97f1c1ea491271a3212b8aa5bc40da7627f08ee5f783be997d5a"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-1023",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 1023
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "c37f30b59f3f4fb5d752e7521122eda1c9583ae90a04e2e407735485df2a5ac9"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-1024",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 1024
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "06bda082f2005bca65d3c207d5091832bcd10b806edf9886c70fa057d554f337"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-1025",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 1025
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "ae4e400b6041fa1f1ea457710a9c619bfa4cb07c027618dddce62313121d04d7"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "root-1000",
+   "kind": "spec",
+   "op": "root",
+   "input": {
+    "leaf_rule": "d_i = bytes([i % 256]) * (i+1)",
+    "size": 1000
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "328ebe87ad19c7e6d569994307b446c206b5c9773dd5231cd8e0d1960399ffaf"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.1",
+    "clause": "MTH({}) = SHA-256(); MTH(D_n) = SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n])), k the largest power of two smaller than n; leaf = SHA-256(0x00 || d)"
+   }
+  },
+  {
+   "id": "rfc6962-reference-root-0",
+   "kind": "spec",
+   "op": "root_explicit",
+   "input": {
+    "leaves": []
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "published_table",
+    "source": "github.com/transparency-dev/merkle testonly/constants.go @ v0.0.2 (commit 036047b5d2f7faf3b1ee643d391e60fe5b1defcf)",
+    "clause": "RootHashes()[0] over LeafInputs()[:0]"
+   }
+  },
+  {
+   "id": "rfc6962-reference-root-1",
+   "kind": "spec",
+   "op": "root_explicit",
+   "input": {
+    "leaves": [
+     ""
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "published_table",
+    "source": "github.com/transparency-dev/merkle testonly/constants.go @ v0.0.2 (commit 036047b5d2f7faf3b1ee643d391e60fe5b1defcf)",
+    "clause": "RootHashes()[1] over LeafInputs()[:1]"
+   }
+  },
+  {
+   "id": "rfc6962-reference-root-2",
+   "kind": "spec",
+   "op": "root_explicit",
+   "input": {
+    "leaves": [
+     "",
+     "00"
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "fac54203e7cc696cf0dfcb42c92a1d9dbaf70ad9e621f4bd8d98662f00e3c125"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "published_table",
+    "source": "github.com/transparency-dev/merkle testonly/constants.go @ v0.0.2 (commit 036047b5d2f7faf3b1ee643d391e60fe5b1defcf)",
+    "clause": "RootHashes()[2] over LeafInputs()[:2]"
+   }
+  },
+  {
+   "id": "rfc6962-reference-root-3",
+   "kind": "spec",
+   "op": "root_explicit",
+   "input": {
+    "leaves": [
+     "",
+     "00",
+     "10"
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "aeb6bcfe274b70a14fb067a5e5578264db0fa9b51af5e0ba159158f329e06e77"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "published_table",
+    "source": "github.com/transparency-dev/merkle testonly/constants.go @ v0.0.2 (commit 036047b5d2f7faf3b1ee643d391e60fe5b1defcf)",
+    "clause": "RootHashes()[3] over LeafInputs()[:3]"
+   }
+  },
+  {
+   "id": "rfc6962-reference-root-4",
+   "kind": "spec",
+   "op": "root_explicit",
+   "input": {
+    "leaves": [
+     "",
+     "00",
+     "10",
+     "2021"
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "d37ee418976dd95753c1c73862b9398fa2a2cf9b4ff0fdfe8b30cd95209614b7"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "published_table",
+    "source": "github.com/transparency-dev/merkle testonly/constants.go @ v0.0.2 (commit 036047b5d2f7faf3b1ee643d391e60fe5b1defcf)",
+    "clause": "RootHashes()[4] over LeafInputs()[:4]"
+   }
+  },
+  {
+   "id": "rfc6962-reference-root-5",
+   "kind": "spec",
+   "op": "root_explicit",
+   "input": {
+    "leaves": [
+     "",
+     "00",
+     "10",
+     "2021",
+     "3031"
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "4e3bbb1f7b478dcfe71fb631631519a3bca12c9aefca1612bfce4c13a86264d4"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "published_table",
+    "source": "github.com/transparency-dev/merkle testonly/constants.go @ v0.0.2 (commit 036047b5d2f7faf3b1ee643d391e60fe5b1defcf)",
+    "clause": "RootHashes()[5] over LeafInputs()[:5]"
+   }
+  },
+  {
+   "id": "rfc6962-reference-root-6",
+   "kind": "spec",
+   "op": "root_explicit",
+   "input": {
+    "leaves": [
+     "",
+     "00",
+     "10",
+     "2021",
+     "3031",
+     "40414243"
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "76e67dadbcdf1e10e1b74ddc608abd2f98dfb16fbce75277b5232a127f2087ef"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "published_table",
+    "source": "github.com/transparency-dev/merkle testonly/constants.go @ v0.0.2 (commit 036047b5d2f7faf3b1ee643d391e60fe5b1defcf)",
+    "clause": "RootHashes()[6] over LeafInputs()[:6]"
+   }
+  },
+  {
+   "id": "rfc6962-reference-root-7",
+   "kind": "spec",
+   "op": "root_explicit",
+   "input": {
+    "leaves": [
+     "",
+     "00",
+     "10",
+     "2021",
+     "3031",
+     "40414243",
+     "5051525354555657"
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "ddb89be403809e325750d3d263cd78929c2942b7942a34b77e122c9594a74c8c"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "published_table",
+    "source": "github.com/transparency-dev/merkle testonly/constants.go @ v0.0.2 (commit 036047b5d2f7faf3b1ee643d391e60fe5b1defcf)",
+    "clause": "RootHashes()[7] over LeafInputs()[:7]"
+   }
+  },
+  {
+   "id": "rfc6962-reference-root-8",
+   "kind": "spec",
+   "op": "root_explicit",
+   "input": {
+    "leaves": [
+     "",
+     "00",
+     "10",
+     "2021",
+     "3031",
+     "40414243",
+     "5051525354555657",
+     "606162636465666768696a6b6c6d6e6f"
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "root": "5dc9da79a70659a9ad559cb701ded9a2ab9d823aad2f4960cfe370eff4604328"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "published_table",
+    "source": "github.com/transparency-dev/merkle testonly/constants.go @ v0.0.2 (commit 036047b5d2f7faf3b1ee643d391e60fe5b1defcf)",
+    "clause": "RootHashes()[8] over LeafInputs()[:8]"
+   }
+  },
+  {
+   "id": "inclusion-7-0",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 0,
+    "leaf_hash": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "proof": [
+     "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "fd20c37bf6e7fcab06af4fd7f9166f7af2b12d157e253f9649bfc0151a2bfc38"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-7-1",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 1,
+    "leaf_hash": "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+    "proof": [
+     "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "fd20c37bf6e7fcab06af4fd7f9166f7af2b12d157e253f9649bfc0151a2bfc38"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-7-2",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 2,
+    "leaf_hash": "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+    "proof": [
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "fd20c37bf6e7fcab06af4fd7f9166f7af2b12d157e253f9649bfc0151a2bfc38"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-7-3",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 3,
+    "leaf_hash": "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "fd20c37bf6e7fcab06af4fd7f9166f7af2b12d157e253f9649bfc0151a2bfc38"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-7-4",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 4,
+    "leaf_hash": "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+    "proof": [
+     "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-7-5",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 5,
+    "leaf_hash": "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-7-6",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 6,
+    "leaf_hash": "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+    "proof": [
+     "eec16e2e5c0d73d4e2399fdc28b07986618f70e35d362bed0d40ce17540a4512",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-8-0",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 8,
+    "index": 0,
+    "leaf_hash": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "proof": [
+     "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "aef1587b1ca913513141664166c82bf2982864cbd39a0a11ea24f9ba7d1cf32b"
+    ],
+    "root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-8-1",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 8,
+    "index": 1,
+    "leaf_hash": "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+    "proof": [
+     "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "aef1587b1ca913513141664166c82bf2982864cbd39a0a11ea24f9ba7d1cf32b"
+    ],
+    "root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-8-2",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 8,
+    "index": 2,
+    "leaf_hash": "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+    "proof": [
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "aef1587b1ca913513141664166c82bf2982864cbd39a0a11ea24f9ba7d1cf32b"
+    ],
+    "root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-8-3",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 8,
+    "index": 3,
+    "leaf_hash": "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "aef1587b1ca913513141664166c82bf2982864cbd39a0a11ea24f9ba7d1cf32b"
+    ],
+    "root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-8-4",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 8,
+    "index": 4,
+    "leaf_hash": "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+    "proof": [
+     "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+     "7fb182ca7774e61ce3edbf823ecdefddc3f080aaa3ce627a50f2667f2d4a3847",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-8-5",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 8,
+    "index": 5,
+    "leaf_hash": "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "7fb182ca7774e61ce3edbf823ecdefddc3f080aaa3ce627a50f2667f2d4a3847",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-8-6",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 8,
+    "index": 6,
+    "leaf_hash": "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+    "proof": [
+     "fe85a674d4f2b205aa8e35ccdbfc4f1e1cded25e3f81a2209d0562af0701ff3f",
+     "eec16e2e5c0d73d4e2399fdc28b07986618f70e35d362bed0d40ce17540a4512",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-8-7",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 8,
+    "index": 7,
+    "leaf_hash": "fe85a674d4f2b205aa8e35ccdbfc4f1e1cded25e3f81a2209d0562af0701ff3f",
+    "proof": [
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "eec16e2e5c0d73d4e2399fdc28b07986618f70e35d362bed0d40ce17540a4512",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-1000-0",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 1000,
+    "index": 0,
+    "leaf_hash": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "proof": [
+     "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "aef1587b1ca913513141664166c82bf2982864cbd39a0a11ea24f9ba7d1cf32b",
+     "dcc61a6d80f13b3787a9f7bd66840c4c697a480344e0e5a0891d5eb6a9917fef",
+     "04950ee42884e8f91d0e4d2dec9d62aae19b0877f14ef5f62d0f411d3af344f9",
+     "a1bb75d988dd85bd6fb090c8cd2c95394ad5e358b03d5d422900456052ab2e23",
+     "eb9b3f8b9656470103d8853bd6be83fc5dc95fe48aced0d6a01f6284483ac822",
+     "37f61813ff52b67b5e56f02d05ba97ec2672d60674d0927b851f581e8c911bc4",
+     "3df02772582caad4a51d4bfcf2465405ab3220464a2877f772ea2f6897b781c7",
+     "86fd5d3d489701b96428bf485932cd97359f6f091b5a110062f78925a6f5afa4"
+    ],
+    "root": "328ebe87ad19c7e6d569994307b446c206b5c9773dd5231cd8e0d1960399ffaf"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-1000-511",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 1000,
+    "index": 511,
+    "leaf_hash": "36f5eac7e5b39adc659d92b539b316a310b458ae71c0206a073394c84fd0bc5d",
+    "proof": [
+     "86b9595ccf194ac1f72be7a40713f0378319ec0c63d860c587998a890bf95a46",
+     "1f324671e9210b527842b996d2f4e36035c707101197f8df0eaf4104c6f3851a",
+     "de6132925e05f0ff48bea3aacb71a023e3322e3d0b2ef93b4ac07fc9176a7168",
+     "f3c189af871e7b826070eb34dfd3afb03dc757a0fd0faa9138237df85342a2e0",
+     "57215ab161fec9e410d7be2160f860e73c3926d0c003fb9daa9366f153c14f1e",
+     "4b755c52a35b8f9513981903f3b57356efb3d2bea1903d50be3a8264007dbc4d",
+     "230236f68d8263c26e41adcb8a41259a64454c46584f00d5cb760ccc8236eae9",
+     "f7a923dfd44a86bd99993a1a9f40d0a98eadc0ff6430117e2c0eda8034af99f5",
+     "ee716fc883e642c64c08cbceef64cc0cfb90d4636c364ff373e7c00f9af76868",
+     "86fd5d3d489701b96428bf485932cd97359f6f091b5a110062f78925a6f5afa4"
+    ],
+    "root": "328ebe87ad19c7e6d569994307b446c206b5c9773dd5231cd8e0d1960399ffaf"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-1000-512",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 1000,
+    "index": 512,
+    "leaf_hash": "b66c1df618413564ae90bca8231bdbb4b9d7195d5e39cecdd1b7613dbb64e71d",
+    "proof": [
+     "30c887c2ced407e46a424a1a73a65eb915dc8984aacc5ac4e052c80e67f96058",
+     "39d11427b4da967d8bfff13462a806da432d0e8a5cf27ff7e60f00a9f9e13631",
+     "8516920a12df74dba842cee1c60c6f01dfccf51f6c80182d51cf58a327980891",
+     "d5a434caccd61308679f88046f679811ab249ab12f62b8b0720e06f496055dc3",
+     "85d3eba1779cabaaa34c85d96e98025b4edb5a87fa0b85e94e9744fa37a5d2dc",
+     "6e8a40a590fcd548ef4387577ea39a5422b6e5fa06a5eb3a312c7e507b24c13a",
+     "cd3d278c995c3cbf3d0641b7ce7f9a11f3c20b7c169ea224206a4055ebfac8f8",
+     "dd36447c978336e2d369dc8de59fe562bdb37e223084a12648bdd35a044d597b",
+     "18ade8012d124495f6b8b8ef566595877885906d3c80d69e6d0bd0c80a02db6f",
+     "8d5c59cff444782b38b9e5a119632b6965577d30fffb8e64b7ec7a1a2ba29c80"
+    ],
+    "root": "328ebe87ad19c7e6d569994307b446c206b5c9773dd5231cd8e0d1960399ffaf"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-1000-999",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 1000,
+    "index": 999,
+    "leaf_hash": "191a3d2c3dd540f71325ffd5afd15b1c181d210a855f5297bbb23fa6839ba417",
+    "proof": [
+     "5a108be331eeb8568f91cd688b749885c81fd2dc4511913a016a8fa614c19083",
+     "560f384b843b4963e27b2af10e7145da0d3def96ecb2461ed61699f7d70c0785",
+     "de7fc79a81fc10d9fac7fdd27fe9a473541b12f502db8441792b61a7d53af1ab",
+     "3f659d7d263ed0161e3aacdfc0d5a474e2b18464cefc9e3c457b7739bda75e99",
+     "84684a626598513eb8506392479afe5e27c18d4ed9cfc0f0b5fd02882afae336",
+     "c9c28e2855685c02aa1139da5bf53882095b13f7a8e714f876ec0bc82f0ea206",
+     "7ca4d15115d5db6725b300d8b649ad28fbfbf6126d7c4874481fb35cc5db2878",
+     "8d5c59cff444782b38b9e5a119632b6965577d30fffb8e64b7ec7a1a2ba29c80"
+    ],
+    "root": "328ebe87ad19c7e6d569994307b446c206b5c9773dd5231cd8e0d1960399ffaf"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-refuse-index-eq-size",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 7,
+    "leaf_hash": "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-refuse-index-above-size",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 9,
+    "leaf_hash": "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-refuse-proof-short",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 5,
+    "leaf_hash": "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-refuse-proof-long",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 5,
+    "leaf_hash": "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-refuse-tampered-proof",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 5,
+    "leaf_hash": "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "ff4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-refuse-wrong-leaf",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 5,
+    "leaf_hash": "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.3.2",
+    "clause": "inclusion proof verification algorithm"
+   }
+  },
+  {
+   "id": "inclusion-refuse-leaf-hash-31-bytes",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 5,
+    "leaf_hash": "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1",
+    "clause": "hashes are SHA-256 outputs (32 bytes)"
+   }
+  },
+  {
+   "id": "inclusion-refuse-proof-hash-31-bytes",
+   "kind": "spec",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": 5,
+    "leaf_hash": "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a84",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1",
+    "clause": "hashes are SHA-256 outputs (32 bytes)"
+   }
+  },
+  {
+   "id": "inclusion-refuse-index-true",
+   "kind": "no_upstream",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": true,
+    "leaf_hash": "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "integers in a frozen structure are type(x) is int, 0 <= x <= 2^63-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a bool or a negative is not a tree index; Go's uint64 cannot express either"
+    }
+   }
+  },
+  {
+   "id": "inclusion-refuse-index-negative",
+   "kind": "no_upstream",
+   "op": "inclusion",
+   "input": {
+    "size": 7,
+    "index": -1,
+    "leaf_hash": "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "integers in a frozen structure are type(x) is int, 0 <= x <= 2^63-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a bool or a negative is not a tree index; Go's uint64 cannot express either"
+    }
+   }
+  },
+  {
+   "id": "consistency-1-1",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 1,
+    "n": 1,
+    "proof": [],
+    "old_root": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "new_root": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "consistency-1-2",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 1,
+    "n": 2,
+    "proof": [
+     "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e"
+    ],
+    "old_root": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "new_root": "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-2-2",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 2,
+    "n": 2,
+    "proof": [],
+    "old_root": "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+    "new_root": "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "consistency-1-3",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 1,
+    "n": 3,
+    "proof": [
+     "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94"
+    ],
+    "old_root": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "new_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-2-3",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 2,
+    "n": 3,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94"
+    ],
+    "old_root": "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+    "new_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-3-3",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 3,
+    "proof": [],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "consistency-1-4",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 1,
+    "n": 4,
+    "proof": [
+     "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b"
+    ],
+    "old_root": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "new_root": "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-2-4",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 2,
+    "n": 4,
+    "proof": [
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b"
+    ],
+    "old_root": "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+    "new_root": "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-3-4",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 4,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f"
+    ],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-4-4",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 4,
+    "n": 4,
+    "proof": [],
+    "old_root": "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05",
+    "new_root": "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "consistency-1-5",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 1,
+    "n": 5,
+    "proof": [
+     "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "old_root": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-2-5",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 2,
+    "n": 5,
+    "proof": [
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "old_root": "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-3-5",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 5,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-4-5",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 4,
+    "n": 5,
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "old_root": "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-5-5",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 5,
+    "n": 5,
+    "proof": [],
+    "old_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "consistency-1-6",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 1,
+    "n": 6,
+    "proof": [
+     "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "eec16e2e5c0d73d4e2399fdc28b07986618f70e35d362bed0d40ce17540a4512"
+    ],
+    "old_root": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "new_root": "56c4c4023c9be921f7cee7d8e542d02eea9607b839cc2e4f53d5d6269ff90561"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-2-6",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 2,
+    "n": 6,
+    "proof": [
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "eec16e2e5c0d73d4e2399fdc28b07986618f70e35d362bed0d40ce17540a4512"
+    ],
+    "old_root": "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+    "new_root": "56c4c4023c9be921f7cee7d8e542d02eea9607b839cc2e4f53d5d6269ff90561"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-3-6",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 6,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "eec16e2e5c0d73d4e2399fdc28b07986618f70e35d362bed0d40ce17540a4512"
+    ],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "56c4c4023c9be921f7cee7d8e542d02eea9607b839cc2e4f53d5d6269ff90561"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-4-6",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 4,
+    "n": 6,
+    "proof": [
+     "eec16e2e5c0d73d4e2399fdc28b07986618f70e35d362bed0d40ce17540a4512"
+    ],
+    "old_root": "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05",
+    "new_root": "56c4c4023c9be921f7cee7d8e542d02eea9607b839cc2e4f53d5d6269ff90561"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-5-6",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 5,
+    "n": 6,
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "old_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f",
+    "new_root": "56c4c4023c9be921f7cee7d8e542d02eea9607b839cc2e4f53d5d6269ff90561"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-6-6",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 6,
+    "n": 6,
+    "proof": [],
+    "old_root": "56c4c4023c9be921f7cee7d8e542d02eea9607b839cc2e4f53d5d6269ff90561",
+    "new_root": "56c4c4023c9be921f7cee7d8e542d02eea9607b839cc2e4f53d5d6269ff90561"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "consistency-1-7",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 1,
+    "n": 7,
+    "proof": [
+     "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "fd20c37bf6e7fcab06af4fd7f9166f7af2b12d157e253f9649bfc0151a2bfc38"
+    ],
+    "old_root": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "new_root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-2-7",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 2,
+    "n": 7,
+    "proof": [
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "fd20c37bf6e7fcab06af4fd7f9166f7af2b12d157e253f9649bfc0151a2bfc38"
+    ],
+    "old_root": "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+    "new_root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-3-7",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 7,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "fd20c37bf6e7fcab06af4fd7f9166f7af2b12d157e253f9649bfc0151a2bfc38"
+    ],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-4-7",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 4,
+    "n": 7,
+    "proof": [
+     "fd20c37bf6e7fcab06af4fd7f9166f7af2b12d157e253f9649bfc0151a2bfc38"
+    ],
+    "old_root": "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05",
+    "new_root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-5-7",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 5,
+    "n": 7,
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "old_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f",
+    "new_root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-6-7",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 6,
+    "n": 7,
+    "proof": [
+     "eec16e2e5c0d73d4e2399fdc28b07986618f70e35d362bed0d40ce17540a4512",
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "old_root": "56c4c4023c9be921f7cee7d8e542d02eea9607b839cc2e4f53d5d6269ff90561",
+    "new_root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-7-7",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 7,
+    "n": 7,
+    "proof": [],
+    "old_root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9",
+    "new_root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "consistency-1-8",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 1,
+    "n": 8,
+    "proof": [
+     "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "aef1587b1ca913513141664166c82bf2982864cbd39a0a11ea24f9ba7d1cf32b"
+    ],
+    "old_root": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "new_root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-2-8",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 2,
+    "n": 8,
+    "proof": [
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "aef1587b1ca913513141664166c82bf2982864cbd39a0a11ea24f9ba7d1cf32b"
+    ],
+    "old_root": "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+    "new_root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-3-8",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 8,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "aef1587b1ca913513141664166c82bf2982864cbd39a0a11ea24f9ba7d1cf32b"
+    ],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-4-8",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 4,
+    "n": 8,
+    "proof": [
+     "aef1587b1ca913513141664166c82bf2982864cbd39a0a11ea24f9ba7d1cf32b"
+    ],
+    "old_root": "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05",
+    "new_root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-5-8",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 5,
+    "n": 8,
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+     "7fb182ca7774e61ce3edbf823ecdefddc3f080aaa3ce627a50f2667f2d4a3847",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "old_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f",
+    "new_root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-6-8",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 6,
+    "n": 8,
+    "proof": [
+     "eec16e2e5c0d73d4e2399fdc28b07986618f70e35d362bed0d40ce17540a4512",
+     "7fb182ca7774e61ce3edbf823ecdefddc3f080aaa3ce627a50f2667f2d4a3847",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "old_root": "56c4c4023c9be921f7cee7d8e542d02eea9607b839cc2e4f53d5d6269ff90561",
+    "new_root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-7-8",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 7,
+    "n": 8,
+    "proof": [
+     "3b4bb81b9d35853d0c08fe6469a1174dd54d6bb43bb4dd143c14fbe007d95944",
+     "fe85a674d4f2b205aa8e35ccdbfc4f1e1cded25e3f81a2209d0562af0701ff3f",
+     "eec16e2e5c0d73d4e2399fdc28b07986618f70e35d362bed0d40ce17540a4512",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05"
+    ],
+    "old_root": "15f290e6a28a2633d48b2b7c86adc7d20596296fdb865166ea8a108e050a30e9",
+    "new_root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-8-8",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 8,
+    "n": 8,
+    "proof": [],
+    "old_root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c",
+    "new_root": "0fea274e6bacdb35de214d2f3fe69d083ace91c36a23087a5a7a6eced4088f8c"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "consistency-1-1000",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 1,
+    "n": 1000,
+    "proof": [
+     "fbb59ed10e9cd4ff45a12c5bb92cbd80df984ba1fe60f26a30febf218e2f0f5e",
+     "d8cf8579888e82ec3bdc6bf0b84efdfe81b1d9fa5533825907b1e18d3970ce9b",
+     "aef1587b1ca913513141664166c82bf2982864cbd39a0a11ea24f9ba7d1cf32b",
+     "dcc61a6d80f13b3787a9f7bd66840c4c697a480344e0e5a0891d5eb6a9917fef",
+     "04950ee42884e8f91d0e4d2dec9d62aae19b0877f14ef5f62d0f411d3af344f9",
+     "a1bb75d988dd85bd6fb090c8cd2c95394ad5e358b03d5d422900456052ab2e23",
+     "eb9b3f8b9656470103d8853bd6be83fc5dc95fe48aced0d6a01f6284483ac822",
+     "37f61813ff52b67b5e56f02d05ba97ec2672d60674d0927b851f581e8c911bc4",
+     "3df02772582caad4a51d4bfcf2465405ab3220464a2877f772ea2f6897b781c7",
+     "86fd5d3d489701b96428bf485932cd97359f6f091b5a110062f78925a6f5afa4"
+    ],
+    "old_root": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+    "new_root": "328ebe87ad19c7e6d569994307b446c206b5c9773dd5231cd8e0d1960399ffaf"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-511-1000",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 511,
+    "n": 1000,
+    "proof": [
+     "86b9595ccf194ac1f72be7a40713f0378319ec0c63d860c587998a890bf95a46",
+     "36f5eac7e5b39adc659d92b539b316a310b458ae71c0206a073394c84fd0bc5d",
+     "1f324671e9210b527842b996d2f4e36035c707101197f8df0eaf4104c6f3851a",
+     "de6132925e05f0ff48bea3aacb71a023e3322e3d0b2ef93b4ac07fc9176a7168",
+     "f3c189af871e7b826070eb34dfd3afb03dc757a0fd0faa9138237df85342a2e0",
+     "57215ab161fec9e410d7be2160f860e73c3926d0c003fb9daa9366f153c14f1e",
+     "4b755c52a35b8f9513981903f3b57356efb3d2bea1903d50be3a8264007dbc4d",
+     "230236f68d8263c26e41adcb8a41259a64454c46584f00d5cb760ccc8236eae9",
+     "f7a923dfd44a86bd99993a1a9f40d0a98eadc0ff6430117e2c0eda8034af99f5",
+     "ee716fc883e642c64c08cbceef64cc0cfb90d4636c364ff373e7c00f9af76868",
+     "86fd5d3d489701b96428bf485932cd97359f6f091b5a110062f78925a6f5afa4"
+    ],
+    "old_root": "2ec4402a4ba27830b63f7080262be446513c938728d13d713daec612cc46858d",
+    "new_root": "328ebe87ad19c7e6d569994307b446c206b5c9773dd5231cd8e0d1960399ffaf"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-512-1000",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 512,
+    "n": 1000,
+    "proof": [
+     "86fd5d3d489701b96428bf485932cd97359f6f091b5a110062f78925a6f5afa4"
+    ],
+    "old_root": "8d5c59cff444782b38b9e5a119632b6965577d30fffb8e64b7ec7a1a2ba29c80",
+    "new_root": "328ebe87ad19c7e6d569994307b446c206b5c9773dd5231cd8e0d1960399ffaf"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-513-1000",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 513,
+    "n": 1000,
+    "proof": [
+     "b66c1df618413564ae90bca8231bdbb4b9d7195d5e39cecdd1b7613dbb64e71d",
+     "30c887c2ced407e46a424a1a73a65eb915dc8984aacc5ac4e052c80e67f96058",
+     "39d11427b4da967d8bfff13462a806da432d0e8a5cf27ff7e60f00a9f9e13631",
+     "8516920a12df74dba842cee1c60c6f01dfccf51f6c80182d51cf58a327980891",
+     "d5a434caccd61308679f88046f679811ab249ab12f62b8b0720e06f496055dc3",
+     "85d3eba1779cabaaa34c85d96e98025b4edb5a87fa0b85e94e9744fa37a5d2dc",
+     "6e8a40a590fcd548ef4387577ea39a5422b6e5fa06a5eb3a312c7e507b24c13a",
+     "cd3d278c995c3cbf3d0641b7ce7f9a11f3c20b7c169ea224206a4055ebfac8f8",
+     "dd36447c978336e2d369dc8de59fe562bdb37e223084a12648bdd35a044d597b",
+     "18ade8012d124495f6b8b8ef566595877885906d3c80d69e6d0bd0c80a02db6f",
+     "8d5c59cff444782b38b9e5a119632b6965577d30fffb8e64b7ec7a1a2ba29c80"
+    ],
+    "old_root": "e0651a5f99d38cb7db92325bd111a5ef084cb80a4027184907891d9b0538ef19",
+    "new_root": "328ebe87ad19c7e6d569994307b446c206b5c9773dd5231cd8e0d1960399ffaf"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-999-1000",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 999,
+    "n": 1000,
+    "proof": [
+     "5a108be331eeb8568f91cd688b749885c81fd2dc4511913a016a8fa614c19083",
+     "191a3d2c3dd540f71325ffd5afd15b1c181d210a855f5297bbb23fa6839ba417",
+     "560f384b843b4963e27b2af10e7145da0d3def96ecb2461ed61699f7d70c0785",
+     "de7fc79a81fc10d9fac7fdd27fe9a473541b12f502db8441792b61a7d53af1ab",
+     "3f659d7d263ed0161e3aacdfc0d5a474e2b18464cefc9e3c457b7739bda75e99",
+     "84684a626598513eb8506392479afe5e27c18d4ed9cfc0f0b5fd02882afae336",
+     "c9c28e2855685c02aa1139da5bf53882095b13f7a8e714f876ec0bc82f0ea206",
+     "7ca4d15115d5db6725b300d8b649ad28fbfbf6126d7c4874481fb35cc5db2878",
+     "8d5c59cff444782b38b9e5a119632b6965577d30fffb8e64b7ec7a1a2ba29c80"
+    ],
+    "old_root": "e04a07ce9e871490dc1818e930f5951ddefb4530ee3984a87ffe51143e203473",
+    "new_root": "328ebe87ad19c7e6d569994307b446c206b5c9773dd5231cd8e0d1960399ffaf"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-0-0",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 0,
+    "n": 0,
+    "proof": [],
+    "old_root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "new_root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size is zero, the consistency proof MUST be empty"
+   }
+  },
+  {
+   "id": "consistency-0-5",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 0,
+    "n": 5,
+    "proof": [],
+    "old_root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size is zero, the consistency proof MUST be empty"
+   }
+  },
+  {
+   "id": "consistency-refuse-0-5-nonempty-proof",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 0,
+    "n": 5,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "old_root": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size is zero, the consistency proof MUST be empty"
+   }
+  },
+  {
+   "id": "consistency-refuse-0-5-old-root-not-empty",
+   "kind": "upstream_lax",
+   "op": "consistency",
+   "input": {
+    "m": 0,
+    "n": 5,
+    "proof": [],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "A checkpoint of size zero MUST have the root hash of the empty tree, which [RFC 6962], Section 2.1 defines as the hash of the empty string"
+   }
+  },
+  {
+   "id": "consistency-refuse-0-0-roots-not-empty",
+   "kind": "upstream_lax",
+   "op": "consistency",
+   "input": {
+    "m": 0,
+    "n": 0,
+    "proof": [],
+    "old_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "A checkpoint of size zero MUST have the root hash of the empty tree, which [RFC 6962], Section 2.1 defines as the hash of the empty string"
+   }
+  },
+  {
+   "id": "consistency-refuse-5-5-nonempty-proof",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 5,
+    "n": 5,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "old_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "consistency-refuse-5-5-roots-differ",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 5,
+    "n": 5,
+    "proof": [],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "consistency-refuse-m-above-n",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 5,
+    "n": 3,
+    "proof": [],
+    "old_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f",
+    "new_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-refuse-empty-proof",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 5,
+    "proof": [],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "If consistency_path is an empty array, stop and fail the proof verification"
+   }
+  },
+  {
+   "id": "consistency-refuse-proof-short",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 5,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f"
+    ],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-refuse-proof-long",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 5,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94"
+    ],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-refuse-tampered-proof",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 5,
+    "proof": [
+     "ff86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-refuse-wrong-old-root",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 5,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "old_root": "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-refuse-wrong-new-root",
+   "kind": "spec",
+   "op": "consistency",
+   "input": {
+    "m": 3,
+    "n": 5,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "56c4c4023c9be921f7cee7d8e542d02eea9607b839cc2e4f53d5d6269ff90561"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1 (https://www.rfc-editor.org/rfc/rfc9162) §2.1.4.2",
+    "clause": "consistency proof verification, 0 < first < second"
+   }
+  },
+  {
+   "id": "consistency-refuse-m-true",
+   "kind": "no_upstream",
+   "op": "consistency",
+   "input": {
+    "m": true,
+    "n": 5,
+    "proof": [
+     "7e86d2ef801a405df86260a535724abea3f1228fb2db064a2531590e281e2a94",
+     "e1ca8f38432470c5d7cf1f9b4dd2fd3e100218784c9ccafb29457c6abb71080d",
+     "e449187a936d72a12be931fa9e3805c22d852419aff6a60dab9644cc706a052f",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "old_root": "bd1a006735cd8a22a057e795ef3eef176b7decaa8cae5f8a30fa7aafe53b23df",
+    "new_root": "18905e86210bad694f6ea49e44eeb076e9f10dfdebca44235e7b10d7a12ef88f"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN §1.1",
+    "clause": "integers in a frozen structure are type(x) is int, 0 <= x <= 2^63-1",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a bool or a negative is not a tree index; Go's uint64 cannot express either"
+    }
+   }
+  }
+ ]
+}
