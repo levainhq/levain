@@ -354,7 +354,7 @@ class EfferentGate:
         unchanged. Signers are state here, never an argument: an authenticator change must not ride a
         policy swap."""
         state = {arg: getattr(self, attr) for arg, attr in _STATE_COLLABORATORS.items()}
-        return EfferentGate(manifest=manifest, binding_risk=binding_risk, **state)
+        return type(self)(manifest=manifest, binding_risk=binding_risk, **state)
 
     def get_pending(self, pending_id: str) -> PendingAction | None:
         """The UNDECIDED pending action by id (no claim), or ``None``: a journaled run's undecided hold

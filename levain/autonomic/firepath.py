@@ -124,9 +124,10 @@ class FireDispatcher:
     evaluator the core never imports), ``request_builder`` (the adapter's action fossil), and a ``clock`` (for the
     ``record_fire`` dormancy timestamp — there is no ambient clock in the core).
 
-    The gate may be a :class:`GateHandle` (a bare gate is wrapped in one that never swaps). Each
-    binding's admission reads the handle ONCE and runs on that gate; a chain's links are the chain
-    executor's admissions, read through the same handle."""
+    The gate may be a :class:`GateHandle` (a bare gate is wrapped in one that never swaps). A
+    single-link binding's admission reads the handle ONCE and runs wholly on that gate. A chain's
+    dispatch capture rules on the effect refusal and is handed to the chain executor for its pre-flight
+    and link 0; each later link is an admission of its own, read through the same handle."""
 
     def __init__(
         self,
@@ -304,7 +305,7 @@ class FireDispatcher:
         # 4. branch: MULTI-link → the chain executor (the gate travels with the chain); SINGLE-link →
         # the gate fires directly (4a). Both operate on the FRESH (claimed) snapshot.
         if len(fresh.goal) > 1:
-            return self._dispatch_chain(fresh, event)
+            return self._dispatch_chain(gate, fresh, event)
         return self._dispatch_single_link(gate, fresh, event, one_shot=one_shot, run_id=run_id)
 
     def _dispatch_single_link(self, gate: EfferentGate, fresh: Binding, event: dict[str, Any], *,
@@ -353,7 +354,7 @@ class FireDispatcher:
 
         return FireDispatch(binding_id=fresh.binding_id, outcome=outcome)
 
-    def _dispatch_chain(self, fresh: Binding, event: dict[str, Any]) -> FireDispatch:
+    def _dispatch_chain(self, gate: EfferentGate, fresh: Binding, event: dict[str, Any]) -> FireDispatch:
         """The Slice-4b chain fire-path: delegate the FRESH (claimed) multi-link binding to the injected
         chain executor, which walks the goal sequence with the gate travelling with it (per-link posture,
         pause-at-the-first-confirm-class-link, the inter-link data-flow). The chain executor NEVER raises.
@@ -365,7 +366,7 @@ class FireDispatcher:
         now closed). The dispatcher no longer records here — that would DOUBLE-count. The executor derives
         ``clean`` from the per-link outcomes + skips one-shots itself."""
         assert self._chain_executor is not None  # _dispatch_one only routes here with an executor wired
-        chain_outcome = self._chain_executor.execute(fresh, event)
+        chain_outcome = self._chain_executor.execute(fresh, event, gate=gate)
         return FireDispatch(binding_id=fresh.binding_id, outcome=self._chain_representative(chain_outcome),
                             chain=chain_outcome)
 

@@ -159,7 +159,7 @@ def test_no_holder_reads_a_gate_attribute_on_an_admission_path():
 def test_the_dispatcher_and_the_chain_executor_share_one_handle(tmp_path):
     w = World(tmp_path / "w")
     # a bare gate given to both: the dispatcher shares the executor's fixed handle
-    assert w.dispatcher.handle is w.chains.handle and w.chains.gate is w.chains.handle
+    assert w.dispatcher.handle is w.chains.handle
     handle = GateHandle(w.gate)
     chains = ChainExecutor(gate=handle, request_builder=_chain_builder, trust_resolver=_trust,
                            clock=lambda: FIXED, binding_store=w.store)

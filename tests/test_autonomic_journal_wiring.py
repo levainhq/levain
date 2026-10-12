@@ -909,7 +909,7 @@ def test_an_approval_after_a_rejection_fires_nothing_and_writes_no_receipt(tmp_p
     w.journal.decide(w.journal.find_pending(p.pending_id)["hold_id"], approve=False, by="human",
                      digest=effect_digest(action_name=p.action_name, payload=p.payload, context_id=p.context_id))
     before = len(list(w.receipts.read()))
-    out = w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id))
+    out = w.chains.resume(p.pending_id, signed_yes(w.chains.handle, p.pending_id))
     assert out.links[-1].outcome.reason == "journal:already_decided"
     assert len(list(w.receipts.read())) == before and w.outbox() == [("link0", "c1-0")]
 
@@ -1021,7 +1021,7 @@ def test_an_approved_effect_that_could_not_run_yet_is_held_and_listed(tmp_path):
     assert len(w.journal.approved_unrun()) == 1
     assert binding_liveness(w.store)["journal"]["approved_unrun"] == 1
     w.journal.effect = real
-    sweep_by = w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id))   # retried
+    sweep_by = w.chains.resume(p.pending_id, signed_yes(w.chains.handle, p.pending_id))   # retried
     assert sweep_by.completed and w.journal.approved_unrun() == []
     receipts = [r for r in w.receipts.read() if r.fired]
     assert len(receipts) == 2 and w.outbox() == [("link0", "c1-0"), ("link1", "c1-1")]
@@ -1518,7 +1518,7 @@ def test_an_approval_recorded_before_the_risk_rose_reopens_for_a_new_signature(t
     w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
     [h] = w.journal.approved_unrun()
     pid = h["pending"]["pending_id"]
-    out = w.chains.resume(pid, signed_yes(w.chains.gate, pid))
+    out = w.chains.resume(pid, signed_yes(w.chains.handle, pid))
     assert out.paused and out.reason == "journal:reopened:signed_under_another_fence"
     assert ("link1", "a1-1") not in w.outbox() and w.journal.approved_unrun() == []
     assert w.journal.find_pending(pid)["decided"] is None
@@ -1580,9 +1580,9 @@ def test_a_rise_after_the_effect_ran_cancels_nothing(tmp_path):
     w.mint(chain=True)
     w.dispatch("c9")
     [p] = w.gate.open_pendings()
-    assert w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id)).completed
+    assert w.chains.resume(p.pending_id, signed_yes(w.chains.handle, p.pending_id)).completed
     w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
-    again = w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id))   # a duplicate reply
+    again = w.chains.resume(p.pending_id, signed_yes(w.chains.handle, p.pending_id))   # a duplicate reply
     assert not again.aborted
     with w.journal.db.read() as conn:
         assert conn.execute("SELECT COUNT(*) FROM cancels").fetchone()[0] == 0
@@ -1795,10 +1795,10 @@ def test_a_rise_whose_effect_starts_between_the_check_and_the_cancel_cancels_not
     w.mint(chain=True)
     w.dispatch("c3")
     [p] = w.gate.open_pendings()
-    assert w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id)).completed
+    assert w.chains.resume(p.pending_id, signed_yes(w.chains.handle, p.pending_id)).completed
     w.gate._manifest = ActionManifest({"link0": LOW, "link1": FINANCIAL})
     w.journal.peek = lambda *a, **k: None                          # the read made before the effect ran
-    w.chains.resume(p.pending_id, signed_yes(w.chains.gate, p.pending_id))
+    w.chains.resume(p.pending_id, signed_yes(w.chains.handle, p.pending_id))
     with w.journal.db.read() as conn:
         assert conn.execute("SELECT COUNT(*) FROM cancels").fetchone()[0] == 0
     assert [r.fired for r in w.receipts.read() if r.action_face["context_id"] == "c3-1"] == [True]

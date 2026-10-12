@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Iterable, Mapping
+from types import MappingProxyType
 from typing import Any
 
 from levain.autonomic.binding import Binding
@@ -27,10 +28,6 @@ from levain.autonomic.gate import EfferentGate
 from levain.autonomic.risk import ActionManifest, ActionRisk
 
 __all__ = ["GateHandle", "Aggregate", "as_handle"]
-
-# ``types.MappingProxyType``, defined the way ``types`` itself defines it, so this package needs no
-# ``types`` import for the one read-only view it wants.
-MappingProxyType = type(type.__dict__)
 
 # (the sealed tools of one link, the frozen tool catalog) -> that link's risk. The same aggregation a
 # binding was ratified at; the handle supplies the catalog, so the function cannot read a live one.
@@ -64,7 +61,10 @@ class GateHandle:
         """Publish a new gate on ``manifest`` whose binding risk resolver is ``aggregate`` over a frozen
         snapshot of ``binding_catalog``; returns it. The catalog is copied before the gate is built, so a
         later change to the caller's mapping reaches no admission. A callable in place of the catalog (a
-        resolver of the caller's own, which could read anything at admission time) is refused."""
+        resolver of the caller's own, which could read anything at admission time) is refused.
+
+        The returned gate is for inspection only: a caller that keeps it and admits on it goes stale at
+        the next swap. Admissions read :meth:`current`."""
         if not self._swappable:
             raise RuntimeError("GateHandle: this handle wraps a fixed gate and never swaps")
         if not isinstance(manifest, ActionManifest):

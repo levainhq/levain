@@ -447,10 +447,12 @@ class ChainExecutor:
     per-link ``request_builder`` / ``trust_resolver`` (the adapter's seams), and a ``clock``. The gate must carry a run journal: a chain
     is a journaled run, and its pause/resume state lives in the run's holds.
 
-    The gate may be a :class:`GateHandle` (a bare gate is wrapped in one that never swaps). Each
-    admission reads the handle ONCE and runs on that gate: one per link fired, one per resume, one per
-    swept hold. A link in flight completes on the gate it captured; the next link reads the handle
-    again."""
+    The gate may be a :class:`GateHandle` (a bare gate is wrapped in one that never swaps). The handle is
+    read once per ADMISSION, and a chain is several admissions, never one: the chain start (its
+    pre-flight and link 0, on the gate the dispatcher captured when it hands one in), each later link,
+    each resume (the paused link's resolve) and each swept hold (its silence decision and its resolve).
+    An admission in flight completes on the gate it captured; the next link reads the handle again, so a
+    chain can span two policies (DESIGN §2.2)."""
 
     def __init__(
         self,
@@ -479,19 +481,16 @@ class ChainExecutor:
         self._journal = gate.journal
 
     @property
-    def gate(self) -> GateHandle:
+    def handle(self) -> GateHandle:
         """The handle this executor reads its gate through (never a gate: a gate held here would go stale
         at the next swap)."""
-        return self._handle
-
-    @property
-    def handle(self) -> GateHandle:
         return self._handle
 
     # ---------------------------------------------------------------------------------------------
     # Entry: walk a fresh (re-acquired, one-shot-claimed) multi-link binding from link 0.
     # ---------------------------------------------------------------------------------------------
-    def execute(self, binding: Binding, event: dict[str, Any]) -> ChainOutcome:
+    def execute(self, binding: Binding, event: dict[str, Any], *,
+                gate: EfferentGate | None = None) -> ChainOutcome:
         """Walk ``binding.goal`` from link 0. ``binding`` is the PRE-CLAIM ACTIVE snapshot the dispatcher
         already re-acquired + (for a one-shot) claimed — the chain owns this fire. Fire on-loop links
         immediately, pause at the first confirm-class link, thread each link's output forward.
@@ -500,9 +499,13 @@ class ChainExecutor:
         not propagate into the dispatch loop). Pre-flight: an UNCLASSIFIABLE link (an undeclared tool →
         ``UnknownAction``) BARS the whole chain before any link fires (fail-closed). The seam-#2 fail-up
         is the per-fire TERMINAL-link ratified floor in :meth:`_fire_link` (the chain can't COMPLETE
-        below ``binding.posture``)."""
+        below ``binding.posture``).
+
+        ``gate`` is the gate the caller captured for this admission (the dispatcher's, which already ruled
+        on the binding's effect refusal): the pre-flight and link 0 run on it. ``None`` reads the handle."""
         try:
-            return self._walk(binding, event, start=0, ctx=ChainContext(trigger_event=event), prior=())
+            return self._walk(binding, event, start=0, ctx=ChainContext(trigger_event=event), prior=(),
+                              gate=gate)
         except Exception as e:  # noqa: BLE001 — a chain fault never crashes the dispatch loop
             _log.error("chainpath execute: binding %s FAILED (%s): %s — chain aborted",
                        binding.binding_id, type(e).__name__, e)
@@ -541,16 +544,19 @@ class ChainExecutor:
         return resolver(binding, i)
 
     def _walk(self, binding: Binding, event: dict[str, Any], *, start: int, ctx: ChainContext,
-              prior: tuple[ChainLinkResult, ...]) -> ChainOutcome:
+              prior: tuple[ChainLinkResult, ...], gate: EfferentGate | None = None) -> ChainOutcome:
         """Walk links [start, len(goal)) over ``ctx``. Shared by ``execute`` (start=0) and a resume
         continuation (start=paused_at+1, ctx carrying the already-fired links). ``prior`` are the
         link-results to PREPEND (the resume's fired paused link), so the returned ChainOutcome's
-        ``links`` reflect the segment ruled on."""
+        ``links`` reflect the segment ruled on. ``gate`` is the captured gate link ``start`` runs on (and,
+        at the chain start, the pre-flight); ``None`` reads the handle. Every later link reads its own."""
         # fail-closed pre-flight (only at the chain START — a resume does not re-run it; the terminal
         # floor in _fire_link applies to the resume continuation too). An unclassifiable link bars the
         # whole chain before any link fires.
         if start == 0:
-            bar = self._unclassifiable_barred(self._handle.current(), binding)
+            if gate is None:
+                gate = self._handle.current()   # the chain start's admission: pre-flight and link 0
+            bar = self._unclassifiable_barred(gate, binding)
             if bar is not None:
                 _log.warning("chainpath: binding %s BARRED pre-flight — %s (a link's risk/trust is "
                              "unclassifiable; fail-closed)", binding.binding_id, bar)
@@ -559,7 +565,7 @@ class ChainExecutor:
 
         results: list[ChainLinkResult] = list(prior)
         for i in range(start, len(binding.goal)):
-            request, outcome = self._fire_link(binding, event, ctx, i)
+            request, outcome = self._fire_link(binding, event, ctx, i, gate if i == start else None)
             results.append(ChainLinkResult(link_index=i, outcome=outcome))
 
             if outcome.fired:
@@ -621,8 +627,8 @@ class ChainExecutor:
             _log.error("chainpath: record_fire(%s) FAILED (%s): %s — chain completed, bookkeeping not "
                        "recorded", binding.binding_id, type(e).__name__, e)
 
-    def _fire_link(self, binding: Binding, event: dict[str, Any], ctx: ChainContext,
-                   i: int) -> tuple[ActionRequest, GateOutcome]:
+    def _fire_link(self, binding: Binding, event: dict[str, Any], ctx: ChainContext, i: int,
+                   gate: EfferentGate | None = None) -> tuple[ActionRequest, GateOutcome]:
         """Build link i's request (adapter) then OVERLAY the governance-critical fields from the SEALED
         binding (so the adapter cannot forge them): per-link ``risk`` (seam #1) + per-link ``trust``
         (seam #5, hops=i) + ``authority`` (binding_invocation, hops=i) + the ``effective_guard`` kills +
@@ -639,7 +645,8 @@ class ChainExecutor:
         continuation the terminal link is the last index, so the floor applies there too. INTERMEDIATE
         links carry ``ratified_posture=None`` — they run at their natural per-link posture (§A: early
         on-loop links fire). The middle-link drift residual remains (per-link sealed postures = 4c)."""
-        gate = self._handle.current()   # this link's admission: one gate, read once, passed down
+        if gate is None:
+            gate = self._handle.current()   # this link's admission: one gate, read once, passed down
         base = self._request_builder(binding, ctx, i)
         is_terminal = i == len(binding.goal) - 1
         run = RunRef(run_id_for(binding.binding_id, event), f"link-{i}", chained=True)
