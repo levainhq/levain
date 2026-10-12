@@ -128,6 +128,18 @@ _NO_HOOKS = ["-c", "core.hooksPath=/dev/null"]
 _REPLAY_CONFIG = ["-c", "rerere.enabled=false", "-c", "rerere.autoupdate=false"]
 
 
+def ledger_env(**extra: str) -> dict[str, str]:
+    """The environment for levain's local git plumbing on the ledger (signing and verifying included): the allowlist
+    plus git's own settings (levain.launch: never a copy of os.environ), the identity and repository-location
+    variables scrubbed, and replace objects and grafts off, so no commit reads as another's bytes. ``extra`` is added
+    last, after the scrub."""
+    env = child_env(prefixes=("GIT_",))
+    for k in _SCRUB_ENV:
+        env.pop(k, None)
+    env.update(LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/dev/null", **extra)
+    return env
+
+
 def git(args: list[str], cwd: Path, *, timeout: float = 60, check: bool = True,
         input_text: str | None = None) -> subprocess.CompletedProcess:
     # The allowlist plus what a fetch or push needs: proxies and CA bundles, git's own settings,
@@ -612,8 +624,7 @@ class GitLedger:
         tree = git(["mktree"], top, input_text="\n".join(rows) + "\n").stdout.strip()
         cp = subprocess.run(["git", *_NO_HOOKS, *self._sign_cfg(key), "commit-tree", "-S", tree, "-m", message],
                             cwd=str(top), capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
-                            env={**{k: v for k, v in os.environ.items() if k not in _SCRUB_ENV},
-                                 "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", **self._sign_env()})
+                            env=ledger_env(**self._sign_env()))
         if cp.returncode != 0:
             raise TeamError(f"could not sign the genesis commit: {(cp.stderr or cp.stdout).strip()[-200:]}")
         return cp.stdout.strip()
@@ -1112,9 +1123,7 @@ class GitLedger:
         message = f"{message.rstrip(chr(10))}{sep}{T.DEVICE_TRAILER}: {self.device}\n"
         cp = subprocess.run(["git", *_NO_HOOKS, *self._sign_cfg(), "commit", "-q", "--no-verify", "-F", "-"],
                             cwd=str(self.wt), capture_output=True, text=True, timeout=60, input=message,
-                            env={**{k: v for k, v in os.environ.items() if k not in _SCRUB_ENV},
-                                 "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "GIT_NO_REPLACE_OBJECTS": "1",
-                                 **self._sign_env()})
+                            env=ledger_env(**self._sign_env()))
         if cp.returncode != 0:
             msg = (cp.stderr or cp.stdout).strip().splitlines()
             git(["reset", "-q", "--mixed", "HEAD"], self.wt, check=False)

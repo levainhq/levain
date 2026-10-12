@@ -33,7 +33,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .transport import _NO_HOOKS, _SCRUB_ENV
+from .transport import _NO_HOOKS, ledger_env
 
 SSH_SIG_BEGIN = "-----BEGIN SSH SIGNATURE-----"
 CACHE_SCHEMA = "sigcache-v2"   # bump whenever a verdict rule or the accepted key set changes
@@ -195,11 +195,9 @@ def _indeterminate(reason: str) -> Verdict:
 
 
 def _env(**extra: str) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
-    # GIT_NO_REPLACE_OBJECTS: `git replace` would make one id read as another object's bytes, so an unsigned commit
-    # could verify as a signed one (L3 r2 codex, measured)
-    env.update(LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/dev/null", **extra)
-    return env
+    # GIT_NO_REPLACE_OBJECTS (set by ledger_env): `git replace` would make one id read as another object's bytes, so an
+    # unsigned commit could verify as a signed one (L3 r2 codex, measured)
+    return ledger_env(**extra)
 
 
 def _output_tail(cp: subprocess.CompletedProcess) -> str:

@@ -279,7 +279,8 @@ def _anneal_probe() -> dict:
     """``{"version", "v3": bool}`` for the installed anneal-memory; ``v3`` False when it cannot be told."""
     from . import export as X
     try:
-        cp = subprocess.run([sys.executable, "-P", "-c", _PROBE], capture_output=True, text=True, timeout=15)
+        cp = subprocess.run([sys.executable, "-P", "-c", _PROBE], capture_output=True, text=True, timeout=15,
+                            env=child_env())
         got = json.loads(cp.stdout.strip().splitlines()[-1]) if cp.returncode == 0 and cp.stdout.strip() else {}
     except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
         got = {}
@@ -295,7 +296,7 @@ def _store_view(db: Path, key: str) -> list | None:
     key, and so does a takeover (``active``)."""
     try:
         cp = subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db), "team-status", "--json"],
-                            capture_output=True, text=True, timeout=20)
+                            capture_output=True, text=True, timeout=20, env=child_env())
         data = json.loads(cp.stdout) if cp.returncode == 0 else {}
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
@@ -331,7 +332,7 @@ def _anneal_import_v3(gl: GitLedger, db: Path, anneal_version: str) -> str | Non
     body = "".join(snap.lines(X.next_seq(gl)))
     try:
         cp = subprocess.run([sys.executable, "-P", "-m", "anneal_memory", "--db", str(db), "team-import", "--json",
-                             "-"], input=body, capture_output=True, text=True, timeout=60)
+                             "-"], input=body, capture_output=True, text=True, timeout=60, env=child_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"[team] anneal import did not run: {exc}"
     try:

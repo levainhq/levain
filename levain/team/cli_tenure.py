@@ -422,10 +422,9 @@ def _nested_genesis(gl: GitLedger, files: dict[str, str], message: str) -> str:
     top = gl.repo.toplevel
     idx = gl.base / "regenesis.index"
     env_idx = {"GIT_INDEX_FILE": str(idx)}
-    import os
     import subprocess
-    from .transport import _NO_HOOKS, _SCRUB_ENV
-    env = {**{k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}, "LC_ALL": "C", **env_idx}
+    from .transport import _NO_HOOKS, ledger_env
+    env = ledger_env(**env_idx)
     try:
         idx.unlink()
     except FileNotFoundError:

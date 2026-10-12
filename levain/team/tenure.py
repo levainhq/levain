@@ -12,7 +12,6 @@ projects/levain/reference). This module holds the derivation; ``transport`` hold
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import tomllib
@@ -22,7 +21,7 @@ from pathlib import Path
 from . import entry as E
 from . import roles as R
 from . import signing as S
-from .transport import _NO_HOOKS, _SCRUB_ENV, TeamError
+from .transport import _NO_HOOKS, TeamError, ledger_env
 
 TENURE_FILE = "tenure.toml"
 TEAM_FILE = "team.toml"
@@ -177,10 +176,9 @@ def key_fps(ten: Tenure, handle: str) -> set[str]:
 
 
 def _env() -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
     # replace refs and grafts both rewrite what git reports as a commit's parents; neither may reach the derivation
-    env.update(LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_NO_REPLACE_OBJECTS="1", GIT_GRAFT_FILE="/dev/null")
-    return env
+    # (ledger_env turns both off)
+    return ledger_env()
 
 
 def _git(top: Path, args: list[str], *, input_text: str | None = None, timeout: float = 120) -> str:
