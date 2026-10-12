@@ -742,7 +742,7 @@
     input.maxLength = 200;
     input.autocomplete = "off";
     input.spellcheck = false;
-    input.placeholder = "Filter";
+    input.placeholder = s.data && s.data.kind === "roster" ? "filter agents\u2026" : "Filter";
     input.setAttribute("aria-label", "Filter " + s.title);
     input.dataset.pid = s.pid;
     const count = el("span", "xfilter-count");
@@ -772,6 +772,7 @@
   // an on-call member's last call, failed or not, is a neutral fact.
   const FLEET_GROUPS = [["resident", "Resident \u00b7 judged by their writing"], ["on_call", "On call \u00b7 judged by their last answer"],
                         ["roundtable", "Roundtable"]];
+  const fleetGroupOf = (r) => r.fleet_group || (r.group === "roundtable" ? "roundtable" : r.cadence === "resident" ? "resident" : "on_call");
   function fleetRow(r) {
     const h = isObj(r.health) ? r.health : { tone: "unknown", text: "no data", at: null, memory: "" };
     const alarm = h.tone === "alarm";
@@ -786,13 +787,15 @@
     const when = h.at ? " " + (ago(h.at) || h.at) : "";
     const d = el("div", "d" + (alarm ? " bad" : "") + (h.tone === "unknown" ? " unk" : ""), (h.text || "") + when);
     row.append(n, d);
-    const tags = [r.role, h.memory].filter(Boolean).join(" \u00b7 ");
+    // a resident's tags say only "memory" (mock-e); the store's size is an on-call fact. "stateless" stays as the kernel says it.
+    const mem = fleetGroupOf(r) === "resident" && /^memory\b/.test(h.memory || "") ? "memory" : h.memory;
+    const tags = [r.role, mem].filter(Boolean).join(" \u00b7 ");
     if (tags) row.appendChild(el("div", "tags", tags));
     return row;
   }
   function paintRoster(host, rows, d) {
     for (const [gid, title] of FLEET_GROUPS) {
-      const rs = rows.filter((r) => (r.fleet_group || (r.group === "roundtable" ? "roundtable" : r.cadence === "resident" ? "resident" : "on_call")) === gid);
+      const rs = rows.filter((r) => fleetGroupOf(r) === gid);
       if (!rs.length) continue;
       const g = el("div", "fl-group");
       g.setAttribute("data-ck-fleet-group", gid);
