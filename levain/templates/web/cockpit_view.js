@@ -160,7 +160,7 @@
     const v = panel.value || {};
     const kind = ALIAS[head.kind] || head.kind;
     const out = { note: head.note || "", empty: head.empty || "nothing here", kind: kind, pid: head.id, typed: false,
-                  search: searchOf(panel) };
+                  search: searchOf(panel), face: panel.face === "count" ? "count" : "" };
     if (kind === "list" || kind === "count-queue") {
       out.lines = (panel.rows || []).map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
@@ -464,32 +464,38 @@
 
     // header region: state goes under the masthead; any other header panel (a downstream's weather, say)
     // is drawn as a panel first in Operate, never silently dropped. An older kernel's `focus` panel is
-    // retired data, not a fault: it is skipped.
+    // retired data, not a fault: it is skipped. A manifest that declares hero / brief / widgets is KE-shaped:
+    // those regions are drawn from their own lists and `header` (their derived union) is not read.
+    const ke = Array.isArray(m.regions.hero) && Array.isArray(m.regions.brief) && Array.isArray(m.regions.widgets);
     const headerExtra = [];
-    for (const pid of (m.regions.header || [])) {
+    const mapState = (pid, head) => {
+      const bad = failure(pid);
+      if (bad) { view.errors[pid] = bad; return; }
+      try {
+        view.state = lineOf(P.get(pid), P.get(pid), now);
+        // the version the line was rendered with, which a write to it names (the kernel refuses a changed line)
+        const sp = P.get(pid);
+        const acts = Array.isArray(sp.actions) ? sp.actions.filter((a) => isObj(a) && typeof a.verb === "string") : [];
+        const sv = isObj(sp.value) && typeof sp.value.value_version === "string" ? sp.value.value_version : null;
+        if (acts.length) view.targets.panels[pid] = { actions: acts, panel_version: sv };
+        if (view.state && view.writable) {
+          view.state.version = sv;
+          view.state.can_edit = acts.some((a) => a.verb === "operator_state");
+        }
+      } catch (e) { view.state = null; view.errors[pid] = String(e && e.message || e); }
+    };
+    for (const pid of (ke ? [] : m.regions.header || [])) {
       const head = heads.get(pid);
       if (!head) { view.errors[pid] = "listed in the manifest header but has no head"; continue; }
-      const bad = failure(pid);
       if (pid === "focus") continue;
-      if (pid === "state") {
-        if (bad) { view.errors[pid] = bad; continue; }
-        try {
-          view.state = lineOf(P.get(pid), P.get(pid), now);
-          // the version the line was rendered with, which a write to it names (the kernel refuses a changed line)
-          const sp = P.get(pid);
-          const acts = Array.isArray(sp.actions) ? sp.actions.filter((a) => isObj(a) && typeof a.verb === "string") : [];
-          const sv = isObj(sp.value) && typeof sp.value.value_version === "string" ? sp.value.value_version : null;
-          if (acts.length) view.targets.panels[pid] = { actions: acts, panel_version: sv };
-          if (view.state && view.writable) {
-            view.state.version = sv;
-            view.state.can_edit = acts.some((a) => a.verb === "operator_state");
-          }
-        } catch (e) { view.state = null; view.errors[pid] = String(e && e.message || e); }
-      } else headerExtra.push(pid);
+      if (pid === "state") mapState(pid, head); else headerExtra.push(pid);
     }
 
     let sectionRef = 0;
-    const place = (pid, zoneId) => {
+    // `region` is set for a hero / brief / widgets panel: those are drawn bare by the page, always through the
+    // typed external path, never as one of the kernel's own built-in panels (a widget named `health` is not the Health panel)
+    const place = (pid, zoneId, region) => {
+      const nat = region ? "" : pid;
       const head = heads.get(pid);
       if (!head) { view.errors[pid] = "listed in the manifest but has no head"; return; }
       const bad = failure(pid);
@@ -499,11 +505,12 @@
       for (const g of panel.groups || head.groups || []) groupTitles.set(g.id, titleOf(g.title, String(g.id)));
       const entry = { zone: zoneId, edit_class: "", title: titleOf(panel.title, titleOf(head.title, pid)), id: pid,
                       pkind: ALIAS[panel.kind] || panel.kind };
+      if (region) entry.region = region;
       const banner = bannerOf(panel, panel, now);
       if (banner) entry.banner = banner;
       if (panel.as_of) entry.fresh = ageLabel(panel.as_of, now, "read ");
       const rows = panel.rows || [];
-      const kind = NATIVE.get(pid);
+      const kind = NATIVE.get(nat);
       // what this panel lets the operator do: its own actions (a create, a value write, a downstream verb)
       // and the actions its rows carry. The page offers a verb only where the kernel offered one.
       const pActions = Array.isArray(panel.actions) ? panel.actions.filter((a) => isObj(a) && typeof a.verb === "string") : [];
@@ -518,11 +525,11 @@
       // every capture is the Tray's create, so the Keep's capture box shows whenever the Tray offers one
       const tp = P.get("tray");
       const traySeeds = isObj(tp) && Array.isArray(tp.actions) && tp.actions.some((a) => isObj(a) && a.verb === "spore_seed" && isPostable(a));
-      if ((rowsAct || pActions.length || (pid === "keep" && traySeeds)) && (pid === "tray" || pid === "loops" || pid === "keep" || pid === "episodes")) entry.edit_class = "B";
+      if ((rowsAct || pActions.length || (nat === "keep" && traySeeds)) && (nat === "tray" || nat === "loops" || nat === "keep" || nat === "episodes")) entry.edit_class = "B";
       const lists = { tray: "tray", loops: "open_spores", keep: "keep" };
-      if ((pid === "tray" || pid === "loops" || pid === "keep") && (panel.kind === "triage-list" || panel.kind === "list")) {
+      if ((nat === "tray" || nat === "loops" || nat === "keep") && (panel.kind === "triage-list" || panel.kind === "list")) {
         view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows));
-        if (pid === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
+        if (nat === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
           // the kernel's named orderings and the row ids in each; the renderer picks one, never sorts
           const named = head.views.filter((v) => isObj(v) && typeof v.id === "string" && Array.isArray(panel.view_rows[v.id]));
           if (named.length) {
@@ -532,18 +539,18 @@
           }
         }
         view.layout.push(Object.assign(entry, { kind: kind }));
-      } else if (pid === "episodes" && (panel.kind === "triage-list" || panel.kind === "list")) {
+      } else if (nat === "episodes" && (panel.kind === "triage-list" || panel.kind === "list")) {
         view.episodes = rows.map((r) => ({ panel_id: pid, row_id: r.id, row_version: r.version, id: bare(r.id), timestamp: (r.facets || {}).at, type: (r.facets || {}).episode_type,
           source: (r.facets || {}).source, agent: titleOf((r.facets || {}).agent, ""),
           actions: Array.isArray(r.actions) ? r.actions : undefined, tags: tagsOf((r.facets || {}).tags), content: r.body || r.title,
           emphasis: r.emphasis }));
         view.layout.push(Object.assign(entry, { kind: "episodes" }));
-      } else if (pid === "edits" && (panel.kind === "triage-list" || panel.kind === "list")) {
+      } else if (nat === "edits" && (panel.kind === "triage-list" || panel.kind === "list")) {
         view.recent_edits = rows.map((r) => ({ panel_id: pid, row_id: r.id, row_version: r.version,
           actions: Array.isArray(r.actions) ? r.actions : [], id: bare(r.id), ts: (r.facets || {}).at, action: (r.facets || {}).edit_kind,
           source: r.title, undoable: (r.facets || {}).undoable }));
         view.layout.push(Object.assign(entry, { kind: "edits" }));
-      } else if (pid === "crystals" && (panel.kind === "triage-list" || panel.kind === "list")) {
+      } else if (nat === "crystals" && (panel.kind === "triage-list" || panel.kind === "list")) {
         view.crystal_index = rows.map((r) => {
           const f = r.facets || {};
           const tags = tagsOf(f.tags);
@@ -551,17 +558,17 @@
                    last_activated_on: f.last_activated_on, tags: tags };
         });
         view.layout.push(Object.assign(entry, { kind: "crystals" }));
-      } else if (pid === "health" && (panel.kind === "metric" || panel.kind === "status-dots")) {
+      } else if (nat === "health" && (panel.kind === "metric" || panel.kind === "status-dots")) {
         view.health = healthOf((panel.value || {}).metrics, wrapsData);
         view.layout.push(Object.assign(entry, { kind: "health" }));
-      } else if (pid === "graph" && (panel.kind === "visual" || panel.kind === "ambient")) {
+      } else if (nat === "graph" && (panel.kind === "visual" || panel.kind === "ambient")) {
         view.graph = (panel.value || {}).data || null;
         view.layout.push(Object.assign(entry, { kind: "graph" }));
-      } else if (pid === "wraps" && (panel.kind === "visual" || panel.kind === "ambient")) {
+      } else if (nat === "wraps" && (panel.kind === "visual" || panel.kind === "ambient")) {
         if (wrapsShape) throw wrapsShape;
         view.wraps = Array.isArray(wrapsData) ? wrapsData : [];
         view.layout.push(Object.assign(entry, { kind: "wraps" }));
-      } else if ((panel.kind === "prose" || panel.kind === "brief") && pid.indexOf("section:") === 0 && (panel.value || {}).markdown != null) {
+      } else if ((panel.kind === "prose" || panel.kind === "brief") && nat.indexOf("section:") === 0 && (panel.value || {}).markdown != null) {
         view.sections.push({ heading: titleOf(panel.title, titleOf(head.title, pid)), body: panel.value.markdown });
         // a section the kernel offers section_edit on is the operator's to edit; its panel id stands as the
         // write address, and the save posts the action the panel offered
@@ -593,11 +600,11 @@
     };
 
     const placed = new Set();
-    const placeOnce = (pid, zoneId) => {
+    const placeOnce = (pid, zoneId, region) => {
       if (placed.has(pid)) return;
       placed.add(pid);
       const mark = view.layout.length, nSections = view.sections.length, refMark = sectionRef;
-      try { place(pid, zoneId); } catch (e) {
+      try { place(pid, zoneId, region); } catch (e) {
         // one malformed panel must not blank the cockpit: it becomes an unavailable panel with the reason
         view.layout.length = mark;
         view.sections.length = nSections;
@@ -607,7 +614,29 @@
       }
     };
     for (const pid of headerExtra) placeOnce(pid, "operate");
-    for (const zone of (m.regions.zones || [])) for (const pid of (zone.panels || [])) placeOnce(pid, zone.id);
+    if (ke) {
+      // the page's own regions, each panel kept in the kernel's order: hero (reading, ambient), brief, widgets, then
+      // the zones as cards. `state` is not a card: it is the operator's line, drawn at the top of the brief.
+      view.ke = { hero: [], brief: [], widgets: [], zones: [] };
+      for (const region of ["hero", "brief", "widgets"]) {
+        for (const pid of m.regions[region]) {
+          if (view.ke[region].indexOf(pid) >= 0 || pid === "focus") continue;   // an older kernel's `focus` is retired data, never drawn
+          if (pid === "state" && region === "brief") { if (heads.has(pid)) mapState(pid, heads.get(pid)); else view.errors[pid] = "listed in the manifest brief but has no head"; continue; }
+          view.ke[region].push(pid);
+          placeOnce(pid, region, region);
+        }
+      }
+    }
+    for (const zone of (m.regions.zones || [])) {
+      for (const pid of (zone.panels || [])) placeOnce(pid, zone.id);
+      if (ke) {
+        const cards = Array.isArray(zone.cards) ? zone.cards.filter(isObj) : [];
+        view.ke.zones.push({ id: zone.id, title: titleOf(zone.title, zone.id), cards: cards.map((c) => ({
+          panels: (Array.isArray(c.panels) ? c.panels : []).filter((x) => typeof x === "string"),
+          size: ["tall", "medium", "short"].indexOf(c.size) >= 0 ? c.size : "medium",
+          span: c.span === 2 || c.span === 3 ? c.span : 1, tabs: typeof c.tabs === "string" && c.tabs ? c.tabs : "" })) });
+      }
+    }
     for (const e of view.layout) e.modes = modesOf(e);
     // the verbs the kernel offered somewhere with a gesture a browser can perform: an affordance whose
     // verb is not here has nothing to post to
@@ -748,23 +777,157 @@
     }
   }
 
+  // The reading's icon: one inline SVG per token of the contract's READING_SYMBOLS, drawn from a few shared
+  // parts (no external asset, no icon font). An unknown token draws the plain cloud rather than nothing.
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const ICON_INK = "#c9d2e3", ICON_SUN = "#ffd36b", ICON_RAIN = "#7fb2ff";
+  const P = {
+    cloud: ["path", { d: "M14 30h24a9 9 0 0 0 1-17.9A12 12 0 0 0 14.3 11 10 10 0 0 0 14 30z", fill: ICON_INK }],
+    cloudHi: ["path", { d: "M12 30h22a9 9 0 0 0 .8-18A11.5 11.5 0 0 0 12.3 11 9.6 9.6 0 0 0 12 30z", fill: ICON_INK }],
+    sun: ["circle", { cx: 26, cy: 20, r: 9, fill: ICON_SUN }],
+    sunHi: ["circle", { cx: 34, cy: 12, r: 7, fill: ICON_SUN }],
+    rays: ["path", { d: "M26 3v5M26 32v5M9 20h5M38 20h5M14 8l3.5 3.5M34.5 28.5L38 32M14 32l3.5-3.5M34.5 11.5L38 8", stroke: ICON_SUN, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
+    moon: ["path", { d: "M32 6a14 14 0 1 0 8 25A11 11 0 0 1 32 6z", fill: ICON_INK }],
+    moonHi: ["path", { d: "M38 4a9 9 0 1 0 5 16A7 7 0 0 1 38 4z", fill: ICON_INK }],
+    drops: ["path", { d: "M18 35l-2 6M27 35l-2 6M36 35l-2 6", stroke: ICON_RAIN, "stroke-width": 2.5, "stroke-linecap": "round", fill: "none" }],
+    drizzle: ["path", { d: "M19 35l-1 3M28 35l-1 3M37 35l-1 3", stroke: ICON_RAIN, "stroke-width": 2, "stroke-linecap": "round", fill: "none" }],
+    heavy: ["path", { d: "M15 34l-3 8M22 34l-3 8M29 34l-3 8M36 34l-3 8", stroke: ICON_RAIN, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
+    snow: ["path", { d: "M18 36v5M15.5 38.5h5M27 36v5M24.5 38.5h5M36 36v5M33.5 38.5h5", stroke: ICON_INK, "stroke-width": 2, "stroke-linecap": "round", fill: "none" }],
+    bolt: ["path", { d: "M29 28l-7 9h5l-3 7 9-10h-5z", fill: ICON_SUN }],
+    lines: ["path", { d: "M8 34h36M12 40h28M8 28h36", stroke: ICON_INK, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
+    wind: ["path", { d: "M6 18h28a5 5 0 1 0-5-5M6 26h36a5 5 0 1 1-5 5M6 34h20", stroke: ICON_INK, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
+    haze: ["path", { d: "M10 20h32M6 27h40M10 34h32", stroke: ICON_SUN, "stroke-width": 3, "stroke-linecap": "round", opacity: 0.7, fill: "none" }],
+  };
+  const ICONS = {
+    "clear": ["sun", "rays"], "clear-night": ["moon"], "partly-cloudy": ["sunHi", "cloudHi"], "partly-cloudy-night": ["moonHi", "cloudHi"],
+    "cloudy": ["cloud"], "fog": ["cloud", "lines"], "drizzle": ["cloud", "drizzle"], "rain": ["cloud", "drops"], "heavy-rain": ["cloud", "heavy"],
+    "thunderstorm": ["cloud", "bolt"], "snow": ["cloud", "snow"], "sleet": ["cloud", "drops", "snow"], "wind": ["wind"], "haze": ["haze"],
+  };
+  function weatherIcon(symbol) {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 52 44");
+    svg.setAttribute("width", "52");
+    svg.setAttribute("height", "44");
+    svg.setAttribute("class", "wx-icon");
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", typeof symbol === "string" && symbol ? symbol : "weather");
+    for (const key of (Object.prototype.hasOwnProperty.call(ICONS, symbol) ? ICONS[symbol] : ICONS.cloudy)) {
+      const [tag, attrs] = P[key];
+      const n = document.createElementNS(SVG_NS, tag);
+      for (const k of Object.keys(attrs)) n.setAttribute(k, String(attrs[k]));
+      svg.appendChild(n);
+    }
+    return svg;
+  }
+  // the EPA band a sub-reading names, compared case-insensitively against the contract's lowercase tokens
+  const BAND_WORDS = { "good": "Good", "moderate": "Moderate", "unhealthy-sensitive": "Unhealthy for sensitive groups", "unhealthy": "Unhealthy",
+    "very-unhealthy": "Very unhealthy", "hazardous": "Hazardous" };
+  function bandOf(raw) {
+    const t = String(raw).trim().toLowerCase().replace(/\s+/g, "-");
+    return Object.prototype.hasOwnProperty.call(BAND_WORDS, t) ? t : "";
+  }
+  function bars() {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 16 14");
+    svg.setAttribute("width", "16");
+    svg.setAttribute("height", "14");
+    svg.setAttribute("aria-hidden", "true");
+    const g = document.createElementNS(SVG_NS, "path");
+    g.setAttribute("d", "M2 3h9M2 7h12M2 11h7");
+    g.setAttribute("stroke", "currentColor");
+    g.setAttribute("stroke-width", "2");
+    g.setAttribute("stroke-linecap", "round");
+    g.setAttribute("fill", "none");
+    svg.appendChild(g);
+    return svg;
+  }
+
   function paintReading(host, v) {
-    const top = el("div", "rd");
-    top.appendChild(el("span", "rd-n num", v.value));
-    if (v.unit) top.appendChild(el("span", "rd-u", v.unit));
-    if (v.condition) top.appendChild(el("span", "rd-c", v.condition));
+    const top = el("div", "rd wx-main");
+    const icon = weatherIcon(v.symbol);
+    icon.setAttribute("data-ck-weather", "icon");
+    top.appendChild(icon);
+    const main = el("div", "wx-big");
+    const t = el("div", "wx-t");
+    t.appendChild(el("span", "rd-n num", v.value));
+    if (v.unit) t.appendChild(el("span", "rd-u", v.unit));
+    main.appendChild(t);
+    if (v.condition) main.appendChild(el("div", "rd-c wx-c", v.condition));
+    top.appendChild(main);
+    // what sits to the side of the figure: the bounds, and every sub-reading that carries no band
+    const side = el("div", "wx-side");
+    const subs = Array.isArray(v.sub) ? v.sub : [];
+    for (const sub of subs) {
+      if (typeof sub.band === "string" && sub.band) continue;
+      const line = el("div", "rd-sub");
+      line.appendChild(document.createTextNode(sub.label + " "));
+      line.appendChild(el("b", "num", sub.value == null ? "" : sub.value));
+      side.appendChild(line);
+    }
+    const bounds = [isNum(v.hi) ? ["H", v.hi] : null, isNum(v.lo) ? ["L", v.lo] : null].filter(Boolean);
+    if (bounds.length) {
+      const line = el("div", "rd-b");
+      bounds.forEach(([k, n], i) => { if (i) line.appendChild(document.createTextNode(" · ")); line.appendChild(document.createTextNode(k + " ")); line.appendChild(el("b", "num", Math.round(n) + "°")); });
+      side.appendChild(line);
+    }
+    if (side.childNodes.length) top.appendChild(side);
     host.appendChild(top);
-    const bounds = [isNum(v.hi) ? "high " + v.hi : "", isNum(v.lo) ? "low " + v.lo : ""].filter(Boolean).join(" · ");
-    if (bounds) host.appendChild(el("div", "rd-b num", bounds));
-    for (const s of Array.isArray(v.sub) ? v.sub : []) {
-      const row = el("div", "rd-sub");
-      row.appendChild(el("span", "k", s.label));
-      row.appendChild(el("span", "num", s.value == null ? "" : s.value));
-      if (typeof s.band === "string" && s.band) row.appendChild(el("span", "pill" + (s.band === "good" ? "" : " hot"), s.band));
+    for (const sub of subs) {
+      if (!(typeof sub.band === "string" && sub.band)) continue;
+      const token = bandOf(sub.band);
+      const row = el("div", "aqi band-" + (token || "other"));
+      row.appendChild(bars());
+      row.appendChild(el("b", "num", sub.label.charAt(0).toUpperCase() + sub.label.slice(1) + (sub.value == null ? "" : " " + sub.value)));
+      // the pill carries the band in words; `good` is calm, any other named band is hot, an unknown one neutral
+      const pill = el("span", "pill" + (token && token !== "good" ? " hot" : ""), token ? BAND_WORDS[token] : sub.band);
+      pill.setAttribute("data-ck-weather", "aqi");
+      row.appendChild(pill);
       host.appendChild(row);
+      if (typeof sub.detail === "string" && sub.detail) host.appendChild(el("div", "wx-src", sub.detail));
     }
     const age = typeof v.as_of === "string" ? ago(v.as_of) : "";
-    if (age) host.appendChild(el("div", "xnote", "read " + age));
+    if (age) host.appendChild(el("div", "wx-src", "read " + age));
+  }
+
+  // ---- the widget faces: one answer each, never a row (cockpit contract, widgets region) ----
+  const WIDGET_DOTS = 4, WIDGET_FIGURES = 4;
+  const figure = (n) => Number.isInteger(n) ? n.toLocaleString("en-US") : String(n);
+  function paintWidget(s, host) {
+    const d = s.data;
+    if (d.face === "count") {
+      host.appendChild(el("div", "big num", isNum(d.count) ? d.count : (d.lines || []).length));
+      if (d.note) host.appendChild(el("div", "sub", d.note));
+      else if (!(isNum(d.count) ? d.count : (d.lines || []).length)) host.appendChild(el("div", "sub", d.empty));
+      return;
+    }
+    if (d.kind === "status-dots") {
+      const ms = d.metrics || [];
+      const dots = ms.filter((m) => m.status === "ok" || m.status === "warn" || m.status === "bad");
+      const figs = ms.filter((m) => !(m.status === "ok" || m.status === "warn" || m.status === "bad") && isNum(m.value) && Number.isInteger(m.value));
+      if (dots.length) {
+        const box = el("div", "dots");
+        paintStatusDots(box, dots.slice(0, WIDGET_DOTS));
+        host.appendChild(box);
+      }
+      if (figs.length) {
+        const row = el("div", "row");
+        for (const m of figs.slice(0, WIDGET_FIGURES)) { const c = el("span"); c.append(el("b", "num", figure(m.value)), document.createTextNode(m.label)); row.appendChild(c); }
+        host.appendChild(row);
+      }
+      if (!ms.length) host.appendChild(el("div", "sub", d.empty || "nothing to show"));
+      return;
+    }
+    if (d.kind === "metric-grid") {
+      const ns = d.numbers || [];
+      if (ns[0]) { host.appendChild(el("div", "big num", figure(ns[0].value))); }
+      const row = el("div", "row");
+      ns.forEach((n, i) => { const c = el("span"); if (i) c.appendChild(el("b", "num", figure(n.value))); c.appendChild(document.createTextNode(n.label)); row.appendChild(c); });
+      if (ns.length) host.appendChild(row);
+      return;
+    }
+    if (d.kind === "reading") { paintReading(host, d.reading); return; }
+    for (const l of d.lines || []) host.appendChild(el("div", "sub", l.text));
+    if (!(d.lines || []).length) host.appendChild(el("div", "sub", d.empty || "nothing to show"));
   }
 
   function paintGrid(host, numbers) {
@@ -778,13 +941,28 @@
     host.appendChild(g);
   }
 
-  function paintBrief(host, b) {
+  // In the brief region a label that repeats is a list, not a paragraph: its lines sit in a side column, clamped, and
+  // the rest read as the card's body. The first-seen order is kept; nothing is sorted.
+  const BRIEF_SIDE_LINES = 6;
+  function paintBrief(host, b, region) {
     if (b.headline) host.appendChild(el("div", "q", b.headline));
+    const count = new Map();
+    for (const l of b.lines) count.set(l.label || "", (count.get(l.label || "") || 0) + 1);
+    const side = [];
     for (const l of b.lines) {
+      if (region && l.label && count.get(l.label) > 1) { side.push(l); continue; }
       const row = el("div", "brief-line");
       if (l.label) row.appendChild(el("span", "k", l.label));
       row.appendChild(el("p", "", l.text));
       host.appendChild(row);
+    }
+    if (side.length) {
+      host.classList.add("has-side");
+      const col = el("div", "brief-side");
+      col.appendChild(el("span", "k", side[0].label));
+      for (const l of side.slice(0, BRIEF_SIDE_LINES)) col.appendChild(el("p", "side-line", l.text));
+      if (side.length > BRIEF_SIDE_LINES) col.appendChild(el("p", "xnote", "+" + (side.length - BRIEF_SIDE_LINES) + " more"));
+      host.appendChild(col);
     }
   }
 
@@ -794,8 +972,17 @@
   let clockTimer = 0;
   function setClock(c) {
     const d = new Date();
-    c.node.textContent = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-    c.date.textContent = d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+    const h = d.getHours();
+    c.node.replaceChildren(document.createTextNode((h % 12 || 12) + ":" + String(d.getMinutes()).padStart(2, "0")), el("small", "", h < 12 ? "am" : "pm"));
+    c.date.textContent = d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+  }
+  // the page's own clock (the hero's column), ticking whether or not a sky is mounted
+  function mountClock(node, date) {
+    const clk = { node: node, date: date, seen: false, born: Date.now() };
+    clocks.add(clk);
+    setClock(clk);
+    if (!clockTimer) clockTimer = root.setInterval(tickClocks, 30000);
+    return clk;
   }
   function tickClocks() {
     for (const c of Array.from(clocks)) {
@@ -826,7 +1013,13 @@
   function skyCounts(sky) {
     const repos = new Set(sky.events.map((e) => e.repo).filter((r) => typeof r === "string" && r));
     const failed = sky.events.filter((e) => e.outcome === "failed").length;
-    return sky.events.length + " events from " + repos.size + " repos" + (failed ? " · " + failed + " failed" : "");
+    return { text: sky.events.length + " events from " + repos.size + " repos", failed: failed };
+  }
+  // the failed count is the one accent on the line: a failed review is where attention goes
+  function paintCounts(node, sky) {
+    const c = skyCounts(sky);
+    node.replaceChildren(document.createTextNode(c.text));
+    if (c.failed) { node.appendChild(document.createTextNode(" · ")); node.appendChild(el("span", "bad", c.failed + " failed")); }
   }
   // An ambient panel whose sky is already mounted takes new events through the mount's own update(), so the
   // animation keeps running instead of restarting. True when it did; false leaves the paint to remount.
@@ -834,32 +1027,40 @@
     const k = s.skyParts;
     if (!k || !s.skyHandle || typeof s.skyHandle.update !== "function" || !k.plot.isConnected || !s.body.contains(k.plot)) return false;
     try { s.skyHandle.update({ events: sky.events, legend: sky.legend }); } catch (_) { return false; }
-    k.win.textContent = skyCounts(sky);
+    paintCounts(k.win, sky);
     k.legend.textContent = sky.legend;
     return true;
   }
+  // In the hero the clock, the date and the events line are the page's own nodes (ctx.hero), drawn in the clock
+  // column beside the sky; anywhere else the sky carries its own.
   function paintSky(s, host, sky) {
     dropSky(s);
-    const wrap = el("div", "sky");
-    const when = el("div", "when");
-    const t = el("div", "clock num");
-    const date = el("div", "date");
-    when.append(t, date);
-    const win = el("div", "win", skyCounts(sky));
-    when.appendChild(win);
-    const clk = { node: t, date: date, seen: false, born: Date.now() };
-    s.clock = clk;
-    clocks.add(clk);
-    setClock(clk);
-    if (!clockTimer) clockTimer = root.setInterval(tickClocks, 30000);
+    const hero = s.ctx && s.ctx.hero;
+    const wrap = el("div", "sky" + (hero ? " sky-hero" : ""));
+    let win;
+    if (hero) win = hero.events;
+    else {
+      const when = el("div", "when");
+      const t = el("div", "clock num");
+      const date = el("div", "date");
+      win = el("div", "win");
+      when.append(t, date, win);
+      const clk = { node: t, date: date, seen: false, born: Date.now() };
+      s.clock = clk;
+      clocks.add(clk);
+      setClock(clk);
+      if (!clockTimer) clockTimer = root.setInterval(tickClocks, 30000);
+      wrap.appendChild(when);
+    }
+    paintCounts(win, sky);
     const plot = el("div", "plot");
     plot.dataset.skySlot = "1";
-    wrap.append(when, plot);
+    wrap.appendChild(plot);
     host.appendChild(wrap);
     if (root.LevainSky && typeof root.LevainSky.mount === "function") {
       try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend }, { legend: false }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
-    const legend = el("div", "legendbar frame", sky.legend);
+    const legend = el("div", "legendbar" + (hero ? "" : " frame"), sky.legend);
     host.appendChild(legend);
     s.skyParts = { plot: plot, win: win, legend: legend };
   }
@@ -879,16 +1080,17 @@
   }
   // state s: pid, title, data (the mapper's record), body (the node this paints into), query, results.
   function fill(p, data, ctx) {
-    const s = { pid: data.pid, title: (p.querySelector("h2") || {}).textContent || data.pid, data: data, p: p, ctx: ctx || {},
+    const s = { pid: data.pid, title: (ctx && ctx.entry && ctx.entry.title) || (p.querySelector("h2") || {}).textContent || data.pid, data: data, p: p, ctx: ctx || {},
                 modal: !!(ctx && ctx.modal), query: saved(FILTER_KEY + data.pid) || "", results: null, timer: 0, seq: 0, born: Date.now() };
     // a rebuilt board leaves its old bodies behind: drop the ones that were never going to be seen again
     for (const o of Array.from(states)) if (!o.body.isConnected && Date.now() - o.born > 5000) teardown(o);
     p.classList.add("k-" + data.kind);
-    if (data.kind === "ambient" && data.sky) p.classList.add("panel-hero");
+    if (data.face === "count") p.classList.add("k-count");
+    if (data.kind === "ambient" && data.sky && !(ctx && ctx.hero)) p.classList.add("panel-hero");
     s.body = el("div", "xbody");
     const sr = data.search || {};
     const rowKind = data.kind === "list" || data.kind === "count-queue" || data.kind === "roster" || data.kind === "log";
-    s.searchable = rowKind && sr.on === true;
+    s.searchable = rowKind && sr.on === true && !(ctx && ctx.widget);
     if (!s.searchable) s.query = "";     // a filter saved for a panel that has no filter box must not filter it
     s.shape = shapeOf(ctx && ctx.entry ? ctx.entry : { title: s.title }, data);
     if (data.kind === "count-queue") {
@@ -931,10 +1133,11 @@
     s.body.replaceChildren();
     if (s.fault) { s.body.appendChild(el("p", "err", "unavailable — " + s.fault)); return; }
     if (s.cqN) s.cqN.textContent = String(isNum(d.count) ? d.count : (d.lines || []).length);
+    if (s.ctx.widget) { paintWidget(s, s.body); return; }
     if (d.kind === "status-dots") { paintStatusDots(s.body, d.metrics || []); if (!(d.metrics || []).length) s.body.appendChild(el("p", "empty", d.empty)); return; }
     if (d.kind === "reading") { paintReading(s.body, d.reading); return; }
     if (d.kind === "metric-grid") { paintGrid(s.body, d.numbers); return; }
-    if (d.kind === "brief") { paintBrief(s.body, d.brief); return; }
+    if (d.kind === "brief") { paintBrief(s.body, d.brief, s.ctx.region === "brief"); return; }
     if (d.kind === "ambient") { paintSky(s, s.body, d.sky); return; }
     if (d.kind === "form") {
       // the compose box (mounted by the core when the verb is offered) is the form; without it, say why
@@ -1202,7 +1405,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { fill, refetchPanel, pruneModal, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode });
+  Object.assign(K, { fill, mountClock, refetchPanel, pruneModal, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

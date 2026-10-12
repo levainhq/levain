@@ -81,7 +81,7 @@ SEARCH_INFLIGHT = 2       # live store-search workers per panel: the current que
 SCOPES = ("rows", "store")
 FORM_FIELD_TYPES = ("text", "recipient", "date")
 PRIORITIES = ("gate", "gauge", "feed")
-ZONES = (("operate", "Operate"), ("mind", "Mind"), ("identity", "Identity"))
+ZONES = (("operate", "Work"), ("mind", "Mind"), ("identity", "Identity"))
 HEADER = "header"     # the legacy region: normalised to hero or brief (or operate) when a spec is built
 # the regions above the zones, in drawing order; a panel in one is a single answer, never a list
 HERO, BRIEF, WIDGETS = "hero", "brief", "widgets"
