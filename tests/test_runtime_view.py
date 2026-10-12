@@ -7,6 +7,14 @@ is absent inside bash, ``mv`` fails, both probes get ENOENT and the wire count i
 gpg signed through the bound-back agent, ``ssh-add -l`` listed a key through an agent under the runtime
 dir, and a socket named in ``runtime_sockets`` answered while it was absent without it
 (levain project_memory/1012-dirmngr/).
+
+REPRODUCED the same day for a dirmngr whose socket is in its GNUPGHOME (started where /run/user/<uid>
+was absent, still alive when levain ran; ``gnupghome_rename_1012b.sh``): on 0b299c6 renaming the
+GNUPGHOME, and renaming its parent, each reached dirmngr from the next session, 60 packets on port 53;
+with the GNUPGHOME view both ``mv`` got EBUSY, the probes ENOENT, wire 0. With that view and a
+use-keyboxd home, gpg listed and signed through the host's agent and keyboxd (the same pids inside and
+out); on 0b299c6 the keyboxd was unreachable inside and gpg started a second one on the same database
+(``gpg_view_probe_1012b.sh``).
 """
 from __future__ import annotations
 
@@ -64,7 +72,7 @@ def rd(tmp_path, monkeypatch):
     (tmp_path / "home").mkdir()
     monkeypatch.setenv("SSH_AUTH_SOCK", str(root / "ssh-agent.sock"))
     monkeypatch.setattr(conf, "_runtime_dirs", lambda: [str(root)])
-    monkeypatch.setattr(conf, "_gpg_agent_sockets",
+    monkeypatch.setattr(conf, "_gpg_sockets",
                         lambda: [root / "gnupg" / "S.gpg-agent", root / "gnupg" / "S.gpg-agent.ssh"])
     yield root.resolve()
     for s in socks:
@@ -215,7 +223,7 @@ def test_linux_live_a_renamed_dirmngr_dir_is_not_reachable_and_the_agent_is(tmp_
                "s.connect(sys.argv[1]);print(s.recv(64))\" ")
     try:
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(conf, "_gpg_agent_sockets", lambda: conf_sockets)
+            mp.setattr(conf, "_gpg_sockets", lambda: conf_sockets)
             mp.delenv("SSH_AUTH_SOCK")
             with BwrapProvider().spawn_shell(build_policy(_entity(tmp_path), deny_localhost_outbound=True)) as sh:
                 assert sh.run(f"ls -A {rd}").output.split() == ["gnupg"]
@@ -229,3 +237,145 @@ def test_linux_live_a_renamed_dirmngr_dir_is_not_reachable_and_the_agent_is(tmp_
     finally:
         agent.close()
     assert (rd / "gnupg" / "d.abc" / "S.dirmngr").exists() and not (rd / "moved").exists()
+
+
+def test_gpg_sockets_reads_all_of_list_dirs_and_keeps_the_agent_and_keyboxd(monkeypatch) -> None:
+    """One ``gpgconf --list-dirs`` with no names (gnupg 2.2 fails a query naming keyboxd-socket), its
+    values percent-unescaped, and only the agent's two sockets and keyboxd's picked out."""
+    from types import SimpleNamespace
+
+    out = ("sysconfdir:/etc/gnupg\nhomedir:/home/u/g%3ah\nagent-socket:/run/user/1/gnupg/d.x/S.gpg-agent\n"
+           "agent-ssh-socket:/run/user/1/gnupg/d.x/S.gpg-agent.ssh\n"
+           "agent-extra-socket:/run/user/1/gnupg/d.x/S.gpg-agent.extra\n"
+           "agent-browser-socket:/run/user/1/gnupg/d.x/S.gpg-agent.browser\n"
+           "dirmngr-socket:/run/user/1/gnupg/d.x/S.dirmngr\n"
+           "keyboxd-socket:/run/user/1/gnupg/d%3ax/S.keyboxd\n")
+    seen = []
+    monkeypatch.setattr(conf.shutil, "which", lambda name: "/usr/bin/gpgconf")
+    monkeypatch.setattr(conf.subprocess, "run", lambda argv, **kw: seen.append(argv) or SimpleNamespace(
+        returncode=0, stdout=out))
+    assert conf._gpg_sockets() == [Path("/run/user/1/gnupg/d.x/S.gpg-agent"),
+                                   Path("/run/user/1/gnupg/d.x/S.gpg-agent.ssh"),
+                                   Path("/run/user/1/gnupg/d:x/S.keyboxd")]
+    assert seen == [["/usr/bin/gpgconf", "--list-dirs"]]
+
+
+def test_keyboxd_comes_back_into_the_runtime_view(tmp_path, rd, monkeypatch) -> None:
+    kb = _listen(rd / "gnupg" / "S.keyboxd")
+    try:
+        monkeypatch.setattr(conf, "_gpg_sockets", lambda: [rd / "gnupg" / "S.gpg-agent", rd / "gnupg" / "S.keyboxd"])
+        bound = _bound_back(_bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True)), rd)
+        assert str(rd / "gnupg" / "S.keyboxd") in bound
+    finally:
+        kb.close()
+
+
+@pytest.fixture
+def gh(rd, monkeypatch):
+    """A GNUPGHOME outside the runtime dir holding a live dirmngr, laid out as gnupg leaves one that
+    started with no /run/user/<uid>: two levels below a fresh /tmp dir, so it and its parent are
+    renameable."""
+    top = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvgh"))
+    g = top / "a" / "gh"
+    g.mkdir(parents=True, mode=0o700)
+    socks = [_listen(g / n) for n in ("S.dirmngr", "S.gpg-agent", "S.gpg-agent.extra", "S.keyboxd")]
+    (g / "trustdb.gpg").write_bytes(b"trust")
+    (g / "common.conf").write_text("use-keyboxd\n")
+    (g / "private-keys-v1.d").mkdir()
+    os.symlink("/nonexistent/gpg.conf", g / "gpg.conf")
+    monkeypatch.setattr(conf, "_dirmngr_sockets", lambda: [g / "S.dirmngr"])
+    yield g.resolve()
+    for s in socks:
+        s.close()
+    import shutil
+    shutil.rmtree(top)
+
+
+def test_a_gnupghome_holding_dirmngr_is_a_view_pinned_from_above(tmp_path, gh) -> None:
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+    ops = _ops(argv)
+    view = [i for i, op, a in ops if op == "--tmpfs" and a == [str(gh)]]
+    assert len(view) == 1 and argv[view[0] - 2:view[0]] == ["--perms", "0700"]
+    for anc in (gh.parent, gh.parent.parent):   # renaming either moved dirmngr past the mask (RUN)
+        pins = [i for i, op, a in ops if op == "--bind" and a == [str(anc), str(anc)]]
+        assert pins and max(pins) < view[0], anc
+    for i, op, args in ops:
+        if args and _under(args[-1], gh):
+            assert i > view[0], (op, args)
+    assert _bound_back(argv, gh) == {str(gh / n) for n in ("S.gpg-agent", "S.keyboxd", "trustdb.gpg", "common.conf")}
+    # Writable: with the trustdb read-only, `gpg --list-keys` died on its trustdb check (RUN 2026-10-12).
+    assert ["--bind", str(gh / "trustdb.gpg"), str(gh / "trustdb.gpg")] in [argv[k:k + 3] for k in range(len(argv))]
+    assert ["--symlink", "/nonexistent/gpg.conf", str(gh / "gpg.conf")] in [argv[k:k + 3] for k in range(len(argv))]
+    assert not [a for _, op, a in ops if a[:1] == ["/dev/null"] and _under(a[1], gh)]   # the view replaces the mask
+
+
+def test_a_gnupghome_is_left_alone_when_bash_has_network(tmp_path, gh) -> None:
+    """dirmngr is a deputy only for bash without network; with network bash fetches by itself."""
+    argv = _bwrap_argv(build_policy(_entity(tmp_path)))
+    assert not [a for _, op, a in _ops(argv) if a and (_under(a[-1], gh) or a[-1] == str(gh))]
+
+
+def test_a_gnupghome_holding_the_workspace_is_refused(tmp_path, gh) -> None:
+    ent = _entity(tmp_path)
+    with pytest.raises(ConfinementError, match="holds"):
+        (gh / "ws").mkdir()
+        _bwrap_argv(build_policy(ent, workspace=gh / "ws", deny_localhost_outbound=True))
+
+
+def test_a_dirmngr_directly_in_home_keeps_its_mask(tmp_path, rd, monkeypatch) -> None:
+    """$HOME's own entries are frozen by its view, so bash cannot rename the socket away: the mask holds."""
+    home = Path(os.environ["HOME"]).resolve()
+    (home / "S.dirmngr").write_text("")
+    monkeypatch.setattr(conf, "_dirmngr_sockets", lambda: [home / "S.dirmngr"])
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+    assert ["--ro-bind", "/dev/null", str(home / "S.dirmngr")] in [argv[k:k + 3] for k in range(len(argv))]
+    assert ["--perms", "0700", "--tmpfs", str(home)] not in [argv[k:k + 4] for k in range(len(argv))]
+
+
+def test_gnupghome_passes_the_launch_allowlist() -> None:
+    """Under ``levain run`` the re-exec keeps only allowlisted names, and gpgconf needs GNUPGHOME to
+    name a non-default home's sockets."""
+    from levain.launch import allowed
+
+    assert allowed("GNUPGHOME")
+
+
+@linux_live
+def test_linux_live_a_gnupghome_view_hides_dirmngr_and_keeps_the_agent(tmp_path, rd, gh) -> None:
+    """The 2026-10-12 GNUPGHOME attack against the view, with stand-in sockets that answer."""
+    for s in ("S.dirmngr", "S.gpg-agent"):
+        (gh / s).unlink()
+    answer = {}
+    for s in ("S.dirmngr", "S.gpg-agent"):
+        srv = _listen(gh / s)
+        srv.settimeout(20)
+        answer[s] = srv
+
+        def serve(srv=srv, name=s) -> None:
+            try:
+                c, _ = srv.accept()
+                c.sendall(f"OK {name}\n".encode())
+                c.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=serve, daemon=True).start()
+    connect = ("python3 -c \"import socket,sys;s=socket.socket(socket.AF_UNIX);s.settimeout(5);"
+               "s.connect(sys.argv[1]);print(s.recv(64))\" ")
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.delenv("SSH_AUTH_SOCK")
+            with BwrapProvider().spawn_shell(build_policy(_entity(tmp_path), deny_localhost_outbound=True)) as sh:
+                listed = sh.run(f"ls -A {gh}").output.split()
+                assert sorted(listed) == ["S.gpg-agent", "S.keyboxd", "common.conf", "gpg.conf", "trustdb.gpg"]
+                assert sh.run(connect + f"{gh}/S.dirmngr").exit_code != 0
+                assert sh.run(f"mv {gh} {gh}.moved").exit_code != 0
+                assert sh.run(f"mv {gh.parent} {gh.parent}.moved").exit_code != 0
+                assert sh.run(f"echo x >> {gh}/trustdb.gpg").exit_code == 0
+                r = sh.run(connect + f"{gh}/S.gpg-agent")
+                assert r.exit_code == 0 and "OK S.gpg-agent" in r.output, r.output
+    finally:
+        for srv in answer.values():
+            srv.close()
+    assert (gh / "S.dirmngr").exists() and not Path(f"{gh}.moved").exists()
+    assert (gh / "trustdb.gpg").read_bytes() == b"trustx\n"
