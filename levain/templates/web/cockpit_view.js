@@ -127,7 +127,7 @@
     for (const f of head.filtered || []) out.push({ tone: "dim", text: f.count + " held back — " + f.reason });
     if (head.note) out.push({ tone: "dim", text: head.note });
     // a Metric's alerts (e.g. a wrap in progress) are part of its reading, never dropped
-    for (const a of ((panel.value || {}).alerts || [])) out.push({ tone: "stale", text: "! " + a.message });
+    for (const a of ((panel.value || {}).alerts || [])) out.push({ tone: "stale", alert: true, text: "! " + a.message });
     return out.length ? out : null;
   }
 
@@ -156,12 +156,41 @@
     };
   }
 
-  function externalOf(head, panel, groupTitles) {
+  // a list panel's compose card as the manifest declares it: {verb, fields} of the form kind's own field types.
+  // A field type the page does not know refuses the panel visibly (the caller's need() throws), never drops it.
+  const COMPOSE_TYPES = ["text", "recipient", "date"];
+  function composeOf(c) {
+    if (c === undefined || c === null) return null;
+    need(isObj(c) && typeof c.verb === "string" && c.verb && Array.isArray(c.fields) && c.fields.length, "compose");
+    const names = new Set();
+    const fields = c.fields.map((f) => {
+      need(isObj(f) && typeof f.name === "string" && f.name && !names.has(f.name), "compose field name");
+      names.add(f.name);
+      need(COMPOSE_TYPES.indexOf(f.type) >= 0, "compose field " + f.name + " has a type this page cannot draw (" + String(f.type) + ")");
+      if (f.type === "recipient") {
+        // the send trims a chosen id: a blank one would send no reader (everyone), and two ids equal after the
+        // trim are one reader drawn twice
+        need(Array.isArray(f.enum) && f.enum.length && f.enum.every((x) => typeof x === "string" && x.trim()), "compose recipient list (a blank id)");
+        need(new Set(f.enum.map((x) => x.trim())).size === f.enum.length, "compose recipient list (an id repeated)");
+      }
+      return f;
+    });
+    // one address line, one chip row
+    need(fields.filter((f) => f.type === "recipient").length <= 1, "compose: one recipient field at most");
+    return { verb: c.verb, fields: fields };
+  }
+
+  function externalOf(head, panel, groupTitles, nowMs) {
     const v = panel.value || {};
     const kind = ALIAS[head.kind] || head.kind;
     const out = { note: head.note || "", empty: head.empty || "nothing here", kind: kind, pid: head.id, typed: false,
-                  search: searchOf(panel) };
+                  search: searchOf(panel), face: panel.face === "count" ? "count" : "" };
     if (kind === "list" || kind === "count-queue") {
+      const compose = composeOf(panel.compose);
+      // an addressed list (its compose picks recipients) draws every row as `source -> for`
+      const rfield = compose ? compose.fields.find((f) => f.type === "recipient") : null;
+      const addressed = !!rfield;
+      if (compose) out.compose = compose;
       out.lines = (panel.rows || []).map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
         const badges = (r.badges || []).map(badgeText).join(" · ");
@@ -170,6 +199,17 @@
         const meta = [typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grp, badges, prov]
           .filter(Boolean).join(" · ");
         const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
+        if (addressed) {
+          const f = r.facets || {};
+          // the kernel refuses an addressed compose whose recipient facet is not declared, so a row with no
+          // value for it names no reader: everyone
+          const fv = f[rfield.name];
+          const to = Array.isArray(fv) ? fv : typeof fv === "string" ? fv.split(",") : [];
+          line.addr = { source: typeof f.source === "string" && f.source.trim() ? f.source.trim() : "unknown",
+                        to: to.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim()),
+                        age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "" };
+          // the meta (badges, provenance, group) stays: the renderer draws it after the address line
+        }
         // a pending (or its outcome) names its state; a WAITING one can be cancelled from here
         if (typeof r.id === "string" && r.id.indexOf("pend:") === 0) {
           const f = r.facets || {};
@@ -366,11 +406,11 @@
   function formField(f) {
     const label = typeof f.label === "string" && f.label ? f.label : f.name;
     if (f.type === "recipient") {
-      return { name: f.name, label: label, kind: "multiselect", required: false,
+      return { name: f.name, label: label, kind: "multiselect", chips: true, required: false,
                options: Array.isArray(f.enum) ? f.enum.filter((x) => typeof x === "string") : [] };
     }
     const long = f.type === "text" && LONG_TEXT.has(f.name);
-    return { name: f.name, label: f.type === "date" ? label + " (YYYY-MM-DD)" : label, kind: long ? "textarea" : "text", required: long };
+    return { name: f.name, label: f.type === "date" ? label + " (YYYY-MM-DD)" : label, kind: long ? "textarea" : "text", required: long, placeholder: long ? label : undefined };
   }
 
   // The last manifest the page was drawn from and when it was fetched: a single panel's refetch maps its fresh
@@ -464,32 +504,38 @@
 
     // header region: state goes under the masthead; any other header panel (a downstream's weather, say)
     // is drawn as a panel first in Operate, never silently dropped. An older kernel's `focus` panel is
-    // retired data, not a fault: it is skipped.
+    // retired data, not a fault: it is skipped. A manifest that declares hero / brief / widgets is KE-shaped:
+    // those regions are drawn from their own lists and `header` (their derived union) is not read.
+    const ke = Array.isArray(m.regions.hero) && Array.isArray(m.regions.brief) && Array.isArray(m.regions.widgets);
     const headerExtra = [];
-    for (const pid of (m.regions.header || [])) {
+    const mapState = (pid, head) => {
+      const bad = failure(pid);
+      if (bad) { view.errors[pid] = bad; return; }
+      try {
+        view.state = lineOf(P.get(pid), P.get(pid), now);
+        // the version the line was rendered with, which a write to it names (the kernel refuses a changed line)
+        const sp = P.get(pid);
+        const acts = Array.isArray(sp.actions) ? sp.actions.filter((a) => isObj(a) && typeof a.verb === "string") : [];
+        const sv = isObj(sp.value) && typeof sp.value.value_version === "string" ? sp.value.value_version : null;
+        if (acts.length) view.targets.panels[pid] = { actions: acts, panel_version: sv };
+        if (view.state && view.writable) {
+          view.state.version = sv;
+          view.state.can_edit = acts.some((a) => a.verb === "operator_state");
+        }
+      } catch (e) { view.state = null; view.errors[pid] = String(e && e.message || e); }
+    };
+    for (const pid of (ke ? [] : m.regions.header || [])) {
       const head = heads.get(pid);
       if (!head) { view.errors[pid] = "listed in the manifest header but has no head"; continue; }
-      const bad = failure(pid);
       if (pid === "focus") continue;
-      if (pid === "state") {
-        if (bad) { view.errors[pid] = bad; continue; }
-        try {
-          view.state = lineOf(P.get(pid), P.get(pid), now);
-          // the version the line was rendered with, which a write to it names (the kernel refuses a changed line)
-          const sp = P.get(pid);
-          const acts = Array.isArray(sp.actions) ? sp.actions.filter((a) => isObj(a) && typeof a.verb === "string") : [];
-          const sv = isObj(sp.value) && typeof sp.value.value_version === "string" ? sp.value.value_version : null;
-          if (acts.length) view.targets.panels[pid] = { actions: acts, panel_version: sv };
-          if (view.state && view.writable) {
-            view.state.version = sv;
-            view.state.can_edit = acts.some((a) => a.verb === "operator_state");
-          }
-        } catch (e) { view.state = null; view.errors[pid] = String(e && e.message || e); }
-      } else headerExtra.push(pid);
+      if (pid === "state") mapState(pid, head); else headerExtra.push(pid);
     }
 
     let sectionRef = 0;
-    const place = (pid, zoneId) => {
+    // `region` is set for a hero / brief / widgets panel: those are drawn bare by the page, always through the
+    // typed external path, never as one of the kernel's own built-in panels (a widget named `health` is not the Health panel)
+    const place = (pid, zoneId, region) => {
+      const nat = region ? "" : pid;
       const head = heads.get(pid);
       if (!head) { view.errors[pid] = "listed in the manifest but has no head"; return; }
       const bad = failure(pid);
@@ -499,11 +545,12 @@
       for (const g of panel.groups || head.groups || []) groupTitles.set(g.id, titleOf(g.title, String(g.id)));
       const entry = { zone: zoneId, edit_class: "", title: titleOf(panel.title, titleOf(head.title, pid)), id: pid,
                       pkind: ALIAS[panel.kind] || panel.kind };
+      if (region) entry.region = region;
       const banner = bannerOf(panel, panel, now);
       if (banner) entry.banner = banner;
       if (panel.as_of) entry.fresh = ageLabel(panel.as_of, now, "read ");
       const rows = panel.rows || [];
-      const kind = NATIVE.get(pid);
+      const kind = NATIVE.get(nat);
       // what this panel lets the operator do: its own actions (a create, a value write, a downstream verb)
       // and the actions its rows carry. The page offers a verb only where the kernel offered one.
       const pActions = Array.isArray(panel.actions) ? panel.actions.filter((a) => isObj(a) && typeof a.verb === "string") : [];
@@ -518,11 +565,11 @@
       // every capture is the Tray's create, so the Keep's capture box shows whenever the Tray offers one
       const tp = P.get("tray");
       const traySeeds = isObj(tp) && Array.isArray(tp.actions) && tp.actions.some((a) => isObj(a) && a.verb === "spore_seed" && isPostable(a));
-      if ((rowsAct || pActions.length || (pid === "keep" && traySeeds)) && (pid === "tray" || pid === "loops" || pid === "keep" || pid === "episodes")) entry.edit_class = "B";
+      if ((rowsAct || pActions.length || (nat === "keep" && traySeeds)) && (nat === "tray" || nat === "loops" || nat === "keep" || nat === "episodes")) entry.edit_class = "B";
       const lists = { tray: "tray", loops: "open_spores", keep: "keep" };
-      if ((pid === "tray" || pid === "loops" || pid === "keep") && (panel.kind === "triage-list" || panel.kind === "list")) {
+      if ((nat === "tray" || nat === "loops" || nat === "keep") && (panel.kind === "triage-list" || panel.kind === "list")) {
         view[lists[pid]] = rows.map((r) => sporeOf(pid, r, groupTitles, hiddenRows));
-        if (pid === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
+        if (nat === "tray" && Array.isArray(head.views) && isObj(panel.view_rows)) {
           // the kernel's named orderings and the row ids in each; the renderer picks one, never sorts
           const named = head.views.filter((v) => isObj(v) && typeof v.id === "string" && Array.isArray(panel.view_rows[v.id]));
           if (named.length) {
@@ -532,18 +579,18 @@
           }
         }
         view.layout.push(Object.assign(entry, { kind: kind }));
-      } else if (pid === "episodes" && (panel.kind === "triage-list" || panel.kind === "list")) {
+      } else if (nat === "episodes" && (panel.kind === "triage-list" || panel.kind === "list")) {
         view.episodes = rows.map((r) => ({ panel_id: pid, row_id: r.id, row_version: r.version, id: bare(r.id), timestamp: (r.facets || {}).at, type: (r.facets || {}).episode_type,
           source: (r.facets || {}).source, agent: titleOf((r.facets || {}).agent, ""),
           actions: Array.isArray(r.actions) ? r.actions : undefined, tags: tagsOf((r.facets || {}).tags), content: r.body || r.title,
           emphasis: r.emphasis }));
         view.layout.push(Object.assign(entry, { kind: "episodes" }));
-      } else if (pid === "edits" && (panel.kind === "triage-list" || panel.kind === "list")) {
+      } else if (nat === "edits" && (panel.kind === "triage-list" || panel.kind === "list")) {
         view.recent_edits = rows.map((r) => ({ panel_id: pid, row_id: r.id, row_version: r.version,
           actions: Array.isArray(r.actions) ? r.actions : [], id: bare(r.id), ts: (r.facets || {}).at, action: (r.facets || {}).edit_kind,
           source: r.title, undoable: (r.facets || {}).undoable }));
         view.layout.push(Object.assign(entry, { kind: "edits" }));
-      } else if (pid === "crystals" && (panel.kind === "triage-list" || panel.kind === "list")) {
+      } else if (nat === "crystals" && (panel.kind === "triage-list" || panel.kind === "list")) {
         view.crystal_index = rows.map((r) => {
           const f = r.facets || {};
           const tags = tagsOf(f.tags);
@@ -551,37 +598,52 @@
                    last_activated_on: f.last_activated_on, tags: tags };
         });
         view.layout.push(Object.assign(entry, { kind: "crystals" }));
-      } else if (pid === "health" && (panel.kind === "metric" || panel.kind === "status-dots")) {
+      } else if (nat === "health" && (panel.kind === "metric" || panel.kind === "status-dots")) {
         view.health = healthOf((panel.value || {}).metrics, wrapsData);
         view.layout.push(Object.assign(entry, { kind: "health" }));
-      } else if (pid === "graph" && (panel.kind === "visual" || panel.kind === "ambient")) {
+      } else if (nat === "graph" && (panel.kind === "visual" || panel.kind === "ambient")) {
         view.graph = (panel.value || {}).data || null;
         view.layout.push(Object.assign(entry, { kind: "graph" }));
-      } else if (pid === "wraps" && (panel.kind === "visual" || panel.kind === "ambient")) {
+      } else if (nat === "wraps" && (panel.kind === "visual" || panel.kind === "ambient")) {
         if (wrapsShape) throw wrapsShape;
         view.wraps = Array.isArray(wrapsData) ? wrapsData : [];
         view.layout.push(Object.assign(entry, { kind: "wraps" }));
-      } else if ((panel.kind === "prose" || panel.kind === "brief") && pid.indexOf("section:") === 0 && (panel.value || {}).markdown != null) {
+      } else if ((panel.kind === "prose" || panel.kind === "brief") && nat.indexOf("section:") === 0 && (panel.value || {}).markdown != null) {
         view.sections.push({ heading: titleOf(panel.title, titleOf(head.title, pid)), body: panel.value.markdown });
         // a section the kernel offers section_edit on is the operator's to edit; its panel id stands as the
         // write address, and the save posts the action the panel offered
         if (view.writable && pActions.some((a) => a.verb === "section_edit" && isPostable(a))) { entry.edit_class = "A"; entry.source = pid; }
         view.layout.push(Object.assign(entry, { kind: "section", ref: sectionRef++, heading: titleOf(panel.title, titleOf(head.title, pid)) }));
       } else {
-        view.extra_panels[pid] = externalOf(panel, panel, groupTitles);
+        view.extra_panels[pid] = externalOf(panel, panel, groupTitles, now);
         view.extra_panels[pid].pid = pid;
+        // a health widget is drawn as a widget, never as the Health panel, so the page's liveness reads its own write-path metric
+        const wp = (view.extra_panels[pid].metrics || []).find((x) => x.label === "write path");
+        if (region && wp && (wp.value === "live" || wp.value === "dark")) view.write_path_live = wp.value === "live";
         // a downstream's own verb on this panel becomes the compose box. The manifest names the verb's
         // fields and not their widgets, so a widget is chosen from the field's name (a known edge).
         // a form panel names its verb: the action is the one offered under that name, and no other
-        const formVerb = view.extra_panels[pid].form ? view.extra_panels[pid].form.verb : null;
+        const formVerb = view.extra_panels[pid].form ? view.extra_panels[pid].form.verb : (view.extra_panels[pid].compose ? view.extra_panels[pid].compose.verb : null);
         const own = pActions.find((a) => (!isObj(a.target) || typeof a.target.row_id !== "string") && (formVerb === null || a.verb === formVerb));
         const vh = own && isObj(view.verb_heads[own.verb]) ? view.verb_heads[own.verb] : null;
+        const cmpDecl = view.extra_panels[pid].compose;
+        if (cmpDecl && view.writable && !NATIVE.has(pid)) {
+          // a writable surface draws the card or says why not, never a silently missing card (a read-only one
+          // draws no verbs at all, so it stays silent)
+          if (!vh) throw new Error("its compose verb " + cmpDecl.verb + " is not offered by this panel");
+          // a job's result arrives by polling, which the card does not do
+          if (vh.job === true) throw new Error("its compose verb " + cmpDecl.verb + " is a job verb, which a compose card cannot send");
+        }
         if (vh && !NATIVE.has(pid)) {
-          view.extra_panels[pid].action = { verb: own.verb, fields: (Array.isArray(vh.fields) ? vh.fields : []).filter((n) => typeof n === "string").map(composeField) };
+          // the action names its own panel: the send posts to THIS panel's offer, never another panel's
+          view.extra_panels[pid].action = { verb: own.verb, panel: pid, fields: (Array.isArray(vh.fields) ? vh.fields : []).filter((n) => typeof n === "string").map(composeField) };
           view.action_verbs[own.verb] = { label: vh.label, confirm_required: vh.confirm === true, idempotent: vh.idempotent === true, job: false };
           // a form panel names its own fields: they win over the widgets guessed from the verb head's names
           const form = view.extra_panels[pid].form;
           if (form && form.verb === own.verb) view.extra_panels[pid].action.fields = form.fields.map(formField);
+          // a list's own compose card: its typed fields win, and the card is drawn on the list itself
+          const cmp = view.extra_panels[pid].compose;
+          if (cmp && cmp.verb === own.verb) { view.extra_panels[pid].action.fields = cmp.fields.map(formField); view.extra_panels[pid].action.card = true; }
         }
         // the external renderer draws the note itself, so the banner must not draw it a second time
         if (entry.banner && panel.note) {
@@ -593,11 +655,11 @@
     };
 
     const placed = new Set();
-    const placeOnce = (pid, zoneId) => {
+    const placeOnce = (pid, zoneId, region) => {
       if (placed.has(pid)) return;
       placed.add(pid);
       const mark = view.layout.length, nSections = view.sections.length, refMark = sectionRef;
-      try { place(pid, zoneId); } catch (e) {
+      try { place(pid, zoneId, region); } catch (e) {
         // one malformed panel must not blank the cockpit: it becomes an unavailable panel with the reason
         view.layout.length = mark;
         view.sections.length = nSections;
@@ -607,7 +669,29 @@
       }
     };
     for (const pid of headerExtra) placeOnce(pid, "operate");
-    for (const zone of (m.regions.zones || [])) for (const pid of (zone.panels || [])) placeOnce(pid, zone.id);
+    if (ke) {
+      // the page's own regions, each panel kept in the kernel's order: hero (reading, ambient), brief, widgets, then
+      // the zones as cards. `state` is not a card: it is the operator's line, drawn at the top of the brief.
+      view.ke = { hero: [], brief: [], widgets: [], zones: [] };
+      for (const region of ["hero", "brief", "widgets"]) {
+        for (const pid of m.regions[region]) {
+          if (view.ke[region].indexOf(pid) >= 0 || pid === "focus") continue;   // an older kernel's `focus` is retired data, never drawn
+          if (pid === "state" && region === "brief") { if (heads.has(pid)) mapState(pid, heads.get(pid)); else view.errors[pid] = "listed in the manifest brief but has no head"; continue; }
+          view.ke[region].push(pid);
+          placeOnce(pid, region, region);
+        }
+      }
+    }
+    for (const zone of (m.regions.zones || [])) {
+      for (const pid of (zone.panels || [])) placeOnce(pid, zone.id);
+      if (ke) {
+        const cards = Array.isArray(zone.cards) ? zone.cards.filter(isObj) : [];
+        view.ke.zones.push({ id: zone.id, title: titleOf(zone.title, zone.id), cards: cards.map((c) => ({
+          panels: (Array.isArray(c.panels) ? c.panels : []).filter((x) => typeof x === "string"),
+          size: ["tall", "medium", "short"].indexOf(c.size) >= 0 ? c.size : "medium",
+          span: c.span === 2 || c.span === 3 ? c.span : 1, tabs: typeof c.tabs === "string" && c.tabs ? c.tabs : "" })) });
+      }
+    }
     for (const e of view.layout) e.modes = modesOf(e);
     // the verbs the kernel offered somewhere with a gesture a browser can perform: an affordance whose
     // verb is not here has nothing to post to
@@ -680,49 +764,66 @@
   // ---- row painting by kind ----
   function dotOf(status) { const d = el("span", "dot " + (status || "unknown")); d.setAttribute("aria-hidden", "true"); return d; }
 
+  // The Fleet card (KE4): resident / on call / roundtable, drawn from the kernel's own fleet_group and health.
+  // Accent is the kernel's tone "alarm" alone, which only a resident member whose silence is a signal can carry;
+  // an on-call member's last call, failed or not, is a neutral fact.
+  const FLEET_GROUPS = [["resident", "Resident \u00b7 judged by their writing"], ["on_call", "On call \u00b7 judged by their last answer"],
+                        ["roundtable", "Roundtable"]];
+  function fleetRow(r) {
+    const h = isObj(r.health) ? r.health : { tone: "unknown", text: "no data", at: null, memory: "" };
+    const alarm = h.tone === "alarm";
+    const row = el("div", "fl rrow");
+    row.setAttribute("data-ck-row", "");
+    row.setAttribute("tabindex", "0");
+    const n = el("div", "n");
+    // unknown is its own mark (a dashed ring) so it never reads as an on-call "not called yet" hollow dot, and never as accent
+    const dot = el("i", alarm ? "bad" : (h.tone === "unknown" ? "unk" : (h.tone === "neutral" && !h.at ? "off" : "")));
+    dot.setAttribute("aria-hidden", "true");
+    n.append(dot, document.createTextNode(r.name));
+    const when = h.at ? " " + (ago(h.at) || h.at) : "";
+    const d = el("div", "d" + (alarm ? " bad" : "") + (h.tone === "unknown" ? " unk" : ""), (h.text || "") + when);
+    row.append(n, d);
+    const tags = [r.role, h.memory].filter(Boolean).join(" \u00b7 ");
+    if (tags) row.appendChild(el("div", "tags", tags));
+    return row;
+  }
   function paintRoster(host, rows, d) {
-    const groups = new Map();
-    for (const r of rows) {
-      const g = typeof r.group === "string" && r.group ? r.group : "";
-      if (!groups.has(g)) groups.set(g, []);
-      groups.get(g).push(r);
-    }
-    for (const [g, rs] of groups) {
-      if (g) host.appendChild(el("h3", "grp-h", g));
-      for (const r of rs) {
-        const row = el("div", "rrow" + (r.cadence === "on_call" ? " oncall" : ""));
-        row.appendChild(dotOf(r.cadence === "on_call" ? "idle" : callStatus(r)));
-        row.appendChild(el("span", "rname", r.name));
-        if (r.role) row.appendChild(el("span", "rrole", r.role));
-        const chips = el("span", "rchips");
-        chips.appendChild(el("span", "chip-s", r.memory || ""));
-        chips.appendChild(el("span", "chip-s", r.cadence === "on_call" ? "on call" : (r.cadence || "")));
-        row.appendChild(chips);
-        const lc = r.last_call;
-        let state;
-        if (isObj(lc) && typeof lc.at === "string") state = (lc.outcome === "failed" ? "failed " : "") + (ago(lc.at) || lc.at);
-        else if (r.cadence === "on_call") state = "on call";
-        else if (r.digest === null || r.digest === undefined) state = "no data";
-        else state = digestText(r.digest);
-        row.appendChild(el("span", "rstate" + (isObj(lc) && lc.outcome === "failed" ? " bad" : ""), state));
-        host.appendChild(row);
+    for (const [gid, title] of FLEET_GROUPS) {
+      const rs = rows.filter((r) => (r.fleet_group || (r.group === "roundtable" ? "roundtable" : r.cadence === "resident" ? "resident" : "on_call")) === gid);
+      if (!rs.length) continue;
+      const g = el("div", "fl-group");
+      g.setAttribute("data-ck-fleet-group", gid);
+      g.appendChild(el("h3", "grp-h", title));
+      if (gid === "roundtable") {
+        // a roundtable's members are on call (the kernel refuses any other): their seats fold into one line
+        let last = NaN, unreadable = false, any = false;
+        for (const r of rs) {
+          const at = isObj(r.health) ? r.health.at : null;
+          if (!at) continue;
+          any = true;
+          const t = parseIso(at);                     // compared as instants, never as strings
+          if (isNaN(t)) unreadable = true; else if (isNaN(last) || t > last) last = t;
+        }
+        const known = !isNaN(last);
+        const row = el("div", "fl rrow");
+        row.setAttribute("tabindex", "0");
+        const n = el("div", "n");
+        const dot = el("i", known ? "" : (unreadable ? "unk" : "off"));
+        dot.setAttribute("aria-hidden", "true");
+        n.append(dot, document.createTextNode("roundtable"));
+        const when = known ? (ago(new Date(last).toISOString()) || "unknown") : (unreadable || any ? "unknown" : "never");
+        const stateless = rs.filter((r) => r.memory === "stateless").length;
+        const tag = stateless === rs.length ? rs.length + " stateless seats" : rs.length + " seats, " + (rs.length - stateless) + " with memory";
+        row.append(n, el("div", "d" + (!known && unreadable ? " unk" : ""), rs.map((r) => r.name).join(", ") + " \u00b7 last called " + when),
+                   el("div", "tags", tag));
+        g.appendChild(row);
+      } else {
+        for (const r of rs) g.appendChild(fleetRow(r));
       }
+      host.appendChild(g);
     }
-    if (d.retiredHidden) host.appendChild(el("p", "xnote", d.retiredHidden + " retired hidden"));
+    if (d.retiredHidden) host.appendChild(el("p", "xnote", d.retiredHidden + " retired " + (d.retiredHidden === 1 ? "member" : "members") + " not shown"));
   }
-  function callStatus(r) {
-    const lc = r.last_call;
-    if (isObj(lc) && lc.outcome === "failed") return "bad";
-    return isObj(lc) ? "ok" : "unknown";
-  }
-  // a roster digest is an object of scalar facts; it is shown as the words it carries, never as zero
-  function digestText(dg) {
-    if (!isObj(dg)) return "no data";
-    const parts = [];
-    for (const k of Object.keys(dg)) if (typeof dg[k] === "string" || isNum(dg[k])) parts.push(k.replace(/_/g, " ") + " " + dg[k]);
-    return parts.slice(0, 3).join(" · ") || "no data";
-  }
-
   // the kernel's sentence, else the verb and the target when the row has one
   function logLine(r) { return typeof r.sentence === "string" && r.sentence ? r.sentence : typeof r.target === "string" && r.target ? r.verb + " · " + r.target : r.verb; }
   function paintLog(host, rows) {
@@ -748,23 +849,169 @@
     }
   }
 
+  // The reading's icon: one inline SVG per token of the contract's READING_SYMBOLS, drawn from a few shared
+  // parts (no external asset, no icon font). An unknown token draws the plain cloud rather than nothing.
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const ICON_INK = "#c9d2e3", ICON_SUN = "#ffd36b", ICON_RAIN = "#7fb2ff";
+  const P = {
+    cloud: ["path", { d: "M14 30h24a9 9 0 0 0 1-17.9A12 12 0 0 0 14.3 11 10 10 0 0 0 14 30z", fill: ICON_INK }],
+    cloudHi: ["path", { d: "M12 30h22a9 9 0 0 0 .8-18A11.5 11.5 0 0 0 12.3 11 9.6 9.6 0 0 0 12 30z", fill: ICON_INK }],
+    sun: ["circle", { cx: 26, cy: 20, r: 9, fill: ICON_SUN }],
+    sunHi: ["circle", { cx: 34, cy: 12, r: 7, fill: ICON_SUN }],
+    rays: ["path", { d: "M26 3v5M26 32v5M9 20h5M38 20h5M14 8l3.5 3.5M34.5 28.5L38 32M14 32l3.5-3.5M34.5 11.5L38 8", stroke: ICON_SUN, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
+    moon: ["path", { d: "M32 6a14 14 0 1 0 8 25A11 11 0 0 1 32 6z", fill: ICON_INK }],
+    moonHi: ["path", { d: "M38 4a9 9 0 1 0 5 16A7 7 0 0 1 38 4z", fill: ICON_INK }],
+    drops: ["path", { d: "M18 35l-2 6M27 35l-2 6M36 35l-2 6", stroke: ICON_RAIN, "stroke-width": 2.5, "stroke-linecap": "round", fill: "none" }],
+    drizzle: ["path", { d: "M19 35l-1 3M28 35l-1 3M37 35l-1 3", stroke: ICON_RAIN, "stroke-width": 2, "stroke-linecap": "round", fill: "none" }],
+    heavy: ["path", { d: "M15 34l-3 8M22 34l-3 8M29 34l-3 8M36 34l-3 8", stroke: ICON_RAIN, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
+    snow: ["path", { d: "M18 36v5M15.5 38.5h5M27 36v5M24.5 38.5h5M36 36v5M33.5 38.5h5", stroke: ICON_INK, "stroke-width": 2, "stroke-linecap": "round", fill: "none" }],
+    bolt: ["path", { d: "M29 28l-7 9h5l-3 7 9-10h-5z", fill: ICON_SUN }],
+    lines: ["path", { d: "M8 34h36M12 40h28M8 28h36", stroke: ICON_INK, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
+    wind: ["path", { d: "M6 18h28a5 5 0 1 0-5-5M6 26h36a5 5 0 1 1-5 5M6 34h20", stroke: ICON_INK, "stroke-width": 3, "stroke-linecap": "round", fill: "none" }],
+    haze: ["path", { d: "M10 20h32M6 27h40M10 34h32", stroke: ICON_SUN, "stroke-width": 3, "stroke-linecap": "round", opacity: 0.7, fill: "none" }],
+  };
+  const ICONS = {
+    "clear": ["sun", "rays"], "clear-night": ["moon"], "partly-cloudy": ["sunHi", "cloudHi"], "partly-cloudy-night": ["moonHi", "cloudHi"],
+    "cloudy": ["cloud"], "fog": ["cloud", "lines"], "drizzle": ["cloud", "drizzle"], "rain": ["cloud", "drops"], "heavy-rain": ["cloud", "heavy"],
+    "thunderstorm": ["cloud", "bolt"], "snow": ["cloud", "snow"], "sleet": ["cloud", "drops", "snow"], "wind": ["wind"], "haze": ["haze"],
+  };
+  function weatherIcon(symbol) {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 52 44");
+    svg.setAttribute("width", "52");
+    svg.setAttribute("height", "44");
+    svg.setAttribute("class", "wx-icon");
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", typeof symbol === "string" && symbol ? symbol : "weather");
+    for (const key of (Object.prototype.hasOwnProperty.call(ICONS, symbol) ? ICONS[symbol] : ICONS.cloudy)) {
+      const [tag, attrs] = P[key];
+      const n = document.createElementNS(SVG_NS, tag);
+      for (const k of Object.keys(attrs)) n.setAttribute(k, String(attrs[k]));
+      svg.appendChild(n);
+    }
+    return svg;
+  }
+  // the EPA band a sub-reading names, compared case-insensitively against the contract's lowercase tokens
+  const BAND_WORDS = { "good": "Good", "moderate": "Moderate", "unhealthy-sensitive": "Unhealthy for sensitive groups", "unhealthy": "Unhealthy",
+    "very-unhealthy": "Very unhealthy", "hazardous": "Hazardous" };
+  function bandOf(raw) {
+    const t = String(raw).trim().toLowerCase().replace(/\s+/g, "-");
+    return Object.prototype.hasOwnProperty.call(BAND_WORDS, t) ? t : "";
+  }
+  function bars() {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 16 14");
+    svg.setAttribute("width", "16");
+    svg.setAttribute("height", "14");
+    svg.setAttribute("aria-hidden", "true");
+    const g = document.createElementNS(SVG_NS, "path");
+    g.setAttribute("d", "M2 3h9M2 7h12M2 11h7");
+    g.setAttribute("stroke", "currentColor");
+    g.setAttribute("stroke-width", "2");
+    g.setAttribute("stroke-linecap", "round");
+    g.setAttribute("fill", "none");
+    svg.appendChild(g);
+    return svg;
+  }
+
   function paintReading(host, v) {
-    const top = el("div", "rd");
-    top.appendChild(el("span", "rd-n num", v.value));
-    if (v.unit) top.appendChild(el("span", "rd-u", v.unit));
-    if (v.condition) top.appendChild(el("span", "rd-c", v.condition));
+    const top = el("div", "rd wx-main");
+    const icon = weatherIcon(v.symbol);
+    icon.setAttribute("data-ck-weather", "icon");
+    top.appendChild(icon);
+    const main = el("div", "wx-big");
+    const t = el("div", "wx-t");
+    t.appendChild(el("span", "rd-n num", v.value));
+    if (v.unit) t.appendChild(el("span", "rd-u", v.unit));
+    main.appendChild(t);
+    if (v.condition) main.appendChild(el("div", "rd-c wx-c", v.condition));
+    top.appendChild(main);
+    // what sits to the side of the figure: the bounds, and every sub-reading that carries no band
+    const side = el("div", "wx-side");
+    const subs = Array.isArray(v.sub) ? v.sub : [];
+    for (const sub of subs) {
+      if (typeof sub.band === "string" && sub.band) continue;
+      const line = el("div", "rd-sub");
+      line.appendChild(document.createTextNode(sub.label + " "));
+      line.appendChild(el("b", "num", sub.value == null ? "" : sub.value));
+      side.appendChild(line);
+    }
+    const bounds = [isNum(v.hi) ? ["H", v.hi] : null, isNum(v.lo) ? ["L", v.lo] : null].filter(Boolean);
+    if (bounds.length) {
+      const line = el("div", "rd-b");
+      bounds.forEach(([k, n], i) => { if (i) line.appendChild(document.createTextNode(" · ")); line.appendChild(document.createTextNode(k + " ")); line.appendChild(el("b", "num", Math.round(n) + "°")); });
+      side.appendChild(line);
+    }
+    if (side.childNodes.length) top.appendChild(side);
     host.appendChild(top);
-    const bounds = [isNum(v.hi) ? "high " + v.hi : "", isNum(v.lo) ? "low " + v.lo : ""].filter(Boolean).join(" · ");
-    if (bounds) host.appendChild(el("div", "rd-b num", bounds));
-    for (const s of Array.isArray(v.sub) ? v.sub : []) {
-      const row = el("div", "rd-sub");
-      row.appendChild(el("span", "k", s.label));
-      row.appendChild(el("span", "num", s.value == null ? "" : s.value));
-      if (typeof s.band === "string" && s.band) row.appendChild(el("span", "pill" + (s.band === "good" ? "" : " hot"), s.band));
+    for (const sub of subs) {
+      if (!(typeof sub.band === "string" && sub.band)) continue;
+      const token = bandOf(sub.band);
+      const row = el("div", "aqi band-" + (token || "other"));
+      row.appendChild(bars());
+      row.appendChild(el("b", "num", sub.label.charAt(0).toUpperCase() + sub.label.slice(1) + (sub.value == null ? "" : " " + sub.value)));
+      // the pill carries the band in words; `good` is calm, any other named band is hot, an unknown one neutral
+      const pill = el("span", "pill" + (token && token !== "good" ? " hot" : ""), token ? BAND_WORDS[token] : sub.band);
+      pill.setAttribute("data-ck-weather", "aqi");
+      row.appendChild(pill);
       host.appendChild(row);
+      if (typeof sub.detail === "string" && sub.detail) host.appendChild(el("div", "wx-src", sub.detail));
     }
     const age = typeof v.as_of === "string" ? ago(v.as_of) : "";
-    if (age) host.appendChild(el("div", "xnote", "read " + age));
+    if (age) host.appendChild(el("div", "wx-src", "read " + age));
+  }
+
+  // ---- the widget faces: one answer each, never a row (cockpit contract, widgets region) ----
+  const WIDGET_DOTS = 4, WIDGET_FIGURES = 4;
+  const figure = (n) => Number.isInteger(n) ? n.toLocaleString("en-US") : isNum(n) ? String(Number(n.toPrecision(3))) : String(n);
+  function paintWidget(s, host) {
+    const d = s.data;
+    if (d.face === "count") {
+      host.appendChild(el("div", "big num", isNum(d.count) ? d.count : (d.lines || []).length));
+      if (d.note) host.appendChild(el("div", "sub", d.note));
+      else if (!(isNum(d.count) ? d.count : (d.lines || []).length) && !s.ctx.alerted) host.appendChild(el("div", "sub", d.empty));
+      return;
+    }
+    if (d.kind === "status-dots") {
+      // each metric is drawn at most once, up to WIDGET_DOTS dots and WIDGET_FIGURES figures (the rest counted in "+N more"): a status that is ok / warn / bad is a dot row; any other metric carrying a value is a
+      // figure (an integer, a fractional or a string alike); one with neither is a dot row in the unknown state
+      const ms = d.metrics || [];
+      const isDot = (m) => m.status === "ok" || m.status === "warn" || m.status === "bad";
+      const dots = ms.filter((m) => isDot(m) || m.value == null);
+      // whole numbers first (they read as the headline figures), then the fractional and the written ones, each in the provider's order
+      const rest = ms.filter((m) => !isDot(m) && m.value != null);
+      const figs = rest.filter((m) => Number.isInteger(m.value)).concat(rest.filter((m) => !Number.isInteger(m.value)));
+      if (dots.length) {
+        const box = el("div", "dots");
+        paintStatusDots(box, dots.slice(0, WIDGET_DOTS));
+        host.appendChild(box);
+      }
+      if (figs.length) {
+        const row = el("div", "row");
+        for (const m of figs.slice(0, WIDGET_FIGURES)) { const c = el("span"); c.append(el("b", "num", figure(m.value) + (m.unit ? " " + m.unit : "")), document.createTextNode(m.label)); row.appendChild(c); }
+        host.appendChild(row);
+      }
+      const hidden = Math.max(0, dots.length - WIDGET_DOTS) + Math.max(0, figs.length - WIDGET_FIGURES);
+      if (hidden) host.appendChild(el("div", "xnote", "+" + hidden + " more"));
+      if (!ms.length && !s.ctx.alerted) host.appendChild(el("div", "sub", d.empty || "nothing to show"));
+      return;
+    }
+    if (d.kind === "metric-grid") {
+      const ns = d.numbers || [];
+      // the first number is the headline, its label beside it; the others follow as a row of figure and label
+      if (ns[0]) {
+        const head = el("div", "bigrow");
+        head.append(el("div", "big num", figure(ns[0].value)), el("span", "bl", ns[0].label + (ns[0].unit ? " (" + ns[0].unit + ")" : "")));
+        host.appendChild(head);
+      }
+      const row = el("div", "row");
+      ns.slice(1).forEach((n) => { const c = el("span"); c.append(el("b", "num", figure(n.value)), document.createTextNode(n.label + (n.unit ? " (" + n.unit + ")" : ""))); row.appendChild(c); });
+      if (ns.length > 1) host.appendChild(row);
+      return;
+    }
+    if (d.kind === "reading") { paintReading(host, d.reading); return; }
+    for (const l of d.lines || []) host.appendChild(el("div", "sub", l.text));
+    if (!(d.lines || []).length && !s.ctx.alerted) host.appendChild(el("div", "sub", d.empty || "nothing to show"));
   }
 
   function paintGrid(host, numbers) {
@@ -778,13 +1025,30 @@
     host.appendChild(g);
   }
 
-  function paintBrief(host, b) {
+  // In the brief region a label that repeats is a list, not a paragraph: its lines sit in a side column, clamped, and
+  // the rest read as the card's body. The first-seen order is kept; nothing is sorted.
+  const BRIEF_SIDE_LINES = 6;
+  function paintBrief(host, b, region) {
     if (b.headline) host.appendChild(el("div", "q", b.headline));
+    const count = new Map();
+    for (const l of b.lines) count.set(l.label || "", (count.get(l.label || "") || 0) + 1);
+    const side = new Map();
     for (const l of b.lines) {
+      if (region && l.label && count.get(l.label) > 1) { if (!side.has(l.label)) side.set(l.label, []); side.get(l.label).push(l); continue; }
       const row = el("div", "brief-line");
       if (l.label) row.appendChild(el("span", "k", l.label));
       row.appendChild(el("p", "", l.text));
       host.appendChild(row);
+    }
+    if (side.size) {
+      host.classList.add("has-side");
+      const col = el("div", "brief-side");
+      for (const [label, ls] of side) {
+        col.appendChild(el("span", "k", label));
+        for (const l of ls.slice(0, BRIEF_SIDE_LINES)) col.appendChild(el("p", "side-line", l.text));
+        if (ls.length > BRIEF_SIDE_LINES) col.appendChild(el("p", "xnote", "+" + (ls.length - BRIEF_SIDE_LINES) + " more"));
+      }
+      host.appendChild(col);
     }
   }
 
@@ -794,8 +1058,17 @@
   let clockTimer = 0;
   function setClock(c) {
     const d = new Date();
-    c.node.textContent = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
-    c.date.textContent = d.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+    const h = d.getHours();
+    c.node.replaceChildren(document.createTextNode((h % 12 || 12) + ":" + String(d.getMinutes()).padStart(2, "0")), el("small", "", h < 12 ? "am" : "pm"));
+    c.date.textContent = d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+  }
+  // the page's own clock (the hero's column), ticking whether or not a sky is mounted
+  function mountClock(node, date) {
+    const clk = { node: node, date: date, seen: false, born: Date.now() };
+    clocks.add(clk);
+    setClock(clk);
+    if (!clockTimer) clockTimer = root.setInterval(tickClocks, 30000);
+    return clk;
   }
   function tickClocks() {
     for (const c of Array.from(clocks)) {
@@ -826,7 +1099,13 @@
   function skyCounts(sky) {
     const repos = new Set(sky.events.map((e) => e.repo).filter((r) => typeof r === "string" && r));
     const failed = sky.events.filter((e) => e.outcome === "failed").length;
-    return sky.events.length + " events from " + repos.size + " repos" + (failed ? " · " + failed + " failed" : "");
+    return { text: sky.events.length + " events from " + repos.size + " repos", failed: failed };
+  }
+  // the failed count is the one accent on the line: a failed review is where attention goes
+  function paintCounts(node, sky) {
+    const c = skyCounts(sky);
+    node.replaceChildren(document.createTextNode(c.text));
+    if (c.failed) { node.appendChild(document.createTextNode(" · ")); node.appendChild(el("span", "bad", c.failed + " failed")); }
   }
   // An ambient panel whose sky is already mounted takes new events through the mount's own update(), so the
   // animation keeps running instead of restarting. True when it did; false leaves the paint to remount.
@@ -834,34 +1113,78 @@
     const k = s.skyParts;
     if (!k || !s.skyHandle || typeof s.skyHandle.update !== "function" || !k.plot.isConnected || !s.body.contains(k.plot)) return false;
     try { s.skyHandle.update({ events: sky.events, legend: sky.legend }); } catch (_) { return false; }
-    k.win.textContent = skyCounts(sky);
-    k.legend.textContent = sky.legend;
+    paintCounts(k.win, sky);
+    paintLegend(k.legend, sky);
     return true;
   }
+  // In the hero the clock, the date and the events line are the page's own nodes (ctx.hero), drawn in the clock
+  // column beside the sky; anywhere else the sky carries its own.
   function paintSky(s, host, sky) {
     dropSky(s);
-    const wrap = el("div", "sky");
-    const when = el("div", "when");
-    const t = el("div", "clock num");
-    const date = el("div", "date");
-    when.append(t, date);
-    const win = el("div", "win", skyCounts(sky));
-    when.appendChild(win);
-    const clk = { node: t, date: date, seen: false, born: Date.now() };
-    s.clock = clk;
-    clocks.add(clk);
-    setClock(clk);
-    if (!clockTimer) clockTimer = root.setInterval(tickClocks, 30000);
+    const hero = s.ctx && s.ctx.hero;
+    const wrap = el("div", "sky" + (hero ? " sky-hero" : ""));
+    let win;
+    if (hero) win = hero.events;
+    else {
+      const when = el("div", "when");
+      const t = el("div", "clock num");
+      const date = el("div", "date");
+      win = el("div", "win");
+      when.append(t, date, win);
+      const clk = { node: t, date: date, seen: false, born: Date.now() };
+      s.clock = clk;
+      clocks.add(clk);
+      setClock(clk);
+      if (!clockTimer) clockTimer = root.setInterval(tickClocks, 30000);
+      wrap.appendChild(when);
+    }
+    paintCounts(win, sky);
     const plot = el("div", "plot");
     plot.dataset.skySlot = "1";
-    wrap.append(when, plot);
+    wrap.appendChild(plot);
     host.appendChild(wrap);
     if (root.LevainSky && typeof root.LevainSky.mount === "function") {
       try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend }, { legend: false }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
-    const legend = el("div", "legendbar frame", sky.legend);
+    const legend = el("div", "legendbar" + (hero ? "" : " frame"));
+    paintLegend(legend, sky);
     host.appendChild(legend);
     s.skyParts = { plot: plot, win: win, legend: legend };
+  }
+
+  // The strip chart's key: the real glyphs, drawn like the chart's own marks (sky.js). Page chrome, not data:
+  // the kernel's `legend` sentence stays as the tooltip. Orange is reserved for failed and now, so the diamond is neutral.
+  // The key names only the kinds sky.js draws apart. A feed carrying any other kind gets the kernel's sentence as the
+  // whole legend and no glyph key, because sky.js draws an unknown kind with the memory square.
+  const DRAWN_KINDS = new Set(["commit", "review", "decision", "memory"]);
+  function paintLegend(host, sky) {
+    host.replaceChildren();
+    host.title = sky.legend;
+    const known = (sky.events || []).every((e) => e && DRAWN_KINDS.has(e.kind));
+    if (!known) { host.appendChild(el("span", "lg-note", String(sky.legend || ""))); return; }
+    const NS = "http://www.w3.org/2000/svg";
+    const glyph = (size, build) => {
+      const svg = document.createElementNS(NS, "svg");
+      svg.setAttribute("width", String(size)); svg.setAttribute("height", String(size));
+      svg.setAttribute("viewBox", "0 0 12 12"); svg.setAttribute("aria-hidden", "true");
+      svg.classList.add("lg-g");
+      build((tag, attrs) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); svg.appendChild(n); });
+      return svg;
+    };
+    const items = [
+      ["commit", (a) => a("circle", { cx: 6, cy: 6, r: 2.5, class: "lg-fill" })],
+      ["review", (a) => a("circle", { cx: 6, cy: 6, r: 3.5, class: "lg-ring" })],
+      ["review that failed", (a) => a("circle", { cx: 6, cy: 6, r: 4, class: "lg-ring lg-bad" })],
+      ["memory write", (a) => a("rect", { x: 5, y: 5, width: 2, height: 2, class: "lg-mem" })],
+      ["decision made", (a) => a("path", { d: "M6 2l4 4-4 4-4-4z", class: "lg-fill" })]
+    ];
+    for (const [label, build] of items) {
+      const it = el("span", "lg");
+      it.append(glyph(12, build), document.createTextNode(label));
+      host.appendChild(it);
+    }
+    host.appendChild(el("span", "lg-sp"));
+    host.appendChild(el("span", "lg-note", "Each mark is one real event. Hover for its time, kind and repo."));
   }
 
   // ---- one typed panel ----
@@ -879,16 +1202,17 @@
   }
   // state s: pid, title, data (the mapper's record), body (the node this paints into), query, results.
   function fill(p, data, ctx) {
-    const s = { pid: data.pid, title: (p.querySelector("h2") || {}).textContent || data.pid, data: data, p: p, ctx: ctx || {},
+    const s = { pid: data.pid, title: (ctx && ctx.entry && ctx.entry.title) || (p.querySelector("h2") || {}).textContent || data.pid, data: data, p: p, ctx: ctx || {},
                 modal: !!(ctx && ctx.modal), query: saved(FILTER_KEY + data.pid) || "", results: null, timer: 0, seq: 0, born: Date.now() };
     // a rebuilt board leaves its old bodies behind: drop the ones that were never going to be seen again
     for (const o of Array.from(states)) if (!o.body.isConnected && Date.now() - o.born > 5000) teardown(o);
     p.classList.add("k-" + data.kind);
-    if (data.kind === "ambient" && data.sky) p.classList.add("panel-hero");
+    if (data.face === "count") p.classList.add("k-count");
+    if (data.kind === "ambient" && data.sky && !(ctx && ctx.hero)) p.classList.add("panel-hero");
     s.body = el("div", "xbody");
     const sr = data.search || {};
     const rowKind = data.kind === "list" || data.kind === "count-queue" || data.kind === "roster" || data.kind === "log";
-    s.searchable = rowKind && sr.on === true;
+    s.searchable = rowKind && sr.on === true && !(ctx && ctx.widget);
     if (!s.searchable) s.query = "";     // a filter saved for a panel that has no filter box must not filter it
     s.shape = shapeOf(ctx && ctx.entry ? ctx.entry : { title: s.title }, data);
     if (data.kind === "count-queue") {
@@ -931,10 +1255,11 @@
     s.body.replaceChildren();
     if (s.fault) { s.body.appendChild(el("p", "err", "unavailable — " + s.fault)); return; }
     if (s.cqN) s.cqN.textContent = String(isNum(d.count) ? d.count : (d.lines || []).length);
-    if (d.kind === "status-dots") { paintStatusDots(s.body, d.metrics || []); if (!(d.metrics || []).length) s.body.appendChild(el("p", "empty", d.empty)); return; }
+    if (s.ctx.widget) { paintWidget(s, s.body); return; }
+    if (d.kind === "status-dots") { paintStatusDots(s.body, d.metrics || []); if (!(d.metrics || []).length && !s.ctx.alerted) s.body.appendChild(el("p", "empty", d.empty)); return; }
     if (d.kind === "reading") { paintReading(s.body, d.reading); return; }
     if (d.kind === "metric-grid") { paintGrid(s.body, d.numbers); return; }
-    if (d.kind === "brief") { paintBrief(s.body, d.brief); return; }
+    if (d.kind === "brief") { paintBrief(s.body, d.brief, s.ctx.region === "brief"); return; }
     if (d.kind === "ambient") { paintSky(s, s.body, d.sky); return; }
     if (d.kind === "form") {
       // the compose box (mounted by the core when the verb is offered) is the form; without it, say why
@@ -1140,6 +1465,7 @@
       if (it.kind === "panel") {
         // a panel the current mode hides is reached through Board, which shows every panel
         if (document.body.dataset.mode && (it.node.dataset.modes || "").split(" ").indexOf(document.body.dataset.mode) < 0) applyMode("board");
+        if (it.node.ckShowTab) it.node.ckShowTab();
         it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); return; }
       applyMode("board");
       it.state.setQuery(it.q, true);
@@ -1202,7 +1528,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { fill, refetchPanel, pruneModal, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode });
+  Object.assign(K, { fill, mountClock, refetchPanel, pruneModal, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

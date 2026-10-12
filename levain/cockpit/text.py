@@ -115,6 +115,8 @@ def _panel_lines(head: dict[str, Any], panel: dict[str, Any] | None, now: dateti
     kind = ALIASES.get(head["kind"], head["kind"])      # a levain.cockpit/1 kernel's names degrade too
     if panel.get("next") and panel.get("rows") is None and panel.get("value") is None:
         out.append((DIM, _fit(f"  (summary only — open {visible(panel['next'])} for the content)", width)))
+    elif kind in ROW_ENGINE_KINDS and head.get("face") == "count":
+        out.append(_row(f"  {head['count'] if head.get('count') is not None else '?'}", width))
     elif kind in ROW_ENGINE_KINDS:
         out.extend(_rows(head, panel, width, top_n))
     else:
@@ -278,7 +280,7 @@ def _rows(head: dict[str, Any], panel: dict[str, Any], width: int, top_n: int) -
 
 def render_lines(snap: dict[str, Any], width: int = 100, *, now: datetime | None = None,
                  top_n: int = DEFAULT_TOP_N) -> list[tuple[str, str]]:
-    """``(style, text)`` lines for the whole cockpit: the entity masthead, the header panels, then
+    """``(style, text)`` lines for the whole cockpit: the entity masthead, the hero, brief and widgets panels, then
     each zone's panels, all in the manifest's own order."""
     manifest, panels = snap["manifest"], snap["panels"]
     now = now or datetime.now(timezone.utc)
@@ -299,7 +301,12 @@ def render_lines(snap: dict[str, Any], width: int = 100, *, now: datetime | None
         panel = panels.get(pid)
         out.extend(_panel_lines(panel if panel is not None else head, panel, now, width, top_n))
 
-    for pid in manifest["regions"].get("header", []):
+    regions = manifest["regions"]
+    if "hero" in regions:       # a manifest from a kernel that predates the hero carries only the compat key
+        top = [*regions["hero"], *regions.get("brief", []), *regions.get("widgets", [])]
+    else:
+        top = regions.get("header", [])
+    for pid in top:
         draw(pid)
     for zone in manifest["regions"].get("zones", []):
         out.append((HEAD, ""))

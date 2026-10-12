@@ -824,50 +824,53 @@ def build_default_cockpit(
         search_fields=("title", "body", "domain"), edit_class=CLASS_B,
     )
     ck.register(ProviderSpec("state", "line", "State", "gauge", _context_line(source),
-                             region="header", rank=0, optional=True, empty="No state line.",
+                             region="brief", rank=0, optional=True, empty="No state line.",
                              verbs=("operator_state",)))
-    # Open loops leads the operate zone, then the Tray (Phill 2026-10-10, "yes to all")
-    for pid, title, bucket, prio, order, rank, views in (
-        ("loops", "Open loops", "loops", "feed", "spore.loops", 0, ()),
-        ("tray", "Tray", "tray", "gate", "spore.tray", 1, TRAY_VIEWS),
-        ("keep", "Keep", "keep", "feed", "spore.keep", 2, ()),
+    # mock-e's default layout (design 1011, "mock-e: what it decides"). The WORK zone (`operate`) is a
+    # 3-column grid whose cards flow in rank order, `now` first: Now, Tray, Open loops (row a, tall) / [Inbox, Fleet,
+    # Stream: downstream-only] / Recent episodes, Keep, Recent edits. Ranks leave gaps so a downstream's
+    # Inbox, Fleet and Stream slot in 16-39, between Open loops and Recent episodes without renumbering the kernel's.
+    for pid, title, bucket, prio, order, rank, views, size in (
+        ("tray", "Tray", "tray", "gate", "spore.tray", 10, TRAY_VIEWS, "tall"),
+        ("loops", "Open loops", "loops", "feed", "spore.loops", 15, (), "tall"),
+        ("keep", "Keep", "keep", "feed", "spore.keep", 50, (), "medium"),
     ):
         ck.register(ProviderSpec(
-            pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank,
+            pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank, size=size,
             order=order, views=views, rowset=f"spore:{bucket}", read_one=_spore_read_one(source, bucket),
             label_key=spore_label_key,
             empty="Nothing waiting.", verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
             **spore_common))
     ck.register(ProviderSpec(
-        "episodes", "triage-list", "Recent episodes", "feed", _episodes(source, feeds), region="operate", rank=3,
+        "episodes", "triage-list", "Recent episodes", "feed", _episodes(source, feeds), region="operate", rank=40,
         # a write's read: the entity's own rows only (a feed row is never a tombstone target)
         read_one=_episode_read_one(source), verbs=("episode_tombstone",),
         order="time.desc", rowset="episodes", facets=EPISODE_FACETS,
         version_fields=EPISODE_STORED,
         search_fields=("title", "body", "source"), edit_class=CLASS_B, empty="No recent episodes."))
     ck.register(ProviderSpec(
-        "edits", "triage-list", "Recent edits", "feed", edits_read, region="operate", rank=4,
+        "edits", "triage-list", "Recent edits", "feed", edits_read, region="operate", rank=60,
         read_one=_scan_read_one(edits_read), verbs=("undo",), label_key=edit_label_key,
         optional=True, order="time.desc", rowset="edits",
         facets=frozenset({"edit_kind", "at", "undoable"}), version_fields=("*",), empty="No edits yet."))
     if job_store is not None:
         ck.register(ProviderSpec(
-            "jobs", "triage-list", "Recent jobs", "feed", _jobs(job_store), region="operate", rank=5,
+            "jobs", "triage-list", "Recent jobs", "feed", _jobs(job_store), region="operate", rank=70,
             optional=True, order="time.desc", rowset="jobs",
             facets=frozenset({"job_status", "verb", "at"}), version_fields=("*",), empty="No jobs yet."))
-    ck.register(ProviderSpec("health", "metric", "Health", "gauge", _health(source), region="mind", rank=0,
+    ck.register(ProviderSpec("health", "metric", "Health", "gauge", _health(source), region="widgets", rank=40,
                              edit_class=CLASS_C))
-    ck.register(ProviderSpec("graph", "visual", "Cognition trace", "feed", _graph(source), region="mind", rank=1,
-                             edit_class=CLASS_C))
+    ck.register(ProviderSpec("graph", "visual", "Cognition trace", "feed", _graph(source), region="mind", rank=200,
+                             size="short", tabs="Cognition", edit_class=CLASS_C))
     ck.register(ProviderSpec(
-        "crystals", "triage-list", "Crystallized patterns", "feed", _crystals(source), region="mind", rank=2,
-        optional=True, order="crystal.level", rowset="crystals",
+        "crystals", "triage-list", "Crystallized patterns", "feed", _crystals(source), region="mind", rank=100,
+        size="tall", optional=True, order="crystal.level", rowset="crystals",
         facets=frozenset({"crystal_level", "permanence", "last_activated_on", "tags"}),
         version_fields=("name", "level", "one_clause", "permanence", "activation_mode", "tags"),
         version_excluded=("last_activated_on",), search_fields=("title", "body"), edit_class=CLASS_C,
         empty="No crystals yet."))
-    ck.register(ProviderSpec("wraps", "visual", "Projection history", "feed", _wraps(source), region="mind", rank=9,
-                             edit_class=CLASS_C))
+    ck.register(ProviderSpec("wraps", "visual", "Projection history", "feed", _wraps(source), region="mind", rank=210,
+                             size="short", tabs="Cognition", edit_class=CLASS_C))
     # prose panels: one per neocortex heading and per seed/config doc, DISCOVERED at every read so a
     # heading added later appears and an unreadable file at first sight is a manifest error, not a
     # permanent silent absence.
@@ -895,7 +898,8 @@ def build_default_cockpit(
             specs.append(ProviderSpec(pid, "prose", s_.heading, "feed",
                                       _anneal_section(source, s_.heading) if edit
                                       else _prose(source, "section", s_.heading),
-                                      region="mind", rank=20 + i, edit_class=s_.edit_class,
+                                      region="mind", rank=i, edit_class=s_.edit_class,
+                                      tabs="Neocortex", span=2, size="tall",
                                       verbs=("section_edit",) if edit else (),
                                       label_key=section_label_key(s_.heading) if edit else None))
         for i, d in enumerate(v.config_docs):

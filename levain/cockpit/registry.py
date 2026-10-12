@@ -66,6 +66,7 @@ FACETS: dict[str, tuple[str, Callable[[Any], bool]]] = {
     "handoff_expired": ("bool", _is_bool),
     "last_seen": ("timestamp|null", _opt(_is_str)),
     "source": ("str", _is_str),
+    "for": ("str", _is_str),            # who an inbox message is addressed to (readers, comma-joined); absent = everyone
     "episode_type": ("str", _is_str),
     "agent": ("str", _is_str),          # who wrote an episode: the entity itself or a federated feed
     "edit_kind": ("str", _is_str),

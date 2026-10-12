@@ -456,10 +456,19 @@
     return postVerb(action, params, { confirm: req.confirm === true, panelVersion: req.panel_version });
   }
 
-  // a downstream verb's compose box: found by verb name on the panels that offer it
-  async function manifestAction(verb, params, confirm) {
+  // a downstream verb's compose box. A box that names its panel posts THAT panel's offer, and refuses when the
+  // panel no longer offers the verb: never another panel's offer of the same verb (KE3 L3 cx2). The idempotency
+  // key argument is the legacy route's; the cockpit route keys its own envelope.
+  async function manifestAction(verb, params, confirm, _idempotencyKey, panelId) {
     if (!live) return { ok: false, error: "not_ready", message: "the page has not finished reading" };
-    const action = panelActionFor(verb, null);
+    let action = null;
+    if (typeof panelId === "string") {
+      const p = Object.prototype.hasOwnProperty.call(live.panels, panelId) ? live.panels[panelId] : null;
+      action = p ? p.actions.find((x) => x && x.verb === verb && !(x.target && typeof x.target.row_id === "string")) || null : null;
+      if (!action) return { ok: false, error: "not_offered", message: "the panel " + panelId + " no longer offers " + verb + "; nothing was sent" };
+    } else {
+      action = panelActionFor(verb, null);
+    }
     if (!action) return { ok: false, error: "not_offered", message: "the cockpit did not offer " + verb + " here" };
     return postVerb(action, params, { confirm: confirm === true });
   }

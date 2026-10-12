@@ -8,6 +8,16 @@
 </head>
 <body>
   <div class="deck">
+    <!-- The KE page's regions (hidden until the manifest declares hero / brief / widgets). The masthead below moves
+         into the hero's strip, and the state line into the brief, while they are shown. -->
+    <section class="hero" id="ck-hero" data-ck-region="hero" hidden>
+      <div class="when" id="ck-when"></div>
+      <div class="skycol" id="ck-skycol"><div class="tools" id="ck-strip"></div><div id="ck-sky"></div></div>
+    </section>
+    <div class="ck-secthead frame" id="ck-h-brief" hidden><h3>Today</h3></div>
+    <section class="ck-brief frame" id="ck-brief" data-ck-region="brief" hidden></section>
+    <div class="ck-secthead frame" id="ck-h-widgets" hidden><h3>At a glance</h3><span>one answer each</span></div>
+    <section class="ck-widgets frame" id="ck-widgets" data-ck-region="widgets" hidden></section>
     <header class="masthead frame">
       <div class="brand">
         <div class="wordmark">Levain</div>

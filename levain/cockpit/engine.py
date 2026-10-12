@@ -28,6 +28,7 @@ reader, ``levain tui --manifest``, ends and stops the Cockpit on an interrupt.]"
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 from collections import Counter
@@ -81,8 +82,25 @@ SEARCH_INFLIGHT = 2       # live store-search workers per panel: the current que
 SCOPES = ("rows", "store")
 FORM_FIELD_TYPES = ("text", "recipient", "date")
 PRIORITIES = ("gate", "gauge", "feed")
-ZONES = (("operate", "Operate"), ("mind", "Mind"), ("identity", "Identity"))
-HEADER = "header"
+ZONES = (("operate", "Work"), ("mind", "Mind"), ("identity", "Identity"))
+HEADER = "header"     # the legacy region: normalised to hero or brief (or operate) when a spec is built
+# the regions above the zones, in drawing order; a panel in one is a single answer, never a list
+HERO, BRIEF, WIDGETS = "hero", "brief", "widgets"
+TOP_REGIONS = (HERO, BRIEF, WIDGETS)
+HERO_KINDS = ("reading", "ambient")
+BRIEF_KINDS = ("line", "brief")
+WIDGET_KINDS = ("reading", "line", "status-dots", "metric-grid")
+SIZES = ("tall", "medium", "short")
+SPANS = (1, 2, 3)
+FACES = ("", "count")
+ZONE_GRID = 3
+_REGION_ORDER = TOP_REGIONS + tuple(z for z, _ in ZONES)
+# the symbol a reading may carry: a provider maps its own source vocabulary onto this set
+READING_SYMBOLS = ("clear", "clear-night", "partly-cloudy", "partly-cloudy-night", "cloudy", "fog", "drizzle",
+                   "rain", "heavy-rain", "thunderstorm", "snow", "sleet", "wind", "haze")
+# the band tokens the contract names for a sub-reading; a renderer compares case-insensitively,
+# `good` is calm, the rest are hot, and any other string renders neutral
+READING_BANDS = ("good", "moderate", "unhealthy-sensitive", "unhealthy", "very-unhealthy", "hazardous")
 VISUALS = ("sky", "constellation", "cognition-graph", "wrap-history")
 TITLE_MAX = 160
 SOON_DAYS = 3
@@ -148,7 +166,7 @@ class ProviderSpec:
     title: str
     priority: str
     read: Callable[["ReadContext"], Result]
-    region: str = "operate"           # "header" or a zone id
+    region: str = "operate"           # "hero", "brief", "widgets", a zone id, or the legacy "header"
     rank: int = 0
     refresh_every_s: float | None = None
     stale_after_s: float = 900.0
@@ -182,18 +200,43 @@ class ProviderSpec:
     # the levain.cockpit/1 name this spec was declared with, when it declared an alias. Derived from
     # ``kind`` alone: a caller cannot set it, so it can never disagree with the kind it normalised.
     legacy_kind: str = field(default="", init=False)
+    # how the panel draws in a widget: "" (its kind's own face) or "count" (a row-engine kind as its row count)
+    face: str = ""
+    # a list panel's compose card: ``{verb, fields: [typed form fields]}``, drawn on the list's own card (never
+    # a second form panel). The verb is one the panel offers; the fields are the form kind's own (text,
+    # recipient, date). A recipient field with nothing chosen sends no value for it: "none selected = everyone".
+    compose: dict[str, Any] | None = None
+    # zone layout (a zone panel only): the card's height and column span, and a shared title that makes
+    # same-zone panels tabs of one card
+    size: str = "medium"
+    span: int = 1
+    tabs: str = ""
+    # "header" when the spec declared the legacy region; ``region`` then holds where it was normalised to.
+    # Derived like ``legacy_kind``: a caller cannot set it.
+    legacy_region: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
+        # rank is a sort key beside str ids: anything but an int would turn every manifest into a 500
+        if type(self.rank) is not int:
+            raise CockpitRegistrationError("a panel's rank must be an int")
         if self.kind in ALIASES:
             self.legacy_kind = self.kind
             self.kind = ALIASES[self.kind]
+        if self.region == HEADER:
+            self.legacy_region = HEADER
+            self.region = HERO if self.kind in HERO_KINDS else (BRIEF if self.kind in BRIEF_KINDS else "operate")
+
+    def replaced(self, **changes: Any) -> "ProviderSpec":
+        """A copy with ``changes``. ``replace`` re-runs ``__post_init__`` on the already-normalised kind and
+        region, so the declared names (the init=False fields) are carried across explicitly, here and nowhere else."""
+        out = dataclasses.replace(self, **changes)
+        out.legacy_kind = self.legacy_kind
+        out.legacy_region = self.legacy_region
+        return out
 
     def with_verbs(self, verbs: tuple[str, ...]) -> "ProviderSpec":
-        """A copy offering ``verbs``. ``replace`` re-runs ``__post_init__`` on the already-normalised
-        kind, so the declared name is carried across explicitly."""
-        out = dataclasses.replace(self, verbs=verbs)
-        out.legacy_kind = self.legacy_kind
-        return out
+        """A copy offering ``verbs``."""
+        return self.replaced(verbs=verbs)
 
 
 def _label_note(note: str | None, labels: "LabelSnapshot | None") -> str | None:
@@ -421,8 +464,13 @@ class Cockpit:
     def attach_verbs(self, view: Any) -> None:
         """Attach the verb registry's view: row and panel actions, the manifest ``verbs`` map, and
         the revision (install class + policy) hashed into every etag, since a gesture can change with
-        rows unchanged (design §9 K2a)."""
-        self._verb_view = view
+        rows unchanged (design §9 K2a). Every compose already registered is checked against the
+        registry first (a verb it holds, panel-bound, not a job, fields inside its allowlist), and a
+        refused one refuses the attach: the registry is known from here on."""
+        with self._lock:
+            for spec in self._specs.values():
+                _check_compose_verbs(spec, view)
+            self._verb_view = view
 
     def attach_labeller(self, fn: Callable[[], LabelSnapshot]) -> None:
         """Attach a labels-only source: ``fn()`` is ONE journal read, taken once per request (design
@@ -461,8 +509,16 @@ class Cockpit:
             if DECISIONS_ID in self._specs and self._specs[DECISIONS_ID] is not self._dec.spec:
                 raise CockpitRegistrationError(
                     "panel 'decisions' is registered by a downstream: attach its source instead of registering it")
+            # transactional: a placement the registry refuses must leave the previous panel and source intact
+            before = (self._dec.source, self._dec.spec, self._specs, self._state, dict(self._rowsets))
             self._dec.source = spec
-            self._install_decisions_locked()
+            try:
+                self._install_decisions_locked()
+            except BaseException:
+                self._dec.source, self._dec.spec, self._specs, self._state, rowsets = before
+                self._rowsets.clear()
+                self._rowsets.update(rowsets)
+                raise
 
     def attach_decision_rows(self, fn: Callable[[datetime], Any]) -> None:
         """The broker's reader of its own decisions rows: ``fn(now)`` returns ``DecisionRows``, None
@@ -479,6 +535,8 @@ class Cockpit:
         spec = ProviderSpec(
             DECISIONS_ID, "triage-list", src.title if src else "Decisions waiting", "gate", _composed,
             region=src.region if src else "operate", rank=src.rank if src else -1,
+            face=src.face if src else "", size=src.size if src else "medium",
+            span=src.span if src else 1, tabs=src.tabs if src else "",
             refresh_every_s=src.refresh_every_s if src else None,
             stale_after_s=src.stale_after_s if src else 900.0, timeout_s=src.timeout_s if src else 10.0,
             order=DECISION_ORDER, facets=KERNEL_DECISION_FACETS | (src.facets if src else frozenset()),
@@ -599,7 +657,7 @@ class Cockpit:
             raise CockpitRegistrationError(f"{sid}: unknown kind {spec.kind!r}")
         if spec.priority not in PRIORITIES:
             raise CockpitRegistrationError(f"{sid}: unknown priority {spec.priority!r}")
-        if spec.region != HEADER and spec.region not in {z for z, _ in ZONES}:
+        if spec.region not in TOP_REGIONS and spec.region not in {z for z, _ in ZONES}:
             raise CockpitRegistrationError(f"{sid}: unknown region {spec.region!r}")
         if spec.priority == "gate" and spec.optional:
             raise CockpitRegistrationError(f"{sid}: a gate panel may not register an optional source")
@@ -634,7 +692,13 @@ class Cockpit:
                 seen_views.add(vid)
         elif spec.order is not None or spec.views:
             raise CockpitRegistrationError(f"{sid}: only a list or count-queue has an ordering or views")
+        spec = self._place_locked(spec)
         _validate_search_decl(spec)
+        if spec.compose is not None:
+            # stored detached: a provider that keeps its dict cannot change what was validated
+            spec = spec.replaced(compose=copy.deepcopy(spec.compose))
+        _validate_compose_decl(spec)
+        _check_compose_verbs(spec, self._verb_view)
         if spec.rowset is not None:
             owner = self._rowsets.get(spec.rowset)
             if owner is not None:
@@ -649,6 +713,54 @@ class Cockpit:
             self._rowsets[spec.rowset] = sid
         self._state = states            # state first: a reader that sees the spec finds its state
         self._specs = specs
+
+    def _place_locked(self, spec: ProviderSpec) -> ProviderSpec:
+        """Validate a spec's place (region, face, size, span, tabs) against the registry and return the spec
+        to store. Registration is incremental, so the hero's at-most-one and a tab card's one size are checked
+        against the specs already registered. A legacy ``header`` reading or ambient that finds the hero slot
+        of its kind taken is stored in ``operate`` instead of refused: a pre-hero provider cannot have known."""
+        sid, kind, region = spec.id, spec.kind, spec.region
+        if not isinstance(spec.face, str) or spec.face not in FACES:
+            raise CockpitRegistrationError(f"{sid}: face must be '' or 'count', got {spec.face!r}")
+        if spec.face == "count" and kind not in ROW_ENGINE_KINDS:
+            raise CockpitRegistrationError(f"{sid}: face 'count' belongs to a row-engine kind "
+                                           f"({', '.join(ROW_ENGINE_KINDS)}), not {kind!r}")
+        if not isinstance(spec.size, str) or spec.size not in SIZES:
+            raise CockpitRegistrationError(f"{sid}: size must be one of {', '.join(SIZES)}, got {spec.size!r}")
+        if isinstance(spec.span, bool) or not isinstance(spec.span, int) or spec.span not in SPANS:
+            raise CockpitRegistrationError(f"{sid}: span must be one of {', '.join(map(str, SPANS))}, got {spec.span!r}")
+        if not isinstance(spec.tabs, str) or len(spec.tabs) > TITLE_MAX:
+            raise CockpitRegistrationError(f"{sid}: tabs must be a card title of at most {TITLE_MAX} characters")
+        if region in TOP_REGIONS:
+            if spec.size != "medium" or spec.span != 1 or spec.tabs:
+                raise CockpitRegistrationError(f"{sid}: size, span and tabs lay out a zone card; {region} takes none")
+        if region == HERO:
+            if kind not in HERO_KINDS:
+                raise CockpitRegistrationError(
+                    f"{sid}: the hero holds a reading and an ambient, not a {kind!r}")
+            if any(o.region == HERO and o.kind == kind for o in self._specs.values()):
+                if spec.legacy_region != HEADER:
+                    raise CockpitRegistrationError(f"{sid}: the hero holds at most one {kind}")
+                return spec.replaced(region="operate")
+        elif region == BRIEF:
+            if kind not in BRIEF_KINDS:
+                raise CockpitRegistrationError(f"{sid}: the brief holds a line or a brief, not a {kind!r}")
+        elif region == WIDGETS:
+            if kind in ROW_ENGINE_KINDS:
+                if spec.face != "count":
+                    raise CockpitRegistrationError(
+                        f"{sid}: a widget is one answer, never a list; a {kind} in widgets must declare face='count'")
+            elif kind not in WIDGET_KINDS:
+                raise CockpitRegistrationError(
+                    f"{sid}: a widget is one answer, never a list; a {kind} cannot sit in widgets "
+                    f"(allowed: {', '.join(WIDGET_KINDS)}, or a list with face='count')")
+        elif spec.tabs:
+            for o in self._specs.values():
+                if o.region == region and o.tabs == spec.tabs and (o.size, o.span) != (spec.size, spec.span):
+                    raise CockpitRegistrationError(
+                        f"{sid}: tabs {spec.tabs!r} in {region} share one card with {o.id!r}, which is "
+                        f"size={o.size} span={o.span}; {sid} asks size={spec.size} span={spec.span}")
+        return spec
 
     @property
     def panel_ids(self) -> list[str]:
@@ -1169,7 +1281,8 @@ class Cockpit:
 
     # --- heads, panels, the now view --------------------------------------------------
     def _etag_of(self, snap: _Snap, groups: list[dict[str, Any]] | None, cred: str, today: date,
-                 views: tuple[tuple[str, str, str], ...] = (), labels: LabelSnapshot | None = None) -> str:
+                 views: tuple[tuple[str, str, str], ...] = (), labels: LabelSnapshot | None = None,
+                 face: str = "", compose: dict[str, Any] | None = None) -> str:
         # Rev 9 (§3.4): the panel etag covers status, rows or value, the credential class and the
         # current date in the install's zone (a held date passing at midnight changes row bands, and
         # from K2a the tiers). ``as_of`` stays outside, so a refresher over unchanged rows still 304s.
@@ -1179,6 +1292,10 @@ class Cockpit:
                      "verbs": self._verb_rev(),
                      # a panel's views shape view_rows: a kernel that adds or reorders one is not a 304
                      **({"views": [list(v) for v in views]} if views else {}),
+                     # the face is drawn from the head, so changing it is not a 304
+                     **({"face": face} if face else {}),
+                     # the compose card is drawn from the head, so a changed declaration is not a 304
+                     **({"compose": compose} if compose else {}),
                      # K2b-3b §0.3: provenance is applied at render, so the journal's revision (and a
                      # snapshot's error) is content; with no labeller there is neither
                      **({"labels": [list(labels.revision) if labels.revision is not None else None, labels.error]}
@@ -1186,7 +1303,7 @@ class Cockpit:
                         else {})})
 
     def _head(self, spec: ProviderSpec, snap: _Snap, cred: str, today: date,
-              labels: LabelSnapshot = NO_LABELS) -> dict[str, Any]:
+              labels: LabelSnapshot = NO_LABELS, now: datetime | None = None) -> dict[str, Any]:
         listy = spec.kind in ROW_ENGINE_KINDS
         # only a panel whose rows (or value) carry labels renders the snapshot
         labelled = labels if spec.label_key is not None else None
@@ -1212,6 +1329,11 @@ class Cockpit:
             title += " (unavailable)"
         elif count is not None:
             title += f" ({count})"
+        etag = self._etag_of(snap, groups, cred, today, spec.views, labelled, spec.face, spec.compose)
+        if spec.kind == "roster" and now is not None and isinstance(snap.value, dict):
+            # a roster's health is read against the clock, so a tone that turns with time is content
+            etag = _sha({"base": etag, "health": [[r["name"], r["health"]["tone"], r["health"]["text"]]
+                                                  for r in _with_health(snap.value, now)["rows"]]})
         return {
             "id": spec.id, "kind": spec.kind, "title": title, "priority": spec.priority,
             "rank": spec.rank, "status": snap.status,
@@ -1220,7 +1342,7 @@ class Cockpit:
             "filtered": snap.filtered, "skipped": snap.skipped,
             "as_of": snap.as_of, "stale_after_s": spec.stale_after_s,
             "refresh_every_s": spec.refresh_every_s,
-            "etag": self._etag_of(snap, groups, cred, today, spec.views, labelled),
+            "etag": etag,
             "error": snap.error, "note": note, "empty": spec.empty if snap.empty is None else snap.empty,
             "order": spec.order, "groups": groups,
             "views": [{"id": i, "title": t, "order": o} for i, t, o in spec.views] or None,
@@ -1229,6 +1351,8 @@ class Cockpit:
                                                       labels.label(snap.value_label_key))
                         if self._verb_view is not None else []),
             "edit_class": spec.edit_class or None,
+            **({"face": spec.face} if spec.face else {}),
+            **({"compose": copy.deepcopy(spec.compose)} if spec.compose else {}),
         }
 
     @staticmethod
@@ -1241,7 +1365,7 @@ class Cockpit:
         searchable = spec.window is not None or (count or 0) > SEARCH_THRESHOLD
         return {
             "search": {"fields": list(search_fields_of(spec)), "scope": spec.search_scope,
-                       "default_visible": spec.search_default_visible, "hook": spec.search is not None},
+                       "default_visible": roster_visible(spec), "hook": spec.search is not None},
             "searchable": searchable, "window": spec.window,
         }
 
@@ -1254,7 +1378,7 @@ class Cockpit:
         its own; every row keeps its source ``panel_id``. Its status is the worst of its sources'."""
         sources = sorted(
             (s for s in specs_map.values() if s.priority == "gate" and s.kind in ROW_ENGINE_KINDS),
-            key=lambda s: (0 if s.region == HEADER else 1 + [z for z, _ in ZONES].index(s.region), s.rank, s.id),
+            key=lambda s: (_REGION_ORDER.index(s.region), s.rank, s.id),
         )
         rows: list[dict[str, Any]] = []
         degraded: list[str] = []
@@ -1396,9 +1520,24 @@ class Cockpit:
                         # one id, one owner: another source never takes over or relabels a panel
                         errors.append({"source": f"discovery:{spec.id}",
                                        "message": f"id collision: {spec.title!r} maps to the id of {have.title!r}"})
-                    elif tuple(have.verbs) != tuple(spec.verbs):
-                        # what a discovered panel offers is its owner's answer, read per pass
-                        self._set_verbs_locked(spec.id, tuple(spec.verbs))
+                    elif (tuple(have.verbs) != tuple(spec.verbs) or have.rank != spec.rank
+                          or have.compose != spec.compose):
+                        # what a discovered panel offers, its rank among its owner's panels and its compose
+                        # card are its owner's answer, read per pass (a heading moved while serving moves
+                        # its tab) (a non-int rank never gets here: ProviderSpec refuses it inside the
+                        # discoverer). The new answer is validated as a registration is; one that fails is
+                        # an errors entry and the panel offers nothing until its owner answers validly
+                        new = have.replaced(verbs=tuple(spec.verbs), rank=spec.rank,
+                                            compose=copy.deepcopy(spec.compose))
+                        try:
+                            _validate_compose_decl(new)
+                            _check_compose_verbs(new, self._verb_view)
+                        except Exception as exc:  # noqa: BLE001 - a bad answer is an errors entry, never a 500
+                            errors.append({"source": f"discovery:{spec.id}", "message": _safe_str(exc)})
+                            new = have.replaced(verbs=(), rank=spec.rank)
+                        specs = dict(self._specs)       # copy-on-write, like a registration
+                        specs[spec.id] = new
+                        self._specs = specs
             with self._lock:
                 # a panel its owner no longer returns keeps its provider (it reads Absent) and offers nothing
                 for pid in [p for p, o in self._discovered.items() if o == i and p not in returned]:
@@ -1413,9 +1552,7 @@ class Cockpit:
 
     @staticmethod
     def _ordered_specs(specs_map: dict[str, ProviderSpec]) -> list[ProviderSpec]:
-        zi = [z for z, _ in ZONES]
-        return sorted(specs_map.values(),
-                      key=lambda s: (-1 if s.region == HEADER else zi.index(s.region), s.rank, s.id))
+        return sorted(specs_map.values(), key=lambda s: (_REGION_ORDER.index(s.region), s.rank, s.id))
 
     def manifest(self, credential: dict[str, Any], *, install_class: str | None = None,
                  transport: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1431,20 +1568,15 @@ class Cockpit:
         specs_map = self._specs      # one snapshot for the whole manifest
         for spec in self._ordered_specs(specs_map):
             snaps[spec.id] = self._snap_for(spec, ctx)
-            heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today, auth.labels)
+            heads[spec.id] = self._head(spec, snaps[spec.id], credential["class"], ctx.today, auth.labels, ctx.now)
         now_head, _ = self._now_head_and_rows(ctx, credential["class"], specs_map, snaps)
         heads[NOW_ID] = now_head
         specs = self._ordered_specs(specs_map)
-        regions = {
-            "header": [s.id for s in specs if s.region == HEADER],
-            "zones": [
-                {"id": zid, "title": zt,
-                 "panels": ([NOW_ID] if zid == "operate" else []) + [s.id for s in specs if s.region == zid]}
-                for zid, zt in ZONES
-            ],
-        }
+        regions = self._regions(specs)
         order = [NOW_ID] + [s.id for s in specs]
-        etag = _sha({"schema": SCHEMA, "panels": [heads[i]["etag"] for i in order], "credential": credential, "verbs": self._verb_rev(),
+        # regions are content: a card's size or tabs changes no panel's etag, so they are hashed here
+        etag = _sha({"schema": SCHEMA, "panels": [heads[i]["etag"] for i in order], "regions": regions,
+                     "credential": credential, "verbs": self._verb_rev(),
                      "install_class": install_class, "policy_revision": POLICY_REVISION,
                      "entity": entity, "errors": errors,    # identity and manifest faults are content too
                      "transport": transport})
@@ -1458,6 +1590,37 @@ class Cockpit:
         if transport is not None:
             out["transport"] = dict(transport)
         return out
+
+    @staticmethod
+    def _regions(specs: list[ProviderSpec]) -> dict[str, Any]:
+        """The manifest's ``regions``. ``specs`` arrives in drawing order. ``header`` is COMPAT: what a renderer
+        that predates hero and brief reads (the hero, the brief, then the widgets, so none disappears: the old
+        page draws an unknown header id into Operate), derived and never declared. A zone's flat ``panels``
+        list is likewise kept beside its ``cards``; ``cards`` is authoritative for layout, and the flat list
+        follows rank order, which differs from card order when tab members are not rank-contiguous."""
+        hero = [s.id for s in specs if s.region == HERO and s.kind == "reading"] + \
+               [s.id for s in specs if s.region == HERO and s.kind != "reading"]
+        brief = [s.id for s in specs if s.region == BRIEF]
+        zones = []
+        for zid, zt in ZONES:
+            members = [s for s in specs if s.region == zid]
+            cards: list[dict[str, Any]] = [
+                {"panels": [NOW_ID], "size": "medium", "span": 1, "tabs": None}] if zid == "operate" else []
+            by_tabs: dict[str, dict[str, Any]] = {}
+            for s in members:
+                if s.tabs and s.tabs in by_tabs:
+                    by_tabs[s.tabs]["panels"].append(s.id)
+                    continue
+                card = {"panels": [s.id], "size": s.size, "span": s.span, "tabs": s.tabs or None}
+                cards.append(card)
+                if s.tabs:
+                    by_tabs[s.tabs] = card
+            zones.append({"id": zid, "title": zt, "grid": ZONE_GRID,
+                          "panels": ([NOW_ID] if zid == "operate" else []) + [s.id for s in members],
+                          "cards": cards})
+        widgets = [s.id for s in specs if s.region == WIDGETS]
+        return {"hero": hero, "brief": brief, "widgets": widgets,
+                "header": hero + brief + widgets, "zones": zones}
 
     def freshness(self) -> dict[str, dict[str, Any]]:
         """``{panel_id: {as_of, status}}`` for every registered panel, ``now`` included (design §3.4).
@@ -1523,7 +1686,7 @@ class Cockpit:
             if spec is None:
                 return None
             snap = self._snap_for(spec, ctx)
-            head = self._head(spec, snap, credential_class, ctx.today, auth.labels)
+            head = self._head(spec, snap, credential_class, ctx.today, auth.labels, ctx.now)
             snap_rows, value, view_order = snap.rows, snap.value, snap.view_order
             if snap_rows is not None:
                 snap_rows = self._with_provenance(snap_rows, snap.label_keys, auth.labels)
@@ -1600,6 +1763,8 @@ class Cockpit:
                     value = self._search_value_rows(spec, value, q, limit, out)
                 if head["kind"] == "log":
                     value = self._log_sentences(value, credential_class)
+                if head["kind"] == "roster":
+                    value = _with_health(value, ctx.now)
             if profile == "compact":
                 out["value"] = _compact_value(head["kind"], value)
                 if head["priority"] == "feed" or head["kind"] in ("ambient", "brief"):
@@ -1686,7 +1851,7 @@ class Cockpit:
                 return {**value, "rows": []}
             try:
                 keep = VALUE_VALIDATORS[spec.kind](spec, {"rows": got})["rows"]
-            except ValueError as exc:
+            except Exception as exc:  # noqa: BLE001 - a hook's bad rows are a search fault, not a crash
                 out["search_error"] = f"search hook returned unusable rows: {_safe_str(exc)}"
                 return {**value, "rows": []}
             out["matched"] = total if total is not None else len(keep)
@@ -1964,6 +2129,10 @@ def _v_reading(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
                 raise _bad(spec, f"value.sub[{i}].value", "must be a number or a string")
             if sr.get("band") is not None and not _is_str(sr["band"]):
                 raise _bad(spec, f"value.sub[{i}].band", "must be a string")
+            if sr.get("detail") is not None and not _is_str(sr["detail"]):
+                raise _bad(spec, f"value.sub[{i}].detail", "must be a string")
+    if v.get("symbol") is not None and v["symbol"] not in READING_SYMBOLS:
+        raise _bad(spec, "value.symbol", f"must be one of {', '.join(READING_SYMBOLS)}, got {v['symbol']!r}")
     return v
 
 
@@ -2059,13 +2228,138 @@ def _v_roster(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
         # null is the honest "no data": a digest is never a faked zero
         if r.get("digest") is not None and not isinstance(r["digest"], dict):
             raise _bad(spec, f"{w}.digest", "must be an object or null (null means no data)")
+        if isinstance(r.get("digest"), dict) and r["digest"].get("last_wrap_at") is not None and not _is_iso(r["digest"]["last_wrap_at"]):
+            raise _bad(spec, f"{w}.digest.last_wrap_at", "must be null or an ISO-8601 timestamp")
+        if r.get("wrap_every") is not None and _wrap_every_s(r["wrap_every"]) is None:
+            raise _bad(spec, f"{w}.wrap_every", f"must be null or a positive count and one unit of m, h, d, w (like '1d'), got {r['wrap_every']!r}")
+        if r.get("group") == "roundtable" and r["cadence"] != "on_call":
+            raise _bad(spec, f"{w}.group", "roundtable members must be cadence on_call: a resident's silence is a signal the folded roundtable line cannot carry")
         lc = r.get("last_call")
         if lc is not None and not (isinstance(lc, dict) and _is_iso(lc.get("at")) and lc.get("outcome") in EVENT_OUTCOMES):
             raise _bad(spec, f"{w}.last_call", f"must be null or {{at (ISO-8601), outcome (one of {list(EVENT_OUTCOMES)})}}")
-    shown = [{**r, "silence_is_signal": (r["silence_is_signal"] if r.get("silence_is_signal") is not None
-                                         else r["cadence"] == "resident")}
-             for r in rows if r["lifecycle"] != "retired"]      # retired members do not render
+    shown = []
+    for r in rows:
+        if r["lifecycle"] == "retired":
+            continue                                            # retired members do not render
+        r = {**r, "silence_is_signal": (r["silence_is_signal"] if r.get("silence_is_signal") is not None
+                                        else r["cadence"] == "resident")}
+        if isinstance(r.get("digest"), dict):
+            # a non-finite number is not representable on the wire: it reads as "not reported"
+            r["digest"] = {k: (None if isinstance(x, float) and not math.isfinite(x) else x) for k, x in r["digest"].items()}
+        r["fleet_group"] = fleet_group(r)
+        shown.append(r)
     return {**v, "rows": shown, "retired_hidden": len(rows) - len(shown)}
+
+
+_WRAP_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def _wrap_every_s(text: Any) -> float | None:
+    """'1d' / '12h' / '2w' in seconds; anything else is no schedule (never a guess)."""
+    if not isinstance(text, str) or len(text) < 2 or text[-1] not in _WRAP_UNITS or not text[:-1].isascii() or not text[:-1].isdigit():
+        return None
+    n = int(text[:-1])
+    return n * _WRAP_UNITS[text[-1]] if n > 0 else None
+
+
+ROSTER_VISIBLE = 40
+
+
+def roster_visible(spec: "ProviderSpec") -> int:
+    """A roster is a bounded set drawn in groups (the roundtable folds to one line), so it is not cut at the
+    list default of 10 unless its contributor declared a window of its own."""
+    d = spec.search_default_visible
+    return ROSTER_VISIBLE if spec.kind == "roster" and d == 10 else d
+
+
+def fleet_group(row: dict[str, Any]) -> str:
+    """Where a roster row is drawn: the roundtable's seats fold into one group, whatever their cadence."""
+    if row.get("group") == "roundtable":
+        return "roundtable"
+    return "resident" if row.get("cadence") == "resident" else "on_call"
+
+
+def _kb(n: float) -> str:
+    return f"{n / 1e6:.1f} MB" if n > 1e6 else f"{round(n / 1e3)} kB"
+
+
+def roster_health(row: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """Health PER KIND, the one place the fleet rules live. ``tone`` is ok | alarm | neutral | unknown;
+    only a RESIDENT member whose silence is a signal can be ``alarm``. An on-call member (and a member the
+    contributor says silence means nothing for) is described by its last call as a neutral fact, its
+    memory as a plain fact; wrap age is an alarm only against ``wrap_every``, only for resident + stateful.
+    The wrap age is read at validation time, so it is as fresh as the snapshot it rides."""
+    dg = row.get("digest") if isinstance(row.get("digest"), dict) else None
+    lc = row.get("last_call") if isinstance(row.get("last_call"), dict) else None
+    stateful = row.get("memory") == "stateful"
+    if stateful:
+        sb = dg.get("store_bytes") if dg else None
+        mem = "memory" + (f" {_kb(sb)}" if isinstance(sb, (int, float)) and not isinstance(sb, bool) and sb else "")
+    else:
+        mem = "stateless"
+    out: dict[str, Any] = {"tone": "neutral", "text": "", "at": None, "memory": mem}
+    if row.get("cadence") == "on_call" or not row.get("silence_is_signal"):
+        if lc:
+            out["text"] = "last call failed" if lc.get("outcome") == "failed" else "answered"
+            out["at"] = lc.get("at")
+        elif row.get("cadence") == "on_call":
+            out["text"] = "not called yet"
+        else:
+            out["text"] = "no signal expected"
+        return out                                              # never an alarm: a neutral fact
+    if dg is None:
+        return {**out, "tone": "unknown", "text": "no data"}
+    if dg.get("available") is False:
+        return {**out, "tone": "alarm", "text": "write path unavailable"}
+    if dg.get("available") is not True:
+        return {**out, "tone": "unknown", "text": "no liveness data"}
+    # tone ranks alarm > unknown > ok; evidence that is missing or unreadable is never read as health
+    rank = {"ok": 0, "unknown": 1, "alarm": 2}
+    tone = "ok"
+    parts: list[str] = []
+
+    def note(t: str, text: str) -> None:
+        nonlocal tone
+        if rank[t] > rank[tone]:
+            tone = t
+        parts.append(text)
+
+    if not stateful:
+        parts.append("running")
+    else:
+        eps = dg.get("episodes_24h")
+        if eps is None:
+            note("unknown", "episodes_24h not reported")
+        elif isinstance(eps, bool) or not isinstance(eps, (int, float)) or not math.isfinite(eps) or eps < 0 or eps != int(eps):
+            note("unknown", "episodes_24h unreadable")
+        elif eps == 0:
+            note("alarm", "no episodes in 24 h, it should be writing")
+        else:
+            parts.append(f"{int(eps)} episodes in 24 h")
+        every = _wrap_every_s(row.get("wrap_every"))
+        if every is not None:
+            lw = dg.get("last_wrap_at")
+            if not _is_iso(lw):
+                note("unknown", f"no wrap time reported (wraps every {row['wrap_every']})")
+            elif (now - _parse_iso(lw)).total_seconds() > every:
+                note("alarm", f"last wrap overdue (due every {row['wrap_every']})")
+            else:
+                parts.append(f"wraps every {row['wrap_every']}")
+    out["tone"], out["text"] = tone, " · ".join(parts)
+    return out
+
+
+def _with_health(value: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """A roster value with each row's health read at ``now`` (the request's clock): health is derived at
+    render, never stored in a snapshot, so a cached read cannot keep a stale tone."""
+    rows = []
+    for r in value.get("rows") or []:
+        try:
+            h = roster_health(r, now)
+        except Exception:  # noqa: BLE001 - a row that cannot be judged is unknown, never a crashed GET
+            h = {"tone": "unknown", "text": "health unreadable", "at": None, "memory": ""}
+        rows.append({**r, "health": h})
+    return {**value, "rows": rows}
 
 
 def _v_form(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
@@ -2089,6 +2383,16 @@ def _v_form(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
             en = f.get("enum")
             if not (isinstance(en, list) and en and all(_is_str(x) and x for x in en)):
                 raise _bad(spec, f"{w}.enum", "a recipient field carries a non-empty list of ids from the provider's registry")
+            # the page trims a chosen id and drops a blank one, so a blank id would send no reader (everyone),
+            # and two ids equal after trimming are one reader drawn twice
+            seen_ids: set[str] = set()
+            for j, x in enumerate(en):
+                t = x.strip()
+                if not t:
+                    raise _bad(spec, f"{w}.enum[{j}]", "is blank (a chosen blank id would send to everyone)")
+                if t in seen_ids:
+                    raise _bad(spec, f"{w}.enum[{j}]", f"{t!r} is repeated (after trimming)")
+                seen_ids.add(t)
         elif "enum" in f:
             raise _bad(spec, f"{w}.enum", "belongs to a recipient field only")
     if v.get("verb") is not None and not _is_str(v["verb"]):
@@ -2124,6 +2428,49 @@ ROW_SEARCH_DEFAULT = {"list": ("title", "body", "id"), "count-queue": ("title", 
 
 def search_fields_of(spec: "ProviderSpec") -> tuple[str, ...]:
     return spec.search_fields or ROW_SEARCH_DEFAULT.get(spec.kind, ())
+
+
+def _validate_compose_decl(spec: "ProviderSpec") -> None:
+    """Refuse a compose declaration the page could not honour (registration time): a list panel only, a
+    verb the panel offers, and fields of the form kind's own contract."""
+    if spec.compose is None:
+        return
+    sid, c = spec.id, spec.compose
+    if spec.kind != "list":
+        raise CockpitRegistrationError(f"{sid}: only a list carries a compose card")
+    if spec.face == "count":
+        raise CockpitRegistrationError(f"{sid}: a list drawn as a count shows no compose card")
+    if not isinstance(c, dict) or set(c) - {"verb", "fields"}:
+        raise CockpitRegistrationError(f"{sid}: compose is {{verb, fields}}")
+    if not isinstance(c.get("verb"), str) or not c["verb"] or c["verb"] not in spec.verbs:
+        raise CockpitRegistrationError(f"{sid}: compose names a verb the panel offers, got {c.get('verb')!r}")
+    try:
+        _v_form(spec, {"verb": c["verb"], "fields": c.get("fields")})
+    except ValueError as exc:
+        raise CockpitRegistrationError(f"{sid}: compose {exc}") from None
+    recipients = [f for f in c["fields"] if f["type"] == "recipient"]
+    if len(recipients) > 1:
+        # the card has one address line and one chip row
+        raise CockpitRegistrationError(f"{sid}: compose carries at most one recipient field, got {len(recipients)}")
+    if recipients:
+        # a row of an addressed list draws `source -> <recipient>` from its facets: both must be declared, so a
+        # row with no reader value names no reader (everyone), never a facet the provider forgot to declare
+        need = {recipients[0]["name"], "source"}
+        if not need <= set(spec.facets):
+            raise CockpitRegistrationError(
+                f"{sid}: a compose with a recipient field declares the facets {sorted(need)}, "
+                f"missing {sorted(need - set(spec.facets))}")
+
+
+def _check_compose_verbs(spec: "ProviderSpec", view: Any) -> None:
+    """Refuse a compose the verb registry cannot honour (``VerbView.compose_refusal``): a no-op until the
+    registry is attached, and for a view that does not answer the question."""
+    if spec.compose is None or view is None:
+        return
+    ask = getattr(view, "compose_refusal", None)
+    why = ask(spec.id, spec.compose) if callable(ask) else None
+    if why:
+        raise CockpitRegistrationError(f"{spec.id}: compose {why}")
 
 
 def _validate_search_decl(spec: "ProviderSpec") -> None:
