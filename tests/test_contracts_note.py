@@ -190,3 +190,15 @@ def test_a_note_with_a_lone_surrogate_in_its_text_is_refused():
     with pytest.raises(ContractError):
         N.check_text("a\udbff b\n")
 
+
+def test_the_character_check_allocates_no_copy_of_the_note():
+    """The surrogate check walks the str; it does not build a UTF-8 copy of the whole note to find one."""
+    import tracemalloc
+    text = "é" * 1_000_000 + "\n"
+    tracemalloc.start()
+    try:
+        N.check_text(text)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 100_000, peak
