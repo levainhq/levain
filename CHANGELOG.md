@@ -4,6 +4,15 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 > **This file starts at 0.4.2.** Earlier releases were documented in commit messages only — which is itself one of the defects this release closes: an operator upgrading through 0.4.x had no surface that told them what changed underneath their install. Entries for 0.4.0 and 0.4.1 are backfilled below because they carry a behaviour change adopters needed to know about and were never told.
 
+## [0.9.1] — 2026-10-12
+
+A security fix. Upgrade if you use gpg on a machine where Levain runs bash.
+
+### Security
+
+- **Bash can no longer write gnupg's configuration files.** Bash runs as you, so it could write `gpg-agent.conf` and gnupg's other configuration files. Your gpg-agent runs outside Levain's floor and starts programs those files name, so a bash session could get a program of its choosing run outside the floor, with your network and your files. `gpg-agent.conf`, `scdaemon.conf`, `gpg.conf`, `dirmngr.conf` and `common.conf` are now read-only to bash in `~/.gnupg`, and in `$GNUPGHOME` when Levain's own environment sets it to an absolute path. gpg signing and decryption through your agent keep working. Found in Levain's own review and reproduced on Linux; the fix was verified there against the same reproduction.
+- **Known open issue: bash can still reach your gpg-agent.** This release closes the configuration-file path that was reproduced. It does not keep a bash session from reaching gpg-agent by other means. Levain 2.0 changes how bash reaches local services, so that gpg-agent is out of its reach unless you allow it.
+
 ## [0.9.0] — 2026-10-12
 
 Two things ship together: the signed team tier (team ledgers signed by SSH keys, the team replayed from signed history) and the live cockpit (eleven panel kinds, a page that redraws only what changed, an ambient sky).
