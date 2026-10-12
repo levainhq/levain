@@ -104,13 +104,14 @@
     });
   }
 
-  // the settled answer of one refetch: "applied", "fault" or false
+  // the settled answer of one refetch: "applied", "superseded" (a newer refetch owns the panel: nothing to clear or record), "fault" or false
   function refetch(id) {
     var done;
     try { done = V.refetchPanel(id); } catch (_) { done = Promise.resolve("fault"); }
     return Promise.resolve(done).then(function (r) {
+      if (r === "superseded") return r;
       if (r === "applied" || r === true) {
-        clearFault(id);     // the view recorded the etag its own panel read returned; the announced one is another credential's
+        clearFault(id);     // refetchPanel recorded the etag of its own panel read; the announced one is another credential's
       } else if (r === "fault") scheduleFault(id);
       else wantReload();
       return r;

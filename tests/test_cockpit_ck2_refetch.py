@@ -65,6 +65,25 @@ const ok = (c, w) => { if (!c) { failed++; console.log("FAIL " + w); } };
   ok(painted[painted.length - 1] === 5, "the body repainted the new rows: " + painted);
   ok(measures >= 1, "the host was re-measured");
   ok(s.body.parent === host, "the body node was kept in its host");
+  // the held etag follows the panel read that was applied, not any event: only the page's own read records it
+  globalThis.LevainCockpitHeld = { p: { etag: "drawn" } };
+  globalThis.__next = Object.assign(payload(6), { etag: "own-read" });
+  r = await K.refetchPanel("p");
+  ok(r === "applied" && globalThis.LevainCockpitHeld.p.etag === "own-read", "an applied refetch records its own read's etag: " + JSON.stringify(globalThis.LevainCockpitHeld));
+  // a superseded refetch (an older read finishing after a newer one) is neither applied nor a fault, and records nothing
+  {
+    const gates = [];
+    globalThis.LevainCockpitTransport = { readJson: () => new Promise((res) => gates.push(res)) };
+    globalThis.LevainCockpitHeld = { p: { etag: "drawn" } };
+    const older = K.refetchPanel("p"), newer = K.refetchPanel("p");
+    gates[1](Object.assign(payload(7), { etag: "newer" }));
+    ok(await newer === "applied", "the newer refetch applies");
+    gates[0](Object.assign(payload(4), { etag: "older" }));
+    const ro = await older;
+    ok(ro === "superseded", "the older refetch is superseded, not applied: " + ro);
+    ok(globalThis.LevainCockpitHeld.p.etag === "newer", "a superseded read records nothing: " + globalThis.LevainCockpitHeld.p.etag);
+    globalThis.LevainCockpitTransport = { readJson: async () => globalThis.__next };
+  }
   // changed shape: the title is chrome
   globalThis.__next = payload(5, "Other things");
   r = await K.refetchPanel("p");
