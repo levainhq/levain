@@ -16,6 +16,7 @@ kill-inside-``record_fault`` case, r7 (drain barrier, standby panel, heal ACL pr
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -72,16 +73,20 @@ def _real_clock_broker(home: Path, spores: Path, store: Any = None, **kw: Any) -
     return b
 
 
-def _recover_until(b: Broker, data: Path, query: str, want: Any, timeout: float = 10.0) -> None:
-    """Recover until the journal reads ``want``. The re-drive thread shares the injected clock, so it can hold
-    the op's mutex when ``recover`` arrives (a held mutex skips the pass) and its own pass can carry a stale
-    ``now``; one ``recover`` is therefore not one attempt. Re-recovering is idempotent: a unit not yet due
-    is passed over. Polls to a deadline, never a fixed sleep."""
+def _recover_until(b: Broker, data: Path, query: str, want: Any, timeout: float = 10.0) -> Any:
+    """Recover until the journal reads ``want`` (a count: at least ``want``), and return what it read. The
+    re-drive thread shares the injected clock, so it can hold the op's mutex when ``recover`` arrives (a
+    held mutex skips the pass) and its own pass can carry a stale ``now``; one ``recover`` is therefore not
+    one attempt. Re-recovering is idempotent: a unit not yet due is passed over. Polls to a deadline, never
+    a fixed sleep. A count is waited for as a floor so an overshoot returns at once, for the caller to
+    assert the exact value, rather than spinning to the deadline."""
     end = time.monotonic() + timeout
     while True:
         b.recover()
-        if _sql(data, query)[0][0] == want or time.monotonic() >= end:
-            return
+        got = _sql(data, query)[0][0]
+        reached = got >= want if isinstance(want, int) and isinstance(got, int) else got == want
+        if reached or time.monotonic() >= end:
+            return got
         time.sleep(0.02)
 
 
@@ -278,6 +283,17 @@ def test_transient_oserror_leaves_planned_and_redrive_finishes(home: Path, spore
         b.stop()
 
 
+def test_recover_until_returns_at_once_when_a_count_overshoots(monkeypatch: pytest.MonkeyPatch) -> None:
+    # complement LOW: an exact-count wait spun to its deadline when one recover moved the count past the
+    # target, and the caller's assertion then failed on a misleading value
+    counts = itertools.chain([1], itertools.repeat(3))   # one recover takes the count from 1 past 2
+    monkeypatch.setitem(globals(), "_sql", lambda data, query: [(next(counts),)])
+    broker = type("B", (), {"recover": lambda self: None})()
+    start = time.monotonic()
+    got = _recover_until(broker, Path("unused"), "SELECT attempts FROM effects", 2, timeout=2.0)
+    assert time.monotonic() - start < 1.0 and got == 3
+
+
 def test_nine_faults_kill_restart_eleven_minutes_later_applies(home: Path, spores: Path) -> None:
     clock = Clock()
     b = _real_clock_broker(home, spores, Flaky(spores, fail=None), clock=clock)
@@ -285,7 +301,7 @@ def test_nine_faults_kill_restart_eleven_minutes_later_applies(home: Path, spore
         pid = _issue(b, spores, "update_text")["pending_id"]
         for n in range(2, 10):
             clock.at += timedelta(seconds=130)
-            _recover_until(b, home / "data", "SELECT attempts FROM effects", n)
+            assert _recover_until(b, home / "data", "SELECT attempts FROM effects", n) == n
         att = _sql(home / "data", "SELECT attempts, status FROM effects")[0]
         assert att == (9, "PLANNED"), att                                   # CONTROL: nine, still planned
     finally:
@@ -307,7 +323,7 @@ def test_ten_faults_end_store_error_naming_the_last(home: Path, spores: Path) ->
         pid = _issue(b, spores, "update_text")["pending_id"]
         for n in range(2, 11):
             clock.at += timedelta(seconds=130)
-            _recover_until(b, home / "data", "SELECT attempts FROM effects", n)
+            assert _recover_until(b, home / "data", "SELECT attempts FROM effects", n) == n
         status, reason, att = _sql(home / "data", "SELECT status, reason, attempts FROM effects")[0]
         assert status == "UNAPPLIED" and att == 10
         assert reason.startswith("store error:") and "boom10" in reason, reason
