@@ -323,6 +323,27 @@ def test_a_gnupghome_holding_dirmngr_is_a_view_pinned_from_above(tmp_path, gh) -
     assert not [a for _, op, a in ops if a[:1] == ["/dev/null"] and _under(a[1], gh)]   # the view replaces the mask
 
 
+def test_a_gnupghome_that_cannot_be_listed_is_refused_naming_it(tmp_path, gh) -> None:
+    gh.chmod(0o300)
+    try:
+        with pytest.raises(ConfinementError, match="could not list"):
+            _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+    finally:
+        gh.chmod(0o700)
+
+
+def test_a_gnupghome_owned_by_another_user_gets_no_view(tmp_path, gh, monkeypatch) -> None:
+    """Its files are not the operator's to bind back into a view: its dirmngr keeps the mask."""
+    real_stat = os.stat
+    monkeypatch.setattr(conf.os, "stat", lambda p, *a, **k: (
+        os.stat_result((*real_stat(p, *a, **k)[:4], os.geteuid() + 1, *real_stat(p, *a, **k)[5:]))
+        if Path(p) == gh else real_stat(p, *a, **k)))
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+    assert not [a for _, op, a in _ops(argv) if op == "--tmpfs" and a == [str(gh)]]
+    assert not _bound_back(argv, gh)
+    assert [a for _, op, a in _ops(argv) if a[:1] == ["/dev/null"] and Path(a[1]).resolve() == gh / "S.dirmngr"]
+
+
 def test_a_gnupghome_is_left_alone_when_bash_has_network(tmp_path, gh) -> None:
     """dirmngr is a deputy only for bash without network; with network bash fetches by itself."""
     argv = _bwrap_argv(build_policy(_entity(tmp_path)))

@@ -5004,8 +5004,9 @@ def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path]) -> t
     Each such directory is a view like a runtime dir's, and its ancestors (``pins``) are pinned so it
     cannot be moved from above. A directory that is ``/``, ``/run``, ``/var/run``, ``/tmp``,
     ``/var/tmp`` or ``$HOME``, or one directly in ``$HOME`` (``~/.gnupg``: step (0)'s view of $HOME
-    makes it a mountpoint), is left to the mask: bash cannot rename it or anything above it. A
-    directory that holds the workspace, the entity or ``$HOME`` is refused: a view would hide them."""
+    makes it a mountpoint), is left to the mask: bash cannot rename it or anything above it. One
+    another user owns keeps the mask too: its files are not the operator's to bind back. A directory that holds the workspace, the entity or ``$HOME`` is
+    refused: a view would hide them."""
     if not policy.deny_localhost_outbound:
         return [], []
     shared = {Path(p).resolve() for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp")}
@@ -5017,6 +5018,8 @@ def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path]) -> t
         if (g in shared or g.parent == home or g in views
                 or any(g == r or g.is_relative_to(r) for r in runtime_roots)):
             continue
+        if os.stat(g).st_uid != os.geteuid():
+            continue   # another user's home: its files are not the operator's to bind back; the mask stays
         for held in (policy.workspace.resolve(), policy.entity_dir.resolve(), home):
             if held == g or held.is_relative_to(g):
                 raise ConfinementError(
@@ -5100,8 +5103,13 @@ def _runtime_view(policy: CrownJewelsPolicy) -> tuple[list[str], list[Path], lis
             ops += ["--bind", str(s), str(s)]
     for g in homes:
         ops += ["--perms", "0700", "--tmpfs", str(g)]
-        for child in sorted(g.iterdir(), key=lambda p: p.name):
-            st = os.lstat(child)
+        try:
+            children = [(c, os.lstat(c)) for c in sorted(g.iterdir(), key=lambda p: p.name)]
+        except OSError as exc:
+            raise ConfinementError(
+                f"could not list the gnupg home {g}, which holds a dirmngr socket ({exc}). Refusing to grant "
+                "bash hands (fail-closed).") from None
+        for child, st in children:
             if stat.S_ISLNK(st.st_mode):
                 ops += ["--symlink", os.readlink(child), str(child)]
             elif child.name.startswith("S.") and child.name not in _GNUPG_HOME_SOCKETS:
