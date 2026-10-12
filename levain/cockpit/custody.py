@@ -147,12 +147,23 @@ def read_sidecar(key_path: Path) -> Sidecar | None:
 
 
 def _write_new(path: Path, data: bytes, mode: int) -> None:
+    """A new file (``O_EXCL``) holding all of ``data``: a short write is continued until every byte is
+    written, and a failed write or fsync (or an interrupt) removes the file this call created."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode)
     try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except BaseException:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
 
 
 def _write_sidecar(key_path: Path, sidecar: Sidecar, made: list[Path]) -> None:

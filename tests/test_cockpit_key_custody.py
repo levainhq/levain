@@ -397,6 +397,31 @@ def test_every_tool_the_helpers_start_gets_the_allowlist_and_nothing_else(tmp_pa
     assert bad == {}
 
 
+# --- file writes (L3 r1 P4) ------------------------------------------------------------------------------
+
+
+def test_a_short_write_is_continued_until_every_byte_is_written(tmp_path, monkeypatch):
+    """codex LOW (L3 r1): one os.write was taken as the whole file."""
+    import os
+    real = os.write
+    monkeypatch.setattr(custody.os, "write", lambda fd, data: real(fd, bytes(data)[:3]))
+    body = b"sk-ecdsa-sha2-nistp256@openssh.com AAAA levain-test\n"
+    custody._write_new(tmp_path / "f.pub", body, 0o644)
+    monkeypatch.undo()
+    assert (tmp_path / "f.pub").read_bytes() == body
+
+
+@pytest.mark.parametrize("fails", ["write", "fsync"])
+def test_a_failed_write_or_fsync_removes_the_new_file(tmp_path, monkeypatch, fails):
+    def boom(*a):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(custody.os, fails, boom)
+    with pytest.raises(OSError, match="No space"):
+        custody._write_new(tmp_path / "f.pub", b"abc\n", 0o644)
+    monkeypatch.undo()
+    assert not (tmp_path / "f.pub").exists()
+
+
 # --- key create --custody passphrase --------------------------------------------------------------------
 
 
