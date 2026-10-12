@@ -13,6 +13,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Changed
 
 - **The cockpit schema is `levain.cockpit/2`.** The `/1` kinds `triage-list`, `metric`, `visual` and `prose` are accepted as aliases of `list`, `status-dots`, `ambient` and `brief`, and the manifest and every panel carry the new names. Field names are kept, and v2 validates them strictly: a metric needs a non-empty label and, when it sends a value, a finite number or a string; prose needs markdown or lines, markdown must be a string, and every prose line must be an object with a string text; a `visual` value's text must be a list. A provider whose `/1` value was looser is refused until it sends well-formed values.
+- **Cockpit signing keys live in a signed authority log.** Who may sign a cockpit write is a verified replay of `authority_log` in `cockpit.db`, read once per request; the `keys` and `policy` tables are gone. `levain cockpit enroll` and `revoke` append a signed link and take `--signing-key`: an enrolment is signed by a laptop-presence key, a revocation by a key of at least the revoked key's class. `--compromised-since` takes an authority seq, which `levain cockpit keys` lists. A pending's fence names the log head it was issued under, so any appended link turns waiting pendings STALE.
+- **Breaking: the journal format is `levain-cockpit/3`.** A 0.9.x journal migrates at first open: its keys are set aside, waiting pendings end STALE, and every signed act is refused, naming `levain cockpit ledger init`, until the keys are enrolled again with a touch on a laptop-presence key. `ledger init` is not in this build yet. A 0.9.x binary refuses a migrated journal.
 
 ### Removed
 
