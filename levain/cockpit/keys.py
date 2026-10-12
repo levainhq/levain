@@ -282,9 +282,13 @@ def ssh_signer(key_path: Path, *, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN) -
     fp = fingerprint_of(normalise_public_key(text), ssh_keygen=ssh_keygen)
 
     def sign(message: bytes) -> str:
+        from levain.launch import child_env
         try:
+            # the launch allowlist (it carries SSH_AUTH_SOCK, for an agent-held key) and a configured
+            # FIDO provider; stderr stays the terminal's, for the touch prompt
             cp = subprocess.run([str(ssh_keygen), "-Y", "sign", "-f", str(key_path), "-n", NAMESPACE],
-                                input=message, stdout=subprocess.PIPE, timeout=_SIGN_TIMEOUT, check=False)
+                                input=message, stdout=subprocess.PIPE, timeout=_SIGN_TIMEOUT, check=False,
+                                env=child_env("SSH_SK_PROVIDER"))
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise KeyError_(f"ssh-keygen could not sign ({type(exc).__name__})") from None
         if cp.returncode != 0:
