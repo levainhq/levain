@@ -10,6 +10,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 - **`GateHandle`** (`levain.autonomic.handle`). A process holds one handle over its current `EfferentGate`. `swap(manifest, binding_catalog, aggregate)` builds a new gate on a frozen copy of the catalog and publishes it in one step; pending holds, receipts and the journal carry across. `FireDispatcher` and `ChainExecutor` read the handle once per admission, so an admission in flight completes on the gate it started with.
 
+### Changed
+
+- **Cockpit signing keys live in a signed authority log.** Who may sign a cockpit write is a verified replay of `authority_log` in `cockpit.db`, read once per request; the `keys` and `policy` tables are gone. `levain cockpit enroll` and `revoke` append a signed link and take `--signing-key`: an enrolment is signed by a laptop-presence key, a revocation by a key of at least the revoked key's class. `--compromised-since` takes an authority seq, which `levain cockpit keys` lists. A pending's fence names the log head it was issued under, so any appended link turns waiting pendings STALE.
+- **Breaking: the journal format is `levain-cockpit/3`.** A 0.9.x journal migrates at first open: its keys are set aside, waiting pendings end STALE, and every signed act is refused, naming `levain cockpit ledger init`, until the keys are enrolled again with a touch on a laptop-presence key. `ledger init` is not in this build yet. A 0.9.x binary refuses a migrated journal.
+
 ### Removed
 
 - **`ChainExecutor.gate`.** The executor now holds a `GateHandle`, exposed as `ChainExecutor.handle`; read the gate with `handle.current()`, once per admission. A gate kept across a policy swap goes stale, so the executor no longer hands one out.
