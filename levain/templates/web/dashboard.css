@@ -1115,6 +1115,10 @@ body.ke .ck-secthead h3 { margin: 0; font: 700 13px var(--round); letter-spacing
 body.ke .ck-secthead span { font-size: 12px; color: var(--meta); }
 body.ke .ck-brief { padding-top: var(--s3); }
 body.ke .ck-secthead + .ck-brief, body.ke .ck-secthead + .ck-widgets { padding-top: 12px; }
+/* The mode filter for the KE page. The page-wide rule near the top loses to KE card rules that set display (a widget card
+   is display:flex); this one carries body.ke so a Morning/Build mode hides a card the manifest did not give that mode. */
+body.ke[data-mode="morning"] [data-modes]:not([data-modes~="morning"]),
+body.ke[data-mode="build"] [data-modes]:not([data-modes~="build"]) { display: none; }
 body.ke .zone-head { display: flex; align-items: baseline; gap: 12px; margin: 0 0 12px; }
 body.ke .zone-head .zone-title { margin: 0; }
 body.ke .zone-gloss { font-size: 12px; color: var(--meta); }
