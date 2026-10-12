@@ -145,3 +145,16 @@ def test_ssh_agent_note_round_trip_equals_the_frozen_vector():
 def test_agent_signature_unwrap_refusals(blob):
     with pytest.raises(ContractError):
         K.unwrap_agent_signature(blob)
+
+
+@pytest.mark.parametrize("sig_type", [2, 0, -1, 256, True, 1.0])
+def test_make_key_refuses_every_type_but_ed25519_and_cosignature_v1(sig_type):
+    with pytest.raises(ContractError):
+        N.make_key("a.example/k", bytes(32), sig_type)
+
+
+def test_make_key_accepts_both_types_and_parse_vkey_reads_them_back():
+    for t in (N.SIG_TYPE_ED25519, N.SIG_TYPE_COSIG_V1):
+        k = N.make_key("a.example/k", bytes(32), t)
+        assert N.parse_vkey(k.vkey()) == k
+

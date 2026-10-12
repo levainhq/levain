@@ -54,7 +54,9 @@ class VerifierKey:
 def make_key(name: str, pub: bytes, sig_type: int = SIG_TYPE_ED25519) -> VerifierKey:
     if not valid_key_name(name):
         raise ContractError(f"invalid key name {name!r}")
-    if len(pub) != ed25519.PUBLIC_KEY_LEN:
+    if type(sig_type) is not int or sig_type not in (SIG_TYPE_ED25519, SIG_TYPE_COSIG_V1):
+        raise ContractError(f"signature type {sig_type!r} is not Ed25519 (0x01) or cosignature/v1 (0x04)")
+    if not isinstance(pub, bytes) or len(pub) != ed25519.PUBLIC_KEY_LEN:
         raise ContractError("an Ed25519 public key is 32 bytes")
     return VerifierKey(name, key_id(name, sig_type, pub), sig_type, pub)
 
