@@ -57,7 +57,50 @@ def test_pinned_rows_replace_the_busiest_and_a_single_repo_rows_are_event_types(
 def test_frame_loop_stops_after_the_last_meteor_settles():
     out = subprocess.run([NODE, str(REPLAY / "run_cdp.mjs"), CHROME], capture_output=True, text=True, timeout=120, check=True).stdout
     lines = [ln for ln in out.splitlines() if "RESULT" in ln]
-    assert len(lines) == 2, out
+    assert len(lines) == 3, out
     for ln in lines:
         res = json.loads(ln.split("RESULT ", 1)[1])
         assert res["pass"], res
+
+
+def _node(js: str, payload: dict) -> dict:
+    out = subprocess.run([NODE, "-e", js, str(SKY)], input=json.dumps(payload), capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_an_at_without_an_offset_is_read_as_utc_whatever_the_browser_zone():
+    js = ("const {normalise}=require(process.argv[1]);const i=JSON.parse(require('fs').readFileSync(0,'utf8'));"
+          "console.log(JSON.stringify(i.map(a=>normalise({events:[{kind:'commit',at:a}]})[0].t)));")
+    ats = ["2026-10-11T06:10:12", "2026-10-11 06:10:12", "2026-10-11T06:10", "2026-10-11T06:10:12Z", "2026-10-11T02:10:12-04:00"]
+    for tz in ("America/New_York", "Asia/Tokyo"):
+        out = subprocess.run([NODE, "-e", js, str(SKY)], input=json.dumps(ats), capture_output=True, text=True, check=True,
+                             env={"TZ": tz, "PATH": "/usr/bin:/bin"}).stdout
+        t = json.loads(out)
+        assert t[0] == t[1] == t[3] == t[4] == 1791699012000 and t[2] == t[0] - 12000, (tz, t)
+
+
+_FRESH = ("const {normalise,diffFresh}=require(process.argv[1]);const i=JSON.parse(require('fs').readFileSync(0,'utf8'));"
+          "const st={seen:{},loaded:false};"
+          "console.log(JSON.stringify(i.feeds.map(f=>diffFresh(normalise({events:f}),st).length)));")
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_first_feed_is_history_even_when_empty_so_the_first_live_event_is_fresh():
+    c = _ev("commit", "a")
+    assert _node(_FRESH, {"feeds": [[], [c], [c]]}) == [0, 1, 0]
+    assert _node(_FRESH, {"feeds": [[c], [c]]}) == [0, 0]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_equal_events_count_as_occurrences_and_an_outcome_change_is_fresh():
+    c = _ev("commit", "a")
+    assert _node(_FRESH, {"feeds": [[c], [c, dict(c), dict(c)]]}) == [0, 2]
+    ok, bad = _ev("review", "a", outcome="ok"), _ev("review", "a", outcome="failed")
+    assert _node(_FRESH, {"feeds": [[ok], [bad]]}) == [0, 1]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_repo_less_review_is_left_out_of_the_auto_single_repo_view():
+    m = _model([_ev("commit", "only"), _ev("review", None, outcome="failed")], {})
+    assert m["single"] == "only" and m["counts"]["review"] == 0 and m["counts"]["failed"] == 0

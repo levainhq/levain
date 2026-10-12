@@ -38,4 +38,5 @@ async function run(query, shotName, midShot) {
 try {
   console.log('multi', await run('', outdir === '-' ? null : 'ck3_sky.png', outdir === '-' ? null : 'ck3_sky_midflight.png'));
   console.log('single', await run('?single=repo-alpha', outdir === '-' ? null : 'ck3_sky_single_repo.png'));
+  console.log('hidden', await run('?hidden=1', null));
 } finally { proc.kill(); }

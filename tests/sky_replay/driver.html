@@ -8,6 +8,7 @@
   .sky-bar{display:flex;justify-content:space-between;align-items:center;padding:8px 0;color:var(--label)}
   .sky-toggle{background:#131a27;color:var(--label);border:1px solid #28324a;border-radius:8px;padding:4px 10px}
   .sky-legend{color:var(--meta);padding-top:6px}
+  .hidden #host{width:0;padding:0;overflow:hidden}
   pre{color:var(--label)}
 </style>
 <div id="host"></div>
@@ -23,6 +24,7 @@
   var commits = R.events.filter(function (e) { return e.kind === 'commit'; });
   var late = commits.slice(-6), lateSet = new Set(late);
   var base = R.events.filter(function (e) { return !lateSet.has(e); });
+  if (q.get('hidden')) document.body.className = 'hidden';
   var opts = { now: clock };
   if (q.get('single')) opts.single = q.get('single');
   var sky = LevainSky.mount(document.getElementById('host'), { events: base, legend: R.legend }, opts);

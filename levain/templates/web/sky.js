@@ -35,19 +35,42 @@
     return n;
   }
 
+  // An `at` with no offset is UTC, as the kernel reads it; Date.parse would take it as browser-local.
+  var NAIVE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/;
+  function parseAt(at) {
+    var s = String(at);
+    return Date.parse(NAIVE.test(s) ? s.replace(' ', 'T') + 'Z' : s);
+  }
+
   function normalise(value) {
     var out = [];
     var src = (value && value.events) || [];
     for (var i = 0; i < src.length; i++) {
-      var e = src[i], t = Date.parse(e.at);
+      var e = src[i], t = parseAt(e.at);
       if (!e || isNaN(t) || !e.kind) continue;
       out.push({ t: t, kind: String(e.kind), repo: e.repo == null ? null : String(e.repo),
         agent: e.agent == null ? null : String(e.agent), ok: e.outcome !== 'failed',
-        key: e.at + '|' + e.kind + '|' + e.repo + '|' + e.agent });
+        key: e.at + '|' + e.kind + '|' + e.repo + '|' + e.agent + '|' + e.outcome });
     }
     out.sort(function (a, b) { return a.t - b.t; });
     return out;
   }
+
+  // Which events are new since the last feed. `state` is {seen: {key: count}, loaded}. Equal events are
+  // counted as occurrences, so a second identical event is new; the first feed is history, however empty.
+  function diffFresh(evs, state) {
+    var cnt = {}, fresh = [];
+    evs.forEach(function (e) {
+      cnt[e.key] = (cnt[e.key] || 0) + 1;
+      if (cnt[e.key] > (state.seen[e.key] || 0) && state.loaded) fresh.push(e);
+    });
+    for (var k in cnt) if (cnt[k] > (state.seen[k] || 0)) state.seen[k] = cnt[k];
+    state.loaded = true;
+    return fresh;
+  }
+
+  // A repo-less commit or review belongs to no single repo, so the single-repo view leaves it out.
+  function offView(e, single) { return single && e.repo !== single && (e.kind === 'commit' || e.kind === 'review'); }
 
   // Which rows, and which row each event lands on. Pure: no DOM, so it is testable under node.
   function buildModel(events, opts, nowMs) {
@@ -83,7 +106,7 @@
     }
     var counts = { commit: 0, review: 0, failed: 0, memory: 0 };
     inWin.forEach(function (e) {
-      if (single && e.repo && e.repo !== single && (e.kind === 'commit' || e.kind === 'review')) return;
+      if (offView(e, single)) return;
       if (e.kind === 'commit') counts.commit++;
       else if (e.kind === 'review') { counts.review++; if (!e.ok) counts.failed++; }
       else if (e.kind !== 'decision') counts.memory++;
@@ -119,7 +142,7 @@
 
     var g = cv.getContext('2d');
     var W = 0, H = 0, DPR = Math.min(2, window.devicePixelRatio || 1), gutter = GUTTER_MIN;
-    var events = [], model = null, seen = {}, meteors = [], raf = 0, timer = 0, ro = null, dead = false, hits = [];
+    var events = [], model = null, meteors = [], feed = { seen: {}, loaded: false }, raf = 0, timer = 0, ro = null, dead = false, hits = [];
 
     function css(name, fallback) {
       var v = getComputedStyle(root).getPropertyValue(name).trim();
@@ -194,9 +217,9 @@
     }
 
     function draw() {
+      if (model) advanceMeteors(performance.now());   // before the width guard: a hidden mount must still let meteors expire
       if (!model || !W) return;
       var P = palette(), now = clock();
-      advanceMeteors(performance.now());
       g.setTransform(DPR, 0, 0, DPR, 0, 0); g.clearRect(0, 0, W, H);
       var nowX = xOf(now, now);
       hits = [];
@@ -216,7 +239,7 @@
       }
       events.forEach(function (e) {
         if (e.t < model.start || e.t > now) return;
-        if (model.single && e.repo && e.repo !== model.single && (e.kind === 'commit' || e.kind === 'review')) return;
+        if (offView(e, model.single)) return;
         var row = model.rowOf(e), x = xOf(e.t, now), y = rowY(row) + (hash01(e.t + e.kind.length) - 0.5) * 12;
         var a = Math.max(0.35, 1 - ((now - e.t) / 3600000) / (opts.windowHours * 1.15));
         if (e.kind === 'commit') { g.globalAlpha = a; g.fillStyle = P.contrast; g.beginPath(); g.arc(x, y, 1.3 + hash01(e.t) * 0.9, 0, 7); g.fill(); }
@@ -267,7 +290,7 @@
     }
 
     function launch(e) {
-      if (!ambientOn || !model) return;
+      if (!ambientOn || !model || (!e.repo && offView(e, model.single))) return;
       if (e.kind !== 'commit' && !(e.kind === 'review' && !e.ok)) return;   // commits and failures streak; the rest just appear
       meteors.push({ e: e, row: model.rowOf(e), born: performance.now(), x: 0, y: 0, tx: 0, ty: 0, len: 60, a: 1, fail: e.kind === 'review' });
       schedule();
@@ -304,9 +327,7 @@
     function update(next) {
       if (dead) return;
       value = next;
-      var evs = normalise(next), first = !events.length && !Object.keys(seen).length;
-      var fresh = [];
-      evs.forEach(function (e) { if (!seen[e.key]) { seen[e.key] = 1; if (!first) fresh.push(e); } });
+      var evs = normalise(next), fresh = diffFresh(evs, feed);
       events = evs;
       rebuild();
       draw(); drawAxis();
@@ -333,7 +354,7 @@
     };
   }
 
-  var api = { mount: mount, buildModel: buildModel, stats: stats };
+  var api = { mount: mount, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
   if (typeof window !== 'undefined') window.LevainSky = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();
