@@ -46,13 +46,14 @@ Notes a provider relies on:
 
 A spec declaring an alias is normalised to the new kind when it is built (`ProviderSpec.kind` reads
 the new name; `legacy_kind` records the declared one), so the manifest and every panel carry only the
-new names. The four keep their field names, and v2 validates them more strictly than `/1` did: a
-`metric` value is read as `status-dots`'s, and each metric needs a non-empty label and a value that is a
-finite number or a string; a `prose` value (`{headline, markdown}`) is read as a `brief`, whose markdown must
-be a string and whose lines, when sent, must each be an object with a string text; a `triage-list` is a
-`list`. A `visual`
-keeps its `/1` value (`{visual, text}`, with `visual` one of the known pictures) only while it is
-declared as `visual`; a panel declared `ambient` sends events and a legend. A renderer that
+new names. The four keep their field names, and v2 validates them more strictly than `/1` did. A
+`metric` value is read as `status-dots`'s: it needs a `metrics` list, each metric a non-empty string
+`label`, and, when it sends a `value`, a finite number or a string (`null` or absent passes). A `prose` value
+(`{headline, markdown}`) is read as a `brief`: it needs `markdown` (a string) or `lines`, a `headline` that,
+when sent, is a string, and lines that, when sent, are each an object with a string `text`. A `triage-list` is
+a `list`. A `visual` keeps its `/1` value (`{visual, text}`) only while it is declared as `visual`: `visual`
+must be one of the known pictures and `text` must be a list. A panel declared `ambient` sends events and a
+legend. A renderer that
 reads `head.kind` sees the new names whatever the provider declared.
 
 ## Schema and revalidation

@@ -1033,7 +1033,7 @@
   // focus modal alike, repaints its body in place and re-measures its host, and no node is created, moved or
   // detached. When the shape changed, this declines and the caller answers with a full reload, so the board's
   // one render path stays the only place a panel is mounted. Resolves "applied" when the page was brought up to
-  // date (or a newer refetch of the same panel took over), "fault" when the read or the mapping failed (the panel
+  // date, "superseded" when a newer refetch of the same panel took over (this one changed nothing and says nothing), "fault" when the read or the mapping failed (the panel
   // says so, and the caller may retry), and false when the caller must reload.
   const refetchGen = new Map();
   const liveOf = (pid) => Array.from(states).filter((s) => s.pid === pid && onPage(s));
@@ -1043,7 +1043,7 @@
     refetchGen.set(pid, gen);
     let raw, fault = "";
     try { raw = await readPanel(pid); } catch (e) { fault = e && e.message ? e.message : String(e); }
-    if (refetchGen.get(pid) !== gen) return "applied";      // a newer refetch of this panel owns the answer
+    if (refetchGen.get(pid) !== gen) return "superseded";   // a newer refetch of this panel owns the answer and the record
     const live = liveOf(pid);
     if (!live.length) return false;
     if (fault) { for (const s of live) { s.fault = fault; paint(s); } return "fault"; }
@@ -1074,6 +1074,9 @@
         if (core.measureOverflow && host.classList.contains("clamped")) core.measureOverflow(host);
       }
     }
+    // the page now shows what this read returned, so the held etag is this read's own (never a stream event's)
+    const heldMap = root.LevainCockpitHeld;
+    if (heldMap && raw && typeof raw.etag === "string") heldMap[pid] = Object.assign({}, heldMap[pid], { etag: raw.etag });
     return "applied";
   }
 
