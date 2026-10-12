@@ -59,6 +59,9 @@ _ALLOW = frozenset({
     "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH",
     # A display's auth file PATH (the file is the secret, and stays where it is), for the browser.
     "XAUTHORITY",
+    # gnupg's home directory PATH (the keys are in it, and stay there): the confinement floor asks
+    # gpgconf for the agent's sockets, and without it gpgconf names only the default home's.
+    "GNUPGHOME",
 })
 # Config namespaces: the locale, XDG dirs, the interpreter's own switches, and this stack's settings.
 # A name in one of them that is SHAPED like a credential is carried all the same (:data:`_TOKEN_SHAPED`):

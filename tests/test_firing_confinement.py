@@ -3531,9 +3531,13 @@ def test_offline_bash_masks_every_dirmngr_the_kernel_lists(tmp_path, monkeypatch
     monkeypatch.setattr(_conf, "_bound_unix_socket_paths",
                         lambda: [str(linked / "S.dirmngr"), str(elsewhere / "S.gpg-agent")])
     on = _bwrap_argv(build_policy(_entity(tmp_path, "on"), deny_localhost_outbound=True))
-    dirmngr = str(elsewhere.resolve() / "S.dirmngr")
-    assert any(on[k:k + 3] == ["--ro-bind", "/dev/null", dirmngr] for k in range(len(on)))
-    assert "/dev/null " + str(elsewhere.resolve() / "S.gpg-agent") not in " ".join(on)
+    # Hidden by a view of its directory, not a mask a rename escapes (dirmngr A-1b, RUN 2026-10-12):
+    # nothing named S.dirmngr comes back into it, and the agent's socket does.
+    keyring = str(elsewhere.resolve())
+    assert ["--perms", "0700", "--tmpfs", keyring] in [on[k:k + 4] for k in range(len(on))]
+    assert not [on[k:k + 3] for k in range(len(on)) if on[k].endswith("bind")
+                and on[k + 2] == keyring + "/S.dirmngr"]
+    assert ["--bind", keyring + "/S.gpg-agent", keyring + "/S.gpg-agent"] in [on[k:k + 3] for k in range(len(on))]
 
 
 def test_offline_bash_is_refused_when_the_kernel_socket_list_cannot_be_read(
