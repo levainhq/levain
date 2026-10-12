@@ -202,6 +202,37 @@ def test_the_host_restores_activation_a_failed_sandbox_left_renamed(entity, monk
     assert not [p for p in entity.iterdir() if p.name.startswith("activation-moved")]
 
 
+def test_a_failed_host_restore_raises_naming_the_moved_path(entity, monkeypatch):
+    # verify r2, codex introduced HIGH + LOW-5: the host-side restore swallowed its own OSError and
+    # left the live activation/ at activation-moved-*, behind a C5 line nobody had to read
+    act = entity / "activation"
+    real_rename = os.rename
+    driven = []
+
+    def fake_drive(argv, *, prompt, **kw):
+        real_rename(act, entity / f"activation-moved-{_nonce_from(prompt)}")
+        driven.append(True)
+        return hc._Turn(timed_out=True)
+
+    def refusing_rename(src, dst, *a, **kw):
+        if driven:
+            raise OSError(1, "Operation not permitted")
+        return real_rename(src, dst, *a, **kw)
+
+    monkeypatch.setattr(hc, "_drive", fake_drive)
+    monkeypatch.setattr(hc.os, "rename", refusing_rename)
+    with pytest.raises(hc.ActivationNotRestored) as ei:
+        hc.run_cc_canary(_profile(entity))
+    moved = [p for p in entity.iterdir() if p.name.startswith("activation-moved")]
+    assert len(moved) == 1 and not act.exists()
+    assert os.fspath(moved[0]) in str(ei.value)
+    assert ei.value.moved == moved[0]
+    verdict = ei.value.verdict
+    assert not verdict.ok
+    c5 = [c for c in verdict.checks if c.name.startswith("C5")]
+    assert c5 and c5[0].status == "fail" and os.fspath(moved[0]) in c5[0].evidence, verdict.checks
+
+
 def test_the_host_never_moves_a_directory_that_is_not_the_original(entity, monkeypatch):
     # The restore is by identity: a different directory left at the moved name stays where it is
     act = entity / "activation"
@@ -235,3 +266,28 @@ def test_a_sibling_of_activation_is_not_covered_by_deny_write(entity):
     sibling = entity / "activation-moved-x"
     assert entity / "activation" in deny
     assert not any(sibling == d or d in sibling.parents for d in deny)
+
+
+def test_a_failed_host_restore_is_not_hidden_by_a_failure_in_the_run(entity, monkeypatch):
+    # The stranded directory outranks whatever else went wrong: an exception escaping the run must
+    # not carry the recovery error away with it
+    act = entity / "activation"
+    real_rename = os.rename
+    driven = []
+
+    def fake_drive(argv, *, prompt, **kw):
+        real_rename(act, entity / f"activation-moved-{_nonce_from(prompt)}")
+        driven.append(True)
+        raise RuntimeError("the turn blew up")
+
+    def refusing_rename(src, dst, *a, **kw):
+        if driven:
+            raise OSError(1, "Operation not permitted")
+        return real_rename(src, dst, *a, **kw)
+
+    monkeypatch.setattr(hc, "_drive", fake_drive)
+    monkeypatch.setattr(hc.os, "rename", refusing_rename)
+    with pytest.raises(hc.ActivationNotRestored) as ei:
+        hc.run_cc_canary(_profile(entity))
+    assert isinstance(ei.value.__context__, RuntimeError)
+    assert "activation-moved-" in str(ei.value)

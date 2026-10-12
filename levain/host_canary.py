@@ -28,6 +28,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -39,8 +40,8 @@ import signal
 from levain.host_guard import (CC_HOSTED_TOOLS, CC_VERSION_FLOOR, CCHostProfile, HostRefusal,
                                parse_cc_version)
 
-__all__ = ["Check", "CanaryVerdict", "run_cc_canary", "check_init_event", "probe_command",
-           "probe_script"]
+__all__ = ["ActivationNotRestored", "Check", "CanaryVerdict", "run_cc_canary", "check_init_event",
+           "probe_command", "probe_script"]
 
 Status = Literal["pass", "fail", "inconclusive"]
 
@@ -67,6 +68,20 @@ class CanaryVerdict:
     def reason(self) -> str:
         bad = [c for c in self.checks if c.status != "pass"]
         return "; ".join(f"{c.name} {c.status}: {c.evidence}" for c in bad) or "all checks passed"
+
+
+class ActivationNotRestored(RuntimeError):
+    """The entity's live activation/ is still at the probe's moved name after the host tried to put
+    it back. Raised, never folded into a verdict line, because every later run of the entity meets
+    a missing activation tree until an operator moves ``moved`` back by hand (verify r2, codex HIGH).
+    ``verdict`` is the failed canary verdict, attached once the run's cleanup is done."""
+
+    def __init__(self, moved: Path, activation: Path, cause: str) -> None:
+        super().__init__(f"the entity's activation directory was left at {os.fspath(moved)!r}; move it "
+                         f"back to {os.fspath(activation)!r} by hand ({cause})")
+        self.moved = moved
+        self.activation = activation
+        self.verdict: CanaryVerdict | None = None
 
 
 # ---------------------------------------------------------------------------- init event
@@ -584,7 +599,11 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
             checks.extend(_evaluate(turn, nonce=nonce, cmd=cmd, listener=listener,
                                     landed=landed, want=want))
     finally:
-        _restore_activation(activation, moved, activation_id)
+        stranded: ActivationNotRestored | None = None
+        try:
+            _restore_activation(activation, moved, activation_id)
+        except ActivationNotRestored as exc:
+            stranded = exc  # raised once the rest of the cleanup has run
         if listener is not None:
             listener.close()
         for p in landed:
@@ -594,6 +613,8 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
             except OSError:
                 pass
         shutil.rmtree(work, ignore_errors=True)
+        if stranded is not None and sys.exc_info()[1] is not None:
+            raise stranded  # the escaping exception rides along as __context__
     left = _activation_problem(activation, moved, activation_id)
     if moved_by_probe or left:
         checks.append(Check("C5 activation intact", "fail", "; ".join(
@@ -603,8 +624,12 @@ def run_cc_canary(profile: CCHostProfile, *, timeout: float = 240.0, canary_mode
         checks.append(Check("C5 activation intact", "pass", "the original directory, nothing at the moved name"))
     version = (turn.init or {}).get("claude_code_version") if turn is not None else None
     ok = bool(checks) and all(c.status == "pass" for c in checks)
-    return CanaryVerdict(ok=ok, checks=tuple(checks), claude_version=version,
-                         claude_bin=os.path.realpath(profile.claude_bin), profile_digest=profile.digest())
+    verdict = CanaryVerdict(ok=ok, checks=tuple(checks), claude_version=version,
+                            claude_bin=os.path.realpath(profile.claude_bin), profile_digest=profile.digest())
+    if stranded is not None:
+        stranded.verdict = verdict
+        raise stranded
+    return verdict
 
 
 def _dir_ident(p: Path) -> tuple[int, int] | None:
@@ -626,13 +651,22 @@ def _activation_problem(activation: Path, moved: Path, ident: tuple[int, int]) -
 def _restore_activation(activation: Path, moved: Path, ident: tuple[int, int]) -> None:
     """Host-side, after the process group is dead: move the original directory back from the
     probe's name, only when nothing stands at activation/ and the moved directory IS the original
-    by device and inode. Anything else is left for the operator, and C5 reports it."""
-    if os.path.lexists(activation) or _dir_ident(moved) != ident:
+    by device and inode. If the original is at the moved name and is not back at activation/
+    afterwards, raise ActivationNotRestored naming the moved path; no retry. A moved name that
+    does not hold the original is left alone for the operator, and C5 reports it."""
+    if _dir_ident(moved) != ident:
         return
-    try:
-        os.rename(moved, activation)
-    except OSError:
-        pass
+    cause = "something stands at the activation path"
+    if not os.path.lexists(activation):
+        try:
+            os.rename(moved, activation)
+        except OSError as exc:
+            cause = f"the host's rename back failed: {exc}"
+        else:
+            if _dir_ident(activation) == ident:
+                return
+            cause = "the rename back did not leave the original directory at the activation path"
+    raise ActivationNotRestored(moved, activation, cause)
 
 
 _PROBE_LINES = ("TCP", "UDS", "FSOUT", "RENAME", "FSHOOK", "FSCLAUDE", "FSLINK", "HARDLINK",
