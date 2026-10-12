@@ -368,6 +368,32 @@ def test_noop_refused(base, keys):
     refused(base, "changes nothing")
 
 
+def test_raise_to_the_lowest_tier_on_a_verb_with_no_floor_is_a_noop(base, keys):
+    """F11: no floor already means the lowest tier; the raise changes nothing, so it is refused."""
+    assert auth.classify(head(base).policy, auth.AuthorityPolicy.from_dict(
+        {"raise_to": {"fresh": "C1"}, "timeouts": {}, "grants": {}})) == auth.NOOP
+    insert(base, {"op": "raise", "verb": "fresh", "tier": "C1"}, keys["phone"])
+    refused(base, "changes nothing")
+
+
+def test_loosen_to_the_same_policy_is_a_noop(base, keys):
+    link(base, {"op": "raise", "verb": "v", "tier": "T3"}, keys["phone"])
+    insert(base, {"op": "loosen", "policy": head(base).policy.as_dict()}, keys["laptop"])
+    refused(base, "changes nothing")
+
+
+def test_timeouts_to_the_same_values_is_a_noop(base, keys):
+    link(base, {"op": "timeouts", "timeouts": {"k": {"on_timeout": "deny"}}}, keys["laptop"])
+    insert(base, {"op": "timeouts", "timeouts": {"k": {"on_timeout": "deny"}}}, keys["laptop"])
+    refused(base, "changes nothing")
+
+
+def test_create_grant_cannot_be_a_noop(granted, keys):
+    """The identical grant again never computes to NOOP: an existing id is refused outright."""
+    insert(granted, {"op": "create_grant", "grant": _grant()}, keys["laptop"])
+    refused(granted, "grant 'g1' already exists")
+
+
 def test_loosen_by_phone_refused(base, keys):
     link(base, {"op": "raise", "verb": "v", "tier": "T3"}, keys["phone"])
     insert(base, {"op": "loosen", "policy": {"raise_to": {}, "timeouts": {}, "grants": {}}}, keys["phone"])

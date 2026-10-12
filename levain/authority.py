@@ -584,19 +584,19 @@ def _grant_change(old: Mapping[str, Any], new: Mapping[str, Any]) -> str:
 
 def classify(old: AuthorityPolicy, new: AuthorityPolicy) -> str:
     """The kind of the difference from ``old`` to ``new``, computed from the two policies alone (§4.3).
-    Anything not byte-identical or PROVABLY narrower is :data:`LOOSEN`; a grant extended and nothing
+    :data:`NOOP` when nothing changes in effect (a missing floor and a floor at the lowest tier are the
+    same). Anything else not PROVABLY narrower is :data:`LOOSEN`; a grant extended and nothing
     else changed is :data:`RENEW`; one grant removed and nothing else is :data:`GRANT_REVOKE`."""
     if old == new:
         return NOOP
     changes: list[str] = []
     tiers = _tiers()
     for verb in set(old.raise_to) | set(new.raise_to):
-        o, n = old.raise_to.get(verb), new.raise_to.get(verb)
-        if o == n:
-            continue
-        rank_o = -1 if o is None else tiers.index(o)
-        rank_n = -1 if n is None else tiers.index(n)
-        changes.append("tight" if rank_n > rank_o else "loose")
+        # no floor IS the lowest tier (apply never lowers), so a raise to it, or dropping it, changes nothing
+        rank_o = tiers.index(old.raise_to.get(verb, tiers[0]))
+        rank_n = tiers.index(new.raise_to.get(verb, tiers[0]))
+        if rank_n != rank_o:
+            changes.append("tight" if rank_n > rank_o else "loose")
     # timeout semantics are S4b's: until then no change is provably stricter
     if _canonical(_thaw(old.timeouts)) != _canonical(_thaw(new.timeouts)):
         changes.append("loose")
@@ -615,7 +615,7 @@ def classify(old: AuthorityPolicy, new: AuthorityPolicy) -> str:
         return RENEW if len(changes) == 1 else LOOSEN
     if changes == ["revoke"]:
         return GRANT_REVOKE
-    return TIGHTEN
+    return TIGHTEN if changes else NOOP
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -911,7 +911,6 @@ def snapshot(conn: sqlite3.Connection, *, cache: ReplayCache | None = None,
 @dataclass(frozen=True)
 class UnsignedLink:
     """A link ready to sign: ``message`` is what the signer signs (namespace :data:`NAMESPACE`)."""
-    store_id: str
     seq: int
     prev_hash: str
     record: str
@@ -966,7 +965,7 @@ def prepare(conn: sqlite3.Connection, op: Mapping[str, Any], *, signer_fp: str, 
     _step(state, row, ssh_keygen=ssh_keygen, check_signature=False)
     if state is not None:
         _append_only_checks(state, json.loads(record), now)
-    return UnsignedLink(sid, seq, prev, record, signer_fp)
+    return UnsignedLink(seq, prev, record, signer_fp)
 
 
 def append(conn: sqlite3.Connection, link: UnsignedLink, signature: str, *, now: datetime,
