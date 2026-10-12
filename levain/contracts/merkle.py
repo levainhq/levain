@@ -94,7 +94,7 @@ def _check_proof(proof: object) -> list[bytes]:
     return [_check_hash(p, "a proof element") for p in proof]
 
 
-def _check_root_of_size(size: int, root_hash: bytes, what: str) -> None:
+def check_root_of_size(size: int, root_hash: bytes, what: str) -> None:
     if size == 0 and root_hash != EMPTY_ROOT:
         raise ContractError(f"{what} has size 0 and its root is not SHA-256 of the empty string")
 
@@ -137,8 +137,8 @@ def verify_consistency(m: int, n: int, proof: list[bytes], old_root: bytes, new_
     proof = _check_proof(proof)
     if m > n:
         raise ContractError("the old size is larger than the new size")
-    _check_root_of_size(m, old_root, "the old tree")
-    _check_root_of_size(n, new_root, "the new tree")
+    check_root_of_size(m, old_root, "the old tree")
+    check_root_of_size(n, new_root, "the new tree")
     if m == 0:
         if proof:
             raise ContractError("the old size is zero and the consistency proof is not empty")

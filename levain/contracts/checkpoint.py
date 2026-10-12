@@ -44,6 +44,15 @@ def _check_origin_name(origin: str) -> None:
         raise ContractError(f"origin {origin!r} is not a legal log origin")
 
 
+def check_tree_head(size: int, root: bytes) -> None:
+    """The one size/root check: ``sign`` calls it, and ``parse_text`` (so ``verify``, ``cosign``,
+    ``verify_cosignatures`` and ``add_checkpoint_body``) calls it. A size-0 root is SHA-256 of the empty string."""
+    check_int(size, NOTE_INT_MAX)
+    if not isinstance(root, bytes) or len(root) != merkle.HASH_LEN:
+        raise ContractError("a checkpoint root is 32 bytes")
+    merkle.check_root_of_size(size, root, "the checkpoint")
+
+
 def parse_text(text: str) -> Checkpoint:
     """A checkpoint note text: origin, size, base64 root, then optional non-empty extension lines."""
     if not isinstance(text, str) or not text.endswith("\n"):
@@ -55,8 +64,7 @@ def parse_text(text: str) -> Checkpoint:
     _check_origin_name(origin)
     size = parse_decimal(size_s, NOTE_INT_MAX)
     root = b64decode(root_s)
-    if len(root) != merkle.HASH_LEN:
-        raise ContractError("a checkpoint root is 32 bytes")
+    check_tree_head(size, root)
     for e in ext:
         if not e:
             raise ContractError("a checkpoint extension line is non-empty")
@@ -96,9 +104,7 @@ def sign(cp: Checkpoint, seed: bytes) -> str:
     if cp.extensions:
         raise ContractError("a levain checkpoint carries no extension lines")
     O.log_kind(cp.origin)
-    check_int(cp.size, NOTE_INT_MAX)
-    if len(cp.root) != merkle.HASH_LEN:
-        raise ContractError("a checkpoint root is 32 bytes")
+    check_tree_head(cp.size, cp.root)
     return N.sign(cp.text(), cp.origin, seed)
 
 

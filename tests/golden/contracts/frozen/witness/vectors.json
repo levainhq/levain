@@ -248,6 +248,27 @@
    }
   },
   {
+   "id": "size-0-non-empty-root-refused",
+   "kind": "no_upstream",
+   "op": "add_checkpoint",
+   "input": {
+    "old_size": 0,
+    "proof": [],
+    "checkpoint": "levain-team/0123456789abcdef0123456789abcdef\n0\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/p2Vwe1a5NxO0DUSKtbLUHm0LsmY8om86fE+GJaQ+KDB66/MzGpVLs9U8vRdlPK5nbeI3oxD8J8Zp8Zx9lFAJAM=\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "A checkpoint of size zero MUST have the root hash of the empty tree"
+   }
+  },
+  {
    "id": "proof-hash-31-bytes-refused",
    "kind": "no_upstream",
    "op": "add_checkpoint",

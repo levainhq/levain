@@ -56,6 +56,9 @@ add("old-above-new-refused", "no_upstream", 10, [], cp(9), None,
     spec(TW, "The old size MUST be equal to or lower than the checkpoint size."))
 add("sixty-four-proof-lines-refused", "no_upstream", 5, [p[0].hex()] * 64, cp(9), None,
     spec(TW, "The client MUST NOT send more than 63 consistency proof lines."))
+t0 = f"{ORIGIN}\n0\n{b64(mth(d[:9]))}\n"
+add("size-0-non-empty-root-refused", "no_upstream", 0, [], t0 + "\n" + note_sig(t0, ORIGIN, LOG), None,
+    spec(TW, "A checkpoint of size zero MUST have the root hash of the empty tree"))
 add("proof-hash-31-bytes-refused", "no_upstream", 5, [p[0].hex()[:62]], cp(9), None,
     spec(TW, "Each consistency proof line MUST encode a single hash in base64."))
 

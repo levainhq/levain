@@ -59,6 +59,9 @@ for vid, s, kind in (("leading-zero", "01", "upstream_lax"), ("negative", "-1", 
                      ("space", " 1", "spec"), ("underscore", "1_0", "spec"), ("fullwidth", "１", "spec")):
     add(f"size-{vid}-refused", kind, signed(f"{ORIGIN}\n{s}\n{b64(R)}\n"), NO, DEC)
 add("extension-line-refused", "levain_profile", signed(f"{ORIGIN}\n1\n{b64(R)}\nan extension\n"), NO, EXT)
+add("size-0-non-empty-root-refused", "upstream_lax", signed(f"{ORIGIN}\n0\n{b64(R)}\n"), NO,
+    spec("C2SP tlog-witness@v1.1.0", "A checkpoint of size zero MUST have the root hash of the empty tree, which "
+                                     "[RFC 6962], Section 2.1 defines as the hash of the empty string."))
 add("root-31-bytes-refused", "upstream_lax", signed(f"{ORIGIN}\n1\n{b64(R[:31])}\n"), NO, TEXT)
 canon = b64(R)
 alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
