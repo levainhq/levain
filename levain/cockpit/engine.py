@@ -412,7 +412,7 @@ class Cockpit:
         self._edits_reader: Callable[[int], Any] | None = None
         # source reads made inside a write still running (a hung source keeps its flight here)
         self._one_live: list[list[Any]] = []
-        # panel id -> its store search still running; one at a time, so a hung hook costs one thread
+        # panel id -> its live store-search workers, capped at SEARCH_INFLIGHT, so hung hooks cost bounded threads
         self._searching: dict[str, list[threading.Thread]] = {}
         self._search_mu = threading.Lock()
 
