@@ -349,7 +349,7 @@ def test_install_seat_reports_the_RESOLVED_cred_floor(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "cred floor" in out and "DENIED" in out
-    assert "the default for an unattended seat" in out
+    assert "DENIED (the default)" in out
 
 
 def test_install_seat_warns_LOUDLY_when_creds_are_opted_back_in(tmp_path, capsys):

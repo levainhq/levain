@@ -610,6 +610,45 @@ def test_run_entity_passes_confined_tools_by_default(
     assert _hands(captured["tools"]) == ["file_editor", "bash"]
 
 
+def test_the_repl_folds_the_standard_cred_stores_into_its_floor_by_default(
+    tmp_path: Path, monkeypatch, capsys, _clean_entity_env
+):
+    """N7 (Phill 2026-10-12, "agreed on your rec"): an entity with no ``deny_standard_creds`` key gets
+    the standard credential stores denied at the interactive REPL too, through the same binding its
+    hands carry; ``false`` is the opt-in and reopens them."""
+    pytest.importorskip("openhands.sdk", reason="openhands extra absent")
+    from levain.firing.binding import ConversationBinding
+    from levain.firing.confinement import crown_jewel_reason
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    entity = _openhands_entity(tmp_path)
+    monkeypatch.setattr("levain.session.confinement_supported", lambda: True)
+    monkeypatch.setattr("levain.firing.confinement.select_provider", lambda: _LocalhostProvider(True))
+    netrc = tmp_path / ".netrc"
+    gh = tmp_path / ".config" / "gh" / "hosts.yml"
+
+    def _repl_binding() -> ConversationBinding:
+        captured: dict = {}
+        _spy_build_entity_agent(monkeypatch, captured)
+        assert run_entity(entity, with_tools=True) == 2
+        binding = ConversationBinding.from_params(captured["tools"][0].params["binding"])
+        assert binding.mode == "interactive"
+        return binding
+
+    denied = _repl_binding()
+    assert denied.deny_standard_creds is True
+    assert crown_jewel_reason(denied.floor, netrc) is not None
+    assert crown_jewel_reason(denied.floor, gh) is not None
+
+    cfg = entity / ".levain" / "confinement.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('{"deny_standard_creds": false}\n')
+    opted_in = _repl_binding()
+    assert opted_in.deny_standard_creds is False
+    assert crown_jewel_reason(opted_in.floor, netrc) is None
+    assert crown_jewel_reason(opted_in.floor, gh) is None
+
+
 class _LocalhostProvider:
     localhost_deny_removes_network = False
 
