@@ -66,12 +66,13 @@ def test_unknown_log_kind_and_bad_mode():
 def test_the_shipped_registry_holds_each_frozen_type_with_its_validator():
     """HEAD_RULINGS #7: each type is registered with its field validator, so framing alone never accepts a leaf.
 
-    S1-a asserted ``C.REGISTRY == {}``; S1-b registers (line, 1) with F9's validator, team log only.
+    S1-a asserted ``C.REGISTRY == {}``; S1-b registers (line, 1) (F9) and (receipt_checkpoint, 1) (F10), team log only.
     """
-    from levain.contracts.leaves import team
-    assert set(C.REGISTRY) == {("line", 1)}
+    from levain.contracts.leaves import receipt, team
+    assert set(C.REGISTRY) == {("line", 1), ("receipt_checkpoint", 1)}
     assert C.REGISTRY[("line", 1)] == C.LeafType(frozenset({"team"}), team.check_line_fields)
-    for framed_only in (b'{"leaf":"line","v":1}',):
+    assert C.REGISTRY[("receipt_checkpoint", 1)] == C.LeafType(frozenset({"team"}), receipt.check_fields)
+    for framed_only in (b'{"leaf":"line","v":1}', b'{"leaf":"receipt_checkpoint","v":1}'):
         assert C.classify_leaf(framed_only, "team", at="ingest") == C.REFUSE
         assert C.classify_leaf(framed_only, "team", at="verify") == C.REFUSE
         with pytest.raises(ContractError):

@@ -25,3 +25,8 @@ runs both commands on every push to `main` and `seat/**`.
 
 `ssh-keygen -lf` (F7), `ssh-keygen -Y check-novalidate` (F12) and `no_upstream` vectors are counted, not run, here:
 the Python tests check them.
+
+F10's `receipt_checkpoint` vectors are levain's own rule (`no_upstream`), but every anchor levain accepts has its
+F1-F3 layers run through upstream Go (`receiptLayers` in `main.go`): the checkpoint note opens under the vector's
+vkey (`sumdb/note`), parses (`formats/log`), and the consistency proof from the same origin's previous accepted
+anchor verifies (`merkle/proof`).

@@ -40,20 +40,21 @@ import (
 // minCount is the minimum number of vectors each frozen directory must hold. A directory missing from this
 // table is unrecognised and fails the run; S1-b adds its own directories here when it lands them.
 var minCount = map[string]int{
-	"grammar":     30,
-	"merkle":      100,
-	"ed25519":     12,
-	"note":        15,
-	"checkpoint":  20,
-	"cosig":       10,
-	"witness":     5,
-	"origin":      20,
-	"fingerprint": 7,
-	"canon":       40,
-	"sshsig":      13,
-	"entry":       80,
-	"line":        40,
-	"scope":       45,
+	"grammar":            30,
+	"merkle":             100,
+	"ed25519":            12,
+	"note":               15,
+	"checkpoint":         20,
+	"cosig":              10,
+	"witness":            5,
+	"origin":             20,
+	"fingerprint":        7,
+	"canon":              40,
+	"sshsig":             13,
+	"entry":              80,
+	"line":               40,
+	"scope":              45,
+	"receipt_checkpoint": 25,
 }
 
 type vector struct {
@@ -375,6 +376,8 @@ func main() {
 		fail("witness oracle: %v", err)
 	}
 
+	fmt.Printf("receipt_checkpoint: %d accepted anchors' F1-F3 layers checked against Go\n", receiptLayers(root))
+
 	if *emit != "" {
 		must(emitVectors(*emit), "emit")
 	}
@@ -385,6 +388,87 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("xcheck: OK")
+}
+
+// receiptLayers runs the F1-F3 layers inside every receipt_checkpoint anchor levain ACCEPTS through upstream Go
+// (S1_DESIGN §1 "Independent cross-check": F10 is levain's own rule, kind no_upstream, and Go checks the layers
+// inside it): the checkpoint note opens under the vector's vkey (sumdb/note), parses as a checkpoint
+// (formats/log), and the consistency proof from the same origin's previous accepted anchor verifies (merkle/proof).
+// A levain-refused anchor asserts nothing here. Returns the number of anchors checked.
+func receiptLayers(root string) int {
+	raw, err := os.ReadFile(filepath.Join(root, "receipt_checkpoint", "vectors.json"))
+	must(err, "receipt_checkpoint")
+	var doc struct {
+		Vectors []vector `json:"vectors"`
+	}
+	must(json.Unmarshal(raw, &doc), "receipt_checkpoint")
+	checked := 0
+	for i := range doc.Vectors {
+		v := &doc.Vectors[i]
+		var leaves []struct {
+			Data string `json:"data_hex"`
+			Vkey string `json:"vkey"`
+		}
+		must(json.Unmarshal(v.Input["leaves"], &leaves), v.ID)
+		var verdicts []string
+		must(json.Unmarshal(v.Expect.Levain["verdicts"], &verdicts), v.ID)
+		type anchor struct {
+			size uint64
+			root []byte
+		}
+		prev := map[string]anchor{}
+		for j, l := range leaves {
+			if verdicts[j] != "accept" {
+				continue
+			}
+			b, err := hex.DecodeString(l.Data)
+			must(err, v.ID)
+			var leaf struct {
+				Checkpoint  string   `json:"checkpoint"`
+				OldSize     uint64   `json:"old_size"`
+				Consistency []string `json:"consistency"`
+			}
+			must(json.Unmarshal(b, &leaf), v.ID)
+			ver, err := note.NewVerifier(l.Vkey)
+			must(err, v.ID+" vkey")
+			origin, _, _ := strings.Cut(leaf.Checkpoint, "\n")
+			cp, _, _, err := fmtlog.ParseCheckpoint([]byte(leaf.Checkpoint), origin, ver)
+			if err != nil {
+				fail("receipt_checkpoint/%s leaf %d: Go refuses the checkpoint levain accepts: %v", v.ID, j, err)
+				continue
+			}
+			old, ok := prev[origin]
+			if !ok {
+				old = anchor{0, rfc6962.DefaultHasher.EmptyRoot()}
+			}
+			var pr [][]byte
+			for _, s := range leaf.Consistency {
+				h, err := base64.StdEncoding.DecodeString(s)
+				must(err, v.ID)
+				pr = append(pr, h)
+			}
+			if leaf.OldSize != old.size {
+				fail("receipt_checkpoint/%s leaf %d: old_size %d, previous anchor %d", v.ID, j, leaf.OldSize, old.size)
+			}
+			switch {
+			case old.size == 0:
+				if len(pr) != 0 {
+					fail("receipt_checkpoint/%s leaf %d: a proof from size 0", v.ID, j)
+				}
+			case old.size == cp.Size:
+				if len(pr) != 0 || !bytes.Equal(old.root, cp.Hash) {
+					fail("receipt_checkpoint/%s leaf %d: equal sizes, roots or proof differ", v.ID, j)
+				}
+			default:
+				if err := proof.VerifyConsistency(rfc6962.DefaultHasher, old.size, cp.Size, pr, old.root, cp.Hash); err != nil {
+					fail("receipt_checkpoint/%s leaf %d: Go refuses the proof levain accepts: %v", v.ID, j, err)
+				}
+			}
+			prev[origin] = anchor{cp.Size, cp.Hash}
+			checked++
+		}
+	}
+	return checked
 }
 
 // ---- Go-generated vectors, for tests/test_contracts_gogen.py --------------------------------------------

@@ -7,8 +7,9 @@ build refuses to write or ingest them. ``canon.check_leaf`` reads this registry 
 from __future__ import annotations
 
 from ..canon import LeafType
-from . import team
+from . import receipt, team
 
 REGISTRY: dict[tuple[str, int], LeafType] = {
     (team.LEAF, team.VERSION): LeafType(frozenset({team.LOG_KIND}), team.check_line_fields),
+    (receipt.LEAF, receipt.VERSION): LeafType(frozenset({receipt.LOG_KIND}), receipt.check_fields),
 }

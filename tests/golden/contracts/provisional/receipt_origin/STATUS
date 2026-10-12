@@ -1,0 +1,13 @@
+PROVISIONAL (S1_DESIGN §2, P12). Not frozen; no package code builds or accepts this production.
+
+What is here: origins.json, the fixture receipt-log origins F10's goldens (frozen/receipt_checkpoint/) are signed
+under. Their form follows Shadow Receipt §7's proposal with C1's recommendation applied (fp_hex, never the
+SHA256: form): levain-receipt/<scope id>/<fp_hex of the device key blob>.
+
+Open question that freezes it: P12, receipt identity. The levain-receipt/... production (scope id for solo vs
+team; whether it embeds fp_hex), which key signs a receipt log (the enrolled device key if Ed25519, or a
+dedicated Ed25519 log key bound to it; SR's signer is a Secure Enclave key), the successor rule when that key
+rotates, and T's receipt-checkpoints/ folder rule. Unblocked by: R5's brief + SR's next round.
+
+F10's checks do not depend on this form: they need only F6's levain-receipt/ prefix and grammar, F3's
+key-name = origin, and the per-origin anchor order.
