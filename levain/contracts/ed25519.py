@@ -5,7 +5,7 @@ levain's Ed25519 profile is "the Go/OpenSSL row": exactly the 12 verdicts the pu
 ``crypto/ed25519``, OpenSSL 3.0, BoringSSL and PyCA. No pre-check and no ZIP-215 sit in front of the
 library: ``tests/test_contracts_ed25519.py`` asserts that this module reproduces the row, so a wheel that
 changes it turns CI red. A ``cryptography`` built against another backend is untested (the row test is the
-detector). F2 note signatures, F4 cosignatures, F12 SSHSIG and F13 all verify through ``verify``.
+detector). Every Ed25519 verdict in ``contracts`` goes through ``verify``.
 """
 from __future__ import annotations
 

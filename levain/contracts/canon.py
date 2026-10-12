@@ -22,7 +22,7 @@ import json
 from . import ContractError
 from .grammar import JSON_INT_MAX, check_int
 
-MAX_DEPTH = 32        # levain's bound (no spec governs it); frozen leaves nest at most 4 deep
+MAX_DEPTH = 32        # levain's bound (no spec governs it)
 LOG_KINDS = ("team", "fleet", "receipt")
 
 # The one global registry: (leaf, v) -> the log kinds that accept it. A leaf name has one meaning across every
