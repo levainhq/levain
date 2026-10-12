@@ -74,7 +74,7 @@ def _status(ck: Cockpit, pid: str) -> dict[str, Any]:
 
 def _derived(fields: dict) -> ProviderSpec:
     """A spec rebuilt from another's ``__dict__`` with some fields changed; ``legacy_kind`` is derived, not an argument."""
-    return ProviderSpec(**{k: v for k, v in fields.items() if k != "legacy_kind"})
+    return ProviderSpec(**{k: v for k, v in fields.items() if k not in ("legacy_kind", "legacy_region")})
 
 
 def _simple(pid: str = "p", *, rows=(), priority="feed", **kw: Any) -> ProviderSpec:

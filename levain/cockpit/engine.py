@@ -82,7 +82,24 @@ SCOPES = ("rows", "store")
 FORM_FIELD_TYPES = ("text", "recipient", "date")
 PRIORITIES = ("gate", "gauge", "feed")
 ZONES = (("operate", "Operate"), ("mind", "Mind"), ("identity", "Identity"))
-HEADER = "header"
+HEADER = "header"     # the legacy region: normalised to hero or brief (or operate) when a spec is built
+# the regions above the zones, in drawing order; a panel in one is a single answer, never a list
+HERO, BRIEF, WIDGETS = "hero", "brief", "widgets"
+TOP_REGIONS = (HERO, BRIEF, WIDGETS)
+HERO_KINDS = ("reading", "ambient")
+BRIEF_KINDS = ("line", "brief")
+WIDGET_KINDS = ("reading", "line", "status-dots", "metric-grid")
+SIZES = ("tall", "medium", "short")
+SPANS = (1, 2, 3)
+FACES = ("", "count")
+ZONE_GRID = 3
+_REGION_ORDER = TOP_REGIONS + tuple(z for z, _ in ZONES)
+# the symbol a reading may carry: a provider maps its own source vocabulary onto this set
+READING_SYMBOLS = ("clear", "clear-night", "partly-cloudy", "partly-cloudy-night", "cloudy", "fog", "drizzle",
+                   "rain", "heavy-rain", "thunderstorm", "snow", "sleet", "wind", "haze")
+# the band tokens the contract names for a sub-reading; a renderer compares case-insensitively,
+# `good` is calm, the rest are hot, and any other string renders neutral
+READING_BANDS = ("good", "moderate", "unhealthy-sensitive", "unhealthy", "very-unhealthy", "hazardous")
 VISUALS = ("sky", "constellation", "cognition-graph", "wrap-history")
 TITLE_MAX = 160
 SOON_DAYS = 3
@@ -148,7 +165,7 @@ class ProviderSpec:
     title: str
     priority: str
     read: Callable[["ReadContext"], Result]
-    region: str = "operate"           # "header" or a zone id
+    region: str = "operate"           # "hero", "brief", "widgets", a zone id, or the legacy "header"
     rank: int = 0
     refresh_every_s: float | None = None
     stale_after_s: float = 900.0
@@ -182,17 +199,31 @@ class ProviderSpec:
     # the levain.cockpit/1 name this spec was declared with, when it declared an alias. Derived from
     # ``kind`` alone: a caller cannot set it, so it can never disagree with the kind it normalised.
     legacy_kind: str = field(default="", init=False)
+    # how the panel draws in a widget: "" (its kind's own face) or "count" (a row-engine kind as its row count)
+    face: str = ""
+    # zone layout (a zone panel only): the card's height and column span, and a shared title that makes
+    # same-zone panels tabs of one card
+    size: str = "medium"
+    span: int = 1
+    tabs: str = ""
+    # "header" when the spec declared the legacy region; ``region`` then holds where it was normalised to.
+    # Derived like ``legacy_kind``: a caller cannot set it.
+    legacy_region: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
         if self.kind in ALIASES:
             self.legacy_kind = self.kind
             self.kind = ALIASES[self.kind]
+        if self.region == HEADER:
+            self.legacy_region = HEADER
+            self.region = HERO if self.kind in HERO_KINDS else (BRIEF if self.kind in BRIEF_KINDS else "operate")
 
     def with_verbs(self, verbs: tuple[str, ...]) -> "ProviderSpec":
         """A copy offering ``verbs``. ``replace`` re-runs ``__post_init__`` on the already-normalised
         kind, so the declared name is carried across explicitly."""
         out = dataclasses.replace(self, verbs=verbs)
         out.legacy_kind = self.legacy_kind
+        out.legacy_region = self.legacy_region
         return out
 
 
@@ -599,7 +630,7 @@ class Cockpit:
             raise CockpitRegistrationError(f"{sid}: unknown kind {spec.kind!r}")
         if spec.priority not in PRIORITIES:
             raise CockpitRegistrationError(f"{sid}: unknown priority {spec.priority!r}")
-        if spec.region != HEADER and spec.region not in {z for z, _ in ZONES}:
+        if spec.region not in TOP_REGIONS and spec.region not in {z for z, _ in ZONES}:
             raise CockpitRegistrationError(f"{sid}: unknown region {spec.region!r}")
         if spec.priority == "gate" and spec.optional:
             raise CockpitRegistrationError(f"{sid}: a gate panel may not register an optional source")
@@ -634,6 +665,7 @@ class Cockpit:
                 seen_views.add(vid)
         elif spec.order is not None or spec.views:
             raise CockpitRegistrationError(f"{sid}: only a list or count-queue has an ordering or views")
+        spec = self._place_locked(spec)
         _validate_search_decl(spec)
         if spec.rowset is not None:
             owner = self._rowsets.get(spec.rowset)
@@ -649,6 +681,56 @@ class Cockpit:
             self._rowsets[spec.rowset] = sid
         self._state = states            # state first: a reader that sees the spec finds its state
         self._specs = specs
+
+    def _place_locked(self, spec: ProviderSpec) -> ProviderSpec:
+        """Validate a spec's place (region, face, size, span, tabs) against the registry and return the spec
+        to store. Registration is incremental, so the hero's at-most-one and a tab card's one size are checked
+        against the specs already registered. A legacy ``header`` reading or ambient that finds the hero slot
+        of its kind taken is stored in ``operate`` instead of refused: a pre-hero provider cannot have known."""
+        sid, kind, region = spec.id, spec.kind, spec.region
+        if not isinstance(spec.face, str) or spec.face not in FACES:
+            raise CockpitRegistrationError(f"{sid}: face must be '' or 'count', got {spec.face!r}")
+        if spec.face == "count" and kind not in ROW_ENGINE_KINDS:
+            raise CockpitRegistrationError(f"{sid}: face 'count' belongs to a row-engine kind "
+                                           f"({', '.join(ROW_ENGINE_KINDS)}), not {kind!r}")
+        if not isinstance(spec.size, str) or spec.size not in SIZES:
+            raise CockpitRegistrationError(f"{sid}: size must be one of {', '.join(SIZES)}, got {spec.size!r}")
+        if isinstance(spec.span, bool) or not isinstance(spec.span, int) or spec.span not in SPANS:
+            raise CockpitRegistrationError(f"{sid}: span must be one of {', '.join(map(str, SPANS))}, got {spec.span!r}")
+        if not isinstance(spec.tabs, str) or len(spec.tabs) > TITLE_MAX:
+            raise CockpitRegistrationError(f"{sid}: tabs must be a card title of at most {TITLE_MAX} characters")
+        if region in TOP_REGIONS:
+            if spec.size != "medium" or spec.span != 1 or spec.tabs:
+                raise CockpitRegistrationError(f"{sid}: size, span and tabs lay out a zone card; {region} takes none")
+        if region == HERO:
+            if kind not in HERO_KINDS:
+                raise CockpitRegistrationError(
+                    f"{sid}: the hero holds a reading and an ambient, not a {kind!r}")
+            if any(o.region == HERO and o.kind == kind for o in self._specs.values()):
+                if spec.legacy_region != HEADER:
+                    raise CockpitRegistrationError(f"{sid}: the hero holds at most one {kind}")
+                moved = dataclasses.replace(spec, region="operate")
+                moved.legacy_region = spec.legacy_region
+                return moved
+        elif region == BRIEF:
+            if kind not in BRIEF_KINDS:
+                raise CockpitRegistrationError(f"{sid}: the brief holds a line or a brief, not a {kind!r}")
+        elif region == WIDGETS:
+            if kind in ROW_ENGINE_KINDS:
+                if spec.face != "count":
+                    raise CockpitRegistrationError(
+                        f"{sid}: a widget is one answer, never a list; a {kind} in widgets must declare face='count'")
+            elif kind not in WIDGET_KINDS:
+                raise CockpitRegistrationError(
+                    f"{sid}: a widget is one answer, never a list; a {kind} cannot sit in widgets "
+                    f"(allowed: {', '.join(WIDGET_KINDS)}, or a list with face='count')")
+        elif spec.tabs:
+            for o in self._specs.values():
+                if o.region == region and o.tabs == spec.tabs and (o.size, o.span) != (spec.size, spec.span):
+                    raise CockpitRegistrationError(
+                        f"{sid}: tabs {spec.tabs!r} in {region} share one card with {o.id!r}, which is "
+                        f"size={o.size} span={o.span}; {sid} asks size={spec.size} span={spec.span}")
+        return spec
 
     @property
     def panel_ids(self) -> list[str]:
@@ -1229,6 +1311,7 @@ class Cockpit:
                                                       labels.label(snap.value_label_key))
                         if self._verb_view is not None else []),
             "edit_class": spec.edit_class or None,
+            **({"face": spec.face} if spec.face else {}),
         }
 
     @staticmethod
@@ -1254,7 +1337,7 @@ class Cockpit:
         its own; every row keeps its source ``panel_id``. Its status is the worst of its sources'."""
         sources = sorted(
             (s for s in specs_map.values() if s.priority == "gate" and s.kind in ROW_ENGINE_KINDS),
-            key=lambda s: (0 if s.region == HEADER else 1 + [z for z, _ in ZONES].index(s.region), s.rank, s.id),
+            key=lambda s: (_REGION_ORDER.index(s.region), s.rank, s.id),
         )
         rows: list[dict[str, Any]] = []
         degraded: list[str] = []
@@ -1413,9 +1496,7 @@ class Cockpit:
 
     @staticmethod
     def _ordered_specs(specs_map: dict[str, ProviderSpec]) -> list[ProviderSpec]:
-        zi = [z for z, _ in ZONES]
-        return sorted(specs_map.values(),
-                      key=lambda s: (-1 if s.region == HEADER else zi.index(s.region), s.rank, s.id))
+        return sorted(specs_map.values(), key=lambda s: (_REGION_ORDER.index(s.region), s.rank, s.id))
 
     def manifest(self, credential: dict[str, Any], *, install_class: str | None = None,
                  transport: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1435,16 +1516,11 @@ class Cockpit:
         now_head, _ = self._now_head_and_rows(ctx, credential["class"], specs_map, snaps)
         heads[NOW_ID] = now_head
         specs = self._ordered_specs(specs_map)
-        regions = {
-            "header": [s.id for s in specs if s.region == HEADER],
-            "zones": [
-                {"id": zid, "title": zt,
-                 "panels": ([NOW_ID] if zid == "operate" else []) + [s.id for s in specs if s.region == zid]}
-                for zid, zt in ZONES
-            ],
-        }
+        regions = self._regions(specs)
         order = [NOW_ID] + [s.id for s in specs]
-        etag = _sha({"schema": SCHEMA, "panels": [heads[i]["etag"] for i in order], "credential": credential, "verbs": self._verb_rev(),
+        # regions are content: a card's size or tabs changes no panel's etag, so they are hashed here
+        etag = _sha({"schema": SCHEMA, "panels": [heads[i]["etag"] for i in order], "regions": regions,
+                     "credential": credential, "verbs": self._verb_rev(),
                      "install_class": install_class, "policy_revision": POLICY_REVISION,
                      "entity": entity, "errors": errors,    # identity and manifest faults are content too
                      "transport": transport})
@@ -1458,6 +1534,34 @@ class Cockpit:
         if transport is not None:
             out["transport"] = dict(transport)
         return out
+
+    @staticmethod
+    def _regions(specs: list[ProviderSpec]) -> dict[str, Any]:
+        """The manifest's ``regions``. ``specs`` arrives in drawing order. ``header`` is COMPAT: what a renderer
+        that predates hero and brief reads (the hero, then the brief), derived and never declared. A zone's
+        flat ``panels`` list is likewise kept beside its ``cards``."""
+        hero = [s.id for s in specs if s.region == HERO and s.kind == "reading"] + \
+               [s.id for s in specs if s.region == HERO and s.kind != "reading"]
+        brief = [s.id for s in specs if s.region == BRIEF]
+        zones = []
+        for zid, zt in ZONES:
+            members = [s for s in specs if s.region == zid]
+            cards: list[dict[str, Any]] = [
+                {"panels": [NOW_ID], "size": "medium", "span": 1, "tabs": None}] if zid == "operate" else []
+            by_tabs: dict[str, dict[str, Any]] = {}
+            for s in members:
+                if s.tabs and s.tabs in by_tabs:
+                    by_tabs[s.tabs]["panels"].append(s.id)
+                    continue
+                card = {"panels": [s.id], "size": s.size, "span": s.span, "tabs": s.tabs or None}
+                cards.append(card)
+                if s.tabs:
+                    by_tabs[s.tabs] = card
+            zones.append({"id": zid, "title": zt, "grid": ZONE_GRID,
+                          "panels": ([NOW_ID] if zid == "operate" else []) + [s.id for s in members],
+                          "cards": cards})
+        return {"hero": hero, "brief": brief, "widgets": [s.id for s in specs if s.region == WIDGETS],
+                "header": hero + brief, "zones": zones}
 
     def freshness(self) -> dict[str, dict[str, Any]]:
         """``{panel_id: {as_of, status}}`` for every registered panel, ``now`` included (design §3.4).
@@ -1964,6 +2068,10 @@ def _v_reading(spec: "ProviderSpec", v: Any) -> dict[str, Any]:
                 raise _bad(spec, f"value.sub[{i}].value", "must be a number or a string")
             if sr.get("band") is not None and not _is_str(sr["band"]):
                 raise _bad(spec, f"value.sub[{i}].band", "must be a string")
+            if sr.get("detail") is not None and not _is_str(sr["detail"]):
+                raise _bad(spec, f"value.sub[{i}].detail", "must be a string")
+    if v.get("symbol") is not None and v["symbol"] not in READING_SYMBOLS:
+        raise _bad(spec, "value.symbol", f"must be one of {', '.join(READING_SYMBOLS)}, got {v['symbol']!r}")
     return v
 
 

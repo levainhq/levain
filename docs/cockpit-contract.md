@@ -12,7 +12,7 @@ Every timestamp (`as_of`, `at`) is ISO-8601.
 
 | kind | the provider sends | refused when |
 |---|---|---|
-| `reading` | `{value, unit, condition, as_of, hi?, lo?, sub?: [{label, value, band?}]}`; `value` is a number or a non-empty string | `value` missing, boolean or null; `unit`/`condition` not strings (empty is fine); `as_of` not ISO; `hi`/`lo` not numbers; a sub-reading without a label |
+| `reading` | `{value, unit, condition, as_of, hi?, lo?, symbol?, sub?: [{label, value, band?, detail?}]}`; `value` is a number or a non-empty string | `value` missing, boolean or null; `unit`/`condition` not strings (empty is fine); `as_of` not ISO; `hi`/`lo` not numbers; a `symbol` outside the token set below; a sub-reading without a label, or a `detail` that is not a string |
 | `line` | `{lines: [{text, label?, at?}]}` | `lines` not a list of objects; a `text` that is not a string; an `at` that is not ISO |
 | `brief` | `{markdown?, lines?: [{label?, text}], headline?}`; at least one of `markdown` / `lines` | neither present; `markdown` or `headline` not a string; a line without `text` |
 | `count-queue` | the `list` contract below; the head's `count` is the queue's big number | as `list` |
@@ -34,6 +34,53 @@ Notes a provider relies on:
 - **`log`**: the kernel adds a `sentence` to each row, `"<verb label> · <target>"`, from the
   manifest's verb labels (`Snoozed · spore-1238`). A verb with no label renders as its raw name.
 - **`ambient`**: the kernel stores and serves the events as sent. The renderer owns the encoding.
+
+## Regions and zone layout
+
+`ProviderSpec.region` places a panel. A renderer draws, top to bottom: the **hero**, the **brief**, the
+**widgets**, then the three zones (`operate`, `mind`, `identity`) on a three-column grid.
+
+| region | holds | refused |
+|---|---|---|
+| `hero` | a `reading` (at most one) and an `ambient` (at most one); the renderer draws its own clock first, the reading under it, the ambient beside it | a second reading or ambient; any other kind |
+| `brief` | `line` and `brief`, in rank order | any other kind |
+| `widgets` | one answer each: `reading`, `line`, `status-dots`, `metric-grid`, and a `list` or `count-queue` that declares `face="count"` | `brief`, `ambient`, `roster`, `log`, `form`, and a row-engine kind without `face="count"`. A widget is one answer, never a list |
+| `operate` / `mind` / `identity` | any kind | |
+
+- **`face`** is `""` (the kind's own face) or `"count"`. `"count"` is valid only on a `list` or `count-queue`, in any
+  region; in a widget it draws the row count and the panel's note, and the rows surface through `now` and the
+  panel's own view. A panel head carries `face` only when it is non-empty.
+- **`size`** (`tall`, `medium`, `short`; default `medium`), **`span`** (`1`, `2`, `3`; default `1`) and **`tabs`** (a card
+  title) lay out a zone panel; a non-default on a hero, brief or widgets panel is refused. Panels of one zone that
+  share a non-empty `tabs` title are the tabs of ONE card, in rank order. The card takes the first panel's size and
+  span, and a later registration in the same zone and `tabs` with a different size or span is refused, naming both panels.
+- **The legacy region `header`** is still accepted and is normalised when the spec is built, like a kind alias
+  (`legacy_region` records the declared one): a `reading` or `ambient` becomes `hero`, a `line` or `brief` becomes
+  `brief`, any other kind becomes `operate`. If the hero already holds a panel of that kind, the later legacy panel
+  goes to `operate` rather than being refused; a declared `hero` is refused.
+
+The manifest's `regions`:
+
+```
+"regions": {
+  "hero": [ids], "brief": [ids], "widgets": [ids],
+  "header": [hero ids..., brief ids...],
+  "zones": [{"id", "title", "grid": 3, "panels": [ids],
+             "cards": [{"panels": [ids], "size", "span", "tabs": title|null}]}]
+}
+```
+
+`header` is **compat**: what a renderer that predates the hero reads, derived and never declared. A zone's `panels`
+is the flat list as before; `cards` is the layout over the same ids, in panel order. `now` leads `operate` as a card
+of its own (size `medium`, span 1, no tabs). Regions are content: they are hashed into the manifest etag.
+
+**Reading tokens.** `value.symbol` is optional and one of `clear`, `clear-night`, `partly-cloudy`,
+`partly-cloudy-night`, `cloudy`, `fog`, `drizzle`, `rain`, `heavy-rain`, `thunderstorm`, `snow`, `sleet`, `wind`,
+`haze` (`READING_SYMBOLS`); a provider maps its own source vocabulary onto the set, and an unknown token is refused.
+A sub-reading's `band` stays any string, and the contract names the lowercase tokens `good`, `moderate`,
+`unhealthy-sensitive`, `unhealthy`, `very-unhealthy`, `hazardous` (`READING_BANDS`): a renderer compares
+case-insensitively, `good` is calm, the rest are hot, and any other token renders neutral. A sub-reading's `detail`
+is a free string (for instance the measuring source).
 
 ## Aliases and `levain.cockpit/1` providers
 
@@ -106,7 +153,7 @@ A property of every row-shaped kind (`list`, `count-queue`, `roster`, `log`), ow
 ## Text fallback
 
 `levain.cockpit.text` draws every kind as text lines, for the terminal view and for any renderer
-that has no component for a kind: `reading` (value, unit, condition, hi/lo, age, sub-readings),
+that has no component for a kind: `reading` (value, unit, condition, hi/lo, age, sub-readings); it draws the hero, brief and widgets, then each zone,
 `line`, `brief`, `ambient` (legend, event count, per-repo counts; a `/1` visual draws its own
 text projection), `status-dots`, `metric-grid`, `roster` (grouped, with last call or "no data"),
 `form` (fields and recipient choices), `log` (one sentence per row), `list` and `count-queue` (rows).

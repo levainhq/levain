@@ -8,6 +8,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ### Added
 
+- **The cockpit contract gains `hero`, `brief` and `widgets` regions, a zone grid and reading tokens** (still `levain.cockpit/2`; a current provider registers and renders unchanged). The hero holds one `reading` and one `ambient`; the brief holds `line`s and `brief`s; a widget is one answer, so a `list` there must declare `face="count"`. A zone panel takes `size`, `span` and `tabs` (same-zone panels sharing a `tabs` title are one card), and the manifest's `regions` carries `cards` beside the flat `panels`. The legacy `header` region is normalised at registration (a reading or ambient to the hero, a line or brief to the brief, anything else to `operate`) and `regions.header` stays as a derived compat key. A `reading` may send a `symbol` from a fixed token set and a sub-reading a `detail`; the band tokens are named in the contract.
 - **`GateHandle`** (`levain.autonomic.handle`). A process holds one handle over its current `EfferentGate`. `swap(manifest, binding_catalog, aggregate)` builds a new gate on a frozen copy of the catalog and publishes it in one step; pending holds, receipts and the journal carry across. `FireDispatcher` and `ChainExecutor` read the handle once per admission, so an admission in flight completes on the gate it started with.
 
 ### Changed

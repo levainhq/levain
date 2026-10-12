@@ -278,7 +278,7 @@ def _rows(head: dict[str, Any], panel: dict[str, Any], width: int, top_n: int) -
 
 def render_lines(snap: dict[str, Any], width: int = 100, *, now: datetime | None = None,
                  top_n: int = DEFAULT_TOP_N) -> list[tuple[str, str]]:
-    """``(style, text)`` lines for the whole cockpit: the entity masthead, the header panels, then
+    """``(style, text)`` lines for the whole cockpit: the entity masthead, the hero, brief and widgets panels, then
     each zone's panels, all in the manifest's own order."""
     manifest, panels = snap["manifest"], snap["panels"]
     now = now or datetime.now(timezone.utc)
@@ -299,7 +299,12 @@ def render_lines(snap: dict[str, Any], width: int = 100, *, now: datetime | None
         panel = panels.get(pid)
         out.extend(_panel_lines(panel if panel is not None else head, panel, now, width, top_n))
 
-    for pid in manifest["regions"].get("header", []):
+    regions = manifest["regions"]
+    if "hero" in regions:       # a manifest from a kernel that predates the hero carries only the compat key
+        top = [*regions["hero"], *regions.get("brief", []), *regions.get("widgets", [])]
+    else:
+        top = regions.get("header", [])
+    for pid in top:
         draw(pid)
     for zone in manifest["regions"].get("zones", []):
         out.append((HEAD, ""))
