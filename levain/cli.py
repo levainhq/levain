@@ -338,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ck_p = subparsers.add_parser(
         "cockpit",
-        help="Enroll, revoke and list the cockpit's signing keys (a reported install).",
+        help="Enroll, revoke and list the cockpit's signing keys, and initialise its authority log (a reported install).",
         description=(
             "The keys that sign the cockpit's T2/T3 writes, held as links in the signed authority log. "
             "`enroll` adds an OpenSSH public key (class laptop-presence signs T2 and T3, display-phone "
@@ -385,6 +385,31 @@ def main(argv: list[str] | None = None) -> int:
     ck_keys = ck_sub.add_parser("keys", help="List enrolled keys.")
     _ck_common(ck_keys)
     ck_keys.set_defaults(func=_cmd_cockpit_keys)
+    ck_ledger = ck_sub.add_parser("ledger", help="The authority log itself.")
+    ck_ledger_sub = ck_ledger.add_subparsers(dest="ledger_cmd", required=True)
+    ck_init = ck_ledger_sub.add_parser(
+        "init",
+        help="Write the authority log's first links.",
+        description=(
+            "Initialise the authority log, every link signed by --signing-key (a laptop-presence key; a "
+            "touch-required key asks once per link). A fresh store gets the genesis: the signing key "
+            "enrolled as laptop-presence, signed by itself (trust on first use). A store upgraded from "
+            "levain-cockpit/2 lists the keys it held; each confirmed key is re-enrolled (a revoked one "
+            "enrolled then revoked), a key whose type its class no longer accepts is skipped, and the rest "
+            "are dropped. Every key enrolled is confirmed, the signing key included: at a terminal by a "
+            "prompt per key, otherwise by --confirm."
+        ),
+    )
+    ck_init.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                         help="The laptop-presence key that signs every link (its private key file, or the "
+                              ".pub of a key an agent holds).")
+    ck_init.add_argument("--confirm", dest="confirm", action="append", default=[], metavar="FINGERPRINT",
+                         help="Keep this key (SHA256:...); repeatable. With --confirm or --drop-unlisted "
+                              "nothing is asked.")
+    ck_init.add_argument("--drop-unlisted", dest="drop_unlisted", action="store_true",
+                         help="Drop every listed key not named by --confirm.")
+    _ck_common(ck_init)
+    ck_init.set_defaults(func=_cmd_cockpit_ledger_init)
 
     run_p = subparsers.add_parser(
         "run",
@@ -1626,6 +1651,74 @@ def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
         print(f"{r.fingerprint}  {r.key_class:<16} {state:<44} enrolled at seq {r.enrolled_seq}"
               + (f" ({r.enrolled_at})" if r.enrolled_at else "")
               + (f", first enrolled {r.legacy_enrolled_at}" if r.legacy_enrolled_at else ""))
+    return 0
+
+
+def _ask(prompt: str) -> bool:
+    try:
+        return input(prompt).strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _cmd_cockpit_ledger_init(args: argparse.Namespace) -> int:
+    from levain.cockpit.keys import init_plan, ledger_init, signing_public_key, ssh_signer
+
+    try:
+        root = _cockpit_root(args)
+        signer_fp, sign = ssh_signer(args.signing_key)
+        signer_pub = signing_public_key(args.signing_key)
+        plan = init_plan(root, now=_utc_now())
+        if plan.migrated:
+            print(f"this store was upgraded from levain-cockpit/2 and held {len(plan.rows)} key(s):")
+        else:
+            print("a fresh store: its first link enrols the signing key as laptop-presence, signed by "
+                  "itself (trust on first use)")
+        if plan.seq:
+            print(f"an earlier init was cut off with the log's head at seq {plan.seq}; this run resumes it")
+        for r in plan.rows:
+            notes = ["revoked" + (", compromised" if r.compromised else "") if r.revoked else "active"]
+            if r.fingerprint == signer_fp:
+                notes.append("the signing key")
+            if r.in_log is not None:
+                notes.append(f"in the log at seq {r.in_log.enrolled_seq}")
+            if r.problem:
+                notes.append(f"SKIPPED: {r.problem}")
+            print(f"  {r.fingerprint}  {r.key_class:<16} {r.key_type:<36} enrolled {r.enrolled_at or '?'}  "
+                  f"({'; '.join(notes)})")
+        if signer_fp not in {r.fingerprint for r in plan.rows}:
+            print(f"  {signer_fp}  {'laptop-presence':<16} {signer_pub.split()[0]:<36} the signing key "
+                  "(new: the genesis)")
+        if args.confirm or args.drop_unlisted:
+            confirmed, drop = set(args.confirm), args.drop_unlisted
+        elif sys.stdin.isatty():
+            confirmed, drop = set(), True
+            asks = [signer_fp] + [r.fingerprint for r in plan.rows
+                                  if r.problem is None and r.fingerprint != signer_fp]
+            for fp in asks:
+                if _ask(f"keep {fp}{' (the signing key, the genesis)' if fp == signer_fp else ''}? [y/N] "):
+                    confirmed.add(fp)
+        else:
+            sys.stdout.flush()
+            print("ledger init refused: stdin is not a terminal, so nothing can be confirmed; pass "
+                  "--confirm <fingerprint> for each key to keep (the signing key included) and "
+                  "--drop-unlisted to drop the rest", file=sys.stderr)
+            return 1
+        result = ledger_init(root, signer_public_key=signer_pub, signer_fp=signer_fp, sign=sign, clock=_utc_now,
+                             confirmed=confirmed, drop_unlisted=drop)
+    except _cockpit_refusals() as exc:
+        sys.stdout.flush()                    # the listing above, before the refusal under it
+        print(f"ledger init refused: {exc}", file=sys.stderr)
+        return 1
+    for line in result.links:
+        print(line)
+    for fp in result.dropped:
+        print(f"dropped: {fp}")
+    for fp in result.skipped:
+        print(f"skipped: {fp}")
+    print(f"initialised: store {result.store_id}, head at seq {result.seq}")
+    if result.warning:
+        print(f"warning: {result.warning}", file=sys.stderr)
     return 0
 
 
