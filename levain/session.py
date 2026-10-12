@@ -767,17 +767,13 @@ class EntitySession:
         not. The gate therefore treats ``headless`` and ``unattended`` identically, which is
         correct: neither has anyone to fan an action in to at the moment it would fire.
 
-        The **crown-jewels cred floor** draws the same line: the standard credential stores are denied
-        in every mode but ``interactive``, unless the entity's ``confinement.json`` sets
-        ``deny_standard_creds`` (``false`` allows them in every mode, ``true`` denies them in every mode). A ``headless`` turn is read after its text was captured, the same as a
-        scheduled seat's, so a credential it reads can compound into always-loaded memory before
-        anyone sees it. An entity whose task needs ``gh`` or an HTTPS git remote sets
-        ``"deny_standard_creds": false`` (or uses an ssh remote). Why this is the floor's one
-        drive-dependent part, and the rest of it presence-INDEPENDENT, is argued in full in
+        The **crown-jewels cred floor** does not read presence: absent a declaration it denies the
+        standard credential stores in every drive, the interactive REPL included (2026-10-12), and
+        the entity's ``deny_standard_creds: false`` reopens them. Why is argued in full in
         :mod:`levain.firing.drive`.
 
-        **It defaults to ``"headless"``** — a caller that forgets gets the GATE armed and the
-        standard credential stores denied: governed, not ungoverned, on both axes.
+        **It defaults to ``"headless"``** — a caller that forgets gets the GATE armed (governed,
+        not ungoverned); the cred floor is the same in every drive.
 
         Raises :class:`SessionStartError` (message already operator-ready) if the entity cannot
         be started sovereignly — INCLUDING a gate that would not arm. A session that believes it

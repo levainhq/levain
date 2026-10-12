@@ -28,11 +28,11 @@ person: whatever read it from the server's output (a script, a supervisor, a log
 session, and activity is pull-only, so nothing guarantees a human reads it. The precondition is not
 met, so the server does not claim it, and a client that presents the token does not earn
 ``interactive``. In ``headless`` an entity whose ``efferent_gate`` is ``"auto"`` is GATED: a turn that
-proposes an efferent action halts, and the client approves or rejects it. The choice also moves the
-credential floor: an entity that does not declare ``deny_standard_creds`` has the standard credential
-stores denied in ``headless``, as in ``unattended``, and readable only in ``interactive``, where a human
-watches the read happen (:func:`levain.firing.drive.resolve_cred_floor`). A chat entity whose work needs
-one of those stores opts in with ``deny_standard_creds: false``. (L1 review 2026-10-03; revisit only if
+proposes an efferent action halts, and the client approves or rejects it. The credential floor does
+not read the mode: an entity that does not declare ``deny_standard_creds`` has the standard credential
+stores denied in every drive, ``interactive`` included since 2026-10-12
+(:func:`levain.firing.drive.resolve_cred_floor`). A chat entity whose work needs one of those stores opts
+in with ``deny_standard_creds: false``. (L1 review 2026-10-03; revisit only if
 a chat client can show that a present human, not just a token holder, is driving.)
 
 **An entity that may reach this server is refused.** With ``allow_localhost_outbound`` its shell

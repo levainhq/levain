@@ -205,10 +205,10 @@ def test_the_binding_threads_deny_standard_creds(tmp_path: Path, monkeypatch):
     (ent / ".levain" / "confinement.json").write_text('{"deny_standard_creds": true}')
     pol = _policy(ws, mode="interactive")
     assert crown_jewel_reason(pol, tmp_path / ".config" / "gh" / "hosts.yml") is not None
-    # a DIFFERENT entity with no confinement.json does NOT fold them in AT AN INTERACTIVE DRIVE
-    # (gh hands intact for the operator who is sitting right there)
+    # a DIFFERENT entity that opts in with false does NOT fold them in, even at the REPL
     ent2 = tmp_path / "e2"
     (ent2 / ".levain").mkdir(parents=True)
+    (ent2 / ".levain" / "confinement.json").write_text('{"deny_standard_creds": false}')
     ws2 = ent2 / "workspace"
     ws2.mkdir()
     pol2 = _policy(ws2, mode="interactive")
@@ -237,20 +237,16 @@ def test_the_binding_wires_deny_localhost_outbound_both_modes(tmp_path: Path, mo
     assert _policy(ws).deny_localhost_outbound is False
 
 
-def test_the_binding_denies_standard_creds_on_an_UNATTENDED_drive(tmp_path: Path,
-                                                                            monkeypatch):
-    """K4a: with no declaration, an UNATTENDED seat folds the standard cred stores into the floor
-    while an interactive drive does not — same entity, same (absent) config, drive mode the only
-    variable. This is the FILE-EDITOR enforcer, which is the one that matters: `view` is afferent,
-    so the K3 gate never sees the read."""
+def test_the_binding_denies_standard_creds_on_EVERY_drive(tmp_path: Path, monkeypatch):
+    """K4a, then N7 (2026-10-12): with no declaration, every drive folds the standard cred stores into
+    the floor, the interactive REPL included. This is the FILE-EDITOR enforcer, which is the one that
+    matters: `view` is afferent, so the K3 gate never sees the read."""
     monkeypatch.setenv("HOME", str(tmp_path))
     ent, ws = _entity(tmp_path)          # no confinement.json at all → the tri-state ABSENT
     gh = tmp_path / ".config" / "gh" / "hosts.yml"
 
-    assert crown_jewel_reason(
-        _policy(ws, mode="interactive"), gh) is None
-    assert crown_jewel_reason(
-        _policy(ws, mode="unattended"), gh) is not None
+    for mode in ("interactive", "headless", "unattended"):
+        assert crown_jewel_reason(_policy(ws, mode=mode), gh) is not None, mode
 
 
 def test_the_binding_honours_an_EXPLICIT_false_even_unattended(tmp_path: Path,
