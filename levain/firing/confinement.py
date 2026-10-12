@@ -4955,12 +4955,15 @@ def _gpg_agent_sockets() -> list[Path]:
     """The operator's gpg-agent sockets, its own and its ssh one, as ``gpgconf`` names them for this
     process's GNUPGHOME, the default one or not. Empty when gpgconf is missing or fails: gpg inside bash
     then finds no agent, a degrade rather than an exposure."""
+    from levain.launch import child_env
+
     exe = shutil.which("gpgconf")
     if exe is None:
         return []
     try:
         done = subprocess.run([exe, "--list-dirs", "agent-socket", "agent-ssh-socket"],
-                              capture_output=True, text=True, timeout=10, check=False)
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/",
+                              env=child_env("GNUPGHOME"), timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         return []
     if done.returncode != 0:
