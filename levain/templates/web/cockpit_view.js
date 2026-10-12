@@ -131,13 +131,23 @@
     return out.length ? out : null;
   }
 
-  // the text a search matches for one row: the declared fields' values, folded once here
-  function hayOf(parts) { return fold(parts.filter((x) => typeof x === "string" || isNum(x)).join(" ")); }
+  // The text a search matches for one row: only the panel's declared search fields, folded once here, with
+  // the kernel's own rules (levain/cockpit/engine.py `_field_text` for a row panel, a plain field read for a
+  // roster or log row): title, body and id are the row's own, any other name is a facet whose list is joined.
+  const ROW_FIELDS = ["title", "body", "id"];
+  const textOf = (v) => v === null || v === undefined ? "" : Array.isArray(v) ? v.map(textOf).join(" ")
+    : typeof v === "string" || isNum(v) || typeof v === "boolean" ? String(v) : "";
+  const rowText = (r, f) => f === "title" || f === "body" || f === "id" ? (typeof r[f] === "string" ? r[f] : "") : textOf((r.facets || {})[f]);
+  const valueText = (r, f) => r[f] ? textOf(r[f]) : "";
+  const hayOfRow = (r, fields) => fold(fields.map((f) => rowText(r, f)).join(" "));
+  const hayOfValue = (r, fields) => fold(fields.map((f) => valueText(r, f)).join(" "));
+  const fieldsOf = (sr, dflt) => sr.fields.length ? sr.fields : dflt;
 
   function searchOf(panel) {
     const s = isObj(panel.search) ? panel.search : {};
     return {
-      on: panel.searchable === true, scope: s.scope === "store" ? "store" : "rows", hook: s.hook === true,
+      on: panel.searchable === true, fields: Array.isArray(s.fields) ? s.fields.filter((f) => typeof f === "string") : [],
+      scope: s.scope === "store" ? "store" : "rows", hook: s.hook === true,
       window: isNum(panel.window) ? panel.window : null,
       visible: Number.isInteger(s.default_visible) && s.default_visible > 0 ? s.default_visible : 10,
       matchLabel: typeof panel.match_label === "string" ? panel.match_label : "",
@@ -173,8 +183,8 @@
         }
         return line;
       });
-      out.hays = (panel.rows || []).map((r) => hayOf([bare(r.id), r.title, r.body].concat(
-        Object.values(isObj(r.facets) ? r.facets : {}).filter((x) => typeof x === "string"))));
+      const fields = fieldsOf(out.search, ROW_FIELDS);
+      out.hays = (panel.rows || []).map((r) => hayOfRow(r, fields));
       out.typed = true;
       out.count = isNum(panel.count) ? panel.count : null;
       if (panel.degraded && panel.degraded.length) {
@@ -220,13 +230,15 @@
       need(Array.isArray(v.rows) && v.rows.every((r) => isObj(r) && typeof r.name === "string"), "roster rows");
       const rows = v.rows.filter((r) => r.lifecycle !== "retired");
       out.roster = rows;
-      out.hays = rows.map((r) => hayOf([r.name, r.role, r.group, r.memory, r.cadence, r.lifecycle, r.wrap_every]));
+      const fields = fieldsOf(out.search, ["name", "role", "group"]);
+      out.hays = rows.map((r) => hayOfValue(r, fields));
       out.retiredHidden = isNum(v.retired_hidden) ? v.retired_hidden : 0;
       out.typed = true;
     } else if (kind === "log") {
       need(Array.isArray(v.rows) && v.rows.every((r) => isObj(r) && typeof r.verb === "string"), "log rows");
       out.logRows = v.rows;
-      out.hays = v.rows.map((r) => hayOf([r.verb, r.target, r.actor, r.at, r.sentence]));
+      const fields = fieldsOf(out.search, ["verb", "target", "actor"]);
+      out.hays = v.rows.map((r) => hayOfValue(r, fields));
       out.typed = true;
     } else if (kind === "form") {
       need(Array.isArray(v.fields) && v.fields.length && v.fields.every((f) => isObj(f) && typeof f.name === "string"), "form fields");
@@ -361,9 +373,19 @@
     return { name: f.name, label: f.type === "date" ? label + " (YYYY-MM-DD)" : label, kind: long ? "textarea" : "text", required: long };
   }
 
+  // The last manifest the page was drawn from and when it was fetched: a single panel's refetch maps its fresh
+  // payload through the same mapper, against this manifest, so it draws exactly what a full load would.
+  let lastManifest = null;
+  let manifestAt = 0;
+
   // snap = {manifest, panels}; returns the SubstrateView-shaped object dashboard_core.js renders.
   // `snap.panels` maps a panel id to its payload, or to {error} when its fetch failed.
   function fromManifest(raw, opts) {
+    lastManifest = raw.manifest;
+    manifestAt = Date.now() - Math.max(0, (opts && opts.elapsedMs) || 0);
+    return mapSnapshot(raw, opts);
+  }
+  function mapSnapshot(raw, opts) {
     const elapsed = Math.max(0, (opts && opts.elapsedMs) || 0);   // time since the manifest was fetched, measured by the caller
     // The manifest and each panel are cleaned apart: a hostile key inside ONE panel's payload (two keys that
     // clean to one) rejects that panel alone; a collision in the manifest or between two panel ids is
@@ -550,7 +572,9 @@
         view.extra_panels[pid].pid = pid;
         // a downstream's own verb on this panel becomes the compose box. The manifest names the verb's
         // fields and not their widgets, so a widget is chosen from the field's name (a known edge).
-        const own = pActions.find((a) => !isObj(a.target) || typeof a.target.row_id !== "string");
+        // a form panel names its verb: the action is the one offered under that name, and no other
+        const formVerb = view.extra_panels[pid].form ? view.extra_panels[pid].form.verb : null;
+        const own = pActions.find((a) => (!isObj(a.target) || typeof a.target.row_id !== "string") && (formVerb === null || a.verb === formVerb));
         const vh = own && isObj(view.verb_heads[own.verb]) ? view.verb_heads[own.verb] : null;
         if (vh && !NATIVE.has(pid)) {
           view.extra_panels[pid].action = { verb: own.verb, fields: (Array.isArray(vh.fields) ? vh.fields : []).filter((n) => typeof n === "string").map(composeField) };
@@ -699,10 +723,12 @@
     return parts.slice(0, 3).join(" · ") || "no data";
   }
 
+  // the kernel's sentence, else the verb and the target when the row has one
+  function logLine(r) { return typeof r.sentence === "string" && r.sentence ? r.sentence : typeof r.target === "string" && r.target ? r.verb + " · " + r.target : r.verb; }
   function paintLog(host, rows) {
     for (const r of rows) {
       const row = el("div", "lrow");
-      row.appendChild(el("span", "lsent", typeof r.sentence === "string" && r.sentence ? r.sentence : r.verb + " · " + r.target));
+      row.appendChild(el("span", "lsent", logLine(r)));
       row.appendChild(el("span", "lactor", r.actor));
       row.appendChild(el("span", "lage", ago(r.at) || r.at));
       host.appendChild(row);
@@ -774,12 +800,27 @@
   function tickClocks() {
     for (const c of Array.from(clocks)) {
       if (c.node.isConnected) c.seen = true;
-      else if (c.seen) { clocks.delete(c); continue; }       // a clock never attached yet is still being built
+      else if (c.seen || Date.now() - c.born > 5000) { clocks.delete(c); continue; }   // a clock never attached yet is still being built
       setClock(c);
     }
     if (!clocks.size && clockTimer) { root.clearInterval(clockTimer); clockTimer = 0; }
   }
+  // The sky's mount and the clock a panel owns end with the paint that made them.
+  function dropSky(s) {
+    if (s.skyHandle && typeof s.skyHandle.destroy === "function") { try { s.skyHandle.destroy(); } catch (_) { /* a mount that cannot unmount */ } }
+    s.skyHandle = null;
+    if (s.clock) clocks.delete(s.clock);
+    s.clock = null;
+  }
+  // A panel body that leaves the page for good: nothing it started keeps running.
+  function teardown(s) {
+    root.clearTimeout(s.timer);
+    s.seq++;
+    dropSky(s);
+    states.delete(s);
+  }
   function paintSky(s, host, sky) {
+    dropSky(s);
     const wrap = el("div", "sky");
     const when = el("div", "when");
     const t = el("div", "clock num");
@@ -788,7 +829,8 @@
     const repos = new Set(sky.events.map((e) => e.repo).filter((r) => typeof r === "string" && r));
     const failed = sky.events.filter((e) => e.outcome === "failed").length;
     when.appendChild(el("div", "win", sky.events.length + " events from " + repos.size + " repos" + (failed ? " · " + failed + " failed" : "")));
-    const clk = { node: t, date: date, seen: false };
+    const clk = { node: t, date: date, seen: false, born: Date.now() };
+    s.clock = clk;
     clocks.add(clk);
     setClock(clk);
     if (!clockTimer) clockTimer = root.setInterval(tickClocks, 30000);
@@ -808,13 +850,14 @@
     const s = { pid: data.pid, title: (p.querySelector("h2") || {}).textContent || data.pid, data: data, p: p, ctx: ctx || {},
                 query: saved(FILTER_KEY + data.pid) || "", results: null, timer: 0, seq: 0, born: Date.now() };
     // a rebuilt board leaves its old bodies behind: drop the ones that were never going to be seen again
-    for (const o of Array.from(states)) if (!o.p.isConnected && Date.now() - o.born > 5000) states.delete(o);
+    for (const o of Array.from(states)) if (!o.body.isConnected && Date.now() - o.born > 5000) teardown(o);
     p.classList.add("k-" + data.kind);
     if (data.kind === "ambient" && data.sky) p.classList.add("panel-hero");
     s.body = el("div", "xbody");
     const sr = data.search || {};
     const rowKind = data.kind === "list" || data.kind === "count-queue" || data.kind === "roster" || data.kind === "log";
     s.searchable = rowKind && sr.on === true;
+    if (!s.searchable) s.query = "";     // a filter saved for a panel that has no filter box must not filter it
     if (data.kind === "count-queue") {
       const n = isNum(data.count) ? data.count : (data.lines || []).length;
       const big = el("div", "cq");
@@ -828,7 +871,7 @@
     s.paint = () => paint(s);
     states.add(s);
     paint(s);
-    if (s.searchable && s.query && sr.scope === "store") runStoreSearch(s);
+    if (s.searchable && sendable(s.query) && sr.scope === "store") runStoreSearch(s);
     if (focusKeep && focusKeep.pid === s.pid && s.filterInput) {
       const keep = focusKeep;
       // the panel is attached by the caller after this returns; a node that is not in the page cannot take focus
@@ -849,6 +892,7 @@
 
   function paint(s) {
     const d = s.data, sr = d.search || {};
+    dropSky(s);
     s.body.replaceChildren();
     if (s.fault) { s.body.appendChild(el("p", "err", "unavailable — " + s.fault)); return; }
     if (d.kind === "status-dots") { paintStatusDots(s.body, d.metrics || []); if (!(d.metrics || []).length) s.body.appendChild(el("p", "empty", d.empty)); return; }
@@ -862,8 +906,9 @@
       return;
     }
     // row-shaped: the window, or the store's answer to the query
+    const nq = sendable(s.query);     // the query as the kernel would take it: a blank one is no query
     const terms = termsOf(s.query);
-    const store = sr.scope === "store" && s.query && s.searchable;
+    const store = sr.scope === "store" && nq && s.searchable;
     let items = itemsOf(d), hays = d.hays || [], label = "", err = "";
     if (store) {
       if (s.results) { items = s.results.items; hays = s.results.hays; label = s.results.label; err = s.results.error; if (err) items = []; }
@@ -881,7 +926,7 @@
     if (err) s.body.appendChild(el("p", "err", "search failed — " + err));
     else if (!items.length) s.body.appendChild(el("p", "empty", store && !s.results ? "searching…" : (terms.length ? "no match" : d.empty)));
     // the first screenful, unless the operator asked for all of it or is filtering
-    const cap = s.searchable && !s.query && !s.showAll && items.length > (sr.visible || 10) ? (sr.visible || 10) : items.length;
+    const cap = s.searchable && !nq && !s.showAll && items.length > (sr.visible || 10) ? (sr.visible || 10) : items.length;
     const shown = items.slice(0, cap);
     if (d.kind === "roster") paintRoster(s.body, shown, d);
     else if (d.kind === "log") paintLog(s.body, shown);
@@ -905,8 +950,9 @@
   }
   function paintOrSearch(s, now) {
     const sr = s.data.search || {};
+    s.seq++;     // every change of query or data retires the search in flight, not only the one that gets sent
     if (sr.scope === "store" && s.searchable) {
-      if (!s.query) { s.seq++; s.results = null; root.clearTimeout(s.timer); paint(s); return; }
+      if (!sendable(s.query)) { s.results = null; root.clearTimeout(s.timer); paint(s); return; }
       s.results = null;
       paint(s);
       root.clearTimeout(s.timer);
@@ -944,28 +990,43 @@
     return t.readJson("/cockpit/panel/" + encodeURIComponent(pid) + ".json?profile=full" + (extra || ""));
   }
 
-  // Refetch one panel by id and redraw it in place. The streaming lane (CK4) calls this when an event says a
-  // panel moved. Resolves true when a typed panel on the page was redrawn; false when the page holds no typed
-  // panel by that id (a native panel, or none), which the caller answers with a full reload.
+  // Refetch one panel by id and redraw it whole. The streaming lane (CK4) calls this when an event says a
+  // panel moved. The fresh payload goes through the same mapper and the same panel builder as the first
+  // draw, so the count, title, notes, actions and kind classes follow the data; the filter's query, its
+  // focus and an expanded list carry over. Resolves true when a typed panel on the page was redrawn (or a
+  // newer refetch of the same panel took over); false when the page holds no typed panel by that id (a
+  // native panel, or none), which the caller answers with a full reload.
+  const refetchGen = new Map();
+  const liveOf = (pid) => Array.from(states).filter((s) => s.pid === pid && s.p.isConnected);
   async function refetchPanel(pid) {
-    const live = Array.from(states).filter((s) => s.pid === pid && s.p.isConnected);
+    if (!liveOf(pid).length) return false;
+    const gen = (refetchGen.get(pid) || 0) + 1;
+    refetchGen.set(pid, gen);
+    let raw, fault = "";
+    try { raw = await readPanel(pid); } catch (e) { fault = e && e.message ? e.message : String(e); }
+    if (refetchGen.get(pid) !== gen) return true;      // a newer refetch of this panel owns the answer
+    const live = liveOf(pid);
     if (!live.length) return false;
-    let payload, fault = "";
-    try { payload = clean(await readPanel(pid)); } catch (e) { fault = e && e.message ? e.message : String(e); }
-    for (const s of live) {
-      if (!fault && (payload.status === "error")) fault = payload.error || "unavailable";
-      if (fault) { s.fault = fault; paint(s); continue; }
-      try {
-        const titles = new Map();
-        for (const g of payload.groups || []) titles.set(g.id, titleOf(g.title, String(g.id)));
-        const ext = externalOf(payload, payload, titles);
-        ext.pid = pid;
-        ext.action = s.data.action;
-        s.data = ext;
-        s.fault = "";
-        s.results = null;
-        paintOrSearch(s, true);
-      } catch (e) { s.fault = "could not be mapped (" + (e && e.message ? e.message : e) + ")"; paint(s); }
+    if (fault) { for (const s of live) { s.fault = fault; paint(s); } return true; }
+    const core = root.LevainDashboard;
+    if (!lastManifest || !core || typeof core.renderPanel !== "function") return false;
+    let view, entry, data;
+    try {
+      view = mapSnapshot({ manifest: lastManifest, panels: { [pid]: raw } }, { elapsedMs: Date.now() - manifestAt });
+      entry = view.layout.find((e) => e.id === pid);
+      data = view.extra_panels[pid];
+    } catch (e) { for (const s of live) { s.fault = "could not be mapped (" + (e && e.message ? e.message : e) + ")"; paint(s); } return true; }
+    if (!entry || !data) return false;      // the panel is no longer an external one: a full reload draws it
+    for (const old of live) {
+      const input = old.filterInput;
+      if (input && document.activeElement === input) keepFocus(input, pid);
+      const node = core.renderPanel(entry, view);
+      for (const c of Array.from(old.p.classList)) if (c.indexOf("k-") !== 0 && c !== "panel-hero") node.classList.add(c);
+      teardown(old);
+      old.p.replaceWith(node);
+      if (hoverPanel === old.p) hoverPanel = node;
+      const fresh = Array.from(states).find((o) => o.p === node);
+      if (fresh && old.showAll) { fresh.showAll = true; paint(fresh); }
     }
     return true;
   }
@@ -999,7 +1060,7 @@
         its.forEach((it, i) => {
           if (n < 5 && hits(hays[i] || "", terms)) {
             n++;
-            const text = d.kind === "roster" ? it.name : d.kind === "log" ? (it.sentence || it.verb + " · " + it.target) : it.text;
+            const text = d.kind === "roster" ? it.name : d.kind === "log" ? logLine(it) : it.text;
             items.push({ kind: "row", label: String(text), where: s.title, state: s, q: q });
           }
         });
@@ -1027,7 +1088,10 @@
     const close = () => { dlg.remove(); palette = null; };
     const choose = (it) => {
       close();
-      if (it.kind === "panel") { it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); return; }
+      if (it.kind === "panel") {
+        // a panel the current mode hides is reached through Board, which shows every panel
+        if (document.body.dataset.mode && (it.node.dataset.modes || "").split(" ").indexOf(document.body.dataset.mode) < 0) applyMode("board");
+        it.node.scrollIntoView({ block: "start" }); it.node.setAttribute("tabindex", "-1"); it.node.focus({ preventScroll: true }); return; }
       applyMode("board");
       it.state.setQuery(it.q, true);
       it.state.p.scrollIntoView({ block: "start" });
@@ -1088,7 +1152,7 @@
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", install); else install();
   }
 
-  Object.assign(K, { fill, refetchPanel, fold, termsOf, hits, jumpItems, applyMode });
+  Object.assign(K, { fill, refetchPanel, reset: () => { for (const o of Array.from(states)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

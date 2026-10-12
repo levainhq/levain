@@ -230,6 +230,8 @@
 
     const board = document.getElementById("board");
     if (!board) return;
+    // the typed panels about to be dropped end their timers and mounts first
+    if (window.LevainCockpitKinds && window.LevainCockpitKinds.reset) window.LevainCockpitKinds.reset();
     board.replaceChildren();
 
     const entityEl = document.getElementById("entity");
@@ -2754,5 +2756,5 @@
   // Export the entry points onto a namespace the surface shim calls. `jobsActive` lets the boot
   // layer DEFER a board reload while an async job is polling (a reload would detach the live result
   // box) — flushed via the injected onJobsIdle when the last job finishes (L3 codex MED).
-  window.LevainDashboard = { render, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0 };
+  window.LevainDashboard = { render, renderPanel: renderPanelSafe, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0 };
 })();
