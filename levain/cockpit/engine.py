@@ -211,6 +211,9 @@ class ProviderSpec:
     legacy_region: str = field(default="", init=False)
 
     def __post_init__(self) -> None:
+        # rank is a sort key beside str ids: anything but an int would turn every manifest into a 500
+        if type(self.rank) is not int:
+            raise CockpitRegistrationError("a panel's rank must be an int")
         if self.kind in ALIASES:
             self.legacy_kind = self.kind
             self.kind = ALIASES[self.kind]
@@ -1497,6 +1500,7 @@ class Cockpit:
                     elif tuple(have.verbs) != tuple(spec.verbs) or have.rank != spec.rank:
                         # what a discovered panel offers, and its rank among its owner's panels, are its
                         # owner's answer, read per pass (a heading moved while serving moves its tab)
+                        # (a non-int rank never gets here: ProviderSpec refuses it inside the discoverer)
                         specs = dict(self._specs)       # copy-on-write, like a registration
                         specs[spec.id] = have.replaced(verbs=tuple(spec.verbs), rank=spec.rank)
                         self._specs = specs

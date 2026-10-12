@@ -118,3 +118,16 @@ class TestDiscoveredRankFollowsItsOwner:
         order[:] = ["c", "b", "a"]                 # a heading inserted, two moved
         again = _zone(ck.manifest(NONE_CRED)["regions"], "mind")["cards"][0]["panels"]
         assert again == ["c", "b", "a"]
+
+    def test_a_non_int_rank_on_a_later_pass_is_an_error_entry_and_the_last_rank_holds(self) -> None:
+        from levain.cockpit import Cockpit
+        from tests.test_cockpit_k1 import NONE_CRED, _simple
+
+        rank: list[object] = [0]
+        ck = Cockpit()
+        ck.discover(lambda ctx: [_simple("a", rank=rank[0]), _simple("b", rank=1)])
+        assert ck.manifest(NONE_CRED)["errors"] == []
+        rank[0] = "bad"                            # codex r2: once a 500 in the manifest sort
+        m = ck.manifest(NONE_CRED)
+        assert [e["source"] for e in m["errors"]] == ["discovery:0"]
+        assert m["panels"]["a"]["rank"] == 0
