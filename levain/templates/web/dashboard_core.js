@@ -533,10 +533,22 @@
     return node;
   }
 
+  let heroEpoch = 0;
   function renderHero(view, byId) {
     const hero = document.getElementById("ck-hero"), when = document.getElementById("ck-when"), skycol = document.getElementById("ck-skycol");
     const strip = document.getElementById("ck-strip"), skyHost = document.getElementById("ck-sky");
     const mast = document.querySelector("header.masthead");
+    // The legend band (#ck-legend) is the hero's: cleared and hidden here, filled and placed with the other mounts at
+    // the end, and only when a sky painted a key. Until then the sky hands its legend to `place`, which holds it off
+    // the page; after, `place` writes the band (a hot repaint) and `hide` clears it (a dropped or failed sky).
+    const band = document.getElementById("ck-legend");
+    if (band) { band.replaceChildren(); band.hidden = true; }
+    let live = false, pending = null;
+    const epoch = ++heroEpoch;   // a sky from an earlier hero render (torn down late) must not touch this render's band
+    const legendHook = {
+      place: (node) => { if (!band || epoch !== heroEpoch) return false; if (live) { band.replaceChildren(node); band.hidden = false; } else pending = node; return true; },
+      hide: () => { if (epoch !== heroEpoch) return; pending = null; if (live && band) { band.replaceChildren(); band.hidden = true; } }
+    };
     const entries = view.ke.hero.map((id) => byId.get(id)).filter(Boolean);
     const kindOf = (e) => ((view.extra_panels || {})[e.id] || {}).kind;
     const wx = entries.find((e) => kindOf(e) === "reading"), sky = entries.find((e) => kindOf(e) === "ambient");
@@ -555,7 +567,7 @@
       node.dataset.ckHero = "weather";
       whenKids.push(node);
     } else whenKids.push(Object.assign(el("div", "wx"), { hidden: true }));
-    if (sky) skyKids.push(bareNode(sky, view, "ck-sky", { hero: { events: events } }));
+    if (sky) skyKids.push(bareNode(sky, view, "ck-sky", { hero: { events: events, place: legendHook.place, hide: legendHook.hide } }));
     for (const e of entries) if (e !== wx && e !== sky) skyKids.push(bareNode(e, view, "ck-card"));
     // the clock is mounted only now: nothing after this can throw, so no clock ticks on a node that never attached
     if (window.LevainCockpitKinds) window.LevainCockpitKinds.mountClock(clock, date);
@@ -565,6 +577,9 @@
     if (mast) strip.replaceChildren(mast);
     skyHost.replaceChildren(...skyKids);
     hero.hidden = false;
+    live = true;
+    if (band && sky && pending) { band.replaceChildren(pending); band.hidden = false; }
+    pending = null;
   }
 
   function renderBriefRegion(view, byId) {

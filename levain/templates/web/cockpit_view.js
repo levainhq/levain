@@ -1100,6 +1100,8 @@
     if (s.skyHandle && typeof s.skyHandle.destroy === "function") { try { s.skyHandle.destroy(); } catch (_) { /* a mount that cannot unmount */ } }
     s.skyHandle = null;
     s.skyParts = null;
+    // the hero's legend band goes with the sky it keyed: a dropped, failed or repainting sky leaves no stale key
+    if (s.ctx && s.ctx.hero && typeof s.ctx.hero.hide === "function") s.ctx.hero.hide();
     if (s.clock) clocks.delete(s.clock);
     s.clock = null;
   }
@@ -1165,10 +1167,10 @@
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
     const legend = el("div", "legendbar" + (hero ? "" : " frame"));
     paintLegend(legend, sky);
-    // the hero's key is a full-width band BELOW the hero (mock-e), not a row inside the sky column: it goes to the
-    // page's own #ck-legend mount; a sky anywhere else, or a page without the mount, keeps it under its plot
-    const band = hero && document.getElementById ? document.getElementById("ck-legend") : null;
-    if (band) { band.replaceChildren(legend); band.hidden = false; } else host.appendChild(legend);
+    // the hero's key is a full-width band BELOW the hero (mock-e), not a row inside the sky column. The band is the
+    // page's mount, which renderHero owns: this hands the legend to it (place) and never writes the live mount
+    // itself. A sky anywhere else, or a page without the mount (place answers false), keeps it under its plot.
+    if (!(hero && typeof hero.place === "function" && hero.place(legend))) host.appendChild(legend);
     s.skyParts = { plot: plot, win: win, legend: legend };
   }
 
