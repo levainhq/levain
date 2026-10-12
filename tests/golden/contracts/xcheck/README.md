@@ -23,4 +23,5 @@ Run locally (with a Go toolchain from https://go.dev/dl/ on `PATH`):
 CI: the `xcheck` job in `.github/workflows/contracts-xcheck.yml` (actions/setup-go with this `go.mod`'s version)
 runs both commands on every push to `main` and `seat/**`.
 
-`ssh-keygen -lf` (F7) and `no_upstream` vectors are counted, not run, here: the Python tests check them.
+`ssh-keygen -lf` (F7), `ssh-keygen -Y check-novalidate` (F12) and `no_upstream` vectors are counted, not run, here:
+the Python tests check them.

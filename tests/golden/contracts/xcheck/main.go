@@ -50,6 +50,7 @@ var minCount = map[string]int{
 	"origin":      20,
 	"fingerprint": 7,
 	"canon":       40,
+	"sshsig":      13,
 }
 
 type vector struct {
@@ -340,8 +341,8 @@ func main() {
 			}
 			var up upstream
 			must(json.Unmarshal(v.Expect.Upstream, &up), dir+"/"+v.ID)
-			if up.Implementation == "ssh-keygen -lf" || strings.HasPrefix(up.Implementation, "github.com/transparency-dev/witness/") {
-				t.notGo++ // ssh-keygen is checked by the Python tests; the witness oracle runs below
+			if strings.HasPrefix(up.Implementation, "ssh-keygen ") || strings.HasPrefix(up.Implementation, "github.com/transparency-dev/witness/") {
+				t.notGo++ // ssh-keygen (-lf, -Y check-novalidate) is checked by the Python tests; the witness oracle runs below
 				continue
 			}
 			checkVersion(dir, v, up, pinned)

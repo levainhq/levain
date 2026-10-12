@@ -31,6 +31,8 @@ UPSTREAM = {
     # F7's observation, not run by xcheck; the version is `ssh -V` on the generating machine (an observation,
     # never the authority).
     "ssh-keygen": ("ssh-keygen -lf", "OpenSSH_10.3p1"),
+    # F12's observation (test-time only): the armored form of the vector's blob through check-novalidate.
+    "sshsig": ("ssh-keygen -Y check-novalidate", "OpenSSH_10.3p1"),
 }
 
 ACCEPT, REFUSE, UNVERIFIABLE = "accept", "refuse", "unverifiable"
@@ -169,3 +171,54 @@ def subproof(m: int, d: list[bytes], b: bool) -> list[bytes]:
 def leaves(n: int) -> list[bytes]:
     """F1's golden leaf rule: ``d_i = bytes([i % 256]) * (i+1)``."""
     return [bytes([i % 256]) * (i + 1) for i in range(n)]
+
+
+# ---- SSH wire, SSHSIG (OpenSSH PROTOCOL.sshsig §2-§3), F9's device message, independently ----------------
+
+
+def ssh_str(b: bytes) -> bytes:
+    """An SSH ``string``: uint32 big-endian byte length, then the bytes."""
+    return struct.pack(">I", len(b)) + b
+
+
+def ed_key_blob(pk: bytes) -> bytes:
+    return ssh_str(b"ssh-ed25519") + ssh_str(pk)
+
+
+def fp(blob: bytes) -> str:
+    """F7: 'SHA256:' + unpadded base64 of SHA-256 of the key's wire blob."""
+    return "SHA256:" + b64(hashlib.sha256(blob).digest()).rstrip("=")
+
+
+def sshsig_signed_data(ns: bytes, msg: bytes, reserved: bytes = b"", alg: bytes = b"sha512") -> bytes:
+    h = {b"sha512": hashlib.sha512, b"sha256": hashlib.sha256}[alg](msg).digest()
+    return b"SSHSIG" + ssh_str(ns) + ssh_str(reserved) + ssh_str(alg) + ssh_str(h)
+
+
+def sshsig_blob(key_blob: bytes, ns: bytes, sig_blob: bytes, reserved: bytes = b"", alg: bytes = b"sha512") -> bytes:
+    return b"SSHSIG" + struct.pack(">I", 1) + ssh_str(key_blob) + ssh_str(ns) + ssh_str(reserved) + ssh_str(alg) \
+        + ssh_str(sig_blob)
+
+
+def ed_sshsig(sd: bytes, ns: bytes, msg: bytes) -> bytes:
+    """A raw Ed25519 SSHSIG blob (sha512, empty reserved) by the key with seed ``sd``."""
+    sig = ed_sign(sd, sshsig_signed_data(ns, msg))
+    return sshsig_blob(ed_key_blob(pub(sd)), ns, ssh_str(b"ssh-ed25519") + ssh_str(sig))
+
+
+def armor(blob: bytes) -> str:
+    """PROTOCOL.sshsig §1: header, base64 broken every 76 characters, footer."""
+    t = b64(blob)
+    return ("-----BEGIN SSH SIGNATURE-----\n" + "\n".join(t[i:i + 76] for i in range(0, len(t), 76))
+            + "\n-----END SSH SIGNATURE-----\n")
+
+
+def dearmor(text: str) -> bytes:
+    lines = text.strip().splitlines()
+    assert lines[0] == "-----BEGIN SSH SIGNATURE-----" and lines[-1] == "-----END SSH SIGNATURE-----"
+    return base64.b64decode("".join(lines[1:-1]), validate=True)
+
+
+def device_message(origin: str, file: str, chain_hash_hex: str) -> bytes:
+    """S1_DESIGN F9: string(origin ASCII) || string(file UTF-8) || string(32 raw bytes of the chain hash)."""
+    return ssh_str(origin.encode("ascii")) + ssh_str(file.encode("utf-8")) + ssh_str(bytes.fromhex(chain_hash_hex))

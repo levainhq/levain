@@ -1,0 +1,357 @@
+{
+ "item": "F12",
+ "generator": "gen.py",
+ "ssh_version": "OpenSSH_10.3p1",
+ "message": {
+  "origin": "levain-team/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "file": "ledger/dana/findings.jsonl",
+  "chain_hash": "0000000000000000000000000000000000000000000000000000000000000001"
+ },
+ "vectors": [
+  {
+   "id": "signed-data-fixed-message",
+   "kind": "no_upstream",
+   "op": "signed_data",
+   "input": {
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "bytes_hex": "535348534947000000116c657661696e2d7465616d2d656e7472790000000000000006736861353132000000402b4b4f5712bfb548f87cf8fc27211ccab0f737ba789f2320331a682da54a073c7a341d865db63a673caf9a7cd2155dfb952da3159ab0306f045bc9fd84693aba"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "OpenSSH PROTOCOL.sshsig (openssh-portable master 73c1399e, $OpenBSD: PROTOCOL.sshsig,v 1.5 2026/10/10$) §3 / S1_DESIGN F12",
+    "clause": "'SSHSIG' || string(namespace) || string(reserved) || string(hash_algorithm) || string(H(message))"
+   }
+  },
+  {
+   "id": "good",
+   "kind": "spec",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJKqe0eDwXORAGkvjQP3AnKXrLuJanwBHhDtirFajXxAAAAARbGV2YWluLXRlYW0tZW50cnkAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArS4tWhnc7iBql5UMf8LL1BdXScz3VEP+Shffw1p0tJDeQiyNLeQYEq9pPTA52cT2Jb+7Zqos+zJbaR5ShlefDQ==",
+    "device_fp": "SHA256:KZa89p0gvJmcacQyi+uRqevFbDq1flywOn5T47e2f5A",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -Y check-novalidate",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "OpenSSH PROTOCOL.sshsig (openssh-portable master 73c1399e, $OpenBSD: PROTOCOL.sshsig,v 1.5 2026/10/10$) §3 / S1_DESIGN F12 + F2",
+    "clause": "the Ed25519 signature inside the blob verifies over §3's signed data under the embedded key, with levain's one Ed25519 profile"
+   }
+  },
+  {
+   "id": "wrong-namespace-refused",
+   "kind": "spec",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJKqe0eDwXORAGkvjQP3AnKXrLuJanwBHhDtirFajXxAAAAARbGV2YWluLXRlYW0tb3RoZXIAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABA3MbhfGe14DXoxs6Lyx/78X46GSmPMkoKHDepQ7HK1auQhHuCIsKOmI34CXXb7TJRihqnXY8Vy2TIXAdJKQ5WDw==",
+    "device_fp": "SHA256:KZa89p0gvJmcacQyi+uRqevFbDq1flywOn5T47e2f5A",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -Y check-novalidate",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "OpenSSH PROTOCOL.sshsig (openssh-portable master 73c1399e, $OpenBSD: PROTOCOL.sshsig,v 1.5 2026/10/10$) §2",
+    "clause": "The purpose of the namespace value is to specify an unambiguous interpretation domain for the signature"
+   }
+  },
+  {
+   "id": "hash-sha256-refused",
+   "kind": "levain_profile",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJKqe0eDwXORAGkvjQP3AnKXrLuJanwBHhDtirFajXxAAAAARbGV2YWluLXRlYW0tZW50cnkAAAAAAAAABnNoYTI1NgAAAFMAAAALc3NoLWVkMjU1MTkAAABAy9gp3KpNf/aBCKeZi5m2iSmkwnF20YSqYCSqHtvgz3iBK7grSVVt+Y3vv44Kg04VknfG8H/8jneT/PS7lSXdDQ==",
+    "device_fp": "SHA256:KZa89p0gvJmcacQyi+uRqevFbDq1flywOn5T47e2f5A",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -Y check-novalidate",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F12",
+    "clause": "the hash algorithm is sha512",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "The supported hash algorithms are \"sha256\" and \"sha512\"."
+    }
+   }
+  },
+  {
+   "id": "reserved-non-empty-refused",
+   "kind": "levain_profile",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJKqe0eDwXORAGkvjQP3AnKXrLuJanwBHhDtirFajXxAAAAARbGV2YWluLXRlYW0tZW50cnkAAAABeAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5AAAAQK0uLVoZ3O4gapeVDH/Cy9QXV0nM91RD/koX38NadLSQ3kIsjS3kGBKvaT0wOdnE9iW/u2aqLPsyW2keUoZXnw0=",
+    "device_fp": "SHA256:KZa89p0gvJmcacQyi+uRqevFbDq1flywOn5T47e2f5A",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -Y check-novalidate",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F12",
+    "clause": "the reserved field is empty",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "Implementations should ignore the reserved field if it is not empty."
+    }
+   }
+  },
+  {
+   "id": "embedded-key-not-device-fp-refused",
+   "kind": "no_upstream",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJKqe0eDwXORAGkvjQP3AnKXrLuJanwBHhDtirFajXxAAAAARbGV2YWluLXRlYW0tZW50cnkAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArS4tWhnc7iBql5UMf8LL1BdXScz3VEP+Shffw1p0tJDeQiyNLeQYEq9pPTA52cT2Jb+7Zqos+zJbaR5ShlefDQ==",
+    "device_fp": "SHA256:iInrgf1Vg4zT7Gkug+jFeI+CYs+p92nDcaGM8eR2WSg",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F12",
+    "clause": "fp_of_blob(embedded public key) == the leaf's device_fp",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the leaf names its device by device_fp; ssh-keygen -Y check-novalidate has no such input"
+    }
+   }
+  },
+  {
+   "id": "ecdsa-p256-key-refused",
+   "kind": "levain_profile",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAAGgAAAATZWNkc2Etc2hhMi1uaXN0cDI1NgAAAAhuaXN0cDI1NgAAAEEEDLFFM6uORke/Bb6RehQj11fHa+WbkSv2KyRRDOavylfYZyhrEg5VhW0GO4Gl2COgXKTb6ER8mp6RUe81g8B4YAAAABFsZXZhaW4tdGVhbS1lbnRyeQAAAAAAAAAGc2hhNTEyAAAAYwAAABNlY2RzYS1zaGEyLW5pc3RwMjU2AAAASAAAACA/+dq/mkQT0nC6FWXtYbW0o5gFXsttBHVagyFAkjgPGwAAACA4I3XAlcqc5rJnuvNKfyXvnmcA+gV0fFhblceeuKgqGA==",
+    "device_fp": "SHA256:1fFZ+RHK39M340k3Fcy9fIQXks7KvvCjjkuCKEOR68k",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -Y check-novalidate",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F12",
+    "clause": "the embedded key is ssh-ed25519; a P-256 device line is P11's, as a new (line, v)",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "FL l.264: device keys are Ed25519; ECDSA's (r, s) / (r, n-s) malleability would give one signed entry two leaf hashes unless a low-S rule froze with it"
+    }
+   }
+  },
+  {
+   "id": "one-byte-tampered-refused",
+   "kind": "spec",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJKqe0eDwXORAGkvjQP3AnKXrLuJanwBHhDtirFajXxAAAAARbGV2YWluLXRlYW0tZW50cnkAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArS4tWhnc7iBql5UMf8LL1BdXScz3VEP+Shffw1p0tJDeQiyNLeQYEq9pPTA52cT2Jb+7Zqos+zJbaR5ShlefDA==",
+    "device_fp": "SHA256:KZa89p0gvJmcacQyi+uRqevFbDq1flywOn5T47e2f5A",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -Y check-novalidate",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "OpenSSH PROTOCOL.sshsig (openssh-portable master 73c1399e, $OpenBSD: PROTOCOL.sshsig,v 1.5 2026/10/10$) §3 / S1_DESIGN F12 + F2",
+    "clause": "the Ed25519 signature inside the blob verifies over §3's signed data under the embedded key, with levain's one Ed25519 profile"
+   }
+  },
+  {
+   "id": "wrong-key-refused",
+   "kind": "spec",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJKqe0eDwXORAGkvjQP3AnKXrLuJanwBHhDtirFajXxAAAAARbGV2YWluLXRlYW0tZW50cnkAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABAEDPtJMk91yARQNVpvm5lsnCi43VAY33vM1rwu5C3eokJa0cRsSAVH3SQpcTuWcNiRct7OkYxukzrCcVjgD6kAA==",
+    "device_fp": "SHA256:KZa89p0gvJmcacQyi+uRqevFbDq1flywOn5T47e2f5A",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -Y check-novalidate",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "OpenSSH PROTOCOL.sshsig (openssh-portable master 73c1399e, $OpenBSD: PROTOCOL.sshsig,v 1.5 2026/10/10$) §3 / S1_DESIGN F12 + F2",
+    "clause": "the Ed25519 signature inside the blob verifies over §3's signed data under the embedded key, with levain's one Ed25519 profile"
+   }
+  },
+  {
+   "id": "trailing-byte-outer-blob-refused",
+   "kind": "spec",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJKqe0eDwXORAGkvjQP3AnKXrLuJanwBHhDtirFajXxAAAAARbGV2YWluLXRlYW0tZW50cnkAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArS4tWhnc7iBql5UMf8LL1BdXScz3VEP+Shffw1p0tJDeQiyNLeQYEq9pPTA52cT2Jb+7Zqos+zJbaR5ShlefDQA=",
+    "device_fp": "SHA256:KZa89p0gvJmcacQyi+uRqevFbDq1flywOn5T47e2f5A",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -Y check-novalidate",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "OpenSSH PROTOCOL.sshsig (openssh-portable master 73c1399e, $OpenBSD: PROTOCOL.sshsig,v 1.5 2026/10/10$) §2 / S1_DESIGN F12",
+    "clause": "byte[6] 'SSHSIG' · uint32 1 · string publickey · string namespace · string reserved · string hash_algorithm · string signature; the outer blob, the publickey blob and the signature blob are each read to their last byte"
+   }
+  },
+  {
+   "id": "trailing-byte-key-blob-refused",
+   "kind": "spec",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAADQAAAALc3NoLWVkMjU1MTkAAAAgJKqe0eDwXORAGkvjQP3AnKXrLuJanwBHhDtirFajXxAAAAAAEWxldmFpbi10ZWFtLWVudHJ5AAAAAAAAAAZzaGE1MTIAAABTAAAAC3NzaC1lZDI1NTE5AAAAQK0uLVoZ3O4gapeVDH/Cy9QXV0nM91RD/koX38NadLSQ3kIsjS3kGBKvaT0wOdnE9iW/u2aqLPsyW2keUoZXnw0=",
+    "device_fp": "SHA256:KZa89p0gvJmcacQyi+uRqevFbDq1flywOn5T47e2f5A",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -Y check-novalidate",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "OpenSSH PROTOCOL.sshsig (openssh-portable master 73c1399e, $OpenBSD: PROTOCOL.sshsig,v 1.5 2026/10/10$) §2 / S1_DESIGN F12",
+    "clause": "byte[6] 'SSHSIG' · uint32 1 · string publickey · string namespace · string reserved · string hash_algorithm · string signature; the outer blob, the publickey blob and the signature blob are each read to their last byte"
+   }
+  },
+  {
+   "id": "trailing-byte-signature-blob-refused",
+   "kind": "spec",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJKqe0eDwXORAGkvjQP3AnKXrLuJanwBHhDtirFajXxAAAAARbGV2YWluLXRlYW0tZW50cnkAAAAAAAAABnNoYTUxMgAAAFQAAAALc3NoLWVkMjU1MTkAAABArS4tWhnc7iBql5UMf8LL1BdXScz3VEP+Shffw1p0tJDeQiyNLeQYEq9pPTA52cT2Jb+7Zqos+zJbaR5ShlefDQA=",
+    "device_fp": "SHA256:KZa89p0gvJmcacQyi+uRqevFbDq1flywOn5T47e2f5A",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -Y check-novalidate",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "OpenSSH PROTOCOL.sshsig (openssh-portable master 73c1399e, $OpenBSD: PROTOCOL.sshsig,v 1.5 2026/10/10$) §2 / S1_DESIGN F12",
+    "clause": "byte[6] 'SSHSIG' · uint32 1 · string publickey · string namespace · string reserved · string hash_algorithm · string signature; the outer blob, the publickey blob and the signature blob are each read to their last byte"
+   }
+  },
+  {
+   "id": "s-plus-l-mutation-refused",
+   "kind": "upstream_lax",
+   "op": "verify",
+   "input": {
+    "blob_b64": "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgJKqe0eDwXORAGkvjQP3AnKXrLuJanwBHhDtirFajXxAAAAARbGV2YWluLXRlYW0tZW50cnkAAAAAAAAABnNoYTUxMgAAAFMAAAALc3NoLWVkMjU1MTkAAABArS4tWhnc7iBql5UMf8LL1BdXScz3VEP+Shffw1p0tJDLFiLqR0craoUGNdMX06MLJr+7Zqos+zJbaR5ShlefHQ==",
+    "device_fp": "SHA256:KZa89p0gvJmcacQyi+uRqevFbDq1flywOn5T47e2f5A",
+    "namespace": "levain-team-entry",
+    "message_hex": "0000002c6c657661696e2d7465616d2f61616161616161616161616161616161616161616161616161616161616161610000001a6c65646765722f64616e612f66696e64696e67732e6a736f6e6c000000200000000000000000000000000000000000000000000000000000000000000001"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "ssh-keygen -Y check-novalidate",
+     "version": "OpenSSH_10.3p1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 8032 §5.1.7 (pinned in levain by the speccheck row, S1_DESIGN F2)",
+    "clause": "Decode the first half as a point R, and the second half as an integer S, in the range 0 <= s < L. ... If any of the decodings fail (including S being out of range), the signature is invalid."
+   }
+  }
+ ]
+}
