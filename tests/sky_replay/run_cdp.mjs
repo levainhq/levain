@@ -1,21 +1,38 @@
 // Drives driver.html in headless Chrome over CDP: real frames, real time. Prints the page's RESULT line,
 // and saves screenshots when asked.   node run_cdp.mjs <chrome> <outdir|-> 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const [chrome, outdir = '-'] = process.argv.slice(2);
 const here = dirname(fileURLToPath(import.meta.url));
-const port = 9300 + Math.floor(Math.random() * 500);
 const profile = mkdtempSync(join(tmpdir(), 'sky-cdp-'));
 const proc = spawn(chrome, ['--headless=new', '--disable-gpu', '--hide-scrollbars', '--allow-file-access-from-files',
-  `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, '--window-size=1180,700', 'about:blank'], { stdio: 'ignore' });
+  '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--window-size=1180,700', 'about:blank'], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Chrome picks a free port itself (port 0) and writes it to <profile>/DevToolsActivePort, the way Puppeteer finds
+// it: a guessed port could collide with another Chrome on the runner, which CI hit as "no chrome target".
+let exited = null;
+proc.on('exit', (code, signal) => { exited = `chrome exited (code ${code}, signal ${signal})`; });
+let port = null;
+async function devtoolsPort() {
+  for (let i = 0; i < 150; i++) {
+    if (exited) throw new Error(`no chrome target: ${exited}`);
+    try { const p = parseInt(readFileSync(join(profile, 'DevToolsActivePort'), 'utf8').split('\n')[0], 10); if (p > 0) return p; } catch {}
+    await sleep(200);
+  }
+  throw new Error('no chrome target: DevToolsActivePort never appeared in 30 s');
+}
 async function targets() {
-  for (let i = 0; i < 50; i++) { try { const r = await fetch(`http://127.0.0.1:${port}/json`); const t = (await r.json()).find((x) => x.type === 'page'); if (t) return t; } catch {} await sleep(200); }
-  throw new Error('no chrome target');
+  port = port ?? await devtoolsPort();
+  for (let i = 0; i < 150; i++) {
+    if (exited) throw new Error(`no chrome target: ${exited}`);
+    try { const r = await fetch(`http://127.0.0.1:${port}/json`); const t = (await r.json()).find((x) => x.type === 'page'); if (t) return t; } catch {}
+    await sleep(200);
+  }
+  throw new Error(`no chrome target on port ${port} in 30 s`);
 }
 async function session(wsUrl) {
   const ws = new WebSocket(wsUrl); await new Promise((r) => (ws.onopen = r));
