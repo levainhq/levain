@@ -339,7 +339,7 @@
       if (res.timed_out) failure("The turn timed out before it finished.");
       if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
         if (res.reply) replyBubble(res);
-        showConsent(res.pending, res.decision_id, myRun);
+        showConsent(res.pending, res.decision_id, res.approvable, myRun);
         return;
       }
       if (res.gated && !res.error) failure("The turn halted on a gated action but reported nothing to decide.");
@@ -486,7 +486,7 @@
       }
       const verdict = r.status === 200 ? judgeLastJob(s.last_job, ctx) : "";
       if (r.status === 200 && s.state === "gated" && Array.isArray(s.pending) && s.pending.length) {
-        showConsent(s.pending, s.decision_id, myRun, warning); return;
+        showConsent(s.pending, s.decision_id, s.approvable, myRun, warning); return;
       }
       if (r.status === 200 && s.state === "busy") {
         failure("The session is still working. Check again in a moment.");
@@ -504,15 +504,17 @@
       rereadButton(myRun, ctx);
     });
   }
-  function showConsent(pending, decisionId, myRun, warning) {
+  function showConsent(pending, decisionId, approvable, myRun, warning) {
     const box = el("div", "chat-consent");
     box.setAttribute("role", "group");
     box.setAttribute("aria-label", "actions awaiting your decision");
     box.appendChild(el("div", "chat-consent-head", "Held for your approval"));
     if (warning) box.appendChild(el("div", "chat-reason", "⚠ " + warning));
-    // Fail closed: Approve exists only when this halt carries a decision id AND every held action is shown in
-    // full. Anything else (an unreadable action, an older server) can still be rejected or closed.
-    const decidable = typeof decisionId === "string" && decisionId !== "" && pending.every((p) => shownInFull(p.full));
+    // Fail closed: Approve exists only when this halt carries a decision id, the server said it is approvable
+    // (exactly true: it alone knows whether the hold names its bytes), AND every held action is shown in full.
+    // Anything else (an unreadable action, a hold with no digest, an older server) can still be rejected or closed.
+    const decidable = typeof decisionId === "string" && decisionId !== "" && approvable === true &&
+      pending.every((p) => shownInFull(p.full));
     pending.forEach((p) => {
       const item = el("div", "chat-pending");
       item.appendChild(el("div", "chat-tool", visible(p.tool)));
@@ -525,7 +527,7 @@
       if (p.recognized === false) item.appendChild(el("div", "chat-reason", "This action was not recognised by the entity's policy."));
       box.appendChild(item);
     });
-    if (!decidable) box.appendChild(el("div", "chat-reason", "Approve is not offered: this halt cannot be shown in full or carries no decision id, so only Reject (or Close session) is safe."));
+    if (!decidable) box.appendChild(el("div", "chat-reason", "Approve is not offered: this halt cannot be shown in full, cannot be bound to what it holds, or carries no decision id, so only Reject (or Close session) is safe."));
     const reasonIn = el("textarea", "chat-input chat-grow");
     reasonIn.placeholder = "reason for rejecting (optional)";
     reasonIn.setAttribute("aria-label", "reason for rejecting");
@@ -555,7 +557,7 @@
       if (res.timed_out) failure("The turn timed out before it finished.");
       if (!res.error && res.gated && Array.isArray(res.pending) && res.pending.length) {
         if (res.reply) replyBubble(res);
-        showConsent(res.pending, res.decision_id, myRun); return;
+        showConsent(res.pending, res.decision_id, res.approvable, myRun); return;
       }
       if (res.reply) replyBubble(res);
       else if (!res.error && !res.timed_out) failure("The entity returned no reply.");
