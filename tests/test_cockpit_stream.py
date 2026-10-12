@@ -294,6 +294,16 @@ def _events_for(resp, seconds: float) -> list[tuple[str, str, Any]]:
 _pumps: dict[int, "queue.Queue[str]"] = {}
 
 
+
+def _await_events(resp, timeout: float = 15.0, settle: float = 1.0) -> list[tuple[str, str, Any]]:
+    """The frames that follow an expected change: wait (up to ``timeout``) for the first, then collect for
+    ``settle`` more seconds so an extra frame still shows. A loaded runner is slow; a fixed window would be a flake."""
+    deadline = time.monotonic() + timeout
+    got: list[tuple[str, str, Any]] = []
+    while not got and time.monotonic() < deadline:
+        got = _events_for(resp, 0.25)
+    return got + _events_for(resp, settle) if got else got
+
 def _cockpit(src: SubstrateSource, rows: list[RowIn]):
     """A cockpit with one ON-DEMAND panel ``od`` whose rows the test edits; ``reads`` counts provider calls."""
     state = {"rows": rows, "reads": 0}
@@ -334,7 +344,7 @@ class TestHttp:
                 _read_frame(r)
                 assert _events_for(r, 0.4) == []        # an idle store announces nothing
                 state["rows"] = [_row(1), _row(2)]       # the edit; no client reads the panel
-                got = _events_for(r, 1.5)
+                got = _await_events(r)
                 assert [(e[0], e[2]["id"]) for e in got] == [("panel-changed", "od")], got
                 assert got[0][2]["etag"]
             finally:
@@ -366,7 +376,7 @@ class TestHttp:
             try:
                 _read_frame(r)
                 ck.register(_simple("later", rows=()))
-                got = _events_for(r, 1.5)
+                got = _await_events(r)
                 assert [e[0] for e in got] == ["manifest-changed"], got
             finally:
                 c.close()
@@ -379,7 +389,7 @@ class TestHttp:
             try:
                 _name, hello_id, hello = _parse(_read_frame(r))
                 state["rows"] = [_row(1), _row(2)]
-                (ev,) = _events_for(r, 1.5)
+                (ev,) = _await_events(r)
                 assert ev[0] == "panel-changed"
                 last = ev[1]
             finally:
@@ -393,7 +403,7 @@ class TestHttp:
                     _n, _i, h2 = _parse(_read_frame(r2))
                     if h2["epoch"] == hello["epoch"]:
                         assert h2["resync"] is False
-                        assert [e[0] for e in _events_for(r2, 0.5)] == ["panel-changed"]       # replayed
+                        assert [e[0] for e in _await_events(r2)] == ["panel-changed"]       # replayed
                     else:
                         assert h2["resync"] is True        # the first stream's end stopped the watcher: a new epoch
                 finally:
@@ -463,10 +473,7 @@ class TestHttp:
                 assert httpd.stream_watcher.running and httpd.stream_watcher.stream_count == 1
                 flag["fail"] = False
                 state["rows"] = [_row(1), _row(2)]
-                got: list[Any] = []
-                deadline = time.monotonic() + 15.0      # a slow runner: wait for the recovered tick, never a fixed window
-                while not got and time.monotonic() < deadline:
-                    got = _events_for(r, 0.5)
+                got = _await_events(r)
                 assert [e[0] for e in got] == ["panel-changed"], got
             finally:
                 c.close()
