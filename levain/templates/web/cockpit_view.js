@@ -813,6 +813,9 @@
     s.clock = null;
   }
   // A panel body that leaves the page for good: nothing it started keeps running.
+  // The focus modal moves a typed panel's body out of its panel node (which is then discarded), so a modal
+  // state is on the page while its body is; a board state while its panel is.
+  function onPage(s) { return (s.modal ? s.body : s.p).isConnected; }
   function teardown(s) {
     root.clearTimeout(s.timer);
     s.seq++;
@@ -848,7 +851,7 @@
   // state s: pid, title, data (the mapper's record), body (the node this paints into), query, results.
   function fill(p, data, ctx) {
     const s = { pid: data.pid, title: (p.querySelector("h2") || {}).textContent || data.pid, data: data, p: p, ctx: ctx || {},
-                query: saved(FILTER_KEY + data.pid) || "", results: null, timer: 0, seq: 0, born: Date.now() };
+                modal: !!(ctx && ctx.modal), query: saved(FILTER_KEY + data.pid) || "", results: null, timer: 0, seq: 0, born: Date.now() };
     // a rebuilt board leaves its old bodies behind: drop the ones that were never going to be seen again
     for (const o of Array.from(states)) if (!o.body.isConnected && Date.now() - o.born > 5000) teardown(o);
     p.classList.add("k-" + data.kind);
@@ -944,7 +947,7 @@
     s.query = q;
     s.showAll = false;
     save(FILTER_KEY + s.pid, q);
-    for (const o of states) if (o !== s && o.pid === s.pid && o.p.isConnected) { o.query = q; if (o.filterInput) o.filterInput.value = q; paintOrSearch(o, now); }
+    for (const o of states) if (o !== s && o.pid === s.pid && onPage(o)) { o.query = q; if (o.filterInput) o.filterInput.value = q; paintOrSearch(o, now); }
     if (s.filterInput && s.filterInput.value !== q) s.filterInput.value = q;
     paintOrSearch(s, now);
   }
@@ -971,7 +974,7 @@
       const raw = await readPanel(s.pid, "&q=" + encodeURIComponent(q) + "&limit=" + STORE_LIMIT);
       out = mapSearch(s, clean(raw));
     } catch (e) { out = { items: [], hays: [], label: "", error: e && e.message ? e.message : String(e) }; }
-    if (seq !== s.seq || !s.p.isConnected) return;     // a newer query, or the panel is gone
+    if (seq !== s.seq || !onPage(s)) return;     // a newer query, or the panel is gone
     s.results = out;
     paint(s);
   }
@@ -997,7 +1000,7 @@
   // newer refetch of the same panel took over); false when the page holds no typed panel by that id (a
   // native panel, or none), which the caller answers with a full reload.
   const refetchGen = new Map();
-  const liveOf = (pid) => Array.from(states).filter((s) => s.pid === pid && s.p.isConnected);
+  const liveOf = (pid) => Array.from(states).filter((s) => s.pid === pid && onPage(s));
   async function refetchPanel(pid) {
     if (!liveOf(pid).length) return false;
     const gen = (refetchGen.get(pid) || 0) + 1;
@@ -1020,10 +1023,25 @@
     for (const old of live) {
       const input = old.filterInput;
       if (input && document.activeElement === input) keepFocus(input, pid);
-      const node = core.renderPanel(entry, view);
+      const node = core.renderPanel(entry, view, old.modal ? { modal: true } : undefined);
+      if (old.modal) {
+        // the modal holds only the panel's body: swap the new body in beside the old one's place
+        const fresh = Array.from(states).find((o) => o.p === node);
+        const host = old.body.parentNode;
+        const phead = node.querySelector(".phead");
+        const kids = [];
+        if (phead) { let n = phead.nextSibling; while (n) { kids.push(n); n = n.nextSibling; } }
+        teardown(old);
+        if (host && fresh && kids.length) {
+          host.replaceChildren(...kids);
+          if (old.showAll) { fresh.showAll = true; paint(fresh); }
+        }
+        continue;
+      }
       for (const c of Array.from(old.p.classList)) if (c.indexOf("k-") !== 0 && c !== "panel-hero") node.classList.add(c);
       teardown(old);
       old.p.replaceWith(node);
+      if (core.finalizeNode) core.finalizeNode(node, entry);     // the board finalisation of the first draw: .pbody, the clamp, the overflow cue
       if (hoverPanel === old.p) hoverPanel = node;
       const fresh = Array.from(states).find((o) => o.p === node);
       if (fresh && old.showAll) { fresh.showAll = true; paint(fresh); }
@@ -1054,7 +1072,7 @@
     }
     if (terms.length) {
       for (const s of states) {
-        if (!s.p.isConnected || !s.searchable) continue;
+        if (!onPage(s) || !s.searchable) continue;
         const d = s.data, hays = d.hays || [], its = itemsOf(d);
         let n = 0;
         its.forEach((it, i) => {
@@ -1152,7 +1170,7 @@
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", install); else install();
   }
 
-  Object.assign(K, { fill, refetchPanel, reset: () => { for (const o of Array.from(states)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode });
+  Object.assign(K, { fill, refetchPanel, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

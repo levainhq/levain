@@ -408,9 +408,20 @@
   }
 
   function finalizePanels(board) {
-    for (const p of board.querySelectorAll(".panel")) {
+    for (const p of board.querySelectorAll(".panel")) finalizePanel(p);
+  }
+  // The board finalisation of ONE panel node: the single-panel redraw (cockpit_view.refetchPanel) runs this
+  // too, on a node already in the page (the overflow measure needs layout), so a redrawn panel is bounded
+  // exactly like the first draw.
+  function finalizeNode(p, entry) {
+    if (CLAMP_KINDS.has(entry.kind)) p.setAttribute("data-clamp", "");
+    finalizePanel(p);
+    measureClauses(p);
+  }
+  function finalizePanel(p) {
+    {
       const phead = p.querySelector(".phead");
-      if (!phead) continue;
+      if (!phead) return;
       const body = el("div", "pbody");
       while (phead.nextSibling) body.appendChild(phead.nextSibling);
       p.appendChild(body);
@@ -460,7 +471,7 @@
       case "section": return renderSection(entry, (view.sections || [])[entry.ref]);
       case "config": return renderConfig(entry, (view.config_docs || [])[entry.ref]);
       case "edits": return renderEdits(entry, view);
-      case "external": return renderExternal(entry, view);
+      case "external": return renderExternal(entry, view, opts);
       default: return null;
     }
   }
@@ -2260,7 +2271,7 @@
     return wrap;
   }
 
-  function renderExternal(entry, view) {
+  function renderExternal(entry, view, opts) {
     const p = panel(entry);
     const data = (view.extra_panels || {})[entry.id] || {};
     if (data.error) {
@@ -2292,7 +2303,7 @@
     // A typed panel of the v2 kinds draws itself (cockpit_view.js); the row engine stays here, so a pending's
     // cancel and the per-item expand are the same code whichever component asks for rows.
     if (data.typed && window.LevainCockpitKinds) {
-      window.LevainCockpitKinds.fill(p, data, { rows: appendExternalLines });
+      window.LevainCockpitKinds.fill(p, data, { rows: appendExternalLines, modal: !!(opts && opts.modal) });
       return p;
     }
     const lines = Array.isArray(data.lines) ? data.lines : [];
@@ -2756,5 +2767,5 @@
   // Export the entry points onto a namespace the surface shim calls. `jobsActive` lets the boot
   // layer DEFER a board reload while an async job is polling (a reload would detach the live result
   // box) — flushed via the injected onJobsIdle when the last job finishes (L3 codex MED).
-  window.LevainDashboard = { render, renderPanel: renderPanelSafe, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0 };
+  window.LevainDashboard = { render, renderPanel: renderPanelSafe, finalizeNode, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0 };
 })();
