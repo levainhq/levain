@@ -57,15 +57,45 @@ class TestDefaultLayout:
         assert all(p.startswith("section:") for p in neo["panels"])
         assert [c["panels"] for c in cards[1:2]] == [["crystals"]]    # beside the card, not before it
 
-    def test_the_mind_zone_ends_with_the_compact_row(self, regions) -> None:
+    def test_the_mind_zone_ends_with_one_cognition_card(self, regions) -> None:
         r, _ = regions
         cards = _zone(r, "mind")["cards"]
-        assert [c["panels"] for c in cards[-2:]] == [["graph"], ["wraps"]]
-        assert [c["size"] for c in cards[-2:]] == ["short", "short"]
-        assert not any(c["size"] == "short" for c in cards[:-2])
+        last = cards[-1]
+        assert last["panels"] == ["graph", "wraps"] and last["tabs"] == "Cognition"
+        assert last["size"] == "short" and last["span"] == 1
+        assert not any(c["size"] == "short" for c in cards[:-1])
+
+    def test_tray_and_loops_are_tall_the_rest_of_the_work_zone_medium(self, regions) -> None:
+        r, _ = regions
+        sizes = {c["panels"][0]: c["size"] for c in _zone(r, "operate")["cards"]}
+        assert sizes["tray"] == "tall" and sizes["loops"] == "tall" and sizes["now"] == "medium"
+        assert sizes["episodes"] == sizes["keep"] == "medium"
+
+    def test_ranks_leave_the_embedder_gap_and_loops_clears_it(self, regions) -> None:
+        _, heads = regions
+        assert heads["tray"]["rank"] == 10 and heads["loops"]["rank"] == 15
+        assert heads["loops"]["rank"] < 16 <= 39 < heads["episodes"]["rank"]
+        assert heads["graph"]["rank"] == 200 and heads["wraps"]["rank"] == 210
 
     def test_every_panel_is_placed_exactly_once(self, regions) -> None:
         r, heads = regions
         placed = r["hero"] + r["brief"] + r["widgets"] + [p for z in r["zones"] for c in z["cards"] for p in c["panels"]]
         assert sorted(placed) == sorted(set(placed))
         assert set(placed) == set(heads)
+
+
+@pytest.mark.parametrize("headings,want", [([], 0), (["State"], 1)])
+def test_zero_or_one_neocortex_section(tmp_path, headings, want) -> None:
+    root = _make_levain_install(tmp_path)
+    body = "# Continuity — Sage\n\n" + "".join(f"## {h}\nbody\n\n" for h in headings)
+    (root / ".levain" / "memory.continuity.md").write_text(body, encoding="utf-8")
+    ck = build_default_cockpit(SubstrateSource.local(root),
+                               clock=lambda: datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc))
+    m = ck.manifest(CRED)
+    assert not m.get("errors")
+    cards = next(z for z in m["regions"]["zones"] if z["id"] == "mind")["cards"]
+    neo = [c for c in cards if c["tabs"] == "Neocortex"]
+    if want == 0:
+        assert neo == []
+    else:
+        assert len(neo) == 1 and len(neo[0]["panels"]) == 1

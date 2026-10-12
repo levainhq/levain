@@ -827,16 +827,16 @@ def build_default_cockpit(
                              region="brief", rank=0, optional=True, empty="No state line.",
                              verbs=("operator_state",)))
     # mock-e's default layout (design 1011, "mock-e: what it decides"). The WORK zone (`operate`) is a
-    # 3-column grid whose cards flow in rank order, `now` first: Now, Tray, Open loops / [Inbox, Fleet,
+    # 3-column grid whose cards flow in rank order, `now` first: Now, Tray, Open loops (row a, tall) / [Inbox, Fleet,
     # Stream: downstream-only] / Recent episodes, Keep, Recent edits. Ranks leave gaps so a downstream's
-    # Inbox, Fleet and Stream slot between Open loops and Recent episodes without renumbering the kernel's.
-    for pid, title, bucket, prio, order, rank, views in (
-        ("tray", "Tray", "tray", "gate", "spore.tray", 10, TRAY_VIEWS),
-        ("loops", "Open loops", "loops", "feed", "spore.loops", 20, ()),
-        ("keep", "Keep", "keep", "feed", "spore.keep", 50, ()),
+    # Inbox, Fleet and Stream slot in 16-39, between Open loops and Recent episodes without renumbering the kernel's.
+    for pid, title, bucket, prio, order, rank, views, size in (
+        ("tray", "Tray", "tray", "gate", "spore.tray", 10, TRAY_VIEWS, "tall"),
+        ("loops", "Open loops", "loops", "feed", "spore.loops", 15, (), "tall"),
+        ("keep", "Keep", "keep", "feed", "spore.keep", 50, (), "medium"),
     ):
         ck.register(ProviderSpec(
-            pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank,
+            pid, "triage-list", title, prio, _spore_provider(source, bucket), region="operate", rank=rank, size=size,
             order=order, views=views, rowset=f"spore:{bucket}", read_one=_spore_read_one(source, bucket),
             label_key=spore_label_key,
             empty="Nothing waiting.", verbs=SPORE_ROW_VERBS + (("spore_seed",) if bucket == "tray" else ()),
@@ -861,7 +861,7 @@ def build_default_cockpit(
     ck.register(ProviderSpec("health", "metric", "Health", "gauge", _health(source), region="widgets", rank=40,
                              edit_class=CLASS_C))
     ck.register(ProviderSpec("graph", "visual", "Cognition trace", "feed", _graph(source), region="mind", rank=200,
-                             size="short", edit_class=CLASS_C))
+                             size="short", tabs="Cognition", edit_class=CLASS_C))
     ck.register(ProviderSpec(
         "crystals", "triage-list", "Crystallized patterns", "feed", _crystals(source), region="mind", rank=100,
         size="tall", optional=True, order="crystal.level", rowset="crystals",
@@ -870,7 +870,7 @@ def build_default_cockpit(
         version_excluded=("last_activated_on",), search_fields=("title", "body"), edit_class=CLASS_C,
         empty="No crystals yet."))
     ck.register(ProviderSpec("wraps", "visual", "Projection history", "feed", _wraps(source), region="mind", rank=210,
-                             size="short", edit_class=CLASS_C))
+                             size="short", tabs="Cognition", edit_class=CLASS_C))
     # prose panels: one per neocortex heading and per seed/config doc, DISCOVERED at every read so a
     # heading added later appears and an unreadable file at first sight is a manifest error, not a
     # permanent silent absence.
