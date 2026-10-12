@@ -5600,6 +5600,15 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # Compared RESOLVED, because the socket targets are: a symlinked HOME compared lexically would
     # get the directory form, a read-only tmpfs over the whole of it (L1 + L2).
     runtime_ops, runtime_roots, view_pins = _runtime_view(policy)
+    for r in runtime_roots:
+        for t in tool_views:
+            if r == t or r.is_relative_to(t):
+                # The tool directory's view is placed after it, so would cover it, and bind the host
+                # directory back as one of its subdirectories, dirmngr included.
+                raise ConfinementError(
+                    f"{r}, which bash gets as a view without dirmngr, is inside the tool directory {t}, "
+                    "whose own view would put the host's back. Refusing to grant bash hands "
+                    "(fail-closed). Stop the dirmngr there, or move that directory out of it.")
     shared = {Path(p).resolve() for p in ("/", "/run", "/var/run", "/tmp", "/var/tmp")}
     shared.add(Path.home().resolve())
     hidden_dirs: list[Path] = []
@@ -5634,7 +5643,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     #   · every other daemon socket in the dir, present or started later, which a roster would miss.
     # A GNUPGHOME holding a live dirmngr outside every runtime dir is a view too, for bash without
     # network (:func:`_gnupg_home_views`), with its parents pinned: renaming it or its parent moved
-    # dirmngr past the mask (argushub 2026-10-12, 60 packets each).
+    # dirmngr past the mask (argushub 2026-10-12, 60 packets each). A view inside a tool directory's
+    # view (``~/.kube/gnupg``) is refused where :func:`_runtime_view` is called.
     # ⚠ A D-Bus on an abstract socket (older distros) is not in any directory: it is closed only where
     # bash has no network (``--unshare-net``).
     # The cost: inside bash the runtime dir holds only those sockets. A bound-back socket keeps its

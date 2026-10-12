@@ -391,6 +391,25 @@ def test_a_gnupghome_under_home_is_a_view_nothing_later_covers(tmp_path, home_gh
     assert pins and max(pins) < view[0]
 
 
+@pytest.mark.parametrize("tool", [".kube", ".docker", ".aws", ".config/git"])
+def test_a_gnupghome_under_a_tool_directory_view_is_refused(tmp_path, rd, monkeypatch, tool) -> None:
+    """A tool directory's view is a read-only tmpfs placed after the GNUPGHOME's, so it would cover
+    that view, and bind the GNUPGHOME back from the host as one of its subdirectories."""
+    home = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvhm")).resolve()
+    monkeypatch.setenv("HOME", str(home))
+    g = home / tool / "gh"
+    g.mkdir(parents=True, mode=0o700)
+    s = _listen(g / "S.dirmngr")
+    monkeypatch.setattr(conf, "_dirmngr_sockets", lambda: [g / "S.dirmngr"])
+    try:
+        with pytest.raises(ConfinementError, match="tool directory"):
+            _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True, deny_standard_creds=True))
+    finally:
+        s.close()
+        import shutil
+        shutil.rmtree(home)
+
+
 def test_a_gnupghome_is_left_alone_when_bash_has_network(tmp_path, gh) -> None:
     """dirmngr is a deputy only for bash without network; with network bash fetches by itself."""
     argv = _bwrap_argv(build_policy(_entity(tmp_path)))
