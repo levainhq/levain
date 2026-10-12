@@ -197,6 +197,21 @@ def test_the_cli_enrolls_revokes_and_refuses_with_exit_codes(tmp_path: Path, cap
     assert "revoked at seq 3, compromised since seq 2" in out and "enrolled at seq 1" in out
 
 
+def test_keys_prints_the_enrol_time_only_when_it_is_set(tmp_path: Path, capsys, monkeypatch) -> None:
+    """L3 r1 F4 (1012+80): a key with no enrol time lists no "(None)"."""
+    from levain import cli
+    from levain.cockpit import keys as cockpit_keys
+    from levain.cockpit.keys import KeyRow
+
+    rows = [KeyRow("SHA256:untimed", "kuntimed", "presence", 1, None, None, None),
+            KeyRow("SHA256:timed", "ktimed", "presence", 2, "2026-10-11T12:00:00.000000Z", None, None)]
+    monkeypatch.setattr(cockpit_keys, "keys", lambda *a, **kw: (rows, None))
+    assert cli.main(["cockpit", "keys", "--data-root", str(tmp_path)]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].endswith("enrolled at seq 1") and "None" not in out[0]
+    assert out[1].endswith("enrolled at seq 2 (2026-10-11T12:00:00.000000Z)")
+
+
 def test_a_busy_journal_is_a_refusal_not_a_traceback(tmp_path: Path, capsys) -> None:
     import sqlite3
 

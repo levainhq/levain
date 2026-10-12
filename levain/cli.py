@@ -1623,7 +1623,8 @@ def _cmd_cockpit_keys(args: argparse.Namespace) -> int:
         state = f"revoked at seq {r.revoked_seq}" if r.revoked_seq is not None else "active"
         if r.compromised_since is not None:
             state += f", compromised since seq {r.compromised_since}"
-        print(f"{r.fingerprint}  {r.key_class:<16} {state:<44} enrolled at seq {r.enrolled_seq} ({r.enrolled_at})"
+        print(f"{r.fingerprint}  {r.key_class:<16} {state:<44} enrolled at seq {r.enrolled_seq}"
+              + (f" ({r.enrolled_at})" if r.enrolled_at else "")
               + (f", first enrolled {r.legacy_enrolled_at}" if r.legacy_enrolled_at else ""))
     return 0
 
