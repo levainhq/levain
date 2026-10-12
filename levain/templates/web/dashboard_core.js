@@ -466,6 +466,12 @@
     const anchor = state && state.parentNode === store.parentNode ? state : store;
     if (mast.parentNode !== store.parentNode || mast.nextSibling !== anchor) store.parentNode.insertBefore(mast, anchor);
   }
+  // a failed hero render: the masthead goes home and the CONTENT mounts are emptied (stale weather and sky beside the
+  // error line would read as current); the structural mounts (#ck-hero, #ck-skycol, #ck-strip) stay for the next render
+  function restoreHero() {
+    restoreMasthead();
+    for (const id of ["ck-when", "ck-sky"]) { const m = document.getElementById(id); if (m) m.replaceChildren(); }
+  }
   function keShell(on) {
     const hero = document.getElementById("ck-hero"), brief = document.getElementById("ck-brief"), widgets = document.getElementById("ck-widgets");
     if (!hero || !brief || !widgets) return;
@@ -539,7 +545,6 @@
     const stamp = el("div", "clockbox");
     stamp.append(clock, date);
     whenKids.push(stamp, events);
-    if (window.LevainCockpitKinds) window.LevainCockpitKinds.mountClock(clock, date);
     if (wx) {
       const node = bareNode(wx, view, "wx");
       node.dataset.ckHero = "weather";
@@ -547,6 +552,8 @@
     } else whenKids.push(Object.assign(el("div", "wx"), { hidden: true }));
     if (sky) skyKids.push(bareNode(sky, view, "ck-sky", { hero: { events: events } }));
     for (const e of entries) if (e !== wx && e !== sky) skyKids.push(bareNode(e, view, "ck-card"));
+    // the clock is mounted only now: nothing after this can throw, so no clock ticks on a node that never attached
+    if (window.LevainCockpitKinds) window.LevainCockpitKinds.mountClock(clock, date);
     when.replaceChildren();
     if (brand) when.appendChild(brand);
     when.append(...whenKids);
@@ -700,7 +707,7 @@
     const byId = new Map();
     for (const e of view.layout) byId.set(e.id, e);
     for (const old of document.querySelectorAll("#ck-hero > .ck-region-err")) old.remove();   // a clean hero render clears its last error line
-    guardRegion("the hero", () => renderHero(view, byId), regionErr("ck-hero", false), restoreMasthead);
+    guardRegion("the hero", () => renderHero(view, byId), regionErr("ck-hero", false), restoreHero);
     guardRegion("the brief", () => renderBriefRegion(view, byId), regionErr("ck-brief", true), restoreState);
     guardRegion("the widgets", () => renderWidgets(view, byId), regionErr("ck-widgets", true));
     // a zone builds its section off to the side and attaches it last, so a throw leaves nothing half-drawn behind

@@ -904,7 +904,7 @@
       return;
     }
     if (d.kind === "status-dots") {
-      // every metric is drawn once: a status that is ok / warn / bad is a dot row; any other metric carrying a value is a
+      // each metric is drawn at most once, up to WIDGET_DOTS dots and WIDGET_FIGURES figures (the rest counted in "+N more"): a status that is ok / warn / bad is a dot row; any other metric carrying a value is a
       // figure (an integer, a fractional or a string alike); one with neither is a dot row in the unknown state
       const ms = d.metrics || [];
       const isDot = (m) => m.status === "ok" || m.status === "warn" || m.status === "bad";
