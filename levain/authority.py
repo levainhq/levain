@@ -15,12 +15,14 @@ leads; a log behind it refuses to open.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 import re
 import secrets
 import sqlite3
+import struct
 import subprocess
 import tempfile
 import threading
@@ -292,34 +294,124 @@ def _signers_line(principal: str, namespace: str, public_key: str) -> str:
     return f'{principal} namespaces="{namespace}" {public_key}\n'
 
 
+_SSHSIG_BEGIN = "-----BEGIN SSH SIGNATURE-----"
+_SSHSIG_END = "-----END SSH SIGNATURE-----"
+_SK_USER_PRESENT = 0x01
+
+
+class _Wire:
+    """A cursor over SSH wire-format bytes (RFC 4251 §5); any overrun or trailing byte is ValueError."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data, self._pos = data, 0
+
+    def take(self, n: int) -> bytes:
+        if self._pos + n > len(self._data):
+            raise ValueError("truncated")
+        out = self._data[self._pos:self._pos + n]
+        self._pos += n
+        return out
+
+    def u32(self) -> int:
+        return int(struct.unpack(">I", self.take(4))[0])
+
+    def string(self) -> bytes:
+        return self.take(self.u32())
+
+    def end(self) -> None:
+        if self._pos != len(self._data):
+            raise ValueError("trailing bytes")
+
+
+def _sshsig_type_and_flags(armored: str) -> tuple[str, int | None]:
+    """The signature algorithm inside an armored SSHSIG, and its FIDO flags byte (None for a non-sk
+    algorithm). Raises ValueError on anything malformed.
+
+    The SSHSIG blob (OpenSSH PROTOCOL.sshsig §"Blob format"): byte[6] "SSHSIG", uint32 version (1),
+    string publickey, string namespace, string reserved, string hash_algorithm, string signature.
+    For an sk-* algorithm the ``signature`` string is (OpenSSH PROTOCOL.u2f §"SSH U2F signatures"):
+    string sig-type, string inner signature, byte flags, uint32 counter; flags bit 0x01 is user
+    presence. Every other algorithm is string sig-type, string signature."""
+    text = armored.strip()
+    if not text.startswith(_SSHSIG_BEGIN) or not text.endswith(_SSHSIG_END):
+        raise ValueError("not an armored SSH signature")
+    blob = base64.b64decode("".join(text[len(_SSHSIG_BEGIN):-len(_SSHSIG_END)].split()), validate=True)
+    outer = _Wire(blob)
+    if outer.take(6) != b"SSHSIG" or outer.u32() != 1:
+        raise ValueError("not an SSHSIG v1 blob")
+    for _ in range(4):              # publickey, namespace, reserved, hash_algorithm: ssh-keygen judges them
+        outer.string()
+    inner = _Wire(outer.string())
+    outer.end()
+    sig_type = inner.string().decode("ascii")
+    inner.string()
+    if not sig_type.startswith("sk-"):
+        inner.end()
+        return sig_type, None
+    flags = inner.take(1)[0]
+    inner.u32()
+    inner.end()
+    return sig_type, flags
+
+
+def _pipe_reading(data: bytes) -> int:
+    """The read end of a pipe that yields ``data`` and then EOF. A thread writes it, so no size can
+    block the caller; it ends with a broken pipe once the caller closes the read end."""
+    r, w = os.pipe()
+
+    def feed() -> None:
+        try:
+            with open(w, "wb") as fh:
+                fh.write(data)
+        except OSError:
+            pass
+
+    threading.Thread(target=feed, name="levain-authority-pipe", daemon=True).start()
+    return r
+
+
 def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerprint: str,
                     namespace: str = NAMESPACE, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
                     timeout: float = 10.0) -> bool:
-    """True only if ``signature`` is an SSHSIG over ``message`` in ``namespace`` by ``public_key``, and
-    the verifier reports exactly ``fingerprint`` for the key it verified with. The fingerprint check is the
-    defence against the temporary signers file being swapped by the same uid between write and use.
+    """True only if ``signature`` is an SSHSIG over ``message`` in ``namespace`` by ``public_key``, the
+    verifier reports exactly ``fingerprint`` for the key it verified with, and, for a FIDO (sk-*) key or
+    signature, the signature carries the user-presence flag. The signers line and the signature reach
+    ssh-keygen through pipes (``/dev/fd/N``), never a file, so no same-uid process can swap either one
+    (say, for a signers line with ``no-touch-required``) between write and use; the presence flag is
+    checked here as well, so a no-touch signature is refused whatever the verifier would say.
     Raises :class:`AuthorityError` when the verifier cannot run (that is never a verdict)."""
-    if not isinstance(signature, str) or len(signature) > _MAX_SIGNATURE \
-            or "-----BEGIN SSH SIGNATURE-----" not in signature:
+    if not isinstance(signature, str) or len(signature) > _MAX_SIGNATURE:
+        return False
+    try:
+        sig_bytes = (signature.strip() + "\n").encode("ascii")
+        sig_type, flags = _sshsig_type_and_flags(signature)
+    except (ValueError, UnicodeError):
+        return False
+    key_type = public_key.split()[0] if isinstance(public_key, str) and public_key.split() else ""
+    if (key_type.startswith("sk-") or sig_type.startswith("sk-")) \
+            and (flags is None or not flags & _SK_USER_PRESENT):
         return False
     problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
     if problem is not None:
         raise AuthorityError(f"cannot verify an authority signature: {problem}")
     principal = "authority-signer"
-    with tempfile.TemporaryDirectory(prefix="levain-authority-") as d:
-        signers = os.path.join(d, "signers")
-        sig = os.path.join(d, "sig")
-        with open(signers, "w", encoding="ascii") as fh:
-            fh.write(_signers_line(principal, namespace, public_key))
-        with open(sig, "w", encoding="ascii") as fh:
-            fh.write(signature.strip() + "\n")
-        try:
-            cp = subprocess.run([str(keygen), "-Y", "verify", "-f", signers, "-I", principal, "-n", namespace,
-                                 "-s", sig], input=message, capture_output=True, timeout=timeout,
-                                env=dict(_VERIFY_ENV))
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise AuthorityError(f"ssh-keygen could not verify an authority signature ({type(exc).__name__})") \
-                from None
+    try:
+        signers = _signers_line(principal, namespace, public_key).encode("ascii")
+    except UnicodeError:
+        return False
+    fds: list[int] = []
+    try:
+        fds.append(_pipe_reading(signers))
+        fds.append(_pipe_reading(sig_bytes))
+        cp = subprocess.run([str(keygen), "-Y", "verify", "-f", f"/dev/fd/{fds[0]}", "-I", principal,
+                             "-n", namespace, "-s", f"/dev/fd/{fds[1]}"], input=message, capture_output=True,
+                            timeout=timeout, env=dict(_VERIFY_ENV), pass_fds=tuple(fds))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AuthorityError(f"ssh-keygen could not verify an authority signature ({type(exc).__name__})") \
+            from None
+    finally:
+        for fd in fds:
+            os.close(fd)
     if cp.returncode != 0:
         return False
     good = re.compile(r'Good "' + re.escape(namespace) + r'" signature for ' + re.escape(principal)

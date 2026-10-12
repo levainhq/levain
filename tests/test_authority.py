@@ -191,6 +191,85 @@ def test_laptop_floor_admits_an_sk_key(base, keys):
     assert "no-touch-required" not in auth._signers_line("p", auth.NAMESPACE, pk)
 
 
+# --- the signature check (F1) ---------------------------------------------------------------------
+
+
+def _ssh_string(b: bytes) -> bytes:
+    return struct.pack(">I", len(b)) + b
+
+
+def _armored_sshsig(public_key: str, sig_type: str, *, flags: int | None) -> str:
+    """An SSHSIG (PROTOCOL.sshsig) whose signature field is ``sig_type`` + junk signature bytes, plus,
+    for an sk type, the PROTOCOL.u2f flags byte and counter. No FIDO key exists headless, so the
+    signature cannot verify: the tests stand in a verifier that says Good, to show the presence check
+    refuses on its own."""
+    sig = _ssh_string(sig_type.encode()) + _ssh_string(os.urandom(64))
+    if flags is not None:
+        sig += bytes([flags]) + struct.pack(">I", 7)
+    blob = (b"SSHSIG" + struct.pack(">I", 1) + _ssh_string(base64.b64decode(public_key.split()[1]))
+            + _ssh_string(auth.NAMESPACE.encode()) + _ssh_string(b"") + _ssh_string(b"sha512")
+            + _ssh_string(sig))
+    b64 = base64.b64encode(blob).decode()
+    body = "\n".join(b64[i:i + 70] for i in range(0, len(b64), 70))
+    return f"-----BEGIN SSH SIGNATURE-----\n{body}\n-----END SSH SIGNATURE-----\n"
+
+
+FAKE_FP = "SHA256:" + "A" * 43
+
+
+def _verifier_says_good(monkeypatch) -> None:
+    """Stand in an ssh-keygen that accepts anything, reporting FAKE_FP."""
+    def run(argv, **kw):
+        return subprocess.CompletedProcess(argv, 0, b'Good "levain-authority" signature for authority-signer '
+                                                    b"with ED25519-SK key " + FAKE_FP.encode() + b"\n", b"")
+    monkeypatch.setattr(auth.subprocess, "run", run)
+
+
+def test_sk_signature_without_user_presence_refused_whatever_the_verifier_says(monkeypatch):
+    pk = _sk_public_key()
+    _verifier_says_good(monkeypatch)
+    no_touch = _armored_sshsig(pk, "sk-ssh-ed25519@openssh.com", flags=0x04)    # UV set, UP clear
+    assert not auth.verify_link_sig(b"m", no_touch, public_key=pk, fingerprint=FAKE_FP)
+    touched = _armored_sshsig(pk, "sk-ssh-ed25519@openssh.com", flags=0x01)
+    assert auth.verify_link_sig(b"m", touched, public_key=pk, fingerprint=FAKE_FP)   # the control
+
+
+def test_sk_key_with_a_non_sk_signature_refused(monkeypatch):
+    pk = _sk_public_key()
+    _verifier_says_good(monkeypatch)
+    assert not auth.verify_link_sig(b"m", _armored_sshsig(pk, "ssh-ed25519", flags=None), public_key=pk,
+                                    fingerprint=FAKE_FP)
+
+
+def test_malformed_sshsig_refused_before_the_verifier(monkeypatch):
+    pk = _sk_public_key()
+    _verifier_says_good(monkeypatch)
+    good = _armored_sshsig(pk, "sk-ssh-ed25519@openssh.com", flags=0x01)
+    trailing = _armored_sshsig(pk, "sk-ssh-ed25519@openssh.com", flags=0x01).replace(
+        "-----END", "AAAA\n-----END")
+    for bad in (good.replace("SSH SIGNATURE", "SSH SIG"), trailing, good[:60] + "!" + good[61:], "é" + good):
+        assert not auth.verify_link_sig(b"m", bad, public_key=pk, fingerprint=FAKE_FP)
+
+
+def test_signers_and_signature_reach_ssh_keygen_through_pipes_never_disk(monkeypatch, keys):
+    """A real verify, with every temp-file maker poisoned: the signers line and the signature travel as
+    /dev/fd/N, so a same-uid process has no file to swap."""
+    def poisoned(*a, **k):
+        raise AssertionError("an authority signature check touched a temp file")
+    monkeypatch.setattr(auth.tempfile, "TemporaryDirectory", poisoned)
+    monkeypatch.setattr(auth.tempfile, "mkstemp", poisoned)
+    monkeypatch.setattr(auth.tempfile, "NamedTemporaryFile", poisoned)
+    real, argvs = auth.subprocess.run, []
+    monkeypatch.setattr(auth.subprocess, "run", lambda argv, **kw: ("verify" in argv and argvs.append(argv)) or real(argv, **kw))
+    k = keys["laptop"]
+    assert auth.verify_link_sig(b"msg", k.sign(b"msg"), public_key=k.public_key, fingerprint=k.fp)
+    assert not auth.verify_link_sig(b"other", k.sign(b"msg"), public_key=k.public_key, fingerprint=k.fp)
+    assert len(argvs) == 2
+    for argv in argvs:
+        assert argv[argv.index("-f") + 1].startswith("/dev/fd/")
+        assert argv[argv.index("-s") + 1].startswith("/dev/fd/")
+
+
 # --- §3.3a enrol ---------------------------------------------------------------------------------
 
 
