@@ -4,7 +4,7 @@ The wire and cryptographic substrate every levain log speaks: Merkle math, signe
 cosignatures, witness submissions, origins, key fingerprints, canonical JSON leaf framing, the two frozen leaf types
 and SSHSIG for device lines. Code: `levain/contracts/` (stdlib and `cryptography>=48` only; nothing there imports
 `levain.team` or any other levain module). Vectors: `tests/golden/contracts/frozen/`. Design: levain
-`project_memory/1012-s1/S1_DESIGN.md` (rev 10).
+`project_memory/1012-s1/S1_DESIGN.md` (rev 11).
 
 **Status: built, NOT yet frozen.** The freeze tag `levain-contracts/1` is cut only after a seat other than the
 builder reads this document against the design's §1 (T36). Until that tag exists, nothing below is a promise.
