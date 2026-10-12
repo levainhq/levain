@@ -65,9 +65,18 @@ def _ecdsa(d: Path, name: str) -> str:
 
 # --- the fakes ---------------------------------------------------------------------------------------
 
+# Each fake records the environment it was started with (STATE + ".env", one JSON line per run), and finds
+# its state through the STATE line written above its body, never the environment: a helper hands its tools
+# the allowlist only (levain.launch.child_env), which carries no FAKE_STATE.
+_RECORD_ENV = r'''
+import json, os, sys
+with open(STATE + ".env", "a") as _fh:
+    _fh.write(json.dumps({"argv": sys.argv[1:], "env": dict(os.environ)}) + "\n")
+'''
+
 _FAKE_SC_AUTH = r'''
 import json, sys, os
-state = os.environ["FAKE_STATE"]
+state = STATE
 db = json.load(open(state))
 cmd = sys.argv[1:]
 log = open(state + ".log", "a")
@@ -93,7 +102,7 @@ json.dump(db, open(state, "w"))
 
 _FAKE_SSH_KEYGEN = r'''
 import json, os, sys
-state = os.environ["FAKE_STATE"]
+state = STATE
 args = sys.argv[1:]
 if "-K" not in args:
     os.execv("/usr/bin/ssh-keygen", ["ssh-keygen"] + args)
@@ -123,7 +132,7 @@ class Mac:
         self.state = tmp / "fake_state.json"
         self.sc_auth, self.ssh_keygen = self.dir / "sc_auth", self.dir / "ssh-keygen"
         for path, body in ((self.sc_auth, _FAKE_SC_AUTH), (self.ssh_keygen, _FAKE_SSH_KEYGEN)):
-            path.write_text(f"#!{PY} -I\n" + body)
+            path.write_text(f"#!{PY} -I\nSTATE = {str(self.state)!r}\n" + _RECORD_ENV + body)
             path.chmod(0o755)
         keys = tmp / "points"
         keys.mkdir()
@@ -133,8 +142,6 @@ class Mac:
         self.new = [{"hash": _point_sha1(p), "pub": p} for p in pubs[existing:]]
         self.db = {"identities": ident, "next": list(self.new)}
         self.save()
-        monkeypatch.setenv("FAKE_STATE", str(self.state))
-        monkeypatch.setattr(custody, "_VERIFY_ENV", {**custody._VERIFY_ENV, "FAKE_STATE": str(self.state)})
         monkeypatch.setattr(custody, "APPLE_PROVIDER", "/usr/lib/ssh-keychain.dylib")
 
     def save(self) -> None:
@@ -146,6 +153,10 @@ class Mac:
     def log(self) -> str:
         p = Path(str(self.state) + ".log")
         return p.read_text() if p.exists() else ""
+
+    def envs(self) -> list[dict]:
+        p = Path(str(self.state) + ".env")
+        return [json.loads(ln) for ln in p.read_text().splitlines()] if p.exists() else []
 
     def create(self, kdir: Path, label: str = "levain-test", **kw):
         return custody.create_touch_id(kdir, label, sc_auth=self.sc_auth, ssh_keygen=self.ssh_keygen,
@@ -251,13 +262,51 @@ def test_point_sha1_is_what_sc_auth_lists():
     assert custody.point_sha1(line) == "6996CA0EAAA409791400B4785C224D2837A18EB3"
 
 
+# --- what every tool the helpers start is given (L3 r1 P1) ------------------------------------------------
+
+_PLANTED = "planted-secret-0c8e"
+
+
+def _outside_the_allowlist(record: dict) -> list[str]:
+    """The names in one spawn's environment that neither the allowlist admits nor the call itself sets
+    (``_VERIFY_ENV`` for the ssh-keygen checks), and any name holding the planted secret."""
+    from levain.launch import allowed
+    env = record["env"]
+    return sorted({k for k in env if not allowed(k) and k not in custody._VERIFY_ENV}
+                  | {k for k, v in env.items() if _PLANTED in v})
+
+
+def test_every_tool_the_helpers_start_gets_the_allowlist_and_nothing_else(tmp_path, monkeypatch,
+                                                                          provider_present):
+    """codex HIGH (L3 r1): sc_auth and ssh-keygen inherited the whole restored environment, which sits in
+    each child's exec-time block (``ps -E``) while it runs; ssh-keygen may wait ten minutes on a person."""
+    for name in ("GH_TOKEN", "OPENAI_API_KEY", "LEVAIN_TEAM_TOKEN", "SOME_PLAIN_NAME"):
+        monkeypatch.setenv(name, _PLANTED)
+    mac = Mac(tmp_path, monkeypatch)
+    mac.create(tmp_path / "keys")                            # list, create, list, ssh-keygen -K
+    mac.db = mac.load()
+    mac.db["prot"] = "none"
+    mac.save()
+    with pytest.raises(KeyError_, match="not bio"):
+        mac.create(tmp_path / "keys", "levain-two")          # and delete
+    custody.create_passphrase(tmp_path / "pkeys", "pp", ssh_keygen=_fake_keygen_making(tmp_path, "pw"),
+                              interactive=True)              # ssh-keygen -t ed25519, then -y -P ""
+    records = mac.envs() + [json.loads(ln) for ln in (tmp_path / "keygen.env").read_text().splitlines()]
+    ran = " | ".join(" ".join(r["argv"]) for r in records)
+    for what in ("list-ctk-identities", "create-ctk-identity", "delete-ctk-identity", "-K -w", "-t ed25519",
+                 "-y -P"):
+        assert what in ran, f"{what!r} never ran: {ran}"
+    bad = {" ".join(r["argv"][:2]): _outside_the_allowlist(r) for r in records if _outside_the_allowlist(r)}
+    assert bad == {}
+
+
 # --- key create --custody passphrase --------------------------------------------------------------------
 
 
 def _fake_keygen_making(tmp: Path, passphrase: str) -> Path:
     """An ssh-keygen whose key generation uses ``passphrase`` (the real one asks it on the terminal)."""
     path = tmp / "keygen-make"
-    path.write_text(f"#!{PY} -I\nimport os, sys\nargs = sys.argv[1:]\n"
+    path.write_text(f"#!{PY} -I\nSTATE = {str(tmp / 'keygen')!r}\n" + _RECORD_ENV + "import os, sys\nargs = sys.argv[1:]\n"
                     f"if '-t' in args:\n    args = args + ['-q', '-N', {passphrase!r}]\n"
                     "os.execv('/usr/bin/ssh-keygen', ['ssh-keygen'] + args)\n")
     path.chmod(0o755)

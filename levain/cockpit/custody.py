@@ -20,6 +20,10 @@ why creation is the load-bearing piece here, and why every enrol record declares
   ``SSH_SK_PROVIDER`` itself; the CLI reads it for the default ``--custody``. The provider must be one this
   module knows: a sidecar never names a library for ssh-keygen to load.
 
+Every tool this module starts is given an explicit environment: ``child_env()`` (the allowlist levain.launch
+documents, nothing carried) for ``sc_auth`` and the interactive ``ssh-keygen``, and the fixed ``_VERIFY_ENV``
+alone for the ``ssh-keygen`` checks. ``-K`` names its provider on argv, so no call needs ``SSH_SK_PROVIDER``.
+
 Every custody is a DECLARATION the enrolling key signs, never a proof; these checks stop an accidental weak
 enrolment on the machine that makes or holds the key, nothing more.
 """
@@ -44,6 +48,7 @@ from typing import Any
 from levain.authority import CUSTODIES, LAPTOP, UNSTATED, custody_problem
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN
 from levain.cockpit.keys import KeyError_, normalise_public_key
+from levain.launch import child_env
 
 __all__ = ["APPLE_PROVIDER", "SC_AUTH", "SIDECAR_SUFFIX", "CreatedKey", "Identity", "Sidecar", "create_passphrase",
            "create_touch_id", "ctk_status", "custody_note", "declared_custody", "default_key_dir", "is_encrypted_file",
@@ -257,7 +262,7 @@ def list_identities(*, sc_auth: Path | str = SC_AUTH) -> list[Identity]:
     header line; a row is read at the header's column offsets."""
     try:
         cp = subprocess.run([str(sc_auth), "list-ctk-identities"], stdin=subprocess.DEVNULL, capture_output=True,
-                            timeout=_TOOL_TIMEOUT, check=False, start_new_session=True)
+                            timeout=_TOOL_TIMEOUT, check=False, start_new_session=True, env=child_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise KeyError_(f"sc_auth could not list CTK identities ({type(exc).__name__})") from None
     text = cp.stdout.decode("utf-8", "replace")
@@ -285,7 +290,8 @@ def _delete_identity(digest: str, sc_auth: Path | str) -> str | None:
     """Delete one CTK identity (no touch: measured); the reason it could not be, else None."""
     try:
         cp = subprocess.run([str(sc_auth), "delete-ctk-identity", "-h", digest], stdin=subprocess.DEVNULL,
-                            capture_output=True, timeout=_TOOL_TIMEOUT, check=False, start_new_session=True)
+                            capture_output=True, timeout=_TOOL_TIMEOUT, check=False, start_new_session=True,
+                            env=child_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         return f"sc_auth could not delete CTK identity {digest} ({type(exc).__name__})"
     if cp.returncode != 0:
@@ -442,7 +448,7 @@ def create_touch_id(key_dir: Path | None = None, label: str | None = None, *,
     try:
         cp = subprocess.run([str(sc_auth), "create-ctk-identity", "-l", label, "-k", "p-256-ne", "-t", "bio"],
                             stdin=subprocess.DEVNULL, capture_output=True, timeout=_TOOL_TIMEOUT, check=False,
-                            start_new_session=True)
+                            start_new_session=True, env=child_env())
     except (OSError, subprocess.TimeoutExpired) as exc:
         created = [i for i in list_identities(sc_auth=sc_auth) if i.label == label]
         raise KeyError_(f"sc_auth could not create the identity ({type(exc).__name__})"
@@ -552,7 +558,7 @@ def create_passphrase(key_dir: Path | None = None, label: str | None = None, *,
         try:
             # ssh-keygen asks the passphrase (twice) on the terminal itself: it never reaches levain or argv
             cp = subprocess.run([str(ssh_keygen), "-t", "ed25519", "-C", label, "-f", str(src)],
-                                timeout=_TYPING_TIMEOUT, check=False)
+                                timeout=_TYPING_TIMEOUT, check=False, env=child_env())
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise KeyError_(f"ssh-keygen could not make the key ({type(exc).__name__})") from None
         if cp.returncode != 0 or not src.is_file():
