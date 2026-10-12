@@ -475,8 +475,8 @@ class Broker:
 
     def _advance_anchor(self, db: CockpitDB, now: datetime) -> None:
         """At open, a log at or ahead of its anchor moves the anchor up to its head (DESIGN §3.8). A log
-        the anchor refuses is left refused (every request captures that refusal); it never stops the
-        broker, whose token-reported reads and writes do not depend on it."""
+        the anchor refuses is left refused, and the broker still starts: reads go on, and every request
+        that would write captures the refusal and is refused at issue or submit."""
         auth = self._capture(db, now)
         if auth.authority is None:
             if not auth.log_empty:
