@@ -1096,7 +1096,8 @@ def _check_cockpit_authority(install: Path) -> list[CheckResult]:
     A WARNING, never a failure, while exactly one unrevoked laptop-presence key is enrolled: losing it
     leaves nothing that can enrol a successor. No row at all without a cockpit journal. The journal is
     opened read-only (SQLite may add its WAL side files beside it): a ``levain-cockpit/2`` journal is
-    reported, not migrated, and no schema is created; any other format but /3 fails."""
+    reported, not migrated, and no schema is created; any other format but /3 fails. It reads
+    ``<install>/.levain/cockpit`` only: a store at another data root (an embedder's) gets no row."""
     from datetime import datetime, timezone
 
     from levain.authority import LAPTOP, anchor_path
