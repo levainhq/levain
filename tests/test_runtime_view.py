@@ -323,6 +323,17 @@ def test_a_gnupghome_holding_dirmngr_is_a_view_pinned_from_above(tmp_path, gh) -
     assert not [a for _, op, a in ops if a[:1] == ["/dev/null"] and _under(a[1], gh)]   # the view replaces the mask
 
 
+def test_a_gnupghome_view_binds_back_no_socket_but_the_agent_and_keyboxd(tmp_path, gh) -> None:
+    extra = [_listen(gh / n) for n in ("S.other", "dirmngr.sock", "S.gpg-agent.browser")]
+    try:
+        argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+        socks = {p for p in _bound_back(argv, gh) if Path(p).is_socket()}
+        assert socks == {str(gh / "S.gpg-agent"), str(gh / "S.keyboxd")}
+    finally:
+        for s in extra:
+            s.close()
+
+
 def test_a_gnupghome_that_cannot_be_listed_is_refused_naming_it(tmp_path, gh) -> None:
     gh.chmod(0o300)
     try:
