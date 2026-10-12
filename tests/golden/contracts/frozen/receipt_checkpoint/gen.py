@@ -111,6 +111,18 @@ anchors("consistency-not-a-list-refused", [(leaf(OA, 5, 0, [], consistency=""), 
 anchors("v2-refused-at-ingest", [(leaf(OA, 5, 0, [], v=2), VA)], [REFUSE], REG)
 anchors("v2-unverifiable-at-verify", [(leaf(OA, 5, 0, [], v=2), VA)], [UNVERIFIABLE], REG, at="verify")
 
+# rev 11 Q9: the registry's context-free validator (canon.classify_leaf -> receipt.check_fields) never reaches the
+# Merkle proof, so a 31-byte proof line is refused there by F10's 32-byte rule ALONE (at judge_anchors,
+# merkle's own proof check refuses the same input a second time). This isolates that one rule.
+for vid, data_, verdict, auth in (
+        ("good-control", leaf(OA, 9, 5, proof(5, 9)), ACCEPT, F10),
+        ("proof-line-31-bytes-refused-by-the-shape-alone",
+         leaf(OA, 9, 5, [], consistency=[b64(b"\x01" * 31)] + pr[1:]), REFUSE, SHAPE),
+        ("proof-line-33-bytes-refused-by-the-shape-alone",
+         leaf(OA, 9, 5, [], consistency=[b64(b"\x01" * 33)] + pr[1:]), REFUSE, SHAPE)):
+    V.append(vector(f"classify-{vid}", "no_upstream", "classify",
+                    {"data_hex": data_.hex(), "log_kind": "team", "at": "ingest"}, {"verdict": verdict}, auth, None))
+
 # rev 11: at verify an UNVERIFIABLE anchor leaf poisons every later leaf of its origin; an unknown (leaf, v) has no
 # origin levain can read, so it poisons every origin. Ingest is unchanged.
 CASCADE = profile("S1_DESIGN F10 rev 11", "at verify, once a receipt_checkpoint leaf is UNVERIFIABLE every later leaf "

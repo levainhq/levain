@@ -32,6 +32,8 @@ def test_vector(v):
                                              snapshot=T.Snapshot(), at=i["at"], now=now)
         assert verdict == want["verdict"], reason
         assert (leaf is not None) == (verdict == C.ACCEPT)
+    elif v["op"] == "classify":    # the registry's context-free validator alone (rev 11 Q9)
+        assert C.classify_leaf(h(i["data_hex"]), i["log_kind"], at=i["at"]) == want["verdict"]
     elif v["op"] == "receipt":
         obj = json.loads(h(i["leaf_hex"]))
         leaf = T.check_line_fields(obj)

@@ -13,8 +13,11 @@ VECTORS = load("receipt_checkpoint")
 @pytest.mark.parametrize("v", VECTORS, ids=ids(VECTORS))
 def test_vector(v):
     check_shape(v)
-    assert v["op"] == "anchors"
     i, want = v["input"], v["expect"]["levain"]
+    if v["op"] == "classify":     # the registry's context-free validator alone (rev 11 Q9)
+        assert C.classify_leaf(h(i["data_hex"]), i["log_kind"], at=i["at"]) == want["verdict"]
+        return
+    assert v["op"] == "anchors"
     got = R.judge_anchors([(h(x["data_hex"]), N.parse_vkey(x["vkey"])) for x in i["leaves"]], at=i["at"])
     assert [g for g, _ in got] == want["verdicts"], got
     if "first_unverifiable" in want:

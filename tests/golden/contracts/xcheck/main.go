@@ -376,7 +376,15 @@ func main() {
 		fail("witness oracle: %v", err)
 	}
 
-	fmt.Printf("receipt_checkpoint: %d accepted anchors' F1-F3 layers checked against Go\n", receiptLayers(root))
+	checkedAnchors, acceptedAnchors := receiptLayers(root)
+	fmt.Printf("receipt_checkpoint: %d of %d accepted anchors' F1-F3 layers checked against Go\n", checkedAnchors,
+		acceptedAnchors)
+	// S1_DESIGN rev 11: a check that cannot fail is not evidence. The count must equal the accepted anchors, and
+	// there must be some, or the Go layer silently stopped running.
+	if acceptedAnchors == 0 || checkedAnchors != acceptedAnchors {
+		fail("receipt_checkpoint: %d anchors checked against Go, but the vectors accept %d", checkedAnchors,
+			acceptedAnchors)
+	}
 
 	if *emit != "" {
 		must(emitVectors(*emit), "emit")
@@ -394,17 +402,33 @@ func main() {
 // (S1_DESIGN §1 "Independent cross-check": F10 is levain's own rule, kind no_upstream, and Go checks the layers
 // inside it): the checkpoint note opens under the vector's vkey (sumdb/note), parses as a checkpoint
 // (formats/log), and the consistency proof from the same origin's previous accepted anchor verifies (merkle/proof).
-// A levain-refused anchor asserts nothing here. Returns the number of anchors checked.
-func receiptLayers(root string) int {
+// A levain-refused anchor asserts nothing here. Returns the number of anchors checked and, counted apart from the
+// checking loop, the number of accept verdicts in the vector file; main fails unless the two are equal.
+func receiptLayers(root string) (int, int) {
 	raw, err := os.ReadFile(filepath.Join(root, "receipt_checkpoint", "vectors.json"))
 	must(err, "receipt_checkpoint")
 	var doc struct {
 		Vectors []vector `json:"vectors"`
 	}
 	must(json.Unmarshal(raw, &doc), "receipt_checkpoint")
-	checked := 0
+	checked, accepted := 0, 0
+	for i := range doc.Vectors {
+		if doc.Vectors[i].Op != "anchors" {
+			continue // "classify": the context-free leaf validator alone, no anchor walk
+		}
+		var verdicts []string
+		must(json.Unmarshal(doc.Vectors[i].Expect.Levain["verdicts"], &verdicts), doc.Vectors[i].ID)
+		for _, x := range verdicts {
+			if x == "accept" {
+				accepted++
+			}
+		}
+	}
 	for i := range doc.Vectors {
 		v := &doc.Vectors[i]
+		if v.Op != "anchors" {
+			continue
+		}
 		var leaves []struct {
 			Data string `json:"data_hex"`
 			Vkey string `json:"vkey"`
@@ -468,7 +492,7 @@ func receiptLayers(root string) int {
 			checked++
 		}
 	}
-	return checked
+	return checked, accepted
 }
 
 // ---- Go-generated vectors, for tests/test_contracts_gogen.py --------------------------------------------

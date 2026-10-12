@@ -11,8 +11,9 @@ import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from _genlib import (ACCEPT, REFUSE, UNVERIFIABLE, b64, canon_json, derivation, ed_key_blob, fp,  # noqa: E402
-                     line_leaf, profile, pub, seal_entry, seed, vector, write)
+from _genlib import (ACCEPT, REFUSE, UNVERIFIABLE, b64, canon_json, derivation, device_message,  # noqa: E402
+                     ed_key_blob, ed_sign, fp, line_leaf, profile, pub, seal_entry, seed, ssh_str, sshsig_blob,
+                     sshsig_signed_data, vector, write)
 
 ORIGIN = "levain-team/" + "a" * 32
 OTHER_ORIGIN = "levain-team/" + "b" * 32
@@ -122,6 +123,27 @@ v2 = canon_json({**good_obj, "v": 2}).encode()
 leaf("line-v2-refused-at-ingest", v2, "ingest", REFUSE, authority=REG)
 leaf("line-v2-unverifiable-at-verify", v2, "verify", UNVERIFIABLE, authority=REG)
 leaf("receipt-scope-writes-no-line-refused", GOOD, "ingest", REFUSE, scope="receipt")
+
+# ---- rev 11 Q9: the registry's context-free validator (canon.classify_leaf -> check_line_fields) runs F12's
+# profile check without the signature, so a sha256 SSHSIG is refused there by the hash-algorithm rule ALONE (at
+# judge_line, sshsig.signed_data refuses the same blob a second time). This isolates that one rule.
+SHA256_RULE = profile("S1_DESIGN F12", "the hash algorithm is sha512 (the profile check, before any signature)",
+                      quote='The supported hash algorithms are "sha256" and "sha512".')
+sig256 = ed_sign(DANA, sshsig_signed_data(b"levain-team-entry", device_message(ORIGIN, FILE, S1["hash"]),
+                                          alg=b"sha256"))
+blob256 = sshsig_blob(ed_key_blob(pub(DANA)), b"levain-team-entry", ssh_str(b"ssh-ed25519") + ssh_str(sig256),
+                      alg=b"sha256")
+
+
+def classify(vid, data: bytes, verdict, authority):
+    V.append(vector(f"classify-{vid}", "no_upstream", "classify", {"data_hex": data.hex(), "log_kind": "team",
+                                                                    "at": "ingest"}, {"verdict": verdict}, authority,
+                    None))
+
+
+classify("good-control", GOOD, ACCEPT, LEAF)
+classify("device-sig-sha256-refused-by-the-profile-alone", canon_json({**good_obj, "device_sig": b64(blob256)}).encode(),
+         REFUSE, SHA256_RULE)
 
 # ---- the sidecar receipt (TS §1.4), a hint --------------------------------------------------------------------
 DEVICE_HINT = hashlib.sha256(ed_key_blob(pub(DANA))).hexdigest()[:16]
