@@ -106,8 +106,9 @@ def test_a_direct_meta_write_grants_nothing(broker, spores, keydir):
     conn.execute("INSERT INTO meta (key, value) VALUES ('policy_rev', '0')")
     conn.execute("INSERT INTO meta (key, value) VALUES ('authority_seq', '99')")
     conn.close()
-    assert broker.capture().fence == {"authority_store_id": broker.capture().authority.store_id,
-                                      "authority_seq": 2}
+    head = broker.capture().authority
+    assert broker.capture().fence == {"authority_store_id": head.store_id, "authority_seq": 2,
+                                      "authority_head_hash": head.head_hash}
     assert broker.submit(pid, sig)["state"] == "COMMITTED"
 
 
@@ -408,6 +409,30 @@ def test_one_request_captures_once(broker, spores, keydir, monkeypatch):
     monkeypatch.setattr(RequestAuthority, "capture", classmethod(counting))
     assert broker.submit(pid, sig)["state"] == "COMMITTED"
     assert len(calls) == 1
+
+
+# --- L3 r1 (1012+80): the fence names the head hash ---------------------------------------------------
+
+def test_a_pending_issued_on_a_replaced_suffix_ends_stale(broker, spores, keydir):
+    """F1: a fork after a failed anchor advance puts a second validly signed link at the same seq. A
+    pending issued on the first is decided under the second, so its fence must name the head hash."""
+    phone = Key(keydir, "phone").enroll(broker, "display-phone")
+    root = root_of(broker.db)
+    a, b = RealKey(keydir, "a"), RealKey(keydir, "b")
+    with broker.db.autocommit() as conn:                              # suffix A; its anchor advance failed
+        authority.sign_and_append(conn, {"op": "enrol", "fingerprint": a.fingerprint, "public_key": a.public,
+                                         "class": "presence"}, signer_fp=root.fingerprint, sign=root.sign_link,
+                                  clock=lambda: datetime.now(timezone.utc), anchor=None)
+    issued_on = broker.capture().authority
+    pid, sig = _sign_pending(broker, spores, phone)
+    raw = _raw(broker)
+    raw.execute("DELETE FROM authority_log WHERE seq = ?", (issued_on.seq,))
+    raw.close()
+    replaced = enrol(broker.db, b, "presence", by=root)               # suffix B at the same seq
+    assert replaced.seq == issued_on.seq and replaced.head_hash != issued_on.head_hash
+    assert broker.capture().authority_error is None
+    out = broker.submit(pid, sig)
+    assert (out["state"], out["reason"]) == ("STALE", "authority changed")
 
 
 # --- structural fences ----------------------------------------------------------------------------
