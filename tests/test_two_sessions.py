@@ -48,6 +48,10 @@ def _entity(root: Path, name: str) -> Path:
     return ent
 
 
+def _opt_in(ent: Path) -> None:
+    (ent / ".levain" / "confinement.json").write_text(json.dumps({"deny_standard_creds": False}))
+
+
 def _open(path: Path, mode: str) -> EntitySession:
     return EntitySession.open(path, mode=mode, with_tools=True)
 
@@ -72,14 +76,18 @@ def _gh_reads(session: EntitySession, home: Path) -> dict[str, bool]:
 def test_one_sessions_drive_mode_does_not_reach_anothers_floor(tmp_path, home):
     """62e16b2: A (interactive) opened, then B (unattended) on the same entity. A's banner said the
     standard creds were allowed while BOTH of A's hands refused them — B's bind had moved the
-    process channel both enforcers read. Now each hand resolves its own conversation's mode."""
-    ent = _entity(tmp_path, "ent")
-    a = _open(ent, "interactive")
-    b = _open(ent, "unattended")
+    process channel both enforcers read. Now each hand resolves its own conversation's mode.
+    Since N7 (2026-10-12) the cred floor no longer differs by drive, so each session's own MODE is
+    read from its gate, and each banner is checked against its own hands."""
+    ent_a, ent_b = _entity(tmp_path, "entA"), _entity(tmp_path, "entB")
+    _opt_in(ent_a)                                     # A opts in, B keeps the default deny: DIFFERENT floors
+    a = _open(ent_a, "interactive")
+    b = _open(ent_b, "unattended")
     try:
+        assert (a.gate_mode, b.gate_mode) == ("ungated", "gated")   # each session keeps its own mode
         assert a.deny_standard_creds is False and b.deny_standard_creds is True
         reads_a, reads_b = _gh_reads(a, home), _gh_reads(b, home)
-        assert all(reads_a.values()), reads_a          # A's floor matches A's banner
+        assert all(reads_a.values()), reads_a          # A's floor matches A's banner (allowed)
         assert not any(reads_b.values()), reads_b      # B stays denied
         if confinement_supported():
             assert "bash" in reads_a and "bash" in reads_b   # both enforcers were actually probed
@@ -128,12 +136,15 @@ def test_an_interactive_session_opens_after_an_unattended_one_with_its_own_floor
     retired with the env channel (Phill, 2026-10-02: "b on levain") because no floor reads it.
     Now the interactive session opens and each floor is its own — the reverse order of the first
     test, the one the guard used to refuse."""
-    ent = _entity(tmp_path, "ent")
-    u = _open(ent, "unattended")
-    i = _open(ent, "interactive")
+    ent_u, ent_i = _entity(tmp_path, "entU"), _entity(tmp_path, "entI")
+    _opt_in(ent_i)                                     # the interactive entity opts in; the unattended one does not
+    u = _open(ent_u, "unattended")
+    i = _open(ent_i, "interactive")
     try:
+        assert (u.gate_mode, i.gate_mode) == ("gated", "ungated")
+        assert i.deny_standard_creds is False and u.deny_standard_creds is True
         assert not any(_gh_reads(u, home).values())
-        assert all(_gh_reads(i, home).values())
+        assert all(_gh_reads(i, home).values())       # its own floor: opted in, so allowed
         assert "LEVAIN_DRIVE_MODE" not in os.environ   # nothing publishes the retired channel
     finally:
         u.close()
@@ -270,13 +281,16 @@ def test_concurrent_sessions_for_two_entities_under_gc_pressure_each_get_their_o
     (25 rounds, 2026-10-02), so it smoke-tests isolation under pressure, nothing more:
     threads open sessions for two entities with OPPOSITE modes and build their tools at the same
     moment, with the cyclic GC firing on nearly every allocation. Every thread must finish (a hang
-    fails the timeout), and every conversation's hands must read its OWN binding's floor."""
+    fails the timeout), and every conversation's hands must read its OWN binding's floor. Since N7
+    (2026-10-12) the drive no longer moves the cred floor, so entX opts in with ``false`` and the two
+    entities' floors differ by their own declarations."""
     import gc
     import threading
 
     from levain.firing.confinement import crown_jewel_reason
 
     x, y = _entity(tmp_path, "entX"), _entity(tmp_path, "entY")
+    (x / ".levain" / "confinement.json").write_text(json.dumps({"deny_standard_creds": False}))
     plan = [(x, "interactive"), (y, "unattended")] * 4
     gh = home / ".config" / "gh" / "hosts.yml"
     barrier = threading.Barrier(len(plan))
@@ -315,7 +329,7 @@ def test_concurrent_sessions_for_two_entities_under_gc_pressure_each_get_their_o
         assert not isinstance(got, BaseException), got
         entity_dir, denies_gh, one_floor = got
         assert entity_dir == ent.resolve()
-        assert denies_gh is (mode == "unattended")
+        assert denies_gh is (ent == y)
         if confinement_supported():                    # bash exists here, so both hands were built
             assert one_floor is True
 

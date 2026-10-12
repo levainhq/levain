@@ -1,0 +1,295 @@
+{
+ "item": "F5",
+ "generator": "gen.py",
+ "vectors": [
+  {
+   "id": "spec-example",
+   "kind": "spec",
+   "op": "add_checkpoint",
+   "input": {
+    "old_size": 20852014,
+    "proof": [
+     "3e544d0abc07a6a846aeea6e7b42fb8316e36cc88a03db5e9afb996430e991ac",
+     "8eb2590e663c63b4b2244d0c58ba4ba3390854c48c65c0f992fb8ac4f0b7b309",
+     "e7ea4a954762d8b785fc170c1c19fe2aeeb284f18d0acc19643d57ffa4203ddf",
+     "ffa59584fb360b04ac6f9ad8047e5c8c757fc12980efd69b5c0c215f0dca8ffd"
+    ],
+    "checkpoint": "example.com/behind-the-sofa\n20852163\nCsUYapGGPo4dkMgIAUqom/Xajj7h2fB2MPA3j2jxq2I=\n\n— example.com/behind-the-sofa Az3grlgtzPICa5OS8npVmf1Myq/5IZniMp+ZJurmRDeOoRDe4URYN7u5/Zhcyv2q1gGzGku9nTo+zyWE+xeMcTOAYQ8=\n— example.com/behind-the-sofa opLqBQsREYCgu6xQkYQwJr9fo45a62DN9EdmHXnZdXNqlcVGlCum2Wks+49/V6267UEjw6QUXTS5Rovnzv++qbSzm9Q=\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "body": "old 20852014\nPlRNCrwHpqhGrupue0L7gxbjbMiKA9temvuZZDDpkaw=\njrJZDmY8Y7SyJE0MWLpLozkIVMSMZcD5kvuKxPC3swk=\n5+pKlUdi2LeF/BcMHBn+Ku6yhPGNCswZZD1X/6QgPd8=\n/6WVhPs2CwSsb5rYBH5cjHV/wSmA79abXAwhXw3Kj/0=\n\nexample.com/behind-the-sofa\n20852163\nCsUYapGGPo4dkMgIAUqom/Xajj7h2fB2MPA3j2jxq2I=\n\n— example.com/behind-the-sofa Az3grlgtzPICa5OS8npVmf1Myq/5IZniMp+ZJurmRDeOoRDe4URYN7u5/Zhcyv2q1gGzGku9nTo+zyWE+xeMcTOAYQ8=\n— example.com/behind-the-sofa opLqBQsREYCgu6xQkYQwJr9fo45a62DN9EdmHXnZdXNqlcVGlCum2Wks+49/V6267UEjw6QUXTS5Rovnzv++qbSzm9Q=\n"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/witness/witness.NewAddCheckpointHandler",
+     "version": "v0.0.0-20260925114237-b4c9458d9b14",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "Example request body"
+   }
+  },
+  {
+   "id": "old-size-0",
+   "kind": "spec",
+   "op": "add_checkpoint",
+   "input": {
+    "old_size": 0,
+    "proof": [],
+    "checkpoint": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "body": "old 0\n\nlevain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/witness/witness.NewAddCheckpointHandler",
+     "version": "v0.0.0-20260925114237-b4c9458d9b14",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "The request body MUST be a sequence of an old size line, zero or more consistency proof lines, and an empty line, followed by a [checkpoint]. Each line MUST terminate in a newline character (U+000A)."
+   }
+  },
+  {
+   "id": "old-equals-new",
+   "kind": "spec",
+   "op": "add_checkpoint",
+   "input": {
+    "old_size": 9,
+    "proof": [],
+    "checkpoint": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "body": "old 9\n\nlevain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/witness/witness.NewAddCheckpointHandler",
+     "version": "v0.0.0-20260925114237-b4c9458d9b14",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "The request body MUST be a sequence of an old size line, zero or more consistency proof lines, and an empty line, followed by a [checkpoint]. Each line MUST terminate in a newline character (U+000A)."
+   }
+  },
+  {
+   "id": "old-5-new-9",
+   "kind": "spec",
+   "op": "add_checkpoint",
+   "input": {
+    "old_size": 5,
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+     "7fb182ca7774e61ce3edbf823ecdefddc3f080aaa3ce627a50f2667f2d4a3847",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05",
+     "0fe0c933060a99b7c250a108a37bec0b79aaeeea047823d8a24e528fa775a6c4"
+    ],
+    "checkpoint": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "body": "old 5\nJ+G/Au0UqvCF70LK0X7zbxC4SYHplToYtT+m56ZKhE0=\nFTlmF+MhR35uDw5pLUoprycaSDi48Owji7uc2D4Aw6M=\nf7GCynd05hzj7b+CPs3v3cPwgKqjzmJ6UPJmfy1KOEc=\nVJTCmSnOE+xiAWxgYX+id53T36H8BRteDwx1L2H9nwU=\nD+DJMwYKmbfCUKEIo3vsC3mq7uoEeCPYok5Sj6d1psQ=\n\nlevain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/witness/witness.NewAddCheckpointHandler",
+     "version": "v0.0.0-20260925114237-b4c9458d9b14",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "The request body MUST be a sequence of an old size line, zero or more consistency proof lines, and an empty line, followed by a [checkpoint]. Each line MUST terminate in a newline character (U+000A)."
+   }
+  },
+  {
+   "id": "old-size-0-with-proof-refused",
+   "kind": "no_upstream",
+   "op": "add_checkpoint",
+   "input": {
+    "old_size": 0,
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "checkpoint": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size is zero, the consistency proof MUST be empty"
+   }
+  },
+  {
+   "id": "old-above-new-refused",
+   "kind": "no_upstream",
+   "op": "add_checkpoint",
+   "input": {
+    "old_size": 10,
+    "proof": [],
+    "checkpoint": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "The old size MUST be equal to or lower than the checkpoint size."
+   }
+  },
+  {
+   "id": "sixty-four-proof-lines-refused",
+   "kind": "no_upstream",
+   "op": "add_checkpoint",
+   "input": {
+    "old_size": 5,
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d"
+    ],
+    "checkpoint": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "The client MUST NOT send more than 63 consistency proof lines."
+   }
+  },
+  {
+   "id": "size-0-non-empty-root-refused",
+   "kind": "no_upstream",
+   "op": "add_checkpoint",
+   "input": {
+    "old_size": 0,
+    "proof": [],
+    "checkpoint": "levain-team/0123456789abcdef0123456789abcdef\n0\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/p2Vwe1a5NxO0DUSKtbLUHm0LsmY8om86fE+GJaQ+KDB66/MzGpVLs9U8vRdlPK5nbeI3oxD8J8Zp8Zx9lFAJAM=\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "A checkpoint of size zero MUST have the root hash of the empty tree"
+   }
+  },
+  {
+   "id": "proof-hash-31-bytes-refused",
+   "kind": "no_upstream",
+   "op": "add_checkpoint",
+   "input": {
+    "old_size": 5,
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a84"
+    ],
+    "checkpoint": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "Each consistency proof line MUST encode a single hash in base64."
+   }
+  }
+ ]
+}

@@ -2,9 +2,8 @@
 links, and their refusals. The L4 enroll drive (project memory 1010-cockpit/L4_k2b/enroll_drive.py)
 drove the /2 unsigned enroll end to end; its signed successor waits on `levain cockpit ledger init`.
 
-A laptop-presence key must be a FIDO key, which cannot be made headless: every test here widens the
-class floor to software ed25519 keys (``widen_laptop_floor``); the floor itself is tested in
-``test_authority``."""
+Custody (rev 6): a software ed25519 laptop-presence key is enrolled ``passphrase`` (the replay holds the
+declaration to the key type); the custody table itself is tested in ``test_authority``."""
 
 from __future__ import annotations
 
@@ -17,14 +16,9 @@ import pytest
 from levain.cockpit.firejournal import CockpitDB
 from levain.cockpit.install import marker_path
 from levain.cockpit.keys import KeyError_, enroll, keys, normalise_public_key, principal_of, revoke
-from tests.cockpit_authority_rig import RealKey, enrol as genesis_enrol, widen_laptop_floor
+from tests.cockpit_authority_rig import RealKey, enrol as genesis_enrol
 
 NOW = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
-
-
-@pytest.fixture(autouse=True)
-def _laptop_floor(monkeypatch):
-    widen_laptop_floor(monkeypatch)
 
 
 def _key(tmp: Path, name: str) -> str:
@@ -72,7 +66,7 @@ def test_no_journal_is_refused_and_none_is_created(tmp_path: Path) -> None:
     root.mkdir()
     k = RealKey(tmp_path, "k")
     with pytest.raises(KeyError_, match="no cockpit journal"):
-        enroll(root, _key(tmp_path, "a"), "laptop-presence", **_by(k), marker_directory=tmp_path / "m")
+        enroll(root, _key(tmp_path, "a"), "laptop-presence", custody="passphrase", **_by(k), marker_directory=tmp_path / "m")
     assert list(root.iterdir()) == []
 
 
@@ -88,14 +82,14 @@ def test_a_governed_marker_or_class_refuses(tmp_path: Path) -> None:
     gov = _journal(other, cls="governed")
     k = RealKey(tmp_path, "k")
     with pytest.raises(KeyError_, match="install class is 'governed'"):
-        enroll(gov, _key(tmp_path, "b"), "laptop-presence", **_by(k), marker_directory=tmp_path / "none")
+        enroll(gov, _key(tmp_path, "b"), "laptop-presence", custody="passphrase", **_by(k), marker_directory=tmp_path / "none")
 
 
 def test_an_empty_log_refuses_and_names_ledger_init(tmp_path: Path) -> None:
     root = _journal(tmp_path)
     k = RealKey(tmp_path, "k")
     with pytest.raises(KeyError_, match="ledger init"):
-        enroll(root, k.public, "laptop-presence", **_by(k), marker_directory=tmp_path / "m")
+        enroll(root, k.public, "laptop-presence", custody="passphrase", **_by(k), marker_directory=tmp_path / "m")
     rows, note = keys(root, now=NOW, marker_directory=tmp_path / "m")
     assert rows == [] and "ledger init" in str(note)
 
@@ -151,10 +145,10 @@ def test_the_cli_helps_tier_claims_hold() -> None:
 def test_revoke_lands_when_another_laptop_key_exists_and_records_the_compromise(tmp_path: Path) -> None:
     root, a = _initialised(tmp_path)
     kw = {**_by(a), "marker_directory": tmp_path / "m"}
-    again, created, _ = enroll(root, a.public, "laptop-presence", **kw)
+    again, created, _ = enroll(root, a.public, "laptop-presence", custody="passphrase", **kw)
     assert not created and again.fingerprint == a.fingerprint and again.enrolled_seq == 1
     c = RealKey(tmp_path, "c")
-    enroll(root, c.public, "laptop-presence", **kw)
+    enroll(root, c.public, "laptop-presence", custody="passphrase", **kw)
     r, _ = revoke(root, a.fingerprint, compromised_since=1, **{**kw, **_by(c)})
     assert (r.revoked_seq, r.compromised_since) == (3, 1)
     rows, note = keys(root, now=NOW, marker_directory=tmp_path / "m")
@@ -183,7 +177,8 @@ def test_the_cli_enrolls_revokes_and_refuses_with_exit_codes(tmp_path: Path, cap
     assert run("enroll", str(tmp_path / "c.pub"), "--class", "display-phone", "--signing-key", str(laptop.path)) == 0
     assert "at seq 2" in capsys.readouterr().out
     assert run("enroll", str(tmp_path / "nope.pub"), "--signing-key", str(laptop.path)) == 1
-    assert run("enroll", str(tmp_path / "c.pub"), "--signing-key", str(tmp_path / "nokey")) == 1
+    assert run("enroll", str(tmp_path / "c.pub"), "--class", "display-phone", "--signing-key",
+               str(tmp_path / "nokey")) == 1
     assert "cannot read the signing key" in capsys.readouterr().err
     c_fp = keys(root, now=NOW, marker_directory=tmp_path / "m")[0][1].fingerprint
     with pytest.raises(SystemExit):
@@ -222,8 +217,8 @@ def test_a_busy_journal_is_a_refusal_not_a_traceback(tmp_path: Path, capsys) -> 
     hold = sqlite3.connect(root / "cockpit.db", timeout=0)
     hold.execute("BEGIN EXCLUSIVE")
     try:
-        rc = cli.main(["cockpit", "enroll", str(tmp_path / "a.pub"), "--signing-key", str(laptop.path),
-                       "--data-root", str(root)])
+        rc = cli.main(["cockpit", "enroll", str(tmp_path / "a.pub"), "--class", "display-phone", "--signing-key",
+                       str(laptop.path), "--data-root", str(root)])
     finally:
         hold.rollback()
         hold.close()

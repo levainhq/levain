@@ -263,7 +263,7 @@ levain serve --path ./ada --chat ./ada            # the cockpit on ada's memory,
 
 - **It is that entity, not your partner.** The chat entity boots from its own `seed/` (origin, world, partnership, memory), its own consolidated memory and its own crystallized-pattern recall. Each completed turn is captured to that entity's store. Nothing consolidates it until someone runs `levain wrap` on it.
 - **Actions wait for you, under the default gate.** Chat turns run headless: with the entity's default gate, a proposed efferent action halts the turn and the panel shows the held call for you to Approve or Reject. A `--task` run and a scheduled seat halt at the same point and exit instead; chat is the only headless driver that waits for your answer. The `levain run` REPL waits only if you pin it to `gated`. By default it never stops to ask about an action, the same as an entity set to `ungated` under any driver (the confinement floor still applies to both). Each launch of `levain serve --chat` mints a token, printed at startup; on macOS the browser opens unlocked with it, elsewhere open the printed link.
-- **Chat, like a scheduled seat, cannot read your standard credential stores unless you allow them.** Those are `~/.config/gh`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.pypirc`, `~/.npmrc`, `~/.docker/config.json`, `~/.kube/config`, the cloud CLIs' token caches (`~/.aws/sso/cache`, `~/.aws/cli/cache`, `~/.aws/login/cache`, `~/.aws/boto/cache`, `~/.config/gcloud`, `~/.azure`), and on macOS the Keychain. Reading a file is not an action, so the gate would never ask; the floor denies the read instead, in every drive but the `levain run` REPL, where you read each turn's activity before typing the next. An entity that needs `gh` or `aws` in chat or in a `--task` run sets `"deny_standard_creds": false` in its `.levain/confinement.json`.
+- **No drive reads your standard credential stores unless you allow them: not chat, not a scheduled seat, not the `levain run` REPL.** Those are `~/.config/gh`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.pypirc`, `~/.npmrc`, `~/.docker/config.json`, `~/.kube/config`, the cloud CLIs' token caches (`~/.aws/sso/cache`, `~/.aws/cli/cache`, `~/.aws/login/cache`, `~/.aws/boto/cache`, `~/.config/gcloud`, `~/.azure`), and on macOS the Keychain. Reading a file is not an action, so the gate would never ask; the floor denies the read instead, in every drive. That includes the `levain run` REPL: you see a turn's activity only after it ran, so a read a prompt injection asked for is already in the model's context by the time you see it. An entity that needs `gh` or `aws`, in the REPL or anywhere else, sets `"deny_standard_creds": false` in its `.levain/confinement.json`.
 - **Conversations live in server memory.** A restart of `levain serve` ends every one.
 - **`--path` and `--chat` are independent.** `--path` picks whose memory the cockpit shows; `--chat` picks which entity the chat talks to. Nothing checks that they match, so the page can show one entity's memory while the chat talks to another. `--path` defaults to the current directory, so start `levain serve --chat ./ada` from your own install and the page shows your memory beside ada's chat. Point both at the same directory when you want them to agree.
 
@@ -286,6 +286,27 @@ levain state --clear                   # remove it
 ```
 
 Two of those write targets are your own inbox into the partnership. Dump anything mid-stream (a thought, a handoff, something to pick up next time) and it surfaces at the start of your next session, then resolves. Keep durable reference you want your partner to recall when it's relevant. You dump freely; the kit sorts.
+
+### The cockpit's signing keys
+
+A cockpit write at tier T2 or T3 is signed. The keys that may sign are links in a signed authority log in the cockpit's journal, and the first is written by `levain cockpit ledger init`. Every key states how it is held, its **custody**, and `levain cockpit keys` shows it beside the key's class. Nothing has to be bought: the laptop key works on what the machine already has, and a FIDO key is an optional upgrade.
+
+```
+levain cockpit key create                         # touch-id where Touch ID is set up, else passphrase; says which
+levain cockpit key create --custody touch-id      # macOS: a Secure Enclave key, Touch ID per signature
+levain cockpit key create --custody passphrase    # anywhere: an encrypted key, its passphrase per signature
+levain cockpit ledger init --signing-key ~/.levain/keys/<label>
+```
+
+What each custody guarantees, and what it does not:
+
+- `touch-id`: a fingerprint per signature on a key that cannot leave the Secure Enclave, as created by `levain cockpit key create`.
+- `passphrase`: a typed passphrase per signature, and no defence against same-uid malware (a program running as you can keylog it or copy the file). The lowest class.
+- `tpm`: a non-exportable key, and no presence.
+- `fido`: a touch on a key you plugged in, custody declared.
+- `fido-attested` (not yet): the only class levain would prove; it is refused until attestation at enrol is built.
+
+The custody is a declaration, signed by the key that enrols it, not a proof. A signature from a Secure Enclave key looks the same whether or not the key was made to need a touch, so the touch rests on how the key was made, which is why the helper makes it and confirms it.
 
 For hosts that render MCP Apps (and only those), `pip install 'levain[app]'` adds what `levain serve-app` needs to run: a read-only in-host view served over stdio. `levain serve` needs nothing beyond the base install.
 

@@ -1,0 +1,589 @@
+{
+ "item": "F6",
+ "generator": "gen.py",
+ "vectors": [
+  {
+   "id": "grammar-simple",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "a",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "ASCII [a-z0-9][a-z0-9._-]* segments joined by '/', at most 255 bytes",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a subset of the C2SP name rule chosen so every levain origin is a legal note key name"
+    }
+   }
+  },
+  {
+   "id": "grammar-all-classes",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "a0.b-c_d/e9",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "ASCII [a-z0-9][a-z0-9._-]* segments joined by '/', at most 255 bytes",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a subset of the C2SP name rule chosen so every levain origin is a legal note key name"
+    }
+   }
+  },
+  {
+   "id": "grammar-255-bytes",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-cosignature@v1.1.0",
+    "clause": "A cosigner name is a non-empty UTF-8 string, at most 255 bytes long and containing no Unicode spaces, plus characters (U+002B), or control characters"
+   }
+  },
+  {
+   "id": "grammar-256-bytes-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-cosignature@v1.1.0",
+    "clause": "A cosigner name is a non-empty UTF-8 string, at most 255 bytes long and containing no Unicode spaces, plus characters (U+002B), or control characters"
+   }
+  },
+  {
+   "id": "grammar-plus-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team/a+b",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-cosignature@v1.1.0",
+    "clause": "A cosigner name is a non-empty UTF-8 string, at most 255 bytes long and containing no Unicode spaces, plus characters (U+002B), or control characters"
+   }
+  },
+  {
+   "id": "grammar-space-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team/a b",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-cosignature@v1.1.0",
+    "clause": "A cosigner name is a non-empty UTF-8 string, at most 255 bytes long and containing no Unicode spaces, plus characters (U+002B), or control characters"
+   }
+  },
+  {
+   "id": "grammar-uppercase-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team/ABC",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "ASCII [a-z0-9][a-z0-9._-]* segments joined by '/', at most 255 bytes",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a subset of the C2SP name rule chosen so every levain origin is a legal note key name"
+    }
+   }
+  },
+  {
+   "id": "grammar-ssh-fingerprint-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-receipt/t/SHA256:u5DmLEHQQnGsZJ3QJ0J5w0e2mJiCixbt0bK3Wlv1xGM",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "ASCII [a-z0-9][a-z0-9._-]* segments joined by '/', at most 255 bytes",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a subset of the C2SP name rule chosen so every levain origin is a legal note key name"
+    }
+   }
+  },
+  {
+   "id": "grammar-empty-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-cosignature@v1.1.0",
+    "clause": "A cosigner name is a non-empty UTF-8 string, at most 255 bytes long and containing no Unicode spaces, plus characters (U+002B), or control characters"
+   }
+  },
+  {
+   "id": "grammar-empty-segment-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "a//b",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "ASCII [a-z0-9][a-z0-9._-]* segments joined by '/', at most 255 bytes",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a subset of the C2SP name rule chosen so every levain origin is a legal note key name"
+    }
+   }
+  },
+  {
+   "id": "grammar-trailing-slash-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "a/",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "ASCII [a-z0-9][a-z0-9._-]* segments joined by '/', at most 255 bytes",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a subset of the C2SP name rule chosen so every levain origin is a legal note key name"
+    }
+   }
+  },
+  {
+   "id": "grammar-leading-dot-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": ".a",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "ASCII [a-z0-9][a-z0-9._-]* segments joined by '/', at most 255 bytes",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a subset of the C2SP name rule chosen so every levain origin is a legal note key name"
+    }
+   }
+  },
+  {
+   "id": "grammar-non-ascii-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team/é",
+    "check": "grammar"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "ASCII [a-z0-9][a-z0-9._-]* segments joined by '/', at most 255 bytes",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "a subset of the C2SP name rule chosen so every levain origin is a legal note key name"
+    }
+   }
+  },
+  {
+   "id": "kind-team",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team/0123456789abcdef0123456789abcdef",
+    "check": "log_kind"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "log_kind": "team"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "a levain origin carries levain-team/, levain-fleet/ or levain-receipt/",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "frozen prefixes; a new prefix is a version, never an edit"
+    }
+   }
+  },
+  {
+   "id": "kind-fleet",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-fleet/m1",
+    "check": "log_kind"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "log_kind": "fleet"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "a levain origin carries levain-team/, levain-fleet/ or levain-receipt/",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "frozen prefixes; a new prefix is a version, never an edit"
+    }
+   }
+  },
+  {
+   "id": "kind-receipt",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-receipt/t1/abababababababababababababababababababababababababababababababab",
+    "check": "log_kind"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "log_kind": "receipt"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "a levain origin carries levain-team/, levain-fleet/ or levain-receipt/",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "frozen prefixes; a new prefix is a version, never an edit"
+    }
+   }
+  },
+  {
+   "id": "kind-other-prefix-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-other/x",
+    "check": "log_kind"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "a levain origin carries levain-team/, levain-fleet/ or levain-receipt/",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "frozen prefixes; a new prefix is a version, never an edit"
+    }
+   }
+  },
+  {
+   "id": "kind-no-prefix-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "example.com/log",
+    "check": "log_kind"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "a levain origin carries levain-team/, levain-fleet/ or levain-receipt/",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "frozen prefixes; a new prefix is a version, never an edit"
+    }
+   }
+  },
+  {
+   "id": "kind-bare-prefix-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team",
+    "check": "log_kind"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "a levain origin carries levain-team/, levain-fleet/ or levain-receipt/",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "frozen prefixes; a new prefix is a version, never an edit"
+    }
+   }
+  },
+  {
+   "id": "team-production",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team/0123456789abcdef0123456789abcdef",
+    "check": "team"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "the team production is exactly levain-team/<32 lowercase hex>",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "128 random bits chosen at genesis"
+    }
+   }
+  },
+  {
+   "id": "team-31-hex-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team/0123456789abcdef0123456789abcde",
+    "check": "team"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "the team production is exactly levain-team/<32 lowercase hex>",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "128 random bits chosen at genesis"
+    }
+   }
+  },
+  {
+   "id": "team-33-hex-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team/0123456789abcdef0123456789abcdef0",
+    "check": "team"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "the team production is exactly levain-team/<32 lowercase hex>",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "128 random bits chosen at genesis"
+    }
+   }
+  },
+  {
+   "id": "team-uppercase-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team/0123456789ABCDEF0123456789ABCDEF",
+    "check": "team"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "the team production is exactly levain-team/<32 lowercase hex>",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "128 random bits chosen at genesis"
+    }
+   }
+  },
+  {
+   "id": "team-trailing-segment-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team/0123456789abcdef0123456789abcdef/x",
+    "check": "team"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "the team production is exactly levain-team/<32 lowercase hex>",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "128 random bits chosen at genesis"
+    }
+   }
+  },
+  {
+   "id": "team-non-hex-refused",
+   "kind": "no_upstream",
+   "op": "origin",
+   "input": {
+    "origin": "levain-team/gggggggggggggggggggggggggggggggg",
+    "check": "team"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F6",
+    "clause": "the team production is exactly levain-team/<32 lowercase hex>",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "128 random bits chosen at genesis"
+    }
+   }
+  }
+ ]
+}

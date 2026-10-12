@@ -1,0 +1,12 @@
+{
+ "status": "provisional (P12)",
+ "production": "levain-receipt/<scope id>/<fp_hex of the device key blob>",
+ "origins": {
+  "device-a": "levain-receipt/0123456789abcdef0123456789abcdef/eb9b731d0e5784d9f3ace77b056a444dc533335ec2445d991dcdf6762bd1fe7a",
+  "device-b": "levain-receipt/0123456789abcdef0123456789abcdef/221430e07ffa2ee86e94dec39eaea105b1b0a4023e67d0acff6cd18818a3a968"
+ },
+ "seed_labels": {
+  "device-a": "receipt-log-device-a",
+  "device-b": "receipt-log-device-b"
+ }
+}

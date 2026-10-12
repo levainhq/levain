@@ -44,12 +44,12 @@ from typing import Any
 from levain.autonomic.confirm import _VERIFY_ENV, DEFAULT_SSH_KEYGEN, trust_anchor_problem
 
 __all__ = [
-    "ANCHOR_DIR", "ANCHOR_NAME", "FORMAT", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
+    "ANCHOR_DIR", "ANCHOR_NAME", "CUSTODIES", "FIDO_ATTESTED", "FORMAT", "NAMESPACE", "RESET_FORMAT", "RESET_NAMESPACE", "SCHEMA",
     "Anchor", "AnchorError", "AuthorityError", "AuthorityKey", "AuthorityPolicy", "AuthoritySnapshot",
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead",
-    "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify", "create_schema",
+    "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify", "create_schema", "custody_problem",
     "genesis_policy", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
-    "snapshot", "verify_anchor_reset", "verify_link_sig",
+    "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
 
 FORMAT = "levain-authority/1"
@@ -71,10 +71,50 @@ SCHEMA = ("CREATE TABLE IF NOT EXISTS authority_log (seq INTEGER PRIMARY KEY, pr
           "record TEXT NOT NULL, signer_fp TEXT NOT NULL, signature TEXT NOT NULL, hash TEXT NOT NULL UNIQUE)")
 
 LAPTOP = "laptop-presence"
-# The class floor (§3.2): a laptop-presence key must be a FIDO key, which ssh-keygen verifies with the
-# user-presence flag required because the signers line never carries ``no-touch-required``. It stops an
-# accidental weak enrolment; it does not prove hardware custody.
-_LAPTOP_KEY_TYPES = frozenset({"sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"})
+# Custody (rev 6 presence floor, DESIGN §3.2 items 1-3): every enrol record states how its key is held. It
+# is a DECLARATION, signed by the enrolling key, never a proof: the verifier cannot tell a touch key from a
+# no-touch one (a Secure Enclave key echoes the presence flag it is handed), so the touch rests wholly on
+# how the key was made. The replay holds the declaration to the key types it can be true of.
+UNSTATED = "unstated"
+FIDO_ATTESTED = "fido-attested"
+CUSTODIES = ("touch-id", "passphrase", "tpm", "fido", "windows-hello", FIDO_ATTESTED, UNSTATED)
+_SK_KEY_TYPES = frozenset({"sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"})
+# the custody table: the key types each stated custody admits (``unstated`` is not in it)
+_CUSTODY_KEY_TYPES: Mapping[str, frozenset[str]] = MappingProxyType({
+    "touch-id": _SK_KEY_TYPES, "fido": _SK_KEY_TYPES, "windows-hello": _SK_KEY_TYPES, FIDO_ATTESTED: _SK_KEY_TYPES,
+    "tpm": frozenset({"ecdsa-sha2-nistp256"}),
+    "passphrase": frozenset({"ssh-ed25519", "ecdsa-sha2-nistp256"}),
+})
+# The laptop-presence floor IS the custody table: every stated custody is accepted for the class, so the
+# types it admits are the table's union (a carried legacy key with no stated custody stays inside it). The
+# signers line never carries ``no-touch-required``, so an sk key's presence flag is still required.
+_LAPTOP_KEY_TYPES = frozenset().union(*_CUSTODY_KEY_TYPES.values())
+
+
+def custody_problem(key_class: str, custody: Any, key_type: str, *, legacy: bool = False) -> str | None:
+    """Why ``custody`` cannot be declared for a ``key_class`` key of ``key_type`` (None when it can): the
+    one rule the replay enforces and the CLI checks before anything is signed. ``legacy``: the key is
+    carried from a levain-cockpit/2 store (its record has ``legacy_enrolled_at``), the one laptop-presence
+    key that may leave its custody ``unstated``."""
+    if not isinstance(custody, str) or custody not in CUSTODIES:
+        return f"unknown custody {str(custody)[:40]!r}; one of {', '.join(CUSTODIES)}"
+    if custody == FIDO_ATTESTED:
+        return (f"custody {FIDO_ATTESTED} is refused until attestation at enrol is built (it comes with the "
+                "governed install); an unattested FIDO key is custody fido")
+    if custody == UNSTATED:
+        if key_class != LAPTOP:
+            return None
+        if not legacy:
+            return (f"a {LAPTOP} key must state its custody "
+                    f"({', '.join(c for c in CUSTODIES if c not in (UNSTATED, FIDO_ATTESTED))}); "
+                    f"{UNSTATED} is for display-phone and presence keys and a carried legacy key")
+        if key_type not in _LAPTOP_KEY_TYPES:
+            return f"key type {key_type} is not eligible for {LAPTOP} (one of {', '.join(sorted(_LAPTOP_KEY_TYPES))})"
+        return None
+    admits = _CUSTODY_KEY_TYPES[custody]
+    if key_type not in admits:
+        return f"custody {custody} needs a key of type {', '.join(sorted(admits))}, not {key_type}"
+    return None
 
 # Delta kinds the recompute classifier returns (§4.3).
 NOOP, TIGHTEN, LOOSEN, RENEW, GRANT_REVOKE = "noop", "tighten", "loosen", "renew", "grant_revoke"
@@ -87,7 +127,7 @@ _OP_DELTAS = {"raise": {TIGHTEN}, "revoke_grant": {GRANT_REVOKE}, "renew": {RENE
 _BASE_FIELDS = frozenset({"format", "store_id", "seq", "at", "op"})
 # per op: (required fields, optional fields), beyond the base
 _OP_FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
-    "enrol": (frozenset({"fingerprint", "public_key", "class"}), frozenset({"legacy_enrolled_at"})),
+    "enrol": (frozenset({"fingerprint", "public_key", "class", "custody"}), frozenset({"legacy_enrolled_at"})),
     "revoke_key": (frozenset({"fingerprint"}), frozenset({"compromised_since"})),
     "raise": (frozenset({"verb", "tier"}), frozenset()),
     "loosen": (frozenset({"policy"}), frozenset()),
@@ -206,6 +246,8 @@ class AuthorityKey:
     legacy_enrolled_at: str | None = None
     # the enrol link's ``at``: provenance only, never authority
     enrolled_at: str | None = None
+    # the custody its enrol record declares (CUSTODIES): a declaration, never a proof
+    custody: str = UNSTATED
 
     @property
     def principal(self) -> str:
@@ -696,8 +738,13 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
         raise AuthorityError(str(exc)) from None
     if computed != fp:
         raise AuthorityError(f"the record's fingerprint {fp} is not the key's ({computed})")
-    if cls == LAPTOP and public_key.split()[0] not in _LAPTOP_KEY_TYPES:
-        raise AuthorityError(f"a {LAPTOP} key must be one of {', '.join(sorted(_LAPTOP_KEY_TYPES))}")
+    legacy = rec.get("legacy_enrolled_at")
+    if legacy is not None and not isinstance(legacy, str):
+        raise AuthorityError("legacy_enrolled_at must be text")
+    custody = rec["custody"]
+    problem = custody_problem(cls, custody, public_key.split()[0], legacy=legacy is not None)
+    if problem is not None:
+        raise AuthorityError(problem)
     old = keys.get(fp)
     if old is not None:
         if not old.active:
@@ -705,10 +752,7 @@ def _enrolled_key(rec: Mapping[str, Any], seq: int, keys: Mapping[str, Authority
         if old.key_class != cls:
             raise AuthorityError(f"{fp} is enrolled as {old.key_class!r}; a key keeps its class")
         raise AuthorityError(f"{fp} is already enrolled")
-    legacy = rec.get("legacy_enrolled_at")
-    if legacy is not None and not isinstance(legacy, str):
-        raise AuthorityError("legacy_enrolled_at must be text")
-    return AuthorityKey(fp, public_key, cls, seq, legacy_enrolled_at=legacy, enrolled_at=rec["at"])
+    return AuthorityKey(fp, public_key, cls, seq, legacy_enrolled_at=legacy, enrolled_at=rec["at"], custody=custody)
 
 
 def _step(state: AuthoritySnapshot | None, row: _Row, *, ssh_keygen: Path | str,

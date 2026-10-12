@@ -1,0 +1,1925 @@
+{
+ "item": "F8",
+ "generator": "gen.py",
+ "max_depth": 32,
+ "vectors": [
+  {
+   "id": "canonical-code-point-key-order",
+   "kind": "no_upstream",
+   "op": "canonical",
+   "input": {
+    "value": {
+     "b": 1,
+     "a": 2,
+     "é": 3,
+     "z": 4,
+     "😀": 5,
+     "ｚ": 6
+    }
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "bytes_hex": "7b2261223a322c2262223a312c227a223a342c22c3a9223a332c22efbd9a223a362c22f09f9880223a357d"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F8",
+    "clause": "json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False), UTF-8; keys sorted by Unicode code point; '\"' and '\\\\' escaped; \\b \\f \\n \\r \\t short forms; other U+0000-U+001F as lowercase \\u00xx; everything else raw"
+   }
+  },
+  {
+   "id": "canonical-escape-set",
+   "kind": "no_upstream",
+   "op": "canonical",
+   "input": {
+    "value": {
+     "s": "\"\\\b\f\n\r\t\u0000\u001f  <>&/"
+    }
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "bytes_hex": "7b2273223a225c225c5c5c625c665c6e5c725c745c75303030305c75303031667fe280a8e280a93c3e262f227d"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F8",
+    "clause": "json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False), UTF-8; keys sorted by Unicode code point; '\"' and '\\\\' escaped; \\b \\f \\n \\r \\t short forms; other U+0000-U+001F as lowercase \\u00xx; everything else raw"
+   }
+  },
+  {
+   "id": "canonical-emoji-value",
+   "kind": "no_upstream",
+   "op": "canonical",
+   "input": {
+    "value": {
+     "v": "🍞"
+    }
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "bytes_hex": "7b2276223a22f09f8d9e227d"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F8",
+    "clause": "json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False), UTF-8; keys sorted by Unicode code point; '\"' and '\\\\' escaped; \\b \\f \\n \\r \\t short forms; other U+0000-U+001F as lowercase \\u00xx; everything else raw"
+   }
+  },
+  {
+   "id": "canonical-integers",
+   "kind": "no_upstream",
+   "op": "canonical",
+   "input": {
+    "value": {
+     "n": 9007199254740991,
+     "m": 0,
+     "k": -5
+    }
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "bytes_hex": "7b226b223a2d352c226d223a302c226e223a393030373139393235343734303939317d"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F8",
+    "clause": "json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False), UTF-8; keys sorted by Unicode code point; '\"' and '\\\\' escaped; \\b \\f \\n \\r \\t short forms; other U+0000-U+001F as lowercase \\u00xx; everything else raw"
+   }
+  },
+  {
+   "id": "canonical-nesting-and-literals",
+   "kind": "no_upstream",
+   "op": "canonical",
+   "input": {
+    "value": {
+     "f": false,
+     "e": true,
+     "c": [
+      1,
+      [
+       2,
+       {
+        "d": null
+       }
+      ]
+     ],
+     "b": {},
+     "a": []
+    }
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "bytes_hex": "7b2261223a5b5d2c2262223a7b7d2c2263223a5b312c5b322c7b2264223a6e756c6c7d5d5d2c2265223a747275652c2266223a66616c73657d"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F8",
+    "clause": "json.dumps(obj, sort_keys=True, separators=(',', ':'), ensure_ascii=False), UTF-8; keys sorted by Unicode code point; '\"' and '\\\\' escaped; \\b \\f \\n \\r \\t short forms; other U+0000-U+001F as lowercase \\u00xx; everything else raw"
+   }
+  },
+  {
+   "id": "leaf-canonical-accepted",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a317d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "ingest and verify refuse unless canonical(parse(d)) == d byte for byte",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "one leaf object has one leaf hash"
+    }
+   }
+  },
+  {
+   "id": "leaf-canonical-accepted-at-verify",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a317d",
+    "log_kind": "team",
+    "at": "verify",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "ingest and verify refuse unless canonical(parse(d)) == d byte for byte",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "one leaf object has one leaf hash"
+    }
+   }
+  },
+  {
+   "id": "leaf-non-canonical-reordered-keys-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b2276223a312c226c656166223a226c696e65227d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "ingest and verify refuse unless canonical(parse(d)) == d byte for byte",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "one leaf object has one leaf hash"
+    }
+   }
+  },
+  {
+   "id": "leaf-non-canonical-whitespace-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a20226c696e65222c2276223a317d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "ingest and verify refuse unless canonical(parse(d)) == d byte for byte",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "one leaf object has one leaf hash"
+    }
+   }
+  },
+  {
+   "id": "leaf-non-canonical-escaped-e-acute-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a225c7530306539227d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "ingest and verify refuse unless canonical(parse(d)) == d byte for byte",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "one leaf object has one leaf hash"
+    }
+   }
+  },
+  {
+   "id": "leaf-non-canonical-minus-zero-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a2d307d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "ingest and verify refuse unless canonical(parse(d)) == d byte for byte",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "one leaf object has one leaf hash"
+    }
+   }
+  },
+  {
+   "id": "leaf-non-canonical-bom-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "efbbbf7b226c656166223a226c696e65222c2276223a317d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "ingest and verify refuse unless canonical(parse(d)) == d byte for byte",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "one leaf object has one leaf hash"
+    }
+   }
+  },
+  {
+   "id": "leaf-non-canonical-trailing-newline-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a317d0a",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "ingest and verify refuse unless canonical(parse(d)) == d byte for byte",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "one leaf object has one leaf hash"
+    }
+   }
+  },
+  {
+   "id": "leaf-canonical-e-acute-control",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a22c3a9227d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "ingest and verify refuse unless canonical(parse(d)) == d byte for byte",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "one leaf object has one leaf hash"
+    }
+   }
+  },
+  {
+   "id": "leaf-canonical-zero-control",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a307d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "ingest and verify refuse unless canonical(parse(d)) == d byte for byte",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "one leaf object has one leaf hash"
+    }
+   }
+  },
+  {
+   "id": "leaf-parse-float-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a312e307d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "parse refuses duplicate keys, lone surrogates, floats, NaN/Infinity, |n| > 2^53-1, a BOM",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "json.loads accepts each of these (measured), and each gives one leaf two readings"
+    }
+   }
+  },
+  {
+   "id": "leaf-parse-exponent-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a3165327d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "parse refuses duplicate keys, lone surrogates, floats, NaN/Infinity, |n| > 2^53-1, a BOM",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "json.loads accepts each of these (measured), and each gives one leaf two readings"
+    }
+   }
+  },
+  {
+   "id": "leaf-parse-nan-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a4e614e7d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "parse refuses duplicate keys, lone surrogates, floats, NaN/Infinity, |n| > 2^53-1, a BOM",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "json.loads accepts each of these (measured), and each gives one leaf two readings"
+    }
+   }
+  },
+  {
+   "id": "leaf-parse-infinity-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a2d496e66696e6974797d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "parse refuses duplicate keys, lone surrogates, floats, NaN/Infinity, |n| > 2^53-1, a BOM",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "json.loads accepts each of these (measured), and each gives one leaf two readings"
+    }
+   }
+  },
+  {
+   "id": "leaf-parse-duplicate-key-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c226c656166223a226c696e65222c2276223a317d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "parse refuses duplicate keys, lone surrogates, floats, NaN/Infinity, |n| > 2^53-1, a BOM",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "json.loads accepts each of these (measured), and each gives one leaf two readings"
+    }
+   }
+  },
+  {
+   "id": "leaf-parse-lone-surrogate-escape-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a225c7564383030227d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "parse refuses duplicate keys, lone surrogates, floats, NaN/Infinity, |n| > 2^53-1, a BOM",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "json.loads accepts each of these (measured), and each gives one leaf two readings"
+    }
+   }
+  },
+  {
+   "id": "leaf-parse-surrogate-bytes-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a22eda080227d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "parse refuses duplicate keys, lone surrogates, floats, NaN/Infinity, |n| > 2^53-1, a BOM",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "json.loads accepts each of these (measured), and each gives one leaf two readings"
+    }
+   }
+  },
+  {
+   "id": "leaf-parse-invalid-utf8-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a22ff227d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "parse refuses duplicate keys, lone surrogates, floats, NaN/Infinity, |n| > 2^53-1, a BOM",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "json.loads accepts each of these (measured), and each gives one leaf two readings"
+    }
+   }
+  },
+  {
+   "id": "leaf-parse-int-2-53-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a393030373139393235343734303939327d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "parse refuses duplicate keys, lone surrogates, floats, NaN/Infinity, |n| > 2^53-1, a BOM",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "json.loads accepts each of these (measured), and each gives one leaf two readings"
+    }
+   }
+  },
+  {
+   "id": "leaf-parse-int-minus-2-53-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a2d393030373139393235343734303939327d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "parse refuses duplicate keys, lone surrogates, floats, NaN/Infinity, |n| > 2^53-1, a BOM",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "json.loads accepts each of these (measured), and each gives one leaf two readings"
+    }
+   }
+  },
+  {
+   "id": "leaf-int-2-53-minus-1-accepted",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a393030373139393235343734303939317d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "parse refuses duplicate keys, lone surrogates, floats, NaN/Infinity, |n| > 2^53-1, a BOM",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "json.loads accepts each of these (measured), and each gives one leaf two readings"
+    }
+   }
+  },
+  {
+   "id": "leaf-depth-4-accepted",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a5b5b5b5d5d5d7d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "nesting depth above 32 is refused, measured iteratively",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no specification governs JSON nesting; an interpreter's recursion limit must never be the rule"
+    }
+   }
+  },
+  {
+   "id": "leaf-depth-32-accepted",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d7d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "nesting depth above 32 is refused, measured iteratively",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no specification governs JSON nesting; an interpreter's recursion limit must never be the rule"
+    }
+   }
+  },
+  {
+   "id": "leaf-depth-33-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d7d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "nesting depth above 32 is refused, measured iteratively",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no specification governs JSON nesting; an interpreter's recursion limit must never be the rule"
+    }
+   }
+  },
+  {
+   "id": "leaf-depth-5000-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d5d7d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "nesting depth above 32 is refused, measured iteratively",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no specification governs JSON nesting; an interpreter's recursion limit must never be the rule"
+    }
+   }
+  },
+  {
+   "id": "leaf-brackets-in-strings-are-not-depth",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a312c2278223a225b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b227d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "nesting depth above 32 is refused, measured iteratively",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "no specification governs JSON nesting; an interpreter's recursion limit must never be the rule"
+    }
+   }
+  },
+  {
+   "id": "leaf-unknown-leaf-refused-at-ingest",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226e6f7065222c2276223a317d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-unknown-leaf-unverifiable-at-verify",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226e6f7065222c2276223a317d",
+    "log_kind": "team",
+    "at": "verify",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "unverifiable"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-unknown-v-refused-at-ingest",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a327d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-unknown-v-unverifiable-at-verify",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a327d",
+    "log_kind": "team",
+    "at": "verify",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "unverifiable"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-registered-leaf-wrong-log-kind-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a317d",
+    "log_kind": "fleet",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-registered-leaf-wrong-log-kind-refused-at-verify",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a317d",
+    "log_kind": "receipt",
+    "at": "verify",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-receipt-checkpoint-on-team-accepted",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a22726563656970745f636865636b706f696e74222c2276223a317d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-frame-not-an-object-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "5b315d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-frame-missing-v-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65227d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-frame-v-true-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a747275657d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-frame-v-string-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a2231227d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-frame-v-negative-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a226c696e65222c2276223a2d317d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-frame-leaf-empty-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a22222c2276223a317d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-frame-leaf-not-string-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "7b226c656166223a312c2276223a317d",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "leaf-frame-empty-refused",
+   "kind": "no_upstream",
+   "op": "leaf",
+   "input": {
+    "data_hex": "",
+    "log_kind": "team",
+    "at": "ingest",
+    "registry": [
+     {
+      "leaf": "line",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     },
+     {
+      "leaf": "receipt_checkpoint",
+      "v": 1,
+      "log_kinds": [
+       "team"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F8",
+    "clause": "one global registry of (leaf, v); an unknown (leaf, v) is refused at ingest and UNVERIFIABLE at verify; a leaf on a log kind its entry does not list is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "the same bytes never carry two meanings, and an old levain never calls a newer leaf tampering"
+    }
+   }
+  },
+  {
+   "id": "chain-hash-team-golden-1",
+   "kind": "no_upstream",
+   "op": "chain_hash",
+   "input": {
+    "prev": "",
+    "entry": {
+     "v": 1,
+     "id": "ana-20261004120000-0a1b2c3d",
+     "ts": "2026-10-04T12:00:00Z",
+     "author": "ana",
+     "agent": "claude-code",
+     "type": "decision",
+     "kind": "ruling",
+     "paths": [
+      "src/billing.py"
+     ],
+     "owner": "client:Dana",
+     "words": "Per-line rounding stays — the bank’s validator rejects mismatched totals.",
+     "supersedes": [],
+     "prev": ""
+    }
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "hash": "64e621bb36fc63176a4b17966cb58a51921980f27559d0fc4308c2fff80b7e94",
+     "canonical": "{\"agent\":\"claude-code\",\"author\":\"ana\",\"id\":\"ana-20261004120000-0a1b2c3d\",\"kind\":\"ruling\",\"owner\":\"client:Dana\",\"paths\":[\"src/billing.py\"],\"prev\":\"\",\"supersedes\":[],\"ts\":\"2026-10-04T12:00:00Z\",\"type\":\"decision\",\"v\":1,\"words\":\"Per-line rounding stays — the bank’s validator rejects mismatched totals.\"}"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F8 / levain team/entry.py:85-86 @ 31dea1f",
+    "clause": "chain_hash(prev, entry) = lowercase hex SHA-256 of UTF-8(prev || canonical(entry without 'hash'))"
+   }
+  },
+  {
+   "id": "chain-hash-team-golden-2",
+   "kind": "no_upstream",
+   "op": "chain_hash",
+   "input": {
+    "prev": "64e621bb36fc63176a4b17966cb58a51921980f27559d0fc4308c2fff80b7e94",
+    "entry": {
+     "v": 1,
+     "id": "ana-20261004120100-0a1b2c3e",
+     "ts": "2026-10-04T12:01:00Z",
+     "author": "ana",
+     "type": "ack",
+     "refs": [
+      "ana-20261004120000-0a1b2c3d"
+     ],
+     "session": "s1",
+     "paths": [],
+     "supersedes": [],
+     "prev": "64e621bb36fc63176a4b17966cb58a51921980f27559d0fc4308c2fff80b7e94"
+    }
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "hash": "1370dd29f84c9723e0536fc39dfac071fb4356b05db3717f13a2f1eef853417e",
+     "canonical": "{\"author\":\"ana\",\"id\":\"ana-20261004120100-0a1b2c3e\",\"paths\":[],\"prev\":\"64e621bb36fc63176a4b17966cb58a51921980f27559d0fc4308c2fff80b7e94\",\"refs\":[\"ana-20261004120000-0a1b2c3d\"],\"session\":\"s1\",\"supersedes\":[],\"ts\":\"2026-10-04T12:01:00Z\",\"type\":\"ack\",\"v\":1}"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F8 / levain team/entry.py:85-86 @ 31dea1f",
+    "clause": "chain_hash(prev, entry) = lowercase hex SHA-256 of UTF-8(prev || canonical(entry without 'hash'))"
+   }
+  },
+  {
+   "id": "chain-hash-ignores-hash-field",
+   "kind": "no_upstream",
+   "op": "chain_hash",
+   "input": {
+    "prev": "64e621bb36fc63176a4b17966cb58a51921980f27559d0fc4308c2fff80b7e94",
+    "entry": {
+     "v": 1,
+     "id": "ana-20261004120100-0a1b2c3e",
+     "ts": "2026-10-04T12:01:00Z",
+     "author": "ana",
+     "type": "ack",
+     "refs": [
+      "ana-20261004120000-0a1b2c3d"
+     ],
+     "session": "s1",
+     "paths": [],
+     "supersedes": [],
+     "prev": "64e621bb36fc63176a4b17966cb58a51921980f27559d0fc4308c2fff80b7e94",
+     "hash": "1370dd29f84c9723e0536fc39dfac071fb4356b05db3717f13a2f1eef853417e"
+    }
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "hash": "1370dd29f84c9723e0536fc39dfac071fb4356b05db3717f13a2f1eef853417e",
+     "canonical": "{\"author\":\"ana\",\"id\":\"ana-20261004120100-0a1b2c3e\",\"paths\":[],\"prev\":\"64e621bb36fc63176a4b17966cb58a51921980f27559d0fc4308c2fff80b7e94\",\"refs\":[\"ana-20261004120000-0a1b2c3d\"],\"session\":\"s1\",\"supersedes\":[],\"ts\":\"2026-10-04T12:01:00Z\",\"type\":\"ack\",\"v\":1}"
+    },
+    "upstream": "n/a"
+   },
+   "authority": {
+    "kind": "byte_derivation",
+    "source": "S1_DESIGN F8 / levain team/entry.py:85-86 @ 31dea1f",
+    "clause": "chain_hash(prev, entry) = lowercase hex SHA-256 of UTF-8(prev || canonical(entry without 'hash'))"
+   }
+  }
+ ]
+}

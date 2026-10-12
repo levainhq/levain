@@ -145,11 +145,12 @@ def test_turn_result_carries_no_task_success_field():
     into it.
 
     ``unreadable_call`` (0.6.8) is admissible on the same rule: the HARNESS's reading of the reply's shape (the
-    model's raw tool-call syntax arrived as text, so no tool ran), never the agent's claim about its own work."""
+    model's raw tool-call syntax arrived as text, so no tool ran), never the agent's claim about its own work. So is
+    ``unreadable_unchecked``: the HARNESS's own record that that reading could not be made."""
     fields = set(TurnResult.__dataclass_fields__)
     assert fields == {
         "reply", "tool_activity", "error", "nudged", "gated", "pending", "timed_out", "held_digest",
-        "unreadable_call",
+        "unreadable_call", "unreadable_unchecked",
     }
     for forbidden in ("succeeded", "success", "task_ok", "passed", "verdict"):
         assert not hasattr(TurnResult(reply="x"), forbidden)
@@ -379,11 +380,10 @@ def test_run_task_unattended_is_a_DISTINCT_mode_from_plain_headless(tmp_path: Pa
                                                                     capsys):
     """K4a: `--task` typed by a human and a scheduled seat are NOT the same drive.
 
-    The gate rightly treats them alike (neither has anyone to fan an action in to). The crown-
-    jewels CRED floor must not: a human running `--task "open a PR"` legitimately needs `gh`,
-    while a seat's silent credential read can compound into always-loaded memory with nobody in
-    the loop. Collapsing them is the bug this mode exists to prevent — so pin that they differ,
-    AND that both still deny a human."""
+    The gate rightly treats them alike (neither has anyone to fan an action in to), and since
+    2026-10-12 so does the cred floor (it denies in every drive). The mode stays the record that a
+    scheduler, not a person, invoked the run, so pin that they differ, AND that both still deny a
+    human."""
     from levain.firing.drive import human_present
     from levain.run import run_task
 
@@ -736,7 +736,7 @@ def test_apply_drive_policy_resolves_the_floor_from_the_DRIVE_not_the_raw_value(
 
     assert fresh(_Cfg(None), "unattended") is True     # absent + seat → DENY
     assert fresh(_Cfg(None), "headless") is True       # absent + headless → DENY (flipped 2026-10-07)
-    assert fresh(_Cfg(None), "interactive") is False   # absent + a human driving → allow
+    assert fresh(_Cfg(None), "interactive") is True    # absent + a human driving → DENY (flipped 2026-10-12)
     assert fresh(_Cfg(False), "unattended") is False   # explicit opt-IN survives
     assert fresh(_Cfg(True), "interactive") is True    # explicit pin survives
 
