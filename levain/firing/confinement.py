@@ -637,8 +637,10 @@ def _runtime_socket_refusal(rel: str) -> str | None:
     dir, or None. The service manager (``systemd/``) and the session bus (``bus``) run what they are
     asked outside the sandbox, the whole-floor bypass measured 2026-09-30, and dirmngr fetches over
     the network for whoever connects (the 2026-10-10 rename attack)."""
+    if "\0" in rel:
+        return "holds a NUL byte"
     parts = Path(rel).parts
-    if not rel or Path(rel).is_absolute() or ".." in parts:
+    if not parts or Path(rel).is_absolute() or ".." in parts:
         return "is not a path inside the runtime dir"
     if parts[0] == "systemd":
         return "is the user's service manager, which runs any command outside the sandbox"
