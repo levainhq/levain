@@ -27,7 +27,7 @@ class FakeLabels:
     ``unverified`` with nulls, as the contract's snapshot does for a value with no label."""
 
     labelled: Mapping[str, str] = field(default_factory=dict)
-    revision: tuple[str, int, int] | None = ("reported", 1, 7)
+    revision: tuple[str, int, int, str] | None = ("reported", 1, 7, "1:stand-in")
     error: str | None = None
     calls: list[int] = field(default_factory=list)
 

@@ -97,7 +97,7 @@ def labels_of(db):
 def test_provenance_labels_the_fired_value_and_not_a_changed_one(db):
     pid = fire(db, "k0", text="fired")
     snap = labels_of(db)
-    assert snap.error is None and snap.revision == ("", 1, 1)
+    assert snap.error is None and snap.revision == ("", 1, 1, "refused")
     prov = snap.provenance(LabelKey("ok-0", {"text": "fired"}))
     assert prov == {"label": "claims cockpit token", "signer": None, "credential": PHONE,
                     "fired_at": utc_stamp(T0 + timedelta(minutes=1)), "operation_id": pid,

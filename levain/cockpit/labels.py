@@ -61,11 +61,13 @@ _NO_FIELD = {"label": UNVERIFIED, "signer": None, "fired_at": None, "operation_i
 
 @dataclass(frozen=True)
 class LabelSnapshot:
-    """One read of the journal's labels. ``revision`` is ``(install_class or "", epoch, label_rev)``,
-    None with ``error`` set or when no labeller is attached (``error`` None too: provenance is null
+    """One read of the journal's labels. ``revision`` is ``(install_class or "", epoch, label_rev,
+    authority)``, ``authority`` the head the signers were judged at (``"<seq>:<head_hash>"``) or
+    ``"refused"`` when the request had no snapshot, so an etag over it moves when the log flips between
+    verified and refused; None with ``error`` set or when no labeller is attached (``error`` None too: provenance is null
     everywhere, today's output). ``degraded`` counts label rows dropped for corruption; each degrades
     only its own resource to unverified (§8d row 3)."""
-    revision: tuple[str, int, int] | None
+    revision: tuple[str, int, int, str] | None
     error: str | None
     degraded: int = 0
     _index: Mapping[tuple[str, str], tuple[_Fire, ...]] = field(default_factory=dict, repr=False,
@@ -142,32 +144,32 @@ class BrokerLabeller:
 
     def __init__(self, db: CockpitDB) -> None:
         self.db = db
-        self._memo: tuple[tuple[int, str] | None, LabelSnapshot] | None = None
+        self._memo: LabelSnapshot | None = None
 
     def snapshot(self, conn: sqlite3.Connection, authority: AuthoritySnapshot | None) -> LabelSnapshot:
         """The labels read on ``conn`` (the request's open read transaction), their signers judged
         by ``authority`` (that request's snapshot)."""
-        head = None if authority is None else (authority.seq, authority.head_hash)
+        head = "refused" if authority is None else f"{authority.seq}:{authority.head_hash}"
         try:
             meta = dict(conn.execute("SELECT key, value FROM meta WHERE key IN "
                                      "('install_class', 'epoch', 'label_rev')").fetchall())
             if "epoch" not in meta or "label_rev" not in meta:
                 return UNAVAILABLE_SNAPSHOT("the journal has no epoch or label_rev")
             install_class = meta.get("install_class") or ""
-            revision = (install_class, int(meta["epoch"]), int(meta["label_rev"]))
+            revision = (install_class, int(meta["epoch"]), int(meta["label_rev"]), head)
             memo = self._memo
-            if memo is not None and memo[0] == head and memo[1].revision == revision:
-                return memo[1]
+            if memo is not None and memo.revision == revision:
+                return memo
             snap = _build(conn, revision, authority)
         except Exception as exc:        # a label is never a gate on reading: any fault is "unavailable"
             return UNAVAILABLE_SNAPSHOT(f"{type(exc).__name__}: {str(exc)[:200]}")
-        self._memo = (head, snap)
+        self._memo = snap
         return snap
 
 
-def _build(conn: sqlite3.Connection, revision: tuple[str, int, int],
+def _build(conn: sqlite3.Connection, revision: tuple[str, int, int, str],
            authority: AuthoritySnapshot | None) -> LabelSnapshot:
-    install_class, epoch, _ = revision
+    install_class, epoch, _, _ = revision
     index: dict[tuple[str, str], list[_Fire]] = {}
     degraded_keys: set[str] = set()
     degraded = 0
