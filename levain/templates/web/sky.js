@@ -135,6 +135,7 @@
     axis.style.position = 'relative'; axis.style.height = '24px';
     var tip = el('div', { class: 'sky-tip', role: 'status' });
     tip.style.cssText = 'position:absolute;pointer-events:none;display:none;z-index:2;white-space:nowrap;padding:6px 10px;border-radius:10px;font-size:12px;border:1px solid var(--hair-2,#28324a);background:var(--base,#060912);color:var(--contrast,var(--text,#f3f5f9))';
+    var showLegend = o.legend !== false;    // a host that draws its own legend passes legend:false
     var legend = el('div', { class: 'sky-legend' });
     plot.append(cv, axis, tip);
     root.append(bar, plot, legend);
@@ -195,12 +196,13 @@
     function rebuild() {
       var now = clock();
       model = buildModel(events, opts, now);
-      var rowsH = Math.max(160, PAD_T + PAD_B + model.rows.length * ROW_H_MIN);
+      var narrow = host.getBoundingClientRect().width < 520;   // a phone: taller rows and a taller floor, so the plot is usable
+      var rowsH = Math.max(narrow ? 240 : 160, PAD_T + PAD_B + model.rows.length * (narrow ? 36 : ROW_H_MIN));
       cv.style.height = rowsH + 'px';
       var c = model.counts;
       summary.textContent = 'Last ' + opts.windowHours + ' hours: ' + c.commit + ' commits, ' + c.review + ' reviews (' + c.failed + ' failed), ' + c.memory + ' memory writes';
       cv.setAttribute('aria-label', summary.textContent + '. ' + (value && value.legend ? value.legend : ''));
-      legend.textContent = value && value.legend ? value.legend : '';
+      legend.textContent = showLegend && value && value.legend ? value.legend : '';
       var r = cv.getBoundingClientRect(); W = r.width; H = r.height;
       if (W) { measureGutter(); cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR); }
     }
@@ -265,9 +267,12 @@
       var now = clock(), nowX = xOf(now, now);
       axis.replaceChildren();
       var h0 = Math.ceil(model.start / 3600000) * 3600000;
+      // label every Nth hour, N the smallest of 2/3/4/6/12 that leaves ~56px between labels at this width
+      var perHour = xOf(now, now) - xOf(now - 3600000, now), step = 12;
+      [2, 3, 4, 6, 12].some(function (n) { if (perHour * n >= 56) { step = n; return true; } return false; });
       for (var t = h0; t < now; t += 3600000) {
         var x = xOf(t, now); if (x < gutter || x > W - PAD_R - 20 || Math.abs(x - nowX) < 34) continue;
-        var hr = new Date(t).getHours(); if (hr % 2) continue;
+        var hr = new Date(t).getHours(); if (hr % step) continue;
         var s = el('span', null, pad2(hr) + ':00');
         s.style.cssText = 'position:absolute;top:6px;transform:translateX(-50%);font:11px ui-monospace,"SF Mono",Menlo,monospace;color:var(--meta,#7d889c);left:' + x + 'px';
         axis.appendChild(s);
