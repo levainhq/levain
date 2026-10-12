@@ -355,6 +355,42 @@ def test_a_gnupghome_owned_by_another_user_gets_no_view(tmp_path, gh, monkeypatc
     assert [a for _, op, a in _ops(argv) if a[:1] == ["/dev/null"] and Path(a[1]).resolve() == gh / "S.dirmngr"]
 
 
+@pytest.fixture
+def home_gh(rd, monkeypatch):
+    """A GNUPGHOME holding a live dirmngr two levels under $HOME (``~/x/gh``), so step (0)'s view of
+    $HOME, the pins of ``~/x`` and the GNUPGHOME's own view all meet. $HOME is made under /tmp because
+    a unix socket path has a short length limit."""
+    home = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvhm")).resolve()
+    monkeypatch.setenv("HOME", str(home))
+    g = home / "x" / "gh"
+    g.mkdir(parents=True, mode=0o700)
+    (home / "x" / "notes").write_text("n")
+    socks = [_listen(g / n) for n in ("S.dirmngr", "S.gpg-agent")]
+    (g / "trustdb.gpg").write_bytes(b"trust")
+    monkeypatch.setattr(conf, "_dirmngr_sockets", lambda: [g / "S.dirmngr"])
+    yield g
+    for s in socks:
+        s.close()
+    import shutil
+    shutil.rmtree(home)
+
+
+def test_a_gnupghome_under_home_is_a_view_nothing_later_covers(tmp_path, home_gh) -> None:
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+    ops = _ops(argv)
+    view = [i for i, op, a in ops if op == "--tmpfs" and a == [str(home_gh)]]
+    assert len(view) == 1
+    covering = {str(home_gh), *(str(a) for a in home_gh.parents)}
+    # After the view, no op of any kind lands on it or on a directory above it: a mount there would
+    # cover the view and put the host's GNUPGHOME, dirmngr included, back in front of bash. bwrap's
+    # --remount-ro is not recursive, so $HOME's own leaves the view below it as it is.
+    later = [(op, a) for i, op, a in ops if i > view[0] and a and a[-1] in covering and op != "--remount-ro"]
+    assert later == []
+    assert _bound_back(argv, home_gh) == {str(home_gh / "S.gpg-agent"), str(home_gh / "trustdb.gpg")}
+    pins = [i for i, op, a in ops if op == "--bind" and a == [str(home_gh.parent)] * 2]
+    assert pins and max(pins) < view[0]
+
+
 def test_a_gnupghome_is_left_alone_when_bash_has_network(tmp_path, gh) -> None:
     """dirmngr is a deputy only for bash without network; with network bash fetches by itself."""
     argv = _bwrap_argv(build_policy(_entity(tmp_path)))
