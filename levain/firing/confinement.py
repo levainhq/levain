@@ -5639,20 +5639,20 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     #                               a daemon restart, because the new socket lands in the host dir
     #                               the sandbox cannot see. Measured.
     # So the directory form is used wherever the socket lives in a directory the daemon owns, and
-    # the file form only where the parent is shared by everything (/run, $XDG_RUNTIME_DIR) and
-    # hiding it would break the host. Paths are the RESOLVED targets, which is what connect() uses.
+    # the file form only where the parent is shared by everything (/run, /tmp, $HOME) and hiding it
+    # would break the host. A user runtime dir is neither: it is step (7)'s view. Paths are the
+    # RESOLVED targets, which is what connect() uses.
     # A daemon dir that is absent but creatable by this user (its parent exists and is writable)
     # is still mounted — bwrap creates it empty — because the user-level daemons
     # (``systemctl --user start podman.socket``) can be STARTED FROM INSIDE THE SANDBOX, and a
     # dir that is not hidden at spawn would then show the socket. An absent dir under a parent the
     # user cannot write belongs to a root daemon this user cannot start, and is skipped.
-    # ⚠ RESIDUAL, STATED: a socket in a SHARED dir (rootful /run/docker.sock, rootless
-    # $XDG_RUNTIME_DIR/docker.sock) is covered only while its inode lives. A restart re-exposes it
-    # for the rest of that shell, and a rootless daemon absent at spawn can be started afterwards.
-    # Both run through the user's service manager, which is outside this namespace.
-    # That manager is itself the sharper bypass, and step (7) hides it: the entity cannot ask it to
-    # start or restart anything. A socket under a user runtime dir is step (7)'s: absent from that
-    # dir's view unless the entity's ``runtime_sockets`` brings it back, so no form here.
+    # ⚠ RESIDUAL, STATED: a socket in a SHARED dir (rootful /run/docker.sock) is covered only while
+    # its inode lives: a restart re-exposes it for the rest of that shell. A rootless daemon's socket
+    # is under a user runtime dir, which is step (7)'s: absent from that dir's view, before and after
+    # a restart, unless the entity's ``runtime_sockets`` brings it back, so no form here. Step (7)
+    # also hides the user's service manager, the sharper bypass: the entity cannot ask it to start
+    # or restart anything.
     # Compared RESOLVED, because the socket targets are: a symlinked HOME compared lexically would
     # get the directory form, a read-only tmpfs over the whole of it (L1 + L2).
     runtime_ops, runtime_roots, view_pins = _runtime_view(policy)
