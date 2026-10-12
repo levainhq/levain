@@ -1,0 +1,385 @@
+{
+ "item": "F4",
+ "generator": "gen.py",
+ "vectors": [
+  {
+   "id": "spec-example-input",
+   "kind": "spec",
+   "op": "verify_cosignatures",
+   "input": {
+    "note": "example.com/behind-the-sofa\n20852163\nCsUYapGGPo4dkMgIAUqom/Xajj7h2fB2MPA3j2jxq2I=\n\n— example.com/behind-the-sofa QddpXVyzey9kGycv9egn2hZt+kUp6sHSVxG0QGoZRv9p7xTztZx3HmNobe7alxbYdJkK08kdyNoxCvo8NRJtgdVEkQA=\n— witness.example/w1 uq5/SwAAAABkGFDLV+QWnkKVRizsrm6yPZ+Ie67Vyd5mdGWv0RrxLqeMGJrPOXeQk1emGTBJExDq5MTTjN31lOjJMWKuaXwGEJXqDA==\n",
+    "trusted": [
+     "witness.example/w1+baae7f4b+BPIXObI6raKlf6J93KUO091tNdij/rEcbyIj59eU6y7H"
+    ],
+    "now": 1679315147,
+    "signed_message": "cosignature/v1\ntime 1679315147\nexample.com/behind-the-sofa\n20852163\nCsUYapGGPo4dkMgIAUqom/Xajj7h2fB2MPA3j2jxq2I=\n"
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "records": [
+      {
+       "cosigner_name": "witness.example/w1",
+       "key_id": "baae7f4b",
+       "timestamp": 1679315147
+      }
+     ]
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/note.NewVerifierForCosignatureV1",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-cosignature@v1.1.0",
+    "clause": "The signature value is computed according to [RFC 8032] over the concatenation of the following lines. Each line is terminated by a newline (U+000A): cosignature/v1; time <ASCII decimal>; the log origin; the tree size; the base64 encoding of the tree hash; zero or more extension lines"
+   }
+  },
+  {
+   "id": "three-cosignatures",
+   "kind": "spec",
+   "op": "verify_cosignatures",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n— witness.example/w1 uq5/SwAAAABo53gAXkMhliFwgvpitQjezBzXUCRTQe7C6HKmNDg5yvohHjMk/TwNmUwPiM1CEu08Kz05UVwxRVywuor2nois1G2XDw==\n— witness.example/w2 uupb5AAAAABo53f/uihaEgIxZKaRboMyoZgwZ7Jcg9U0XZt2CrpWQkq67YfrT9JmuV9Dq9PEE5JShspJddJ5iPBghGxStbwdFwONDg==\n— witness.example/w3 2El6owAAAABo53f+eQfel76LUD2LltYioOV7NOBxPDmMDkIgfXvFKCpNUmEMQtgz77eER6YoFKq0Px1NFSi1FsUKMcbjK+U2hSTmCg==\n",
+    "trusted": [
+     "witness.example/w1+baae7f4b+BPIXObI6raKlf6J93KUO091tNdij/rEcbyIj59eU6y7H",
+     "witness.example/w2+baea5be4+BBrKU3Slaj9gWVrVtWnFqV0quCUguUG/G5r+gamzqVeq",
+     "witness.example/w3+d8497aa3+BMKcMTGlsRjRJBgD9P/D59QTf+f+6WUcwfRZ93M4SBNS"
+    ],
+    "now": 1760000000
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "records": [
+      {
+       "cosigner_name": "witness.example/w1",
+       "key_id": "baae7f4b",
+       "timestamp": 1760000000
+      },
+      {
+       "cosigner_name": "witness.example/w2",
+       "key_id": "baea5be4",
+       "timestamp": 1759999999
+      },
+      {
+       "cosigner_name": "witness.example/w3",
+       "key_id": "d8497aa3",
+       "timestamp": 1759999998
+      }
+     ]
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/note.NewVerifierForCosignatureV1",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-cosignature@v1.1.0",
+    "clause": "The signature value is computed according to [RFC 8032] over the concatenation of the following lines. Each line is terminated by a newline (U+000A): cosignature/v1; time <ASCII decimal>; the log origin; the tree size; the base64 encoding of the tree hash; zero or more extension lines"
+   }
+  },
+  {
+   "id": "timestamp-now-plus-600-accepted",
+   "kind": "spec",
+   "op": "verify_cosignatures",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n— witness.example/w1 uq5/SwAAAABo53pYbj8yXbsITnK3zt/t03cMF1hcnejJ3mWCZRWVo/6RqJv/jmxDQ2ekfGdX0RdDcV4Bjtn/25faW8SONTOIF1ovCA==\n",
+    "trusted": [
+     "witness.example/w1+baae7f4b+BPIXObI6raKlf6J93KUO091tNdij/rEcbyIj59eU6y7H"
+    ],
+    "now": 1760000000
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "records": [
+      {
+       "cosigner_name": "witness.example/w1",
+       "key_id": "baae7f4b",
+       "timestamp": 1760000600
+      }
+     ]
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/note.NewVerifierForCosignatureV1",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F4",
+    "clause": "a cosignature timestamped above now + 600 is refused; now is an argument",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "Verifiers MAY reject checkpoint cosignatures with timestamps in the future."
+    }
+   }
+  },
+  {
+   "id": "timestamp-now-plus-601-refused",
+   "kind": "levain_profile",
+   "op": "verify_cosignatures",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n— witness.example/w1 uq5/SwAAAABo53pZX0nLwb/Tz9bDowj3MHh4PI7KveO4eyTFw0/WLLUuo3tbZYf8Llojm/Fgc0I2fdqHigSBpWVZaVT5h/MTxsyxAw==\n",
+    "trusted": [
+     "witness.example/w1+baae7f4b+BPIXObI6raKlf6J93KUO091tNdij/rEcbyIj59eU6y7H"
+    ],
+    "now": 1760000000
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/note.NewVerifierForCosignatureV1",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F4",
+    "clause": "a cosignature timestamped above now + 600 is refused; now is an argument",
+    "basis": {
+     "kind": "spec_permission",
+     "quote": "Verifiers MAY reject checkpoint cosignatures with timestamps in the future."
+    }
+   }
+  },
+  {
+   "id": "type-04-signature-under-type-01-vkey-refused",
+   "kind": "levain_profile",
+   "op": "verify_cosignatures",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n— witness.example/w1 uq5/SwAAAABo53gAXkMhliFwgvpitQjezBzXUCRTQe7C6HKmNDg5yvohHjMk/TwNmUwPiM1CEu08Kz05UVwxRVywuor2nois1G2XDw==\n",
+    "trusted": [
+     "witness.example/w1+dde6a4b5+AfIXObI6raKlf6J93KUO091tNdij/rEcbyIj59eU6y7H"
+    ],
+    "now": 1760000000
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/note.NewVerifierForCosignatureV1",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "profile_rule",
+    "source": "S1_DESIGN F4",
+    "clause": "a cosigner is configured with a type 0x04 key; a 0x01 vkey is refused",
+    "basis": {
+     "kind": "local_bound",
+     "rationale": "one key, one signature type: Go's NewVerifierForCosignatureV1 silently re-reads a 0x01 vkey as 0x04, so the configured key ID and the verified one differ"
+    }
+   }
+  },
+  {
+   "id": "trusted-cosigner-bad-signature-refused",
+   "kind": "spec",
+   "op": "verify_cosignatures",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n— witness.example/w1 uq5/SwAAAABo53gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n",
+    "trusted": [
+     "witness.example/w1+baae7f4b+BPIXObI6raKlf6J93KUO091tNdij/rEcbyIj59eU6y7H"
+    ],
+    "now": 1760000000
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/note.NewVerifierForCosignatureV1",
+     "version": "v0.1.1",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "If a signature from a known key fails to verify, clients SHOULD reject the whole note. (taken by levain, as in F2)"
+   }
+  },
+  {
+   "id": "unknown-cosigner-ignored",
+   "kind": "spec",
+   "op": "verify_cosignatures",
+   "input": {
+    "note": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n\n— levain-team/0123456789abcdef0123456789abcdef UrMq/rg6z/pAMAg4I9RlApL7mVNWLbNqttKQqg42QYnKj8NqzWxPBSzCBlzzyXK26kQyuKU1fZcpzys6kBRD6HsCJAA=\n— witness.example/w1 uq5/SwAAAABo53gAXkMhliFwgvpitQjezBzXUCRTQe7C6HKmNDg5yvohHjMk/TwNmUwPiM1CEu08Kz05UVwxRVywuor2nois1G2XDw==\n— witness.example/unknown G7UrigAAAABo53gAguqefAKSWnnXT5TnzZ/hftLTXifsnmrfxc56EzKHLHKrkDoxLfne202mwFklRisLW4wMRuniefi2doTPVopRCg==\n",
+    "trusted": [
+     "witness.example/w1+baae7f4b+BPIXObI6raKlf6J93KUO091tNdij/rEcbyIj59eU6y7H"
+    ],
+    "now": 1760000000
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept",
+     "records": [
+      {
+       "cosigner_name": "witness.example/w1",
+       "key_id": "baae7f4b",
+       "timestamp": 1760000000
+      }
+     ]
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/formats/note.NewVerifierForCosignatureV1",
+     "version": "v0.1.1",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP signed-note@v1.1.0",
+    "clause": "Verifiers MUST ignore signatures from unknown keys"
+   }
+  },
+  {
+   "id": "advance-consistent-accepted",
+   "kind": "spec",
+   "op": "check_advance",
+   "input": {
+    "held": "levain-team/0123456789abcdef0123456789abcdef\n5\nGJBehiELrWlPbqSeRO6wdunxDf3rykQjXnsQ16Eu+I8=\n",
+    "new": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+     "7fb182ca7774e61ce3edbf823ecdefddc3f080aaa3ce627a50f2667f2d4a3847",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05",
+     "0fe0c933060a99b7c250a108a37bec0b79aaeeea047823d8a24e528fa775a6c4"
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1.4.2",
+    "clause": "consistency proof verification"
+   }
+  },
+  {
+   "id": "advance-same-size-same-root-accepted",
+   "kind": "spec",
+   "op": "check_advance",
+   "input": {
+    "held": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n",
+    "new": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n",
+    "proof": []
+   },
+   "expect": {
+    "levain": {
+     "verdict": "accept"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "accept"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "advance-same-size-different-root-refused",
+   "kind": "spec",
+   "op": "check_advance",
+   "input": {
+    "held": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n",
+    "new": "levain-team/0123456789abcdef0123456789abcdef\n9\njQx6yZKvL0kTtH1CWvD+CNyjXRV8vyfkDCA1ibmD0f0=\n",
+    "proof": []
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-witness@v1.1.0",
+    "clause": "If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical"
+   }
+  },
+  {
+   "id": "advance-smaller-refused",
+   "kind": "spec",
+   "op": "check_advance",
+   "input": {
+    "held": "levain-team/0123456789abcdef0123456789abcdef\n9\nNIvF1zv9CKrkmeKVW6RvwN8BWPgRLKBDydQjH4UZh+w=\n",
+    "new": "levain-team/0123456789abcdef0123456789abcdef\n5\nGJBehiELrWlPbqSeRO6wdunxDf3rykQjXnsQ16Eu+I8=\n",
+    "proof": []
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "C2SP tlog-cosignature@v1.1.0",
+    "clause": "checkpoint cosignatures MUST be monotonically increasing"
+   }
+  },
+  {
+   "id": "advance-inconsistent-refused",
+   "kind": "spec",
+   "op": "check_advance",
+   "input": {
+    "held": "levain-team/0123456789abcdef0123456789abcdef\n5\nGJBehiELrWlPbqSeRO6wdunxDf3rykQjXnsQ16Eu+I8=\n",
+    "new": "levain-team/0123456789abcdef0123456789abcdef\n9\njQx6yZKvL0kTtH1CWvD+CNyjXRV8vyfkDCA1ibmD0f0=\n",
+    "proof": [
+     "27e1bf02ed14aaf085ef42cad17ef36f10b84981e9953a18b53fa6e7a64a844d",
+     "15396617e321477e6e0f0e692d4a29af271a4838b8f0ec238bbb9cd83e00c3a3",
+     "7fb182ca7774e61ce3edbf823ecdefddc3f080aaa3ce627a50f2667f2d4a3847",
+     "5494c29929ce13ec62016c60617fa2779dd3dfa1fc051b5e0f0c752f61fd9f05",
+     "0fe0c933060a99b7c250a108a37bec0b79aaeeea047823d8a24e528fa775a6c4"
+    ]
+   },
+   "expect": {
+    "levain": {
+     "verdict": "refuse"
+    },
+    "upstream": {
+     "implementation": "github.com/transparency-dev/merkle/proof",
+     "version": "v0.0.2",
+     "verdict": "refuse"
+    }
+   },
+   "authority": {
+    "kind": "spec",
+    "source": "RFC 9162 §2.1.4.2",
+    "clause": "consistency proof verification"
+   }
+  }
+ ]
+}
