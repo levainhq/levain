@@ -610,13 +610,15 @@ def _health(source: SubstrateSource) -> Callable[[ReadContext], Result]:
             {"label": "write path", "value": "live" if h.write_path_live else "dark",
              "unit": None, "status": "ok" if h.write_path_live else "bad", "read": None},
         ]
+        # the widget draws the dot first, then the first four whole-number metrics in order (mock-e: links, wraps,
+        # graduated, demoted), so those lead; the rest follow for the full panel
         for label, value in (
-            ("links", h.total_links), ("avg strength", h.avg_strength), ("max strength", h.max_strength),
+            ("links", h.total_links), ("wraps", h.total_wraps),
+            ("graduated", h.graduations_validated_total), ("demoted", h.graduations_demoted_total),
+            ("avg strength", h.avg_strength), ("max strength", h.max_strength),
             ("density", h.density), ("local density", h.local_density),
             ("episodes", h.total_episodes), ("episodes since wrap", h.episodes_since_wrap),
-            ("tombstones", h.tombstones), ("wraps", h.total_wraps),
-            ("graduations validated", h.graduations_validated_total),
-            ("graduations demoted", h.graduations_demoted_total),
+            ("tombstones", h.tombstones),
         ):
             metrics.append({"label": label, "value": value, "unit": None, "status": "unknown", "read": None})
         alerts = [{"message": "a wrap is in progress; this snapshot may be inconsistent", "severity": "warn"}] \

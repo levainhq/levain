@@ -352,7 +352,7 @@
 
   // The figures health reads: each is a finite number, except the write-path flag.
   const HEALTH_FIGURES = ["links", "avg strength", "max strength", "density", "local density", "episodes",
-    "episodes since wrap", "tombstones", "wraps", "graduations validated", "graduations demoted"];
+    "episodes since wrap", "tombstones", "wraps", "graduated", "demoted"];
   function healthOf(metrics, wraps) {
     need(Array.isArray(metrics), "metrics");
     const m = new Map();
@@ -367,7 +367,7 @@
       max_strength: n("max strength"), density: n("density"), local_density: n("local density"),
       total_episodes: n("episodes"), episodes_since_wrap: n("episodes since wrap"),
       tombstones: n("tombstones"), total_wraps: n("wraps"),
-      graduations_validated_total: n("graduations validated"), graduations_demoted_total: n("graduations demoted"),
+      graduations_validated_total: n("graduated"), graduations_demoted_total: n("demoted"),
       last_wrap_at: last ? last.wrapped_at : null, continuity_chars: last ? last.continuity_chars : null,
       wrap_history_unavailable: wraps === "unavailable",
     };

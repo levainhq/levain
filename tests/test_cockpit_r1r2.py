@@ -163,7 +163,7 @@ def _view(snap: dict[str, Any]) -> dict[str, Any]:
 def _full_metrics(**figures: Any) -> list[dict[str, Any]]:
     """A complete health reading, as the kernel always sends one: every figure plus the write-path flag."""
     names = ("links", "avg strength", "max strength", "density", "local density", "episodes", "episodes since wrap",
-             "tombstones", "wraps", "graduations validated", "graduations demoted")
+             "tombstones", "wraps", "graduated", "demoted")
     vals = {k: 1 for k in names} | figures
     return [{"label": "write path", "value": "live", "unit": None, "status": "ok", "read": None}] + [
         {"label": k, "value": vals[k], "unit": None, "status": "ok", "read": None} for k in names]
@@ -515,7 +515,7 @@ class TestManifestMapperParses:
             self._degraded(view, "health")
 
     FIGURES = ("links", "avg strength", "max strength", "density", "local density", "episodes", "episodes since wrap",
-               "tombstones", "wraps", "graduations validated", "graduations demoted")
+               "tombstones", "wraps", "graduated", "demoted")
 
     def _full_health(self) -> list[dict[str, Any]]:
         return [self._metric("write path", "live")] + [self._metric(k, 1) for k in self.FIGURES]
