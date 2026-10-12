@@ -156,12 +156,33 @@
     };
   }
 
-  function externalOf(head, panel, groupTitles) {
+  // a list panel's compose card as the manifest declares it: {verb, fields} of the form kind's own field types.
+  // A field type the page does not know refuses the panel visibly (the caller's need() throws), never drops it.
+  const COMPOSE_TYPES = ["text", "recipient", "date"];
+  function composeOf(c) {
+    if (c === undefined || c === null) return null;
+    need(isObj(c) && typeof c.verb === "string" && c.verb && Array.isArray(c.fields) && c.fields.length, "compose");
+    const names = new Set();
+    const fields = c.fields.map((f) => {
+      need(isObj(f) && typeof f.name === "string" && f.name && !names.has(f.name), "compose field name");
+      names.add(f.name);
+      need(COMPOSE_TYPES.indexOf(f.type) >= 0, "compose field " + f.name + " has a type this page cannot draw (" + String(f.type) + ")");
+      need(f.type !== "recipient" || (Array.isArray(f.enum) && f.enum.length && f.enum.every((x) => typeof x === "string" && x)), "compose recipient list");
+      return f;
+    });
+    return { verb: c.verb, fields: fields };
+  }
+
+  function externalOf(head, panel, groupTitles, nowMs) {
     const v = panel.value || {};
     const kind = ALIAS[head.kind] || head.kind;
     const out = { note: head.note || "", empty: head.empty || "nothing here", kind: kind, pid: head.id, typed: false,
                   search: searchOf(panel), face: panel.face === "count" ? "count" : "" };
     if (kind === "list" || kind === "count-queue") {
+      const compose = composeOf(panel.compose);
+      // an addressed list (its compose picks recipients) draws every row as `source -> for`
+      const addressed = !!(compose && compose.fields.some((f) => f.type === "recipient"));
+      if (compose) out.compose = compose;
       out.lines = (panel.rows || []).map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
         const badges = (r.badges || []).map(badgeText).join(" · ");
@@ -170,6 +191,14 @@
         const meta = [typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grp, badges, prov]
           .filter(Boolean).join(" · ");
         const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
+        if (addressed) {
+          const f = r.facets || {};
+          const to = Array.isArray(f["for"]) ? f["for"] : typeof f["for"] === "string" ? f["for"].split(",") : [];
+          line.addr = { source: typeof f.source === "string" && f.source.trim() ? f.source.trim() : "unknown",
+                        to: to.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim()),
+                        age: typeof f.at === "string" ? ageLabel(f.at, nowMs || Date.now(), "") : "" };
+          line.meta = "";
+        }
         // a pending (or its outcome) names its state; a WAITING one can be cancelled from here
         if (typeof r.id === "string" && r.id.indexOf("pend:") === 0) {
           const f = r.facets || {};
@@ -366,11 +395,11 @@
   function formField(f) {
     const label = typeof f.label === "string" && f.label ? f.label : f.name;
     if (f.type === "recipient") {
-      return { name: f.name, label: label, kind: "multiselect", required: false,
+      return { name: f.name, label: label, kind: "multiselect", chips: true, required: false,
                options: Array.isArray(f.enum) ? f.enum.filter((x) => typeof x === "string") : [] };
     }
     const long = f.type === "text" && LONG_TEXT.has(f.name);
-    return { name: f.name, label: f.type === "date" ? label + " (YYYY-MM-DD)" : label, kind: long ? "textarea" : "text", required: long };
+    return { name: f.name, label: f.type === "date" ? label + " (YYYY-MM-DD)" : label, kind: long ? "textarea" : "text", required: long, placeholder: long ? label : undefined };
   }
 
   // The last manifest the page was drawn from and when it was fetched: a single panel's refetch maps its fresh
@@ -575,7 +604,7 @@
         if (view.writable && pActions.some((a) => a.verb === "section_edit" && isPostable(a))) { entry.edit_class = "A"; entry.source = pid; }
         view.layout.push(Object.assign(entry, { kind: "section", ref: sectionRef++, heading: titleOf(panel.title, titleOf(head.title, pid)) }));
       } else {
-        view.extra_panels[pid] = externalOf(panel, panel, groupTitles);
+        view.extra_panels[pid] = externalOf(panel, panel, groupTitles, now);
         view.extra_panels[pid].pid = pid;
         // a health widget is drawn as a widget, never as the Health panel, so the page's liveness reads its own write-path metric
         const wp = (view.extra_panels[pid].metrics || []).find((x) => x.label === "write path");
@@ -583,7 +612,7 @@
         // a downstream's own verb on this panel becomes the compose box. The manifest names the verb's
         // fields and not their widgets, so a widget is chosen from the field's name (a known edge).
         // a form panel names its verb: the action is the one offered under that name, and no other
-        const formVerb = view.extra_panels[pid].form ? view.extra_panels[pid].form.verb : null;
+        const formVerb = view.extra_panels[pid].form ? view.extra_panels[pid].form.verb : (view.extra_panels[pid].compose ? view.extra_panels[pid].compose.verb : null);
         const own = pActions.find((a) => (!isObj(a.target) || typeof a.target.row_id !== "string") && (formVerb === null || a.verb === formVerb));
         const vh = own && isObj(view.verb_heads[own.verb]) ? view.verb_heads[own.verb] : null;
         if (vh && !NATIVE.has(pid)) {
@@ -592,6 +621,9 @@
           // a form panel names its own fields: they win over the widgets guessed from the verb head's names
           const form = view.extra_panels[pid].form;
           if (form && form.verb === own.verb) view.extra_panels[pid].action.fields = form.fields.map(formField);
+          // a list's own compose card: its typed fields win, and the card is drawn on the list itself
+          const cmp = view.extra_panels[pid].compose;
+          if (cmp && cmp.verb === own.verb) { view.extra_panels[pid].action.fields = cmp.fields.map(formField); view.extra_panels[pid].action.card = true; }
         }
         // the external renderer draws the note itself, so the banner must not draw it a second time
         if (entry.banner && panel.note) {

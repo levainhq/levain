@@ -2387,6 +2387,32 @@
     const controls = [];
     for (const f of fields) {
       if (!f || typeof f !== "object" || !f.name) continue;
+      if (f.kind === "multiselect" && f.chips) {
+        // the KE compose card's recipient chips: toggle buttons, none pressed = the field is omitted = everyone
+        const group = el("div", "ck-to");
+        group.appendChild(el("span", "ck-to-label", "To"));
+        const chips = [];
+        for (const opt of (Array.isArray(f.options) ? f.options : [])) {
+          const value = typeof opt === "string" ? opt : (opt && opt.value);
+          if (typeof value !== "string" || !value) continue;
+          const chip = el("button", "rc-chip", typeof opt === "string" ? opt : (opt.label || value));
+          chip.type = "button";
+          chip.dataset.value = value;
+          chip.setAttribute("aria-pressed", "false");
+          chip.setAttribute("data-ck-compose", "recipient");
+          chip.addEventListener("click", () => {
+            chip.setAttribute("aria-pressed", chip.getAttribute("aria-pressed") === "true" ? "false" : "true");
+            chipAddr();
+          });
+          group.appendChild(chip);
+          chips.push(chip);
+        }
+        group.appendChild(el("span", "ck-to-hint", "none selected = everyone"));
+        box.insertBefore(group, box.firstChild);
+        controls.push({ f: f, nodes: chips,
+                        read: () => chips.filter((c) => c.getAttribute("aria-pressed") === "true").map((c) => c.dataset.value) });
+        continue;
+      }
       if (f.kind === "multiselect") {
         // a fixed-set chooser (checkboxes) — the operator picks from known options instead of
         // recalling names; nothing checked → the field is omitted (e.g. broadcast for `for`).
@@ -2421,6 +2447,15 @@
     const row = el("div", "tray-dump-controls");
     const go = el("button", "tray-dump-btn", spec.label || action.verb);
     go.type = "button";
+    // the card's address line says in words who a send reaches: the chosen readers, or everyone
+    const chipCtl = controls.find((c) => c.f.chips);
+    const addr = chipCtl ? el("span", "ck-addr", "") : null;
+    function chipAddr() {
+      if (!addr) return;
+      const to = chipCtl.read();
+      addr.textContent = "to " + (to.length ? to.join(", ") : "everyone");
+    }
+    if (addr) { chipAddr(); row.appendChild(addr); }
     const msg = el("span", "edit-msg", "");
     row.append(go, msg);
     box.appendChild(row);
@@ -2617,6 +2652,15 @@
       const o = ln && typeof ln === "object" ? ln : {};
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.meta) row.appendChild(el("span", "ext-meta", String(o.meta)));
+      if (o.addr) {
+        // an addressed row leads with `source -> for` ("everyone" when it names no reader)
+        row.setAttribute("data-ck-row", "");
+        const a = el("div", "ck-rowaddr");
+        const src = el("b", null, String(o.addr.source));
+        src.setAttribute("data-ck-row-source", "");
+        a.append(src, document.createTextNode(" \u2192 " + (o.addr.to.length ? o.addr.to.join(", ") : "everyone") + (o.addr.age ? " \u00b7 " + o.addr.age : "")));
+        row.appendChild(a);
+      }
       appendClause(row, o.text != null ? String(o.text) : "");  // per-item expand, like episodes
       if (o.cancel && cancelPending) appendRowVerbs(row, buildPendingCancel(o.cancel));
       host.appendChild(row);

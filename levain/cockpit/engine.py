@@ -28,6 +28,7 @@ reader, ``levain tui --manifest``, ends and stops the Cockpit on an interrupt.]"
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 from collections import Counter
@@ -201,6 +202,10 @@ class ProviderSpec:
     legacy_kind: str = field(default="", init=False)
     # how the panel draws in a widget: "" (its kind's own face) or "count" (a row-engine kind as its row count)
     face: str = ""
+    # a list panel's compose card: ``{verb, fields: [typed form fields]}``, drawn on the list's own card (never
+    # a second form panel). The verb is one the panel offers; the fields are the form kind's own (text,
+    # recipient, date). A recipient field with nothing chosen sends no value for it: "none selected = everyone".
+    compose: dict[str, Any] | None = None
     # zone layout (a zone panel only): the card's height and column span, and a shared title that makes
     # same-zone panels tabs of one card
     size: str = "medium"
@@ -684,6 +689,7 @@ class Cockpit:
             raise CockpitRegistrationError(f"{sid}: only a list or count-queue has an ordering or views")
         spec = self._place_locked(spec)
         _validate_search_decl(spec)
+        _validate_compose_decl(spec)
         if spec.rowset is not None:
             owner = self._rowsets.get(spec.rowset)
             if owner is not None:
@@ -1330,6 +1336,7 @@ class Cockpit:
                         if self._verb_view is not None else []),
             "edit_class": spec.edit_class or None,
             **({"face": spec.face} if spec.face else {}),
+            **({"compose": copy.deepcopy(spec.compose)} if spec.compose else {}),
         }
 
     @staticmethod
@@ -2257,6 +2264,24 @@ ROW_SEARCH_DEFAULT = {"list": ("title", "body", "id"), "count-queue": ("title", 
 
 def search_fields_of(spec: "ProviderSpec") -> tuple[str, ...]:
     return spec.search_fields or ROW_SEARCH_DEFAULT.get(spec.kind, ())
+
+
+def _validate_compose_decl(spec: "ProviderSpec") -> None:
+    """Refuse a compose declaration the page could not honour (registration time): a list panel only, a
+    verb the panel offers, and fields of the form kind's own contract."""
+    if spec.compose is None:
+        return
+    sid, c = spec.id, spec.compose
+    if spec.kind != "list":
+        raise CockpitRegistrationError(f"{sid}: only a list carries a compose card")
+    if not isinstance(c, dict) or set(c) - {"verb", "fields"}:
+        raise CockpitRegistrationError(f"{sid}: compose is {{verb, fields}}")
+    if not isinstance(c.get("verb"), str) or c["verb"] not in spec.verbs:
+        raise CockpitRegistrationError(f"{sid}: compose names a verb the panel offers, got {c.get('verb')!r}")
+    try:
+        _v_form(spec, {"verb": c["verb"], "fields": c.get("fields")})
+    except ValueError as exc:
+        raise CockpitRegistrationError(f"{sid}: compose {exc}") from None
 
 
 def _validate_search_decl(spec: "ProviderSpec") -> None:
