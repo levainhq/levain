@@ -327,24 +327,28 @@ def test_levains_own_state_channel_on_stdin_is_kept():
 
 
 def test_a_connected_named_socket_on_stdin_is_not_taken_for_the_state_channel():
+    d = tempfile.TemporaryDirectory(dir="/tmp")   # short: AF_UNIX paths are bounded; removed in finally
     srv = socket.socket(socket.AF_UNIX)
-    path = os.path.join(tempfile.mkdtemp(dir="/tmp"), "agent")   # short: AF_UNIX paths are bounded
-    srv.bind(path)
-    srv.listen(1)
-    cli = socket.socket(socket.AF_UNIX)
-    cli.connect(path)
-    r, w = os.pipe()
-    extra_r, extra_w = os.pipe()
-    p = _hygiene(cli.fileno(), w, "carry", extra_w)
-    cli.close()
-    os.close(w)
-    os.close(extra_w)
-    out = os.read(r, 4096).decode().split()
-    p.wait(timeout=30)
-    assert out[0] == "other"
-    srv.close()
-    os.close(r)
-    os.close(extra_r)
+    try:
+        path = os.path.join(d.name, "agent")
+        srv.bind(path)
+        srv.listen(1)
+        cli = socket.socket(socket.AF_UNIX)
+        cli.connect(path)
+        r, w = os.pipe()
+        extra_r, extra_w = os.pipe()
+        p = _hygiene(cli.fileno(), w, "carry", extra_w)
+        cli.close()
+        os.close(w)
+        os.close(extra_w)
+        out = os.read(r, 4096).decode().split()
+        p.wait(timeout=30)
+        assert out[0] == "other"
+        os.close(r)
+        os.close(extra_r)
+    finally:
+        srv.close()
+        d.cleanup()
 
 
 # --- the canary verdict -------------------------------------------------------------------------
@@ -491,7 +495,8 @@ def test_the_stub_runs_right_before_bash_with_the_canary_bound(tmp_path, monkeyp
     canary = sh._canary
     assert argv[argv.index("--canary", at) + 1] == canary.path
     i = argv.index("--new-session")
-    assert argv[i - 3:i] == ["--bind", canary.path, canary.path]
+    # bound before the session starts (the default grant's bind, where the host has /dev/log, follows it)
+    assert ["--bind", canary.path, canary.path] in [argv[k:k + 3] for k in range(i)]
     assert os.path.exists(canary.path)
     sh.close()
     assert not os.path.exists(canary.path)
@@ -623,6 +628,9 @@ def test_a_canary_whose_socket_cannot_be_made_leaves_no_directory(monkeypatch):
 _RELAY_CHILD = r"""
 import os, sys, time
 exec(compile(sys.argv[1], "defs", "exec"))
+if sys.argv[3] == "fallback":   # no fd directory to list: open_fds falls back to a range from 3
+    def open_fds():
+        return list(range(3, 1024))
 relay_into(1)
 relay_into(2)
 os.close(int(sys.argv[2]))   # the command closes one stream and keeps running
@@ -630,11 +638,12 @@ time.sleep(30)
 """
 
 
+@pytest.mark.parametrize("listing", ["proc", "fallback"])
 @pytest.mark.parametrize("closed", [1, 2])
-def test_each_socket_stdio_relay_reaches_eof_when_the_command_closes_it(closed):
+def test_each_socket_stdio_relay_reaches_eof_when_the_command_closes_it(closed, listing):
     out_a, out_b = socket.socketpair()
     err_a, err_b = socket.socketpair()
-    p = subprocess.Popen([sys.executable, "-I", "-S", "-c", _RELAY_CHILD, L._STUB_DEFS, str(closed)],
+    p = subprocess.Popen([sys.executable, "-I", "-S", "-c", _RELAY_CHILD, L._STUB_DEFS, str(closed), listing],
                          stdin=subprocess.DEVNULL, stdout=out_b.fileno(), stderr=err_b.fileno(),
                          start_new_session=True)
     out_b.close()

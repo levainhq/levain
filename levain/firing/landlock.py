@@ -197,9 +197,10 @@ def relay_into(fd):
     # bash gets is a byte stream, never the socket (no fd passing, no peer of its own).
     # The relay keeps only its pipe's read end and its target: an fd it inherits beyond them (another
     # relay's pipe, the original stdout or stderr) would hold that stream open after bash closed it.
+    # 0-2 are named too: open_fds' fallback, where no fd directory can be listed, starts at 3.
     r, w = os.pipe()
     if os.fork() == 0:
-        for x in open_fds():
+        for x in sorted(set(open_fds()) | {0, 1, 2}):
             if x != r and x != fd:
                 try:
                     os.close(x)
