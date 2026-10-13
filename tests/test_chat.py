@@ -513,7 +513,10 @@ class _Floored(_Stub):
             policy = type("P", (), {"deny_localhost_outbound": deny_localhost,
                                     "socket_sources": tuple(Path(x) for x in sockets),
                                     "runtime_sockets": ()})()
-            executor = type("E", (), {"_policy": policy})()
+            from levain.firing.confinement import GrantSnapshot
+
+            floor = type("F", (), {"grants": GrantSnapshot()})()
+            executor = type("E", (), {"_policy": policy, "_floor": floor})()
             tool = type("T", (), {"executor": executor})()
             agent = type("A", (), {"tools_map": {"file_editor": tool}})()
             self.conversation = type("C", (), {"agent": agent})()

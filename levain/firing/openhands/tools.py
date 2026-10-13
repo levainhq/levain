@@ -105,7 +105,9 @@ from levain.firing.confinement import (
     CrownJewelsPolicy,
     HandsFileRefused,
     HandsIdentity,
+    GrantSnapshot,
     SandboxedShell,
+    _accepts_kw,
     _jewel_inodes,
     crown_jewel_reason,
     linked_jewel_reason,
@@ -113,6 +115,8 @@ from levain.firing.confinement import (
     opened_file_reason,
     refresh_socket_denies,
     select_provider,
+    snapshot_operator_grants,
+    with_gpg_program_denies,
 )
 from levain.firing.binding import ConversationBinding
 
@@ -946,7 +950,7 @@ class _SharedFloor:
     correct because of who happens to call it is a contract, and this file's own history says
     contracts drift."""
 
-    __slots__ = ("_policy", "hands", "_lock", "_refusal", "_on_refuse")
+    __slots__ = ("_policy", "hands", "grants", "_lock", "_refusal", "_on_refuse")
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "_SharedFloor":
         # The SDK's fork deep-copies a conversation's events, and the system-prompt event holds the
@@ -955,6 +959,12 @@ class _SharedFloor:
         return self
 
     def __init__(self, policy: CrownJewelsPolicy, hands: HandsIdentity | None = None) -> None:
+        # The operator's socket grants, read ONCE for the conversation: every (re)spawn of its shell and
+        # chat's reach check use this snapshot, never a later read of the file (codex L3 b1b r1). With
+        # gpg's extra socket in it, gnupg's default programs are write-denied for both hands from here on.
+        self.grants: GrantSnapshot = snapshot_operator_grants(hands)
+        if any(g.gpg_extra for g in self.grants.grants):
+            policy = with_gpg_program_denies(policy)
         self._policy = policy
         # The separate user both hands act as (bash runs as it; the editor writes as it), or None.
         self.hands = hands
@@ -1398,10 +1408,12 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                 # holds the same denies even if the start fails; a refresh failure refuses both hands
                 # (codex L3 2026-10-03).
                 refreshed = self._floor.refresh()
+                grants = self._floor.grants.get()   # a grant file that could not be read refuses bash
                 try:
                     candidate = provider.spawn_shell(
                         refreshed, default_timeout=self._default_timeout,
                         **({"hands": self._floor.hands} if self._floor.hands is not None else {}),
+                        **({"grants": grants} if grants and _accepts_kw(provider.spawn_shell, "grants") else {}),
                     )
                 except FloorRefreshError as exc:
                     # The provider's own refresh failed: a refusal of the floor for both hands,

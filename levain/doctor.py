@@ -894,8 +894,9 @@ def _check_confinement(install: Path) -> list[CheckResult]:
 def _check_unix_sockets(install: Path) -> list[CheckResult]:
     """The unix-socket lines ``levain run`` prints (one generator, :func:`~levain.firing.confinement.
     unix_socket_lines`): the tier claim, each operator grant as a named waiver, each default grant, the
-    ssh agent, and a legacy ``runtime_sockets`` key as ignored. A grant file that cannot be read FAILS:
-    ``levain run`` refuses bash with it. A broken entity config is ``_check_confinement``'s to report."""
+    ssh agent, and a legacy ``runtime_sockets`` key as ignored. A grant file that cannot be read, or
+    whose state cannot be determined at all, FAILS: ``levain run`` refuses bash with it. A hands user's
+    entity reads no grant file. A broken entity config is ``_check_confinement``'s to report."""
     try:
         from levain.firing.confinement import ConfinementError, load_confinement_config, unix_socket_lines
     except Exception as exc:  # noqa: BLE001 — never let a diagnosis break the whole doctor run
@@ -908,8 +909,8 @@ def _check_unix_sockets(install: Path) -> list[CheckResult]:
         lines = unix_socket_lines(cfg)
     except ConfinementError as exc:
         return [CheckResult("unix sockets", False, f"`levain run` will refuse bash: {exc}")]
-    except Exception as exc:  # noqa: BLE001
-        return [CheckResult("unix sockets", True, f"not determinable ({exc})")]
+    except Exception as exc:  # noqa: BLE001 — an undeterminable grant file is a FAIL, never a pass
+        return [CheckResult("unix sockets", False, f"not determinable, so `levain run` may refuse bash ({exc})")]
     return [CheckResult("unix sockets", True, "\n      ".join(lines))]
 
 

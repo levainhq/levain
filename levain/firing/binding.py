@@ -102,6 +102,7 @@ def _policy_to_params(policy: CrownJewelsPolicy) -> dict[str, Any]:
 # `from __future__ import annotations` in confinement.py cannot quietly move fields to "unchecked").
 _PATH, _OPT_PATH, _PATHS, _BOOL, _SSH_MODE = "path", "optional_path", "paths", "bool", "ssh_mode"
 _PATH_PAIRS = "path_pairs"
+_LEGACY_RUNTIME_SOCKETS = "runtime_sockets"
 
 
 def _field_kinds() -> dict[str, str]:
@@ -136,8 +137,15 @@ def _abs_path(name: str, v: Any) -> Path:
 
 def _policy_from_params(data: Any) -> CrownJewelsPolicy:
     # EXACT key set. Most policy fields default to an empty tuple, so a missing key would construct
-    # a floor with a silent hole; an extra key means this is not the shape this code wrote.
+    # a floor with a silent hole; an extra key means this is not the shape this code wrote. The one
+    # exception is the legacy `runtime_sockets` field an earlier version wrote: it grants nothing now
+    # (sockets are the operator's grants), so a list of names there is dropped and the binding resumes.
     kinds = _field_kinds()
+    if isinstance(data, dict) and _LEGACY_RUNTIME_SOCKETS in data and _LEGACY_RUNTIME_SOCKETS not in kinds:
+        legacy = data[_LEGACY_RUNTIME_SOCKETS]
+        if not isinstance(legacy, list) or not all(isinstance(x, str) for x in legacy):
+            raise BindingError(f"floor field {_LEGACY_RUNTIME_SOCKETS!r} is not a list of names (fail-closed).")
+        data = {k: v for k, v in data.items() if k != _LEGACY_RUNTIME_SOCKETS}
     if not isinstance(data, dict) or set(data) != set(kinds):
         raise BindingError(
             "the serialized floor does not carry exactly the crown-jewels policy fields — refusing "

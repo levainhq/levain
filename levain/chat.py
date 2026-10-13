@@ -38,7 +38,8 @@ a chat client can show that a present human, not just a token holder, is driving
 **An entity that may reach this server is refused.** With ``allow_localhost_outbound`` its shell
 could call these routes itself and approve its own held actions; with ``allow_container_sockets`` it
 could do the same from a container it starts on the host network, and through any socket the operator
-grants its shell other than gpg's restricted extra socket (a granted rootless podman, say). Every other entity's shell is
+grants its shell other than gpg's restricted extra socket (a granted rootless podman, say; grants are
+bound on Linux only). Every other entity's shell is
 denied loopback and the container daemon sockets its floor lists. (L2 review, codex L3 r1,
 2026-10-03.)
 The refusal fires twice: early from the config, and
@@ -291,7 +292,12 @@ class ChatError(Exception):
 def chat_refusal(entity_dir: Path) -> str | None:
     """Why ``entity_dir`` may not be hosted for chat, or ``None``. A config that does not load is not
     refused HERE: opening the session reports it in full."""
-    from levain.firing.confinement import ConfinementError, load_confinement_config, load_operator_grants
+    from levain.firing.confinement import (
+        ConfinementError,
+        grants_apply,
+        load_confinement_config,
+        load_operator_grants,
+    )
 
     try:
         cfg = load_confinement_config(entity_dir)
@@ -310,7 +316,8 @@ def chat_refusal(entity_dir: Path) -> str | None:
             "this server's chat routes from there, approving its own held actions. Chat refuses to "
             "host it; use `levain run` for this entity."
         )
-    if cfg.hands_user is None:
+    # Grants are bound only on Linux: on macOS none reaches the shell (until B2), so none is cited.
+    if cfg.hands_user is None and grants_apply():
         try:
             granted = [g.name for g in load_operator_grants() if not g.gpg_extra]
         except ConfinementError:
@@ -409,23 +416,22 @@ def _snapshot_payload(snap: TurnSnapshot) -> dict[str, Any]:
 def _hands_reach_this_server(session: Any) -> str | None:
     """What lets ``session``'s shell reach this server, read from the floor the hands enforce, or
     ``None``. Three ways: connecting to localhost, a container daemon socket (a container on the
-    host network connects to localhost), and a socket the operator grants (not gpg's extra socket; a hands
-    user's shell gets no operator grant). The floor carries no socket sources only when the
+    host network connects to localhost), and a socket the operator grants (not gpg's extra socket),
+    read from the conversation's own grant snapshot, the one its shell spawns with (a hands user's shell,
+    and any shell on macOS, has none). The floor carries no socket sources only when the
     entity opted out of the socket denies. An unreadable floor on a session with a shell counts
     as reaching it (fail-closed)."""
     if not getattr(session, "bash_ok", False):
         return None
     try:
-        floor = session.conversation.agent.tools_map["file_editor"].executor._policy
+        executor = session.conversation.agent.tools_map["file_editor"].executor
+        floor = executor._policy
         if not bool(floor.deny_localhost_outbound):
             return "may connect to localhost"
         if not tuple(floor.socket_sources):
             return "may reach the container daemon sockets"
-        if getattr(session, "hands_user", None) is None:
-            from levain.firing.confinement import load_operator_grants
-
-            if any(not g.gpg_extra for g in load_operator_grants()):
-                return "may reach the sockets the operator grants"
+        if any(not g.gpg_extra for g in executor._floor.grants.get()):
+            return "may reach the sockets the operator grants"
         return None
     except Exception:  # noqa: BLE001 — cannot read the floor: assume the worst
         return "has a floor that cannot be read"
