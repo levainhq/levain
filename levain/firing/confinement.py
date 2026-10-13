@@ -5128,6 +5128,8 @@ def _creatable_by_me(p: Path) -> bool:
     a = p.parent
     while not os.path.lexists(a) and a != a.parent:
         a = a.parent
+    if os.path.islink(a):
+        return True   # a link it leads through could be replaced or made to lead anywhere: assume yes (L3 r4)
     return a.is_dir() and os.access(a, os.W_OK)
 
 
