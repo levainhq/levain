@@ -1190,19 +1190,45 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
    plain meta text. */
 /* the verbs of a row stay in the tab order (clipped, not removed) so a keyboard reaches them, and show on hover or focus;
    a screen with no hover shows them always */
-body.ke .row .verb-actions { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
-body.ke .row:hover .verb-actions, body.ke .row:focus-within .verb-actions { position: static; width: auto; height: auto; margin: 0 0 0 auto; overflow: visible; clip: auto; white-space: normal; display: inline-flex; }
-@media (hover: none) { body.ke .row .verb-actions { position: static; width: auto; height: auto; margin: 0 0 0 auto; overflow: visible; clip: auto; white-space: normal; display: inline-flex; } }
+/* ONE ROW (D3, D5): the text at full width on top, one meta line under it (id, kind, date) with the verbs at its right. The verbs
+   keep their layout space and fade in by opacity, so hovering never moves the row; a screen with no hover shows them always. */
+body.ke .row:has(> .clause.clampable) { display: flex; flex-wrap: wrap; align-items: center; gap: 0 12px; padding: 8px 0;
+  border-radius: 0; font-size: 13px; }
+body.ke .xbody .row:has(> .clause.clampable) { padding: 8px 0; border-radius: 0; font-size: 13px; }
+body.ke .xbody .row:has(> .clause.clampable):hover { background: none; }
+body.ke .row.ext-accent:has(> .clause.clampable) { padding-left: 9px; }
+body.ke .row > .clause.clampable { order: 0; flex: 1 1 calc(100% - 44px); font-size: 13px; line-height: 1.5; color: var(--text); }
+body.ke .row > .clause-toggle { order: 0; }
+body.ke .row:has(> .clause.clampable) > :not(.clause):not(.clause-toggle):not(.ck-rowaddr) { order: 1; }
+body.ke .row > .ck-rowaddr { order: -1; }
+body.ke .row:has(> .clause.clampable) > .sid, body.ke .row:has(> .clause.clampable) > [data-ck-tag], body.ke .row:has(> .clause.clampable) > .muted,
+body.ke .row:has(> .clause.clampable) > .ext-meta { font-size: 12px; line-height: 24px; min-height: 24px; }
+body.ke .row:has(> .clause.clampable) > .sid { font-size: 11px; }
+body.ke .row .verb-actions { order: 1; margin: 0 0 0 auto; flex-wrap: nowrap; gap: 2px; position: relative; opacity: 0; transition: opacity .12s ease; }
+body.ke .row:hover .verb-actions, body.ke .row:focus-within .verb-actions, body.ke .row .verb-actions:has([aria-expanded="true"]) { opacity: 1; }
+@media (hover: none) { body.ke .row .verb-actions { opacity: 1; } }
+/* an open form takes the whole line under the meta, and shows (the opacity rule above would hide it with the row unhovered) */
+body.ke .row .verb-actions:has(.verb-form), body.ke .row .verb-actions:has(.edit-msg) { flex: 1 1 100%; opacity: 1; flex-wrap: wrap; }
+body.ke .row .verb-menu { position: absolute; top: 100%; right: 0; z-index: 20; display: flex; flex-direction: column; min-width: 120px; padding: 4px;
+  background: var(--card); border: 1px solid var(--hair-2); border-radius: 8px; box-shadow: 0 6px 18px -8px rgb(0 0 0 / .5); }
+body.ke .row .verb-menu[hidden] { display: none; }
+body.ke .row .verb-menu.up { top: auto; bottom: 100%; }
+body.ke .row .verb-menu .verb-btn { text-align: left; }
 /* panel chrome follows the row: the edit-class chip and the expand control show on the card you are on */
 body.ke .panel .phead .chip, body.ke .panel .phead .pexpand { opacity: 0; transition: opacity .12s ease; }
 body.ke .panel:hover .phead .chip, body.ke .panel:hover .phead .pexpand, body.ke .panel:focus-within .phead .chip, body.ke .panel:focus-within .phead .pexpand { opacity: 1; }
 @media (hover: none) { body.ke .panel .phead .chip, body.ke .panel .phead .pexpand { opacity: 1; } }
 body.ke .row:focus-visible { outline: 1px solid var(--hair-2); outline-offset: -1px; border-radius: 12px; }
-body.ke .verb-btn, body.ke .undo-btn {
+body.ke .undo-btn {
   font: 500 12px/1.4 var(--sans); letter-spacing: 0; text-transform: none; color: var(--label); background: none;
   border: 1px solid var(--hair-2); border-radius: 7px; padding: 2px 9px; box-shadow: none; }
+body.ke .verb-btn {
+  font: 500 12px/1 var(--sans); letter-spacing: 0; text-transform: none; color: var(--label); background: none;
+  border: 0; border-radius: 6px; padding: 0 8px; min-height: 24px; height: 24px; box-shadow: none; white-space: nowrap; }
+body.ke .verb-btn.verb-more { padding: 0 6px; letter-spacing: .1em; }
 body.ke .undo-btn::before { content: none; }
-body.ke .verb-btn:hover, body.ke .undo-btn:hover { color: var(--text); background: none; border-color: var(--label); box-shadow: none; }
+body.ke .undo-btn:hover { color: var(--text); background: none; border-color: var(--label); box-shadow: none; }
+body.ke .verb-btn:hover { color: var(--text); background: var(--card-2); box-shadow: none; }
 body.ke .verb-btn:focus-visible, body.ke .undo-btn:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
 body.ke [data-ck-tag] { color: var(--meta); font: 500 11.5px/1.5 var(--sans); letter-spacing: 0; text-transform: none;
   background: none; border: 0; padding: 0; border-radius: 0; text-shadow: none; opacity: 1; }

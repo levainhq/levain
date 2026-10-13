@@ -986,8 +986,66 @@
   // The ONE place a verb-bearing row takes its verbs: every row kind (spore, episode, pending cancel) passes through
   // here. On the KE page the verbs are clipped until the row is hovered or has focus, so the row itself must be
   // focusable (tabIndex 0) or a keyboard user never reaches them.
-  function appendRowVerbs(row, group) {
-    if (document.body.classList.contains("ke")) row.tabIndex = 0;
+  // On the KE page at most VERBS_VISIBLE verbs show; the rest sit behind a "···" menu (a popover: Enter/Space opens it,
+  // Esc closes it and returns focus, arrows and Tab move). `prefer` names the labels that stay visible first (the Tray:
+  // edit, schedule, dismiss); otherwise the first three the kernel offered, in its order. Every verb keeps its own
+  // button, handlers and data attributes: the menu only moves the node.
+  const VERBS_VISIBLE = 3;
+  function overflowVerbs(group, prefer) {
+    const btns = Array.prototype.slice.call(group.querySelectorAll(":scope > .verb-btn"));
+    if (btns.length <= VERBS_VISIBLE) return;
+    let keep = [];
+    for (const label of prefer || []) {
+      const b = btns.find((x) => x.textContent === label);
+      if (b && keep.length < VERBS_VISIBLE) keep.push(b);
+    }
+    for (const b of btns) if (keep.length < VERBS_VISIBLE && keep.indexOf(b) < 0) keep.push(b);
+    const rest = btns.filter((b) => keep.indexOf(b) < 0);
+    const more = el("button", "verb-btn verb-more", "\u00b7\u00b7\u00b7");
+    more.type = "button";
+    more.setAttribute("aria-haspopup", "menu");
+    more.setAttribute("aria-expanded", "false");
+    more.setAttribute("aria-label", "more: " + rest.map((b) => b.textContent).join(", "));
+    const menu = el("span", "verb-menu");
+    menu.setAttribute("role", "menu");
+    menu.hidden = true;
+    for (const b of rest) { b.setAttribute("role", "menuitem"); menu.appendChild(b); }
+    const items = () => Array.prototype.slice.call(menu.querySelectorAll(".verb-btn")).filter((b) => !b.disabled);
+    const close = (refocus) => {
+      menu.hidden = true; menu.classList.remove("up");
+      more.setAttribute("aria-expanded", "false");
+      if (refocus) more.focus();
+    };
+    const open = () => {
+      menu.hidden = false;
+      more.setAttribute("aria-expanded", "true");
+      const host = group.closest(".pbody, .modal-body, .xbody");
+      if (host) {
+        const room = host.getBoundingClientRect().bottom - more.getBoundingClientRect().bottom;
+        menu.classList.toggle("up", room < menu.offsetHeight + 8);
+      }
+      const first = items()[0]; if (first) first.focus();
+    };
+    more.addEventListener("click", (ev) => { ev.stopPropagation(); if (menu.hidden) open(); else close(true); });
+    menu.addEventListener("click", () => close(false));
+    group.addEventListener("keydown", (ev) => {
+      if (menu.hidden) return;
+      if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); close(true); return; }
+      const list = items(); const i = list.indexOf(document.activeElement);
+      if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+        ev.preventDefault();
+        const n = list.length; if (!n) return;
+        list[(i + (ev.key === "ArrowDown" ? 1 : -1) + n) % n].focus();
+      } else if (ev.key === "Tab") close(false);
+    });
+    group.addEventListener("focusout", (ev) => {
+      if (!menu.hidden && !(ev.relatedTarget && group.contains(ev.relatedTarget))) close(false);
+    });
+    group.appendChild(more);
+    group.appendChild(menu);
+  }
+  function appendRowVerbs(row, group, prefer) {
+    if (document.body.classList.contains("ke")) { row.tabIndex = 0; overflowVerbs(group, prefer); }
     row.appendChild(group);
     return row;
   }
@@ -1012,7 +1070,7 @@
       row.appendChild(due);
     }
     if (s.age_shown && s.age) row.appendChild(el("span", "muted", s.age));
-    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind));
+    if (verbs && s.id) appendRowVerbs(row, buildSporeVerbs(s, panelKind), panelKind === "tray" ? ["edit", "schedule", "dismiss"] : null);
     return row;
   }
 
