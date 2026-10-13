@@ -1756,7 +1756,7 @@ def build_policy(
     # on macOS and nothing on Linux. The paths are the RESOLVED ones, which is what SQLite names its
     # sidecars after.
     sidecars: list[Path] = []
-    known_dirs = {*listed_dirs, *_spellings("~/.levain-runtime/floor")}
+    known_dirs = {*listed_dirs, *_spellings("~/.levain-runtime/floor"), (levain_home / GRANTS_DIR).resolve()}
     for jewel in _dedup(subtrees + files):
         if jewel in known_dirs and not jewel.is_file():
             continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
