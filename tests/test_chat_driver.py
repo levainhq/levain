@@ -386,7 +386,8 @@ def test_a_driver_that_returns_anything_but_a_snapshot_is_refused(tmp_path):
     host = _host(tmp_path, {"alpha": d})
     sid, _ = _open(host, "alpha")
     st = _wait(host, host.turn(sid, "go")["job_id"])
-    assert st["status"] == "failed" and "not TurnSnapshot" in st["error"] and d.closed
+    assert st["status"] == "failed" and "not TurnSnapshot" in st["error"]
+    _until(lambda: d.closed, what="the release")   # published before the close, by design
 
 
 def test_per_turn_options_and_after_turn_answers_refuse_by_default(tmp_path):
