@@ -256,6 +256,7 @@ from typing import Any, Callable, Literal, NoReturn
 # gate must agree on the vocabulary by construction, not by two lists staying in sync. Both modules
 # are stdlib-only leaves, so this adds no dependency weight.
 from levain.firing.gate import GATE_SETTINGS, GateSetting
+from levain.firing import landlock as _landlock
 
 __all__ = [
     "SANDBOX_EXEC",
@@ -7879,6 +7880,9 @@ class _BwrapShell(SandboxedShell):
     whose bash is pid 1 of its pid namespace, so nothing a command starts (a background job, a
     ``setsid`` child) outlives it to hold access past the next check."""
 
+    #: The unix-socket policy's pathname canary (:class:`levain.firing.landlock.Canary`), stopped by close().
+    _canary: "_landlock.Canary | None" = None
+
     def __init__(
         self,
         *,
@@ -8051,6 +8055,8 @@ class _BwrapShell(SandboxedShell):
         finally:
             if self._relay is not None:
                 self._relay.stop()   # after the commands: nothing inside is left to use it
+            if self._canary is not None:
+                self._canary.stop()
             # The shell lets go of its claim, and of its registration, only when it releases the claim.
             # Until then (a preflight still outstanding, a group that did not empty, a leaf not settled)
             # it keeps both: a spawn the preflight still makes is retagged onto the claim, and a later
@@ -8294,7 +8300,8 @@ class BwrapProvider(ConfinementProvider):
         return bwrap_netns_available()
 
     def _prepare(self, policy: CrownJewelsPolicy, made: list[tuple[str, str]],
-                 hands: HandsIdentity | None = None, relay_dir: str | None = None):
+                 hands: HandsIdentity | None = None, relay_dir: str | None = None,
+                 canary: "_landlock.Canary | None" = None):
         """Plan the floor and put on the host what it needs, inside the caller's ledger transaction:
         ``(argv, create_first, mounted, unmounted, manifest)``. Every object it creates is appended to
         ``made`` as it goes, so a refusal part-way still hands the ledger everything made."""
@@ -8333,7 +8340,15 @@ class BwrapProvider(ConfinementProvider):
         # A hands launch with egress ports starts each command's bash through the namespace side of the
         # proxy relays, which execs it (see `_HANDS_RELAY`): bash is still pid 1.
         relay_in = _hands_relay_in(hands, relay_dir) if hands is not None and relay_dir is not None else []
-        argv = argv + ["--new-session", "--as-pid-1", *relay_in, "/bin/bash", "--noprofile", "--norc", "-p"]
+        # The unix-socket policy (:mod:`levain.firing.landlock`): a stub inside bwrap, right before bash,
+        # restricts itself and execs bash, so the policy covers bash and all it starts (bwrap itself
+        # cannot be under it: a Landlock domain that handles a filesystem right may not mount). It runs
+        # after the hands relay, whose own process stays outside the policy, as it must to reach the
+        # host side. The canary it checks the policy with is created outside every sandbox (`Canary`).
+        landlock = _landlock.stub_argv(HANDS_PYTHON if hands is not None else sys.executable,
+                                       canary=canary.view_path if canary is not None else None)
+        argv = argv + [*(canary.bind_ops() if canary is not None else []), "--new-session", "--as-pid-1",
+                       *relay_in, *landlock, "/bin/bash", "--noprofile", "--norc", "-p"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
         # Each one this process made is levain's, recorded in the placeholder ledger and removed once
@@ -8437,6 +8452,20 @@ class BwrapProvider(ConfinementProvider):
         # FIRST, so a crashed session's objects are either gone before the plan looks or claimed by it.
         claim = _new_claim()
         made: list[tuple[str, str]] = []
+        # A hands view's /run is its own tmpfs, so the canary is bound there; the operator floor sees the
+        # host's tree, so it is bound at its own path. Owned by the shell from its construction on.
+        canary = _landlock.Canary(shared=hands is not None,
+                                  view_path="/run/levain-canary" if hands is not None else None)
+        try:
+            return self._spawn_bwrap_canaried(policy, env, default_timeout, hands, relay, claim, made, canary)
+        except BaseException:
+            canary.stop()
+            raise
+
+    def _spawn_bwrap_canaried(self, policy: CrownJewelsPolicy, env: dict[str, str] | None,
+                              default_timeout: float, hands: HandsIdentity | None, relay: _HandsRelay | None,
+                              claim: str, made: list[tuple[str, str]],
+                              canary: _landlock.Canary) -> SandboxedShell:
         with _LedgerTxn() as txn:
             if not txn.ok:
                 # Without a ledger this shell's claims cannot reach the disk, and another session
@@ -8448,7 +8477,7 @@ class BwrapProvider(ConfinementProvider):
             txn.sweep()
             try:
                 argv, create_first, mounted, unmounted, manifest = self._prepare(
-                    policy, made, hands, relay.sockdir if relay is not None else None)
+                    policy, made, hands, relay.sockdir if relay is not None else None, canary)
             finally:
                 # Recorded even on a refusal: unclaimed, it is removed as the transaction ends.
                 txn.record(made)
@@ -8489,6 +8518,7 @@ class BwrapProvider(ConfinementProvider):
         shell._ledger_claim = claim
         shell._claim_base = claim
         shell._relay = relay
+        shell._canary = canary
         shell._hands = hands
         _LIVE_BWRAP_SHELLS.add(shell)
         try:
