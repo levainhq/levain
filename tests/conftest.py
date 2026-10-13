@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -53,6 +54,12 @@ def _isolate_activation_env(monkeypatch):
     # auto-memory sweep rooted at levain/templates/ (measured: it wrote .levain/ state there).
     # tests/test_automemory_mirror.py builds its own env and sets this deliberately.
     monkeypatch.setenv("LEVAIN_AUTOMEMORY_MIRROR", "off")
+    # And the host's gnupg and grants: gpgconf's default pinentry/scdaemon join every floor's write-denies
+    # (`_gpg_components`), and the operator's grant file every Linux spawn and every run/doctor socket
+    # line. Tests of either set them explicitly (tests/test_operator_grants.py).
+    import levain.firing.confinement as conf
+    monkeypatch.setattr(conf, "_gpg_components", lambda: [])
+    monkeypatch.setattr(conf, "grants_file", lambda: Path("/nonexistent/levain-test/grants.json"))
 
 
 @pytest.fixture(autouse=True)

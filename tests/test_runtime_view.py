@@ -72,8 +72,6 @@ def rd(tmp_path, monkeypatch):
     (tmp_path / "home").mkdir()
     monkeypatch.setenv("SSH_AUTH_SOCK", str(root / "ssh-agent.sock"))
     monkeypatch.setattr(conf, "_runtime_dirs", lambda: [str(root)])
-    monkeypatch.setattr(conf, "_gpg_sockets",
-                        lambda: [root / "gnupg" / "S.gpg-agent", root / "gnupg" / "S.gpg-agent.ssh"])
     yield root.resolve()
     for s in socks:
         s.close()
@@ -140,54 +138,55 @@ def test_a_runtime_dir_bash_could_move_from_above_is_pinned_from_above(tmp_path,
         shutil.rmtree(top)
 
 
-def test_only_socket_files_come_back_never_a_directory(tmp_path, rd) -> None:
+def test_no_socket_comes_back_on_its_own(tmp_path, rd) -> None:
+    """The agents in the runtime dir (gpg's, the ssh agent $SSH_AUTH_SOCK names) are not bound back:
+    only an operator grant is, at spawn."""
     argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
-    for _, op, args in _ops(argv):
-        if op.endswith("bind") and _under(args[1], rd):
-            assert args[0] == args[1] and not os.path.isdir(args[0]), (op, args)
-    assert _bound_back(argv, rd) == {str(rd / "gnupg" / "S.gpg-agent"), str(rd / "gnupg" / "S.gpg-agent.ssh"),
-                                     str(rd / "ssh-agent.sock")}
-    assert ["--perms", "0700", "--dir", str(rd / "gnupg")] in [argv[k:k + 4] for k in range(len(argv))]
+    assert _bound_back(argv, rd) == set()
+    assert not [a for _, op, a in _ops(argv) if op == "--dir" and _under(a[0], rd)]
+    assert not [a for _, op, a in _ops(argv) if op == "--symlink" and _under(a[1], rd)]
     # The deleted per-dir handling: no systemd tmpfs, no bus or dirmngr mask, nothing else under the dir.
     assert not [a for _, op, a in _ops(argv) if op in ("--tmpfs", "--remount-ro") and _under(a[0], rd)]
     assert not [a for _, op, a in _ops(argv) if a[:1] == ["/dev/null"] and _under(a[1], rd)]
 
 
-def test_an_allowlisted_socket_comes_back_and_a_link_to_a_refused_one_does_not(tmp_path, rd) -> None:
-    (rd / "podman" / "file").write_text("not a socket")
-    policy = build_policy(_entity(tmp_path), runtime_sockets=(
-        "podman/podman.sock", "podman/link.sock", "podman/file", "gnupg/d.abc", "podman/absent.sock"))
-    bound = _bound_back(_bwrap_argv(policy), rd)
-    assert bound - {str(rd / n) for n in ("gnupg/S.gpg-agent", "gnupg/S.gpg-agent.ssh", "ssh-agent.sock")} == {
-        str(rd / "podman" / "podman.sock")}
-    # absent by default, though it is on the container-socket roster
-    assert str(rd / "podman" / "podman.sock") not in _bound_back(_bwrap_argv(build_policy(_entity(tmp_path / "b"))), rd)
+@pytest.mark.parametrize("legacy", [["podman/podman.sock"], ["bus", "systemd/private"], "podman/podman.sock"])
+def test_a_legacy_runtime_sockets_key_grants_nothing_and_is_reported_ignored(tmp_path, rd, legacy) -> None:
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text(json.dumps({"runtime_sockets": legacy}))
+    cfg = load_confinement_config(ent)   # no longer refused: it decides nothing
+    assert cfg.runtime_sockets
+    assert "runtime_sockets" not in _policy_to_params(build_policy(ent))
+    assert _bound_back(_bwrap_argv(build_policy(ent, deny_localhost_outbound=True)), rd) == set()
+    lines = conf.unix_socket_lines(cfg, system="Linux")
+    assert any(ln.startswith("ignored: runtime_sockets") for ln in lines), lines
 
 
-def test_a_name_that_is_a_link_comes_back_as_the_link_and_a_link_to_a_refused_socket_does_not(tmp_path, rd, monkeypatch) -> None:
-    """Only the resolved socket was bound back, so ``SSH_AUTH_SOCK=<rd>/agent-link`` (a link to the
-    agent's ssh socket) and an allowlisted link both named nothing inside bash."""
-    os.symlink("gnupg/S.gpg-agent.ssh", rd / "agent-link")
-    os.symlink("podman/podman.sock", rd / "docker.sock")
-    (rd / "sub").mkdir()
-    os.symlink("../docker.sock", rd / "sub" / "chain.sock")
-    monkeypatch.setenv("SSH_AUTH_SOCK", str(rd / "agent-link"))
-    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True, runtime_sockets=(
-        "docker.sock", "sub/chain.sock", "podman/link.sock")))
-    windows = [argv[k:k + 3] for k in range(len(argv))]
-    assert ["--symlink", "gnupg/S.gpg-agent.ssh", str(rd / "agent-link")] in windows
-    assert ["--symlink", "podman/podman.sock", str(rd / "docker.sock")] in windows
-    # a chain comes back as one link, to the socket itself
-    assert ["--symlink", str(rd / "podman" / "podman.sock"), str(rd / "sub" / "chain.sock")] in windows
-    assert ["--perms", "0700", "--dir", str(rd / "sub")] in [argv[k:k + 4] for k in range(len(argv))]
-    assert _bound_back(argv, rd) >= {str(rd / "gnupg" / "S.gpg-agent.ssh"), str(rd / "podman" / "podman.sock")}
-    ops = _ops(argv)
-    view = max(i for i, op, a in ops if op == "--tmpfs" and a == [str(rd)])
-    links = [i for i, op, a in ops if op == "--symlink" and _under(a[1], rd)]
-    assert links and min(links) > view
-    # podman/link.sock -> gnupg/S.dirmngr: neither the link nor what it resolves to comes back
-    for _, op, a in ops:
-        assert str(rd / "podman" / "link.sock") not in a and str(rd / "gnupg" / "S.dirmngr") not in a, (op, a)
+def test_chat_refuses_an_entity_whose_shell_gets_an_operator_grant(tmp_path, monkeypatch) -> None:
+    """A granted rootless podman can start a container on the host network, the reason chat refuses
+    allow_container_sockets; gpg's extra socket cannot, and a hands user's shell gets no grant."""
+    from types import SimpleNamespace
+
+    from levain import chat as chat_mod
+
+    ent = _entity(tmp_path)
+    (ent / ".levain" / "confinement.json").write_text("{}")
+    gf = tmp_path / "grants.json"
+    monkeypatch.setattr(conf, "grants_file", lambda: gf)
+    floor = build_policy(ent, deny_localhost_outbound=True)
+    editor = SimpleNamespace(executor=SimpleNamespace(_policy=floor))
+    session = SimpleNamespace(bash_ok=True, conversation=SimpleNamespace(
+        agent=SimpleNamespace(tools_map={"file_editor": editor})))
+    for grants, refused in (([], False), ([{"path": "/run/user/1/gnupg/S.gpg-agent.extra", "name": "gpg",
+                                            "why": "signing"}], False),
+                            ([{"path": "/run/user/1/podman/podman.sock", "name": "podman", "why": "builds"}], True)):
+        gf.write_text(json.dumps({"grants": grants}))
+        gf.chmod(0o600)
+        assert ("podman" in (chat_mod.chat_refusal(ent) or "")) is refused
+        assert chat_mod._hands_reach_this_server(session) == (
+            "may reach the sockets the operator grants" if refused else None)
+    session.hands_user = "ent-hands"
+    assert chat_mod._hands_reach_this_server(session) is None
 
 
 @pytest.mark.parametrize("held", ["workspace", "entity", "home"])
@@ -217,55 +216,6 @@ def test_a_socket_outside_the_runtime_dir_is_unaffected(tmp_path, rd, monkeypatc
         other.rmdir()
 
 
-@pytest.mark.parametrize("entry,why", [
-    ("systemd/private", "service manager"), ("systemd/x/y", "service manager"), ("bus", "session bus"),
-    ("gnupg/S.dirmngr", "dirmngr"), ("gnupg/d.abc/S.dirmngr", "dirmngr"), ("../run/x", "inside the runtime dir"),
-    ("/run/user/1000/podman/podman.sock", "inside the runtime dir"), ("", "inside the runtime dir"),
-    (".", "inside the runtime dir"), ("./", "inside the runtime dir"), ("podman/\0x.sock", "NUL"),
-])
-def test_runtime_sockets_refuses_the_service_manager_the_bus_and_dirmngr(tmp_path, entry, why) -> None:
-    ent = _entity(tmp_path)
-    (ent / ".levain" / "confinement.json").write_text(json.dumps({"runtime_sockets": [entry]}))
-    with pytest.raises(ConfinementError, match=why):
-        load_confinement_config(ent)
-    with pytest.raises(ConfinementError, match=why):
-        build_policy(ent, runtime_sockets=(entry,))
-
-
-def test_runtime_sockets_loads_and_survives_the_binding(tmp_path) -> None:
-    ent = _entity(tmp_path)
-    (ent / ".levain" / "confinement.json").write_text(json.dumps({"runtime_sockets": ["podman/podman.sock"]}))
-    assert load_confinement_config(ent).runtime_sockets == ("podman/podman.sock",)
-    (ent / ".levain" / "confinement.json").write_text(json.dumps({"runtime_sockets": "podman/podman.sock"}))
-    with pytest.raises(ConfinementError, match="runtime_sockets"):
-        load_confinement_config(ent)
-    params = _policy_to_params(build_policy(ent, runtime_sockets=("podman/podman.sock",)))
-    assert _policy_from_params(params).runtime_sockets == ("podman/podman.sock",)
-    with pytest.raises(BindingError, match="session bus"):
-        _policy_from_params({**params, "runtime_sockets": ["bus"]})
-
-
-def test_chat_refuses_an_entity_whose_shell_gets_runtime_sockets(tmp_path) -> None:
-    """A rootless podman bound back can start a container on the host network, the reason chat refuses
-    allow_container_sockets."""
-    from types import SimpleNamespace
-
-    from levain import chat as chat_mod
-
-    ent = _entity(tmp_path)
-    (ent / ".levain" / "confinement.json").write_text(json.dumps({"runtime_sockets": ["podman/podman.sock"]}))
-    assert "runtime_sockets" in (chat_mod.chat_refusal(ent) or "")
-    (ent / ".levain" / "confinement.json").write_text("{}")
-    assert chat_mod.chat_refusal(ent) is None
-    for listed, reach in ((("podman/podman.sock",), "may reach the daemon sockets its runtime_sockets lists"),
-                          ((), None)):
-        floor = build_policy(ent, deny_localhost_outbound=True, runtime_sockets=listed)
-        editor = SimpleNamespace(executor=SimpleNamespace(_policy=floor))
-        session = SimpleNamespace(bash_ok=True, conversation=SimpleNamespace(
-            agent=SimpleNamespace(tools_map={"file_editor": editor})))
-        assert chat_mod._hands_reach_this_server(session) == reach
-
-
 @linux_live
 def test_linux_live_a_renamed_dirmngr_dir_is_not_reachable_and_the_agent_is(tmp_path, rd) -> None:
     """The 2026-10-10 attack against the view, with a stand-in agent that answers OK."""
@@ -283,12 +233,15 @@ def test_linux_live_a_renamed_dirmngr_dir_is_not_reachable_and_the_agent_is(tmp_
             pass
 
     threading.Thread(target=serve, daemon=True).start()
-    conf_sockets = [rd / "gnupg" / "S.gpg-agent.live"]
+    gf = tmp_path / "grants.json"
+    gf.write_text(json.dumps({"grants": [{"path": str(rd / "gnupg" / "S.gpg-agent.live"), "name": "agent",
+                                          "why": "the stand-in agent"}]}))
+    gf.chmod(0o600)
     connect = ("python3 -c \"import socket,sys;s=socket.socket(socket.AF_UNIX);s.settimeout(5);"
                "s.connect(sys.argv[1]);print(s.recv(64))\" ")
     try:
         with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(conf, "_gpg_sockets", lambda: conf_sockets)
+            mp.setattr(conf, "grants_file", lambda: gf)
             mp.delenv("SSH_AUTH_SOCK")
             with BwrapProvider().spawn_shell(build_policy(_entity(tmp_path), deny_localhost_outbound=True)) as sh:
                 assert sh.run(f"ls -A {rd}").output.split() == ["gnupg"]
@@ -304,33 +257,28 @@ def test_linux_live_a_renamed_dirmngr_dir_is_not_reachable_and_the_agent_is(tmp_
     assert (rd / "gnupg" / "d.abc" / "S.dirmngr").exists() and not (rd / "moved").exists()
 
 
-def test_gpg_sockets_reads_all_of_list_dirs_and_keeps_the_agent_and_keyboxd(monkeypatch) -> None:
-    """One ``gpgconf --list-dirs`` with no names (gnupg 2.2 fails a query naming keyboxd-socket), its
-    values percent-unescaped, and only the agent's two sockets and keyboxd's picked out."""
+def test_bash_gpg_finds_its_agent_where_gpgconf_says_for_the_shells_own_home(monkeypatch) -> None:
+    """``gpgconf --list-dirs agent-socket`` with the shell env's GNUPGHOME (none: the default home) and
+    its HOME, never levain's own GNUPGHOME; the value percent-unescaped."""
     from types import SimpleNamespace
 
-    out = ("sysconfdir:/etc/gnupg\nhomedir:/home/u/g%3ah\nagent-socket:/run/user/1/gnupg/d.x/S.gpg-agent\n"
-           "agent-ssh-socket:/run/user/1/gnupg/d.x/S.gpg-agent.ssh\n"
-           "agent-extra-socket:/run/user/1/gnupg/d.x/S.gpg-agent.extra\n"
-           "agent-browser-socket:/run/user/1/gnupg/d.x/S.gpg-agent.browser\n"
-           "dirmngr-socket:/run/user/1/gnupg/d.x/S.dirmngr\n"
-           "keyboxd-socket:/run/user/1/gnupg/d%3ax/S.keyboxd\n")
     seen = []
+    monkeypatch.setenv("GNUPGHOME", "/levains/own")
     monkeypatch.setattr(conf.shutil, "which", lambda name: "/usr/bin/gpgconf")
-    monkeypatch.setattr(conf.subprocess, "run", lambda argv, **kw: seen.append(argv) or SimpleNamespace(
-        returncode=0, stdout=out))
-    assert conf._gpg_sockets() == [Path("/run/user/1/gnupg/d.x/S.gpg-agent"),
-                                   Path("/run/user/1/gnupg/d.x/S.gpg-agent.ssh"),
-                                   Path("/run/user/1/gnupg/d:x/S.keyboxd")]
-    assert seen == [["/usr/bin/gpgconf", "--list-dirs"]]
+    monkeypatch.setattr(conf.subprocess, "run", lambda argv, **kw: seen.append((argv, kw["env"])) or SimpleNamespace(
+        returncode=0, stdout="/run/user/1/gnupg/d.x%3ay/S.gpg-agent\n"))
+    assert conf.gpg_agent_view_path({"HOME": "/home/u"}) == Path("/run/user/1/gnupg/d.x:y/S.gpg-agent")
+    assert seen[0][0] == ["/usr/bin/gpgconf", "--list-dirs", "agent-socket"]
+    assert seen[0][1]["HOME"] == "/home/u" and "GNUPGHOME" not in seen[0][1]
+    conf.gpg_agent_view_path({"HOME": "/home/u", "GNUPGHOME": "/home/u/g"})
+    assert seen[1][1]["GNUPGHOME"] == "/home/u/g"
 
 
-def test_keyboxd_comes_back_into_the_runtime_view(tmp_path, rd, monkeypatch) -> None:
+def test_keyboxd_does_not_come_back_into_the_runtime_view(tmp_path, rd) -> None:
     kb = _listen(rd / "gnupg" / "S.keyboxd")
     try:
-        monkeypatch.setattr(conf, "_gpg_sockets", lambda: [rd / "gnupg" / "S.gpg-agent", rd / "gnupg" / "S.keyboxd"])
         bound = _bound_back(_bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True)), rd)
-        assert str(rd / "gnupg" / "S.keyboxd") in bound
+        assert bound == set()
     finally:
         kb.close()
 
@@ -367,7 +315,7 @@ def test_a_gnupghome_holding_dirmngr_is_a_view_pinned_from_above(tmp_path, gh) -
     for i, op, args in ops:
         if args and _under(args[-1], gh):
             assert i > view[0], (op, args)
-    assert _bound_back(argv, gh) == {str(gh / n) for n in ("S.gpg-agent", "S.keyboxd", "trustdb.gpg", "common.conf")}
+    assert _bound_back(argv, gh) == {str(gh / n) for n in ("trustdb.gpg", "common.conf")}
     # Writable: with the trustdb read-only, `gpg --list-keys` died on its trustdb check (RUN 2026-10-12).
     assert ["--bind", str(gh / "trustdb.gpg"), str(gh / "trustdb.gpg")] in [argv[k:k + 3] for k in range(len(argv))]
     # A configuration file comes back read-only, and a link to none stays out (Diogenes HIGH 2026-10-13).
@@ -404,12 +352,12 @@ def test_a_gnupghome_that_vanished_before_its_stat_is_skipped(tmp_path, gh, monk
     assert not [a for _, op, a in _ops(argv) if op == "--tmpfs" and a == [str(gh)]]
 
 
-def test_a_gnupghome_view_binds_back_no_socket_but_the_agent_and_keyboxd(tmp_path, gh) -> None:
+def test_a_gnupghome_view_binds_back_no_socket(tmp_path, gh) -> None:
     extra = [_listen(gh / n) for n in ("S.other", "dirmngr.sock", "S.gpg-agent.browser")]
     try:
         argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
         socks = {p for p in _bound_back(argv, gh) if Path(p).is_socket()}
-        assert socks == {str(gh / "S.gpg-agent"), str(gh / "S.keyboxd")}
+        assert socks == set()
     finally:
         for s in extra:
             s.close()
@@ -469,7 +417,7 @@ def test_a_gnupghome_under_home_is_a_view_nothing_later_covers(tmp_path, home_gh
     # --remount-ro is not recursive, so $HOME's own leaves the view below it as it is.
     later = [(op, a) for i, op, a in ops if i > view[0] and a and a[-1] in covering and op != "--remount-ro"]
     assert later == []
-    assert _bound_back(argv, home_gh) == {str(home_gh / "S.gpg-agent"), str(home_gh / "trustdb.gpg")}
+    assert _bound_back(argv, home_gh) == {str(home_gh / "trustdb.gpg")}
     pins = [i for i, op, a in ops if op == "--bind" and a == [str(home_gh.parent)] * 2]
     assert pins and max(pins) < view[0]
 
@@ -552,8 +500,9 @@ def test_gnupghome_passes_the_launch_allowlist() -> None:
 
 
 @linux_live
-def test_linux_live_a_gnupghome_view_hides_dirmngr_and_keeps_the_agent(tmp_path, rd, gh) -> None:
-    """The 2026-10-12 GNUPGHOME attack against the view, with stand-in sockets that answer."""
+def test_linux_live_a_gnupghome_view_hides_dirmngr_and_the_agent(tmp_path, rd, gh) -> None:
+    """The 2026-10-12 GNUPGHOME attack against the view, with stand-in sockets that answer. The agent is
+    not bound back either (only an operator grant would be)."""
     for s in ("S.dirmngr", "S.gpg-agent"):
         (gh / s).unlink()
     answer = {}
@@ -578,14 +527,13 @@ def test_linux_live_a_gnupghome_view_hides_dirmngr_and_keeps_the_agent(tmp_path,
             mp.delenv("SSH_AUTH_SOCK")
             with BwrapProvider().spawn_shell(build_policy(_entity(tmp_path), deny_localhost_outbound=True)) as sh:
                 listed = sh.run(f"ls -A {gh}").output.split()
-                assert sorted(listed) == ["S.gpg-agent", "S.keyboxd", "common.conf", "trustdb.gpg"]
+                assert sorted(listed) == ["common.conf", "trustdb.gpg"]
                 assert sh.run(f"echo pinentry-program /bin/true >> {gh}/common.conf").exit_code != 0
                 assert sh.run(connect + f"{gh}/S.dirmngr").exit_code != 0
                 assert sh.run(f"mv {gh} {gh}.moved").exit_code != 0
                 assert sh.run(f"mv {gh.parent} {gh.parent}.moved").exit_code != 0
                 assert sh.run(f"echo x >> {gh}/trustdb.gpg").exit_code == 0
-                r = sh.run(connect + f"{gh}/S.gpg-agent")
-                assert r.exit_code == 0 and "OK S.gpg-agent" in r.output, r.output
+                assert sh.run(connect + f"{gh}/S.gpg-agent").exit_code != 0
     finally:
         for srv in answer.values():
             srv.close()
