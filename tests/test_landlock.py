@@ -430,8 +430,10 @@ def test_the_canary_keeps_answering_after_an_accept_error(monkeypatch):
     monkeypatch.setattr(socket.socket, "accept", flaky)
     c = L.Canary()
     try:
-        # More than the backlog: only a serve loop that survived drains it. A full backlog refuses at
-        # once on macOS (blocks on Linux), so each connect gets a few seconds of retries.
+        # More than the backlog: only a serve loop that survived drains it. A connect to a full backlog
+        # fails at once, ECONNREFUSED on macOS and EAGAIN on Linux (a socket with a timeout is
+        # non-blocking underneath, and Linux's unix connect does not wait), so each gets a few seconds
+        # of retries.
         for _ in range(40):
             deadline = time.monotonic() + 5
             while True:
@@ -440,7 +442,7 @@ def test_the_canary_keeps_answering_after_an_accept_error(monkeypatch):
                 try:
                     s.connect(c.path)
                     break
-                except ConnectionRefusedError:
+                except (ConnectionRefusedError, BlockingIOError):
                     if time.monotonic() > deadline:
                         raise
                     time.sleep(0.05)

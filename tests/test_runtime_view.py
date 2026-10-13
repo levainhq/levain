@@ -164,29 +164,45 @@ def test_a_legacy_runtime_sockets_key_grants_nothing_and_is_reported_ignored(tmp
 
 def test_chat_refuses_an_entity_whose_shell_gets_an_operator_grant(tmp_path, monkeypatch) -> None:
     """A granted rootless podman can start a container on the host network, the reason chat refuses
-    allow_container_sockets; gpg's extra socket cannot, and a hands user's shell gets no grant."""
+    allow_container_sockets; gpg's extra socket cannot, and a hands user's shell gets no grant. The
+    post-open check reads the conversation's own snapshot (the one its shell spawns with), so a grant
+    added after the session opened is not in it, and neither is it in any respawn of that shell."""
     from types import SimpleNamespace
 
     from levain import chat as chat_mod
 
+    monkeypatch.setattr(conf.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(conf, "_gpg_extra_sockets", lambda: {"/run/user/1/gnupg/S.gpg-agent.extra": "/h"})
     ent = _entity(tmp_path)
     (ent / ".levain" / "confinement.json").write_text("{}")
     gf = tmp_path / "grants.json"
     monkeypatch.setattr(conf, "grants_file", lambda: gf)
     floor = build_policy(ent, deny_localhost_outbound=True)
-    editor = SimpleNamespace(executor=SimpleNamespace(_policy=floor))
-    session = SimpleNamespace(bash_ok=True, conversation=SimpleNamespace(
-        agent=SimpleNamespace(tools_map={"file_editor": editor})))
+
+    def session_for(hands=None):
+        snap = conf.snapshot_operator_grants(hands)
+        editor = SimpleNamespace(executor=SimpleNamespace(_policy=floor, _floor=SimpleNamespace(grants=snap)))
+        return SimpleNamespace(bash_ok=True, conversation=SimpleNamespace(
+            agent=SimpleNamespace(tools_map={"file_editor": editor})))
+    podman = [{"path": "/run/user/1/podman/podman.sock", "name": "podman", "why": "builds"}]
     for grants, refused in (([], False), ([{"path": "/run/user/1/gnupg/S.gpg-agent.extra", "name": "gpg",
-                                            "why": "signing"}], False),
-                            ([{"path": "/run/user/1/podman/podman.sock", "name": "podman", "why": "builds"}], True)):
+                                            "why": "signing"}], False), (podman, True)):
         gf.write_text(json.dumps({"grants": grants}))
         gf.chmod(0o600)
         assert ("podman" in (chat_mod.chat_refusal(ent) or "")) is refused
-        assert chat_mod._hands_reach_this_server(session) == (
+        assert chat_mod._hands_reach_this_server(session_for()) == (
             "may reach the sockets the operator grants" if refused else None)
-    session.hands_user = "ent-hands"
-    assert chat_mod._hands_reach_this_server(session) is None
+    assert chat_mod._hands_reach_this_server(session_for(hands=object())) is None
+    # Opened with no grant; podman granted afterwards: the session's snapshot (and its shell's) has none.
+    gf.write_text(json.dumps({"grants": []}))
+    opened = session_for()
+    gf.write_text(json.dumps({"grants": podman}))
+    assert opened.conversation.agent.tools_map["file_editor"].executor._floor.grants.get() == ()
+    assert chat_mod._hands_reach_this_server(opened) is None
+    # On macOS no grant is bound, so chat cites none.
+    monkeypatch.setattr(conf.platform, "system", lambda: "Darwin")
+    assert chat_mod.chat_refusal(ent) is None
+    assert chat_mod._hands_reach_this_server(session_for()) is None
 
 
 @pytest.mark.parametrize("held", ["workspace", "entity", "home"])
@@ -243,7 +259,8 @@ def test_linux_live_a_renamed_dirmngr_dir_is_not_reachable_and_the_agent_is(tmp_
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(conf, "grants_file", lambda: gf)
             mp.delenv("SSH_AUTH_SOCK")
-            with BwrapProvider().spawn_shell(build_policy(_entity(tmp_path), deny_localhost_outbound=True)) as sh:
+            with BwrapProvider().spawn_shell(build_policy(_entity(tmp_path), deny_localhost_outbound=True),
+                                             grants=conf.load_operator_grants()) as sh:
                 assert sh.run(f"ls -A {rd}").output.split() == ["gnupg"]
                 assert sh.run(f"ls -A {rd}/gnupg").output.split() == ["S.gpg-agent.live"]
                 assert sh.run(f"mv {rd}/gnupg/d.abc {rd}/moved").exit_code != 0
@@ -271,7 +288,8 @@ def test_bash_gpg_finds_its_agent_where_gpgconf_says_for_the_shells_own_home(mon
     assert seen[0][0] == ["/usr/bin/gpgconf", "--list-dirs", "agent-socket"]
     assert seen[0][1]["HOME"] == "/home/u" and "GNUPGHOME" not in seen[0][1]
     conf.gpg_agent_view_path({"HOME": "/home/u", "GNUPGHOME": "/home/u/g"})
-    assert seen[1][1]["GNUPGHOME"] == "/home/u/g"
+    assert seen[1][0] == ["/usr/bin/gpgconf", "--homedir", "/home/u/g", "--list-dirs", "agent-socket"]
+    assert "GNUPGHOME" not in seen[1][1]
 
 
 def test_keyboxd_does_not_come_back_into_the_runtime_view(tmp_path, rd) -> None:

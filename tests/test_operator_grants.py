@@ -21,6 +21,7 @@ from levain.firing.confinement import ConfinementError, SocketGrant, build_polic
 
 # Captured at import, before tests/conftest.py replaces it with the host-neutral stub for every test.
 _REAL_GPG_COMPONENTS = conf._gpg_components
+_REAL_GPG_EXTRA_SOCKETS = conf._gpg_extra_sockets
 
 
 def _entity(root: Path) -> Path:
@@ -87,14 +88,48 @@ def test_a_hardlink_alias_of_the_grant_file_in_the_workspace_is_refused(tmp_path
 
 # --- loading -------------------------------------------------------------------------------------
 
-def test_an_absent_grant_file_grants_nothing_and_a_valid_one_loads(grants, tmp_path):
+def test_an_absent_grant_file_grants_nothing_and_a_valid_one_loads(grants, tmp_path, monkeypatch):
     assert conf.load_operator_grants(tmp_path / "absent.json") == ()
+    monkeypatch.setattr(conf, "_gpg_extra_sockets", lambda: {"/run/user/1/gnupg/S.gpg-agent.extra": "/h/.gnupg"})
     grants([{"path": "/run/user/1/gnupg/S.gpg-agent.extra", "name": "gpg", "why": "signing"},
             {"path": "/run/user/1/podman/podman.sock", "name": "podman", "why": "builds"}])
     got = conf.load_operator_grants()
-    assert got == (SocketGrant("/run/user/1/gnupg/S.gpg-agent.extra", "gpg", "signing"),
+    assert got == (SocketGrant("/run/user/1/gnupg/S.gpg-agent.extra", "gpg", "signing", gpg_home="/h/.gnupg"),
                    SocketGrant("/run/user/1/podman/podman.sock", "podman", "builds"))
     assert [g.gpg_extra for g in got] == [True, False]
+
+
+def test_a_grant_is_gpgs_only_at_the_path_gpgconf_names_never_by_its_name(grants, monkeypatch):
+    """A socket is gpg's extra socket only where gpgconf puts the default home's or levain's GNUPGHOME's;
+    another socket under that name (a daemon, another home's agent) is refused, never taken as gpg's."""
+    monkeypatch.setattr(conf, "_gpg_extra_sockets", lambda: {"/run/user/1/gnupg/S.gpg-agent.extra": "/h/.gnupg"})
+    grants([{"path": "/run/user/1/x/S.gpg-agent.extra", "name": "podman", "why": "w"}])
+    with pytest.raises(ConfinementError, match="gpg grant for another home is refused"):
+        conf.load_operator_grants()
+    grants([{"path": "/run/user/1/x/S.gpg-agent.extra2", "name": "named-alike", "why": "w"}])
+    assert [g.gpg_extra for g in conf.load_operator_grants()] == [False]   # an ordinary grant
+
+
+def test_gpgs_extra_sockets_are_asked_for_the_default_home_and_levains_gnupghome(monkeypatch):
+    from types import SimpleNamespace
+
+    seen = []
+    monkeypatch.setattr(conf, "_gpg_extra_sockets", _REAL_GPG_EXTRA_SOCKETS)
+    monkeypatch.setenv("GNUPGHOME", "/levains/g")
+    monkeypatch.setattr(conf.shutil, "which", lambda name: "/usr/bin/gpgconf")
+    out = {None: "/run/user/1/gnupg/S.gpg-agent.extra\n", "/levains/g": "/run/user/1/gnupg/d.x%3ay/S.gpg-agent.extra\n"}
+
+    def run(argv, **kw):
+        seen.append((argv, kw["env"]))
+        return SimpleNamespace(returncode=0, stdout=out[argv[2] if argv[1] == "--homedir" else None])
+    monkeypatch.setattr(conf.subprocess, "run", run)
+    got = conf._gpg_extra_sockets()
+    assert got == {"/run/user/1/gnupg/S.gpg-agent.extra": str(Path.home() / ".gnupg"),
+                   "/run/user/1/gnupg/d.x:y/S.gpg-agent.extra": "/levains/g"}
+    assert [a for a, _ in seen] == [["/usr/bin/gpgconf", "--list-dirs", "agent-extra-socket"],
+                                    ["/usr/bin/gpgconf", "--homedir", "/levains/g", "--list-dirs",
+                                     "agent-extra-socket"]]
+    assert all("GNUPGHOME" not in env for _, env in seen)
 
 
 @pytest.mark.parametrize("entries,why", [
@@ -112,9 +147,16 @@ def test_an_absent_grant_file_grants_nothing_and_a_valid_one_loads(grants, tmp_p
      "granted twice"),
     ([{"path": "/run/1/S.gpg-agent.extra", "name": "a", "why": "w"},
       {"path": "/run/2/S.gpg-agent.extra", "name": "b", "why": "w"}], "more than one gpg extra"),
+    ([{"path": "/run/3/S.gpg-agent.extra", "name": "a", "why": "w"}], "gpg grant for another home"),
+    (b'{"grants": []}\xff', "cannot be read"),
 ])
-def test_a_grant_file_levain_cannot_take_as_written_is_refused(grants, entries, why):
-    grants(entries)
+def test_a_grant_file_levain_cannot_take_as_written_is_refused(grants, entries, why, monkeypatch):
+    monkeypatch.setattr(conf, "_gpg_extra_sockets",
+                        lambda: {"/run/1/S.gpg-agent.extra": "/h1", "/run/2/S.gpg-agent.extra": "/h2"})
+    if isinstance(entries, bytes):
+        grants([]).write_bytes(entries)   # not UTF-8
+    else:
+        grants(entries)
     with pytest.raises(ConfinementError, match=why):
         conf.load_operator_grants()
 
@@ -138,7 +180,7 @@ def test_a_grant_resolves_only_as_an_operator_owned_socket_in_reach_of_nothing_c
     try:
         ok = SocketGrant(str(rd / "podman" / "p.sock"), "podman", "builds")
         conf.resolve_grant(ok, [rd])   # inside the runtime dir's view: fine
-        with pytest.raises(ConfinementError, match="'podman'.*which confined bash can write"):
+        with pytest.raises(ConfinementError, match="'podman'.*where confined bash can rename it"):
             conf.resolve_grant(ok, [])   # the same dir, not a view: bash could replace the socket
         (rd / "file").write_text("x")
         (rd / "dir").mkdir()
@@ -152,6 +194,24 @@ def test_a_grant_resolves_only_as_an_operator_owned_socket_in_reach_of_nothing_c
             conf.resolve_grant(ok, [rd])
     finally:
         srv.close()
+
+
+def test_a_grant_under_a_directory_of_yours_in_sticky_tmp_is_refused():
+    """Its own directory unwritable is not enough: in sticky /tmp you may rename what you own, so confined
+    bash could move that directory away and put another in its place before the bind."""
+    top = Path(tempfile.mkdtemp(dir="/tmp", prefix="lvst")).resolve()
+    srv = _listen(top / "s.sock")
+    try:
+        os.chmod(top, 0o555)
+        g = SocketGrant(str(top / "s.sock"), "s", "w")
+        with pytest.raises(ConfinementError, match=f"has {top} in {top.parent}, where confined bash can rename it"):
+            conf.resolve_grant(g, [])
+        conf.resolve_grant(g, [top])   # a runtime dir's view: bash sees levain's mountpoint, not this
+    finally:
+        srv.close()
+        os.chmod(top, 0o700)
+        (top / "s.sock").unlink()
+        top.rmdir()
 
 
 def test_a_grant_whose_parent_another_user_can_write_is_refused(rd):
@@ -168,7 +228,7 @@ def test_grant_ops_bind_each_socket_and_gpgs_extra_socket_where_bashs_gpg_looks(
     socks = [_listen(rd / "podman" / "p.sock"), _listen(rd / "gnupg" / "S.gpg-agent.extra")]
     try:
         gs = (SocketGrant(str(rd / "podman" / "p.sock"), "podman", "w"),
-              SocketGrant(str(rd / "gnupg" / "S.gpg-agent.extra"), "gpg", "w"))
+              SocketGrant(str(rd / "gnupg" / "S.gpg-agent.extra"), "gpg", "w", gpg_home="/h/.gnupg"))
         view = rd / "gnupg" / "d.abc" / "S.gpg-agent"   # a non-default home's hashed socket dir
         ops, views = conf._grant_ops(gs, [rd], view)
         assert views == [str(rd / "podman" / "p.sock"), str(view)]
@@ -200,7 +260,7 @@ def test_the_default_grant_is_bound_at_dev_log_from_the_socket_it_resolves_to(rd
 
 # --- the spawn -----------------------------------------------------------------------------------
 
-def _spawn(tmp_path, monkeypatch, env):
+def _spawn(tmp_path, monkeypatch, env, *, hands=None, grants=None):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     (tmp_path / "home").mkdir(exist_ok=True)
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
@@ -210,12 +270,15 @@ def _spawn(tmp_path, monkeypatch, env):
     monkeypatch.setattr(conf._BwrapShell, "start", lambda self: seen.setdefault("shell", self))
     monkeypatch.setattr(conf._BwrapShell, "_recheck", lambda self: None)
     monkeypatch.setattr(conf._landlock, "host_read", lambda: (10, None))   # read as T9; no syscall
-    conf.BwrapProvider()._spawn_shell_impl(build_policy(_entity(tmp_path)), env=env)
+    if grants is None:   # the conversation's snapshot, as its floor reads it
+        grants = conf.snapshot_operator_grants(hands, system="Linux").get()
+    conf.BwrapProvider()._spawn_bwrap(build_policy(_entity(tmp_path)), env, 120.0, hands, None, grants)
     return seen["shell"]
 
 
 def test_the_spawn_binds_each_grant_and_hands_the_stub_its_view_path(rd, grants, tmp_path, monkeypatch):
     socks = [_listen(rd / "podman" / "p.sock"), _listen(rd / "gnupg" / "S.gpg-agent.extra")]
+    monkeypatch.setattr(conf, "_gpg_extra_sockets", lambda: {str(rd / "gnupg" / "S.gpg-agent.extra"): "/h/.gnupg"})
     grants([{"path": str(rd / "podman" / "p.sock"), "name": "podman", "why": "builds"},
             {"path": str(rd / "gnupg" / "S.gpg-agent.extra"), "name": "gpg", "why": "signing"}])
     asked = []
@@ -248,12 +311,27 @@ def test_a_grant_that_does_not_resolve_refuses_the_spawn_naming_it(rd, grants, t
         _spawn(tmp_path, monkeypatch, {"PATH": "/usr/bin"})
 
 
-def test_no_grant_reaches_a_hands_users_shell(rd, grants):
-    """The hands spawn reads no grant file: the operator's sockets are not the hands user's to use."""
-    import inspect
-
-    src = inspect.getsource(conf.BwrapProvider._spawn_bwrap_canaried)
-    assert "load_operator_grants() if hands is None else ()" in src
+def test_no_grant_reaches_a_hands_users_shell(rd, grants, tmp_path, monkeypatch):
+    """A hands user's shell gets no operator grant: its snapshot is empty without reading the file (a
+    broken one included), and a grant handed to its spawn anyway is neither bound nor given to the stub."""
+    hands = conf.HandsIdentity(user="ent-hands", uid=os.getuid() + 1, home=str(tmp_path / "hh"),
+                               workspace=tmp_path / "hw")
+    grants("{broken")
+    assert conf.snapshot_operator_grants(hands, system="Linux").get() == ()
+    srv = _listen(rd / "podman" / "p.sock")
+    try:
+        g = SocketGrant(str(rd / "podman" / "p.sock"), "podman", "builds")
+        monkeypatch.setattr(conf, "_hands_policy", lambda policy, hands: policy)
+        monkeypatch.setattr(conf, "hands_prefix", lambda hands: ["sudo", "-u", hands.user, "--"])
+        monkeypatch.setattr(conf, "_hands_env", lambda hands: {"PATH": "/usr/bin"})
+        sh = _spawn(tmp_path, monkeypatch, {"PATH": "/usr/bin"}, hands=hands, grants=(g,))
+        argv = sh._argv
+        assert str(rd / "podman" / "p.sock") not in argv[:argv.index(L.STUB)]   # not bound
+        assert "--grant" not in argv   # not granted by the stub
+        sh._canary = None
+        sh.close()
+    finally:
+        srv.close()
 
 
 # --- gnupg's programs ----------------------------------------------------------------------------
@@ -270,7 +348,7 @@ def test_the_programs_gpg_agent_starts_are_write_denied_with_their_ancestors(tmp
     monkeypatch.delenv("GNUPGHOME", raising=False)
     monkeypatch.setattr(conf, "_gpg_components", lambda: [home / "tools" / "scdaemon"])   # absent, creatable
     (home / "tools").mkdir()
-    got = conf._gpg_program_spellings()
+    got = conf._gpg_program_spellings(components=True)
     real_home = home.resolve()
     assert (home / "bin" / "pinentry") in got   # the name the conf gives (a link: re-pointing it is denied)
     assert (real_home / "bin" / "pinentry-real") in got   # and what it runs
@@ -279,12 +357,48 @@ def test_the_programs_gpg_agent_starts_are_write_denied_with_their_ancestors(tmp
     policy = build_policy(_entity(tmp_path))
     assert (real_home / "bin" / "pinentry-real") in policy.deny_write_files
     assert (home / "bin") in policy.deny_write_dirs   # renaming its directory is refused too
+    # gnupg's defaults are asked for only with a gpg grant: the floor has them then, with their ancestors.
+    assert (home / "tools" / "scdaemon") not in policy.deny_write_files
+    with_gpg = conf.with_gpg_program_denies(policy)
+    assert (home / "tools" / "scdaemon") in with_gpg.deny_write_files
+    assert (home / "tools") in with_gpg.deny_write_dirs
+
+
+def test_gpgconfs_components_are_asked_only_when_a_gpg_extra_socket_is_granted(grants, tmp_path, monkeypatch):
+    """The conversation's floor asks gpgconf for gnupg's default programs only when its grant snapshot
+    holds gpg's extra socket (build_policy never asks)."""
+    pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
+    from levain.firing.openhands.tools import _SharedFloor
+
+    asked = []
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home" / "tools").mkdir(parents=True)
+    monkeypatch.setattr(conf, "_gpg_components", lambda: asked.append(1) or [tmp_path / "home" / "tools" / "scd"])
+    monkeypatch.setattr(conf.platform, "system", lambda: "Linux")
+    policy = build_policy(_entity(tmp_path))
+    grants([{"path": "/run/user/1/podman/podman.sock", "name": "podman", "why": "builds"}])
+    floor = _SharedFloor(policy)
+    assert asked == [] and floor.policy == policy
+    monkeypatch.setattr(conf, "_gpg_extra_sockets", lambda: {"/run/user/1/gnupg/S.gpg-agent.extra": "/h"})
+    grants([{"path": "/run/user/1/gnupg/S.gpg-agent.extra", "name": "gpg", "why": "signing"}])
+    floor = _SharedFloor(policy)
+    assert asked == [1] and (tmp_path / "home" / "tools" / "scd") in floor.policy.deny_write_files
 
 
 def test_a_program_this_user_cannot_change_is_left_out(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "_gpg_components", lambda: [Path("/bin/sh")])   # root's, in root's dir
-    assert conf._gpg_program_spellings() == []
+    assert conf._gpg_program_spellings(components=True) == []
+    # A link in a directory this user cannot write, to such a binary (Linux's /bin/sh -> dash): the
+    # link's own mode bits do not make it changeable (CI on Linux 2026-10-13 read them as writable).
+    (tmp_path / "ro").mkdir()
+    (tmp_path / "ro" / "sh").symlink_to("/bin/sh")
+    (tmp_path / "ro").chmod(0o555)
+    try:
+        monkeypatch.setattr(conf, "_gpg_components", lambda: [tmp_path / "ro" / "sh"])
+        assert conf._gpg_program_spellings(components=True) == []
+    finally:
+        (tmp_path / "ro").chmod(0o755)
 
 
 def test_gpgconfs_components_give_the_default_pinentry_and_scdaemon(monkeypatch):
@@ -301,10 +415,12 @@ def test_gpgconfs_components_give_the_default_pinentry_and_scdaemon(monkeypatch)
 # --- run / doctor output -------------------------------------------------------------------------
 
 def test_one_generator_gives_the_tier_each_waiver_the_defaults_ssh_and_the_ignored_key(grants, monkeypatch):
+    monkeypatch.setattr(conf, "_gpg_extra_sockets", lambda: {"/run/user/1/gnupg/S.gpg-agent.extra": "/h"})
     grants([{"path": "/run/user/1/gnupg/S.gpg-agent.extra", "name": "gpg", "why": "signing"},
             {"path": "/run/user/1/podman/podman.sock", "name": "podman", "why": "builds"}])
     monkeypatch.setattr(L, "host_read", lambda system=None: (8, None))
-    lines = conf.unix_socket_lines(SimpleNamespace(runtime_sockets=("podman/podman.sock",)), system="Linux")
+    lines = conf.unix_socket_lines(SimpleNamespace(runtime_sockets=("podman/podman.sock",), hands_user=None),
+                                   system="Linux")
     assert lines[0] == L.tier_line(8)
     assert lines[1] == ("waiver (operator grant) gpg: /run/user/1/gnupg/S.gpg-agent.extra (signing); "
                         + conf.GPG_EXTRA_WAIVER)
@@ -316,6 +432,23 @@ def test_one_generator_gives_the_tier_each_waiver_the_defaults_ssh_and_the_ignor
     mac = conf.unix_socket_lines(None, system="Darwin")
     assert mac[0].startswith("unix sockets (T0: Darwin has no Landlock)")
     assert "default grant: /private/var/run/mDNSResponder (name resolution)" in mac
+    # Never bound on macOS, so each grant says so.
+    assert ("waiver (operator grant) podman: /run/user/1/podman/podman.sock (builds) "
+            + conf.GRANTS_NOT_APPLIED) in mac
+
+
+def test_a_hands_users_entity_reads_and_reports_no_operator_grant(grants, tmp_path, monkeypatch):
+    """Its shell gets none, so run and doctor neither read the file (a broken one included) nor list one."""
+    from levain import doctor
+
+    grants("{broken")
+    ent = _entity(tmp_path)
+    cfg = SimpleNamespace(hands_user="ent-hands", runtime_sockets=())
+    monkeypatch.setattr(conf, "load_confinement_config", lambda d: cfg)
+    lines = conf.unix_socket_lines(cfg, system="Linux")
+    assert conf.HANDS_GRANTS_LINE in lines and not any("waiver" in ln for ln in lines)
+    (r,) = doctor._check_unix_sockets(ent)
+    assert r.ok and conf.HANDS_GRANTS_LINE in r.detail
 
 
 def test_doctor_and_run_print_the_same_lines(grants, tmp_path, capsys, monkeypatch):
@@ -337,6 +470,11 @@ def test_doctor_and_run_print_the_same_lines(grants, tmp_path, capsys, monkeypat
     grants("{broken")
     (r,) = doctor._check_unix_sockets(ent)
     assert not r.ok and "will refuse bash" in r.detail
+    grants([])
+    monkeypatch.setattr(conf, "unix_socket_lines", lambda cfg: (_ for _ in ()).throw(UnicodeDecodeError(
+        "utf-8", b"\xff", 0, 1, "invalid start byte")))
+    (r,) = doctor._check_unix_sockets(ent)
+    assert not r.ok and "not determinable" in r.detail   # undeterminable is a FAIL, never a pass
 
 
 def test_the_canary_is_stopped_with_the_claims_release_not_before(tmp_path, monkeypatch):
@@ -350,3 +488,52 @@ def test_the_canary_is_stopped_with_the_claims_release_not_before(tmp_path, monk
     monkeypatch.setattr(conf._BwrapShell, "_settled", lambda self: True)
     sh.close()
     assert sh._ledger_claim is None and not os.path.exists(canary.path)
+
+
+def test_every_spawn_of_a_conversations_shell_uses_the_grants_read_when_it_opened(grants, tmp_path, monkeypatch):
+    """The floor reads the grant file once; the first spawn and every respawn of its shell get that
+    snapshot, so a grant added after chat checked the session never reaches a lazy respawn."""
+    pytest.importorskip("openhands.tools.file_editor", reason="openhands extra absent")
+    import levain.firing.openhands.tools as _t
+    from levain.firing.confinement import SandboxedShell
+
+    monkeypatch.setattr(conf.platform, "system", lambda: "Linux")
+    ent = _entity(tmp_path)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    grants([{"path": "/run/user/1/bus", "name": "bus", "why": "notifications"}])
+    ex = _t.SandboxedBashExecutor(build_policy(ent, workspace=ws))
+    grants([{"path": "/run/user/1/bus", "name": "bus", "why": "notifications"},
+            {"path": "/run/user/1/podman/podman.sock", "name": "podman", "why": "added later"}])
+    seen = []
+
+    class _Recording:
+        def spawn_shell(self, policy, *, env=None, default_timeout=120.0, grants=None):
+            seen.append(tuple(g.name for g in grants or ()))
+            sh = SandboxedShell(argv=["/bin/true"], cwd=ws, env={})
+            sh.effective_policy = policy
+            return sh
+
+    monkeypatch.setattr(_t, "select_provider", lambda: _Recording())
+    ex._ensure_shell().close()   # the shell exits: the next command respawns it
+    ex._ensure_shell().close()
+    assert seen == [("bus",), ("bus",)]
+
+
+def test_a_binding_written_with_the_legacy_runtime_sockets_field_resumes_without_it(tmp_path):
+    """An autosaved conversation from before grants carries ``runtime_sockets`` in its floor: it grants
+    nothing now, so it is dropped and the binding resumes; any other unexpected field still refuses."""
+    from levain.firing.binding import BindingError, ConversationBinding
+
+    ent = _entity(tmp_path)
+    b = ConversationBinding.create(ent, mode="interactive", workspace=tmp_path / "ws")
+    old = json.loads(json.dumps(b.to_params()))   # JSON, as the SDK's autosave keeps it
+    old["floor"]["runtime_sockets"] = ["podman/podman.sock"]
+    assert ConversationBinding.from_params(old).floor == b.floor
+    old["floor"]["runtime_sockets"] = "podman/podman.sock"
+    with pytest.raises(BindingError, match="runtime_sockets"):
+        ConversationBinding.from_params(old)
+    del old["floor"]["runtime_sockets"]
+    old["floor"]["something_else"] = []
+    with pytest.raises(BindingError, match="exactly the crown-jewels policy fields"):
+        ConversationBinding.from_params(old)
