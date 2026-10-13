@@ -22,11 +22,14 @@ What the program does, in order:
    kernel check, so this is a spawn rule, not a kernel claim.
 2. Reads the running ABI and builds the ruleset for THAT ABI only: a field or right the ABI lacks is
    never sent (the scope field below ABI 6 is refused with E2BIG; the unix-resolve right before
-   ABI 9 is refused with EINVAL; both measured).
-3. T9 and T6: binds an abstract canary socket (created now, so outside the domain about to be made),
-   applies the ruleset, then connects to it and to the pathname canary levain created outside the
-   sandbox and bound into the view. T9 requires both refused (EACCES or EPERM), T6 the abstract one
-   refused and the pathname one answered. Any other result (connected, ENOENT, ECONNREFUSED, a
+   ABI 9 is refused with EINVAL; both measured). Only ENOSYS and EOPNOTSUPP read as "no Landlock";
+   any other error refuses the command, and so does a tier lower than the one levain read outside
+   the sandbox and passed in.
+3. T9 and T6: binds an abstract canary socket (created now, so outside the domain about to be made)
+   and connects to it and to the pathname canary levain created outside the sandbox and bound into
+   the view: both must answer (the positive control), or the command is refused. Then it applies the
+   ruleset and connects to both again. T9 requires both refused (EACCES or EPERM), T6 the abstract
+   one refused and the pathname one answered. Any other result (connected, ENOENT, ECONNREFUSED, a
    timeout) refuses the command with a named error: the policy is not enforcing what the tier claims.
 4. Execs the command.
 
@@ -53,6 +56,8 @@ import threading
 #                         the workspace).
 #   --canary PATH         the pathname canary socket, created outside the sandbox by levain.
 #   --carry-stdin         stdin is levain's state channel (an unnamed socketpair): kept.
+#   --expect-tier TIER    the tier levain read outside the sandbox (required): a lower tier read here
+#                         refuses the command, so a filter in between can never quietly downgrade it.
 _STUB_DEFS = r"""import ctypes, errno, os, socket, stat, struct, sys
 SYS_CREATE_RULESET, SYS_ADD_RULE, SYS_RESTRICT_SELF = 444, 445, 446
 CREATE_RULESET_VERSION = 1
@@ -67,6 +72,7 @@ SCOPE_ABSTRACT_UNIX_SOCKET, SCOPE_SIGNAL = 1, 2
 SCOPE_ABI = 6
 PR_SET_NO_NEW_PRIVS = 38
 DENIED = ("EACCES", "EPERM")
+TIERS = ("T0", "T6", "T9")
 def tier_for(abi):
     return "T9" if abi >= UNIX_RESOLVE_ABI else "T6" if abi >= SCOPE_ABI else "T0"
 def plan(abi, grants=(), private_tmp=None):
@@ -100,12 +106,15 @@ def syscall(nr, *args):
         raise OSError(e, os.strerror(e))
     return r
 def running_abi():
-    # 0 when the kernel has no Landlock or it is disabled: T0, never a refusal.
+    # 0 only when the kernel has no Landlock (ENOSYS) or has it disabled (EOPNOTSUPP). Any other error
+    # (EPERM from a seccomp filter, say) is raised: it says nothing about the kernel's Landlock.
     try:
         return int(syscall(SYS_CREATE_RULESET, ctypes.c_void_p(None), ctypes.c_size_t(0),
                            ctypes.c_uint32(CREATE_RULESET_VERSION)))
-    except OSError:
-        return 0
+    except OSError as e:
+        if e.errno in (errno.ENOSYS, errno.EOPNOTSUPP):
+            return 0
+        raise
 def open_rule_target(path, kind):
     fd = os.open(path, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC | (os.O_DIRECTORY if kind == "dir" else 0))
     if kind == "socket" and not stat.S_ISSOCK(os.fstat(fd).st_mode):
@@ -113,6 +122,9 @@ def open_rule_target(path, kind):
         raise OSError(errno.ENOTSOCK, "not a socket")
     return fd
 def no_new_privs():
+    # Already set when this runs under bwrap, which calls prctl(PR_SET_NO_NEW_PRIVS) unconditionally in
+    # its main ("Never gain any more privs during exec"); the flag is inherited and cannot be cleared.
+    # Set again so the restriction does not depend on how the stub was started.
     if os.uname().sysname != "Linux":
         raise OSError(errno.ENOSYS, "prctl is Linux only")
     libc = ctypes.CDLL(None, use_errno=True)
@@ -212,8 +224,68 @@ def judge(tier, pathname, abstract):
         return ("the unix socket check did not show the T6 policy (pathname: %s, expected CONNECTED; "
                 "abstract: %s, expected EACCES or EPERM)" % (pathname, abstract))
     return None
+def abstract_listener():
+    # A listening abstract socket created now, before the domain exists, so outside it.
+    name = "\0levain-canary-%d-%s" % (os.getpid(), os.urandom(6).hex())
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.bind(name)
+        s.listen(4)
+    except BaseException:
+        s.close()
+        raise
+    return s, name
+def confine(opts):
+    # Restrict this process for the running ABI and check the policy holds; None, or why the command
+    # is refused.
+    try:
+        abi = running_abi()
+    except OSError as e:
+        return "could not read the running kernel's Landlock ABI (%s)" % e
+    tier = tier_for(abi)
+    if TIERS.index(tier) < TIERS.index(opts["expect-tier"]):
+        return ("the kernel reads Landlock ABI %d (%s) inside the sandbox, below the %s levain read "
+                "outside it" % (abi, tier, opts["expect-tier"]))
+    grants = list(opts["grant"])
+    for g in opts["default-grant"]:
+        r = os.path.realpath(g)
+        try:
+            if stat.S_ISSOCK(os.lstat(r).st_mode):
+                grants.append(r)
+        except OSError:
+            pass
+    tier, attr, rules = plan(abi, grants, opts["private-tmp"])
+    if tier == "T0":
+        return None
+    if opts["canary"] is None:
+        return "no canary socket was given to check the unix-socket policy with"
+    for g in opts["grant"]:
+        try:
+            os.close(open_rule_target(g, "socket"))
+        except OSError as e:
+            return "the granted socket %s cannot be granted: %s" % (g, e.strerror)
+    try:
+        listener, name = abstract_listener()
+    except OSError as e:
+        return "could not create the abstract canary socket: %s" % e
+    try:
+        # The positive control: before the domain exists both canaries must answer, so a refusal after
+        # it is the policy's and not a missing, unreachable or untraversable socket.
+        for kind, addr in (("pathname", opts["canary"]), ("abstract", name)):
+            r = connect(addr)
+            if r != "CONNECTED":
+                return ("the self-test could not reach its %s canary before the policy was applied (%s)"
+                        % (kind, r))
+        try:
+            apply(attr, rules)
+        except OSError as e:
+            return "could not apply the unix-socket policy for Landlock ABI %d (%s): %s" % (abi, tier, e)
+        return judge(tier, connect(opts["canary"]), connect(name))
+    finally:
+        listener.close()
 def parse(args):
-    opts = {"grant": [], "default-grant": [], "private-tmp": None, "canary": None, "carry-stdin": False}
+    opts = {"grant": [], "default-grant": [], "private-tmp": None, "canary": None, "carry-stdin": False,
+            "expect-tier": None}
     i = 0
     while i < len(args) and args[i] != "--":
         k = args[i][2:] if args[i].startswith("--") else None
@@ -223,13 +295,15 @@ def parse(args):
         elif k in ("grant", "default-grant") and i + 1 < len(args):
             opts[k].append(args[i + 1])
             i += 2
-        elif k in ("private-tmp", "canary") and i + 1 < len(args):
+        elif k in ("private-tmp", "canary", "expect-tier") and i + 1 < len(args):
             opts[k] = args[i + 1]
             i += 2
         else:
             raise ValueError("unknown option %r" % args[i])
     if i >= len(args) - 1:
         raise ValueError("no command after --")
+    if opts["expect-tier"] not in TIERS:
+        raise ValueError("--expect-tier must be one of %s, not %r" % ("/".join(TIERS), opts["expect-tier"]))
     return opts, args[i + 1:]
 """
 
@@ -245,36 +319,9 @@ if __name__ == "__main__":
         refuse("the unix-socket confinement stub was started wrongly: %s" % e)
     hygiene(opts["carry-stdin"])
     if os.uname().sysname == "Linux":
-        abi = running_abi()
-        grants = list(opts["grant"])
-        for g in opts["default-grant"]:
-            r = os.path.realpath(g)
-            try:
-                if stat.S_ISSOCK(os.lstat(r).st_mode):
-                    grants.append(r)
-            except OSError:
-                pass
-        tier, attr, rules = plan(abi, grants, opts["private-tmp"])
-        if tier != "T0":
-            if opts["canary"] is None:
-                refuse("no canary socket was given to check the unix-socket policy with")
-            for g in opts["grant"]:
-                try:
-                    os.close(open_rule_target(g, "socket"))
-                except OSError as e:
-                    refuse("the granted socket %s cannot be granted: %s" % (g, e.strerror))
-            name = "\0levain-canary-%d-%s" % (os.getpid(), os.urandom(6).hex())
-            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            try:
-                listener.bind(name)
-                listener.listen(1)
-                apply(attr, rules)
-            except OSError as e:
-                refuse("could not apply the unix-socket policy for Landlock ABI %d (%s): %s" % (abi, tier, e))
-            problem = judge(tier, connect(opts["canary"]), connect(name))
-            listener.close()
-            if problem is not None:
-                refuse(problem)
+        problem = confine(opts)
+        if problem is not None:
+            refuse(problem)
     os.execv(argv[0], argv)
 """
 
@@ -321,7 +368,8 @@ def judge(tier: str, pathname: str, abstract: str) -> str | None:
 
 
 def running_abi(system: str | None = None) -> int:
-    """The running kernel's Landlock ABI, 0 without one. Never issues the syscall off Linux."""
+    """The running kernel's Landlock ABI, 0 without one (ENOSYS, or EOPNOTSUPP when disabled); any other
+    error is raised as the :class:`OSError` it is. Never issues the syscall off Linux."""
     if (system or platform.system()) != "Linux":
         return 0
     return _ns["running_abi"]()
@@ -333,12 +381,14 @@ def tier_line(abi: int) -> str:
     return f"unix sockets ({tier}, Landlock ABI {abi}): {TIER_CLAIMS[tier]}"
 
 
-def stub_argv(python: str, *, canary: str | None, grants: tuple[str, ...] = (),
+def stub_argv(python: str, *, canary: str | None, expect_tier: str, grants: tuple[str, ...] = (),
               default_grants: tuple[str, ...] = DEFAULT_GRANTS, private_tmp: str | None = None,
               carry_stdin: bool = True) -> list[str]:
     """What goes in front of bash inside bwrap. Every input is argv the entity cannot write (it is
-    levain's bwrap command line). ``grants`` are paths in the sandbox's view, resolved by the caller."""
-    argv = [python, "-I", "-S", "-c", STUB]
+    levain's bwrap command line). ``grants`` are paths in the sandbox's view, resolved by the caller.
+    ``expect_tier`` is the tier of levain's own read (``tier_for(running_abi())``): the stub refuses
+    the command when its read inside the sandbox is lower."""
+    argv = [python, "-I", "-S", "-c", STUB, "--expect-tier", expect_tier]
     for g in grants:
         argv += ["--grant", g]
     for g in default_grants:
@@ -356,7 +406,8 @@ class Canary:
     """The pathname canary: a listening unix socket levain creates OUTSIDE every sandbox, bound into
     each command's view at :attr:`view_path`. Connections are accepted and closed by a thread, so a T6
     run (where they succeed) never fills the backlog. ``shared``: reachable by another user (a hands
-    launch), so the directory is 0711 and the socket 0666; it only ever accepts and closes."""
+    launch), so the directory is 0711 and the socket 0666; it only ever accepts and closes. :attr:`made`
+    is what it created, for the placeholder ledger, so a crashed levain's canary is swept."""
 
     def __init__(self, *, shared: bool = False, view_path: str | None = None) -> None:
         # A shared one under /tmp: another user must be able to reach it, which a TMPDIR under the
@@ -364,11 +415,13 @@ class Canary:
         self.dir = tempfile.mkdtemp(prefix="lvc-", dir="/tmp" if shared else None)
         self.path = os.path.join(self.dir, "c")
         self.view_path = view_path or self.path
+        self.made: list[tuple[str, str]] = [(self.dir, "dir")]
         self._stop = threading.Event()
         self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             self._sock.bind(self.path)
             self._sock.listen(16)
+            self.made.append((self.path, "socket"))
             if shared:
                 os.chmod(self.dir, 0o711)
                 os.chmod(self.path, 0o666)
@@ -379,12 +432,14 @@ class Canary:
         self._thread.start()
 
     def _serve(self) -> None:
+        # Runs until stop(): an accept error (EMFILE, say) is transient, so it waits and goes on; a T6
+        # canary that stopped answering would refuse every later command.
         while not self._stop.is_set():
             try:
                 if select.select([self._sock], [], [], 0.5)[0]:
                     self._sock.accept()[0].close()
             except (OSError, ValueError):
-                return
+                self._stop.wait(0.05)
 
     def bind_ops(self) -> list[str]:
         """The bwrap ops that put the canary in the view (a read-write bind: a read-only mount must

@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ import pytest
 from levain.firing import landlock as L
 
 NS = L._ns
+_REAL_RUNNING_ABI = NS["running_abi"]
 
 
 def _attr(abi):
@@ -54,9 +56,18 @@ def test_abi_9_on_handles_unix_resolve_with_exact_inode_grants(abi):
     assert all(acc != NS["FS_RESOLVE_UNIX"] or p != "/" for p, acc, _ in rules)
 
 
-def test_the_unix_resolve_bit_and_its_abi_are_the_documented_ones():
-    assert NS["FS_RESOLVE_UNIX"] == 1 << 16 and NS["UNIX_RESOLVE_ABI"] == 9 and NS["SCOPE_ABI"] == 6
-    assert "ninth version of the Landlock ABI" in L.STUB
+def test_the_unix_resolve_bit_is_sent_from_abi_9_and_never_before():
+    # include/uapi/linux/landlock.h: LANDLOCK_ACCESS_FS_RESOLVE_UNIX (1ULL << 16); the kernel documentation
+    # dates it to "the ninth version of the Landlock ABI". The literals here, not the module's constants.
+    resolve, refer, abstract, signal = 1 << 16, 1 << 13, 1 << 0, 1 << 1
+    for abi in (6, 7, 8):
+        fs, _net, scoped = struct.unpack("=QQQ", _attr(abi))
+        assert not fs & resolve and scoped == abstract | signal
+        assert not any(acc & resolve for _p, acc, _k in L.plan(abi, ["/run/a.sock"], "/tmp/p")[2])
+    for abi in (9, 10):
+        fs, _net, scoped = struct.unpack("=QQQ", _attr(abi))
+        assert fs == resolve | refer and scoped == abstract | signal
+        assert [(p, acc) for p, acc, _k in L.plan(abi, ["/run/a.sock"])[2]] == [("/", refer), ("/run/a.sock", resolve)]
 
 
 class _Calls:
@@ -123,11 +134,103 @@ def test_running_abi_reads_the_version_flag_and_is_0_without_landlock(monkeypatc
     monkeypatch.setitem(NS, "syscall", lambda nr, *a: seen.append((nr, a[2].value)) or 10)
     assert NS["running_abi"]() == 10 and seen == [(444, 1)]
 
-    def nosys(nr, *a):
-        raise OSError(errno.EOPNOTSUPP, "disabled")
+    for e in (errno.ENOSYS, errno.EOPNOTSUPP):
+        def none(nr, *a, e=e):
+            raise OSError(e, os.strerror(e))
 
+        monkeypatch.setitem(NS, "syscall", none)
+        assert NS["running_abi"]() == 0
+
+
+@pytest.mark.parametrize("err", [errno.EPERM, errno.EACCES, errno.EINVAL, errno.EFAULT])
+def test_any_other_error_from_the_version_read_is_not_no_landlock(monkeypatch, err):
+    def filtered(nr, *a):
+        raise OSError(err, os.strerror(err))
+
+    monkeypatch.setitem(NS, "syscall", filtered)
+    with pytest.raises(OSError) as e:
+        NS["running_abi"]()
+    assert e.value.errno == err
+    # levain's own read raises it too (the spawn turns it into a named refusal).
+    with pytest.raises(OSError):
+        L.running_abi(system="Linux")
+
+
+# --- the stub's confine step (every syscall, socket and connect replaced) --------------------------
+
+class _Probe:
+    """Stands in for the abstract listener, the connects and apply; records the order."""
+
+    def __init__(self, monkeypatch, abi=10, before=("CONNECTED", "CONNECTED"), after=("EACCES", "EPERM")):
+        self.log = []
+        self.results = {"before": list(before), "after": list(after)}
+        self.applied = False
+        monkeypatch.setitem(NS, "running_abi", lambda: abi if not isinstance(abi, Exception) else self._raise(abi))
+        monkeypatch.setitem(NS, "abstract_listener", lambda: (self, "\0abstract"))
+        monkeypatch.setitem(NS, "connect", self.connect)
+        monkeypatch.setitem(NS, "apply", self.apply)
+
+    @staticmethod
+    def _raise(e):
+        raise e
+
+    def connect(self, addr):
+        phase = "after" if self.applied else "before"
+        self.log.append((phase, addr))
+        return self.results[phase][0 if addr == "/run/levain-canary" else 1]
+
+    def apply(self, attr, rules):
+        self.log.append(("apply",))
+        self.applied = True
+
+    def close(self):
+        self.log.append(("closed",))
+
+
+def _opts(expect="T9", canary="/run/levain-canary"):
+    return {"grant": [], "default-grant": [], "private-tmp": None, "canary": canary, "carry-stdin": False,
+            "expect-tier": expect}
+
+
+def test_confine_checks_reachability_then_restricts_then_expects_the_denial(monkeypatch):
+    pr = _Probe(monkeypatch)
+    assert NS["confine"](_opts()) is None
+    assert pr.log == [("before", "/run/levain-canary"), ("before", "\0abstract"), ("apply",),
+                      ("after", "/run/levain-canary"), ("after", "\0abstract"), ("closed",)]
+
+
+@pytest.mark.parametrize("before", [("EACCES", "CONNECTED"), ("ENOENT", "CONNECTED"), ("CONNECTED", "ECONNREFUSED")])
+def test_a_canary_unreachable_before_the_policy_refuses_and_never_restricts(monkeypatch, before):
+    pr = _Probe(monkeypatch, before=before)
+    problem = NS["confine"](_opts())
+    assert problem is not None and "self-test could not reach its" in problem
+    assert ("apply",) not in pr.log and pr.log[-1] == ("closed",)
+
+
+def test_a_lower_tier_than_levain_read_refuses_by_name(monkeypatch):
+    pr = _Probe(monkeypatch, abi=8)
+    problem = NS["confine"](_opts(expect="T9"))
+    assert "ABI 8 (T6)" in problem and "below the T9 levain read" in problem
+    assert pr.log == []
+    pr = _Probe(monkeypatch, abi=0)
+    assert "(T0)" in NS["confine"](_opts(expect="T6"))
+
+
+def test_an_eperm_version_read_refuses_and_enosys_is_t0(monkeypatch):
+    pr = _Probe(monkeypatch, abi=OSError(errno.EPERM, "Operation not permitted"))
+    assert "could not read the running kernel's Landlock ABI" in NS["confine"](_opts(expect="T0"))
+    assert pr.log == []
+
+    def nosys(nr, *a):
+        raise OSError(errno.ENOSYS, "Function not implemented")
+
+    pr = _Probe(monkeypatch)
+    monkeypatch.setitem(NS, "running_abi", _REAL_RUNNING_ABI)   # the real read, over a replaced syscall
     monkeypatch.setitem(NS, "syscall", nosys)
-    assert NS["running_abi"]() == 0
+    assert NS["confine"](_opts(expect="T0")) is None   # T0: no ruleset, no probe
+    assert pr.log == []
+    assert "below the T9" in NS["confine"](_opts(expect="T9"))
+
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="O_PATH is Linux")
@@ -252,9 +355,10 @@ def test_the_canary_verdict_per_tier(tier, pathname, abstract, ok):
 
 
 def test_the_stub_argv_is_levains_and_ends_at_the_command():
-    argv = L.stub_argv("/usr/bin/python3", canary="/run/levain-canary", grants=("/run/g.sock",))
+    argv = L.stub_argv("/usr/bin/python3", canary="/run/levain-canary", expect_tier="T9", grants=("/run/g.sock",))
     assert argv[:5] == ["/usr/bin/python3", "-I", "-S", "-c", L.STUB] and argv[-1] == "--"
     opts, cmd = NS["parse"](argv[5:] + ["/bin/bash", "-p"])
+    assert opts["expect-tier"] == "T9"
     assert opts["grant"] == ["/run/g.sock"] and opts["default-grant"] == ["/dev/log"]
     assert opts["canary"] == "/run/levain-canary" and opts["carry-stdin"] is True
     assert cmd == ["/bin/bash", "-p"]
@@ -262,6 +366,10 @@ def test_the_stub_argv_is_levains_and_ends_at_the_command():
         NS["parse"](["--bogus", "--", "/bin/bash"])
     with pytest.raises(ValueError):
         NS["parse"](["--canary", "/x", "--"])
+    with pytest.raises(ValueError, match="expect-tier"):   # required: never a silent T0
+        NS["parse"](["--canary", "/x", "--", "/bin/bash"])
+    with pytest.raises(ValueError, match="expect-tier"):
+        NS["parse"](["--expect-tier", "T7", "--", "/bin/bash"])
 
 
 def test_the_stub_imports_nothing_of_levain():
@@ -291,6 +399,60 @@ def test_the_canary_answers_and_is_removed(tmp_path):
     c.stop()
 
 
+def test_the_canary_keeps_answering_after_an_accept_error(monkeypatch):
+    real = socket.socket.accept
+    failed = []
+
+    def flaky(self):
+        if not failed:
+            failed.append(True)
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real(self)
+
+    monkeypatch.setattr(socket.socket, "accept", flaky)
+    c = L.Canary()
+    try:
+        # More than the backlog: only a serve loop that survived drains it. A full backlog refuses at
+        # once on macOS (blocks on Linux), so each connect gets a few seconds of retries.
+        for _ in range(40):
+            deadline = time.monotonic() + 5
+            while True:
+                s = socket.socket(socket.AF_UNIX)
+                s.settimeout(5)
+                try:
+                    s.connect(c.path)
+                    break
+                except ConnectionRefusedError:
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.05)
+                finally:
+                    s.close()
+        assert failed and c._thread.is_alive()
+    finally:
+        c.stop()
+
+
+def test_a_crashed_levains_canary_is_swept_by_the_ledger(tmp_path, monkeypatch):
+    import levain.firing.confinement as conf
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    c = L.Canary()
+    assert c.made == [(c.dir, "dir"), (c.path, "socket")]
+    c._stop.set()   # the crash: its thread and socket are gone, the files are not
+    c._sock.close()
+    with conf._LedgerTxn() as txn:
+        assert txn.ok
+        txn.record(c.made)
+        txn.claim({p for p, _ in c.made}, "1:1:1:dead")   # a claim whose process is gone
+    assert os.path.exists(c.path)
+    with conf._LedgerTxn() as txn:   # the next spawn's sweep
+        monkeypatch.setattr(conf, "_claim_alive", lambda claim: False)
+        txn.sweep()
+    assert txn.removed == [c.path, c.dir]
+    assert not os.path.exists(c.dir)
+
+
 def test_the_stub_runs_right_before_bash_with_the_canary_bound(tmp_path, monkeypatch):
     import levain.firing.confinement as conf
     from levain.firing.confinement import build_policy
@@ -310,6 +472,7 @@ def test_the_stub_runs_right_before_bash_with_the_canary_bound(tmp_path, monkeyp
     bash = argv.index("/bin/bash", at)
     assert argv[at - 4:at] == [sys.executable, "-I", "-S", "-c"]
     assert argv[bash - 1] == "--" and argv[bash:] == ["/bin/bash", "--noprofile", "--norc", "-p"]
+    assert argv[argv.index("--expect-tier", at) + 1] == L.tier_for(L.running_abi())
     canary = sh._canary
     assert argv[argv.index("--canary", at) + 1] == canary.path
     i = argv.index("--new-session")
@@ -317,3 +480,22 @@ def test_the_stub_runs_right_before_bash_with_the_canary_bound(tmp_path, monkeyp
     assert os.path.exists(canary.path)
     sh.close()
     assert not os.path.exists(canary.path)
+
+
+def test_the_spawn_refuses_when_levains_own_abi_read_errors(tmp_path, monkeypatch):
+    import levain.firing.confinement as conf
+    from levain.firing.confinement import ConfinementError, build_policy
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: pytest.fail("started"))
+
+    def filtered(system=None):
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(conf._landlock, "running_abi", filtered)
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    with pytest.raises(ConfinementError, match="Landlock ABI"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(ent), env={"PATH": "/usr/bin"})
