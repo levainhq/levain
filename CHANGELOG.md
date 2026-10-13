@@ -6,6 +6,8 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-10-12
+
 ### Changed
 
 - **A cockpit write fires on one click.** A write that may rise above its rendered tier still asks the server first (`dry_run`) and fires in the same click, naming the tier and gesture that dry run answered (`tier_seen`, `gesture_seen`); the server still refuses `409 tier_moved` / `gesture_moved` when either has changed. The second "Click again to fire" click is gone: a click is never the authority (the surface token in a reported install is, or the signature), and the tier and `claims cockpit token` stay in the audit record. A write whose answer was lost (or came back 5xx) keeps its envelope, and the next click sends that envelope again before any new dry run, so a write that landed returns its own answer; identical submits while one is in flight fire once.
@@ -13,6 +15,7 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 ### Fixed
 
 - **The cockpit header keeps its weather in Build mode.** Build mode dropped every `reading` panel, the hero's weather included; anything placed in the hero now shows in every mode.
+- **Cockpit rendering after the 0.10.0 launch:** a count widget's zero is final only on a clean, fresh read, and a zero-row read whose status is `empty` is a clean zero; panel address lines follow the panel's declared facets, not row values; the hero owns the sky's legend band, and a dropped or failed sky hides it; the Health panel leads with links, wraps, graduated and demoted; a row's meta line wraps inside its card at phone width; the Now panel carries the same filter box as Tray, Open loops and Keep; an inbox row draws sender -> reader from its own facets.
 
 ## [0.10.0] — 2026-10-12
 
