@@ -126,7 +126,8 @@
     var bar = el('div', { class: 'sky-bar' });
     var summary = el('span', { class: 'sky-summary' });
     var toggle = el('button', { type: 'button', class: 'sky-toggle' });
-    bar.append(summary, toggle);
+    // a host that owns a control row (the hero's strip) takes the toggle there, so the row is one row
+    if (o.toggleHost) { o.toggleHost.insertBefore(toggle, o.toggleBefore || null); bar.append(summary); } else bar.append(summary, toggle);
     var plot = el('div', { class: 'sky-plot' });
     plot.style.position = 'relative';
     var cv = el('canvas', { class: 'sky-canvas', role: 'img' });
@@ -156,7 +157,7 @@
     }
 
     function setToggle() {
-      toggle.textContent = ambientOn ? 'Ambient on' : 'Ambient paused';
+      toggle.textContent = o.toggleHost ? 'Ambient' : (ambientOn ? 'Ambient on' : 'Ambient paused');
       toggle.setAttribute('aria-pressed', ambientOn ? 'true' : 'false');
       toggle.setAttribute('aria-label', 'Ambient motion, currently ' + (ambientOn ? 'on' : 'paused'));
     }
@@ -201,8 +202,11 @@
       var rowsH = Math.max(narrow ? 240 : 160, PAD_T + PAD_B + model.rows.length * (narrow ? 36 : ROW_H_MIN));
       cv.style.height = rowsH + 'px';
       var c = model.counts;
-      summary.textContent = 'Last ' + opts.windowHours + ' hours: ' + c.commit + ' commits, ' + c.review + ' reviews (' + c.failed + ' failed), ' + c.memory + ' memory writes';
-      cv.setAttribute('aria-label', summary.textContent + '. ' + (value && value.legend ? value.legend : ''));
+      var line = 'Last ' + opts.windowHours + ' hours: ' + c.commit + ' commits, ' + c.review + ' reviews (' + c.failed + ' failed), ' + c.memory + ' memory writes';
+      var bold = function (n) { var e = document.createElement('b'); e.className = 'num'; e.textContent = String(n); return e; };
+      var txt = function (x) { return document.createTextNode(x); };
+      summary.replaceChildren(txt('Last ' + opts.windowHours + ' hours: '), bold(c.commit), txt(' commits · '), bold(c.review), txt(' reviews (' + c.failed + ' failed) · '), bold(c.memory), txt(' memory writes'));
+      cv.setAttribute('aria-label', line + '. ' + (value && value.legend ? value.legend : ''));
       legend.textContent = showLegend && value && value.legend ? value.legend : '';
       var r = cv.getBoundingClientRect(); W = r.width; H = r.height;
       if (W) { measureGutter(); cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR); }
@@ -356,6 +360,7 @@
         clearInterval(timer); if (ro) ro.disconnect(); else window.removeEventListener('resize', resize);
         if (reduce && reduce.removeEventListener) reduce.removeEventListener('change', onReduce);
         root.remove();
+        if (o.toggleHost) toggle.remove();
       },
     };
   }

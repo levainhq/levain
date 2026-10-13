@@ -1166,7 +1166,7 @@
     wrap.appendChild(plot);
     host.appendChild(wrap);
     if (root.LevainSky && typeof root.LevainSky.mount === "function") {
-      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend }, { legend: false }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
+      try { s.skyHandle = root.LevainSky.mount(plot, { events: sky.events, legend: sky.legend }, hero ? { legend: false, toggleHost: document.querySelector("header.masthead .indicators"), toggleBefore: document.getElementById("jumpbtn") } : { legend: false }); } catch (e) { plot.appendChild(el("p", "err", "sky failed: " + (e && e.message ? e.message : e))); }
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
     const legend = el("div", "legendbar" + (hero ? "" : " frame"));
     paintLegend(legend, sky);
@@ -1436,6 +1436,32 @@
     document.body.dataset.mode = m;
     save(MODE_KEY, m);
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
+    fillGrids();
+  }
+  // The grids fill per mode: a mode hides cards, so the cards it keeps are measured and the last row's cards span the
+  // rest (Morning's single Work card takes the whole row; two widgets take half each). The zone grid is six tracks
+  // under three, four under two and one under one, so a card is `span (tracks / cards in the row)` tracks wide.
+  function shown(n) { return getComputedStyle(n).display !== "none"; }
+  function fillGrids() {
+    if (typeof getComputedStyle !== "function") return;   // a harness without layout
+    for (const w of document.querySelectorAll(".ck-widgets")) {
+      const n = Array.from(w.children).filter(shown).length;
+      if (n) w.style.setProperty("--ck-n", String(n));
+    }
+    for (const grid of document.querySelectorAll(".ck-zgrid")) {
+      const kids = Array.from(grid.children);
+      for (const k of kids) k.style.gridColumn = "";
+      const tracks = getComputedStyle(grid).gridTemplateColumns.split(" ").length;
+      const per = tracks >= 6 ? 3 : tracks >= 4 ? 2 : 1;
+      if (per < 2) continue;
+      let row = [], used = 0;
+      for (const k of kids.filter(shown)) {
+        const w = Math.min(per, k.classList.contains("ck-span-3") ? 3 : k.classList.contains("ck-span-2") ? 2 : 1);
+        if (used + w > per) { row = []; used = 0; }
+        row.push(k); used += w;
+      }
+      if (row.length && used < per) for (const k of row) k.style.gridColumn = "span " + tracks / row.length;
+    }
   }
   function typing(t) { return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable); }
   function visibleFilters() {
@@ -1525,6 +1551,8 @@
 
   function install() {
     applyMode(saved(MODE_KEY) || "board");
+    let fillTimer = 0;
+    if (typeof root.addEventListener === "function") root.addEventListener("resize", () => { root.clearTimeout(fillTimer); fillTimer = root.setTimeout(fillGrids, 120); });
     document.addEventListener("click", (ev) => {
       const t = ev.target && ev.target.closest ? ev.target.closest("[data-mode-tab],#jumpbtn") : null;
       if (!t) return;
@@ -1553,7 +1581,7 @@
   }
 
   const pruneModal = () => { for (const o of Array.from(states)) if (o.modal && !o.body.isConnected) teardown(o); };
-  Object.assign(K, { fill, mountClock, refetchPanel, pruneModal, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode });
+  Object.assign(K, { fill, mountClock, refetchPanel, pruneModal, reset: () => { for (const o of Array.from(states)) if (!(o.modal && o.body.isConnected)) teardown(o); }, fold, termsOf, hits, jumpItems, applyMode, fillGrids });
 
   const api = { fromManifest, ageLabel, badgeText, visible, clean, refetchPanel, fold };
   if (typeof module !== "undefined" && module.exports) module.exports = api;

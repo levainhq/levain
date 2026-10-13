@@ -33,15 +33,18 @@ def test_hovering_a_row_never_changes_its_height(tmp_path: Path) -> None:
 def test_at_most_three_verbs_show_and_the_rest_sit_in_the_overflow_menu(tmp_path: Path) -> None:
     vals = _page(tmp_path, [{"eval": f"""(() => {{ const v = {ROW}.querySelector('.verb-actions');
       const vis = [...v.querySelectorAll(':scope > .verb-btn')].map(b => b.textContent);
-      const menu = [...v.querySelectorAll('.verb-menu .verb-btn')].map(b => b.textContent);
+      const menu = [...v.querySelectorAll('.verb-menu .verb-btn:not(.verb-dup)')].map(b => b.textContent);
+      const dups = [...v.querySelectorAll('.verb-menu .verb-dup')].map(b => b.textContent + ':' + getComputedStyle(b).display);
       const more = v.querySelector('.verb-more');
       const b = v.querySelector(':scope > .verb-btn'); const cs = getComputedStyle(b);
-      return {{vis, menu, haspopup: more.getAttribute('aria-haspopup'), expanded: more.getAttribute('aria-expanded'),
+      return {{vis, menu, dups, haspopup: more.getAttribute('aria-haspopup'), expanded: more.getAttribute('aria-expanded'),
         fs: cs.fontSize, h: b.getBoundingClientRect().height, border: cs.borderTopWidth,
         rowfs: getComputedStyle({ROW}.querySelector('.clause')).fontSize, menuHidden: v.querySelector('.verb-menu').hidden}}; }})()"""}])
     got = vals[1]
     assert got["vis"] == ["edit", "schedule", "dismiss", "···"], got
     assert got["menu"] == ["reclassify", "metabolize"], got
+    # a copy of each inline verb waits in the menu for a narrow row (container query); it shows nowhere on a wide one
+    assert got["dups"] == ["edit:none", "schedule:none", "dismiss:none"], got
     assert (got["haspopup"], got["expanded"], got["menuHidden"]) == ("menu", "false", True), got
     assert got["fs"] == "12px" and got["h"] == 24 and got["border"] == "0px" and got["rowfs"] == "13px", got
 

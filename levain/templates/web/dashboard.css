@@ -36,7 +36,7 @@
     /* type: 7 sizes, 4 weights (800 only on the clock), 4 line-heights (spec D2) */
     --fs-micro: 11px; --fs-meta: 12px; --fs-body: 13px; --fs-lead: 15px; --fs-title: 16px; --fs-figure: 34px; --fs-display: 92px;
     --fw-regular: 400; --fw-medium: 500; --fw-semibold: 600; --fw-bold: 700; --fw-clock: 800;
-    --lh-display: .9; --lh-tight: 1.25; --lh-list: 1.45; --lh-prose: 1.6;
+    --lh-display: 84px; --lh-tight: 1.25; --lh-list: 1.45; --lh-prose: 1.6;
     --track-caps: .08em; --track-tight: -.03em;
     /* radii: 4 steps. 6 chips + verb hover box, 8 controls, 18 cards and overlays, pill for counts and dots */
     --r-sm: 6px; --r-md: 8px; --r-lg: 18px; --r-pill: 999px;
@@ -187,20 +187,9 @@
   .pbody.clamped::-webkit-scrollbar-thumb { background: var(--line-hot); border-radius: var(--r-sm);
     border: 2px solid var(--panel); }
   .pbody.clamped::-webkit-scrollbar-track { background: transparent; }
-  /* "more below" cue: a subtle down-chevron pinned at the SCROLL BODY's bottom edge — an
-     absolute ::after on the position:relative .pbody, so it tracks the scroll viewport (not
-     the panel) and never drifts into a config/section panel's edit-row below it. Present
-     whenever the body overflows (.has-overflow) but only VISIBLE at the resting top
-     (.at-top) — a "there's more, scroll" hint that fades the instant you scroll and fades
-     back when you return to the top (a chevron hanging mid-scroll reads as crap). A rotated
-     border (font-independent + crisp) over a soft glow; centered, clear of the scrollbar. */
-  .pbody.clamped.has-overflow::after {
-    content: ""; position: absolute; bottom: 6px; left: 50%; width: 7px; height: 7px;
-    transform: translateX(-50%) rotate(45deg);
-    border-right: 1.5px solid var(--mind); border-bottom: 1.5px solid var(--mind);
-    opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); pointer-events: none; z-index: 2;
-  }
-  .pbody.clamped.has-overflow.at-top::after { opacity: .82; }
+  /* "more below" cue: the last 24px of a bounded body fades out while there is more to scroll. A mask, so nothing is painted
+     over the text; .at-end (set by measureOverflow) drops it at the bottom. */
+  .pbody.clamped.has-overflow:not(.at-end) { -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent); mask-image: linear-gradient(to bottom, #000 calc(100% - 24px), transparent); }
 
   /* edit-class chip — a recessed status LED (armed/locked; lights up in Slice 2) */
   .chip {
@@ -237,7 +226,7 @@
   .clause { color: var(--dim); font-size: var(--fs-meta); flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
   /* Per-item progressive disclosure. The wire now carries the FULL canonical text (it
      no longer truncates → no data loss on edit, and the whole thing is reachable). A
-     long clause clamps to 4 lines for list density; the per-item toggle expands it to
+     long clause clamps to 3 lines for list density; the per-item toggle expands it to
      full inline. The toggle only appears when the clause actually overflows the clamp
      (measureClauses sets .has-more on the row, mirroring panel-level measureOverflow).
      ONLY clauses routed through appendClause carry .clampable — a bare .clause (a crystal
@@ -248,7 +237,7 @@
      structure is unreachable [codex L3 MED]. */
   .clause.clampable { white-space: pre-wrap; }
   .row:not(.row-expanded) .clause.clampable { display: -webkit-box; -webkit-box-orient: vertical;
-    -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; }
+    -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }
   /* caret-only (no "more"/"less" word) — subtle but a comfortable tap target on mobile
      (≈26px min, padded) with the action conveyed to screen readers via the flipping
      aria-label, since the glyph alone isn't descriptive. */
@@ -976,6 +965,7 @@
   .panel-hero .legendbar { padding-inline: var(--gutter); }
   .sky-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-5); flex-wrap: wrap; padding-bottom: var(--sp-5); }
   .sky-summary { font-size: var(--fs-meta); color: var(--meta); line-height: var(--lh-prose); min-width: 0; }
+  .sky-summary b { color: var(--label); font-weight: var(--fw-semibold); }
   .sky-toggle { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); color: var(--label); font: var(--fw-semibold) var(--fs-meta) var(--round); cursor: pointer; flex: none; }
   .sky-toggle:hover { color: var(--text); border-color: var(--hair-2); }
   .sky-legend { padding-top: var(--sp-3); font-size: var(--fs-meta); color: var(--label); }
@@ -1012,12 +1002,12 @@ body.ke .hero { display: grid; grid-template-columns: 340px minmax(0, 1fr); bord
   background: var(--base); }
 body.ke .hero .when { padding: var(--sp-6) var(--sp-6) var(--sp-6) var(--gutter); border-right: 1px solid var(--hair);
   display: flex; flex-direction: column; justify-content: flex-start; gap: var(--sp-5); }
-body.ke .hero .brand .wordmark { font: var(--fw-bold) var(--fs-lead)/1 var(--round); color: var(--label); letter-spacing: 0; gap: var(--sp-3); }
+body.ke .hero .brand .wordmark { font: var(--fw-bold) var(--fs-lead)/16px var(--round); color: var(--label); letter-spacing: 0; gap: var(--sp-3); }
 body.ke .hero .brand .wordmark::before { width: 8px; height: 8px; }
-body.ke .hero .clock { font: var(--fw-clock) var(--fs-display)/var(--lh-display) var(--round); letter-spacing: var(--track-tight); margin-top: var(--sp-1); }
-body.ke .hero .clock small { font-size: var(--fs-title); font-weight: var(--fw-bold); color: var(--label); margin-left: var(--sp-2); letter-spacing: 0; }
-body.ke .hero .date { font: var(--fw-semibold) var(--fs-title) var(--round); color: var(--text); margin-top: var(--sp-3); }
-body.ke .hero .events { font-size: var(--fs-body); line-height: var(--lh-list); color: var(--label); margin-top: calc(var(--sp-2) * -1); }
+body.ke .hero .clock { font: var(--fw-clock) var(--fs-display)/var(--lh-display) var(--round); letter-spacing: var(--track-tight); margin-top: var(--sp-2); }
+body.ke .hero .clock small { font-size: var(--fs-title); line-height: 1; font-weight: var(--fw-bold); color: var(--label); margin-left: var(--sp-2); letter-spacing: 0; }
+body.ke .hero .date { font: var(--fw-semibold) var(--fs-title)/20px var(--round); color: var(--text); margin-top: var(--sp-3); }
+body.ke .hero .events { font-size: var(--fs-body); line-height: 20px; color: var(--label); margin-top: calc(var(--sp-2) * -1); }
 body.ke .hero .events .bad { color: var(--accent); }
 body.ke .hero .wx { border-top: 1px solid var(--hair); padding-top: var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-4); min-width: 0; }
 body.ke .hero .wx .xbody { display: flex; flex-direction: column; gap: var(--sp-4); }
@@ -1043,17 +1033,38 @@ body.ke .hero .wx .xbody { display: flex; flex-direction: column; gap: var(--sp-
 .aqi.band-other .pill { background: var(--card-2); color: var(--label); }
 
 body.ke .hero .skycol { min-width: 0; display: flex; flex-direction: column; }
-body.ke .hero .tools { display: flex; align-items: center; gap: var(--sp-4); padding: var(--sp-5) var(--gutter) var(--sp-3) var(--sp-6); }
-body.ke .hero .masthead { flex: 1; min-width: 0; padding: 0; border: 0; gap: var(--sp-4); flex-wrap: wrap; }
+body.ke .hero .tools { display: flex; align-items: center; padding: var(--sp-5) var(--gutter) var(--sp-4) var(--sp-6); }
+/* ONE control row at --ctl-md: the mode segment, the status cluster (sans, tabular numerals), then Sync / Ambient / Jump.
+   Nothing wraps alone; on a narrow screen the cluster drops under the segment as a whole (see the 720px rule). */
+body.ke .hero .masthead { flex: 1; min-width: 0; padding: 0; border: 0; gap: var(--sp-3); flex-wrap: nowrap; align-items: center; }
 body.ke .hero .masthead.frame { padding-inline: 0; }
-body.ke .hero .seg { border-radius: var(--r-md); }
-body.ke .hero .mode { padding: var(--sp-2) var(--sp-4); font-size: var(--fs-meta); border-radius: var(--r-md); }
-body.ke .hero .readout { gap: var(--sp-4); }
-body.ke .hero .entity { font-size: var(--fs-body); }
-body.ke .hero .jar svg { width: 20px; height: 26px; }
-body.ke .hero .jar-label { font-size: var(--fs-micro); }
-body.ke .hero button#refresh, body.ke .hero button#jumpbtn { padding: var(--sp-2) var(--sp-3); border-radius: var(--r-md); font-size: var(--fs-meta); }
-body.ke .hero .stamp { font-size: var(--fs-meta); }
+body.ke .hero .seg { height: var(--ctl-md); padding: var(--sp-1); border-radius: var(--r-md); align-items: stretch; flex: none; }
+body.ke .hero .mode { display: inline-flex; align-items: center; padding: 0 var(--sp-3); font-size: var(--fs-meta); font-weight: var(--fw-medium); border-radius: var(--r-sm); white-space: nowrap; }
+body.ke .hero .readout { gap: var(--sp-3); flex: 1; justify-content: flex-end; flex-wrap: nowrap; min-width: 0; font-variant-numeric: tabular-nums; }
+body.ke .hero .unit { gap: 0; flex: 0 1 auto; }
+body.ke .hero .unit-label { display: none; }
+body.ke .hero .entity { font: var(--fw-medium) var(--fs-meta) var(--sans); color: var(--label); max-width: 12ch; }
+body.ke .hero .jar { gap: var(--sp-3); font: var(--fw-regular) var(--fs-meta) var(--sans); white-space: nowrap; min-width: 0; }
+body.ke .hero .jar svg { width: 16px; height: 20px; flex: none; }
+body.ke .hero .jar-label { font-size: var(--fs-meta); overflow: hidden; text-overflow: ellipsis; }
+body.ke .hero .indicators { flex-wrap: nowrap; gap: var(--sp-3); flex: none; }
+body.ke .hero .stamp, body.ke .hero .livechip { font: var(--fw-regular) var(--fs-meta) var(--sans); font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--label); }
+body.ke .hero .indicators button { height: var(--ctl-md); padding: 0 var(--sp-4); display: inline-flex; align-items: center; gap: var(--sp-2); border-radius: var(--r-md); font: var(--fw-medium) var(--fs-meta) var(--sans); white-space: nowrap; flex: none; }
+body.ke .hero .indicators button#refresh { font-family: var(--sans); }
+body.ke .hero .tools { container-type: inline-size; }
+/* where the strip cannot hold one row (a phone, a half-width window), the SAME controls regroup by role: the segment on its own
+   line, the three buttons together under it, the status cluster last. Nothing is left alone on a line it does not share. */
+@container (max-width: 880px) {
+  body.ke .hero .masthead { flex-wrap: wrap; row-gap: var(--sp-3); }
+  body.ke .hero .readout, body.ke .hero .indicators, body.ke .hero .unit { display: contents; }
+  body.ke .hero .seg { order: 1; flex: 1 1 100%; }
+  body.ke .hero .seg .mode { flex: 1 1 0; justify-content: center; }
+  body.ke .hero .indicators button { order: 2; }
+  body.ke .hero .jar, body.ke .hero .livechip, body.ke .hero .stamp { order: 3; }
+  body.ke .hero .entity { display: none; }   /* the clock column already names the unit */
+  body.ke .hero .jar { flex: 0 1 auto; }
+}
+body.ke .hero .sky-toggle[aria-pressed="true"] { background: var(--card-2); color: var(--text); }
 #ck-sky { padding: 0 var(--gutter) 0 var(--sp-6); min-width: 0; }
 body.ke .hero .ck-sky { min-width: 0; }
 body.ke .hero .sky-hero { display: block; border: 0; }
@@ -1124,10 +1135,10 @@ body.ke .zone-head { display: flex; align-items: baseline; gap: var(--sp-4); mar
 body.ke .zone-head .zone-title { margin: 0; }
 body.ke .zone-gloss { font-size: var(--fs-meta); color: var(--meta); }
 body.ke .zone-title { font: var(--fw-bold) var(--fs-body) var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; color: var(--label); margin: 0 0 var(--sp-4); }
-body.ke .ck-zgrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--gap); align-items: stretch; }
-body.ke .ck-zgrid > .panel { grid-column: auto; min-width: 0; overflow: hidden; border-radius: var(--r-lg); }
-body.ke .ck-zgrid > .panel.ck-span-2 { grid-column: span 2; }
-body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: span 3; }
+body.ke .ck-zgrid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: var(--gap); align-items: stretch; }
+body.ke .ck-zgrid > .panel { grid-column: span 2; min-width: 0; overflow: hidden; border-radius: var(--r-lg); }
+body.ke .ck-zgrid > .panel.ck-span-2 { grid-column: span 4; }
+body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: span 6; }
 body.ke .ck-zgrid > .panel.ck-h-tall { height: var(--card-tall); }
 body.ke .ck-zgrid > .panel.ck-h-medium { height: var(--card-medium); }
 body.ke .ck-zgrid > .panel.ck-h-short { height: var(--card-short); }
@@ -1137,6 +1148,15 @@ body.ke .ck-zgrid .panel h2 { font: var(--fw-bold) var(--fs-title)/1 var(--round
 body.ke .ck-zgrid .panel .pbody { flex: 1; min-height: 0; max-height: none; overflow-y: auto; overflow-x: hidden; overscroll-behavior: auto; padding: 0 var(--sp-6) var(--sp-5); }
 body.ke .ck-zgrid .panel .pbody.clamped { max-height: none; overscroll-behavior: auto; }
 body.ke .ck-zgrid .panel > .xbody, body.ke .ck-zgrid .panel > .ext-note, body.ke .ck-zgrid .panel > .xfilter { margin-inline: var(--sp-6); }
+/* the filter on a card: the bar sits inside the card's padding (no bleed), and where it carries the order select the bar IS the one
+   filter box, the select inside it behind a hairline (as after_traycard) */
+body.ke .ck-zgrid .ep-search { margin: 0 0 var(--sp-3); padding: 0 0 var(--sp-3); border-bottom: 0; background: var(--card); align-items: center; }
+body.ke .ck-zgrid .ep-search:has(> .tray-dump-type) { flex-wrap: nowrap; gap: var(--sp-3); height: calc(var(--ctl-md) + var(--sp-3)); padding-bottom: var(--sp-3); position: sticky; }
+body.ke .ck-zgrid .ep-search:has(> .tray-dump-type)::before { content: ""; position: absolute; inset: 0 0 var(--sp-3) 0; border: 1px solid var(--hair-2); border-radius: var(--r-md); pointer-events: none; }
+body.ke .ck-zgrid .ep-search:has(> .tray-dump-type):focus-within::before { border-color: var(--label); }
+body.ke .ck-zgrid .ep-search:has(> .tray-dump-type) > .ep-search-input { border: 0; background: none; padding-inline: var(--sp-4) 0; height: var(--ctl-md); outline: none; }
+body.ke .ck-zgrid .ep-search:has(> .tray-dump-type) > .ep-search-status { white-space: nowrap; }
+body.ke .ck-zgrid .ep-search > .tray-dump-type { height: var(--ctl-row); margin: 0 var(--sp-3) 0 0; padding: 0 0 0 var(--sp-3); border: 0; border-left: 1px solid var(--hair); border-radius: 0; background: none; color: var(--label); flex: none; max-width: 40%; }
 body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padding-bottom: var(--sp-5); }
 .ck-tabs { display: flex; gap: var(--sp-2); flex-wrap: wrap; flex-basis: 100%; margin-top: var(--sp-3); }
 .ck-tab { background: none; border: 0; border-radius: var(--r-md); padding: var(--sp-2) var(--sp-3); color: var(--label); cursor: pointer; font: var(--fw-semibold) var(--fs-meta) var(--round); }
@@ -1146,13 +1166,13 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
   body.ke .hero { grid-template-columns: 1fr; }
   body.ke .hero .when { border-right: 0; padding-left: var(--gutter); }
   body.ke .ck-widgets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  body.ke .ck-zgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: span 2; }
+  body.ke .ck-zgrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  body.ke .ck-zgrid > .panel.ck-span-2, body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: span 4; }
 }
 @media (max-width: 720px) {
   body.ke { --gutter-ke: 16px; }
   body.ke .ck-widgets, body.ke .ck-zgrid { grid-template-columns: 1fr; }
-  body.ke .ck-zgrid > .panel.ck-span-2, body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: auto; }
+  body.ke .ck-zgrid > .panel, body.ke .ck-zgrid > .panel.ck-span-2, body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: auto; }
   body.ke .ck-zgrid > .panel { height: auto; max-height: 560px; }
   body.ke .ck-card.w { height: auto; min-height: var(--widget-h); }
   body.ke .ck-brief-body .xbody.has-side { display: block; }
@@ -1169,7 +1189,7 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
    narrow the longest meta item is cut with an ellipsis and the verbs (an `auto` column, nowrap) keep their width. The verbs keep their
    layout space and fade in by opacity, so hovering never moves the row; a screen with no hover shows them always.
    Rows: 1 the address line (a pending write only), 2 the text and its expand toggle, 3 the meta line, 4 an open form. */
-body.ke .row:has(> .clause.clampable) { display: grid; grid-template-columns: repeat(4, minmax(0, auto)) minmax(0, 1fr) auto auto; column-gap: 0;
+body.ke .row:has(> .clause.clampable) { display: grid; grid-template-columns: repeat(4, minmax(0, auto)) minmax(0, 1fr) auto auto; column-gap: 0; row-gap: 0;
   align-items: center; padding: var(--sp-4) 0; border-radius: 0; font-size: var(--fs-body); }
 body.ke .xbody .row:has(> .clause.clampable) { padding: var(--sp-4) 0; border-radius: 0; font-size: var(--fs-body); }
 body.ke .xbody .row:has(> .clause.clampable):hover { background: none; }
@@ -1182,6 +1202,13 @@ body.ke .row > .ck-rowaddr { grid-column: 1 / -1; grid-row: 1; }
 body.ke .row:has(> .clause.clampable) > .sid, body.ke .row:has(> .clause.clampable) > [data-ck-tag], body.ke .row:has(> .clause.clampable) > .muted,
 body.ke .row:has(> .clause.clampable) > .ext-meta { font-size: var(--fs-meta); line-height: var(--lh-tight); min-height: var(--ctl-row); display: block; line-height: var(--ctl-row); }
 body.ke .row:has(> .clause.clampable) > .sid { font-size: var(--fs-micro); }
+body.ke .row:has(> .clause.clampable) { container-type: inline-size; }
+body.ke .row .verb-menu .verb-dup { display: none; }
+/* a row too narrow for its meta line beside the verbs (a phone): the inline verbs go, their copies join the "···" menu */
+@container (max-width: 340px) {
+  body.ke .row .verb-actions > .verb-btn:not(.verb-more) { display: none; }
+  body.ke .row .verb-menu .verb-dup { display: block; }
+}
 body.ke .row .verb-actions { grid-column: 6 / 8; grid-row: 3; justify-self: end; margin: 0; flex-wrap: nowrap; gap: var(--sp-1); position: relative; opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }
 body.ke .row:hover .verb-actions, body.ke .row:focus-within .verb-actions, body.ke .row .verb-actions:has([aria-expanded="true"]) { opacity: 1; }
 @media (hover: none) { body.ke .row .verb-actions { opacity: 1; } }
@@ -1225,9 +1252,9 @@ body.ke .edit-act, body.ke .ext-meta { color: var(--meta); font: var(--fw-medium
 body.ke .state-edit, body.ke .edit-btn, body.ke .name-edit { background: none; border: 0; padding: 0; font: var(--fw-medium) var(--fs-meta) var(--sans);
   letter-spacing: 0; text-transform: none; color: var(--label); text-decoration: underline; text-decoration-color: var(--hair-2); text-underline-offset: 3px; }
 body.ke .state-edit:hover, body.ke .edit-btn:hover, body.ke .name-edit:hover { color: var(--text); background: none; }
-body.ke .pexpand { color: var(--meta); background: none; border: 1px solid var(--hair); }
+body.ke .pexpand { color: var(--meta); background: none; border: 0; border-radius: var(--r-sm); }
 body.ke .pexpand:hover { color: var(--text); background: none; }
-body.ke .chip-B { color: var(--label); background: none; }
+body.ke .chip, body.ke .chip-B { color: var(--label); background: none; border: 0; padding: 0; }
 body.ke .ext-note.stale { color: var(--label); }
 body.ke .row.ext-accent { border-left-color: var(--hair-2); }
 /* the inbox compose card (KE3): one card on the list itself, recipient chips, an address line in words, one primary send */

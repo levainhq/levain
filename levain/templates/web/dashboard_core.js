@@ -312,7 +312,7 @@
 
     const layout = Array.isArray(view.layout) ? view.layout : [];
     keShell(!!view.ke);
-    if (view.ke) renderKe(view, board);
+    if (view.ke) { renderKe(view, board); if (window.LevainCockpitKinds && window.LevainCockpitKinds.fillGrids) window.LevainCockpitKinds.fillGrids(); }
     let lastZone = null;
     for (const entry of view.ke ? [] : layout) {
       // In the "All" view, drop a zone separator before each zone's first panel.
@@ -370,6 +370,7 @@
   // .clamped max-height is actually applied (a detached board would read zero overflow).
   function measureOverflow(body) {
     const atTop = () => body.scrollTop <= 1;
+    const atEnd = () => body.scrollTop + body.clientHeight >= body.scrollHeight - 1;
     const over = body.scrollHeight > body.clientHeight + 1;
     body.classList.toggle("has-overflow", over);
     // Keyboard access (codex L3): make the scroll region focusable + named so arrow-keys
@@ -379,25 +380,24 @@
       body.setAttribute("role", "region");
       const h = body.parentElement && body.parentElement.querySelector(".phead h2");
       body.setAttribute("aria-label", (h && h.textContent ? h.textContent + " — " : "") + "scrollable");
-      // The "more below" chevron (CSS, gated on .has-overflow.at-top) shows ONLY at the
-      // resting TOP position — a "there's more, scroll" hint — and fades the moment you
-      // scroll; a chevron hanging mid-scroll reads as crap (Phill's visual gate). Wire the
-      // scroll→.at-top toggle once; finalizePanels builds a fresh .pbody each render, so no
-      // listener piles up across renders.
+      // The "more below" cue is a fade mask on the last 24px (CSS, gated on .has-overflow:not(.at-end)),
+      // never a glyph over the text; it goes when the bottom is reached. Wire the scroll toggles once;
+      // finalizePanels builds a fresh .pbody each render, so no listener piles up across renders.
       if (!body.dataset.scrollWired) {
         body.dataset.scrollWired = "1";
-        body.addEventListener("scroll", () => body.classList.toggle("at-top", atTop()), { passive: true });
+        body.addEventListener("scroll", () => { body.classList.toggle("at-top", atTop()); body.classList.toggle("at-end", atEnd()); }, { passive: true });
       }
       body.classList.toggle("at-top", atTop());  // recompute now (content size may have changed)
+      body.classList.toggle("at-end", atEnd());
     } else {
       body.removeAttribute("tabindex");
       body.removeAttribute("role");
       body.removeAttribute("aria-label");
-      body.classList.remove("at-top");
+      body.classList.remove("at-top", "at-end");
     }
   }
 
-  // Per-ITEM overflow scent — the row-level twin of measureOverflow. A clause clamps to 4
+  // Per-ITEM overflow scent — the row-level twin of measureOverflow. A clause clamps to 3
   // lines (CSS); reveal its expand toggle ONLY when the FULL canonical text actually
   // overflows that clamp, so short rows stay clean. Reads layout synchronously (valid for
   // the same reason measureOverflow is — the rows are live in #board / the modal). Skips a
@@ -951,7 +951,7 @@
   // Append a clause + its per-item expand toggle (shared by spore + episode rows). The
   // FULL canonical text goes into the DOM via textContent (the wire no longer truncates),
   // so expand is instant and any edit reads the whole thing — no truncation, no data loss.
-  // CSS clamps the clause to 4 lines; measureClauses reveals the toggle only when it
+  // CSS clamps the clause to 3 lines; measureClauses reveals the toggle only when it
   // overflows; the toggle flips .row-expanded to show all of it inline.
   function appendClause(row, text) {
     // .clampable is what the CSS clamps + measureClauses targets — bare .clause (crystals,
@@ -991,14 +991,11 @@
   // edit, schedule, dismiss); otherwise the first three the kernel offered, in its order. Every verb keeps its own
   // button, handlers and data attributes: the menu only moves the node.
   const VERBS_VISIBLE = 3;
-  // On a phone-width page (the CSS breakpoint, 720px) the meta line (id, tag, date, age) has no room beside even one verb, and a
-  // verb group that does not fit wraps to its own line and grows the row. There every verb sits behind "···" (read when the row is
-  // built; the board rebuilds on every poll, so a rotated phone catches up).
-  const NARROW_QUERY = "(max-width: 720px)";
+  // Where the row is too narrow for the meta line (id, tag, date, age) beside the verbs, a container query on the row
+  // (CSS, decided at render and on every resize) hides the inline verbs and shows a copy of each in the "···" menu.
   function overflowVerbs(group, prefer) {
     const btns = Array.prototype.slice.call(group.querySelectorAll(":scope > .verb-btn"));
-    const narrow = typeof window.matchMedia === "function" && window.matchMedia(NARROW_QUERY).matches;
-    const visible = narrow ? 0 : VERBS_VISIBLE;
+    const visible = VERBS_VISIBLE;
     if (btns.length <= visible) return;
     let keep = [];
     for (const label of prefer || []) {
@@ -1015,8 +1012,15 @@
     const menu = el("span", "verb-menu");
     menu.setAttribute("role", "menu");
     menu.hidden = true;
+    // a copy of each inline verb, shown only where the row's container is narrow (CSS): it presses the real button
+    for (const b of keep) {
+      const d = el("button", "verb-btn verb-dup", b.textContent);
+      d.type = "button"; d.setAttribute("role", "menuitem");
+      d.addEventListener("click", () => b.click());
+      menu.appendChild(d);
+    }
     for (const b of rest) { b.setAttribute("role", "menuitem"); menu.appendChild(b); }
-    const items = () => Array.prototype.slice.call(menu.querySelectorAll(".verb-btn")).filter((b) => !b.disabled);
+    const items = () => Array.prototype.slice.call(menu.querySelectorAll(".verb-btn")).filter((b) => !b.disabled && b.offsetParent !== null);
     const close = (refocus) => {
       menu.hidden = true; menu.classList.remove("up");
       more.setAttribute("aria-expanded", "false");
