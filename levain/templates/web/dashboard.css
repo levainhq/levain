@@ -290,13 +290,13 @@
   /* ONE status line for empty / loading / unavailable (spec §3 "Card states"): a 6px dot + a
      12px sentence in --label. The dot carries the state: neutral = empty, pulsing = loading,
      --warn = unavailable. Errors take their status colour, never the accent orange. */
-  .err, .empty { display: flex; align-items: center; gap: var(--sp-3); margin: 0; padding: var(--sp-4) 0;
+  p.err, p.empty { display: flex; align-items: center; gap: var(--sp-3); margin: 0; padding: var(--sp-4) 0;
     color: var(--label); font: var(--fw-regular) var(--fs-meta)/1.4 var(--sans); }
-  .err::before, .empty::before { content: ""; width: 6px; height: 6px; flex: none; border-radius: var(--r-pill); background: var(--meta); }
-  .err::before { background: var(--warn); }
-  .empty.loading::before { animation: statusPulse 1.2s ease-in-out infinite; }
+  p.err::before, p.empty::before { content: ""; width: 6px; height: 6px; flex: none; border-radius: var(--r-pill); background: var(--meta); }
+  p.err::before { background: var(--warn); }
+  p.empty.loading::before { animation: statusPulse 1.2s ease-in-out infinite; }
   @keyframes statusPulse { 50% { opacity: .3; } }
-  @media (prefers-reduced-motion: reduce) { .empty.loading::before { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { p.empty.loading::before { animation: none; } }
 
   /* external panels (the downstream extra-panel seam): first-class `.row` panels (clamped +
      ⤢ modal like every box). A status note on top; each row gets the actionable accent (e.g.
@@ -1206,7 +1206,7 @@ body.ke .row:has(> .clause.clampable) { container-type: inline-size; }
 body.ke .row .verb-menu .verb-dup { display: none; }
 /* a row too narrow for its meta line beside the verbs (a phone): the inline verbs go, their copies join the "···" menu */
 @container (max-width: 340px) {
-  body.ke .row .verb-actions > .verb-btn:not(.verb-more) { display: none; }
+  body.ke .row .verb-actions:has(> .verb-more) > .verb-btn:not(.verb-more) { display: none; }
   body.ke .row .verb-menu .verb-dup { display: block; }
 }
 body.ke .row .verb-actions { grid-column: 6 / 8; grid-row: 3; justify-self: end; margin: 0; flex-wrap: nowrap; gap: var(--sp-1); position: relative; opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }

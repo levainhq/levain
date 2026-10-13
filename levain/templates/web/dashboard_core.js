@@ -685,6 +685,9 @@
     const show = () => {
       nodes.forEach((n, i) => n.classList.toggle("ck-tab-off", i !== at));
       for (const group of buttons) group.forEach((b, i) => b.setAttribute("aria-selected", i === at ? "true" : "false"));
+      // the cards the grid shows changed: re-measure its last row
+      const K = window.LevainCockpitKinds;
+      if (K && typeof K.fillGrids === "function") K.fillGrids();
     };
     nodes.forEach((node, ni) => {
       // the jump box reaches a panel inside a tab card by showing its tab first
@@ -1013,28 +1016,46 @@
     menu.setAttribute("role", "menu");
     menu.hidden = true;
     // a copy of each inline verb, shown only where the row's container is narrow (CSS): it presses the real button
+    const dups = [];
     for (const b of keep) {
       const d = el("button", "verb-btn verb-dup", b.textContent);
       d.type = "button"; d.setAttribute("role", "menuitem");
       d.addEventListener("click", () => b.click());
+      dups.push([b, d]);
       menu.appendChild(d);
     }
+    // a copy states what its source states now (disabled, title, aria-*), re-read each time the menu opens
+    const mirror = () => {
+      for (const [src, d] of dups) {
+        d.disabled = src.disabled;
+        if (src.title) d.title = src.title; else d.removeAttribute("title");
+        for (const a of Array.from(d.attributes)) if (a.name.indexOf("aria-") === 0) d.removeAttribute(a.name);
+        for (const a of Array.from(src.attributes)) if (a.name.indexOf("aria-") === 0) d.setAttribute(a.name, a.value);
+      }
+    };
     for (const b of rest) { b.setAttribute("role", "menuitem"); menu.appendChild(b); }
     const items = () => Array.prototype.slice.call(menu.querySelectorAll(".verb-btn")).filter((b) => !b.disabled && b.offsetParent !== null);
+    // an outside press closes the menu (a button takes no focus on a mouse press in Safari/Firefox, so a focusout with
+    // no relatedTarget says nothing about where the press went)
+    const outside = (ev) => { if (!group.contains(ev.target)) close(false); };
     const close = (refocus) => {
       menu.hidden = true; menu.classList.remove("up");
       more.setAttribute("aria-expanded", "false");
+      document.removeEventListener("pointerdown", outside, true);
       if (refocus) more.focus();
     };
     const open = () => {
+      mirror();
       menu.hidden = false;
+      document.addEventListener("pointerdown", outside, true);
       more.setAttribute("aria-expanded", "true");
       const host = group.closest(".pbody, .modal-body, .xbody");
       if (host) {
         const room = host.getBoundingClientRect().bottom - more.getBoundingClientRect().bottom;
         menu.classList.toggle("up", room < menu.offsetHeight + 8);
       }
-      const first = items()[0]; if (first) first.focus();
+      const first = items()[0];
+      if (first) first.focus(); else close(false);
     };
     more.addEventListener("click", (ev) => { ev.stopPropagation(); if (menu.hidden) open(); else close(true); });
     menu.addEventListener("click", () => close(false));
@@ -1049,7 +1070,9 @@
       } else if (ev.key === "Tab") close(false);
     });
     group.addEventListener("focusout", (ev) => {
-      if (!menu.hidden && !(ev.relatedTarget && group.contains(ev.relatedTarget))) close(false);
+      // only a keyboard move to a real element outside the group closes here; a null relatedTarget is a mouse press
+      // (the pointerdown listener above decides that one)
+      if (!menu.hidden && ev.relatedTarget && !group.contains(ev.relatedTarget)) close(false);
     });
     group.appendChild(more);
     group.appendChild(menu);

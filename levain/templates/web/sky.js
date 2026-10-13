@@ -127,7 +127,7 @@
     var summary = el('span', { class: 'sky-summary' });
     var toggle = el('button', { type: 'button', class: 'sky-toggle' });
     // a host that owns a control row (the hero's strip) takes the toggle there, so the row is one row
-    if (o.toggleHost) { o.toggleHost.insertBefore(toggle, o.toggleBefore || null); bar.append(summary); } else bar.append(summary, toggle);
+    if (o.toggleHost) { Array.prototype.forEach.call(o.toggleHost.querySelectorAll(':scope > .sky-toggle'), function (t) { t.remove(); }); o.toggleHost.insertBefore(toggle, o.toggleBefore && o.toggleBefore.parentNode === o.toggleHost ? o.toggleBefore : null); bar.append(summary); } else bar.append(summary, toggle);
     var plot = el('div', { class: 'sky-plot' });
     plot.style.position = 'relative';
     var cv = el('canvas', { class: 'sky-canvas', role: 'img' });

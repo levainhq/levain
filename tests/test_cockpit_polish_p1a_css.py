@@ -53,5 +53,5 @@ def test_both_filter_boxes_share_one_look():
 
 
 def test_unavailable_is_not_the_accent_orange():
-    r = re.search(r"(?m)^\s*\.err::before\s*\{([^}]*)\}", CSS).group(1)
+    r = re.search(r"(?m)^\s*p\.err::before\s*\{([^}]*)\}", CSS).group(1)
     assert "var(--warn)" in r and "--hot" not in r
