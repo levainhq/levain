@@ -370,7 +370,9 @@ def test_a_gnupghome_holding_dirmngr_is_a_view_pinned_from_above(tmp_path, gh) -
     assert _bound_back(argv, gh) == {str(gh / n) for n in ("S.gpg-agent", "S.keyboxd", "trustdb.gpg", "common.conf")}
     # Writable: with the trustdb read-only, `gpg --list-keys` died on its trustdb check (RUN 2026-10-12).
     assert ["--bind", str(gh / "trustdb.gpg"), str(gh / "trustdb.gpg")] in [argv[k:k + 3] for k in range(len(argv))]
-    assert ["--symlink", "/nonexistent/gpg.conf", str(gh / "gpg.conf")] in [argv[k:k + 3] for k in range(len(argv))]
+    # A configuration file comes back read-only, and a link to none stays out (Diogenes HIGH 2026-10-13).
+    assert ["--ro-bind", str(gh / "common.conf"), str(gh / "common.conf")] in [argv[k:k + 3] for k in range(len(argv))]
+    assert not [a for _, op, a in ops if a and a[-1] == str(gh / "gpg.conf")]
     assert not [a for _, op, a in ops if a[:1] == ["/dev/null"] and _under(a[1], gh)]   # the view replaces the mask
 
 
@@ -565,7 +567,8 @@ def test_linux_live_a_gnupghome_view_hides_dirmngr_and_keeps_the_agent(tmp_path,
             mp.delenv("SSH_AUTH_SOCK")
             with BwrapProvider().spawn_shell(build_policy(_entity(tmp_path), deny_localhost_outbound=True)) as sh:
                 listed = sh.run(f"ls -A {gh}").output.split()
-                assert sorted(listed) == ["S.gpg-agent", "S.keyboxd", "common.conf", "gpg.conf", "trustdb.gpg"]
+                assert sorted(listed) == ["S.gpg-agent", "S.keyboxd", "common.conf", "trustdb.gpg"]
+                assert sh.run(f"echo pinentry-program /bin/true >> {gh}/common.conf").exit_code != 0
                 assert sh.run(connect + f"{gh}/S.dirmngr").exit_code != 0
                 assert sh.run(f"mv {gh} {gh}.moved").exit_code != 0
                 assert sh.run(f"mv {gh.parent} {gh.parent}.moved").exit_code != 0
@@ -577,6 +580,7 @@ def test_linux_live_a_gnupghome_view_hides_dirmngr_and_keeps_the_agent(tmp_path,
             srv.close()
     assert (gh / "S.dirmngr").exists() and not Path(f"{gh}.moved").exists()
     assert (gh / "trustdb.gpg").read_bytes() == b"trustx\n"
+    assert (gh / "common.conf").read_text() == "use-keyboxd\n"   # the host file, unchanged
 
 
 def test_a_gnupghome_view_keeps_gnupgs_configuration_files_read_only(tmp_path, gh, monkeypatch) -> None:
@@ -593,6 +597,29 @@ def test_a_gnupghome_view_keeps_gnupgs_configuration_files_read_only(tmp_path, g
         last = [(i, op) for i, op, a in ops if a and a[-1] == str(gh / name)]
         assert last and last[-1][0] > view and last[-1][1] == "--ro-bind", (name, last)
     # trustdb stays writable (RUN 2026-10-12: read-only, `gpg --list-keys` died on its trustdb check)
+    assert ["--bind", str(gh / "trustdb.gpg"), str(gh / "trustdb.gpg")] in [argv[k:k + 3] for k in range(len(argv))]
+
+
+def test_a_gnupghome_view_levain_does_not_name_keeps_its_configuration_files_read_only(tmp_path, gh, monkeypatch) -> None:
+    """The view exists for a home levain's environment does NOT name (a cron or pre-linger gpg), so no
+    0.9.1 bind covers it: the view itself must bring the configuration files back read-only, a link as
+    its target's content. REPRODUCED by Diogenes 2026-10-13 on 977d5bd: the test above minus its
+    GNUPGHOME setenv failed ``('gpg-agent.conf', [(True, '--bind')])`` (shipped in 0.10.0 and 0.10.1)."""
+    monkeypatch.delenv("GNUPGHOME", raising=False)
+    (gh / "gpg.conf").unlink()
+    (gh / "gpg-agent.conf").write_text("")
+    target = gh.parent / "dirmngr.conf.real"
+    target.write_text("")
+    os.symlink(target, gh / "dirmngr.conf")   # a dotfile-manager link: writing through it reached the host
+    os.symlink(gh.parent / "absent.conf", gh / "scdaemon.conf")   # leads nowhere: stays out
+    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+    ops = _ops(argv)
+    view = max(i for i, op, a in ops if op == "--tmpfs" and a == [str(gh)])
+    for name in ("gpg-agent.conf", "common.conf", "dirmngr.conf"):
+        last = [(i, op) for i, op, a in ops if a and a[-1] == str(gh / name)]
+        assert last and last[-1][0] > view and last[-1][1] == "--ro-bind", (name, last)
+    assert ["--ro-bind", str(target.resolve()), str(gh / "dirmngr.conf")] in [argv[k:k + 3] for k in range(len(argv))]
+    assert not [a for _, op, a in ops if a and a[-1] == str(gh / "scdaemon.conf")]
     assert ["--bind", str(gh / "trustdb.gpg"), str(gh / "trustdb.gpg")] in [argv[k:k + 3] for k in range(len(argv))]
 
 

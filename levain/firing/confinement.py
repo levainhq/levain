@@ -319,7 +319,8 @@ _MAX_OUTPUT_CHARS = 8 * 1024 * 1024   # per-command returned output cap (then tr
 # module's thesis is no claim>enforcement gap. SURGICAL (literal, not ancestor-expanded — see build_policy).
 _SSH_WRITE_DENIED = ("authorized_keys", "authorized_keys2", "config", "rc")
 
-# The gnupg configuration files WRITE-denied in every host GNUPGHOME the floor knows: the gpg
+# The gnupg configuration files WRITE-denied in every host GNUPGHOME the floor knows (``_gnupg_homes``,
+# and on Linux each GNUPGHOME view of ``_runtime_view``, which binds them back read-only): the gpg
 # analogue of the ssh ``config`` vector above. The operator's gpg-agent, scdaemon and dirmngr run
 # OUTSIDE the floor, read these files, and start programs they name (``pinentry-program``,
 # ``scdaemon-program``), so bash writing one would choose a program the host runs unconfined.
@@ -5119,7 +5120,8 @@ def _runtime_view(policy: CrownJewelsPolicy,
     would hide them. Each dir's ancestors go back as ``pins``.
 
     Each GNUPGHOME of :func:`_gnupg_home_views` is a view too, whose ancestors go back as ``pins``. Its
-    sockets in :data:`_GNUPG_HOME_SOCKETS` and its files come back, the files writable: with the trustdb
+    sockets in :data:`_GNUPG_HOME_SOCKETS` and its files come back, gnupg's configuration files
+    (:data:`_GNUPG_CONF_WRITE_DENIED`) read-only and the other files writable: with the trustdb
     read-only, ``gpg --list-keys`` died "failed to append a record" on its trustdb check (RUN on
     argushub 2026-10-12). Its directories do not come back (``private-keys-v1.d`` is the agent's,
     ``public-keys.d`` keyboxd's); links come back as the same links. The costs: gpg inside bash cannot
@@ -5201,7 +5203,20 @@ def _runtime_view(policy: CrownJewelsPolicy,
                 f"could not list the gnupg home {g}, which holds a dirmngr socket ({exc}). Refusing to grant "
                 "bash hands (fail-closed).") from None
         for child, st in children:
-            if stat.S_ISLNK(st.st_mode):
+            if child.name in _GNUPG_CONF_WRITE_DENIED:
+                # READ-ONLY, a link included: the host agent reads this file and starts the programs
+                # it names, so a writable one here rebuilt the 0.9.0 pinentry escape for the one home
+                # the view exists for, a home levain's environment does not name (Diogenes HIGH
+                # 2026-10-13). A link comes back as its target's content, read-only, never as the
+                # link (bash would write through it); one that leads to no regular file stays out.
+                try:
+                    real = child.resolve(strict=True)
+                    is_reg = stat.S_ISREG(os.stat(real).st_mode)
+                except (OSError, RuntimeError):
+                    continue
+                if is_reg:
+                    ops += ["--ro-bind", str(real), str(child)]
+            elif stat.S_ISLNK(st.st_mode):
                 ops += ["--symlink", os.readlink(child), str(child)]
             elif child.name.startswith("S.") and child.name not in _GNUPG_HOME_SOCKETS:
                 continue   # dirmngr's, the agent's forwarding sockets, or one of those names as a file
