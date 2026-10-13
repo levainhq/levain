@@ -106,10 +106,8 @@ cases.cx2_each_card_action_names_its_own_panel = async () => {
 
 cases.cx2_a_send_posts_to_the_panel_whose_card_it_is = async () => {
   const env = await makeEnv().start();
-  const r0 = await env.opts().commitAction("send_inbox", { message: "x" }, true, "k1", "inbox-compose");
-  ok(r0 && r0.preview === true, "a T2 send previews first");
   const r = await env.opts().commitAction("send_inbox", { message: "x" }, true, "k1", "inbox-compose");
-  ok(r && r.ok === true, "the second click fires: " + JSON.stringify(r));
+  ok(r && r.ok === true, "one click fires: " + JSON.stringify(r));
   ok(env.posts.length > 0 && env.posts.every((p) => p.body.panel_id === "inbox-compose"), "every post names inbox-compose: " + JSON.stringify(env.posts.map((p) => p.body.panel_id)));
   const env2 = await makeEnv().start();
   await env2.opts().commitAction("send_inbox", { message: "x" }, true, "k1", "inbox");

@@ -258,12 +258,13 @@
 
   // ---- MANIFEST WRITES (R1): every affordance on the manifest source posts /cockpit/verb ----
   //
-  // The page decides no tier. A gesture that may escalate asks the kernel first (a dry run), shows the
-  // tier it would take, and fires only on the operator's second click, with exactly the request it showed.
+  // The page decides no tier. A gesture that may escalate asks the kernel first (a dry run) and fires on
+  // the same click, naming the tier and gesture that dry run answered (`tier_seen`, `gesture_seen`): the
+  // kernel refuses the fire if either moved in between. The authority is the token or the signature, never
+  // a click, so there is no second click: the tier and "reported" are in the audit record, not in a prompt.
   // `live` is the write surface of the view last RENDERED: a write names the row version the operator saw,
   // so a re-read never moves it under an open form (the kernel's `stale` answer is the backstop).
   let live = null;
-  let frozen = null;        // the previewed request: {fp0, tier, gesture, intent}
   let notice = null;        // what the last write said, drawn on its row once the board is rebuilt
 
   const KEYS_STORE = "levain_cockpit_keys";
@@ -327,29 +328,19 @@
     const code = d.error || "HTTP " + r.status;
     const text = d.message || code;
     if (REREAD.has(code) || r.status === 501) {
-      frozen = null;
       notice = { key: what.row_id || null, text: what.label + ": " + text + " (re-read)", cls: "err" };
       paintNow(notice);
       load({ passive: true });   // a re-read that never discards an open form: it defers while one is dirty
-      return { ok: false, error: code, message: text + " Re-read the page; review and click again." };
+      return { ok: false, error: code, message: text + " Re-read the page and try again." };
     }
     return { ok: false, error: code, message: text };
-  }
-
-  function previewText(head, action, tier, gesture, base) {
-    const how = gesture === "sign" ? "waits for a signature" : "fires now, recorded as reported (claims cockpit token)";
-    const from = action.tier && action.tier !== tier ? " (rises from " + action.tier + ")" : "";
-    const cut = (v) => { const t = typeof v === "string" ? v : String(JSON.stringify(v)); return JSON.stringify(t.length > 60 ? t.slice(0, 57) + "..." : t); };
-    const vals = Object.keys(base.params).map((k) => k + " = " + cut(base.params[k])).join(", ") || "no values";
-    return (head.label || base.verb) + " is " + tier + from + ": " + how + ". " + (head.effect ? head.effect + ". " : "")
-      + "Sending " + vals + ". Click again to fire.";
   }
 
   async function postVerb(action, params, opts) {
     opts = opts || {};
     const head = (live && live.heads && live.heads[action.verb]) || {};
     const label = head.label || action.verb;
-    // an undefined value is no value: it is not sent, not fingerprinted and not previewed
+    // an undefined value is no value: it is not sent and not fingerprinted
     const given = {};
     for (const k of Object.keys(params || {})) if (params[k] !== undefined) given[k] = params[k];
     params = given;
@@ -363,33 +354,23 @@
     if (typeof pv === "string") base.panel_version = pv;
     if (head.confirm === true && opts.confirm === true) base.confirm = true;
     const what = { row_id: base.row_id, label: label };
-    const fp0 = canon(base);
 
     let tier = "C1", gesture = action.gesture, intent = null;
-    if (frozen && frozen.fp0 === fp0) {
-      tier = frozen.tier; gesture = frozen.gesture; intent = frozen.intent;
-    } else {
-      frozen = null;
-      const mayEscalate = !(action.gesture === "direct" && (!Array.isArray(action.escalates) || action.escalates.length === 0));
-      if (mayEscalate) {
-        const d = await send("/cockpit/verb", Object.assign({}, base, { dry_run: true }));
-        if (d.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };
-        if (!d.ok) return fault(d, what);
-        tier = d.data.tier; gesture = d.data.gesture;
-        if (gesture === "refused" || gesture === "laptop-only") {
-          return { ok: false, error: "gesture", message: label + " is " + tier + " with these values, and its gesture is " + gesture + ": it cannot be done from this page." };
-        }
-        if (tier !== "C1") {
-          intent = gesture === "sign" ? "sign" : "reported";
-          frozen = { fp0: fp0, tier: tier, gesture: gesture, intent: intent };
-          return { ok: false, preview: true, error: "preview", message: previewText(head, action, tier, gesture, base) };
-        }
+    const mayEscalate = !(action.gesture === "direct" && (!Array.isArray(action.escalates) || action.escalates.length === 0));
+    if (mayEscalate) {
+      const d = await send("/cockpit/verb", Object.assign({}, base, { dry_run: true }));
+      if (d.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };
+      if (!d.ok) return fault(d, what);
+      tier = d.data.tier; gesture = d.data.gesture;
+      if (gesture === "refused" || gesture === "laptop-only") {
+        return { ok: false, error: "gesture", message: label + " is " + tier + " with these values, and its gesture is " + gesture + ": it cannot be done from this page." };
       }
+      if (tier !== "C1") intent = gesture === "sign" ? "sign" : "reported";
     }
 
     let env = Object.assign({}, base);
     if (intent) { env.intent = intent; env.tier_seen = tier; env.gesture_seen = gesture; }
-    // A T2+ fire (or an idempotent verb's) carries one key, minted for this frozen request and kept with
+    // A T2+ fire (or an idempotent verb's) carries one key, minted for this request and kept with
     // the whole request until the kernel answers, so a lost answer is replayed, never re-decided.
     let fpKey = null;
     if (tier !== "C1" || head.idempotent === true) {
@@ -400,8 +381,7 @@
       else { env.idempotency_key = newKey(); keys[fpKey] = { envelope: env }; writeKeys(keys); }
     }
     const r = await send("/cockpit/verb", env);
-    if (r.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };   // key and preview stay
-    frozen = null;
+    if (r.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };   // the key stays, so a retry replays it
     if (fpKey) { const keys = readKeys(); delete keys[fpKey]; writeKeys(keys); }
     if (!r.ok) return fault(r, what);
     const d = r.data;
@@ -516,18 +496,6 @@
     }
   }
 
-  // Any edit to a form discards the preview: the operator fires only what they were shown.
-  function discardPreview(ev) {
-    if (!frozen) return;
-    frozen = null;
-    const t = ev && ev.target && ev.target.closest ? ev.target.closest(".verb-form, .tray-dump, .edit-controls, .editor, .state-editor") : null;
-    const m = t ? t.querySelector(".edit-msg.preview") : null;
-    if (m) { m.className = "edit-msg"; m.textContent = ""; }
-  }
-  if (useManifest) {
-    document.addEventListener("input", discardPreview, true);
-    document.addEventListener("change", discardPreview, true);
-  }
 
   let heldNext = null;
   async function loadManifestView(passive) {
@@ -605,7 +573,6 @@
         const mview = await loadManifestView(passive);
         if (passive && editInProgress()) { notice = null; status("editing — refresh deferred"); return false; }
         writeTokenRequired = mview.write_token_required === true;
-        frozen = null;   // a rebuilt board shows no preview, so none may be fired
         window.LevainDashboard.render(mview, mview.writable
           ? { commit: manifestCommit, commitAction: manifestAction, cancelPending, onJobsIdle, recall } : { recall });
         live = { rows: mview.targets.rows, panels: mview.targets.panels, heads: mview.verb_heads };

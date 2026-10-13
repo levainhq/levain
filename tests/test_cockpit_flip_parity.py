@@ -64,14 +64,12 @@ def test_the_default_page_edits_the_state_section_through_the_broker(tmp_path: P
             {"eval": f"{STATE_PANEL}.querySelector('.edit-btn').click(); 1"},
             {"until": f"(() => {{ const ta = {STATE_PANEL}.querySelector('.edit-ta'); if (!ta) return null; ta.value = {json.dumps(new)};"
                       " ta.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()"},
-            {"eval": f"{STATE_PANEL}.querySelector('.edit-save').click(); 1"},
-            {"until": f"/preview/.test({STATE_PANEL}.querySelector('.edit-msg').className) && {STATE_PANEL}.querySelector('.edit-msg').className"},
+            # one click: the dry run asks the tier and the fire follows it
             {"eval": f"{STATE_PANEL}.querySelector('.edit-save').click(); 1"},
             {"posts": 2},
         ])
         state = _eventually(lambda: _state(db), new)
     assert out["values"][0] == ["A", True], out
-    assert "preview" in out["values"][4], out          # the first click shows what fires and fires nothing
     assert state == new
     posts = _verb_posts(out)
     assert [p.get("dry_run") is True for p in posts] == [True, False], posts
@@ -117,17 +115,12 @@ def test_the_default_page_submits_a_downstream_send_through_the_broker(tmp_path:
         out = _drive(tmp_path, f"{url}/#write_token=T", [
             {"until": "(() => { const m = document.querySelector('[aria-label=body]'); if (!m) return null;"
                       " m.value = 'hello from the page'; m.dispatchEvent(new Event('input', {bubbles: true})); return 1; })()"},
-            # send, then the fat-finger confirm: the dry run answers with the preview and fires nothing
-            {"eval": f"{box}.querySelector('.tray-dump-btn').click(); 1"},
-            {"until": f"{box}.querySelector('.verb-confirm') && ({box}.querySelector('.verb-confirm').click(), 1)"},
-            {"until": f"/preview/.test({box}.querySelector('.edit-msg').className) && {box}.querySelector('.edit-msg').className"},
-            # the same content again: the preview's tier is what fires
+            # send, then the fat-finger confirm: the dry run asks the tier and the fire follows it
             {"eval": f"{box}.querySelector('.tray-dump-btn').click(); 1"},
             {"until": f"{box}.querySelector('.verb-confirm') && ({box}.querySelector('.verb-confirm').click(), 1)"},
             {"posts": 2},
         ])
         bodies = _eventually(lambda: [n.get("body") for n in inbox.notes.values()], ["hello from the page"])
-    assert "preview" in out["values"][3], out
     posts = _verb_posts(out)
     assert [p.get("dry_run") is True for p in posts] == [True, False], (posts, out["values"])
     assert posts[1]["verb"] == "send_inbox" and posts[1]["params"].get("body") == "hello from the page"

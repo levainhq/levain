@@ -6,6 +6,14 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+
+- **A cockpit write fires on one click.** A write that may rise above its rendered tier still asks the server first (`dry_run`) and fires in the same click, naming the tier and gesture that dry run answered (`tier_seen`, `gesture_seen`); the server still refuses `409 tier_moved` / `gesture_moved` when either has changed. The second "Click again to fire" click is gone: a click is never the authority (the surface token in a reported install is, or the signature), and the tier and `claims cockpit token` stay in the audit record.
+
+### Fixed
+
+- **The cockpit header keeps its weather in Build mode.** Build mode dropped every `reading` panel, the hero's weather included; anything placed in the hero now shows in every mode.
+
 ## [0.10.0] — 2026-10-12
 
 ### Added

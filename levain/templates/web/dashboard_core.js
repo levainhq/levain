@@ -1814,9 +1814,9 @@
     return wrap;
   }
 
-  // A failed (or previewed) answer in a message span. A preview is not an error: it asks for a second click.
+  // A failed answer in a message span.
   function showFail(msg, res, fallback) {
-    msg.className = "edit-msg " + (res && res.preview ? "preview" : "err");
+    msg.className = "edit-msg err";
     msg.textContent = (res && (res.message || res.error)) || fallback;
   }
 

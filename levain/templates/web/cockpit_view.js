@@ -320,7 +320,7 @@
   }
 
   // Which of the three modes show a panel. Morning is the intake read (what is waiting, the state, the
-  // sky); Build drops the readings that are only for orientation; Board is everything. The hero sky is in all.
+  // sky); Build drops the readings that are only for orientation; Board is everything. An ambient panel, and anything placed in the hero, is in all.
   const MORNING_KINDS = new Set(["brief", "reading", "count-queue", "ambient", "status-dots", "section"]);
   const BUILD_DROPS = new Set(["brief", "reading", "section"]);
   function modesOf(e) {
@@ -700,7 +700,9 @@
           span: c.span === 2 || c.span === 3 ? c.span : 1, tabs: typeof c.tabs === "string" && c.tabs ? c.tabs : "" })) });
       }
     }
-    for (const e of view.layout) e.modes = modesOf(e);
+    // the hero is the page's header and reads the same in every mode: its weather is not one of the orientation
+    // readings Build drops
+    for (const e of view.layout) e.modes = e.zone === "hero" ? "morning board build" : modesOf(e);
     // the verbs the kernel offered somewhere with a gesture a browser can perform: an affordance whose
     // verb is not here has nothing to post to
     view.offered_verbs = Object.create(null);
