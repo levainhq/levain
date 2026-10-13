@@ -644,37 +644,6 @@ def _runtime_dirs() -> list[str]:
     return out
 
 
-def _runtime_socket_refusal(rel: str) -> str | None:
-    """Why ``rel`` (a path relative to a user runtime dir) may not come back into bash's view of that
-    dir, or None. The service manager (``systemd/``) and the session bus (``bus``) run what they are
-    asked outside the sandbox, the whole-floor bypass measured 2026-09-30, and dirmngr fetches over
-    the network for whoever connects (the 2026-10-10 rename attack)."""
-    if "\0" in rel:
-        return "holds a NUL byte"
-    parts = Path(rel).parts
-    if not parts or Path(rel).is_absolute() or ".." in parts:
-        return "is not a path inside the runtime dir"
-    if parts[0] == "systemd":
-        return "is the user's service manager, which runs any command outside the sandbox"
-    if parts[0] == "bus":
-        return "is the session bus, which reaches the service manager"
-    if "S.dirmngr" in parts:
-        return "is gnupg's dirmngr, which fetches from the network for whoever connects"
-    return None
-
-
-def check_runtime_sockets(entries, *, where: str) -> tuple[str, ...]:
-    """The ``runtime_sockets`` allowlist as given, or :class:`ConfinementError` naming the first entry
-    the runtime-dir view never binds back (:func:`_runtime_socket_refusal`)."""
-    out: list[str] = []
-    for rel in entries:
-        why = _runtime_socket_refusal(rel) if isinstance(rel, str) else "is not a string"
-        if why is not None:
-            raise ConfinementError(f"{where}: {rel!r} {why}. Remove it — fail-closed.")
-        out.append(rel)
-    return tuple(dict.fromkeys(out))
-
-
 def _expand_socket_source(spec: str) -> list[Path]:
     """One roster entry as the paths it names; empty when it names a runtime dir this host does not
     have — a path still containing ``$`` would deny a file nobody can create, and read as cover."""
@@ -696,6 +665,248 @@ class FloorRefreshError(ConfinementError):
     """The floor's evolving denies could not be re-derived (a trust file naming a store that cannot be
     hidden, an unreadable trust path). Distinct from a shell that failed to start, so a caller can
     record it as a refusal of the whole floor without replaying the derivation (codex L3 r5)."""
+
+
+# --- operator-declared unix-socket grants ------------------------------------------------------
+#
+# A grant is the operator's declared trust in one socket, written where no confined process can reach:
+# ``<levain home>/confinement/grants.json`` (``$LEVAIN_HOME``, else ``~/.levain``). :func:`build_policy`
+# hides that directory from every confined process, read and write, beside the autonomic store and the
+# cockpit keys, so with the entity's ``confinement.json`` it is one of the floor's authority files:
+# hidden, its ancestors write-denied, and refused at spawn when it has another name on disk. Nothing is
+# detected: no socket is granted because it is running, named in the environment or listed by the
+# entity. ``levain run`` and ``levain doctor`` print every grant as a named waiver
+# (:func:`unix_socket_lines`). Schema::
+#
+#     {"grants": [{"path": "/run/user/1000/gnupg/S.gpg-agent.extra",
+#                  "name": "gpg signing", "why": "signed commits in the entity's repos"}]}
+#
+# A path is exact: absolute (``~/`` is expanded), normalised, no glob character. gnupg's agent is
+# granted only through its restricted EXTRA socket, which bash's gpg then finds where it looks for the
+# agent; its standard, ssh and browser sockets are refused, and so is dirmngr (a network deputy for bash
+# without network).
+GRANTS_DIR = "confinement"
+GRANTS_FILE = "grants.json"
+GPG_EXTRA_SOCKET = "S.gpg-agent.extra"
+_GRANT_REFUSED_NAMES = {
+    "S.gpg-agent": "is gpg-agent's standard socket; grant its restricted extra socket (S.gpg-agent.extra)",
+    "S.gpg-agent.ssh": "is gpg-agent's ssh socket, which hands bash every ssh key the agent holds",
+    "S.gpg-agent.browser": "is gpg-agent's browser socket; grant its restricted extra socket (S.gpg-agent.extra)",
+    "S.dirmngr": "is gnupg's dirmngr, which fetches from the network for whoever connects",
+}
+
+
+@dataclass(frozen=True)
+class SocketGrant:
+    """One operator-declared socket: its exact ``path``, and the ``name`` and ``why`` the operator wrote."""
+
+    path: str
+    name: str
+    why: str
+
+    @property
+    def gpg_extra(self) -> bool:
+        return Path(self.path).name == GPG_EXTRA_SOCKET
+
+
+def grants_file() -> Path:
+    """``<levain home>/confinement/grants.json``, absolute (:func:`build_policy` hides its directory)."""
+    home = Path(os.environ.get("LEVAIN_HOME") or Path.home() / ".levain").expanduser()
+    return (home / GRANTS_DIR).resolve() / GRANTS_FILE
+
+
+def load_operator_grants(path: Path | None = None) -> tuple[SocketGrant, ...]:
+    """The operator's grants, or :class:`ConfinementError` naming what is wrong (fail-closed: a grant file
+    levain cannot read is never read as "no grants"). Absent: none. Opened without following a link, and
+    it must be a regular file this user owns that no one else can write."""
+    f = path if path is not None else grants_file()
+    try:
+        fd = os.open(f, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        return ()
+    except OSError as exc:
+        raise ConfinementError(f"the grant file {f} cannot be opened ({exc.strerror or exc}): a link is "
+                               "refused (fail-closed).") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
+            raise ConfinementError(f"the grant file {f} must be a regular file you own that no one else can "
+                                   "write (fail-closed).")
+        with os.fdopen(os.dup(fd), "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    finally:
+        os.close(fd)
+    if not raw.strip():
+        return ()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfinementError(f"the grant file {f} is not valid JSON ({exc}) — fail-closed.") from None
+    entries = data.get("grants") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        raise ConfinementError(f'the grant file {f} must be {{"grants": [...]}} — fail-closed.')
+    out: list[SocketGrant] = []
+    for i, e in enumerate(entries):
+        where = f"{f}: grant {i + 1}"
+        if not isinstance(e, dict) or not all(isinstance(e.get(k), str) and e[k].strip()
+                                              for k in ("path", "name", "why")):
+            raise ConfinementError(f"{where} needs a non-empty path, name and why — fail-closed.")
+        p = os.path.expanduser(e["path"]) if e["path"].startswith("~/") else e["path"]
+        if not os.path.isabs(p) or os.path.normpath(p) != p or "\0" in p:
+            raise ConfinementError(f"{where} ({e['path']!r}) is not an exact absolute path — fail-closed.")
+        if any(c in p for c in "*?["):
+            raise ConfinementError(f"{where} ({e['path']!r}) is a pattern; a grant names one socket — fail-closed.")
+        why = _GRANT_REFUSED_NAMES.get(Path(p).name)
+        if why is not None:
+            raise ConfinementError(f"{where} ({p}) {why} — fail-closed.")
+        if any(g.path == p for g in out):
+            raise ConfinementError(f"{where} ({p}) is granted twice — fail-closed.")
+        out.append(SocketGrant(path=p, name=e["name"].strip(), why=e["why"].strip()))
+    if sum(g.gpg_extra for g in out) > 1:
+        raise ConfinementError(f"{f} grants more than one gpg extra socket; bash's gpg finds one agent — fail-closed.")
+    return tuple(out)
+
+
+def resolve_grant(grant: SocketGrant, view_roots: list[Path]) -> None:
+    """Check ``grant`` at entry, or :class:`ConfinementError` naming it: the path is reached without a
+    link anywhere in it, it is a socket now, the operator owns it, and nothing a confined process can
+    write is on its parent chain. Every ancestor is root's or the operator's and writable by no one
+    else; the socket's own directory is one this user cannot write, or one inside a user runtime dir
+    (``view_roots``), which confined bash sees only as levain's view (a fresh tmpfs), never the host's."""
+    p = grant.path
+    def refuse(why: str) -> NoReturn:
+        raise ConfinementError(f"the operator grant {grant.name!r} ({p}) {why}. Refusing to grant bash hands "
+                               "(fail-closed); fix or remove it in " + str(grants_file()) + ".")
+    if os.path.realpath(p) != p:
+        refuse(f"is reached through a link (it resolves to {os.path.realpath(p)}); name the real path")
+    try:
+        if hasattr(os, "O_PATH"):   # Linux: the object itself, never through a final link
+            fd = os.open(p, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                st = os.fstat(fd)
+            finally:
+                os.close(fd)
+        else:   # macOS cannot open a socket; lstat reads it without following a final link
+            st = os.lstat(p)
+    except OSError as exc:
+        refuse(f"cannot be opened ({exc.strerror or exc})")
+    if not stat.S_ISSOCK(st.st_mode):
+        refuse("is not a socket")
+    if st.st_uid != os.geteuid():
+        refuse(f"is owned by uid {st.st_uid}, not you")
+    for a in Path(p).parents:
+        try:
+            ast = os.stat(a)
+        except OSError as exc:
+            refuse(f"has a parent {a} that cannot be read ({exc.strerror or exc})")
+        if ast.st_uid not in (0, os.geteuid()) or (ast.st_mode & 0o022 and not (ast.st_uid == 0 and ast.st_mode & stat.S_ISVTX)):
+            refuse(f"has a parent {a} that another user can write")
+    parent = Path(p).parent
+    if os.access(parent, os.W_OK) and not any(parent == r or parent.is_relative_to(r) for r in view_roots):
+        refuse(f"is in {parent}, which confined bash can write (a socket there could be replaced); keep "
+               "granted sockets in the user runtime dir or a directory you cannot write")
+
+
+def gpg_agent_view_path(env: dict[str, str]) -> Path | None:
+    """Where bash's gpg looks for its agent, for the GNUPGHOME of the shell ``env`` (the default home when
+    it names none): ``gpgconf --list-dirs agent-socket``, run with that home and nothing from a login
+    shell. The hashed socket directory of a non-default home is gpgconf's to compute (gpgconf creates
+    that directory under the runtime dir, as any gpg command run there does; RUN on argushub 2026-10-12,
+    gnupg 2.4.4). Asked only when a gpg extra socket is granted. None when gpgconf is missing or fails."""
+    from levain.launch import child_env
+
+    exe = shutil.which("gpgconf")
+    if exe is None:
+        return None
+    genv = child_env()
+    genv.pop("GNUPGHOME", None)
+    genv["HOME"] = env.get("HOME", str(Path.home()))
+    if env.get("GNUPGHOME"):
+        genv["GNUPGHOME"] = env["GNUPGHOME"]
+    try:
+        done = subprocess.run([exe, "--list-dirs", "agent-socket"], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, cwd="/", env=genv, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = urllib.parse.unquote(done.stdout.strip())   # gpgconf percent-escapes its values
+    return Path(value) if done.returncode == 0 and value.startswith("/") else None
+
+
+def _grant_ops(grants: tuple[SocketGrant, ...], view_roots: list[Path],
+               gpg_view: Path | None) -> tuple[list[str], list[str]]:
+    """``(bwrap ops, view paths)`` for the operator's grants, each checked by :func:`resolve_grant`. A
+    socket is bound at its own path, the gpg extra socket at ``gpg_view``; one inside a runtime dir's
+    view gets its parent directories there, 0700 (gnupg refuses a socket directory others can read)."""
+    ops: list[str] = []
+    views: list[str] = []
+    for g in grants:
+        resolve_grant(g, view_roots)
+        dest = Path(g.path)
+        if g.gpg_extra:
+            if gpg_view is None or not any(gpg_view.is_relative_to(r) for r in view_roots):
+                raise ConfinementError(
+                    f"the operator grant {g.name!r} ({g.path}) is gpg's extra socket, but bash's gpg looks "
+                    f"for its agent at {gpg_view or 'no path gpgconf could name'}, outside a user runtime "
+                    "dir, where levain does not bind it. Refusing to grant bash hands (fail-closed).")
+            dest = gpg_view
+        for d in sorted({str(a) for a in dest.parents
+                         if any(a != r and a.is_relative_to(r) for r in view_roots)}, key=len):
+            ops += ["--perms", "0700", "--dir", d]
+        # A read-write bind: a read-only mount must never be what refuses the connect.
+        ops += ["--bind", g.path, str(dest)]
+        views.append(str(dest))
+    return ops, views
+
+
+def _default_grant_ops() -> list[str]:
+    """The default grant's bind (``/dev/log``, write-only syslog): ``--dev /dev`` makes a fresh /dev with
+    no ``/dev/log``, so the socket it resolves to on the host is bound there. Absent, or not a socket:
+    nothing, and the stub then skips the grant."""
+    out: list[str] = []
+    for g in _landlock.DEFAULT_GRANTS:
+        real = os.path.realpath(g)
+        try:
+            if stat.S_ISSOCK(os.stat(real).st_mode):
+                out += ["--bind", real, g]
+        except OSError:
+            continue
+    return out
+
+
+DEFAULT_GRANT_LINES = {
+    "Linux": ("/dev/log (write-only syslog)",),
+    "Darwin": ("/private/var/run/mDNSResponder (name resolution)",),
+}
+SSH_AGENT_LINES = {
+    "Linux": ("ssh agent: none until levain's scoped agent (B2); $SSH_AUTH_SOCK is not passed to bash, so "
+              "git over ssh inside bash fails until then"),
+    "Darwin": ("ssh agent: $SSH_AUTH_SOCK is passed to bash; macOS has no unix-socket rule until levain's "
+               "macOS tier (B2), so bash running as you can reach your agent"),
+}
+GPG_EXTRA_WAIVER = "gpg's extra socket closes the agent's command channel, not its program-exec shape"
+
+
+def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | None = None) -> list[str]:
+    """The unix-socket lines ``levain run`` and ``levain doctor`` print, from one place (one table): the
+    tier claim (:func:`levain.firing.landlock.tier_line` of levain's own read), every operator grant as a
+    named waiver, every default grant, the ssh agent, and the entity's legacy ``runtime_sockets`` key as
+    ignored. A grant file that cannot be read raises :class:`ConfinementError`, as the spawn does."""
+    system = system or platform.system()
+    abi, reason = _landlock.host_read(system)
+    if system != "Linux" and reason is None:
+        reason = f"{system} has no Landlock"
+    lines = [_landlock.tier_line(abi, reason)]
+    for g in load_operator_grants():
+        extra = f"; {GPG_EXTRA_WAIVER}" if g.gpg_extra else ""
+        lines.append(f"waiver (operator grant) {g.name}: {g.path} ({g.why}){extra}")
+    for d in DEFAULT_GRANT_LINES.get(system, ()):
+        lines.append(f"default grant: {d}")
+    if system in SSH_AGENT_LINES:
+        lines.append(SSH_AGENT_LINES[system])
+    if cfg is not None and cfg.runtime_sockets:
+        lines.append(f"ignored: runtime_sockets in .levain/confinement.json ({', '.join(cfg.runtime_sockets)}) "
+                     f"grants nothing; the operator declares sockets in {grants_file()}")
+    return lines
 
 
 # --- the OS-agnostic policy (the canonical object) -------------------------------------------
@@ -895,9 +1106,6 @@ class CrownJewelsPolicy:
     # the entity dir and $HOME, resolved ONCE here. A symlink above one of them is the operator's,
     # not the entity's: the file editor's walk (levain.firing.openhands.tools) maps a path under one
     # to its real spelling and then follows no symlink below it (head ruling 2026-10-07).
-    runtime_sockets: tuple[str, ...] = ()  # the operator's allowlist of sockets bound back into the
-    # Linux runtime-dir view (step (7) of :func:`_bwrap_plan_impl`), each relative to the runtime dir,
-    # checked by :func:`check_runtime_sockets`. Empty: only the gpg agent, keyboxd and the ssh agent come back.
 
 
 def _trusted_roots(entity_dir, workspace) -> tuple[tuple[Path, Path], ...]:
@@ -1220,7 +1428,6 @@ def build_policy(
     # operator who genuinely runs containers from the entity and accepts that.
     allow_container_sockets: bool = False,
     deny_localhost_outbound: bool = False,
-    runtime_sockets: tuple[str, ...] = (),
 ) -> CrownJewelsPolicy:
     """Assemble the crown-jewels floor for the entity at ``entity_dir``.
 
@@ -1327,6 +1534,9 @@ def build_policy(
     levain_home = Path(os.environ.get("LEVAIN_HOME") or home / ".levain").expanduser()
     subtrees.append((levain_home / AUTONOMIC_STORE_DIR).resolve())
     subtrees.append((levain_home / COCKPIT_KEY_DIR).resolve())
+    # The operator's unix-socket grants (:func:`grants_file`): hidden both ways, so no confined process
+    # can read, write, create or rename what decides which sockets it may reach.
+    subtrees.append((levain_home / GRANTS_DIR).resolve())
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
     listed_dirs = _trust_listed_stores(home, ed, ws)
@@ -1458,6 +1668,10 @@ def build_policy(
             deny_write_files_l.extend(_spellings(home / conf))
     # And in every GNUPGHOME holding a dirmngr socket outside the runtime dirs (:func:`_dirmngr_home_conf_spellings`).
     deny_write_files_l.extend(_dirmngr_home_conf_spellings())
+    # The programs the operator's gpg-agent starts (pinentry, scdaemon), resolved, with their ancestors
+    # through ``all_jewels``: a confined process may make the agent run the operator's own programs (a
+    # sign through a granted extra socket can), never a binary it wrote (:func:`_gpg_program_spellings`).
+    deny_write_files_l.extend(_gpg_program_spellings())
     # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
     # A trust spelling whose own location (final component unresolved) is already denied both ways
@@ -1670,7 +1884,6 @@ def build_policy(
         ro_tool_dirs=tuple(tool_dirs),
         cred_dir_sources=tuple(cred_dir_sources),
         trusted_roots=_trusted_roots(entity_dir, workspace),
-        runtime_sockets=check_runtime_sockets(runtime_sockets, where="runtime_sockets"),
     )
 
 
@@ -2191,10 +2404,11 @@ class ConfinementConfig:
     # bash, its numeric id, and the workspace it created for it outside the operator's home; removed
     # by its `--undo`. All three or none: absent means not set up. Appended last, per the rule above.
     runtime_sockets: tuple[str, ...] = ()
-    # The sockets under the user runtime dir that bash on Linux may still reach (``podman/podman.sock``),
-    # Flatpak ``--socket=`` style: every other entry of that dir is absent inside bash (step (7) of
-    # :func:`_bwrap_plan_impl`). Naming a daemon's socket here hands bash that daemon, knowingly.
-    # :func:`check_runtime_sockets` refuses the service manager, the session bus and dirmngr.
+    # LEGACY, GRANTS NOTHING: an entity's ``runtime_sockets`` once named sockets bash got back in its view
+    # of the user runtime dir. A grant in the entity's own config is a grant the entity could write, so
+    # the key no longer authorizes any socket; it is kept, as written, only so ``levain doctor`` and
+    # ``levain run`` can say it is ignored (:func:`unix_socket_lines`). The operator's grants live in
+    # :func:`grants_file`.
 
 
 _CONFINEMENT_CONFIG_NAME = "confinement.json"
@@ -2211,8 +2425,7 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
          "deny_standard_creds": false,
          "allow_container_sockets": false,
          "allow_localhost_outbound": false,
-         "efferent_gate": "auto",
-         "runtime_sockets": ["podman/podman.sock"]}
+         "efferent_gate": "auto"}
 
     ``~`` is expanded in every path. Unknown keys are IGNORED (forward-compat). A MISSING file returns
     the default (empty declarations, ``ssh_mode="agent"``, ``efferent_gate="auto"``) — the universal
@@ -2368,10 +2581,10 @@ def load_confinement_config(entity_dir: Path | str, *, bound_hands: bool = True)
         except HandsSetupError as exc:
             raise ConfinementError(f"{base}: {exc} — fail-closed.") from None
 
-    runtime_sockets = data.get("runtime_sockets", [])
-    if not isinstance(runtime_sockets, list) or not all(isinstance(v, str) for v in runtime_sockets):
-        raise ConfinementError(f"{base}: 'runtime_sockets' must be a list of path strings — fail-closed.")
-    runtime_sockets = check_runtime_sockets(runtime_sockets, where=f"{base}: runtime_sockets")
+    # Legacy and ignored (see ConfinementConfig.runtime_sockets): recorded as written, never refused.
+    legacy = data.get("runtime_sockets", [])
+    runtime_sockets = (tuple(str(v) for v in legacy) if isinstance(legacy, list)
+                       else (str(legacy),)) if legacy else ()
 
     return ConfinementConfig(
         deny_files=_paths("deny_files"),
@@ -4395,7 +4608,9 @@ def _default_shell_env() -> dict[str, str]:
     # Forward the ssh-agent socket PATH (not a secret — a socket, not key material) so ``ssh_mode=
     # "agent"`` can actually authenticate: it denies raw key READS precisely to force agent auth, so
     # the agent socket must be reachable or agent-auth fails outright (apparatus L1 #5). The private
-    # keys themselves stay unreadable via the profile.
+    # keys themselves stay unreadable via the profile. macOS only: the Linux floor never passes the
+    # operator's agent to bash (the bwrap spawn drops the variable, whoever built the env), and its ssh
+    # waits for levain's scoped agent (B2).
     auth_sock = os.environ.get("SSH_AUTH_SOCK")
     if auth_sock:
         env["SSH_AUTH_SOCK"] = auth_sock
@@ -5040,43 +5255,6 @@ def _dirmngr_sockets() -> list[Path]:
     return list(dict.fromkeys(f for f in found if _reachable(f) and f.exists()))
 
 
-#: The ``gpgconf --list-dirs`` names of the gnupg sockets bash gets back: the agent's own and its ssh
-#: one, and keyboxd's (GnuPG 2.4 ``use-keyboxd``: the public keyring as a local daemon). NOT the agent's
-#: ``.extra`` and ``.browser`` sockets (meant for forwarding to another host) nor dirmngr's.
-_GPG_SOCKET_DIRS = ("agent-socket", "agent-ssh-socket", "keyboxd-socket")
-
-
-def _gpg_sockets() -> list[Path]:
-    """The operator's gnupg sockets named in :data:`_GPG_SOCKET_DIRS`, as ``gpgconf`` names them for this
-    process's GNUPGHOME, the default one or not. All of ``--list-dirs`` is read and the names picked out,
-    so a gnupg without keyboxd (before 2.3) is never asked for a name it does not have. Empty when
-    gpgconf is missing or fails: gpg inside bash then finds no agent, a degrade rather than an exposure."""
-    from levain.launch import child_env
-
-    exe = shutil.which("gpgconf")
-    if exe is None:
-        return []
-    try:
-        done = subprocess.run([exe, "--list-dirs"],
-                              capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/",
-                              env=child_env("GNUPGHOME"), timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if done.returncode != 0:
-        return []
-    out: list[Path] = []
-    for line in done.stdout.splitlines():
-        name, _, value = line.partition(":")
-        value = urllib.parse.unquote(value)   # gpgconf percent-escapes its values (":" is %3a)
-        if name in _GPG_SOCKET_DIRS and value.startswith("/"):
-            out.append(Path(value))
-    return out
-
-
-#: The sockets a view of a GNUPGHOME (:func:`_gnupg_home_views`) binds back, by name.
-_GNUPG_HOME_SOCKETS = frozenset({"S.gpg-agent", "S.gpg-agent.ssh", "S.keyboxd"})
-
-
 def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path],
                       dirmngr: list[Path]) -> tuple[list[Path], list[Path]]:
     """The GNUPGHOMEs that hold a dirmngr socket outside every runtime dir, as ``(views, pins)``, for bash
@@ -5134,6 +5312,66 @@ def _creatable_by_me(p: Path) -> bool:
     return a.is_dir() and os.access(a, os.W_OK)
 
 
+_GPG_PROGRAM_OPTIONS = ("pinentry-program", "scdaemon-program")
+
+
+def _gpg_components() -> list[Path]:
+    """The pinentry and scdaemon gnupg starts when its configuration names none: ``gpgconf
+    --list-components``, never a login shell's lookup (a shell's startup files are the entity's to write).
+    Empty when gpgconf is missing or fails."""
+    from levain.launch import child_env
+
+    exe = shutil.which("gpgconf")
+    if exe is None:
+        return []
+    try:
+        done = subprocess.run([exe, "--list-components"], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, cwd="/", env=child_env("GNUPGHOME"), timeout=10,
+                              check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out: list[Path] = []
+    for line in done.stdout.splitlines() if done.returncode == 0 else []:
+        fields = line.split(":")
+        if len(fields) >= 3 and fields[0] in ("pinentry", "scdaemon"):
+            value = urllib.parse.unquote(fields[2])   # gpgconf percent-escapes its values
+            if value.startswith("/"):
+                out.append(Path(value))
+    return out
+
+
+def _gpg_program_spellings() -> list[Path]:
+    """The programs the operator's gpg-agent starts, as write-denied jewel spellings (:func:`_spellings`:
+    the name as written and its resolved target): each ``pinentry-program`` and ``scdaemon-program``
+    line of ``gpg-agent.conf`` in every home :func:`_gnupg_homes` names, and gnupg's defaults
+    (:func:`_gpg_components`). The agent runs them unconfined, and a sign through a granted extra socket
+    can make it start one (``SCD SERIALNO`` execs scdaemon; measured, DESIGN §9.1). A spelling this user
+    could not change anyway (a root-owned binary in a root-owned directory, or an absent one it cannot
+    create) is left out: denying it buys nothing, and pinning ``/usr/bin`` would."""
+    programs: list[Path] = []
+    for home in _gnupg_homes():
+        try:
+            text = (home / "gpg-agent.conf").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2 and parts[0] in _GPG_PROGRAM_OPTIONS:
+                value = os.path.expanduser(parts[1].strip().strip('"'))
+                if os.path.isabs(value):
+                    programs.append(Path(value))
+    programs += _gpg_components()
+    out: list[Path] = []
+    for prog in dict.fromkeys(programs):
+        for sp in _spellings(prog):
+            if os.path.lexists(sp):
+                if os.access(sp, os.W_OK, follow_symlinks=False) or os.access(sp.parent, os.W_OK):
+                    out.append(sp)
+            elif _creatable_by_me(sp):
+                out.append(sp)
+    return list(dict.fromkeys(out))
+
+
 def _dirmngr_home_conf_spellings() -> list[Path]:
     """The gnupg configuration files (:data:`_GNUPG_CONF_WRITE_DENIED`, at :func:`_spellings`) of every
     operator-owned directory holding a dirmngr socket outside the user runtime dirs (Linux). gnupg puts
@@ -5170,31 +5408,9 @@ def _dirmngr_home_conf_spellings() -> list[Path]:
     return out
 
 
-def _runtime_view(policy: CrownJewelsPolicy,
-                  dirmngr: list[Path] | None = None) -> tuple[list[str], list[Path], list[Path]]:
-    """Step (7) of :func:`_bwrap_plan_impl` as ``(ops, view_roots, pins)``: each user runtime dir this
-    user owns (:func:`_runtime_dirs`, resolved) becomes a fresh 0700 tmpfs, and only socket FILES come
-    back into it: gnupg's (:func:`_gpg_sockets`), ``$SSH_AUTH_SOCK``, and the entity's
-    ``runtime_sockets``, each kept only when it resolves under that dir, is a socket now, and is not one
-    :func:`_runtime_socket_refusal` names. A name among those that is a link in the dir comes back as
-    the same link, beside the socket it resolves to. The tmpfs and the parent directories the sockets need are
-    made at 0700: with them at 0755, gpg-connect-agent answered "no gpg-agent running in this session"
-    through the bound-back socket, and at 0700 it reached the agent (RUN on argushub 2026-10-12, gnupg
-    2.4.4, bubblewrap 0.9.0). The view stays writable, so an agent a tool starts inside bash can make
-    its socket there; it is gone with the shell. A runtime dir that holds the workspace, the entity or
-    ``$HOME`` (``XDG_RUNTIME_DIR`` pointed at one of the operator's directories) is refused: its view
-    would hide them. Each dir's ancestors go back as ``pins``.
-
-    Each GNUPGHOME of :func:`_gnupg_home_views` is a view too, whose ancestors go back as ``pins``. Its
-    sockets in :data:`_GNUPG_HOME_SOCKETS` and its files come back, gnupg's configuration files
-    (:data:`_GNUPG_CONF_WRITE_DENIED`) read-only and the other files writable: with the trustdb
-    read-only, ``gpg --list-keys`` died "failed to append a record" on its trustdb check (RUN on
-    argushub 2026-10-12). Its directories do not come back (``private-keys-v1.d`` is the agent's,
-    ``public-keys.d`` keyboxd's); links come back as the same links, except a configuration file's, which
-    comes back as its file's content, read-only (a sibling it leads to is read-only too). The costs: gpg inside bash cannot
-    replace a file there (an ``--import`` into a ``pubring.kbx`` keyring renames it, and gets EBUSY),
-    and its lock files land in the view, so a gpg on the host writing the trustdb at the same moment
-    does not see the lock."""
+def _runtime_roots() -> list[Path]:
+    """The user runtime dirs this user owns (:func:`_runtime_dirs`), resolved, outermost only: each is a
+    view in step (7) of :func:`_bwrap_plan_impl`."""
     roots: list[Path] = []
     for r in _runtime_dirs():
         rd = Path(r)
@@ -5206,7 +5422,33 @@ def _runtime_view(policy: CrownJewelsPolicy,
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or real in roots:
             continue
         roots.append(real)
-    roots = [r for r in roots if not any(r != o and r.is_relative_to(o) for o in roots)]   # the outer view covers it
+    return [r for r in roots if not any(r != o and r.is_relative_to(o) for o in roots)]   # the outer view covers it
+
+
+def _runtime_view(policy: CrownJewelsPolicy,
+                  dirmngr: list[Path] | None = None) -> tuple[list[str], list[Path], list[Path]]:
+    """Step (7) of :func:`_bwrap_plan_impl` as ``(ops, view_roots, pins)``: each user runtime dir this
+    user owns (:func:`_runtime_dirs`, resolved) becomes a fresh 0700 tmpfs, and nothing of the host's
+    comes back into it on its own: no agent socket is bound back because it is running or named in the
+    environment. The operator's grants are bound into it at spawn (:func:`_grant_ops`), with their
+    parent directories at 0700: with them at 0755, gpg-connect-agent answered "no gpg-agent running in
+    this session" through a bound socket, and at 0700 it reached the agent (RUN on argushub 2026-10-12,
+    gnupg 2.4.4, bubblewrap 0.9.0). The view stays writable, so an agent a tool starts inside bash can make
+    its socket there; it is gone with the shell. A runtime dir that holds the workspace, the entity or
+    ``$HOME`` (``XDG_RUNTIME_DIR`` pointed at one of the operator's directories) is refused: its view
+    would hide them. Each dir's ancestors go back as ``pins``.
+
+    Each GNUPGHOME of :func:`_gnupg_home_views` is a view too, whose ancestors go back as ``pins``. Its
+    files come back (no socket does), gnupg's configuration files
+    (:data:`_GNUPG_CONF_WRITE_DENIED`) read-only and the other files writable: with the trustdb
+    read-only, ``gpg --list-keys`` died "failed to append a record" on its trustdb check (RUN on
+    argushub 2026-10-12). Its directories do not come back (``private-keys-v1.d`` is the agent's,
+    ``public-keys.d`` keyboxd's); links come back as the same links, except a configuration file's, which
+    comes back as its file's content, read-only (a sibling it leads to is read-only too). The costs: gpg inside bash cannot
+    replace a file there (an ``--import`` into a ``pubring.kbx`` keyring renames it, and gets EBUSY),
+    and its lock files land in the view, so a gpg on the host writing the trustdb at the same moment
+    does not see the lock."""
+    roots = _runtime_roots()
     for root in roots:
         for held in (policy.workspace.resolve(), policy.entity_dir.resolve(), Path.home().resolve()):
             if held == root or held.is_relative_to(root):
@@ -5222,45 +5464,9 @@ def _runtime_view(policy: CrownJewelsPolicy,
     # to a name the next session has no view of (complement L3 r1). /run/user/<uid>'s parents are
     # root's; their self-binds are pins like any other present ancestor.
     pins = sorted({*pins, *(a for r in roots for a in r.parents if str(a) != a.anchor)})
-    wanted = list(_gpg_sockets()) if roots else []
-    auth_sock = os.environ.get("SSH_AUTH_SOCK", "")
-    if auth_sock.startswith("/"):
-        wanted.append(Path(auth_sock))
-    wanted += [rt / rel for rt in roots for rel in policy.runtime_sockets]
     ops: list[str] = []
     for root in roots:
-        keep: list[Path] = []
-        links: dict[Path, str] = {}   # a wanted name that is a link to a kept socket -> its link value
-        for s in wanted:
-            try:
-                real = s.resolve()
-                is_sock = stat.S_ISSOCK(os.stat(real).st_mode)
-                lexical = s.parent.resolve() / s.name
-                value = os.readlink(lexical) if lexical != real and os.path.islink(lexical) else None
-            except (OSError, RuntimeError):
-                continue
-            if not is_sock or real == root or not real.is_relative_to(root):
-                continue
-            if _runtime_socket_refusal(str(real.relative_to(root))) is not None:
-                continue   # a link in the allowlist pointing at a refused socket
-            keep.append(real)
-            if (value is not None and lexical.is_relative_to(root)
-                    and _runtime_socket_refusal(str(lexical.relative_to(root))) is None):
-                # The name the operator gave ($SSH_AUTH_SOCK, a runtime_sockets entry) is a link: it
-                # comes back as the same link, or a variable naming it would point at nothing (codex
-                # L3 r1). A chain of links comes back as one, to the socket itself.
-                one_hop = os.path.normpath(os.path.join(lexical.parent, value)) == str(real)
-                links[lexical] = value if one_hop else str(real)
-        keep = list(dict.fromkeys(keep))
         ops += ["--perms", "0700", "--tmpfs", str(root)]
-        dirs = sorted({str(a) for s in (*keep, *links) for a in s.parents if a != root and a.is_relative_to(root)})
-        for d in dirs:
-            ops += ["--perms", "0700", "--dir", d]
-        for s in keep:
-            # A read-only bind would not stop connect(), so it buys nothing over a plain one.
-            ops += ["--bind", str(s), str(s)]
-        for link, value in links.items():
-            ops += ["--symlink", value, str(link)]
     for g in homes:
         ops += ["--perms", "0700", "--tmpfs", str(g)]
         try:
@@ -5298,11 +5504,8 @@ def _runtime_view(policy: CrownJewelsPolicy,
                     ops += ["--ro-bind", str(real), str(child)]
             elif stat.S_ISLNK(st.st_mode):
                 ops += ["--symlink", os.readlink(child), str(child)]
-            elif child.name.startswith("S.") and child.name not in _GNUPG_HOME_SOCKETS:
-                continue   # dirmngr's, the agent's forwarding sockets, or one of those names as a file
-            elif stat.S_ISSOCK(st.st_mode):
-                if child.name in _GNUPG_HOME_SOCKETS:   # a socket by any other name stays out
-                    ops += ["--bind", str(child), str(child)]
+            elif child.name.startswith("S.") or stat.S_ISSOCK(st.st_mode):
+                continue   # no socket comes back (an operator grant is bound at spawn), nor a file by a socket's name
             elif stat.S_ISREG(st.st_mode):
                 ops += ["--ro-bind" if child.resolve() in conf_targets else "--bind", str(child), str(child)]
     return ops, roots + homes, pins
@@ -5318,9 +5521,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     ``/dev/null`` form for a write-denied file, and a 16-byte header read of file-shaped jewels
     (:func:`_refuse_plantable_sqlite_jewels`), and, for bash without network, the kernel's list of bound
     unix sockets (:func:`_bound_unix_socket_paths`, which refuses when it cannot be read). Reads, never
-    a mutation, except one: ``gpgconf --list-dirs`` (:func:`_gpg_sockets`) creates gnupg's socket
-    directory under the runtime dir for a non-default GNUPGHOME, as any gpg command run there does
-    (RUN on argushub 2026-10-12, gnupg 2.4.4)."""
+    a mutation."""
     _refuse_plantable_sqlite_jewels(policy)
     argv: list[str] = [
         BWRAP,
@@ -5795,7 +5996,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # ⚠ RESIDUAL, STATED: a socket in a SHARED dir (rootful /run/docker.sock) is covered only while
     # its inode lives: a restart re-exposes it for the rest of that shell. A rootless daemon's socket
     # is under a user runtime dir, which is step (7)'s: absent from that dir's view, before and after
-    # a restart, unless the entity's ``runtime_sockets`` brings it back, so no form here. Step (7)
+    # a restart, unless the operator grants it, so no form here. Step (7)
     # also hides the user's service manager, the sharper bypass: the entity cannot ask it to start
     # or restart anything.
     # Compared RESOLVED, because the socket targets are: a symlinked HOME compared lexically would
@@ -5831,9 +6032,9 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             hidden_dirs.append(parent)
 
     # (7) EACH USER RUNTIME DIR IS A VIEW (:func:`_runtime_view`; its ops are placed after the pins,
-    # below). A fresh tmpfs over the dir, and only socket FILES bound back into it: the gpg agent,
-    # keyboxd, the ssh agent and the entity's ``runtime_sockets``. Never a directory: a bound directory would carry
-    # every socket beside the one wanted, and stay renameable. That closes three things at once:
+    # below). A fresh tmpfs over the dir, and nothing of the host's bound back into it but the operator's
+    # grants, each a socket FILE bound at spawn (:func:`_grant_ops`). Never a directory: a bound directory
+    # would carry every socket beside the one wanted, and stay renameable. That closes three things at once:
     #   · the user's service manager and session bus (spore-1244, MEASURED 2026-09-30, systemd 255):
     #     reachable, `systemd-run --user --pipe --wait cat <jewel>` from inside bash printed the
     #     jewel; hidden, it is "Failed to connect to bus";
@@ -5848,8 +6049,8 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # view (``~/.kube/gnupg``) is refused where :func:`_runtime_view` is called.
     # ⚠ A D-Bus on an abstract socket (older distros) is not in any directory: it is closed only where
     # bash has no network (``--unshare-net``).
-    # The cost: inside bash the runtime dir holds only those sockets. A bound-back socket keeps its
-    # inode, so an agent restarted on the host is unreachable for the rest of that shell.
+    # The cost: inside bash the runtime dir holds only the granted sockets. A grant is bound by name for
+    # each command, and a granted socket replaced on the host closes the shell (it is in the manifest).
     # (7b) THE HOST'S NETWORK DEPUTIES, WHENEVER BASH HAS NO IP NETWORK. ``--unshare-net``
     # removes bash's own sockets from the network, but a root daemon reached over a unix socket
     # resolves (and so sends on the wire) whatever name bash hands it, and the name can carry data
@@ -7927,13 +8128,13 @@ class _BwrapShell(SandboxedShell):
         try:
             super().close()
         finally:
-            # Each stopped on its own, so one that raises never leaves the other running.
-            for part in (self._relay, self._canary):   # after the commands: nothing inside is left to use them
-                if part is not None:
-                    try:
-                        part.stop()
-                    except Exception as exc:
-                        _log.warning("levain: stopping the shell's %s failed: %s", type(part).__name__, exc)
+            # After the commands: nothing inside is left to use it. The canary is stopped below, with the
+            # claim's release: while the claim is kept a command may still be running against it.
+            if self._relay is not None:
+                try:
+                    self._relay.stop()
+                except Exception as exc:
+                    _log.warning("levain: stopping the shell's relay failed: %s", exc)
             # The shell lets go of its claim, and of its registration, only when it releases the claim.
             # Until then (a preflight still outstanding, a group that did not empty, a leaf not settled)
             # it keeps both: a spawn the preflight still makes is retagged onto the claim, and a later
@@ -7953,6 +8154,11 @@ class _BwrapShell(SandboxedShell):
                 if claim is None or _ledger_release(claim) is not None:
                     self._ledger_claim = None
                     _LIVE_BWRAP_SHELLS.discard(self)
+                    if self._canary is not None:
+                        try:
+                            self._canary.stop()
+                        except Exception as exc:
+                            _log.warning("levain: stopping the shell's canary failed: %s", exc)
                 else:
                     _log.warning("levain: the placeholder ledger could not be written; the shell keeps its "
                                  "claim, and a later close() or levain's exit releases it")
@@ -8178,7 +8384,8 @@ class BwrapProvider(ConfinementProvider):
 
     def _prepare(self, policy: CrownJewelsPolicy, made: list[tuple[str, str]],
                  hands: HandsIdentity | None = None, relay_dir: str | None = None,
-                 canary: "_landlock.Canary | None" = None, expect_tier: str = "T0"):
+                 canary: "_landlock.Canary | None" = None, expect_tier: str = "T0",
+                 grants: tuple[SocketGrant, ...] = (), gpg_view: Path | None = None):
         """Plan the floor and put on the host what it needs, inside the caller's ledger transaction:
         ``(argv, create_first, mounted, unmounted, manifest)``. Every object it creates is appended to
         ``made`` as it goes, so a refusal part-way still hands the ledger everything made."""
@@ -8223,11 +8430,17 @@ class BwrapProvider(ConfinementProvider):
         # after the hands relay, whose own process stays outside the policy, as it must to reach the
         # host side. The canary it checks the policy with is created outside every sandbox (`Canary`).
         # levain's own read of the ABI (`_spawn_bwrap`) goes in as the tier the stub must find.
+        # The operator's grants (operator floor only: a hands user cannot use the operator's sockets) are
+        # checked now and bound after every view, each passed to the stub by its view path; the default
+        # grant (/dev/log) is bound on both floors. On every tier the bind happens; the tier line says
+        # what is enforced (`unix_socket_lines`).
+        grant_ops, grant_views = _grant_ops(grants, _runtime_roots(), gpg_view) if grants else ([], [])
         landlock = _landlock.stub_argv(HANDS_PYTHON if hands is not None else sys.executable,
                                        canary=canary.view_path if canary is not None else None,
-                                       expect_tier=expect_tier)
-        argv = argv + [*(canary.bind_ops() if canary is not None else []), "--new-session", "--as-pid-1",
-                       *relay_in, *landlock, "/bin/bash", "--noprofile", "--norc", "-p"]
+                                       expect_tier=expect_tier, grants=tuple(grant_views))
+        argv = argv + [*(canary.bind_ops() if canary is not None else []), *grant_ops, *_default_grant_ops(),
+                       "--new-session", "--as-pid-1", *relay_in, *landlock, "/bin/bash", "--noprofile",
+                       "--norc", "-p"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
         # Created in parent-first order, 0700, by this process: bwrap cannot pin what it creates.
         # Each one this process made is levain's, recorded in the placeholder ledger and removed once
@@ -8246,6 +8459,9 @@ class BwrapProvider(ConfinementProvider):
         try:
             _prepare_mountpoints(mounted, made)
             manifest = {q: _identity(Path(q)) for q in [*mounted, *unmounted]}
+            # A granted socket replaced on the host closes the shell, like a jewel: the next spawn checks
+            # the new one (owner, parent chain) before binding it.
+            manifest.update({g.path: _identity(Path(g.path)) for g in grants})
         except (OSError, RuntimeError) as exc:
             raise ConfinementError(
                 f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
@@ -8374,8 +8590,13 @@ class BwrapProvider(ConfinementProvider):
                 )
             txn.sweep()
             try:
+                # The operator's declared sockets, read at each spawn (a grant file levain cannot read refuses).
+                grants = load_operator_grants() if hands is None else ()
+                gpg_view = (gpg_agent_view_path(env if env is not None else _default_shell_env())
+                            if any(g.gpg_extra for g in grants) else None)
                 argv, create_first, mounted, unmounted, manifest = self._prepare(
-                    policy, made, hands, relay.sockdir if relay is not None else None, canary, tier)
+                    policy, made, hands, relay.sockdir if relay is not None else None, canary, tier,
+                    grants, gpg_view)
             finally:
                 # Recorded even on a refusal: unclaimed, it is removed as the transaction ends.
                 txn.record(made)
@@ -8393,9 +8614,11 @@ class BwrapProvider(ConfinementProvider):
         # Startup-execution controls stripped as well as ignored by `-p`: bash would source, import or
         # expand these before the first per-command check, so a jewel that appeared after the manifest
         # could be read before anything looked (codex L3 r5, r6).
+        # The operator's ambient ssh agent is never passed through: bash's ssh agent is levain's scoped
+        # one (B2), or an operator grant.
         shell_env = {
             k: v for k, v in (env if env is not None else _default_shell_env()).items()
-            if k not in _STARTUP_EXEC_VARS and not k.startswith("BASH_FUNC_")
+            if k not in _STARTUP_EXEC_VARS and not k.startswith("BASH_FUNC_") and k != "SSH_AUTH_SOCK"
         }
         if hands is not None:
             # sudo OUTSIDE bwrap, as on macOS; bash starts from the hands user's environment alone.

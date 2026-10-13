@@ -117,6 +117,7 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     core.extend(_check_recorded_answers(install))
     core.extend(_check_runtime(install))
     core.extend(_check_confinement(install))
+    core.extend(_check_unix_sockets(install))
     if hookless:
         core.extend(_check_hands_isolation(install))
     core.extend(_check_floor_placeholders())
@@ -888,6 +889,28 @@ def _check_confinement(install: Path) -> list[CheckResult]:
     if d.remedy:
         detail += f"\n      → to enable the bash hand: {d.remedy}"
     return [CheckResult("confinement floor", True, detail)]
+
+
+def _check_unix_sockets(install: Path) -> list[CheckResult]:
+    """The unix-socket lines ``levain run`` prints (one generator, :func:`~levain.firing.confinement.
+    unix_socket_lines`): the tier claim, each operator grant as a named waiver, each default grant, the
+    ssh agent, and a legacy ``runtime_sockets`` key as ignored. A grant file that cannot be read FAILS:
+    ``levain run`` refuses bash with it. A broken entity config is ``_check_confinement``'s to report."""
+    try:
+        from levain.firing.confinement import ConfinementError, load_confinement_config, unix_socket_lines
+    except Exception as exc:  # noqa: BLE001 — never let a diagnosis break the whole doctor run
+        return [CheckResult("unix sockets", True, f"not determinable ({exc})")]
+    try:
+        cfg = load_confinement_config(install)
+    except Exception:  # noqa: BLE001 — _check_confinement already FAILs a broken config
+        cfg = None
+    try:
+        lines = unix_socket_lines(cfg)
+    except ConfinementError as exc:
+        return [CheckResult("unix sockets", False, f"`levain run` will refuse bash: {exc}")]
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult("unix sockets", True, f"not determinable ({exc})")]
+    return [CheckResult("unix sockets", True, "\n      ".join(lines))]
 
 
 def _check_hands_isolation(install: Path) -> list[CheckResult]:
