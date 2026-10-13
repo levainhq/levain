@@ -480,7 +480,9 @@ def test_the_shell_never_runs_startup_code_from_its_env(tmp_path, monkeypatch):
     conf.BwrapProvider()._spawn_shell_impl(
         build_policy(_entity(tmp_path)), env={"PATH": "/usr/bin", **hostile})
     assert not set(hostile) & set(seen["env"]) and seen["env"]["PATH"] == "/usr/bin"
-    assert seen["argv"][-5:] == ["--as-pid-1", "/bin/bash", "--noprofile", "--norc", "-p"]
+    # bash follows the unix-socket policy stub (levain.firing.landlock), which ends its options with --.
+    assert seen["argv"][-5:] == ["--", "/bin/bash", "--noprofile", "--norc", "-p"]
+    assert "--as-pid-1" in seen["argv"]
 
 
 def test_a_filesystem_error_in_the_post_start_recheck_is_a_refusal(tmp_path, monkeypatch):
