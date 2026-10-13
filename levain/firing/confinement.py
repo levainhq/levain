@@ -5122,6 +5122,15 @@ def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path],
     return views, pins
 
 
+def _creatable_by_me(p: Path) -> bool:
+    """Whether this user could create ``p``: its nearest existing ancestor is a directory this user can
+    write. An absent path no one here can create needs no mask against a plant."""
+    a = p.parent
+    while not os.path.lexists(a) and a != a.parent:
+        a = a.parent
+    return a.is_dir() and os.access(a, os.W_OK)
+
+
 def _dirmngr_home_conf_spellings() -> list[Path]:
     """The gnupg configuration files (:data:`_GNUPG_CONF_WRITE_DENIED`, at :func:`_spellings`) of every
     operator-owned directory holding a dirmngr socket outside the user runtime dirs (Linux). gnupg puts
@@ -5706,6 +5715,11 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # leaves it out (a link to nothing), and its tmpfs is mounted first, so a mount here would
             # only stub a file the view left out on purpose. Every other write-denied file is mounted
             # as usual (complement + codex L3 r1: a blanket skip dropped a trust file's deny).
+            continue
+        if f.name in _GNUPG_CONF_WRITE_DENIED and not os.path.lexists(f) and not _creatable_by_me(f):
+            # The absent target of a configuration link that leads nowhere bash can create anything
+            # (``gpg.conf -> /nonexistent/gpg.conf``): nothing to plant, so no mask, and no pin that
+            # would have to create ``/nonexistent`` (RUN in CI's bwrap job 2026-10-13: bash refused).
             continue
         if f in deny_both or f in file_roots:
             # Step (4) (or step (2), for a subtree root that is a file) already denies it BOTH ways. A self-bind here would take its source from the

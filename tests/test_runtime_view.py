@@ -373,6 +373,8 @@ def test_a_gnupghome_holding_dirmngr_is_a_view_pinned_from_above(tmp_path, gh) -
     # A configuration file comes back read-only, and a link to none stays out (Diogenes HIGH 2026-10-13).
     assert ["--ro-bind", str(gh / "common.conf"), str(gh / "common.conf")] in [argv[k:k + 3] for k in range(len(argv))]
     assert not [a for _, op, a in ops if a and a[-1] == str(gh / "gpg.conf")]
+    # nor is its target, which no one here can create: no mask and no pin of /nonexistent (RUN, CI bwrap job)
+    assert not [a for _, op, a in ops if any(x.startswith("/nonexistent") for x in a)]
     assert not [a for _, op, a in ops if a[:1] == ["/dev/null"] and _under(a[1], gh)]   # the view replaces the mask
 
 
