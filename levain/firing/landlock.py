@@ -35,8 +35,9 @@ What the program does, in order:
    timeout) refuses the command with a named error: the policy is not enforcing what the tier claims.
 4. Execs the command.
 
-Never on macOS: every path that issues the Landlock syscalls checks for Linux first, and the unit
-tests replace the syscall layer.
+Never on macOS: every path that issues the Landlock syscalls checks for Linux first, and then for a
+machine whose syscall numbers are cited in the program (x86_64, aarch64); on any other machine none is
+issued and the tier is T0, with the architecture named. The unit tests replace the syscall layer.
 """
 
 from __future__ import annotations
@@ -63,7 +64,14 @@ import threading
 #                         refuses the command, so a filter in between can never quietly downgrade it.
 #                         T0: the stub applies nothing and its own read is not made.
 _STUB_DEFS = r"""import ctypes, errno, os, socket, stat, struct, sys
+# The raw syscall numbers are each architecture's own: issued only on a machine whose table is cited
+# here, never elsewhere. x86_64, arch/x86/entry/syscalls/syscall_64.tbl: "444  common
+# landlock_create_ruleset  sys_landlock_create_ruleset" (445 landlock_add_rule, 446
+# landlock_restrict_self); an x32 process adds __X32_SYSCALL_BIT, so 64-bit pointers are required too.
+# aarch64, arch/arm64/tools/syscall_64.tbl (scripts/syscall.tbl, the generic table): "444  common
+# landlock_create_ruleset  sys_landlock_create_ruleset", the same three numbers.
 SYS_CREATE_RULESET, SYS_ADD_RULE, SYS_RESTRICT_SELF = 444, 445, 446
+LANDLOCK_MACHINES = ("x86_64", "aarch64")
 CREATE_RULESET_VERSION = 1
 RULE_PATH_BENEATH = 1
 FS_REFER = 1 << 13
@@ -99,9 +107,19 @@ def plan(abi, grants=(), private_tmp=None):
     if private_tmp is not None:
         rules.append((private_tmp, FS_RESOLVE_UNIX, "dir"))
     return tier, struct.pack("=QQQ", FS_RESOLVE_UNIX | FS_REFER, 0, scoped), rules
+def machine_problem(machine=None):
+    # None on a machine whose syscall table above is levain's, else why the syscalls are never issued.
+    m = machine if machine is not None else os.uname().machine
+    if m not in LANDLOCK_MACHINES or struct.calcsize("P") != 8:
+        return "architecture %s not in levain's Landlock table" % (
+            m if struct.calcsize("P") == 8 else m + " (32-bit)")
+    return None
 def syscall(nr, *args):
     if os.uname().sysname != "Linux":
         raise OSError(errno.ENOSYS, "Landlock is Linux only")
+    problem = machine_problem()
+    if problem is not None:
+        raise OSError(errno.ENOSYS, problem)
     libc = ctypes.CDLL(None, use_errno=True)
     libc.syscall.restype = ctypes.c_long
     r = libc.syscall(ctypes.c_long(nr), *args)
@@ -161,7 +179,13 @@ def open_fds():
             continue
     return list(range(3, 1024))
 def is_socketpair(fd):
-    s = socket.socket(fileno=os.dup(fd))
+    # A socket it cannot wrap is raised (OSError), and the stub refuses the command by name.
+    d = os.dup(fd)
+    try:
+        s = socket.socket(fileno=d)
+    except BaseException:
+        os.close(d)
+        raise
     try:
         return s.family == socket.AF_UNIX and s.getpeername() in ("", b"")
     except OSError:
@@ -171,9 +195,16 @@ def is_socketpair(fd):
 def relay_into(fd):
     # A pipe in place of a socket on stdout/stderr, and a process that copies the pipe into it: what
     # bash gets is a byte stream, never the socket (no fd passing, no peer of its own).
+    # The relay keeps only its pipe's read end and its target: an fd it inherits beyond them (another
+    # relay's pipe, the original stdout or stderr) would hold that stream open after bash closed it.
     r, w = os.pipe()
     if os.fork() == 0:
-        os.close(w)
+        for x in open_fds():
+            if x != r and x != fd:
+                try:
+                    os.close(x)
+                except OSError:
+                    pass
         while True:
             d = os.read(r, 65536)
             if not d:
@@ -323,12 +354,18 @@ if __name__ == "__main__":
         opts, argv = parse(sys.argv[1:])
     except ValueError as e:
         refuse("the unix-socket confinement stub was started wrongly: %s" % e)
-    hygiene(opts["carry-stdin"])
+    try:
+        hygiene(opts["carry-stdin"])
+    except OSError as e:
+        refuse("could not make the command's stdin, stdout and stderr safe to hand it (%s)" % e)
     if os.uname().sysname == "Linux":
         problem = confine(opts)
         if problem is not None:
             refuse(problem)
-    os.execv(argv[0], argv)
+    try:
+        os.execv(argv[0], argv)
+    except OSError as e:
+        refuse("could not start the command %s (%s)" % (argv[0], e))
 """
 
 #: The whole program text (``python3 -I -S -c STUB <options> -- <command>``).
@@ -373,20 +410,27 @@ def judge(tier: str, pathname: str, abstract: str) -> str | None:
     return _ns["judge"](tier, pathname, abstract)
 
 
-def running_abi(system: str | None = None) -> int:
+def running_abi(system: str | None = None, machine: str | None = None) -> int:
     """The running kernel's Landlock ABI, 0 without one (ENOSYS, or EOPNOTSUPP when disabled); any other
-    error is raised as the :class:`OSError` it is. Never issues the syscall off Linux."""
-    if (system or platform.system()) != "Linux":
+    error is raised as the :class:`OSError` it is. Never issues the syscall off Linux, nor on a machine
+    outside levain's syscall table (0 there too; :func:`host_read` names it)."""
+    if (system or platform.system()) != "Linux" or _ns["machine_problem"](machine) is not None:
         return 0
     return _ns["running_abi"]()
 
 
-def host_read(system: str | None = None) -> tuple[int, str | None]:
+def host_read(system: str | None = None, machine: str | None = None) -> tuple[int, str | None]:
     """levain's own read, outside the sandbox: ``(abi, reason)``. It never refuses: an error other than
     "no Landlock" (EPERM from a seccomp filter, say) is ABI 0, tier T0, with ``reason`` naming it
-    ("Landlock unavailable (EPERM)"); ``reason`` is None when the read succeeded."""
+    ("Landlock unavailable (EPERM)"), and so is a machine outside levain's syscall table ("architecture
+    mips64 not in levain's Landlock table"), where no syscall is issued; ``reason`` is None when the
+    read succeeded."""
+    if (system or platform.system()) == "Linux":
+        problem = _ns["machine_problem"](machine)
+        if problem is not None:
+            return 0, problem
     try:
-        return running_abi(system), None
+        return running_abi(system, machine), None
     except OSError as exc:
         name = errno.errorcode.get(exc.errno, str(exc.errno)) if exc.errno is not None else str(exc)
         return 0, f"Landlock unavailable ({name})"
@@ -429,26 +473,28 @@ class Canary:
     is what it created, for the placeholder ledger, so a crashed levain's canary is swept."""
 
     def __init__(self, *, shared: bool = False, view_path: str | None = None) -> None:
-        # A shared one under /tmp: another user must be able to reach it, which a TMPDIR under the
-        # operator's home would not allow.
-        self.dir = tempfile.mkdtemp(prefix="lvc-", dir="/tmp" if shared else None)
+        # Always under /tmp, never $TMPDIR: a unix socket's path is bounded (108 bytes on Linux), which a
+        # long TMPDIR would exceed, and a shared one must be reachable by another user, which a TMPDIR
+        # under the operator's home would not allow.
+        self.dir = tempfile.mkdtemp(prefix="lvc-", dir="/tmp")
         self.path = os.path.join(self.dir, "c")
         self.view_path = view_path or self.path
         self.made: list[tuple[str, str]] = [(self.dir, "dir")]
         self._stop = threading.Event()
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock: socket.socket | None = None
         try:
+            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._sock.bind(self.path)
             self._sock.listen(16)
             self.made.append((self.path, "socket"))
             if shared:
                 os.chmod(self.dir, 0o711)
                 os.chmod(self.path, 0o666)
+            self._thread = threading.Thread(target=self._serve, name="levain-canary", daemon=True)
+            self._thread.start()
         except BaseException:
             self.stop()
             raise
-        self._thread = threading.Thread(target=self._serve, name="levain-canary", daemon=True)
-        self._thread.start()
 
     def _serve(self) -> None:
         # Runs until stop(): an accept error (EMFILE, say) is transient, so it waits and goes on; a T6
@@ -469,7 +515,8 @@ class Canary:
         """Close and remove it; idempotent."""
         self._stop.set()
         try:
-            self._sock.close()
+            if self._sock is not None:
+                self._sock.close()
         except OSError:
             pass
         for p in (self.path, self.dir):
