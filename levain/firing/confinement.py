@@ -951,7 +951,7 @@ GPG_EXTRA_WAIVER = "gpg's extra socket closes the agent's command channel, not i
 
 
 HANDS_GRANTS_LINE = "operator grants: none (the entity's own user)"
-GRANTS_NOT_APPLIED = "(not applied on macOS until B2)"
+GRANTS_NOT_APPLIED_LINE = "operator grants: not applied on this platform (until B2)"
 
 
 @dataclass(frozen=True)
@@ -984,9 +984,9 @@ def snapshot_operator_grants(hands: "HandsIdentity | None" = None, *,
 def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | None = None) -> list[str]:
     """The unix-socket lines ``levain run`` and ``levain doctor`` print, from one place (one table): the
     tier claim (:func:`levain.firing.landlock.tier_line` of levain's own read), every operator grant as a
-    named waiver (marked not applied off Linux; none read for a hands user's entity), every default
-    grant, the ssh agent, and the entity's legacy ``runtime_sockets`` key as ignored. A grant file that
-    cannot be read raises :class:`ConfinementError`, as the spawn does."""
+    named waiver (none read for a hands user's entity, nor where grants are not applied: one line says
+    so), every default grant, the ssh agent, and the entity's legacy ``runtime_sockets`` key as ignored.
+    A grant file that cannot be read raises :class:`ConfinementError`, as the spawn does."""
     system = system or platform.system()
     abi, reason = _landlock.host_read(system)
     if system != "Linux" and reason is None:
@@ -994,11 +994,14 @@ def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | N
     lines = [_landlock.tier_line(abi, reason)]
     if cfg is not None and getattr(cfg, "hands_user", None) is not None:
         lines.append(HANDS_GRANTS_LINE)
+    elif not grants_apply(system):
+        # The spawn never reads the file here, so neither does this (a Linux grant file shared with
+        # this host is not validated against this host's gpg; codex L3 b1b r2).
+        lines.append(GRANTS_NOT_APPLIED_LINE)
     else:
-        applied = "" if grants_apply(system) else f" {GRANTS_NOT_APPLIED}"
         for g in load_operator_grants():
             extra = f"; {GPG_EXTRA_WAIVER}" if g.gpg_extra else ""
-            lines.append(f"waiver (operator grant) {g.name}: {g.path} ({g.why}){extra}{applied}")
+            lines.append(f"waiver (operator grant) {g.name}: {g.path} ({g.why}){extra}")
     for d in DEFAULT_GRANT_LINES.get(system, ()):
         lines.append(f"default grant: {d}")
     if system in SSH_AGENT_LINES:
@@ -1663,6 +1666,15 @@ def build_policy(
     # The model API key file levain was given (`--api-key-file`): denied both ways, so the key the
     # flag keeps off the command line is not left readable to the entity instead (L2 r1).
     files.extend(floor_roots(_secret_files()))
+    # gnupg's secret keys in every home _gnupg_homes() names: ``private-keys-v1.d`` denied both ways
+    # UNCONDITIONALLY, like the ssh vectors; the legacy ``secring.gpg`` only where it exists (gnupg 2.1+
+    # never creates it, and an absent cred file is never guessed into the floor). A gpg inside bash reads
+    # them directly with no agent in between, so without this the operator's key signs from the floor
+    # (or a protected one is copied out) with no grant at all. The operator's agent uses them host-side,
+    # outside the floor; a sign through a granted extra socket needs no read of them here.
+    gnupg_homes = _gnupg_homes()
+    subtrees.extend(floor_roots(h / "private-keys-v1.d" for h in gnupg_homes))
+    files.extend(floor_roots(h / "secring.gpg" for h in gnupg_homes if (h / "secring.gpg").exists()))
     # The ledger of the session-scoped Linux placeholders (:func:`_ledger_enter`) decides what levain
     # deletes from the operator's home, so the entity may neither read nor write it.
     # At all three spellings, like every other jewel (L1 r1): a link at ~/.levain-runtime must not
@@ -1763,7 +1775,7 @@ def build_policy(
     # ancestors (an intermediate symlink in the path must not be swappable), and the home dir itself is
     # ancestor-write-denied (``--bind P P``: rename EBUSY, file creation inside still OK, so trustdb and
     # keyring writes are unaffected).
-    for home in _gnupg_homes():
+    for home in gnupg_homes:
         for conf in _GNUPG_CONF_WRITE_DENIED:
             deny_write_files_l.extend(_spellings(home / conf))
     # And in every GNUPGHOME holding a dirmngr socket outside the runtime dirs (:func:`_dirmngr_home_conf_spellings`).
@@ -1858,7 +1870,8 @@ def build_policy(
     # on macOS and nothing on Linux. The paths are the RESOLVED ones, which is what SQLite names its
     # sidecars after.
     sidecars: list[Path] = []
-    known_dirs = {*listed_dirs, *_spellings("~/.levain-runtime/floor"), (levain_home / GRANTS_DIR).resolve()}
+    known_dirs = {*listed_dirs, *_spellings("~/.levain-runtime/floor"), (levain_home / GRANTS_DIR).resolve(),
+                  *(sp for h in gnupg_homes for sp in _spellings(h / "private-keys-v1.d"))}
     for jewel in _dedup(subtrees + files):
         if jewel in known_dirs and not jewel.is_file():
             continue   # a store directory, possibly absent: it has no sidecars beside it (glm L3 r3)
@@ -3955,7 +3968,8 @@ class ConfinementProvider(ABC):
         With ``hands`` (see :func:`hands_for`), bash runs as that user; a provider that cannot do
         that refuses, never runs bash as the operator instead. ``grants`` is the conversation's operator
         grant snapshot (:class:`GrantSnapshot`), passed to a provider that binds grants; without it a
-        shell gets none.
+        shell gets none. With gpg's extra socket among them, the shell's policy carries
+        :func:`with_gpg_program_denies`.
 
         ⛔⛔ **THE CALLER REFRESHES THE SOCKET FLOOR, NOT THIS METHOD — AND A METACLASS GUARD THAT
         TRIED TO ENFORCE THE OPPOSITE WAS DELETED AFTER FIVE VERSIONS AND SEVEN BYPASSES**
@@ -4017,6 +4031,11 @@ class ConfinementProvider(ABC):
         # policy the SHELL reports (`effective_policy`), not its own earlier snapshot, and
         # `refresh_socket_denies` is a monotonic union — so a second resolution can only ever widen
         # what the first produced. Round 4's lost-update came from keeping the EARLIER answer.
+        # With gpg's extra socket granted, gnupg's default programs are write-denied HERE, at the one
+        # place a shell is spawned, so a direct caller of this method gets them too (codex L3 b1b r2).
+        # The conversation floor applies them as well, earlier, for the file-editor hand.
+        if grants and any(g.gpg_extra for g in grants):
+            policy = with_gpg_program_denies(policy)
         try:
             refreshed = refresh_socket_denies(policy)
         except Exception as exc:

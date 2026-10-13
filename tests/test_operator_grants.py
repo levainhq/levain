@@ -385,6 +385,57 @@ def test_gpgconfs_components_are_asked_only_when_a_gpg_extra_socket_is_granted(g
     assert asked == [1] and (tmp_path / "home" / "tools" / "scd") in floor.policy.deny_write_files
 
 
+def test_gnupgs_secret_keys_are_jewels_in_every_home_on_both_floors(tmp_path, monkeypatch):
+    """The secret-key directory (and legacy secret keyring) of the default home and of levain's own
+    $GNUPGHOME are denied both ways: in the policy's jewel lists, and so in the macOS profile (rendered
+    as text only, never run)."""
+    home = tmp_path / "home"
+    (home / ".gnupg" / "private-keys-v1.d").mkdir(parents=True)
+    (home / ".gnupg" / "secring.gpg").write_text("")
+    other = tmp_path / "g2"   # absent: gpg creates it on first run, so its keys are denied already
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GNUPGHOME", str(other))
+    policy = build_policy(_entity(tmp_path))
+    profile = conf.SeatbeltProvider().render_profile(policy)
+    for h in (home.resolve() / ".gnupg", other.resolve()):
+        assert h / "private-keys-v1.d" in policy.deny_read_write
+        assert f'(subpath "{h / "private-keys-v1.d"}")' in profile
+    # The legacy keyring only where it exists (gnupg 2.1+ never creates one; absent cred files are not guessed).
+    present = home.resolve() / ".gnupg" / "secring.gpg"
+    assert present in policy.deny_files and f'(literal "{present}")' in profile
+    assert other.resolve() / "secring.gpg" not in policy.deny_files
+
+
+def test_a_direct_spawn_with_a_gpg_grant_carries_gnupgs_program_denies(tmp_path, monkeypatch):
+    """The provider's own spawn applies them, so a caller without the conversation floor is covered."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home" / "tools").mkdir(parents=True)
+    scd = tmp_path / "home" / "tools" / "scd"
+    monkeypatch.setattr(conf, "_gpg_components", lambda: [scd])
+    seen = []
+
+    class _Direct(conf.ConfinementProvider):
+        def available(self):
+            return True
+
+        def render_profile(self, policy):
+            return ""
+
+        def _spawn_shell_impl(self, policy, *, env=None, default_timeout=120.0, grants=None):
+            seen.append(policy)
+            return conf.SandboxedShell(argv=["/bin/true"], cwd=tmp_path, env={})
+
+    policy = build_policy(_entity(tmp_path))
+    assert scd not in policy.deny_write_files
+    podman = SocketGrant("/run/user/1/podman/podman.sock", "podman", "builds")
+    gpg = SocketGrant("/run/user/1/gnupg/S.gpg-agent.extra", "gpg", "signing", gpg_home="/h/.gnupg")
+    _Direct().spawn_shell(policy, grants=(podman,))
+    assert scd not in seen[-1].deny_write_files   # no gpg grant: not asked for
+    shell = _Direct().spawn_shell(policy, grants=(podman, gpg))
+    assert scd in seen[-1].deny_write_files and scd in shell.effective_policy.deny_write_files
+    assert scd.parent in seen[-1].deny_write_dirs
+
+
 def test_a_program_this_user_cannot_change_is_left_out(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "_gpg_components", lambda: [Path("/bin/sh")])   # root's, in root's dir
@@ -432,9 +483,11 @@ def test_one_generator_gives_the_tier_each_waiver_the_defaults_ssh_and_the_ignor
     mac = conf.unix_socket_lines(None, system="Darwin")
     assert mac[0].startswith("unix sockets (T0: Darwin has no Landlock)")
     assert "default grant: /private/var/run/mDNSResponder (name resolution)" in mac
-    # Never bound on macOS, so each grant says so.
-    assert ("waiver (operator grant) podman: /run/user/1/podman/podman.sock (builds) "
-            + conf.GRANTS_NOT_APPLIED) in mac
+    # Never bound on macOS, so one line says so, and the file is neither read nor validated here (a
+    # Linux gpg path, or a broken file, does not fail this host's doctor).
+    assert conf.GRANTS_NOT_APPLIED_LINE in mac and not any("waiver" in ln for ln in mac)
+    grants("{broken")
+    assert conf.GRANTS_NOT_APPLIED_LINE in conf.unix_socket_lines(None, system="Darwin")
 
 
 def test_a_hands_users_entity_reads_and_reports_no_operator_grant(grants, tmp_path, monkeypatch):
@@ -467,6 +520,9 @@ def test_doctor_and_run_print_the_same_lines(grants, tmp_path, capsys, monkeypat
     _print_banner(ent, binding, model="m", with_tools=True, bash_ok=True, socket_lines=lines)
     banner = " ".join(capsys.readouterr().out.split())
     assert all(" ".join(line.split()) in banner for line in lines), banner
+    # Where grants apply (the file is not read elsewhere), a broken one fails doctor.
+    monkeypatch.setattr(conf.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(L, "host_read", lambda system=None: (0, None))   # no syscall
     grants("{broken")
     (r,) = doctor._check_unix_sockets(ent)
     assert not r.ok and "will refuse bash" in r.detail
