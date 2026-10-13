@@ -765,6 +765,7 @@ def _print_banner(
     bash_offline: bool = False,
     hands_user: str | None = None,
     workspace: Path | None = None,
+    socket_lines: list[str] | None = None,
 ) -> None:
     """The session header — and the HONESTY FLOOR: show the operator exactly which stores this
     entity reads/writes, what hands it has, AND what the crown-jewels floor keeps off-limits, so
@@ -868,6 +869,12 @@ def _print_banner(
                 print("             \u26a0 on Linux a socket in a SHARED dir (/run/docker.sock, the user")
                 print("               runtime dir) is masked as a file: if its daemon starts or")
                 print("               restarts after the shell does, it is reachable until the next one")
+        # Unix sockets: the tier claim, every grant as a named waiver or default, the ssh agent and any
+        # ignored legacy key, from the one generator doctor prints too (`unix_socket_lines`).
+        for i, line in enumerate(socket_lines or ()):
+            print(textwrap.fill(line, width=88, initial_indent="  sockets:   " if i == 0 else "             ",
+                                subsequent_indent="               ", break_on_hyphens=False,
+                                break_long_words=False))
         print("             its OWN memory store (continuity/crystal/episodic) is WRITE-protected —")
         print("             only `levain wrap` composes it; the hands may READ but not rewrite it")
         # The GATE line sits with the floor because it answers the same question the floor does —
@@ -921,6 +928,14 @@ def _banner_for(
             bash_note = diagnose_confinement().operator_note()
         except Exception:  # noqa: BLE001 — a diagnosis that fails must never break the banner
             bash_note = None
+    socket_lines = None
+    if session.with_tools:
+        try:
+            from levain.firing.confinement import load_confinement_config, unix_socket_lines
+
+            socket_lines = unix_socket_lines(load_confinement_config(session.entity_dir))
+        except Exception as exc:  # noqa: BLE001 — the spawn refuses bash on the same error, and says so
+            socket_lines = [f"unix sockets: not determinable ({exc})"]
     _print_banner(
         session.entity_dir, session.binding,
         model=session.model_label, with_tools=session.with_tools, bash_ok=session.bash_ok,
@@ -931,6 +946,7 @@ def _banner_for(
         hands_user=getattr(session, "hands_user", None),
         workspace=(getattr(session, "workspace", None)
                    if getattr(session, "hands_user", None) else None),
+        socket_lines=socket_lines,
     )
 
 

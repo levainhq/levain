@@ -37,8 +37,8 @@ a chat client can show that a present human, not just a token holder, is driving
 
 **An entity that may reach this server is refused.** With ``allow_localhost_outbound`` its shell
 could call these routes itself and approve its own held actions; with ``allow_container_sockets`` it
-could do the same from a container it starts on the host network, and with ``runtime_sockets`` through
-whatever daemon it names (a rootless podman is the case it exists for). Every other entity's shell is
+could do the same from a container it starts on the host network, and through any socket the operator
+grants its shell other than gpg's restricted extra socket (a granted rootless podman, say). Every other entity's shell is
 denied loopback and the container daemon sockets its floor lists. (L2 review, codex L3 r1,
 2026-10-03.)
 The refusal fires twice: early from the config, and
@@ -291,7 +291,7 @@ class ChatError(Exception):
 def chat_refusal(entity_dir: Path) -> str | None:
     """Why ``entity_dir`` may not be hosted for chat, or ``None``. A config that does not load is not
     refused HERE: opening the session reports it in full."""
-    from levain.firing.confinement import ConfinementError, load_confinement_config
+    from levain.firing.confinement import ConfinementError, load_confinement_config, load_operator_grants
 
     try:
         cfg = load_confinement_config(entity_dir)
@@ -310,13 +310,18 @@ def chat_refusal(entity_dir: Path) -> str | None:
             "this server's chat routes from there, approving its own held actions. Chat refuses to "
             "host it; use `levain run` for this entity."
         )
-    if cfg.runtime_sockets:
-        return (
-            f"{entity_dir} gives its shell daemon sockets from the user runtime dir (runtime_sockets: "
-            f"{', '.join(cfg.runtime_sockets)}), and a daemon such as podman can start a container on the "
-            "host network that calls this server's chat routes, approving its own held actions. Chat "
-            "refuses to host it; use `levain run` for this entity."
-        )
+    if cfg.hands_user is None:
+        try:
+            granted = [g.name for g in load_operator_grants() if not g.gpg_extra]
+        except ConfinementError:
+            return None   # the session's spawn refuses bash and says why
+        if granted:
+            return (
+                f"your grants ({', '.join(granted)}) hand {entity_dir}'s shell sockets outside its sandbox, "
+                "and a daemon such as podman can start a container on the host network that calls this "
+                "server's chat routes, approving its own held actions. Chat refuses to host it; use "
+                "`levain run` for this entity."
+            )
     return None
 
 
@@ -404,7 +409,8 @@ def _snapshot_payload(snap: TurnSnapshot) -> dict[str, Any]:
 def _hands_reach_this_server(session: Any) -> str | None:
     """What lets ``session``'s shell reach this server, read from the floor the hands enforce, or
     ``None``. Three ways: connecting to localhost, a container daemon socket (a container on the
-    host network connects to localhost), and a runtime-dir socket the entity lists. The floor carries no socket sources only when the
+    host network connects to localhost), and a socket the operator grants (not gpg's extra socket; a hands
+    user's shell gets no operator grant). The floor carries no socket sources only when the
     entity opted out of the socket denies. An unreadable floor on a session with a shell counts
     as reaching it (fail-closed)."""
     if not getattr(session, "bash_ok", False):
@@ -415,8 +421,11 @@ def _hands_reach_this_server(session: Any) -> str | None:
             return "may connect to localhost"
         if not tuple(floor.socket_sources):
             return "may reach the container daemon sockets"
-        if tuple(floor.runtime_sockets):
-            return "may reach the daemon sockets its runtime_sockets lists"
+        if getattr(session, "hands_user", None) is None:
+            from levain.firing.confinement import load_operator_grants
+
+            if any(not g.gpg_extra for g in load_operator_grants()):
+                return "may reach the sockets the operator grants"
         return None
     except Exception:  # noqa: BLE001 — cannot read the floor: assume the worst
         return "has a floor that cannot be read"

@@ -59,19 +59,24 @@ def test_the_launch_is_offered_on_every_tier_and_the_line_matches_it(policy) -> 
 def test_t9_refuses_a_host_socket_and_admits_one_made_inside(policy) -> None:
     if TIER != "T9":
         pytest.skip(f"the running kernel reads Landlock ABI {ABI} ({TIER}); T9 needs ABI 9 or later")
-    d = tempfile.mkdtemp(dir="/tmp")
+    # Under /tmp, not tmp_path: a unix socket's path is bounded, and a long TMPDIR would exceed it. Removed
+    # in finally, socket included (closing a socket does not unlink it).
+    d = tempfile.TemporaryDirectory(dir="/tmp")
     srv = socket.socket(socket.AF_UNIX)
-    srv.bind(os.path.join(d, "host"))
-    srv.listen(4)
-    shell = BwrapProvider().spawn_shell(policy)
     try:
-        outside = shell.run(_connect_cmd(os.path.join(d, "host")))
-        inside = shell.run(
-            "python3 -I -S -c \"import socket,os;p='/tmp/lv-in-%d'%os.getpid();s=socket.socket(socket.AF_UNIX);"
-            "s.bind(p);s.listen(1);c=socket.socket(socket.AF_UNIX);c.connect(p);print('CONNECTED');os.unlink(p)\"")
+        srv.bind(os.path.join(d.name, "host"))
+        srv.listen(4)
+        shell = BwrapProvider().spawn_shell(policy)
+        try:
+            outside = shell.run(_connect_cmd(os.path.join(d.name, "host")))
+            inside = shell.run(
+                "python3 -I -S -c \"import socket,os;p='/tmp/lv-in-%d'%os.getpid();s=socket.socket(socket.AF_UNIX);"
+                "s.bind(p);s.listen(1);c=socket.socket(socket.AF_UNIX);c.connect(p);print('CONNECTED');os.unlink(p)\"")
+        finally:
+            shell.close()
     finally:
-        shell.close()
         srv.close()
+        d.cleanup()
     assert outside.output.split()[-1] in ("EACCES", "EPERM"), outside.output
     assert "CONNECTED" in inside.output, inside.output
 
@@ -79,14 +84,17 @@ def test_t9_refuses_a_host_socket_and_admits_one_made_inside(policy) -> None:
 def test_t6_leaves_pathname_sockets_reachable(policy) -> None:
     if TIER != "T6":
         pytest.skip(f"the running kernel reads Landlock ABI {ABI} ({TIER}); this is the T6 (ABI 6..8) check")
-    d = tempfile.mkdtemp(dir="/tmp")
+    d = tempfile.TemporaryDirectory(dir="/tmp")   # short and removed, as above
     srv = socket.socket(socket.AF_UNIX)
-    srv.bind(os.path.join(d, "host"))
-    srv.listen(4)
-    shell = BwrapProvider().spawn_shell(policy)
     try:
-        r = shell.run(_connect_cmd(os.path.join(d, "host")))
+        srv.bind(os.path.join(d.name, "host"))
+        srv.listen(4)
+        shell = BwrapProvider().spawn_shell(policy)
+        try:
+            r = shell.run(_connect_cmd(os.path.join(d.name, "host")))
+        finally:
+            shell.close()
     finally:
-        shell.close()
         srv.close()
+        d.cleanup()
     assert "CONNECTED" in r.output, r.output
