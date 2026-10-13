@@ -8347,15 +8347,10 @@ class BwrapProvider(ConfinementProvider):
         # cannot be under it: a Landlock domain that handles a filesystem right may not mount). It runs
         # after the hands relay, whose own process stays outside the policy, as it must to reach the
         # host side. The canary it checks the policy with is created outside every sandbox (`Canary`).
-        # levain's own read of the ABI goes in as the tier the stub must find; an error that is not "no
-        # Landlock" refuses here, as it does in the stub.
-        try:
-            abi = _landlock.running_abi()
-        except OSError as exc:
-            raise ConfinementError(
-                f"could not read the running kernel's Landlock ABI ({exc}) — refusing to grant bash "
-                "hands (fail-closed): only ENOSYS or EOPNOTSUPP mean the kernel has none."
-            ) from exc
+        # levain's own read of the ABI goes in as the tier the stub must find. It never refuses: an error
+        # reads as T0 (T0 is offered, never refused; `host_read`'s reason names the error for the tier
+        # line), and the stub then claims nothing more.
+        abi, _reason = _landlock.host_read()
         landlock = _landlock.stub_argv(HANDS_PYTHON if hands is not None else sys.executable,
                                        canary=canary.view_path if canary is not None else None,
                                        expect_tier=_landlock.tier_for(abi))
