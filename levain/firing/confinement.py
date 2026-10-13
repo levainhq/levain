@@ -1455,24 +1455,8 @@ def build_policy(
     for home in _gnupg_homes():
         for conf in _GNUPG_CONF_WRITE_DENIED:
             deny_write_files_l.extend(_spellings(home / conf))
-    # And in every home holding a dirmngr socket (Linux; a cron or pre-linger gpg in a home levain's
-    # environment does not name): the bwrap plan gives such a home a view, and the agent beside that
-    # dirmngr reads these files, so every writer must refuse them, the file editor included, or the
-    # editor writes ``pinentry-program`` while bash reloads the agent through the view (Diogenes HIGH
-    # 2026-10-13). Inside a view the view's own read-only binds govern (:func:`_runtime_view`). An
-    # unreadable socket list adds nothing here: the plan reads it again and refuses offline bash itself.
-    try:
-        dirmngr_homes = list(dict.fromkeys(Path(s).parent for s in _dirmngr_sockets()))
-    except ConfinementError:
-        dirmngr_homes = []
-    for home in dirmngr_homes:
-        try:
-            if os.stat(home.resolve()).st_uid != os.geteuid():
-                continue   # another user's home: not the operator's files, nor writable as the operator
-        except (OSError, RuntimeError):
-            continue   # gone since the socket was listed
-        for conf in _GNUPG_CONF_WRITE_DENIED:
-            deny_write_files_l.extend(_spellings(home / conf))
+    # And in every GNUPGHOME holding a dirmngr socket outside the runtime dirs (:func:`_dirmngr_home_conf_spellings`).
+    deny_write_files_l.extend(_dirmngr_home_conf_spellings())
     # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
     # A trust spelling whose own location (final component unresolved) is already denied both ways
@@ -1794,6 +1778,13 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     # Trust-listed project stores are re-derived at the same seam, as a union for the same reason
     # (spore-1308 follow-on, codex L3 2026-10-03): a store anneal starts trusting after the binding
     # was built is covered from the next spawn on. Raises ConfinementError on an unsafe store.
+    gpg_conf = [f for f in _dirmngr_home_conf_spellings() if f not in policy.deny_write_files]
+    if gpg_conf:   # a dirmngr home that appeared since the build: its configuration, for the editor too
+        policy = replace(
+            policy,
+            deny_write_files=_dedup_paths(list(policy.deny_write_files) + gpg_conf),
+            deny_write_dirs=_dedup_paths(list(policy.deny_write_dirs) + list(_write_deny_ancestors(gpg_conf))),
+        )
     listed = _trust_listed_stores(Path.home(), policy.entity_dir, policy.workspace)
     new_dirs = list(_dedup_paths([d for d in listed if d not in policy.deny_read_write]))
     if new_dirs:
@@ -5131,6 +5122,42 @@ def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path],
     return views, pins
 
 
+def _dirmngr_home_conf_spellings() -> list[Path]:
+    """The gnupg configuration files (:data:`_GNUPG_CONF_WRITE_DENIED`, at :func:`_spellings`) of every
+    operator-owned directory holding a dirmngr socket outside the user runtime dirs (Linux). gnupg puts
+    its sockets in GNUPGHOME itself only when it finds no ``/run/user/<uid>``, so there the socket's
+    directory IS the home (a cron or pre-linger gpg in a home levain's environment does not name);
+    under a runtime dir it is a hashed ``d.*`` directory that names no home, and is skipped. The bwrap
+    plan gives such a home a view (:func:`_gnupg_home_views`), and the agent beside that dirmngr reads
+    these files, so every writer must refuse them, the file editor included, or the editor writes
+    ``pinentry-program`` while bash reloads the agent through the view (Diogenes HIGH 2026-10-13).
+    Read by :func:`build_policy` and again, unioned, by :func:`refresh_socket_denies` at each spawn. An
+    unreadable socket list adds nothing: the plan reads it again and refuses offline bash itself."""
+    try:
+        sockets = _dirmngr_sockets()
+    except ConfinementError:
+        return []
+    runtime: list[Path] = []
+    for r in _runtime_dirs():
+        try:
+            runtime.append(Path(r).resolve())
+        except (OSError, RuntimeError):
+            continue
+    out: list[Path] = []
+    for home in dict.fromkeys(Path(s).parent for s in sockets):
+        try:
+            real = home.resolve()
+            if os.stat(real).st_uid != os.geteuid():
+                continue   # another user's home: not the operator's files, nor writable as the operator
+        except (OSError, RuntimeError):
+            continue   # gone since the socket was listed
+        if any(real == r or real.is_relative_to(r) for r in runtime):
+            continue
+        for conf in _GNUPG_CONF_WRITE_DENIED:
+            out.extend(_spellings(home / conf))
+    return out
+
+
 def _runtime_view(policy: CrownJewelsPolicy,
                   dirmngr: list[Path] | None = None) -> tuple[list[str], list[Path], list[Path]]:
     """Step (7) of :func:`_bwrap_plan_impl` as ``(ops, view_roots, pins)``: each user runtime dir this
@@ -5251,7 +5278,10 @@ def _runtime_view(policy: CrownJewelsPolicy,
                     is_reg = stat.S_ISREG(os.stat(real).st_mode)
                 except (OSError, RuntimeError):
                     continue
-                if is_reg:
+                hidden = (real in policy.deny_files
+                          or any(real == d or real.is_relative_to(d) for d in policy.deny_read_write)
+                          or (policy.ssh_dir is not None and real.is_relative_to(policy.ssh_dir.resolve())))
+                if is_reg and not hidden:   # a link into a jewel would carry the jewel in (codex L3 r1)
                     ops += ["--ro-bind", str(real), str(child)]
             elif stat.S_ISLNK(st.st_mode):
                 ops += ["--symlink", os.readlink(child), str(child)]
@@ -5669,10 +5699,12 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
         if _absent_in_ro_store(f) or _left_out_of_a_view(f):
             continue
-        if any(_host_spelling(f).parent.resolve().is_relative_to(r) for r in runtime_roots):
-            # Inside a view (step 7): the view decides what comes back there and how (a gnupg
-            # configuration file read-only, a link to nothing left out), and its tmpfs is mounted
-            # first, so a mount here would only stub a file the view left out on purpose.
+        if f.name in _GNUPG_CONF_WRITE_DENIED and any(
+                _host_spelling(f).parent.resolve().is_relative_to(r) for r in runtime_roots):
+            # A gnupg configuration file inside a view (step 7): the view brings it back read-only or
+            # leaves it out (a link to nothing), and its tmpfs is mounted first, so a mount here would
+            # only stub a file the view left out on purpose. Every other write-denied file is mounted
+            # as usual (complement + codex L3 r1: a blanket skip dropped a trust file's deny).
             continue
         if f in deny_both or f in file_roots:
             # Step (4) (or step (2), for a subtree root that is a file) already denies it BOTH ways. A self-bind here would take its source from the

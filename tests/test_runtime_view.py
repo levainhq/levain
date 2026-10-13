@@ -639,6 +639,29 @@ def test_a_gnupghome_view_levain_does_not_name_keeps_its_configuration_files_rea
     assert conf.crown_jewel_reason(pol, target) is not None   # and a link's target outside the home
     assert not [a for _, op, a in ops if a and a[-1] == str(gh / "scdaemon.conf")]
     assert ["--bind", str(gh / "trustdb.gpg"), str(gh / "trustdb.gpg")] in [argv[k:k + 3] for k in range(len(argv))]
+    # L3 r1: a dirmngr home that appears after the policy was built reaches the editor at the next spawn
+    monkeypatch.setattr(conf, "_dirmngr_sockets", lambda: [])
+    early = build_policy(_entity(tmp_path / "e2"), deny_localhost_outbound=True)
+    assert conf.crown_jewel_reason(early, gh / "gpg-agent.conf") is None
+    monkeypatch.setattr(conf, "_dirmngr_sockets", lambda: [gh / "S.dirmngr"])
+    assert conf.crown_jewel_reason(conf.refresh_socket_denies(early), gh / "gpg-agent.conf") is not None
+
+
+def test_a_gnupghome_view_carries_no_jewel_in_and_drops_no_other_deny(tmp_path, gh, monkeypatch) -> None:
+    """L3 r1 (codex + complement): a configuration link into a denied subtree must not bring the jewel's
+    content into the view, and a write-denied file of another kind in the home keeps its read-only bind."""
+    jewel = tmp_path / "home" / ".anneal-memory"
+    jewel.mkdir(parents=True)
+    (jewel / "secret").write_text("x")
+    (gh / "gpg-agent.conf").unlink(missing_ok=True)
+    os.symlink(jewel / "secret", gh / "gpg-agent.conf")
+    (gh / "trust.json").write_text("{}")
+    monkeypatch.setenv("ANNEAL_MEMORY_DERIVE_TRUST", str(gh / "trust.json"))
+    ops = _ops(_bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True)))
+    assert not [a for _, op, a in ops if a and a[-1] == str(gh / "gpg-agent.conf")]
+    assert not [a for _, op, a in ops if a and a[0] == str((jewel / "secret").resolve()) and _under(a[-1], gh)]
+    last = [op for _, op, a in ops if a and a[-1] == str(gh / "trust.json")]
+    assert last and last[-1] == "--ro-bind", last
 
 
 def test_a_tmpfs_refusal_that_does_not_name_perms_is_not_read_as_an_old_bwrap(tmp_path, monkeypatch) -> None:
