@@ -1067,6 +1067,16 @@ class TestSession2Gaps:
         labels = [m["label"] for m in ck.panel("health")["value"]["metrics"]]
         assert "max strength" in labels and "local density" in labels
 
+    def test_health_leads_with_the_mock_e_four(self, env) -> None:
+        """The widget draws the write-path dot, then the first four whole-number metrics in order: links, wraps,
+        graduated, demoted (mock-e); the rest follow for the full panel."""
+        _r, _s, ck = env
+        ms = ck.panel("health")["value"]["metrics"]
+        assert ms[0]["label"] == "write path"
+        whole = [m["label"] for m in ms if isinstance(m["value"], int) and not isinstance(m["value"], bool)]
+        assert whole[:4] == ["links", "wraps", "graduated", "demoted"]
+        assert {"avg strength", "episodes", "tombstones"} <= {m["label"] for m in ms}
+
     def test_crystal_tags_are_a_real_list(self, env) -> None:
         root, _s, ck = env
         (root / ".levain" / "memory.crystal.json").write_text(json.dumps({"crystal": [

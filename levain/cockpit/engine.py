@@ -1352,6 +1352,9 @@ class Cockpit:
                         if self._verb_view is not None else []),
             "edit_class": spec.edit_class or None,
             **({"face": spec.face} if spec.face else {}),
+            # the facets the panel DECLARES: a renderer decides what its rows mean (an addressed list) from this,
+            # never from the values the current rows happen to carry
+            **({"facets": sorted(spec.facets)} if spec.facets else {}),
             **({"compose": copy.deepcopy(spec.compose)} if spec.compose else {}),
         }
 
@@ -1419,7 +1422,12 @@ class Cockpit:
             # the Now view applies the snapshot to its rows, so it explains a degraded one as _head does
             "note": _label_note(snap.note, labels if labelled else None),
             "empty": "Nothing needs you now.", "order": None, "groups": None,
-            "search": None, "searchable": False, "window": None,
+            # the gate view is row-shaped, so it carries the same filter box as every other long panel (Phill 10-11),
+            # over the rows' own title/body/id. It is never cut to a first screenful: a row waiting on him is not
+            # hidden behind "show all", so default_visible is the row count itself.
+            "search": {"fields": list(ROW_SEARCH_DEFAULT["list"]), "scope": "rows", "default_visible": max(len(rows), 1),
+                       "hook": False} if rows else None,
+            "searchable": bool(rows), "window": None,
             "actions": [], "degraded": degraded, "edit_class": None,
         }
         # the union of the source panels' declared groups (labels and order), counted over the now

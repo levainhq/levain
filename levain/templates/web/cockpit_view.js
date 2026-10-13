@@ -184,12 +184,20 @@
     const v = panel.value || {};
     const kind = ALIAS[head.kind] || head.kind;
     const out = { note: head.note || "", empty: head.empty || "nothing here", kind: kind, pid: head.id, typed: false,
-                  search: searchOf(panel), face: panel.face === "count" ? "count" : "" };
+                  search: searchOf(panel), face: panel.face === "count" ? "count" : "",
+                  // whether the read behind this panel is clean and fresh (a widget's definitive zero needs it)
+                  clean: (head.status === undefined || head.status === "ok" || head.status === "empty") && !(head.skipped || []).length && !(head.filtered || []).length };
     if (kind === "list" || kind === "count-queue") {
       const compose = composeOf(panel.compose);
-      // an addressed list (its compose picks recipients) draws every row as `source -> for`
+      // an addressed list draws every row as `source -> for`. Its address is the compose's recipient field when
+      // the panel declares a compose; a read-only serve declares none (no send verb), but the panel still DECLARES
+      // the `for` facet (head.facets), so the declaration alone addresses the rows: never the write side, and never
+      // the values the current rows happen to carry (a broadcast-only inbox is still addressed; a list whose rows
+      // carry a `for` key it does not declare is not).
       const rfield = compose ? compose.fields.find((f) => f.type === "recipient") : null;
-      const addressed = !!rfield;
+      const forName = rfield ? rfield.name : "for";
+      const declared = Array.isArray(head.facets) ? head.facets : Array.isArray(panel.facets) ? panel.facets : [];
+      const addressed = !!rfield || declared.indexOf("for") >= 0;
       if (compose) out.compose = compose;
       out.lines = (panel.rows || []).map((r) => {
         const grp = r.group ? (groupTitles.get(r.group) || r.group) : "";
@@ -203,7 +211,7 @@
           const f = r.facets || {};
           // the kernel refuses an addressed compose whose recipient facet is not declared, so a row with no
           // value for it names no reader: everyone
-          const fv = f[rfield.name];
+          const fv = f[forName];
           const to = Array.isArray(fv) ? fv : typeof fv === "string" ? fv.split(",") : [];
           line.addr = { source: typeof f.source === "string" && f.source.trim() ? f.source.trim() : "unknown",
                         to: to.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim()),
@@ -312,7 +320,7 @@
   }
 
   // Which of the three modes show a panel. Morning is the intake read (what is waiting, the state, the
-  // sky); Build drops the readings that are only for orientation; Board is everything. The hero sky is in all.
+  // sky); Build drops the readings that are only for orientation; Board is everything. An ambient panel, and anything placed in the hero, is in all.
   const MORNING_KINDS = new Set(["brief", "reading", "count-queue", "ambient", "status-dots", "section"]);
   const BUILD_DROPS = new Set(["brief", "reading", "section"]);
   function modesOf(e) {
@@ -349,7 +357,7 @@
 
   // The figures health reads: each is a finite number, except the write-path flag.
   const HEALTH_FIGURES = ["links", "avg strength", "max strength", "density", "local density", "episodes",
-    "episodes since wrap", "tombstones", "wraps", "graduations validated", "graduations demoted"];
+    "episodes since wrap", "tombstones", "wraps", "graduated", "demoted"];
   function healthOf(metrics, wraps) {
     need(Array.isArray(metrics), "metrics");
     const m = new Map();
@@ -364,7 +372,7 @@
       max_strength: n("max strength"), density: n("density"), local_density: n("local density"),
       total_episodes: n("episodes"), episodes_since_wrap: n("episodes since wrap"),
       tombstones: n("tombstones"), total_wraps: n("wraps"),
-      graduations_validated_total: n("graduations validated"), graduations_demoted_total: n("graduations demoted"),
+      graduations_validated_total: n("graduated"), graduations_demoted_total: n("demoted"),
       last_wrap_at: last ? last.wrapped_at : null, continuity_chars: last ? last.continuity_chars : null,
       wrap_history_unavailable: wraps === "unavailable",
     };
@@ -692,7 +700,10 @@
           span: c.span === 2 || c.span === 3 ? c.span : 1, tabs: typeof c.tabs === "string" && c.tabs ? c.tabs : "" })) });
       }
     }
-    for (const e of view.layout) e.modes = modesOf(e);
+    // the hero is the page's header and reads the same in every mode: its weather is not one of the orientation
+    // readings Build drops
+    const inHero = new Set(view.ke ? view.ke.hero : []);
+    for (const e of view.layout) e.modes = inHero.has(e.id) ? "morning board build" : modesOf(e);
     // the verbs the kernel offered somewhere with a gesture a browser can perform: an affordance whose
     // verb is not here has nothing to post to
     view.offered_verbs = Object.create(null);
@@ -739,7 +750,7 @@
     input.maxLength = 200;
     input.autocomplete = "off";
     input.spellcheck = false;
-    input.placeholder = "Filter";
+    input.placeholder = s.data && s.data.kind === "roster" ? "filter agents\u2026" : "Filter";
     input.setAttribute("aria-label", "Filter " + s.title);
     input.dataset.pid = s.pid;
     const count = el("span", "xfilter-count");
@@ -769,6 +780,7 @@
   // an on-call member's last call, failed or not, is a neutral fact.
   const FLEET_GROUPS = [["resident", "Resident \u00b7 judged by their writing"], ["on_call", "On call \u00b7 judged by their last answer"],
                         ["roundtable", "Roundtable"]];
+  const fleetGroupOf = (r) => r.fleet_group || (r.group === "roundtable" ? "roundtable" : r.cadence === "resident" ? "resident" : "on_call");
   function fleetRow(r) {
     const h = isObj(r.health) ? r.health : { tone: "unknown", text: "no data", at: null, memory: "" };
     const alarm = h.tone === "alarm";
@@ -783,13 +795,15 @@
     const when = h.at ? " " + (ago(h.at) || h.at) : "";
     const d = el("div", "d" + (alarm ? " bad" : "") + (h.tone === "unknown" ? " unk" : ""), (h.text || "") + when);
     row.append(n, d);
-    const tags = [r.role, h.memory].filter(Boolean).join(" \u00b7 ");
+    // a resident's tags say only "memory" (mock-e); the store's size is an on-call fact. "stateless" stays as the kernel says it.
+    const mem = fleetGroupOf(r) === "resident" && /^memory\b/.test(h.memory || "") ? "memory" : h.memory;
+    const tags = [r.role, mem].filter(Boolean).join(" \u00b7 ");
     if (tags) row.appendChild(el("div", "tags", tags));
     return row;
   }
   function paintRoster(host, rows, d) {
     for (const [gid, title] of FLEET_GROUPS) {
-      const rs = rows.filter((r) => (r.fleet_group || (r.group === "roundtable" ? "roundtable" : r.cadence === "resident" ? "resident" : "on_call")) === gid);
+      const rs = rows.filter((r) => fleetGroupOf(r) === gid);
       if (!rs.length) continue;
       const g = el("div", "fl-group");
       g.setAttribute("data-ck-fleet-group", gid);
@@ -967,9 +981,15 @@
   function paintWidget(s, host) {
     const d = s.data;
     if (d.face === "count") {
-      host.appendChild(el("div", "big num", isNum(d.count) ? d.count : (d.lines || []).length));
-      if (d.note) host.appendChild(el("div", "sub", d.note));
-      else if (!(isNum(d.count) ? d.count : (d.lines || []).length) && !s.ctx.alerted) host.appendChild(el("div", "sub", d.empty));
+      const n = isNum(d.count) ? d.count : (d.lines || []).length;
+      host.appendChild(el("div", "big num", n));
+      // at zero the answer is the panel's empty sentence ("Nothing waiting on you"), as the mock draws it, but only for
+      // a clean, fresh read: on a degraded one (partial, stale, cached, alerted, something held back) the zero may be a
+      // failed read, so the provider's note stays the line. The sentence is the panel's own: only a plain lowercase
+      // English word at its head is capitalised (an identifier or a path is left as written).
+      const sentence = (e) => /^[a-z]+ /.test(e) ? e.charAt(0).toUpperCase() + e.slice(1) : e;
+      if (!n && !s.ctx.alerted && d.clean !== false) { const e = String(d.empty || ""); if (e) host.appendChild(el("div", "sub", sentence(e))); }
+      else if (d.note) host.appendChild(el("div", "sub", d.note));
       return;
     }
     if (d.kind === "status-dots") {
@@ -1083,6 +1103,8 @@
     if (s.skyHandle && typeof s.skyHandle.destroy === "function") { try { s.skyHandle.destroy(); } catch (_) { /* a mount that cannot unmount */ } }
     s.skyHandle = null;
     s.skyParts = null;
+    // the hero's legend band goes with the sky it keyed: a dropped, failed or repainting sky leaves no stale key
+    if (s.ctx && s.ctx.hero && typeof s.ctx.hero.hide === "function") s.ctx.hero.hide();
     if (s.clock) clocks.delete(s.clock);
     s.clock = null;
   }
@@ -1148,7 +1170,10 @@
     } else plot.appendChild(el("p", "xnote", "the sky draws here once sky.js is loaded"));
     const legend = el("div", "legendbar" + (hero ? "" : " frame"));
     paintLegend(legend, sky);
-    host.appendChild(legend);
+    // the hero's key is a full-width band BELOW the hero (mock-e), not a row inside the sky column. The band is the
+    // page's mount, which renderHero owns: this hands the legend to it (place) and never writes the live mount
+    // itself. A sky anywhere else, or a page without the mount (place answers false), keeps it under its plot.
+    if (!(hero && typeof hero.place === "function" && hero.place(legend))) host.appendChild(legend);
     s.skyParts = { plot: plot, win: win, legend: legend };
   }
 

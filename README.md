@@ -308,6 +308,8 @@ What each custody guarantees, and what it does not:
 
 The custody is a declaration, signed by the key that enrols it, not a proof. A signature from a Secure Enclave key looks the same whether or not the key was made to need a touch, so the touch rests on how the key was made, which is why the helper makes it and confirms it.
 
+The keys directory (`<levain home>/keys`) is denied to an entity's bash and file editor, read and write.
+
 For hosts that render MCP Apps (and only those), `pip install 'levain[app]'` adds what `levain serve-app` needs to run: a read-only in-host view served over stdio. `levain serve` needs nothing beyond the base install.
 
 ## Keep it running (macOS and Linux)

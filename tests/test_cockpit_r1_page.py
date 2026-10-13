@@ -148,22 +148,19 @@ cases.direct_c1_with_no_escalation_fires_once_with_no_intent = async () => {
   ok(!env.posts.some((p) => p.url === "/edit" || p.url === "/action"), "never the legacy routes");
 };
 
-cases.escalating_write_previews_then_fires_the_frozen_request = async () => {
+cases.an_escalating_write_fires_on_one_click_with_the_dry_run_tier = async () => {
   const env = makeEnv();
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
   await env.start();
   const req = { kind: "spore_update", spore_id: "spore-1", text: "new text" };
-  const r1 = await env.opts().commit(req);
-  ok(r1.ok === false && r1.preview === true, "first click previews");
-  ok(/T2/.test(r1.message) && /marks|changes the text/.test(r1.message) && /new text/.test(r1.message), "preview names tier, effect and the values");
-  ok(env.posts.length === 1 && env.posts[0].body.dry_run === true, "the preview is a dry run");
+  const r = await env.opts().commit(req);
+  ok(r.ok === true && !r.preview, "one click fires: " + JSON.stringify(r));
+  ok(env.posts.length === 2 && env.posts[0].body.dry_run === true, "a dry run, then the fire");
   ok(!("idempotency_key" in env.posts[0].body) && !("tier_seen" in env.posts[0].body) && !("intent" in env.posts[0].body), "a dry run carries no key, no tier_seen, no intent");
-  const r2 = await env.opts().commit(req);
-  ok(r2.ok === true, "second click fires");
   const f = env.posts[1].body;
   ok(f.intent === "reported" && f.tier_seen === "T2" && f.gesture_seen === "direct-reported", "intent and seen tier come from the dry run");
   ok(typeof f.idempotency_key === "string" && f.idempotency_key, "a T2 fire carries a key");
-  ok(f.params.text === "new text" && !("dry_run" in f), "exactly the frozen params");
+  ok(f.params.text === "new text" && !("dry_run" in f), "exactly the dry run's params");
 };
 
 cases.the_fire_uses_the_dry_run_gesture_not_the_rendered_one = async () => {
@@ -172,7 +169,6 @@ cases.the_fire_uses_the_dry_run_gesture_not_the_rendered_one = async () => {
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "sign" }]];
   await env.start();
   const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
-  await env.opts().commit(req);
   await env.opts().commit(req);
   ok(env.posts[1].body.intent === "sign" && env.posts[1].body.gesture_seen === "sign", "sign from the dry run");
 };
@@ -188,17 +184,6 @@ cases.a_dry_run_that_stays_c1_fires_at_once = async () => {
   ok(typeof f.idempotency_key === "string", "an idempotent C1 verb sends a key");
 };
 
-cases.a_changed_form_discards_the_preview = async () => {
-  const env = makeEnv();
-  env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }],
-                     [200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
-  await env.start();
-  await env.opts().commit({ kind: "spore_update", spore_id: "spore-1", text: "one" });
-  const r = await env.opts().commit({ kind: "spore_update", spore_id: "spore-1", text: "two" });
-  ok(r.preview === true, "different values preview again");
-  ok(env.posts.length === 2 && env.posts.every((p) => p.body.dry_run === true), "nothing fired");
-};
-
 cases.stale_and_tier_moved_reread_and_never_retry_with_an_intent = async () => {
   for (const [code, status] of [["stale", 409], ["tier_moved", 409], ["gesture_moved", 409], ["needs_intent", 409]]) {
     const env = makeEnv();
@@ -206,15 +191,16 @@ cases.stale_and_tier_moved_reread_and_never_retry_with_an_intent = async () => {
                        [status, { error: code, message: "the server says " + code }]];
     await env.start();
     const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
-    await env.opts().commit(req);
     const before = env.reads.length;
     const r = await env.opts().commit(req);
     await env.settle();
     ok(r.ok === false && r.error === code && /the server says/.test(r.message), code + " answer shown");
     ok(env.posts.length === 2, code + ": no automatic retry");
     ok(env.reads.length > before, code + ": the page re-read");
-    const r3 = await env.opts().commit(req);
-    ok(r3.preview === true, code + ": the next click re-previews");
+    env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T3", rendered_tier: "C1", gesture: "sign" }]];
+    await env.opts().commit(req);
+    ok(env.posts[2].body.dry_run === true && env.posts[3].body.tier_seen === "T3" && env.posts[3].body.gesture_seen === "sign",
+       code + ": the next click asks again and fires the tier it is told now");
   }
 };
 
@@ -223,7 +209,6 @@ cases.a_lost_answer_replays_under_the_same_key_and_an_answer_clears_it = async (
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }], "net"];
   await env.start();
   const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
-  await env.opts().commit(req);
   const r = await env.opts().commit(req);
   ok(r.ok === false && r.error === "network", "a lost answer is reported as such");
   const stored = JSON.parse(env.ss.levain_cockpit_keys);
@@ -233,25 +218,64 @@ cases.a_lost_answer_replays_under_the_same_key_and_an_answer_clears_it = async (
   ok(stored[keys[0]].envelope.idempotency_key === first.idempotency_key, "the whole envelope is kept with it");
   const r2 = await env.opts().commit(req);
   ok(r2.ok === true, "the retry lands");
-  ok(JSON.stringify(env.posts[2].body) === JSON.stringify(first), "the retry sends exactly the same envelope and key");
+  ok(env.posts.length === 3 && JSON.stringify(env.posts[2].body) === JSON.stringify(first), "the retry sends exactly the same envelope and key, with no new dry run");
   ok(Object.keys(JSON.parse(env.ss.levain_cockpit_keys)).length === 0, "an answer clears the key");
 };
 
 cases.a_replay_survives_a_reload = async () => {
-  // a first page's lost fire leaves its envelope in sessionStorage; a fresh page replays it after its own preview
+  // a first page's lost fire leaves its envelope in sessionStorage; a fresh page replays it after its own dry run
   const env1 = makeEnv();
   env1.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }], "net"];
   await env1.start();
   const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
   await env1.opts().commit(req);
-  await env1.opts().commit(req);
   const lost = env1.posts[1].body;
   const env2 = makeEnv({ session: { levain_cockpit_keys: env1.ss.levain_cockpit_keys } });
-  env2.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
   await env2.start();
   await env2.opts().commit(req);
-  await env2.opts().commit(req);
-  ok(JSON.stringify(env2.posts[1].body) === JSON.stringify(lost), "the reloaded page replays the stored envelope");
+  ok(env2.posts.length === 1 && JSON.stringify(env2.posts[0].body) === JSON.stringify(lost), "the reloaded page replays the stored envelope first");
+};
+
+cases.a_lost_write_that_landed_is_replayed_not_dry_run_into_stale = async () => {
+  // L3 r1 (codex HIGH, complement, L1): the fire commits and moves the row, its answer is lost. A dry run of the
+  // retry would answer stale and strand the key; the replay under the stored key gets the landed answer back.
+  const env = makeEnv();
+  env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }], "net",
+                     [409, { error: "stale", message: "the row moved" }]];
+  await env.start();
+  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  await env.opts().commit(req);
+  const first = env.posts[1].body;
+  env.verbAnswers = [[200, { ok: true, state: "COMMITTED", label: "replayed" }]];
+  const r = await env.opts().commit(req);
+  ok(r.ok === true, "the replay's answer is the landed write: " + JSON.stringify(r));
+  ok(env.posts.length === 3 && !env.posts[2].body.dry_run && env.posts[2].body.idempotency_key === first.idempotency_key, "no dry run before the replay");
+  ok(Object.keys(JSON.parse(env.ss.levain_cockpit_keys)).length === 0, "the answer clears the key");
+};
+
+cases.a_5xx_with_a_json_body_keeps_the_envelope = async () => {
+  // L3 r1 (glm): a 5xx is indeterminate; a retry under a new key could apply the write twice
+  const env = makeEnv();
+  env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }],
+                     [503, { error: "unavailable", message: "try later" }]];
+  await env.start();
+  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  const r = await env.opts().commit(req);
+  ok(r.ok === false, "the 5xx is shown");
+  ok(Object.keys(JSON.parse(env.ss.levain_cockpit_keys)).length === 1, "the envelope is kept");
+  await env.opts().commit(req);
+  ok(env.posts.length === 3 && env.posts[2].body.idempotency_key === env.posts[1].body.idempotency_key, "the retry replays the same key");
+};
+
+cases.identical_submits_in_flight_fire_once = async () => {
+  // L3 r1 (codex HIGH): a repeated Cmd+Enter while the first write is still asking, firing or re-reading
+  const env = makeEnv();
+  env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
+  await env.start();
+  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  const [a, b] = await Promise.all([env.opts().commit(req), env.opts().commit(req)]);
+  ok(a.ok === true && b.ok === true, "both callers get the answer");
+  ok(env.posts.length === 2 && env.posts[0].body.dry_run === true && !env.posts[1].body.dry_run, "one dry run and one fire: " + env.posts.length);
 };
 
 cases.refused_and_laptop_only_never_post = async () => {
@@ -334,9 +358,8 @@ cases.send_inbox_501_shows_the_server_text = async () => {
   ok(env.view().action_verbs.send_inbox.confirm_required === true, "the verb head's confirm rides along");
   ok(ext.action.fields.map((f) => f.name + ":" + f.kind).join() === "message:textarea,for:csv", "fields from the head's names");
   const params = { message: "hi" };
-  const p1 = await env.opts().commitAction("send_inbox", params, true, "ignored-key");
-  ok(p1.preview === true, "the compose goes through the preview too");
   const p2 = await env.opts().commitAction("send_inbox", params, true, "ignored-key");
+  ok(env.posts[0].body.dry_run === true, "the compose asks the tier first");
   ok(p2.ok === false && /no broker effect store/.test(p2.message), "the page shows the server's text, not a swallow");
   ok(env.posts[1].body.idempotency_key !== "ignored-key", "the page mints its own key");
 };
@@ -408,14 +431,13 @@ cases.the_keep_capture_box_needs_a_postable_tray_create = async () => {
   ok(keep && keep.edit_class !== "B", "a laptop-only create gives the Keep no capture box");
 };
 
-cases.an_undefined_param_is_dropped_and_never_throws_in_the_preview = async () => {
+cases.an_undefined_param_is_dropped_and_never_throws = async () => {
   const env = makeEnv();
   env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
   await env.start();
   const r = await env.opts().commit({ kind: "spore_update", spore_id: "spore-1", text: "x", domain: undefined });
-  ok(r.preview === true, "the preview is drawn");
-  ok(!("domain" in env.posts[0].body.params), "an undefined value is not sent");
-  ok(!/domain/.test(r.message), "nor previewed");
+  ok(r.ok === true, "the write lands");
+  ok(env.posts.every((p) => !("domain" in p.body.params)), "an undefined value is not sent");
 };
 
 cases.a_cancel_after_a_lost_answer_replays_its_envelope_and_an_answer_clears_it = async () => {

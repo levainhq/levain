@@ -62,6 +62,7 @@ const ke = V.fromManifest({ manifest: manifest(keRegions), panels });
 out.ke = ke.ke;
 out.kinds = Object.fromEntries(ke.layout.map((e) => [e.id, e.kind]));
 out.regionOf = Object.fromEntries(ke.layout.map((e) => [e.id, e.region || null]));
+out.modes = Object.fromEntries(ke.layout.map((e) => [e.id, e.modes]));
 out.face = ke.extra_panels.decisions.face;
 const old = V.fromManifest({ manifest: manifest({ header: ["state", "weather"], zones: [{ id: "operate", title: "Operate", panels: ["tray"] }] }), panels });
 out.old = { ke: old.ke === undefined, layout: old.layout.map((e) => e.id) };
@@ -99,6 +100,10 @@ def test_ke_regions_map_and_the_reading_draws_its_icon_and_pill(tmp_path: Path) 
     # a widget named health is a typed external panel, never the built-in Health component
     assert out["kinds"]["health"] == "external" and out["regionOf"]["health"] == "widgets"
     assert out["face"] == "count"
+    # the hero is the header in every mode: its weather is not a Build-dropped reading (Phill 10-12: "why is the
+    # header in Build mode missing the weather?"); the brief, an orientation read, still leaves Build
+    assert out["modes"]["weather"].split() == ["morning", "board", "build"]
+    assert "build" not in out["modes"]["brief"].split()
     assert out["old"]["ke"] and "focus" not in out["old"]["layout"]
     assert out["icon"] == 1
     assert out["pill"] == [["Moderate", "pill hot"]]

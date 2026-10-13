@@ -16,6 +16,7 @@ import pytest
 
 from levain.firing.confinement import (
     AUTONOMIC_STORE_DIR,
+    COCKPIT_KEY_DIR,
     SeatbeltProvider,
     _bwrap_argv,
     _refuse_plantable_sqlite_jewels,
@@ -93,6 +94,23 @@ def test_the_floor_names_the_directory_db_py_creates(home, monkeypatch):
 
     policy = build_policy(_entity(home))
     assert default_store_dir().resolve() in policy.deny_read_write
+
+
+@pytest.mark.parametrize("levain_home", [False, True])
+def test_the_floor_denies_the_cockpit_signing_key_directory(home, tmp_path, monkeypatch, levain_home):
+    """Diogenes MEDIUM 2026-10-13: ``levain cockpit key create`` writes the T2/T3 signing keys under
+    ``<levain home>/keys`` and the floor did not name it, so bash could copy a passphrase key or swap
+    the key, ``.pub`` and sidecar before ``enroll`` (RUN: crown_jewel_reason returned None)."""
+    from levain.cockpit.custody import default_key_dir
+
+    if levain_home:
+        monkeypatch.setenv("LEVAIN_HOME", str(tmp_path / "levain-home"))
+    keys = default_key_dir()
+    assert keys.name == COCKPIT_KEY_DIR
+    policy = build_policy(_entity(home))
+    assert keys.resolve() in policy.deny_read_write
+    for name in ("levain-x", "levain-x.pub", "levain-x.levain-key.json"):
+        assert crown_jewel_reason(policy, keys / name) is not None, name
 
 
 def test_a_relative_levain_home_names_one_store_whatever_the_cwd_does(home, tmp_path, monkeypatch):
