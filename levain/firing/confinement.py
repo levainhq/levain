@@ -6626,9 +6626,9 @@ def _prepare_mountpoints(mounted: dict[str, str | None],
 # before every Linux spawn, at levain's launch and in ``levain doctor`` (a crash or SIGKILL leaves
 # claims whose process is gone).
 # ⛔ Removed only while it is still the object created: same device and inode, and for a file still
-# empty and 0444, for a directory still empty. An operator's ``npm login`` that replaced it by rename
-# leaves a different inode, which this keeps (and the replacement closed the live shell, through the
-# manifest check in :class:`_BwrapShell`).
+# empty and 0444, for a directory still empty, for a socket (the unix-socket canary) still a socket.
+# An operator's ``npm login`` that replaced it by rename leaves a different inode, which this keeps
+# (and the replacement closed the live shell, through the manifest check in :class:`_BwrapShell`).
 # The ledger directory is a crown jewel (``build_policy``), so the entity can neither read it nor
 # forge a claim. Directories the provider creates to pin them (an absent ~/.kube, say) are recorded
 # the same way.
@@ -6776,6 +6776,8 @@ def _object_unchanged(entry: dict) -> bool:
             return not os.listdir(entry["path"])
         except OSError:
             return False
+    if entry.get("kind") == "socket":   # the unix-socket policy's canary (levain.firing.landlock.Canary)
+        return stat.S_ISSOCK(st.st_mode)
     return stat.S_ISREG(st.st_mode) and st.st_size == 0 and stat.S_IMODE(st.st_mode) == 0o444
 
 
@@ -8217,8 +8219,18 @@ class BwrapProvider(ConfinementProvider):
         # cannot be under it: a Landlock domain that handles a filesystem right may not mount). It runs
         # after the hands relay, whose own process stays outside the policy, as it must to reach the
         # host side. The canary it checks the policy with is created outside every sandbox (`Canary`).
+        # levain's own read of the ABI goes in as the tier the stub must find; an error that is not "no
+        # Landlock" refuses here, as it does in the stub.
+        try:
+            abi = _landlock.running_abi()
+        except OSError as exc:
+            raise ConfinementError(
+                f"could not read the running kernel's Landlock ABI ({exc}) — refusing to grant bash "
+                "hands (fail-closed): only ENOSYS or EOPNOTSUPP mean the kernel has none."
+            ) from exc
         landlock = _landlock.stub_argv(HANDS_PYTHON if hands is not None else sys.executable,
-                                       canary=canary.view_path if canary is not None else None)
+                                       canary=canary.view_path if canary is not None else None,
+                                       expect_tier=_landlock.tier_for(abi))
         argv = argv + [*(canary.bind_ops() if canary is not None else []), "--new-session", "--as-pid-1",
                        *relay_in, *landlock, "/bin/bash", "--noprofile", "--norc", "-p"]
         # Directories the floor must PIN but that do not exist yet (see step (1) in `_bwrap_plan`).
@@ -8328,6 +8340,8 @@ class BwrapProvider(ConfinementProvider):
         # host's tree, so it is bound at its own path. Owned by the shell from its construction on.
         canary = _landlock.Canary(shared=hands is not None,
                                   view_path="/run/levain-canary" if hands is not None else None)
+        # Recorded and claimed with the floor's objects, so a crashed levain's canary is swept.
+        made += canary.made
         try:
             return self._spawn_bwrap_canaried(policy, env, default_timeout, hands, relay, claim, made, canary)
         except BaseException:
