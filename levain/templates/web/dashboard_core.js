@@ -991,15 +991,21 @@
   // edit, schedule, dismiss); otherwise the first three the kernel offered, in its order. Every verb keeps its own
   // button, handlers and data attributes: the menu only moves the node.
   const VERBS_VISIBLE = 3;
+  // On a phone-width page (the CSS breakpoint, 720px) the meta line (id, tag, date, age) has no room beside even one verb, and a
+  // verb group that does not fit wraps to its own line and grows the row. There every verb sits behind "···" (read when the row is
+  // built; the board rebuilds on every poll, so a rotated phone catches up).
+  const NARROW_QUERY = "(max-width: 720px)";
   function overflowVerbs(group, prefer) {
     const btns = Array.prototype.slice.call(group.querySelectorAll(":scope > .verb-btn"));
-    if (btns.length <= VERBS_VISIBLE) return;
+    const narrow = typeof window.matchMedia === "function" && window.matchMedia(NARROW_QUERY).matches;
+    const visible = narrow ? 0 : VERBS_VISIBLE;
+    if (btns.length <= visible) return;
     let keep = [];
     for (const label of prefer || []) {
       const b = btns.find((x) => x.textContent === label);
-      if (b && keep.length < VERBS_VISIBLE) keep.push(b);
+      if (b && keep.length < visible) keep.push(b);
     }
-    for (const b of btns) if (keep.length < VERBS_VISIBLE && keep.indexOf(b) < 0) keep.push(b);
+    for (const b of btns) if (keep.length < visible && keep.indexOf(b) < 0) keep.push(b);
     const rest = btns.filter((b) => keep.indexOf(b) < 0);
     const more = el("button", "verb-btn verb-more", "\u00b7\u00b7\u00b7");
     more.type = "button";
@@ -1062,7 +1068,7 @@
     if (badgeField === "disposition") badge = s.disposition;
     else if (badgeField === "keep") badge = s.disposition === "note" ? "note" : s.tier;
     else badge = s.tier;
-    if (badge) row.appendChild(tagEl("tier", `[${badge}]`));
+    if (badge) row.appendChild(tagEl("tier", badge));
     appendClause(row, s.text);  // FULL text + per-item expand (no truncation, no edit data-loss)
     if (s.next) {
       const due = tagEl("muted", "→ " + s.next);
@@ -1248,7 +1254,7 @@
   function episodeRow(e, verbs, showAgent) {
     const row = el("div", "row" + (e.emphasis === "dim" ? " ext-dim" : ""));
     if (e.row_id) row.dataset.rowKey = e.row_id;
-    if (showAgent && e.agent) row.appendChild(tagEl("tier", `[${e.agent}]`));
+    if (showAgent && e.agent) row.appendChild(tagEl("tier", e.agent));
     if (e.type) row.appendChild(tagEl("etype", e.type));
     appendClause(row, e.content);  // FULL content + per-item expand (no truncation)
     if (Array.isArray(e.tags) && e.tags.length) {
