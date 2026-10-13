@@ -5276,12 +5276,13 @@ def _runtime_view(policy: CrownJewelsPolicy,
                 try:
                     real = child.resolve(strict=True)
                     is_reg = stat.S_ISREG(os.stat(real).st_mode)
+                    # A link into a jewel would carry the jewel in (codex L3 r1), matched as the policy
+                    # matches (case- and normalization-insensitively; codex L3 r2).
+                    hidden = _caller_denies(real, policy) or (
+                        policy.ssh_dir is not None and _ci_within(real, policy.ssh_dir.resolve()))
                 except (OSError, RuntimeError):
                     continue
-                hidden = (real in policy.deny_files
-                          or any(real == d or real.is_relative_to(d) for d in policy.deny_read_write)
-                          or (policy.ssh_dir is not None and real.is_relative_to(policy.ssh_dir.resolve())))
-                if is_reg and not hidden:   # a link into a jewel would carry the jewel in (codex L3 r1)
+                if is_reg and not hidden:
                     ops += ["--ro-bind", str(real), str(child)]
             elif stat.S_ISLNK(st.st_mode):
                 ops += ["--symlink", os.readlink(child), str(child)]
