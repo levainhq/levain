@@ -684,7 +684,11 @@ class FloorRefreshError(ConfinementError):
 # A path is exact: absolute (``~/`` is expanded), normalised, no glob character. gnupg's agent is
 # granted only through its restricted EXTRA socket, which bash's gpg then finds where it looks for the
 # agent; its standard, ssh and browser sockets are refused, and so is dirmngr (a network deputy for bash
-# without network).
+# without network). A grant is gpg's only when its path is the one gpgconf names as
+# ``agent-extra-socket`` for the default home or levain's own ``$GNUPGHOME`` (:func:`_gpg_extra_sockets`),
+# the homes whose agent programs the floor write-denies; a name never makes one. Any other path named
+# ``S.gpg-agent.extra`` is another home's agent and is refused. Grants apply on Linux only (macOS gets
+# its unix-socket rule with B2).
 GRANTS_DIR = "confinement"
 GRANTS_FILE = "grants.json"
 GPG_EXTRA_SOCKET = "S.gpg-agent.extra"
@@ -698,15 +702,62 @@ _GRANT_REFUSED_NAMES = {
 
 @dataclass(frozen=True)
 class SocketGrant:
-    """One operator-declared socket: its exact ``path``, and the ``name`` and ``why`` the operator wrote."""
+    """One operator-declared socket: its exact ``path``, and the ``name`` and ``why`` the operator wrote.
+    ``gpg_home`` is set only by :func:`load_operator_grants`, when the path is gpgconf's extra socket of
+    that home."""
 
     path: str
     name: str
     why: str
+    gpg_home: str | None = None
 
     @property
     def gpg_extra(self) -> bool:
-        return Path(self.path).name == GPG_EXTRA_SOCKET
+        return self.gpg_home is not None
+
+
+def grants_apply(system: str | None = None) -> bool:
+    """Whether operator grants are bound into bash's view here: Linux only, until levain's macOS tier (B2)."""
+    return (system or platform.system()) == "Linux"
+
+
+def _gpgconf_dir(name: str, *, home: str | None = None, homedir: str | None = None) -> Path | None:
+    """``gpgconf [--homedir H] --list-dirs <name>``: the bare path it prints (percent-escaped), with
+    ``HOME`` set to ``home`` when given and no ``GNUPGHOME`` from levain's environment, never a login
+    shell. None when gpgconf is missing or fails."""
+    from levain.launch import child_env
+
+    exe = shutil.which("gpgconf")
+    if exe is None:
+        return None
+    genv = child_env()
+    genv.pop("GNUPGHOME", None)
+    if home is not None:
+        genv["HOME"] = home
+    argv = [exe, *(["--homedir", homedir] if homedir else []), "--list-dirs", name]
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd="/",
+                              env=genv, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = urllib.parse.unquote(done.stdout.strip())   # gpgconf percent-escapes its values
+    return Path(value) if done.returncode == 0 and value.startswith("/") else None
+
+
+def _gpg_extra_sockets() -> dict[str, str]:
+    """``{extra socket path: home}`` for the homes whose agent programs the floor write-denies (the
+    default home and levain's own absolute ``$GNUPGHOME``, as :func:`_gnupg_homes` reads them), as
+    gpgconf names each one's ``agent-extra-socket``."""
+    out: dict[str, str] = {}
+    default = _gpgconf_dir("agent-extra-socket", home=str(Path.home()))
+    if default is not None:
+        out[str(default)] = str(Path.home() / ".gnupg")
+    ambient = os.environ.get("GNUPGHOME")
+    if ambient and os.path.isabs(ambient):
+        got = _gpgconf_dir("agent-extra-socket", homedir=ambient)
+        if got is not None:
+            out.setdefault(str(got), ambient)
+    return out
 
 
 def grants_file() -> Path:
@@ -732,8 +783,11 @@ def load_operator_grants(path: Path | None = None) -> tuple[SocketGrant, ...]:
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
             raise ConfinementError(f"the grant file {f} must be a regular file you own that no one else can "
                                    "write (fail-closed).")
-        with os.fdopen(os.dup(fd), "r", encoding="utf-8") as fh:
-            raw = fh.read()
+        try:
+            with os.fdopen(os.dup(fd), "r", encoding="utf-8") as fh:
+                raw = fh.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ConfinementError(f"the grant file {f} cannot be read ({exc}) — fail-closed.") from None
     finally:
         os.close(fd)
     if not raw.strip():
@@ -762,6 +816,16 @@ def load_operator_grants(path: Path | None = None) -> tuple[SocketGrant, ...]:
         if any(g.path == p for g in out):
             raise ConfinementError(f"{where} ({p}) is granted twice — fail-closed.")
         out.append(SocketGrant(path=p, name=e["name"].strip(), why=e["why"].strip()))
+    gpg = _gpg_extra_sockets() if out else {}
+    for i, g in enumerate(out):
+        if g.path in gpg:
+            out[i] = replace(g, gpg_home=gpg[g.path])
+        elif Path(g.path).name == GPG_EXTRA_SOCKET:
+            raise ConfinementError(
+                f"{f}: grant {i + 1} ({g.path}) is named as gpg's extra socket but is not the one gpgconf "
+                f"names for your default home or levain's GNUPGHOME ({', '.join(gpg) or 'gpgconf named none'}). "
+                "A gpg grant for another home is refused: the floor write-denies only those homes' agent "
+                "programs — fail-closed.")
     if sum(g.gpg_extra for g in out) > 1:
         raise ConfinementError(f"{f} grants more than one gpg extra socket; bash's gpg finds one agent — fail-closed.")
     return tuple(out)
@@ -771,8 +835,10 @@ def resolve_grant(grant: SocketGrant, view_roots: list[Path]) -> None:
     """Check ``grant`` at entry, or :class:`ConfinementError` naming it: the path is reached without a
     link anywhere in it, it is a socket now, the operator owns it, and nothing a confined process can
     write is on its parent chain. Every ancestor is root's or the operator's and writable by no one
-    else; the socket's own directory is one this user cannot write, or one inside a user runtime dir
-    (``view_roots``), which confined bash sees only as levain's view (a fresh tmpfs), never the host's."""
+    else; no component (the socket or a directory above it) can be renamed by this user: each sits in
+    a directory this user cannot write, or in a sticky one that it does not own, or is a user runtime
+    dir or inside one (``view_roots``), which confined bash sees only as levain's view (a fresh tmpfs),
+    never the host's."""
     p = grant.path
     def refuse(why: str) -> NoReturn:
         raise ConfinementError(f"the operator grant {grant.name!r} ({p}) {why}. Refusing to grant bash hands "
@@ -801,10 +867,23 @@ def resolve_grant(grant: SocketGrant, view_roots: list[Path]) -> None:
             refuse(f"has a parent {a} that cannot be read ({exc.strerror or exc})")
         if ast.st_uid not in (0, os.geteuid()) or (ast.st_mode & 0o022 and not (ast.st_uid == 0 and ast.st_mode & stat.S_ISVTX)):
             refuse(f"has a parent {a} that another user can write")
-    parent = Path(p).parent
-    if os.access(parent, os.W_OK) and not any(parent == r or parent.is_relative_to(r) for r in view_roots):
-        refuse(f"is in {parent}, which confined bash can write (a socket there could be replaced); keep "
-               "granted sockets in the user runtime dir or a directory you cannot write")
+    # Every component (the socket and each directory above it) must be one confined bash, running as
+    # you, cannot rename between this check and the bind: its directory is unwritable by you, or is
+    # sticky and the component is not yours (sticky /tmp lets you rename only what you own), or it is
+    # a user runtime dir or inside one, which bash sees only as levain's view (its root a mountpoint).
+    comp = Path(p)
+    while comp.parent != comp:
+        d = comp.parent
+        if os.access(d, os.W_OK) and not any(comp.is_relative_to(r) for r in view_roots):
+            try:
+                dst, cst = os.stat(d), os.lstat(comp)
+            except OSError as exc:
+                refuse(f"has a component {comp} that cannot be read ({exc.strerror or exc})")
+            if not (dst.st_mode & stat.S_ISVTX and cst.st_uid != os.geteuid()):
+                refuse(f"has {comp} in {d}, where confined bash can rename it (a socket there could be "
+                       "replaced); keep granted sockets in the user runtime dir or under directories you "
+                       "cannot write")
+        comp = d
 
 
 def gpg_agent_view_path(env: dict[str, str]) -> Path | None:
@@ -813,23 +892,8 @@ def gpg_agent_view_path(env: dict[str, str]) -> Path | None:
     shell. The hashed socket directory of a non-default home is gpgconf's to compute (gpgconf creates
     that directory under the runtime dir, as any gpg command run there does; RUN on argushub 2026-10-12,
     gnupg 2.4.4). Asked only when a gpg extra socket is granted. None when gpgconf is missing or fails."""
-    from levain.launch import child_env
-
-    exe = shutil.which("gpgconf")
-    if exe is None:
-        return None
-    genv = child_env()
-    genv.pop("GNUPGHOME", None)
-    genv["HOME"] = env.get("HOME", str(Path.home()))
-    if env.get("GNUPGHOME"):
-        genv["GNUPGHOME"] = env["GNUPGHOME"]
-    try:
-        done = subprocess.run([exe, "--list-dirs", "agent-socket"], capture_output=True, text=True,
-                              stdin=subprocess.DEVNULL, cwd="/", env=genv, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    value = urllib.parse.unquote(done.stdout.strip())   # gpgconf percent-escapes its values
-    return Path(value) if done.returncode == 0 and value.startswith("/") else None
+    return _gpgconf_dir("agent-socket", home=env.get("HOME", str(Path.home())),
+                        homedir=env.get("GNUPGHOME") or None)
 
 
 def _grant_ops(grants: tuple[SocketGrant, ...], view_roots: list[Path],
@@ -886,19 +950,55 @@ SSH_AGENT_LINES = {
 GPG_EXTRA_WAIVER = "gpg's extra socket closes the agent's command channel, not its program-exec shape"
 
 
+HANDS_GRANTS_LINE = "operator grants: none (the entity's own user)"
+GRANTS_NOT_APPLIED = "(not applied on macOS until B2)"
+
+
+@dataclass(frozen=True)
+class GrantSnapshot:
+    """One conversation's operator grants, read ONCE (:func:`snapshot_operator_grants`): every spawn of
+    its shell and chat's reach check use this, never a later read of the file. A file that could not be
+    read is kept as ``problem``, and :meth:`get` raises it each time."""
+
+    grants: tuple[SocketGrant, ...] = ()
+    problem: str | None = None
+
+    def get(self) -> tuple[SocketGrant, ...]:
+        if self.problem is not None:
+            raise ConfinementError(self.problem)
+        return self.grants
+
+
+def snapshot_operator_grants(hands: "HandsIdentity | None" = None, *,
+                             system: str | None = None) -> GrantSnapshot:
+    """The grants a conversation's shell gets: none for a hands user's shell (the operator's sockets are
+    not its to use) or where grants are not applied (:func:`grants_apply`), else the grant file now."""
+    if hands is not None or not grants_apply(system):
+        return GrantSnapshot()
+    try:
+        return GrantSnapshot(load_operator_grants())
+    except ConfinementError as exc:
+        return GrantSnapshot(problem=str(exc))
+
+
 def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | None = None) -> list[str]:
     """The unix-socket lines ``levain run`` and ``levain doctor`` print, from one place (one table): the
     tier claim (:func:`levain.firing.landlock.tier_line` of levain's own read), every operator grant as a
-    named waiver, every default grant, the ssh agent, and the entity's legacy ``runtime_sockets`` key as
-    ignored. A grant file that cannot be read raises :class:`ConfinementError`, as the spawn does."""
+    named waiver (marked not applied off Linux; none read for a hands user's entity), every default
+    grant, the ssh agent, and the entity's legacy ``runtime_sockets`` key as ignored. A grant file that
+    cannot be read raises :class:`ConfinementError`, as the spawn does."""
     system = system or platform.system()
     abi, reason = _landlock.host_read(system)
     if system != "Linux" and reason is None:
         reason = f"{system} has no Landlock"
     lines = [_landlock.tier_line(abi, reason)]
-    for g in load_operator_grants():
-        extra = f"; {GPG_EXTRA_WAIVER}" if g.gpg_extra else ""
-        lines.append(f"waiver (operator grant) {g.name}: {g.path} ({g.why}){extra}")
+    if cfg is not None and getattr(cfg, "hands_user", None) is not None:
+        lines.append(HANDS_GRANTS_LINE)
+    else:
+        applied = "" if grants_apply(system) else f" {GRANTS_NOT_APPLIED}"
+        for g in load_operator_grants():
+            extra = f"; {GPG_EXTRA_WAIVER}" if g.gpg_extra else ""
+            lines.append(f"waiver (operator grant) {g.name}: {g.path} ({g.why}){extra}{applied}")
     for d in DEFAULT_GRANT_LINES.get(system, ()):
         lines.append(f"default grant: {d}")
     if system in SSH_AGENT_LINES:
@@ -1793,9 +1893,11 @@ def build_policy(
             deny_write_files_l.extend(_spellings(home / conf))
     # And in every GNUPGHOME holding a dirmngr socket outside the runtime dirs (:func:`_dirmngr_home_conf_spellings`).
     deny_write_files_l.extend(_dirmngr_home_conf_spellings())
-    # The programs the operator's gpg-agent starts (pinentry, scdaemon), resolved, with their ancestors
+    # The programs the operator's gpg-agent.conf names (pinentry, scdaemon), resolved, with their ancestors
     # through ``all_jewels``: a confined process may make the agent run the operator's own programs (a
     # sign through a granted extra socket can), never a binary it wrote (:func:`_gpg_program_spellings`).
+    # gnupg's defaults join a conversation's floor only when its grants hold gpg's extra socket
+    # (:func:`with_gpg_program_denies`).
     deny_write_files_l.extend(_gpg_program_spellings())
     # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
@@ -3971,11 +4073,14 @@ class ConfinementProvider(ABC):
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
         hands: HandsIdentity | None = None,
+        grants: tuple[SocketGrant, ...] | None = None,
     ) -> SandboxedShell:
         """Start a stateful shell confined by ``policy``. The returned :class:`SandboxedShell` is
         already ``start()``\\ ed and carries the policy it was confined by in ``effective_policy``.
         With ``hands`` (see :func:`hands_for`), bash runs as that user; a provider that cannot do
-        that refuses, never runs bash as the operator instead.
+        that refuses, never runs bash as the operator instead. ``grants`` is the conversation's operator
+        grant snapshot (:class:`GrantSnapshot`), passed to a provider that binds grants; without it a
+        shell gets none.
 
         ⛔⛔ **THE CALLER REFRESHES THE SOCKET FLOOR, NOT THIS METHOD — AND A METACLASS GUARD THAT
         TRIED TO ENFORCE THE OPPOSITE WAS DELETED AFTER FIVE VERSIONS AND SEVEN BYPASSES**
@@ -4056,6 +4161,7 @@ class ConfinementProvider(ABC):
         shell = self._spawn_shell_impl(
             refreshed, env=env, default_timeout=default_timeout,
             **({"hands": hands} if hands is not None else {}),
+            **({"grants": grants} if grants and _accepts_kw(self._spawn_shell_impl, "grants") else {}),
         )
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
         # only MOVED the crash to the caller's `.run`, as an AttributeError that `__call__` does not
@@ -4103,11 +4209,16 @@ class ConfinementProvider(ABC):
 
 def _accepts_hands(fn: Any) -> bool:
     """Whether ``fn`` takes a ``hands`` keyword (named, or through ``**kwargs``)."""
+    return _accepts_kw(fn, "hands")
+
+
+def _accepts_kw(fn: Any, name: str) -> bool:
+    """Whether ``fn`` takes a ``name`` keyword (named, or through ``**kwargs``)."""
     try:
         params = inspect.signature(fn).parameters.values()
     except (TypeError, ValueError):
         return False
-    return any(p.name == "hands" and p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD)
+    return any(p.name == name and p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD)
                or p.kind is p.VAR_KEYWORD for p in params)
 
 
@@ -5465,12 +5576,13 @@ def _gpg_components() -> list[Path]:
     return out
 
 
-def _gpg_program_spellings() -> list[Path]:
+def _gpg_program_spellings(*, components: bool = False) -> list[Path]:
     """The programs the operator's gpg-agent starts, as write-denied jewel spellings (:func:`_spellings`:
     the name as written and its resolved target): each ``pinentry-program`` and ``scdaemon-program``
-    line of ``gpg-agent.conf`` in every home :func:`_gnupg_homes` names, and gnupg's defaults
-    (:func:`_gpg_components`). The agent runs them unconfined, and a sign through a granted extra socket
-    can make it start one (``SCD SERIALNO`` execs scdaemon; measured, DESIGN §9.1). A spelling this user
+    line of ``gpg-agent.conf`` in every home :func:`_gnupg_homes` names, and with ``components`` gnupg's
+    defaults (:func:`_gpg_components`, asked only when a gpg extra socket is granted:
+    :func:`with_gpg_program_denies`). The agent runs them unconfined, and a sign through a granted extra
+    socket can make it start one (``SCD SERIALNO`` execs scdaemon). A spelling this user
     could not change anyway (a root-owned binary in a root-owned directory, or an absent one it cannot
     create) is left out: denying it buys nothing, and pinning ``/usr/bin`` would."""
     programs: list[Path] = []
@@ -5485,17 +5597,34 @@ def _gpg_program_spellings() -> list[Path]:
                 value = os.path.expanduser(parts[1].strip().strip('"'))
                 if os.path.isabs(value):
                     programs.append(Path(value))
-    programs += _gpg_components()
+    if components:
+        programs += _gpg_components()
     out: list[Path] = []
     for prog in dict.fromkeys(programs):
         for sp in _spellings(prog):
             if os.path.lexists(sp):
-                if os.access(sp, os.W_OK, follow_symlinks=False) or os.access(sp.parent, os.W_OK):
+                # A link is changed only through its directory: its own mode bits (0777 on Linux) say
+                # nothing, and read as writable would pin /usr/bin for a root-owned /bin/sh -> dash.
+                if (not os.path.islink(sp) and os.access(sp, os.W_OK)) or os.access(sp.parent, os.W_OK):
                     out.append(sp)
             elif _creatable_by_me(sp):
                 out.append(sp)
     return list(dict.fromkeys(out))
 
+
+
+def with_gpg_program_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
+    """``policy`` with gnupg's default pinentry and scdaemon (and the conf-named ones) write-denied, with
+    their ancestors: for a conversation whose grant snapshot holds a gpg extra socket, from its start,
+    so neither hand can plant a program that agent then runs."""
+    progs = [p for p in _gpg_program_spellings(components=True) if p not in policy.deny_write_files]
+    if not progs:
+        return policy
+    return replace(
+        policy,
+        deny_write_files=_dedup_paths(list(policy.deny_write_files) + progs),
+        deny_write_dirs=_dedup_paths(list(policy.deny_write_dirs) + list(_write_deny_ancestors(progs))),
+    )
 
 def _dirmngr_home_conf_spellings() -> list[Path]:
     """The gnupg configuration files (:data:`_GNUPG_CONF_WRITE_DENIED`, at :func:`_spellings`) of every
@@ -8628,6 +8757,7 @@ class BwrapProvider(ConfinementProvider):
         env: dict[str, str] | None = None,
         default_timeout: float = 120.0,
         hands: HandsIdentity | None = None,
+        grants: tuple[SocketGrant, ...] = (),
     ) -> SandboxedShell:
         relay_dir: str | None = None
         if hands is not None:
@@ -8653,14 +8783,15 @@ class BwrapProvider(ConfinementProvider):
         # probe; from the shell's construction on, the shell owns it and its close stops it.
         relay = _start_hands_relay(hands, relay_dir) if hands is not None and relay_dir else None
         try:
-            return self._spawn_bwrap(policy, env, default_timeout, hands, relay)
+            return self._spawn_bwrap(policy, env, default_timeout, hands, relay, grants)
         except BaseException:
             if relay is not None:
                 relay.stop()
             raise
 
     def _spawn_bwrap(self, policy: CrownJewelsPolicy, env: dict[str, str] | None, default_timeout: float,
-                     hands: HandsIdentity | None, relay: _HandsRelay | None) -> SandboxedShell:
+                     hands: HandsIdentity | None, relay: _HandsRelay | None,
+                     grants: tuple[SocketGrant, ...] = ()) -> SandboxedShell:
         if hands is not None:
             # Planned, claimed and rechecked under the view's jewels only; the hardlink rule ran over the
             # whole policy before this (`spawn_shell`).
@@ -8695,7 +8826,7 @@ class BwrapProvider(ConfinementProvider):
             made += canary.made
         try:
             return self._spawn_bwrap_canaried(policy, env, default_timeout, hands, relay, claim, made, canary,
-                                              tier)
+                                              tier, grants)
         except BaseException:
             if canary is not None:
                 canary.stop()
@@ -8704,7 +8835,8 @@ class BwrapProvider(ConfinementProvider):
     def _spawn_bwrap_canaried(self, policy: CrownJewelsPolicy, env: dict[str, str] | None,
                               default_timeout: float, hands: HandsIdentity | None, relay: _HandsRelay | None,
                               claim: str, made: list[tuple[str, str]],
-                              canary: _landlock.Canary | None, tier: str) -> SandboxedShell:
+                              canary: _landlock.Canary | None, tier: str,
+                              grants: tuple[SocketGrant, ...] = ()) -> SandboxedShell:
         with _LedgerTxn() as txn:
             if not txn.ok:
                 # Without a ledger this shell's claims cannot reach the disk, and another session
@@ -8715,8 +8847,9 @@ class BwrapProvider(ConfinementProvider):
                 )
             txn.sweep()
             try:
-                # The operator's declared sockets, read at each spawn (a grant file levain cannot read refuses).
-                grants = load_operator_grants() if hands is None else ()
+                # The operator's declared sockets: the conversation's snapshot, read once by its floor
+                # (`snapshot_operator_grants`), never the file again at a respawn; none for a hands user.
+                grants = tuple(grants) if hands is None else ()
                 gpg_view = (gpg_agent_view_path(env if env is not None else _default_shell_env())
                             if any(g.gpg_extra for g in grants) else None)
                 argv, create_first, mounted, unmounted, manifest = self._prepare(
