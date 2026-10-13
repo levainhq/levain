@@ -380,8 +380,9 @@ def test_dirmngr_sockets_are_read_once_per_plan(tmp_path, gh, monkeypatch) -> No
     """Read twice, a dirmngr that appeared between the view and the masks got a mask only, which a
     rename moves past (complement L3 r1)."""
     calls = []
+    policy = build_policy(_entity(tmp_path), deny_localhost_outbound=True)   # its own reading: the editor's
     monkeypatch.setattr(conf, "_dirmngr_sockets", lambda: calls.append(1) or [gh / "S.dirmngr"])
-    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+    argv = _bwrap_argv(policy)
     assert calls == [1]
     assert [i for i, op, a in _ops(argv) if op == "--tmpfs" and a == [str(gh)]]
 
@@ -490,10 +491,18 @@ def test_a_gnupghome_under_a_tool_directory_view_is_refused(tmp_path, rd, monkey
         shutil.rmtree(home)
 
 
-def test_a_gnupghome_is_left_alone_when_bash_has_network(tmp_path, gh) -> None:
-    """dirmngr is a deputy only for bash without network; with network bash fetches by itself."""
-    argv = _bwrap_argv(build_policy(_entity(tmp_path)))
-    assert not [a for _, op, a in _ops(argv) if a and (_under(a[-1], gh) or a[-1] == str(gh))]
+def test_a_gnupghome_gets_no_view_when_bash_has_network_but_its_configuration_stays_read_only(tmp_path, gh) -> None:
+    """dirmngr is a deputy only for bash without network; with network bash fetches by itself, so no view.
+    The agent beside that dirmngr still reads the configuration files, so they stay read-only either way
+    (Diogenes HIGH 2026-10-13)."""
+    (gh / "gpg.conf").unlink()   # a dangling link where no view takes it is refused, as in ~/.gnupg since 0.9.1
+    policy = build_policy(_entity(tmp_path))
+    argv = _bwrap_argv(policy)
+    touched = [(op, a) for _, op, a in _ops(argv) if a and (_under(a[-1], gh) or a[-1] == str(gh))]
+    assert touched and all(op == "--ro-bind" and a[-1].endswith(".conf") or a == [str(gh), str(gh)]
+                           for op, a in touched), touched
+    assert ("--ro-bind", [str(gh / "common.conf"), str(gh / "common.conf")]) in touched
+    assert conf.crown_jewel_reason(policy, gh / "gpg-agent.conf") is not None   # the file editor too
 
 
 def test_a_gnupghome_holding_the_workspace_is_refused(tmp_path, gh) -> None:
@@ -612,13 +621,22 @@ def test_a_gnupghome_view_levain_does_not_name_keeps_its_configuration_files_rea
     target.write_text("")
     os.symlink(target, gh / "dirmngr.conf")   # a dotfile-manager link: writing through it reached the host
     os.symlink(gh.parent / "absent.conf", gh / "scdaemon.conf")   # leads nowhere: stays out
-    argv = _bwrap_argv(build_policy(_entity(tmp_path), deny_localhost_outbound=True))
+    (gh / "agent.local").write_text("")
+    (gh / "gpg-agent.conf").unlink()
+    os.symlink("agent.local", gh / "gpg-agent.conf")   # a sibling target must not stay writable (L2)
+    pol = build_policy(_entity(tmp_path), deny_localhost_outbound=True)
+    argv = _bwrap_argv(pol)
     ops = _ops(argv)
     view = max(i for i, op, a in ops if op == "--tmpfs" and a == [str(gh)])
     for name in ("gpg-agent.conf", "common.conf", "dirmngr.conf"):
         last = [(i, op) for i, op, a in ops if a and a[-1] == str(gh / name)]
         assert last and last[-1][0] > view and last[-1][1] == "--ro-bind", (name, last)
     assert ["--ro-bind", str(target.resolve()), str(gh / "dirmngr.conf")] in [argv[k:k + 3] for k in range(len(argv))]
+    last = [op for i, op, a in ops if a and a[-1] == str(gh / "agent.local")]
+    assert last and last[-1] == "--ro-bind", last
+    for name in ("gpg-agent.conf", "dirmngr.conf", "common.conf"):   # the file editor refuses them too
+        assert conf.crown_jewel_reason(pol, gh / name) is not None, name
+    assert conf.crown_jewel_reason(pol, target) is not None   # and a link's target outside the home
     assert not [a for _, op, a in ops if a and a[-1] == str(gh / "scdaemon.conf")]
     assert ["--bind", str(gh / "trustdb.gpg"), str(gh / "trustdb.gpg")] in [argv[k:k + 3] for k in range(len(argv))]
 
