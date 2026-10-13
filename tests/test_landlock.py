@@ -151,9 +151,12 @@ def test_any_other_error_from_the_version_read_is_not_no_landlock(monkeypatch, e
     with pytest.raises(OSError) as e:
         NS["running_abi"]()
     assert e.value.errno == err
-    # levain's own read raises it too (the spawn turns it into a named refusal).
+    # levain's raw read raises it too; its host read turns it into T0 with the error's name, never a refusal.
     with pytest.raises(OSError):
         L.running_abi(system="Linux")
+    abi, reason = L.host_read(system="Linux")
+    assert abi == 0 and reason == f"Landlock unavailable ({errno.errorcode[err]})"
+    assert L.tier_line(abi, reason).startswith(f"unix sockets (T0: Landlock unavailable ({errno.errorcode[err]})): NO AGENT CLAIM")
 
 
 # --- the stub's confine step (every syscall, socket and connect replaced) --------------------------
@@ -216,10 +219,13 @@ def test_a_lower_tier_than_levain_read_refuses_by_name(monkeypatch):
     assert "(T0)" in NS["confine"](_opts(expect="T6"))
 
 
-def test_an_eperm_version_read_refuses_and_enosys_is_t0(monkeypatch):
+def test_an_eperm_version_read_refuses_above_t0_and_enosys_is_t0(monkeypatch):
+    # levain read 9 outside, the stub reads EPERM inside: refused by name.
     pr = _Probe(monkeypatch, abi=OSError(errno.EPERM, "Operation not permitted"))
-    assert "could not read the running kernel's Landlock ABI" in NS["confine"](_opts(expect="T0"))
+    assert "could not read the running kernel's Landlock ABI" in NS["confine"](_opts(expect="T9"))
     assert pr.log == []
+    # levain read T0: the stub's own read is not made, so its EPERM refuses nothing.
+    assert NS["confine"](_opts(expect="T0")) is None
 
     def nosys(nr, *a):
         raise OSError(errno.ENOSYS, "Function not implemented")
@@ -230,6 +236,14 @@ def test_an_eperm_version_read_refuses_and_enosys_is_t0(monkeypatch):
     assert NS["confine"](_opts(expect="T0")) is None   # T0: no ruleset, no probe
     assert pr.log == []
     assert "below the T9" in NS["confine"](_opts(expect="T9"))
+
+
+def test_a_t0_claim_applies_nothing_even_where_the_stub_reads_more(monkeypatch):
+    # levain read 0 outside, the stub reads 9 inside: T0 is what levain claims, so nothing is applied,
+    # probed or refused (never more than levain read).
+    pr = _Probe(monkeypatch, abi=10)
+    assert NS["confine"](_opts(expect="T0", canary=None)) is None
+    assert pr.log == [] and not pr.applied
 
 
 
@@ -482,14 +496,16 @@ def test_the_stub_runs_right_before_bash_with_the_canary_bound(tmp_path, monkeyp
     assert not os.path.exists(canary.path)
 
 
-def test_the_spawn_refuses_when_levains_own_abi_read_errors(tmp_path, monkeypatch):
+def test_the_spawn_is_offered_at_t0_when_levains_own_abi_read_errors(tmp_path, monkeypatch):
     import levain.firing.confinement as conf
-    from levain.firing.confinement import ConfinementError, build_policy
+    from levain.firing.confinement import build_policy
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(conf, "bwrap_available", lambda: True)
     monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
-    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: pytest.fail("started"))
+    seen = {}
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: seen.setdefault("shell", self))
+    monkeypatch.setattr(conf._BwrapShell, "_recheck", lambda self: None)
 
     def filtered(system=None):
         raise OSError(errno.EPERM, "Operation not permitted")
@@ -497,5 +513,9 @@ def test_the_spawn_refuses_when_levains_own_abi_read_errors(tmp_path, monkeypatc
     monkeypatch.setattr(conf._landlock, "running_abi", filtered)
     ent = tmp_path / "ent"
     (ent / ".levain").mkdir(parents=True)
-    with pytest.raises(ConfinementError, match="Landlock ABI"):
-        conf.BwrapProvider()._spawn_shell_impl(build_policy(ent), env={"PATH": "/usr/bin"})
+    conf.BwrapProvider()._spawn_shell_impl(build_policy(ent), env={"PATH": "/usr/bin"})
+    sh = seen["shell"]
+    at = sh._argv.index(L.STUB)
+    assert sh._argv[sh._argv.index("--expect-tier", at) + 1] == "T0"
+    assert L.tier_line(*L.host_read(system="Linux")).startswith("unix sockets (T0: Landlock unavailable (EPERM))")
+    sh.close()
