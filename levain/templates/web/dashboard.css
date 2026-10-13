@@ -33,6 +33,10 @@
     --round: ui-rounded, "SF Pro Rounded", -apple-system, system-ui, sans-serif;
     --sans: -apple-system, "SF Pro Text", ui-sans-serif, system-ui, sans-serif;
     --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    /* type roles + control metrics from the 1012 polish spec (§2); only the roles in use so far */
+    --fs-micro: 11px; --fs-meta: 12px; --fs-lead: 15px;
+    --ctl-md: 28px; --r-md: 8px;
+    --warn: oklch(0.84 0.13 90);
 
     /* the names the older components were written against, now derived from the tokens above */
     --bg: var(--base);
@@ -187,7 +191,7 @@
 
   /* edit-class chip — a recessed status LED (armed/locked; lights up in Slice 2) */
   .chip {
-    font: 800 9px/1.4 var(--label); letter-spacing: .08em; border-radius: 3px; padding: 2px 6px 2px 5px;
+    font: 600 var(--fs-micro)/1.4 var(--round); letter-spacing: .08em; border-radius: 3px; padding: 2px 6px 2px 5px;
     display: inline-flex; align-items: center; gap: 4px; border: 1px solid currentColor;
     box-shadow: inset 0 0 6px -2px currentColor;
   }
@@ -207,7 +211,7 @@
   .kv .v { text-align: right; min-width: 0; overflow-wrap: anywhere; color: var(--ink); }
 
   .badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 3px;
-    font: 800 10px/1.5 var(--label); letter-spacing: .12em; text-transform: uppercase; }
+    font: 600 var(--fs-micro)/1.5 var(--round); letter-spacing: .12em; text-transform: uppercase; }
   .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
   .badge.live { color: var(--mind); background: color-mix(in srgb, var(--mind) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--mind) 40%, transparent); animation: pulse 2.6s ease-in-out infinite; }
@@ -239,14 +243,14 @@
      (≈26px min, padded) with the action conveyed to screen readers via the flipping
      aria-label, since the glyph alone isn't descriptive. */
   .clause-toggle { display: none; flex: 0 0 auto; cursor: pointer; background: none; border: 0;
-    color: var(--mind); font: 700 15px/1 var(--label); padding: 4px 8px; min-width: 26px;
+    color: var(--mind); font: 600 var(--fs-lead)/1 var(--sans); padding: 4px 8px; min-width: 26px;
     min-height: 26px; opacity: .7; align-self: flex-start; }
   .clause-toggle:hover { opacity: 1; }
   .clause-toggle:focus-visible { outline: 1px solid color-mix(in srgb, var(--mind) 55%, var(--line-hot)); outline-offset: 1px; }
   .row.has-more .clause-toggle { display: inline-block; }
-  .tier { color: var(--operate); flex: 0 0 auto; font: 700 10px/1.6 var(--label); letter-spacing: .08em; text-transform: uppercase; }
-  .sid { color: var(--mind); flex: 0 0 auto; font: 600 11px/1.6 var(--label); letter-spacing: .03em; opacity: .92; }
-  .etype { color: var(--identity); flex: 0 0 auto; font: 700 9px/1.7 var(--label); letter-spacing: .1em; text-transform: uppercase;
+  .tier { color: var(--operate); flex: 0 0 auto; font: 600 var(--fs-micro)/1.6 var(--round); letter-spacing: .08em; text-transform: uppercase; }
+  .sid { color: var(--mind); flex: 0 0 auto; font: 600 var(--fs-micro)/1.6 var(--mono); letter-spacing: .03em; opacity: .92; }
+  .etype { color: var(--identity); flex: 0 0 auto; font: 600 var(--fs-micro)/1.7 var(--round); letter-spacing: .1em; text-transform: uppercase;
     border: 1px solid color-mix(in srgb, var(--identity) 30%, var(--line)); border-radius: 3px; padding: 0 5px; }
   .tags { color: color-mix(in srgb, var(--mind) 75%, var(--dim)); font-size: 11px; flex: 0 0 auto; opacity: .85; }
   .muted { color: var(--faint); flex: 0 0 auto; font-size: 11px; }
@@ -284,9 +288,16 @@
   .md-quote { margin: 0 0 9px; padding: 1px 0 1px 11px; border-left: 2px solid var(--line-hot); color: var(--dim); }
   .md-hr { border: 0; border-top: 1px solid var(--line); margin: 12px 0; }
 
-  .err { color: var(--hot); font-size: 11.5px; padding: 3px 0; }
-  .err::before { content: "▲ "; }
-  .empty { color: var(--faint); font-style: italic; font-size: 12px; }
+  /* ONE status line for empty / loading / unavailable (spec §3 "Card states"): a 6px dot + a
+     12px sentence in --label. The dot carries the state: neutral = empty, pulsing = loading,
+     --warn = unavailable. Errors take their status colour, never the accent orange. */
+  .err, .empty { display: flex; align-items: center; gap: var(--s1); margin: 0; padding: 12px 0;
+    color: var(--label); font: 400 var(--fs-meta)/1.4 var(--sans); }
+  .err::before, .empty::before { content: ""; width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--meta); }
+  .err::before { background: var(--warn); }
+  .empty.loading::before { animation: statusPulse 1.2s ease-in-out infinite; }
+  @keyframes statusPulse { 50% { opacity: .3; } }
+  @media (prefers-reduced-motion: reduce) { .empty.loading::before { animation: none; } }
 
   /* external panels (the downstream extra-panel seam): first-class `.row` panels (clamped +
      ⤢ modal like every box). A status note on top; each row gets the actionable accent (e.g.
@@ -294,12 +305,12 @@
      .clause/.row machinery, so per-item expand + line-clamp are inherited, not re-invented. */
   .ext-note { color: var(--dim); font-size: 11px; margin: 2px 0 8px; }
   .ext-note.stale { color: var(--operate); }
-  .grp-head { color: var(--faint); font: 700 10px/1.6 var(--label); letter-spacing: .12em; text-transform: uppercase;
+  .grp-head { color: var(--faint); font: 600 var(--fs-micro)/1.6 var(--round); letter-spacing: .12em; text-transform: uppercase;
     margin: 10px 0 2px; padding-top: 6px; border-top: 1px solid var(--line, rgba(255,255,255,.08)); }
   .grp-head:first-child { border-top: 0; margin-top: 0; }
   .row.ext-accent { border-left: 2px solid var(--operate); padding-left: 9px; }
   .row.ext-dim .clause { color: var(--dim); }
-  .ext-meta { color: var(--faint); flex: 0 1 auto; min-width: 0; max-width: 100%; overflow-wrap: anywhere; font: 700 10px/1.6 var(--label);
+  .ext-meta { color: var(--faint); flex: 0 1 auto; min-width: 0; max-width: 100%; overflow-wrap: anywhere; font: 600 var(--fs-micro)/1.6 var(--round);
     letter-spacing: .06em; }
 
   /* episode keyword-search (spore-107): the inline read-only search box on the
@@ -316,12 +327,13 @@
        delineation and looks tucked UNDER the search box (Phill's visual gate, twice). */
     border-bottom: 1px solid var(--line-hot);
     box-shadow: 0 6px 9px -7px rgba(0,0,0,.7); }
-  .ep-search-input { flex: 1 1 150px; min-width: 0; background: var(--bg); color: var(--ink);
-    border: 1px solid var(--line); border-radius: 4px; padding: 5px 8px; font: 12px/1.4 var(--mono);
-    -webkit-appearance: none; appearance: none; }
-  .ep-search-input::placeholder { color: var(--faint); }
-  .ep-search-input:focus { outline: none; border-color: color-mix(in srgb, var(--mind) 55%, var(--line-hot));
-    box-shadow: 0 0 12px -4px var(--mind); }
+  /* ONE filter look (spec D4): 28px, 8px radius, 12px sans. .xfilter (KE panels) wraps its input,
+     .ep-search-input (episodes / spore filters) is the bare input; both draw this box. */
+  .ep-search-input { flex: 1 1 150px; min-width: 0; height: var(--ctl-md); box-sizing: border-box;
+    background: var(--bg); color: var(--ink); border: 1px solid var(--hair-2); border-radius: var(--r-md);
+    padding: 0 12px; font: 400 var(--fs-meta)/1.4 var(--sans); -webkit-appearance: none; appearance: none; }
+  .ep-search-input::placeholder { color: var(--meta); }
+  .ep-search-input:focus { outline: none; border-color: var(--accent); box-shadow: none; }
   .ep-search-status { color: var(--faint); font-size: 10.5px; letter-spacing: .03em; flex: 0 0 auto; }
   .ep-results, .sp-results { display: flex; flex-direction: column; }
   /* The grid search bar full-bleeds to the panel-body top via margin-top:-11px, which
@@ -360,9 +372,9 @@
   /* read-side instrument controls — METAL (materiality rule), real verbs only:
      timebase redraws the window; a channel chip solos its trace (CSS-only). */
   .scope-bar { display: flex; gap: 6px; align-items: center; margin: 0 0 8px; }
-  .scope-bar .lbl { font: 700 8.5px/1 var(--label); letter-spacing: .24em; text-transform: uppercase; color: var(--faint); margin-right: 3px; }
+  .scope-bar .lbl { font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .24em; text-transform: uppercase; color: var(--faint); margin-right: 3px; }
   .scope-tb {
-    font: 700 9.5px/1 var(--label); letter-spacing: .1em; color: var(--dim);
+    font: 500 var(--fs-meta)/1 var(--sans); letter-spacing: .1em; color: var(--dim);
     background: linear-gradient(180deg, var(--card-2), var(--card)); border: 1px solid var(--line);
     border-bottom-width: 2px; border-radius: 3px; padding: 4px 9px; cursor: pointer; transition: all .13s ease;
   }
@@ -373,7 +385,7 @@
   }
   .scope-legend { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 9px; }
   .scope-ch {
-    font: 700 9px/1.4 var(--label); letter-spacing: .12em; cursor: pointer;
+    font: 500 var(--fs-meta)/1.4 var(--sans); letter-spacing: .12em; cursor: pointer;
     background: none; border: 1px solid transparent; border-radius: 3px; padding: 3px 7px;
     transition: all .13s ease;
   }
@@ -420,7 +432,7 @@
     display: flex; justify-content: flex-end; padding: 9px 13px 12px; margin-top: auto;
   }
   .edit-btn {
-    font: 700 9px/1 var(--label); letter-spacing: .14em; text-transform: uppercase;
+    font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .14em; text-transform: uppercase;
     color: color-mix(in srgb, var(--accent) 78%, var(--ink));
     background: linear-gradient(180deg, var(--card-2), var(--card));
     border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--line)); border-bottom-width: 2px;
@@ -446,7 +458,7 @@
   }
   .edit-controls { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
   .edit-save, .edit-cancel {
-    font: 700 10px/1 var(--label); letter-spacing: .12em; text-transform: uppercase;
+    font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .12em; text-transform: uppercase;
     border-radius: 4px; padding: 7px 14px; cursor: pointer; transition: all .14s ease;
     border: 1px solid var(--line); border-bottom-width: 2px;
   }
@@ -472,7 +484,7 @@
   /* entity-name rename — the masthead "Unit" name is a Class-A input too. A clearly-
      labeled metal button (was a near-invisible faint glyph), so it's discoverable. */
   .name-edit {
-    font: 700 9.5px/1 var(--label); letter-spacing: .12em; text-transform: uppercase;
+    font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .12em; text-transform: uppercase;
     color: color-mix(in srgb, var(--mind) 78%, var(--dim));
     background: linear-gradient(180deg, var(--card-2), var(--card));
     border: 1px solid color-mix(in srgb, var(--mind) 32%, var(--line)); border-bottom-width: 2px;
@@ -502,7 +514,7 @@
   /* the masthead state line's inline edit — operate-amber (the operator's OWN frame, the
      .stateline hue), the prose sibling of the entity-name's uppercase .name-edit/.name-input. */
   .state-edit {
-    font: 700 9px/1 var(--label); letter-spacing: .12em; text-transform: uppercase;
+    font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .12em; text-transform: uppercase;
     color: color-mix(in srgb, var(--operate) 80%, var(--dim));
     background: linear-gradient(180deg, var(--card-2), var(--card));
     border: 1px solid color-mix(in srgb, var(--operate) 30%, var(--line)); border-bottom-width: 2px;
@@ -533,11 +545,11 @@
   .edit-row { display: flex; flex-wrap: wrap; gap: 7px; align-items: baseline; padding: 5px 0;
     border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent); }
   .edit-row:first-of-type { border-top: 0; }
-  .edit-act { color: var(--operate); flex: 0 0 auto; font: 700 9px/1.7 var(--label);
+  .edit-act { color: var(--operate); flex: 0 0 auto; font: 600 var(--fs-micro)/1.7 var(--round);
     letter-spacing: .1em; text-transform: uppercase; }
   .edit-act.undo { color: var(--faint); }
   .undo-btn {
-    font: 700 9px/1 var(--label); letter-spacing: .1em; text-transform: uppercase; color: var(--hot);
+    font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .1em; text-transform: uppercase; color: var(--hot);
     background: none; border: 1px solid color-mix(in srgb, var(--hot) 35%, var(--line));
     border-radius: 3px; padding: 3px 8px; cursor: pointer; margin-left: auto; transition: all .13s ease;
   }
@@ -552,7 +564,7 @@
      ref), and `confirm tombstone` reads hot (.danger). Aligned to the row's right. */
   .verb-actions { display: inline-flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-left: auto; }
   .verb-btn {
-    font: 700 8.5px/1 var(--label); letter-spacing: .1em; text-transform: uppercase;
+    font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .1em; text-transform: uppercase;
     color: color-mix(in srgb, var(--operate) 80%, var(--ink));
     background: linear-gradient(180deg, var(--card-2), var(--card));
     border: 1px solid color-mix(in srgb, var(--operate) 30%, var(--line)); border-bottom-width: 2px;
@@ -572,7 +584,7 @@
     box-shadow: 0 0 10px -4px var(--operate);
   }
   .verb-confirm, .verb-cancel {
-    font: 700 9px/1 var(--label); letter-spacing: .1em; text-transform: uppercase;
+    font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .1em; text-transform: uppercase;
     border-radius: 3px; padding: 4px 10px; cursor: pointer; transition: all .13s ease;
     border: 1px solid var(--line); border-bottom-width: 2px;
   }
@@ -638,7 +650,7 @@
     box-shadow: 0 0 10px -4px var(--operate);
   }
   .tray-dump-btn {
-    font: 700 9px/1 var(--label); letter-spacing: .1em; text-transform: uppercase;
+    font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .1em; text-transform: uppercase;
     color: var(--on-accent); border: 1px solid var(--operate); border-bottom-width: 2px;
     border-radius: 3px; padding: 6px 12px; cursor: pointer; transition: all .13s ease;
     background: linear-gradient(180deg, var(--operate), color-mix(in srgb, var(--operate) 70%, #000));
@@ -650,7 +662,7 @@
   /* multiselect compose field (a fixed set of checkboxes, e.g. inbox readers) */
   .action-multiselect { display: flex; flex-direction: column; gap: 4px; }
   .action-ms-label {
-    font: 700 9px/1 var(--label); letter-spacing: .1em; text-transform: uppercase; color: var(--dim);
+    font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .1em; text-transform: uppercase; color: var(--dim);
   }
   .action-ms-opts { display: flex; flex-wrap: wrap; gap: 4px 12px; }
   .action-ms-opt {
@@ -846,7 +858,7 @@
 
 /* ── the chat panel (dashboard_chat.js; present only under `levain serve --chat`) ─────────────────────────────── */
 .chat-panel { margin: 0 0 14px; }
-.chat-head { font: 700 11px/1 var(--label); letter-spacing: .14em; text-transform: uppercase; color: var(--operate); padding: 12px 14px 0; }
+.chat-head { font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .14em; text-transform: uppercase; color: var(--operate); padding: 12px 14px 0; }
 .chat-body { padding: 10px 14px 14px; display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .chat-note { margin: 0; color: var(--dim); font: 12px/1.5 var(--mono); }
 .chat-note.dim { color: var(--faint); }
@@ -859,7 +871,7 @@
 }
 .chat-input:focus { outline: none; border-color: var(--operate); }
 .chat-btn {
-  font: 700 11px/1 var(--label); letter-spacing: .12em; text-transform: uppercase; color: var(--operate);
+  font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .12em; text-transform: uppercase; color: var(--operate);
   background: linear-gradient(180deg, var(--card-2), var(--card)); border: 1px solid color-mix(in srgb, var(--operate) 40%, var(--line));
   border-radius: 4px; padding: 10px 14px; cursor: pointer;
 }
@@ -876,7 +888,7 @@
 .chat-msg.me { border-left: 2px solid var(--identity); }
 .chat-msg.them { border-left: 2px solid var(--mind); }
 .chat-msg.err { border-left: 2px solid var(--hot); }
-.chat-who { font: 700 10px/1 var(--label); letter-spacing: .14em; text-transform: uppercase; color: var(--faint); margin-bottom: 6px; }
+.chat-who { font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .14em; text-transform: uppercase; color: var(--faint); margin-bottom: 6px; }
 .chat-text { white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 var(--mono); color: var(--ink); }
 .chat-unreadable { color: var(--hot); }
 .chat-raw { margin-top: 6px; color: var(--dim); }
@@ -890,7 +902,7 @@
 .chat-grow { flex: 0 0 auto; resize: none; overflow: hidden; min-height: 0; display: block; width: 100%; box-sizing: border-box; }
 .chat-consent .chat-input { flex: 0 0 auto; }
 .chat-consent { border: 1px solid color-mix(in srgb, var(--operate) 55%, var(--line)); border-radius: 5px; padding: 10px; display: flex; flex-direction: column; gap: 8px; background: color-mix(in oklch, var(--accent) 5%, transparent); }
-.chat-consent-head { font: 700 11px/1 var(--label); letter-spacing: .14em; text-transform: uppercase; color: var(--operate); }
+.chat-consent-head { font: 600 var(--fs-micro)/1 var(--round); letter-spacing: .14em; text-transform: uppercase; color: var(--operate); }
 .chat-tool { font: 700 12px/1.4 var(--mono); color: var(--ink); }
 .chat-detail { margin: 4px 0 0; padding: 8px; overflow: visible; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--base); border: 1px solid var(--line); border-radius: 4px; font: 12px/1.4 var(--mono); color: var(--ink); }
 .chat-reason { margin-top: 4px; color: var(--dim); font: 11px/1.5 var(--mono); overflow-wrap: anywhere; }
@@ -907,15 +919,16 @@
   .xnote { font-size: 12px; color: var(--meta); margin: var(--s1) 0 0; }
   .xmore { background: none; border: 0; padding: var(--s1); color: var(--label); font-size: 12px; text-decoration: underline dotted; cursor: pointer; }
 
-  .xfilter { display: flex; align-items: center; gap: var(--s1); margin: 0 0 var(--s2); padding: 6px 12px;
-    background: var(--base); border: 1px solid var(--hair-2); border-radius: 12px; }
+  .xfilter { display: flex; align-items: center; gap: var(--s1); margin: 0 0 var(--s2); padding: 0 12px;
+    height: var(--ctl-md); box-sizing: border-box;
+    background: var(--base); border: 1px solid var(--hair-2); border-radius: var(--r-md); }
   .xfilter:focus-within { border-color: var(--accent); }
-  .xfilter-input { flex: 1 1 auto; min-width: 0; background: none; border: 0; outline: none; color: var(--text); font: 14px var(--sans); padding: 2px 0; }
+  .xfilter-input { flex: 1 1 auto; min-width: 0; background: none; border: 0; outline: none; color: var(--text); font: 400 var(--fs-meta)/1.4 var(--sans); padding: 0; }
   .xfilter-input::placeholder { color: var(--meta); }
   .xfilter-input::-webkit-search-cancel-button { display: none; }
-  .xfilter-count { font: 12px var(--mono); color: var(--label); white-space: nowrap; }
+  .xfilter-count { font: 400 var(--fs-meta) var(--sans); font-variant-numeric: tabular-nums; color: var(--label); white-space: nowrap; }
   .xfilter-count.bad { color: var(--accent); }
-  .xfilter-key { font: 11px var(--mono); color: var(--meta); border: 1px solid var(--hair-2); border-radius: 5px; padding: 0 5px; }
+  .xfilter-key { font: var(--fs-micro) var(--mono); color: var(--meta); border: 1px solid var(--hair-2); border-radius: 6px; padding: 0 5px; }
 
   .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--dot); display: inline-block; }
   .dot.warn { background: none; border: 2px solid var(--accent); }

@@ -1310,7 +1310,7 @@
     }
     if (s.countEl) { s.countEl.textContent = err ? "search failed" : label; s.countEl.classList.toggle("bad", !!err); }
     if (err) s.body.appendChild(el("p", "err", "search failed — " + err));
-    else if (!items.length) s.body.appendChild(el("p", "empty", store && !s.results ? "searching…" : (terms.length ? "no match" : d.empty)));
+    else if (!items.length) s.body.appendChild(el("p", "empty" + (store && !s.results ? " loading" : ""), store && !s.results ? "searching…" : (terms.length ? "no match" : d.empty)));
     // the first screenful, unless the operator asked for all of it or is filtering
     const cap = s.searchable && !nq && !s.showAll && items.length > (sr.visible || 10) ? (sr.visible || 10) : items.length;
     const shown = items.slice(0, cap);
