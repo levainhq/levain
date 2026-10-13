@@ -97,7 +97,7 @@ from levain.cockpit.firejournal import (
 )
 from levain.cockpit.install import REPORTED, decide_install, network_fs_problem
 from levain.cockpit.labels import BrokerLabeller, LabelSnapshot, label_class
-from levain.authority import AnchorError, advance_anchor, anchor_path
+from levain.authority import AnchorError, advance_anchor, anchor_path, presence_missing
 from levain.cockpit.authority import RequestAuthority, bound, current, inactive
 from levain.cockpit.results import Absent, Fault
 from levain.cockpit.verbs import KERNEL_VERBS
@@ -1000,6 +1000,10 @@ class Broker:
         key = authority.key(verdict.fingerprint) if verdict.fingerprint is not None else None
         if key is None or not key.active or key.principal != verdict.principal:
             raise BrokerError("bad_signature", 400, "the signing key is not the enrolled key")
+        if presence_missing(signature, key.public_key):
+            # the authority links' rule (levain.authority.presence_missing): a FIDO key made
+            # no-touch-required signs a T2/T3 act only with a touch, like its links (Diogenes LOW 2026-10-13)
+            raise BrokerError("bad_signature", 400, "a FIDO signature without user presence (no touch)")
         assert verdict.fingerprint is not None
         return verdict.fingerprint
 

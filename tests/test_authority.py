@@ -1186,3 +1186,26 @@ def test_a_pipe_thread_that_cannot_start_closes_its_fds(keys, monkeypatch):
     for fd in pipes[1]:
         with pytest.raises(OSError):
             os.fstat(fd)
+
+
+def test_a_cockpit_act_signed_without_user_presence_is_refused_like_a_link(monkeypatch, tmp_path):
+    """Diogenes LOW 2026-10-13: the broker's act verifier lacked the presence rule F1 gave the links, so
+    a FIDO key made ``no-touch-required`` had its links refused while every T2/T3 act it signed passed.
+    The act check now uses the same rule (``presence_missing``); the stand-in verifier says Good."""
+    from types import SimpleNamespace
+
+    from levain.autonomic.confirm import VERIFIED, CockpitVerdict
+    from levain.cockpit import broker as broker_mod
+
+    pk = _sk_public_key()
+    key = SimpleNamespace(principal="laptop", public_key=pk, active=True)
+    authority = SimpleNamespace(active_keys=lambda: [key], key=lambda fp: key if fp == FAKE_FP else None)
+    me = SimpleNamespace(data_root=tmp_path, ssh_keygen="/usr/bin/ssh-keygen")
+    monkeypatch.setattr(broker_mod, "verify_cockpit_signature",
+                        lambda *a, **kw: CockpitVerdict(VERIFIED, "laptop", FAKE_FP))
+    no_touch = _armored_sshsig(pk, "sk-ssh-ed25519@openssh.com", flags=0x04)
+    with pytest.raises(broker_mod.BrokerError) as e:
+        broker_mod.Broker._verify(me, authority, b"m", no_touch)
+    assert e.value.code == "bad_signature"
+    touched = _armored_sshsig(pk, "sk-ssh-ed25519@openssh.com", flags=0x01)
+    assert broker_mod.Broker._verify(me, authority, b"m", touched) == FAKE_FP   # the control
