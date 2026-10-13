@@ -922,7 +922,8 @@ def _check_unix_sockets(install: Path) -> list[CheckResult]:
     unix_socket_lines`): the tier claim, each operator grant as a named waiver, each default grant, the
     ssh agent, and a legacy ``runtime_sockets`` key as ignored. A grant file that cannot be read, or
     whose state cannot be determined at all, FAILS: ``levain run`` refuses bash with it. A hands user's
-    entity reads no grant file. A broken entity config is ``_check_confinement``'s to report."""
+    entity reads no grant file, and none is read where grants are not applied (one line says so). A
+    broken entity config is ``_check_confinement``'s to report."""
     try:
         from levain.firing.confinement import ConfinementError, load_confinement_config, unix_socket_lines
     except Exception as exc:  # noqa: BLE001 — never let a diagnosis break the whole doctor run
