@@ -11,7 +11,8 @@ from pathlib import Path
 
 from . import entry as E
 from . import roles as R
-from .transport import GitLedger, TeamError
+from .ledger_api import LedgerTransport
+from .transport import TeamError
 
 
 def _fingerprint_entry(e: dict) -> str:
@@ -50,7 +51,7 @@ def plan(judgment: R.Judgment, existing: dict[str, dict],
     return out
 
 
-def seed(gl: GitLedger, pack_dir: Path, *, push: bool = True) -> list[dict]:
+def seed(gl: LedgerTransport, pack_dir: Path, *, push: bool = True) -> list[dict]:
     path = pack_dir / R.JUDGMENT_FILE
     # One pack-sync at a time: two that plan from the same ledger would both supersede the same old rule.
     # the op first, then the pack lock: the CLI order (code L3 r7 codex 1: seed took pack then op, a deadlock); every

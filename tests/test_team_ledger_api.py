@@ -172,7 +172,6 @@ def test_the_guard_can_fail_and_can_pass(tmp_path):
                                          "caller.py:2 GitLedger._ledger_of", "caller.py:5 self.gl._dcache"]
 
 
-@pytest.mark.xfail(strict=True, reason="S0-b migrates the callers")
 def test_no_caller_reaches_a_private_ledger_member():
     reaches = private_reaches()
     assert reaches == [], "callers reach private ledger members:\n" + "\n".join(reaches)
