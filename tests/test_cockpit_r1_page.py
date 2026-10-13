@@ -216,11 +216,9 @@ cases.a_lost_answer_replays_under_the_same_key_and_an_answer_clears_it = async (
   ok(keys.length === 1, "the key is kept");
   const first = env.posts[1].body;
   ok(stored[keys[0]].envelope.idempotency_key === first.idempotency_key, "the whole envelope is kept with it");
-  env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
   const r2 = await env.opts().commit(req);
   ok(r2.ok === true, "the retry lands");
-  ok(env.posts[2].body.dry_run === true, "the retry asks the tier again");
-  ok(JSON.stringify(env.posts[3].body) === JSON.stringify(first), "the retry sends exactly the same envelope and key");
+  ok(env.posts.length === 3 && JSON.stringify(env.posts[2].body) === JSON.stringify(first), "the retry sends exactly the same envelope and key, with no new dry run");
   ok(Object.keys(JSON.parse(env.ss.levain_cockpit_keys)).length === 0, "an answer clears the key");
 };
 
@@ -233,10 +231,51 @@ cases.a_replay_survives_a_reload = async () => {
   await env1.opts().commit(req);
   const lost = env1.posts[1].body;
   const env2 = makeEnv({ session: { levain_cockpit_keys: env1.ss.levain_cockpit_keys } });
-  env2.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
   await env2.start();
   await env2.opts().commit(req);
-  ok(JSON.stringify(env2.posts[1].body) === JSON.stringify(lost), "the reloaded page replays the stored envelope");
+  ok(env2.posts.length === 1 && JSON.stringify(env2.posts[0].body) === JSON.stringify(lost), "the reloaded page replays the stored envelope first");
+};
+
+cases.a_lost_write_that_landed_is_replayed_not_dry_run_into_stale = async () => {
+  // L3 r1 (codex HIGH, complement, L1): the fire commits and moves the row, its answer is lost. A dry run of the
+  // retry would answer stale and strand the key; the replay under the stored key gets the landed answer back.
+  const env = makeEnv();
+  env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }], "net",
+                     [409, { error: "stale", message: "the row moved" }]];
+  await env.start();
+  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  await env.opts().commit(req);
+  const first = env.posts[1].body;
+  env.verbAnswers = [[200, { ok: true, state: "COMMITTED", label: "replayed" }]];
+  const r = await env.opts().commit(req);
+  ok(r.ok === true, "the replay's answer is the landed write: " + JSON.stringify(r));
+  ok(env.posts.length === 3 && !env.posts[2].body.dry_run && env.posts[2].body.idempotency_key === first.idempotency_key, "no dry run before the replay");
+  ok(Object.keys(JSON.parse(env.ss.levain_cockpit_keys)).length === 0, "the answer clears the key");
+};
+
+cases.a_5xx_with_a_json_body_keeps_the_envelope = async () => {
+  // L3 r1 (glm): a 5xx is indeterminate; a retry under a new key could apply the write twice
+  const env = makeEnv();
+  env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }],
+                     [503, { error: "unavailable", message: "try later" }]];
+  await env.start();
+  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  const r = await env.opts().commit(req);
+  ok(r.ok === false, "the 5xx is shown");
+  ok(Object.keys(JSON.parse(env.ss.levain_cockpit_keys)).length === 1, "the envelope is kept");
+  await env.opts().commit(req);
+  ok(env.posts.length === 3 && env.posts[2].body.idempotency_key === env.posts[1].body.idempotency_key, "the retry replays the same key");
+};
+
+cases.identical_submits_in_flight_fire_once = async () => {
+  // L3 r1 (codex HIGH): a repeated Cmd+Enter while the first write is still asking, firing or re-reading
+  const env = makeEnv();
+  env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T2", rendered_tier: "C1", gesture: "direct-reported" }]];
+  await env.start();
+  const req = { kind: "spore_update", spore_id: "spore-1", text: "x" };
+  const [a, b] = await Promise.all([env.opts().commit(req), env.opts().commit(req)]);
+  ok(a.ok === true && b.ok === true, "both callers get the answer");
+  ok(env.posts.length === 2 && env.posts[0].body.dry_run === true && !env.posts[1].body.dry_run, "one dry run and one fire: " + env.posts.length);
 };
 
 cases.refused_and_laptop_only_never_post = async () => {

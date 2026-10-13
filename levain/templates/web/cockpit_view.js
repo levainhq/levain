@@ -702,7 +702,8 @@
     }
     // the hero is the page's header and reads the same in every mode: its weather is not one of the orientation
     // readings Build drops
-    for (const e of view.layout) e.modes = e.zone === "hero" ? "morning board build" : modesOf(e);
+    const inHero = new Set(view.ke ? view.ke.hero : []);
+    for (const e of view.layout) e.modes = inHero.has(e.id) ? "morning board build" : modesOf(e);
     // the verbs the kernel offered somewhere with a gesture a browser can perform: an affordance whose
     // verb is not here has nothing to post to
     view.offered_verbs = Object.create(null);

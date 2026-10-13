@@ -336,6 +336,10 @@
     return { ok: false, error: code, message: text };
   }
 
+  // One write per fingerprint at a time: a second identical submit while the first is still asking, firing or
+  // re-reading (a repeated Cmd+Enter, a double click) gets the first one's answer instead of minting a new key.
+  const writing = new Map();
+
   async function postVerb(action, params, opts) {
     opts = opts || {};
     const head = (live && live.heads && live.heads[action.verb]) || {};
@@ -353,36 +357,45 @@
     const pv = opts.panelVersion !== undefined && opts.panelVersion !== null ? opts.panelVersion : t.panel_version;
     if (typeof pv === "string") base.panel_version = pv;
     if (head.confirm === true && opts.confirm === true) base.confirm = true;
+    // the request as the operator asked it, before any tier is known: a stored envelope is found by it
+    const fpKey = canon([base.verb, base.panel_id, base.row_id || null, base.row_version || base.panel_version || null,
+                         base.params, base.confirm === true]);
+    if (writing.has(fpKey)) return writing.get(fpKey);
+    const run = fire(base, head, label, action, fpKey);
+    writing.set(fpKey, run);
+    try { return await run; } finally { writing.delete(fpKey); }
+  }
+
+  async function fire(base, head, label, action, fpKey) {
     const what = { row_id: base.row_id, label: label };
-
-    let tier = "C1", gesture = action.gesture, intent = null;
-    const mayEscalate = !(action.gesture === "direct" && (!Array.isArray(action.escalates) || action.escalates.length === 0));
-    if (mayEscalate) {
-      const d = await send("/cockpit/verb", Object.assign({}, base, { dry_run: true }));
-      if (d.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };
-      if (!d.ok) return fault(d, what);
-      tier = d.data.tier; gesture = d.data.gesture;
-      if (gesture === "refused" || gesture === "laptop-only") {
-        return { ok: false, error: "gesture", message: label + " is " + tier + " with these values, and its gesture is " + gesture + ": it cannot be done from this page." };
+    // A T2+ fire (or an idempotent verb's) carries one key, minted for this request and kept with the whole
+    // envelope until the kernel answers. A kept envelope is sent again BEFORE any new dry run: the write it
+    // carries may have landed and moved the row, and only a replay under its own key gets that answer back.
+    let env = (readKeys()[fpKey] || {}).envelope || null;
+    if (env === null) {
+      let tier = "C1", gesture = action.gesture, intent = null;
+      const mayEscalate = !(action.gesture === "direct" && (!Array.isArray(action.escalates) || action.escalates.length === 0));
+      if (mayEscalate) {
+        const d = await send("/cockpit/verb", Object.assign({}, base, { dry_run: true }));
+        if (d.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };
+        if (!d.ok) return fault(d, what);
+        tier = d.data.tier; gesture = d.data.gesture;
+        if (gesture === "refused" || gesture === "laptop-only") {
+          return { ok: false, error: "gesture", message: label + " is " + tier + " with these values, and its gesture is " + gesture + ": it cannot be done from this page." };
+        }
+        if (tier !== "C1") intent = gesture === "sign" ? "sign" : "reported";
       }
-      if (tier !== "C1") intent = gesture === "sign" ? "sign" : "reported";
-    }
-
-    let env = Object.assign({}, base);
-    if (intent) { env.intent = intent; env.tier_seen = tier; env.gesture_seen = gesture; }
-    // A T2+ fire (or an idempotent verb's) carries one key, minted for this request and kept with
-    // the whole request until the kernel answers, so a lost answer is replayed, never re-decided.
-    let fpKey = null;
-    if (tier !== "C1" || head.idempotent === true) {
-      fpKey = canon([base.verb, base.panel_id, base.row_id || null, base.row_version || base.panel_version || null,
-                     base.params, intent, base.confirm === true]);
-      const keys = readKeys();
-      if (keys[fpKey] && keys[fpKey].envelope) env = keys[fpKey].envelope;
-      else { env.idempotency_key = newKey(); keys[fpKey] = { envelope: env }; writeKeys(keys); }
+      env = Object.assign({}, base);
+      if (intent) { env.intent = intent; env.tier_seen = tier; env.gesture_seen = gesture; }
+      if (tier !== "C1" || head.idempotent === true) {
+        env.idempotency_key = newKey();
+        const keys = readKeys(); keys[fpKey] = { envelope: env }; writeKeys(keys);
+      }
     }
     const r = await send("/cockpit/verb", env);
-    if (r.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };   // the key stays, so a retry replays it
-    if (fpKey) { const keys = readKeys(); delete keys[fpKey]; writeKeys(keys); }
+    if (r.net) return { ok: false, error: "network", message: NETWORK_MESSAGE };   // the envelope stays, so a retry replays it
+    // a 5xx is indeterminate (the write may have landed before it): the envelope stays for the retry
+    if (env.idempotency_key && r.status < 500) { const keys = readKeys(); delete keys[fpKey]; writeKeys(keys); }
     if (!r.ok) return fault(r, what);
     const d = r.data;
     const state = typeof d.state === "string" && d.state ? d.state : "done";
