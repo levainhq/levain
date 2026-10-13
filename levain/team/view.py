@@ -31,7 +31,7 @@ from levain.web_server import load_web_asset
 from . import canon as C
 from . import index as I
 from . import roles as R
-from .transport import GitLedger
+from .ledger_api import LedgerTransport
 
 DEFAULT_PORT = 7450
 DEFAULT_COCKPIT_URL = "http://127.0.0.1:7420/"
@@ -389,7 +389,7 @@ class _ViewHandler(GuardedHandler):
     server: _ViewServer
 
     def _model(self, path_filter: str = "") -> dict:
-        gl: GitLedger = self.server.ledger_reader
+        gl: LedgerTransport = self.server.ledger_reader
         # Serializes model generation WITHIN this process only (it says nothing about other processes' git use).
         # A cold history read can take a minute, so a waiter gives up after model_lock_timeout and the caller
         # answers 503 "busy" rather than piling up handler threads. Static assets never come through here.
@@ -461,7 +461,7 @@ def _ipv4_loopback(host: str) -> bool:
     return ip.version == 4 and ip.is_loopback
 
 
-def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFAULT_PORT,
+def make_view_server(gl: LedgerTransport, *, host: str = "127.0.0.1", port: int = DEFAULT_PORT,
                      recheck_days: int = DEFAULT_RECHECK_DAYS, ack_flag: int = DEFAULT_ACK_FLAG,
                      cockpit_url: str = DEFAULT_COCKPIT_URL) -> _ViewServer:
     """A bound, not-yet-serving server. Loopback only: refused before binding, and the bound address is checked again."""
@@ -489,7 +489,7 @@ def make_view_server(gl: GitLedger, *, host: str = "127.0.0.1", port: int = DEFA
     return httpd
 
 
-def serve(gl: GitLedger, *, host: str, port: int, recheck_days: int, ack_flag: int,
+def serve(gl: LedgerTransport, *, host: str, port: int, recheck_days: int, ack_flag: int,
           cockpit_url: str = DEFAULT_COCKPIT_URL) -> int:
     from . import registry
     httpd = make_view_server(gl, host=host, port=port, recheck_days=recheck_days, ack_flag=ack_flag,

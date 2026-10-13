@@ -18,7 +18,8 @@ from . import roles as R
 from . import wire as W
 from .export import export_stream
 from .hook import decide
-from .transport import _NO_HOOKS, GitLedger, InitIncomplete, JoinIncomplete, Repo, TeamError, ledger_env
+from .ledger_api import LedgerTransport, open_ledger
+from .transport import InitIncomplete, JoinIncomplete, Repo, TeamError
 
 
 def _repo(args) -> Repo:
@@ -79,7 +80,7 @@ def _members(values: list[str] | None) -> tuple[dict[str, str], dict[str, str]]:
 
 def cmd_init(args) -> int:
     repo = _repo(args)
-    gl = GitLedger(repo)
+    gl = open_ledger(repo)
     incomplete = None
     try:
         members, keys = _members(args.member)
@@ -138,7 +139,7 @@ def cmd_init(args) -> int:
 
 def cmd_join(args) -> int:
     repo = _repo(args)
-    gl = GitLedger(repo)
+    gl = open_ledger(repo)
     accepted = {}
     for v in args.accept_merge or []:
         sha, _, n = v.partition(":")
@@ -168,7 +169,7 @@ def cmd_join(args) -> int:
     return 0
 
 
-def _actor(gl: GitLedger) -> tuple[R.Team, str]:
+def _actor(gl: LedgerTransport) -> tuple[R.Team, str]:
     team = gl.team()
     handle = gl.handle(team)
     if handle is None:
@@ -181,7 +182,7 @@ def _actor(gl: GitLedger) -> tuple[R.Team, str]:
 
 def cmd_record(args) -> int:
     repo = _repo(args)
-    gl = GitLedger(repo)
+    gl = open_ledger(repo)
     gl.require_joined()
     team, handle = _actor(gl)
     words = args.words
@@ -208,7 +209,7 @@ def cmd_record(args) -> int:
 
 def cmd_retire(args) -> int:
     repo = _repo(args)
-    gl = GitLedger(repo)
+    gl = open_ledger(repo)
     gl.require_joined()
     team, handle = _actor(gl)
     if args.owner and not team.owner_ok(args.owner):
@@ -221,14 +222,14 @@ def cmd_retire(args) -> int:
 
 
 def cmd_sync(args) -> int:
-    gl = GitLedger(_repo(args))
+    gl = open_ledger(_repo(args))
     print(gl.sync(push=not args.no_push))
     return 0
 
 
 def cmd_status(args) -> int:
     repo = _repo(args)
-    gl = GitLedger(repo)
+    gl = open_ledger(repo)
     gl.require_joined()
     sha, team, ledger = gl.snapshot()
     handle = gl.handle(team)
@@ -266,7 +267,7 @@ def cmd_status(args) -> int:
 
 
 def cmd_verify(args) -> int:
-    gl = GitLedger(_repo(args))
+    gl = open_ledger(_repo(args))
     gl.require_joined()
     sha, team, ledger = gl.snapshot()
     canon_text = gl.read_canon(sha)
@@ -288,7 +289,7 @@ def cmd_verify(args) -> int:
 
 
 def cmd_consolidate(args) -> int:
-    gl = GitLedger(_repo(args))
+    gl = open_ledger(_repo(args))
     gl.require_joined()
     team, handle = _actor(gl)
     if handle != team.owner:
@@ -302,12 +303,12 @@ def cmd_consolidate(args) -> int:
         print(text, end="")
         return 0
     print(gl.write_canon(text, push=not args.no_push))
-    print(f"PROJECT.md: {gl.wt / 'PROJECT.md'}")
+    print(f"PROJECT.md: {gl.canon_path}")
     return 0
 
 
 def cmd_export(args) -> int:
-    gl = GitLedger(_repo(args))
+    gl = open_ledger(_repo(args))
     gl.require_joined()
     if args.in_force:
         sys.stdout.writelines(export_stream(gl.ledger(), in_force=True))
@@ -329,7 +330,7 @@ def _port(text: str) -> int:
 
 def cmd_view(args) -> int:
     from .view import serve
-    gl = GitLedger(_repo(args))
+    gl = open_ledger(_repo(args))
     gl.require_joined()
     return serve(gl, host=args.host, port=args.port, recheck_days=args.recheck_days, ack_flag=args.ack_flag,
                  cockpit_url=args.cockpit_url)
@@ -346,7 +347,7 @@ def cmd_install(args) -> int:
 
 
 def cmd_member_add(args) -> int:
-    gl = GitLedger(_repo(args))
+    gl = open_ledger(_repo(args))
     gl.require_joined()
     team, handle = _actor(gl)
     if handle != team.owner:
@@ -373,7 +374,7 @@ def cmd_member_add(args) -> int:
 
 
 def cmd_pack_sync(args) -> int:
-    gl = GitLedger(_repo(args))
+    gl = open_ledger(_repo(args))
     gl.require_joined()
     written = P.seed(gl, Path(args.pack_dir), push=not args.no_push)
     print(f"{len(written)} pack entr{'y' if len(written) == 1 else 'ies'} written"
@@ -383,12 +384,12 @@ def cmd_pack_sync(args) -> int:
 
 def cmd_doctor(args) -> int:
     repo = _repo(args)
-    gl = GitLedger(repo)
+    gl = open_ledger(repo)
     rows: list[tuple[bool, str]] = []
     if not gl.joined():
         print(f"FAIL  this clone has not joined a team ledger ({repo.toplevel})")
         return 1
-    rows.append((True, f"ledger worktree {gl.wt} (device {gl.device})"))
+    rows.append(gl.location_row())
     try:
         team = gl.team()
         rows.append((True, f"team.toml valid: {team.project}, owner {team.owner}, mode {team.mode}"))
@@ -400,21 +401,7 @@ def cmd_doctor(args) -> int:
     ledger = gl.ledger()
     rows.append((not ledger.problems, f"{len(ledger.entries)} entries, chains intact" if not ledger.problems
                  else f"{len(ledger.problems)} integrity problem(s): run `levain team verify`"))
-    st = gl.state()
-    if gl.remote:
-        err = st.get("last_fetch_error")
-        rows.append((not err, f"remote {gl.remote}: last fetch "
-                     + (I.age(_iso(st.get('last_fetch_ok'))) if st.get("last_fetch_ok") else "never")
-                     + (f"; last error: {err}" if err else "")))
-        ahead = subprocess.run(["git", *_NO_HOOKS, "log", "--format=%s", f"refs/remotes/{gl.remote}/{gl.branch}..HEAD"],
-                               cwd=gl.wt, capture_output=True, text=True, env=ledger_env())
-        subjects = ahead.stdout.splitlines() if ahead.returncode == 0 else ["?"]
-        real = [s for s in subjects if not s.startswith("levain team: ack ")]
-        rows.append((not real, f"{len(subjects)} local ledger commit(s) not pushed"
-                     + ("" if not subjects else (": run `levain team sync`" if real
-                        else " (acknowledgements only; they go out with the next write)"))))
-    else:
-        rows.append((True, "no remote: ledger is local only"))
+    rows += gl.publish_rows()
     rows += W.check(repo)
     py_ok, py_line = _hook_import_check(repo)
     rows.append((py_ok, py_line))
@@ -425,14 +412,6 @@ def cmd_doctor(args) -> int:
         bad += not ok
     print("All team checks passed." if not bad else f"{bad} check(s) failed.")
     return 0 if not bad else 1
-
-
-def _iso(ts) -> str:
-    from datetime import datetime, timezone
-    try:
-        return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    except (TypeError, ValueError):
-        return ""
 
 
 def _hook_import_check(repo: Repo) -> tuple[bool, str]:
@@ -450,7 +429,7 @@ def _hook_import_check(repo: Repo) -> tuple[bool, str]:
     return True, "the wired interpreter imports levain.team.hook"
 
 
-def _anneal_row(gl: GitLedger) -> tuple[bool, str]:
+def _anneal_row(gl: LedgerTransport) -> tuple[bool, str]:
     import importlib.util
     from .hook import _anneal_db
     try:
@@ -581,7 +560,7 @@ def register(subparsers) -> None:
     mr.add_argument("handle")
     mr.add_argument("--repo")
     mr.add_argument("--no-push", action="store_true")
-    mr.set_defaults(func=_guarded(lambda a: cli_tenure.cmd_member_remove(GitLedger(_repo(a)), a)))
+    mr.set_defaults(func=_guarded(lambda a: cli_tenure.cmd_member_remove(open_ledger(_repo(a)), a)))
     cli_tenure.register(sub, add)
 
     p = add("pack-sync", cmd_pack_sync, "Owner only: seed or upgrade a pack's judgment.toml rules into the ledger.")
@@ -602,7 +581,7 @@ def _guarded(func):
             if getattr(args, "team_command", None) in _OUTSIDE_OP:
                 return func(args)      # read-only, or a server whose writes take the op themselves
             # every other team command is ONE operation on the clone, start to finish (code L3 r6: git's frame)
-            with GitLedger(_repo(args)).op():
+            with open_ledger(_repo(args)).op():
                 return func(args)
         except (TeamError, E.EntryError, R.RolesError, ValueError, OSError) as exc:
             print(f"levain team: {exc}", file=sys.stderr)

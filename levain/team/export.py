@@ -93,7 +93,7 @@ class Snapshot:
     envelopes: list[dict]
     enforced: list[tuple[str, str]]        # (id, hash) of every enforced line
     honoured: list[tuple[str, str]]        # (target, linker): what the enforced lines' ``honours`` carry
-    state_hash: str                        # GitLedger.state_hash of the same ledger (entries, team, problems)
+    state_hash: str                        # LedgerTransport.state_hash of the same ledger (entries, team, problems)
 
     def lines(self, seq: int) -> list[str]:
         """The framed v3 stream (each line ends with a newline)."""
@@ -138,37 +138,12 @@ def _epoch(root: str, distrust: object, repair_point: object) -> str:
     return hashlib.sha256(json.dumps(["levain-epoch-v1", root, ds, rp]).encode("utf-8")).hexdigest()
 
 
-def _pos(gl, d) -> int:
-    """Commits on the walk up to this clone's ``anchor`` (the last PUBLISHED tip it derived in full); with no anchor,
-    the walk to the remote-tracking tip, or to the local tip when the clone has no remote. 0 when none resolves."""
-    from . import tenure as T
-    st = gl.state()
-    anchor = st.get("anchor") if isinstance(st.get("anchor"), str) and st.get("anchor") else None
-    target = anchor
-    if target is None:
-        if gl.remote:
-            rref = f"refs/remotes/{gl.remote}/{gl.branch}"
-            target = rref if gl._has(rref) else None
-        else:
-            target = d.tip
-    if target is None:
-        return 0
-    if target in d.walk:
-        return d.walk.index(target) + 1
-    try:
-        top = gl.repo.toplevel
-        sha = T._git(top, ["rev-parse", "--verify", "-q", target + "^{commit}"]).strip()
-        return len(T.effective_walk(T.parents_of(top, sha), sha, gl.clone().accepted))
-    except T.Unjudgeable:
-        return 0
-
-
 def snapshot(gl, d=None) -> Snapshot:
     """This clone's v3 verdict from the tenure derivation ``d`` (default: the tip's). Creates the clone key on the
     first call. Raises TeamError when the clone cannot judge its ledger."""
-    from .transport import GitLedger, TeamError
+    from .transport import TeamError
     d = d if d is not None else gl.derivation()
-    ledger = GitLedger._ledger_of(d)
+    ledger = gl.ledger_of(d)
     st = gl.state()
     root = gl.pinned_root
     if not root:
@@ -182,7 +157,7 @@ def snapshot(gl, d=None) -> Snapshot:
         "prev_root": prev if isinstance(prev, str) and _SHORT.fullmatch(prev) else root,
         "epoch": _epoch(root, st.get("distrust"), st.get("repair_point")),
         "repin_n": _count(st.get("repin_n")),
-        "pos": min(_pos(gl, d), _INT_MAX),
+        "pos": min(gl.export_pos(d), _INT_MAX),
         "judged": d.judged if d.judged in ("full", "partial") else "partial",
     }
     by_rel = {f.rel: f for f in ledger.files}
@@ -218,7 +193,7 @@ def snapshot(gl, d=None) -> Snapshot:
                         t for t in (sup if isinstance(sup, list) else []) if isinstance(t, str) and (t, lid) in pairs))
                     honoured += [(t, str(lid)) for t in honours]
             envelopes.append({"frame": label, "n": n, "line": line, "enforced": is_enforced, "honours": honours})
-    return Snapshot(head, envelopes, enforced, sorted(set(honoured)), GitLedger.state_hash(ledger, d.team))
+    return Snapshot(head, envelopes, enforced, sorted(set(honoured)), gl.state_hash(ledger, d.team))
 
 
 def record_exported(gl, snap: Snapshot) -> None:

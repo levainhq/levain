@@ -319,7 +319,8 @@ _MAX_OUTPUT_CHARS = 8 * 1024 * 1024   # per-command returned output cap (then tr
 # module's thesis is no claim>enforcement gap. SURGICAL (literal, not ancestor-expanded — see build_policy).
 _SSH_WRITE_DENIED = ("authorized_keys", "authorized_keys2", "config", "rc")
 
-# The gnupg configuration files WRITE-denied in every host GNUPGHOME the floor knows: the gpg
+# The gnupg configuration files WRITE-denied in every host GNUPGHOME the floor knows (``_gnupg_homes``,
+# and on Linux each GNUPGHOME view of ``_runtime_view``, which binds them back read-only): the gpg
 # analogue of the ssh ``config`` vector above. The operator's gpg-agent, scdaemon and dirmngr run
 # OUTSIDE the floor, read these files, and start programs they name (``pinentry-program``,
 # ``scdaemon-program``), so bash writing one would choose a program the host runs unconfined.
@@ -937,6 +938,12 @@ PROJECT_MEMORY_HOME = ".anneal-projects"
 # run journal, SQLite sidecars and effect leases, denied read and write as ONE subtree under the levain
 # home (``$LEVAIN_HOME``, else ``~/.levain``). The database's sidecars live inside it, so bash is not refused.
 AUTONOMIC_STORE_DIR = "autonomic"
+# The cockpit's signing keys (``levain.cockpit.custody.default_key_dir``: ``levain cockpit key create``
+# writes the T2/T3 keys, their ``.pub`` and custody sidecar there), denied read and write as one subtree
+# under the levain home for the same reason as ``~/.ssh``: read, a passphrase key goes to offline guessing;
+# written between ``key create`` and ``enroll``, the entity's own key gets enrolled (Diogenes MEDIUM
+# 2026-10-13). ``levain cockpit`` runs outside the floor, so nothing legitimate loses access.
+COCKPIT_KEY_DIR = "keys"
 DERIVE_TRUST_ENV = "ANNEAL_MEMORY_DERIVE_TRUST"
 
 
@@ -1225,6 +1232,7 @@ def build_policy(
       - the autonomic engine's store directory ``<levain home>/autonomic`` (``$LEVAIN_HOME``, else
         ``~/.levain``; subtree, read and write) — the binding registry and run journal that decide
         what fires, so an entity can neither read nor rewrite its own authority (:data:`AUTONOMIC_STORE_DIR`);
+      - the cockpit's signing keys ``<levain home>/keys`` (subtree, read and write; :data:`COCKPIT_KEY_DIR`);
       - ⛔ ALL of ``~/.ssh`` (read+write-denied when ``ssh_mode="agent"``, except ``known_hosts``
         r+w and ``config`` r) — LOCATION-BASED, NOT NAME-BASED. See this module's docstring, which
         is the one home for this fact and carries its provenance (apparatus L2). This bullet used
@@ -1315,7 +1323,9 @@ def build_policy(
     home = Path.home()
 
     subtrees: list[Path] = [(home / ".anneal-memory").resolve()]
-    subtrees.append((Path(os.environ.get("LEVAIN_HOME") or home / ".levain").expanduser() / AUTONOMIC_STORE_DIR).resolve())
+    levain_home = Path(os.environ.get("LEVAIN_HOME") or home / ".levain").expanduser()
+    subtrees.append((levain_home / AUTONOMIC_STORE_DIR).resolve())
+    subtrees.append((levain_home / COCKPIT_KEY_DIR).resolve())
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
     listed_dirs = _trust_listed_stores(home, ed, ws)
@@ -1445,6 +1455,8 @@ def build_policy(
     for home in _gnupg_homes():
         for conf in _GNUPG_CONF_WRITE_DENIED:
             deny_write_files_l.extend(_spellings(home / conf))
+    # And in every GNUPGHOME holding a dirmngr socket outside the runtime dirs (:func:`_dirmngr_home_conf_spellings`).
+    deny_write_files_l.extend(_dirmngr_home_conf_spellings())
     # The relocated derive-trust file (spore-1308): write-only, both spellings, for the same reason as
     # the ssh vectors above. Writing it rebinds a re-derive label to a root the writer picked.
     # A trust spelling whose own location (final component unresolved) is already denied both ways
@@ -1766,6 +1778,13 @@ def refresh_socket_denies(policy: CrownJewelsPolicy) -> CrownJewelsPolicy:
     # Trust-listed project stores are re-derived at the same seam, as a union for the same reason
     # (spore-1308 follow-on, codex L3 2026-10-03): a store anneal starts trusting after the binding
     # was built is covered from the next spawn on. Raises ConfinementError on an unsafe store.
+    gpg_conf = [f for f in _dirmngr_home_conf_spellings() if f not in policy.deny_write_files]
+    if gpg_conf:   # a dirmngr home that appeared since the build: its configuration, for the editor too
+        policy = replace(
+            policy,
+            deny_write_files=_dedup_paths(list(policy.deny_write_files) + gpg_conf),
+            deny_write_dirs=_dedup_paths(list(policy.deny_write_dirs) + list(_write_deny_ancestors(gpg_conf))),
+        )
     listed = _trust_listed_stores(Path.home(), policy.entity_dir, policy.workspace)
     new_dirs = list(_dedup_paths([d for d in listed if d not in policy.deny_read_write]))
     if new_dirs:
@@ -5103,6 +5122,53 @@ def _gnupg_home_views(policy: CrownJewelsPolicy, runtime_roots: list[Path],
     return views, pins
 
 
+def _creatable_by_me(p: Path) -> bool:
+    """Whether this user could create ``p``: its nearest existing ancestor is a directory this user can
+    write. An absent path no one here can create needs no mask against a plant."""
+    a = p.parent
+    while not os.path.lexists(a) and a != a.parent:
+        a = a.parent
+    if os.path.islink(a):
+        return True   # a link it leads through could be replaced or made to lead anywhere: assume yes (L3 r4)
+    return a.is_dir() and os.access(a, os.W_OK)
+
+
+def _dirmngr_home_conf_spellings() -> list[Path]:
+    """The gnupg configuration files (:data:`_GNUPG_CONF_WRITE_DENIED`, at :func:`_spellings`) of every
+    operator-owned directory holding a dirmngr socket outside the user runtime dirs (Linux). gnupg puts
+    its sockets in GNUPGHOME itself only when it finds no ``/run/user/<uid>``, so there the socket's
+    directory IS the home (a cron or pre-linger gpg in a home levain's environment does not name);
+    under a runtime dir it is a hashed ``d.*`` directory that names no home, and is skipped. The bwrap
+    plan gives such a home a view (:func:`_gnupg_home_views`), and the agent beside that dirmngr reads
+    these files, so every writer must refuse them, the file editor included, or the editor writes
+    ``pinentry-program`` while bash reloads the agent through the view (Diogenes HIGH 2026-10-13).
+    Read by :func:`build_policy` and again, unioned, by :func:`refresh_socket_denies` at each spawn. An
+    unreadable socket list adds nothing: the plan reads it again and refuses offline bash itself."""
+    try:
+        sockets = _dirmngr_sockets()
+    except ConfinementError:
+        return []
+    runtime: list[Path] = []
+    for r in _runtime_dirs():
+        try:
+            runtime.append(Path(r).resolve())
+        except (OSError, RuntimeError):
+            continue
+    out: list[Path] = []
+    for home in dict.fromkeys(Path(s).parent for s in sockets):
+        try:
+            real = home.resolve()
+            if os.stat(real).st_uid != os.geteuid():
+                continue   # another user's home: not the operator's files, nor writable as the operator
+        except (OSError, RuntimeError):
+            continue   # gone since the socket was listed
+        if any(real == r or real.is_relative_to(r) for r in runtime):
+            continue
+        for conf in _GNUPG_CONF_WRITE_DENIED:
+            out.extend(_spellings(home / conf))
+    return out
+
+
 def _runtime_view(policy: CrownJewelsPolicy,
                   dirmngr: list[Path] | None = None) -> tuple[list[str], list[Path], list[Path]]:
     """Step (7) of :func:`_bwrap_plan_impl` as ``(ops, view_roots, pins)``: each user runtime dir this
@@ -5119,10 +5185,12 @@ def _runtime_view(policy: CrownJewelsPolicy,
     would hide them. Each dir's ancestors go back as ``pins``.
 
     Each GNUPGHOME of :func:`_gnupg_home_views` is a view too, whose ancestors go back as ``pins``. Its
-    sockets in :data:`_GNUPG_HOME_SOCKETS` and its files come back, the files writable: with the trustdb
+    sockets in :data:`_GNUPG_HOME_SOCKETS` and its files come back, gnupg's configuration files
+    (:data:`_GNUPG_CONF_WRITE_DENIED`) read-only and the other files writable: with the trustdb
     read-only, ``gpg --list-keys`` died "failed to append a record" on its trustdb check (RUN on
     argushub 2026-10-12). Its directories do not come back (``private-keys-v1.d`` is the agent's,
-    ``public-keys.d`` keyboxd's); links come back as the same links. The costs: gpg inside bash cannot
+    ``public-keys.d`` keyboxd's); links come back as the same links, except a configuration file's, which
+    comes back as its file's content, read-only (a sibling it leads to is read-only too). The costs: gpg inside bash cannot
     replace a file there (an ``--import`` into a ``pubring.kbx`` keyring renames it, and gets EBUSY),
     and its lock files land in the view, so a gpg on the host writing the trustdb at the same moment
     does not see the lock."""
@@ -5200,8 +5268,34 @@ def _runtime_view(policy: CrownJewelsPolicy,
             raise ConfinementError(
                 f"could not list the gnupg home {g}, which holds a dirmngr socket ({exc}). Refusing to grant "
                 "bash hands (fail-closed).") from None
+        # A configuration file that is a link to a sibling here: the sibling comes back read-only too,
+        # or bash writes the configuration through the sibling's writable bind (L2 review).
+        conf_targets: set[Path] = set()
+        for child, _st in children:
+            if child.name in _GNUPG_CONF_WRITE_DENIED:
+                try:
+                    conf_targets.add(child.resolve(strict=True))
+                except (OSError, RuntimeError):
+                    pass
         for child, st in children:
-            if stat.S_ISLNK(st.st_mode):
+            if child.name in _GNUPG_CONF_WRITE_DENIED:
+                # READ-ONLY, a link included: the host agent reads this file and starts the programs
+                # it names, so a writable one here rebuilt the 0.9.0 pinentry escape for the one home
+                # the view exists for, a home levain's environment does not name (Diogenes HIGH
+                # 2026-10-13). A link comes back as its target's content, read-only, never as the
+                # link (bash would write through it); one that leads to no regular file stays out.
+                try:
+                    real = child.resolve(strict=True)
+                    is_reg = stat.S_ISREG(os.stat(real).st_mode)
+                    # A link into a jewel would carry the jewel in (codex L3 r1), matched as the policy
+                    # matches (case- and normalization-insensitively; codex L3 r2).
+                    hidden = _caller_denies(real, policy) or (
+                        policy.ssh_dir is not None and _ci_within(real, policy.ssh_dir.resolve()))
+                except (OSError, RuntimeError):
+                    continue
+                if is_reg and not hidden:
+                    ops += ["--ro-bind", str(real), str(child)]
+            elif stat.S_ISLNK(st.st_mode):
                 ops += ["--symlink", os.readlink(child), str(child)]
             elif child.name.startswith("S.") and child.name not in _GNUPG_HOME_SOCKETS:
                 continue   # dirmngr's, the agent's forwarding sockets, or one of those names as a file
@@ -5209,7 +5303,7 @@ def _runtime_view(policy: CrownJewelsPolicy,
                 if child.name in _GNUPG_HOME_SOCKETS:   # a socket by any other name stays out
                     ops += ["--bind", str(child), str(child)]
             elif stat.S_ISREG(st.st_mode):
-                ops += ["--bind", str(child), str(child)]
+                ops += ["--ro-bind" if child.resolve() in conf_targets else "--bind", str(child), str(child)]
     return ops, roots + homes, pins
 
 
@@ -5611,8 +5705,23 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # lands on top of it (the masks-last rule above). The case-folded compare this replaced also hid
     # a distinct, write-only file on a case-sensitive volume (0.5.4 known open issue).
     denied_both_targets = set(masked_both)
+    # Read ONCE: the views and the masks of step (7b) must see the same dirmngr sockets.
+    dirmngr = _dirmngr_sockets() if policy.deny_localhost_outbound else []
+    runtime_ops, runtime_roots, view_pins = _runtime_view(policy, dirmngr)
     for f in tuple(policy.deny_write_files) + tuple(policy.own_memory_files):
         if _absent_in_ro_store(f) or _left_out_of_a_view(f):
+            continue
+        if f.name in _GNUPG_CONF_WRITE_DENIED and any(
+                _host_spelling(f).parent.resolve().is_relative_to(r) for r in runtime_roots):
+            # A gnupg configuration file inside a view (step 7): the view brings it back read-only or
+            # leaves it out (a link to nothing), and its tmpfs is mounted first, so a mount here would
+            # only stub a file the view left out on purpose. Every other write-denied file is mounted
+            # as usual (complement + codex L3 r1: a blanket skip dropped a trust file's deny).
+            continue
+        if f.name in _GNUPG_CONF_WRITE_DENIED and not os.path.lexists(f) and not _creatable_by_me(f):
+            # The absent target of a configuration link that leads nowhere bash can create anything
+            # (``gpg.conf -> /nonexistent/gpg.conf``): nothing to plant, so no mask, and no pin that
+            # would have to create ``/nonexistent`` (RUN in CI's bwrap job 2026-10-13: bash refused).
             continue
         if f in deny_both or f in file_roots:
             # Step (4) (or step (2), for a subtree root that is a file) already denies it BOTH ways. A self-bind here would take its source from the
@@ -5690,9 +5799,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
     # or restart anything.
     # Compared RESOLVED, because the socket targets are: a symlinked HOME compared lexically would
     # get the directory form, a read-only tmpfs over the whole of it (L1 + L2).
-    # Read ONCE: the views and the masks of step (7b) must see the same dirmngr sockets.
-    dirmngr = _dirmngr_sockets() if policy.deny_localhost_outbound else []
-    runtime_ops, runtime_roots, view_pins = _runtime_view(policy, dirmngr)
+    # The views and pins of step (7), computed before step (5) (see there).
     for r in runtime_roots:
         for t in tool_views:
             if r == t or r.is_relative_to(t):

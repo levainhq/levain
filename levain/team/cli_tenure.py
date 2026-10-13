@@ -6,13 +6,13 @@ they are the operator's own judgement, taken on the owner's word out of band (te
 """
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from . import roles as R
 from . import signing as S
 from . import tenure as T
-from .transport import BRANCH, LEGACY_BRANCH, GitLedger, TeamError, git
+from .ledger_api import LedgerTransport, open_ledger, require_git_wire
+from .transport import BRANCH, LEGACY_BRANCH, TeamError, git
 
 
 def _key_line(value: str) -> str:
@@ -26,14 +26,14 @@ def _key_line(value: str) -> str:
     return line
 
 
-def _me(gl: GitLedger) -> str:
+def _me(gl: LedgerTransport) -> str:
     h = gl.handle()
     if h is None:
         raise TeamError("this machine's key is not a member's key in this ledger")
     return h
 
 
-def _require_owner(gl: GitLedger) -> T.Derivation:
+def _require_owner(gl: LedgerTransport) -> T.Derivation:
     d = gl.derivation()
     if gl.own_fingerprint() not in T.key_fps(d.tenure, d.team.owner):
         raise TeamError(f"only the owner in force ({d.team.owner}) can do this, signing with her key")
@@ -44,7 +44,7 @@ LOST = ("a member who lost every key is invited again under a new handle (a remo
         "a stolen key is also revoked with `levain team revoke`")
 
 
-def cmd_owner(gl: GitLedger, args) -> int:
+def cmd_owner(gl: LedgerTransport, args) -> int:
     gl.require_joined()
     d = _require_owner(gl)
     if args.cancel:
@@ -71,7 +71,7 @@ def cmd_owner(gl: GitLedger, args) -> int:
     return 0
 
 
-def cmd_accept(gl: GitLedger, args) -> int:
+def cmd_accept(gl: LedgerTransport, args) -> int:
     gl.require_joined()
     d = gl.derivation()
     off = d.tenure.offer
@@ -87,7 +87,7 @@ def cmd_accept(gl: GitLedger, args) -> int:
     return 0
 
 
-def cmd_member_remove(gl: GitLedger, args) -> int:
+def cmd_member_remove(gl: LedgerTransport, args) -> int:
     gl.require_joined()
     d = _require_owner(gl)
     if args.handle == d.team.owner:
@@ -105,7 +105,7 @@ def cmd_member_remove(gl: GitLedger, args) -> int:
     return 0
 
 
-def cmd_key_add(gl: GitLedger, args) -> int:
+def cmd_key_add(gl: LedgerTransport, args) -> int:
     gl.require_joined()
     d = gl.derivation()
     me = gl.handle()
@@ -131,13 +131,13 @@ def cmd_key_add(gl: GitLedger, args) -> int:
     return 0
 
 
-def cmd_key_confirm(gl: GitLedger, args) -> int:
+def cmd_key_confirm(gl: LedgerTransport, args) -> int:
     gl.require_joined()
-    print("confirmed" if gl._confirm_own_key(gl.derivation()) else "this machine's key is not pending for anyone")
+    print("confirmed" if gl.confirm_own_key(gl.derivation()) else "this machine's key is not pending for anyone")
     return 0
 
 
-def cmd_key_remove(gl: GitLedger, args) -> int:
+def cmd_key_remove(gl: LedgerTransport, args) -> int:
     gl.require_joined()
     d = gl.derivation()
     if gl.handle() not in (d.team.owner, args.handle):
@@ -150,7 +150,8 @@ def cmd_key_remove(gl: GitLedger, args) -> int:
     return 0
 
 
-def cmd_revoke(gl: GitLedger, args) -> int:
+def cmd_revoke(gl: LedgerTransport, args) -> int:
+    gl = require_git_wire(gl)
     gl.require_joined()
     d = _require_owner(gl)
     if args.fingerprint in T.key_fps(d.tenure, d.team.owner):
@@ -177,7 +178,8 @@ def cmd_revoke(gl: GitLedger, args) -> int:
     return 0
 
 
-def cmd_veto(gl: GitLedger, args) -> int:
+def cmd_veto(gl: LedgerTransport, args) -> int:
+    gl = require_git_wire(gl)
     gl.require_joined()
     d = _require_owner(gl)
     since = git(["rev-parse", "--verify", args.since + "^{commit}"], gl.repo.toplevel).stdout.strip()
@@ -202,7 +204,8 @@ def cmd_veto(gl: GitLedger, args) -> int:
 # ---- this clone's own trust acts (never pushed) ----------------------------------------------------------------
 
 
-def cmd_distrust(gl: GitLedger, args) -> int:
+def cmd_distrust(gl: LedgerTransport, args) -> int:
+    gl = require_git_wire(gl)
     st = gl.state()
     cur = set(st.get("distrust") or [])
     if args.list:
@@ -219,7 +222,8 @@ def cmd_distrust(gl: GitLedger, args) -> int:
     return 0
 
 
-def cmd_repin(gl: GitLedger, args) -> int:
+def cmd_repin(gl: LedgerTransport, args) -> int:
+    gl = require_git_wire(gl)
     if args.root:
         sha = git(["rev-parse", "--verify", args.root + "^{commit}"], gl.repo.toplevel).stdout.strip()
         if git(["rev-list", "--parents", "-n", "1", sha], gl.repo.toplevel).stdout.split()[1:]:
@@ -244,14 +248,15 @@ def cmd_repin(gl: GitLedger, args) -> int:
         # the repair point (the commit the owner named) feeds the export epoch, so honest clones that apply the same
         # repair agree; repin_n makes this clone's next export win over its own stored high-water mark (seam §3a)
         gl.save_state(anchor=sha, repair_point=sha, repin_n=int(gl.state().get("repin_n") or 0) + 1)
-    gl._dcache = None
+    gl.forget_derivation()
     d = gl.derivation()
     print(f"re-pinned; judged {d.judged}, owner in force {d.team.owner}")
     return 0
 
 
-def cmd_accept_merge(gl: GitLedger, args) -> int:
+def cmd_accept_merge(gl: LedgerTransport, args) -> int:
     """This OPERATOR's act on the owner's out-of-band word: follow parent N of one merge. Lists what it leaves out."""
+    gl = require_git_wire(gl)
     gl.require_joined()
     sha = git(["rev-parse", "--verify", args.merge + "^{commit}"], gl.repo.toplevel).stdout.strip()
     parents = git(["rev-list", "--parents", "-n", "1", sha], gl.repo.toplevel).stdout.split()[1:]
@@ -302,15 +307,16 @@ def cmd_accept_merge(gl: GitLedger, args) -> int:
         raise TeamError(f"following parent {n} of {sha[:10]} leaves a history this clone cannot judge ({exc}); "
                         "nothing was accepted") from None
     gl.save_state(_mutate=lambda st: st.__setitem__("accepted", {**dict(st.get("accepted") or {}), sha: n}))
-    gl._dcache = None
+    gl.forget_derivation()
     print("\n".join(listing))
     print(f"Every member runs exactly: levain team accept-merge {sha} --parent {n}")
     print(f"now judged {d.judged}; owner in force {d.team.owner}")
     return 0
 
 
-def cmd_regenesis(gl: GitLedger, args) -> int:
+def cmd_regenesis(gl: LedgerTransport, args) -> int:
     """Option 2: a FRESH strict genesis on a NEW branch, carrying the old ledger as a read-only record under prior/."""
+    gl = require_git_wire(gl)
     gl.require_joined()
     old_tip = git(["rev-parse", "--verify", args.from_ + "^{commit}"], gl.repo.toplevel).stdout.strip()
     # the ledger re-genesised is the one this clone is pinned to: a --from on another ledger was derived against this
@@ -369,7 +375,7 @@ def cmd_regenesis(gl: GitLedger, args) -> int:
     files = {T.TEAM_FILE: R.dump_team(team), T.TENURE_FILE: T.dump_tenure(ten)}
     for row in git(["ls-tree", "-r", "--name-only", old_tip, "ledger/"], gl.repo.toplevel).stdout.splitlines():
         files[f"prior/{old_root[:12]}/{row}"] = git(["show", f"{old_tip}:{row}"], gl.repo.toplevel).stdout
-    commit = _nested_genesis(gl, files, f"levain team: re-genesis of {old_root[:12]} (prior tip {old_tip[:12]})")
+    commit = gl.nested_genesis(files, f"levain team: re-genesis of {old_root[:12]} (prior tip {old_tip[:12]})")
     name = f"{BRANCH}-{commit[:12]}"
     git(["update-ref", f"refs/heads/{name}", commit, ""], gl.repo.toplevel)
     if gl.remote and not args.no_push:
@@ -381,18 +387,18 @@ def cmd_regenesis(gl: GitLedger, args) -> int:
     print("Re-record the rulings the team still wants; the old in-force entries were:")
     try:
         d = gl.derivation(old_tip)
-        for e in gl._ledger_of(d).in_force:
+        for e in gl.ledger_of(d).in_force:
             print(f"   {e['id']}: {e.get('words') or e.get('summary') or ''}"[:160])
     except TeamError as exc:
         print(f"   (cannot judge the old ledger here: {exc})")
     return 0
 
 
-def cmd_retire_legacy(gl: GitLedger, args) -> int:
+def cmd_retire_legacy(gl: LedgerTransport, args) -> int:
     """Delete the remote 0.6.x ``levain-ledger`` (never read or converted by this levain), once a strict ledger exists.
     Only the 0.6.x ledger's owner may (0.6.x has no signatures: the user's email must equal that owner's, T r22-2
     complement L2), or anyone with --force."""
-    from .transport import LEGACY_BRANCH
+    gl = require_git_wire(gl)
     gl.require_joined()
     remote = gl.remote
     if not remote:
@@ -417,42 +423,15 @@ def cmd_retire_legacy(gl: GitLedger, args) -> int:
     return 0
 
 
-def _nested_genesis(gl: GitLedger, files: dict[str, str], message: str) -> str:
-    """A signed parentless commit whose tree holds ``files`` (paths may nest)."""
-    top = gl.repo.toplevel
-    idx = gl.base / "regenesis.index"
-    env_idx = {"GIT_INDEX_FILE": str(idx)}
-    import subprocess
-    from .transport import _NO_HOOKS, ledger_env
-    env = ledger_env(**env_idx)
-    try:
-        idx.unlink()
-    except FileNotFoundError:
-        pass
-    for path, text in sorted(files.items()):
-        blob = git(["hash-object", "-w", "--stdin"], top, input_text=text).stdout.strip()
-        subprocess.run(["git", *_NO_HOOKS, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}"],
-                       cwd=str(top), env=env, check=True, capture_output=True)
-    tree = subprocess.run(["git", *_NO_HOOKS, "write-tree"], cwd=str(top), env=env, check=True,
-                          capture_output=True, text=True).stdout.strip()
-    idx.unlink(missing_ok=True)
-    cp = subprocess.run(["git", *_NO_HOOKS, *gl._sign_cfg(), "commit-tree", "-S", tree, "-m", message],
-                        cwd=str(top), capture_output=True, text=True, env={**env, **gl._sign_env()},
-                        stdin=subprocess.DEVNULL, timeout=60)
-    if cp.returncode != 0:
-        raise TeamError(f"could not sign the re-genesis: {(cp.stderr or cp.stdout).strip()[-200:]}")
-    return cp.stdout.strip()
-
-
 def register(sub, add) -> None:
     """Add the tenure commands to ``levain team``. ``add`` is cli.register's helper (it wires --repo and guarding)."""
     def wrap(fn, fetch: bool = True):
         def run(args):
             from .cli import _repo
-            g = GitLedger(_repo(args))
+            g = open_ledger(_repo(args))
             if fetch and g.joined() and g.remote:
                 g.sync(push=False)     # act on the team as it is now, not as this clone last saw it
-                g._dcache = None
+                g.forget_derivation()
             return fn(g, args)
         return run
 
@@ -524,7 +503,7 @@ def register(sub, add) -> None:
     p.add_argument("--no-push", action="store_true")
 
 
-def status_lines(gl: GitLedger) -> list[str]:
+def status_lines(gl: LedgerTransport) -> list[str]:
     """What every member must see (§3f, signing doc §6): the pinned genesis and branch, a frozen state, role changes
     from the last 14 days, a pending offer, and any re-genesis whose ``prior`` names this ledger."""
     from datetime import datetime, timedelta, timezone
@@ -533,7 +512,7 @@ def status_lines(gl: GitLedger) -> list[str]:
         d = gl.derivation()
     except TeamError as exc:
         return [f"cannot judge the team ledger on this clone: {exc}"]
-    out.append(f"ledger {gl.branch}, genesis {d.walk[0][:12]}, owner in force {d.team.owner}")
+    out.append(f"{gl.ledger_label()}, genesis {d.walk[0][:12]}, owner in force {d.team.owner}")
     if d.judged != "full":
         fix = ("`levain team accept-merge <merge> --parent <n>`, the parent the owner names" if "merge" in d.frozen_why
                else "`levain team repin --anchor <commit>`, the commit the owner names, or the host restores the branch")
@@ -547,43 +526,11 @@ def status_lines(gl: GitLedger) -> list[str]:
             continue
         if when >= cutoff:
             out.append(f"role change {when.date()}: {text} ({sha[:10]})")
-    last = gl.state().get("last_fetch_ok")
-    if gl.remote:
-        import time
-        age = (time.time() - float(last)) if last else None
-        newest = git(["log", "-1", "--format=%cr", gl.ref], gl.repo.toplevel, check=False).stdout.strip()
-        out.append(f"last fetched {('%d min ago' % (age // 60)) if age is not None else 'never'}; newest ledger "
-                   f"commit {newest or 'unknown'}. A host can withhold newer commits without any signal: compare "
-                   "the tip id with a teammate if anything looks stale")
+    out += gl.freshness_lines()
     if d.tenure.offer:
         out.append(f"pending ownership offer to {d.tenure.offer['handle']} (`levain team owner --cancel` withdraws it)")
     for h, lines in sorted(d.tenure.pending_keys.items()):
         if lines:
             out.append(f"{h} has {len(lines)} key(s) pending confirmation")
-    if gl.remote:
-        refs = git(["for-each-ref", "--format=%(refname)", f"refs/remotes/{gl.remote}/"], gl.repo.toplevel,
-                   check=False).stdout.split()
-        if f"refs/remotes/{gl.remote}/{LEGACY_BRANCH}" in refs:
-            # T46, RUN: a 0.6.x ledger beside the strict one was never mentioned
-            out.append(f"a 0.6.x {LEGACY_BRANCH} branch was on {gl.remote} at this clone's last fetch: this levain never "
-                       "reads it (nothing in it is enforced); the owner deletes it with `levain team retire-legacy`")
-        for ref in refs:
-            name = ref.rsplit("/", 1)[-1]
-            if not name.startswith(BRANCH + "-") or name == gl.branch:
-                continue
-            roots = git(["rev-list", "--max-parents=0", ref], gl.repo.toplevel, check=False).stdout.split()
-            ten = gl._show(T.TENURE_FILE, roots[0]) if roots else None
-            try:
-                rt = T.parse_tenure(ten or "", "x")
-                rteam = R.parse_team(gl._show(T.TEAM_FILE, roots[0]) or "", "x")
-                prior, rowner = rt.prior, rteam.owner
-                rfps = ", ".join(sorted(T.key_fps(rt, rowner))) or "none"
-            except Exception:  # noqa: BLE001 - a display line; a foreign ledger's bad file is not this clone's problem
-                prior = None
-            if prior and prior.get("root") == d.walk[0]:
-                # anyone who can push can make one, so the line names its owner and keys and claims nothing for it
-                # (docs L3 r1 anansi: an unqualified "to move" line advertised whatever branch was pushed)
-                out.append(f"a branch {name} claims to RE-GENESIS this team, owner {rowner} (keys {rfps}); UNVERIFIED: "
-                           f"move only if your owner confirms those keys out of band "
-                           f"(`levain team join --root {name.rsplit('-', 1)[-1]}`)")
+    out += gl.foreign_ledger_lines(d)
     return out

@@ -30,7 +30,8 @@ from . import canon as C
 from . import entry as E
 from . import index as I
 from . import roles as R
-from .transport import BRANCH, DIRNAME, LEGACY_MESSAGE, GitLedger, Repo, TeamError
+from .ledger_api import LedgerTransport, open_ledger
+from .transport import BRANCH, DIRNAME, LEGACY_MESSAGE, Repo, TeamError
 
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 TAG = "[levain team]"
@@ -150,16 +151,16 @@ def _in_ledger_machinery(path: str) -> bool:
     return False
 
 
-def _interval(gl: GitLedger) -> float:
+def _interval(gl: LedgerTransport) -> float:
     try:
         return float(gl.team().fetch_interval)
     except (R.RolesError, TeamError):
         return 300.0
 
 
-def _wired_but_broken(gl: GitLedger) -> bool:
+def _wired_but_broken(gl: LedgerTransport) -> bool:
     try:
-        return bool(gl._local_branch_exists())
+        return bool(gl.has_local_ledger())
     except TeamError:
         return False
 
@@ -182,14 +183,14 @@ def pretooluse(payload: dict) -> None:
     repo = Repo.discover(Path(target))
     if repo is None:
         return
-    gl = GitLedger(repo)
+    gl = open_ledger(repo)
     if not gl.joined():
         if gl.legacy_only():
             _fail_open("PreToolUse", LEGACY_MESSAGE)      # B-1: reported, nothing from it enforced
             return
         # a clone that pinned a ledger and lost its worktree or refs still has a ledger it cannot judge (code L3 r2
         # codex MED: it fell through and allowed the edit)
-        if gl.pinned_root or _wired_but_broken(gl) or (gl.remote and gl._has(f"refs/remotes/{gl.remote}/{BRANCH}")):
+        if gl.pinned_root or _wired_but_broken(gl) or gl.has_remote_ledger():
             # a strict ledger exists here and this clone never pinned it (UNPINNED): judge nothing from it, halt
             _deny_unjudged(f"this clone has a {BRANCH} ledger it has not pinned (run `levain team join`)")
         return
@@ -245,7 +246,7 @@ def pretooluse(payload: dict) -> None:
     _out({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}})
 
 
-def _anneal_db(gl: GitLedger) -> Path | None:
+def _anneal_db(gl: LedgerTransport) -> Path | None:
     configured = gl.state().get("anneal_db")
     if isinstance(configured, str) and configured:
         p = Path(configured).expanduser()
@@ -318,7 +319,7 @@ def _v3_import_key(snap, db: Path, store: list | None, anneal_version: str) -> s
     return hashlib.sha256(json.dumps(blob, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def _anneal_import_v3(gl: GitLedger, db: Path, anneal_version: str) -> str | None:
+def _anneal_import_v3(gl: LedgerTransport, db: Path, anneal_version: str) -> str | None:
     """Send this clone's complete verdict (contract v3) and mark it imported only when anneal REPLACED with it."""
     from . import export as X
     try:
@@ -373,7 +374,7 @@ def _anneal_import_v3(gl: GitLedger, db: Path, anneal_version: str) -> str | Non
     return f"[team] team links in your memory store were NOT updated ({outcome}): {why}"
 
 
-def anneal_import(gl: GitLedger, ledger: I.Ledger, tree: str, owner: str) -> str | None:  # tree: state hash
+def anneal_import(gl: LedgerTransport, ledger: I.Ledger, tree: str, owner: str) -> str | None:  # tree: state hash
     """Optional seam: mirror levain's verdict into anneal's store.
 
     Runs only when the installed anneal-memory ships ``anneal_memory.team`` and a store is known. An anneal that
@@ -427,7 +428,7 @@ def sessionstart(payload: dict) -> None:
     repo = Repo.discover(Path(cwd))
     if repo is None:
         return
-    gl = GitLedger(repo)
+    gl = open_ledger(repo)
     if not gl.joined():
         if gl.legacy_only():
             _fail_open("SessionStart", LEGACY_MESSAGE)
@@ -452,7 +453,7 @@ def sessionstart(payload: dict) -> None:
              f"{I.age(newest) if newest else 'none'}; you are {handle or 'NOT a member (this machine key is not in force)'}."]
     from .cli_tenure import status_lines
     lines += [f"[team] {x}" for x in status_lines(gl)]
-    lines.append(f"[team] {C.staleness(canon_text, tree)}. Canon: {gl.wt / 'PROJECT.md'} (or `levain team status`)")
+    lines.append(f"[team] {C.staleness(canon_text, tree)}. Canon: {gl.canon_path} (or `levain team status`)")
     from .transport import WARNINGS
     # A fallback to an older team.toml (or any other read warning) must reach the session, not only the edit hook.
     lines += [f"[team] {w}" for w in WARNINGS]

@@ -49,7 +49,7 @@ __all__ = [
     "HeadBelowCache", "NotInitialised", "PROCESS_CACHE", "ReplayCache", "ReplayError", "StaleHead",
     "UnsignedLink", "VerifierUnavailable", "append", "advance_anchor", "anchor_path", "check_anchor", "classify", "create_schema", "custody_problem",
     "genesis_policy", "prepare", "read_anchor", "reset_anchor", "reset_message", "sign_and_append",
-    "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
+    "presence_missing", "snapshot", "UNSTATED", "verify_anchor_reset", "verify_link_sig",
 ]
 
 FORMAT = "levain-authority/1"
@@ -454,6 +454,19 @@ def _sshsig_type_and_flags(armored: str) -> tuple[str, int | None]:
     return sig_type, flags
 
 
+def presence_missing(signature: str, public_key: str) -> bool:
+    """True if a FIDO (sk-*) key or signature lacks the user-presence flag, or ``signature`` cannot be
+    read for one: the one presence rule for every levain signature check (authority links here, cockpit
+    acts in the broker), so a key made ``no-touch-required`` never signs without a touch."""
+    try:
+        sig_type, flags = _sshsig_type_and_flags(signature)
+    except (ValueError, UnicodeError):
+        return True
+    key_type = public_key.split()[0] if isinstance(public_key, str) and public_key.split() else ""
+    return (key_type.startswith("sk-") or sig_type.startswith("sk-")) \
+        and (flags is None or not flags & _SK_USER_PRESENT)
+
+
 def _pipe_reading(data: bytes) -> int:
     """The read end of a pipe that yields ``data`` and then EOF. A thread writes it, so no size can
     block the caller; it ends with a broken pipe once the caller closes the read end."""
@@ -489,12 +502,9 @@ def verify_link_sig(message: bytes, signature: Any, *, public_key: str, fingerpr
         return False
     try:
         sig_bytes = (signature.strip() + "\n").encode("ascii")
-        sig_type, flags = _sshsig_type_and_flags(signature)
-    except (ValueError, UnicodeError):
+    except UnicodeError:
         return False
-    key_type = public_key.split()[0] if isinstance(public_key, str) and public_key.split() else ""
-    if (key_type.startswith("sk-") or sig_type.startswith("sk-")) \
-            and (flags is None or not flags & _SK_USER_PRESENT):
+    if presence_missing(signature, public_key):
         return False
     problem, keygen = trust_anchor_problem(ssh_keygen, what="ssh-keygen")
     if problem is not None:

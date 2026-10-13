@@ -6,6 +6,17 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-10-13
+
+A security fix. Upgrade if Levain runs bash on Linux where you use gpg, or if you use the cockpit's signing keys.
+
+### Security
+
+- **On Linux, gnupg's configuration files are now read-only to the entity in a gnupg home where Levain finds a running dirmngr.** 0.9.1 made `gpg-agent.conf` and gnupg's other configuration files read-only to bash in `~/.gnupg`, and in `$GNUPGHOME` when Levain's own environment sets it. That did not cover a gnupg home outside both that holds a dirmngr started where `/run/user/<uid>` did not exist, such as from cron or before linger. In 0.10.0, bash without network gets a fresh view of such a home, and that view bound the home's files back writable, next to the socket of the gpg-agent that reads them. A bash session could therefore get your gpg-agent to run a program of its choosing outside the floor. In that home those files are now read-only to bash, with or without network, and to the file editor. A configuration file that is a symlink comes back as its file's content, read-only. One that leads into a directory the floor denies, or leads nowhere, is left out. If bash has network and such a configuration file is a symlink that leads nowhere, bash is refused, as it has been in `~/.gnupg` since 0.9.1. Found in Levain's own review, reproduced in the floor's plan, and checked on Linux by running bash under bubblewrap.
+- **Still open, as 0.9.1 stated:** a gnupg home that Levain is not told about, and where it finds no dirmngr, keeps writable configuration files, on Linux and macOS. That closes before Levain 2.0.
+- **The cockpit's signing keys are now behind the floor.** `levain cockpit key create` puts the keys that sign T2 and T3 writes in `<levain home>/keys` (`~/.levain/keys`), and 0.10.0 did not deny that directory to bash or the file editor. A bash session could copy a passphrase-protected key and guess the passphrase offline. It could also replace a new key between `key create` and `enroll`, so the touch you gave to enrol it enrolled a key bash chose. The directory is now denied, read and write, like `~/.ssh`. Known edges: a directory you pick with `key create --dir` is not covered, and `enroll` still accepts the new key's public half without a signature from that key, so a program running as you outside Levain can make the same swap. The README's `passphrase` custody already says it is no defence against such a program.
+- **A FIDO key now needs a touch for a cockpit write, as it already did for an authority link.** OpenSSH's signature check does not enforce the touch itself. A key made with `no-touch-required` had its authority links refused but could sign a T2 or T3 write without a touch. Both checks now use one rule.
+
 ## [0.10.1] — 2026-10-12
 
 ### Changed
