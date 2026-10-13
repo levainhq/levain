@@ -153,8 +153,8 @@ def test_any_other_error_from_the_version_read_is_not_no_landlock(monkeypatch, e
     assert e.value.errno == err
     # levain's raw read raises it too; its host read turns it into T0 with the error's name, never a refusal.
     with pytest.raises(OSError):
-        L.running_abi(system="Linux")
-    abi, reason = L.host_read(system="Linux")
+        L.running_abi(system="Linux", machine="x86_64")
+    abi, reason = L.host_read(system="Linux", machine="x86_64")
     assert abi == 0 and reason == f"Landlock unavailable ({errno.errorcode[err]})"
     assert L.tier_line(abi, reason).startswith(f"unix sockets (T0: Landlock unavailable ({errno.errorcode[err]})): NO AGENT CLAIM")
 
@@ -477,6 +477,7 @@ def test_the_stub_runs_right_before_bash_with_the_canary_bound(tmp_path, monkeyp
     seen = {}
     monkeypatch.setattr(conf._BwrapShell, "start", lambda self: seen.setdefault("shell", self))
     monkeypatch.setattr(conf._BwrapShell, "_recheck", lambda self: None)
+    monkeypatch.setattr(conf._landlock, "host_read", lambda: (10, None))   # read as T9; no syscall
     ent = tmp_path / "ent"
     (ent / ".levain").mkdir(parents=True)
     conf.BwrapProvider()._spawn_shell_impl(build_policy(ent), env={"PATH": "/usr/bin"})
@@ -486,7 +487,7 @@ def test_the_stub_runs_right_before_bash_with_the_canary_bound(tmp_path, monkeyp
     bash = argv.index("/bin/bash", at)
     assert argv[at - 4:at] == [sys.executable, "-I", "-S", "-c"]
     assert argv[bash - 1] == "--" and argv[bash:] == ["/bin/bash", "--noprofile", "--norc", "-p"]
-    assert argv[argv.index("--expect-tier", at) + 1] == L.tier_for(L.running_abi())
+    assert argv[argv.index("--expect-tier", at) + 1] == "T9"
     canary = sh._canary
     assert argv[argv.index("--canary", at) + 1] == canary.path
     i = argv.index("--new-session")
@@ -507,7 +508,10 @@ def test_the_spawn_is_offered_at_t0_when_levains_own_abi_read_errors(tmp_path, m
     monkeypatch.setattr(conf._BwrapShell, "start", lambda self: seen.setdefault("shell", self))
     monkeypatch.setattr(conf._BwrapShell, "_recheck", lambda self: None)
 
-    def filtered(system=None):
+    real_host_read = L.host_read
+    monkeypatch.setattr(conf._landlock, "host_read", lambda: real_host_read(machine="x86_64"))
+
+    def filtered(system=None, machine=None):
         raise OSError(errno.EPERM, "Operation not permitted")
 
     monkeypatch.setattr(conf._landlock, "running_abi", filtered)
@@ -517,5 +521,156 @@ def test_the_spawn_is_offered_at_t0_when_levains_own_abi_read_errors(tmp_path, m
     sh = seen["shell"]
     at = sh._argv.index(L.STUB)
     assert sh._argv[sh._argv.index("--expect-tier", at) + 1] == "T0"
-    assert L.tier_line(*L.host_read(system="Linux")).startswith("unix sockets (T0: Landlock unavailable (EPERM))")
+    assert L.tier_line(*real_host_read(system="Linux", machine="x86_64")).startswith(
+        "unix sockets (T0: Landlock unavailable (EPERM))")
+    # T0: no canary is made, none is bound and the stub is given none.
+    assert sh._canary is None and "--canary" not in sh._argv[at:]
     sh.close()
+
+
+# --- the architecture table (L3 r1) -----------------------------------------------------------------
+
+@pytest.mark.parametrize("machine", ["mips64", "ppc64le", "armv7l", "s390x"])
+def test_a_machine_outside_the_syscall_table_is_t0_by_name_and_never_issues_one(monkeypatch, machine):
+    def boom(*a):
+        raise AssertionError("a Landlock syscall was reached")
+
+    monkeypatch.setitem(NS, "syscall", boom)
+    monkeypatch.setitem(NS, "running_abi", boom)
+    abi, reason = L.host_read(system="Linux", machine=machine)
+    assert abi == 0 and reason == f"architecture {machine} not in levain's Landlock table"
+    assert L.tier_line(abi, reason).startswith(f"unix sockets (T0: architecture {machine} not in levain's Landlock table)")
+    assert L.running_abi(system="Linux", machine=machine) == 0
+    assert NS["machine_problem"]("x86_64") is None and NS["machine_problem"]("aarch64") is None
+
+
+def test_the_stub_issues_no_syscall_on_a_machine_outside_its_table(monkeypatch):
+    # The stub's own layer: a Linux uname on an unlisted machine never reaches libc (CDLL replaced, so
+    # nothing could reach the kernel even if the check were gone).
+    class _Uname:
+        sysname, machine = "Linux", "mips64"
+
+    def no_libc(*a, **k):
+        raise AssertionError("libc reached")
+
+    monkeypatch.setattr(NS["os"], "uname", lambda: _Uname())
+    monkeypatch.setattr(NS["ctypes"], "CDLL", no_libc)
+    with pytest.raises(OSError) as e:
+        NS["syscall"](444, None, 0, 1)
+    assert e.value.errno == errno.ENOSYS and "mips64" in str(e.value)
+    assert NS["running_abi"]() == 0
+    # A T6/T9 claim from levain then meets T0 here and refuses; T0 asks nothing of the kernel.
+    assert "below the T9" in NS["confine"](_opts("T9"))
+    assert NS["confine"](_opts("T0")) is None
+
+
+# --- the canary's place and creation (L3 r1) --------------------------------------------------------
+
+def test_the_canary_is_under_tmp_whatever_tmpdir_says(monkeypatch, tmp_path):
+    long_tmp = tmp_path / ("x" * 120)
+    long_tmp.mkdir()
+    monkeypatch.setenv("TMPDIR", str(long_tmp))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    c = L.Canary()
+    try:
+        assert c.dir.startswith("/tmp/lvc-") and os.path.exists(c.path)
+    finally:
+        c.stop()
+
+
+def test_a_canary_that_cannot_be_made_refuses_the_spawn_by_name(tmp_path, monkeypatch):
+    import levain.firing.confinement as conf
+    from levain.firing.confinement import ConfinementError, build_policy
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(conf, "bwrap_available", lambda: True)
+    monkeypatch.setattr(conf, "_prepare_mountpoints", lambda mounted, made=None: None)
+    monkeypatch.setattr(conf._landlock, "host_read", lambda: (10, None))
+    started = []
+    monkeypatch.setattr(conf._BwrapShell, "start", lambda self: started.append(self))
+
+    def no_canary(**k):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(conf._landlock, "Canary", no_canary)
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    with pytest.raises(ConfinementError, match="canary socket under /tmp .*Too many open files"):
+        conf.BwrapProvider()._spawn_shell_impl(build_policy(ent), env={"PATH": "/usr/bin"})
+    assert not started
+
+
+def test_a_canary_whose_socket_cannot_be_made_leaves_no_directory(monkeypatch):
+    made = []
+    real = tempfile.mkdtemp
+
+    def track(**k):
+        made.append(real(**k))
+        return made[-1]
+
+    def no_socket(*a, **k):
+        raise OSError(errno.EMFILE, "Too many open files")
+
+    monkeypatch.setattr(tempfile, "mkdtemp", track)
+    monkeypatch.setattr(socket, "socket", no_socket)
+    with pytest.raises(OSError):
+        L.Canary()
+    assert made and not os.path.exists(made[0])
+
+
+# --- the relays and the stub's own refusals (L3 r1) -------------------------------------------------
+
+_RELAY_CHILD = r"""
+import os, sys, time
+exec(compile(sys.argv[1], "defs", "exec"))
+relay_into(1)
+relay_into(2)
+os.close(int(sys.argv[2]))   # the command closes one stream and keeps running
+time.sleep(30)
+"""
+
+
+@pytest.mark.parametrize("closed", [1, 2])
+def test_each_socket_stdio_relay_reaches_eof_when_the_command_closes_it(closed):
+    out_a, out_b = socket.socketpair()
+    err_a, err_b = socket.socketpair()
+    p = subprocess.Popen([sys.executable, "-I", "-S", "-c", _RELAY_CHILD, L._STUB_DEFS, str(closed)],
+                         stdin=subprocess.DEVNULL, stdout=out_b.fileno(), stderr=err_b.fileno(),
+                         start_new_session=True)
+    out_b.close()
+    err_b.close()
+    try:
+        peer = out_a if closed == 1 else err_a
+        peer.settimeout(10)
+        # Only the relay for that stream may still hold it, and it ends once its pipe is closed.
+        assert peer.recv(4096) == b""
+    finally:
+        os.killpg(p.pid, 9)
+        p.wait(timeout=30)
+        out_a.close()
+        err_a.close()
+
+
+def _run_stub(prefix, args, **kw):
+    return subprocess.run([sys.executable, "-I", "-S", "-c", L._STUB_DEFS + prefix + L._STUB_MAIN, *args],
+                          capture_output=True, timeout=60, **kw)
+
+
+def test_a_command_that_cannot_be_executed_is_a_named_refusal():
+    r = _run_stub("", ["--expect-tier", "T0", "--", "/nonexistent/levain-no-such-command"])
+    assert r.returncode == 126
+    assert b"could not start the command /nonexistent/levain-no-such-command" in r.stderr
+    assert b"Traceback" not in r.stderr
+
+
+def test_a_stdin_socket_that_cannot_be_inspected_is_a_named_refusal():
+    a, b = socket.socketpair()
+    prefix = "\ndef _unwrappable(*a, **k):\n    raise OSError(errno.EINVAL, 'cannot wrap')\nsocket.socket = _unwrappable\n"
+    try:
+        r = _run_stub(prefix, ["--expect-tier", "T0", "--carry-stdin", "--", "/bin/echo", "ran"], stdin=b.fileno())
+    finally:
+        a.close()
+        b.close()
+    assert r.returncode == 126 and b"ran" not in r.stdout
+    assert b"could not make the command's stdin, stdout and stderr safe" in r.stderr and b"cannot wrap" in r.stderr
+    assert b"Traceback" not in r.stderr
