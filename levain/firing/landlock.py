@@ -22,9 +22,11 @@ What the program does, in order:
    kernel check, so this is a spawn rule, not a kernel claim.
 2. Reads the running ABI and builds the ruleset for THAT ABI only: a field or right the ABI lacks is
    never sent (the scope field below ABI 6 is refused with E2BIG; the unix-resolve right before
-   ABI 9 is refused with EINVAL; both measured). Only ENOSYS and EOPNOTSUPP read as "no Landlock";
-   any other error refuses the command, and so does a tier lower than the one levain read outside
-   the sandbox and passed in.
+   ABI 9 is refused with EINVAL; both measured). When levain read T0 outside the sandbox the stub
+   applies nothing and refuses nothing (T0 is offered, never refused). Above T0, only ENOSYS and
+   EOPNOTSUPP read as "no Landlock": any other error refuses the command, and so does a tier lower
+   than the one levain read outside the sandbox and passed in. levain's own read never refuses: an
+   error there is T0, with the error's name in the tier line (:func:`host_read`).
 3. T9 and T6: binds an abstract canary socket (created now, so outside the domain about to be made)
    and connects to it and to the pathname canary levain created outside the sandbox and bound into
    the view: both must answer (the positive control), or the command is refused. Then it applies the
@@ -39,6 +41,7 @@ tests replace the syscall layer.
 
 from __future__ import annotations
 
+import errno
 import os
 import platform
 import select
@@ -58,6 +61,7 @@ import threading
 #   --carry-stdin         stdin is levain's state channel (an unnamed socketpair): kept.
 #   --expect-tier TIER    the tier levain read outside the sandbox (required): a lower tier read here
 #                         refuses the command, so a filter in between can never quietly downgrade it.
+#                         T0: the stub applies nothing and its own read is not made.
 _STUB_DEFS = r"""import ctypes, errno, os, socket, stat, struct, sys
 SYS_CREATE_RULESET, SYS_ADD_RULE, SYS_RESTRICT_SELF = 444, 445, 446
 CREATE_RULESET_VERSION = 1
@@ -237,7 +241,9 @@ def abstract_listener():
     return s, name
 def confine(opts):
     # Restrict this process for the running ABI and check the policy holds; None, or why the command
-    # is refused.
+    # is refused. Never more than levain claims: on T0 nothing is applied and nothing is refused.
+    if opts["expect-tier"] == "T0":
+        return None
     try:
         abi = running_abi()
     except OSError as e:
@@ -375,10 +381,23 @@ def running_abi(system: str | None = None) -> int:
     return _ns["running_abi"]()
 
 
-def tier_line(abi: int) -> str:
-    """The unix-socket claim line for a kernel at ``abi``, as ``run`` and ``doctor`` print it."""
+def host_read(system: str | None = None) -> tuple[int, str | None]:
+    """levain's own read, outside the sandbox: ``(abi, reason)``. It never refuses: an error other than
+    "no Landlock" (EPERM from a seccomp filter, say) is ABI 0, tier T0, with ``reason`` naming it
+    ("Landlock unavailable (EPERM)"); ``reason`` is None when the read succeeded."""
+    try:
+        return running_abi(system), None
+    except OSError as exc:
+        name = errno.errorcode.get(exc.errno, str(exc.errno)) if exc.errno is not None else str(exc)
+        return 0, f"Landlock unavailable ({name})"
+
+
+def tier_line(abi: int, reason: str | None = None) -> str:
+    """The unix-socket claim line for a kernel at ``abi``, as ``run`` and ``doctor`` print it; ``reason``
+    (from :func:`host_read`) replaces the ABI when levain's read failed."""
     tier = tier_for(abi)
-    return f"unix sockets ({tier}, Landlock ABI {abi}): {TIER_CLAIMS[tier]}"
+    read = f"{tier}: {reason}" if reason is not None else f"{tier}, Landlock ABI {abi}"
+    return f"unix sockets ({read}): {TIER_CLAIMS[tier]}"
 
 
 def stub_argv(python: str, *, canary: str | None, expect_tier: str, grants: tuple[str, ...] = (),
