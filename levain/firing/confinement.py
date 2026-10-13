@@ -5602,7 +5602,7 @@ def _runtime_view(policy: CrownJewelsPolicy,
             if held == root or held.is_relative_to(root):
                 raise ConfinementError(
                     f"the user runtime dir {root} holds {held}. Bash gets a view of that directory "
-                    "holding only its agent sockets, and the view would hide that too. Refusing "
+                    "holding only the sockets you grant, and the view would hide that too. Refusing "
                     "to grant bash hands (fail-closed). Point XDG_RUNTIME_DIR at a directory of its own.")
     if dirmngr is None:
         dirmngr = _dirmngr_sockets() if policy.deny_localhost_outbound else []
