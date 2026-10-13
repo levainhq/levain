@@ -167,6 +167,58 @@ class LedgerTransport(Protocol):
         ...
 
 
+    def confirm_own_key(self, d) -> bool:
+        """If this machine's key is PENDING for a member, move it into force with a commit signed by that key."""
+        ...
+
+    @staticmethod
+    def ledger_of(d) -> I.Ledger:
+        """The enforced ledger for a derivation (pure)."""
+        ...
+
+    def forget_derivation(self) -> None:
+        """Drop the cached derivation (this clone's trust state or the tip changed under it)."""
+        ...
+
+    def has_local_ledger(self) -> bool:
+        """Whether a strict team ledger is held here locally (whether or not this clone pinned it)."""
+        ...
+
+    def has_remote_ledger(self) -> bool:
+        """Whether a remote-tracking strict ledger branch is here."""
+        ...
+
+    @property
+    def canon_path(self) -> Path:
+        """Where the generated canon (PROJECT.md) lives in this clone's private worktree."""
+        ...
+
+    def export_pos(self, d) -> int:
+        """Commits on the walk up to this clone's ``anchor`` (the last PUBLISHED tip it derived in full); with no anchor,
+        the walk to the remote-tracking tip, or to the local tip when the clone has no remote. 0 when none resolves."""
+        ...
+
+    def location_row(self) -> tuple[bool, str]:
+        """The doctor's first row: where this clone's private ledger lives and which device it is."""
+        ...
+
+    def publish_rows(self) -> list[tuple[bool, str]]:
+        """The doctor's publishing rows: the last fetch and what is not pushed, or that the ledger is local only."""
+        ...
+
+    def ledger_label(self) -> str:
+        """The ``ledger <branch>`` part of the first status line."""
+        ...
+
+    def freshness_lines(self) -> list[str]:
+        """The status line on how fresh this clone's fetch is (none when the ledger is local only)."""
+        ...
+
+    def foreign_ledger_lines(self, d) -> list[str]:
+        """Status lines on other ledgers on the remote: a 0.6.x branch, and branches claiming to re-genesis this team."""
+        ...
+
+
 def open_ledger(repo: Repo) -> LedgerTransport:
     """The team ledger for ``repo`` on the wire this clone uses (the git wire, until a second wire exists)."""
     return GitLedger(repo)

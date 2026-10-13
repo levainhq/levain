@@ -547,20 +547,162 @@ class GitLedger:
         """(sha, team, ledger), all derived from ONE commit of the ledger branch."""
         sha = self.head()
         d = self.derivation(sha)
-        return sha, d.team, self._ledger_of(d)
+        return sha, d.team, self.ledger_of(d)
 
     def ledger(self, team: R.Team | None = None, rev: str | None = None) -> I.Ledger:
         """The ledger as enforced: every line in its chain, enforced only where tenure says so."""
-        return self._ledger_of(self.derivation(rev))
+        return self.ledger_of(self.derivation(rev))
 
     @staticmethod
-    def _ledger_of(d) -> I.Ledger:
+    def ledger_of(d) -> I.Ledger:
         problems = list(d.problems)
         if d.judged != "full":
             problems.append(f"judged: partial: {d.frozen_why}; verdicts are frozen at {str(d.frozen_at)[:10]}"
                             + (f"; {d.waiting} line(s) after it are waiting" if d.waiting else ""))
         files = [(rel, lines) for rel, lines in sorted(d.files.items())]
         return I.build(files, d.team.owner, problems, unenforced=d.unenforced, authority=d.owner_authority)
+
+    # ---- the caller-facing surface (S0-b): ledger logic that used to live in callers, moved here whole ------------
+
+    def forget_derivation(self) -> None:
+        """Drop the cached derivation (this clone's trust state or the tip changed under it)."""
+        self._dcache = None
+
+    def has_remote_ledger(self) -> bool:
+        """Whether a remote-tracking strict ledger branch is here."""
+        return bool(self.remote and self._has(f"refs/remotes/{self.remote}/{BRANCH}"))
+
+    @property
+    def canon_path(self) -> Path:
+        """Where the generated canon (PROJECT.md) lives in this clone's private worktree."""
+        return self.wt / CANON_FILE
+
+    def export_pos(self, d) -> int:
+        """Commits on the walk up to this clone's ``anchor`` (the last PUBLISHED tip it derived in full); with no anchor,
+        the walk to the remote-tracking tip, or to the local tip when the clone has no remote. 0 when none resolves."""
+        from . import tenure as T
+        st = self.state()
+        anchor = st.get("anchor") if isinstance(st.get("anchor"), str) and st.get("anchor") else None
+        target = anchor
+        if target is None:
+            if self.remote:
+                rref = f"refs/remotes/{self.remote}/{self.branch}"
+                target = rref if self._has(rref) else None
+            else:
+                target = d.tip
+        if target is None:
+            return 0
+        if target in d.walk:
+            return d.walk.index(target) + 1
+        try:
+            top = self.repo.toplevel
+            sha = T._git(top, ["rev-parse", "--verify", "-q", target + "^{commit}"]).strip()
+            return len(T.effective_walk(T.parents_of(top, sha), sha, self.clone().accepted))
+        except T.Unjudgeable:
+            return 0
+
+    def location_row(self) -> tuple[bool, str]:
+        """The doctor's first row: where this clone's private ledger lives and which device it is."""
+        return (True, f"ledger worktree {self.wt} (device {self.device})")
+
+    def publish_rows(self) -> list[tuple[bool, str]]:
+        """The doctor's publishing rows: the last fetch and what is not pushed, or that the ledger is local only."""
+        from datetime import datetime, timezone
+
+        def iso(ts) -> str:
+            try:
+                return datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (TypeError, ValueError):
+                return ""
+        rows: list[tuple[bool, str]] = []
+        st = self.state()
+        if self.remote:
+            err = st.get("last_fetch_error")
+            rows.append((not err, f"remote {self.remote}: last fetch "
+                         + (I.age(iso(st.get('last_fetch_ok'))) if st.get("last_fetch_ok") else "never")
+                         + (f"; last error: {err}" if err else "")))
+            ahead = subprocess.run(["git", *_NO_HOOKS, "log", "--format=%s",
+                                    f"refs/remotes/{self.remote}/{self.branch}..HEAD"],
+                                   cwd=self.wt, capture_output=True, text=True, env=ledger_env())
+            subjects = ahead.stdout.splitlines() if ahead.returncode == 0 else ["?"]
+            real = [s for s in subjects if not s.startswith("levain team: ack ")]
+            rows.append((not real, f"{len(subjects)} local ledger commit(s) not pushed"
+                         + ("" if not subjects else (": run `levain team sync`" if real
+                            else " (acknowledgements only; they go out with the next write)"))))
+        else:
+            rows.append((True, "no remote: ledger is local only"))
+        return rows
+
+    def ledger_label(self) -> str:
+        """The ``ledger <branch>`` part of the first status line."""
+        return f"ledger {self.branch}"
+
+    def freshness_lines(self) -> list[str]:
+        """The status line on how fresh this clone's fetch is (none when the ledger is local only)."""
+        if not self.remote:
+            return []
+        last = self.state().get("last_fetch_ok")
+        age = (time.time() - float(last)) if last else None
+        newest = git(["log", "-1", "--format=%cr", self.ref], self.repo.toplevel, check=False).stdout.strip()
+        return [f"last fetched {('%d min ago' % (age // 60)) if age is not None else 'never'}; newest ledger "
+                f"commit {newest or 'unknown'}. A host can withhold newer commits without any signal: compare "
+                "the tip id with a teammate if anything looks stale"]
+
+    def foreign_ledger_lines(self, d) -> list[str]:
+        """Status lines on other ledgers on the remote: a 0.6.x branch, and branches claiming to re-genesis this team."""
+        from . import tenure as T
+        out: list[str] = []
+        if not self.remote:
+            return out
+        refs = git(["for-each-ref", "--format=%(refname)", f"refs/remotes/{self.remote}/"], self.repo.toplevel,
+                   check=False).stdout.split()
+        if f"refs/remotes/{self.remote}/{LEGACY_BRANCH}" in refs:
+            # T46, RUN: a 0.6.x ledger beside the strict one was never mentioned
+            out.append(f"a 0.6.x {LEGACY_BRANCH} branch was on {self.remote} at this clone's last fetch: this levain never "
+                       "reads it (nothing in it is enforced); the owner deletes it with `levain team retire-legacy`")
+        for ref in refs:
+            name = ref.rsplit("/", 1)[-1]
+            if not name.startswith(BRANCH + "-") or name == self.branch:
+                continue
+            roots = git(["rev-list", "--max-parents=0", ref], self.repo.toplevel, check=False).stdout.split()
+            ten = self._show(T.TENURE_FILE, roots[0]) if roots else None
+            try:
+                rt = T.parse_tenure(ten or "", "x")
+                rteam = R.parse_team(self._show(T.TEAM_FILE, roots[0]) or "", "x")
+                prior, rowner = rt.prior, rteam.owner
+                rfps = ", ".join(sorted(T.key_fps(rt, rowner))) or "none"
+            except Exception:  # noqa: BLE001 - a display line; a foreign ledger's bad file is not this clone's problem
+                prior = None
+            if prior and prior.get("root") == d.walk[0]:
+                # anyone who can push can make one, so the line names its owner and keys and claims nothing for it
+                # (docs L3 r1 anansi: an unqualified "to move" line advertised whatever branch was pushed)
+                out.append(f"a branch {name} claims to RE-GENESIS this team, owner {rowner} (keys {rfps}); UNVERIFIED: "
+                           f"move only if your owner confirms those keys out of band "
+                           f"(`levain team join --root {name.rsplit('-', 1)[-1]}`)")
+        return out
+
+    def nested_genesis(self, files: dict[str, str], message: str) -> str:
+        """A signed parentless commit whose tree holds ``files`` (paths may nest)."""
+        top = self.repo.toplevel
+        idx = self.base / "regenesis.index"
+        env = ledger_env(GIT_INDEX_FILE=str(idx))
+        try:
+            idx.unlink()
+        except FileNotFoundError:
+            pass
+        for path, text in sorted(files.items()):
+            blob = git(["hash-object", "-w", "--stdin"], top, input_text=text).stdout.strip()
+            subprocess.run(["git", *_NO_HOOKS, "update-index", "--add", "--cacheinfo", f"100644,{blob},{path}"],
+                           cwd=str(top), env=env, check=True, capture_output=True)
+        tree = subprocess.run(["git", *_NO_HOOKS, "write-tree"], cwd=str(top), env=env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+        idx.unlink(missing_ok=True)
+        cp = subprocess.run(["git", *_NO_HOOKS, *self._sign_cfg(), "commit-tree", "-S", tree, "-m", message],
+                            cwd=str(top), capture_output=True, text=True, env={**env, **self._sign_env()},
+                            stdin=subprocess.DEVNULL, timeout=60)
+        if cp.returncode != 0:
+            raise TeamError(f"could not sign the re-genesis: {(cp.stderr or cp.stdout).strip()[-200:]}")
+        return cp.stdout.strip()
 
     def team_history_problems(self, team: R.Team, rev: str | None = None) -> list[str]:
         """Kept for callers: on a strict ledger these are part of the derivation's own problems."""
@@ -575,7 +717,7 @@ class GitLedger:
         cp = git(["ls-remote", "--heads", remote, f"refs/heads/{self.branch}"], self.repo.toplevel, timeout=60)
         return bool(cp.stdout.strip())
 
-    def _local_branch_exists(self) -> bool:
+    def has_local_ledger(self) -> bool:
         cp = git(["rev-parse", "--verify", "-q", f"refs/heads/{self.branch}"], self.repo.toplevel, check=False)
         return cp.returncode == 0
 
@@ -670,7 +812,7 @@ class GitLedger:
         if self.legacy_only() and not replace_legacy:
             raise TeamError(LEGACY_MESSAGE)
         branch = self.branch
-        if self._local_branch_exists():
+        if self.has_local_ledger():
             if self.pinned_root:
                 # a real ledger this clone trusts, never "left from an init": no delete advice (r14 complement 2)
                 raise TeamError(f"branch {branch} already exists here and this clone is pinned to it: "
@@ -1001,7 +1143,7 @@ class GitLedger:
             # persisted: a failure from here keeps the new state and says what is still needed, never a plain
             # "failed" (code L3 r5 complement 8)
             try:
-                if not self._local_branch_exists():
+                if not self.has_local_ledger():
                     git(["branch", name, rref], self.repo.toplevel)
                 self._record_seen_sha(tip)       # the joined tip was published: never movable (code L3 r1 codex HIGH)
                 self._remember_own_key()
@@ -1033,7 +1175,7 @@ class GitLedger:
         if moved:
             tofu = f"re-pinned from genesis {pinned[:12]} to {found[name][:12]} on your --root.\n" + tofu
         try:
-            confirmed = self._confirm_own_key(d)
+            confirmed = self.confirm_own_key(d)
         except TeamError as exc:
             confirmed = False
             confirm_failed = True
@@ -1131,7 +1273,7 @@ class GitLedger:
                             + (msg[-1] if msg else f"exit {cp.returncode}")
                             + ". The signing key must be in ssh-agent or have no passphrase")
 
-    def _confirm_own_key(self, d) -> bool:
+    def confirm_own_key(self, d) -> bool:
         """If this machine's key is PENDING for a member, move it into force with a commit signed by that key."""
         from . import tenure as T
         fp = self.own_fingerprint()
