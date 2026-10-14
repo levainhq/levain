@@ -466,7 +466,7 @@ _EDIT_PHRASES = {
     "spore_touch": "marked seen", "spore_descend": "resolved", "spore_surface_at": "rescheduled", "spore_update": "edited",
     "spore_set_disposition": "moved", "spore_ascend": "promoted", "spore_seed": "added", "episode_tombstone": "deleted episode",
     "operator_state": "set the state line", "section_edit": "edited", "config": "edited", "entity_name": "renamed the entity",
-    "undo": "undid an edit", "pending_cancel": "cancelled a pending change", "token_rotate": "rotated a surface token"}
+    "undo": "undid an edit", "pending_cancel": "cancelled a pending change", "token_rotate": "rotated the surface token"}
 
 
 def _edit_target(resource_key: str) -> str:
@@ -475,6 +475,10 @@ def _edit_target(resource_key: str) -> str:
         return f"item {ident}"
     if kind == "section" and ident:
         return f"the {ident} section"
+    if kind == "token":
+        return ident          # a surface token: "rotated the surface token browser"
+    if kind == "pend":
+        return ""             # a pending change is named by its verb alone
     return resource_key       # a shape this table does not know is named as the store names it
 
 
@@ -522,7 +526,7 @@ def _journal_edits(source: SubstrateSource, page: Any) -> list[RowIn]:
             rows.append(RowIn(id=f"tomb:{episode_id}:{e.operation_id}", title=plain_edit_title("episode_tombstone", episode_id, e.credential),
                               facets=facets, stored=stored))
         else:
-            rows.append(RowIn(id=f"fire:{e.operation_id}:{e.idx}", title=plain_edit_title(str(e.verb), _edit_target(e.resource_key), e.credential),
+            rows.append(RowIn(id=f"fire:{e.operation_id}:{e.idx}", title=plain_edit_title(e.verb or "", _edit_target(e.resource_key), e.credential),
                               facets=facets, stored=stored))
     return rows
 

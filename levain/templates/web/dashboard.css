@@ -1327,7 +1327,11 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
   body.ke .hero .masthead { justify-content: center; text-align: center; }
   body.ke .hero .mode kbd, body.ke .hero #jumpbtn kbd { display: none; }
   /* the status cluster is always its own line under the buttons, however short it is: a zero-height full-width item sits between */
-  body.ke .hero .masthead::after { content: ""; flex: 1 1 100%; order: 3; height: 0; }
+  body.ke .hero .masthead::after { content: ""; flex: 1 1 100%; order: 3; height: 0; margin-top: calc(var(--sp-3) * -1); }
+  /* the nav is the first thing on a phone, so its controls are touch-sized */
+  body.ke .hero .seg { height: auto; min-height: var(--hit-min); }
+  body.ke .hero .mode { min-height: calc(var(--hit-min) - var(--sp-1) * 2); }
+  body.ke .hero .indicators button { height: var(--hit-min); }
   body.ke .hero .jar, body.ke .hero .livechip, body.ke .hero .stamp { order: 4; justify-content: center; }
   /* the sky is full-bleed: the plot runs edge to edge, the summary line keeps the page gutter */
   body.ke .hero .sky-bar { padding: var(--sp-4) var(--gutter) var(--sp-3); }
@@ -1337,7 +1341,7 @@ body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertic
    neighbour an empty card used to leave a void under it; as a bar at the end of the zone it takes one thin full-width line, and the
    cards with something to show fill the rows above it. */
 body.ke .ck-zgrid > .panel.ck-fold { grid-column: 1 / -1; order: 90; flex-direction: row; flex-wrap: wrap; align-items: baseline; align-self: stretch; height: auto; max-height: none; }
-body.ke .ck-zgrid > .panel.ck-fold .phead { padding: var(--sp-4) var(--sp-4) var(--sp-4) var(--sp-6); flex: none; flex-wrap: nowrap; }
+body.ke .ck-zgrid > .panel.ck-fold .phead { padding: var(--sp-4) var(--sp-4) var(--sp-4) var(--sp-6); flex: none; }
 body.ke .ck-zgrid > .panel.ck-fold .pbody { padding: var(--sp-4) var(--sp-6) var(--sp-4) 0; flex: 1 1 200px; overflow: visible; max-height: none; }
 body.ke .ck-zgrid > .panel.ck-fold .pbody { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--sp-5); }
 body.ke .ck-zgrid > .panel.ck-fold .pbody .empty, body.ke .ck-zgrid > .panel.ck-fold .pbody .ext-note { margin: 0; padding: 0; }
@@ -1348,5 +1352,6 @@ body.ke .ck-zgrid .pbody > .edit-trigger-row { float: right; padding: 0; margin:
 /* a section card (the Neocortex) is as tall as its text, up to the tall height, where it scrolls */
 body.ke .ck-zgrid > .panel.k-brief.ck-h-tall { height: auto; max-height: var(--card-tall); }
 
-/* the compose box starts at one line and grows with what is typed, up to a cap */
-body.ke .tray-dump-ta { min-height: 0; max-height: 220px; }
+/* the compose box starts at one line and grows with what is typed, up to a cap; the text editor keeps its own sizing */
+body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: 32px; max-height: 220px; }
+@media (pointer: coarse) { body.ke .tray-dump:not(.text-editor) .tray-dump-ta { min-height: var(--hit-min); } }

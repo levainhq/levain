@@ -49,22 +49,33 @@ def _page(tmp_path: Path, steps: list[dict]) -> list:
 
 @needs_browser
 def test_the_phone_header_leads_with_the_nav_and_centres_its_buttons(tmp_path: Path) -> None:
-    vals = _page(tmp_path, [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"eval": """(async () => { await new Promise(r => setTimeout(r, 500));
+    vals = _page(tmp_path, [{"emulate": {"w": 390, "h": 844, "dpr": 2, "mobile": True}}, {"until": "document.querySelector('.hero .seg') && document.querySelector('.hero .clock') && document.querySelector('.hero .indicators button')"}, {"eval": """(() => {
       const top = (s) => document.querySelector(s).getBoundingClientRect().top, box = (e) => e.getBoundingClientRect();
       const seg = document.querySelector('.hero .seg'), btns = [...document.querySelectorAll('.hero .indicators button')];
       const l = Math.min(...btns.map(b => box(b).left)), r = Math.max(...btns.map(b => box(b).right));
       return { segTop: top('.hero .seg'), clockTop: top('.hero .clock'), segShare: box(seg).width / innerWidth, mid: (l + r) / 2, vw: innerWidth, sw: document.documentElement.scrollWidth }; })()"""}])
-    got = vals[1]
+    got = vals[2]
     assert got["segTop"] < got["clockTop"] and got["segShare"] > 0.85 and abs(got["mid"] - got["vw"] / 2) < 8 and got["sw"] <= got["vw"], got
 
 
 @needs_browser
 def test_an_empty_card_with_no_compose_box_is_a_full_width_bar_after_its_zones_cards(tmp_path: Path) -> None:
-    vals = _page(tmp_path, [{"eval": """(async () => { await new Promise(r => setTimeout(r, 500));
+    vals = _page(tmp_path, [{"until": "document.querySelector('.ck-zgrid > .panel.ck-fold')"}, {"eval": """(() => {
       const bars = [...document.querySelectorAll('.ck-zgrid > .panel.ck-fold')].filter(p => getComputedStyle(p).display !== 'none'); if (!bars.length) return null;
       return bars.map(b => { const g = b.parentElement, gw = g.getBoundingClientRect().width, bt = b.getBoundingClientRect().top;
         const cards = [...g.children].filter(p => p !== b && !p.classList.contains('ck-fold') && getComputedStyle(p).display !== 'none');
         return [b.getBoundingClientRect().width / gw, cards.every(c => c.getBoundingClientRect().bottom <= bt + 1), !!b.querySelector('.tray-dump')]; }); })()"""}])
-    assert vals[1], vals
-    for share, after_cards, has_box in vals[1]:
+    assert vals[2], vals
+    for share, after_cards, has_box in vals[2]:
         assert share > 0.95 and after_cards and not has_box, vals
+
+
+def test_a_fire_reads_as_a_sentence_and_an_unknown_shape_is_named_as_the_store_names_it() -> None:
+    from levain.cockpit.providers import _edit_target, plain_edit_title
+
+    assert plain_edit_title("spore_descend", _edit_target("spore:spore-017"), "token:browser:1") == "resolved item spore-017, from the browser"
+    assert plain_edit_title("section_edit", _edit_target("section:State"), "device:ab12") == "edited the State section, from a signed device"
+    assert plain_edit_title("token_rotate", _edit_target("token:browser"), "token:browser:2") == "rotated the surface token browser, from the browser"
+    assert plain_edit_title("pending_cancel", _edit_target("pend:xyz"), "") == "cancelled a pending change"
+    assert plain_edit_title("new_verb_x", _edit_target("thing:1"), None) == "new verb x thing:1"
+    assert plain_edit_title("", "", None) == ""

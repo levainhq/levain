@@ -19,7 +19,7 @@
   var NOW_AT = 0.85;                // where "now" sits across the plot
   var TICK_MS = 30000;              // the window slides on a timer, not on frames
   var ROW_H_MIN = 26, PAD_T = 28, PAD_B = 12, PAD_R = 24, GUTTER_PAD = 16, GUTTER_MIN = 56;
-  var SHORT_LABELS = { memory: 'mem', decisions: 'dec', commits: 'commit', reviews: 'review' };
+  var SHORT_LABELS = { memory: 'mem', decisions: 'dec' };   // by row id
   var FONT_MONO = '11px ui-monospace, "SF Mono", Menlo, monospace';
   var FONT_SEAT = '600 11.5px ui-rounded, -apple-system, sans-serif';
 
@@ -112,7 +112,7 @@
       inWin.forEach(function (e) { if (!offView(e, single)) used[rowOf(e)] = 1; });
       var kept = rows.filter(function (r) { return used[r.id]; });
       if (kept.length) rows = kept;
-      rows.forEach(function (r) { if (SHORT_LABELS[r.label]) r.label = SHORT_LABELS[r.label]; });
+      rows.forEach(function (r) { if (Object.prototype.hasOwnProperty.call(SHORT_LABELS, r.id)) r.label = SHORT_LABELS[r.id]; });
     }
     var counts = { commit: 0, review: 0, failed: 0, memory: 0 };
     inWin.forEach(function (e) {

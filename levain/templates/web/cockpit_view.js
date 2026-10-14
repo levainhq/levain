@@ -1462,9 +1462,9 @@
     for (const p of document.querySelectorAll(".ck-zgrid > .panel")) {
       const none = !!p.querySelector(".pbody .empty") && !p.querySelector(".xfilter, .pbody .row, .pbody .rrow, .pbody .lrow, .pbody .section-display, .pbody .ep-search-input");
       p.classList.toggle("ck-is-empty", none);
-      // an empty card folds into a slim bar at the end of its zone, unless it has a compose box on it (Tray, Keep, Inbox) or tabs
-      // (Cognition trace): the box and the tabs are its content, so it stays a card (at its natural height)
-      p.classList.toggle("ck-fold", none && !p.querySelector(".tray-dump:not([hidden]), .ck-tabs"));
+      // an empty card folds into a slim bar at the end of its zone, unless it has a compose box or an editor behind an Edit link on it
+      // (Tray, Keep, Inbox, an empty identity card) or tabs (Cognition trace): they are its content, so it stays a card
+      p.classList.toggle("ck-fold", none && !p.querySelector(".tray-dump, .ck-tabs, .edit-trigger-row"));
     }
   }
   function fillGrids() {
