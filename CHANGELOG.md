@@ -6,6 +6,12 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Known edges
+
+- **Installing the Claude Code consent hook replaces a `PermissionRequest` handler it takes for its own.** A reinstall removes the earlier levain handler even when it was written for another Python, by its shape: a command of exactly two words whose second is levain's installed hook script path. A handler of your own written exactly that way (any program, then levain's script path, nothing else) would be replaced too; a handler with any other command (a third word, another script) is always kept.
+- **An edit of levain's own installed code always goes to you.** The consent hook runs levain's package, so an Edit or Write into that package (or into the interpreter's `.pth`, `sitecustomize.py` or `usercustomize.py`, which can redirect it) is treated as agent config and never answered by policy. With an editable install the package is your levain checkout, so a session working on levain itself asks you about each such edit when Claude Code would ask at all.
+- **A plugin's own scripts are agent config only inside `~/.claude/plugins`.** For a plugin outside it (a local marketplace, `--plugin-dir`), its `.claude-plugin/` directory and its `hooks/` are treated as agent config, but a script its `plugin.json` names elsewhere in the plugin (such as `scripts/x.sh`) is not, so an edit of that script can be answered by policy.
+
 ## [0.10.3] — 2026-10-14
 
 The cockpit's visual pass. No change to what a write needs, to the floor, or to any stored format.
