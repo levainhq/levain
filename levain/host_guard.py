@@ -446,6 +446,13 @@ def _dir_digest(root: Path) -> str:
     return h.hexdigest()
 
 
+def _codex_hooks_digest(cj: Path) -> str:
+    try:
+        return _sha_bytes(cj.read_bytes()) if cj.is_file() else "absent"
+    except OSError:
+        return "unreadable"
+
+
 def agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
                     ) -> dict[str, str]:
     """Component name -> digest for every file the agents run hooks from for this install."""
@@ -463,7 +470,7 @@ def agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.PathLi
         ".claude/settings.local.json hooks": _hooks_entry_digest(cc / "settings.local.json"),
         ".claude/hooks/ (scripts)": _dir_digest(cc / "hooks"),
         "activation/hooks/ (scripts)": scripts,
-        f"{cj} (Codex)": _sha_bytes(cj.read_bytes()) if cj.is_file() else "absent",
+        f"{cj} (Codex)": _codex_hooks_digest(cj),
     }
 
 
@@ -487,6 +494,30 @@ def repin_agent_hooks(install: str | os.PathLike[str], codex_home: str | os.Path
         json.dump({"entity": str(ent), "pins": pins}, fh, indent=1, sort_keys=True)
     os.replace(tmp, ent / _AGENT_PIN_FILE)
     return pins
+
+
+def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
+                     ) -> Literal["none", "match", "changed"]:
+    """The pin's state right now, WITHOUT recording anything (``check_agent_hook_pins`` records on
+    first use). A levain command that is about to write hook files asks this first."""
+    ent = Path(os.path.abspath(install))
+    old = _read_agent_pins(ent)
+    if old is None:
+        return "none"
+    now = agent_hook_pins(ent, codex_home)
+    return "match" if all(old.get(k) == v for k, v in now.items()) else "changed"
+
+
+def repin_after_levain_write(install: str | os.PathLike[str], before: Literal["none", "match", "changed"],
+                             codex_home: str | os.PathLike[str] | None = None) -> bool:
+    """Levain's own hook writes (init, update) re-pin as their last act, through the one pin writer
+    (``repin_agent_hooks``). ``before`` is :func:`agent_pin_status` taken BEFORE the write: a pin that
+    was already ``changed`` had been edited by something other than levain, and re-pinning now would
+    bless that edit, so it stays unpinned and doctor keeps failing. Returns whether it re-pinned."""
+    if before == "changed":
+        return False
+    repin_agent_hooks(install, codex_home)
+    return True
 
 
 def check_agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
