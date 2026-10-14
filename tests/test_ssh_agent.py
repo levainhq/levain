@@ -376,6 +376,11 @@ def test_the_run_lines_show_this_sessions_agent_and_each_key_with_its_limit(keye
     agent, key, _ = keyed
     lines = ssh_agent.status_lines("Linux", agent=agent)
     assert lines[0].startswith(f"ssh agent: levain's scoped agent for this session (pid {agent.pid}, ")
+    # tier-true (L1 #2 / L2 #4): "only it" at T9 alone, where pathname unix sockets are refused
+    assert "reachable at this tier (unknown" in lines[0] and "only it" not in lines[0]
+    assert "reachable at this tier (T6" in ssh_agent.status_lines("Linux", agent=agent, tier="T6")[0]
+    assert ssh_agent.status_lines("Linux", agent=agent, tier="T9")[0].endswith(
+        "bash reaches only it, at its $SSH_AUTH_SOCK")
     assert lines[1].startswith("ssh agent: no keys; add one from your own shell: `levain ssh-add <key> -h <host>`")
     ssh_agent.add_key(key, ["git.example.test"], lifetime=7200, system="Linux")
     fp = ssh_agent.fingerprint(key)
