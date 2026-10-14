@@ -156,7 +156,8 @@ def test_the_spawn_binds_the_agent_only_while_its_started_pid_answers(home, tmp_
     rt = tmp_path / "rt"
     ops, view = _ssh_agent_ops(a, [rt])
     assert view == str(rt / "levain-ssh" / "agent.sock")
-    assert ops == ["--perms", "0700", "--dir", str(rt / "levain-ssh"), "--bind", a.socket, view]
+    assert ops == ["--perms", "0700", "--dir", str(rt / "levain-ssh"), "--bind", a.socket, view,
+                   "--bind", str(a.dir / "known_hosts"), str(rt / "levain-ssh" / "known_hosts")]
     impostor = ssh_agent.ScopedAgent(a.session_id, a.socket, a.pid + 1)
     with pytest.raises(ConfinementError, match=f"answered by pid {a.pid}, not the agent levain started"):
         _ssh_agent_ops(impostor, [rt])
@@ -312,3 +313,15 @@ def test_the_doctor_lines_list_every_running_session_and_the_other_cases(keyed, 
     assert ssh_agent.status_lines("Darwin") == [ssh_agent.DARWIN_LINE]
     monkeypatch.setattr(ssh_agent, "openssh_problem", lambda: "OpenSSH 8.4 has no destination constraints")
     assert "OpenSSH 8.4" in ssh_agent.status_lines("Linux")[0]
+
+
+def test_the_session_known_hosts_holds_the_checked_keys_of_each_keys_hosts_and_goes_with_the_agent(keyed):
+    agent, key, manifest = keyed
+    kh = agent.dir / "known_hosts"
+    assert stat.S_IMODE(os.lstat(kh).st_mode) == 0o600 and kh.read_text() == ""
+    ssh_agent.add_key(key, ["git.example.test"], lifetime=600, system="Linux")
+    assert kh.read_text() == manifest.read_text()
+    found = subprocess.run(["ssh-keygen", "-F", "git.example.test", "-f", str(kh)], capture_output=True)
+    assert found.returncode == 0
+    ssh_agent.stop(agent)
+    assert not agent.dir.exists()

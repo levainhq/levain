@@ -49,6 +49,7 @@ from typing import Any
 RUN_DIR = "run"
 SOCKET_NAME = "agent.sock"
 RECORD_NAME = "agent.json"
+KNOWN_HOSTS_NAME = "known_hosts"
 VIEW_DIR = "levain-ssh"
 NO_PROVIDER = "!*"
 MIN_OPENSSH = (8, 9)   # destination constraints (ssh-add -h) arrived in OpenSSH 8.9
@@ -106,6 +107,11 @@ def run_root() -> Path:
 def view_socket(runtime_root: Path) -> Path:
     """Where bash finds the agent inside its view of the user runtime dir ``runtime_root``."""
     return runtime_root / VIEW_DIR / SOCKET_NAME
+
+
+def view_known_hosts(runtime_root: Path) -> Path:
+    """Where bash's ssh finds the session's own known_hosts (:data:`KNOWN_HOSTS_NAME`), beside the agent."""
+    return runtime_root / VIEW_DIR / KNOWN_HOSTS_NAME
 
 
 # --- OpenSSH --------------------------------------------------------------------------------------
@@ -277,6 +283,10 @@ def start(*, entity: str = "", lifetime: int = DEFAULT_LIFETIME) -> ScopedAgent:
     _private_dir(d, exclusive=True)
     proc: subprocess.Popen | None = None
     try:
+        # The session's own known_hosts, which confined ssh may write (never the operator's, which their
+        # own ssh trusts); `add_key` puts in it the checked host keys of the hosts each key is for.
+        os.close(os.open(d / KNOWN_HOSTS_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                         0o600))
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path.home()),
                "LANG": os.environ.get("LANG", "C")}
         # Its own session: a Ctrl-C at the operator's terminal reaches levain, never the agent.
@@ -324,7 +334,7 @@ def _remove_dir(d: Path) -> None:
     except OSError:
         return
     for n in names:
-        if n in (SOCKET_NAME, RECORD_NAME) or n.startswith(f".{RECORD_NAME}."):
+        if n in (SOCKET_NAME, RECORD_NAME, KNOWN_HOSTS_NAME) or n.startswith(f".{RECORD_NAME}."):
             try:
                 os.unlink(d / n)
             except OSError:
@@ -565,6 +575,17 @@ def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, se
     done = subprocess.run(argv, env=env, check=False)   # stdin and the terminal stay: a passphrase prompt
     if done.returncode != 0:
         raise AgentError(f"ssh-add exited with status {done.returncode}; nothing was recorded")
+    if hosts:
+        # The checked host keys of these hosts into the session's known_hosts, so confined ssh knows them.
+        lines = []
+        for dest in hosts:
+            for h in _hop_hosts(dest):
+                found = subprocess.run(["ssh-keygen", "-F", h, "-f", str(manifest)], capture_output=True,
+                                       text=True, stdin=subprocess.DEVNULL, timeout=30, check=False)
+                lines += [ln for ln in found.stdout.splitlines() if ln.strip() and not ln.startswith("#")]
+        fd = os.open(d / KNOWN_HOSTS_NAME, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write("".join(f"{ln}\n" for ln in lines))
     rec = read_record(d) or rec
     rec["keys"] = [k for k in rec["keys"] if not (isinstance(k, dict) and k.get("fingerprint") == fp)]
     rec["keys"].append({"fingerprint": fp, "hosts": list(hosts), "lifetime": lifetime,
