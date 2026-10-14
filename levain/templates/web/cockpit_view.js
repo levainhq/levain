@@ -1083,7 +1083,9 @@
   function setClock(c) {
     const d = new Date();
     const h = d.getHours();
-    c.node.replaceChildren(document.createTextNode((h % 12 || 12) + ":" + String(d.getMinutes()).padStart(2, "0")), el("small", "", h < 12 ? "am" : "pm"));
+    // the clock's colon is its own node and the node carries the time of day, for the variant that tints them (B)
+    c.node.replaceChildren(document.createTextNode(String(h % 12 || 12)), el("span", "clock-colon", ":"), document.createTextNode(String(d.getMinutes()).padStart(2, "0")), el("small", "", h < 12 ? "am" : "pm"));
+    c.node.dataset.tod = h >= 5 && h < 8 ? "dawn" : h >= 21 ? "night" : "day";
     c.date.textContent = d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
   }
   // the page's own clock (the hero's column), ticking whether or not a sky is mounted
@@ -1467,9 +1469,39 @@
       p.classList.toggle("ck-fold", none && !p.querySelector(".tray-dump, .ck-tabs, .edit-trigger-row"));
     }
   }
+  // ---- PREVIEW variants (cockpit pass-2 colour trial): repo tags on rows that name a repo, and the Decisions signal ----
+  // A row names a repo when its own words do (a tag, the text); the tag is the first thing on the line. A production version would
+  // read a structured repo facet from the provider instead of the row's words.
+  const REPO_WORDS = [["levain", /\blevain\b/i], ["anneal", /\banneal(?:-memory)?\b/i], ["flow", /\bflow(?:connect)?\b/i],
+    ["wisp", /\bwisp\b/i], ["squish", /\bsquish\b/i], ["nowhere", /\bnowhere\b/i], ["shatterbeat", /\bshatterbeat\b/i],
+    ["income", /\b(?:income|invoice|rent|arlington)\b/i]];
+  function tintRepos() {
+    const variant = document.documentElement.dataset.variant;
+    if (!variant) return;
+    const sky = root.LevainSky;
+    for (const row of document.querySelectorAll(".ck-zgrid .row")) {
+      const clause = row.querySelector(":scope > .clause");
+      if (!clause || clause.querySelector(":scope > .rp-tag")) continue;
+      const hit = REPO_WORDS.find(([, re]) => re.test(row.textContent));
+      const key = hit && sky && sky.hueKey ? sky.hueKey(hit[0]) : "";
+      if (!key) continue;
+      const tag = el("span", "rp-tag", hit[0]);
+      tag.dataset.repo = key;
+      clause.insertBefore(tag, clause.firstChild);
+    }
+    // the Decisions tile glows only while something waits on him
+    for (const w of document.querySelectorAll('.ck-card.w[data-ck-panel="decisions"]')) {
+      const big = w.querySelector(".big");
+      const n = big ? parseInt(big.textContent, 10) : 0;
+      if (n > 0) w.dataset.signal = "on"; else delete w.dataset.signal;
+    }
+  }
+  // a panel that refetches on its own repaints its rows after fillGrids has run, so the tags are laid again on a slow tick
+  if (typeof document !== "undefined" && document.documentElement && document.documentElement.dataset.variant) root.setInterval(tintRepos, 1500);
   function fillGrids() {
     if (typeof getComputedStyle !== "function") return;   // a harness without layout
     markEmptyCards();
+    tintRepos();
     for (const w of document.querySelectorAll(".ck-widgets")) {
       const n = Array.from(w.children).filter(shown).length;
       w.style.setProperty("--ck-n", String(Math.max(4, n)));

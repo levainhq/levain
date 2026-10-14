@@ -19,6 +19,15 @@
   var NOW_AT = 0.85;                // where "now" sits across the plot
   var TICK_MS = 30000;              // the window slides on a timer, not on frames
   var ROW_H_MIN = 26, PAD_T = 28, PAD_B = 12, PAD_R = 24, GUTTER_PAD = 16, GUTTER_MIN = 56;
+  // PREVIEW variants (the cockpit pass-2 colour trial): a repo's hue key, shared with the row tags in cockpit_view.js
+  var HUE_KEYS = [['levain', /^levain/], ['anneal', /^anneal/], ['flow', /^flow/],
+    ['games', /^(wisp|nowhere|squish|shatterbeat|solitaire|blackjack|video[-_ ]?poker|flowpoker)/], ['money', /^(income|arlington|clapham|invoice)/]];
+  function hueKey(repo) {
+    var r = String(repo || '').toLowerCase();
+    for (var i = 0; i < HUE_KEYS.length; i++) if (HUE_KEYS[i][1].test(r)) return HUE_KEYS[i][0];
+    return '';
+  }
+  function variant() { return typeof document !== 'undefined' ? (document.documentElement.dataset.variant || '') : ''; }
   var SHORT_LABELS = { memory: 'mem', decisions: 'dec' };   // by row id
   var FONT_MONO = '11px ui-monospace, "SF Mono", Menlo, monospace';
   var FONT_SEAT = '600 11.5px ui-rounded, -apple-system, sans-serif';
@@ -163,7 +172,9 @@
     }
     function palette() {
       return { base: css('--base', '#060912'), accent: css('--accent', '#ff8a3d'), contrast: css('--contrast', css('--text', '#f3f5f9')),
-        label: css('--label', '#9ba6ba'), meta: css('--meta', '#7d889c'), hair: css('--hair', '#1c2435'), hair2: css('--hair-2', '#121a2a') };
+        label: css('--label', '#9ba6ba'), meta: css('--meta', '#7d889c'), hair: css('--hair', '#1c2435'), hair2: css('--hair-2', '#121a2a'),
+        bad: css('--bad', '#e5484d'),
+        hues: variant() ? { levain: css('--hue-levain', ''), anneal: css('--hue-anneal', ''), flow: css('--hue-flow', ''), games: css('--hue-games', ''), money: css('--hue-money', '') } : null };
     }
 
     function setToggle() {
@@ -248,6 +259,8 @@
         g.fillStyle = P.meta;
         var shown = fit(r.label, gutter - GUTTER_PAD * 2 + 8);
         g.fillText(shown, gutter - GUTTER_PAD, y + 4);
+        var sw = P.hues && r.id.indexOf('r:') === 0 ? P.hues[hueKey(r.id.slice(2))] : '';
+        if (sw) { g.fillStyle = sw; g.beginPath(); g.arc(gutter - GUTTER_PAD - g.measureText(shown).width - 8, y, 3, 0, 7); g.fill(); g.fillStyle = P.meta; }
         hits.push({ label: true, row: r, x0: 0, x1: gutter, y: y });
       });
       var h0 = Math.ceil(model.start / 3600000) * 3600000;
@@ -260,8 +273,15 @@
         if (offView(e, model.single)) return;
         var row = model.rowOf(e), x = xOf(e.t, now), y = rowY(row) + (hash01(e.t + e.kind.length) - 0.5) * 12;
         var a = Math.max(0.35, 1 - ((now - e.t) / 3600000) / (opts.windowHours * 1.15));
-        if (e.kind === 'commit') { g.globalAlpha = a; g.fillStyle = P.contrast; g.beginPath(); g.arc(x, y, 1.3 + hash01(e.t) * 0.9, 0, 7); g.fill(); }
-        else if (e.kind === 'review') { g.globalAlpha = e.ok ? a * 0.8 : 1; g.strokeStyle = e.ok ? P.label : P.accent; g.lineWidth = e.ok ? 1 : 1.5; g.beginPath(); g.arc(x, y, e.ok ? 2.6 : 3.2, 0, 7); g.stroke(); }
+        var hue = P.hues ? P.hues[hueKey(e.repo)] : '';
+        if (e.kind === 'commit') { g.globalAlpha = hue ? Math.max(a, 0.6) : a; g.fillStyle = hue || P.contrast; g.beginPath(); g.arc(x, y, (hue ? 2 : 1.3) + hash01(e.t) * 0.9, 0, 7); g.fill(); }
+        else if (e.kind === 'review') {
+          g.globalAlpha = e.ok ? a * 0.8 : 1; g.lineWidth = e.ok ? 1.2 : 1.5;
+          var glow = !e.ok && variant() !== 'C';   // a failed review glows red in A and B; C keeps the orange ring
+          g.strokeStyle = e.ok ? (hue || P.label) : (glow ? P.bad : P.accent);
+          if (glow) { g.shadowColor = P.bad; g.shadowBlur = 12; g.lineWidth = 2; }
+          g.beginPath(); g.arc(x, y, e.ok ? 2.8 : 3.6, 0, 7); g.stroke(); g.shadowBlur = 0;
+        }
         else if (e.kind === 'decision') { g.globalAlpha = 1; g.fillStyle = P.contrast; g.beginPath(); g.moveTo(x, y - 4); g.lineTo(x + 4, y); g.lineTo(x, y + 4); g.lineTo(x - 4, y); g.closePath(); g.fill(); }
         else { g.globalAlpha = a * 0.55; g.fillStyle = P.contrast; g.fillRect(x, y, 1.4, 1.4); }
         g.globalAlpha = 1;
@@ -376,7 +396,7 @@
     };
   }
 
-  var api = { mount: mount, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
+  var api = { mount: mount, hueKey: hueKey, buildModel: buildModel, normalise: normalise, diffFresh: diffFresh, stats: stats };
   if (typeof window !== 'undefined') window.LevainSky = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();
