@@ -188,3 +188,86 @@ def test_the_session_close_stops_its_agent(home, tmp_path):
     s.close()
     assert s.release_error is None
     assert not ssh_agent._alive(a.pid) and not a.dir.exists()
+
+
+# --- levain ssh-add (RUN: a real key, a real agent, ssh-add -H/-h; the Linux branch, with the
+# no_new_privs read stubbed where this host has no /proc) ------------------------------------------
+
+@pytest.fixture
+def keyed(home, tmp_path, monkeypatch):
+    """A running agent, a client key, and a manifest holding one host key for ``git.example.test``."""
+    monkeypatch.setattr(ssh_agent, "_no_new_privs", lambda: False)
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(tmp_path / "id")], check=True)
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(tmp_path / "hostkey")], check=True)
+    (home / "ssh").mkdir(mode=0o700)
+    manifest = home / "ssh" / "known_hosts"
+    manifest.write_text("git.example.test " + (tmp_path / "hostkey.pub").read_text().split(" ", 2)[0] + " "
+                        + (tmp_path / "hostkey.pub").read_text().split(" ", 2)[1] + "\n")
+    os.chmod(manifest, 0o600)
+    agent = ssh_agent.start(entity="ent")
+    return agent, tmp_path / "id", manifest
+
+
+def _listed(agent):
+    env = dict(os.environ, SSH_AUTH_SOCK=agent.socket)
+    return subprocess.run(["ssh-add", "-l"], env=env, capture_output=True, text=True).stdout
+
+
+def test_a_key_goes_in_limited_to_its_host_and_is_recorded(keyed):
+    agent, key, _manifest = keyed
+    line = ssh_agent.add_key(key, ["git.example.test"], lifetime=600, system="Linux")
+    fp = ssh_agent.fingerprint(key)
+    assert f"pid {agent.pid}, peer checked" in line and "for git.example.test" in line
+    assert fp in _listed(agent)
+    [k] = ssh_agent.read_record(agent.dir)["keys"]
+    assert k["fingerprint"] == fp and k["hosts"] == ["git.example.test"] and k["lifetime"] == 600
+    assert not k["waived"]
+
+
+def test_a_key_is_gone_after_its_lifetime(keyed):
+    import time
+
+    agent, key, _ = keyed
+    ssh_agent.add_key(key, ["git.example.test"], lifetime=1, system="Linux")
+    time.sleep(2.5)
+    assert ssh_agent.fingerprint(key) not in _listed(agent)
+
+
+def test_refusals_add_nothing(keyed, monkeypatch):
+    agent, key, manifest = keyed
+    with pytest.raises(ssh_agent.AgentError, match="name the hosts"):
+        ssh_agent.add_key(key, [], system="Linux")
+    with pytest.raises(ssh_agent.AgentError, match="other.example.test has no host key"):
+        ssh_agent.add_key(key, ["git.example.test>other.example.test"], system="Linux")
+    with pytest.raises(ssh_agent.AgentError, match="between 1 and"):
+        ssh_agent.add_key(key, ["git.example.test"], lifetime=ssh_agent.MAX_LIFETIME + 1, system="Linux")
+    os.chmod(manifest, 0o620)
+    with pytest.raises(ssh_agent.AgentError, match="no one else can write"):
+        ssh_agent.add_key(key, ["git.example.test"], system="Linux")
+    os.chmod(manifest, 0o600)
+    rec = ssh_agent.read_record(agent.dir)
+    rec["pid"] = agent.pid + 1
+    ssh_agent.write_record(agent.dir, rec)
+    with pytest.raises(ssh_agent.AgentError, match="no levain session with a scoped ssh agent is running"):
+        ssh_agent.add_key(key, ["git.example.test"], system="Linux")
+    monkeypatch.setattr(ssh_agent, "_no_new_privs", lambda: True)
+    with pytest.raises(ssh_agent.AgentError, match="no_new_privs"):
+        ssh_agent.add_key(key, ["git.example.test"], system="Linux")
+    assert "no identities" in _listed(agent)
+
+
+def test_the_waiver_adds_for_any_host_and_is_recorded_as_one(keyed):
+    agent, key, _ = keyed
+    line = ssh_agent.add_key(key, [], waive_destinations=True, system="Linux")
+    assert "ANY host" in line
+    assert ssh_agent.read_record(agent.dir)["keys"][0]["waived"] is True
+
+
+def test_two_sessions_need_a_session_id(keyed):
+    agent, key, _ = keyed
+    other = ssh_agent.start(entity="other")
+    with pytest.raises(ssh_agent.AgentError, match="more than one levain session"):
+        ssh_agent.add_key(key, ["git.example.test"], system="Linux")
+    ssh_agent.add_key(key, ["git.example.test"], session=other.session_id, system="Linux")
+    assert ssh_agent.fingerprint(key) in _listed(other)
+    assert ssh_agent.fingerprint(key) not in _listed(agent)
