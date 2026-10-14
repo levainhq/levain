@@ -55,11 +55,13 @@ def _isolate_activation_env(monkeypatch):
     # tests/test_automemory_mirror.py builds its own env and sets this deliberately.
     monkeypatch.setenv("LEVAIN_AUTOMEMORY_MIRROR", "off")
     # And the host's gnupg and grants: gpgconf's default pinentry/scdaemon (`_gpg_components`) and the
-    # extra sockets it names (`_gpg_extra_sockets`), and the operator's grant file every Linux floor and
-    # every run/doctor socket line. Tests of either set them explicitly (tests/test_operator_grants.py).
+    # extra and ssh sockets it names (`_gpg_extra_sockets`, `_gpg_ssh_sockets`), and the operator's
+    # grant file every Linux floor and every run/doctor socket line. Tests of either set them explicitly
+    # (tests/test_operator_grants.py).
     import levain.firing.confinement as conf
     monkeypatch.setattr(conf, "_gpg_components", lambda: [])
     monkeypatch.setattr(conf, "_gpg_extra_sockets", lambda: {})
+    monkeypatch.setattr(conf, "_gpg_ssh_sockets", lambda: [])
     monkeypatch.setattr(conf, "grants_file", lambda: Path("/nonexistent/levain-test/grants.json"))
 
 

@@ -22,6 +22,7 @@ from levain.firing.confinement import ConfinementError, SocketGrant, build_polic
 # Captured at import, before tests/conftest.py replaces it with the host-neutral stub for every test.
 _REAL_GPG_COMPONENTS = conf._gpg_components
 _REAL_GPG_EXTRA_SOCKETS = conf._gpg_extra_sockets
+_REAL_GPG_SSH_SOCKETS = conf._gpg_ssh_sockets
 
 
 def _entity(root: Path) -> Path:
@@ -194,6 +195,49 @@ def test_a_grant_resolves_only_as_an_operator_owned_socket_in_reach_of_nothing_c
             conf.resolve_grant(ok, [rd])
     finally:
         srv.close()
+
+
+def test_a_grant_of_the_operators_own_ssh_agent_is_refused_by_where_it_resolves(rd, grants, monkeypatch):
+    """D1: a grant of your ssh agent would hand bash every key it holds while doctor printed no agent.
+    Refused by what the path resolves to at check time, under any name: the socket `$SSH_AUTH_SOCK`
+    names (here reached through a link, as gnome-keyring's often is) and gpgconf's agent-ssh-socket."""
+    agent = _listen(rd / "keyring" / "ssh")
+    gpg_ssh = _listen(rd / "gnupg" / "S.renamed")
+    (rd / "agent-link").symlink_to(rd / "keyring" / "ssh")
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(rd / "agent-link"))
+    monkeypatch.setattr(conf, "_gpg_ssh_sockets", lambda: [str(rd / "gnupg" / "S.renamed")])
+    try:
+        for path in (rd / "keyring" / "ssh", rd / "gnupg" / "S.renamed"):
+            grants([{"path": str(path), "name": "keys", "why": "git over ssh"}])
+            with pytest.raises(ConfinementError, match="is an ssh agent's socket"):
+                conf.load_operator_grants()
+            with pytest.raises(ConfinementError, match="is an ssh agent's socket"):
+                conf.resolve_grant(SocketGrant(str(path), "keys", "w"), [rd])   # the spawn's entry check
+        # Another socket is still a grant, and no agent named means nothing more is refused.
+        grants([{"path": str(rd / "gnupg" / "S.renamed"), "name": "x", "why": "w"}])
+        monkeypatch.delenv("SSH_AUTH_SOCK")
+        monkeypatch.setattr(conf, "_gpg_ssh_sockets", lambda: [])
+        assert [g.name for g in conf.load_operator_grants()] == ["x"]
+    finally:
+        agent.close()
+        gpg_ssh.close()
+
+
+def test_gpgs_ssh_sockets_are_asked_for_the_default_home_and_levains_gnupghome(monkeypatch):
+    seen = []
+
+    def gdir(name, *, home=None, homedir=None):
+        seen.append((name, homedir))
+        return Path(f"/run/user/1/gnupg/{homedir or 'd'}/S.gpg-agent.ssh")
+    monkeypatch.setattr(conf, "_gpgconf_dir", gdir)
+    monkeypatch.setenv("GNUPGHOME", "/levains/g")
+    assert _REAL_GPG_SSH_SOCKETS() == ["/run/user/1/gnupg/d/S.gpg-agent.ssh",
+                                       "/run/user/1/gnupg/levains/g/S.gpg-agent.ssh"]
+    assert seen == [("agent-ssh-socket", None), ("agent-ssh-socket", "/levains/g")]
+    monkeypatch.setenv("GNUPGHOME", "relative")   # gpg resolves a relative home itself; not asked
+    seen.clear()
+    _REAL_GPG_SSH_SOCKETS()
+    assert seen == [("agent-ssh-socket", None)]
 
 
 def test_a_grant_under_a_directory_of_yours_in_sticky_tmp_is_refused():
