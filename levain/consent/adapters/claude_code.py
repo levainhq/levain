@@ -9,7 +9,7 @@ hook runs (measured, Q0 item 2); a later ``allow`` from the hook dismisses it an
 2. asks the core's policy seam (:func:`levain.consent.decide_by_policy`, which decides nothing today), except for
    a request that targets agent config or hooks (:func:`targets_agent_config`), which is never eligible for one;
 3. when away mode is on (an adapter setting, default off, default hold 0 s) waits up to the hold for a signed
-   answer the core verifies, and withdraws the request if none came;
+   answer the core verifies, and withdraws the request if none came (one whose hold ran out is expired);
 4. prints ``allow`` only for a verified allow and ``deny`` only for a verified deny. Anything else, including any
    exception, prints nothing and exits 0: the native dialog stands and the human answers it.
 
