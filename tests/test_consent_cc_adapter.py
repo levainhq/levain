@@ -589,6 +589,40 @@ def test_a_policy_that_would_allow_an_mcp_json_edit_is_never_consulted(monkeypat
     assert calls == []
 
 
+def test_an_edit_of_the_imported_levain_package_is_never_policy_answered(monkeypatch):
+    """ruling 3b item 1: the installed hook script imports levain, so its package source is agent config."""
+    import levain
+    calls = []
+
+    def allow_all(request):
+        calls.append(request)
+        return Decision(request_id=request.id, decision="allow", signer_fp="policy", decided_at="t",
+                        request_digest=request.digest)
+    pkg = Path(levain.__file__).parent
+    for target in (pkg / "consent" / "queue.py", Path(os.path.realpath(pkg)) / "authority.py", pkg / "new.py"):
+        for tool in ("Edit", "Write"):
+            q = FakeQueue(None)
+            e = event(tool, {"file_path": str(target), "old_string": "a", "new_string": "b"})
+            rc, out = run_main(monkeypatch, q, json.dumps(e), settings=cc.AdapterSettings(), policy=allow_all)
+            assert (rc, out) == (0, "") and q.filed[0]["tier"] == cc.AGENT_CONFIG_TIER, (tool, target)
+    assert calls == []
+
+
+@pytest.mark.parametrize("rel,tagged", [
+    ("levain-0.5.3.dev0.dist-info/RECORD", True), ("__editable__.levain-0.5.3.dev0.pth", True),
+    ("__editable___levain_0_5_3_dev0_finder.py", True), ("zz-anything.pth", True), ("sitecustomize.py", True),
+    ("levain/__init__.py", True), ("levain.py", True),
+    ("requests/api.py", False), ("requests-2.0.dist-info/RECORD", False), ("pkg/data.pth", False),
+    ("levainx/__init__.py", False),
+])
+def test_entries_that_redirect_import_levain_are_agent_config(monkeypatch, tmp_path, rel, tagged):
+    """The interpreter's site-dir entries that decide what `import levain` loads; not the rest of site-packages."""
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    monkeypatch.setattr(cc, "import_site_dirs", lambda: (os.path.realpath(site_dir).lower(),))
+    assert cc.targets_agent_config("Write", {"file_path": str(site_dir / rel)}, "/work/proj", home=HOME) is tagged
+
+
 def test_decide_always_goes_through_the_guard(monkeypatch):
     """complement-4: a direct decide() caller, with the default policy or its own, reaches the policy only
     through guarded_policy (fail closed)."""

@@ -31,7 +31,9 @@ import json
 import math
 import os
 import shlex
+import site
 import sys
+import sysconfig
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -162,6 +164,40 @@ def _under(path: Path, roots: tuple[str, ...]) -> bool:
     return any(p == r or p.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
 
 
+def levain_package_dir() -> str:
+    """The directory of the levain package this interpreter imports (realpath'd): the installed hook script runs
+    ``levain.consent.adapters.claude_code`` from it, so an edit there changes what the consent hook does."""
+    import levain
+    return os.path.realpath(os.path.dirname(levain.__file__))
+
+
+def import_site_dirs() -> tuple[str, ...]:
+    """This interpreter's site directories (realpath'd), where the entries that redirect ``import levain`` live."""
+    dirs = [sysconfig.get_path("purelib"), sysconfig.get_path("platlib")]
+    if site.ENABLE_USER_SITE:
+        dirs.append(site.getusersitepackages())
+    return tuple({os.path.realpath(d).lower() for d in dirs if d})
+
+
+def _redirects_the_import(path: Path, sites: tuple[str, ...]) -> bool:
+    """A site-directory entry that decides what ``import levain`` loads: a ``levain`` package or module, a
+    ``levain-*.dist-info``, an ``__editable__`` levain finder, or any ``.pth`` / ``sitecustomize.py`` /
+    ``usercustomize.py`` (run at interpreter start, whatever their name). Nothing else in site-packages."""
+    p = str(path).lower()
+    for s in sites:
+        prefix = s.rstrip(os.sep) + os.sep
+        if not p.startswith(prefix):
+            continue
+        first, _, rest = p[len(prefix):].partition(os.sep)
+        if first in ("levain", "levain.py") or (first.startswith("levain-") and first.endswith(".dist-info")):
+            return True
+        if first.startswith("__editable__") and "levain" in first:
+            return True
+        if not rest and (first.endswith(".pth") or first in ("sitecustomize.py", "usercustomize.py")):
+            return True
+    return False
+
+
 def _targets(tool_name: str, tool_input: Any) -> list[Any] | None:
     """The paths a request names, or ``None`` when it is not a tool this tags. A file tool names one
     (``file_path``, else ``notebook_path``); an MCP tool names whatever its :data:`MCP_PATH_FIELDS` hold (a
@@ -185,7 +221,9 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     in the workspace or the home directory: a ``.claude/settings*.json``; anything under a ``.claude/`` ``hooks``,
     ``agents``, ``skills``, ``commands`` or ``plugins`` directory (the adapter's own installed hook script is in
     ``.claude/hooks/``); a ``.mcp.json`` or ``.claude.json``; a ``.codex/hooks.json`` or ``.codex/config.toml``;
-    anything under a ``.claude-plugin/`` directory, or under ``hooks/`` beside one (a plugin); or any of
+    anything under a ``.claude-plugin/`` directory, or under ``hooks/`` beside one (a plugin); anything under the
+    levain package this interpreter imports (:func:`levain_package_dir`, the hook runs it) or a site-directory entry
+    that redirects that import (:func:`_redirects_the_import`); or any of
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
     tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and nothing
     else. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
@@ -196,8 +234,10 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         return False
     home = home if home is not None else Path.home()
     try:
-        roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())})
-    except (OSError, ValueError):
+        roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}
+                      | {levain_package_dir().lower()})
+        sites = import_site_dirs()
+    except (OSError, ValueError, ImportError, TypeError):
         return True
     for target in targets:
         if not isinstance(target, str) or not target:
@@ -211,6 +251,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         except (OSError, ValueError):
             return True
         if _is_config_path(written) or _is_config_path(resolved) or _under(written, roots) or _under(resolved, roots):
+            return True
+        if _redirects_the_import(written, sites) or _redirects_the_import(resolved, sites):
             return True
     return False
 
