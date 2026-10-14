@@ -271,3 +271,44 @@ def test_two_sessions_need_a_session_id(keyed):
     ssh_agent.add_key(key, ["git.example.test"], session=other.session_id, system="Linux")
     assert ssh_agent.fingerprint(key) in _listed(other)
     assert ssh_agent.fingerprint(key) not in _listed(agent)
+
+
+# --- the run/doctor ssh lines (D2), from a live agent ----------------------------------------------
+
+def test_the_run_lines_show_this_sessions_agent_and_each_key_with_its_limit(keyed):
+    agent, key, _ = keyed
+    lines = ssh_agent.status_lines("Linux", agent=agent)
+    assert lines[0].startswith(f"ssh agent: levain's scoped agent for this session (pid {agent.pid}, ")
+    assert lines[1].startswith("ssh agent: no keys; add one from your own shell: `levain ssh-add <key> -h <host>`")
+    ssh_agent.add_key(key, ["git.example.test"], lifetime=7200, system="Linux")
+    fp = ssh_agent.fingerprint(key)
+    assert ssh_agent.status_lines("Linux", agent=agent)[1] in (
+        f"ssh agent key {fp}: for git.example.test, 2h00m left",
+        f"ssh agent key {fp}: for git.example.test, 1h59m left")
+
+
+def test_a_key_added_around_levain_and_a_waived_one_are_named_as_such(keyed, tmp_path):
+    agent, key, _ = keyed
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(tmp_path / "raw")], check=True)
+    env = dict(os.environ, SSH_AUTH_SOCK=agent.socket)
+    subprocess.run(["ssh-add", "-q", str(tmp_path / "raw")], env=env, check=True, capture_output=True)
+    ssh_agent.add_key(key, [], waive_destinations=True, lifetime=600, system="Linux")
+    lines = ssh_agent.status_lines("Linux", agent=agent)[1:]
+    raw_fp, fp = ssh_agent.fingerprint(tmp_path / "raw"), ssh_agent.fingerprint(key)
+    assert f"ssh agent key {raw_fp}: added from inside the session, no destination limit known" in lines
+    assert any(ln.startswith(f"waiver (levain ssh-add --no-destination-limit) ssh agent key {fp}: ANY host")
+               for ln in lines)
+
+
+def test_the_doctor_lines_list_every_running_session_and_the_other_cases(keyed, monkeypatch):
+    agent, _, _ = keyed
+    lines = ssh_agent.status_lines("Linux")
+    assert lines[0] == f"ssh agent: session {agent.session_id} (ent), pid {agent.pid}"
+    assert lines[1].startswith("ssh agent: no keys")
+    ssh_agent.stop(agent)
+    assert ssh_agent.status_lines("Linux")[0].endswith("(none running now)")
+    assert ssh_agent.status_lines("Linux", note="why")[0].startswith("ssh agent: none for this session (why)")
+    assert ssh_agent.status_lines("Linux", hands=True)[0].startswith("ssh agent: none (the entity's own user)")
+    assert ssh_agent.status_lines("Darwin") == [ssh_agent.DARWIN_LINE]
+    monkeypatch.setattr(ssh_agent, "openssh_problem", lambda: "OpenSSH 8.4 has no destination constraints")
+    assert "OpenSSH 8.4" in ssh_agent.status_lines("Linux")[0]
