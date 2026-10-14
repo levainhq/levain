@@ -357,7 +357,17 @@
     install_disabled: "Writes are turned off for this install.",
     pending_cap: "Too many changes are waiting. Decide one first.",
     idempotency_conflict: "That is already being saved. Try again in a moment.",
-    refused: "That was refused."
+    refused: "That was refused.",
+    team_entry: "A teammate's entry cannot be removed from this page. Remove it with anneal's command line.",
+    invalid_body: "That text cannot be saved: a line may not start with \"## \". Change that line and save again.",
+    too_large: "That is too long to save. Shorten it and try again.",
+    wrap_in_progress: "A memory update is running. Save again once it finishes.",
+    not_editable: "That section is written by the memory update, not by hand.",
+    not_found: "That is no longer there. Reload to see the current page.",
+    bad_target: "That row is not available any more. Reload and try again.",
+    bad_request: "That request was not understood. Reload and try again.",
+    bad_signature: "That signature was not accepted. Sign again.",
+    credential_required: "Saving needs the write token for this page. Open the page from the link that carries it."
   };
   // Only a landed state is silent; a state this page does not know speaks too (never a quiet failure). Own-property lookups:
   // a state or code named "constructor" must not index into Object.prototype.

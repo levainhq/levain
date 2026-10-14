@@ -766,7 +766,7 @@ class Broker:
             if source.startswith("team:"):
                 # anneal's next v3 team replace brings back an entry its stream enforces unless the
                 # delete carries team_operator, which only anneal's CLI sets (L2 r1 C)
-                raise BrokerError("refused", 409, f"row {row_id!r} is a team entry: remove it with anneal's CLI")
+                raise BrokerError("team_entry", 409, f"row {row_id!r} is a team entry: remove it with anneal's CLI")
         else:
             ok = target.get("origin_key")
             if not isinstance(ok, str) or not ok:

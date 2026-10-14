@@ -192,7 +192,7 @@ def test_a_team_entry_is_refused_with_its_reason(broker, db):
     ep = _episode(db, "ok.team")
     got = EpisodeEffectStore(db).read("ok.team")
     t = {"kind": "row", "panel_id": "episodes", "row_id": f"episode:{ep.id}", "row_version": got.rendered}
-    err = _refused("refused", broker.issue, verb="episode_tombstone", params={}, target=t, tier="T2",
+    err = _refused("team_entry", broker.issue, verb="episode_tombstone", params={}, target=t, tier="T2",
                    credential=BROWSER, intent="reported")
     assert "team entry" in str(err)
     assert _episode(db, "ok.team") is not None
