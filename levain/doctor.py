@@ -1868,8 +1868,9 @@ def _check_agent_hook_pins(install: Path, repin: bool = False) -> list[CheckResu
     extra = _unpinned_commands_result(install)
     if status == "recorded":
         return [CheckResult(name, True, "first run: pinned the hook entries and scripts as they are now "
-                            "(trust on first use)", "If anything here is not yours, "
-                            "fix it before relying on this pin.", warn=True)] + extra
+                            "(trust on first use): " + (", ".join(diffs) or "nothing present yet"),
+                            "If anything here is not yours, fix it before relying on this pin.",
+                            warn=True)] + extra
     if status == "match":
         return [CheckResult(name, True, "hook entries and scripts match the pin")] + extra
     return [CheckResult(name, False, "changed since pinned: " + "; ".join(diffs),
@@ -1886,14 +1887,18 @@ def _unpinned_commands_result(install: Path) -> list[CheckResult]:
     if not toks:
         return []
     return [CheckResult("agent hook commands", True,
-                        "not pinned (executable did not resolve to a file): " + ", ".join(toks),
-                        "Use an absolute path for the hook command so its file is pinned.", warn=True)]
+                        "not pinned (the command names no file under the install): " + ", ".join(toks),
+                        "Point the hook command at a script under the install by absolute path "
+                        "(or ${CLAUDE_PROJECT_DIR}) so its file is pinned.", warn=True)]
 
 
 def _check_cc_sandbox(install: Path) -> list[CheckResult]:
     """Ruling 3b item 2b: warn when Claude Code's own sandbox is off for this workspace."""
     from levain import host_guard as hg
+    from levain.install import effective_adapter
 
+    if effective_adapter(install) == "codex":
+        return []  # Claude Code's sandbox setting says nothing about a Codex install
     on, source = hg.cc_sandbox_state(install)
     read = ", ".join(hg.cc_sandbox_sources(install)) or "no settings file"
     seen = (f"[read: {read}; not visible to doctor: CLAUDE_CONFIG_DIR relocation, --settings, "

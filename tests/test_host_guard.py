@@ -809,7 +809,8 @@ def _pinned_entity(tmp_path: Path):
 
 def test_agent_pin_first_use_then_match(tmp_path):
     ent, ch = _pinned_entity(tmp_path)
-    assert hg.check_agent_hook_pins(ent, ch) == ("recorded", [])
+    status, pinned = hg.check_agent_hook_pins(ent, ch)
+    assert status == "recorded" and ".claude/settings.json hooks" in pinned and "absent" not in pinned
     assert hg.check_agent_hook_pins(ent, ch) == ("match", [])
 
 

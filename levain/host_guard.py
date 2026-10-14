@@ -30,6 +30,7 @@ import stat
 import sys
 import subprocess
 import tempfile
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, Sequence
@@ -402,8 +403,8 @@ def repin(entity: str | os.PathLike[str], state_dir: Path) -> str:
 
 # ---------------------------------------------------------------------------- agent hook pins
 # `levain doctor` pins what the agents run on the operator's say-so: Claude Code's hook entries
-# (a settings file can name any command), the scripts those entries run, and the file each hook
-# command's first token names, because Claude Code does not notice an edited hook SCRIPT (Q0 item
+# (a settings file can name any command), the scripts those entries run, and every file under the install each hook
+# command names (an interpreter is never pinned), because Claude Code does not notice an edited hook SCRIPT (Q0 item
 # 8, measured). Doctor only DETECTS: the pin file is Levain's own state under `.levain/`; the
 # agents' settings are never written.
 #
@@ -444,30 +445,48 @@ def _read_settings_doc(path: Path) -> Any:
         raise AgentPinError([f"{path}: not valid JSON"]) from None
 
 
+# Keys of a Claude Code settings file that run code or switch hooks off, pinned beside `hooks`.
+# `env` is NOT read: it holds ordinary variables that change for no security reason, so a pin
+# on it would be a standing false positive (named as unread in the CHANGELOG).
+_SETTINGS_PINNED_KEYS = ("hooks", "disableAllHooks", "statusLine", "apiKeyHelper")
+
+
 def _hooks_entry_digest(path: Path) -> str:
     doc = _read_settings_doc(path)
     if doc is None:
         return "absent"
-    hooks = doc.get("hooks") if isinstance(doc, dict) else None
-    return _sha_bytes(json.dumps(hooks, sort_keys=True).encode())
+    sub = {k: doc.get(k) for k in _SETTINGS_PINNED_KEYS} if isinstance(doc, dict) else {}
+    return _sha_bytes(json.dumps(sub, sort_keys=True).encode())
 
 
-def _dir_digest(root: Path) -> str:
-    """sha256 over every file under ``root`` (relative path and bytes), links followed by name
-    only: a symlink contributes its target string, so retargeting one changes the digest. A file
-    that cannot be read raises AgentPinError."""
+def _dir_digest(root: Path, _seen: frozenset[str] = frozenset()) -> str:
+    """sha256 over every file under ``root`` (relative path and bytes). A symlink contributes its
+    link string AND its target's content (a directory link: the target tree's digest), so both a
+    retarget and an edit of what it points at change the digest. A file that cannot be read
+    raises AgentPinError; a dangling link is hashed as dangling."""
     if not os.path.lexists(root):
         return "absent"
+    real = os.path.realpath(root)
+    if real in _seen:
+        return "cycle"
+    seen = _seen | {real}
     h = hashlib.sha256()
     for cur, dirs, files in os.walk(root, followlinks=False):
         dirs[:] = sorted(d for d in dirs if d != "__pycache__")
         for f in sorted(files + [d for d in dirs if os.path.islink(os.path.join(cur, d))]):
             p = os.path.join(cur, f)
             rel = os.fsencode(os.path.relpath(p, root))
-            if os.path.islink(p):
-                h.update(rel + b"\0link\0" + os.fsencode(os.readlink(p)))
-                continue
             try:
+                if os.path.islink(p):
+                    h.update(rel + b"\0link\0" + os.fsencode(os.readlink(p)) + b"\0")
+                    if os.path.isdir(p):
+                        h.update(_dir_digest(Path(p), seen).encode())
+                    elif os.path.isfile(p):
+                        with open(p, "rb") as fh:
+                            h.update(hashlib.sha256(fh.read()).digest())
+                    else:
+                        h.update(b"dangling")
+                    continue
                 with open(p, "rb") as fh:
                     h.update(rel + b"\0" + hashlib.sha256(fh.read()).digest())
             except OSError as exc:
@@ -482,6 +501,28 @@ def _codex_hooks_digest(cj: Path) -> str:
         return _sha_bytes(cj.read_bytes())
     except OSError as exc:
         raise AgentPinError([f"{cj}: unreadable ({exc.strerror or exc})"]) from None
+
+
+def _read_toml_doc(path: Path) -> Any:
+    """The parsed TOML file, or None when absent; AgentPinError when it is there and cannot be read or parsed."""
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AgentPinError([f"{path}: unreadable ({exc.strerror or exc})"]) from None
+    try:
+        return tomllib.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise AgentPinError([f"{path}: not valid TOML"]) from None
+
+
+def _workspace_codex_digest(path: Path) -> str:
+    """Digest of the `[hooks]` table of the workspace's `.codex/config.toml` (the rest of the file is not hook-bearing)."""
+    doc = _read_toml_doc(path)
+    if doc is None:
+        return "absent"
+    return _sha_bytes(json.dumps(doc.get("hooks"), sort_keys=True, default=str).encode())
 
 
 def _git_root(ent: Path) -> Path | None:
@@ -521,42 +562,68 @@ def _walk_commands(node: Any, out: list[str]) -> None:
 def _hook_commands(docs: Sequence[Any]) -> list[str]:
     cmds: list[str] = []
     for doc in docs:
-        hooks = doc.get("hooks") if isinstance(doc, dict) else None
-        _walk_commands(hooks, cmds)
+        if not isinstance(doc, dict):
+            continue
+        _walk_commands(doc.get("hooks"), cmds)
+        _walk_commands(doc.get("statusLine"), cmds)
+        if isinstance(doc.get("apiKeyHelper"), str):
+            cmds.append(doc["apiKeyHelper"])
     return cmds
 
 
-def _first_token_file(cmd: str, ent: Path) -> tuple[str, Path | None]:
-    """(the first token as written, the existing file it names after ${CLAUDE_PROJECT_DIR} and ~
-    expansion, or None). Nothing past the first token is parsed."""
-    try:
-        argv = shlex.split(cmd)
-    except ValueError:
-        argv = []
-    if not argv:
-        return cmd.strip()[:80], None
-    tok = argv[0]
-    exp = os.path.expanduser(tok.replace("${CLAUDE_PROJECT_DIR}", str(ent)).replace("$CLAUDE_PROJECT_DIR", str(ent)))
+def _expand_token(tok: str, ent: Path) -> str:
+    return os.path.expanduser(tok.replace("${CLAUDE_PROJECT_DIR}", str(ent)).replace("$CLAUDE_PROJECT_DIR", str(ent)))
+
+
+def _in_root_file(tok: str, ent: Path, first: bool) -> Path | None:
+    """The existing file ``tok`` names under the install root, or None. An absolute path (after
+    ${CLAUDE_PROJECT_DIR} and ~ expansion) is taken as written; a relative path containing a slash
+    resolves against the install only for the command's first token. Files outside the install
+    (an interpreter, a system tool) are not pinned: their content changes for reasons that are
+    not a tampering signal (a Python upgrade)."""
+    exp = _expand_token(tok, ent)
     if "/" not in exp:
-        return tok, None  # a bare name: resolving it needs a PATH lookup the host does not share
-    p = Path(exp) if os.path.isabs(exp) else ent / exp
-    return tok, (p if p.is_file() else None)
+        return None
+    if os.path.isabs(exp):
+        p = Path(exp)
+    elif first:
+        p = ent / exp
+    else:
+        return None
+    if not p.is_file():
+        return None
+    root = os.path.realpath(ent)
+    real = os.path.realpath(p)
+    return p if real == root or real.startswith(root + os.sep) else None
 
 
 def _command_pins(ent: Path, docs: Sequence[Any]) -> tuple[dict[str, str], list[str]]:
-    """(component -> digest of each hook command's first-token file, the tokens that did not resolve)."""
+    """(component -> digest of every file a hook command names under the install, the first tokens
+    of commands that named no such file). An interpreter is never pinned."""
     pins: dict[str, str] = {}
     unresolved: list[str] = []
     for cmd in _hook_commands(docs):
-        tok, p = _first_token_file(cmd, ent)
-        if p is None:
+        try:
+            argv = shlex.split(cmd)
+        except ValueError:
+            argv = []
+        if not argv:
+            tok = cmd.strip()[:80]
             if tok not in unresolved:
                 unresolved.append(tok)
             continue
-        try:
-            pins[f"hook command {tok}"] = _sha_bytes(p.read_bytes())
-        except OSError as exc:
-            raise AgentPinError([f"{p}: unreadable ({exc.strerror or exc})"]) from None
+        found = False
+        for i, tok in enumerate(argv):
+            p = _in_root_file(tok, ent, i == 0)
+            if p is None:
+                continue
+            found = True
+            try:
+                pins[f"hook command {tok}"] = _sha_bytes(p.read_bytes())
+            except OSError as exc:
+                raise AgentPinError([f"{p}: unreadable ({exc.strerror or exc})"]) from None
+        if not found and argv[0] not in unresolved:
+            unresolved.append(argv[0])
     return pins, unresolved
 
 
@@ -601,6 +668,14 @@ def _agent_pins_and_unresolved(install: str | os.PathLike[str], codex_home: str 
             raise AgentPinError([f"unreadable ({exc.strerror or exc})"]) from None
     run("activation/hooks/ (scripts)", scripts)
     run(_CODEX_KEY, lambda: _codex_hooks_digest(cj))
+    wcc = ent / ".codex" / "config.toml"
+    run(".codex/config.toml [hooks] (workspace)", lambda: _workspace_codex_digest(wcc))
+    try:
+        wdoc = _read_toml_doc(wcc)
+        if wdoc is not None:
+            docs.append(wdoc)
+    except AgentPinError:
+        pass
     unresolved: list[str] = []
     try:
         cdoc = _read_settings_doc(cj)
@@ -700,6 +775,9 @@ def agent_pin_status(install: str | os.PathLike[str], codex_home: str | os.PathL
         root = _git_root(ent)
         if root is not None and root != ent:
             local += [root / ".claude" / "settings.json", root / ".claude" / "settings.local.json"]
+        local.append(ent / ".codex" / "config.toml")
+        # a Codex hooks.json already on disk is global and not levain's: unvetted on first use
+        local.append(_codex_home(codex_home) / "hooks.json")
         return "none" if any(os.path.lexists(p) for p in local) else "fresh"
     try:
         now = agent_hook_pins(ent, codex_home)
@@ -728,7 +806,7 @@ def repin_after_levain_write(install: str | os.PathLike[str], before: Literal["n
 def check_agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
                           ) -> tuple[Literal["recorded", "match", "changed"], list[str]]:
     """Trust on first use (only when the pin file does not exist), then compare. Returns the status
-    and one named line per problem ("<what>: was <old>, now <new>"). An invalid pin file or a
+    and one named line per problem (for ``recorded``: the components pinned on first use) ("<what>: was <old>, now <new>"). An invalid pin file or a
     component that cannot be hashed is ``changed``, named, never recorded over. Never edits an
     agent settings file."""
     ent = Path(os.path.abspath(install))
@@ -742,7 +820,8 @@ def check_agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.
         return "changed", [f"cannot be pinned: {i}" for i in exc.items]
     if old is None:
         repin_agent_hooks(ent, codex_home)
-        return "recorded", []
+        # what trust-on-first-use just vouched for: every component that exists
+        return "recorded", sorted(k for k, v in now.items() if v != "absent")
     diffs = [f"{k}: was {old.get(k, 'not pinned')[:12]}, now {now[k][:12]}"
              for k in now if old.get(k) != now[k]]
     diffs += [f"{k}: was {old[k][:12]}, now gone" for k in old if k not in now]
