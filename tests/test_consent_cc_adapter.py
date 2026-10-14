@@ -19,6 +19,7 @@ import pytest
 
 import levain.authority as auth
 from levain.authority import ReplayCache
+from levain.cockpit.firejournal import CockpitDB
 from levain.consent import ConsentQueue, Decision, answer_message, authority_source
 from levain.consent.adapters import claude_code as cc
 from levain.consent.record import ANSWER_NAMESPACE, ExternalGateRequest
@@ -314,8 +315,9 @@ def test_real_core_signed_allow_through_main(tmp_path):
     key = Key(tmp_path, "laptop")
     root = tmp_path / "cockpit"
     root.mkdir()
+    with CockpitDB(root).read():  # a real cockpit journal (its meta table): capture reads it, DESIGN §3.4
+        pass
     conn = sqlite3.connect(root / "cockpit.db", isolation_level=None)
-    auth.create_schema(conn)
     auth.sign_and_append(conn, {"op": "enrol", "fingerprint": key.fp, "public_key": key.public_key,
                                 "class": "laptop-presence", "custody": "passphrase"},
                          signer_fp=key.fp, sign=lambda m: key.sign(m, auth.NAMESPACE),
