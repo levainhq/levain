@@ -350,7 +350,8 @@
     gesture_moved: "This needs a fresh confirmation. Try again.",
     needs_broker: "That cannot be done from this page right now.",
     standby: "That cannot be done from this page right now.",
-    not_built: "That cannot be done from this page yet."
+    not_built: "That cannot be done from this page yet.",
+    not_initialised: "This install is not set up to do that yet."
   };
   // Only a landed state is silent; a state this page does not know speaks too (never a quiet failure). Own-property lookups:
   // a state or code named "constructor" must not index into Object.prototype.

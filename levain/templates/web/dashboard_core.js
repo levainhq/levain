@@ -2505,7 +2505,7 @@
     const box = buildActionBox(Object.assign({}, act, { fields: [field] }), spec);
     box.classList.add("text-editor");
     const ta = box.querySelector("textarea");
-    if (ta) { ta.value = current; ta.dataset.orig = current; ta.rows = Math.min(14, Math.max(4, current.split("\n").length + 1)); }
+    if (ta) { ta.value = current; ta.dataset.orig = ta.value; ta.rows = Math.min(14, Math.max(4, current.split("\n").length + 1)); }
     const save = box.querySelector(".tray-dump-btn");
     if (save) save.textContent = "save";
     const cancel = el("button", "verb-cancel", "cancel");
