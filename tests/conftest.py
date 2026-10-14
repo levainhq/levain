@@ -63,6 +63,10 @@ def _isolate_activation_env(monkeypatch):
     monkeypatch.setattr(conf, "_gpg_extra_sockets", lambda: {})
     monkeypatch.setattr(conf, "_gpg_ssh_sockets", lambda: [])
     monkeypatch.setattr(conf, "grants_file", lambda: Path("/nonexistent/levain-test/grants.json"))
+    # The scoped ssh agents' directory (`ssh_agent.run_root`): the run/doctor ssh lines and a session's
+    # agent start read the host's otherwise. tests/test_ssh_agent.py points it at its own.
+    import levain.firing.ssh_agent as ssh_agent
+    monkeypatch.setattr(ssh_agent, "run_root", lambda: Path("/nonexistent/levain-test/run"))
 
 
 @pytest.fixture(autouse=True)
