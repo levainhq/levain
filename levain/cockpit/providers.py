@@ -461,6 +461,41 @@ def _tomb_gate(store: Any, origin_key: str, effect_id: Any, episode_id: str) -> 
     return "mismatch"
 
 
+# what a broker fire reads as in Recent edits: a past-tense phrase per verb, then the thing it touched, then where it came from
+_EDIT_PHRASES = {
+    "spore_touch": "marked seen", "spore_descend": "resolved", "spore_surface_at": "rescheduled", "spore_update": "edited",
+    "spore_set_disposition": "moved", "spore_ascend": "promoted", "spore_seed": "added", "episode_tombstone": "deleted episode",
+    "operator_state": "set the state line", "section_edit": "edited", "config": "edited", "entity_name": "renamed the entity",
+    "undo": "undid an edit", "pending_cancel": "cancelled a pending change", "token_rotate": "rotated a surface token"}
+
+
+def _edit_target(resource_key: str) -> str:
+    kind, _, ident = resource_key.partition(":")
+    if kind == "spore" and ident:
+        return f"item {ident}"
+    if kind == "section" and ident:
+        return f"the {ident} section"
+    return resource_key       # a shape this table does not know is named as the store names it
+
+
+def _edit_origin(credential: Any) -> str:
+    """Where a write came from, in words: ``token:browser:1`` is the browser (the surface's name, never its generation)."""
+    cred = str(credential or "")
+    kind, _, rest = cred.partition(":")
+    if kind == "token" and rest:
+        return f"from the {rest.rpartition(':')[0] or rest}"
+    if kind == "device":
+        return "from a signed device"
+    return ""
+
+
+def plain_edit_title(verb: str, target: str, credential: Any) -> str:
+    """A broker fire as a sentence a person reads: ``resolved item spore-017, from the browser``."""
+    said = " ".join(x for x in (_EDIT_PHRASES.get(verb) or verb.replace("_", " "), target) if x)
+    origin = _edit_origin(credential)
+    return f"{said}, {origin}" if origin else said
+
+
 def _journal_edits(source: SubstrateSource, page: Any) -> list[RowIn]:
     """The broker's applied effects as Recent edits rows (K2b-3b §0.6, §0.7): ``fire:<op>:<idx>``,
     or ``tomb:<episode_id>:<op>`` for a tombstone's create, its gate read here once."""
@@ -475,7 +510,6 @@ def _journal_edits(source: SubstrateSource, page: Any) -> list[RowIn]:
             "resource_key": e.resource_key, "store": e.store, "changes": dict(e.changes),
             "credential": e.credential, "applied_at": e.applied_at}
         facets = {"edit_kind": str(e.verb or ""), "at": _utc_at(e.applied_at), "undoable": False}
-        who = f" ({e.credential})" if e.credential else ""
         if e.resource_key.startswith(TOMB_KEY_PREFIX):
             ok = e.resource_key[len(TOMB_KEY_PREFIX):]
             row_id = str((e.target or {}).get("row_id") or "")
@@ -485,10 +519,10 @@ def _journal_edits(source: SubstrateSource, page: Any) -> list[RowIn]:
                 episodes = EpisodeEffectStore((ws.anneal if ws is not None else source.anneal).episodic_db)
             stored.update(origin_key=ok, episode_id=episode_id, effect_id=e.changes.get("effect_id"),
                           _tomb_gate=_tomb_gate(episodes, ok, e.changes.get("effect_id"), episode_id))
-            rows.append(RowIn(id=f"tomb:{episode_id}:{e.operation_id}", title=f"{e.verb} episode {episode_id}{who}",
+            rows.append(RowIn(id=f"tomb:{episode_id}:{e.operation_id}", title=plain_edit_title("episode_tombstone", episode_id, e.credential),
                               facets=facets, stored=stored))
         else:
-            rows.append(RowIn(id=f"fire:{e.operation_id}:{e.idx}", title=f"{e.verb} {e.resource_key}{who}",
+            rows.append(RowIn(id=f"fire:{e.operation_id}:{e.idx}", title=plain_edit_title(str(e.verb), _edit_target(e.resource_key), e.credential),
                               facets=facets, stored=stored))
     return rows
 

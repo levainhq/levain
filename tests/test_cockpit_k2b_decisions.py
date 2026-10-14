@@ -191,7 +191,8 @@ def test_edits_with_no_ledger_shows_the_journal_fire(tmp_path):
     assert row["id"] == f"fire:{pid}:0"
     assert row["facets"] == {"edit_kind": "spore_update", "at": "2026-10-10T12:01:00.000000Z", "undoable": False}
     assert row["provenance"] is None               # a fire: row is history; only tomb: rows carry a label (L2 F2)
-    assert "token" in row["title"]                 # who made the edit: its credential
+    # who made the edit, in words (the surface's name), never the audit string "token:phone:1"
+    assert row["title"].startswith("edited ") and row["title"].endswith(", from the phone") and "token:" not in row["title"]
     assert row["actions"] == []                    # undo applies to undoable rows only
 
 

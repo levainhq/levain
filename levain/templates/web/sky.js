@@ -19,6 +19,7 @@
   var NOW_AT = 0.85;                // where "now" sits across the plot
   var TICK_MS = 30000;              // the window slides on a timer, not on frames
   var ROW_H_MIN = 26, PAD_T = 28, PAD_B = 12, PAD_R = 24, GUTTER_PAD = 16, GUTTER_MIN = 56;
+  var SHORT_LABELS = { memory: 'mem', decisions: 'dec', commits: 'commit', reviews: 'review' };
   var FONT_MONO = '11px ui-monospace, "SF Mono", Menlo, monospace';
   var FONT_SEAT = '600 11.5px ui-rounded, -apple-system, sans-serif';
 
@@ -103,6 +104,15 @@
         if (e.kind !== 'commit' && e.kind !== 'review') return 'memory';
         return e.repo && mainSet[e.repo] ? 'r:' + e.repo : 'other';
       };
+    }
+    // a phone drops the rows nothing landed on (memory and decisions are the ones that can be empty) and shortens their names;
+    // if nothing landed anywhere the rows stay, so the plot is never a bare frame
+    if (opts.compact) {
+      var used = {};
+      inWin.forEach(function (e) { if (!offView(e, single)) used[rowOf(e)] = 1; });
+      var kept = rows.filter(function (r) { return used[r.id]; });
+      if (kept.length) rows = kept;
+      rows.forEach(function (r) { if (SHORT_LABELS[r.label]) r.label = SHORT_LABELS[r.label]; });
     }
     var counts = { commit: 0, review: 0, failed: 0, memory: 0 };
     inWin.forEach(function (e) {
@@ -197,9 +207,10 @@
 
     function rebuild() {
       var now = clock();
+      var narrow = host.getBoundingClientRect().width < 520;   // a phone: only the rows with events, taller rows, so the plot is usable
+      opts.compact = narrow;
       model = buildModel(events, opts, now);
-      var narrow = host.getBoundingClientRect().width < 520;   // a phone: taller rows and a taller floor, so the plot is usable
-      var rowsH = Math.max(narrow ? 240 : 160, PAD_T + PAD_B + model.rows.length * (narrow ? 36 : ROW_H_MIN));
+      var rowsH = Math.max(narrow ? 200 : 160, PAD_T + PAD_B + model.rows.length * (narrow ? 48 : ROW_H_MIN));
       cv.style.height = rowsH + 'px';
       var c = model.counts;
       var line = 'Last ' + opts.windowHours + ' hours: ' + c.commit + ' commits, ' + c.review + ' reviews (' + c.failed + ' failed), ' + c.memory + ' memory writes';
@@ -256,7 +267,7 @@
         g.globalAlpha = 1;
         hits.push({ e: e, x: x, y: y });
       });
-      if (!model.hasDecisions) { g.fillStyle = P.meta; g.textAlign = 'left'; g.fillText('none in this window', gutter + 8, rowY('decisions') + 4); }
+      if (!model.hasDecisions && model.rows.some(function (r) { return r.id === 'decisions'; })) { g.fillStyle = P.meta; g.textAlign = 'left'; g.fillText('none in this window', gutter + 8, rowY('decisions') + 4); }
       var grad = g.createLinearGradient(0, PAD_T - 10, 0, H);
       grad.addColorStop(0, 'transparent'); grad.addColorStop(0.25, P.accent); grad.addColorStop(1, P.accent);
       g.globalAlpha = 0.5; g.fillStyle = grad; g.fillRect(nowX, PAD_T - 10, 1.5, H - PAD_T + 10); g.globalAlpha = 1;

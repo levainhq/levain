@@ -2540,6 +2540,12 @@
     box.before(trigger);
   }
 
+  // a compose box is one line until something is typed, then as tall as its text
+  function growToText(ta) {
+    ta.style.height = "auto";
+    ta.style.height = ta.scrollHeight + "px";
+  }
+
   function buildActionBox(action, spec) {
     const box = el("div", "tray-dump");
     // The at-most-once key for an idempotent verb is stable per SEND CONTENT: a retry of identical
@@ -2612,7 +2618,7 @@
       }
       const isTA = f.kind === "textarea";
       const node = el(isTA ? "textarea" : "input", "tray-dump-ta");
-      if (isTA) node.rows = 2; else node.type = "text";
+      if (isTA) { node.rows = 1; node.addEventListener("input", () => growToText(node)); } else node.type = "text";
       if (f.placeholder) node.placeholder = String(f.placeholder);
       if (f.label) node.setAttribute("aria-label", String(f.label));
       box.appendChild(node);

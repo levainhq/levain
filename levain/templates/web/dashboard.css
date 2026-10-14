@@ -1311,3 +1311,42 @@ body.ke .ck-card-title { font: var(--fw-bold) var(--fs-title)/1 var(--round); co
 
 .tray-dump[hidden], .edit-trigger-row[hidden] { display: none; }
 body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertical; }
+
+/* ═══════════════════════════ PASS 2 (Phill 10-14 ~19:2x): the phone's header, and the known gaps ═══════════════════════════ */
+
+/* PHONE HEADER (<=720px). The nav comes FIRST: the mode segment spans the width, the three buttons are one centred row under it, the
+   status line under that; then the clock and the weather; then the sky, full-bleed. The strip's own container query already
+   regroups the controls by role (the segment on its own line, the buttons together, the status last); this puts the strip first
+   and centres it. The numerals on the mode buttons and the shortcut hint on Jump are keyboard cues: a phone has no keyboard. */
+@media (max-width: 720px) {
+  body.ke .hero { display: flex; flex-direction: column; }
+  body.ke .hero .skycol { display: contents; }
+  body.ke .hero .tools { order: -2; padding: var(--sp-4) var(--gutter); border-bottom: 1px solid var(--hair); }
+  body.ke .hero .when { order: -1; padding: var(--sp-6) var(--gutter); border-right: 0; border-bottom: 1px solid var(--hair); }
+  body.ke #ck-sky { order: 0; padding: 0; }
+  body.ke .hero .masthead { justify-content: center; text-align: center; }
+  body.ke .hero .mode kbd, body.ke .hero #jumpbtn kbd { display: none; }
+  /* the status cluster is always its own line under the buttons, however short it is: a zero-height full-width item sits between */
+  body.ke .hero .masthead::after { content: ""; flex: 1 1 100%; order: 3; height: 0; }
+  body.ke .hero .jar, body.ke .hero .livechip, body.ke .hero .stamp { order: 4; justify-content: center; }
+  /* the sky is full-bleed: the plot runs edge to edge, the summary line keeps the page gutter */
+  body.ke .hero .sky-bar { padding: var(--sp-4) var(--gutter) var(--sp-3); }
+}
+
+/* AN EMPTY CARD is a slim bar, last in its zone (a card with a list behind it keeps its place and its height). Beside a tall
+   neighbour an empty card used to leave a void under it; as a bar at the end of the zone it takes one thin full-width line, and the
+   cards with something to show fill the rows above it. */
+body.ke .ck-zgrid > .panel.ck-fold { grid-column: 1 / -1; order: 90; flex-direction: row; flex-wrap: wrap; align-items: baseline; align-self: stretch; height: auto; max-height: none; }
+body.ke .ck-zgrid > .panel.ck-fold .phead { padding: var(--sp-4) var(--sp-4) var(--sp-4) var(--sp-6); flex: none; flex-wrap: nowrap; }
+body.ke .ck-zgrid > .panel.ck-fold .pbody { padding: var(--sp-4) var(--sp-6) var(--sp-4) 0; flex: 1 1 200px; overflow: visible; max-height: none; }
+body.ke .ck-zgrid > .panel.ck-fold .pbody { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 var(--sp-5); }
+body.ke .ck-zgrid > .panel.ck-fold .pbody .empty, body.ke .ck-zgrid > .panel.ck-fold .pbody .ext-note { margin: 0; padding: 0; }
+
+/* the Edit link of an identity card sits on the first line of the text, to its right, instead of on a row of its own above it */
+body.ke .ck-zgrid .pbody > .edit-trigger-row { float: right; padding: 0; margin: 0 0 var(--sp-2) var(--sp-4); }
+
+/* a section card (the Neocortex) is as tall as its text, up to the tall height, where it scrolls */
+body.ke .ck-zgrid > .panel.k-brief.ck-h-tall { height: auto; max-height: var(--card-tall); }
+
+/* the compose box starts at one line and grows with what is typed, up to a cap */
+body.ke .tray-dump-ta { min-height: 0; max-height: 220px; }
