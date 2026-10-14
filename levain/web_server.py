@@ -1150,7 +1150,8 @@ class _Handler(GuardedHandler):
 
     def _pending_post(self, pending_id: str, action: str, req: Any) -> dict[str, Any]:
         """``POST /cockpit/pending/<id>/signature`` (K2b §3.2: a signature over the stored bytes) and
-        ``.../cancel`` (§3.5: C1 on your own pending, a pending of its tier on another's)."""
+        ``.../cancel`` (§3.5: C1 on your own pending, a pending of its tier on another's, each lifted to the
+        standing policy's ``pending_cancel`` floor)."""
         if not isinstance(req, dict):
             raise EditError("bad_request", 400, "request must be a JSON object")
         unknown = sorted(set(req) - _PENDING_KEYS[action])

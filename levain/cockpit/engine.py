@@ -1903,7 +1903,7 @@ class Cockpit:
             pid = r.get("panel_id") or panel_id
             if self._is_composed(pid) and str(r["id"]).startswith(KERNEL_DECISION_PREFIXES):
                 # a broker row offers no panel verb; a pending offers its own cancel (§3)
-                acts = (self._verb_view.pending_actions(r, cred)
+                acts = (self._verb_view.pending_actions(r, cred, auth=auth)
                         if str(r["id"]).startswith(PENDING_ROW_PREFIX) else [])
             else:
                 acts = self._verb_view.row_actions(pid, r, cred, today, auth=auth)

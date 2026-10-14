@@ -144,10 +144,11 @@ class RequestAuthority:
     authority_error: str | None = None
     # the journal it was captured from (its path); None when no journal was read
     source: str | None = None
-    # the log has no links (and no anchor names one): nothing signs, a token-reported fire still may
+    # the log has no links (and no anchor names one), or, with ``no_log``, no trace of a log exists on the
+    # data root (``Broker._ledger_trace``): nothing signs, a token-reported fire still may
     log_empty: bool = False
     # no log was asked: this server's broker is not ACTIVE, so it holds no journal it may read (K2b-3b
-    # §8d row 1) and tiers under the shipped default (a stated edge: only the active broker's server reads it)
+    # §8d row 1). Unless ``log_empty`` too, its policy is UNKNOWN_POLICY: the log it cannot read may hold a raise
     no_log: bool = False
     # journal reads one request shares (K2b-3b §0.6: Recent edits' broker side), so a write's probes
     # through ``_scan_read_one`` read the journal once, never once per probe
@@ -170,11 +171,13 @@ class RequestAuthority:
     @property
     def policy(self) -> "TierPolicy":
         """The standing policy this request tiers under (trust-tiering DESIGN §4.1): the replay's, from
-        the one snapshot this request captured. The genesis policy (the shipped default) when the log
-        has no links, or when no log was asked (no authority attached, or a broker that is not ACTIVE:
-        ``no_log``). When a log was asked and could not be read or was refused, what it raises is
-        unknown, so every verb is T3 (:data:`UNKNOWN_POLICY`): a fire never falls back to the shipped
-        default past a signed raise it cannot see."""
+        the one snapshot this request captured. The genesis policy (the shipped default) only when the
+        log is positively established empty, or when the cockpit has no authority system at all (no
+        broker attached: a read-only server with no data root). Otherwise what the log raises is
+        unknown (a log refused or unreadable, or a broker that is not ACTIVE, ``no_log``, on a data root
+        holding any trace of a log: STANDBY, install-disabled, failed at start), so every verb is T3
+        (:data:`UNKNOWN_POLICY`) and the inactive broker refuses it: a fire never falls back to the
+        shipped default past a signed raise it cannot see."""
         from levain.authority import genesis_policy
         if self.authority is not None:
             return self.authority.policy
@@ -184,7 +187,7 @@ class RequestAuthority:
 
     @property
     def _genesis(self) -> bool:
-        return self.log_empty or self.no_log or self.authority_error is None
+        return self.log_empty or (self.authority_error is None and not self.no_log)
 
     @property
     def revision(self) -> list[Any]:

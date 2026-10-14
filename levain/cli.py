@@ -429,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
             "every page rendered before it must render again."
         ),
     )
-    ck_raise.add_argument("verb", help="The verb's name, as the manifest's verbs map lists it.")
+    ck_raise.add_argument("verb", help="The verb's name, as the manifest's verbs map lists it, or pending_cancel.")
     ck_raise.add_argument("tier", choices=("T2", "T3"), help="The verb's new floor (C1 is no floor).")
     ck_raise.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
                           help="An enrolled display-phone or laptop-presence key that signs the raise (its "

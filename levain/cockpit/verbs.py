@@ -509,14 +509,17 @@ def row_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, row: 
     return out
 
 
-def pending_actions(row: dict[str, Any], credential_class: str, install_class: str) -> list[dict[str, Any]]:
+def pending_actions(row: dict[str, Any], credential_class: str, install_class: str, *,
+                    policy: "TierPolicy") -> list[dict[str, Any]]:
     """A ``pend:`` row's one action (K2b-3b §3): ``pending_cancel`` at the PENDING's own tier for every
-    caller (the upper bound: the broker lowers it to C1 for the caller's own principal at the POST),
-    answered on the broker's pending route, never ``/cockpit/verb``."""
+    caller, raised to ``policy``'s ``pending_cancel`` floor (the upper bound: the broker lowers it to
+    that floor over C1 for the caller's own principal at the POST), answered on the broker's pending
+    route, never ``/cockpit/verb``."""
     pid = str(row["id"])[len("pend:"):]
     tier = (row.get("facets") or {}).get("pending_tier")
     if tier not in TIERS:
         return []
+    tier = _raised(policy, "pending_cancel", tier)
     return [{"verb": "pending_cancel", "tier": tier, "gesture": gesture_for(tier, credential_class, install_class),
              "escalates": [], "target": {"kind": "pending", "pending_id": pid},
              "route": f"/cockpit/pending/{pid}/cancel"}]
@@ -1022,8 +1025,8 @@ class VerbView:
         return row_actions(self.registry, self.cockpit, panel_id, row, cred, self.install_class, today,
                            policy=auth.policy)
 
-    def pending_actions(self, row: dict[str, Any], cred: str) -> list[dict[str, Any]]:
-        return pending_actions(row, cred, self.install_class)
+    def pending_actions(self, row: dict[str, Any], cred: str, *, auth: "RequestAuthority") -> list[dict[str, Any]]:
+        return pending_actions(row, cred, self.install_class, policy=auth.policy)
 
     def panel_actions(self, panel_id: str, cred: str, today: date,
                       value_version: str | None = None, label: str = UNVERIFIED, *,

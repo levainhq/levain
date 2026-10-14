@@ -86,6 +86,7 @@ from levain.cockpit.effects import (
 from levain.cockpit.firejournal import (
     CockpitDB,
     CockpitFormatError,
+    DB_NAME,
     DecisionRows,
     EditsPage,
     IdempotencyConflict,
@@ -105,7 +106,7 @@ from levain.cockpit.verbs import KERNEL_VERBS
 if TYPE_CHECKING:
     from levain.authority import AuthoritySnapshot
 
-__all__ = ["Broker", "BrokerError", "COCKPIT_STORE", "INTERNAL_VERBS", "LOCK_NAME", "Lifecycle",
+__all__ = ["Broker", "BrokerError", "COCKPIT_STORE", "FLOOR_INTERNAL_VERBS", "INTERNAL_VERBS", "LOCK_NAME", "Lifecycle",
            "PENDING_TTL", "STANDBY_FAULT", "label_class"]
 
 _log = logging.getLogger(__name__)
@@ -115,6 +116,8 @@ PENDING_TTL = timedelta(minutes=15)      # an unsigned cockpit pending's life (f
 COCKPIT_STORE = "cockpit"                # cockpit.db's own objects as a store (§4.1.4)
 STANDBY_FAULT = "write-disabled: another broker holds this data root"
 INTERNAL_VERBS = ("pending_cancel", "token_rotate")
+# the internal verbs that honour a standing-policy floor: ``token_rotate`` is always T3, so a raise of it means nothing
+FLOOR_INTERNAL_VERBS = ("pending_cancel",)
 _TIERS = ("C1", "T2", "T3")
 
 
@@ -317,9 +320,28 @@ class Broker:
         now = self._now() if now is None else now
         db = self._active_db()
         if db is None:
+            # no journal and no anchor (by stat, no opener): no log has ever been kept here, so it is
+            # positively empty and the shipped default holds; any trace of one may hold a raise this
+            # broker cannot read, so the policy is unknown (every verb T3) and its writes are refused
             return RequestAuthority(now, inactive("provenance is served by the active broker"),
-                                    authority_error="the broker is not active", no_log=True)
+                                    authority_error="the broker is not active", no_log=True,
+                                    log_empty=not self._ledger_trace())
         return self._capture(db, now)
+
+    def _ledger_trace(self) -> bool:
+        """Whether this data root holds any trace of an authority log: the journal, its WAL, or the
+        anchor. ``lstat`` only, so a STANDBY broker still opens nothing (§8d row 1); any fault but
+        "no such file" counts as a trace (fail closed)."""
+        journal = self.data_root / DB_NAME
+        for p in (journal, journal.with_name(DB_NAME + "-wal"), anchor_path(self.data_root)):
+            try:
+                p.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return True
+            return True
+        return False
 
     def _capture(self, db: CockpitDB, now: datetime) -> RequestAuthority:
         labeller = self._labeller
@@ -1007,9 +1029,11 @@ class Broker:
         assert verdict.fingerprint is not None
         return verdict.fingerprint
 
-    def _recompute(self, db: CockpitDB, view: Any) -> tuple[bytes | None, list[Any]]:
+    def _recompute(self, db: CockpitDB, view: Any, policy: Any) -> tuple[bytes | None, list[Any]]:
         """§3.2.1: every effect's object read again, tier and canonical effects recomputed, the
-        record rebuilt with the stored fence and times. ``(None, [])`` when a read faulted."""
+        record rebuilt with the stored fence and times. ``(None, [])`` when a read faulted. A
+        ``pending_cancel``'s tier is recomputed as :meth:`cancel` set it, under ``policy`` (the
+        deciding request's: the stored fence makes it the issuing one's, or the decision is STALE)."""
         rec = view.record
         try:
             built = self._build(db, rec["verb"], rec.get("params") or {}, rec.get("target") or {},
@@ -1029,7 +1053,7 @@ class Broker:
             if tier is None or isinstance(tier, Fault):
                 return None, []
         elif rec["verb"] == "pending_cancel":
-            tier = self._target_tier(db, rec.get("target") or {}) or tier
+            tier = self._target_cancel_tier(db, rec.get("target") or {}, view.principal_base, policy) or tier
         raw = self._record(pid=view.pending_id, verb=rec["verb"], intent=rec["intent"], built=built,
                            params=rec.get("params") or {}, tier=str(tier), fence=rec["fence"],
                            issued_at=rec["issued_at"], expires_at=rec["expires_at"])
@@ -1042,19 +1066,21 @@ class Broker:
         fx = [dict(e, expect={"unbuildable": True}) for e in rec["effects"]]
         return encode(dict(rec, effects=fx)), [None] * len(fx)
 
-    @staticmethod
-    def _target_tier(db: CockpitDB, target: Mapping[str, Any]) -> str | None:
+    @classmethod
+    def _target_cancel_tier(cls, db: CockpitDB, target: Mapping[str, Any], canceller_base: str,
+                            policy: Any) -> str | None:
         try:
-            return str(db.load(str(target.get("pending_id"))).record.get("tier"))
+            tview = db.load(str(target.get("pending_id")))
         except (UnknownPending, JournalCorruptError):
             return None
+        return cls._cancel_tier(tview, canceller_base, policy)
 
     def _decide(self, db: CockpitDB, auth: RequestAuthority, pid: str, kind: str, signer_fp: str | None,
                 signature: str | None) -> dict[str, Any]:
         view = self._load(db, pid)
         if view.state != "WAITING":
             return self.result(db, pid, replay=True)
-        recomputed, pre_images = self._recompute(db, view)
+        recomputed, pre_images = self._recompute(db, view, auth.policy)
         self._kp("verified")
         out = db.decide(operation_id=pid, decision_kind=kind, recomputed=recomputed,  # type: ignore[arg-type]
                         now=self._now(), authority=auth.authority, signer_fp=signer_fp, signature=signature,
@@ -1076,20 +1102,34 @@ class Broker:
     def cancel(self, pending_id: str, *, credential: Mapping[str, Any], intent: str | None = None,
                idempotency_key: str | None = None) -> dict[str, Any]:
         """C1 on the canceller's own pending; on another principal's, a pending of that pending's
-        tier whose one effect cancels it (§3.5)."""
+        tier whose one effect cancels it (§3.5). Either is raised to the standing policy's floor for
+        ``pending_cancel``, read from the authority captured here before anything else (trust-tiering
+        DESIGN §4.1): an own cancellation the floor lifts above C1 is a pending of that tier too, and
+        under an unknown policy (a refused log) every cancellation is T3 and refused for want of a fence."""
         with self._admitted() as db:
-            principal = self.principal_of(db, credential)
-            view = self._load(db, pending_id)
-            base = principal.rpartition(":")[0] if principal.startswith("token:") else principal
-            if view.principal_base == base:
-                out = db.cancel(pending_id, principal, self._now())
-                if out.state != "CANCELLED":
-                    raise BrokerError("refused", 409, f"pending {pending_id} is {out.state}; "
-                                                      "only a WAITING pending is cancelled")
-                return self.result(db, pending_id)
-            tier = str(view.record.get("tier"))
-        return self.issue(verb="pending_cancel", params={}, target={"kind": "pending", "pending_id": pending_id},
-                          tier=tier, credential=credential, intent=intent, idempotency_key=idempotency_key)
+            auth = self._request_authority(db)
+            with bound(auth):
+                principal = self.principal_of(db, credential)
+                view = self._load(db, pending_id)
+                base = principal.rpartition(":")[0] if principal.startswith("token:") else principal
+                tier = self._cancel_tier(view, base, auth.policy)
+                if tier == "C1":
+                    out = db.cancel(pending_id, principal, self._now())
+                    if out.state != "CANCELLED":
+                        raise BrokerError("refused", 409, f"pending {pending_id} is {out.state}; "
+                                                          "only a WAITING pending is cancelled")
+                    return self.result(db, pending_id)
+        with bound(auth):
+            return self.issue(verb="pending_cancel", params={},
+                              target={"kind": "pending", "pending_id": pending_id}, tier=tier,
+                              credential=credential, intent=intent, idempotency_key=idempotency_key)
+
+    @staticmethod
+    def _cancel_tier(target: Any, canceller_base: str, policy: Any) -> str:
+        """A cancellation's tier: C1 on the canceller's own pending, the target's tier on another
+        principal's, raised to the policy's ``pending_cancel`` floor (never lowered)."""
+        base = "C1" if target.principal_base == canceller_base else str(target.record.get("tier"))
+        return policy.apply("pending_cancel", base)
 
     def rotate_token(self, name: str, *, credential: Mapping[str, Any], intent: str | None = None,
                      idempotency_key: str | None = None) -> dict[str, Any]:

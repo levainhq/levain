@@ -26,7 +26,7 @@ from levain.cockpit.verbs import dispatch
 from levain.writes import EditError
 from tests.cockpit_authority_rig import link
 from tests.test_cockpit_k2a import CRED, INSTALL_CLASS
-from tests.test_cockpit_k2b_broker import Key, home, keydir  # noqa: F401 - fixtures
+from tests.test_cockpit_k2b_broker import Key, home, keydir, spores  # noqa: F401 - fixtures
 from tests.test_cockpit_k2b_section import rig_broker  # noqa: F401 - fixture
 
 LEVAIN = Path(levain.__file__).parent
@@ -113,6 +113,10 @@ def test_the_manifest_etag_moves_with_the_authority_head_and_nothing_else(tmp_pa
 # --- (c) a fire made against the pre-raise render is refused ----------------------------------------------
 
 def test_a_fire_carrying_the_pre_raise_preview_is_refused_and_fires_nothing(stack):
+    """Only a fire that carries the preview's ``tier_seen``/``gesture_seen`` is refused ``tier_moved``.
+    An ordinary rendered C1 action carries neither, so one clicked after a raise is NOT refused: it
+    becomes a WAITING pending at the new tier, or ``not_built`` for a verb with no adapter (the next
+    test; codex 4, L3 r1, a known edge in the CHANGELOG)."""
     rig, b, _laptop, phone = stack
     before = rig.spore("seed")
     preview = rig.post("spore_touch", "tray", "seed", dry_run=True)
@@ -124,13 +128,17 @@ def test_a_fire_carrying_the_pre_raise_preview_is_refused_and_fires_nothing(stac
     assert rig.spore("seed") == before
 
 
-def test_after_a_raise_a_plain_fire_becomes_a_pending_never_a_direct_c1(stack):
-    """``spore_surface_at`` (C1 on a row that is not held, and the broker has its adapter): raised, the
-    same request becomes a signed pending and the row is untouched until it is signed. (A raised verb
-    the broker has no adapter for, ``spore_touch``, is refused naming that: it never fires direct.)"""
+def test_after_a_raise_a_pre_raise_c1_action_becomes_a_pending_at_the_new_tier(stack):
+    """What really happens to an ordinary C1 action rendered BEFORE a raise and clicked after it (codex
+    4): it is not refused; it becomes a WAITING pending at the new tier, the safe direction, and the row
+    is untouched until it is signed. A raised verb the broker has no adapter for (``spore_touch``) answers
+    ``not_built``: it never fires direct either."""
     rig, b, _laptop, phone = stack
     params = {"surface_at": "2026-10-20"}
     assert rig.tier("spore_surface_at", "tray", "seed", params) == "C1"
+    rendered = next(a for r in rig.ck.panel("tray", credential_class="token")["rows"]
+                    if r["id"] == f"spore:{rig.ids['seed']}" for a in r["actions"] if a["verb"] == "spore_surface_at")
+    assert rendered["tier"] == "C1" and "tier_seen" not in rendered    # the click carries no seen tier
     before = rig.spore("seed")
     link(b.db, {"op": "raise", "verb": "spore_surface_at", "tier": "T2"}, phone)
     out = _fire(rig, b, verb="spore_surface_at", params=params)       # no intent: the sign path
@@ -173,7 +181,10 @@ def test_the_policy_and_revision_of_each_capture_kind():
     assert RequestAuthority(now).policy == genesis                        # no authority attached
     assert RequestAuthority(now, log_empty=True, authority_error="not initialised").policy == genesis
     inactive = RequestAuthority(now, authority_error="the broker is not active", no_log=True)
-    assert inactive.policy == genesis and inactive.revision == ["genesis"]     # a stated edge (DESIGN §4.1)
+    # a broker that is not ACTIVE cannot read a log that may hold a raise (FIX1 H1): never genesis
+    assert inactive.policy is UNKNOWN_POLICY and inactive.revision == ["unknown"] and inactive.fence is None
+    never = RequestAuthority(now, authority_error="the broker is not active", no_log=True, log_empty=True)
+    assert never.policy == genesis and never.revision == ["genesis"]       # no trace of a log on the root
     refused = RequestAuthority(now, authority_error="the authority log is refused: x")
     assert refused.policy is UNKNOWN_POLICY and refused.revision == ["unknown"]
     assert UNKNOWN_POLICY.apply("anything", "C1") == "T3"
@@ -261,3 +272,145 @@ def test_only_the_request_authority_reaches_the_genesis_policy():
                 if name == "genesis_policy":
                     hits.append((path.name, node.lineno))
     assert [h[0] for h in hits] == ["authority.py"], hits
+
+
+# --- FIX1 H1: a broker that is not ACTIVE never tiers under the shipped default -------------------------
+
+def test_a_standby_broker_tiers_every_verb_t3_fires_nothing_and_no_genesis_capture_survives(stack):
+    """codex 1 + complement 1 (L3 r1, HIGH): a second server on the same data root holds a STANDBY
+    broker. It cannot read the log, which here holds a signed raise, so it tiers under UNKNOWN_POLICY
+    (every verb T3) and refuses the write, never the shipped default's direct C1. When it turns ACTIVE,
+    a capture taken while it stood by is still unknown, and a fresh one reads the raise."""
+    from levain.cockpit.authority import UNKNOWN_POLICY
+    from levain.cockpit.broker import Broker, Lifecycle
+    from tests.test_cockpit_k2b_broker import _wait
+
+    rig, b, _laptop, phone = stack
+    params = {"surface_at": "2026-10-20"}
+    link(b.db, {"op": "raise", "verb": "spore_surface_at", "tier": "T2"}, phone)
+    second = Broker(b.data_root, stores=dict(b.stores), store_paths=list(b.store_paths), install_class="reported",
+                    tier_of=b.tier_of, ssh_keygen=b.ssh_keygen, lock_poll=0.05)
+    second.start()
+    try:
+        assert second.state is Lifecycle.STANDBY
+        rig.ck.attach_authority(second.capture)
+        stood_by = second.capture()
+        assert stood_by.policy is UNKNOWN_POLICY and stood_by.revision == ["unknown"]
+        before = rig.spore("seed")
+        assert rig.tier("spore_surface_at", "tray", "seed", params) == "T3"
+        assert rig.ck.manifest(CRED)["verbs"]["spore_surface_at"]["tier"] == "T3"
+        with pytest.raises(EditError):
+            _fire(rig, second, verb="spore_surface_at", params=params)
+        assert rig.spore("seed") == before
+        b.stop()
+        assert _wait(lambda: second.state is Lifecycle.ACTIVE, 5.0)
+        assert stood_by.policy is UNKNOWN_POLICY                          # no genesis capture survives
+        assert second.capture().policy.raise_to["spore_surface_at"] == "T2"
+        assert rig.tier("spore_surface_at", "tray", "seed", params) == "T2"
+    finally:
+        second.stop()
+
+
+# --- FIX1 H2: pending_cancel honours its standing floor, on every path ----------------------------------
+
+@pytest.fixture
+def canceller(home, spores, keydir):  # noqa: F811 - fixtures
+    from tests.test_cockpit_k2b_broker import _broker
+
+    b = _broker(home, spores)
+    try:
+        Key(keydir, "laptop").enroll(b, "laptop-presence")
+        phone = Key(keydir, "phone").enroll(b, "display-phone")
+        yield b, phone
+    finally:
+        b.stop()
+
+
+def test_a_raised_pending_cancel_lifts_a_foreign_cancellation_and_the_render(canceller, spores):  # noqa: F811 - fixture
+    """codex 2 (L3 r1, HIGH): with ``pending_cancel`` raised to T3, another token's reported T2
+    cancellation of a T2 pending is refused (T3 on the token alone), never committed below the floor;
+    the decisions row offers the cancel at T3."""
+    from levain.cockpit.broker import BrokerError
+    from levain.cockpit.verbs import pending_actions
+    from tests.test_cockpit_k2b_broker import PHONE, _move
+
+    b, phone = canceller
+    link(b.db, {"op": "raise", "verb": "pending_cancel", "tier": "T3"}, phone)
+    pid = _move(b, spores)["pending_id"]
+    with pytest.raises(BrokerError) as ei:
+        b.cancel(pid, credential=PHONE, intent="reported", idempotency_key="c1")
+    assert ei.value.code == "refused" and "T3" in str(ei.value)
+    assert b.outcome(pid)["state"] == "WAITING"
+    signed = b.cancel(pid, credential=PHONE, idempotency_key="c2")
+    assert b.db.load(signed["pending_id"]).record["tier"] == "T3"
+    row = {"id": f"pend:{pid}", "facets": {"pending_tier": "T2"}}
+    policy = b.capture().policy
+    assert [a["tier"] for a in pending_actions(row, "token", "reported", policy=policy)] == ["T3"]
+
+
+def test_a_raised_pending_cancel_lifts_an_own_cancellation_off_c1_and_recompute_agrees(canceller, spores):  # noqa: F811 - fixture
+    """The canceller's own pending: C1 at genesis, so with ``pending_cancel`` raised to T2 it is a T2
+    pending (the target stays WAITING), and a reported one of a T3 target commits: the decide's
+    recompute reproduces the floor over C1, never the target's T3 (which would end it STALE)."""
+    b, phone = canceller
+    from tests.test_cockpit_k2b_broker import BROWSER, _move
+
+    link(b.db, {"op": "raise", "verb": "pending_cancel", "tier": "T2"}, phone)
+    pid = _move(b, spores)["pending_id"]
+    out = b.cancel(pid, credential=BROWSER)
+    assert out["pending_id"] != pid and out["state"] == "WAITING"
+    assert b.outcome(pid)["state"] == "WAITING"
+    t3 = _move(b, spores, "k.seed2", tier="T3")["pending_id"]
+    done = b.cancel(t3, credential=BROWSER, intent="reported", idempotency_key="c3")
+    assert done["state"] == "COMMITTED", done
+    assert b.outcome(t3)["state"] == "CANCELLED"
+
+
+def test_under_a_refused_log_an_own_cancellation_is_refused_and_cancels_nothing(canceller, spores):  # noqa: F811 - fixture
+    """codex 2: the own-cancel branch mutated the pending as C1 without capturing authority. Under a
+    refused log the policy is unknown, so the cancellation is T3 and refused for want of a fence."""
+    from levain.cockpit.broker import BrokerError
+    from tests.test_cockpit_k2b_broker import BROWSER, _move
+
+    b, _phone = canceller
+    pid = _move(b, spores)["pending_id"]
+    anchor = anchor_path(b.data_root)
+    at = authority.read_anchor(anchor)
+    anchor.write_text(json.dumps({"format": authority.ANCHOR_FORMAT, "store_id": at.store_id,
+                                  "seq": at.seq + 1, "head_hash": "0" * 64}))
+    with pytest.raises(BrokerError) as ei:
+        b.cancel(pid, credential=BROWSER)
+    assert ei.value.code == "authority_unavailable"
+    assert b.db.load(pid).state == "WAITING"
+
+
+def test_the_cli_raise_refuses_a_verb_nothing_honours(tmp_path):
+    """complement 2/3 (L3 r1, LOW): a misspelt verb, or an internal verb with no floor, is refused
+    before anything is signed; ``pending_cancel`` (an internal verb that honours a floor) is accepted."""
+    from levain.cockpit.keys import KeyError_, _raisable
+
+    for verb, why in (("spore_tuch", "not a cockpit verb"), ("token_rotate", "honours no standing-policy floor")):
+        with pytest.raises(KeyError_, match=why):
+            _raisable(verb)
+    _raisable("pending_cancel")
+    _raisable("spore_touch")
+
+
+def test_an_inactive_broker_keeps_the_shipped_tiers_only_where_no_log_was_ever_kept(home, spores):  # noqa: F811 - fixture
+    """The one inactive case that is positively empty: no journal, no WAL, no anchor on the data root (by
+    ``lstat``, no opener). Any trace of a log, and the policy is unknown."""
+    from levain.cockpit.authority import UNKNOWN_POLICY
+    from tests.test_cockpit_k2b_broker import _broker
+
+    b = _broker(home, spores, install_class=None)
+    try:
+        assert not b.enabled
+        fresh = b.capture()
+        assert fresh.policy == authority.genesis_policy() and fresh.revision == ["genesis"]
+        anchor = anchor_path(b.data_root)
+        anchor.parent.mkdir(parents=True, exist_ok=True)
+        anchor.write_text("{}")
+        traced = b.capture()
+        assert traced.policy is UNKNOWN_POLICY and traced.revision == ["unknown"]
+    finally:
+        b.stop()

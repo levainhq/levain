@@ -265,11 +265,26 @@ def policy_raise(data_root: Path | str, verb: str, tier: str, *, signer_fp: str,
     the link, the link's seq, and the anchor warning as :func:`enroll`."""
     if not isinstance(verb, str) or not verb:
         raise KeyError_("a raise names a verb")
+    _raisable(verb)
     db = _journal(data_root, marker_directory=marker_directory)
     _signing_authority(_capture(db, _now(clock), ssh_keygen))     # refused before anything is signed
     new = _append(db, {"op": "raise", "verb": verb, "tier": tier}, signer_fp=signer_fp, sign=sign, clock=clock,
                   ssh_keygen=ssh_keygen)
     return new.policy.raise_to[verb], new.seq, new.anchor_warning
+
+
+def _raisable(verb: str) -> None:
+    """Refuse a raise that would be signed and then honoured by nothing: a verb the kernel registry
+    does not know, or an internal verb that honours no floor. A downstream's own verbs are not in the
+    kernel registry, so they are refused here too (a known edge: the log itself cannot know them)."""
+    from levain.cockpit.broker import FLOOR_INTERNAL_VERBS, INTERNAL_VERBS
+    from levain.cockpit.verbs import VerbRegistry
+
+    if verb in FLOOR_INTERNAL_VERBS or verb in VerbRegistry().names():
+        return
+    if verb in INTERNAL_VERBS:
+        raise KeyError_(f"{verb!r} honours no standing-policy floor (it is always T3); nothing to raise")
+    raise KeyError_(f"{verb!r} is not a cockpit verb; a raise of it would protect nothing")
 
 
 def keys(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
