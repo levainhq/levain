@@ -1887,7 +1887,7 @@ def _unpinned_commands_result(install: Path) -> list[CheckResult]:
     if not toks:
         return []
     return [CheckResult("agent hook commands", True,
-                        "not pinned (the command names no file under the install): " + ", ".join(toks),
+                        "not pinned (a hook command names code outside the install, or no file under it): " + ", ".join(toks),
                         "Point the hook command at a script under the install by absolute path "
                         "(or ${CLAUDE_PROJECT_DIR}) so its file is pinned.", warn=True)]
 

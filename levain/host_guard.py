@@ -575,55 +575,96 @@ def _expand_token(tok: str, ent: Path) -> str:
     return os.path.expanduser(tok.replace("${CLAUDE_PROJECT_DIR}", str(ent)).replace("$CLAUDE_PROJECT_DIR", str(ent)))
 
 
-def _in_root_file(tok: str, ent: Path, first: bool) -> Path | None:
-    """The existing file ``tok`` names under the install root, or None. An absolute path (after
-    ${CLAUDE_PROJECT_DIR} and ~ expansion) is taken as written; a relative path containing a slash
-    resolves against the install only for the command's first token. Files outside the install
-    (an interpreter, a system tool) are not pinned: their content changes for reasons that are
-    not a tampering signal (a Python upgrade)."""
+def _operand_path(tok: str, ent: Path, first: bool) -> Path | None:
+    """The existing file or directory ``tok`` names, as an absolute LEXICAL path (no symlink
+    followed), or None. An absolute path (after ${CLAUDE_PROJECT_DIR} and ~ expansion) is taken as
+    written; a relative path containing a slash resolves against the install only for the command's
+    first token."""
     exp = _expand_token(tok, ent)
     if "/" not in exp:
         return None
     if os.path.isabs(exp):
-        p = Path(exp)
+        p = Path(os.path.abspath(exp))
     elif first:
-        p = ent / exp
+        p = Path(os.path.abspath(ent / exp))
     else:
         return None
-    if not p.is_file():
-        return None
-    root = os.path.realpath(ent)
-    real = os.path.realpath(p)
-    return p if real == root or real.startswith(root + os.sep) else None
+    return p if p.exists() else None
+
+
+def _lexically_in_root(p: Path, ent: Path) -> bool:
+    s = str(p)
+    return any(s == r or s.startswith(r + os.sep) for r in {str(ent), os.path.realpath(ent)})
+
+
+_INTERPRETER = re.compile(r"^(python[0-9.]*|pypy[0-9.]*|node|nodejs|deno|bun|ruby|perl|php|sh|bash|zsh|dash|uv|uvx|npx|env)$")
+_BINARY_MAGIC = (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"MZ")
+
+
+def _is_interpreter(tok: str, ent: Path) -> bool:
+    """argv[0] when later tokens exist: a known interpreter name, or a native binary (a copied or
+    rebuilt venv python). A script with arguments is the executed code and is pinned."""
+    if _INTERPRETER.match(os.path.basename(tok)):
+        return True
+    p = _operand_path(tok, ent, True)
+    try:
+        if p is not None and p.is_file():
+            with open(p, "rb") as fh:
+                return fh.read(4).startswith(_BINARY_MAGIC)
+    except OSError:
+        pass
+    return False
+
+
+def _pin_digest(p: Path) -> str:
+    """Content of the file (through a link) plus the link string when ``p`` is itself a link."""
+    data = p.read_bytes()
+    if p.is_symlink():
+        data = b"link:" + os.readlink(p).encode("utf-8", "surrogateescape") + b"\0" + data
+    return _sha_bytes(data)
 
 
 def _command_pins(ent: Path, docs: Sequence[Any]) -> tuple[dict[str, str], list[str]]:
-    """(component -> digest of every file a hook command names under the install, the first tokens
-    of commands that named no such file). An interpreter is never pinned."""
+    """(component -> digest of every file a hook command names under the install, what the commands
+    name that no pin covers). argv[0] is the interpreter (a known name or a native binary) when later
+    tokens exist and is never pinned; any other argv[0] is the executed script and is. Containment is lexical: an in-root symlink
+    is pinned by link string and target content wherever the target lives. Every later existing
+    file or directory operand outside the install is named, whether or not another operand pinned."""
     pins: dict[str, str] = {}
     unresolved: list[str] = []
+
+    def warn(label: str) -> None:
+        if label not in unresolved:
+            unresolved.append(label)
+
     for cmd in _hook_commands(docs):
         try:
             argv = shlex.split(cmd)
         except ValueError:
             argv = []
         if not argv:
-            tok = cmd.strip()[:80]
-            if tok not in unresolved:
-                unresolved.append(tok)
+            warn(cmd.strip()[:80])
             continue
         found = False
         for i, tok in enumerate(argv):
-            p = _in_root_file(tok, ent, i == 0)
+            if i == 0 and len(argv) > 1 and _is_interpreter(tok, ent):
+                continue
+            p = _operand_path(tok, ent, i == 0)
             if p is None:
+                continue
+            if not _lexically_in_root(p, ent):
+                if i > 0:
+                    warn(f"{tok} (operand outside the install)")
+                continue
+            if not p.is_file():
                 continue
             found = True
             try:
-                pins[f"hook command {tok}"] = _sha_bytes(p.read_bytes())
+                pins[f"hook command {tok}"] = _pin_digest(p)
             except OSError as exc:
                 raise AgentPinError([f"{p}: unreadable ({exc.strerror or exc})"]) from None
-        if not found and argv[0] not in unresolved:
-            unresolved.append(argv[0])
+        if not found:
+            warn(argv[0])
     return pins, unresolved
 
 
