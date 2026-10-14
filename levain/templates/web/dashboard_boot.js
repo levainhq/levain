@@ -307,8 +307,17 @@
   // answers after which the page's picture of the row or of the install is stale or unavailable
   const REREAD = new Set(["needs_intent", "stale", "tier_moved", "gesture_moved", "needs_broker", "standby", "not_built"]);
 
-  // The kernel's answer, drawn on its row the moment it arrives: the full re-read can take seconds, and a
-  // row that says "…" until then hides a landed write. The row is not locked meanwhile: an edit sent
+  // a landed write paints nothing, so the row's own "saving…" (set by the form that sent it) is cleared here rather than
+  // left for the re-read, which can defer behind a polling job
+  function clearBusy(key) {
+    if (!key) return;
+    for (const row of document.querySelectorAll("[data-row-key]")) {
+      if (row.dataset.rowKey !== key) continue;
+      for (const m of row.querySelectorAll(".edit-msg.busy")) { m.className = "edit-msg"; m.textContent = ""; }
+    }
+  }
+  // The kernel's answer, drawn on its row the moment it arrives when it is one a person needs (a landed write says nothing:
+  // the full re-read can take seconds). The row is not locked meanwhile: an edit sent
   // against the old row version is refused "stale" by the kernel.
   function paintNow(n) {
     if (!n || !n.key) return;
@@ -327,17 +336,18 @@
   // says nothing (the row shows the new content); only a write that did not land, or is still waiting, speaks.
   const RESULT_WORDS = {
     COMMITTED_INCOMPLETE: "Only part of that change was saved. Check the row.",
-    STALE: "That changed somewhere else first. The page reloaded; try again.",
+    STALE: "That changed somewhere else first. Reload to see the new version.",
     REFUSED: "Levain refused that change.",
     EXPIRED: "That request ran out of time. Try again.",
     CANCELLED: "Cancelled.",
-    WAITING: "Waiting for your signature."
+    WAITING: "Waiting for your signature.",
+    applying: "Still saving."
   };
   const FAULT_WORDS = {
-    stale: "That changed somewhere else first. The page reloaded; try again.",
-    needs_intent: "This needs a fresh confirmation. The page reloaded; try again.",
-    tier_moved: "This needs a fresh confirmation. The page reloaded; try again.",
-    gesture_moved: "This needs a fresh confirmation. The page reloaded; try again.",
+    stale: "That changed somewhere else first. Reload to see the new version.",
+    needs_intent: "This needs a fresh confirmation. Try again.",
+    tier_moved: "This needs a fresh confirmation. Try again.",
+    gesture_moved: "This needs a fresh confirmation. Try again.",
     needs_broker: "That cannot be done from this page right now.",
     standby: "That cannot be done from this page right now.",
     not_built: "That cannot be done from this page yet."
@@ -350,7 +360,7 @@
   function fault(r, what) {
     const d = r.data || {};
     const code = d.error || "HTTP " + r.status;
-    const text = FAULT_WORDS[code] || d.message || "That did not go through.";
+    const text = FAULT_WORDS[code] || d.message || "That did not go through (" + code + ").";
     if (REREAD.has(code) || r.status === 501) {
       notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);
@@ -424,8 +434,8 @@
     const d = r.data;
     const state = typeof d.state === "string" && d.state ? d.state : "done";
     const words = resultWords(state);
-    notice = words ? { key: base.row_id || null, text: words, cls: state === "WAITING" ? "preview" : "err" } : null;
-    if (notice) paintNow(notice);
+    notice = words ? { key: base.row_id || null, text: words, cls: state === "WAITING" || state === "applying" ? "preview" : "err" } : null;
+    if (notice) paintNow(notice); else clearBusy(base.row_id || null);
     await afterWrite();
     return { ok: true, data: d };
   }

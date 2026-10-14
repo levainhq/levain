@@ -1245,7 +1245,7 @@ body.ke .panel .phead .chip, body.ke .panel .phead .pexpand { opacity: 0; transi
 body.ke .panel:hover .phead .chip, body.ke .panel:hover .phead .pexpand, body.ke .panel:focus-within .phead .chip, body.ke .panel:focus-within .phead .pexpand { opacity: 1; }
 @media (hover: none) { body.ke .panel .phead .pexpand { opacity: 1; } }
 /* the edit class (A / B / C) and a panel's source id ("section:state") are the kernel's bookkeeping, not something a person reads */
-body.ke .panel .phead .chip, body.ke .panel .phead .src:not(.fresh) { display: none; }
+body.ke .panel .phead .chip, body.ke .modal .chip, body.ke .panel .phead .src:not(.fresh) { display: none; }
 body.ke .row:focus-visible { outline: 1px solid var(--hair-2); outline-offset: -1px; border-radius: var(--r-md); }
 body.ke .undo-btn {
   font: var(--fw-medium) var(--fs-meta)/var(--lh-list) var(--sans); letter-spacing: 0; text-transform: none; color: var(--label); background: none;

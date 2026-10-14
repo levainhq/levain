@@ -194,7 +194,7 @@ cases.stale_and_tier_moved_reread_and_never_retry_with_an_intent = async () => {
     const before = env.reads.length;
     const r = await env.opts().commit(req);
     await env.settle();
-    ok(r.ok === false && r.error === code && /fresh confirmation|changed somewhere else/.test(r.message) && !new RegExp(code).test(r.message), code + " answer shown in plain words: " + r.message);
+    ok(r.ok === false && r.error === code && /fresh confirmation|changed somewhere else/.test(r.message) && !/reloaded/.test(r.message) && !new RegExp(code).test(r.message), code + " answer shown in plain words: " + r.message);
     ok(env.posts.length === 2, code + ": no automatic retry");
     ok(env.reads.length > before, code + ": the page re-read");
     env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T3", rendered_tier: "C1", gesture: "sign" }]];
