@@ -782,8 +782,10 @@ _SSH_AGENT_GRANT = ("is an ssh agent's socket ({}), which hands bash every key t
                     "agent is levain's scoped one, keys added with `levain ssh-add <key> -h <host>`")
 
 
-#: ``/proc/<pid>/comm`` of the agents recognised by what listens (comm is cut at 15 bytes).
-_AGENT_LISTENERS = ("ssh-agent", "gpg-agent", "gnome-keyring-d")
+#: ``/proc/<pid>/comm`` of the agents recognised by what listens (comm is cut at 15 bytes). Not
+#: ``gpg-agent``: it also listens on its extra socket, the gpg signing grant; its ssh socket is refused
+#: by inode against gpgconf's ``agent-ssh-socket`` instead.
+_AGENT_LISTENERS = ("ssh-agent", "gnome-keyring-d")
 
 
 def _same_socket(a: str, b: str) -> bool:
@@ -811,8 +813,8 @@ def _listener_comm(p: str) -> str | None:
 def _ssh_agent_refusal(p: str) -> str | None:
     """Why ``p`` cannot be a grant because it is an ssh agent, or None: it is the same inode as the
     socket the operator's ``$SSH_AUTH_SOCK`` names now, or as gpg-agent's ssh socket (gpgconf's path),
-    under any name; or, on Linux, what listens on it is an ``ssh-agent``, ``gpg-agent`` or
-    gnome-keyring (by ``/proc/<pid>/comm``), wherever it is and whatever levain's environment holds. A
+    under any name; or, on Linux, what listens on it is an ``ssh-agent`` or gnome-keyring (by
+    ``/proc/<pid>/comm``), wherever it is and whatever levain's environment holds. A
     socket nobody answers on is not refused here (the grant check owns liveness). Off Linux, an agent
     at a path neither names is not recognised (a stated limit). Doctor (:func:`load_operator_grants`)
     and the spawn (:func:`resolve_grant`) both call this."""
