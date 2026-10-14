@@ -133,8 +133,10 @@ def protected_paths(queue_dir: Path, settings: AdapterSettings) -> tuple[Path, .
 # Under a ``.claude`` directory (the workspace's or ~'s), what Claude Code loads and runs: hooks, subagents, skills,
 # slash commands, and the plugin install tree (``~/.claude/plugins``: each plugin's hooks, MCP servers, agents).
 CLAUDE_CONFIG_DIRS = frozenset({"hooks", "agents", "skills", "commands", "plugins"})
-# MCP server definitions: a workspace's ``.mcp.json`` and the user's ``~/.claude.json``.
-CONFIG_FILE_NAMES = frozenset({".mcp.json", ".claude.json"})
+# MCP server definitions: a ``.mcp.json`` anywhere (a workspace's). The user's ``~/.claude.json`` is matched by
+# its full path in :func:`targets_agent_config`: a ``.claude.json`` elsewhere (a test fixture) is not config.
+CONFIG_FILE_NAMES = frozenset({".mcp.json"})
+USER_CONFIG_NAME = ".claude.json"
 # The tool_input fields an MCP tool's target paths are read from (the reference filesystem server's names, plus
 # Claude Code's own): only these, never a value parsed out of another field.
 MCP_PATH_FIELDS = ("file_path", "path", "paths", "notebook_path", "source", "destination")
@@ -220,10 +222,10 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     """True when a file tool (Edit/Write/MultiEdit/NotebookEdit) or an MCP tool targets an agent's config or hooks,
     in the workspace or the home directory: a ``.claude/settings*.json``; anything under a ``.claude/`` ``hooks``,
     ``agents``, ``skills``, ``commands`` or ``plugins`` directory (the adapter's own installed hook script is in
-    ``.claude/hooks/``); a ``.mcp.json`` or ``.claude.json``; a ``.codex/hooks.json`` or ``.codex/config.toml``;
-    anything under a ``.claude-plugin/`` directory, or under ``hooks/`` beside one (a plugin); anything under the
-    levain package this interpreter imports (:func:`levain_package_dir`, the hook runs it) or a site-directory entry
-    that redirects that import (:func:`_redirects_the_import`); or any of
+    ``.claude/hooks/``); a ``.mcp.json``, or the home directory's ``.claude.json``; a ``.codex/hooks.json`` or
+    ``.codex/config.toml``; anything under a ``.claude-plugin/`` directory, or under ``hooks/`` beside one (a
+    plugin); anything under the levain package this interpreter imports (:func:`levain_package_dir`, the hook runs
+    it) or a site-directory entry that redirects that import (:func:`_redirects_the_import`); or any of
     ``protected`` (a file, or anything under a directory; the adapter passes :func:`protected_paths`). A file
     tool's target is its ``file_path``/``notebook_path``; an MCP tool's are its :data:`MCP_PATH_FIELDS` and nothing
     else. Each path is checked as written (``~`` expanded, joined to ``cwd``, normalised) and as resolved through
@@ -237,6 +239,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         roots = tuple({s for p in protected for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())}
                       | {levain_package_dir().lower()})
         sites = import_site_dirs()
+        user_config = Path(home) / USER_CONFIG_NAME
+        user_configs = {os.path.normpath(user_config).lower(), os.path.realpath(user_config).lower()}
     except (OSError, ValueError, ImportError, TypeError):
         return True
     for target in targets:
@@ -251,6 +255,8 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
         except (OSError, ValueError):
             return True
         if _is_config_path(written) or _is_config_path(resolved) or _under(written, roots) or _under(resolved, roots):
+            return True
+        if str(written).lower() in user_configs or str(resolved).lower() in user_configs:
             return True
         if _redirects_the_import(written, sites) or _redirects_the_import(resolved, sites):
             return True
@@ -278,13 +284,17 @@ def hook_output(decision: Decision) -> dict[str, Any]:
 
 def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_hold: float = DEFAULT_MAX_HOLD,
            policy: Callable[[ExternalGateRequest], Decision | None] | None = None,
-           home: Path | None = None, protected: Iterable[Path] = (),
-           clock: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
+           home: Path | None = None, clock: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
     """The hook's output for one event, or ``None`` for no decision. Raises on anything unexpected (after
     withdrawing the request it filed, so no ghost stays pending); the caller (:func:`main`) turns that into no
     decision. ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it. ``policy``
     (default :func:`levain.consent.decide_by_policy`) is only ever reached through :func:`guarded_policy`, and
-    never for a request filed at :data:`AGENT_CONFIG_TIER`: a direct caller cannot bypass ruling 3b item 1."""
+    never for a request filed at :data:`AGENT_CONFIG_TIER`: a direct caller cannot bypass ruling 3b item 1. What
+    the adapter trusts (:func:`protected_paths`) is taken from ``queue.directory`` and ``settings`` here, never
+    from the caller, so no call can leave it out; a queue without a directory raises before anything is filed."""
+    if getattr(queue, "directory", None) is None:
+        raise TypeError("the queue has no directory: the adapter's own files cannot be protected")
+    protected = protected_paths(Path(queue.directory), settings)
     deadline = clock() + max(0.0, float(max_hold)) - CLEANUP_RESERVE
     if not isinstance(event, Mapping) or event.get("hook_event_name") != EVENT:
         return None
@@ -362,8 +372,7 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         queue_dir = Path(args.queue_dir) if args.queue_dir else default_queue_dir()
         settings = load_settings(queue_dir)
         event = json.loads(stdin.read())
-        out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
-                     protected=protected_paths(queue_dir, settings))
+        out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold)
         if out is not None:
             stdout.write(json.dumps(out) + "\n")
             stdout.flush()

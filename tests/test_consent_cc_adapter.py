@@ -41,6 +41,8 @@ class FakeQueue:
     """The core's surface the adapter uses. ``verdict`` is what the core verified: None, 'allow', 'deny', or
     an exception to raise from the wait."""
 
+    directory = Path("/nonexistent/levain-consent")  # decide() protects what lives here, as ConsentQueue.directory
+
     def __init__(self, verdict=None, *, at="await"):
         self.verdict, self.at = verdict, at
         self.filed: list[dict] = []
@@ -377,6 +379,7 @@ def test_the_adapters_own_trust_root_is_agent_config(tmp_path, rel):
 def test_main_files_a_write_to_the_adapter_settings_at_t3_without_policy(monkeypatch, tmp_path):
     calls = []
     q = FakeQueue(None)
+    q.directory = tmp_path / "consent"  # _queue_for builds the queue over main's --queue-dir
     target = str(tmp_path / "consent" / cc.SETTINGS_NAME)
     monkeypatch.setattr(cc, "_queue_for", lambda d, s: q)
     monkeypatch.setattr(cc, "decide_by_policy", lambda r: calls.append(r))
@@ -653,3 +656,43 @@ def test_a_request_filed_at_the_config_tier_never_reaches_a_direct_callers_polic
              cwd="/w", tier=cc.AGENT_CONFIG_TIER)
     with pytest.raises(cc.PolicyNotEligible):
         cc.guarded_policy(mcp.requests[0], lambda r: None)
+
+
+# --- fix round 4 (L3 Q2 r4 complement MED, codex LOW) -------------------------------------------------------------
+
+@pytest.mark.parametrize("rel", ["consent/claude_code.json", "consent/queue.db", "cockpit/cockpit.db",
+                                 "cockpit/anchor/authority.anchor"])
+def test_a_direct_decide_caller_cannot_skip_the_adapters_own_protection(tmp_path, rel):
+    """complement MED (r4): decide() takes the protected paths from its own queue and settings, so a direct
+    caller cannot file a write to the adapter settings, the queue db or the authority anchor at T2."""
+    calls = []
+    q = FakeQueue(None)
+    q.directory = tmp_path / "consent"
+    settings = cc.AdapterSettings(away_mode=True, away_hold_seconds=20, cockpit_data_root=str(tmp_path / "cockpit"))
+    cc.decide(event("Write", {"file_path": str(tmp_path / rel), "content": "{}"}), q, settings,
+              policy=lambda r: calls.append(r))
+    assert q.filed[0]["tier"] == cc.AGENT_CONFIG_TIER and calls == []
+
+
+def test_decide_without_a_queue_directory_fails_closed():
+    """No directory to protect is no decision (decide raises; main turns that into the native dialog)."""
+    class NoDir(FakeQueue):
+        directory = None
+    with pytest.raises(Exception):
+        cc.decide(event(), NoDir("allow"), AWAY)
+
+
+def test_dot_claude_json_is_config_only_as_the_users_own(tmp_path):
+    """codex LOW (r4): ``.claude.json`` is the user's MCP config at ``~/.claude.json`` only; a repository fixture of
+    that name is ordinary. A path that resolves to the home file is still config."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text("{}")
+    ws = tmp_path / "ws"
+    (ws / "tests" / "fixtures").mkdir(parents=True)
+    (ws / "link.json").symlink_to(home / ".claude.json")
+    for path in ("~/.claude.json", str(home / ".claude.json"), "link.json"):
+        assert cc.targets_agent_config("Write", {"file_path": path}, str(ws), home=home), path
+    for path in ("tests/fixtures/.claude.json", ".claude.json", str(home / "sub" / ".claude.json")):
+        assert not cc.targets_agent_config("Write", {"file_path": path}, str(ws), home=home), path
+    assert cc.targets_agent_config("Write", {"file_path": "sub/.mcp.json"}, str(ws), home=home)
