@@ -47,13 +47,13 @@ from pathlib import Path
 from typing import Any
 
 from levain.authority import (
-    AuthorityError, AuthoritySnapshot, ReplayCache, VerifierUnavailable, check_anchor, read_anchor, snapshot,
-    verify_link_sig,
+    AuthorityError, AuthoritySnapshot, ReplayCache, VerifierUnavailable, verify_link_sig,
 )
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.autonomic.receipt import build_action_face, build_gate_face, build_gate_verdict
+from levain.cockpit.authority import RequestAuthority
 from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, _TIER_NEEDS
 from levain.consent.record import (
@@ -135,12 +135,14 @@ def default_queue_dir() -> Path:
 
 class AuthoritySource:
     """The trusted authority source for a queue; make it with :func:`authority_source`. Each call opens the
-    cockpit database read-only and returns :func:`levain.authority.snapshot` (a verified replay of the log's
-    head) checked by :func:`levain.authority.check_anchor` against the anchor file
-    :func:`levain.authority.read_anchor` read first (as ``cockpit.authority.RequestAuthority.capture`` orders
-    them: an append committing in between can only put the log ahead of the anchor). ``anchor=None`` checks
-    no anchor, so the replay is only as trustworthy as the database file: production passes the real anchor.
-    Raises on any failure; the queue turns that into no decision.
+    cockpit database read-only, begins a read transaction and returns the verified log head that
+    :meth:`levain.cockpit.authority.RequestAuthority.capture` (``levain/cockpit/authority.py``, the one
+    snapshot builder, DESIGN §3.4) takes in it: the anchor file read first, then the replay, then the replay
+    checked against that anchor, so an append committing in between can only put the log ahead of the anchor.
+    ``anchor=None`` checks no anchor, so the replay is only as trustworthy as the database file: production
+    passes the real anchor. Raises on any failure: capture's refusal (a refused log or anchor, a verifier that
+    cannot run, an empty or uninitialised log) as :class:`levain.authority.AuthorityError` with capture's
+    reason, a journal read as ``sqlite3.Error``; the queue turns either into no decision.
 
     A queue takes only this class (not a subclass, not any callable): freshness is the queue's guarantee,
     never a promise a caller's ``lambda: snapshot`` could break."""
@@ -159,13 +161,13 @@ class AuthoritySource:
         conn = sqlite3.connect(self._uri, uri=True, isolation_level=None, timeout=30.0)
         try:
             conn.execute("BEGIN")
-            pinned = None if self._anchor is None else read_anchor(self._anchor)
-            snap = snapshot(conn, **self._kw)
-            check_anchor(snap, pinned)
+            got = RequestAuthority.capture(conn, now=datetime.now(timezone.utc), anchor=self._anchor, **self._kw)
             conn.execute("COMMIT")
-            return snap
         finally:
             conn.close()
+        if got.authority is None or got.authority_error is not None:
+            raise AuthorityError(got.authority_error or "the authority log yields no head")
+        return got.authority
 
 
 def authority_source(cockpit_db: Path | str, *, anchor: Path | None, cache: ReplayCache | None = None,
