@@ -933,7 +933,9 @@ def _banner_for(
         try:
             from levain.firing.confinement import load_confinement_config, unix_socket_lines
 
-            socket_lines = unix_socket_lines(load_confinement_config(session.entity_dir))
+            socket_lines = unix_socket_lines(load_confinement_config(session.entity_dir),
+                                             ssh_agent=getattr(session, "ssh_agent", None),
+                                             ssh_agent_note=getattr(session, "ssh_agent_note", None))
         except Exception as exc:  # noqa: BLE001 — the spawn refuses bash on the same error, and says so
             socket_lines = [f"unix sockets: not determinable ({exc})"]
     _print_banner(
