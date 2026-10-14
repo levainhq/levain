@@ -1155,6 +1155,8 @@ body.ke .ck-zgrid > .panel.ck-h-tall { height: var(--card-tall); }
 body.ke .ck-zgrid > .panel.ck-h-medium { height: var(--card-medium); }
 body.ke .ck-zgrid > .panel.ck-h-short { height: var(--card-short); }
 body.ke .ck-zgrid > .panel.ck-tab-off { display: none; }
+body.ke .ck-zgrid > .panel.ck-is-empty { height: auto; align-self: start; }
+body.ke .ck-zgrid > .panel.k-brief.ck-h-medium { height: auto; max-height: var(--card-medium); }   /* a prose card sizes to its text; only a long one reaches the medium height and scrolls */
 body.ke .ck-zgrid .panel .phead { padding: var(--sp-5) var(--sp-6) var(--sp-4); flex: none; }
 body.ke .ck-zgrid .panel h2 { font: var(--fw-bold) var(--fs-title)/1 var(--round); }
 body.ke .ck-zgrid .panel .pbody { flex: 1; min-height: 0; max-height: none; overflow-y: auto; overflow-x: hidden; overscroll-behavior: auto; padding: 0 var(--sp-6) var(--sp-5); }
@@ -1297,3 +1299,6 @@ body.ke .ck-card-title { font: var(--fw-bold) var(--fs-title)/1 var(--round); co
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0ms !important; animation: none !important; }
 }
+
+.tray-dump[hidden], .edit-trigger-row[hidden] { display: none; }
+body.ke .tray-dump.text-editor .tray-dump-ta { min-height: 120px; resize: vertical; }

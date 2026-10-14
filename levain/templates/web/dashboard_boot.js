@@ -385,7 +385,7 @@
     for (const k of Object.keys(params || {})) if (params[k] !== undefined) given[k] = params[k];
     params = given;
     if (action.gesture === "refused" || action.gesture === "laptop-only") {
-      return { ok: false, error: "gesture", message: label + " cannot be done from this page." };
+      return { ok: false, error: "gesture", message: "That cannot be done from this page." };
     }
     const t = action.target || {};
     const base = { verb: action.verb, panel_id: t.panel_id, params: params || {} };
@@ -417,7 +417,7 @@
         if (!d.ok) return fault(d, what);
         tier = d.data.tier; gesture = d.data.gesture;
         if (gesture === "refused" || gesture === "laptop-only") {
-          return { ok: false, error: "gesture", message: label + " cannot be done from this page." };
+          return { ok: false, error: "gesture", message: "That cannot be done from this page." };
         }
         if (tier !== "C1") intent = gesture === "sign" ? "sign" : "reported";
       }

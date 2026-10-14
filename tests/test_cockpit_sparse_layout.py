@@ -35,3 +35,27 @@ def test_morning_does_not_stretch_a_lone_work_card_across_the_page(tmp_path: Pat
     assert vals[1] == "morning", vals
     n, share = vals[2]
     assert n == 1 and 0.25 < share < 0.4, vals
+
+
+@needs_browser
+def test_an_empty_card_is_its_header_and_one_line_not_a_populated_height(tmp_path: Path) -> None:
+    vals = _page(tmp_path, [{"eval": """(async () => { await new Promise(r => setTimeout(r, 400));
+      const out = {}; for (const p of document.querySelectorAll('.ck-zgrid > .panel')) { const h = p.querySelector('h2'); if (h && /\\(0\\)$/.test(h.textContent)) out[h.textContent] = [p.classList.contains('ck-is-empty'), p.getBoundingClientRect().height]; }
+      const tall = [...document.querySelectorAll('.ck-zgrid > .panel.ck-h-tall')].filter(p => !p.classList.contains('ck-is-empty') && p.getBoundingClientRect().height > 0).map(p => p.getBoundingClientRect().height);
+      return { out, tall: tall.length ? Math.min(...tall) : 0 }; })()"""}])
+    got = vals[1]
+    assert got["out"], vals
+    for name, (marked, h) in got["out"].items():
+        assert marked and h < got["tall"] / 2, (name, h, got["tall"])
+
+
+@needs_browser
+def test_a_text_panel_reads_first_and_opens_an_editor_holding_its_text(tmp_path: Path) -> None:
+    vals = _page(tmp_path, [{"eval": """(async () => { await new Promise(r => setTimeout(r, 400));
+      const card = [...document.querySelectorAll('.panel')].find(p => /Operator · Identity/.test((p.querySelector('h2') || {}).textContent || ''));
+      const box = card.querySelector('.tray-dump.text-editor'); const hidden = box.hidden;
+      card.querySelector('.edit-btn').click(); const ta = box.querySelector('textarea');
+      return { hidden, open: !box.hidden, value: ta.value, titles: (card.innerText.match(/Operator · Identity/g) || []).length, label: ta.getAttribute('aria-label') }; })()"""}])
+    got = vals[1]
+    assert got["hidden"] is True and got["open"] is True and got["value"].strip() != "" and got["titles"] == 1, got
+    assert got["label"] == "Edit this text", got

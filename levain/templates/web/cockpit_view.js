@@ -263,7 +263,7 @@
     } else if (kind === "brief") {
       const lines = labelled(v.lines, "lines");
       const head1 = typeof v.headline === "string" && v.headline ? v.headline : "";
-      if (typeof v.markdown === "string" && v.markdown) out.markdown = (head1 ? "**" + head1 + "**\n\n" : "") + v.markdown;
+      if (typeof v.markdown === "string" && v.markdown) out.markdown = v.markdown;   // the card's own head carries the title: a bold copy of it above the text read as a second title
       else { out.typed = true; out.brief = { headline: head1, lines: lines }; }
     } else if (kind === "reading") {
       need(isNum(v.value) || (typeof v.value === "string" && v.value), "reading value");
@@ -1251,9 +1251,10 @@
     if (s.searchable) p.appendChild(buildFilter(s));
     p.appendChild(s.body);
     s.setQuery = (q, now) => setQuery(s, q, now);
-    s.paint = () => paint(s);
+    s.paint = () => { paint(s); root.setTimeout(markEmptyCards, 0); };   // a repaint can empty or fill a card; the caller attaches a new one after this returns
     states.add(s);
     paint(s);
+    root.setTimeout(markEmptyCards, 0);
     if (s.searchable && sendable(s.query) && sr.scope === "store") runStoreSearch(s);
     if (focusKeep && focusKeep.pid === s.pid && s.filterInput) {
       const keep = focusKeep;
@@ -1442,8 +1443,18 @@
   // across the page "looks like shit"): a card spans its own tracks and the last row stays short, left-aligned. Widgets sit
   // on four tracks (more than four widgets open more); the zone grid is six tracks under three, four under two, one under one.
   function shown(n) { return getComputedStyle(n).display !== "none"; }
+  // A card with nothing to list is its header and the one empty-state line, not a populated card's height with a gap in it.
+  // Decided at render (this runs after each one): a card the person is filtering keeps its height, since the filter is the
+  // reason the list is short and a collapsing card would jump under the cursor.
+  function markEmptyCards() {
+    for (const p of document.querySelectorAll(".ck-zgrid > .panel")) {
+      const none = !!p.querySelector(".pbody .empty") && !p.querySelector(".pbody .row, .pbody .rrow, .pbody .lrow, .pbody .section-display, .pbody .ep-search-input");
+      p.classList.toggle("ck-is-empty", none);
+    }
+  }
   function fillGrids() {
     if (typeof getComputedStyle !== "function") return;   // a harness without layout
+    markEmptyCards();
     for (const w of document.querySelectorAll(".ck-widgets")) {
       const n = Array.from(w.children).filter(shown).length;
       w.style.setProperty("--ck-n", String(Math.max(4, n)));

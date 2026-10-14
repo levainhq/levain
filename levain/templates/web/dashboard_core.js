@@ -2498,6 +2498,32 @@
       .forEach((w) => renderJobResultInto(w, verb));
   }
 
+  // The editor for a text panel: closed by default behind an "edit" button, prefilled with the current text, saved through
+  // the panel's own verb (the same box a compose uses, so confirm, keys and failure text behave the same).
+  function mountTextEditor(p, act, spec, current) {
+    const field = Object.assign({}, act.fields[0], { kind: "textarea", label: "Edit this text" });
+    const box = buildActionBox(Object.assign({}, act, { fields: [field] }), spec);
+    box.classList.add("text-editor");
+    const ta = box.querySelector("textarea");
+    if (ta) { ta.value = current; ta.rows = Math.min(14, Math.max(4, current.split("\n").length + 1)); }
+    const save = box.querySelector(".tray-dump-btn");
+    if (save) save.textContent = "save";
+    const cancel = el("button", "verb-cancel", "cancel");
+    cancel.type = "button";
+    if (save && save.parentNode) save.parentNode.insertBefore(cancel, save.nextSibling);
+    box.hidden = true;
+    const trigger = el("div", "edit-trigger-row");
+    const open = el("button", "edit-btn", "edit");
+    open.type = "button";
+    trigger.appendChild(open);
+    const show = (on) => { box.hidden = !on; trigger.hidden = on; if (on && ta) ta.focus(); else open.focus(); };
+    open.addEventListener("click", () => show(true));
+    cancel.addEventListener("click", () => { if (ta) ta.value = current; show(false); });
+    box.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && !(save && save.disabled)) { ev.preventDefault(); ev.stopPropagation(); if (ta) ta.value = current; show(false); } });
+    mountCaptureBox(p, box);
+    box.before(trigger);
+  }
+
   function buildActionBox(action, spec) {
     const box = el("div", "tray-dump");
     // The at-most-once key for an idempotent verb is stable per SEND CONTENT: a retry of identical
@@ -2751,7 +2777,11 @@
     const act = data.action;
     if (act && commitAction && act.verb) {
       const spec = (view.action_verbs || {})[act.verb];
-      if (spec) mountCaptureBox(p, buildActionBox(act, spec));
+      // A text panel whose one verb replaces its text (new_body) is read first and edited on request: the text shows, an
+      // "edit" button opens the editor holding that same text. Any other action keeps its compose box on top.
+      const textEdit = spec && data.markdown != null && Array.isArray(act.fields) && act.fields.length === 1 && act.fields[0] && act.fields[0].name === "new_body";
+      if (textEdit) mountTextEditor(p, act, spec, String(data.markdown));
+      else if (spec) mountCaptureBox(p, buildActionBox(act, spec));
     }
     if (data.note) p.appendChild(el("div", "ext-note", data.note));
     // Prose external panels (e.g. the morning-ritual reports) carry a `markdown` string instead of
