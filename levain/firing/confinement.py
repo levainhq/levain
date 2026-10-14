@@ -8184,7 +8184,7 @@ class _BwrapShell(SandboxedShell):
     """A :class:`SandboxedShell` that checks, before every command, that the disk still matches the
     mounts it was started with (spore-1312, rec C, ruled 2026-10-03, widened by its L3).
 
-    Two checks, one rule each:
+    Three checks, one rule each:
       - the spawn-time SQLite jewel check (:func:`_refuse_plantable_sqlite_jewels`) again, because an
         empty jewel can be initialised as a database IN PLACE, keeping its inode (RUN on Linux at
         3838801: the next command read a row out of the host's ``-wal``);
@@ -8192,8 +8192,14 @@ class _BwrapShell(SandboxedShell):
         the mounts were made, which covers every way the host can put something new where a mount
         was: an atomic rewrite, an unlink while a connection keeps a ``-wal``, a swap for a link, a
         sidecar that was absent (so unmounted) and appeared. Each of those was RUN or reviewed on
-        2026-10-03 before this replaced the per-case checks.
-    If either fires, the shell is closed (its process group killed) and the command refused; the next
+        2026-10-03 before this replaced the per-case checks;
+      - the session's scoped ssh agent, when bash has one, is still answered by the pid levain started,
+        read from the host side (:func:`levain.firing.ssh_agent.peer_pid`). The manifest alone cannot
+        see an agent killed and restarted on the same path: ext4 handed the freed inode straight back
+        12 times of 12 (RUN 2026-10-14, VM T9), so the identity was unchanged while another process
+        answered. A peer that cannot be read refuses too. A restart that reuses both the inode and the
+        exact recorded pid is not seen.
+    If any fires, the shell is closed (its process group killed) and the command refused; the next
     spawn mounts what is there now, or refuses at the spawn check. A filesystem error while checking
     refuses the same way. A host-side rewrite of a protected file therefore closes the live shell,
     including a ``levain wrap`` rewriting the entity's own continuity, or a daemon recreating its socket:
@@ -8238,6 +8244,7 @@ class _BwrapShell(SandboxedShell):
         self._units = 0
         self._relay: _HandsRelay | None = None   # a hands launch's host-side proxy relay, if any
         self._hands: HandsIdentity | None = None   # a hands launch's user, whose files are repaired
+        self._agent: tuple[str, int] | None = None   # the scoped ssh agent's (host socket, pid), when bound
         self._command_since = 0.0
         # Clear from a run()'s admission (`_before_command`, under `_lock`, refused once closed) until its
         # command's group is registered or the run is refused. close() waits for it, so it never settles
@@ -8550,6 +8557,16 @@ class _BwrapShell(SandboxedShell):
                     f"{q} changed since the shell started ({_describe(was)} -> {_describe(now)}); "
                     "the floor no longer covers what is on disk there."
                 )
+        if self._agent is not None:
+            sock, pid = self._agent
+            try:
+                answering = _ssh_agent.peer_pid(sock)
+            except _ssh_agent.AgentError as exc:
+                raise ConfinementError(f"levain's scoped ssh agent ({sock}) cannot be checked ({exc}); "
+                                       "the agent bash talks to is no longer known.") from None
+            if answering != pid:
+                raise ConfinementError(f"levain's scoped ssh agent ({sock}) is now answered by pid {answering}, "
+                                       f"not the agent levain started (pid {pid}).")
 
     def _before_command(self) -> None:
         with self._lock:
@@ -8917,6 +8934,9 @@ class BwrapProvider(ConfinementProvider):
         shell._relay = relay
         shell._canary = canary
         shell._hands = hands
+        if ssh_agent is not None and hands is None:
+            # Beside the manifest's socket entry: who answers on it is checked per command, not only its inode.
+            shell._agent = (ssh_agent.socket, ssh_agent.pid)
         _LIVE_BWRAP_SHELLS.add(shell)
         try:
             # Each command, the start probe included, tags the claim with its process group.

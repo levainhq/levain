@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -166,6 +167,48 @@ def test_the_spawn_binds_the_agent_only_while_its_started_pid_answers(home, tmp_
     ssh_agent.stop(a)
     with pytest.raises(ConfinementError, match="cannot be read"):
         _ssh_agent_ops(a, [rt])
+
+
+def test_an_agent_restarted_on_its_path_closes_the_shell_though_the_socket_kept_its_inode(home, monkeypatch):
+    """VM item 11 (T9, 2026-10-14): the operator's agent was killed and another started on the same
+    path; ext4 gave the new socket the freed inode (12/12), so the manifest saw nothing and bash's
+    `ssh-add -l` reached the new agent. Here the agents and the peer read are real; the inode reuse is
+    stood in for by holding `_identity` to the recorded value (this filesystem may not reuse it)."""
+    import levain.firing.confinement as conf
+
+    monkeypatch.setattr(conf, "_refuse_plantable_sqlite_jewels", lambda policy: None)
+    a = ssh_agent.start()
+    held = conf._identity(Path(a.socket))
+
+    def shell():
+        sh = conf._BwrapShell(policy=None, manifest={a.socket: held}, argv=["/bin/false"],  # type: ignore[arg-type]
+                              cwd=home, env={})
+        sh._agent = (a.socket, a.pid)
+        return sh
+
+    with pytest.raises(conf.ConfinementError, match="not running"):   # the started agent answers: checks pass
+        shell().run("echo x")
+    ssh_agent._terminate(ssh_agent._POPENS.pop(a.pid))
+    assert not os.path.exists(a.socket)   # ssh-agent removes its socket on SIGTERM
+    rogue = subprocess.Popen(["ssh-agent", "-D", "-a", a.socket], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=ssh_agent._tool_env())
+    try:
+        for _ in range(250):
+            if os.path.exists(a.socket):
+                break
+            time.sleep(0.02)
+        assert ssh_agent.peer_pid(a.socket) == rogue.pid
+        monkeypatch.setattr(conf, "_identity", lambda p: held)   # ext4's reuse: the manifest sees no change
+        sh = shell()
+        with pytest.raises(conf.ConfinementError,
+                           match=rf"now answered by pid {rogue.pid}, not the agent levain started \(pid {a.pid}\)"):
+            sh.run("echo x")
+        assert sh._closed
+    finally:
+        rogue.terminate()
+        rogue.wait(5)
+    with pytest.raises(conf.ConfinementError, match="cannot be checked"):   # nobody answers: refused too
+        shell().run("echo x")
 
 
 def test_no_agent_is_started_where_it_is_not_bound_into_bash(home):
