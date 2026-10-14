@@ -140,6 +140,22 @@ def test_a_decision_for_another_request_is_not_delivered(monkeypatch):
     assert run_main(monkeypatch, Other(), json.dumps(event())) == (0, "")
 
 
+def test_a_decision_over_another_request_digest_is_not_delivered(monkeypatch):
+    """Q1 round 2 adds Decision.request_digest: when present it must be the digest of the request filed."""
+    class Digest(FakeQueue):
+        def __init__(self, digest_of):
+            super().__init__("allow")
+            self.digest_of = digest_of
+
+        def await_decision(self, request_id, timeout, **kw):
+            d = Decision(request_id=request_id, decision="allow", signer_fp="k", decided_at="t")
+            object.__setattr__(d, "request_digest", self.digest_of(self.requests[-1]))
+            return d
+    assert run_main(monkeypatch, Digest(lambda r: "sha256:other"), json.dumps(event())) == (0, "")
+    rc, out = run_main(monkeypatch, Digest(lambda r: r.digest), json.dumps(event()))
+    assert json.loads(out)["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+
+
 def test_an_answer_landing_after_the_wait_is_still_delivered(monkeypatch):
     rc, out = run_main(monkeypatch, FakeQueue("allow", at="race"), json.dumps(event()))
     assert json.loads(out)["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
@@ -332,5 +348,6 @@ def test_real_core_without_authority_is_no_decision(tmp_path):
     out = io.StringIO()
     rc = cc.main(["--queue-dir", str(qdir)], stdin=io.StringIO(json.dumps(event())), stdout=out)
     assert (rc, out.getvalue()) == (0, "")
-    q = ConsentQueue(qdir, authority=lambda: None)
+    q = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
     assert q.pending() == []  # filed, then withdrawn: the native dialog stands
+    assert q._fresh_authority() is None  # the no-root source never replays

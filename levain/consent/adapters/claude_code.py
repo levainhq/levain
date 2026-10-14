@@ -129,10 +129,15 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
 # --- the decision ------------------------------------------------------------------------------------------
 
 def _verified(decision: Any, request: ExternalGateRequest) -> Decision | None:
-    """``decision`` only if it is the core's Decision for THIS request with a known verdict."""
-    if isinstance(decision, Decision) and decision.request_id == request.id and decision.decision in ("allow", "deny"):
-        return decision
-    return None
+    """``decision`` only if it is the core's Decision for THIS request with a known verdict, and, when the core's
+    Decision carries a ``request_digest``, that digest is the one of the request this hook filed."""
+    if not (isinstance(decision, Decision) and decision.request_id == request.id
+            and decision.decision in ("allow", "deny")):
+        return None
+    digest = getattr(decision, "request_digest", None)
+    if digest is not None and digest != request.digest:
+        return None
+    return decision
 
 
 def hook_output(decision: Decision) -> dict[str, Any]:
@@ -192,8 +197,9 @@ def _queue_for(queue_dir: Path, settings: AdapterSettings) -> ConsentQueue:
         root = Path(settings.cockpit_data_root)
         source = authority_source(root / "cockpit.db", anchor=anchor_path(root))
     else:
-        def source():
-            raise OSError("no cockpit data root is set: no answer can verify")
+        # No cockpit data root: a source over the queue DIRECTORY, which sqlite cannot open as a database, so
+        # every replay fails and no answer can verify (never a file path a writer could plant a log at).
+        source = authority_source(queue_dir, anchor=None)
     return ConsentQueue(queue_dir, authority=source)
 
 
