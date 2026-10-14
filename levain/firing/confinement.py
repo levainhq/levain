@@ -1107,7 +1107,8 @@ def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | N
     for d in DEFAULT_GRANT_LINES.get(system, ()):
         lines.append(f"default grant: {d}")
     lines.extend(_ssh_agent.status_lines(system, agent=ssh_agent, note=ssh_agent_note,
-                                         hands=cfg is not None and getattr(cfg, "hands_user", None) is not None))
+                                         hands=cfg is not None and getattr(cfg, "hands_user", None) is not None,
+                                         tier=_landlock.tier_for(abi) if reason is None else "T0"))
     if cfg is not None and cfg.runtime_sockets:
         lines.append(f"ignored: runtime_sockets in .levain/confinement.json ({', '.join(cfg.runtime_sockets)}) "
                      f"grants nothing; the operator declares sockets in {grants_file()}")

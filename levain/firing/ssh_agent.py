@@ -695,9 +695,12 @@ def key_lines(d: Path, rec: dict[str, Any], *, now: float | None = None) -> list
 
 
 def status_lines(system: str, *, agent: ScopedAgent | None = None, note: str | None = None,
-                 hands: bool = False) -> list[str]:
+                 hands: bool = False, tier: str | None = None) -> list[str]:
     """The ssh lines ``levain run`` (with this session's ``agent``, or the ``note`` saying why it has
-    none) and ``levain doctor`` (neither: every running session's agent) print."""
+    none) and ``levain doctor`` (neither: every running session's agent) print. ``tier`` is the
+    Landlock tier (:func:`levain.firing.landlock.tier_for`): only at T9 are pathname unix sockets
+    outside the sandbox refused, so only there does bash reach the scoped agent alone; unknown is
+    read as below T9."""
     if system == "Darwin":
         return [DARWIN_LINE]
     if system != "Linux":
@@ -706,8 +709,11 @@ def status_lines(system: str, *, agent: ScopedAgent | None = None, note: str | N
         return [f"ssh agent: none (the entity's own user); {_NO_AGENT_TAIL}"]
     if agent is not None:
         rec = read_record(agent.dir) or {"keys": []}
-        return [f"ssh agent: levain's scoped agent for this session (pid {agent.pid}, {agent.socket}); "
-                "bash reaches only it, at its $SSH_AUTH_SOCK", *key_lines(agent.dir, rec)]
+        reach = ("bash reaches only it, at its $SSH_AUTH_SOCK" if tier == "T9" else
+                 f"bash's $SSH_AUTH_SOCK is it; an agent socket elsewhere in bash's view (e.g. /tmp) stays "
+                 f"reachable at this tier ({tier or 'unknown'}, pathname unix sockets are refused only at T9)")
+        return [f"ssh agent: levain's scoped agent for this session (pid {agent.pid}, {agent.socket}); {reach}",
+                *key_lines(agent.dir, rec)]
     if note is not None:
         return [f"ssh agent: none for this session ({note}); {_NO_AGENT_TAIL}"]
     problem = openssh_problem()
