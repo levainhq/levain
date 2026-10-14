@@ -276,9 +276,10 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def start(*, entity: str = "", lifetime: int = DEFAULT_LIFETIME) -> ScopedAgent:
+def start(*, entity: str = "", lifetime: int = DEFAULT_LIFETIME, ssh_mode: str = "agent") -> ScopedAgent:
     """Start one session's agent and return it, or :class:`AgentError` (nothing left behind). Sweeps
-    agents a killed levain left first (:func:`sweep_orphans`)."""
+    agents a killed levain left first (:func:`sweep_orphans`). ``ssh_mode`` is the entity's floor
+    setting, recorded for :func:`add_key` (only ``agent`` hides ``~/.ssh`` from bash)."""
     problem = openssh_problem()
     if problem is not None:
         raise AgentError(problem)
@@ -320,7 +321,7 @@ def start(*, entity: str = "", lifetime: int = DEFAULT_LIFETIME) -> ScopedAgent:
                              f"(pid {proc.pid})")
         write_record(d, {"session_id": sid, "pid": proc.pid, "owner": os.getpid(), "entity": entity,
                          "socket": str(sock), "lifetime": int(lifetime), "started_at": int(time.time()),
-                         "keys": []})
+                         "ssh_mode": ssh_mode, "keys": []})
     except BaseException:
         if proc is not None:
             _terminate(proc)
@@ -539,6 +540,31 @@ def fingerprint(key: Path) -> str:
     return fields[1]
 
 
+def _readable_key_problem(key: Path, rec: dict[str, Any]) -> str | None:
+    """Why bash could read ``key``, or None. ssh-agent replaces a held key's constraints when the same
+    key is added again (ssh-agent.c, process_add_identity), so a bash that can read the file strips
+    its ``-h`` with a plain ``ssh-add`` while ``agent.json`` still prints "for <host>" (L2 #2). The
+    floor's own decision is not reachable here without the entity's built policy, so this is the
+    bound form: the key must resolve under ``~/.ssh`` with one link, and the session's entity must
+    run ``ssh_mode="agent"``, where that whole directory is hidden from bash. A caller-declared
+    ``deny_files`` key elsewhere is refused too (stricter than the floor). There is no waiver."""
+    mode = rec.get("ssh_mode")
+    if mode != "agent":
+        return (f"the session's entity runs ssh_mode={mode or 'unknown'}, where bash can read the keys in "
+                "~/.ssh and could re-add one without its -h limit; nothing was added")
+    ssh_dir = (Path.home() / ".ssh").resolve()
+    real = Path(os.path.realpath(key))
+    try:
+        nlink = os.stat(real).st_nlink
+    except OSError as exc:
+        return f"{key} cannot be read ({exc.strerror or exc})"
+    if ssh_dir not in real.parents or nlink != 1:
+        return (f"{key} is not a file only under {ssh_dir} (resolved: {real}, links: {nlink}), the one "
+                "place the floor hides from bash in ssh_mode=agent; a key bash can read can be re-added "
+                "from inside without its -h limit. Move it under ~/.ssh; nothing was added")
+    return None
+
+
 def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, session: str | None = None,
             waive_destinations: bool = False, system: str | None = None) -> str:
     """``levain ssh-add``: add ``key`` to a running session's scoped agent, limited to ``hosts`` (checked
@@ -581,6 +607,9 @@ def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, se
                              + (", ".join(fps) or "(fingerprint not shown by ssh-keygen)"))
     fp = fingerprint(key)
     d, rec = _pick_session(session)
+    why = _readable_key_problem(key, rec)
+    if why is not None:
+        raise AgentError(why)
     sock = str(d / SOCKET_NAME)
     got = peer_pid(sock)
     if got != rec["pid"]:
