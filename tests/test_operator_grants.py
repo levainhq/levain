@@ -266,6 +266,15 @@ def test_gpg_agents_extra_socket_stays_a_grant_while_gpg_agent_listens_on_it(rd,
         grants([{"path": str(rd / "gnupg" / "S.gpg-agent.ssh"), "name": "keys", "why": "w"}])
         with pytest.raises(ConfinementError, match="gpg-agent's ssh socket"):
             conf.load_operator_grants()
+        # L3 b2a r2 (codex): any other socket gpg-agent answers on (another home's ssh socket under a new
+        # name, which gpgconf's paths do not name) is refused by its listener; only the extra socket is exempt.
+        alias = _listen(rd / "other" / "keys.sock")
+        try:
+            grants([{"path": str(rd / "other" / "keys.sock"), "name": "keys", "why": "w"}])
+            with pytest.raises(ConfinementError, match="the process listening on it is gpg-agent"):
+                conf.load_operator_grants()
+        finally:
+            alias.close()
         monkeypatch.setattr(conf, "_listener_comm", lambda p: "ssh-agent")   # the list still refuses ssh-agent
         grants([{"path": str(rd / "gnupg" / "S.gpg-agent.extra"), "name": "gpg", "why": "signing"}])
         with pytest.raises(ConfinementError, match="the process listening on it is ssh-agent"):
