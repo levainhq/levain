@@ -1386,5 +1386,5 @@ html:is([data-variant="A"], [data-variant="B"]) .ck-card.w[data-ck-panel="decisi
 /* B: the clock's colon and am/pm take the time of day: cool before eight in the morning, neutral by day, warm from nine at night */
 html[data-variant="B"] .clock[data-tod="dawn"] { --tod: oklch(0.78 0.12 235); }
 html[data-variant="B"] .clock[data-tod="night"] { --tod: oklch(0.72 0.19 350); }
-html[data-variant="B"] .clock :is(.clock-colon, small) { color: var(--tod, var(--label)); }
+html[data-variant="B"] body.ke .hero .clock small { color: var(--tod, var(--label)); }
 html[data-variant="B"] .clock .clock-colon { color: var(--tod, inherit); }
