@@ -1032,11 +1032,11 @@ class EntitySession:
                     logging.getLogger("levain.session").warning(
                         "closing a conversation from a failed start raised", exc_info=True
                     )
-            # After the conversation, and only if it closed and nothing of the hands user is left: a
-            # shell or process still alive must keep ws-git out.
             # After the conversation and its shell: the agent goes with a start that failed.
             if not started and scoped_agent is not None:
                 stop_ssh_agent(scoped_agent)
+            # After the conversation, and only if it closed and nothing of the hands user is left: a
+            # shell or process still alive must keep ws-git out.
             if not started and hands_session_fd is not None and hands_id is not None:
                 torn_down = _stop_hands_user(hands_id.user, hands_id.uid) is None and torn_down
             if not started and torn_down:
