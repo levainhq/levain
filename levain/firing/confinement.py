@@ -24,7 +24,9 @@ it needed an empirically-hunted "system allow-set"; a default-ALLOW profile need
   - sibling entities' ``<other>/.levain/`` stores (one entity can't read another's memory);
   - the ``~/.ssh`` key material (``ssh_mode="agent"``): the entity may USE keys via the agent socket
     to authenticate, but may not READ raw key material to exfil it — so ALL of ``~/.ssh`` is read+
-    write-denied EXCEPT ``known_hosts`` (r+w, so ssh can record new host keys) and ``config`` (r).
+    write-denied EXCEPT ``known_hosts`` and ``config``, both read-only on Linux (bash's git records
+    hosts in the session's own known_hosts, :mod:`levain.firing.ssh_agent`); macOS re-allows
+    ``known_hosts`` r+w (its session known_hosts arrives with B2b).
     This is location-based, not name-based: it catches ``deploy_key`` / per-host keys, not just
     ``id_*`` (apparatus L2). ``ssh_mode="raw"`` is the fallback (allow raw ``~/.ssh`` read) — a live
     agent-mode round-trip 2026-07-12 (real ``ssh -T git@github.com`` auth + ``git ls-remote``, raw key
@@ -1638,7 +1640,7 @@ def build_policy(
         what fires, so an entity can neither read nor rewrite its own authority (:data:`AUTONOMIC_STORE_DIR`);
       - the cockpit's signing keys ``<levain home>/keys`` (subtree, read and write; :data:`COCKPIT_KEY_DIR`);
       - ⛔ ALL of ``~/.ssh`` (read+write-denied when ``ssh_mode="agent"``, except ``known_hosts``
-        r+w and ``config`` r) — LOCATION-BASED, NOT NAME-BASED. See this module's docstring, which
+        (r on Linux, r+w on macOS) and ``config`` r) — LOCATION-BASED, NOT NAME-BASED. See this module's docstring, which
         is the one home for this fact and carries its provenance (apparatus L2). This bullet used
         to say ``~/.ssh/id_*``, describing the name-based design the module explicitly REPLACED —
         and it contradicted the very next bullet, four lines below, which says the whole subtree is
@@ -4931,9 +4933,9 @@ class _HandsSeatbeltShell(_SeatbeltShell):
 #   deny_write_dirs (ancestors)  --bind P P (self-bind)     rename EBUSY, writes INSIDE still OK
 #   deny_write_files             --ro-bind P P (self-bind)  read OK, write EROFS
 #   own_memory_files             --ro-bind P P (self-bind)  read OK, write EROFS
-#   ssh_dir (agent mode)         --tmpfs, then bind back    key material ENOENT; known_hosts r+w
-#                                known_hosts (rw) + config  reaches the REAL host file; config
-#                                (ro) INTO the tmpfs        read OK / write EROFS
+#   ssh_dir (agent mode)         --tmpfs, then bind back    key material ENOENT; known_hosts and
+#                                known_hosts + config (both config read OK / write EROFS
+#                                ro) INTO the tmpfs
 #   deny_sockets, daemon dir     --tmpfs P --remount-ro P   connect ENOENT, holds across a daemon
 #                                                           restart (measured 2026-09-30)
 #   deny_sockets, shared dir     --ro-bind /dev/null S      connect ECONNREFUSED until the daemon
@@ -6052,11 +6054,14 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         remount_ro.append(str(sub))
 
     # (3) ssh KEY MATERIAL (agent mode). tmpfs the directory, then bind the two files ssh actually
-    # needs back INTO it — the mount-namespace analogue of SBPL's last-match-wins re-allow. The
-    # known_hosts bind is READ-WRITE and reaches the REAL host file (measured: a write inside the
-    # sandbox appeared in the host's known_hosts), so ssh can still record new host keys; config is
-    # read-only, matching macOS where its WRITE stays denied in BOTH modes. NEVER re-allow a path the
-    # CALLER explicitly denied — same rule, same reason as the seatbelt provider.
+    # needs back INTO it — the mount-namespace analogue of SBPL's last-match-wins re-allow. Both are
+    # READ-ONLY. known_hosts was bound read-write until B2a fix 1, and a write inside the sandbox
+    # reached the REAL host file (measured), so bash could plant a host key the operator's own ssh
+    # then trusted and that `levain ssh-add`'s guidance once told them to copy into the protected
+    # manifest (L1 #1 / L2 #1, 2026-10-14); bash's git records hosts in the session's own known_hosts
+    # (`_ssh_agent_ops`), plain ssh warns it cannot add a host and still connects to a known one.
+    # config is read-only, matching macOS where its WRITE stays denied in BOTH modes. NEVER re-allow
+    # a path the CALLER explicitly denied — same rule, same reason as the seatbelt provider.
     rebound: list[Path] = []
     if policy.ssh_dir is not None:
         ssh = policy.ssh_dir
@@ -6065,7 +6070,7 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
         known_hosts = ssh / "known_hosts"
         config = ssh / "config"
         if known_hosts.exists() and not _caller_denies(known_hosts, policy):
-            argv += ["--bind", str(known_hosts), str(known_hosts)]
+            argv += ["--ro-bind", str(known_hosts), str(known_hosts)]
             rebound.append(known_hosts)
         if config.exists() and not _caller_denies(config, policy):
             argv += ["--ro-bind", str(config), str(config)]
@@ -6187,18 +6192,19 @@ def _bwrap_plan_impl(policy: CrownJewelsPolicy) -> tuple[list[str], list[str]]:
             # missing-file branch below would try to CREATE a socket path under a root-owned /run.
             continue
         if f in rebound:   # exact: a case-folded match here would SKIP a protection (codex, L3 b)
-            # known_hosts / config were deliberately bound BACK for ssh to work. known_hosts is
-            # read-write by design; config is a ``--ro-bind``, which already refuses writes honestly
-            # (EROFS). Over-mounting either here would undo the re-allow.
+            # known_hosts / config were deliberately bound BACK for ssh to work, each a ``--ro-bind``,
+            # which already refuses writes honestly (EROFS). Over-mounting either here would undo the
+            # re-allow.
             continue
         if _shadowed_by(f, roots):
             # Inside a tmpfs the content is already gone, but a WRITE would SILENTLY SUCCEED and
             # evaporate — measured live: planting ~/.ssh/authorized_keys under agent mode returned
             # rc=0 while the host file stayed absent. The attack fails; the REPORT lies, which is the
             # `absence_of_signal_rendered_as_health` shape this module refuses elsewhere (it is why
-            # `--remount-ro` is paired onto every jewel tmpfs). The ssh tmpfs CANNOT be remounted
-            # read-only because known_hosts has to stay writable, so the honesty is restored per-file
-            # on exactly the paths that matter: the vectors are a fixed, enumerable list.
+            # `--remount-ro` is paired onto every jewel tmpfs). The ssh tmpfs is not remounted
+            # read-only (it was written when known_hosts had to stay writable, and the per-file masks
+            # land in it), so the honesty is restored per-file on exactly the paths that matter: the
+            # vectors are a fixed, enumerable list.
             # ⚡ AND THE MOUNTPOINT LANDS INSIDE THE TMPFS, so unlike the missing-file case below this
             # costs NO host mutation at all — bwrap creates it in the ephemeral filesystem.
             masks.append(str(f))
