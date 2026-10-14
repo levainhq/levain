@@ -828,8 +828,9 @@ def _ssh_agent_refusal(p: str) -> str | None:
     socket the operator's ``$SSH_AUTH_SOCK`` names now, or as gpg-agent's ssh socket (gpgconf's path),
     under any name; or, on Linux, what listens on it is an ``ssh-agent``, gnome-keyring or a gpg-agent (by
     ``/proc/<pid>/comm``), wherever it is and whatever levain's environment holds, except gpg-agent's
-    extra socket at a path gpgconf names. A socket nobody answers on is not refused here (the grant check owns liveness). Off Linux, an agent
-    at a path neither names is not recognised (a stated limit). Doctor (:func:`load_operator_grants`)
+    extra socket at a path gpgconf names. A socket nobody answers on is not refused here (the grant
+    check owns liveness). Off Linux, an agent at a path neither names is not recognised (a stated
+    limit). Doctor (:func:`load_operator_grants`)
     and the spawn (:func:`resolve_grant`) both call this."""
     ambient = os.environ.get("SSH_AUTH_SOCK")
     if ambient and os.path.isabs(ambient) and _same_socket(ambient, p):
