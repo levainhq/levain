@@ -1056,6 +1056,8 @@ def start_session_ssh_agent(entity: str, *, system: str | None = None, ssh_mode:
         return None, str(exc)
     except OSError as exc:
         return None, f"ssh-agent could not be started ({exc.strerror or exc})"
+    except subprocess.SubprocessError as exc:
+        return None, f"ssh-agent could not be started ({exc})"
 
 
 def _default_grant_ops() -> list[str]:
