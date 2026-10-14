@@ -514,6 +514,7 @@ def test_one_generator_gives_the_tier_each_waiver_the_defaults_ssh_and_the_ignor
     grants([{"path": "/run/user/1/gnupg/S.gpg-agent.extra", "name": "gpg", "why": "signing"},
             {"path": "/run/user/1/podman/podman.sock", "name": "podman", "why": "builds"}])
     monkeypatch.setattr(L, "host_read", lambda system=None: (8, None))
+    monkeypatch.setattr(conf._ssh_agent, "openssh_problem", lambda: None)
     lines = conf.unix_socket_lines(SimpleNamespace(runtime_sockets=("podman/podman.sock",), hands_user=None),
                                    system="Linux")
     assert lines[0] == L.tier_line(8)
@@ -521,7 +522,7 @@ def test_one_generator_gives_the_tier_each_waiver_the_defaults_ssh_and_the_ignor
                         + conf.GPG_EXTRA_WAIVER)
     assert lines[2] == "waiver (operator grant) podman: /run/user/1/podman/podman.sock (builds)"
     assert lines[3] == "default grant: /dev/log (write-only syslog)"
-    assert lines[4].startswith("ssh agent: none until levain's scoped agent (B2)")
+    assert lines[4].startswith("ssh agent: levain starts a scoped one for each session's bash, never yours")
     assert lines[5].startswith("ignored: runtime_sockets in .levain/confinement.json (podman/podman.sock)")
     monkeypatch.setattr(L, "host_read", lambda system=None: (0, None))
     mac = conf.unix_socket_lines(None, system="Darwin")
