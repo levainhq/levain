@@ -257,6 +257,8 @@ from typing import Any, Callable, Literal, NoReturn
 # are stdlib-only leaves, so this adds no dependency weight.
 from levain.firing.gate import GATE_SETTINGS, GateSetting
 from levain.firing import landlock as _landlock
+from levain.firing import ssh_agent as _ssh_agent
+from levain.firing.ssh_agent import RUN_DIR as AGENT_RUN_DIR
 
 __all__ = [
     "SANDBOX_EXEC",
@@ -1674,6 +1676,9 @@ def build_policy(
     # The operator's unix-socket grants (:func:`grants_file`): hidden both ways, so no confined process
     # can read, write, create or rename what decides which sockets it may reach.
     subtrees.append((levain_home / GRANTS_DIR).resolve())
+    # The scoped ssh agents' sockets and records (:mod:`levain.firing.ssh_agent`): hidden the same way,
+    # so bash reaches its agent only through the one socket bound into its view, and cannot replace it.
+    subtrees.append((levain_home / AGENT_RUN_DIR).resolve())
     project_subtrees, trust_spellings, store_links = _project_memory_jewels(home)
     subtrees.extend(project_subtrees)
     listed_dirs = _trust_listed_stores(home, ed, ws)
@@ -1905,6 +1910,7 @@ def build_policy(
     # sidecars after.
     sidecars: list[Path] = []
     known_dirs = {*listed_dirs, *_spellings("~/.levain-runtime/floor"), (levain_home / GRANTS_DIR).resolve(),
+                  (levain_home / AGENT_RUN_DIR).resolve(),
                   *(sp for h in gnupg_homes for sp in _spellings(h / "private-keys-v1.d"))}
     for jewel in _dedup(subtrees + files):
         if jewel in known_dirs and not jewel.is_file():
