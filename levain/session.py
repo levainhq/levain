@@ -906,7 +906,7 @@ class EntitySession:
             # The scoped ssh agent, before the binding that carries it and the first bash command: an
             # operator-floor bash only (a hands user's shell is not the operator's to give keys to).
             if cfg is not None and bash_ok and hands_id is None:
-                scoped_agent, ssh_agent_note = start_session_ssh_agent(entity_dir.name)
+                scoped_agent, ssh_agent_note = start_session_ssh_agent(entity_dir.name, ssh_mode=ssh_mode)
             conv_binding = (
                 ConversationBinding.create(
                     entity_dir, mode=mode, workspace=workspace, config=cfg, hands=hands_id,

@@ -239,9 +239,12 @@ def test_the_session_close_stops_its_agent(home, tmp_path):
 
 @pytest.fixture
 def keyed(home, tmp_path, monkeypatch):
-    """A running agent, a client key, and a manifest holding one host key for ``git.example.test``."""
+    """A running agent, a client key under ``~/.ssh`` (HOME is ``tmp_path``), and a manifest holding one
+    host key for ``git.example.test``."""
     monkeypatch.setattr(ssh_agent, "_no_new_privs", lambda: False)
-    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(tmp_path / "id")], check=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".ssh").mkdir(mode=0o700)
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(tmp_path / ".ssh" / "id")], check=True)
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(tmp_path / "hostkey")], check=True)
     (home / "ssh").mkdir(mode=0o700)
     manifest = home / "ssh" / "known_hosts"
@@ -249,7 +252,7 @@ def keyed(home, tmp_path, monkeypatch):
                         + (tmp_path / "hostkey.pub").read_text().split(" ", 2)[1] + "\n")
     os.chmod(manifest, 0o600)
     agent = ssh_agent.start(entity="ent")
-    return agent, tmp_path / "id", manifest
+    return agent, tmp_path / ".ssh" / "id", manifest
 
 
 def _listed(agent):
@@ -263,7 +266,7 @@ def test_a_key_goes_in_limited_to_its_host_and_is_recorded(keyed):
     fp = ssh_agent.fingerprint(key)
     assert f"pid {agent.pid}, peer checked" in line and "for git.example.test" in line
     # the manifest key the limit binds to, by fingerprint, so the operator can check it (L1 #1)
-    host_fp = ssh_agent.fingerprint(key.parent / "hostkey.pub")
+    host_fp = ssh_agent.fingerprint(key.parent.parent / "hostkey.pub")
     assert f"bound to git.example.test's host key in {_manifest.resolve()}: {host_fp} (ED25519)" in line
     assert fp in _listed(agent)
     [k] = ssh_agent.read_record(agent.dir)["keys"]
@@ -299,6 +302,31 @@ def test_refusals_add_nothing(keyed, monkeypatch):
         ssh_agent.add_key(key, ["git.example.test"], system="Linux")
     monkeypatch.setattr(ssh_agent, "_no_new_privs", lambda: True)
     with pytest.raises(ssh_agent.AgentError, match="no_new_privs"):
+        ssh_agent.add_key(key, ["git.example.test"], system="Linux")
+    assert "no identities" in _listed(agent)
+
+
+def test_a_key_file_bash_could_read_is_refused(keyed, tmp_path):
+    """L2 #2: re-adding a held key replaces its constraints, so a key file bash can read lets bash strip
+    the -h limit. Only a key under ~/.ssh (one link) of an ssh_mode=agent entity goes in."""
+    agent, key, _ = keyed
+    outside = tmp_path / "keys"
+    outside.mkdir()
+    shutil.copy(key, outside / "deploy")
+    os.chmod(outside / "deploy", 0o600)
+    with pytest.raises(ssh_agent.AgentError, match="not a file only under"):
+        ssh_agent.add_key(outside / "deploy", ["git.example.test"], system="Linux")
+    os.symlink(outside / "deploy", key.parent / "via_link")   # resolves outside ~/.ssh
+    with pytest.raises(ssh_agent.AgentError, match="not a file only under"):
+        ssh_agent.add_key(key.parent / "via_link", ["git.example.test"], system="Linux")
+    os.link(key, outside / "hard")                            # a second name bash could read
+    with pytest.raises(ssh_agent.AgentError, match="links: 2"):
+        ssh_agent.add_key(key, ["git.example.test"], system="Linux")
+    os.unlink(outside / "hard")
+    rec = ssh_agent.read_record(agent.dir)
+    rec["ssh_mode"] = "raw"
+    ssh_agent.write_record(agent.dir, rec)
+    with pytest.raises(ssh_agent.AgentError, match="ssh_mode=raw"):
         ssh_agent.add_key(key, ["git.example.test"], system="Linux")
     assert "no identities" in _listed(agent)
 
