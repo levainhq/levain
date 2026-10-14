@@ -6,6 +6,13 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Security
+
+- **`levain doctor` pins the hook files the agents run, and says what changed.** It records a pin over Claude Code's hook entries (`.claude/settings.json` and `settings.local.json`), the scripts under `.claude/hooks/` and `activation/hooks/`, and Codex's `hooks.json`, in `.levain/agent_hook_pins.json`. The first run trusts what is there (a warning says so). A later run that finds any of them changed fails, naming the file and the old and new digest. The script contents are pinned, not only the settings entry, because Claude Code does not notice an edited hook script. If you made the change, `levain doctor --repin-hooks` records it. Doctor never edits your settings.
+- **`levain doctor` warns when Claude Code's own sandbox is off for the workspace.** It reads `sandbox.enabled` the way the host guard reads managed settings (managed, then the workspace's local and shared settings, then yours); none set means off.
+- **`.codex` is now write-denied to hosted Claude Code's Bash**, like `.claude`. A sandboxed model's Bash could create `<workspace>/.codex/config.toml`.
+- **Known edge:** in your own mode (skip-permissions, no Claude Code sandbox) a model's Bash edit of hook files is not stopped; doctor finds it afterwards.
+
 ## [0.10.2] — 2026-10-13
 
 A security fix. Upgrade if Levain runs bash on Linux where you use gpg, or if you use the cockpit's signing keys.

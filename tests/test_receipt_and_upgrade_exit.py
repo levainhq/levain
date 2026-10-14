@@ -166,7 +166,7 @@ def _stub_doctor(monkeypatch, tmp_path: Path, results: list[CheckResult]) -> Pat
     monkeypatch.setattr(inst, "effective_adapter", lambda _p: "claude-code")
     for name in ("_check_install_layout", "_check_hook_freshness", "_check_activation_scope",
                  "_check_seed_content", "_check_recorded_answers", "_check_runtime",
-                 "_check_store", "_check_compat_set"):
+                 "_check_store", "_check_compat_set", "_check_agent_hook_pins", "_check_cc_sandbox"):
         monkeypatch.setattr(doctor, name, lambda *_a, **_k: [])
     monkeypatch.setattr(doctor, "_check_claude_code", lambda _p: list(results))
     return install

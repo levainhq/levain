@@ -37,7 +37,8 @@ from typing import Any, Literal, Mapping, Sequence
 __all__ = [
     "HostRefusal", "CCHostProfile", "cc_host_profile", "cc_writable_roots", "is_within",
     "host_dir", "cc_sandbox_block", "check_sandbox_types", "cc_hook_settings", "cc_mcp_config",
-    "hook_pin", "check_or_record_pin", "repin", "check_managed_settings", "host_env",
+    "hook_pin", "check_or_record_pin", "repin", "agent_hook_pins", "check_agent_hook_pins",
+    "repin_agent_hooks", "cc_sandbox_state", "check_managed_settings", "host_env",
     "parse_cc_version", "CC_HOSTED_TOOLS", "CC_VERSION_FLOOR",
     "check_shared_code", "codex_initialize_params", "codex_config_overrides",
     "security_inputs_digest",
@@ -69,7 +70,9 @@ CC_VERSION_FLOOR = (2, 1, 285)
 CC_HOSTED_TOOLS = ("Bash", "Read")
 
 
-PROTECTED_NAMES = frozenset({"activation", ".levain", ".claude", ".git", ".mcp.json"})
+# `.codex`: r3a measured a sandboxed model Bash creating <ws>/.codex/config.toml in hosted CC
+# (1013-consent/R3A_RESULT.md), the workspace config Codex reads for hooks and its own sandbox.
+PROTECTED_NAMES = frozenset({"activation", ".levain", ".claude", ".codex", ".git", ".mcp.json"})
 
 _ENV_ALLOW = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TERM", "TMPDIR"})
 _ENV_ALLOW_PREFIXES = ("LC_",)
@@ -395,6 +398,132 @@ def repin(entity: str | os.PathLike[str], state_dir: Path) -> str:
     current = hook_pin(ent)
     _write_pin(state_dir, ent, current)
     return current
+
+
+# ---------------------------------------------------------------------------- agent hook pins
+# `levain doctor` pins what the agents run on the operator's say-so: Claude Code's hook entries
+# (a settings file can name any command) AND the scripts those entries run, because Claude Code
+# does not notice an edited hook SCRIPT (Q0 item 8, measured). Doctor only DETECTS: the pin file
+# is Levain's own state under `.levain/`; the agents' settings are never written.
+
+_AGENT_PIN_FILE = Path(".levain") / "agent_hook_pins.json"
+
+
+def _sha_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _hooks_entry_digest(path: Path) -> str:
+    if not path.exists():
+        return "absent"
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "unparseable"
+    hooks = doc.get("hooks") if isinstance(doc, dict) else None
+    return _sha_bytes(json.dumps(hooks, sort_keys=True).encode())
+
+
+def _dir_digest(root: Path) -> str:
+    """sha256 over every file under ``root`` (relative path and bytes), links followed by name
+    only: a symlink contributes its target string, so retargeting one changes the digest."""
+    if not os.path.lexists(root):
+        return "absent"
+    h = hashlib.sha256()
+    for cur, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        for f in sorted(files + [d for d in dirs if os.path.islink(os.path.join(cur, d))]):
+            p = os.path.join(cur, f)
+            rel = os.fsencode(os.path.relpath(p, root))
+            if os.path.islink(p):
+                h.update(rel + b"\0link\0" + os.fsencode(os.readlink(p)))
+                continue
+            try:
+                with open(p, "rb") as fh:
+                    h.update(rel + b"\0" + hashlib.sha256(fh.read()).digest())
+            except OSError:
+                h.update(rel + b"\0unreadable")
+    return h.hexdigest()
+
+
+def agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
+                    ) -> dict[str, str]:
+    """Component name -> digest for every file the agents run hooks from for this install."""
+    ent = Path(os.path.abspath(install))
+    cc = ent / ".claude"
+    try:
+        scripts = hook_pin(ent)
+    except HostRefusal as exc:
+        scripts = f"refused: {exc}"
+    ch = Path(codex_home) if codex_home is not None else Path(
+        os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+    cj = ch / "hooks.json"
+    return {
+        ".claude/settings.json hooks": _hooks_entry_digest(cc / "settings.json"),
+        ".claude/settings.local.json hooks": _hooks_entry_digest(cc / "settings.local.json"),
+        ".claude/hooks/ (scripts)": _dir_digest(cc / "hooks"),
+        "activation/hooks/ (scripts)": scripts,
+        f"{cj} (Codex)": _sha_bytes(cj.read_bytes()) if cj.is_file() else "absent",
+    }
+
+
+def _read_agent_pins(ent: Path) -> dict[str, str] | None:
+    try:
+        rec = json.loads((ent / _AGENT_PIN_FILE).read_text(encoding="utf-8"))
+        pins = rec.get("pins")
+        return pins if isinstance(pins, dict) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def repin_agent_hooks(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
+                      ) -> dict[str, str]:
+    """The operator's explicit act: record the pins as they are now."""
+    ent = Path(os.path.abspath(install))
+    pins = agent_hook_pins(ent, codex_home)
+    tmp = ent / ".levain" / f".agent_hook_pins.{os.getpid()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"entity": str(ent), "pins": pins}, fh, indent=1, sort_keys=True)
+    os.replace(tmp, ent / _AGENT_PIN_FILE)
+    return pins
+
+
+def check_agent_hook_pins(install: str | os.PathLike[str], codex_home: str | os.PathLike[str] | None = None
+                          ) -> tuple[Literal["recorded", "match", "changed"], list[str]]:
+    """Trust on first use, then compare. Returns the status and one named line per changed
+    component ("<what>: was <old>, now <new>"). Never edits an agent settings file."""
+    ent = Path(os.path.abspath(install))
+    old = _read_agent_pins(ent)
+    if old is None:
+        repin_agent_hooks(ent, codex_home)
+        return "recorded", []
+    now = agent_hook_pins(ent, codex_home)
+    diffs = [f"{k}: was {old.get(k, 'not pinned')[:12]}, now {now[k][:12]}"
+             for k in now if old.get(k) != now[k]]
+    return ("changed" if diffs else "match"), diffs
+
+
+def cc_sandbox_state(install: str | os.PathLike[str], home: str | os.PathLike[str] | None = None,
+                     managed: Sequence[tuple[str, Any]] | None = None) -> tuple[bool, str]:
+    """Is Claude Code's own sandbox on for this workspace? Claude Code's order: managed settings,
+    then the workspace's local settings, the workspace's settings, the user's. The first layer that
+    sets ``sandbox.enabled`` decides; none set means OFF (CC's default). Returns (on, source)."""
+    ent = Path(os.path.abspath(install))
+    hm = Path(home) if home is not None else Path(os.path.expanduser("~"))
+    docs: list[tuple[str, Any]] = list(load_managed_settings() if managed is None else managed)
+    for p in (ent / ".claude" / "settings.local.json", ent / ".claude" / "settings.json",
+              hm / ".claude" / "settings.json"):
+        if p.exists():
+            try:
+                docs.append((str(p), json.loads(p.read_text(encoding="utf-8"))))
+            except (OSError, ValueError):
+                docs.append((str(p), _MISSING))
+    for path, doc in docs:
+        v = _get(doc, ("sandbox", "enabled")) if isinstance(doc, Mapping) else _MISSING
+        if v is not _MISSING:
+            return v is True, path
+    return False, "no settings layer sets sandbox.enabled (Claude Code's default is off)"
 
 
 _ANNEAL_BIN = re.compile(r'^_INSTALL_ANNEAL_BIN\s*=\s*"([^"]*)"', re.M)

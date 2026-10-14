@@ -220,6 +220,14 @@ def main(argv: list[str] | None = None) -> int:
             "Codex 0.132/0.133 where hook trust is per-content-hash."
         ),
     )
+    doc_p.add_argument(
+        "--repin-hooks",
+        action="store_true",
+        help=(
+            "Record the agent hook entries and hook scripts as they are now, after you "
+            "changed them on purpose. Doctor reports a changed pin until you do."
+        ),
+    )
     doc_p.set_defaults(func=_cmd_doctor)
 
     vh_p = subparsers.add_parser(
@@ -1319,7 +1327,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 def _cmd_doctor(args: argparse.Namespace) -> int:
     from levain.doctor import run_doctor
 
-    return run_doctor(path=args.path, invoke=args.invoke)
+    return run_doctor(path=args.path, invoke=args.invoke, repin_hooks=args.repin_hooks)
 
 
 def _cmd_verify_hooks(args: argparse.Namespace) -> int:
