@@ -194,7 +194,7 @@ def test_an_agent_restarted_on_its_path_closes_the_shell_though_the_socket_kept_
     def shell():
         sh = conf._BwrapShell(policy=None, manifest={a.socket: held}, argv=["/bin/false"],  # type: ignore[arg-type]
                               cwd=home, env={})
-        sh._agent = (a.socket, a.pid)
+        sh._agent = (a.socket, a.pid, conf._process_start(a.pid))
         return sh
 
     with pytest.raises(conf.ConfinementError, match="not running"):   # the started agent answers: checks pass
@@ -220,6 +220,56 @@ def test_an_agent_restarted_on_its_path_closes_the_shell_though_the_socket_kept_
         rogue.wait(5)
     with pytest.raises(conf.ConfinementError, match="cannot be checked"):   # nobody answers: refused too
         shell().run("echo x")
+
+
+@needs_openssh
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the start time is read from /proc (Linux)")
+def test_a_reused_pid_answering_on_the_path_closes_the_shell(home, monkeypatch):
+    """L3 b2a r1 (codex MED): a replacement agent that got both the freed inode and the recorded pid back
+    passed the peer-pid check. The pid's start time is compared too. The agent and both reads are real;
+    the reuse is stood in for by recording a start time the answering process does not have."""
+    import levain.firing.confinement as conf
+
+    monkeypatch.setattr(conf, "_refuse_plantable_sqlite_jewels", lambda policy: None)
+    a = ssh_agent.start()
+    held = conf._identity(Path(a.socket))
+    started = conf._process_start(a.pid)
+    assert started is not None and started.isdigit()
+
+    def shell(start):
+        sh = conf._BwrapShell(policy=None, manifest={a.socket: held}, argv=["/bin/false"],  # type: ignore[arg-type]
+                              cwd=home, env={})
+        sh._agent = (a.socket, a.pid, start)
+        return sh
+
+    try:
+        with pytest.raises(conf.ConfinementError, match="not running"):   # the same process: checks pass
+            shell(started).run("echo x")
+        sh = shell(str(int(started) + 1))   # same pid, another process
+        with pytest.raises(conf.ConfinementError, match=rf"pid {a.pid}, but that pid is not the process"):
+            sh.run("echo x")
+        assert sh._closed
+        with pytest.raises(conf.ConfinementError, match="recorded unreadable"):   # fail-closed
+            shell(None).run("echo x")
+    finally:
+        ssh_agent.stop(a)
+
+
+def test_the_process_start_time_is_field_22_read_after_the_last_paren(tmp_path, monkeypatch):
+    """comm may hold `)` and spaces; field 22 is counted from after the last one."""
+    import builtins
+
+    import levain.firing.confinement as conf
+
+    line = "4242 (a) b c) S " + " ".join(str(n) for n in range(4, 22)) + " 987654 23 24\n"
+    real_open = builtins.open
+    monkeypatch.setattr(builtins, "open", lambda p, *a, **k: real_open(tmp_path / "stat", *a, **k)
+                        if p == "/proc/4242/stat" else real_open(p, *a, **k))
+    (tmp_path / "stat").write_text(line)
+    assert conf._process_start(4242) == "987654"
+    (tmp_path / "stat").write_text("4242 (no close paren S 1 2")
+    assert conf._process_start(4242) is None
+    assert conf._process_start(2 ** 22 + 7) is None   # above any pid_max: no such process
 
 
 @needs_openssh
