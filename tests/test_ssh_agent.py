@@ -16,8 +16,10 @@ import pytest
 
 import levain.firing.ssh_agent as ssh_agent
 
-pytestmark = pytest.mark.skipif(ssh_agent.openssh_problem() is not None,
-                                reason=f"no usable OpenSSH here: {ssh_agent.openssh_problem()}")
+# Only the tests that run OpenSSH skip without it (L1 #12): the binding shape and the no-agent paths
+# run everywhere, so a regression in them never goes silent on a host without ssh tools.
+needs_openssh = pytest.mark.skipif(ssh_agent.openssh_problem() is not None,
+                                   reason=f"no usable OpenSSH here: {ssh_agent.openssh_problem()}")
 
 
 @pytest.fixture
@@ -41,6 +43,7 @@ def home(monkeypatch):
     shutil.rmtree(d, ignore_errors=True)
 
 
+@needs_openssh
 def test_the_agent_starts_on_a_private_socket_and_answers_with_its_own_pid(home):
     a = ssh_agent.start(entity="e1")
     assert Path(a.socket).parent == ssh_agent.run_root() / a.session_id
@@ -58,6 +61,7 @@ def test_the_agent_starts_on_a_private_socket_and_answers_with_its_own_pid(home)
     assert not a.dir.exists()
 
 
+@needs_openssh
 def test_ssh_add_s_cannot_make_the_agent_load_a_provider(home):
     a = ssh_agent.start()
     env = dict(os.environ, SSH_AUTH_SOCK=a.socket)
@@ -67,6 +71,7 @@ def test_ssh_add_s_cannot_make_the_agent_load_a_provider(home):
     assert "refused" in done.stderr
 
 
+@needs_openssh
 def test_a_session_dir_under_a_directory_others_can_write_is_refused(home):
     os.chmod(home, 0o777)
     with pytest.raises(ssh_agent.AgentError, match="can be written by another user"):
@@ -74,6 +79,7 @@ def test_a_session_dir_under_a_directory_others_can_write_is_refused(home):
     assert not any(n for n in os.listdir(home / "run")), "the refused session left its directory"
 
 
+@needs_openssh
 def test_a_socket_path_too_long_for_a_unix_socket_is_refused(monkeypatch, home):
     deep = home / ("d" * 90)
     deep.mkdir(mode=0o700)
@@ -82,6 +88,7 @@ def test_a_socket_path_too_long_for_a_unix_socket_is_refused(monkeypatch, home):
         ssh_agent.start()
 
 
+@needs_openssh
 def test_a_dead_levains_agent_is_swept_and_a_live_ones_is_not(home):
     mine = ssh_agent.start()
     orphan = ssh_agent.start()
@@ -104,6 +111,7 @@ def test_a_dead_levains_agent_is_swept_and_a_live_ones_is_not(home):
     assert ssh_agent.peer_pid(mine.socket) == mine.pid
 
 
+@needs_openssh
 def test_a_record_whose_pid_is_not_the_socket_peer_is_never_signalled(home):
     a = ssh_agent.start()
     bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
@@ -120,9 +128,10 @@ def test_a_record_whose_pid_is_not_the_socket_peer_is_never_signalled(home):
 
 
 def test_the_binding_form_round_trips_and_refuses_another_shape():
-    a = ssh_agent.ScopedAgent("0123456789ab", "/h/run/0123456789ab/agent.sock", 4242)
+    a = ssh_agent.ScopedAgent("0123456789ab", str(ssh_agent.run_root() / "0123456789ab" / "agent.sock"), 4242)
     assert ssh_agent.ScopedAgent.from_params(a.to_params()) == a
-    for bad in ({**a.to_params(), "socket": "/h/run/ffffffffffff/agent.sock"},
+    for bad in ({**a.to_params(), "socket": str(ssh_agent.run_root() / "ffffffffffff" / "agent.sock")},
+                {**a.to_params(), "socket": "/h/run/0123456789ab/agent.sock"},   # not under run_root()
                 {**a.to_params(), "pid": True}, {**a.to_params(), "extra": 1}, "x"):
         with pytest.raises(ssh_agent.AgentError):
             ssh_agent.ScopedAgent.from_params(bad)
@@ -137,7 +146,7 @@ def test_the_binding_carries_the_agent_and_refuses_it_beside_a_hands_user(tmp_pa
 
     ent = tmp_path / "ent"
     (ent / ".levain").mkdir(parents=True)
-    a = ssh_agent.ScopedAgent("0123456789ab", "/h/run/0123456789ab/agent.sock", 4242)
+    a = ssh_agent.ScopedAgent("0123456789ab", str(ssh_agent.run_root() / "0123456789ab" / "agent.sock"), 4242)
     b = ConversationBinding.create(ent, mode="interactive", workspace=tmp_path / "ws", ssh_agent=a)
     params = json.loads(json.dumps(b.to_params()))   # JSON, as the SDK's autosave keeps it
     assert ConversationBinding.from_params(params).ssh_agent == a
@@ -150,6 +159,7 @@ def test_the_binding_carries_the_agent_and_refuses_it_beside_a_hands_user(tmp_pa
         ConversationBinding.from_params(params)
 
 
+@needs_openssh
 def test_the_spawn_binds_the_agent_only_while_its_started_pid_answers(home, tmp_path):
     from levain.firing.confinement import ConfinementError, _ssh_agent_ops
 
@@ -169,6 +179,7 @@ def test_the_spawn_binds_the_agent_only_while_its_started_pid_answers(home, tmp_
         _ssh_agent_ops(a, [rt])
 
 
+@needs_openssh
 def test_an_agent_restarted_on_its_path_closes_the_shell_though_the_socket_kept_its_inode(home, monkeypatch):
     """VM item 11 (T9, 2026-10-14): the operator's agent was killed and another started on the same
     path; ext4 gave the new socket the freed inode (12/12), so the manifest saw nothing and bash's
@@ -211,6 +222,7 @@ def test_an_agent_restarted_on_its_path_closes_the_shell_though_the_socket_kept_
         shell().run("echo x")
 
 
+@needs_openssh
 def test_gits_ssh_names_the_scoped_agent_over_any_identity_agent_in_the_ssh_config(tmp_path):
     """L2 #3: an `IdentityAgent` in ~/.ssh/config (1Password, Secretive, gpg) overrides $SSH_AUTH_SOCK;
     a command-line -o wins over the config file. Read back by ssh itself (`ssh -G`), not by eye."""
@@ -241,6 +253,7 @@ def test_no_agent_is_started_where_it_is_not_bound_into_bash(home):
     assert not (home / "run").exists()
 
 
+@needs_openssh
 def test_the_session_close_stops_its_agent(home, tmp_path):
     from levain.session import EntitySession
 
@@ -263,6 +276,8 @@ def test_the_session_close_stops_its_agent(home, tmp_path):
 def keyed(home, tmp_path, monkeypatch):
     """A running agent, a client key under ``~/.ssh`` (HOME is ``tmp_path``), and a manifest holding one
     host key for ``git.example.test``."""
+    if ssh_agent.openssh_problem() is not None:
+        pytest.skip(f"no usable OpenSSH here: {ssh_agent.openssh_problem()}")
     monkeypatch.setattr(ssh_agent, "_no_new_privs", lambda: False)
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / ".ssh").mkdir(mode=0o700)
@@ -356,8 +371,32 @@ def test_a_key_file_bash_could_read_is_refused(keyed, tmp_path):
 def test_the_waiver_adds_for_any_host_and_is_recorded_as_one(keyed):
     agent, key, _ = keyed
     line = ssh_agent.add_key(key, [], waive_destinations=True, system="Linux")
-    assert "ANY host" in line
+    assert "ANY host, including hosts it is forwarded to" in line
     assert ssh_agent.read_record(agent.dir)["keys"][0]["waived"] is True
+
+
+def test_ssh_add_t_0_is_refused_not_turned_into_the_default(keyed, capsys, monkeypatch):
+    """L1 #6: `-t 0` became 8 hours (`args.lifetime or DEFAULT`)."""
+    from levain.cli import main
+
+    _agent, key, _ = keyed
+    monkeypatch.setattr(ssh_agent, "confinement_refusal", lambda system=None: None)   # the Linux branch, here
+    assert main(["ssh-add", str(key), "-h", "git.example.test", "-t", "0"]) == 1
+    assert "-t must be between 1 and" in capsys.readouterr().err
+    assert "no identities" in _listed(_agent)
+
+
+def test_a_forged_line_in_a_key_comment_does_not_list_a_key(keyed, tmp_path):
+    """L2 #10: a key comment is the adder's text; one carrying a newline and an ssh-add -l shaped line
+    must not make run/doctor show a fingerprint the agent does not hold."""
+    agent, _key, _ = keyed
+    forged = "SHA256:" + "A" * 43
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"x\n256 {forged} y (ED25519)",
+                    "-f", str(tmp_path / "evil")], check=True)
+    subprocess.run(["ssh-add", "-q", str(tmp_path / "evil")], env=dict(os.environ, SSH_AUTH_SOCK=agent.socket),
+                   check=True, capture_output=True)
+    held = ssh_agent._held(agent.socket)
+    assert held == [ssh_agent.fingerprint(tmp_path / "evil")] and forged not in held
 
 
 def test_two_sessions_need_a_session_id(keyed):
