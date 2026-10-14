@@ -6,6 +6,25 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+## [0.10.3] — 2026-10-14
+
+The cockpit's visual pass. No change to what a write needs, to the floor, or to any stored format.
+
+### Changed
+
+- **The cockpit page has one visual system.** Type, spacing and radii are tokens (seven font sizes, four weights, a nine-step space scale, four radii); the accent colour is kept to a short list of uses, and errors and "unavailable" read as a status dot with neutral text instead of orange; glows, gradients and pressed-button offsets are gone, and `prefers-reduced-motion` stops the motion. Monospace is for identifiers and uppercase for section labels only.
+- **Every row has one shape.** The text runs full width, a meta line sits under it, and the row's verbs sit at the meta line's right as small text buttons that fade in without moving the row. The Tray shows edit, schedule and dismiss; other panels show the first three verbs the kernel offers, and the rest sit in a keyboard-reachable `···` menu. On a narrow row every verb moves into that menu. Rows clamp at three lines.
+- **The hero is one control row**: the mode segment, the status counts, Sync, Ambient and Jump, with the jar (now in the accent orange). Below about 880px of width the controls regroup instead of wrapping one at a time.
+- **The zone grid fills its last row in every mode**, and a panel that scrolls shows a fade at its bottom edge instead of a glyph over the text. The team view uses the same fade.
+- **The Cognition chart draws its three series in three hues** (links in the accent, episodes and graduations in two chart-only colours), and on the Build tab the chart fits its card with no inner scroll.
+- **List filters and episode search share one box style**, and the Tray's filter and order select are one box.
+- **Team ledger callers go through one interface** (`levain.team.ledger_api`: `LedgerTransport`, `open_ledger`, `require_git_wire`). Commands that only work on a git-backed ledger say so through `require_git_wire`. `levain team status` and `doctor` print the same lines as before.
+
+### Fixed
+
+- **The Cognition chart's settled traces no longer draw dotted** in engines that dash a non-scaling stroke.
+- **The overflow menu returns focus to its trigger** when it closes.
+
 ## [0.10.2] — 2026-10-13
 
 A security fix. Upgrade if Levain runs bash on Linux where you use gpg, or if you use the cockpit's signing keys.
