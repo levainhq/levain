@@ -613,7 +613,7 @@
     region.replaceChildren(...cards);
     region.hidden = !entries.length;
     const hw = document.getElementById("ck-h-widgets"); if (hw) hw.hidden = region.hidden;
-    region.style.setProperty("--ck-n", String(Math.max(1, entries.length)));
+    region.style.setProperty("--ck-n", String(Math.max(4, entries.length)));   // four tracks at least: a lone widget keeps its width
   }
 
   function ckPlaceholder(entry) {

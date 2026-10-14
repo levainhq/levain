@@ -303,7 +303,7 @@
     return { ok: res.ok, status: res.status, data: data || {} };
   }
 
-  const NETWORK_MESSAGE = "no answer: the request may or may not have landed. Re-read the page to see; sending it again lands once only if it carries a key.";
+  const NETWORK_MESSAGE = "Levain did not answer, so this change may not have been saved. Reload the page to see where it stands.";
   // answers after which the page's picture of the row or of the install is stale or unavailable
   const REREAD = new Set(["needs_intent", "stale", "tier_moved", "gesture_moved", "needs_broker", "standby", "not_built"]);
 
@@ -323,15 +323,39 @@
     }
   }
 
+  // What a person reads for an answer: a plain sentence, never a state code or an authority label. A landed write
+  // says nothing (the row shows the new content); only a write that did not land, or is still waiting, speaks.
+  const RESULT_WORDS = {
+    COMMITTED_INCOMPLETE: "Only part of that change was saved. Check the row.",
+    STALE: "That changed somewhere else first. The page reloaded; try again.",
+    REFUSED: "Levain refused that change.",
+    EXPIRED: "That request ran out of time. Try again.",
+    CANCELLED: "Cancelled.",
+    WAITING: "Waiting for your signature."
+  };
+  const FAULT_WORDS = {
+    stale: "That changed somewhere else first. The page reloaded; try again.",
+    needs_intent: "This needs a fresh confirmation. The page reloaded; try again.",
+    tier_moved: "This needs a fresh confirmation. The page reloaded; try again.",
+    gesture_moved: "This needs a fresh confirmation. The page reloaded; try again.",
+    needs_broker: "That cannot be done from this page right now.",
+    standby: "That cannot be done from this page right now.",
+    not_built: "That cannot be done from this page yet."
+  };
+  function resultWords(state) {
+    if (state === "COMMITTED" || state === "done") return null;
+    return RESULT_WORDS[state] || null;
+  }
+
   function fault(r, what) {
     const d = r.data || {};
     const code = d.error || "HTTP " + r.status;
-    const text = d.message || code;
+    const text = FAULT_WORDS[code] || d.message || "That did not go through.";
     if (REREAD.has(code) || r.status === 501) {
-      notice = { key: what.row_id || null, text: what.label + ": " + text + " (re-read)", cls: "err" };
+      notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);
       load({ passive: true });   // a re-read that never discards an open form: it defers while one is dirty
-      return { ok: false, error: code, message: text + " Re-read the page and try again." };
+      return { ok: false, error: code, message: text };
     }
     return { ok: false, error: code, message: text };
   }
@@ -349,7 +373,7 @@
     for (const k of Object.keys(params || {})) if (params[k] !== undefined) given[k] = params[k];
     params = given;
     if (action.gesture === "refused" || action.gesture === "laptop-only") {
-      return { ok: false, error: "gesture", message: label + " is " + action.gesture + " here: it cannot be done from this page." };
+      return { ok: false, error: "gesture", message: label + " cannot be done from this page." };
     }
     const t = action.target || {};
     const base = { verb: action.verb, panel_id: t.panel_id, params: params || {} };
@@ -381,7 +405,7 @@
         if (!d.ok) return fault(d, what);
         tier = d.data.tier; gesture = d.data.gesture;
         if (gesture === "refused" || gesture === "laptop-only") {
-          return { ok: false, error: "gesture", message: label + " is " + tier + " with these values, and its gesture is " + gesture + ": it cannot be done from this page." };
+          return { ok: false, error: "gesture", message: label + " cannot be done from this page." };
         }
         if (tier !== "C1") intent = gesture === "sign" ? "sign" : "reported";
       }
@@ -399,8 +423,9 @@
     if (!r.ok) return fault(r, what);
     const d = r.data;
     const state = typeof d.state === "string" && d.state ? d.state : "done";
-    notice = { key: base.row_id || null, text: label + ": " + state + (d.label ? " · " + d.label : ""), cls: state === "COMMITTED" || state === "done" ? "note" : "preview" };
-    paintNow(notice);
+    const words = resultWords(state);
+    notice = words ? { key: base.row_id || null, text: words, cls: state === "WAITING" ? "preview" : "err" } : null;
+    if (notice) paintNow(notice);
     await afterWrite();
     return { ok: true, data: d };
   }
@@ -484,7 +509,8 @@
     if (r.status < 500) { const after = readKeys(); delete after[slot]; writeKeys(after); }   // a 5xx is indeterminate: keep it
     if (!r.ok) return fault(r, { row_id: null, label: "cancel" });
     const d = r.data;
-    notice = { key: null, text: "cancel: " + (d.state || "done") + (d.label ? " · " + d.label : ""), cls: "note" };
+    const cancelWords = resultWords(d.state || "done");
+    notice = cancelWords ? { key: null, text: cancelWords, cls: "note" } : null;
     await afterWrite();
     return { ok: true, data: d };
   }

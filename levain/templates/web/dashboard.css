@@ -1177,7 +1177,7 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
   body.ke { --gutter-ke: 32px; }
   body.ke .hero { grid-template-columns: 1fr; }
   body.ke .hero .when { border-right: 0; padding-left: var(--gutter); }
-  body.ke .ck-widgets { grid-template-columns: repeat(var(--ck-n2, 2), minmax(0, 1fr)); }
+  body.ke .ck-widgets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   body.ke .ck-zgrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   body.ke .ck-zgrid > .panel.ck-span-2, body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: span 4; }
 }
@@ -1185,8 +1185,9 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
   body.ke { --gutter-ke: 16px; }
   body.ke .ck-widgets, body.ke .ck-zgrid { grid-template-columns: 1fr; }
   body.ke .ck-zgrid > .panel, body.ke .ck-zgrid > .panel.ck-span-2, body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: auto; }
-  body.ke .ck-zgrid > .panel { height: auto; max-height: 560px; }
+  body.ke .ck-zgrid > .panel, body.ke .ck-zgrid > .panel.ck-h-tall, body.ke .ck-zgrid > .panel.ck-h-medium, body.ke .ck-zgrid > .panel.ck-h-short { height: auto; max-height: 560px; }   /* the desktop heights are for a grid row; one column sizes to its content */
   body.ke .ck-card.w { height: auto; min-height: var(--widget-h); }
+  body.ke .panel .phead .src.fresh { display: none; }   /* "read 0s ago" pushed the expand control onto a line of its own at this width */
   body.ke .ck-brief-body .xbody.has-side { display: block; }
   .brief-side { border-left: 0; padding-left: 0; margin-top: var(--sp-6); }
 }
@@ -1242,7 +1243,9 @@ body.ke .row .verb-menu .verb-btn { text-align: left; }
 /* panel chrome follows the row: the edit-class chip and the expand control show on the card you are on */
 body.ke .panel .phead .chip, body.ke .panel .phead .pexpand { opacity: 0; transition: opacity var(--dur-micro) var(--ease-out); }
 body.ke .panel:hover .phead .chip, body.ke .panel:hover .phead .pexpand, body.ke .panel:focus-within .phead .chip, body.ke .panel:focus-within .phead .pexpand { opacity: 1; }
-@media (hover: none) { body.ke .panel .phead .chip, body.ke .panel .phead .pexpand { opacity: 1; } }
+@media (hover: none) { body.ke .panel .phead .pexpand { opacity: 1; } }
+/* the edit class (A / B / C) and a panel's source id ("section:state") are the kernel's bookkeeping, not something a person reads */
+body.ke .panel .phead .chip, body.ke .panel .phead .src:not(.fresh) { display: none; }
 body.ke .row:focus-visible { outline: 1px solid var(--hair-2); outline-offset: -1px; border-radius: var(--r-md); }
 body.ke .undo-btn {
   font: var(--fw-medium) var(--fs-meta)/var(--lh-list) var(--sans); letter-spacing: 0; text-transform: none; color: var(--label); background: none;

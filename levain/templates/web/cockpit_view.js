@@ -1438,29 +1438,15 @@
     for (const b of document.querySelectorAll("[data-mode-tab]")) b.setAttribute("aria-selected", b.dataset.modeTab === m ? "true" : "false");
     fillGrids();
   }
-  // The grids fill per mode: a mode hides cards, so the cards it keeps are measured and the last row's cards span the
-  // rest (Morning's single Work card takes the whole row; two widgets take half each). The zone grid is six tracks
-  // under three, four under two and one under one, so a card is `span (tracks / cards in the row)` tracks wide.
+  // The grids keep their designed widths whatever a mode hides (Phill 10-14: a lone widget or a lone Work card stretched
+  // across the page "looks like shit"): a card spans its own tracks and the last row stays short, left-aligned. Widgets sit
+  // on four tracks (more than four widgets open more); the zone grid is six tracks under three, four under two, one under one.
   function shown(n) { return getComputedStyle(n).display !== "none"; }
   function fillGrids() {
     if (typeof getComputedStyle !== "function") return;   // a harness without layout
     for (const w of document.querySelectorAll(".ck-widgets")) {
       const n = Array.from(w.children).filter(shown).length;
-      if (n) { w.style.setProperty("--ck-n", String(n)); w.style.setProperty("--ck-n2", String(Math.min(n, 2))); }   // the two-column breakpoint reads the capped count
-    }
-    for (const grid of document.querySelectorAll(".ck-zgrid")) {
-      const kids = Array.from(grid.children);
-      for (const k of kids) k.style.gridColumn = "";
-      const tracks = getComputedStyle(grid).gridTemplateColumns.split(" ").length;
-      const per = tracks >= 6 ? 3 : tracks >= 4 ? 2 : 1;
-      if (per < 2) continue;
-      let row = [], used = 0;
-      for (const k of kids.filter(shown)) {
-        const w = Math.min(per, k.classList.contains("ck-span-3") ? 3 : k.classList.contains("ck-span-2") ? 2 : 1);
-        if (used + w > per) { row = []; used = 0; }
-        row.push(k); used += w;
-      }
-      if (row.length && used < per) for (const k of row) k.style.gridColumn = "span " + tracks / row.length;
+      w.style.setProperty("--ck-n", String(Math.max(4, n)));
     }
   }
   function typing(t) { return t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable); }

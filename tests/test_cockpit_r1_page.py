@@ -194,7 +194,7 @@ cases.stale_and_tier_moved_reread_and_never_retry_with_an_intent = async () => {
     const before = env.reads.length;
     const r = await env.opts().commit(req);
     await env.settle();
-    ok(r.ok === false && r.error === code && /the server says/.test(r.message), code + " answer shown");
+    ok(r.ok === false && r.error === code && /fresh confirmation|changed somewhere else/.test(r.message) && !new RegExp(code).test(r.message), code + " answer shown in plain words: " + r.message);
     ok(env.posts.length === 2, code + ": no automatic retry");
     ok(env.reads.length > before, code + ": the page re-read");
     env.verbAnswers = [[200, { ok: true, dry_run: true, tier: "T3", rendered_tier: "C1", gesture: "sign" }]];
@@ -283,7 +283,7 @@ cases.refused_and_laptop_only_never_post = async () => {
     const env = makeEnv({ actions: [ROW("spore_touch", "C1", g)] });
     await env.start();
     const r = await env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
-    ok(r.ok === false && /refused|laptop-only/.test(r.message) && env.posts.length === 0, g + " is not posted");
+    ok(r.ok === false && /cannot be done from this page/.test(r.message) && !/refused|laptop-only|C1/.test(r.message) && env.posts.length === 0, g + " is not posted, and says so in plain words: " + r.message);
   }
 };
 
@@ -360,7 +360,7 @@ cases.send_inbox_501_shows_the_server_text = async () => {
   const params = { message: "hi" };
   const p2 = await env.opts().commitAction("send_inbox", params, true, "ignored-key");
   ok(env.posts[0].body.dry_run === true, "the compose asks the tier first");
-  ok(p2.ok === false && /no broker effect store/.test(p2.message), "the page shows the server's text, not a swallow");
+  ok(p2.ok === false && /cannot be done from this page yet/.test(p2.message), "the page says so in plain words, not a swallow and not the store's internals: " + p2.message);
   ok(env.posts[1].body.idempotency_key !== "ignored-key", "the page mints its own key");
 };
 
@@ -510,7 +510,8 @@ cases.the_answer_reaches_the_row_before_the_reread_resolves = async () => {
   env.holdReads = gate;
   const p = env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
   await env.settle();
-  ok(row.msg && /COMMITTED/.test(row.msg.textContent) && /claims cockpit token/.test(row.msg.textContent), "committed text on the row before the re-read: " + (row.msg && row.msg.textContent));
+  // a landed write says nothing on the row: no state code, no authority label (Phill 10-14), the re-read shows the new content
+  ok(!row.msg || row.msg.textContent === "", "a landed write leaves no status text on the row: " + (row.msg && row.msg.textContent));
   // not locked: a re-read that defers (a dirty form) or fails would leave a locked row stuck; the kernel
   // refuses an edit against the old row version "stale"
   ok(row.btns.every((b) => b.disabled !== true), "the row stays usable while the re-read is pending");
@@ -528,7 +529,7 @@ cases.a_refusal_shows_its_text_at_once = async () => {
   env.holdReads = new Promise((r) => { release = r; });
   const p = env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
   await env.settle();
-  ok(row.msg && /the row moved/.test(row.msg.textContent), "refusal text on the row before the re-read: " + (row.msg && row.msg.textContent));
+  ok(row.msg && /changed somewhere else/.test(row.msg.textContent) && !/row moved|stale/.test(row.msg.textContent), "refusal text on the row before the re-read: " + (row.msg && row.msg.textContent));
   release();
   await p;
 };

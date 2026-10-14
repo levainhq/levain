@@ -566,7 +566,7 @@ def _crystals(source: SubstrateSource) -> Callable[[ReadContext], Result]:
     def read(ctx: ReadContext) -> Result:
         path = source.anneal.crystal_json
         if not path.exists():
-            return Absent(f"no crystal store at {path}")
+            return Absent("no crystal store yet")   # no absolute path in a sentence the page shows
         try:
             from anneal_memory.crystal import CrystalStore
 
