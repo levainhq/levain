@@ -63,3 +63,24 @@ def test_the_overflow_menu_opens_and_closes_by_keyboard(tmp_path: Path) -> None:
     assert vals[1] == ["true", False, "reclassify"], vals
     assert vals[2] == "metabolize", vals
     assert vals[3] == ["false", True, "···"], vals
+
+
+@needs_browser
+def test_a_press_that_moves_focus_to_the_row_does_not_close_the_menu_before_the_click(tmp_path: Path) -> None:
+    """Safari/WebKit: a mouse press on a menu button does not focus the button, so focus goes to the nearest focusable
+    ancestor (the row), and the browser fires focusout with relatedTarget = the row. That must not close the menu, or the
+    click lands on whatever sits under it (found in real WebKit 2026-10-14; headless Chrome focuses the button itself)."""
+    vals = _page(tmp_path, [
+        {"eval": f"(() => {{ const v = {ROW}.querySelector('.verb-actions'); const m = v.querySelector('.verb-more'); m.focus(); m.click(); "
+                 "return v.querySelector('.verb-menu').hidden; })()"},
+        {"eval": f"(() => {{ const r = {ROW}; const v = r.querySelector('.verb-actions'); const a = document.activeElement; "
+                 "a.dispatchEvent(new FocusEvent('focusout', {bubbles: true, relatedTarget: r})); "
+                 "return v.querySelector('.verb-menu').hidden; })()"},
+        {"eval": f"(() => {{ const v = {ROW}.querySelector('.verb-actions'); const a = document.activeElement; "
+                 "const o = document.body.appendChild(document.createElement('button')); "
+                 "a.dispatchEvent(new FocusEvent('focusout', {bubbles: true, relatedTarget: o})); "
+                 "return v.querySelector('.verb-menu').hidden; })()"},
+    ])
+    assert vals[1] is False, vals
+    assert vals[2] is False, vals    # relatedTarget = the row: the menu stays open for the click
+    assert vals[3] is True, vals     # a keyboard move to an unrelated element still closes it

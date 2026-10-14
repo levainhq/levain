@@ -1077,8 +1077,10 @@
     });
     group.addEventListener("focusout", (ev) => {
       // only a keyboard move to a real element outside the group closes here; a null relatedTarget is a mouse press
-      // (the pointerdown listener above decides that one)
-      if (!menu.hidden && ev.relatedTarget && !group.contains(ev.relatedTarget)) close(false);
+      // (the pointerdown listener above decides that one). A press on a menu item in Safari moves focus to the nearest
+      // focusable ANCESTOR (the row, tabIndex 0), so a relatedTarget that CONTAINS the group is that press, not a move out
+      const rt = ev.relatedTarget;
+      if (!menu.hidden && rt && !group.contains(rt) && !rt.contains(group)) close(false);
     });
     group.appendChild(more);
     group.appendChild(menu);
