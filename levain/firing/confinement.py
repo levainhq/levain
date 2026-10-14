@@ -1000,6 +1000,13 @@ def _ssh_agent_ops(agent: "_ssh_agent.ScopedAgent", view_roots: list[Path]) -> t
             "--bind", str(kh), str(_ssh_agent.view_known_hosts(view_roots[0]))], str(view)
 
 
+def git_ssh_command(runtime_root: Path) -> str:
+    """bash's ``GIT_SSH_COMMAND`` with a scoped agent: ssh through ``$SSH_AUTH_SOCK`` whatever the
+    operator's ssh config names, checking hosts against the session's known_hosts."""
+    return ("ssh -o IdentityAgent=SSH_AUTH_SOCK -o UserKnownHostsFile="
+            + shlex.quote(str(_ssh_agent.view_known_hosts(runtime_root))))
+
+
 def start_session_ssh_agent(entity: str, *, system: str | None = None, ssh_mode: str = "agent"
                             ) -> "tuple[_ssh_agent.ScopedAgent | None, str | None]":
     """Start the scoped ssh agent for one operator-floor session: ``(agent, None)``, or ``(None, why
@@ -9032,12 +9039,14 @@ class BwrapProvider(ConfinementProvider):
         if ssh_agent is not None and hands is None:
             # The scoped agent's view path, where `_prepare` bound it (`_ssh_agent_ops`), and git's ssh
             # pointed at the session's known_hosts there, unless the operator set git's ssh themselves.
-            # Plain `ssh` in bash still reads ~/.ssh/known_hosts (no environment variable reaches it).
+            # `IdentityAgent=SSH_AUTH_SOCK` (the literal name means "read the variable", ssh_config(5))
+            # because an IdentityAgent in the operator's ~/.ssh/config, which bash reads, overrides
+            # $SSH_AUTH_SOCK, and a command-line -o is the first value obtained, so it wins (L2 #3).
+            # Plain `ssh` in bash still reads ~/.ssh/known_hosts and config (no variable reaches it).
             root = _runtime_roots()[0]
             shell_env["SSH_AUTH_SOCK"] = str(_ssh_agent.view_socket(root))
             if "GIT_SSH_COMMAND" not in shell_env and "GIT_SSH" not in shell_env:
-                shell_env["GIT_SSH_COMMAND"] = ("ssh -o UserKnownHostsFile="
-                                                + shlex.quote(str(_ssh_agent.view_known_hosts(root))))
+                shell_env["GIT_SSH_COMMAND"] = git_ssh_command(root)
         if hands is not None:
             # sudo OUTSIDE bwrap, as on macOS; bash starts from the hands user's environment alone.
             argv = [*hands_prefix(hands), *argv]

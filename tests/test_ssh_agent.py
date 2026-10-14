@@ -211,6 +211,28 @@ def test_an_agent_restarted_on_its_path_closes_the_shell_though_the_socket_kept_
         shell().run("echo x")
 
 
+def test_gits_ssh_names_the_scoped_agent_over_any_identity_agent_in_the_ssh_config(tmp_path):
+    """L2 #3: an `IdentityAgent` in ~/.ssh/config (1Password, Secretive, gpg) overrides $SSH_AUTH_SOCK;
+    a command-line -o wins over the config file. Read back by ssh itself (`ssh -G`), not by eye."""
+    import shlex
+
+    from levain.firing.confinement import git_ssh_command
+
+    cmd = git_ssh_command(tmp_path / "rt")
+    assert cmd.startswith("ssh -o IdentityAgent=SSH_AUTH_SOCK -o UserKnownHostsFile=")
+    cfg = tmp_path / "config"
+    cfg.write_text("Host *\n  IdentityAgent /nonexistent/other-agent.sock\n")
+    argv = [*shlex.split(cmd)[:1], "-F", str(cfg), *shlex.split(cmd)[1:], "-G", "git.example.test"]
+    sock = str(tmp_path / "scoped.sock")
+    done = subprocess.run(argv, env=dict(os.environ, SSH_AUTH_SOCK=sock), capture_output=True, text=True,
+                          check=True)
+    resolved = [ln for ln in done.stdout.splitlines() if ln.lower().startswith("identityagent ")]
+    assert resolved == ["identityagent SSH_AUTH_SOCK"] or resolved == [f"identityagent {sock}"]
+    control = subprocess.run(["ssh", "-F", str(cfg), "-G", "git.example.test"], capture_output=True, text=True,
+                             env=dict(os.environ, SSH_AUTH_SOCK=sock), check=True)
+    assert "identityagent /nonexistent/other-agent.sock" in control.stdout   # the config wins without the -o
+
+
 def test_no_agent_is_started_where_it_is_not_bound_into_bash(home):
     from levain.firing.confinement import start_session_ssh_agent
 
