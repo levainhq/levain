@@ -464,6 +464,41 @@ def test_an_exception_after_filing_withdraws(where):
     assert q.withdrawn == [q.requests[0].id]
 
 
+def test_a_withdraw_that_raises_is_retried_by_the_cleanup():
+    """L3 q2 r2 (fix-introduced MED): `settled` was set before the normal-path withdraw, so a withdraw that raised
+    (a locked store past its busy timeout) skipped the cleanup and left a ghost request pending."""
+    q = FakeQueue(None)
+    calls = []
+
+    def withdraw(request_id, note=""):
+        calls.append(request_id)
+        if len(calls) == 1:
+            raise RuntimeError("database is locked")
+        q.withdrawn.append(request_id)
+        return True
+    q.withdraw = withdraw
+    with pytest.raises(RuntimeError):
+        cc.decide(event(), q, AWAY, policy=lambda r: None)
+    assert len(calls) == 2 and q.withdrawn == [q.requests[0].id]
+
+
+def test_reinstall_under_another_python_replaces_the_old_levain_handler(tmp_path):
+    """L3 q2 r2 (fix-introduced MED): matching only the exact command left the old interpreter's handler running
+    beside the new one. A lookalike script path is still never ours."""
+    ws = tmp_path / "ws"
+    (ws / ".claude").mkdir(parents=True)
+    script, settings = cc.install(ws, python="/old/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    data = json.loads(settings.read_text())
+    lookalike = {"type": "command", "command": f"/old/bin/python3 {script}.bak"}
+    data["hooks"]["PermissionRequest"].append({"matcher": "*", "hooks": [lookalike]})
+    settings.write_text(json.dumps(data))
+    cc.install(ws, python="/new/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    commands = [h["command"] for g in json.loads(settings.read_text())["hooks"]["PermissionRequest"] for h in g["hooks"]]
+    assert commands.count(f"/new/bin/python3 {script}") == 1
+    assert not any(c == f"/old/bin/python3 {script}" for c in commands)
+    assert lookalike["command"] in commands
+
+
 def test_max_hold_is_a_total_deadline_and_the_cc_timeout_exceeds_it():
     """P6 (codex 7): the wait leaves CLEANUP_RESERVE of max_hold for withdraw + re-read; Claude Code's timeout
     is above wait + reserve, so it never cancels a hook that is delivering a verified answer."""

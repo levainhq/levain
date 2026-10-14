@@ -226,7 +226,7 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
         if got is None and wait > 0:
             got = _verified(queue.await_decision(request.id, wait), request)
         if got is None:
-            settled = True
+            # `settled` is set only after this withdraw returns: if the withdraw itself raises, the finally retries it
             if not queue.withdraw(request.id, note="the hook stopped waiting; the native dialog stands"):
                 # Not pending any more: an answer may have landed between the wait and the withdraw.
                 got = _verified(queue.decision(request.id), request)
@@ -341,7 +341,7 @@ def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path
             settings = {}
         if not isinstance(settings, dict):
             raise ValueError(f"{settings_path} is not a JSON object")
-        _merge_handler(settings, command, handler)
+        _merge_handler(settings, command, handler, script=script)
         if _stat_key(settings_path) != before:
             continue  # changed while we merged: merge again onto the newer file
         _atomic_write(settings_path, json.dumps(settings, indent=2) + "\n", mode=0o644, keep_mode=True)
@@ -356,8 +356,26 @@ def hook_timeout(max_hold: float) -> int:
     return int(math.ceil(max(max_hold, CLEANUP_RESERVE))) + TIMEOUT_MARGIN
 
 
-def _merge_handler(settings: dict[str, Any], command: str, handler: dict[str, Any]) -> None:
-    """Remove ONLY the handler whose command is exactly ``command`` (other handlers and every group field
+def _is_ours(h: Any, command: str, script: Path | None) -> bool:
+    """A handler this installation owns: its command is exactly ``command``, or it is exactly
+    ``<one interpreter> <this installation's absolute script path>`` (a reinstall under another Python must replace
+    the old handler, not run beside it). Lookalike paths and any other command shape are never ours."""
+    if not isinstance(h, dict) or not isinstance(h.get("command"), str):
+        return False
+    if h["command"] == command:
+        return True
+    if script is None:
+        return False
+    try:
+        tokens = shlex.split(h["command"])
+    except ValueError:
+        return False
+    return len(tokens) == 2 and tokens[1] == str(script)
+
+
+def _merge_handler(settings: dict[str, Any], command: str, handler: dict[str, Any],
+                   script: Path | None = None) -> None:
+    """Remove ONLY the handlers this installation owns (:func:`_is_ours`; other handlers and every group field
     kept; a group dropped only when that leaves it with no handlers), then add ``handler`` in its own group."""
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):
@@ -370,7 +388,7 @@ def _merge_handler(settings: dict[str, Any], command: str, handler: dict[str, An
         if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
             kept.append(group)
             continue
-        handlers = [h for h in group["hooks"] if not (isinstance(h, dict) and h.get("command") == command)]
+        handlers = [h for h in group["hooks"] if not _is_ours(h, command, script)]
         if handlers or not group["hooks"]:
             kept.append({**group, "hooks": handlers})
     kept.append({"matcher": "*", "hooks": [handler]})
