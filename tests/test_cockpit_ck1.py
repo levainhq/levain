@@ -194,10 +194,10 @@ def test_log_sentence_uses_the_manifest_verb_label() -> None:
     ck = _value_panel("log", LOG)
 
     class V:
-        def verbs_map(self, cred: str) -> dict[str, Any]:
+        def verbs_map(self, cred: str, **k: Any) -> dict[str, Any]:
             return {"snooze": {"label": "Snoozed"}}
 
-        def revision(self) -> str:
+        def revision(self, auth: Any) -> str:
             return "r1"
 
         def panel_actions(self, *a: Any, **k: Any) -> list[Any]:

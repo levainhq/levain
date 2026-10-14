@@ -6,6 +6,11 @@ All notable changes to Levain. Format is loosely [Keep a Changelog](https://keep
 
 ## [Unreleased]
 
+### Changed
+
+- **The cockpit's standing policy is now the signed authority log's.** A verb's tier floor comes from the policy links in the log, replayed for each request, and no longer from a constant in the code. `levain cockpit policy raise <verb> <T2|T3> --signing-key <key>` appends a raise, signed by a display-phone or laptop-presence key; a raise only ever lifts a tier, and lowering one is a loosen that only a laptop-presence key signs. After a raise, the cockpit shows and enforces the new tier on the next request, every page and manifest etag changes, a fire previewed before it is refused as moved, and a pending issued before it goes stale. A verb the broker has no adapter for (`spore_touch`) cannot fire once raised above C1: it is refused, naming why.
+- **A cockpit whose authority log is refused shows every verb at T3.** A log it cannot read or verify may hold a raise it cannot see, so nothing fires at a lower tier until the log is readable again. A server whose broker is not active reads no log and keeps the shipped tiers.
+
 ## [0.10.2] — 2026-10-13
 
 A security fix. Upgrade if Levain runs bash on Linux where you use gpg, or if you use the cockpit's signing keys.

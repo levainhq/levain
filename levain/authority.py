@@ -311,8 +311,9 @@ AuthorityPolicy = StandingPolicy
 
 
 # The policy before any policy link, pinned for this FORMAT: replay is a pure function of the log, so
-# it never reads live code (``verbs.Policy()`` may change; a log replays the same either way). These
-# are the shipped ``verbs.Policy()`` values when the format was born: no raises.
+# it never reads live code (a log replays the same whatever the code ships). These are the values the
+# retired ``verbs.Policy()`` shipped when the format was born: no raises. Every cockpit tier reads
+# this through ``RequestAuthority.policy`` and nowhere else (S4a).
 _GENESIS_RAISE_TO: Mapping[str, str] = MappingProxyType({})
 
 

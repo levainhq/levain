@@ -24,9 +24,10 @@ has no tier function and is therefore T2. The steps of ``/cockpit/verb``:
 Provenance: every ``tier_fn`` receives the row's label (``row["provenance"]["label"]``, ``"unverified"``
 when null) from ONE authority snapshot per outer request (K2b-3b §0.1): the render's for the actions it
 shows, a fresh one taken by ``dispatch`` and by ``retier`` for the tier that governs. With no labeller
-attached every label is ``"unverified"``, as in K2a. The standing policy that may raise a tier is a
-T3 store that does not exist yet; :data:`POLICY` is the identity policy and its revision is hashed
-into every etag.
+attached every label is ``"unverified"``, as in K2a. The standing policy that may raise a tier comes
+from that same snapshot (``RequestAuthority.policy``: the replay of the signed policy links, trust-tiering
+DESIGN §4.1); there is no module-level policy. The snapshot's head (``RequestAuthority.revision``) is
+hashed into every etag, so a signed raise moves every panel's validator and the manifest's.
 
 The credential is verified by the HTTP layer before this module runs and handed in as a dict;
 ``dispatch`` refuses a ``none`` class itself as well, so a caller that forgets the check fails
@@ -34,7 +35,7 @@ closed."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
@@ -47,7 +48,7 @@ from levain.writes import (ActionVerb, EditError, _apply_operator_state_edit, _n
                            apply_action, apply_edit)
 
 if TYPE_CHECKING:
-    from levain.cockpit.authority import RequestAuthority
+    from levain.cockpit.authority import RequestAuthority, TierPolicy
     from levain.cockpit.broker import Broker
     from levain.cockpit.engine import Cockpit
     from levain.jobs import JobRuntime
@@ -76,21 +77,13 @@ def tier_max(*tiers: Tier) -> Tier:
     return max(tiers, key=TIERS.index) if tiers else "C1"
 
 
-@dataclass(frozen=True)
-class Policy:
-    """The standing policy (a T3 act, §4.4): it may raise any verb's tier and never lower one.
-    ``raise_to`` maps a verb to a minimum tier. ``revision`` is hashed into every etag, so a policy
-    change that alters a gesture with rows unchanged still changes the panel's validator."""
-
-    revision: int = 1
-    raise_to: dict[str, Tier] = field(default_factory=dict)
-
-    def apply(self, verb: str, tier: Tier) -> Tier:
-        floor = self.raise_to.get(verb)
-        return tier_max(tier, floor) if floor else tier
-
-
-POLICY = Policy()
+def _raised(policy: "TierPolicy", verb: str, base: Tier) -> Tier:
+    """``base`` under ``policy``: raised to its floor for ``verb``, and never lowered whatever the
+    policy answers."""
+    got = policy.apply(verb, base)
+    if got not in TIERS:
+        raise ValueError(f"the standing policy answered {got!r} for {verb!r}")
+    return tier_max(base, got)  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)
@@ -131,21 +124,26 @@ class VerbSpec:
     applies_to: Callable[[dict[str, Any]], bool] | None = None   # rows a row verb offers itself on
     options: Callable[[dict[str, Any]], dict[str, list[Any]]] | None = None   # a row action's allowed values per param
 
-    def tier(self, params: dict[str, Any], row: dict[str, Any] | None, provenance: str, today: date) -> Tier:
-        base: Tier = "T2" if self.tier_fn is None else self.tier_fn(params, row, provenance, today)
-        return POLICY.apply(self.name, base)
+    # ``policy`` is the request's standing policy (``RequestAuthority.policy``, trust-tiering DESIGN
+    # §3.4, §4.1): it may raise a tier, never lower one
 
-    def rendered_tier(self, row: dict[str, Any] | None, provenance: str, today: date) -> Tier:
+    def tier(self, params: dict[str, Any], row: dict[str, Any] | None, provenance: str, today: date, *,
+             policy: "TierPolicy") -> Tier:
+        base: Tier = "T2" if self.tier_fn is None else self.tier_fn(params, row, provenance, today)
+        return _raised(policy, self.name, base)
+
+    def rendered_tier(self, row: dict[str, Any] | None, provenance: str, today: date, *,
+                      policy: "TierPolicy") -> Tier:
         if self.tier_fn is None:
             base: Tier = "T2"
         elif self.row_tier is not None:
             base = self.row_tier(row, provenance, today)
         else:
             base = self.floor
-        return POLICY.apply(self.name, base)
+        return _raised(policy, self.name, base)
 
-    def head(self, gesture: str) -> dict[str, Any]:
-        return {"label": self.label, "tier": POLICY.apply(self.name, self.floor if self.tier_fn else "T2"),
+    def head(self, gesture: str, *, policy: "TierPolicy") -> dict[str, Any]:
+        return {"label": self.label, "tier": _raised(policy, self.name, self.floor if self.tier_fn else "T2"),
                 "confirm": self.confirm_required, "idempotent": self.idempotent, "job": self.job,
                 "reversible": self.reversible, "fields": list(self.fields or ()), "effect": self.effect,
                 "gesture": gesture, "route": self.route}
@@ -491,15 +489,19 @@ def row_label(row: dict[str, Any] | None) -> str:
 
 
 def row_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str, row: dict[str, Any],
-                credential_class: str, install_class: str, today: date) -> list[dict[str, Any]]:
+                credential_class: str, install_class: str, today: date, *,
+                policy: "TierPolicy") -> list[dict[str, Any]]:
     out = []
     label = row_label(row)
     for v in offered(registry, cockpit, panel_id):
         if v.binding != "row" or (v.applies_to is not None and not v.applies_to(row)):
             continue
-        t = v.rendered_tier(row, label, today)
+        t = v.rendered_tier(row, label, today, policy=policy)
+        # an escalation names the tier the fire will take, so the policy raises it as it raises the fire
+        escalates = [{**e, "tier": _raised(policy, v.name, e["tier"])} for e in v.escalates(row, label, today)] \
+            if v.escalates else []
         action = {"verb": v.name, "tier": t, "gesture": gesture_for(t, credential_class, install_class),
-                  "escalates": v.escalates(row, label, today) if v.escalates else [],
+                  "escalates": escalates,
                   "target": {"panel_id": panel_id, "row_id": row["id"], "row_version": row["version"]}}
         if v.options is not None:
             action["options"] = v.options(row)
@@ -522,14 +524,15 @@ def pending_actions(row: dict[str, Any], credential_class: str, install_class: s
 
 def panel_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str,
                   credential_class: str, install_class: str, today: date,
-                  value_version: str | None = None, label: str = UNVERIFIED) -> list[dict[str, Any]]:
+                  value_version: str | None = None, label: str = UNVERIFIED, *,
+                  policy: "TierPolicy") -> list[dict[str, Any]]:
     """A value write's target names the version of the value it was rendered with (§4.4), so a
     renderer sends back what it showed; with no readable value there is none to name."""
     out = []
     for v in offered(registry, cockpit, panel_id):
         if v.binding == "row":
             continue
-        t = v.rendered_tier(None, label, today)
+        t = v.rendered_tier(None, label, today, policy=policy)
         target: dict[str, Any] = {"panel_id": panel_id}
         if v.binding == "value":
             target["panel_version"] = value_version
@@ -539,7 +542,7 @@ def panel_actions(registry: VerbRegistry, cockpit: "Cockpit", panel_id: str,
 
 
 def verbs_map(registry: VerbRegistry, cockpit: "Cockpit", credential_class: str,
-              install_class: str) -> dict[str, dict[str, Any]]:
+              install_class: str, *, policy: "TierPolicy") -> dict[str, dict[str, Any]]:
     """The manifest's ``verbs`` map (§4.1): only verbs some panel offers, by the same rule a write
     checks (``offered``). A broker head never comes from a panel's declared verbs: it is the
     broker's to publish (K2b), so a feed naming one adds nothing here."""
@@ -547,8 +550,8 @@ def verbs_map(registry: VerbRegistry, cockpit: "Cockpit", credential_class: str,
     for pid in cockpit.panel_ids:
         for v in offered(registry, cockpit, pid):
             if v.name not in out:
-                tier = v.head("")["tier"]
-                out[v.name] = v.head(gesture_for(tier, credential_class, install_class))
+                tier = v.head("", policy=policy)["tier"]
+                out[v.name] = v.head(gesture_for(tier, credential_class, install_class), policy=policy)
     return out
 
 
@@ -636,7 +639,7 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         bad = sorted(set(params) - set(verb.fields)) if verb.fields is not None else []
         if bad:
             raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
-        tier = verb.tier(params, None, auth.labels.label(None), today)    # no row, no label
+        tier = verb.tier(params, None, auth.labels.label(None), today, policy=auth.policy)    # no row, no label
         _refuse_unless_c1(verb, tier, credential, install_class)
         return _fire_downstream(registry, verb, scope, params, req, job_runtime)
 
@@ -687,8 +690,8 @@ def _dispatch(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope | N
         _check_value_version(cockpit, panel_id, req.get("panel_version"))
         label = _value_label(cockpit, verb, panel_id, auth)
 
-    tier = verb.tier(params, row, label, today)
-    floor = verb.rendered_tier(row, label, today)
+    tier = verb.tier(params, row, label, today, policy=auth.policy)
+    floor = verb.rendered_tier(row, label, today, policy=auth.policy)
     gesture = gesture_for(tier, credential["class"], install_class)
     # before the key check: a fire previewed at T2 carries a key, so a T2->C1 move must answer as one
     _check_moved(req, tier, gesture)
@@ -868,7 +871,8 @@ def retier(registry: "VerbRegistry", cockpit: "Cockpit", verb_name: str, params:
         if not isinstance(res, Read):
             return None
         row = res.value
-    return verb.tier(dict(params), row, row_label(row), auth.now.astimezone().date())   # one instant per decide
+    return verb.tier(dict(params), row, row_label(row), auth.now.astimezone().date(),   # one instant per decide
+                     policy=auth.policy)
 
 
 def _governed(cockpit: "Cockpit") -> bool:
@@ -941,8 +945,8 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
         raise _refuse("field_not_allowed", 400, f"{verb.name!r} does not take {bad}")
     if (verb.tier_fn is None or _is_const(verb)) and (broker is None or not broker.enabled):
         # a verb whose tier does not depend on the row: refuse a T2/T3 before reading anything
-        _refuse_unless_c1(verb, verb.tier(params, None, authority.labels.label(None), today), credential,
-                          install_class, broker)
+        _refuse_unless_c1(verb, verb.tier(params, None, authority.labels.label(None), today, policy=authority.policy),
+                          credential, install_class, broker)
     panel_id, row = (None, None)
     label = authority.labels.label(None)
     if verb.binding == "row":
@@ -960,8 +964,8 @@ def _legacy_edit(registry: VerbRegistry, cockpit: "Cockpit", scope: "WriteScope"
             raise _refuse("not_offered", 404, f"{verb.name!r} is not a /edit value write")
         _check_value_version(cockpit, panel_id, req.get("panel_version"))
         label = _value_label(cockpit, verb, panel_id, authority)
-    tier = verb.tier(params, row, label, today)
-    floor = verb.rendered_tier(row, label, today)
+    tier = verb.tier(params, row, label, today, policy=authority.policy)
+    floor = verb.rendered_tier(row, label, today, policy=authority.policy)
     # A legacy body carries no intent: a reported install sends "reported" for a write that escalates
     # nothing and refuses an escalating one; a governed one sends "sign" (§9 Order).
     if TIERS.index(tier) > TIERS.index(floor):
@@ -994,9 +998,10 @@ def _is_const(verb: VerbSpec) -> bool:
 
 class VerbView:
     """What the engine asks of the registry at render time (``Cockpit.attach_verbs``). The install
-    class and the policy revision are hashed into every etag through ``revision``. ``install_class``
-    may be a callable, read at every render: a server passes its broker's live class, so a broker
-    that is disabled renders no reported gesture and one that heals changes the etag."""
+    class and the request's authority head are hashed into every etag through ``revision``, and every
+    tier reads the request's standing policy (``auth``: the render's one ``RequestAuthority``).
+    ``install_class`` may be a callable, read at every render: a server passes its broker's live class,
+    so a broker that is disabled renders no reported gesture and one that heals changes the etag."""
 
     def __init__(self, registry: VerbRegistry, cockpit: "Cockpit",
                  install_class: "str | Callable[[], str]") -> None:
@@ -1009,22 +1014,25 @@ class VerbView:
         ic = self._install_class
         return ic() if callable(ic) else ic
 
-    def revision(self) -> list[Any]:
-        return [self.install_class, POLICY.revision, sorted(self.registry.names())]
+    def revision(self, auth: "RequestAuthority") -> list[Any]:
+        return [self.install_class, auth.revision, sorted(self.registry.names())]
 
-    def row_actions(self, panel_id: str, row: dict[str, Any], cred: str, today: date) -> list[dict[str, Any]]:
-        return row_actions(self.registry, self.cockpit, panel_id, row, cred, self.install_class, today)
+    def row_actions(self, panel_id: str, row: dict[str, Any], cred: str, today: date, *,
+                    auth: "RequestAuthority") -> list[dict[str, Any]]:
+        return row_actions(self.registry, self.cockpit, panel_id, row, cred, self.install_class, today,
+                           policy=auth.policy)
 
     def pending_actions(self, row: dict[str, Any], cred: str) -> list[dict[str, Any]]:
         return pending_actions(row, cred, self.install_class)
 
     def panel_actions(self, panel_id: str, cred: str, today: date,
-                      value_version: str | None = None, label: str = UNVERIFIED) -> list[dict[str, Any]]:
+                      value_version: str | None = None, label: str = UNVERIFIED, *,
+                      auth: "RequestAuthority") -> list[dict[str, Any]]:
         return panel_actions(self.registry, self.cockpit, panel_id, cred, self.install_class, today,
-                             value_version, label)
+                             value_version, label, policy=auth.policy)
 
-    def verbs_map(self, cred: str) -> dict[str, dict[str, Any]]:
-        return verbs_map(self.registry, self.cockpit, cred, self.install_class)
+    def verbs_map(self, cred: str, *, auth: "RequestAuthority") -> dict[str, dict[str, Any]]:
+        return verbs_map(self.registry, self.cockpit, cred, self.install_class, policy=auth.policy)
 
     def compose_refusal(self, panel_id: str, compose: dict[str, Any]) -> str | None:
         return compose_refusal(self.registry, panel_id, compose)

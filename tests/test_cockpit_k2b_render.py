@@ -139,11 +139,13 @@ def test_a_verified_held_row_snoozes_earlier_as_c1_at_render_and_issue(rig: Rig)
     assert len(snap.calls) == 2
     row = rig.ck.read_one("tray", held).value
     assert row["provenance"]["label"] == "verified"
-    acts = {a["verb"]: a for a in row_actions(rig.reg, rig.ck, "tray", row, "token", INSTALL_CLASS, rig.ck.today())}
+    acts = {a["verb"]: a for a in row_actions(rig.reg, rig.ck, "tray", row, "token", INSTALL_CLASS, rig.ck.today(),
+                                                    policy=rig.ck.authority().policy)}
     assert acts["spore_surface_at"]["escalates"] == []
     snap.labelled = {}
     row = rig.ck.read_one("tray", held).value
-    acts = {a["verb"]: a for a in row_actions(rig.reg, rig.ck, "tray", row, "token", INSTALL_CLASS, rig.ck.today())}
+    acts = {a["verb"]: a for a in row_actions(rig.reg, rig.ck, "tray", row, "token", INSTALL_CLASS, rig.ck.today(),
+                                                    policy=rig.ck.authority().policy)}
     assert acts["spore_surface_at"]["escalates"]
 
 

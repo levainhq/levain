@@ -416,6 +416,26 @@ def main(argv: list[str] | None = None) -> int:
                            help="Where the key goes (default: <levain home>/keys, i.e. $LEVAIN_HOME/keys or "
                                 "~/.levain/keys; made 0700).")
     ck_create.set_defaults(func=_cmd_cockpit_key_create)
+    ck_policy = ck_sub.add_parser("policy", help="The standing policy, as signed links in the authority log.")
+    ck_policy_sub = ck_policy.add_subparsers(dest="policy_cmd", required=True)
+    ck_raise = ck_policy_sub.add_parser(
+        "raise",
+        help="Raise a verb's tier floor (it never lowers one).",
+        description=(
+            "Append a signed raise to the authority log: from the next request on, VERB shows and fires "
+            "at TIER or above. The log classifies the change itself: a raise needs a display-phone or "
+            "laptop-presence key, one that would lower a floor is a loosen (laptop-presence, and not this "
+            "command), and one that changes nothing is refused. Every waiting pending goes stale, and "
+            "every page rendered before it must render again."
+        ),
+    )
+    ck_raise.add_argument("verb", help="The verb's name, as the manifest's verbs map lists it.")
+    ck_raise.add_argument("tier", choices=("T2", "T3"), help="The verb's new floor (C1 is no floor).")
+    ck_raise.add_argument("--signing-key", dest="signing_key", type=Path, required=True,
+                          help="An enrolled display-phone or laptop-presence key that signs the raise (its "
+                               "private key file, or the .pub of a key an agent holds).")
+    _ck_common(ck_raise)
+    ck_raise.set_defaults(func=_cmd_cockpit_policy_raise)
     ck_keys = ck_sub.add_parser("keys", help="List enrolled keys.")
     _ck_common(ck_keys)
     ck_keys.set_defaults(func=_cmd_cockpit_keys)
@@ -1669,6 +1689,22 @@ def _cmd_cockpit_revoke(args: argparse.Namespace) -> int:
         return 1
     print(f"revoked: {row.fingerprint} at seq {row.revoked_seq}"
           + (f" (compromised since seq {row.compromised_since})" if row.compromised_since else ""))
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
+    return 0
+
+
+def _cmd_cockpit_policy_raise(args: argparse.Namespace) -> int:
+    from levain.cockpit.keys import policy_raise, ssh_signer
+
+    try:
+        signer_fp, sign = ssh_signer(args.signing_key)
+        tier, seq, warning = policy_raise(_cockpit_root(args), args.verb, args.tier, signer_fp=signer_fp,
+                                          sign=sign, clock=_utc_now)
+    except _cockpit_refusals() as exc:
+        print(f"raise refused: {exc}", file=sys.stderr)
+        return 1
+    print(f"raised: {args.verb} at {tier} or above, at seq {seq}")
     if warning:
         print(f"warning: {warning}", file=sys.stderr)
     return 0

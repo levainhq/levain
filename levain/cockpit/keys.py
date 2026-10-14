@@ -44,7 +44,7 @@ from levain.cockpit.firejournal import _CLASS_RANK, DB_NAME, UNINITIALISED, Cock
 from levain.cockpit.install import REPORTED, marker_path, marker_present, marker_unreadable
 
 __all__ = ["KEY_CLASSES", "InitPlan", "InitResult", "KeyError_", "KeyRow", "LegacyRow", "Signer", "enroll", "keys",
-           "fingerprint_of", "init_plan", "ledger_init", "normalise_public_key", "principal_of", "revoke",
+           "fingerprint_of", "init_plan", "ledger_init", "normalise_public_key", "policy_raise", "principal_of", "revoke",
            "signing_public_key", "ssh_signer"]
 
 KEY_CLASSES = tuple(sorted(_CLASS_RANK, key=_CLASS_RANK.__getitem__))
@@ -253,6 +253,23 @@ def revoke(data_root: Path | str, ref: str, *, signer_fp: str, sign: Signer, clo
     key = new.key(target.fingerprint)
     assert key is not None
     return _row(key), new.anchor_warning
+
+
+def policy_raise(data_root: Path | str, verb: str, tier: str, *, signer_fp: str, sign: Signer,
+                 clock: Callable[[], datetime], ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,
+                 marker_directory: Path | None = None) -> tuple[str, int, str | None]:
+    """Raise ``verb``'s floor to ``tier`` in the standing policy (trust-tiering DESIGN §4.3), by a link
+    ``signer_fp`` signs. The replay classifies the change itself: a raise that tightens needs a
+    display-phone key or above, one that would lower a floor is refused as a loosen, and one that
+    changes nothing is refused. Returns ``(tier, seq, warning)``: the verb's floor in the policy after
+    the link, the link's seq, and the anchor warning as :func:`enroll`."""
+    if not isinstance(verb, str) or not verb:
+        raise KeyError_("a raise names a verb")
+    db = _journal(data_root, marker_directory=marker_directory)
+    _signing_authority(_capture(db, _now(clock), ssh_keygen))     # refused before anything is signed
+    new = _append(db, {"op": "raise", "verb": verb, "tier": tier}, signer_fp=signer_fp, sign=sign, clock=clock,
+                  ssh_keygen=ssh_keygen)
+    return new.policy.raise_to[verb], new.seq, new.anchor_warning
 
 
 def keys(data_root: Path | str, *, now: datetime, ssh_keygen: Path | str = DEFAULT_SSH_KEYGEN,

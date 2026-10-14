@@ -318,7 +318,7 @@ class Broker:
         db = self._active_db()
         if db is None:
             return RequestAuthority(now, inactive("provenance is served by the active broker"),
-                                    authority_error="the broker is not active")
+                                    authority_error="the broker is not active", no_log=True)
         return self._capture(db, now)
 
     def _capture(self, db: CockpitDB, now: datetime) -> RequestAuthority:
