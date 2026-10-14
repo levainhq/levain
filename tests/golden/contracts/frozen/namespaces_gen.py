@@ -23,6 +23,7 @@ DOC = {
         {"namespace": "levain-team-entry", "status": "reserved", "owner": "S1 F9 / F12"},
         {"namespace": "levain-manifest", "status": "reserved", "owner": "fleet design §11o item 1"},
         {"namespace": "levain-consent", "status": "reserved", "owner": "fleet design §11o item 1"},
+        {"namespace": "levain-consent-answer", "status": "reserved", "owner": "levain/consent/record.py"},
     ],
     "families": [{"prefix": "levain-team-", "taken": ["entry"],
                   "rule": "P1's envelope kinds; no envelope kind is named 'entry'; a member is registered as its "
