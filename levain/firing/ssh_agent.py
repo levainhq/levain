@@ -46,6 +46,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from levain.launch import child_env
+
 RUN_DIR = "run"
 SOCKET_NAME = "agent.sock"
 RECORD_NAME = "agent.json"
@@ -114,6 +116,17 @@ def view_known_hosts(runtime_root: Path) -> Path:
     return runtime_root / VIEW_DIR / KNOWN_HOSTS_NAME
 
 
+def _tool_env(sock: str | None = None) -> dict[str, str]:
+    """The environment for an OpenSSH tool levain runs: :func:`~levain.launch.child_env` (the askpass
+    variables carried, for a passphrase prompt), never the operator's ``$SSH_AUTH_SOCK``; ``sock`` instead
+    when the tool talks to a scoped agent."""
+    env = child_env("SSH_ASKPASS", "SSH_ASKPASS_REQUIRE")
+    env.pop("SSH_AUTH_SOCK", None)
+    if sock is not None:
+        env["SSH_AUTH_SOCK"] = sock
+    return env
+
+
 # --- OpenSSH --------------------------------------------------------------------------------------
 
 def openssh_version(ssh: str | None = None) -> tuple[int, int] | None:
@@ -123,7 +136,7 @@ def openssh_version(ssh: str | None = None) -> tuple[int, int] | None:
     if exe is None:
         return None
     try:
-        done = subprocess.run([exe, "-V"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        done = subprocess.run([exe, "-V"], capture_output=True, text=True, stdin=subprocess.DEVNULL, env=_tool_env(),
                               timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
@@ -516,7 +529,7 @@ def _pick_session(session: str | None) -> tuple[Path, dict[str, Any]]:
 
 def fingerprint(key: Path) -> str:
     """``SHA256:...`` of ``key`` (``ssh-keygen -l``), or :class:`AgentError`."""
-    done = subprocess.run(["ssh-keygen", "-l", "-E", "sha256", "-f", str(key)], capture_output=True,
+    done = subprocess.run(["ssh-keygen", "-l", "-E", "sha256", "-f", str(key)], capture_output=True, env=_tool_env(),
                           text=True, stdin=subprocess.DEVNULL, timeout=30, check=False)
     fields = done.stdout.split()
     if done.returncode != 0 or len(fields) < 2 or not fields[1].startswith("SHA256:"):
@@ -553,7 +566,7 @@ def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, se
             if not _HOST_RE.match(dest.replace(">", "")):
                 raise AgentError(f"-h {dest!r} is not a destination ssh-add takes ([user@]host, hops joined by >)")
             for h in _hop_hosts(dest):
-                found = subprocess.run(["ssh-keygen", "-F", h, "-f", str(manifest)], capture_output=True,
+                found = subprocess.run(["ssh-keygen", "-F", h, "-f", str(manifest)], capture_output=True, env=_tool_env(),
                                        stdin=subprocess.DEVNULL, timeout=30, check=False)
                 if found.returncode != 0:
                     raise AgentError(f"{h} has no host key in {manifest}; add the key you have checked first")
@@ -570,9 +583,7 @@ def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, se
         for dest in hosts:
             argv += ["-h", dest]
     argv.append(str(key))
-    env = {k: v for k, v in os.environ.items() if k != "SSH_AUTH_SOCK"}
-    env["SSH_AUTH_SOCK"] = sock
-    done = subprocess.run(argv, env=env, check=False)   # stdin and the terminal stay: a passphrase prompt
+    done = subprocess.run(argv, env=_tool_env(sock), check=False)   # stdin and the terminal stay: a passphrase prompt
     if done.returncode != 0:
         raise AgentError(f"ssh-add exited with status {done.returncode}; nothing was recorded")
     if hosts:
@@ -580,7 +591,7 @@ def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, se
         lines = []
         for dest in hosts:
             for h in _hop_hosts(dest):
-                found = subprocess.run(["ssh-keygen", "-F", h, "-f", str(manifest)], capture_output=True,
+                found = subprocess.run(["ssh-keygen", "-F", h, "-f", str(manifest)], capture_output=True, env=_tool_env(),
                                        text=True, stdin=subprocess.DEVNULL, timeout=30, check=False)
                 lines += [ln for ln in found.stdout.splitlines() if ln.strip() and not ln.startswith("#")]
         fd = os.open(d / KNOWN_HOSTS_NAME, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
@@ -605,10 +616,8 @@ _NO_AGENT_TAIL = "$SSH_AUTH_SOCK is not passed to bash, so git over ssh inside b
 
 def _held(sock: str) -> list[str] | None:
     """The SHA256 fingerprints the agent on ``sock`` holds (``ssh-add -l``), or None if it cannot say."""
-    env = {k: v for k, v in os.environ.items() if k != "SSH_AUTH_SOCK"}
-    env["SSH_AUTH_SOCK"] = sock
     try:
-        done = subprocess.run(["ssh-add", "-l", "-E", "sha256"], env=env, capture_output=True, text=True,
+        done = subprocess.run(["ssh-add", "-l", "-E", "sha256"], env=_tool_env(sock), capture_output=True, text=True,
                               stdin=subprocess.DEVNULL, timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
