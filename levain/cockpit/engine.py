@@ -1346,7 +1346,7 @@ class Cockpit:
             "error": snap.error, "note": note, "empty": spec.empty if snap.empty is None else snap.empty,
             "order": spec.order, "groups": groups,
             "views": [{"id": i, "title": t, "order": o} for i, t, o in spec.views] or None,
-            **self._search_head(spec, count),
+            **self._search_head(spec, len(snap.rows) if listy and snap.rows is not None else count),
             "actions": (self._verb_view.panel_actions(spec.id, cred, today, snap.value_version,
                                                       labels.label(snap.value_label_key), auth=auth)
                         if self._verb_view is not None else []),
@@ -1361,7 +1361,8 @@ class Cockpit:
     @staticmethod
     def _search_head(spec: ProviderSpec, count: int | None) -> dict[str, Any]:
         """The searchable property (contract v2): the kernel marks a row-shaped panel ``searchable`` when
-        it holds more rows than SEARCH_THRESHOLD or is windowed. A contributor declares WHAT is searched
+        it holds more rows than SEARCH_THRESHOLD (every row it delivers, not only the counted ones: a decisions panel
+        with two waiting and fifty outcomes is a long list) or is windowed. A contributor declares WHAT is searched
         (``search.fields``, ``scope``), never WHETHER."""
         if spec.kind not in ROW_KINDS:
             return {"search": None, "searchable": False, "window": None}

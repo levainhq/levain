@@ -1436,6 +1436,7 @@
         if (core.measureOverflow && host.classList.contains("clamped")) core.measureOverflow(host);
       }
     }
+    if (core.adoptPanel) core.adoptPanel(pid, view);
     // the page now shows what this read returned, so the held etag is this read's own (never a stream event's)
     const heldMap = root.LevainCockpitHeld;
     if (heldMap && raw && typeof raw.etag === "string") heldMap[pid] = Object.assign({}, heldMap[pid], { etag: raw.etag });

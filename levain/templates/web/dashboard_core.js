@@ -615,11 +615,13 @@
         node.setAttribute("role", "button");
         node.setAttribute("aria-haspopup", "dialog");
         node.setAttribute("aria-label", "Open " + String(e.title).replace(/\s*\(\d+\)\s*$/, "") + " in a focus view");
-        node.addEventListener("click", () => openModal(e, node));
+        // the entry as the page holds it now: a refetch since this tile was drawn may have changed its rows and its title
+        const open = () => openModal(findEntry(currentView, entryKey(e)) || e, node);
+        node.addEventListener("click", open);
         node.addEventListener("keydown", (ev) => {
           if (ev.target !== node || (ev.key !== "Enter" && ev.key !== " ")) return;
           ev.preventDefault();
-          openModal(e, node);
+          open();
         });
       }
       cards.push(node);
@@ -3180,8 +3182,12 @@
     pruneModalKinds();
     document.body.classList.remove("modal-open");
     modalKey = null;
-    const rf = modalReturnFocus;
+    let rf = modalReturnFocus;
     modalReturnFocus = null;
+    // a re-render of the widgets replaces the tile that opened the view: its successor is found by the panel id
+    if (rf && !document.body.contains(rf) && rf.dataset && rf.dataset.ckPanel && rf.classList.contains("w-open")) {
+      rf = Array.prototype.find.call(document.querySelectorAll(".ck-card.w.w-open"), (n) => n.dataset.ckPanel === rf.dataset.ckPanel) || null;
+    }
     // restore focus to the ⤢ trigger if it's still in the DOM (an intervening board
     // re-render may have replaced it — then focus simply falls to <body>, acceptable).
     if (rf && typeof rf.focus === "function" && document.body.contains(rf)) rf.focus();
@@ -3304,5 +3310,18 @@
   // Export the entry points onto a namespace the surface shim calls. `jobsActive` lets the boot
   // layer DEFER a board reload while an async job is polling (a reload would detach the live result
   // box) — flushed via the injected onJobsIdle when the last job finishes (L3 codex MED).
-  window.LevainDashboard = { render, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0 };
+  // A refetch repaints a panel's live copies in place and builds a fresh view of just that panel; the page's own current view
+  // takes that panel from it, so an expand opened afterwards lists what the tile counts and offers the verbs the rows now offer.
+  function adoptPanel(pid, fresh) {
+    if (!currentView || !fresh || !fresh.layout || !currentView.layout) return;
+    const i = currentView.layout.findIndex((e) => e.id === pid), j = fresh.layout.findIndex((e) => e.id === pid);
+    if (i < 0 || j < 0 || !fresh.extra_panels || !fresh.extra_panels[pid]) return;
+    currentView.layout[i] = fresh.layout[j];
+    currentView.extra_panels[pid] = fresh.extra_panels[pid];
+    const rows = currentView.targets.rows;
+    for (const k of Object.keys(rows)) if (rows[k].panel_id === pid) delete rows[k];
+    for (const k of Object.keys(fresh.targets.rows)) if (fresh.targets.rows[k].panel_id === pid) rows[k] = fresh.targets.rows[k];
+    if (fresh.targets.panels[pid]) currentView.targets.panels[pid] = fresh.targets.panels[pid]; else delete currentView.targets.panels[pid];
+  }
+  window.LevainDashboard = { render, adoptPanel, renderPanel: renderPanelSafe, measureClauses, measureOverflow, hasUnsavedEdit, jobsActive: () => _activeJobs.size > 0 };
 })();
