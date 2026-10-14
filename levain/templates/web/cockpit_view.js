@@ -1446,7 +1446,7 @@
     if (typeof getComputedStyle !== "function") return;   // a harness without layout
     for (const w of document.querySelectorAll(".ck-widgets")) {
       const n = Array.from(w.children).filter(shown).length;
-      if (n) w.style.setProperty("--ck-n", String(n));
+      if (n) { w.style.setProperty("--ck-n", String(n)); w.style.setProperty("--ck-n2", String(Math.min(n, 2))); }   // the two-column breakpoint reads the capped count
     }
     for (const grid of document.querySelectorAll(".ck-zgrid")) {
       const kids = Array.from(grid.children);

@@ -1165,7 +1165,7 @@ body.ke .ck-zgrid .panel > .xbody { flex: 1; min-height: 0; overflow: auto; padd
   body.ke { --gutter-ke: 32px; }
   body.ke .hero { grid-template-columns: 1fr; }
   body.ke .hero .when { border-right: 0; padding-left: var(--gutter); }
-  body.ke .ck-widgets { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  body.ke .ck-widgets { grid-template-columns: repeat(var(--ck-n2, 2), minmax(0, 1fr)); }
   body.ke .ck-zgrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   body.ke .ck-zgrid > .panel.ck-span-2, body.ke .ck-zgrid > .panel.ck-span-3 { grid-column: span 4; }
 }

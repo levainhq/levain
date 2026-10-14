@@ -1058,9 +1058,16 @@
       if (first) first.focus(); else close(false);
     };
     more.addEventListener("click", (ev) => { ev.stopPropagation(); if (menu.hidden) open(); else close(true); });
-    menu.addEventListener("click", () => close(false));
+    menu.addEventListener("click", () => {
+      close(false);
+      // the verb's handler ran first; if focus is still on the item that just hid (or on body), return it to the trigger,
+      // never taking it from an element the handler focused elsewhere
+      const a = document.activeElement;
+      if (!a || a === document.body || menu.contains(a)) more.focus();
+    });
     group.addEventListener("keydown", (ev) => {
       if (menu.hidden) return;
+      mirror();
       if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); close(true); return; }
       const list = items(); const i = list.indexOf(document.activeElement);
       if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
