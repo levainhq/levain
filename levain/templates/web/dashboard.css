@@ -109,9 +109,9 @@
      entity's own store); an empty/unknown jar is drawn empty and labelled, never faked. */
   .jar { display: flex; align-items: center; gap: var(--sp-3); color: var(--meta); font-size: var(--fs-meta); }
   .jar svg { width: 32px; height: 42px; overflow: visible; }
-  .jar .jar-glass { fill: none; stroke: var(--label); stroke-width: 1.4; }
+  .jar .jar-glass { fill: none; stroke: var(--accent); stroke-width: 1.4; }
   .jar[hidden] { display: none; }
-  .jar .jar-fill { fill: var(--label); opacity: .55; }
+  .jar .jar-fill { fill: var(--accent); opacity: .85; }
   .jar.empty .jar-fill { opacity: 0; }
   .jar .jar-mark { stroke: var(--meta); stroke-width: 1; stroke-dasharray: 2 2; }
   .jar .jar-bubble { fill: var(--text); opacity: 0; animation: jar-rise 2.4s ease-out forwards; }
@@ -351,6 +351,13 @@
     border-radius: var(--r-sm);
     background: var(--base);
   }
+  /* in a fixed-height card the chart takes the height the card has left (bar, legend and note keep theirs) and
+     stretches to it; the traces keep a constant pixel width (non-scaling-stroke), so the stretch never thins or fattens a line */
+  body.ke .ck-zgrid .panel .pbody:has(> .scope-wrap) { display: flex; flex-direction: column; overflow: hidden; }
+  body.ke .ck-zgrid .scope-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  body.ke .ck-zgrid .scope-box { flex: 1; min-height: 120px; }
+  body.ke .ck-zgrid .scope-box svg.scope { height: 100%; }
+  svg.scope .trace-core, svg.scope .trace-glow { vector-effect: non-scaling-stroke; }
   svg.scope .grat { stroke: color-mix(in oklch, var(--contrast) 7%, transparent); stroke-width: 1; vector-effect: non-scaling-stroke; }
   svg.scope .trace-core {
     stroke-width: 1.7; stroke-linejoin: round; stroke-linecap: round;
@@ -362,9 +369,9 @@
     stroke-dasharray: 1; stroke-dashoffset: 1;
     animation: traceDraw 1.2s ease-out forwards, traceBreathe 10s ease-in-out 1.2s infinite;
   }
-  svg.scope .ch1 { stroke: var(--text); }
-  svg.scope .ch2 { stroke: color-mix(in oklch, var(--contrast) 62%, var(--base)); }
-  svg.scope .ch3 { stroke: color-mix(in oklch, var(--contrast) 40%, var(--base)); }
+  svg.scope .ch1 { stroke: var(--mind); }
+  svg.scope .ch2 { stroke: var(--identity); }
+  svg.scope .ch3 { stroke: var(--accent); }
   /* read-side instrument controls — METAL (materiality rule), real verbs only:
      timebase redraws the window; a channel chip solos its trace (CSS-only). */
   .scope-bar { display: flex; gap: var(--sp-2); align-items: center; margin: 0 0 var(--sp-3); }
@@ -387,9 +394,9 @@
   .scope-ch::before { content: "▰ "; }
   .scope-ch:hover { border-color: var(--line-hot); }
   .scope-ch[aria-pressed="true"] { border-color: currentColor; }
-  .scope-ch.ch1 { color: var(--text); }
-  .scope-ch.ch2 { color: color-mix(in oklch, var(--contrast) 62%, var(--base)); }
-  .scope-ch.ch3 { color: color-mix(in oklch, var(--contrast) 40%, var(--base)); }
+  .scope-ch.ch1 { color: var(--mind); }
+  .scope-ch.ch2 { color: var(--identity); }
+  .scope-ch.ch3 { color: var(--accent); }
   /* solo: hide the other traces (visibility, not opacity — the glow's breathe
      animation owns opacity and would override a static opacity rule) */
   .scope-wrap[data-solo="ch1"] svg.scope polyline:not(.ch1),

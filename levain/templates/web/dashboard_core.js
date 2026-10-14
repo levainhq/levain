@@ -864,6 +864,7 @@
       const svg = document.createElementNS(NS, "svg");
       svg.setAttribute("class", "scope");
       svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+      svg.setAttribute("preserveAspectRatio", "none"); // the card sets the height; see .scope-box in dashboard.css
       for (let i = 0; i <= 8; i++) svg.appendChild(gratLine(NS, (i * W) / 8, 0, (i * W) / 8, H));
       for (let i = 0; i <= 4; i++) svg.appendChild(gratLine(NS, 0, (i * H) / 4, W, (i * H) / 4));
       // Math.max floors the divisor at 1 — forward-defense for a future 1-sample
