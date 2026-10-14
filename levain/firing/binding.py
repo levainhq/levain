@@ -44,6 +44,7 @@ from levain.firing.confinement import (
 )
 from levain.firing.drive import DRIVE_MODES, DriveMode, resolve_cred_floor
 from levain.firing.isolation import guard_entity
+from levain.firing.ssh_agent import AgentError, ScopedAgent
 
 __all__ = [
     "BindingError",
@@ -194,6 +195,9 @@ class ConversationBinding:
     hands: HandsIdentity | None = None
     """The separate user bash runs as (:func:`~levain.firing.confinement.hands_for`), or None for the
     operator. When set, the floor is fenced around the hands user's workspace."""
+    ssh_agent: ScopedAgent | None = None
+    """The session's scoped ssh agent (:mod:`levain.firing.ssh_agent`), started and stopped by the
+    session, bound into each bash the conversation spawns; never with ``hands``."""
 
     @classmethod
     def create(
@@ -204,6 +208,7 @@ class ConversationBinding:
         workspace: Path | str,
         config: ConfinementConfig | None = None,
         hands: HandsIdentity | None = None,
+        ssh_agent: ScopedAgent | None = None,
     ) -> "ConversationBinding":
         """Resolve the floor ONCE, from a live entity.
 
@@ -240,8 +245,10 @@ class ConversationBinding:
             raise BindingError(
                 "a hands-user binding must fence the hands user's own workspace (fail-closed)."
             )
+        if hands is not None and ssh_agent is not None:
+            raise BindingError("a hands-user binding takes no scoped ssh agent (fail-closed).")
         return cls(entity_dir=ed, mode=mode, floor=floor, deny_standard_creds=deny_creds,
-                   hands=hands)
+                   hands=hands, ssh_agent=ssh_agent)
 
     def to_params(self) -> dict[str, Any]:
         """JSON-shaped, so it survives the SDK's fork (``model_dump`` → ``model_validate``) and its
@@ -255,13 +262,15 @@ class ConversationBinding:
         if self.hands is not None:
             out["hands"] = {"user": self.hands.user, "uid": self.hands.uid, "home": self.hands.home,
                             "workspace": str(self.hands.workspace)}
+        if self.ssh_agent is not None:
+            out["ssh_agent"] = self.ssh_agent.to_params()
         return out
 
     @classmethod
     def from_params(cls, data: Any) -> "ConversationBinding":
         """Deserialize only — no file is read and nothing is re-resolved, so the floor a tool is built
         with is the one the session resolved. Fails closed on any shape it did not write."""
-        if not isinstance(data, dict) or set(data) - {"hands"} != {
+        if not isinstance(data, dict) or set(data) - {"hands", "ssh_agent"} != {
             "entity_dir", "mode", "floor", "deny_standard_creds"
         }:
             raise BindingError("not a serialized conversation binding (fail-closed).")
@@ -273,6 +282,14 @@ class ConversationBinding:
                     and isinstance(h["uid"], int) and not isinstance(h["uid"], bool) and h["uid"] > 0):
                 raise BindingError("a serialized conversation binding has a malformed hands user (fail-closed).")
             hands = HandsIdentity(h["user"], h["uid"], h["home"], Path(h["workspace"]))
+        ssh_agent = None
+        if "ssh_agent" in data:
+            if hands is not None:
+                raise BindingError("a serialized hands-user binding carries a scoped ssh agent (fail-closed).")
+            try:
+                ssh_agent = ScopedAgent.from_params(data["ssh_agent"])
+            except AgentError as exc:
+                raise BindingError(f"a serialized conversation binding's ssh agent: {exc}") from None
         ed, mode, creds = data["entity_dir"], data["mode"], data["deny_standard_creds"]
         if not (isinstance(ed, str) and ed) or mode not in DRIVE_MODES or not isinstance(creds, bool):
             raise BindingError("a serialized conversation binding has a malformed field (fail-closed).")
@@ -287,4 +304,4 @@ class ConversationBinding:
                 "user's (fail-closed)."
             )
         return cls(entity_dir=Path(ed), mode=mode, floor=floor, deny_standard_creds=creds,
-                   hands=hands)
+                   hands=hands, ssh_agent=ssh_agent)

@@ -125,3 +125,66 @@ def test_the_binding_form_round_trips_and_refuses_another_shape():
                 {**a.to_params(), "pid": True}, {**a.to_params(), "extra": 1}, "x"):
         with pytest.raises(ssh_agent.AgentError):
             ssh_agent.ScopedAgent.from_params(bad)
+
+
+# --- the wiring: binding, spawn checks, the session's start ----------------------------------------
+
+def test_the_binding_carries_the_agent_and_refuses_it_beside_a_hands_user(tmp_path):
+    import json
+
+    from levain.firing.binding import BindingError, ConversationBinding
+
+    ent = tmp_path / "ent"
+    (ent / ".levain").mkdir(parents=True)
+    a = ssh_agent.ScopedAgent("0123456789ab", "/h/run/0123456789ab/agent.sock", 4242)
+    b = ConversationBinding.create(ent, mode="interactive", workspace=tmp_path / "ws", ssh_agent=a)
+    params = json.loads(json.dumps(b.to_params()))   # JSON, as the SDK's autosave keeps it
+    assert ConversationBinding.from_params(params).ssh_agent == a
+    params["ssh_agent"]["pid"] = "4242"
+    with pytest.raises(BindingError, match="ssh agent"):
+        ConversationBinding.from_params(params)
+    params["ssh_agent"] = a.to_params()
+    params["hands"] = {"user": "_levain_x", "uid": 900, "home": "/h", "workspace": str(tmp_path / "ws")}
+    with pytest.raises(BindingError, match="hands-user binding carries a scoped ssh agent"):
+        ConversationBinding.from_params(params)
+
+
+def test_the_spawn_binds_the_agent_only_while_its_started_pid_answers(home, tmp_path):
+    from levain.firing.confinement import ConfinementError, _ssh_agent_ops
+
+    a = ssh_agent.start()
+    rt = tmp_path / "rt"
+    ops, view = _ssh_agent_ops(a, [rt])
+    assert view == str(rt / "levain-ssh" / "agent.sock")
+    assert ops == ["--perms", "0700", "--dir", str(rt / "levain-ssh"), "--bind", a.socket, view]
+    impostor = ssh_agent.ScopedAgent(a.session_id, a.socket, a.pid + 1)
+    with pytest.raises(ConfinementError, match=f"answered by pid {a.pid}, not the agent levain started"):
+        _ssh_agent_ops(impostor, [rt])
+    with pytest.raises(ConfinementError, match="no user runtime dir"):
+        _ssh_agent_ops(a, [])
+    ssh_agent.stop(a)
+    with pytest.raises(ConfinementError, match="cannot be read"):
+        _ssh_agent_ops(a, [rt])
+
+
+def test_no_agent_is_started_where_it_is_not_bound_into_bash(home):
+    from levain.firing.confinement import start_session_ssh_agent
+
+    agent, why = start_session_ssh_agent("e", system="Darwin")
+    assert agent is None and "not wired on Darwin" in why
+    assert not (home / "run").exists()
+
+
+def test_the_session_close_stops_its_agent(home, tmp_path):
+    from levain.session import EntitySession
+
+    class _Conv:
+        def close(self):
+            pass
+
+    a = ssh_agent.start()
+    s = EntitySession(entity_dir=tmp_path, binding=None, conversation=_Conv(), workspace=tmp_path,
+                      model_label="m", with_tools=True, bash_ok=True, ssh_agent=a)
+    s.close()
+    assert s.release_error is None
+    assert not ssh_agent._alive(a.pid) and not a.dir.exists()
