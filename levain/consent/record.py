@@ -139,13 +139,18 @@ class ExternalGateRequest:
         return record_sha256(encode(self.fields()))
 
 
-def answer_payload(*, queue_id: str, request: ExternalGateRequest, decision: str, signer_fp: str) -> dict[str, str]:
-    """The record an answer signs: this queue, this request, its digest and expiry, the decision, the key."""
+def answer_payload(*, queue_id: str, request: ExternalGateRequest, decision: str, signer_fp: str,
+                   signed_at: str) -> dict[str, str]:
+    """The record an answer signs: this queue, this request, its digest and expiry, the decision, the key, and
+    when it was made (``signed_at``, a :func:`~levain.cockpit.consent.utc_stamp`; the queue's
+    :meth:`~levain.consent.queue.ConsentQueue.answer_payload` sets it from the queue's clock). Delivery checks
+    ``signed_at`` against the expiry, never the row's ``decided_at``, which any raw writer can set."""
     if decision not in DECISIONS:
         raise ConsentError(f"decision must be one of {DECISIONS}: {decision!r}")
+    parse_stamp(signed_at)
     return {"format": ANSWER_FORMAT, "queue_id": _need("queue_id", queue_id), "request_id": request.id,
             "request_digest": request.digest, "decision": decision, "expires_at": request.expires_at,
-            "signer_fp": _need("signer_fp", signer_fp)}
+            "signer_fp": _need("signer_fp", signer_fp), "signed_at": signed_at}
 
 
 def answer_message(payload: dict[str, str]) -> bytes:

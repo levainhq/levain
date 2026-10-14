@@ -121,7 +121,8 @@ class FakeAgent:
 
 
 def signed(queue, request, key, decision="allow", **override):
-    payload = answer_payload(queue_id=queue.queue_id, request=request, decision=decision, signer_fp=key.fp)
+    payload = answer_payload(queue_id=queue.queue_id, request=request, decision=decision, signer_fp=key.fp,
+                             signed_at=utc_stamp(queue._clock()))
     payload.update(override)
     return payload, key.sign(answer_message(payload))
 
@@ -244,7 +245,8 @@ def test_refuses_an_answer_for_another_queue(queue, keys, authority):
 
 def test_a_yes_signed_by_another_key_than_it_names_is_no_decision(queue, keys, authority):
     request = FakeAgent(queue).ask()
-    payload = answer_payload(queue_id=queue.queue_id, request=request, decision="allow", signer_fp=keys["phone"].fp)
+    payload = answer_payload(queue_id=queue.queue_id, request=request, decision="allow", signer_fp=keys["phone"].fp,
+                             signed_at=utc_stamp(NOW))
     sig = keys["stranger"].sign(answer_message(payload))
     with pytest.raises(AnswerRefused, match="does not verify"):
         queue.answer(request.id, payload, sig)
@@ -254,7 +256,8 @@ def test_a_yes_signed_by_another_key_than_it_names_is_no_decision(queue, keys, a
 @pytest.mark.parametrize("namespace", ["levain-cockpit", auth.NAMESPACE, "levain-confirm"])
 def test_a_signature_in_another_namespace_is_no_decision(queue, keys, authority, namespace):
     request = FakeAgent(queue).ask()
-    payload = answer_payload(queue_id=queue.queue_id, request=request, decision="allow", signer_fp=keys["phone"].fp)
+    payload = answer_payload(queue_id=queue.queue_id, request=request, decision="allow", signer_fp=keys["phone"].fp,
+                             signed_at=utc_stamp(NOW))
     sig = keys["phone"].sign(answer_message(payload), namespace)
     with pytest.raises(AnswerRefused, match="does not verify"):
         queue.answer(request.id, payload, sig)
@@ -383,20 +386,17 @@ def test_an_answer_is_checked_against_a_fresh_replay(tmp_path, keys, clock):
     assert queue.get(request.id)[1] == "pending"
 
 
-def test_an_unavailable_authority_is_no_decision(tmp_path, keys, clock, authority):
+def test_an_unavailable_authority_is_no_decision(tmp_path, keys, clock):
     """F2: no replay, no authority: an answer is refused and a stored allow is not delivered."""
-    state = {"up": True}
-
-    def source():
-        if not state["up"]:
-            raise auth.NotInitialised("gone")
-        return authority()
-
-    queue = ConsentQueue(tmp_path / "consent", authority=source, clock=clock)
+    (tmp_path / "auth").mkdir()
+    log = Log(tmp_path / "auth", keys)
+    log.enrol("laptop", "laptop-presence")
+    log.enrol("phone", "display-phone")
+    queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
     a, b = FakeAgent(queue).ask("a"), FakeAgent(queue).ask("b")
     payload, sig = signed(queue, a, keys["phone"])
     queue.answer(a.id, payload, sig)
-    state["up"] = False
+    log.path.rename(tmp_path / "auth" / "moved.db")          # the log is gone: nothing can be replayed
     assert queue.decision(a.id) is None
     payload, sig = signed(queue, b, keys["phone"])
     with pytest.raises(AnswerRefused, match="cannot be replayed"):
@@ -477,6 +477,86 @@ def test_polling_a_pending_request_takes_no_write_lock(queue):
         blocker.close()
         reader.join(35)
     assert got["r"][1] == "pending"
+
+
+# --- fix round 2: G1-G5 ---------------------------------------------------------------------------------------
+
+def test_a_late_signed_answer_with_a_forged_decided_at_is_no_decision(queue, clock, keys):
+    """G1: "in time" is the signed signed_at, never the row's decided_at a raw writer can set."""
+    request = FakeAgent(queue).ask(hold=timedelta(seconds=30))
+    clock.now = NOW + timedelta(seconds=40)
+    assert queue.get(request.id)[1] == "expired"
+    payload, sig = signed(queue, request, keys["phone"])     # a real signature, made after the expiry
+    _raw(queue, ("DROP TRIGGER requests_frozen", ()),
+         ("UPDATE requests SET state = 'allowed', decided_at = ?, answer = ?, signature = ?, signer_fp = ? "
+          "WHERE id = ?", (utc_stamp(NOW), answer_message(payload).decode(), sig, keys["phone"].fp, request.id)))
+    assert queue.decision(request.id) is None
+
+
+def test_an_answer_signed_outside_the_request_window_is_refused(queue, keys):
+    """G1: signed_at must fall in [received_at, expires_at)."""
+    request = FakeAgent(queue).ask(hold=timedelta(seconds=30))
+    for when, why in ((NOW + timedelta(seconds=30), "after the request expired"),
+                      (NOW - timedelta(seconds=1), "before the request was filed")):
+        payload, sig = signed(queue, request, keys["phone"], signed_at=utc_stamp(when))
+        with pytest.raises(AnswerRefused, match=why):
+            queue.answer(request.id, payload, sig)
+    payload, sig = signed(queue, request, keys["phone"], signed_at="yesterday")
+    with pytest.raises(AnswerRefused, match="not a timestamp"):
+        queue.answer(request.id, payload, sig)
+    assert queue.get(request.id)[1] == "pending"
+
+
+def test_the_queue_builds_the_payload_signed_at_its_own_clock(queue, clock, keys):
+    """G1: ConsentQueue.answer_payload stamps signed_at from the queue's clock."""
+    request = FakeAgent(queue).ask()
+    clock.now = NOW + timedelta(seconds=7)
+    payload = queue.answer_payload(request.id, "allow", keys["phone"].fp)
+    assert payload["signed_at"] == utc_stamp(NOW + timedelta(seconds=7))
+    assert queue.answer(request.id, payload, keys["phone"].sign(answer_message(payload))).decision == "allow"
+
+
+def test_authority_must_be_the_replaying_source(tmp_path, authority):
+    """G2: a snapshot, a lambda returning one, or a subclass is refused at construction."""
+    from levain.cockpit.consent import ConsentError
+    from levain.consent.queue import AuthoritySource
+    snap = authority()
+
+    class Stale(AuthoritySource):
+        def __call__(self):
+            return snap
+
+    for bad in (snap, lambda: snap, Stale(tmp_path / "x.db", anchor=None)):
+        with pytest.raises(ConsentError, match="AuthoritySource"):
+            ConsentQueue(tmp_path / "consent", authority=bad)
+
+
+def test_a_retried_hook_event_is_refused_later_too(queue, clock):
+    """G3: the same hook event filed again a second later (a new seal) is still refused; other sessions are not."""
+    from levain.cockpit.consent import ConsentError
+    kw = dict(agent="codex", agent_session_id="s", tool_name="Bash", tool_input={"command": "ls"}, cwd="/w",
+              hold=timedelta(minutes=1), event_id="evt-1")
+    queue.file(**kw)
+    clock.now = NOW + timedelta(seconds=1)
+    with pytest.raises(ConsentError, match="already filed"):
+        queue.file(**kw)
+    assert queue.file(**{**kw, "agent_session_id": "s2"}).event_id == "hook:evt-1"
+    assert len(queue.pending()) == 2
+
+
+def test_a_decision_carries_the_digest_of_the_request_it_answered(queue, keys):
+    """G4: an adapter can bind delivery to the input it showed."""
+    request = FakeAgent(queue).ask()
+    payload, sig = signed(queue, request, keys["phone"])
+    assert queue.answer(request.id, payload, sig).request_digest == request.digest
+    assert queue.decision(request.id).request_digest == request.digest
+
+
+@pytest.mark.parametrize("poll", [-1.0, 0.0, float("nan")])
+def test_a_bad_poll_does_not_crash_the_wait(queue, poll):
+    """G5: poll is clamped to >= 1ms."""
+    request = FakeAgent(queue).ask()
+    assert queue.await_decision(request.id, 0.05, poll=poll) is None
 
 
 # --- the store ---------------------------------------------------------------------------------------------

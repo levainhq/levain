@@ -4,8 +4,8 @@ A hook files an :class:`~levain.consent.record.ExternalGateRequest`; the request
 one of four things ends it:
 
   - ``allowed`` / ``denied``: an answer that VERIFIES (:meth:`ConsentQueue.answer`): a record binding this
-    queue, the request's id, its digest, its expiry and the decision, signed in
-    :data:`~levain.consent.record.ANSWER_NAMESPACE` by a key the replayed authority log holds unrevoked, of a
+    queue, the request's id, its digest, its expiry, the decision and when it was signed (before the expiry),
+    signed in :data:`~levain.consent.record.ANSWER_NAMESPACE` by a key the replayed authority log holds unrevoked, of a
     class that covers the request's tier for an allow. A delivered "yes" that does not verify is no
     decision, never an allow (the 10-08 rule): the request stays pending;
   - ``expired``: its ``expires_at`` passed with no verified answer. Silence is NO decision: the hook outputs
@@ -54,10 +54,10 @@ from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
 from levain.autonomic.receipt import build_action_face, build_gate_face, build_gate_verdict
-from levain.cockpit.consent import ConsentError, utc_stamp
+from levain.cockpit.consent import ConsentError, parse_stamp, utc_stamp
 from levain.cockpit.firejournal import _CLASS_RANK, _TIER_NEEDS
 from levain.consent.record import (
-    ANSWER_FORMAT, ANSWER_NAMESPACE, DECISIONS, ExternalGateRequest, answer_message, redact_display,
+    ANSWER_FORMAT, ANSWER_NAMESPACE, DECISIONS, ExternalGateRequest, answer_message, answer_payload, redact_display,
     tool_input_digest,
 )
 
@@ -69,14 +69,11 @@ STORE_FORMAT = "levain-consent-queue/2"
 STATES: tuple[str, ...] = ("pending", "allowed", "denied", "expired", "withdrawn")
 TERMINAL: frozenset[str] = frozenset(STATES[1:])
 _ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
-                          "signer_fp"})
+                          "signer_fp", "signed_at"})
 _FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_input_digest", "display", "cwd",
            "tier", "received_at", "expires_at")
 _STATE_OF = {"allow": "allowed", "deny": "denied"}
 _ACCESS_BY_OTHERS = 0o077
-
-# A trusted source of authority: each call is a fresh, verified, anchor-checked replay of the log, or raises.
-AuthoritySource = Callable[[], AuthoritySnapshot]
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
@@ -86,6 +83,9 @@ _SCHEMA = (
     "state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','allowed','denied','expired','withdrawn')), "
     "decided_at TEXT, answer TEXT, signature TEXT, signer_fp TEXT, note TEXT)",
     "CREATE INDEX IF NOT EXISTS requests_pending ON requests (state, expires_at)",
+    # a hook's own event id names one permission event: a retry of it, at any time, is refused
+    "CREATE UNIQUE INDEX IF NOT EXISTS requests_hook_event ON requests (agent, agent_session_id, event_id) "
+    "WHERE event_id LIKE 'hook:%'",
     "CREATE TABLE IF NOT EXISTS receipts (seq INTEGER PRIMARY KEY AUTOINCREMENT, request_id TEXT NOT NULL UNIQUE "
     "REFERENCES requests(id), state TEXT NOT NULL, created_at TEXT NOT NULL, face TEXT NOT NULL)",
     # terminal is terminal; a request's fields never change; nothing is deleted; receipts are append-only
@@ -116,11 +116,14 @@ class AnswerRefused(Exception):
 
 @dataclass(frozen=True)
 class Decision:
-    """A verified answer: what the hook delivers. ``decision`` is ``allow`` or ``deny``."""
+    """A verified answer: what the hook delivers. ``decision`` is ``allow`` or ``deny``. ``request_digest`` is
+    the digest of the request the answer signed: an adapter delivers only when it is the digest of the request
+    it filed for the input it is holding (``ExternalGateRequest.digest``)."""
     request_id: str
     decision: str
     signer_fp: str
     decided_at: str
+    request_digest: str
 
 
 def default_queue_dir() -> Path:
@@ -130,32 +133,45 @@ def default_queue_dir() -> Path:
     return ((Path(home).expanduser() if home else Path.home() / ".levain") / "consent").resolve()
 
 
-def authority_source(cockpit_db: Path | str, *, anchor: Path | None, cache: ReplayCache | None = None,
-                     ssh_keygen: Path | str | None = None) -> AuthoritySource:
-    """The trusted authority source for a queue: each call opens ``cockpit_db`` read-only and returns
-    :func:`levain.authority.snapshot` (a verified replay of the log's head) checked by
-    :func:`levain.authority.check_anchor` against the anchor file :func:`levain.authority.read_anchor`
-    read first (as ``cockpit.authority.RequestAuthority.capture`` orders them: an append committing in
-    between can only put the log ahead of the anchor). ``anchor=None`` checks no anchor. Raises on any
-    failure; the queue turns that into no decision."""
-    uri = Path(cockpit_db).resolve().as_uri() + "?mode=ro"
-    kw: dict[str, Any] = {"cache": cache}
-    if ssh_keygen is not None:
-        kw["ssh_keygen"] = ssh_keygen
+class AuthoritySource:
+    """The trusted authority source for a queue; make it with :func:`authority_source`. Each call opens the
+    cockpit database read-only and returns :func:`levain.authority.snapshot` (a verified replay of the log's
+    head) checked by :func:`levain.authority.check_anchor` against the anchor file
+    :func:`levain.authority.read_anchor` read first (as ``cockpit.authority.RequestAuthority.capture`` orders
+    them: an append committing in between can only put the log ahead of the anchor). ``anchor=None`` checks
+    no anchor, so the replay is only as trustworthy as the database file: production passes the real anchor.
+    Raises on any failure; the queue turns that into no decision.
 
-    def replay() -> AuthoritySnapshot:
-        conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=30.0)
+    A queue takes only this class (not a subclass, not any callable): freshness is the queue's guarantee,
+    never a promise a caller's ``lambda: snapshot`` could break."""
+
+    __slots__ = ("_uri", "_anchor", "_kw")
+
+    def __init__(self, cockpit_db: Path | str, *, anchor: Path | None, cache: ReplayCache | None = None,
+                 ssh_keygen: Path | str | None = None) -> None:
+        self._uri = Path(cockpit_db).resolve().as_uri() + "?mode=ro"
+        self._anchor = None if anchor is None else Path(anchor)
+        self._kw: dict[str, Any] = {"cache": cache}
+        if ssh_keygen is not None:
+            self._kw["ssh_keygen"] = ssh_keygen
+
+    def __call__(self) -> AuthoritySnapshot:
+        conn = sqlite3.connect(self._uri, uri=True, isolation_level=None, timeout=30.0)
         try:
             conn.execute("BEGIN")
-            pinned = None if anchor is None else read_anchor(anchor)
-            snap = snapshot(conn, **kw)
+            pinned = None if self._anchor is None else read_anchor(self._anchor)
+            snap = snapshot(conn, **self._kw)
             check_anchor(snap, pinned)
             conn.execute("COMMIT")
             return snap
         finally:
             conn.close()
 
-    return replay
+
+def authority_source(cockpit_db: Path | str, *, anchor: Path | None, cache: ReplayCache | None = None,
+                     ssh_keygen: Path | str | None = None) -> AuthoritySource:
+    """The trusted authority source for a queue (see :class:`AuthoritySource`)."""
+    return AuthoritySource(cockpit_db, anchor=anchor, cache=cache, ssh_keygen=ssh_keygen)
 
 
 def decide_by_policy(request: ExternalGateRequest) -> Decision | None:
@@ -181,8 +197,9 @@ class ConsentQueue:
     def __init__(self, directory: Path | str | None = None, *, authority: AuthoritySource,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  ssh_keygen: Path | str | None = None) -> None:
-        if not callable(authority):
-            raise ConsentError("authority must be a source that replays the authority log (authority_source)")
+        if type(authority) is not AuthoritySource:
+            raise ConsentError("authority must be the AuthoritySource authority_source() returns, which replays "
+                               "the authority log on every call; a snapshot or another callable is refused")
         self.directory = Path(directory) if directory is not None else default_queue_dir()
         self.path = self.directory / DB_NAME
         self._authority = authority
@@ -271,7 +288,8 @@ class ConsentQueue:
         """File one gate an agent is waiting on; it expires ``hold`` after now. ``tier`` must be one an
         allow can be signed at (``T2`` or ``T3``). ``event_id`` is the hook's own unique id for this
         permission event when its agent has one; without it the request gets an unpredictable one. Either
-        way two filings are two requests: filing the same event twice raises, it never returns the first."""
+        way two filings are two requests, never one returned twice: a hook event id is unique per agent and
+        session in the store, so filing the same event again raises, at any time."""
         if tier not in _TIER_NEEDS:
             raise ConsentError(f"tier must be one of {tuple(_TIER_NEEDS)}: {tier!r}")
         if not isinstance(hold, timedelta) or hold <= timedelta(0):
@@ -292,7 +310,8 @@ class ConsentQueue:
                 conn.execute(f"INSERT INTO requests ({', '.join(_FIELDS)}) VALUES "
                              f"({', '.join('?' for _ in _FIELDS)})", tuple(request.fields()[f] for f in _FIELDS))
         except sqlite3.IntegrityError:
-            raise ConsentError(f"request {request.id} is already filed: one event is filed once") from None
+            raise ConsentError(f"request {request.id} (event {event}) is already filed: one event is filed once"
+                               ) from None
         return request
 
     # --- reading -------------------------------------------------------------------------------------
@@ -436,6 +455,15 @@ class ConsentQueue:
             return "the answer signs another version of this request"
         if payload["expires_at"] != request.expires_at:
             return "the answer names another expiry"
+        signed_at = payload["signed_at"]
+        try:
+            parse_stamp(signed_at)
+        except ConsentError:
+            return "the answer's signed_at is not a timestamp"
+        if signed_at < request.received_at:
+            return "the answer was signed before the request was filed"
+        if signed_at >= request.expires_at:
+            return "the answer was signed after the request expired"
         decision = payload["decision"]
         if decision not in DECISIONS:
             return f"decision {decision!r} is not one of {DECISIONS}"
@@ -488,7 +516,20 @@ class ConsentQueue:
                 signature=signature, signer_fp=payload["signer_fp"])
         if not moved:
             raise AnswerRefused(f"request {request_id} is already {now_state or 'gone'}")
-        return Decision(request_id=request.id, decision=decision, signer_fp=payload["signer_fp"], decided_at=stamp)
+        return Decision(request_id=request.id, decision=decision, signer_fp=payload["signer_fp"], decided_at=stamp,
+                        request_digest=request.digest)
+
+    def answer_payload(self, request_id: str, decision: str, signer_fp: str) -> dict[str, str]:
+        """The record to sign to answer ``request_id``, ``signed_at`` now by the queue's clock (what the
+        cockpit shows a signer). Raises :class:`AnswerRefused` when there is no sealed pending request."""
+        got = self.get(request_id)
+        if got is None:
+            raise AnswerRefused(f"no sealed request {request_id!r}")
+        request, state = got
+        if state != "pending":
+            raise AnswerRefused(f"request {request_id} is already {state}")
+        return answer_payload(queue_id=self.queue_id, request=request, decision=decision, signer_fp=signer_fp,
+                              signed_at=utc_stamp(_now_utc(self._clock)))
 
     def decision(self, request_id: str) -> Decision | None:
         """The decision of a terminal request, re-verified now: the stored answer must be the canonical
@@ -502,8 +543,8 @@ class ConsentQueue:
             return None
         request = self._request_of(row)
         stored, decided_at = row["answer"], row["decided_at"]
-        if request is None or not isinstance(stored, str) or not isinstance(decided_at, str) \
-                or decided_at >= request.expires_at:
+        # "in time" is the SIGNED signed_at (checked in _refusal), never decided_at, which a raw writer sets
+        if request is None or not isinstance(stored, str) or not isinstance(decided_at, str):
             return None
         try:
             payload = json.loads(stored)
@@ -519,14 +560,15 @@ class ConsentQueue:
         if authority is None or self._refusal(request, queue_id[0], payload, row["signature"], authority) is not None:
             return None
         return Decision(request_id=request.id, decision=payload["decision"], signer_fp=payload["signer_fp"],
-                        decided_at=decided_at)
+                        decided_at=decided_at, request_digest=request.digest)
 
     def await_decision(self, request_id: str, timeout: float, *, poll: float = 0.1,
                        sleep: Callable[[float], None] = time.sleep) -> Decision | None:
         """Wait up to ``timeout`` seconds for a verified decision. ``None`` is NO decision: the request
         expired, was withdrawn, is unknown, its stored answer no longer verifies, or it is still pending
         when the wait ends (the adapter then outputs nothing, so the native dialog stands, and withdraws or
-        lets it expire)."""
+        lets it expire). ``poll`` below 1ms (or not a number) is 1ms."""
+        poll = poll if poll >= 0.001 else 0.001             # NaN compares false: it becomes 1ms too
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
             got = self.get(request_id)
