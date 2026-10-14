@@ -247,6 +247,34 @@ def test_an_ssh_agent_is_refused_by_what_listens_whatever_the_environment_says(r
         proc.wait(5)
 
 
+def test_gpg_agents_extra_socket_stays_a_grant_while_gpg_agent_listens_on_it(rd, grants, monkeypatch):
+    """L3 b2a r1 (complement #1): with `gpg-agent` in the listener list, the gpg signing grant the README
+    tells you to make was refused whenever the agent was up. comm is faked here (`_listener_comm`
+    stubbed to answer `gpg-agent` for every path); the real read is the Linux test above. gpg's ssh
+    socket, which gpg-agent also listens on, is still refused, by its inode."""
+    extra = _listen(rd / "gnupg" / "S.gpg-agent.extra")
+    gpg_ssh = _listen(rd / "gnupg" / "S.gpg-agent.ssh")
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.setattr(conf, "_listener_comm", lambda p: "gpg-agent")
+    monkeypatch.setattr(conf, "_gpg_extra_sockets", lambda: {str(rd / "gnupg" / "S.gpg-agent.extra"): "/h/.gnupg"})
+    monkeypatch.setattr(conf, "_gpg_ssh_sockets", lambda: [str(rd / "gnupg" / "S.gpg-agent.ssh")])
+    try:
+        grants([{"path": str(rd / "gnupg" / "S.gpg-agent.extra"), "name": "gpg", "why": "signing"}])
+        got = conf.load_operator_grants()
+        assert [(g.name, g.gpg_extra) for g in got] == [("gpg", True)]
+        conf.resolve_grant(got[0], [rd])   # the spawn's entry check accepts it too
+        grants([{"path": str(rd / "gnupg" / "S.gpg-agent.ssh"), "name": "keys", "why": "w"}])
+        with pytest.raises(ConfinementError, match="gpg-agent's ssh socket"):
+            conf.load_operator_grants()
+        monkeypatch.setattr(conf, "_listener_comm", lambda p: "ssh-agent")   # the list still refuses ssh-agent
+        grants([{"path": str(rd / "gnupg" / "S.gpg-agent.extra"), "name": "gpg", "why": "signing"}])
+        with pytest.raises(ConfinementError, match="the process listening on it is ssh-agent"):
+            conf.load_operator_grants()
+    finally:
+        extra.close()
+        gpg_ssh.close()
+
+
 def test_a_grant_of_the_operators_own_ssh_agent_is_refused_by_where_it_resolves(rd, grants, monkeypatch):
     """D1: a grant of your ssh agent would hand bash every key it holds while doctor printed no agent.
     Refused by what the path resolves to at check time, under any name: the socket `$SSH_AUTH_SOCK`
