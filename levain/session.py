@@ -69,8 +69,10 @@ from levain.firing.confinement import (
     hands_for,
     load_confinement_config,
     resolve_localhost_deny,
+    start_session_ssh_agent,
 )
 from levain.firing.deadline import TurnTimeout
+from levain.firing.ssh_agent import stop as stop_ssh_agent
 from levain.firing.drive import (
     DRIVE_MODES,
     DriveMode,
@@ -709,6 +711,11 @@ class EntitySession:
     bash runs as the operator (no setup, the interactive REPL, or Linux): the banner says which."""
     hands_uid: int | None = None
     """That user's id as setup recorded it, for the stop at the session's end (no name lookup)."""
+    ssh_agent: Any = field(default=None, repr=False, compare=False)
+    """The scoped ssh agent this session started for its bash (:mod:`levain.firing.ssh_agent`), or None;
+    :meth:`close` stops it."""
+    ssh_agent_note: str | None = None
+    """Why this session has no scoped ssh agent, when its bash could have had one; the banner says so."""
     _close_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
@@ -839,6 +846,8 @@ class EntitySession:
         started = False
         hands_lock_fd: int | None = None
         hands_session_fd: int | None = None
+        scoped_agent: Any = None
+        ssh_agent_note: str | None = None
         try:
             llm = LLM(usage_id="levain-run", **resolve_llm_kwargs(model, base_url, api_key))
             # Fail CLOSED if support cannot be determined: an undetermined sandbox means NO
@@ -894,9 +903,14 @@ class EntitySession:
             # spore-438: THIS conversation's entity + drive mode + floor, resolved ONCE from the
             # config read above and carried into both hands as data (the tool spec), which are
             # built from it below before open returns. Another session's binding is another object.
+            # The scoped ssh agent, before the binding that carries it and the first bash command: an
+            # operator-floor bash only (a hands user's shell is not the operator's to give keys to).
+            if cfg is not None and bash_ok and hands_id is None:
+                scoped_agent, ssh_agent_note = start_session_ssh_agent(entity_dir.name)
             conv_binding = (
                 ConversationBinding.create(
-                    entity_dir, mode=mode, workspace=workspace, config=cfg, hands=hands_id
+                    entity_dir, mode=mode, workspace=workspace, config=cfg, hands=hands_id,
+                    ssh_agent=scoped_agent,
                 )
                 if cfg is not None
                 else None
@@ -1020,6 +1034,9 @@ class EntitySession:
                     )
             # After the conversation, and only if it closed and nothing of the hands user is left: a
             # shell or process still alive must keep ws-git out.
+            # After the conversation and its shell: the agent goes with a start that failed.
+            if not started and scoped_agent is not None:
+                stop_ssh_agent(scoped_agent)
             if not started and hands_session_fd is not None and hands_id is not None:
                 torn_down = _stop_hands_user(hands_id.user, hands_id.uid) is None and torn_down
             if not started and torn_down:
@@ -1045,6 +1062,8 @@ class EntitySession:
             hands_session_fd=hands_session_fd,
             hands_user=hands_id.user if (with_tools and hands_id is not None) else None,
             hands_uid=hands_id.uid if (with_tools and hands_id is not None) else None,
+            ssh_agent=scoped_agent,
+            ssh_agent_note=ssh_agent_note,
         )
 
     # -- the one operation ---------------------------------------------------
@@ -1645,6 +1664,11 @@ class EntitySession:
             # this process ends, which releases them (S2 L3 r2, codex HIGH).
             # The stop runs whether or not the teardown did: a setsid child is not reached by the
             # conversation's close, and must not outlive a session whose close failed (S2 L3 r3).
+            # The scoped ssh agent after the shell that used it; it holds no file a lock protects.
+            if self.ssh_agent is not None:
+                left = stop_ssh_agent(self.ssh_agent)
+                if left is not None and self.release_error is None:
+                    self.release_error = f"ssh agent: {left}"
             if self.hands_session_fd is not None and self.hands_user is not None:
                 self.left_running = _stop_hands_user(self.hands_user, self.hands_uid)
                 torn_down = torn_down and self.left_running is None

@@ -119,6 +119,7 @@ from levain.firing.confinement import (
     with_gpg_program_denies,
 )
 from levain.firing.binding import ConversationBinding
+from levain.firing.ssh_agent import ScopedAgent
 
 _log = logging.getLogger("levain.firing.tools")  # module convention: see levain/wrap.py, jobs.py
 
@@ -950,7 +951,7 @@ class _SharedFloor:
     correct because of who happens to call it is a contract, and this file's own history says
     contracts drift."""
 
-    __slots__ = ("_policy", "hands", "grants", "_lock", "_refusal", "_on_refuse")
+    __slots__ = ("_policy", "hands", "grants", "ssh_agent", "_lock", "_refusal", "_on_refuse")
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "_SharedFloor":
         # The SDK's fork deep-copies a conversation's events, and the system-prompt event holds the
@@ -958,7 +959,8 @@ class _SharedFloor:
         # (and floor) from its tool spec. A lock cannot be copied, so the record shares this object.
         return self
 
-    def __init__(self, policy: CrownJewelsPolicy, hands: HandsIdentity | None = None) -> None:
+    def __init__(self, policy: CrownJewelsPolicy, hands: HandsIdentity | None = None,
+                 ssh_agent: "ScopedAgent | None" = None) -> None:
         # The operator's socket grants, read ONCE for the conversation: every (re)spawn of its shell and
         # chat's reach check use this snapshot, never a later read of the file (codex L3 b1b r1). With
         # gpg's extra socket in it, gnupg's default programs are write-denied for both hands from here on.
@@ -968,6 +970,9 @@ class _SharedFloor:
         self._policy = policy
         # The separate user both hands act as (bash runs as it; the editor writes as it), or None.
         self.hands = hands
+        # The session's scoped ssh agent (levain.firing.ssh_agent), bound into every bash it spawns; never
+        # with a hands user.
+        self.ssh_agent = ssh_agent if hands is None else None
         self._lock = threading.Lock()
         self._refusal: str | None = None
         self._on_refuse: list[Any] = []   # weak references to hands' revoke callbacks
@@ -1414,6 +1419,8 @@ class SandboxedBashExecutor(ToolExecutor[TerminalAction, TerminalObservation]):
                         refreshed, default_timeout=self._default_timeout,
                         **({"hands": self._floor.hands} if self._floor.hands is not None else {}),
                         **({"grants": grants} if grants and _accepts_kw(provider.spawn_shell, "grants") else {}),
+                        **({"ssh_agent": self._floor.ssh_agent} if self._floor.ssh_agent is not None
+                           and _accepts_kw(provider.spawn_shell, "ssh_agent") else {}),
                     )
                 except FloorRefreshError as exc:
                     # The provider's own refresh failed: a refusal of the floor for both hands,
@@ -1648,7 +1655,7 @@ class LevainHands(ToolDefinition[Action, Observation]):
         with_bash: bool = True,
     ) -> list[ToolDefinition[Any, Any]]:
         resolved = ConversationBinding.from_params(binding)
-        floor = _SharedFloor(resolved.floor, resolved.hands)
+        floor = _SharedFloor(resolved.floor, resolved.hands, resolved.ssh_agent)
         tools: list[ToolDefinition[Any, Any]] = [
             *LevainFileEditorTool.create(conv_state, floor=floor)
         ]
