@@ -1034,8 +1034,8 @@
     };
     for (const b of rest) { b.setAttribute("role", "menuitem"); menu.appendChild(b); }
     const items = () => Array.prototype.slice.call(menu.querySelectorAll(".verb-btn")).filter((b) => !b.disabled && b.offsetParent !== null);
-    // an outside press closes the menu (a button takes no focus on a mouse press in Safari/Firefox, so a focusout with
-    // no relatedTarget says nothing about where the press went)
+    // an outside press closes the menu (a button takes no focus on a mouse press in Safari/Firefox, so a focusout on a
+    // press carries a null relatedTarget, or the focusable ancestor the press landed on, and says nothing about where the press went)
     const outside = (ev) => { if (!group.contains(ev.target)) close(false); };
     const close = (refocus) => {
       menu.hidden = true; menu.classList.remove("up");
@@ -1057,6 +1057,8 @@
       if (first) first.focus(); else close(false);
     };
     more.addEventListener("click", (ev) => { ev.stopPropagation(); if (menu.hidden) open(); else close(true); });
+    // keep focus on the item through a press: Safari would move it to the row, which strands the keyboard outside the group
+    menu.addEventListener("mousedown", (ev) => ev.preventDefault());
     menu.addEventListener("click", () => {
       close(false);
       // the verb's handler ran first; if focus is still on the item that just hid (or on body), return it to the trigger,
@@ -1076,9 +1078,9 @@
       } else if (ev.key === "Tab") close(false);
     });
     group.addEventListener("focusout", (ev) => {
-      // only a keyboard move to a real element outside the group closes here; a null relatedTarget is a mouse press
-      // (the pointerdown listener above decides that one). A press on a menu item in Safari moves focus to the nearest
-      // focusable ANCESTOR (the row, tabIndex 0), so a relatedTarget that CONTAINS the group is that press, not a move out
+      // only a move to a real element outside the group, other than an ancestor of it, closes here; a press arrives with a
+      // null relatedTarget or with the focusable ANCESTOR it landed on (Safari: the row, tabIndex 0), and the pointerdown
+      // listener above decides those. The mousedown handler on the menu keeps the item focused, this is its backstop
       const rt = ev.relatedTarget;
       if (!menu.hidden && rt && !group.contains(rt) && !rt.contains(group)) close(false);
     });

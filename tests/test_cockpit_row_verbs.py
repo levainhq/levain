@@ -84,3 +84,15 @@ def test_a_press_that_moves_focus_to_the_row_does_not_close_the_menu_before_the_
     assert vals[1] is False, vals
     assert vals[2] is False, vals    # relatedTarget = the row: the menu stays open for the click
     assert vals[3] is True, vals     # a keyboard move to an unrelated element still closes it
+
+
+@needs_browser
+def test_a_press_inside_the_menu_keeps_focus_on_the_item(tmp_path: Path) -> None:
+    """The primary half of the Safari fix: mousedown inside the open menu is default-prevented, so the browser does not move
+    focus to the row at all (the keyboard stays inside the group after a mouse press)."""
+    vals = _page(tmp_path, [
+        {"eval": f"(() => {{ const v = {ROW}.querySelector('.verb-actions'); const m = v.querySelector('.verb-more'); m.focus(); m.click(); return v.querySelector('.verb-menu').hidden; }})()"},
+        {"eval": f"(() => {{ const v = {ROW}.querySelector('.verb-actions'); const it = v.querySelector('.verb-menu .verb-btn:not(.verb-dup)'); "
+                 "const ev = new MouseEvent('mousedown', {bubbles: true, cancelable: true}); it.dispatchEvent(ev); return ev.defaultPrevented; })()"},
+    ])
+    assert vals[1] is False and vals[2] is True, vals
