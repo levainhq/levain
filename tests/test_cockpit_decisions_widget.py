@@ -68,7 +68,7 @@ def test_an_empty_decisions_tile_says_so_plainly_and_opens_and_closes(tmp_path: 
 @needs_browser
 def test_the_tile_counts_the_rows_and_the_modal_lists_them(tmp_path: Path) -> None:
     _root, src, _ids = _install(tmp_path)
-    switch = time.monotonic() + 7.0       # the rows change under the page at this instant, the count unchanged
+    switch = time.monotonic() + 10.0      # the rows change under the page at this instant, the count unchanged
     first = _rows()
     second = (first[0], RowIn(id="np:9", title="a new one", body="stopped: a new one", facets={"stopped": "x", "at": "2026-10-14T09:00:00Z"},
                               stored={"what": "n", "np_version": "v1"}))
@@ -87,7 +87,9 @@ def test_the_tile_counts_the_rows_and_the_modal_lists_them(tmp_path: Path) -> No
             {"eval": f"(() => {{ {TILE}.click(); return document.querySelector('#levain-modal .modal-body').innerText.replace(/\\s+/g, ' ').toLowerCase(); }})()"},
             {"eval": f"(() => {{ {ESC}; return !document.getElementById('levain-modal'); }})()"},
             # the rows changed with the count the same: a refetch repaints in place, and an expand opened after it lists the new row
-            {"eval": "(async () => { await new Promise(r => setTimeout(r, 8000)); return await LevainCockpitKinds.refetchPanel('decisions'); })()"},
+            {"eval": "(async () => { for (let i = 0; i < 300; i++) { const p = await LevainCockpitTransport.readJson('/cockpit/panel/decisions.json?profile=full'); "
+                     "if (JSON.stringify(p).includes('a new one')) break; await new Promise(r => setTimeout(r, 200)); } "
+                     "return await LevainCockpitKinds.refetchPanel('decisions'); })()"},
             {"eval": f"(() => {{ {TILE}.click(); return document.querySelector('#levain-modal .modal-body').innerText.replace(/\\s+/g, ' ').toLowerCase(); }})()"},
             # a re-render replaces the tile that opened the view: Esc still hands focus to its successor
             {"eval": f"(async () => {{ const t = {TILE}; t.replaceWith(t.cloneNode(true)); {ESC}; await new Promise(r => setTimeout(r, 200)); "
