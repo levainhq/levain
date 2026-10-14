@@ -369,8 +369,11 @@
     stroke-dasharray: 1; stroke-dashoffset: 1;
     animation: traceDraw 1.2s ease-out forwards, traceBreathe 10s ease-in-out 1.2s infinite;
   }
-  svg.scope .ch1 { stroke: var(--mind); }
-  svg.scope .ch2 { stroke: var(--identity); }
+  /* the three Cognition series each carry their own hue (Phill 10-13: "one more accent color on the chart"); hues kept
+     clear of --accent and of the status hues (--ok, --bad), so no series reads as a status */
+  .scope-wrap, svg.scope { --series-1: oklch(0.78 0.12 200); --series-2: oklch(0.74 0.15 300); }
+  svg.scope .ch1 { stroke: var(--series-1); }
+  svg.scope .ch2 { stroke: var(--series-2); }
   svg.scope .ch3 { stroke: var(--accent); }
   /* read-side instrument controls — METAL (materiality rule), real verbs only:
      timebase redraws the window; a channel chip solos its trace (CSS-only). */
@@ -394,8 +397,8 @@
   .scope-ch::before { content: "▰ "; }
   .scope-ch:hover { border-color: var(--line-hot); }
   .scope-ch[aria-pressed="true"] { border-color: currentColor; }
-  .scope-ch.ch1 { color: var(--mind); }
-  .scope-ch.ch2 { color: var(--identity); }
+  .scope-ch.ch1 { color: var(--series-1); }
+  .scope-ch.ch2 { color: var(--series-2); }
   .scope-ch.ch3 { color: var(--accent); }
   /* solo: hide the other traces (visibility, not opacity — the glow's breathe
      animation owns opacity and would override a static opacity rule) */
