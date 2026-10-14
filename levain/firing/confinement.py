@@ -1000,7 +1000,7 @@ def _ssh_agent_ops(agent: "_ssh_agent.ScopedAgent", view_roots: list[Path]) -> t
             "--bind", str(kh), str(_ssh_agent.view_known_hosts(view_roots[0]))], str(view)
 
 
-def start_session_ssh_agent(entity: str, *, system: str | None = None
+def start_session_ssh_agent(entity: str, *, system: str | None = None, ssh_mode: str = "agent"
                             ) -> "tuple[_ssh_agent.ScopedAgent | None, str | None]":
     """Start the scoped ssh agent for one operator-floor session: ``(agent, None)``, or ``(None, why
     not)``. Started only where it is bound into bash (Linux, as grants are: :func:`grants_apply`) and a
@@ -1012,7 +1012,7 @@ def start_session_ssh_agent(entity: str, *, system: str | None = None
     if not _runtime_roots():
         return None, "no user runtime dir ($XDG_RUNTIME_DIR, /run/user/<uid>) to bind the agent into"
     try:
-        return _ssh_agent.start(entity=entity), None
+        return _ssh_agent.start(entity=entity, ssh_mode=ssh_mode), None
     except _ssh_agent.AgentError as exc:
         return None, str(exc)
     except OSError as exc:
