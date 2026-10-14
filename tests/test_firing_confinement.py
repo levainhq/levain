@@ -533,7 +533,8 @@ def test_live_cred_file_read_and_write_denied_control_readable(tmp_path: Path) -
 def test_live_ssh_keys_denied_location_based_known_hosts_usable(tmp_path: Path, monkeypatch) -> None:
     """``ssh_mode="agent"`` is LOCATION-based (apparatus L2 #4): ALL of ~/.ssh key material is
     read+write-denied — the id_* keys AND a custom-named ``deploy_key`` — while ``known_hosts`` stays
-    read+APPENDable (ssh records new host keys) and ``config`` readable. ``authorized_keys`` can't be
+    readable (APPENDable on macOS only: on Linux a bash write reached the real file and bash's git
+    records hosts in the session's known_hosts, L1 #1 / L2 #1 2026-10-14) and ``config`` readable. ``authorized_keys`` can't be
     planted (write-denied), closing the persistence vector (L1 #8)."""
     monkeypatch.setenv("HOME", str(tmp_path))
     ssh = tmp_path / ".ssh"
@@ -550,7 +551,10 @@ def test_live_ssh_keys_denied_location_based_known_hosts_usable(tmp_path: Path, 
         r_kh = sh.run(f"cat {ssh / 'known_hosts'} 2>&1", timeout=10)
         assert r_kh.exit_code == 0 and "github.com" in r_kh.output
         r_app = sh.run(f"echo 'newhost' >> {ssh / 'known_hosts'} && echo OK 2>&1", timeout=10)
-        assert r_app.exit_code == 0 and "OK" in r_app.output
+        if sys.platform.startswith("linux"):
+            assert r_app.exit_code != 0 and "newhost" not in (ssh / "known_hosts").read_text()
+        else:
+            assert r_app.exit_code == 0 and "OK" in r_app.output
         r_cfg = sh.run(f"cat {ssh / 'config'} 2>&1", timeout=10)
         assert r_cfg.exit_code == 0 and "Host x" in r_cfg.output
         r_plant = sh.run(f"echo evil > {ssh / 'authorized_keys'} 2>&1", timeout=10)
@@ -2636,8 +2640,8 @@ def test_bwrap_subtrees_are_tmpfs_AND_remount_ro(tmp_path, monkeypatch) -> None:
 
 def test_bwrap_every_tmpfs_is_remounted_ro_except_the_ssh_dir(tmp_path, monkeypatch) -> None:
     """The invariant behind the previous test, stated so a NEW tmpfs added later cannot quietly skip
-    the pairing. The ssh dir is the ONE deliberate exception: files are bound back INTO it (known_hosts
-    must stay writable so ssh can record host keys), so it cannot be read-only."""
+    the pairing. The ssh dir is the ONE deliberate exception: files are bound back INTO it (read-only
+    since B2a fix 1; the exception was made when known_hosts had to stay writable)."""
     policy = _lin_policy(tmp_path, monkeypatch)
     argv = _bwrap_argv(policy)
     tmpfs = {t for _, t in _pairs(argv, "--tmpfs")}
@@ -2904,10 +2908,11 @@ def test_bwrap_blocks_planting_a_vector_that_does_not_exist_yet(tmp_path, monkey
 
 def test_bwrap_agent_mode_hides_keys_and_binds_the_two_ssh_files_back(tmp_path, monkeypatch) -> None:
     """The mount-namespace analogue of SBPL's last-match-wins re-allow: tmpfs the directory, then
-    bind the two files ssh actually needs back INTO it. Measured — key material reads ENOENT, the
-    known_hosts bind is READ-WRITE and a write inside the sandbox appears in the REAL host file (so
-    ssh can still record new host keys), and config is read-only, matching macOS where its WRITE
-    stays denied in BOTH modes."""
+    bind the two files ssh actually needs back INTO it. Measured — key material reads ENOENT. Both
+    binds are READ-ONLY: known_hosts was read-write, and a write inside the sandbox appeared in the
+    REAL host file, so bash could plant a host key the operator then trusted (L1 #1 / L2 #1,
+    2026-10-14; bash's git records hosts in the session's known_hosts instead); config is read-only,
+    matching macOS where its WRITE stays denied in BOTH modes."""
     monkeypatch.setenv("HOME", str(tmp_path))
     ssh = tmp_path / ".ssh"
     ssh.mkdir()
@@ -2917,7 +2922,8 @@ def test_bwrap_agent_mode_hides_keys_and_binds_the_two_ssh_files_back(tmp_path, 
     policy = build_policy(_entity(tmp_path), ssh_mode="agent")
     argv = _bwrap_argv(policy)
     assert ("--tmpfs", str(policy.ssh_dir)) in _pairs(argv, "--tmpfs")
-    assert (str(ssh / "known_hosts"), str(ssh / "known_hosts")) in _triples(argv, "--bind")
+    assert (str(ssh / "known_hosts"), str(ssh / "known_hosts")) in _triples(argv, "--ro-bind")
+    assert str(ssh / "known_hosts") not in [d for _, d in _triples(argv, "--bind")]
     assert (str(ssh / "config"), str(ssh / "config")) in _triples(argv, "--ro-bind")
     # the key itself is never bound back — it is simply gone inside the tmpfs
     assert str(ssh / "id_ed25519") not in [d for _, d in _triples(argv, "--bind")]
@@ -2950,8 +2956,8 @@ def test_bwrap_never_binds_a_vector_back_into_a_tmpfs_that_hid_it(tmp_path, monk
 def test_bwrap_denies_writes_to_a_vector_hidden_inside_a_tmpfs(tmp_path, monkeypatch) -> None:
     """⚡ FOUND BY THE LIVE FLOOR TEST, INVISIBLE TO EVERY PURE TEST ABOVE. Under agent mode the ssh
     vectors sit inside the tmpfs'd ``~/.ssh``, so a plant used to return rc=0 while the host file
-    stayed absent — the ATTACK failed but the REPORT lied. The ssh tmpfs cannot be ``--remount-ro``
-    (known_hosts must stay writable), so honesty is restored per-file with ``--ro-bind /dev/null`` on
+    stayed absent — the ATTACK failed but the REPORT lied. The ssh tmpfs is not ``--remount-ro``
+    (written when known_hosts had to stay writable), so honesty is restored per-file with ``--ro-bind /dev/null`` on
     the enumerable vector list. Verified live afterwards: the plant returns Permission denied and the
     host file is still absent, at zero host mutation (the mountpoint lands inside the tmpfs).
 

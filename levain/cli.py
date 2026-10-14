@@ -1388,7 +1388,9 @@ def main(argv: list[str] | None = None) -> int:
             "from your own shell (it refuses inside a levain confinement), after checking that the "
             "process answering on the session's socket is the agent levain started. The key works "
             "only for the hosts named with -h, whose host keys must be in <levain home>/ssh/known_hosts "
-            "(a file only you can write; copy the lines you have checked), and only for -t seconds."
+            "(a file only you can write; seed it with `ssh-keyscan <host>` and compare the fingerprint with one "
+            "obtained out of band, e.g. the one GitHub or GitLab publishes, never from ~/.ssh/known_hosts), "
+            "and only for -t seconds. It prints the fingerprint of each manifest key a host is bound to."
         ),
     )
     ssa_p.add_argument("--help", action="help", help="Show this help and exit.")
