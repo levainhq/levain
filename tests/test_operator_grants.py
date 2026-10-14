@@ -197,6 +197,56 @@ def test_a_grant_resolves_only_as_an_operator_owned_socket_in_reach_of_nothing_c
         srv.close()
 
 
+def test_a_hardlink_to_the_agent_socket_is_refused_by_its_inode(rd, grants, monkeypatch):
+    """L1 #4 / L2 #6: a realpath compare let a hardlink of the agent socket through; the inode does not."""
+    agent = _listen(rd / "keyring" / "ssh")
+    try:
+        try:
+            os.link(rd / "keyring" / "ssh", rd / "alias")
+        except OSError as exc:
+            pytest.skip(f"this filesystem will not hardlink a socket ({exc})")
+        monkeypatch.setenv("SSH_AUTH_SOCK", str(rd / "keyring" / "ssh"))
+        monkeypatch.setattr(conf, "_gpg_ssh_sockets", lambda: [])
+        grants([{"path": str(rd / "alias"), "name": "keys", "why": "w"}])
+        with pytest.raises(ConfinementError, match="your \\$SSH_AUTH_SOCK"):
+            conf.load_operator_grants()
+    finally:
+        agent.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux") or __import__("shutil").which("ssh-agent") is None,
+                    reason="the listener is read through SO_PEERCRED + /proc (Linux) and needs ssh-agent")
+def test_an_ssh_agent_is_refused_by_what_listens_whatever_the_environment_says(rd, grants, monkeypatch):
+    """L1 #3: a daemon or tmux started without $SSH_AUTH_SOCK accepted a grant of the agent socket the
+    doctor run from a login shell refused. What listens decides, on Linux: a real ssh-agent here."""
+    import subprocess
+    import time
+
+    (rd / "agentdir").mkdir(mode=0o700)
+    sock = rd / "agentdir" / "agent.sock"
+    proc = subprocess.Popen(["ssh-agent", "-D", "-a", str(sock)], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    other = _listen(rd / "plain.sock")
+    try:
+        for _ in range(250):
+            if sock.exists():
+                break
+            time.sleep(0.02)
+        monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+        monkeypatch.setattr(conf, "_gpg_ssh_sockets", lambda: [])
+        grants([{"path": str(sock), "name": "keys", "why": "w"}])
+        with pytest.raises(ConfinementError, match="the process listening on it is ssh-agent"):
+            conf.load_operator_grants()
+        with pytest.raises(ConfinementError, match="the process listening on it is ssh-agent"):
+            conf.resolve_grant(SocketGrant(str(sock), "keys", "w"), [rd])
+        grants([{"path": str(rd / "plain.sock"), "name": "x", "why": "w"}])   # control: another listener
+        assert [g.name for g in conf.load_operator_grants()] == ["x"]
+    finally:
+        other.close()
+        proc.terminate()
+        proc.wait(5)
+
+
 def test_a_grant_of_the_operators_own_ssh_agent_is_refused_by_where_it_resolves(rd, grants, monkeypatch):
     """D1: a grant of your ssh agent would hand bash every key it holds while doctor printed no agent.
     Refused by what the path resolves to at check time, under any name: the socket `$SSH_AUTH_SOCK`

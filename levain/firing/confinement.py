@@ -782,16 +782,48 @@ _SSH_AGENT_GRANT = ("is an ssh agent's socket ({}), which hands bash every key t
                     "agent is levain's scoped one, keys added with `levain ssh-add <key> -h <host>`")
 
 
+#: ``/proc/<pid>/comm`` of the agents recognised by what listens (comm is cut at 15 bytes).
+_AGENT_LISTENERS = ("ssh-agent", "gpg-agent", "gnome-keyring-d")
+
+
+def _same_socket(a: str, b: str) -> bool:
+    """Whether ``a`` and ``b`` are one inode (``os.stat``: a link, a hardlink or a bind mount alias)."""
+    try:
+        sa, sb = os.stat(a), os.stat(b)
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
+def _listener_comm(p: str) -> str | None:
+    """Linux: the ``comm`` of the process listening on ``p``, read by connecting without sending a byte
+    (``SO_PEERCRED``), or None (nobody answers, another pid namespace, not Linux)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        pid = _ssh_agent.peer_pid(p)
+        with open(f"/proc/{pid}/comm", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except (_ssh_agent.AgentError, OSError):
+        return None
+
+
 def _ssh_agent_refusal(p: str) -> str | None:
-    """Why ``p`` cannot be a grant because it is an ssh agent, or None: it resolves to the socket the
-    operator's ``$SSH_AUTH_SOCK`` names now, or to gpg-agent's ssh socket (gpgconf's path, under any
-    name). Only those two are recognised; an agent at another path is not (a stated limit)."""
-    real = os.path.realpath(p)
+    """Why ``p`` cannot be a grant because it is an ssh agent, or None: it is the same inode as the
+    socket the operator's ``$SSH_AUTH_SOCK`` names now, or as gpg-agent's ssh socket (gpgconf's path),
+    under any name; or, on Linux, what listens on it is an ``ssh-agent``, ``gpg-agent`` or
+    gnome-keyring (by ``/proc/<pid>/comm``), wherever it is and whatever levain's environment holds. A
+    socket nobody answers on is not refused here (the grant check owns liveness). Off Linux, an agent
+    at a path neither names is not recognised (a stated limit). Doctor (:func:`load_operator_grants`)
+    and the spawn (:func:`resolve_grant`) both call this."""
     ambient = os.environ.get("SSH_AUTH_SOCK")
-    if ambient and os.path.isabs(ambient) and os.path.realpath(ambient) == real:
+    if ambient and os.path.isabs(ambient) and _same_socket(ambient, p):
         return _SSH_AGENT_GRANT.format("your $SSH_AUTH_SOCK")
-    if any(os.path.realpath(s) == real for s in _gpg_ssh_sockets()):
+    if any(_same_socket(s, p) for s in _gpg_ssh_sockets()):
         return _SSH_AGENT_GRANT.format("gpg-agent's ssh socket")
+    comm = _listener_comm(p)
+    if comm is not None and comm in _AGENT_LISTENERS:
+        return _SSH_AGENT_GRANT.format(f"the process listening on it is {comm}")
     return None
 
 
