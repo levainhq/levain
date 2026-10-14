@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -498,6 +499,47 @@ def test_the_doctor_lines_list_every_running_session_and_the_other_cases(keyed, 
     assert lines[1].startswith("ssh agent: no keys")
     ssh_agent.stop(agent)
     assert ssh_agent.status_lines("Linux")[0].endswith("(none running now)")
+
+
+@needs_openssh
+def test_a_raw_mode_session_says_no_key_can_be_added_instead_of_advising_ssh_add(home):
+    """L3 b2a r1 (codex LOW): add_key refuses ssh_mode=raw, so the line must not tell you to run it."""
+    agent = ssh_agent.start(entity="ent", ssh_mode="raw")
+    try:
+        line = ssh_agent.status_lines("Linux", agent=agent)[1]
+        assert line.startswith("ssh agent: no keys, and none can be added: the entity runs ssh_mode=raw")
+        assert "levain ssh-add" not in line
+    finally:
+        ssh_agent.stop(agent)
+
+
+def test_an_identities_count_larger_than_the_answer_is_refused_before_looping(monkeypatch):
+    """L3 b2a r1 (glm LOW): a `count` the answer is too short to hold is refused before the loop. The loop
+    already returned None at its first read past the end, so this pins the result, not the bound itself."""
+    import struct
+    import threading
+
+    d = Path(tempfile.mkdtemp(prefix="lvq", dir="/tmp"))
+    sock = str(d / "a.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(sock)
+    srv.listen(1)
+    body = bytes([ssh_agent._IDENTITIES_ANSWER]) + struct.pack(">I", 2 ** 32 - 1) + b"\0" * 8
+
+    def answer():
+        c, _ = srv.accept()
+        c.recv(5)
+        c.sendall(struct.pack(">I", len(body)) + body)
+        c.close()
+
+    t = threading.Thread(target=answer, daemon=True)
+    t.start()
+    try:
+        assert ssh_agent._held(sock) is None
+    finally:
+        t.join(5)
+        srv.close()
+        shutil.rmtree(d, ignore_errors=True)
     assert ssh_agent.status_lines("Linux", note="why")[0].startswith("ssh agent: none for this session (why)")
     assert ssh_agent.status_lines("Linux", hands=True)[0].startswith("ssh agent: none (the entity's own user)")
     assert ssh_agent.status_lines("Darwin") == [ssh_agent.DARWIN_LINE]
