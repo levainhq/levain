@@ -20,6 +20,7 @@ import pytest
 import levain.authority as auth
 from levain.authority import ReplayCache
 from levain.cockpit.consent import utc_stamp
+from levain.cockpit.firejournal import UNINITIALISED, CockpitDB
 from levain.consent import (
     ANSWER_NAMESPACE, AnswerRefused, ConsentQueue, QueueStoreError, answer_message, answer_payload, authority_source,
     decide_by_policy,
@@ -51,14 +52,14 @@ def keys(tmp_path_factory):
 
 
 class Log:
-    """A real signed authority log in ``directory/cockpit.db``; ``source`` is what a queue replays from."""
+    """A real signed authority log in a real cockpit journal, ``directory/cockpit.db`` (its full schema, as the
+    broker creates it); ``source`` is what a queue replays from."""
 
     def __init__(self, directory: Path, keys) -> None:
         self.path = directory / "cockpit.db"
         self.keys = keys
-        conn = sqlite3.connect(self.path, isolation_level=None)
-        auth.create_schema(conn)
-        conn.close()
+        with CockpitDB(directory).read():
+            pass
         self.source = authority_source(self.path, anchor=None, cache=ReplayCache())
 
     def link(self, op, signer="laptop"):
@@ -529,6 +530,45 @@ def test_authority_must_be_the_replaying_source(tmp_path, authority):
     for bad in (snap, lambda: snap, Stale(tmp_path / "x.db", anchor=None)):
         with pytest.raises(ConsentError, match="AuthoritySource"):
             ConsentQueue(tmp_path / "consent", authority=bad)
+
+
+def test_no_authority_is_no_decision(tmp_path, keys, clock):
+    """An empty log, a log marked uninitialised, and an anchor naming another store each read as no
+    authority: the source raises with RequestAuthority.capture's reason and no answer is authority."""
+    from levain.consent.queue import AuthoritySource
+    log = Log(tmp_path, keys)
+    request_queue = ConsentQueue(tmp_path / "consent", authority=log.source, clock=clock)
+    request = FakeAgent(request_queue).ask()
+    payload = request_queue.answer_payload(request.id, "allow", keys["laptop"].fp)
+    sig = keys["laptop"].sign(answer_message(payload))
+
+    with pytest.raises(auth.AuthorityError, match="not initialised"):
+        log.source()
+    with pytest.raises(AnswerRefused, match="cannot be replayed"):
+        request_queue.answer(request.id, payload, sig)
+
+    log.enrol("laptop", "laptop-presence")
+    conn = sqlite3.connect(log.path, isolation_level=None)
+    conn.execute("INSERT INTO meta (key, value) VALUES (?, 'authority migrated')", (UNINITIALISED,))
+    conn.close()
+    with pytest.raises(auth.AuthorityError, match="not initialised"):
+        log.source()
+    with pytest.raises(AnswerRefused, match="cannot be replayed"):
+        request_queue.answer(request.id, payload, sig)
+
+    conn = sqlite3.connect(log.path, isolation_level=None)
+    conn.execute("DELETE FROM meta WHERE key = ?", (UNINITIALISED,))
+    conn.close()
+    anchor = tmp_path / "anchor"
+    auth.advance_anchor(anchor, log.source())
+    assert AuthoritySource(log.path, anchor=anchor)().seq == 1
+    (tmp_path / "other").mkdir()
+    other = Log(tmp_path / "other", keys)
+    other.enrol("laptop", "laptop-presence")
+    with pytest.raises(auth.AuthorityError, match="refused"):
+        AuthoritySource(other.path, anchor=anchor)()
+    assert request_queue.get(request.id)[1] == "pending"
+    assert request_queue.answer(request.id, payload, sig).decision == "allow"
 
 
 def test_a_retried_hook_event_is_refused_later_too(queue, clock):
