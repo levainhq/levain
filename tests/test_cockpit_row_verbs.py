@@ -77,7 +77,7 @@ def test_a_press_that_moves_focus_to_the_row_does_not_close_the_menu_before_the_
                  "a.dispatchEvent(new FocusEvent('focusout', {bubbles: true, relatedTarget: r})); "
                  "return v.querySelector('.verb-menu').hidden; })()"},
         {"eval": f"(() => {{ const v = {ROW}.querySelector('.verb-actions'); const a = document.activeElement; "
-                 "const o = document.body.appendChild(document.createElement('button')); "
+                 "const o = document.createElement('button'); "
                  "a.dispatchEvent(new FocusEvent('focusout', {bubbles: true, relatedTarget: o})); "
                  "return v.querySelector('.verb-menu').hidden; })()"},
     ])
