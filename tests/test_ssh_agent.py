@@ -262,6 +262,9 @@ def test_a_key_goes_in_limited_to_its_host_and_is_recorded(keyed):
     line = ssh_agent.add_key(key, ["git.example.test"], lifetime=600, system="Linux")
     fp = ssh_agent.fingerprint(key)
     assert f"pid {agent.pid}, peer checked" in line and "for git.example.test" in line
+    # the manifest key the limit binds to, by fingerprint, so the operator can check it (L1 #1)
+    host_fp = ssh_agent.fingerprint(key.parent / "hostkey.pub")
+    assert f"bound to git.example.test's host key in {_manifest.resolve()}: {host_fp} (ED25519)" in line
     assert fp in _listed(agent)
     [k] = ssh_agent.read_record(agent.dir)["keys"]
     assert k["fingerprint"] == fp and k["hosts"] == ["git.example.test"] and k["lifetime"] == 600
