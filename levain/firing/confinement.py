@@ -958,6 +958,55 @@ def _grant_ops(grants: tuple[SocketGrant, ...], view_roots: list[Path],
     return ops, views
 
 
+def _ssh_agent_ops(agent: "_ssh_agent.ScopedAgent", view_roots: list[Path]) -> tuple[list[str], str]:
+    """``(bwrap ops, view path)`` for the session's scoped ssh agent (:mod:`levain.firing.ssh_agent`), or
+    :class:`ConfinementError`: its socket is bound at ``<first runtime dir>/levain-ssh/agent.sock`` with a
+    0700 parent, as a grant's is. Checked first: the socket is one, it is the operator's, its directory
+    chain is the one :func:`levain.firing.ssh_agent.start` made, and the process answering on it is the
+    pid levain started (its host directory is hidden from bash, which binds from the host's tree)."""
+    def refuse(why: str) -> NoReturn:
+        raise ConfinementError(f"levain's scoped ssh agent ({agent.socket}) {why}. Refusing to grant bash "
+                               "hands (fail-closed); end the session and start it again.")
+    if not view_roots:
+        refuse("has no user runtime dir to be bound into")
+    try:
+        st = os.lstat(agent.socket)
+    except OSError as exc:
+        refuse(f"cannot be read ({exc.strerror or exc})")
+    if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.geteuid():
+        refuse("is not a socket you own")
+    problem = _ssh_agent._chain_problem(agent.dir)
+    if problem is not None:
+        refuse(problem)
+    try:
+        answering = _ssh_agent.peer_pid(agent.socket)
+    except _ssh_agent.AgentError as exc:
+        refuse(str(exc))
+    if answering != agent.pid:
+        refuse(f"is answered by pid {answering}, not the agent levain started (pid {agent.pid})")
+    view = _ssh_agent.view_socket(view_roots[0])
+    return ["--perms", "0700", "--dir", str(view.parent), "--bind", agent.socket, str(view)], str(view)
+
+
+def start_session_ssh_agent(entity: str, *, system: str | None = None
+                            ) -> "tuple[_ssh_agent.ScopedAgent | None, str | None]":
+    """Start the scoped ssh agent for one operator-floor session: ``(agent, None)``, or ``(None, why
+    not)``. Started only where it is bound into bash (Linux, as grants are: :func:`grants_apply`) and a
+    user runtime dir exists to bind it into. Never raises: a session without an agent still runs, and
+    its ssh line says why there is none."""
+    system = system or platform.system()
+    if not grants_apply(system):
+        return None, f"levain's scoped agent is not wired on {system} yet"
+    if not _runtime_roots():
+        return None, "no user runtime dir ($XDG_RUNTIME_DIR, /run/user/<uid>) to bind the agent into"
+    try:
+        return _ssh_agent.start(entity=entity), None
+    except _ssh_agent.AgentError as exc:
+        return None, str(exc)
+    except OSError as exc:
+        return None, f"ssh-agent could not be started ({exc.strerror or exc})"
+
+
 def _default_grant_ops() -> list[str]:
     """The default grant's bind (``/dev/log``, write-only syslog): ``--dev /dev`` makes a fresh /dev with
     no ``/dev/log``, so the socket it resolves to on the host is bound there. Absent, or not a socket:
@@ -4002,6 +4051,7 @@ class ConfinementProvider(ABC):
         default_timeout: float = 120.0,
         hands: HandsIdentity | None = None,
         grants: tuple[SocketGrant, ...] | None = None,
+        ssh_agent: "_ssh_agent.ScopedAgent | None" = None,
     ) -> SandboxedShell:
         """Start a stateful shell confined by ``policy``. The returned :class:`SandboxedShell` is
         already ``start()``\\ ed and carries the policy it was confined by in ``effective_policy``.
@@ -4009,7 +4059,8 @@ class ConfinementProvider(ABC):
         that refuses, never runs bash as the operator instead. ``grants`` is the conversation's operator
         grant snapshot (:class:`GrantSnapshot`), passed to a provider that binds grants; without it a
         shell gets none. With gpg's extra socket among them, the shell's policy carries
-        :func:`with_gpg_program_denies`.
+        :func:`with_gpg_program_denies`. ``ssh_agent`` is the session's scoped agent
+        (:mod:`levain.firing.ssh_agent`), passed to a provider that binds it (Linux); never with ``hands``.
 
         ⛔⛔ **THE CALLER REFRESHES THE SOCKET FLOOR, NOT THIS METHOD — AND A METACLASS GUARD THAT
         TRIED TO ENFORCE THE OPPOSITE WAS DELETED AFTER FIVE VERSIONS AND SEVEN BYPASSES**
@@ -4096,6 +4147,8 @@ class ConfinementProvider(ABC):
             refreshed, env=env, default_timeout=default_timeout,
             **({"hands": hands} if hands is not None else {}),
             **({"grants": grants} if grants and _accepts_kw(self._spawn_shell_impl, "grants") else {}),
+            **({"ssh_agent": ssh_agent} if ssh_agent is not None and hands is None
+               and _accepts_kw(self._spawn_shell_impl, "ssh_agent") else {}),
         )
         # ⛔ Reject a non-shell AT THE SOURCE (codex L3, 2026-09-04): tolerating a falsy sentinel
         # only MOVED the crash to the caller's `.run`, as an AttributeError that `__call__` does not
@@ -8573,7 +8626,8 @@ class BwrapProvider(ConfinementProvider):
     def _prepare(self, policy: CrownJewelsPolicy, made: list[tuple[str, str]],
                  hands: HandsIdentity | None = None, relay_dir: str | None = None,
                  canary: "_landlock.Canary | None" = None, expect_tier: str = "T0",
-                 grants: tuple[SocketGrant, ...] = (), gpg_view: Path | None = None):
+                 grants: tuple[SocketGrant, ...] = (), gpg_view: Path | None = None,
+                 ssh_agent: "_ssh_agent.ScopedAgent | None" = None):
         """Plan the floor and put on the host what it needs, inside the caller's ledger transaction:
         ``(argv, create_first, mounted, unmounted, manifest)``. Every object it creates is appended to
         ``made`` as it goes, so a refusal part-way still hands the ledger everything made."""
@@ -8623,6 +8677,11 @@ class BwrapProvider(ConfinementProvider):
         # grant (/dev/log) is bound on both floors. On every tier the bind happens; the tier line says
         # what is enforced (`unix_socket_lines`).
         grant_ops, grant_views = _grant_ops(grants, _runtime_roots(), gpg_view) if grants else ([], [])
+        # The session's scoped ssh agent, operator floor only: bound like a grant into the runtime view and
+        # passed to the stub by that path, its socket watched like a grant's (a replaced one closes the shell).
+        if ssh_agent is not None and hands is None:
+            agent_ops, agent_view = _ssh_agent_ops(ssh_agent, _runtime_roots())
+            grant_ops, grant_views = [*grant_ops, *agent_ops], [*grant_views, agent_view]
         landlock = _landlock.stub_argv(HANDS_PYTHON if hands is not None else sys.executable,
                                        canary=canary.view_path if canary is not None else None,
                                        expect_tier=expect_tier, grants=tuple(grant_views))
@@ -8650,6 +8709,8 @@ class BwrapProvider(ConfinementProvider):
             # A granted socket replaced on the host closes the shell, like a jewel: the next spawn checks
             # the new one (owner, parent chain) before binding it.
             manifest.update({g.path: _identity(Path(g.path)) for g in grants})
+            if ssh_agent is not None and hands is None:
+                manifest[ssh_agent.socket] = _identity(Path(ssh_agent.socket))
         except (OSError, RuntimeError) as exc:
             raise ConfinementError(
                 f"could not prepare or record the floor's mountpoints ({exc}) — refusing to grant "
@@ -8692,6 +8753,7 @@ class BwrapProvider(ConfinementProvider):
         default_timeout: float = 120.0,
         hands: HandsIdentity | None = None,
         grants: tuple[SocketGrant, ...] = (),
+        ssh_agent: "_ssh_agent.ScopedAgent | None" = None,
     ) -> SandboxedShell:
         relay_dir: str | None = None
         if hands is not None:
@@ -8717,7 +8779,7 @@ class BwrapProvider(ConfinementProvider):
         # probe; from the shell's construction on, the shell owns it and its close stops it.
         relay = _start_hands_relay(hands, relay_dir) if hands is not None and relay_dir else None
         try:
-            return self._spawn_bwrap(policy, env, default_timeout, hands, relay, grants)
+            return self._spawn_bwrap(policy, env, default_timeout, hands, relay, grants, ssh_agent)
         except BaseException:
             if relay is not None:
                 relay.stop()
@@ -8725,7 +8787,8 @@ class BwrapProvider(ConfinementProvider):
 
     def _spawn_bwrap(self, policy: CrownJewelsPolicy, env: dict[str, str] | None, default_timeout: float,
                      hands: HandsIdentity | None, relay: _HandsRelay | None,
-                     grants: tuple[SocketGrant, ...] = ()) -> SandboxedShell:
+                     grants: tuple[SocketGrant, ...] = (),
+                     ssh_agent: "_ssh_agent.ScopedAgent | None" = None) -> SandboxedShell:
         if hands is not None:
             # Planned, claimed and rechecked under the view's jewels only; the hardlink rule ran over the
             # whole policy before this (`spawn_shell`).
@@ -8760,7 +8823,7 @@ class BwrapProvider(ConfinementProvider):
             made += canary.made
         try:
             return self._spawn_bwrap_canaried(policy, env, default_timeout, hands, relay, claim, made, canary,
-                                              tier, grants)
+                                              tier, grants, ssh_agent)
         except BaseException:
             if canary is not None:
                 canary.stop()
@@ -8770,7 +8833,8 @@ class BwrapProvider(ConfinementProvider):
                               default_timeout: float, hands: HandsIdentity | None, relay: _HandsRelay | None,
                               claim: str, made: list[tuple[str, str]],
                               canary: _landlock.Canary | None, tier: str,
-                              grants: tuple[SocketGrant, ...] = ()) -> SandboxedShell:
+                              grants: tuple[SocketGrant, ...] = (),
+                              ssh_agent: "_ssh_agent.ScopedAgent | None" = None) -> SandboxedShell:
         with _LedgerTxn() as txn:
             if not txn.ok:
                 # Without a ledger this shell's claims cannot reach the disk, and another session
@@ -8788,7 +8852,7 @@ class BwrapProvider(ConfinementProvider):
                             if any(g.gpg_extra for g in grants) else None)
                 argv, create_first, mounted, unmounted, manifest = self._prepare(
                     policy, made, hands, relay.sockdir if relay is not None else None, canary, tier,
-                    grants, gpg_view)
+                    grants, gpg_view, ssh_agent)
             finally:
                 # Recorded even on a refusal: unclaimed, it is removed as the transaction ends.
                 txn.record(made)
@@ -8806,12 +8870,15 @@ class BwrapProvider(ConfinementProvider):
         # Startup-execution controls stripped as well as ignored by `-p`: bash would source, import or
         # expand these before the first per-command check, so a jewel that appeared after the manifest
         # could be read before anything looked (codex L3 r5, r6).
-        # The operator's ambient ssh agent is never passed through: bash's ssh agent is levain's scoped
-        # one (B2), or an operator grant.
+        # The operator's ambient ssh agent is never passed through (nor granted: `_ssh_agent_refusal`):
+        # bash's ssh agent is the session's scoped one, set just below.
         shell_env = {
             k: v for k, v in (env if env is not None else _default_shell_env()).items()
             if k not in _STARTUP_EXEC_VARS and not k.startswith("BASH_FUNC_") and k != "SSH_AUTH_SOCK"
         }
+        if ssh_agent is not None and hands is None:
+            # The scoped agent's view path, where `_prepare` bound it (`_ssh_agent_ops`).
+            shell_env["SSH_AUTH_SOCK"] = str(_ssh_agent.view_socket(_runtime_roots()[0]))
         if hands is not None:
             # sudo OUTSIDE bwrap, as on macOS; bash starts from the hands user's environment alone.
             argv = [*hands_prefix(hands), *argv]
