@@ -714,6 +714,8 @@ def _held(sock: str) -> list[str] | None:
     if body[0] != _IDENTITIES_ANSWER or len(body) < 5:
         return None
     (count,) = struct.unpack(">I", body[1:5])
+    if count > (len(body) - 5) // 8:   # each identity is at least its two 4-byte lengths
+        return None
     off, out = 5, []
     for _ in range(count):
         for field in ("blob", "comment"):
@@ -741,6 +743,10 @@ def key_lines(d: Path, rec: dict[str, Any], *, now: float | None = None) -> list
     if held is None:
         return [f"ssh agent keys: could not be listed (the agent on {d / SOCKET_NAME} did not answer)"]
     if not held:
+        if rec.get("ssh_mode") == "raw":
+            return [f"ssh agent: no keys, and none can be added: the entity runs ssh_mode=raw, where bash can "
+                    f"read ~/.ssh, so a key bash can read could be added again without its -h limit"
+                    f" (session {d.name})"]
         return [f"ssh agent: no keys; add one from your own shell: `levain ssh-add <key> -h <host>`"
                 f" (session {d.name})"]
     now = time.time() if now is None else now
