@@ -788,6 +788,18 @@ _SSH_AGENT_GRANT = ("is an ssh agent's socket ({}), which hands bash every key t
 _AGENT_LISTENERS = ("ssh-agent", "gnome-keyring-d")
 
 
+def _process_start(pid: int) -> str | None:
+    """Linux: when ``pid`` started (``/proc/<pid>/stat`` field 22, clock ticks since boot, read after
+    the last ``)`` because comm may hold one), so a reused pid is told from the process it was; None
+    when it cannot be read (no such process, not Linux)."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as fh:
+            data = fh.read()
+        return data[data.rindex(")") + 1:].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _same_socket(a: str, b: str) -> bool:
     """Whether ``a`` and ``b`` are one inode (``os.stat``: a link, a hardlink or a bind mount alias)."""
     try:
@@ -8363,11 +8375,13 @@ class _BwrapShell(SandboxedShell):
         sidecar that was absent (so unmounted) and appeared. Each of those was RUN or reviewed on
         2026-10-03 before this replaced the per-case checks;
       - the session's scoped ssh agent, when bash has one, is still answered by the pid levain started,
-        read from the host side (:func:`levain.firing.ssh_agent.peer_pid`). The manifest alone cannot
-        see an agent killed and restarted on the same path: ext4 handed the freed inode straight back
-        12 times of 12 (RUN 2026-10-14, VM T9), so the identity was unchanged while another process
-        answered. A peer that cannot be read refuses too. A restart that reuses both the inode and the
-        exact recorded pid is not seen.
+        read from the host side (:func:`levain.firing.ssh_agent.peer_pid`), and that pid is still the
+        process it was: its start time (:func:`_process_start`), read when the shell is built, after the
+        spawn's own pid check, is compared too. The manifest alone cannot see an agent killed and
+        restarted on the same path: ext4 handed the freed inode straight back 12 times of 12 (RUN
+        2026-10-14, VM T9), so the identity was unchanged while another process answered; the start time
+        covers a replacement that also got the recorded pid back. A peer or start time that cannot be
+        read refuses too.
     If any fires, the shell is closed (its process group killed) and the command refused; the next
     spawn mounts what is there now, or refuses at the spawn check. A filesystem error while checking
     refuses the same way. A host-side rewrite of a protected file therefore closes the live shell,
@@ -8413,7 +8427,9 @@ class _BwrapShell(SandboxedShell):
         self._units = 0
         self._relay: _HandsRelay | None = None   # a hands launch's host-side proxy relay, if any
         self._hands: HandsIdentity | None = None   # a hands launch's user, whose files are repaired
-        self._agent: tuple[str, int] | None = None   # the scoped ssh agent's (host socket, pid), when bound
+        # The scoped ssh agent's (host socket, pid, start time), when bound; the start time is None when
+        # unreadable, which refuses every command.
+        self._agent: tuple[str, int, str | None] | None = None
         self._command_since = 0.0
         # Clear from a run()'s admission (`_before_command`, under `_lock`, refused once closed) until its
         # command's group is registered or the run is refused. close() waits for it, so it never settles
@@ -8727,7 +8743,7 @@ class _BwrapShell(SandboxedShell):
                     "the floor no longer covers what is on disk there."
                 )
         if self._agent is not None:
-            sock, pid = self._agent
+            sock, pid, started = self._agent
             try:
                 answering = _ssh_agent.peer_pid(sock)
             except _ssh_agent.AgentError as exc:
@@ -8736,6 +8752,13 @@ class _BwrapShell(SandboxedShell):
             if answering != pid:
                 raise ConfinementError(f"levain's scoped ssh agent ({sock}) is now answered by pid {answering}, "
                                        f"not the agent levain started (pid {pid}).")
+            if sys.platform.startswith("linux"):   # the bwrap shell's platform; elsewhere it never runs
+                now = _process_start(pid)
+                if started is None or now != started:
+                    raise ConfinementError(
+                        f"levain's scoped ssh agent ({sock}) is answered by pid {pid}, but that pid is not the "
+                        f"process levain started (start time {now or 'unreadable'}, recorded "
+                        f"{started or 'unreadable'}); a reused pid is not the agent.")
 
     def _before_command(self) -> None:
         with self._lock:
@@ -9107,7 +9130,7 @@ class BwrapProvider(ConfinementProvider):
         shell._hands = hands
         if ssh_agent is not None and hands is None:
             # Beside the manifest's socket entry: who answers on it is checked per command, not only its inode.
-            shell._agent = (ssh_agent.socket, ssh_agent.pid)
+            shell._agent = (ssh_agent.socket, ssh_agent.pid, _process_start(ssh_agent.pid))
         _LIVE_BWRAP_SHELLS.add(shell)
         try:
             # Each command, the start probe included, tags the claim with its process group.
