@@ -257,6 +257,8 @@ from typing import Any, Callable, Literal, NoReturn
 # are stdlib-only leaves, so this adds no dependency weight.
 from levain.firing.gate import GATE_SETTINGS, GateSetting
 from levain.firing import landlock as _landlock
+from levain.firing import ssh_agent as _ssh_agent
+from levain.firing.ssh_agent import RUN_DIR as AGENT_RUN_DIR
 
 __all__ = [
     "SANDBOX_EXEC",
@@ -1491,7 +1493,7 @@ def _unhideable(d: Path, home: Path, entity_dir: Path, workspace: Path) -> bool:
 # in :func:`_levain_home_jewels` (a levain home that overlaps the entity). Everywhere else the whole home
 # is denied, so a directory missing here is still covered there. A test ties this tuple to every reader
 # of ``$LEVAIN_HOME`` in the package, so a new one fails until it is named here.
-LEVAIN_HOME_STATE_DIRS = (AUTONOMIC_STORE_DIR, COCKPIT_KEY_DIR, "consent", GRANTS_DIR)
+LEVAIN_HOME_STATE_DIRS = (AUTONOMIC_STORE_DIR, COCKPIT_KEY_DIR, "consent", GRANTS_DIR, AGENT_RUN_DIR)
 
 
 def _levain_home_jewels(home: Path, entity_dir: Path, workspace: Path) -> tuple[Path, list[Path]]:
