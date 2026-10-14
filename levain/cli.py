@@ -1352,6 +1352,30 @@ def main(argv: list[str] | None = None) -> int:
     wsp_p.add_argument("dest", help="Where it goes: a path inside the workspace, or relative to it.")
     wsp_p.set_defaults(func=_cmd_ws_put)
 
+    ssa_p = subparsers.add_parser(
+        "ssh-add",
+        add_help=False,   # -h is ssh-add's destination flag here, as in ssh-add itself
+        help="Add an ssh key to a running session's scoped agent, limited to the hosts you name.",
+        description=(
+            "Each levain session's bash gets its own ssh agent, never yours. This adds one key to it, "
+            "from your own shell (it refuses inside a levain confinement), after checking that the "
+            "process answering on the session's socket is the agent levain started. The key works "
+            "only for the hosts named with -h, whose host keys must be in <levain home>/ssh/known_hosts "
+            "(a file only you can write; copy the lines you have checked), and only for -t seconds."
+        ),
+    )
+    ssa_p.add_argument("--help", action="help", help="Show this help and exit.")
+    ssa_p.add_argument("key", type=Path, help="The private key file.")
+    ssa_p.add_argument("-h", dest="hosts", action="append", default=[], metavar="HOST",
+                       help="A host the key may be used for ([user@]host; hops joined by >). Repeatable.")
+    ssa_p.add_argument("-t", dest="lifetime", type=int, default=None, metavar="SECS",
+                       help="How long the agent keeps the key (default 8 hours, at most 24).")
+    ssa_p.add_argument("--session", default=None,
+                       help="The session's agent id, when more than one session is running.")
+    ssa_p.add_argument("--no-destination-limit", dest="waive", action="store_true",
+                       help="Add the key for ANY host (a waiver `levain run` and `levain doctor` print).")
+    ssa_p.set_defaults(func=_cmd_ssh_add)
+
     from levain.team.cli import register as _register_team
 
     _register_team(subparsers)
@@ -2961,6 +2985,19 @@ def _cmd_setup_isolation(args: argparse.Namespace) -> int:
     ports = tuple(args.egress_ports) if args.egress_ports is not None else None
     return cmd_setup_isolation(args.path, undo=args.undo, dry_run=args.dry_run, reenable=args.reenable,
                                egress_ports=ports)
+
+
+def _cmd_ssh_add(args: argparse.Namespace) -> int:
+    from levain.firing import ssh_agent
+
+    try:
+        print(ssh_agent.add_key(args.key.expanduser(), args.hosts,
+                                lifetime=args.lifetime or ssh_agent.DEFAULT_LIFETIME,
+                                session=args.session, waive_destinations=args.waive))
+    except ssh_agent.AgentError as exc:
+        print(f"levain ssh-add: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _cmd_ws_git(args: argparse.Namespace) -> int:
