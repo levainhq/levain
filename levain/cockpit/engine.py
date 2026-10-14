@@ -533,8 +533,8 @@ class Cockpit:
         src = self._dec.source
         spec = ProviderSpec(
             DECISIONS_ID, "triage-list", src.title if src else "Decisions waiting", "gate", _composed,
-            region=src.region if src else "operate", rank=src.rank if src else -1,
-            face=src.face if src else "", size=src.size if src else "medium",
+            region=src.region if src else WIDGETS, rank=src.rank if src else -1,
+            face=src.face if src else "count", size=src.size if src else "medium",
             span=src.span if src else 1, tabs=src.tabs if src else "",
             refresh_every_s=src.refresh_every_s if src else None,
             stale_after_s=src.stale_after_s if src else 900.0, timeout_s=src.timeout_s if src else 10.0,

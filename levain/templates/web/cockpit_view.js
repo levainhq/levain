@@ -204,9 +204,13 @@
         const badges = (r.badges || []).map(badgeText).join(" · ");
         const prov = r.provenance ? r.provenance.label : "";
         const legacy = (r.facets || {}).legacy_meta;   // an adapted extra panel's own meta line (design §6.2)
-        const meta = [typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grp, badges, prov]
+        // a list drawn as a count opens into the focus modal, where its groups are headings (Waiting on you, Waiting on a
+        // signature, ...) in the kernel's own order, so a group is the heading and no longer repeated on each row
+        const grouped = panel.face === "count" && grp;
+        const meta = [typeof legacy === "string" ? legacy : "", r.panel_id ? r.panel_id : "", grouped ? "" : grp, badges, prov]
           .filter(Boolean).join(" · ");
         const line = { meta: meta, text: r.body || r.title, accent: r.emphasis === "accent", dim: r.emphasis === "dim" };
+        if (grouped) line.grp = grp;
         if (addressed) {
           const f = r.facets || {};
           // the kernel refuses an addressed compose whose recipient facet is not declared, so a row with no

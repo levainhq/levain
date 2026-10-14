@@ -1,4 +1,4 @@
-"""A sparse install (every new user's) keeps the designed widths: one glance widget is one of four tracks, and Morning's lone
+"""A sparse install (every new user's) keeps the designed widths: each glance widget is one of four tracks, and Morning's lone
 Work card is one of three, not stretched across the page (Phill 10-14: "stretches full screen and looks like shit")."""
 
 from __future__ import annotations
@@ -16,11 +16,11 @@ def _page(tmp_path: Path, steps: list[dict]) -> list:
 
 
 @needs_browser
-def test_a_lone_glance_widget_keeps_one_of_four_tracks(tmp_path: Path) -> None:
-    vals = _page(tmp_path, [{"eval": """(() => { const w = document.querySelector('.ck-widgets'); const c = w.querySelector('.ck-card.w');
-      return [w.querySelectorAll(':scope > .ck-card.w').length, c.getBoundingClientRect().width / w.getBoundingClientRect().width]; })()"""}])
-    n, share = vals[1]
-    assert n == 1 and 0.2 < share < 0.3, vals
+def test_a_sparse_glance_keeps_one_of_four_tracks_per_widget(tmp_path: Path) -> None:
+    vals = _page(tmp_path, [{"eval": """(() => { const w = document.querySelector('.ck-widgets'); const cs = [...w.querySelectorAll(':scope > .ck-card.w')];
+      return [cs.length, cs.map(c => c.getBoundingClientRect().width / w.getBoundingClientRect().width)]; })()"""}])
+    n, shares = vals[1]
+    assert 1 <= n <= 4 and all(0.2 < s < 0.3 for s in shares), vals
 
 
 @needs_browser

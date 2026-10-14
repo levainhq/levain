@@ -1113,6 +1113,15 @@ body.ke .dot.ok { background: var(--ok); }
 .w .row b { color: var(--text); font: var(--fw-bold) var(--fs-lead) var(--round); margin-right: var(--sp-2); }
 .w .dots { display: flex; flex-direction: column; gap: var(--sp-1); }
 .w .op { padding: var(--sp-1) 0; font-size: var(--fs-meta); }
+/* a count tile with a list behind it: it is a button, and the glyph is the same one every panel's focus control wears */
+body.ke .ck-card.w.w-open { cursor: pointer; }
+body.ke .ck-card.w.w-open::after { content: "\2922"; position: absolute; top: var(--sp-4); right: var(--sp-5); color: var(--meta); font-size: var(--fs-lead); line-height: 1; }
+body.ke .ck-card.w.w-open:hover { border-color: var(--line-hot); background: var(--card-2); }
+body.ke .ck-card.w.w-open:hover::after { color: var(--text); }
+body.ke .ck-card.w.w-open:focus-visible { outline: 1px solid var(--line-hot); outline-offset: 2px; }
+/* the focus view's group headings (a list drawn as a count): the kernel's own groups, in its own order */
+.ext-grouphead { margin: var(--sp-5) 0 var(--sp-2); color: var(--label); font: var(--fw-semibold) var(--fs-micro)/1 var(--round); letter-spacing: var(--track-caps); text-transform: uppercase; }
+.ext-grouphead:first-child { margin-top: 0; }
 
 /* ZONES: a fixed 3-column grid, a row as tall as its tallest card, spans as grid-column spans */
 body.ke #board.ke { display: block; padding-block: 0; }

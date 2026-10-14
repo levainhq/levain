@@ -608,6 +608,20 @@
       // the card is the node the page grades; the typed mount inside it carries the kind class
       body.removeAttribute("data-ck-panel"); body.removeAttribute("data-ck-kind");
       node.appendChild(body);
+      // a count tile is one answer with a list behind it: it opens that list in the focus modal (a button, so the keyboard reaches it)
+      if (data.face === "count" && data.typed && !data.error) {
+        node.classList.add("w-open");
+        node.tabIndex = 0;
+        node.setAttribute("role", "button");
+        node.setAttribute("aria-haspopup", "dialog");
+        node.setAttribute("aria-label", "Open " + String(e.title).replace(/\s*\(\d+\)\s*$/, "") + " in a focus view");
+        node.addEventListener("click", () => openModal(e, node));
+        node.addEventListener("keydown", (ev) => {
+          if (ev.target !== node || (ev.key !== "Enter" && ev.key !== " ")) return;
+          ev.preventDefault();
+          openModal(e, node);
+        });
+      }
       cards.push(node);
     }
     region.replaceChildren(...cards);
@@ -2810,8 +2824,14 @@
   }
 
   function appendExternalLines(host, lines) {
+    let lastGroup = null;
     for (const ln of lines) {
       const o = ln && typeof ln === "object" ? ln : {};
+      // rows that carry a group (a list drawn as a count) come in the kernel's order: a heading where the group changes
+      if (typeof o.grp === "string" && o.grp !== lastGroup) {
+        lastGroup = o.grp;
+        host.appendChild(el("div", "ext-grouphead", o.grp));
+      }
       const row = el("div", "row" + (o.accent ? " ext-accent" : "") + (o.dim ? " ext-dim" : ""));
       if (o.meta && !o.addr) row.appendChild(el("span", "ext-meta", String(o.meta)));
       if (o.addr) {
