@@ -783,3 +783,91 @@ def test_cc_mcp_db_must_be_exactly_this_entitys_store(ent, tail):
                                                   *[t.replace("{db}", db) for t in tail]]
     probs = hg._check_mcp(cfg, real, (real,))
     assert any("--db" in p for p in probs), probs
+
+
+# ---------------------------------------------------------------------------- ruling 3b: .codex, agent hook pins
+
+
+def test_codex_dir_is_write_denied_to_hosted_bash(ent):
+    """r3a measured a sandboxed model Bash creating <ws>/.codex/config.toml; without `.codex` in
+    PROTECTED_NAMES the profile's denyWrite would not name it."""
+    real = Path(os.path.realpath(ent))
+    deny = hg.cc_sandbox_block(ent)["filesystem"]["denyWrite"]
+    assert str(real / ".codex") in deny
+    assert ".codex" in hg.PROTECTED_NAMES
+
+
+def _pinned_entity(tmp_path: Path):
+    ent = _entity(tmp_path)
+    (ent / ".claude").mkdir()
+    (ent / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"SessionStart": [1]}}))
+    ch = tmp_path / "codexhome"
+    ch.mkdir()
+    (ch / "hooks.json").write_text('{"hooks": {}}')
+    return ent, ch
+
+
+def test_agent_pin_first_use_then_match(tmp_path):
+    ent, ch = _pinned_entity(tmp_path)
+    status, pinned = hg.check_agent_hook_pins(ent, ch)
+    assert status == "recorded" and ".claude/settings.json hooks" in pinned and "absent" not in pinned
+    assert hg.check_agent_hook_pins(ent, ch) == ("match", [])
+
+
+def test_agent_pin_names_an_edited_hook_script(tmp_path):
+    """Q0 item 8: Claude Code does not notice an edited hook SCRIPT, so the pin must."""
+    ent, ch = _pinned_entity(tmp_path)
+    hg.check_agent_hook_pins(ent, ch)
+    with open(ent / "activation" / "hooks" / "session_start.py", "a") as fh:
+        fh.write("# edited\n")
+    status, diffs = hg.check_agent_hook_pins(ent, ch)
+    assert status == "changed"
+    assert len(diffs) == 1 and diffs[0].startswith("activation/hooks/ (scripts): was ")
+
+
+def test_agent_pin_names_settings_hook_codex_and_claude_hooks_dir_changes(tmp_path):
+    ent, ch = _pinned_entity(tmp_path)
+    hg.check_agent_hook_pins(ent, ch)
+    (ent / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"SessionStart": [2]}}))
+    (ch / "hooks.json").write_text('{"hooks": {"x": 1}}')
+    (ent / ".claude" / "hooks").mkdir()
+    (ent / ".claude" / "hooks" / "evil.sh").write_text("x")
+    status, diffs = hg.check_agent_hook_pins(ent, ch)
+    names = " | ".join(diffs)
+    assert status == "changed"
+    assert ".claude/settings.json hooks" in names and "(Codex)" in names and ".claude/hooks/ (scripts)" in names
+
+
+def test_agent_pin_ignores_non_hook_settings_but_repin_clears(tmp_path):
+    ent, ch = _pinned_entity(tmp_path)
+    hg.check_agent_hook_pins(ent, ch)
+    (ent / ".claude" / "settings.json").write_text(json.dumps({"hooks": {"SessionStart": [1]}, "model": "x"}))
+    assert hg.check_agent_hook_pins(ent, ch)[0] == "match"
+    (ch / "hooks.json").write_text("{}")
+    assert hg.check_agent_hook_pins(ent, ch)[0] == "changed"
+    hg.repin_agent_hooks(ent, ch)
+    assert hg.check_agent_hook_pins(ent, ch)[0] == "match"
+
+
+def test_agent_pin_never_edits_agent_settings(tmp_path):
+    ent, ch = _pinned_entity(tmp_path)
+    before = (ent / ".claude" / "settings.json").read_bytes(), (ch / "hooks.json").read_bytes()
+    hg.check_agent_hook_pins(ent, ch)
+    (ch / "hooks.json").write_text("{}")
+    hg.check_agent_hook_pins(ent, ch)
+    assert (ent / ".claude" / "settings.json").read_bytes() == before[0]
+
+
+def test_cc_sandbox_state_precedence(tmp_path):
+    ent, _ = _pinned_entity(tmp_path)
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    on, why = hg.cc_sandbox_state(ent, home, managed=[])
+    assert on is False and "default is off" in why
+    (home / ".claude" / "settings.json").write_text(json.dumps({"sandbox": {"enabled": True}}))
+    assert hg.cc_sandbox_state(ent, home, managed=[])[0] is True
+    (ent / ".claude" / "settings.local.json").write_text(json.dumps({"sandbox": {"enabled": False}}))
+    assert hg.cc_sandbox_state(ent, home, managed=[])[0] is False  # the workspace layer wins over the user's
+    assert hg.cc_sandbox_state(ent, home, managed=[("/m", {"sandbox": {"enabled": True}})])[0] is True
+    (ent / ".claude" / "settings.local.json").write_text(json.dumps({"sandbox": {"enabled": "yes"}}))
+    assert hg.cc_sandbox_state(ent, home, managed=[])[0] is False  # a string is not True

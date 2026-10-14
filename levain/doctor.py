@@ -90,7 +90,7 @@ def _emit(r: CheckResult) -> None:
         print(f"      → {r.hint}")
 
 
-def run_doctor(path: Path, invoke: bool = False) -> int:
+def run_doctor(path: Path, invoke: bool = False, repin_hooks: bool = False) -> int:
     install = Path(str(path)).expanduser().resolve()
     print(f"Levain doctor — checking {install}\n")
 
@@ -109,6 +109,8 @@ def run_doctor(path: Path, invoke: bool = False) -> int:
     core.extend(_check_install_layout(install, expect_hooks=not hookless))
     if not hookless:
         core.extend(_check_hook_freshness(install))
+        core.extend(_check_agent_hook_pins(install, repin=repin_hooks))
+        core.extend(_check_cc_sandbox(install))
     if not hookless:
         # Additive scope report — a hookless (openhands) entity has no hooks and
         # therefore no activation gate to report on.
@@ -1839,6 +1841,82 @@ def _check_carrier_freshness(install: Path, carrier: Path) -> list[CheckResult]:
 # answered (do these hooks differ in anything install did not itself write?).
 # Imported under the old name so every call site and test here is unchanged.
 from levain.install import hook_body as _hook_body  # noqa: E402
+
+
+def _check_agent_hook_pins(install: Path, repin: bool = False) -> list[CheckResult]:
+    """Ruling 3b item 2a. Pins the hook entries and hook scripts the agents run (Claude Code's
+    settings hooks, its hooks dir, levain's activation scripts, Codex's hooks.json) and names what
+    changed since the pin. Claude Code does not notice an edited hook SCRIPT (Q0 item 8), so the
+    pin covers script contents. DETECTS only: the operator's settings are never edited; the pin
+    file is levain's own `.levain/agent_hook_pins.json`."""
+    from levain import host_guard as hg
+
+    name = "agent hook pins"
+    try:
+        if repin:
+            pins = hg.repin_agent_hooks(install)
+            out = [CheckResult(name, True, f"re-pinned {len(pins)} component(s) as they are now")]
+            return out + _unpinned_commands_result(install)
+        status, diffs = hg.check_agent_hook_pins(install)
+    except hg.AgentPinError as exc:
+        return [CheckResult(name, False, "refused to pin: " + "; ".join(exc.items),
+                            "Fix or remove what is named (a placeholder is never pinned in its place), "
+                            "then re-run doctor with --repin-hooks.")]
+    except OSError as exc:
+        return [CheckResult(name, False, f"could not read or record the pin ({exc})",
+                            "Check that .levain/ is writable, then re-run doctor.")]
+    extra = _unpinned_commands_result(install)
+    if status == "recorded":
+        return [CheckResult(name, True, "first run: pinned the hook entries and scripts as they are now "
+                            "(trust on first use): " + (", ".join(diffs) or "nothing present yet"),
+                            "If anything here is not yours, fix it before relying on this pin.",
+                            warn=True)] + extra
+    if status == "match":
+        return [CheckResult(name, True, "hook entries and scripts match the pin")] + extra
+    return [CheckResult(name, False, "changed since pinned: " + "; ".join(diffs),
+                        "If you made the change, run `levain doctor --path "
+                        f"{shlex.quote(str(install))} --repin-hooks`. If you did not, "
+                        "an agent or another program edited code that runs as you: read it first.")]
+
+
+def _unpinned_commands_result(install: Path) -> list[CheckResult]:
+    """A hook command whose executable is not a file doctor can hash is named: its code is not pinned."""
+    from levain import host_guard as hg
+
+    toks = hg.unpinned_hook_commands(install)
+    if not toks:
+        return []
+    return [CheckResult("agent hook commands", True,
+                        "not pinned (a hook command names code outside the install, or no file under it): " + ", ".join(toks),
+                        "Point the hook command at a script under the install by absolute path "
+                        "(or ${CLAUDE_PROJECT_DIR}) so its file is pinned.", warn=True)]
+
+
+def _check_cc_sandbox(install: Path) -> list[CheckResult]:
+    """Ruling 3b item 2b: warn when Claude Code's own sandbox is off for this workspace."""
+    from levain import host_guard as hg
+    from levain.install import effective_adapter
+
+    if effective_adapter(install) == "codex":
+        return []  # Claude Code's sandbox setting says nothing about a Codex install
+    on, source = hg.cc_sandbox_state(install)
+    read = ", ".join(hg.cc_sandbox_sources(install)) or "no settings file"
+    seen = (f"[read: {read}; not visible to doctor: CLAUDE_CONFIG_DIR relocation, --settings, "
+            "server-managed settings]")
+    if on and hg.cc_sandbox_fails_closed(install):
+        return [CheckResult("Claude Code sandbox", True,
+                            f"configured enabled, failIfUnavailable true ({source}) {seen}")]
+    if on:
+        return [CheckResult("Claude Code sandbox", True,
+                            f"configured enabled ({source}) but `sandbox.failIfUnavailable` is not true: "
+                            f"if Claude Code cannot start its sandbox it runs Bash unconfined {seen}",
+                            "Set `sandbox.failIfUnavailable: true` next to `sandbox.enabled` "
+                            "(doctor never edits your settings).", warn=True)]
+    return [CheckResult("Claude Code sandbox", True,
+                        f"OFF for this workspace: {source}. Claude Code's own Bash runs unconfined here {seen}",
+                        "Set `sandbox.enabled: true` in the workspace's .claude/settings.json "
+                        "(doctor never edits your settings), or accept this as your own trust decision.",
+                        warn=True)]
 
 
 def _check_hook_freshness(install: Path) -> list[CheckResult]:

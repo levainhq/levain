@@ -712,6 +712,9 @@ def _apply_init(
         roots = list(activation_roots)
     else:
         roots = [_base_activation_root(chosen, templates_root)]
+    from levain import host_guard
+
+    pin_before = host_guard.agent_pin_status(install) if _adapter_has_hooks(chosen) else None
     _install_adapter(
         chosen, install, templates_root, python_path, anneal_path, import_seed,
         on_demand_seed, activation_roots=roots, emit=emit,
@@ -721,6 +724,11 @@ def _apply_init(
 
     store = install / ".levain" / "memory.db"
     store.parent.mkdir(parents=True, exist_ok=True)
+    if pin_before is not None:
+        # Levain just wrote the hook files doctor pins; re-pin as the last hook write so a
+        # legitimate init is not a "changed since pinned" FAIL. Skipped when the pin was already
+        # broken before this ran (:func:`host_guard.repin_after_levain_write`).
+        host_guard.repin_after_levain_write(install, pin_before)
     # Persist the interview answers (operator-private) so a later `levain update` can
     # RE-RENDER a changed pack render-template with the SAME answers + a targeted
     # re-prompt for only NEW slots, instead of losing them (the render-slot reconcile
@@ -2094,6 +2102,26 @@ PENDING_REL = (".levain", "pending")
 
 
 def refresh_adapter(
+    install: Path, *, apply: bool, emit: Callable[[str], None] = print,
+    carrier: bool = True,
+) -> AdapterRefresh:
+    """:func:`_refresh_adapter` plus the re-pin: when it applied, levain's own hook rewrite is
+    re-pinned as the last act (one pin writer, ``host_guard.repin_after_levain_write``), unless the
+    pin was already broken by an edit that is not levain's."""
+    from levain import host_guard
+
+    pin_before = None
+    if apply:
+        root = install.resolve()
+        if effective_adapter(root) in ("claude-code", "codex"):
+            pin_before = host_guard.agent_pin_status(root)
+    out = _refresh_adapter(install, apply=apply, emit=emit, carrier=carrier)
+    if pin_before is not None:
+        host_guard.repin_after_levain_write(install.resolve(), pin_before)
+    return out
+
+
+def _refresh_adapter(
     install: Path, *, apply: bool, emit: Callable[[str], None] = print,
     carrier: bool = True,
 ) -> AdapterRefresh:
