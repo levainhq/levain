@@ -10,6 +10,10 @@ manual pending carries: recomputing it from the stored fields detects any altera
 catches a buggy writer and corruption, not a hostile process that can recompute it; what makes an answer
 authority is its signature (:func:`answer_message`), never the request row.
 
+Each request carries an ``event_id``: the hook's own unique event id when its agent supplies one, else an
+unpredictable random one. It is sealed (as the seal's ``proposal_id``) and inside the digest an answer signs,
+so two permission events with identical content are two requests, and one answer authorises one of them.
+
 Stdlib only.
 """
 from __future__ import annotations
@@ -82,6 +86,7 @@ class ExternalGateRequest:
     id: str
     agent: str
     agent_session_id: str
+    event_id: str
     tool_name: str
     tool_input_digest: str
     display: str
@@ -91,35 +96,37 @@ class ExternalGateRequest:
     expires_at: str
 
     @staticmethod
-    def _seal(*, agent: str, agent_session_id: str, tool_name: str, tool_input_digest: str, display: str,
-              cwd: str, tier: str, received_at: str, expires_at: str) -> str:
+    def _seal(*, agent: str, agent_session_id: str, event_id: str, tool_name: str, tool_input_digest: str,
+              display: str, cwd: str, tier: str, received_at: str, expires_at: str) -> str:
         return seal_pending_id(
             created_at=received_at, context_id=agent_session_id, action_name=f"{agent}:{tool_name}",
-            payload=tool_input_digest, proposal_id=None, posture=POSTURE, fail_open=False, requires_typed=False,
-            expires_at=expires_at, authority={"agent": agent, "cwd": cwd, "tier": tier}, query_text=display,
-            query_date=received_at[:10], producers=(agent,))
+            payload=tool_input_digest, proposal_id=event_id, posture=POSTURE, fail_open=False,
+            requires_typed=False, expires_at=expires_at, authority={"agent": agent, "cwd": cwd, "tier": tier},
+            query_text=display, query_date=received_at[:10], producers=(agent,))
 
     @classmethod
-    def create(cls, *, agent: str, agent_session_id: str, tool_name: str, tool_input_digest: str, display: str,
-               cwd: str, tier: str, received_at: str, expires_at: str) -> "ExternalGateRequest":
+    def create(cls, *, agent: str, agent_session_id: str, event_id: str, tool_name: str, tool_input_digest: str,
+               display: str, cwd: str, tier: str, received_at: str, expires_at: str) -> "ExternalGateRequest":
         if agent not in AGENTS:
             raise ConsentError(f"agent must be one of {AGENTS}: {agent!r}")
-        for name, value in (("agent_session_id", agent_session_id), ("tool_name", tool_name),
-                            ("tool_input_digest", tool_input_digest), ("cwd", cwd), ("tier", tier)):
+        for name, value in (("agent_session_id", agent_session_id), ("event_id", event_id),
+                            ("tool_name", tool_name), ("tool_input_digest", tool_input_digest), ("cwd", cwd),
+                            ("tier", tier)):
             _need(name, value)
         if not isinstance(display, str):
             raise ConsentError("display must be a string")
         if parse_stamp(received_at) >= parse_stamp(expires_at):
             raise ConsentError("expires_at must be after received_at")
-        fields = dict(agent=agent, agent_session_id=agent_session_id, tool_name=tool_name,
+        fields = dict(agent=agent, agent_session_id=agent_session_id, event_id=event_id, tool_name=tool_name,
                       tool_input_digest=tool_input_digest, display=display, cwd=cwd, tier=tier,
                       received_at=received_at, expires_at=expires_at)
         return cls(id=cls._seal(**fields), **fields)
 
     def fields(self) -> dict[str, str]:
         return {"id": self.id, "agent": self.agent, "agent_session_id": self.agent_session_id,
-                "tool_name": self.tool_name, "tool_input_digest": self.tool_input_digest, "display": self.display,
-                "cwd": self.cwd, "tier": self.tier, "received_at": self.received_at, "expires_at": self.expires_at}
+                "event_id": self.event_id, "tool_name": self.tool_name, "tool_input_digest": self.tool_input_digest,
+                "display": self.display, "cwd": self.cwd, "tier": self.tier, "received_at": self.received_at,
+                "expires_at": self.expires_at}
 
     def seal_matches(self) -> bool:
         f = self.fields()

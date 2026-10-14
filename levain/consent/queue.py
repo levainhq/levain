@@ -12,10 +12,18 @@ one of four things ends it:
     nothing and the agent's native dialog stands;
   - ``withdrawn``: the requester gave up (the human answered the native dialog, the hook stopped holding).
 
+The row is an INDEX, never authority. A process that can write ``queue.db`` raw can set any state, so every
+delivery of a decision (:meth:`ConsentQueue.decision`, :meth:`ConsentQueue.await_decision`) re-reads the
+stored answer and signature, checks the answer binds this queue, this request and the row's decision, and
+re-verifies it against a FRESH replay of the authority log taken at delivery (the queue's ``authority``
+source): a key revoked after it answered delivers nothing. Anything that fails is ``None``, never an allow;
+a raw write can only take a decision away (the native dialog then stands), never make one.
+
 A terminal request never changes again: SQL triggers refuse any update of a terminal row, any change of a
-request's fields, and any delete, so the rule does not rest on this module's discipline. Every terminal
-transition writes its receipt (built by :mod:`levain.autonomic.receipt`) in the same transaction, so a
-transition and its receipt can never disagree.
+request's fields, and any delete (a guard against a buggy writer; authority is the signature above). Every
+terminal transition writes its receipt (built by :mod:`levain.autonomic.receipt`) in the same transaction, so
+a transition and its receipt can never disagree. Every expiry-conditioned transition reads the clock AFTER
+its ``BEGIN IMMEDIATE`` holds the lock, and expires a due request before considering anything else.
 
 The store is ``<levain home>/consent/queue.db``, opened through :mod:`levain.autonomic.durable_sqlite` (WAL,
 synchronous FULL); every write is one ``BEGIN IMMEDIATE``, serialized by SQLite. The directory is the
@@ -38,7 +46,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from levain.authority import AuthoritySnapshot, VerifierUnavailable, verify_link_sig
+from levain.authority import (
+    AuthorityError, AuthoritySnapshot, ReplayCache, VerifierUnavailable, check_anchor, read_anchor, snapshot,
+    verify_link_sig,
+)
 from levain.autonomic.authority import AuthorityScope
 from levain.autonomic.durable_sqlite import open_durable, read_transaction, write_transaction
 from levain.autonomic.durable_sqlite import rollback as _rollback
@@ -50,24 +61,28 @@ from levain.consent.record import (
     tool_input_digest,
 )
 
-__all__ = ["DB_NAME", "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "ConsentQueue", "Decision",
-           "QueueStoreError", "decide_by_policy", "default_queue_dir"]
+__all__ = ["DB_NAME", "STATES", "STORE_FORMAT", "TERMINAL", "AnswerRefused", "AuthoritySource", "ConsentQueue",
+           "Decision", "QueueStoreError", "authority_source", "decide_by_policy", "default_queue_dir"]
 
 DB_NAME = "queue.db"
-STORE_FORMAT = "levain-consent-queue/1"
+STORE_FORMAT = "levain-consent-queue/2"
 STATES: tuple[str, ...] = ("pending", "allowed", "denied", "expired", "withdrawn")
 TERMINAL: frozenset[str] = frozenset(STATES[1:])
 _ANSWER_KEYS = frozenset({"format", "queue_id", "request_id", "request_digest", "decision", "expires_at",
                           "signer_fp"})
-_FIELDS = ("id", "agent", "agent_session_id", "tool_name", "tool_input_digest", "display", "cwd", "tier",
-           "received_at", "expires_at")
+_FIELDS = ("id", "agent", "agent_session_id", "event_id", "tool_name", "tool_input_digest", "display", "cwd",
+           "tier", "received_at", "expires_at")
+_STATE_OF = {"allow": "allowed", "deny": "denied"}
 _ACCESS_BY_OTHERS = 0o077
+
+# A trusted source of authority: each call is a fresh, verified, anchor-checked replay of the log, or raises.
+AuthoritySource = Callable[[], AuthoritySnapshot]
 
 _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, agent TEXT NOT NULL, agent_session_id TEXT NOT NULL, "
-    "tool_name TEXT NOT NULL, tool_input_digest TEXT NOT NULL, display TEXT NOT NULL, cwd TEXT NOT NULL, "
-    "tier TEXT NOT NULL, received_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
+    "event_id TEXT NOT NULL, tool_name TEXT NOT NULL, tool_input_digest TEXT NOT NULL, display TEXT NOT NULL, "
+    "cwd TEXT NOT NULL, tier TEXT NOT NULL, received_at TEXT NOT NULL, expires_at TEXT NOT NULL, "
     "state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','allowed','denied','expired','withdrawn')), "
     "decided_at TEXT, answer TEXT, signature TEXT, signer_fp TEXT, note TEXT)",
     "CREATE INDEX IF NOT EXISTS requests_pending ON requests (state, expires_at)",
@@ -76,7 +91,8 @@ _SCHEMA = (
     # terminal is terminal; a request's fields never change; nothing is deleted; receipts are append-only
     "CREATE TRIGGER IF NOT EXISTS requests_frozen BEFORE UPDATE ON requests WHEN OLD.state != 'pending' "
     "OR NEW.state = 'pending' OR NEW.id IS NOT OLD.id OR NEW.agent IS NOT OLD.agent "
-    "OR NEW.agent_session_id IS NOT OLD.agent_session_id OR NEW.tool_name IS NOT OLD.tool_name "
+    "OR NEW.agent_session_id IS NOT OLD.agent_session_id OR NEW.event_id IS NOT OLD.event_id "
+    "OR NEW.tool_name IS NOT OLD.tool_name "
     "OR NEW.tool_input_digest IS NOT OLD.tool_input_digest OR NEW.display IS NOT OLD.display "
     "OR NEW.cwd IS NOT OLD.cwd OR NEW.tier IS NOT OLD.tier OR NEW.received_at IS NOT OLD.received_at "
     "OR NEW.expires_at IS NOT OLD.expires_at "
@@ -114,6 +130,34 @@ def default_queue_dir() -> Path:
     return ((Path(home).expanduser() if home else Path.home() / ".levain") / "consent").resolve()
 
 
+def authority_source(cockpit_db: Path | str, *, anchor: Path | None, cache: ReplayCache | None = None,
+                     ssh_keygen: Path | str | None = None) -> AuthoritySource:
+    """The trusted authority source for a queue: each call opens ``cockpit_db`` read-only and returns
+    :func:`levain.authority.snapshot` (a verified replay of the log's head) checked by
+    :func:`levain.authority.check_anchor` against the anchor file :func:`levain.authority.read_anchor`
+    read first (as ``cockpit.authority.RequestAuthority.capture`` orders them: an append committing in
+    between can only put the log ahead of the anchor). ``anchor=None`` checks no anchor. Raises on any
+    failure; the queue turns that into no decision."""
+    uri = Path(cockpit_db).resolve().as_uri() + "?mode=ro"
+    kw: dict[str, Any] = {"cache": cache}
+    if ssh_keygen is not None:
+        kw["ssh_keygen"] = ssh_keygen
+
+    def replay() -> AuthoritySnapshot:
+        conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=30.0)
+        try:
+            conn.execute("BEGIN")
+            pinned = None if anchor is None else read_anchor(anchor)
+            snap = snapshot(conn, **kw)
+            check_anchor(snap, pinned)
+            conn.execute("COMMIT")
+            return snap
+        finally:
+            conn.close()
+
+    return replay
+
+
 def decide_by_policy(request: ExternalGateRequest) -> Decision | None:
     """The seam for Q4's policy and criteria (signed standing grants, tool identity, workspace). Decides
     nothing yet: every request goes to a signed answer or to the human."""
@@ -129,13 +173,19 @@ def _now_utc(clock: Callable[[], datetime]) -> datetime:
 
 class ConsentQueue:
     """The queue in ``directory`` (default :func:`default_queue_dir`). Every operation opens its own
-    connection, so one object is safe across threads and several processes may share the store."""
+    connection, so one object is safe across threads and several processes may share the store.
 
-    def __init__(self, directory: Path | str | None = None, *,
+    ``authority`` is the trusted source every answer and every delivered decision is verified against
+    (:func:`authority_source`), called afresh each time: never a snapshot a caller captured earlier."""
+
+    def __init__(self, directory: Path | str | None = None, *, authority: AuthoritySource,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  ssh_keygen: Path | str | None = None) -> None:
+        if not callable(authority):
+            raise ConsentError("authority must be a source that replays the authority log (authority_source)")
         self.directory = Path(directory) if directory is not None else default_queue_dir()
         self.path = self.directory / DB_NAME
+        self._authority = authority
         self._clock = clock
         self._ssh_keygen = ssh_keygen
         self._ready = False
@@ -178,13 +228,13 @@ class ConsentQueue:
             if tables and ("meta" not in tables or conn.execute(
                     "SELECT 1 FROM meta WHERE key = 'format'").fetchone() is None):
                 raise QueueStoreError("the database holds tables but no consent-queue format marker")
+            row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone() if tables else None
+            if row is not None and row[0] != STORE_FORMAT:
+                raise QueueStoreError(f"store format {row[0]!r} is not {STORE_FORMAT!r}")
             for stmt in _SCHEMA:
                 conn.execute(stmt)
-            row = conn.execute("SELECT value FROM meta WHERE key = 'format'").fetchone()
             if row is None:
                 conn.execute("INSERT INTO meta (key, value) VALUES ('format', ?)", (STORE_FORMAT,))
-            elif row[0] != STORE_FORMAT:
-                raise QueueStoreError(f"store format {row[0]!r} is not {STORE_FORMAT!r}")
             conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('queue_id', ?)",
                          ("cq-" + os.urandom(16).hex(),))
             conn.execute("COMMIT")
@@ -207,34 +257,56 @@ class ConsentQueue:
         with self._read() as conn:
             return conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()[0]
 
+    def _fresh_authority(self) -> AuthoritySnapshot | None:
+        """A replay taken now, or ``None`` when the log cannot be replayed or checked."""
+        try:
+            snap = self._authority()
+        except (AuthorityError, sqlite3.Error, OSError, ValueError):
+            return None
+        return snap if isinstance(snap, AuthoritySnapshot) else None
+
     # --- filing --------------------------------------------------------------------------------------
     def file(self, *, agent: str, agent_session_id: str, tool_name: str, tool_input: Any, cwd: str,
-             hold: timedelta, tier: str = "T2") -> ExternalGateRequest:
+             hold: timedelta, tier: str = "T2", event_id: str | None = None) -> ExternalGateRequest:
         """File one gate an agent is waiting on; it expires ``hold`` after now. ``tier`` must be one an
-        allow can be signed at (``T2`` or ``T3``)."""
+        allow can be signed at (``T2`` or ``T3``). ``event_id`` is the hook's own unique id for this
+        permission event when its agent has one; without it the request gets an unpredictable one. Either
+        way two filings are two requests: filing the same event twice raises, it never returns the first."""
         if tier not in _TIER_NEEDS:
             raise ConsentError(f"tier must be one of {tuple(_TIER_NEEDS)}: {tier!r}")
         if not isinstance(hold, timedelta) or hold <= timedelta(0):
             raise ConsentError("hold must be a positive timedelta")
+        if event_id is None:
+            event = "rand:" + os.urandom(16).hex()
+        elif isinstance(event_id, str) and event_id:
+            event = "hook:" + event_id
+        else:
+            raise ConsentError("event_id must be a non-empty string")
         now = _now_utc(self._clock)
         request = ExternalGateRequest.create(
-            agent=agent, agent_session_id=agent_session_id, tool_name=tool_name,
+            agent=agent, agent_session_id=agent_session_id, event_id=event, tool_name=tool_name,
             tool_input_digest=tool_input_digest(tool_input), display=redact_display(tool_name, tool_input),
             cwd=cwd, tier=tier, received_at=utc_stamp(now), expires_at=utc_stamp(now + hold))
-        with self._write() as conn:
-            conn.execute(f"INSERT OR IGNORE INTO requests ({', '.join(_FIELDS)}) VALUES "
-                         f"({', '.join('?' for _ in _FIELDS)})", tuple(request.fields()[f] for f in _FIELDS))
+        try:
+            with self._write() as conn:
+                conn.execute(f"INSERT INTO requests ({', '.join(_FIELDS)}) VALUES "
+                             f"({', '.join('?' for _ in _FIELDS)})", tuple(request.fields()[f] for f in _FIELDS))
+        except sqlite3.IntegrityError:
+            raise ConsentError(f"request {request.id} is already filed: one event is filed once") from None
         return request
 
     # --- reading -------------------------------------------------------------------------------------
     @staticmethod
     def _request_of(row: Mapping[str, Any]) -> ExternalGateRequest | None:
-        request = ExternalGateRequest(**{f: row[f] for f in _FIELDS})
-        return request if request.seal_matches() else None
+        try:
+            request = ExternalGateRequest(**{f: row[f] for f in _FIELDS})
+            return request if request.seal_matches() else None
+        except (ConsentError, TypeError, ValueError):
+            return None
 
     def _row(self, conn: sqlite3.Connection, request_id: str) -> dict[str, Any] | None:
-        cur = conn.execute(f"SELECT {', '.join(_FIELDS)}, state, decided_at, answer, signer_fp FROM requests "
-                           "WHERE id = ?", (request_id,))
+        cur = conn.execute(f"SELECT {', '.join(_FIELDS)}, state, decided_at, answer, signature, signer_fp "
+                           "FROM requests WHERE id = ?", (request_id,))
         row = cur.fetchone()
         if row is None:
             return None
@@ -242,12 +314,18 @@ class ConsentQueue:
 
     def get(self, request_id: str) -> tuple[ExternalGateRequest, str] | None:
         """The request and its state, after expiring it if its time is up. ``None`` if unknown or its seal
-        does not match (a row someone edited is never answered)."""
-        self._expire_one(request_id)
+        does not match (a row someone edited is never answered). Takes the write lock only when the row is
+        actually due to expire."""
         with self._read() as conn:
             row = self._row(conn, request_id)
         if row is None:
             return None
+        if row["state"] == "pending" and row["expires_at"] <= utc_stamp(_now_utc(self._clock)):
+            self._expire_one(request_id)
+            with self._read() as conn:
+                row = self._row(conn, request_id)
+            if row is None:
+                return None
         request = self._request_of(row)
         return None if request is None else (request, row["state"])
 
@@ -256,7 +334,7 @@ class ConsentQueue:
         self.sweep()
         with self._read() as conn:
             cur = conn.execute(f"SELECT {', '.join(_FIELDS)} FROM requests WHERE state = 'pending' "
-                               "ORDER BY received_at, id")
+                               "ORDER BY received_at, rowid")
             names = [d[0] for d in cur.description]
             rows = [dict(zip(names, r)) for r in cur.fetchall()]
         return [r for r in (self._request_of(row) for row in rows) if r is not None]
@@ -283,136 +361,172 @@ class ConsentQueue:
             face["terminal_state"] = "timed_out"
         return face
 
-    def _transition(self, conn: sqlite3.Connection, request: ExternalGateRequest, state: str, *, now: datetime,
+    def _transition(self, conn: sqlite3.Connection, request: ExternalGateRequest, state: str, *, stamp: str,
                     answer: str | None = None, signature: str | None = None, signer_fp: str | None = None,
-                    note: str | None = None, before_expiry: bool = False) -> bool:
+                    note: str | None = None) -> bool:
         """One ``pending -> state`` move plus its receipt, inside the caller's write transaction. False when
-        the request is no longer pending (or, with ``before_expiry``, its time is up): nothing is written."""
-        stamp = utc_stamp(now)
-        sql = ("UPDATE requests SET state = ?, decided_at = ?, answer = ?, signature = ?, signer_fp = ?, note = ? "
-               "WHERE id = ? AND state = 'pending'")
-        args: tuple[Any, ...] = (state, stamp, answer, signature, signer_fp, note, request.id)
-        if before_expiry:
-            sql += " AND expires_at > ?"
-            args += (stamp,)
-        if conn.execute(sql, args).rowcount != 1:
+        the request is no longer pending: nothing is written."""
+        if conn.execute("UPDATE requests SET state = ?, decided_at = ?, answer = ?, signature = ?, signer_fp = ?, "
+                        "note = ? WHERE id = ? AND state = 'pending'",
+                        (state, stamp, answer, signature, signer_fp, note, request.id)).rowcount != 1:
             return False
         conn.execute("INSERT INTO receipts (request_id, state, created_at, face) VALUES (?, ?, ?, ?)",
                      (request.id, state, stamp, json.dumps(self._face(request, state, signer_fp),
                                                            ensure_ascii=False, sort_keys=True)))
         return True
 
+    def _settle(self, conn: sqlite3.Connection, request_id: str
+                ) -> tuple[ExternalGateRequest | None, str | None, str]:
+        """Inside a held write lock: read the clock NOW, expire the request if it is due, and return the
+        sealed request (or ``None``), its state after that, and the stamp every further transition in this
+        transaction uses."""
+        stamp = utc_stamp(_now_utc(self._clock))
+        row = self._row(conn, request_id)
+        request = None if row is None else self._request_of(row)
+        if row is None or request is None:
+            return None, None, stamp
+        state = row["state"]
+        if state == "pending" and request.expires_at <= stamp:
+            self._transition(conn, request, "expired", stamp=stamp)
+            state = "expired"
+        return request, state, stamp
+
     def _expire_one(self, request_id: str) -> None:
-        now = _now_utc(self._clock)
-        stamp = utc_stamp(now)
         with self._write() as conn:
-            row = self._row(conn, request_id)
-            if row is None or row["state"] != "pending" or row["expires_at"] > stamp:
-                return
-            request = self._request_of(row)
-            if request is not None:
-                self._transition(conn, request, "expired", now=now)
+            self._settle(conn, request_id)
 
     def sweep(self) -> int:
         """Expire every pending request whose time is up; returns how many."""
-        now = _now_utc(self._clock)
-        stamp = utc_stamp(now)
         done = 0
         with self._write() as conn:
+            stamp = utc_stamp(_now_utc(self._clock))
             cur = conn.execute(f"SELECT {', '.join(_FIELDS)} FROM requests WHERE state = 'pending' "
                                "AND expires_at <= ?", (stamp,))
             names = [d[0] for d in cur.description]
             for raw in cur.fetchall():
                 request = self._request_of(dict(zip(names, raw)))
-                if request is not None and self._transition(conn, request, "expired", now=now):
+                if request is not None and self._transition(conn, request, "expired", stamp=stamp):
                     done += 1
         return done
 
     def withdraw(self, request_id: str, *, note: str = "") -> bool:
         """The requester stops waiting (the human answered the native dialog; the hook gave up). Needs no
-        signature: it decides nothing, it leaves the agent's own dialog. False if the request is not pending."""
-        now = _now_utc(self._clock)
+        signature: it decides nothing, it leaves the agent's own dialog. False if the request is not pending
+        (a request whose time is up is expired, not withdrawn)."""
         with self._write() as conn:
-            row = self._row(conn, request_id)
-            request = None if row is None else self._request_of(row)
-            if request is None:
+            request, state, stamp = self._settle(conn, request_id)
+            if request is None or state != "pending":
                 return False
-            return self._transition(conn, request, "withdrawn", now=now, note=note or None)
+            return self._transition(conn, request, "withdrawn", stamp=stamp, note=note or None)
 
     # --- answers -------------------------------------------------------------------------------------
-    def answer(self, request_id: str, payload: Mapping[str, Any], signature: str, *,
-               authority: AuthoritySnapshot) -> Decision:
+    def _refusal(self, request: ExternalGateRequest, queue_id: str, payload: Any, signature: Any,
+                 authority: AuthoritySnapshot) -> str | None:
+        """Why ``payload``/``signature`` is not authority for ``request`` under ``authority``; ``None`` when it
+        verifies. The one check an answer passes to be stored AND again every time it is delivered."""
+        if not isinstance(payload, Mapping) or set(payload) != _ANSWER_KEYS:
+            return "the answer is not an answer record"
+        if payload["format"] != ANSWER_FORMAT:
+            return f"answer format {payload['format']!r} is not {ANSWER_FORMAT!r}"
+        if payload["queue_id"] != queue_id:
+            return "the answer names another queue"
+        if payload["request_id"] != request.id:
+            return "the answer is for another request"
+        if payload["request_digest"] != request.digest:
+            return "the answer signs another version of this request"
+        if payload["expires_at"] != request.expires_at:
+            return "the answer names another expiry"
+        decision = payload["decision"]
+        if decision not in DECISIONS:
+            return f"decision {decision!r} is not one of {DECISIONS}"
+        signer_fp = payload["signer_fp"]
+        key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
+        if key is None:
+            return "the signer is not an enrolled key"
+        if not key.active:
+            return "the signer's key is revoked"
+        if decision == "allow":
+            need, have = _TIER_NEEDS[request.tier], _CLASS_RANK.get(key.key_class)
+            if have is None or have < need:
+                return f"key class {key.key_class} does not cover {request.tier}"
+        if not isinstance(signature, str) or not signature:
+            return "the answer carries no signature"
+        try:
+            message = answer_message(dict(payload))
+        except ConsentError as exc:
+            return f"the answer cannot be encoded: {exc}"
+        kwargs: dict[str, Any] = {} if self._ssh_keygen is None else {"ssh_keygen": self._ssh_keygen}
+        try:
+            ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
+                                 namespace=ANSWER_NAMESPACE, **kwargs)
+        except VerifierUnavailable as exc:
+            return f"the answer could not be verified: {exc}"
+        return None if ok else "the answer's signature does not verify"
+
+    def answer(self, request_id: str, payload: Mapping[str, Any], signature: str) -> Decision:
         """Apply a signed answer to ``request_id``, or raise :class:`AnswerRefused` (the request stays as it
-        was, or becomes ``expired`` when the answer came too late). ``authority`` must be a verified replay
-        of the authority log (:func:`levain.authority.snapshot`)."""
+        was, or becomes ``expired`` when the answer came too late). The answer is verified against a fresh
+        replay from the queue's authority source."""
         got = self.get(request_id)                         # expires it first if its time is up
         if got is None:
             raise AnswerRefused(f"no sealed request {request_id!r}")
         request, state = got
         if state != "pending":
             raise AnswerRefused(f"request {request_id} is already {state}")
-        if not isinstance(payload, Mapping) or set(payload) != _ANSWER_KEYS:
-            raise AnswerRefused("the answer is not an answer record")
-        if payload["format"] != ANSWER_FORMAT:
-            raise AnswerRefused(f"answer format {payload['format']!r} is not {ANSWER_FORMAT!r}")
-        if payload["queue_id"] != self.queue_id:
-            raise AnswerRefused("the answer names another queue")
-        if payload["request_id"] != request.id:
-            raise AnswerRefused("the answer is for another request")
-        if payload["request_digest"] != request.digest:
-            raise AnswerRefused("the answer signs another version of this request")
-        if payload["expires_at"] != request.expires_at:
-            raise AnswerRefused("the answer names another expiry")
+        authority = self._fresh_authority()
+        if authority is None:
+            raise AnswerRefused("the authority log cannot be replayed now: no answer is authority")
+        why = self._refusal(request, self.queue_id, payload, signature, authority)
+        if why is not None:
+            raise AnswerRefused(why)
         decision = payload["decision"]
-        if decision not in DECISIONS:
-            raise AnswerRefused(f"decision {decision!r} is not one of {DECISIONS}")
-        signer_fp = payload["signer_fp"]
-        key = authority.key(signer_fp) if isinstance(signer_fp, str) else None
-        if key is None:
-            raise AnswerRefused("the signer is not an enrolled key")
-        if not key.active:
-            raise AnswerRefused("the signer's key is revoked")
-        if decision == "allow":
-            need, have = _TIER_NEEDS[request.tier], _CLASS_RANK.get(key.key_class)
-            if have is None or have < need:
-                raise AnswerRefused(f"key class {key.key_class} does not cover {request.tier}")
-        try:
-            message = answer_message(dict(payload))
-        except ConsentError as exc:
-            raise AnswerRefused(f"the answer cannot be encoded: {exc}") from None
-        kwargs: dict[str, Any] = {} if self._ssh_keygen is None else {"ssh_keygen": self._ssh_keygen}
-        try:
-            ok = verify_link_sig(message, signature, public_key=key.public_key, fingerprint=key.fingerprint,
-                                 namespace=ANSWER_NAMESPACE, **kwargs)
-        except VerifierUnavailable as exc:
-            raise AnswerRefused(f"the answer could not be verified: {exc}") from None
-        if not ok:
-            raise AnswerRefused("the answer's signature does not verify")
-        now = _now_utc(self._clock)
-        state = "allowed" if decision == "allow" else "denied"
+        message = answer_message(dict(payload))
         with self._write() as conn:
-            moved = self._transition(conn, request, state, now=now, answer=message.decode("utf-8"),
-                                     signature=signature, signer_fp=signer_fp, before_expiry=True)
+            current, now_state, stamp = self._settle(conn, request_id)
+            moved = current is not None and now_state == "pending" and self._transition(
+                conn, request, _STATE_OF[decision], stamp=stamp, answer=message.decode("utf-8"),
+                signature=signature, signer_fp=payload["signer_fp"])
         if not moved:
-            self._expire_one(request_id)
-            got = self.get(request_id)
-            raise AnswerRefused(f"request {request_id} is already {got[1] if got else 'gone'}")
-        return Decision(request_id=request.id, decision=decision, signer_fp=signer_fp, decided_at=utc_stamp(now))
+            raise AnswerRefused(f"request {request_id} is already {now_state or 'gone'}")
+        return Decision(request_id=request.id, decision=decision, signer_fp=payload["signer_fp"], decided_at=stamp)
 
     def decision(self, request_id: str) -> Decision | None:
-        """The verified decision of a terminal request; ``None`` while pending and for expired/withdrawn."""
+        """The decision of a terminal request, re-verified now: the stored answer must be the canonical
+        record of this row's decision for this queue and request, decided before its expiry, and its
+        signature must verify under a key a fresh replay holds active (and of a class covering the tier,
+        for an allow). ``None`` while pending, for expired/withdrawn, and for anything that fails."""
         with self._read() as conn:
             row = self._row(conn, request_id)
-        if row is None or row["state"] not in ("allowed", "denied") or self._request_of(row) is None:
+            queue_id = conn.execute("SELECT value FROM meta WHERE key = 'queue_id'").fetchone()
+        if row is None or queue_id is None or row["state"] not in ("allowed", "denied"):
             return None
-        return Decision(request_id=request_id, decision="allow" if row["state"] == "allowed" else "deny",
-                        signer_fp=row["signer_fp"], decided_at=row["decided_at"])
+        request = self._request_of(row)
+        stored, decided_at = row["answer"], row["decided_at"]
+        if request is None or not isinstance(stored, str) or not isinstance(decided_at, str) \
+                or decided_at >= request.expires_at:
+            return None
+        try:
+            payload = json.loads(stored)
+            if not isinstance(payload, dict) or answer_message(payload) != stored.encode("utf-8"):
+                return None
+        except (ValueError, ConsentError, RecursionError):
+            return None
+        named = payload.get("decision")
+        if not isinstance(named, str) or _STATE_OF.get(named) != row["state"] \
+                or payload.get("signer_fp") != row["signer_fp"]:
+            return None
+        authority = self._fresh_authority()
+        if authority is None or self._refusal(request, queue_id[0], payload, row["signature"], authority) is not None:
+            return None
+        return Decision(request_id=request.id, decision=payload["decision"], signer_fp=payload["signer_fp"],
+                        decided_at=decided_at)
 
     def await_decision(self, request_id: str, timeout: float, *, poll: float = 0.1,
                        sleep: Callable[[float], None] = time.sleep) -> Decision | None:
         """Wait up to ``timeout`` seconds for a verified decision. ``None`` is NO decision: the request
-        expired, was withdrawn, is unknown, or is still pending when the wait ends (the adapter then
-        outputs nothing, so the native dialog stands, and withdraws or lets it expire)."""
+        expired, was withdrawn, is unknown, its stored answer no longer verifies, or it is still pending
+        when the wait ends (the adapter then outputs nothing, so the native dialog stands, and withdraws or
+        lets it expire)."""
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
             got = self.get(request_id)
