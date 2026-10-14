@@ -1855,21 +1855,39 @@ def _check_agent_hook_pins(install: Path, repin: bool = False) -> list[CheckResu
     try:
         if repin:
             pins = hg.repin_agent_hooks(install)
-            return [CheckResult(name, True, f"re-pinned {len(pins)} component(s) as they are now")]
+            out = [CheckResult(name, True, f"re-pinned {len(pins)} component(s) as they are now")]
+            return out + _unpinned_commands_result(install)
         status, diffs = hg.check_agent_hook_pins(install)
+    except hg.AgentPinError as exc:
+        return [CheckResult(name, False, "refused to pin: " + "; ".join(exc.items),
+                            "Fix or remove what is named (a placeholder is never pinned in its place), "
+                            "then re-run doctor with --repin-hooks.")]
     except OSError as exc:
         return [CheckResult(name, False, f"could not read or record the pin ({exc})",
                             "Check that .levain/ is writable, then re-run doctor.")]
+    extra = _unpinned_commands_result(install)
     if status == "recorded":
         return [CheckResult(name, True, "first run: pinned the hook entries and scripts as they are now "
                             "(trust on first use)", "If anything here is not yours, "
-                            "fix it before relying on this pin.", warn=True)]
+                            "fix it before relying on this pin.", warn=True)] + extra
     if status == "match":
-        return [CheckResult(name, True, "hook entries and scripts match the pin")]
+        return [CheckResult(name, True, "hook entries and scripts match the pin")] + extra
     return [CheckResult(name, False, "changed since pinned: " + "; ".join(diffs),
                         "If you made the change, run `levain doctor --path "
                         f"{shlex.quote(str(install))} --repin-hooks`. If you did not, "
                         "an agent or another program edited code that runs as you: read it first.")]
+
+
+def _unpinned_commands_result(install: Path) -> list[CheckResult]:
+    """A hook command whose executable is not a file doctor can hash is named: its code is not pinned."""
+    from levain import host_guard as hg
+
+    toks = hg.unpinned_hook_commands(install)
+    if not toks:
+        return []
+    return [CheckResult("agent hook commands", True,
+                        "not pinned (executable did not resolve to a file): " + ", ".join(toks),
+                        "Use an absolute path for the hook command so its file is pinned.", warn=True)]
 
 
 def _check_cc_sandbox(install: Path) -> list[CheckResult]:
@@ -1877,10 +1895,20 @@ def _check_cc_sandbox(install: Path) -> list[CheckResult]:
     from levain import host_guard as hg
 
     on, source = hg.cc_sandbox_state(install)
+    read = ", ".join(hg.cc_sandbox_sources(install)) or "no settings file"
+    seen = (f"[read: {read}; not visible to doctor: CLAUDE_CONFIG_DIR relocation, --settings, "
+            "server-managed settings]")
+    if on and hg.cc_sandbox_fails_closed(install):
+        return [CheckResult("Claude Code sandbox", True,
+                            f"configured enabled, failIfUnavailable true ({source}) {seen}")]
     if on:
-        return [CheckResult("Claude Code sandbox", True, f"on ({source})")]
+        return [CheckResult("Claude Code sandbox", True,
+                            f"configured enabled ({source}) but `sandbox.failIfUnavailable` is not true: "
+                            f"if Claude Code cannot start its sandbox it runs Bash unconfined {seen}",
+                            "Set `sandbox.failIfUnavailable: true` next to `sandbox.enabled` "
+                            "(doctor never edits your settings).", warn=True)]
     return [CheckResult("Claude Code sandbox", True,
-                        f"OFF for this workspace: {source}. Claude Code's own Bash runs unconfined here",
+                        f"OFF for this workspace: {source}. Claude Code's own Bash runs unconfined here {seen}",
                         "Set `sandbox.enabled: true` in the workspace's .claude/settings.json "
                         "(doctor never edits your settings), or accept this as your own trust decision.",
                         warn=True)]

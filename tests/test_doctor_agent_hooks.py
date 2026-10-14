@@ -66,6 +66,6 @@ def test_doctor_does_not_write_the_operators_settings(install):
 def test_sandbox_off_warns_and_on_passes(install):
     (r,) = doctor._check_cc_sandbox(install)
     assert r.ok and r.warn and "OFF" in r.detail
-    (install / ".claude" / "settings.local.json").write_text(json.dumps({"sandbox": {"enabled": True}}))
+    (install / ".claude" / "settings.local.json").write_text(json.dumps({"sandbox": {"enabled": True, "failIfUnavailable": True}}))
     (r,) = doctor._check_cc_sandbox(install)
     assert r.ok and not r.warn
