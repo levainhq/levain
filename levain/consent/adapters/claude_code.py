@@ -129,13 +129,10 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
 # --- the decision ------------------------------------------------------------------------------------------
 
 def _verified(decision: Any, request: ExternalGateRequest) -> Decision | None:
-    """``decision`` only if it is the core's Decision for THIS request with a known verdict, and, when the core's
-    Decision carries a ``request_digest``, that digest is the one of the request this hook filed."""
+    """``decision`` only if it is the core's Decision for THIS request with a known verdict, over the digest
+    of the request this hook filed (``Decision.request_digest`` is required since Q1 round 2)."""
     if not (isinstance(decision, Decision) and decision.request_id == request.id
-            and decision.decision in ("allow", "deny")):
-        return None
-    digest = getattr(decision, "request_digest", None)
-    if digest is not None and digest != request.digest:
+            and decision.decision in ("allow", "deny") and decision.request_digest == request.digest):
         return None
     return decision
 

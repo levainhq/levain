@@ -18,7 +18,7 @@ import pytest
 
 import levain.authority as auth
 from levain.authority import ReplayCache
-from levain.consent import ConsentQueue, Decision, answer_message, answer_payload, authority_source
+from levain.consent import ConsentQueue, Decision, answer_message, authority_source
 from levain.consent.adapters import claude_code as cc
 from levain.consent.record import ANSWER_NAMESPACE, ExternalGateRequest
 
@@ -60,7 +60,9 @@ class FakeQueue:
             raise self.verdict
         if self.verdict is None:
             return None
-        return Decision(request_id=request_id, decision=self.verdict, signer_fp="SHA256:k", decided_at="t")
+        digest = next(r.digest for r in self.requests if r.id == request_id) if self.requests else "sha256:none"
+        return Decision(request_id=request_id, decision=self.verdict, signer_fp="SHA256:k", decided_at="t",
+                        request_digest=digest)
 
     def await_decision(self, request_id, timeout, **kw):
         self.waited.append(timeout)
@@ -136,7 +138,8 @@ def test_nothing_on_stdin_is_a_decision(monkeypatch):
 def test_a_decision_for_another_request_is_not_delivered(monkeypatch):
     class Other(FakeQueue):
         def await_decision(self, request_id, timeout, **kw):
-            return Decision(request_id="someone-else", decision="allow", signer_fp="k", decided_at="t")
+            return Decision(request_id="someone-else", decision="allow", signer_fp="k", decided_at="t",
+                            request_digest=self.requests[-1].digest)
     assert run_main(monkeypatch, Other(), json.dumps(event())) == (0, "")
 
 
@@ -148,9 +151,8 @@ def test_a_decision_over_another_request_digest_is_not_delivered(monkeypatch):
             self.digest_of = digest_of
 
         def await_decision(self, request_id, timeout, **kw):
-            d = Decision(request_id=request_id, decision="allow", signer_fp="k", decided_at="t")
-            object.__setattr__(d, "request_digest", self.digest_of(self.requests[-1]))
-            return d
+            return Decision(request_id=request_id, decision="allow", signer_fp="k", decided_at="t",
+                            request_digest=self.digest_of(self.requests[-1]))
     assert run_main(monkeypatch, Digest(lambda r: "sha256:other"), json.dumps(event())) == (0, "")
     rc, out = run_main(monkeypatch, Digest(lambda r: r.digest), json.dumps(event()))
     assert json.loads(out)["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
@@ -187,7 +189,8 @@ def test_settings_default_to_away_off(tmp_path):
 
 def test_policy_answer_is_delivered_without_a_wait(monkeypatch):
     def policy(request):
-        return Decision(request_id=request.id, decision="allow", signer_fp="policy", decided_at="t")
+        return Decision(request_id=request.id, decision="allow", signer_fp="policy", decided_at="t",
+                        request_digest=request.digest)
     q = FakeQueue(None)
     rc, out = run_main(monkeypatch, q, json.dumps(event()), settings=cc.AdapterSettings(), policy=policy)
     assert json.loads(out)["hookSpecificOutput"]["decision"] == {"behavior": "allow"} and q.waited == []
@@ -250,7 +253,8 @@ def test_agent_config_never_reaches_the_policy_seam(monkeypatch):
 
     def policy(request):
         calls.append(request)
-        return Decision(request_id=request.id, decision="allow", signer_fp="policy", decided_at="t")
+        return Decision(request_id=request.id, decision="allow", signer_fp="policy", decided_at="t",
+                        request_digest=request.digest)
     q = FakeQueue(None)
     rc, out = run_main(monkeypatch, q, json.dumps(event("Edit", {"file_path": ".claude/settings.json",
                                                                   "old_string": "a", "new_string": "b"})),
@@ -329,7 +333,7 @@ def test_real_core_signed_allow_through_main(tmp_path):
                 pending = []
             if pending:
                 r = pending[0]
-                p = answer_payload(queue_id=observer.queue_id, request=r, decision="allow", signer_fp=key.fp)
+                p = observer.answer_payload(r.id, "allow", key.fp)
                 observer.answer(r.id, p, key.sign(answer_message(p), ANSWER_NAMESPACE))
                 return
             time.sleep(0.1)
