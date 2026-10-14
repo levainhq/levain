@@ -243,13 +243,18 @@ def test_linux_live_a_renamed_dirmngr_dir_is_not_reachable_and_the_agent_is(tmp_
     def serve() -> None:
         # Every connection, not one: the grant check connects too (B2a fix 1, F6 reads what listens by
         # connecting without sending), so a single accept was used up before bash's connect (CI 733bc48).
+        # The probe closes without reading, so a send to it can fail (EPIPE): that ends only that connection.
         while True:
             try:
                 c, _ = agent.accept()
-                c.sendall(b"OK agent\n")
-                c.close()
             except OSError:
                 return
+            try:
+                c.sendall(b"OK agent\n")
+            except OSError:
+                pass
+            finally:
+                c.close()
 
     threading.Thread(target=serve, daemon=True).start()
     gf = tmp_path / "grants.json"
