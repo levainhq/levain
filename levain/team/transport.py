@@ -1974,10 +1974,11 @@ class GitLedger:
         cp = git(["rev-parse", "-q", "--verify", f"{self.ref}:ledger"], self.repo.toplevel, check=False)
         return cp.stdout.strip() or "empty"
 
-    def read_canon(self, rev: str | None = None) -> str | None:
-        """The OWNER's canon: PROJECT.md as of the last commit the owner in force signed, never the tip's file."""
+    def read_canon(self, rev: str | None = None, *, d=None) -> str | None:
+        """The OWNER's canon: PROJECT.md as of the last commit the owner in force signed, never the tip's file.
+        ``d``: a derivation the caller already holds (its canon_sha is used; ``rev`` is then ignored)."""
         try:
-            sha = self.derivation(rev).canon_sha
+            sha = (d if d is not None else self.derivation(rev)).canon_sha
         except TeamError:
             return None
         return self._show(CANON_FILE, sha) if sha else None

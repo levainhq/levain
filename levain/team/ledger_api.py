@@ -118,8 +118,8 @@ class LedgerTransport(Protocol):
         """The team in force at ``rev``: the counted team, never an uncounted file."""
         ...
 
-    def read_canon(self, rev: str | None = None) -> str | None:
-        """The canon text at ``rev``, or None when there is none."""
+    def read_canon(self, rev: str | None = None, *, d=None) -> str | None:
+        """The canon text at ``rev`` (or of the derivation ``d`` the caller holds), or None when there is none."""
         ...
 
     @staticmethod

@@ -48,7 +48,10 @@ def _one_line(text: object) -> str:
         line = " ".join(str(text).split())
     except Exception:  # noqa: BLE001
         return ""
-    return line if len(line) <= _WHY_MAX else line[:_WHY_MAX - 1].rstrip() + "\u2026"
+    if len(line) <= _WHY_MAX:
+        return line
+    cut = line[:_WHY_MAX - 1]
+    return (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip() + "\u2026"
 
 
 def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int = DEFAULT_RECHECK_DAYS,
@@ -57,12 +60,12 @@ def read_team(gl: LedgerTransport, *, path_filter: str = "", recheck_days: int =
     try:
         if gl.pinned_root is None and not gl.legacy_only() and not gl.has_local_ledger() and not gl.has_remote_ledger():
             return TeamRead("no_team", None, _NO_TEAM)
-        # ONE derivation feeds the team, the ledger, the judgement, the handle and the canon revision: a tip that
+        # ONE derivation feeds the team, the ledger, the judgement, the handle and the canon: a tip that
         # moves or a trust state that changes between separate reads must not mix two judgements in one model
         d = gl.derivation()
-        team, sha = d.team, d.tip
+        team = d.team
         ledger = gl.ledger_of(d)
-        model = build_model(team, ledger, gl.handle(team, d=d), gl.read_canon(sha), gl.state_hash(ledger, team),
+        model = build_model(team, ledger, gl.handle(team, d=d), gl.read_canon(d=d), gl.state_hash(ledger, team),
                             recheck_days=recheck_days, ack_flag=ack_flag, path_filter=path_filter)
         if d.judged != "full":
             waiting = int(d.waiting or 0)

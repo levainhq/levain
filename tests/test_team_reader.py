@@ -89,6 +89,6 @@ def test_one_read_uses_one_derivation_for_the_team_the_judgement_and_the_handle(
 
     monkeypatch.setattr(GitLedger, "derivation", counting)
     r = read_team(gl)
-    # the tip is resolved ONCE (rev None); the canon read names that same tip. snapshot()+handle() each resolved the tip
-    # again before, so a tip that moved between them mixed two judgements in one model
-    assert r.state == "ok" and calls.count(None) == 1 and len(set(calls) - {None}) <= 1, calls
+    # one derivation for the whole read: the team, the judgement, the handle and the canon text all come from it. The
+    # canon read re-derived at the current trust state before, so an accept-merge between the two reads mixed judgements
+    assert r.state == "ok" and calls == [None], calls
