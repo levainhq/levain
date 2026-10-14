@@ -783,7 +783,7 @@ _SSH_AGENT_GRANT = ("is an ssh agent's socket ({}), which hands bash every key t
 
 
 #: ``/proc/<pid>/comm`` of the agents recognised by what listens (comm is cut at 15 bytes). gpg-agent
-#: also listens on its extra socket, the gpg signing grant: that one socket, by inode against the paths
+#: also listens on its extra socket, the gpg signing grant: that one socket, at the exact path
 #: gpgconf names (:func:`_gpg_extra_sockets`), is exempt; every other socket gpg-agent answers on is
 #: refused (L3 b2a r2, codex: an alias of another home's ssh socket).
 _AGENT_LISTENERS = ("ssh-agent", "gnome-keyring-d", "gpg-agent")
@@ -828,8 +828,7 @@ def _ssh_agent_refusal(p: str) -> str | None:
     socket the operator's ``$SSH_AUTH_SOCK`` names now, or as gpg-agent's ssh socket (gpgconf's path),
     under any name; or, on Linux, what listens on it is an ``ssh-agent``, gnome-keyring or a gpg-agent (by
     ``/proc/<pid>/comm``), wherever it is and whatever levain's environment holds, except gpg-agent's
-    extra socket at a path gpgconf names. A
-    socket nobody answers on is not refused here (the grant check owns liveness). Off Linux, an agent
+    extra socket at a path gpgconf names. A socket nobody answers on is not refused here (the grant check owns liveness). Off Linux, an agent
     at a path neither names is not recognised (a stated limit). Doctor (:func:`load_operator_grants`)
     and the spawn (:func:`resolve_grant`) both call this."""
     ambient = os.environ.get("SSH_AUTH_SOCK")
@@ -838,7 +837,7 @@ def _ssh_agent_refusal(p: str) -> str | None:
     if any(_same_socket(s, p) for s in _gpg_ssh_sockets()):
         return _SSH_AGENT_GRANT.format("gpg-agent's ssh socket")
     comm = _listener_comm(p)
-    if comm == "gpg-agent" and any(_same_socket(s, p) for s in _gpg_extra_sockets()):
+    if comm == "gpg-agent" and p in _gpg_extra_sockets():   # the literal path, as the gpg grant rule
         return None
     if comm is not None and comm in _AGENT_LISTENERS:
         return _SSH_AGENT_GRANT.format(f"the process listening on it is {comm}")
