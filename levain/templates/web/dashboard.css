@@ -412,11 +412,13 @@
 
   /* ── motion ────────────────────────────────────────────────────────────── */
   @keyframes blink { 0%,55% { opacity: 1; } 56%,100% { opacity: 0; } }
-  @keyframes traceDraw { to { stroke-dashoffset: 0; } }
+  /* the settled trace is solid in every engine: with non-scaling-stroke an engine may skip the pathLength
+     normalisation and draw the 1-unit dash as a dotted line, so the end state drops the dash entirely */
+  @keyframes traceDraw { 99% { stroke-dashoffset: 0; } to { stroke-dashoffset: 0; stroke-dasharray: none; } }
   @keyframes traceBreathe { 0%, 88%, 100% { opacity: .16; } 40% { opacity: .34; } }
   @media (prefers-reduced-motion: reduce) {
     .badge.live, .entity::after { animation: none; }
-    svg.scope .trace-core, svg.scope .trace-glow { animation: none; stroke-dashoffset: 0; }
+    svg.scope .trace-core, svg.scope .trace-glow { animation: none; stroke-dashoffset: 0; stroke-dasharray: none; }
   }
 
   /* ── Slice 2a: governed edit affordances — METAL (you grip them to change a
