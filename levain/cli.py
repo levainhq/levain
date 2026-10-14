@@ -3029,7 +3029,7 @@ def _cmd_ssh_add(args: argparse.Namespace) -> int:
 
     try:
         print(ssh_agent.add_key(args.key.expanduser(), args.hosts,
-                                lifetime=args.lifetime or ssh_agent.DEFAULT_LIFETIME,
+                                lifetime=ssh_agent.DEFAULT_LIFETIME if args.lifetime is None else args.lifetime,
                                 session=args.session, waive_destinations=args.waive))
     except ssh_agent.AgentError as exc:
         print(f"levain ssh-add: {exc}", file=sys.stderr)

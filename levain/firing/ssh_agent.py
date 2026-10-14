@@ -30,6 +30,9 @@ A levain that is killed leaves its agent running until the next levain start swe
 
 from __future__ import annotations
 
+import base64
+import fcntl
+import hashlib
 import json
 import os
 import platform
@@ -90,6 +93,7 @@ class ScopedAgent:
                 and isinstance(data["socket"], str) and os.path.isabs(data["socket"])
                 and Path(data["socket"]).name == SOCKET_NAME
                 and Path(data["socket"]).parent.name == data["session_id"]
+                and Path(data["socket"]).parent.parent == run_root()
                 and isinstance(data["pid"], int) and not isinstance(data["pid"], bool) and data["pid"] > 1):
             raise AgentError("not a serialized scoped ssh agent (fail-closed).")
         return cls(data["session_id"], data["socket"], data["pid"])
@@ -324,7 +328,10 @@ def start(*, entity: str = "", lifetime: int = DEFAULT_LIFETIME, ssh_mode: str =
                          "ssh_mode": ssh_mode, "keys": []})
     except BaseException:
         if proc is not None:
-            _terminate(proc)
+            try:
+                _terminate(proc)
+            except (OSError, subprocess.SubprocessError):   # the start's own error is the one to report
+                pass
         _remove_dir(d)
         raise
     _POPENS[proc.pid] = proc
@@ -483,7 +490,8 @@ def confinement_refusal(system: str | None = None) -> str | None:
         return "this process cannot read /proc/self/status, so it cannot show it is outside a levain confinement"
     if nnp:
         return ("this process runs with no_new_privs, as every levain confinement does; run `levain ssh-add` "
-                "from your own shell")
+                "from your own shell (a shell that is not inside a levain session can have it too: Claude Code's "
+                "own sandbox, a flatpak or snap terminal, a container, or a systemd unit with NoNewPrivileges=yes)")
     return None
 
 
@@ -569,7 +577,17 @@ def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, se
             waive_destinations: bool = False, system: str | None = None) -> str:
     """``levain ssh-add``: add ``key`` to a running session's scoped agent, limited to ``hosts`` (checked
     against :func:`host_keys_file`) and to ``lifetime`` seconds, after checking that the agent answering
-    on the session's socket is the pid levain started. Returns the line to print, or :class:`AgentError`."""
+    on the session's socket is the pid levain started. Returns the line to print, or :class:`AgentError`
+    (an OpenSSH tool that times out or cannot run is one too, never a traceback)."""
+    try:
+        return _add_key(key, hosts, lifetime=lifetime, session=session,
+                        waive_destinations=waive_destinations, system=system)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AgentError(f"an OpenSSH tool or the session record failed ({exc}); check `levain doctor`") from None
+
+
+def _add_key(key: Path, hosts: list[str], *, lifetime: int, session: str | None, waive_destinations: bool,
+             system: str | None) -> str:
     why = confinement_refusal(system)
     if why is not None:
         raise AgentError(f"refused: {why}")
@@ -635,12 +653,20 @@ def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, se
         fd = os.open(d / KNOWN_HOSTS_NAME, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0))
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write("".join(f"{ln}\n" for ln in lines))
-    rec = read_record(d) or rec
-    rec["keys"] = [k for k in rec["keys"] if not (isinstance(k, dict) and k.get("fingerprint") == fp)]
-    rec["keys"].append({"fingerprint": fp, "hosts": list(hosts), "lifetime": lifetime,
-                        "added_at": int(time.time()), "waived": bool(waive_destinations)})
-    write_record(d, rec)
-    limit = f"for {', '.join(hosts)}" if hosts else "for ANY host (destination limit waived)"
+    # Read, change and write under a lock on the session directory: two `levain ssh-add` at once would
+    # otherwise drop one key's record (L1 #8).
+    dfd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0))
+    try:
+        fcntl.flock(dfd, fcntl.LOCK_EX)
+        rec = read_record(d) or rec
+        rec["keys"] = [k for k in rec["keys"] if not (isinstance(k, dict) and k.get("fingerprint") == fp)]
+        rec["keys"].append({"fingerprint": fp, "hosts": list(hosts), "lifetime": lifetime,
+                            "added_at": int(time.time()), "waived": bool(waive_destinations)})
+        write_record(d, rec)
+    finally:
+        os.close(dfd)
+    limit = (f"for {', '.join(hosts)}" if hosts else
+             "for ANY host, including hosts it is forwarded to (destination limit waived)")
     return "\n".join([f"added {fp} to session {d.name}'s scoped agent (pid {got}, peer checked) {limit}, "
                       f"for {lifetime}s", *bound])
 
@@ -652,16 +678,55 @@ DARWIN_LINE = ("ssh agent: $SSH_AUTH_SOCK is passed to bash; macOS has no unix-s
 _NO_AGENT_TAIL = "$SSH_AUTH_SOCK is not passed to bash, so git over ssh inside bash fails"
 
 
+_REQUEST_IDENTITIES, _IDENTITIES_ANSWER = 11, 12   # draft-miller-ssh-agent §3.4 / §6.1
+_MAX_ANSWER = 1 << 20
+
+
+def _recv_exact(s: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            raise OSError("the agent closed the connection")
+        buf += chunk
+    return buf
+
+
 def _held(sock: str) -> list[str] | None:
-    """The SHA256 fingerprints the agent on ``sock`` holds (``ssh-add -l``), or None if it cannot say."""
+    """The SHA256 fingerprints the agent on ``sock`` holds, or None if it cannot say. Asked in the agent
+    protocol (REQUEST_IDENTITIES) and computed from each key blob, never parsed out of ``ssh-add -l``: a
+    key comment is text whoever added the key chose, and one holding a newline and an ``ssh-add -l``
+    shaped line listed a fingerprint the agent did not hold (L2 #10; an anchored line regex does not
+    stop it, RUN 2026-10-14: the forged line ends with the real key's type)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        done = subprocess.run(["ssh-add", "-l", "-E", "sha256"], env=_tool_env(sock), capture_output=True, text=True,
-                              stdin=subprocess.DEVNULL, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
+        s.settimeout(10)
+        s.connect(sock)
+        s.sendall(struct.pack(">IB", 1, _REQUEST_IDENTITIES))
+        (n,) = struct.unpack(">I", _recv_exact(s, 4))
+        if not 0 < n <= _MAX_ANSWER:
+            return None
+        body = _recv_exact(s, n)
+    except (OSError, struct.error):
         return None
-    if done.returncode not in (0, 1):
+    finally:
+        s.close()
+    if body[0] != _IDENTITIES_ANSWER or len(body) < 5:
         return None
-    return [f[1] for f in (line.split() for line in done.stdout.splitlines()) if len(f) > 1 and f[1].startswith("SHA256:")]
+    (count,) = struct.unpack(">I", body[1:5])
+    off, out = 5, []
+    for _ in range(count):
+        for field in ("blob", "comment"):
+            if off + 4 > len(body):
+                return None
+            (ln,) = struct.unpack(">I", body[off:off + 4])
+            if off + 4 + ln > len(body):
+                return None
+            if field == "blob":
+                digest = hashlib.sha256(body[off + 4:off + 4 + ln]).digest()
+                out.append("SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("="))
+            off += 4 + ln
+    return out
 
 
 def _left(secs: int) -> str:
@@ -674,7 +739,7 @@ def key_lines(d: Path, rec: dict[str, Any], *, now: float | None = None) -> list
     or, for a key the record does not have, that no limit is known. Or the "no keys" line."""
     held = _held(str(d / SOCKET_NAME))
     if held is None:
-        return [f"ssh agent keys: could not be listed (ssh-add -l on {d / SOCKET_NAME} failed)"]
+        return [f"ssh agent keys: could not be listed (the agent on {d / SOCKET_NAME} did not answer)"]
     if not held:
         return [f"ssh agent: no keys; add one from your own shell: `levain ssh-add <key> -h <host>`"
                 f" (session {d.name})"]
@@ -688,7 +753,8 @@ def key_lines(d: Path, rec: dict[str, Any], *, now: float | None = None) -> list
             continue
         left = _left(int(k.get("added_at", 0)) + int(k.get("lifetime", 0)) - int(now))
         if k.get("waived"):
-            out.append(f"waiver (levain ssh-add {WAIVER_FLAG}) ssh agent key {fp}: ANY host, {left}")
+            out.append(f"waiver (levain ssh-add {WAIVER_FLAG}) ssh agent key {fp}: ANY host, including hosts "
+                       f"it is forwarded to, {left}")
         else:
             out.append(f"ssh agent key {fp}: for {', '.join(k.get('hosts') or [])}, {left}")
     return out
