@@ -307,13 +307,13 @@
   // answers after which the page's picture of the row or of the install is stale or unavailable
   const REREAD = new Set(["needs_intent", "stale", "tier_moved", "gesture_moved", "needs_broker", "standby", "not_built"]);
 
-  // a landed write paints nothing, so the row's own "saving…" (set by the form that sent it) is cleared here rather than
-  // left for the re-read, which can defer behind a polling job
+  // a landed write paints nothing, so the row's own "saving…" or an earlier refusal is cleared here rather than left for the
+  // re-read, which can defer behind a polling job
   function clearBusy(key) {
     if (!key) return;
     for (const row of document.querySelectorAll("[data-row-key]")) {
       if (row.dataset.rowKey !== key) continue;
-      for (const m of row.querySelectorAll(".edit-msg.busy")) { m.className = "edit-msg"; m.textContent = ""; }
+      for (const m of row.querySelectorAll(".edit-msg")) { m.className = "edit-msg"; m.textContent = ""; }   // busy, and an earlier refusal
     }
   }
   // The kernel's answer, drawn on its row the moment it arrives when it is one a person needs (a landed write says nothing:
@@ -352,15 +352,17 @@
     standby: "That cannot be done from this page right now.",
     not_built: "That cannot be done from this page yet."
   };
+  // Only a landed state is silent; a state this page does not know speaks too (never a quiet failure). Own-property lookups:
+  // a state or code named "constructor" must not index into Object.prototype.
   function resultWords(state) {
     if (state === "COMMITTED" || state === "done") return null;
-    return RESULT_WORDS[state] || null;
+    return Object.prototype.hasOwnProperty.call(RESULT_WORDS, state) ? RESULT_WORDS[state] : "That did not finish. Check the row.";
   }
 
   function fault(r, what) {
     const d = r.data || {};
     const code = d.error || "HTTP " + r.status;
-    const text = FAULT_WORDS[code] || d.message || "That did not go through (" + code + ").";
+    const text = (Object.prototype.hasOwnProperty.call(FAULT_WORDS, code) && FAULT_WORDS[code]) || d.message || "That did not go through (" + code + ").";
     if (REREAD.has(code) || r.status === 501) {
       notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);
@@ -436,7 +438,11 @@
     const words = resultWords(state);
     notice = words ? { key: base.row_id || null, text: words, cls: state === "WAITING" || state === "applying" ? "preview" : "err" } : null;
     if (notice) paintNow(notice); else clearBusy(base.row_id || null);
-    await afterWrite();
+    const redrew = await afterWrite();
+    if (!words && redrew === false) {   // landed, but the page could not redraw: say so, the silence was for a page that updates
+      notice = { key: base.row_id || null, text: "Saved. The page could not refresh; reload to see it.", cls: "note" };
+      paintNow(notice);
+    }
     return { ok: true, data: d };
   }
 
@@ -444,9 +450,9 @@
   async function afterWrite() {
     if (window.LevainDashboard && typeof window.LevainDashboard.jobsActive === "function" && window.LevainDashboard.jobsActive()) {
       deferredReload = true;
-    } else {
-      await load();
+      return undefined;
     }
+    return load();   // false when the read or the render failed
   }
 
   // The legacy request kinds the render core still speaks, translated onto cockpit verbs. Only the verb

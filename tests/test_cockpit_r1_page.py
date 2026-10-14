@@ -519,6 +519,18 @@ cases.the_answer_reaches_the_row_before_the_reread_resolves = async () => {
   await p;
 };
 
+cases.an_unknown_state_speaks_never_reads_as_landed = async () => {
+  const env = makeEnv();
+  env.verbAnswers = [[200, { ok: true, state: "MYSTERY" }]];
+  await env.start();
+  const row = fakeRow("spore:spore-1");
+  env.rows = [row];
+  const p = env.opts().commit({ kind: "spore_touch", spore_id: "spore-1" });
+  await env.settle();
+  ok(row.msg && /did not finish/.test(row.msg.textContent), "a state the page does not know says so: " + (row.msg && row.msg.textContent));
+  await p;
+};
+
 cases.a_refusal_shows_its_text_at_once = async () => {
   const env = makeEnv();
   env.verbAnswers = [[409, { ok: false, error: "stale", message: "the row moved" }]];
