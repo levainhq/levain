@@ -440,10 +440,11 @@ def sweep_orphans() -> list[str]:
 # --- levain ssh-add -------------------------------------------------------------------------------
 #
 # Keys go in only from the operator's own shell. The destinations a key is limited to are checked
-# against a protected host-key manifest, ``<levain home>/ssh/known_hosts``, passed to ``ssh-add -H``:
-# never ``~/.ssh/known_hosts``, which a confined process can write (``build_policy`` hides
-# ``<levain home>/ssh`` like ``run``). The operator fills it with host keys they have checked, e.g. the
-# matching lines of their own ``~/.ssh/known_hosts``.
+# against a protected host-key manifest, ``<levain home>/ssh/known_hosts``, passed to ``ssh-add -H``
+# (``build_policy`` hides ``<levain home>/ssh`` like ``run``). The operator fills it with host keys
+# they have checked out of band: ``ssh-keyscan <host>``, its fingerprint compared with one the host's
+# owner publishes (GitHub and GitLab publish theirs). Never copied from ``~/.ssh/known_hosts``: a
+# confined process could write that file until B2a fix 1 (L1 #1 / L2 #1), and on macOS still can.
 
 HOST_KEYS_DIR = "ssh"
 HOST_KEYS_FILE = "known_hosts"
@@ -489,8 +490,9 @@ def _manifest_problem(f: Path) -> str | None:
     try:
         st = os.lstat(f)
     except FileNotFoundError:
-        return (f"the host-key manifest {f} does not exist; put the host keys you have checked there (e.g. "
-                f"the lines for the host from your ~/.ssh/known_hosts), mode 0600")
+        return (f"the host-key manifest {f} does not exist; put there the host keys you have checked out "
+                f"of band (`ssh-keyscan <host>`, its fingerprint compared with one the host publishes; "
+                f"GitHub and GitLab publish theirs), never lines from ~/.ssh/known_hosts, mode 0600")
     except OSError as exc:
         return f"the host-key manifest {f} cannot be read ({exc.strerror or exc})"
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022:
@@ -558,6 +560,7 @@ def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, se
     if not key.is_file():
         raise AgentError(f"{key} is not a key file")
     manifest = host_keys_file()
+    bound: list[str] = []   # per -h host, the manifest keys the limit binds to (checked by the operator)
     if hosts:
         problem = _manifest_problem(manifest)
         if problem is not None:
@@ -566,10 +569,16 @@ def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, se
             if not _HOST_RE.match(dest.replace(">", "")):
                 raise AgentError(f"-h {dest!r} is not a destination ssh-add takes ([user@]host, hops joined by >)")
             for h in _hop_hosts(dest):
-                found = subprocess.run(["ssh-keygen", "-F", h, "-f", str(manifest)], capture_output=True, env=_tool_env(),
+                found = subprocess.run(["ssh-keygen", "-F", h, "-l", "-E", "sha256", "-f", str(manifest)],
+                                       capture_output=True, env=_tool_env(), text=True,
                                        stdin=subprocess.DEVNULL, timeout=30, check=False)
                 if found.returncode != 0:
                     raise AgentError(f"{h} has no host key in {manifest}; add the key you have checked first")
+                fps = [f"{f[2]} ({f[1]})" for f in (ln.split() for ln in found.stdout.splitlines()
+                                                    if not ln.startswith("#"))
+                       if len(f) >= 3 and f[2].startswith("SHA256:")]
+                bound.append(f"  bound to {h}'s host key{'s' if len(fps) > 1 else ''} in {manifest}: "
+                             + (", ".join(fps) or "(fingerprint not shown by ssh-keygen)"))
     fp = fingerprint(key)
     d, rec = _pick_session(session)
     sock = str(d / SOCKET_NAME)
@@ -603,8 +612,8 @@ def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, se
                         "added_at": int(time.time()), "waived": bool(waive_destinations)})
     write_record(d, rec)
     limit = f"for {', '.join(hosts)}" if hosts else "for ANY host (destination limit waived)"
-    return (f"added {fp} to session {d.name}'s scoped agent (pid {got}, peer checked) {limit}, "
-            f"for {lifetime}s")
+    return "\n".join([f"added {fp} to session {d.name}'s scoped agent (pid {got}, peer checked) {limit}, "
+                      f"for {lifetime}s", *bound])
 
 
 # --- the run/doctor lines (D2) --------------------------------------------------------------------
