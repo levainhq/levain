@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sqlite3
 import subprocess
 import threading
@@ -174,7 +175,8 @@ def test_default_mode_answers_at_once(monkeypatch):
 
 def test_the_wait_never_exceeds_the_installed_hold():
     q = FakeQueue(None)
-    cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=5000), max_hold=60)
+    cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=5000), max_hold=60 + cc.CLEANUP_RESERVE,
+              clock=lambda: 0.0)
     assert q.waited == [60.0] and q.filed[0]["hold"] == timedelta(seconds=60)
 
 
@@ -341,7 +343,7 @@ def test_real_core_signed_allow_through_main(tmp_path):
     t = threading.Thread(target=answer)
     t.start()
     out = io.StringIO()
-    rc = cc.main(["--queue-dir", str(qdir), "--max-hold", "20"], stdin=io.StringIO(json.dumps(event())), stdout=out)
+    rc = cc.main(["--queue-dir", str(qdir), "--max-hold", "90"], stdin=io.StringIO(json.dumps(event())), stdout=out)
     t.join()
     assert rc == 0
     assert json.loads(out.getvalue())["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
@@ -355,3 +357,141 @@ def test_real_core_without_authority_is_no_decision(tmp_path):
     q = ConsentQueue(qdir, authority=authority_source(qdir, anchor=None))
     assert q.pending() == []  # filed, then withdrawn: the native dialog stands
     assert q._fresh_authority() is None  # the no-root source never replays
+
+
+# --- fix round 1 (L3 Q2 r1, codex 1/2/4/6/7/8/9) ----------------------------------------------------------------
+
+@pytest.mark.parametrize("rel", ["consent/claude_code.json", "consent/queue.db", "consent/queue.db-wal",
+                                 "cockpit/cockpit.db", "cockpit/cockpit.db-wal", "cockpit/anchor/authority.anchor"])
+def test_the_adapters_own_trust_root_is_agent_config(tmp_path, rel):
+    """P1 (codex 1): the adapter settings, the queue db, the authority db and its anchor are T3, policy-ineligible."""
+    settings = cc.AdapterSettings(cockpit_data_root=str(tmp_path / "cockpit"))
+    protected = cc.protected_paths(tmp_path / "consent", settings)
+    assert cc.targets_agent_config("Write", {"file_path": str(tmp_path / rel)}, "/work/proj", protected=protected)
+    assert not cc.targets_agent_config("Write", {"file_path": str(tmp_path / "other.json")}, "/work/proj",
+                                       protected=protected)
+
+
+def test_main_files_a_write_to_the_adapter_settings_at_t3_without_policy(monkeypatch, tmp_path):
+    calls = []
+    q = FakeQueue(None)
+    target = str(tmp_path / "consent" / cc.SETTINGS_NAME)
+    monkeypatch.setattr(cc, "_queue_for", lambda d, s: q)
+    monkeypatch.setattr(cc, "decide_by_policy", lambda r: calls.append(r))
+    cc.main(["--queue-dir", str(tmp_path / "consent")],
+            stdin=io.StringIO(json.dumps(event("Write", {"file_path": target, "content": "{}"}))), stdout=io.StringIO())
+    assert q.filed[0]["tier"] == cc.AGENT_CONFIG_TIER and calls == []
+
+
+@pytest.mark.parametrize("root", ["authority", "./cockpit", "cockpit/../x", "", 7])
+def test_a_relative_cockpit_root_is_no_authority(tmp_path, root):
+    """P2 (codex 2): never resolved against the hook's cwd (the project)."""
+    (tmp_path / cc.SETTINGS_NAME).write_text(json.dumps({"away_mode": True, "cockpit_data_root": root}))
+    assert cc.load_settings(tmp_path).cockpit_data_root is None
+
+
+def test_a_home_relative_cockpit_root_is_expanded_and_canonical(tmp_path, monkeypatch):
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / cc.SETTINGS_NAME).write_text(json.dumps({"cockpit_data_root": "~/link"}))
+    assert cc.load_settings(tmp_path).cockpit_data_root == os.path.realpath(real)
+
+
+@pytest.mark.parametrize("link", [".claude", ".claude/hooks", ".claude/settings.json",
+                                  ".claude/hooks/levain_consent.py"])
+def test_install_refuses_a_symlink_on_the_path(tmp_path, link):
+    """P3 (codex 4): a workspace symlink never redirects the install (e.g. .claude -> ~/.claude)."""
+    ws, elsewhere = tmp_path / "ws", tmp_path / "elsewhere"
+    ws.mkdir()
+    elsewhere.mkdir()
+    (elsewhere / "victim").write_text("{}")
+    parent = (ws / link).parent
+    parent.mkdir(parents=True, exist_ok=True)
+    (ws / link).symlink_to(elsewhere if not link.endswith((".json", ".py")) else elsewhere / "victim")
+    with pytest.raises(ValueError):
+        cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    assert (elsewhere / "victim").read_text() == "{}" and sorted(p.name for p in elsewhere.iterdir()) == ["victim"]
+
+
+def test_reinstall_removes_only_the_exact_levain_handler(tmp_path):
+    """P4 (codex 8): other handlers in a shared group and group fields stay; a lookalike command stays."""
+    ws = tmp_path / "ws"
+    (ws / ".claude").mkdir(parents=True)
+    script, settings = cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    data = json.loads(settings.read_text())
+    [group] = data["hooks"]["PermissionRequest"]
+    audit = {"type": "command", "command": "/usr/bin/audit backup-levain_consent.py"}
+    group["hooks"].append(audit)
+    group["note"] = "kept"
+    lone = {"matcher": "Bash", "hooks": [{"type": "command", "command": "/x/levain_consent.py.bak"}]}
+    data["hooks"]["PermissionRequest"].append(lone)
+    settings.write_text(json.dumps(data))
+    cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    groups = json.loads(settings.read_text())["hooks"]["PermissionRequest"]
+    assert groups[0] == {"matcher": "*", "hooks": [audit], "note": "kept"}
+    assert groups[1] == lone
+    assert groups[2]["hooks"][0]["command"] == f"/py/bin/python3 {script}" and len(groups) == 3
+
+
+def test_settings_update_is_an_atomic_replace(tmp_path, monkeypatch):
+    """P4 (codex 9): written to a temp file, fsynced, renamed over; never truncated in place."""
+    ws = tmp_path / "ws"
+    (ws / ".claude").mkdir(parents=True)
+    (ws / ".claude" / "settings.json").write_text(json.dumps({"model": "haiku"}))
+    before = os.stat(ws / ".claude" / "settings.json").st_ino
+    synced, replaced = [], []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(cc.os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
+    monkeypatch.setattr(cc.os, "replace", lambda a, b: (replaced.append(Path(b).name), real_replace(a, b))[1])
+    cc.install(ws, python="/py/bin/python3", queue_dir=tmp_path / "q", max_hold=60)
+    assert "settings.json" in replaced and cc.HOOK_SCRIPT_NAME in replaced and len(synced) >= 2
+    assert os.stat(ws / ".claude" / "settings.json").st_ino != before
+    assert json.loads((ws / ".claude" / "settings.json").read_text())["model"] == "haiku"
+    assert [p.name for p in (ws / ".claude").iterdir() if p.name.startswith(".")] == []
+
+
+@pytest.mark.parametrize("where", ["policy", "await"])
+def test_an_exception_after_filing_withdraws(where):
+    """P5 (codex 6): no ghost request stays pending (and answerable) after the hook has gone."""
+    q = FakeQueue(RuntimeError("boom") if where == "await" else None)
+
+    def policy(request):
+        raise RuntimeError("policy boom")
+    with pytest.raises(RuntimeError):
+        cc.decide(event(), q, AWAY, policy=policy if where == "policy" else (lambda r: None))
+    assert q.withdrawn == [q.requests[0].id]
+
+
+def test_max_hold_is_a_total_deadline_and_the_cc_timeout_exceeds_it():
+    """P6 (codex 7): the wait leaves CLEANUP_RESERVE of max_hold for withdraw + re-read; Claude Code's timeout
+    is above wait + reserve, so it never cancels a hook that is delivering a verified answer."""
+    for max_hold in (0, 30, 60, 90, 900, 1800.5):
+        q = FakeQueue(None)
+        cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=10**6), max_hold=max_hold)
+        wait = q.waited[0] if q.waited else 0.0
+        assert wait <= max(0.0, max_hold - cc.CLEANUP_RESERVE) + 1e-6
+        assert wait + cc.CLEANUP_RESERVE < cc.hook_timeout(max_hold)
+    assert cc.CLEANUP_RESERVE >= 30 + 10  # sqlite busy timeout (withdraw) + one signature verification
+
+
+def test_the_deadline_counts_time_already_spent():
+    t = [1000.0]
+    q = FakeQueue(None)
+
+    def slow_policy(request):
+        t[0] += 50
+        return None
+    cc.decide(event(), q, cc.AdapterSettings(away_mode=True, away_hold_seconds=10**6), max_hold=200,
+              policy=slow_policy, clock=lambda: t[0])
+    assert q.waited == [200 - cc.CLEANUP_RESERVE - 50]
+
+
+def test_a_failing_stdout_is_still_exit_0(monkeypatch):
+    class Broken(io.StringIO):
+        def write(self, s):
+            raise BrokenPipeError
+    monkeypatch.setattr(cc, "_queue_for", lambda d, s: FakeQueue("allow"))
+    monkeypatch.setattr(cc, "load_settings", lambda d: AWAY)
+    assert cc.main(["--queue-dir", "/nonexistent"], stdin=io.StringIO(json.dumps(event())), stdout=Broken()) == 0

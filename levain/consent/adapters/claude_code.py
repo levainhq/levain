@@ -18,7 +18,7 @@ parsed (ruling 1): a Bash request is just a Bash request.
 
 Settings live in ``<levain home>/consent/claude_code.json`` (:data:`SETTINGS_NAME`)::
 
-    {"cockpit_data_root": "/path/with/cockpit.db", "away_mode": false, "away_hold_seconds": 0}
+    {"cockpit_data_root": "/absolute/cockpit/data/root", "away_mode": false, "away_hold_seconds": 0}
 
 Missing or unreadable settings mean away mode off and no authority (so no answer can verify). :func:`install`
 writes the hook script (:data:`HOOK_TEMPLATE`) and the ``PermissionRequest`` entry into ONE workspace's project
@@ -32,7 +32,9 @@ import math
 import os
 import shlex
 import sys
-from collections.abc import Callable, Mapping
+import tempfile
+import time
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -49,8 +51,16 @@ HOOK_SCRIPT_NAME = "levain_consent.py"
 # A request is filed for at least this long even when nobody is waiting on it, so the policy seam has a live
 # request to look at; it is withdrawn as soon as the hook stops waiting.
 MIN_FILE_HOLD = timedelta(seconds=5)
-# The hook never waits longer than the hold it was installed with: Claude Code's ``timeout`` for the hook is
-# that hold plus this margin, so Claude Code never cancels the hook mid-wait (a cancelled hook is no decision).
+# ``max_hold`` (the installed ``--max-hold``) is the hook's TOTAL internal deadline, counted from the moment
+# ``decide`` starts. Before it waits, the hook reserves this many seconds of it for what follows the wait: the
+# withdraw (one sqlite write, busy timeout 30 s) and the re-read of a decision that landed meanwhile (one
+# signature verification, 10 s, ``levain.authority`` verify timeout), plus 20 s of slack: 30 + 10 + 20 = 60. So
+# the wait is at most ``max_hold - CLEANUP_RESERVE`` (0 when that is negative) and the hook ends by
+# ``max(max_hold, CLEANUP_RESERVE)``.
+CLEANUP_RESERVE = 60.0
+# Claude Code's ``timeout`` for the hook is :func:`hook_timeout`: ``ceil(max(max_hold, CLEANUP_RESERVE))`` plus
+# this margin (interpreter start, imports, settings read), so it always exceeds wait + CLEANUP_RESERVE and Claude
+# Code never cancels the hook while a verified answer is on its way out (a cancelled hook's output is discarded).
 TIMEOUT_MARGIN = 30
 DEFAULT_MAX_HOLD = 900.0
 # A request on one of these tools whose target path is agent config or a hook is tagged agent_config.
@@ -84,9 +94,35 @@ def load_settings(queue_dir: Path) -> AdapterSettings:
     hold = data.get("away_hold_seconds", 0)
     if isinstance(hold, bool) or not isinstance(hold, (int, float)) or not math.isfinite(hold) or hold < 0:
         hold = 0.0
-    root = data.get("cockpit_data_root")
     return AdapterSettings(away_mode=away, away_hold_seconds=float(hold),
-                           cockpit_data_root=root if isinstance(root, str) and root else None)
+                           cockpit_data_root=_absolute_root(data.get("cockpit_data_root")))
+
+
+def _absolute_root(root: Any) -> str | None:
+    """``root`` canonicalized (``~`` expanded, symlinks resolved) when it is ABSOLUTE after ``~`` expansion; else
+    ``None`` (no authority). A relative path is never resolved: the hook runs in the project's directory, and a
+    repository must not be able to supply the authority it is judged by."""
+    if not isinstance(root, str) or not root or "\x00" in root:
+        return None
+    try:
+        expanded = Path(root).expanduser()
+        if not expanded.is_absolute():
+            return None
+        return os.path.realpath(expanded)
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def protected_paths(queue_dir: Path, settings: AdapterSettings) -> tuple[Path, ...]:
+    """What the adapter itself trusts, so a file tool writing any of it is agent config (codex Q2 r1 #1): the
+    queue directory (the adapter settings and the queue database live in it) and, when a cockpit data root is
+    configured, its authority database (and sqlite's sidecars) and the authority anchor."""
+    out = [Path(os.path.abspath(queue_dir))]
+    if settings.cockpit_data_root:
+        root = Path(settings.cockpit_data_root)
+        db = root / "cockpit.db"
+        out += [db, *(Path(f"{db}{s}") for s in ("-wal", "-shm", "-journal")), anchor_path(root).parent]
+    return tuple(out)
 
 
 # --- ruling 3b item 1: agent config and hooks ----------------------------------------------------------------
@@ -103,10 +139,17 @@ def _is_config_path(path: Path) -> bool:
     return False
 
 
-def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None) -> bool:
+def _under(path: Path, roots: tuple[str, ...]) -> bool:
+    p = str(path).lower()
+    return any(p == r or p.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
+
+
+def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Path | None = None,
+                         protected: Iterable[Path] = ()) -> bool:
     """True when an Edit/Write/MultiEdit/NotebookEdit request targets an agent's config or hooks: a
     ``.claude/settings*.json``, anything under a ``.claude/hooks/``, a ``.codex/hooks.json`` or ``.codex/config.toml``,
-    in the workspace or the home directory. The path is checked as written (``~`` expanded, joined to ``cwd``,
+    in the workspace or the home directory, or any of ``protected`` (a file, or anything under a directory; the
+    adapter passes :func:`protected_paths`). The path is checked as written (``~`` expanded, joined to ``cwd``,
     normalised) and as resolved through symlinks; either match tags it. A file tool whose target cannot be read
     is tagged too. Other tools are never tagged: Bash is not parsed (ruling 1)."""
     if tool_name not in FILE_TOOLS:
@@ -121,9 +164,11 @@ def targets_agent_config(tool_name: str, tool_input: Any, cwd: str, *, home: Pat
     written = Path(os.path.normpath(raw))
     try:
         resolved = Path(os.path.realpath(raw))
+        roots = tuple({s for p in protected
+                       for s in (os.path.normpath(str(p)).lower(), os.path.realpath(p).lower())})
     except (OSError, ValueError):
         return True
-    return _is_config_path(written) or _is_config_path(resolved)
+    return _is_config_path(written) or _is_config_path(resolved) or _under(written, roots) or _under(resolved, roots)
 
 
 # --- the decision ------------------------------------------------------------------------------------------
@@ -147,9 +192,12 @@ def hook_output(decision: Decision) -> dict[str, Any]:
 
 def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_hold: float = DEFAULT_MAX_HOLD,
            policy: Callable[[ExternalGateRequest], Decision | None] = decide_by_policy,
-           home: Path | None = None) -> dict[str, Any] | None:
-    """The hook's output for one event, or ``None`` for no decision. Raises on anything unexpected; the
-    caller (:func:`main`) turns that into no decision."""
+           home: Path | None = None, protected: Iterable[Path] = (),
+           clock: Callable[[], float] = time.monotonic) -> dict[str, Any] | None:
+    """The hook's output for one event, or ``None`` for no decision. Raises on anything unexpected (after
+    withdrawing the request it filed, so no ghost stays pending); the caller (:func:`main`) turns that into no
+    decision. ``max_hold`` is a total deadline: the wait ends :data:`CLEANUP_RESERVE` seconds before it."""
+    deadline = clock() + max(0.0, float(max_hold)) - CLEANUP_RESERVE
     if not isinstance(event, Mapping) or event.get("hook_event_name") != EVENT:
         return None
     tool_name, tool_input, cwd = event.get("tool_name"), event.get("tool_input", {}), event.get("cwd")
@@ -163,21 +211,35 @@ def decide(event: Any, queue: ConsentQueue, settings: AdapterSettings, *, max_ho
     if isinstance(agent_id, str) and agent_id:
         session = f"{session}#agent:{agent_id}"
     tool_use_id = event.get("tool_use_id")
-    agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home)
-    hold = min(float(settings.away_hold_seconds), max(0.0, float(max_hold))) if settings.away_mode else 0.0
+    agent_config = targets_agent_config(tool_name, tool_input, cwd, home=home, protected=protected)
+    hold = min(float(settings.away_hold_seconds), max(0.0, deadline - clock())) if settings.away_mode else 0.0
     request = queue.file(agent=AGENT, agent_session_id=session, tool_name=tool_name, tool_input=tool_input, cwd=cwd,
                          hold=max(timedelta(seconds=hold), MIN_FILE_HOLD),
                          tier=AGENT_CONFIG_TIER if agent_config else DEFAULT_TIER,
                          event_id=tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None)
-    got: Decision | None = None
-    if not agent_config:
-        got = _verified(policy(request), request)
-    if got is None and hold > 0:
-        got = _verified(queue.await_decision(request.id, hold), request)
-    if got is None and not queue.withdraw(request.id, note="the hook stopped waiting; the native dialog stands"):
-        # Not pending any more: an answer may have landed between the wait and the withdraw.
-        got = _verified(queue.decision(request.id), request)
-    return hook_output(got) if got is not None else None
+    settled = False
+    try:
+        got: Decision | None = None
+        if not agent_config:
+            got = _verified(policy(request), request)
+        wait = min(hold, max(0.0, deadline - clock()))
+        if got is None and wait > 0:
+            got = _verified(queue.await_decision(request.id, wait), request)
+        if got is None:
+            settled = True
+            if not queue.withdraw(request.id, note="the hook stopped waiting; the native dialog stands"):
+                # Not pending any more: an answer may have landed between the wait and the withdraw.
+                got = _verified(queue.decision(request.id), request)
+        settled = True
+        return hook_output(got) if got is not None else None
+    finally:
+        if not settled:
+            # An exception between file() and the withdraw: withdraw now so no ghost request stays answerable
+            # after the hook has gone. Its own failure is swallowed; the original exception propagates.
+            try:
+                queue.withdraw(request.id, note="the hook failed; the native dialog stands")
+            except Exception:
+                pass
 
 
 def guarded_policy(request: ExternalGateRequest,
@@ -213,16 +275,16 @@ def main(argv: list[str] | None = None, stdin: IO[str] | None = None, stdout: IO
         settings = load_settings(queue_dir)
         event = json.loads(stdin.read())
         out = decide(event, _queue_for(queue_dir, settings), settings, max_hold=args.max_hold,
-                     policy=guarded_policy)
+                     policy=guarded_policy, protected=protected_paths(queue_dir, settings))
+        if out is not None:
+            stdout.write(json.dumps(out) + "\n")
+            stdout.flush()
     except BaseException as exc:  # noqa: BLE001 - every failure is no decision, never allow
         try:
             print(f"levain consent hook: no decision ({type(exc).__name__}: {exc})"[:500], file=sys.stderr)
         except Exception:
             pass
         return 0
-    if out is not None:
-        stdout.write(json.dumps(out) + "\n")
-        stdout.flush()
     return 0
 
 
@@ -245,37 +307,112 @@ sys.exit(main({argv}))
 def install(workspace: Path | str, *, python: str | None = None, queue_dir: Path | str | None = None,
             max_hold: float = DEFAULT_MAX_HOLD) -> tuple[Path, Path]:
     """Install the hook into ``workspace``: ``.claude/hooks/levain_consent.py`` and a ``PermissionRequest``
-    entry (matcher ``*``, ``timeout`` = ``max_hold`` + :data:`TIMEOUT_MARGIN`) in ``.claude/settings.json``, other
+    entry (matcher ``*``, ``timeout`` = :func:`hook_timeout`) in ``.claude/settings.json``, other
     settings kept and any earlier levain entry replaced. Returns (script, settings)."""
     if not (isinstance(max_hold, (int, float)) and math.isfinite(max_hold) and max_hold >= 0):
         raise ValueError("max_hold must be a finite number of seconds >= 0")
     ws = Path(workspace).resolve()
     claude_dir = ws / ".claude"
     hooks_dir = claude_dir / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
+    script = hooks_dir / HOOK_SCRIPT_NAME
+    settings_path = claude_dir / "settings.json"
+    for directory in (claude_dir, hooks_dir):
+        _refuse_symlink(directory)
+        if not os.path.lexists(directory):
+            os.mkdir(directory)
+        _refuse_symlink(directory)
+    _refuse_symlink(script)
+    _refuse_symlink(settings_path)
+    for target in (script, settings_path):
+        if not os.path.realpath(target.parent).startswith(str(ws) + os.sep):
+            raise ValueError(f"refusing to install outside the workspace: {target}")
     python = python or sys.executable
     argv = ["--max-hold", repr(float(max_hold))]
     if queue_dir is not None:
         argv += ["--queue-dir", str(Path(queue_dir).resolve())]
-    script = hooks_dir / HOOK_SCRIPT_NAME
-    script.write_text(HOOK_TEMPLATE.format(python=python, argv=repr(argv)), encoding="utf-8")
-    script.chmod(0o755)
-    settings_path = claude_dir / "settings.json"
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        settings = {}
-    if not isinstance(settings, dict):
-        raise ValueError(f"{settings_path} is not a JSON object")
-    hooks = settings.setdefault("hooks", {})
+    _atomic_write(script, HOOK_TEMPLATE.format(python=python, argv=repr(argv)), mode=0o755)
     command = f"{shlex.quote(python)} {shlex.quote(str(script))}"
-    entries = [e for e in hooks.get(EVENT, []) if not any(
-        isinstance(h, dict) and HOOK_SCRIPT_NAME in str(h.get("command", "")) for h in e.get("hooks", []))]
-    entries.append({"matcher": "*", "hooks": [{"type": "command", "command": command,
-                                               "timeout": int(math.ceil(max_hold)) + TIMEOUT_MARGIN}]})
-    hooks[EVENT] = entries
-    settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-    return script, settings_path
+    handler = {"type": "command", "command": command, "timeout": hook_timeout(max_hold)}
+    for _ in range(5):
+        before = _stat_key(settings_path)
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            settings = {}
+        if not isinstance(settings, dict):
+            raise ValueError(f"{settings_path} is not a JSON object")
+        _merge_handler(settings, command, handler)
+        if _stat_key(settings_path) != before:
+            continue  # changed while we merged: merge again onto the newer file
+        _atomic_write(settings_path, json.dumps(settings, indent=2) + "\n", mode=0o644, keep_mode=True)
+        return script, settings_path
+    raise RuntimeError(f"{settings_path} kept changing; not updated")
+
+
+def hook_timeout(max_hold: float) -> int:
+    """Claude Code's ``timeout`` for the installed hook: ``ceil(max(max_hold, CLEANUP_RESERVE))`` +
+    :data:`TIMEOUT_MARGIN`. The wait ends :data:`CLEANUP_RESERVE` before ``max_hold`` (or is 0), so this always
+    exceeds wait + that reserve."""
+    return int(math.ceil(max(max_hold, CLEANUP_RESERVE))) + TIMEOUT_MARGIN
+
+
+def _merge_handler(settings: dict[str, Any], command: str, handler: dict[str, Any]) -> None:
+    """Remove ONLY the handler whose command is exactly ``command`` (other handlers and every group field
+    kept; a group dropped only when that leaves it with no handlers), then add ``handler`` in its own group."""
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        raise ValueError("settings 'hooks' is not a JSON object")
+    groups = hooks.get(EVENT, [])
+    if not isinstance(groups, list):
+        raise ValueError(f"settings 'hooks.{EVENT}' is not a list")
+    kept = []
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            kept.append(group)
+            continue
+        handlers = [h for h in group["hooks"] if not (isinstance(h, dict) and h.get("command") == command)]
+        if handlers or not group["hooks"]:
+            kept.append({**group, "hooks": handlers})
+    kept.append({"matcher": "*", "hooks": [handler]})
+    hooks[EVENT] = kept
+
+
+def _refuse_symlink(path: Path) -> None:
+    if os.path.islink(path):
+        raise ValueError(f"refusing to install through a symlink: {path}")
+
+
+def _stat_key(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _atomic_write(path: Path, text: str, *, mode: int, keep_mode: bool = False) -> None:
+    """Write ``text`` to a new temp file beside ``path`` (created exclusively, never through a symlink),
+    fsync it, and rename it over ``path``: a rename replaces a symlink leaf itself, never its target, and a
+    reader sees the old file or the new one, never a partial write."""
+    if keep_mode:
+        try:
+            mode = os.lstat(path).st_mode & 0o777
+        except FileNotFoundError:
+            pass
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fchmod(fh.fileno(), mode)
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 if __name__ == "__main__":
