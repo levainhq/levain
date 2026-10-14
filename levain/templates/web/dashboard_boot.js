@@ -343,6 +343,8 @@
     WAITING: "Waiting for your signature.",
     applying: "Still saving."
   };
+  // The page never shows the server's own text for a refusal: it can carry a path or an OS error. A code not listed here
+  // says only its code.
   const FAULT_WORDS = {
     stale: "That changed somewhere else first. Reload to see the new version.",
     needs_intent: "This needs a fresh confirmation. Try again.",
@@ -351,7 +353,11 @@
     needs_broker: "That cannot be done from this page right now.",
     standby: "That cannot be done from this page right now.",
     not_built: "That cannot be done from this page yet.",
-    not_initialised: "This install is not set up to do that yet."
+    not_initialised: "This install is not set up to do that yet.",
+    install_disabled: "Writes are turned off for this install.",
+    pending_cap: "Too many changes are waiting. Decide one first.",
+    idempotency_conflict: "That is already being saved. Try again in a moment.",
+    refused: "That was refused."
   };
   // Only a landed state is silent; a state this page does not know speaks too (never a quiet failure). Own-property lookups:
   // a state or code named "constructor" must not index into Object.prototype.
@@ -363,7 +369,7 @@
   function fault(r, what) {
     const d = r.data || {};
     const code = d.error || "HTTP " + r.status;
-    const text = (Object.prototype.hasOwnProperty.call(FAULT_WORDS, code) && FAULT_WORDS[code]) || (r.status < 500 && d.message) || "That did not go through (" + code + ").";
+    const text = (Object.prototype.hasOwnProperty.call(FAULT_WORDS, code) && FAULT_WORDS[code]) || "That did not go through (" + code + ").";
     if (REREAD.has(code) || r.status === 501) {
       notice = { key: what.row_id || null, text: text, cls: "err" };
       paintNow(notice);
