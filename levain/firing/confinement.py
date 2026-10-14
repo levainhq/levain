@@ -1026,12 +1026,6 @@ DEFAULT_GRANT_LINES = {
     "Linux": ("/dev/log (write-only syslog)",),
     "Darwin": ("/private/var/run/mDNSResponder (name resolution)",),
 }
-SSH_AGENT_LINES = {
-    "Linux": ("ssh agent: none until levain's scoped agent (B2); $SSH_AUTH_SOCK is not passed to bash, so "
-              "git over ssh inside bash fails until then"),
-    "Darwin": ("ssh agent: $SSH_AUTH_SOCK is passed to bash; macOS has no unix-socket rule until levain's "
-               "macOS tier (B2), so bash running as you can reach your agent"),
-}
 GPG_EXTRA_WAIVER = "gpg's extra socket closes the agent's command channel, not its program-exec shape"
 
 
@@ -1066,12 +1060,16 @@ def snapshot_operator_grants(hands: "HandsIdentity | None" = None, *,
         return GrantSnapshot(problem=str(exc))
 
 
-def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | None = None) -> list[str]:
+def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | None = None,
+                      ssh_agent: "_ssh_agent.ScopedAgent | None" = None,
+                      ssh_agent_note: str | None = None) -> list[str]:
     """The unix-socket lines ``levain run`` and ``levain doctor`` print, from one place (one table): the
     tier claim (:func:`levain.firing.landlock.tier_line` of levain's own read), every operator grant as a
     named waiver (none read for a hands user's entity, nor where grants are not applied: one line says
-    so), every default grant, the ssh agent, and the entity's legacy ``runtime_sockets`` key as ignored.
-    A grant file that cannot be read raises :class:`ConfinementError`, as the spawn does."""
+    so), every default grant, the ssh agent (:func:`levain.firing.ssh_agent.status_lines`: ``run`` passes
+    its session's ``ssh_agent`` or the ``ssh_agent_note`` saying why it has none; ``doctor`` passes
+    neither and gets every running session's), and the entity's legacy ``runtime_sockets`` key as
+    ignored. A grant file that cannot be read raises :class:`ConfinementError`, as the spawn does."""
     system = system or platform.system()
     abi, reason = _landlock.host_read(system)
     if system != "Linux" and reason is None:
@@ -1089,8 +1087,8 @@ def unix_socket_lines(cfg: "ConfinementConfig | None" = None, *, system: str | N
             lines.append(f"waiver (operator grant) {g.name}: {g.path} ({g.why}){extra}")
     for d in DEFAULT_GRANT_LINES.get(system, ()):
         lines.append(f"default grant: {d}")
-    if system in SSH_AGENT_LINES:
-        lines.append(SSH_AGENT_LINES[system])
+    lines.extend(_ssh_agent.status_lines(system, agent=ssh_agent, note=ssh_agent_note,
+                                         hands=cfg is not None and getattr(cfg, "hands_user", None) is not None))
     if cfg is not None and cfg.runtime_sockets:
         lines.append(f"ignored: runtime_sockets in .levain/confinement.json ({', '.join(cfg.runtime_sockets)}) "
                      f"grants nothing; the operator declares sockets in {grants_file()}")

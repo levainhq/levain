@@ -573,3 +573,84 @@ def add_key(key: Path, hosts: list[str], *, lifetime: int = DEFAULT_LIFETIME, se
     limit = f"for {', '.join(hosts)}" if hosts else "for ANY host (destination limit waived)"
     return (f"added {fp} to session {d.name}'s scoped agent (pid {got}, peer checked) {limit}, "
             f"for {lifetime}s")
+
+
+# --- the run/doctor lines (D2) --------------------------------------------------------------------
+
+DARWIN_LINE = ("ssh agent: $SSH_AUTH_SOCK is passed to bash; macOS has no unix-socket rule until levain's "
+               "macOS tier (B2b), so bash running as you can reach your agent")
+_NO_AGENT_TAIL = "$SSH_AUTH_SOCK is not passed to bash, so git over ssh inside bash fails"
+
+
+def _held(sock: str) -> list[str] | None:
+    """The SHA256 fingerprints the agent on ``sock`` holds (``ssh-add -l``), or None if it cannot say."""
+    env = {k: v for k, v in os.environ.items() if k != "SSH_AUTH_SOCK"}
+    env["SSH_AUTH_SOCK"] = sock
+    try:
+        done = subprocess.run(["ssh-add", "-l", "-E", "sha256"], env=env, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode not in (0, 1):
+        return None
+    return [f[1] for f in (line.split() for line in done.stdout.splitlines()) if len(f) > 1 and f[1].startswith("SHA256:")]
+
+
+def _left(secs: int) -> str:
+    h, m = divmod(max(secs, 0) // 60, 60)
+    return f"{h}h{m:02d}m left" if h else f"{m}m left"
+
+
+def key_lines(d: Path, rec: dict[str, Any], *, now: float | None = None) -> list[str]:
+    """One line per key the agent in ``d`` holds: its destinations and remaining lifetime from the record,
+    or, for a key the record does not have, that no limit is known. Or the "no keys" line."""
+    held = _held(str(d / SOCKET_NAME))
+    if held is None:
+        return [f"ssh agent keys: could not be listed (ssh-add -l on {d / SOCKET_NAME} failed)"]
+    if not held:
+        return [f"ssh agent: no keys; add one from your own shell: `levain ssh-add <key> -h <host>`"
+                f" (session {d.name})"]
+    now = time.time() if now is None else now
+    known = {k["fingerprint"]: k for k in rec["keys"] if isinstance(k, dict) and "fingerprint" in k}
+    out = []
+    for fp in held:
+        k = known.get(fp)
+        if k is None:
+            out.append(f"ssh agent key {fp}: added from inside the session, no destination limit known")
+            continue
+        left = _left(int(k.get("added_at", 0)) + int(k.get("lifetime", 0)) - int(now))
+        if k.get("waived"):
+            out.append(f"waiver (levain ssh-add {WAIVER_FLAG}) ssh agent key {fp}: ANY host, {left}")
+        else:
+            out.append(f"ssh agent key {fp}: for {', '.join(k.get('hosts') or [])}, {left}")
+    return out
+
+
+def status_lines(system: str, *, agent: ScopedAgent | None = None, note: str | None = None,
+                 hands: bool = False) -> list[str]:
+    """The ssh lines ``levain run`` (with this session's ``agent``, or the ``note`` saying why it has
+    none) and ``levain doctor`` (neither: every running session's agent) print."""
+    if system == "Darwin":
+        return [DARWIN_LINE]
+    if system != "Linux":
+        return []
+    if hands:
+        return [f"ssh agent: none (the entity's own user); {_NO_AGENT_TAIL}"]
+    if agent is not None:
+        rec = read_record(agent.dir) or {"keys": []}
+        return [f"ssh agent: levain's scoped agent for this session (pid {agent.pid}, {agent.socket}); "
+                "bash reaches only it, at its $SSH_AUTH_SOCK", *key_lines(agent.dir, rec)]
+    if note is not None:
+        return [f"ssh agent: none for this session ({note}); {_NO_AGENT_TAIL}"]
+    problem = openssh_problem()
+    if problem is not None:
+        return [f"ssh agent: none; levain starts no scoped agent here ({problem}); {_NO_AGENT_TAIL}"]
+    running = [(d, rec) for d, rec in sessions() if live(d, rec)]
+    if not running:
+        return ["ssh agent: levain starts a scoped one for each session's bash, never yours; add keys from "
+                "your own shell with `levain ssh-add <key> -h <host>` (none running now)"]
+    out = []
+    for d, rec in running:
+        out.append(f"ssh agent: session {d.name} ({rec.get('entity') or '?'}), pid {rec['pid']}")
+        out.extend(key_lines(d, rec))
+    return out
